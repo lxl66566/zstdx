@@ -51,15 +51,33 @@ impl<'t> HuffmanDecoder<'t> {
         self.state |= new_bits;
         num_bits
     }
+
+    /// Decode the symbol for the current state and advance to the next state in one step.
+    ///
+    /// Equivalent to `decode_symbol` followed by `next_state`, but loads the table entry
+    /// only once per symbol. The packed table stores the symbol in the high 8 bits and
+    /// the code length in the low 6 bits of a u16.
+    pub fn decode_and_advance(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        let entry = self.table.packed[self.state as usize];
+        let num_bits = (entry & 0x3F) as u8;
+        let new_bits = br.get_bits(num_bits);
+        self.state <<= num_bits;
+        self.state &= self.table.packed.len() as u64 - 1;
+        self.state |= new_bits;
+        (entry >> 8) as u8
+    }
 }
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
+    /// Same table as `decode`, but each entry packed into a u16:
+    /// high 8 bits = symbol, low 6 bits = code length. Enables a single load per symbol.
+    packed: Vec<u16>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
-    /// a Huffman tree. Once this tree is constructed, it can be used to build the
-    /// lookup table
+    /// a Huffman tree. Once this tree is constructed, it can be used to build
+    /// the lookup table
     weights: Vec<u8>,
     /// The maximum size in bits a prefix code in the encoded data can be.
     /// This value is used so that the decoder knows how many bits
@@ -78,6 +96,7 @@ impl HuffmanTable {
     pub fn new() -> HuffmanTable {
         HuffmanTable {
             decode: Vec::new(),
+            packed: Vec::new(),
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
@@ -93,6 +112,7 @@ impl HuffmanTable {
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.decode.extend_from_slice(&other.decode);
+        self.packed.extend_from_slice(&other.packed);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.bits.extend_from_slice(&other.bits);
@@ -103,6 +123,7 @@ impl HuffmanTable {
     /// Completely empty the table of all data.
     pub fn reset(&mut self) {
         self.decode.clear();
+        self.packed.clear();
         self.weights.clear();
         self.max_num_bits = 0;
         self.bits.clear();
@@ -116,10 +137,17 @@ impl HuffmanTable {
     /// Returns the number of bytes read.
     pub fn build_decoder(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
         self.decode.clear();
+        self.packed.clear();
 
         let bytes_used = self.read_weights(source)?;
         self.build_table_from_weights()?;
         Ok(bytes_used)
+    }
+
+    /// The decode table packed as u16 entries: `(symbol << 8) | num_bits`.
+    /// Allows a single load per decoded symbol.
+    pub(crate) fn packed_table(&self) -> &[u16] {
+        &self.packed
     }
 
     /// Read weights from the provided source.
@@ -372,6 +400,14 @@ impl HuffmanTable {
                 }
             }
         }
+
+        // build the packed view of the same table
+        self.packed.clear();
+        self.packed.extend(
+            self.decode
+                .iter()
+                .map(|e| ((e.symbol as u16) << 8) | e.num_bits as u16),
+        );
 
         Ok(())
     }

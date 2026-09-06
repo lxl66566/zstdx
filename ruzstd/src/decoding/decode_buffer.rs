@@ -111,32 +111,25 @@ impl DecodeBuffer {
     }
 
     fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
-        // We have at max offset bytes in one chunk, the last one can be smaller
-        let mut start_idx = start_idx;
-        let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
-        while copied_counter_left > 0 {
-            let chunksize = usize::min(offset, copied_counter_left);
-
+        // Copy in exponentially growing chunks anchored at `start_idx`. After `copied` bytes
+        // have been appended, `offset + copied` bytes are readable from `start_idx`, and each
+        // chunk reproduces the periodic pattern exactly because dst[i] = src[i] with
+        // dst start = start_idx + offset + copied >= src end. This needs log2(match_length /
+        // offset) large memcpys instead of match_length / offset single-offset chunks, which
+        // matters a lot for small offsets (e.g. offset=1 used to copy byte by byte).
+        let mut copied = 0;
+        while copied < match_length {
             // SAFETY: Requirements checked:
-            // 1. start_idx + chunksize must be <= self.buffer.len()
-            //      We know that:
-            //      1. start_idx starts at buffer.len() - offset
-            //      2. chunksize <= offset (== offset for each iteration but the last, and match_length modulo offset in the last iteration)
-            //      3. the buffer grows by offset many bytes each iteration but the last
-            //      4. start_idx is increased by the same amount as the buffer grows each iteration
-            //
-            //      Thus follows: start_idx + chunksize == self.buffer.len() in each iteration but the last, where match_length modulo offset == chunksize < offset
-            //          Meaning: start_idx + chunksize <= self.buffer.len()
+            // 1. start_idx + chunk must be <= self.buffer.len()
+            //      chunk <= offset + copied, and buffer.len() == start_idx + offset + copied
+            //      at this point (start of the first iteration has copied == 0 and
+            //      buffer.len() == start_idx + offset, and both sides grow by the same
+            //      amount each iteration). Thus start_idx + chunk <= buffer.len().
             //
             // 2. explicitly reserved enough memory for the whole match_length
-            unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, chunksize)
-            };
-            copied_counter_left -= chunksize;
-            start_idx += chunksize;
+            let chunk = usize::min(offset + copied, match_length - copied);
+            unsafe { self.buffer.extend_from_within_unchecked(start_idx, chunk) };
+            copied += chunk;
         }
     }
 

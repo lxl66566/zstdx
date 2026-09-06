@@ -38,6 +38,28 @@ impl<'s> BitReaderReversed<'s> {
         }
     }
 
+    /// Construct a reader from an explicit window state.
+    ///
+    /// pub(crate) contract (callers must uphold):
+    /// `index + 8 <= source.len()`, and the top `bits_consumed` bits of the
+    /// little-endian u64 at `source[index..]` are the bits the caller already consumed.
+    pub(crate) fn from_parts(
+        source: &'s [u8],
+        index: usize,
+        bits_consumed: u8,
+        extra_bits: usize,
+    ) -> BitReaderReversed<'s> {
+        debug_assert!(index + 8 <= source.len());
+        let bit_container = u64::from_le_bytes((&source[index..][..8]).try_into().unwrap());
+        BitReaderReversed {
+            index,
+            bits_consumed,
+            source,
+            bit_container,
+            extra_bits,
+        }
+    }
+
     /// We refill the container in full bytes, shifting the still unread portion to the left, and filling the lower bits with new data
     #[cold]
     fn refill(&mut self) {
