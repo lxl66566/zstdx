@@ -33,6 +33,9 @@ This document records the changes made between versions, starting with version 0
 * Matcher parameters retuned: 448 KiB window and a steeper probe-step ramp on
   literal runs. Incompressible and skewed data compress up to twice as fast with
   slightly better ratios.
+* Sequence encoding concatenates the three state-transition bit groups and the
+  three extra-bit groups into one bit write each, halving the writer calls in
+  the per-sequence loop.
 
 # After 0.8.3
 

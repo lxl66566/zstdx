@@ -170,9 +170,15 @@ fn encode_sequences(
     let mut ml_state = ml_table.start_state(ml_code).index;
     let mut of_state = of_table.start_state(of_code).index;
 
-    writer.write_bits(ll_add_bits, ll_num_bits);
-    writer.write_bits(ml_add_bits, ml_num_bits);
-    writer.write_bits(of_add_bits, of_num_bits);
+    write_add_bits(
+        writer,
+        ll_add_bits,
+        ll_num_bits,
+        ml_add_bits,
+        ml_num_bits,
+        of_add_bits,
+        of_num_bits,
+    );
 
     let ll_size = ll_table.table_size;
     let ml_size = ml_table.table_size;
@@ -186,28 +192,33 @@ fn encode_sequences(
             let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
-            {
-                let e = of_table.transition(of_code, of_state);
-                let baseline = (e & 0x1FF) as usize;
-                writer.write_bits((of_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
-                of_state = (e >> 13) as usize;
-            }
-            {
-                let e = ml_table.transition(ml_code, ml_state);
-                let baseline = (e & 0x1FF) as usize;
-                writer.write_bits((ml_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
-                ml_state = (e >> 13) as usize;
-            }
-            {
-                let e = ll_table.transition(ll_code, ll_state);
-                let baseline = (e & 0x1FF) as usize;
-                writer.write_bits((ll_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
-                ll_state = (e >> 13) as usize;
-            }
+            // The three state-transition bit groups (max 15 bits each) and the
+            // three extra-bit groups (max 16+16+19 bits) each fit a single
+            // u64 write; concatenating them keeps the writer's hot path.
+            let e_of = of_table.transition(of_code, of_state);
+            let e_ml = ml_table.transition(ml_code, ml_state);
+            let e_ll = ll_table.transition(ll_code, ll_state);
+            let of_diff = (of_state - (e_of & 0x1FF) as usize) as u64;
+            let ml_diff = (ml_state - (e_ml & 0x1FF) as usize) as u64;
+            let ll_diff = (ll_state - (e_ll & 0x1FF) as usize) as u64;
+            let of_nb = ((e_of >> 9) & 0xF) as usize;
+            let ml_nb = ((e_ml >> 9) & 0xF) as usize;
+            let ll_nb = ((e_ll >> 9) & 0xF) as usize;
+            let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
+            writer.write_bits(trans, of_nb + ml_nb + ll_nb);
+            of_state = (e_of >> 13) as usize;
+            ml_state = (e_ml >> 13) as usize;
+            ll_state = (e_ll >> 13) as usize;
 
-            writer.write_bits(ll_add_bits, ll_num_bits);
-            writer.write_bits(ml_add_bits, ml_num_bits);
-            writer.write_bits(of_add_bits, of_num_bits);
+            write_add_bits(
+                writer,
+                ll_add_bits,
+                ll_num_bits,
+                ml_add_bits,
+                ml_num_bits,
+                of_add_bits,
+                of_num_bits,
+            );
         }
     }
     writer.write_bits(ml_state as u64, ml_size.ilog2() as usize);
@@ -220,6 +231,24 @@ fn encode_sequences(
     } else {
         writer.write_bits(1u32, bits_to_fill);
     }
+}
+
+/// Write the per-sequence literal-length, match-length and offset extra bits
+/// with one concatenated bit write (max 51 bits). Bit order matches the
+/// decoder: ll first, then ml, then of.
+fn write_add_bits(
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    ll_add_bits: u32,
+    ll_num_bits: usize,
+    ml_add_bits: u32,
+    ml_num_bits: usize,
+    of_add_bits: u32,
+    of_num_bits: usize,
+) {
+    let add = ll_add_bits as u64
+        | ((ml_add_bits as u64) << ll_num_bits)
+        | ((of_add_bits as u64) << (ll_num_bits + ml_num_bits));
+    writer.write_bits(add, ll_num_bits + ml_num_bits + of_num_bits);
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
