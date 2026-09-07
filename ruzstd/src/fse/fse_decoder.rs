@@ -80,6 +80,10 @@ pub struct FSETable {
     /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1) and so on
     /// up until the highest possible symbol (255).
     symbol_counter: Vec<u32>,
+    /// Per-symbol spread constants for the entry fill pass, parallel to
+    /// `symbol_probabilities`. Only indices with a positive probability are
+    /// ever consulted; the rest stay at `SymbolSpreadInfo::DEFAULT`.
+    symbol_info: [SymbolSpreadInfo; 256],
 }
 
 impl FSETable {
@@ -91,6 +95,7 @@ impl FSETable {
             symbol_counter: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             decode: Vec::new(),                      //depending on acc_log.
             accuracy_log: 0,
+            symbol_info: [SymbolSpreadInfo::DEFAULT; 256],
         }
     }
 
@@ -102,6 +107,7 @@ impl FSETable {
             .extend_from_slice(&other.symbol_probabilities);
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
+        self.symbol_info = other.symbol_info;
     }
 
     /// Empty the table and clear all internal state.
@@ -197,22 +203,40 @@ impl FSETable {
             }
         }
 
-        // baselines and num_bits can only be calculated when all symbols have been spread
+        // baselines and num_bits can only be calculated when all symbols have been spread.
+        // the per-symbol slice math (highest_bit_set + division) is hoisted out of the
+        // per-entry loop into symbol_info; the loop is left with counter + cmp + multiply-add.
+        for (idx, &prob) in self.symbol_probabilities.iter().enumerate() {
+            self.symbol_info[idx] = if prob > 0 {
+                let info = calc_symbol_spread_info(table_size as u32, prob as u32);
+                // nb_d is only reachable through double-width slices; a power-of-two
+                // probability can leave nb_d = acc + 1 with num_double == 0 (unused).
+                assert!(info.num_double == 0 || info.nb_d <= self.accuracy_log);
+                assert!(info.nb_s <= self.accuracy_log);
+                info
+            } else {
+                SymbolSpreadInfo::DEFAULT
+            };
+        }
+
         self.symbol_counter.clear();
         self.symbol_counter
             .resize(self.symbol_probabilities.len(), 0);
         for idx in 0..negative_idx {
             let entry = &mut self.decode[idx];
-            let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
+            let symbol = entry.symbol as usize;
 
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
+            let count = self.symbol_counter[symbol];
+            self.symbol_counter[symbol] = count + 1;
 
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
+            let info = self.symbol_info[symbol];
+            let (bl, nb) = if count < info.num_double {
+                (info.base_d + count * info.stride_d, info.nb_d)
+            } else {
+                // base_s wraps so the single path is also a plain multiply-add;
+                // count >= num_double here so the true baseline is non-negative.
+                (info.base_s.wrapping_add(count * info.stride_s), info.nb_s)
+            };
 
             entry.base_line = bl;
             entry.num_bits = nb;
@@ -338,14 +362,38 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
-fn calc_baseline_and_numbits(
-    num_states_total: u32,
-    num_states_symbol: u32,
-    state_number: u32,
-) -> (u32, u8) {
-    if num_states_symbol == 0 {
-        return (0, 0);
-    }
+/// Per-symbol constants to map an occurrence count (the n-th slot the symbol was
+/// spread to) to its (baseline, num_bits) pair:
+/// `count < num_double` → `base_d + count * stride_d` reading `nb_d` bits,
+/// otherwise → `base_s + count * stride_s` reading `nb_s` bits.
+/// `base_s` is stored wrapping-negated so both paths are a plain multiply-add.
+#[derive(Clone, Copy, Debug)]
+struct SymbolSpreadInfo {
+    num_double: u32,
+    base_d: u32,
+    stride_d: u32,
+    base_s: u32,
+    stride_s: u32,
+    nb_d: u8,
+    nb_s: u8,
+}
+
+impl SymbolSpreadInfo {
+    const DEFAULT: SymbolSpreadInfo = SymbolSpreadInfo {
+        num_double: 0,
+        base_d: 0,
+        stride_d: 0,
+        base_s: 0,
+        stride_s: 0,
+        nb_d: 0,
+        nb_s: 0,
+    };
+}
+
+/// Precompute the spread constants for one symbol with `num_states_symbol > 0`
+/// occurrences in a table of `num_states_total` states.
+fn calc_symbol_spread_info(num_states_total: u32, num_states_symbol: u32) -> SymbolSpreadInfo {
+    debug_assert!(num_states_symbol > 0);
     let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
         num_states_symbol
     } else {
@@ -355,13 +403,15 @@ fn calc_baseline_and_numbits(
     let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
     let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
     let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
-    let num_bits = highest_bit_set(slice_width) - 1; //number of bits needed to read for one slice
+    let nb_s = (highest_bit_set(slice_width) - 1) as u8; //number of bits needed to read for one slice
 
-    if state_number < num_double_width_state_slices {
-        let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
-        (baseline, num_bits as u8 + 1)
-    } else {
-        let index_shifted = state_number - num_double_width_state_slices;
-        ((index_shifted * slice_width), num_bits as u8)
+    SymbolSpreadInfo {
+        num_double: num_double_width_state_slices,
+        base_d: num_single_width_state_slices * slice_width,
+        stride_d: slice_width * 2,
+        base_s: (num_double_width_state_slices * slice_width).wrapping_neg(),
+        stride_s: slice_width,
+        nb_d: nb_s + 1,
+        nb_s,
     }
 }

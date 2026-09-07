@@ -4,6 +4,10 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* FSE decoding-table construction precomputes per-symbol spread constants
+  (slice baselines/strides/bit counts) so the per-entry fill is a counter,
+  compare, and multiply-add; the per-entry `highest_bit_set` scans and the
+  division move to a once-per-symbol pass.
 * The decoder only computes the xxhash checksum when the frame actually carries
   one (`Content_Checksum` flag set), instead of always hashing every drained byte.
 * Sequence decoding reworked into a libzstd-style 64-bit backwards bit reader
