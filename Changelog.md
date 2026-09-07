@@ -13,6 +13,10 @@ This document records the changes made between versions, starting with version 0
   subtract instead of a modulo.
 * Interleaved Huffman decoding accesses its tables and output through
   unchecked reads/writes; the loop bounds already guarantee they are in range.
+* Fix encoder panics on degenerate single-symbol FSE distributions: the table
+  keeps the full weight for the lone symbol instead of redistributing to a
+  nonexistent second maximum, and trailing zero probabilities no longer read
+  past the end of the symbol array when writing the table description.
 
 # After 0.8.3
 

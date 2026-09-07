@@ -173,7 +173,11 @@ impl FSETable {
                 probability_counter += prob as usize;
             } else {
                 let mut zeros = 0u8;
-                while self.states[prob_idx].probability == 0 {
+                // Trailing zero-probability symbols can run to the end of the
+                // table; the outer loop stops on the probability sum anyway.
+                while prob_idx < self.states.len()
+                    && self.states[prob_idx].probability == 0
+                {
                     zeros += 1;
                     prob_idx += 1;
                     if zeros == 3 {
@@ -294,8 +298,15 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
             *min -= decrease as i32;
         }
     }
+    // A distribution with a single distinct symbol has no second maximum to
+    // move weight to; it keeps the full table weight and encodes with zero
+    // bits per symbol.
+    let has_second = {
+        let max = *probs.iter().max().unwrap();
+        probs.iter().any(|x| *x != max)
+    };
     let max = probs.iter_mut().max().unwrap();
-    if avoid_0_numbit && *max > 1 << (acc_log - 1) {
+    if avoid_0_numbit && has_second && *max > 1 << (acc_log - 1) {
         let redistribute = *max - (1 << (acc_log - 1));
         *max -= redistribute;
         let max = *max;
