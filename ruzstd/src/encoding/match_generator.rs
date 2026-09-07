@@ -148,6 +148,34 @@ impl MatchGeneratorDriver {
         self.anchor = self.pos;
         self.miss_count = 0;
     }
+
+    /// Probe continuations at the second repeated offset immediately after a
+    /// match (zstd fast's rep_offset2 loop). Alternating-period data chains
+    /// rep0/rep1 matches back to back with zero literals; emitting with
+    /// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates
+    /// distances on its own.
+    fn emit_immediate_rep1_chain(
+        &mut self,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        while self.block_end - self.pos >= MIN_MATCH as u64 {
+            let Some(cand_abs) = self.pos.checked_sub(self.rep[1] as u64) else {
+                break;
+            };
+            if cand_abs < self.win_base {
+                break;
+            }
+            let pidx = self.idx_of(self.pos);
+            let cand = self.idx_of(cand_abs);
+            let cur = u32::from_le_bytes(self.win[pidx..][..4].try_into().unwrap());
+            if u32::from_le_bytes(self.win[cand..][..4].try_into().unwrap()) != cur {
+                break;
+            }
+            let ml = self.extend_match(pidx, cand);
+            debug_assert!(ml >= MIN_MATCH);
+            self.emit_match(pidx, ml, 1, handle_sequence);
+        }
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -259,6 +287,7 @@ impl Matcher for MatchGeneratorDriver {
                                 ml += 1;
                             }
                             self.emit_match(start, ml, 1, &mut handle_sequence);
+                            self.emit_immediate_rep1_chain(&mut handle_sequence);
                             continue;
                         }
                     }
@@ -291,6 +320,7 @@ impl Matcher for MatchGeneratorDriver {
                             }
                             let of_value = (start - cand + 3) as u32;
                             self.emit_match(start, ml, of_value, &mut handle_sequence);
+                            self.emit_immediate_rep1_chain(&mut handle_sequence);
                             matched = true;
                         }
                     }

@@ -53,6 +53,9 @@ This document records the changes made between versions, starting with version 0
 * The corruption smoke example also fuzzes the flat `decode_all` path and no
   longer panics itself when corruption hits the frame magic (a legitimate
   header error).
+* The matcher probes the second repeated offset immediately after every
+  emitted match (zstd fast's rep_offset2 loop); alternating-period data now
+  chains repcode matches with zero literals (json ratio +6%).
 
 # After 0.8.3
 
