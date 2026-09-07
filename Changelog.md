@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Sequence codes are computed once per block and shared between the FSE
+  table selection and the bitstream encoder, uniform literal sections
+  encode with the one-byte RLE literals mode, and a cheap entropy-bound
+  check skips Huffman attempts on near-incompressible literals instead of
+  encoding them and discarding the result (random-bytes encode 2.4x
+  faster, ratios unchanged).
 * The match window widens from 448 KiB to 768 KiB so repository-tile-sized
   repetition periods stay matchable; hash matches now require 6 bytes (a
   5-byte match's sequence overhead roughly equals the literals it covers,
