@@ -108,6 +108,7 @@ impl FrameDecoderState {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
+        #[allow(unused_mut)] // only mutated when the hash feature is on
         let mut state = FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
@@ -449,6 +450,7 @@ impl FrameDecoder {
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += 3;
 
+            #[cfg(feature = "hash")]
             let produced_before = written;
             match block_header.block_type {
                 BlockType::Raw => {
