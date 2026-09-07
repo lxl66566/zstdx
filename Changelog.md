@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The match window widens from 448 KiB to 768 KiB so repository-tile-sized
+  repetition periods stay matchable; hash matches now require 6 bytes (a
+  5-byte match's sequence overhead roughly equals the literals it covers,
+  and rejecting it lets the scan find the longer match that starts next);
+  the hash table shrinks to 2^15 heavily-contended slots with half-rate
+  miss-path inserts (newest-wins then prefers close, cheap-to-encode
+  offsets); and sequence FSE tables gain libzstd's fast-strategy mode
+  selection (RLE for single-code blocks, predefined below the dynamic-table
+  break-even, otherwise a normalized table built with the ported
+  FSE_normalizeCount + optimalTableLog and the last-sequence count
+  discount). json ratio 5.22 -> 5.70 at +27% throughput, skewed ratio
+  2.00 (= zstd -1) at +81%, text ratio 6.56 -> 239 where the wider window
+  unlocks cross-tile matches.
 * RLE block detection compares 8 bytes at a time (libzstd `ZSTD_isRLE`
   style) instead of a per-byte closure over an indexed first element, and
   skipped (RLE) blocks index only their first position instead of every
