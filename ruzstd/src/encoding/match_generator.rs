@@ -77,14 +77,29 @@ impl MatchGeneratorDriver {
         (abs - self.win_base) as usize
     }
 
-    /// Hash the 5 bytes at `idx` (caller guarantees `idx + 5 <= win.len()`).
+    /// Hash the 5 bytes at `idx`. Caller guarantees `idx + 5 <= win.len()`
+    /// (the scanning and emit loops bound-check once per loop, not per
+    /// position).
+    ///
     /// Five bytes skip the frequent 4-byte boilerplate fragments so probes
     /// land on structural repeats instead of recent junk.
     #[inline(always)]
     fn hash_at(&self, idx: usize) -> usize {
-        let v = u32::from_le_bytes(self.win[idx..][..4].try_into().unwrap()) as u64
-            | ((self.win[idx + 4] as u64) << 32);
-        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
+        // SAFETY: caller guarantees idx + 5 <= win.len(); unaligned reads
+        // because positions are byte-granular.
+        unsafe {
+            let p = self.win.as_ptr().add(idx);
+            let v = (p.cast::<u32>().read_unaligned() as u64) | ((p.add(4).read() as u64) << 32);
+            (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG))
+                & ((1 << HASH_LOG) - 1)
+        }
+    }
+
+    /// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
+    #[inline(always)]
+    fn read4(&self, idx: usize) -> u32 {
+        // SAFETY: see contract above; unaligned because byte-granular.
+        unsafe { self.win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
     }
 
     /// Store `abs` as the newest position for its hash.
@@ -98,18 +113,33 @@ impl MatchGeneratorDriver {
         self.table[h] = (self.epoch << 48) | abs;
     }
 
+    /// Unchecked variant of [`Self::insert_pos`]: the caller guarantees
+    /// `abs` has at least `MIN_HASH` bytes of window behind it.
+    #[inline(always)]
+    fn insert_pos_inline(&mut self, abs: u64) {
+        let h = self.hash_at(self.idx_of(abs));
+        self.table[h] = (self.epoch << 48) | abs;
+    }
+
     /// Longest common prefix of `win[i..]` and `win[j..]` in u64 chunks.
+    /// `i` is the current scan position and `j` a candidate strictly before
+    /// it, so bounding by `i` also bounds `j`.
     #[inline(always)]
     fn extend_match(&self, i: usize, j: usize) -> usize {
         let limit = self.win.len() - i;
+        let base = self.win.as_ptr();
         let mut len = 0;
-        while len + 8 <= limit {
-            let a = u64::from_le_bytes(self.win[i + len..][..8].try_into().unwrap());
-            let b = u64::from_le_bytes(self.win[j + len..][..8].try_into().unwrap());
-            if a == b {
-                len += 8;
-            } else {
-                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+        // SAFETY: i and j are valid indices and i + len + 8 <= win.len()
+        // bounds the reads on both sides (j <= i).
+        unsafe {
+            while len + 8 <= limit {
+                let a = base.add(i + len).cast::<u64>().read_unaligned();
+                let b = base.add(j + len).cast::<u64>().read_unaligned();
+                if a == b {
+                    len += 8;
+                } else {
+                    return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+                }
             }
         }
         while len < limit && self.win[i + len] == self.win[j + len] {
@@ -120,45 +150,54 @@ impl MatchGeneratorDriver {
 
     /// Emit the sequence for a match covering `match_len` bytes at window
     /// index `start`, update the repeated-offset history, index the covered
-    /// range and advance the cursors past it.
-    fn emit_match(
+    /// range and advance the cursors past it. Appends straight into the
+    /// collection buffers: going through the [`Sequence`] callback instead
+    /// keeps both buffer pointers live across the whole call and the
+    /// resulting register pressure stalls the scan loop on stack
+    /// spill-reload chains.
+    fn emit_match_into(
         &mut self,
         start: usize,
         match_len: usize,
         of_value: u32,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        literals: &mut Vec<u8>,
+        sequences: &mut Vec<super::EncodedSequence>,
     ) {
-        let literals = &self.win[self.idx_of(self.anchor)..start];
-        let ll = literals.len() as u32;
-        let mut rep = self.rep;
-        do_offset_history(of_value, ll, &mut rep);
-        self.rep = rep;
-        handle_sequence(Sequence::Triple {
-            literals,
-            offset: of_value as usize,
-            match_len,
+        let anchor_idx = self.idx_of(self.anchor);
+        let ll = (start - anchor_idx) as u32;
+        literals.extend_from_slice(&self.win[anchor_idx..start]);
+        do_offset_history(of_value, ll, &mut self.rep);
+        sequences.push(super::EncodedSequence {
+            ll,
+            ml: match_len as u32,
+            of: of_value,
         });
         let match_end = start + match_len;
         // Index the covered range: short matches keep every position (they
-        // are the majority on structured data and each lost slot can mean a
-        // missed future match); long matches fall back to a 4-byte grid
-        // anchored at the match start plus the final byte, because hashing
-        // every byte of long matches was a large share of encoder time.
+        // carry most of the alignment coverage on structured data); long
+        // matches fall back to a 4-byte grid anchored at the match start
+        // plus the final byte, because hashing every byte of long matches
+        // was a large share of encoder time. The insert bound is hoisted:
+        // a position is insertable while 5 window bytes start at it.
+        let insert_max = self.win_base + self.win.len() as u64 - MIN_HASH as u64;
         if match_len <= 16 {
+            let end = (self.win_base + match_end as u64).min(insert_max);
             let mut p = self.win_base + start as u64;
-            let end = self.win_base + match_end as u64;
             while p < end {
-                self.insert_pos(p);
+                self.insert_pos_inline(p);
                 p += 1;
             }
         } else {
-            let last = self.win_base + (match_end - 1) as u64;
-            let mut p = self.win_base + start as u64;
+            let first = self.win_base + start as u64;
+            let last = (self.win_base + (match_end - 1) as u64).min(insert_max);
+            let mut p = first;
             while p < last {
-                self.insert_pos(p);
+                self.insert_pos_inline(p);
                 p += 4;
             }
-            self.insert_pos(last);
+            if last > first {
+                self.insert_pos_inline(last);
+            }
         }
         self.pos = self.win_base + match_end as u64;
         self.anchor = self.pos;
@@ -172,7 +211,8 @@ impl MatchGeneratorDriver {
     /// distances on its own.
     fn emit_immediate_rep1_chain(
         &mut self,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        literals: &mut Vec<u8>,
+        sequences: &mut Vec<super::EncodedSequence>,
     ) {
         while self.block_end - self.pos >= MIN_MATCH as u64 {
             let Some(cand_abs) = self.pos.checked_sub(self.rep[1] as u64) else {
@@ -183,13 +223,13 @@ impl MatchGeneratorDriver {
             }
             let pidx = self.idx_of(self.pos);
             let cand = self.idx_of(cand_abs);
-            let cur = u32::from_le_bytes(self.win[pidx..][..4].try_into().unwrap());
-            if u32::from_le_bytes(self.win[cand..][..4].try_into().unwrap()) != cur {
+            let cur = self.read4(pidx);
+            if self.read4(cand) != cur {
                 break;
             }
             let ml = self.extend_match(pidx, cand);
             debug_assert!(ml >= MIN_MATCH);
-            self.emit_match(pidx, ml, 1, handle_sequence);
+            self.emit_match_into(pidx, ml, 1, literals, sequences);
         }
     }
 }
@@ -261,6 +301,31 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        let mut literals = Vec::new();
+        let mut sequences = Vec::new();
+        self.start_matching_into(&mut literals, &mut sequences);
+        // Rebuild the interleaved callback order from the collected
+        // buffers: each sequence's ll literals came right before it.
+        let mut offset = 0usize;
+        for seq in sequences {
+            let lits = &literals[offset..offset + seq.ll as usize];
+            offset += seq.ll as usize;
+            handle_sequence(Sequence::Triple {
+                literals: lits,
+                offset: seq.of as usize,
+                match_len: seq.ml as usize,
+            });
+        }
+        handle_sequence(Sequence::Literals {
+            literals: &literals[offset..],
+        });
+    }
+
+    fn start_matching_into(
+        &mut self,
+        literals: &mut Vec<u8>,
+        sequences: &mut Vec<super::EncodedSequence>,
+    ) {
         let epoch = self.epoch;
         let max_window = MAX_WINDOW as u64;
         while self.pos < self.block_end {
@@ -268,7 +333,7 @@ impl Matcher for MatchGeneratorDriver {
             if self.block_end - self.pos < MIN_HASH as u64 {
                 break;
             }
-            let cur = u32::from_le_bytes(self.win[idx..][..4].try_into().unwrap());
+            let cur = self.read4(idx);
 
             // Repcode probe (mirrors zstd's fast strategy: rep[0] only; the
             // weaker rep1/rep2 candidates steal positions from longer hash
@@ -286,8 +351,8 @@ impl Matcher for MatchGeneratorDriver {
                 if cand_abs >= self.win_base {
                     let mut cand = self.idx_of(cand_abs);
                     let pidx = self.idx_of(probe);
-                    let pcur = u32::from_le_bytes(self.win[pidx..][..4].try_into().unwrap());
-                    if u32::from_le_bytes(self.win[cand..][..4].try_into().unwrap()) == pcur {
+                    let pcur = self.read4(pidx);
+                    if self.read4(cand) == pcur {
                         let mut ml = self.extend_match(pidx, cand);
                         if ml >= MIN_MATCH {
                             let anchor_idx = self.idx_of(self.anchor);
@@ -302,8 +367,8 @@ impl Matcher for MatchGeneratorDriver {
                                 start -= 1;
                                 ml += 1;
                             }
-                            self.emit_match(start, ml, 1, &mut handle_sequence);
-                            self.emit_immediate_rep1_chain(&mut handle_sequence);
+                            self.emit_match_into(start, ml, 1, literals, sequences);
+                            self.emit_immediate_rep1_chain(literals, sequences);
                             continue;
                         }
                     }
@@ -319,7 +384,7 @@ impl Matcher for MatchGeneratorDriver {
                 let cand_abs = prev & ((1u64 << 48) - 1);
                 if cand_abs >= self.win_base && self.pos - cand_abs <= max_window {
                     let mut cand = self.idx_of(cand_abs);
-                    if u32::from_le_bytes(self.win[cand..][..4].try_into().unwrap()) == cur {
+                    if self.read4(cand) == cur {
                         let mut ml = self.extend_match(idx, cand);
                         if ml >= MIN_MATCH {
                             let anchor_idx = self.idx_of(self.anchor);
@@ -335,8 +400,8 @@ impl Matcher for MatchGeneratorDriver {
                                 ml += 1;
                             }
                             let of_value = (start - cand + 3) as u32;
-                            self.emit_match(start, ml, of_value, &mut handle_sequence);
-                            self.emit_immediate_rep1_chain(&mut handle_sequence);
+                            self.emit_match_into(start, ml, of_value, literals, sequences);
+                            self.emit_immediate_rep1_chain(literals, sequences);
                             matched = true;
                         }
                     }
@@ -350,8 +415,8 @@ impl Matcher for MatchGeneratorDriver {
             }
         }
         if self.anchor < self.block_end {
-            let literals = &self.win[self.idx_of(self.anchor)..self.idx_of(self.block_end)];
-            handle_sequence(Sequence::Literals { literals });
+            let tail = self.idx_of(self.anchor)..self.idx_of(self.block_end);
+            literals.extend_from_slice(&self.win[tail]);
             self.anchor = self.block_end;
         }
         self.pos = self.block_end;

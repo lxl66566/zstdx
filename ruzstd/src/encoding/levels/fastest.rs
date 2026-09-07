@@ -59,26 +59,46 @@ pub fn compress_fastest<M: Matcher>(
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
         state.matcher.commit_space(uncompressed_data);
-        // Sequence and entropy-coder state advances as the block is encoded;
-        // a raw fallback discards that output, so everything the decoder would
-        // only learn from it must be rolled back: the matcher's repeated
-        // offsets and the reusable Huffman/FSE tables.
         let rep = state.matcher.repcode_snapshot();
-        let last_huff_table = state.last_huff_table.clone();
-        let ll_previous = state.fse_tables.ll_previous.clone();
-        let ml_previous = state.fse_tables.ml_previous.clone();
-        let of_previous = state.fse_tables.of_previous.clone();
-        compress_block(state, &mut compressed);
+        // Take the reusable entropy tables out of the state by value: the
+        // block encoder then can't touch them, so a raw fallback simply puts
+        // them back instead of restoring deep clones (each FSE table clone
+        // is hundreds of small allocations).
+        let old_huff = state.last_huff_table.take();
+        let mut old_tables = [
+            state.fse_tables.ll_previous.take(),
+            state.fse_tables.ml_previous.take(),
+            state.fse_tables.of_previous.take(),
+        ];
+        let tables = {
+            // Borrows of the taken tables and the defaults for one call.
+            let previous = [
+                old_tables[0].as_ref(),
+                old_tables[1].as_ref(),
+                old_tables[2].as_ref(),
+            ];
+            compress_block(
+                &mut state.matcher,
+                old_huff.as_ref(),
+                &previous,
+                (
+                    &state.fse_tables.ll_default,
+                    &state.fse_tables.ml_default,
+                    &state.fse_tables.of_default,
+                ),
+                &mut compressed,
+            )
+        };
         let compressed_size = compressed.len();
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
             state.matcher.restore_repcode(rep);
-            state.last_huff_table = last_huff_table;
-            state.fse_tables.ll_previous = ll_previous;
-            state.fse_tables.ml_previous = ml_previous;
-            state.fse_tables.of_previous = of_previous;
+            state.last_huff_table = old_huff;
+            state.fse_tables.ll_previous = old_tables[0].take();
+            state.fse_tables.ml_previous = old_tables[1].take();
+            state.fse_tables.of_previous = old_tables[2].take();
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
@@ -88,6 +108,24 @@ pub fn compress_fastest<M: Matcher>(
             header.serialize(output);
             output.extend_from_slice(state.matcher.get_last_space());
         } else {
+            // Adopt the tables this block was encoded with; anything the
+            // block did not replace falls back to the previous table.
+            state.last_huff_table = match tables.huff {
+                Some(new) => Some(new),
+                None => old_huff,
+            };
+            state.fse_tables.ll_previous = match tables.ll {
+                Some(new) => Some(new),
+                None => old_tables[0].take(),
+            };
+            state.fse_tables.ml_previous = match tables.ml {
+                Some(new) => Some(new),
+                None => old_tables[1].take(),
+            };
+            state.fse_tables.of_previous = match tables.of {
+                Some(new) => Some(new),
+                None => old_tables[2].take(),
+            };
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Compressed,

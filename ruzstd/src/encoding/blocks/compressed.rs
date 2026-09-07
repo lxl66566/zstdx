@@ -2,40 +2,44 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::frame_compressor::CompressState,
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{build_table_from_data, FSETable},
     huff0::huff0_encoder,
 };
 
+/// Entropy-table outcomes of encoding one compressed block. `Some(table)`
+/// means the block was encoded with a freshly built table the caller should
+/// remember for later blocks; `None` keeps whatever the caller had.
+///
+/// `compress_block` never touches caller-owned state, so a raw-block
+/// fallback just drops these instead of restoring snapshots.
+#[derive(Default)]
+pub(crate) struct BlockTables {
+    pub(crate) huff: Option<huff0_encoder::HuffmanTable>,
+    pub(crate) ll: Option<FSETable>,
+    pub(crate) ml: Option<FSETable>,
+    pub(crate) of: Option<FSETable>,
+}
+
 /// A block of [`crate::common::BlockType::Compressed`]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
+pub(crate) fn compress_block<M: Matcher>(
+    matcher: &mut M,
+    last_huff_table: Option<&huff0_encoder::HuffmanTable>,
+    fse_previous: &[Option<&FSETable>; 3],
+    default_tables: (&FSETable, &FSETable, &FSETable),
+    output: &mut Vec<u8>,
+) -> BlockTables {
+    let mut tables = BlockTables::default();
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: offset as u32,
-                });
-            }
-    });
+    matcher.start_matching_into(&mut literals_vec, &mut sequences);
 
     // literals section
 
     let mut writer = BitWriter::from(output);
     if literals_vec.len() > 1024 {
-        if let Some(table) =
-            compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
-        {
-            state.last_huff_table.replace(table);
+        if let Some(table) = compress_literals(&literals_vec, last_huff_table, &mut writer) {
+            tables.huff = Some(table);
         }
     } else {
         raw_literals(&literals_vec, &mut writer);
@@ -51,20 +55,20 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         // Choose the tables
         // TODO store previously used tables
         let ll_mode = choose_table(
-            state.fse_tables.ll_previous.as_ref(),
-            &state.fse_tables.ll_default,
+            fse_previous[0],
+            default_tables.0,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
         );
         let ml_mode = choose_table(
-            state.fse_tables.ml_previous.as_ref(),
-            &state.fse_tables.ml_default,
+            fse_previous[1],
+            default_tables.1,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
         );
         let of_mode = choose_table(
-            state.fse_tables.of_previous.as_ref(),
-            &state.fse_tables.of_default,
+            fse_previous[2],
+            default_tables.2,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
         );
@@ -84,16 +88,17 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         );
 
         if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
+            tables.ll = Some(table)
         }
         if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
+            tables.ml = Some(table)
         }
         if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
+            tables.of = Some(table)
         }
     }
     writer.flush();
+    tables
 }
 
 #[derive(Clone)]
@@ -156,7 +161,7 @@ fn encode_fse_table_modes(
 }
 
 fn encode_sequences(
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    sequences: &[crate::encoding::EncodedSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_table: &FSETable,
     ml_table: &FSETable,

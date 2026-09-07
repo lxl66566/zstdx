@@ -66,6 +66,17 @@ pub enum CompressionLevel {
     Best,
 }
 
+/// A sequence as emitted into the encoder's collection buffers by
+/// [`Matcher::start_matching_into`]: literal length, match length and the
+/// wire-format offset (1..=3 select a repeated offset, larger values encode
+/// a literal offset as `actual_offset + 3`).
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedSequence {
+    pub ll: u32,
+    pub ml: u32,
+    pub of: u32,
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -92,6 +103,35 @@ pub trait Matcher {
     fn skip_matching(&mut self);
     /// Process the data in the last commited space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
+    /// Buffer-based variant of [`Matcher::start_matching`]: the block's
+    /// literals accumulate in `literals` and each match appends one
+    /// [`EncodedSequence`] whose `ll` counts the literals emitted right
+    /// before it (the interleaving is fully reconstructable). The default
+    /// implementation wraps [`Matcher::start_matching`]; the built-in
+    /// matcher overrides it so its hot emit path appends to the buffers
+    /// directly instead of routing through a closure capture, which spills
+    /// matcher state to the stack around every call.
+    fn start_matching_into(
+        &mut self,
+        literals: &mut Vec<u8>,
+        sequences: &mut Vec<EncodedSequence>,
+    ) {
+        self.start_matching(|seq| match seq {
+            Sequence::Literals { literals: lits } => literals.extend_from_slice(lits),
+            Sequence::Triple {
+                literals: lits,
+                offset,
+                match_len,
+            } => {
+                literals.extend_from_slice(lits);
+                sequences.push(EncodedSequence {
+                    ll: lits.len() as u32,
+                    ml: match_len as u32,
+                    of: offset as u32,
+                });
+            }
+        });
+    }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
     /// The size of the window the decoder will need to execute all sequences produced by this matcher
