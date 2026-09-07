@@ -98,6 +98,14 @@ pub trait Matcher {
     ///
     /// May change after a call to reset with a different compression level
     fn window_size(&self) -> u64;
+    /// Snapshot the repeated-offset history maintained by the matcher
+    ///
+    /// A block whose generated sequences are ultimately not emitted (raw block
+    /// fallback) must restore this snapshot: the decoder only updates its own
+    /// history for sequences it actually decodes.
+    fn repcode_snapshot(&self) -> [u32; 3];
+    /// Restore a snapshot taken by [`Matcher::repcode_snapshot`]
+    fn restore_repcode(&mut self, rep: [u32; 3]);
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -106,7 +114,11 @@ pub enum Sequence<'data> {
     /// Is encoded as a sequence for the decoder sequence execution.
     ///
     /// First the literals will be copied to the decoded data,
-    /// then `match_len` bytes are copied from `offset` bytes back in the decoded data
+    /// then `match_len` bytes are copied from `offset` bytes back in the decoded data.
+    ///
+    /// `offset` is the wire representation: 1..=3 select a repeated offset
+    /// (as updated per sequence by the decoder), any larger value encodes a
+    /// literal offset as `actual_offset + 3`.
     Triple {
         literals: &'data [u8],
         offset: usize,

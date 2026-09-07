@@ -41,12 +41,17 @@ pub fn compress_fastest<M: Matcher>(
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
         state.matcher.commit_space(uncompressed_data);
+        // Sequences update the matcher's repeated-offset history as they are
+        // generated; a raw fallback discards them, so the history must be
+        // rolled back to what the decoder will actually have seen.
+        let rep = state.matcher.repcode_snapshot();
         compress_block(state, &mut compressed);
         let compressed_size = compressed.len();
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
+            state.matcher.restore_repcode(rep);
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,

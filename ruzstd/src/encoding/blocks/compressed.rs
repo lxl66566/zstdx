@@ -18,14 +18,14 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             literals,
             offset,
             match_len,
-        } => {
-            literals_vec.extend_from_slice(literals);
-            sequences.push(crate::blocks::sequence_section::Sequence {
-                ll: literals.len() as u32,
-                ml: match_len as u32,
-                of: (offset + 3) as u32, // TODO make use of the offset history
-            });
-        }
+            } => {
+                literals_vec.extend_from_slice(literals);
+                sequences.push(crate::blocks::sequence_section::Sequence {
+                    ll: literals.len() as u32,
+                    ml: match_len as u32,
+                    of: offset as u32,
+                });
+            }
     });
 
     // literals section

@@ -24,6 +24,9 @@ This document records the changes made between versions, starting with version 0
   one contiguous window: newest-wins hash insertion, u64 chunked forward and
   backward match extension, and escalating probe steps on literal runs.
   Roughly 3x faster matching with better ratios on structured data.
+* The matcher now emits repcode sequences: matches at the current repeated
+  offset are encoded as offset code 1 instead of a full offset, and a raw-block
+  fallback rolls the repeated-offset history back to match the decoder.
 
 # After 0.8.3
 

@@ -16,6 +16,8 @@ use core::convert::TryInto;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
+// Shared with the decoder so both sides agree on offset-history semantics.
+use crate::decoding::sequence_execution::do_offset_history;
 
 /// Shortest match worth encoding; matches the format's MINMATCH range.
 const MIN_MATCH: usize = 4;
@@ -44,6 +46,9 @@ pub struct MatchGeneratorDriver {
     table: Vec<u64>,
     epoch: u64,
     miss_count: usize,
+    /// Repeated-offset history, kept in lockstep with the decoder's
+    /// `offset_hist` so repcode probes see the same candidates it will.
+    rep: [u32; 3],
     space_pool: Vec<Vec<u8>>,
     slice_size: usize,
 }
@@ -61,6 +66,7 @@ impl MatchGeneratorDriver {
             // Epoch 0 is the never-valid state of a zeroed table.
             epoch: 1,
             miss_count: 0,
+            rep: [1, 4, 8],
             space_pool: Vec::new(),
             slice_size,
         }
@@ -111,6 +117,37 @@ impl MatchGeneratorDriver {
         }
         len
     }
+
+    /// Emit the sequence for a match covering `match_len` bytes at window
+    /// index `start`, update the repeated-offset history, index the covered
+    /// range and advance the cursors past it.
+    fn emit_match(
+        &mut self,
+        start: usize,
+        match_len: usize,
+        of_value: u32,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let literals = &self.win[self.idx_of(self.anchor)..start];
+        let ll = literals.len() as u32;
+        let mut rep = self.rep;
+        do_offset_history(of_value, ll, &mut rep);
+        self.rep = rep;
+        handle_sequence(Sequence::Triple {
+            literals,
+            offset: of_value as usize,
+            match_len,
+        });
+        let match_end = start + match_len;
+        let mut p = self.win_base + start as u64;
+        while p < self.win_base + match_end as u64 {
+            self.insert_pos(p);
+            p += 1;
+        }
+        self.pos = self.win_base + match_end as u64;
+        self.anchor = self.pos;
+        self.miss_count = 0;
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -128,10 +165,20 @@ impl Matcher for MatchGeneratorDriver {
             self.epoch = 1;
         }
         self.miss_count = 0;
+        // Matches the decoder's per-frame offset_hist reset.
+        self.rep = [1, 4, 8];
     }
 
     fn window_size(&self) -> u64 {
         MAX_WINDOW as u64
+    }
+
+    fn repcode_snapshot(&self) -> [u32; 3] {
+        self.rep
+    }
+
+    fn restore_repcode(&mut self, rep: [u32; 3]) {
+        self.rep = rep;
     }
 
     fn get_next_space(&mut self) -> Vec<u8> {
@@ -179,6 +226,45 @@ impl Matcher for MatchGeneratorDriver {
             }
             let cur = u32::from_le_bytes(self.win[idx..][..4].try_into().unwrap());
 
+            // Repcode probe (mirrors zstd's fast strategy: rep[0] only; the
+            // weaker rep1/rep2 candidates steal positions from longer hash
+            // matches). A repcode match needs at least one pending literal so
+            // of_value 1 stays encodable: with literals pending the probe
+            // runs at the current position, otherwise one byte ahead so that
+            // byte becomes the literal. The backward extension guard below
+            // never consumes that literal either way.
+            let probe = if self.pos == self.anchor {
+                self.pos + 1
+            } else {
+                self.pos
+            };
+            if let Some(cand_abs) = probe.checked_sub(self.rep[0] as u64) {
+                if cand_abs >= self.win_base {
+                    let mut cand = self.idx_of(cand_abs);
+                    let pidx = self.idx_of(probe);
+                    let pcur = u32::from_le_bytes(self.win[pidx..][..4].try_into().unwrap());
+                    if u32::from_le_bytes(self.win[cand..][..4].try_into().unwrap()) == pcur {
+                        let mut ml = self.extend_match(pidx, cand);
+                        if ml >= MIN_MATCH {
+                            let anchor_idx = self.idx_of(self.anchor);
+                            let mut start = pidx;
+                            // Extend backwards into the pending literals; the
+                            // offset (pidx - cand) stays constant.
+                            while start > anchor_idx + 1
+                                && cand > 0
+                                && self.win[cand - 1] == self.win[start - 1]
+                            {
+                                cand -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            self.emit_match(start, ml, 1, &mut handle_sequence);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let h = self.hash_at(idx);
             let prev = self.table[h];
             self.table[h] = (epoch << 48) | self.pos;
@@ -203,21 +289,8 @@ impl Matcher for MatchGeneratorDriver {
                                 start -= 1;
                                 ml += 1;
                             }
-                            let literals = &self.win[anchor_idx..start];
-                            handle_sequence(Sequence::Triple {
-                                literals,
-                                offset: start - cand,
-                                match_len: ml,
-                            });
-                            let match_end = start + ml;
-                            let mut p = self.win_base + start as u64;
-                            while p < self.win_base + match_end as u64 {
-                                self.insert_pos(p);
-                                p += 1;
-                            }
-                            self.pos = self.win_base + match_end as u64;
-                            self.anchor = self.pos;
-                            self.miss_count = 0;
+                            let of_value = (start - cand + 3) as u32;
+                            self.emit_match(start, ml, of_value, &mut handle_sequence);
                             matched = true;
                         }
                     }
@@ -269,6 +342,8 @@ mod tests {
     fn match_and_reconstruct(data: &[u8], block_size: usize) -> Vec<u8> {
         let mut driver = MatchGeneratorDriver::new(block_size);
         driver.reset(crate::encoding::CompressionLevel::Fastest);
+        // Offset history mirrors the decoder's per-frame scratch.
+        let mut rep = [1u32, 4, 8];
         let mut reconstructed = Vec::new();
         for block in data.chunks(block_size) {
             let mut space = driver.get_next_space();
@@ -283,8 +358,14 @@ mod tests {
                     match_len,
                 } => {
                     reconstructed.extend_from_slice(literals);
+                    let actual =
+                        crate::decoding::sequence_execution::do_offset_history(
+                            offset as u32,
+                            literals.len() as u32,
+                            &mut rep,
+                        );
                     // Matches may overlap their own output (offset < match_len).
-                    let start = reconstructed.len() - offset;
+                    let start = reconstructed.len() - actual as usize;
                     for i in 0..match_len {
                         let b = reconstructed[start + i];
                         reconstructed.push(b);
@@ -359,10 +440,45 @@ mod tests {
         let mut got_triple = false;
         driver.start_matching(|seq| {
             if let Sequence::Triple { offset, .. } = seq {
-                assert_eq!(offset, pattern.len());
+                // New-offset wire value: actual offset 8 encodes as 8 + 3.
+                assert_eq!(offset, pattern.len() + 3);
                 got_triple = true;
             }
         });
         assert!(got_triple, "second block must match the skipped first block");
+    }
+
+    #[test]
+    fn emits_repcode_sequences() {
+        // Structured repetition at a fixed distance: the first repeat is found
+        // by the hash probe (offset becomes rep[0]), later repeats must be
+        // emitted as repcode 1 (wire offset value 1).
+        let pattern: &[u8] = &[
+            0xA5, 0x5A, 0xC3, 0x3C, 0x99, 0x66, 0xF0, 0x0D, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x91, 0x82, 0x73, 0x64,
+        ];
+        let mut data = Vec::new();
+        for i in 0..40 {
+            data.extend_from_slice(pattern);
+            // Constant-length, varying separators keep one pending literal in
+            // front of each repeat and hold the period stable.
+            data.push(0xF0 ^ i as u8);
+        }
+        let mut driver = MatchGeneratorDriver::new(128 * 1024);
+        driver.reset(crate::encoding::CompressionLevel::Fastest);
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(&data);
+        driver.commit_space(space);
+        let mut repcodes = 0usize;
+        driver.start_matching(|seq| {
+            if let Sequence::Triple { offset, .. } = seq {
+                if offset <= 3 {
+                    repcodes += 1;
+                }
+            }
+        });
+        assert!(repcodes > 0, "repeated structure must produce repcode matches");
+        assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
     }
 }
