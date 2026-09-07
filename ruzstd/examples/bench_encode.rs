@@ -1,17 +1,22 @@
 //! Encode-only benchmark with phase timing: matcher vs entropy coding.
-//! Usage: cargo run --release --example bench_encode
+//! Usage: cargo run --release --example bench_encode [-- filter...]
+//! Only corpora whose file name contains one of the filters are benchmarked.
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
+    let filters: Vec<String> = std::env::args().skip(1).collect();
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("../bench/corpus");
     for entry in fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
         if !name.ends_with(".raw") {
+            continue;
+        }
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
             continue;
         }
         let raw = fs::read(&path).unwrap();
