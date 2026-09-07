@@ -127,12 +127,24 @@ pub struct FSETable {
     pub(super) states: [SymbolStates; 256],
     /// Sum of all states.states.len()
     pub(crate) table_size: usize,
+    /// Flat encoder transition table indexed by `symbol * table_size + state`,
+    /// packing the target state as
+    /// `(next_index << 13) | (num_bits << 9) | baseline`.
+    /// Replaces a linear scan per encoded symbol.
+    pub(super) transitions: Vec<u32>,
 }
 
 impl FSETable {
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> &State {
         let states = &self.states[symbol as usize];
         states.get(idx, self.table_size)
+    }
+
+    /// O(1) encoder transition: packed `(next_index << 13) | (num_bits << 9)
+    /// | baseline` for encoding `symbol` while in state `idx`.
+    #[inline(always)]
+    pub(crate) fn transition(&self, symbol: u8, idx: usize) -> u32 {
+        self.transitions[symbol as usize * self.table_size + idx]
     }
 
     pub(crate) fn start_state(&self, symbol: u8) -> &State {
@@ -415,10 +427,32 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         state.states.sort_by_key(|l| l.baseline);
     }
 
+    let transitions = build_transitions(&states[..probs.len()], 1 << acc_log);
     FSETable {
         table_size: 1 << acc_log,
         states,
+        transitions,
     }
+}
+
+/// Build the flat per-symbol transition table used by the encoder. The state
+/// ranges of each symbol tile the index space exactly once, so every entry is
+/// written by exactly one state.
+fn build_transitions(states: &[SymbolStates], table_size: usize) -> Vec<u32> {
+    let mut transitions = alloc::vec![0u32; states.len() * table_size];
+    for (symbol, symbol_states) in states.iter().enumerate() {
+        let base = symbol * table_size;
+        for state in &symbol_states.states {
+            debug_assert!(state.last_index < table_size);
+            let entry = ((state.index as u32) << 13)
+                | ((state.num_bits as u32) << 9)
+                | state.baseline as u32;
+            for idx in state.baseline..=state.last_index {
+                transitions[base + idx] = entry;
+            }
+        }
+    }
+    transitions
 }
 
 /// Calculate the position of the next entry of the table given the current

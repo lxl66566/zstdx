@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     encoding::frame_compressor::CompressState,
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{build_table_from_data, FSETable},
     huff0::huff0_encoder,
 };
 
@@ -12,21 +12,19 @@ use crate::{
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            literals_vec.extend_from_slice(literals);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll: literals.len() as u32,
+                ml: match_len as u32,
+                of: (offset + 3) as u32, // TODO make use of the offset history
+            });
         }
     });
 
@@ -168,13 +166,17 @@ fn encode_sequences(
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
     let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
     let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-    let mut ll_state: &State = ll_table.start_state(ll_code);
-    let mut ml_state: &State = ml_table.start_state(ml_code);
-    let mut of_state: &State = of_table.start_state(of_code);
+    let mut ll_state = ll_table.start_state(ll_code).index;
+    let mut ml_state = ml_table.start_state(ml_code).index;
+    let mut of_state = of_table.start_state(of_code).index;
 
     writer.write_bits(ll_add_bits, ll_num_bits);
     writer.write_bits(ml_add_bits, ml_num_bits);
     writer.write_bits(of_add_bits, of_num_bits);
+
+    let ll_size = ll_table.table_size;
+    let ml_size = ml_table.table_size;
+    let of_size = of_table.table_size;
 
     // encode backwards so the decoder reads the first sequence first
     if sequences.len() > 1 {
@@ -185,22 +187,22 @@ fn encode_sequences(
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
             {
-                let next = of_table.next_state(of_code, of_state.index);
-                let diff = of_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                of_state = next;
+                let e = of_table.transition(of_code, of_state);
+                let baseline = (e & 0x1FF) as usize;
+                writer.write_bits((of_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
+                of_state = (e >> 13) as usize;
             }
             {
-                let next = ml_table.next_state(ml_code, ml_state.index);
-                let diff = ml_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ml_state = next;
+                let e = ml_table.transition(ml_code, ml_state);
+                let baseline = (e & 0x1FF) as usize;
+                writer.write_bits((ml_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
+                ml_state = (e >> 13) as usize;
             }
             {
-                let next = ll_table.next_state(ll_code, ll_state.index);
-                let diff = ll_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ll_state = next;
+                let e = ll_table.transition(ll_code, ll_state);
+                let baseline = (e & 0x1FF) as usize;
+                writer.write_bits((ll_state - baseline) as u64, ((e >> 9) & 0xF) as usize);
+                ll_state = (e >> 13) as usize;
             }
 
             writer.write_bits(ll_add_bits, ll_num_bits);
@@ -208,9 +210,9 @@ fn encode_sequences(
             writer.write_bits(of_add_bits, of_num_bits);
         }
     }
-    writer.write_bits(ml_state.index as u64, ml_table.table_size.ilog2() as usize);
-    writer.write_bits(of_state.index as u64, of_table.table_size.ilog2() as usize);
-    writer.write_bits(ll_state.index as u64, ll_table.table_size.ilog2() as usize);
+    writer.write_bits(ml_state as u64, ml_size.ilog2() as usize);
+    writer.write_bits(of_state as u64, of_size.ilog2() as usize);
+    writer.write_bits(ll_state as u64, ll_size.ilog2() as usize);
 
     let bits_to_fill = writer.misaligned();
     if bits_to_fill == 0 {
@@ -242,18 +244,54 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     }
 }
 
+/// Per-code metadata for literal lengths: (base value, extra bit count).
+const fn ll_meta() -> [(u32, u8); 36] {
+    let mut t = [(0u32, 0u8); 36];
+    let mut code = 0usize;
+    while code <= 15 {
+        t[code] = (code as u32, 0);
+        code += 1;
+    }
+    let rest = [
+        (16u32, 1u8), (18, 1), (20, 1), (22, 1), (24, 2), (28, 2), (32, 3), (40, 3), (48, 4),
+        (64, 6), (128, 7), (256, 8), (512, 9), (1024, 10), (2048, 11), (4096, 12), (8192, 13),
+        (16384, 14), (32768, 15), (65536, 16),
+    ];
+    let mut i = 0;
+    while i < rest.len() {
+        t[16 + i] = rest[i];
+        i += 1;
+    }
+    t
+}
+const LL_META: [(u32, u8); 36] = ll_meta();
+
+/// Literal-length code for the dense low range; mirrors the ladder below.
+const fn ll_code_lut() -> [u8; 64] {
+    let mut t = [0u8; 64];
+    let mut len = 0usize;
+    while len < 64 {
+        let mut code = 35;
+        while code > 0 {
+            if LL_META[code].0 as usize <= len {
+                break;
+            }
+            code -= 1;
+        }
+        t[len] = code as u8;
+        len += 1;
+    }
+    t
+}
+const LL_CODE_LUT: [u8; 64] = ll_code_lut();
+
 fn encode_literal_length(len: u32) -> (u8, u32, usize) {
+    if len < 64 {
+        let code = LL_CODE_LUT[len as usize] as usize;
+        let (base, bits) = LL_META[code];
+        return (code as u8, len - base, bits as usize);
+    }
     match len {
-        0..=15 => (len as u8, 0, 0),
-        16..=17 => (16, len - 16, 1),
-        18..=19 => (17, len - 18, 1),
-        20..=21 => (18, len - 20, 1),
-        22..=23 => (19, len - 22, 1),
-        24..=27 => (20, len - 24, 2),
-        28..=31 => (21, len - 28, 2),
-        32..=39 => (22, len - 32, 3),
-        40..=47 => (23, len - 40, 3),
-        48..=63 => (24, len - 48, 4),
         64..=127 => (25, len - 64, 6),
         128..=255 => (26, len - 128, 7),
         256..=511 => (27, len - 256, 8),
@@ -265,25 +303,60 @@ fn encode_literal_length(len: u32) -> (u8, u32, usize) {
         16384..=32767 => (33, len - 16384, 14),
         32768..=65535 => (34, len - 32768, 15),
         65536..=131071 => (35, len - 65536, 16),
-        131072.. => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
+/// Per-code metadata for match lengths: (base value, extra bit count).
+const fn ml_meta() -> [(u32, u8); 53] {
+    let mut t = [(0u32, 0u8); 53];
+    let mut code = 0usize;
+    // codes 0..=31 encode len = code + 3 directly
+    while code < 32 {
+        t[code] = (code as u32 + 3, 0);
+        code += 1;
+    }
+    let rest = [
+        (35u32, 1u8), (37, 1), (39, 1), (41, 1), (43, 2), (47, 2), (51, 3), (59, 3), (67, 4),
+        (83, 4), (99, 5), (131, 7), (259, 8), (515, 9), (1027, 10), (2051, 11), (4099, 12),
+        (8195, 13), (16387, 14), (32771, 15), (65539, 16),
+    ];
+    let mut i = 0;
+    while i < rest.len() {
+        t[32 + i] = rest[i];
+        i += 1;
+    }
+    t
+}
+const ML_META: [(u32, u8); 53] = ml_meta();
+
+/// Match-length code for the dense low range (len < 131).
+const fn ml_code_lut() -> [u8; 131] {
+    let mut t = [0u8; 131];
+    let mut len = 0usize;
+    while len < 131 {
+        let mut code = 52;
+        while code > 0 {
+            if ML_META[code].0 as usize <= len {
+                break;
+            }
+            code -= 1;
+        }
+        t[len] = code as u8;
+        len += 1;
+    }
+    t
+}
+const ML_CODE_LUT: [u8; 131] = ml_code_lut();
+
 fn encode_match_len(len: u32) -> (u8, u32, usize) {
+    debug_assert!(len >= 3, "match lengths below 3 cannot be encoded");
+    if len < 131 {
+        let code = ML_CODE_LUT[len as usize] as usize;
+        let (base, bits) = ML_META[code];
+        return (code as u8, len - base, bits as usize);
+    }
     match len {
-        0..=2 => unreachable!(),
-        3..=34 => (len as u8 - 3, 0, 0),
-        35..=36 => (32, len - 35, 1),
-        37..=38 => (33, len - 37, 1),
-        39..=40 => (34, len - 39, 1),
-        41..=42 => (35, len - 41, 1),
-        43..=46 => (36, len - 43, 2),
-        47..=50 => (37, len - 47, 2),
-        51..=58 => (38, len - 51, 3),
-        59..=66 => (39, len - 59, 3),
-        67..=82 => (40, len - 67, 4),
-        83..=98 => (41, len - 83, 4),
-        99..=130 => (42, len - 99, 5),
         131..=258 => (43, len - 131, 7),
         259..=514 => (44, len - 259, 8),
         515..=1026 => (45, len - 515, 9),
@@ -294,7 +367,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
         16387..=32770 => (50, len - 16387, 14),
         32771..=65538 => (51, len - 32771, 15),
         65539..=131074 => (52, len - 65539, 16),
-        131075.. => unreachable!(),
+        _ => unreachable!(),
     }
 }
 

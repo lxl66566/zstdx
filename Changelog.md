@@ -17,6 +17,9 @@ This document records the changes made between versions, starting with version 0
   keeps the full weight for the lone symbol instead of redistributing to a
   nonexistent second maximum, and trailing zero probabilities no longer read
   past the end of the symbol array when writing the table description.
+* FSE sequence encoding switches states through a flat per-symbol transition
+  table instead of a linear scan, and literal/match length codes come from
+  constant lookup tables for the dense low ranges.
 
 # After 0.8.3
 
