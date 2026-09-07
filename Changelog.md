@@ -27,6 +27,9 @@ This document records the changes made between versions, starting with version 0
 * The matcher now emits repcode sequences: matches at the current repeated
   offset are encoded as offset code 1 instead of a full offset, and a raw-block
   fallback rolls the repeated-offset history back to match the decoder.
+* A raw-block fallback now also rolls back the reusable Huffman and FSE tables:
+  the decoder never sees the discarded block, so a later block must not reference
+  entropy tables only introduced by it.
 
 # After 0.8.3
 

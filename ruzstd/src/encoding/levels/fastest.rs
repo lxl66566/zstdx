@@ -41,10 +41,15 @@ pub fn compress_fastest<M: Matcher>(
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
         state.matcher.commit_space(uncompressed_data);
-        // Sequences update the matcher's repeated-offset history as they are
-        // generated; a raw fallback discards them, so the history must be
-        // rolled back to what the decoder will actually have seen.
+        // Sequence and entropy-coder state advances as the block is encoded;
+        // a raw fallback discards that output, so everything the decoder would
+        // only learn from it must be rolled back: the matcher's repeated
+        // offsets and the reusable Huffman/FSE tables.
         let rep = state.matcher.repcode_snapshot();
+        let last_huff_table = state.last_huff_table.clone();
+        let ll_previous = state.fse_tables.ll_previous.clone();
+        let ml_previous = state.fse_tables.ml_previous.clone();
+        let of_previous = state.fse_tables.of_previous.clone();
         compress_block(state, &mut compressed);
         let compressed_size = compressed.len();
         // If compression does not shrink the block, store it raw instead.
@@ -52,6 +57,10 @@ pub fn compress_fastest<M: Matcher>(
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
             state.matcher.restore_repcode(rep);
+            state.last_huff_table = last_huff_table;
+            state.fse_tables.ll_previous = ll_previous;
+            state.fse_tables.ml_previous = ml_previous;
+            state.fse_tables.of_previous = of_previous;
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
