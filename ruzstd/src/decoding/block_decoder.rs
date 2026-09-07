@@ -12,9 +12,12 @@ use crate::decoding::errors::{
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::{execute_sequences, execute_sequences_flat};
+use crate::decoding::sequence_execution::execute_sequences;
+use crate::decoding::sequence_execution::execute_decoded_flat;
+use crate::decoding::sequence_section_decoder::SeqDecoder;
 use crate::decoding::errors::ExecuteSequencesError;
 use crate::io::Read;
+use alloc::vec::Vec;
 
 pub struct BlockDecoder {
     header_buffer: [u8; 3],
@@ -101,31 +104,42 @@ impl BlockDecoder {
         workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
-        let (seq_section, raw_len) = self.parse_and_decode_sections(header, workspace, &mut source)?;
+        let DecoderScratch {
+            huf,
+            fse,
+            buffer,
+            offset_hist: _,
+            literals_buffer,
+            sequences,
+            block_content_buffer,
+        } = workspace;
+        let (seq_section, raw) = self.parse_sections(header, block_content_buffer, huf, literals_buffer, &mut source)?;
 
         if seq_section.num_sequences != 0 {
+            decode_sequences(&seq_section, raw, fse, sequences)?;
             vprintln!("Executing sequences");
             execute_sequences(workspace)?;
         } else {
-            if raw_len != 0 {
+            if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
                     DecodeSequenceError::ExtraBits {
-                        bits_remaining: raw_len as isize * 8,
+                        bits_remaining: raw.len() as isize * 8,
                     },
                 ));
             }
-            workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
+            buffer.push(literals_buffer);
+            sequences.clear();
         }
 
         Ok(())
     }
 
     /// Compressed-block fast path for flat decoding: decodes the sections as
-    /// usual but executes the sequences straight into `out[*written..]`,
-    /// bypassing the ring buffer. Returns the number of bytes produced so far.
-    /// `virt_base`/`view` describe the virtual window mapping of the backing
-    /// flat buffer (see `execute_sequences_flat`).
+    /// usual but executes each sequence the moment it is decoded, straight
+    /// into `out[*written..]`, bypassing the ring buffer. Returns the number
+    /// of bytes produced so far. `virt_base`/`view` describe the virtual
+    /// window mapping of the backing flat buffer (see
+    /// `execute_decoded_flat`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decompress_block_flat(
         &mut self,
@@ -137,69 +151,68 @@ impl BlockDecoder {
         virt_base: usize,
         view: crate::decoding::flat_buffer::FlatView,
     ) -> Result<usize, DecompressBlockError> {
-        let (seq_section, raw_len) = self.parse_and_decode_sections(header, workspace, source)?;
+        let DecoderScratch {
+            huf,
+            fse,
+            offset_hist,
+            literals_buffer,
+            sequences,
+            block_content_buffer,
+            ..
+        } = workspace;
+        let (seq_section, raw) = self.parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
 
         if seq_section.num_sequences != 0 {
-            // Budget check once per block; after it passes, every write in
-            // execute_sequences_flat is provably in bounds.
-            let total_out: usize = workspace
-                .sequences
-                .iter()
-                .map(|seq| seq.ml as usize)
-                .sum::<usize>()
-                .saturating_add(workspace.literals_buffer.len());
-            if *written + total_out > out.len() {
-                return Err(DecompressBlockError::ExecuteSequencesError(
-                    ExecuteSequencesError::TargetTooSmall,
-                ));
-            }
-            execute_sequences_flat(
-                &workspace.sequences,
-                &workspace.literals_buffer,
+            let mut dec = SeqDecoder::new(&seq_section, raw, fse)?;
+            execute_decoded_flat(
+                &mut dec,
+                literals_buffer,
                 out,
                 written,
                 virt_base,
                 view,
-                &mut workspace.offset_hist,
+                offset_hist,
             )?;
         } else {
-            if raw_len != 0 {
+            if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
                     DecodeSequenceError::ExtraBits {
-                        bits_remaining: raw_len as isize * 8,
+                        bits_remaining: raw.len() as isize * 8,
                     },
                 ));
             }
-            let literals_len = workspace.literals_buffer.len();
+            let literals_len = literals_buffer.len();
             if *written + literals_len > out.len() {
                 return Err(DecompressBlockError::ExecuteSequencesError(
                     ExecuteSequencesError::TargetTooSmall,
                 ));
             }
-            out[*written..*written + literals_len]
-                .copy_from_slice(&workspace.literals_buffer);
+            out[*written..*written + literals_len].copy_from_slice(literals_buffer);
             *written += literals_len;
-            workspace.sequences.clear();
+            sequences.clear();
         }
         Ok(*written)
     }
 
     /// Read a compressed block's body and decode its literals and sequence
-    /// descriptions into the workspace; shared by the ring-buffer and flat
-    /// execution paths. Returns the sequence section header and the raw bytes
-    /// following it (borrowed from the workspace's block content buffer).
-    fn parse_and_decode_sections(
+    /// section header into the workspace; shared by the ring-buffer and flat
+    /// execution paths. Returns the sequence section header and the raw
+    /// sequence-section bytes (borrowed from the block content buffer) —
+    /// decoding them into actual sequences is the caller's job, so the flat
+    /// path can fuse it with execution. Takes the scratch fields individually
+    /// so the returned borrow coexists with further field borrows.
+    fn parse_sections<'a>(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch,
+        block_content_buffer: &'a mut Vec<u8>,
+        huf: &mut super::scratch::HuffmanScratch,
+        literals_buffer: &mut Vec<u8>,
         source: &mut impl Read,
-    ) -> Result<(SequencesHeader, usize), DecompressBlockError> {
-        workspace
-            .block_content_buffer
-            .resize(header.content_size as usize, 0);
+    ) -> Result<(SequencesHeader, &'a [u8]), DecompressBlockError> {
+        block_content_buffer.resize(header.content_size as usize, 0);
 
-        source.read_exact(workspace.block_content_buffer.as_mut_slice())?;
-        let raw = workspace.block_content_buffer.as_slice();
+        source.read_exact(block_content_buffer.as_mut_slice())?;
+        let raw: &'a [u8] = block_content_buffer.as_slice();
 
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
@@ -230,17 +243,17 @@ impl BlockDecoder {
         let raw_literals = &raw[..upper_limit_for_literals];
         vprintln!("Slice for literals: {}", raw_literals.len());
 
-        workspace.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
+        literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
         let bytes_used_in_literals_section = decode_literals(
             &section,
-            &mut workspace.huf,
+            huf,
             raw_literals,
-            &mut workspace.literals_buffer,
+            literals_buffer,
         )?;
         assert!(
-            section.regenerated_size == workspace.literals_buffer.len() as u32,
+            section.regenerated_size == literals_buffer.len() as u32,
             "Wrong number of literals: {}, Should have been: {}",
-            workspace.literals_buffer.len(),
+            literals_buffer.len(),
             section.regenerated_size
         );
         assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
@@ -266,16 +279,7 @@ impl BlockDecoder {
         );
         vprintln!("Slice for sequences: {}", raw.len());
 
-        if seq_section.num_sequences != 0 {
-            decode_sequences(
-                &seq_section,
-                raw,
-                &mut workspace.fse,
-                &mut workspace.sequences,
-            )?;
-        }
-
-        Ok((seq_section, raw.len()))
+        Ok((seq_section, raw))
     }
 
     /// Reads 3 bytes from the provided reader and returns

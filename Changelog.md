@@ -69,6 +69,14 @@ This document records the changes made between versions, starting with version 0
   fixed-slot array addressed through a single base pointer with constant
   offsets, removing the per-iteration table-pointer reloads and bit-container
   memory operands from the loop.
+* Sequence decoding and flat-path sequence execution are fused into one loop
+  (the libzstd model): each sequence is executed the moment it is decoded
+  instead of round-tripping it through the sequence vector. RLE streams now
+  decode through a one-state fake table packed like any FSE table, so the
+  loop carries no RLE branches at all and the separate RLE/non-RLE decode
+  loops collapse into one `SeqDecoder`. Slice decoding of sequence-heavy
+  data speeds up 5-10% (json +10% at level 1, where ruzstd now decodes
+  faster than the zstd crate's slice decoder).
 
 # After 0.8.3
 

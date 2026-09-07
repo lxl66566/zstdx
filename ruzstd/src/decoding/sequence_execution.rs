@@ -72,117 +72,242 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     Ok(())
 }
 
-/// Execute the decoded sequences directly into a flat output slice, starting
-/// at `*written`. This is the slice-decode fast path: the frame's already
-/// produced bytes live at `out[..*written]` and serve as the match window, so
-/// no ring buffer is involved.
+/// Execute the sequences decoded by `dec` straight into the flat target at
+/// `out[*written..]`, one sequence at a time — decoding and execution fused,
+/// the libzstd model. The frame's already produced bytes at the backing
+/// buffer's lower addresses serve as the match window, so no ring buffer is
+/// involved.
 ///
-/// `virt_base`/`view` generalize this for the streaming flat buffer:
-/// `virt_base` is the virtual address of the first byte of `out` and `view`
-/// maps virtual match addresses to physical offsets (see `FlatView`): the
-/// active segment at the buffer start plus the wrapped-away previous segment
-/// that still serves as the window. A single virtual match source may span
-/// the segment boundary, so copies are split per physical segment; within a
-/// segment the doubling scheme from the ring path applies unchanged.
+/// `virt_base`/`view` map virtual match addresses to physical offsets in the
+/// backing buffer (see `FlatView`): the active segment at the buffer start
+/// plus the wrapped-away previous segment that still serves as the window.
+/// The never-wrapped case (`view.origin == 0`: all of slice decoding plus a
+/// streaming buffer's first generation) runs a monomorphized copy of the loop
+/// without the two-generation mapping branches.
 ///
-/// The caller must ensure the block's total output (all literals plus all
-/// match lengths) fits into `out[*written..]`; the executor then knows every
-/// write stays in bounds and skips per-sequence capacity checks.
-pub(crate) fn execute_sequences_flat(
-    sequences: &[Sequence],
+/// Bounds are checked per sequence (`written + ll + ml <= out.len()`), which
+/// replaces the two-pass path's whole-block budget precheck. Commits
+/// `*written` and validates the bitstream padding (`dec.finish`) on success.
+pub(crate) fn execute_decoded_flat(
+    dec: &mut super::sequence_section_decoder::SeqDecoder,
     literals: &[u8],
     out: &mut [u8],
     written: &mut usize,
     virt_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
-) -> Result<(), ExecuteSequencesError> {
-    if view.origin == 0 {
-        // No wrap has happened yet: virtual addresses are physical offsets
-        // into the single active segment, so every match copies within one
-        // segment and the plain doubling loop suffices. This covers all of
-        // slice decoding (virt_base == 0) plus a streaming buffer's first
-        // generation, and keeps that hot path free of the per-match
-        // two-generation mapping below.
-        return execute_sequences_flat_nowrap(
-            sequences,
-            literals,
-            out,
-            written,
-            virt_base,
-            offset_hist,
-        );
+) -> Result<(), crate::decoding::errors::DecompressBlockError> {
+    // BMI2 compiles the decoder's variable shifts to single-uop shlx/shrx;
+    // the detection cache makes this dispatch cheap relative to a block.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: bmi2 was just detected at runtime
+            return unsafe {
+                execute_decoded_flat_bmi2(dec, literals, out, written, virt_base, view, offset_hist)
+            };
+        }
     }
-    use crate::decoding::flat_buffer::FlatView;
-    let FlatView {
-        origin,
-        prev_origin,
-        seg_a_end,
-        out_len,
-    } = view;
-    let out_ptr = out.as_mut_ptr();
-    let mut w = *written;
-    let mut lit_pos = 0usize;
+    execute_decoded_flat_impl(dec, literals, out, written, virt_base, view, offset_hist)
+}
 
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn execute_decoded_flat_bmi2(
+    dec: &mut super::sequence_section_decoder::SeqDecoder,
+    literals: &[u8],
+    out: &mut [u8],
+    written: &mut usize,
+    virt_base: usize,
+    view: crate::decoding::flat_buffer::FlatView,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), crate::decoding::errors::DecompressBlockError> {
+    execute_decoded_flat_impl(dec, literals, out, written, virt_base, view, offset_hist)
+}
+
+#[inline(always)]
+fn execute_decoded_flat_impl(
+    dec: &mut super::sequence_section_decoder::SeqDecoder,
+    literals: &[u8],
+    out: &mut [u8],
+    written: &mut usize,
+    virt_base: usize,
+    view: crate::decoding::flat_buffer::FlatView,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), crate::decoding::errors::DecompressBlockError> {
+    if view.origin == 0 {
+        execute_decoded_flat_inner::<true>(dec, literals, out, written, virt_base, view, offset_hist)
+    } else {
+        execute_decoded_flat_inner::<false>(dec, literals, out, written, virt_base, view, offset_hist)
+    }
+}
+
+#[inline(always)]
+fn execute_decoded_flat_inner<const NOWRAP: bool>(
+    dec: &mut super::sequence_section_decoder::SeqDecoder,
+    literals: &[u8],
+    out: &mut [u8],
+    written: &mut usize,
+    virt_base: usize,
+    view: crate::decoding::flat_buffer::FlatView,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), crate::decoding::errors::DecompressBlockError> {
+    use crate::decoding::errors::{DecompressBlockError, ExecuteSequencesError};
+
+    let out_ptr = out.as_mut_ptr();
+    let out_len = out.len();
     // `out` is the slice buf[block_start..] of the backing buffer; recover
     // the buffer base so match sources (absolute offsets) address correctly.
     // With a slice-decode target (virt_base == origin) this is `out` itself.
-    let block_start = virt_base.saturating_sub(origin);
+    let block_start = if NOWRAP {
+        virt_base
+    } else {
+        virt_base.saturating_sub(view.origin)
+    };
     // SAFETY: subtracting within the same allocation; the caller guarantees
-    // out is the slice starting block_start bytes into the buffer.
+    // out is the slice starting block_start bytes into the buffer
     let base = unsafe { out_ptr.sub(block_start) };
+    let crate::decoding::flat_buffer::FlatView {
+        origin,
+        prev_origin,
+        seg_a_end,
+        out_len: seg_out_len,
+    } = view;
+    let mut w = *written;
+    let mut lit_pos = 0usize;
 
-    for &seq in sequences {
-        let ll = seq.ll as usize;
-        if ll > 0 {
-            let high = lit_pos + ll;
-            if high > literals.len() {
-                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                    wanted: high,
-                    have: literals.len(),
-                });
-            }
-            // SAFETY: high <= literals.len() by the check above; w + ll stays
-            // below out.len() through the caller's per-block budget
-            unsafe {
-                core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), ll);
-            }
-            lit_pos = high;
-            w += ll;
-        }
+    while let Some(seq) = dec
+        .next()
+        .map_err(DecompressBlockError::DecodeSequenceError)?
+    {
+        exec_one_flat::<NOWRAP>(
+            seq,
+            literals,
+            &mut lit_pos,
+            out_ptr,
+            out_len,
+            &mut w,
+            base,
+            virt_base,
+            origin,
+            prev_origin,
+            seg_a_end,
+            seg_out_len,
+            offset_hist,
+        )
+        .map_err(DecompressBlockError::ExecuteSequencesError)?;
+    }
 
-        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
-        if actual_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
-        }
-        let offset = actual_offset as usize;
-        let cur_v = virt_base + w;
-        if offset > cur_v {
-            // No dictionary in the flat path, so an offset past the frame's
-            // own output is always corruption.
-            return Err(ExecuteSequencesError::DecodebufferError(
-                crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                    offset,
-                    buf_len: cur_v,
-                },
+    let rest = literals.len() - lit_pos;
+    if rest > 0 {
+        if w + rest > out_len {
+            return Err(DecompressBlockError::ExecuteSequencesError(
+                ExecuteSequencesError::TargetTooSmall,
             ));
         }
-        let ml = seq.ml as usize;
-        if ml > 0 {
-            // Copy `ml` bytes from the virtual source `cur_v - offset` to the
-            // absolute position `w`, splitting at the physical segment
-            // boundary. Within a segment the doubling scheme from the ring
-            // path applies: the source anchor stays fixed and each chunk is
-            // capped by the already-written span behind the anchor, so reads
-            // never run ahead of the write cursor.
+        // SAFETY: budget checked above; rest literals fit like the copies above
+        unsafe {
+            core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), rest);
+        }
+        w += rest;
+    }
+    *written = w;
+    dec.finish().map_err(DecompressBlockError::DecodeSequenceError)
+}
+
+/// Execute a single decoded sequence into the flat target: the literal copy,
+/// offset-history resolution, and the match copy.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn exec_one_flat<const NOWRAP: bool>(
+    seq: Sequence,
+    literals: &[u8],
+    lit_pos: &mut usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+    w: &mut usize,
+    base: *mut u8,
+    virt_base: usize,
+    origin: usize,
+    prev_origin: usize,
+    seg_a_end: usize,
+    seg_out_len: usize,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
+    use crate::decoding::errors::ExecuteSequencesError;
+    let ll = seq.ll as usize;
+    let ml = seq.ml as usize;
+    if *w + ll + ml > out_len {
+        return Err(ExecuteSequencesError::TargetTooSmall);
+    }
+    if ll > 0 {
+        let high = *lit_pos + ll;
+        if high > literals.len() {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: literals.len(),
+            });
+        }
+        // SAFETY: high <= literals.len() by the check above; w + ll stays
+        // below out_len through the budget check
+        unsafe {
+            core::ptr::copy_nonoverlapping(literals.as_ptr().add(*lit_pos), out_ptr.add(*w), ll);
+        }
+        *lit_pos = high;
+        *w += ll;
+    }
+
+    let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+    if actual_offset == 0 {
+        return Err(ExecuteSequencesError::ZeroOffset);
+    }
+    let offset = actual_offset as usize;
+    let cur_v = virt_base + *w;
+    if offset > cur_v {
+        // No dictionary in the flat path, so an offset past the frame's
+        // own output is always corruption.
+        return Err(ExecuteSequencesError::DecodebufferError(
+            crate::decoding::errors::DecodeBufferError::OffsetTooBig {
+                offset,
+                buf_len: cur_v,
+            },
+        ));
+    }
+    if ml > 0 {
+        if NOWRAP {
+            // No wrap has happened: virtual addresses are physical offsets,
+            // so the anchor is a plain pointer. Overlapping matches grow in
+            // doubling chunks anchored at the match source (same scheme as
+            // repeat_in_chunks): after `copied` appended bytes the readable
+            // span is `offset + copied` long, so every chunk reads only
+            // already-written bytes.
+            // SAFETY: cur_v - offset >= 0 was checked above and the doubling
+            // cap keeps reads inside the already-written region
+            let src = unsafe { base.add(cur_v - offset) };
+            let mut copied = 0;
+            while copied < ml {
+                let chunk = (offset + copied).min(ml - copied);
+                // SAFETY: src range [src, src + chunk) lies inside the
+                // written region; dst end stays below the budget
+                unsafe {
+                    core::ptr::copy(src, out_ptr.add(*w + copied), chunk);
+                }
+                copied += chunk;
+            }
+        } else {
+            // Copy `ml` bytes from the virtual source `cur_v - offset`,
+            // splitting at the physical segment boundary. Within a segment
+            // the doubling scheme applies: the source anchor stays fixed and
+            // each chunk is capped by the already-written span behind the
+            // anchor, so reads never run ahead of the write cursor.
             let mut src_v = cur_v - offset;
-            let mut dst = w;
+            let mut dst = *w;
             let mut remaining = ml;
             while remaining > 0 {
                 // Map into the active segment, or into the previous segment
                 // below its physical end; anything lower is out of window.
                 let (src_abs, seg_end) = if src_v >= origin {
-                    (src_v - origin, out_len)
+                    (src_v - origin, seg_out_len)
                 } else if src_v >= prev_origin {
                     (src_v - prev_origin, seg_a_end)
                 } else {
@@ -212,110 +337,9 @@ pub(crate) fn execute_sequences_flat(
                 dst += chunk;
                 remaining -= chunk;
             }
-            w += ml;
         }
+        *w += ml;
     }
-
-    let rest = literals.len() - lit_pos;
-    if rest > 0 {
-        // SAFETY: rest literals fit the block budget like the copies above
-        unsafe {
-            core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), rest);
-        }
-        w += rest;
-    }
-    *written = w;
-    Ok(())
-}
-
-/// `execute_sequences_flat` before the first buffer wrap: virtual addresses
-/// are physical offsets (`origin == 0`), so one fixed-anchor doubling loop
-/// per match covers everything. With `virt_base == 0` (slice decode) this is
-/// instruction-for-instruction the historical slice fast path.
-fn execute_sequences_flat_nowrap(
-    sequences: &[Sequence],
-    literals: &[u8],
-    out: &mut [u8],
-    written: &mut usize,
-    virt_base: usize,
-    offset_hist: &mut [u32; 3],
-) -> Result<(), ExecuteSequencesError> {
-    let out_ptr = out.as_mut_ptr();
-    // SAFETY: with virt_base == 0 this is `out` itself; otherwise the caller
-    // guarantees `out` starts virt_base bytes into the backing flat buffer,
-    // so match sources below out (previous blocks) address correctly.
-    let base = unsafe { out_ptr.sub(virt_base) };
-    let mut w = *written;
-    let mut lit_pos = 0usize;
-
-    for &seq in sequences {
-        let ll = seq.ll as usize;
-        if ll > 0 {
-            let high = lit_pos + ll;
-            if high > literals.len() {
-                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                    wanted: high,
-                    have: literals.len(),
-                });
-            }
-            // SAFETY: high <= literals.len() by the check above; w + ll stays
-            // below out.len() through the caller's per-block budget
-            unsafe {
-                core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), ll);
-            }
-            lit_pos = high;
-            w += ll;
-        }
-
-        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
-        if actual_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
-        }
-        let offset = actual_offset as usize;
-        let cur_v = virt_base + w;
-        if offset > cur_v {
-            // No dictionary in the flat path, so an offset past the frame's
-            // own output is always corruption.
-            return Err(ExecuteSequencesError::DecodebufferError(
-                crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                    offset,
-                    buf_len: cur_v,
-                },
-            ));
-        }
-        let ml = seq.ml as usize;
-        if ml > 0 {
-            // Overlapping matches grow in doubling chunks anchored at the
-            // match source (same scheme as repeat_in_chunks): after `copied`
-            // appended bytes the readable span is `offset + copied` long, so
-            // every chunk reads only already-written bytes. Virtual and
-            // physical addresses coincide, so the anchor is a plain pointer.
-            // SAFETY: cur_v - offset >= 0 was checked above and the doubling
-            // cap keeps reads inside the already-written region.
-            let src = unsafe { base.add(cur_v - offset) };
-            let mut copied = 0;
-            while copied < ml {
-                let chunk = (offset + copied).min(ml - copied);
-                // SAFETY: src range [src, src + chunk) lies inside the
-                // already-written region; dst end stays below the block budget
-                unsafe {
-                    core::ptr::copy(src, out_ptr.add(w + copied), chunk);
-                }
-                copied += chunk;
-            }
-            w += ml;
-        }
-    }
-
-    let rest = literals.len() - lit_pos;
-    if rest > 0 {
-        // SAFETY: rest literals fit the block budget like the copies above
-        unsafe {
-            core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), rest);
-        }
-        w += rest;
-    }
-    *written = w;
     Ok(())
 }
 

@@ -62,6 +62,9 @@ impl DecoderScratch {
         self.fse.ll_seq_valid = false;
         self.fse.ml_seq_valid = false;
         self.fse.of_seq_valid = false;
+        self.fse.ll_ready = false;
+        self.fse.of_ready = false;
+        self.fse.ml_ready = false;
 
         self.huf.table.reset();
     }
@@ -112,6 +115,12 @@ pub struct FSEScratch {
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
     pub ml_predefined: bool,
+    /// Whether each stream's decoding table is established (FSE table built,
+    /// RLE fake entry written, or predefined installed) — Repeat mode with
+    /// none of these ever happening is rejected as uninitialized.
+    pub ll_ready: bool,
+    pub of_ready: bool,
+    pub ml_ready: bool,
     /// Packed sequence-decoding tables for the three streams in fixed slots
     /// (LL, then ML, then OF; see `sequence_section_decoder`), so the decode
     /// loop addresses all three through one base pointer with constant
@@ -142,6 +151,9 @@ impl FSEScratch {
             ll_seq_valid: false,
             ml_seq_valid: false,
             of_seq_valid: false,
+            ll_ready: false,
+            of_ready: false,
+            ml_ready: false,
         }
     }
 
@@ -158,6 +170,11 @@ impl FSEScratch {
         self.ll_seq_valid = false;
         self.ml_seq_valid = false;
         self.of_seq_valid = false;
+        // The dictionary's tables are fully established; a first block may
+        // legally reference them through Repeat mode.
+        self.ll_ready = true;
+        self.of_ready = true;
+        self.ml_ready = true;
     }
 }
 
