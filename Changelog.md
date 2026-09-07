@@ -11,6 +11,8 @@ This document records the changes made between versions, starting with version 0
 * Sequence execution reserves the whole block's output up front and appends
   without per-sequence capacity checks; ring buffer wraps with a conditional
   subtract instead of a modulo.
+* Interleaved Huffman decoding accesses its tables and output through
+  unchecked reads/writes; the loop bounds already guarantee they are in range.
 
 # After 0.8.3
 

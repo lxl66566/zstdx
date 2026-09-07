@@ -237,8 +237,11 @@ fn decompress_4streams_interleaved(
 
     macro_rules! decode_sym {
         ($s:literal, $k:literal) => {{
-            let entry = packed[(bits[$s] >> shift) as usize];
-            out[op[$s] + $k] = (entry >> 8) as u8;
+            // SAFETY: `bits >> shift` is below 2^tl == packed.len() by
+            // construction, and `op[s] + k` stays below the iteration bound
+            // precomputed from the output size.
+            let entry = unsafe { *packed.get_unchecked((bits[$s] >> shift) as usize) };
+            unsafe { *out.get_unchecked_mut(op[$s] + $k) = (entry >> 8) as u8 };
             bits[$s] <<= entry & 0x3F;
         }};
     }
@@ -246,8 +249,17 @@ fn decompress_4streams_interleaved(
         ($s:literal) => {{
             let ctz = bits[$s].trailing_zeros() as usize;
             ip[$s] -= ctz >> 3;
-            bits[$s] =
-                (u64::from_le_bytes(region[ip[$s]..][..8].try_into().unwrap()) | 1) << (ctz & 7);
+            // SAFETY: each reload consumes at most 7 bytes and the iteration
+            // count is bounded by ip[0]/7, so ip[s] + 8 never crosses into the
+            // next stream (streams sit back to back inside `region`).
+            let window = unsafe {
+                region
+                    .as_ptr()
+                    .add(ip[$s])
+                    .cast::<u64>()
+                    .read_unaligned()
+            };
+            bits[$s] = (window | 1) << (ctz & 7);
             op[$s] += 5;
         }};
     }
