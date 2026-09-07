@@ -29,7 +29,7 @@ fn main() {
                     step *= 2;
                     reference.reserve(step);
                 }
-                Err(e) => panic!("decode {path} failed: {e}"),
+                Err(e) => panic!("decode {} failed: {:?}", path, e),
             }
         }
 
@@ -38,7 +38,7 @@ fn main() {
             None => path.as_str(),
         };
         if let Ok(raw) = fs::read(raw_path) {
-            assert_eq!(raw, reference, "decoded output mismatch for {path}");
+            assert_eq!(raw, reference, "decoded output mismatch for {}", path);
         }
 
         let mut out = vec![0u8; reference.len()];
@@ -50,7 +50,7 @@ fn main() {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(&out[..], &reference[..], "in-place decode mismatch for {path}");
+        assert_eq!(&out[..], &reference[..], "in-place decode mismatch for {}", path);
         println!(
             "{path}: {:.2} MiB raw, {:.1} MiB/s ({} iters, {:.4} s/iter)",
             reference.len() as f64 / (1024.0 * 1024.0),
