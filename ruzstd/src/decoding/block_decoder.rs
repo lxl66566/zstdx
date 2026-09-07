@@ -121,16 +121,21 @@ impl BlockDecoder {
         Ok(())
     }
 
-    /// Compressed-block fast path for slice decoding: decodes the sections as
+    /// Compressed-block fast path for flat decoding: decodes the sections as
     /// usual but executes the sequences straight into `out[*written..]`,
     /// bypassing the ring buffer. Returns the number of bytes produced so far.
+    /// `virt_base`/`view` describe the virtual window mapping of the backing
+    /// flat buffer (see `execute_sequences_flat`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decompress_block_flat(
         &mut self,
         header: &BlockHeader,
         workspace: &mut DecoderScratch,
-        source: &mut &[u8],
+        source: &mut impl Read,
         out: &mut [u8],
         written: &mut usize,
+        virt_base: usize,
+        view: crate::decoding::flat_buffer::FlatView,
     ) -> Result<usize, DecompressBlockError> {
         let (seq_section, raw_len) = self.parse_and_decode_sections(header, workspace, source)?;
 
@@ -153,6 +158,8 @@ impl BlockDecoder {
                 &workspace.literals_buffer,
                 out,
                 written,
+                virt_base,
+                view,
                 &mut workspace.offset_hist,
             )?;
         } else {

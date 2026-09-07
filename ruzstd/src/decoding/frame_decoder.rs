@@ -9,6 +9,7 @@ use super::frame;
 use crate::decoding;
 use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::FrameDecoderError;
+use crate::decoding::flat_buffer::FlatOut;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
 use alloc::collections::BTreeMap;
@@ -87,6 +88,13 @@ pub struct FrameDecoder {
 struct FrameDecoderState {
     pub frame_header: frame::FrameHeader,
     decoder_scratch: DecoderScratch,
+    /// Dictionary-free frames decode blocks straight into this flat buffer
+    /// instead of the ring buffer (libzstd outBuff model).
+    flat: FlatOut,
+    /// Whether `flat` owns the decoded output; cleared when a dictionary
+    /// takes over mid-frame (force_dict), where its pending bytes are
+    /// dropped along with the decoder state.
+    flat_active: bool,
     frame_finished: bool,
     block_counter: usize,
     bytes_read_counter: u64,
@@ -114,10 +122,13 @@ impl FrameDecoderState {
             frame_finished: false,
             block_counter: 0,
             decoder_scratch: DecoderScratch::new(window_size as usize),
+            flat: FlatOut::new(),
+            flat_active: true,
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
         };
+        state.flat.reset(window_size as usize);
         #[cfg(feature = "hash")]
         state.decoder_scratch.set_checksum_enabled(
             state.frame_header.descriptor.content_checksum_flag(),
@@ -134,6 +145,7 @@ impl FrameDecoderState {
         self.frame_finished = false;
         self.block_counter = 0;
         self.decoder_scratch.reset(window_size as usize);
+        self.flat.reset(window_size as usize);
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
@@ -226,6 +238,7 @@ impl FrameDecoder {
                 .ok_or(err::DictNotProvided { dict_id })?;
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
+            state.flat_active = false;
         }
         Ok(())
     }
@@ -248,6 +261,10 @@ impl FrameDecoder {
             .ok_or(err::DictNotProvided { dict_id })?;
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
+        if state.flat_active {
+            state.flat_active = false;
+            state.flat.reset(state.decoder_scratch.buffer.window_size);
+        }
 
         Ok(())
     }
@@ -324,6 +341,10 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
+        if state.flat_active {
+            return Self::decode_blocks_flat(state, &mut source, strat);
+        }
+
         let mut block_dec = decoding::block_decoder::new();
 
         let buffer_size_before = state.decoder_scratch.buffer.len();
@@ -386,11 +407,136 @@ impl FrameDecoder {
         Ok(state.frame_finished)
     }
 
+    /// Dictionary-free streaming path: decode blocks straight into the flat
+    /// buffer. Space is ensured before each block header is read, so a full
+    /// pending buffer simply pauses decoding until the caller reads.
+    fn decode_blocks_flat(
+        state: &mut FrameDecoderState,
+        source: &mut impl Read,
+        strat: BlockDecodingStrategy,
+    ) -> Result<bool, FrameDecoderError> {
+        use FrameDecoderError as err;
+        let mut block_dec = decoding::block_decoder::new();
+
+        let force = matches!(strat, BlockDecodingStrategy::All);
+        let produced_before = state.flat.produced();
+        let block_counter_before = state.block_counter;
+        loop {
+            if !state.flat.ensure_block_space(force) {
+                break;
+            }
+            let (block_header, block_header_size) = block_dec
+                .read_block_header(&mut *source)
+                .map_err(err::FailedToReadBlockHeader)?;
+            state.bytes_read_counter += u64::from(block_header_size);
+
+            #[cfg(feature = "hash")]
+            let hash_from = state.flat.end_abs();
+
+            match block_header.block_type {
+                BlockType::Raw => {
+                    let size = block_header.decompressed_size as usize;
+                    let target = state.flat.block_target();
+                    source
+                        .read_exact(&mut target[..size])
+                        .map_err(|e| err::FailedToReadBlockBody(
+                            decoding::errors::DecodeBlockContentError::ReadError {
+                                step: BlockType::Raw,
+                                source: e,
+                            },
+                        ))?;
+                    state.flat.advance(size);
+                    state.bytes_read_counter += size as u64;
+                }
+                BlockType::RLE => {
+                    let size = block_header.decompressed_size as usize;
+                    let mut buf = [0u8; 1];
+                    source
+                        .read_exact(&mut buf[..])
+                        .map_err(|e| err::FailedToReadBlockBody(
+                            decoding::errors::DecodeBlockContentError::ReadError {
+                                step: BlockType::RLE,
+                                source: e,
+                            },
+                        ))?;
+                    state.flat.block_target()[..size].fill(buf[0]);
+                    state.flat.advance(size);
+                    state.bytes_read_counter += 1;
+                }
+                BlockType::Compressed => {
+                    let mut written = 0usize;
+                    let view = state.flat.view();
+                    let block_start = state.flat.end_abs();
+                    block_dec
+                        .decompress_block_flat(
+                            &block_header,
+                            &mut state.decoder_scratch,
+                            source,
+                            state.flat.block_target(),
+                            &mut written,
+                            view.origin + block_start,
+                            view,
+                        )
+                        .map_err(|e| err::FailedToReadBlockBody(
+                            decoding::errors::DecodeBlockContentError::DecompressBlockError(
+                                e,
+                            ),
+                        ))?;
+                    state.flat.advance(written);
+                    state.bytes_read_counter += u64::from(block_header.content_size);
+                }
+                BlockType::Reserved => unreachable!("read_block_header rejects reserved"),
+            }
+
+            #[cfg(feature = "hash")]
+            state
+                .decoder_scratch
+                .buffer
+                .hash_bytes(state.flat.abs_slice(hash_from, state.flat.end_abs()));
+
+            state.block_counter += 1;
+
+            if block_header.last_block {
+                state.frame_finished = true;
+                if state.frame_header.descriptor.content_checksum_flag() {
+                    let mut chksum = [0u8; 4];
+                    source
+                        .read_exact(&mut chksum)
+                        .map_err(err::FailedToReadChecksum)?;
+                    state.bytes_read_counter += 4;
+                    state.check_sum = Some(u32::from_le_bytes(chksum));
+                }
+                break;
+            }
+
+            match strat {
+                BlockDecodingStrategy::All => { /* keep going */ }
+                BlockDecodingStrategy::UptoBlocks(n) => {
+                    if state.block_counter - block_counter_before >= n {
+                        break;
+                    }
+                }
+                BlockDecodingStrategy::UptoBytes(n) => {
+                    if state.flat.produced() - produced_before >= n {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(state.frame_finished)
+    }
+
     /// Collect bytes and retain window_size bytes while decoding is still going on.
     /// After decoding of the frame (is_finished() == true) has finished it will collect all remaining bytes
     pub fn collect(&mut self) -> Option<Vec<u8>> {
         let finished = self.is_finished();
         let state = self.state.as_mut()?;
+        if state.flat_active {
+            // Flat data stays in the buffer as match history after being
+            // handed out, so pending bytes can be given unconditionally.
+            return Some(state.flat.take_pending());
+        }
         if finished {
             Some(state.decoder_scratch.buffer.drain())
         } else {
@@ -406,6 +552,9 @@ impl FrameDecoder {
             None => return Ok(0),
             Some(s) => s,
         };
+        if state.flat_active {
+            return state.flat.flush_to_writer(w);
+        }
         if finished {
             state.decoder_scratch.buffer.drain_to_writer(w)
         } else {
@@ -422,6 +571,9 @@ impl FrameDecoder {
             None => return 0,
             Some(s) => s,
         };
+        if state.flat_active {
+            return state.flat.can_flush();
+        }
         if finished {
             state.decoder_scratch.buffer.can_drain()
         } else {
@@ -494,9 +646,16 @@ impl FrameDecoder {
                         .decompress_block_flat(
                             &block_header,
                             &mut state.decoder_scratch,
-                            source,
+                            &mut *source,
                             out,
                             &mut written,
+                            0,
+                            crate::decoding::flat_buffer::FlatView {
+                                origin: 0,
+                                prev_origin: 0,
+                                seg_a_end: out.len(),
+                                out_len: out.len(),
+                            },
                         )
                         .map_err(|e| match e {
                             decoding::errors::DecompressBlockError::ExecuteSequencesError(
@@ -580,14 +739,121 @@ impl FrameDecoder {
                     && state.frame_finished
                     && state.check_sum.is_none()
                 {
-                    //this block is needed if the checksum were the only 4 bytes that were not included in the last decode_from_to call for a frame
+                    // This block is needed if the checksum were the only 4 bytes
+                    // that were not included in the last decode_from_to call for
+                    // a frame. Handles both the flat and ring paths.
                     if mt_source.len() >= 4 {
                         let chksum = mt_source[..4].try_into().expect("optimized away");
                         state.bytes_read_counter += 4;
-                        let chksum = u32::from_le_bytes(chksum);
-                        state.check_sum = Some(chksum);
+                        mt_source = &mt_source[4..];
+                        state.check_sum = Some(u32::from_le_bytes(chksum));
+                    } else {
+                        return Ok((0, 0));
                     }
-                    return Ok((4, 0));
+                }
+
+                if state.flat_active {
+                    // Flat twin of the loop below: room is ensured before the
+                    // header is consumed, and a short source rewinds the
+                    // header instead of erroring (the caller will call again
+                    // with more bytes).
+                    loop {
+                        if mt_source.len() < 3 {
+                            break;
+                        }
+                        if !state.flat.ensure_block_space(false) {
+                            break;
+                        }
+                        let before_header = mt_source;
+                        let (block_header, block_header_size) = block_dec
+                            .read_block_header(&mut mt_source)
+                            .map_err(err::FailedToReadBlockHeader)?;
+                        if mt_source.len() < block_header.content_size as usize {
+                            mt_source = before_header;
+                            break;
+                        }
+                        state.bytes_read_counter += u64::from(block_header_size);
+
+                        #[cfg(feature = "hash")]
+                        let hash_from = state.flat.end_abs();
+
+                        match block_header.block_type {
+                            BlockType::Raw => {
+                                let size = block_header.decompressed_size as usize;
+                                let target = state.flat.block_target();
+                                mt_source
+                                    .read_exact(&mut target[..size])
+                                    .map_err(|e| err::FailedToReadBlockBody(
+                                        decoding::errors::DecodeBlockContentError::ReadError {
+                                            step: BlockType::Raw,
+                                            source: e,
+                                        },
+                                    ))?;
+                                state.flat.advance(size);
+                                state.bytes_read_counter += size as u64;
+                            }
+                            BlockType::RLE => {
+                                let size = block_header.decompressed_size as usize;
+                                let mut buf = [0u8; 1];
+                                mt_source
+                                    .read_exact(&mut buf[..])
+                                    .map_err(|e| err::FailedToReadBlockBody(
+                                        decoding::errors::DecodeBlockContentError::ReadError {
+                                            step: BlockType::RLE,
+                                            source: e,
+                                        },
+                                    ))?;
+                                state.flat.block_target()[..size].fill(buf[0]);
+                                state.flat.advance(size);
+                                state.bytes_read_counter += 1;
+                            }
+                            BlockType::Compressed => {
+                                let mut written = 0usize;
+                                let view = state.flat.view();
+                                let block_start = state.flat.end_abs();
+                                block_dec
+                                    .decompress_block_flat(
+                                        &block_header,
+                                        &mut state.decoder_scratch,
+                                        &mut mt_source,
+                                        state.flat.block_target(),
+                                        &mut written,
+                                        view.origin + block_start,
+                                        view,
+                                    )
+                                    .map_err(|e| err::FailedToReadBlockBody(
+                                        decoding::errors::DecodeBlockContentError::DecompressBlockError(
+                                            e,
+                                        ),
+                                    ))?;
+                                state.flat.advance(written);
+                                state.bytes_read_counter +=
+                                    u64::from(block_header.content_size);
+                            }
+                            BlockType::Reserved => unreachable!("read_block_header rejects reserved"),
+                        }
+
+                        #[cfg(feature = "hash")]
+                        state
+                            .decoder_scratch
+                            .buffer
+                            .hash_bytes(state.flat.abs_slice(hash_from, state.flat.end_abs()));
+
+                        state.block_counter += 1;
+
+                        if block_header.last_block {
+                            state.frame_finished = true;
+                            if state.frame_header.descriptor.content_checksum_flag()
+                                && mt_source.len() >= 4
+                            {
+                                let chksum = mt_source[..4].try_into().expect("optimized away");
+                                state.bytes_read_counter += 4;
+                                mt_source = &mt_source[4..];
+                                state.check_sum = Some(u32::from_le_bytes(chksum));
+                            }
+                            break;
+                        }
+                    }
                 }
 
                 loop {
@@ -746,6 +1012,9 @@ impl Read for FrameDecoder {
             None => return Ok(0),
             Some(s) => s,
         };
+        if state.flat_active {
+            return Ok(state.flat.flush_to(target));
+        }
         if state.frame_finished {
             state.decoder_scratch.buffer.read_all(target)
         } else {

@@ -56,6 +56,13 @@ This document records the changes made between versions, starting with version 0
 * The matcher probes the second repeated offset immediately after every
   emitted match (zstd fast's rep_offset2 loop); alternating-period data now
   chains repcode matches with zero literals (json ratio +6%).
+* Dictionary-free streaming decode executes blocks into a flat windowed
+  buffer (libzstd's outBuff model) instead of the ring buffer: blocks decode
+  straight into the buffer, flushes hand out bytes without retaining a
+  window, and a full buffer wraps to its start with the previous segment's
+  tail serving as the match window. Streaming speeds up 3% (small windows)
+  to 125% (8MB windows); on large-window data ruzstd now matches or beats
+  the zstd crate's streaming decoder.
 
 # After 0.8.3
 
