@@ -358,11 +358,12 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn skip_matching(&mut self) {
-        let mut p = self.block_start;
-        while p < self.block_end {
-            self.insert_pos(p);
-            p += 1;
-        }
+        // Only called for RLE blocks so far: every 5-byte window in a
+        // uniform run hashes to the same slot, so indexing each byte just
+        // rewrites one table entry. The first position covers that slot;
+        // future probes into the run resolve through it or the repcode
+        // chain.
+        self.insert_pos(self.block_start);
         self.pos = self.block_end;
         self.anchor = self.block_end;
     }
