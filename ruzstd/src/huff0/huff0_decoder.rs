@@ -3,6 +3,7 @@
 use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
@@ -87,6 +88,12 @@ pub struct HuffmanTable {
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     rank_indexes: Vec<usize>,
+    /// Double-symbol (X2) decoding table: 2^11 u32 entries, mirroring libzstd's
+    /// HUF_DEltX2 packed layout: bits 0..16 = one or two output symbols
+    /// (little-endian, first symbol in the low byte), bits 16..22 = total bits
+    /// consumed for the entry, bit 24 = number of symbols (1 or 2).
+    /// Empty unless `build_x2_table` ran after the regular table was built.
+    x2: Vec<u32>,
     /// In some cases, the list of weights is compressed using FSE compression.
     fse_table: FSETable,
 }
@@ -103,6 +110,7 @@ impl HuffmanTable {
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
             rank_indexes: Vec::with_capacity(11),
+            x2: Vec::new(),
             fse_table: FSETable::new(255),
         }
     }
@@ -117,6 +125,7 @@ impl HuffmanTable {
         self.max_num_bits = other.max_num_bits;
         self.bits.extend_from_slice(&other.bits);
         self.rank_indexes.extend_from_slice(&other.rank_indexes);
+        self.x2.extend_from_slice(&other.x2);
         self.fse_table.reinit_from(&other.fse_table);
     }
 
@@ -129,6 +138,7 @@ impl HuffmanTable {
         self.bits.clear();
         self.bit_ranks.clear();
         self.rank_indexes.clear();
+        self.x2.clear();
         self.fse_table.reset();
     }
 
@@ -312,6 +322,11 @@ impl HuffmanTable {
     fn build_table_from_weights(&mut self) -> Result<(), HuffmanTableError> {
         use HuffmanTableError as err;
 
+        // invalidate the double-symbol table: it is only valid for the exact
+        // weights this call rebuilds from, and is re-created on demand by
+        // `build_x2_table` (treeless blocks reuse whatever was last built)
+        self.x2.clear();
+
         self.bits.clear();
         self.bits.resize(self.weights.len() + 1, 0);
 
@@ -410,6 +425,160 @@ impl HuffmanTable {
         );
 
         Ok(())
+    }
+
+    /// Build the double-symbol (X2) decoding table from the current weights.
+    ///
+    /// Port of libzstd's `HUF_readDTableX2_wksp` / `HUF_fillDTableX2`. The table
+    /// has a fixed size of 2^11 entries (HUF_DECODER_FAST_TABLELOG): each
+    /// single-symbol code owns the slice of indices sharing its prefix, and
+    /// whenever at least one more shortest code fits into the remaining window
+    /// bits the entries of that slice are upgraded to decode two symbols per
+    /// lookup (level 2), consuming the summed bit count.
+    ///
+    /// Must be called after `build_table_from_weights`; the regular single-symbol
+    /// table is still used by the finish loop and the single-stream path.
+    pub(crate) fn build_x2_table(&mut self) {
+        /// X2 entries are indexed by the top 11 bits of the bit window.
+        const TARGET_LOG: i32 = 11;
+
+        let tl = self.max_num_bits as i32;
+        debug_assert!((1..=11).contains(&tl));
+        let nb_bits_baseline = tl + 1;
+
+        // rank_stats[w] = number of symbols with huffman weight w (1..=tl);
+        // self.bits[] holds per-symbol code lengths incl. the inferred last
+        // symbol, weight = nb_bits_baseline - code_length.
+        let mut rank_stats = [0u32; 13];
+        let mut max_w = 0usize;
+        for &b in &self.bits {
+            if b == 0 {
+                continue;
+            }
+            let w = (nb_bits_baseline - b as i32) as usize;
+            rank_stats[w] += 1;
+            max_w = max_w.max(w);
+        }
+
+        let min_bits = nb_bits_baseline - max_w as i32; // shortest code length
+        let scale_log = nb_bits_baseline - TARGET_LOG; // ≤ 0
+        let rescale = TARGET_LOG - tl - 1;
+
+        // Only keep the X2 table when pairing actually pays off: the share of
+        // the code space whose codes are short enough for a second code to fit
+        // into the 11-bit lookup window must dominate. Below ~80% the many
+        // single-symbol entries (2x wider than X1 entries, u16 writes with a
+        // garbage second byte, variable output advance) make X2 slower than
+        // the plain single-symbol loop despite the halved chain for the rest.
+        let mut eligible_slots = 0u32;
+        for &b in &self.bits {
+            if b == 0 {
+                continue;
+            }
+            let w = nb_bits_baseline - b as i32;
+            if TARGET_LOG - (nb_bits_baseline - w) >= min_bits {
+                eligible_slots += 1u32 << (w + rescale) as u32;
+            }
+        }
+        if eligible_slots * 5 < 4u32 << TARGET_LOG {
+            self.x2.clear();
+            return;
+        }
+
+        // sort symbols by weight: starts[w]..ends[w] is the weight-w range
+        let mut starts = [0u32; 14];
+        let mut next = 0u32;
+        for w in 1..=max_w {
+            starts[w] = next;
+            next += rank_stats[w];
+        }
+        let mut sorted = vec![0u8; next as usize];
+        let mut ends = starts;
+        for (sym, &b) in self.bits.iter().enumerate() {
+            if b == 0 {
+                continue;
+            }
+            let w = (nb_bits_baseline - b as i32) as usize;
+            sorted[ends[w] as usize] = sym as u8;
+            ends[w] += 1;
+        }
+
+        // rank_val0[w] = start of the weight-w span inside the 2^11 table;
+        // a weight-w symbol owns 2^(w + rescale) slots there.
+        let mut rank_val0 = [0u32; 13];
+        let mut acc = 0u32;
+        for w in 1..=max_w {
+            rank_val0[w] = acc;
+            acc += rank_stats[w] << (w as i32 + rescale) as u32;
+        }
+        debug_assert_eq!(acc, 1 << TARGET_LOG);
+
+        // rank_val[consumed][w] = offset of the weight-w second symbols inside
+        // the span of a first symbol that consumed `consumed` bits.
+        let mut rank_val = [[0u32; 13]; 12];
+        for consumed in min_bits..(TARGET_LOG - min_bits + 1) {
+            for w in 1..=max_w {
+                rank_val[consumed as usize][w] = rank_val0[w] >> consumed;
+            }
+        }
+
+        self.x2.clear();
+        self.x2.resize(1 << TARGET_LOG, 0);
+        let dt = &mut self.x2;
+
+        let pack = |sequence: u32, nb_bits: u32, length: u32| {
+            sequence | (nb_bits << 16) | (length << 24)
+        };
+
+        for w in 1..=max_w {
+            let nb_bits = nb_bits_baseline - w as i32;
+            let begin = starts[w] as usize;
+            let end = ends[w] as usize;
+            if TARGET_LOG - nb_bits >= min_bits {
+                // Enough room after the code for at least the shortest second
+                // code: upgrade every entry of the span to two-symbol entries.
+                let length = 1usize << (TARGET_LOG - nb_bits);
+                let min_weight = (nb_bits + scale_log).max(1) as usize;
+                let rv = &rank_val[nb_bits as usize];
+                let mut start = rank_val0[w] as usize;
+                for s in begin..end {
+                    let base_seq = sorted[s];
+                    // continuations whose remaining bits are too few for any
+                    // second code keep decoding a single symbol
+                    let skip = rv[min_weight] as usize;
+                    dt[start..start + skip].fill(pack(base_seq as u32, nb_bits as u32, 1));
+                    for w2 in min_weight..=max_w {
+                        let total_bits = nb_bits_baseline - w2 as i32 + nb_bits;
+                        let span = 1usize << (TARGET_LOG - total_bits);
+                        let mut base = start + rv[w2] as usize;
+                        for &second in &sorted[starts[w2] as usize..ends[w2] as usize] {
+                            let double = pack(
+                                base_seq as u32 | ((second as u32) << 8),
+                                total_bits as u32,
+                                2,
+                            );
+                            dt[base..base + span].fill(double);
+                            base += span;
+                        }
+                    }
+                    start += length;
+                }
+            } else {
+                // no room for a second symbol: single-symbol entries
+                let span = 1usize << (TARGET_LOG - nb_bits);
+                let mut start = rank_val0[w] as usize;
+                for &sym in &sorted[begin..end] {
+                    dt[start..start + span].fill(pack(sym as u32, nb_bits as u32, 1));
+                    start += span;
+                }
+            }
+        }
+    }
+
+    /// The double-symbol table, empty when it was not built for the current
+    /// table description.
+    pub(crate) fn x2_table(&self) -> &[u32] {
+        &self.x2
     }
 }
 

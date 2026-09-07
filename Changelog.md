@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Huffman literals decoding gains a double-symbol (X2) table for the
+  interleaved 4-stream fast path, ported from libzstd: each lookup emits one
+  or two literals (a single unaligned u16 store) and consumes the summed bit
+  count, halving the serial load-shift chain on skewed distributions. The
+  table is chosen per literals section with libzstd's size-based cost model
+  and only kept when at least ~80% of the code space can pair two codes into
+  the 11-bit lookup window (pairing pays off on skewed tables; on
+  long-code tables the wider entries and variable advance lose to the plain
+  single-symbol loop). skewed ~+15%/+43% (zstd-3/zstd-1), json +1-4%,
+  text +0-2%.
 * FSE decoding-table construction precomputes per-symbol spread constants
   (slice baselines/strides/bit counts) so the per-entry fill is a counter,
   compare, and multiply-add; the per-entry `highest_bit_set` scans and the

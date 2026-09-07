@@ -55,6 +55,71 @@ pub fn round_trip(data: &[u8]) {
     assert_eq!(&decoded, data);
 }
 
+/// Same as `round_trip` but decoding through the double-symbol X2 table,
+/// one table lookup at a time (1 or 2 symbols per lookup).
+#[cfg(any(test, feature = "fuzz_exports"))]
+pub fn round_trip_x2(data: &[u8]) {
+    use crate::bit_io::{BitReaderReversed, BitWriter};
+    use alloc::vec::Vec;
+
+    if data.len() < 2 {
+        return;
+    }
+    if data.iter().all(|x| *x == data[0]) {
+        return;
+    }
+    let mut writer = BitWriter::new();
+    let encoder_table = huff0_encoder::HuffmanTable::build_from_data(data);
+    let mut encoder = huff0_encoder::HuffmanEncoder::new(&encoder_table, &mut writer);
+
+    encoder.encode(data, true);
+    let encoded = writer.dump();
+    let mut decoder_table = HuffmanTable::new();
+    let table_bytes = decoder_table.build_decoder(&encoded).unwrap();
+    decoder_table.build_x2_table();
+    let dt = decoder_table.x2_table();
+    if dt.is_empty() {
+        // the table is not pair-friendly enough for X2 to pay off
+        return;
+    }
+
+    let mut br = BitReaderReversed::new(&encoded[table_bytes as usize..]);
+    let mut skipped_bits = 0;
+    loop {
+        let val = br.get_bits(1);
+        skipped_bits += 1;
+        if val == 1 || skipped_bits > 8 {
+            break;
+        }
+    }
+    if skipped_bits > 8 {
+        panic!("Corrupted end marker");
+    }
+
+    let mut decoded = Vec::new();
+    while decoded.len() < data.len() {
+        // the very last symbol of the stream may share its lookup with
+        // padding bits that look like a second code; decode it through the
+        // single-symbol table instead (mirrors libzstd's decodeLastSymbolX2)
+        if decoded.len() + 2 > data.len() {
+            let mut dec1 = HuffmanDecoder::new(&decoder_table);
+            let _ = dec1.init_state(&mut br);
+            decoded.push(dec1.decode_symbol());
+            dec1.next_state(&mut br);
+            break;
+        }
+        let entry = dt[br.peek_bits_refilled(11) as usize];
+        let nb = ((entry >> 16) & 0x3F) as u8;
+        let len = (entry >> 24) as usize;
+        br.consume(nb);
+        decoded.push(entry as u8);
+        if len == 2 {
+            decoded.push((entry >> 8) as u8);
+        }
+    }
+    assert_eq!(&decoded, data);
+}
+
 #[test]
 fn roundtrip() {
     use alloc::vec::Vec;
@@ -65,11 +130,13 @@ fn roundtrip() {
         use alloc::vec;
         let data = vec![123; size];
         round_trip(&data);
+        round_trip_x2(&data);
         let mut data = Vec::new();
         for x in 0..size {
             data.push(x as u8);
         }
         round_trip(&data);
+        round_trip_x2(&data);
     }
 
     #[cfg(feature = "std")]

@@ -134,6 +134,17 @@ impl<'s> BitReaderReversed<'s> {
         (self.bit_container >> shift_by) & mask
     }
 
+    /// Like `peek_bits` but refills the container first, so the peek is always
+    /// backed by fresh stream bits (padding zeroes past the end of the stream).
+    #[cfg(any(test, feature = "fuzz_exports"))]
+    #[inline(always)]
+    pub fn peek_bits_refilled(&mut self, n: u8) -> u64 {
+        if self.bits_consumed + n > 64 {
+            self.refill();
+        }
+        self.peek_bits(n)
+    }
+
     /// Consume `n` bits from the source.
     #[inline(always)]
     pub fn consume(&mut self, n: u8) {

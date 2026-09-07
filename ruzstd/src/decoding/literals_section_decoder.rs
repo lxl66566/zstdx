@@ -57,6 +57,11 @@ fn decompress_literals(
         LiteralsSectionType::Compressed => {
             //read Huffman tree description
             bytes_read += scratch.table.build_decoder(source)?;
+            // pick the decoding table shape for this block's literals,
+            // mirroring libzstd's HUF_selectDecoder cost model
+            if select_x2_table(section.regenerated_size as usize, compressed_size) {
+                scratch.table.build_x2_table();
+            }
             vprintln!("Built huffman table using {} bytes", bytes_read);
         }
         LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
@@ -104,13 +109,23 @@ fn decompress_literals(
             && stream_bounds.iter().all(|&(s, e)| e - s >= 8)
             && scratch.table.max_num_bits >= 1
         {
-            decompress_4streams_interleaved(
-                &scratch.table,
-                source,
-                &stream_bounds,
-                total_out,
-                target,
-            )?;
+            if scratch.table.x2_table().is_empty() {
+                decompress_4streams_interleaved(
+                    &scratch.table,
+                    source,
+                    &stream_bounds,
+                    total_out,
+                    target,
+                )?;
+            } else {
+                decompress_4streams_interleaved_x2(
+                    &scratch.table,
+                    source,
+                    &stream_bounds,
+                    total_out,
+                    target,
+                )?;
+            }
         } else {
             for &(start, end) in &stream_bounds {
                 let stream = &source[start..end];
@@ -317,6 +332,38 @@ fn decompress_4streams_interleaved(
     }
 
     // Finish each stream with the scalar decoder, bounded by its segment end.
+    finish_streams(
+        table,
+        region,
+        stream_bounds,
+        &seg_end,
+        &ip,
+        &bits,
+        &op,
+        out,
+    )?;
+
+    Ok(())
+}
+
+/// Per-stream tail of the interleaved fast loops: hands the u64 window state
+/// (bit position `ip[s]`, marker at `bits[s].trailing_zeros()`) back to a
+/// regular bit reader and decodes the remaining symbols of the stream's
+/// segment one at a time through the single-symbol table.
+#[allow(clippy::too_many_arguments)]
+fn finish_streams(
+    table: &HuffmanTable,
+    region: &[u8],
+    stream_bounds: &[(usize, usize); 4],
+    seg_end: &[usize; 4],
+    ip: &[usize; 4],
+    bits: &[u64; 4],
+    op: &[usize; 4],
+    out: &mut [u8],
+) -> Result<(), DecompressLiteralsError> {
+    use DecompressLiteralsError as err;
+
+    let tl = table.max_num_bits as isize;
     for s in 0..4 {
         let (start, end) = stream_bounds[s];
         // The window may reach at most 8 bytes below the stream start (bytes already
@@ -324,7 +371,7 @@ fn decompress_4streams_interleaved(
         if ip[s] + 8 < start {
             return Err(err::BitstreamReadMismatch {
                 read_til: 0,
-                expected: -(tl as isize),
+                expected: -tl,
             });
         }
         if op[s] > seg_end[s] {
@@ -345,17 +392,205 @@ fn decompress_4streams_interleaved(
         let mut decoder = HuffmanDecoder::new(table);
         decoder.init_state(&mut br);
         let mut o = op[s];
-        while o < seg_end[s] && br.bits_remaining() - foreign > -(tl as isize) {
+        while o < seg_end[s] && br.bits_remaining() - foreign > -tl {
             out[o] = decoder.decode_and_advance(&mut br);
             o += 1;
         }
-        if o != seg_end[s] || br.bits_remaining() - foreign != -(tl as isize) {
+        if o != seg_end[s] || br.bits_remaining() - foreign != -tl {
             return Err(err::BitstreamReadMismatch {
                 read_til: br.bits_remaining() - foreign,
-                expected: -(tl as isize),
+                expected: -tl,
             });
         }
     }
+
+    Ok(())
+}
+
+/// Decide between the single-symbol (X1) and double-symbol (X2) huffman
+/// decoding table from the literals section sizes. Port of libzstd's
+/// `HUF_selectDecoder` / `algoTime`: Q quantizes the compression ratio of the
+/// literals, and the two cost models trade the (higher) X2 table build time
+/// against its (lower) per-256-bytes decode time; X2 additionally gets a
+/// slight penalty for its larger memory footprint.
+fn select_x2_table(dst_size: usize, c_src_size: usize) -> bool {
+    /// (table_time, decode_time_per_256_bytes) for [X1, X2] per ratio quant Q.
+    #[rustfmt::skip]
+    const ALGO_TIME: [[(u32, u32); 2]; 16] = [
+        [(0, 0), (1, 1)], [(0, 0), (1, 1)],
+        [(150, 216), (381, 119)], [(170, 205), (514, 112)],
+        [(177, 199), (539, 110)], [(197, 194), (644, 107)],
+        [(221, 192), (735, 107)], [(256, 189), (881, 106)],
+        [(359, 188), (1167, 109)], [(582, 187), (1570, 114)],
+        [(688, 187), (1712, 122)], [(825, 186), (1965, 136)],
+        [(976, 185), (2131, 150)], [(1180, 186), (2070, 175)],
+        [(1377, 185), (1731, 202)], [(1412, 185), (1695, 202)],
+    ];
+
+    let q = if c_src_size >= dst_size {
+        15
+    } else {
+        (c_src_size * 16 / dst_size).min(15)
+    };
+    let d256 = (dst_size >> 8) as u32;
+    let t0 = ALGO_TIME[q][0].0 + ALGO_TIME[q][0].1 * d256;
+    let t1 = ALGO_TIME[q][1].0 + ALGO_TIME[q][1].1 * d256;
+    let t1 = t1 + (t1 >> 5);
+    t1 < t0
+}
+
+/// Double-symbol variant of the interleaved 4-stream decoder, port of libzstd's
+/// `HUF_decompress4X2_usingDTable_internal_fast_c_loop`.
+///
+/// Each lookup produces one or two literal bytes (written as a single unaligned
+/// u16) and consumes the summed bit count, roughly halving the
+/// load→shift→load dependency chain per decoded byte on skewed distributions.
+/// The iteration bound takes the minimum over all four output segments
+/// (each iteration writes at most 10 bytes per stream), which also keeps every
+/// u16 write at least one byte away from the segment end: the four writes
+/// preceding a lookup advance by at most 8, so a lookup starting within an
+/// iteration never starts at `seg_end - 1` and cannot spill into the next
+/// stream's territory. The final byte of each stream is written by the scalar
+/// finish loop.
+#[allow(clippy::too_many_lines)]
+fn decompress_4streams_interleaved_x2(
+    table: &HuffmanTable,
+    region: &[u8],
+    stream_bounds: &[(usize, usize); 4],
+    total_out: usize,
+    target: &mut Vec<u8>,
+) -> Result<(), DecompressLiteralsError> {
+    use DecompressLiteralsError as err;
+
+    let dt = table.x2_table();
+    debug_assert_eq!(dt.len(), 1 << 11);
+
+    // per-stream output segments: stream k ends at (k+1) * segment, stream 4 at total_out
+    let segment = total_out.div_ceil(4);
+    let seg_end = [segment, 2 * segment, 3 * segment, total_out];
+
+    // initialize the four bit windows (same layout as the X1 loop)
+    let mut ip = [0usize; 4];
+    let mut bits = [0u64; 4];
+    for s in 0..4 {
+        let end = stream_bounds[s].1;
+        let p = end - 8;
+        let last_byte = region[p + 7];
+        let skip = if last_byte != 0 {
+            1 + last_byte.leading_zeros()
+        } else {
+            0
+        };
+        ip[s] = p;
+        bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
+    }
+    let mut op = [0, segment, 2 * segment, 3 * segment];
+
+    let out_start = target.len();
+    target.resize(out_start + total_out, 0);
+    let out = &mut target[out_start..];
+    let out_ptr = out.as_mut_ptr();
+
+    macro_rules! decode_sym_x2 {
+        ($s:literal) => {{
+            // SAFETY: `bits >> 53` is below 2^11 == dt.len() by construction.
+            // The write stays inside the stream's segment: see the function
+            // level comment, and `op[s]` is advanced by the entry length so it
+            // never passes `seg_end[s]`.
+            let entry = unsafe { *dt.get_unchecked((bits[$s] >> 53) as usize) };
+            unsafe {
+                (out_ptr.add(op[$s]) as *mut u16).write_unaligned(entry as u16);
+            }
+            op[$s] += (entry >> 24) as usize;
+            bits[$s] <<= (entry >> 16) & 0x3F;
+        }};
+    }
+    macro_rules! reload_x2 {
+        ($s:literal) => {{
+            let ctz = bits[$s].trailing_zeros() as usize;
+            ip[$s] -= ctz >> 3;
+            // SAFETY: same reload discipline as the X1 loop - each reload
+            // consumes at most 7 bytes and the iteration count is bounded by
+            // ip[0]/7, so the 8 byte read stays inside `region`.
+            let window = unsafe {
+                region
+                    .as_ptr()
+                    .add(ip[$s])
+                    .cast::<u64>()
+                    .read_unaligned()
+            };
+            bits[$s] = (window | 1) << (ctz & 7);
+        }};
+    }
+
+    loop {
+        // Each iteration performs 5 lookups per stream: at most 55 input bits
+        // (7 bytes) and at most 10 output bytes per stream. Bound iterations by
+        // the input left in the first stream and by EVERY stream's remaining
+        // output segment.
+        let iters = (ip[0] / 7)
+            .min((seg_end[0] - op[0]) / 10)
+            .min((seg_end[1] - op[1]) / 10)
+            .min((seg_end[2] - op[2]) / 10)
+            .min((seg_end[3] - op[3]) / 10);
+        if iters == 0 {
+            break;
+        }
+        // A stream crossing below its predecessor indicates corruption
+        if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
+            return Err(err::BitstreamReadMismatch {
+                read_til: 0,
+                expected: -(table.max_num_bits as isize),
+            });
+        }
+        // each iteration advances op[3] by at least 5 bytes
+        let olimit = op[3] + iters * 5;
+
+        loop {
+            // Decode 5 lookups in each of the 4 streams, column-major so the
+            // four dependency chains interleave.
+            decode_sym_x2!(0);
+            decode_sym_x2!(1);
+            decode_sym_x2!(2);
+            decode_sym_x2!(3);
+            decode_sym_x2!(0);
+            decode_sym_x2!(1);
+            decode_sym_x2!(2);
+            decode_sym_x2!(3);
+            decode_sym_x2!(0);
+            decode_sym_x2!(1);
+            decode_sym_x2!(2);
+            decode_sym_x2!(3);
+            decode_sym_x2!(0);
+            decode_sym_x2!(1);
+            decode_sym_x2!(2);
+            decode_sym_x2!(3);
+            decode_sym_x2!(0);
+            decode_sym_x2!(1);
+            decode_sym_x2!(2);
+            decode_sym_x2!(3);
+
+            reload_x2!(0);
+            reload_x2!(1);
+            reload_x2!(2);
+            reload_x2!(3);
+
+            if op[3] >= olimit {
+                break;
+            }
+        }
+    }
+
+    finish_streams(
+        table,
+        region,
+        stream_bounds,
+        &seg_end,
+        &ip,
+        &bits,
+        &op,
+        out,
+    )?;
 
     Ok(())
 }
