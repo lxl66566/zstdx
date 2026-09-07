@@ -2,13 +2,13 @@ use super::super::blocks::sequence_section::ModeType;
 use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::scratch::FSEScratch;
-use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 use crate::decoding::errors::DecodeSequenceError;
-use crate::fse::FSEDecoder;
+use crate::fse::FSETable;
 use alloc::vec::Vec;
+use core::convert::TryInto;
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
 pub fn decode_sequences(
@@ -23,21 +23,7 @@ pub fn decode_sequences(
 
     let bit_stream = &source[bytes_read..];
 
-    let mut br = BitReaderReversed::new(bit_stream);
-
-    //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    if skipped_bits > 8 {
-        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-        return Err(DecodeSequenceError::ExtraPadding { skipped_bits });
-    }
+    let mut br = SeqBitReader::new(bit_stream)?;
 
     if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
         decode_sequences_with_rle(section, &mut br, scratch, target)
@@ -46,240 +32,520 @@ pub fn decode_sequences(
     }
 }
 
-fn decode_sequences_with_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+/// Backwards bitstream reader over a 64-bit container, ported from libzstd's
+/// BIT_DStream. The window position is tracked by a byte pointer instead of
+/// recounting consumed bits, and reads are served by two shifts on the
+/// container. Reads must respect the reload discipline: after a reload at most
+/// 57 bits are available, which bounds how far reads may run between reloads.
+struct SeqBitReader<'s> {
+    source: &'s [u8],
+    /// The container holds `source[ip..ip+8]`.
+    ip: usize,
+    bits: u64,
+    /// Bits consumed from the top of the container. May exceed 64 once the
+    /// stream is overconsumed; `remaining` stays exact either way.
+    consumed: u32,
+}
 
-    if scratch.ll_rle.is_none() {
-        ll_dec.init_state(br)?;
-    }
-    if scratch.of_rle.is_none() {
-        of_dec.init_state(br)?;
-    }
-    if scratch.ml_rle.is_none() {
-        ml_dec.init_state(br)?;
-    }
+enum Reload {
+    Unfinished,
+    /// Window is clamped at the stream start; reads past the end yield zeroes.
+    EndOfBuffer,
+    /// Stream overconsumed (more bits read than it contains).
+    Overflow,
+}
 
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    for _seq_idx in 0..section.num_sequences {
-        //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
-            ll_rle
-        } else {
-            ll_dec.decode_symbol()
+impl<'s> SeqBitReader<'s> {
+    /// Start reading from the end of the stream, skipping the zero padding and
+    /// the final 1 marker (which must sit within the last byte).
+    fn new(source: &'s [u8]) -> Result<Self, DecodeSequenceError> {
+        let Some(&last) = source.last() else {
+            return Err(DecodeSequenceError::ExtraPadding { skipped_bits: 9 });
         };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
-            ml_rle
+        if last == 0 {
+            // Marker not within the last byte: invalid stream end
+            return Err(DecodeSequenceError::ExtraPadding { skipped_bits: 9 });
+        }
+        let pad = 1 + last.leading_zeros();
+        if source.len() >= 8 {
+            let ip = source.len() - 8;
+            let bits = u64::from_le_bytes(source[ip..].try_into().unwrap());
+            Ok(SeqBitReader {
+                source,
+                ip,
+                bits,
+                consumed: pad,
+            })
         } else {
-            ml_dec.decode_symbol()
-        };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
-            of_rle
-        } else {
-            of_dec.decode_symbol()
-        };
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        //println!("Sequence: {}", i);
-        //println!("of stat: {}", of_dec.state);
-        //println!("of Code: {}", of_code);
-        //println!("ll stat: {}", ll_dec.state);
-        //println!("ll bits: {}", ll_num_bits);
-        //println!("ll Code: {}", ll_value);
-        //println!("ml stat: {}", ml_dec.state);
-        //println!("ml bits: {}", ml_num_bits);
-        //println!("ml Code: {}", ml_value);
-        //println!("");
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            if scratch.ll_rle.is_none() {
-                ll_dec.update_state(br);
-            }
-            if scratch.ml_rle.is_none() {
-                ml_dec.update_state(br);
-            }
-            if scratch.of_rle.is_none() {
-                of_dec.update_state(br);
-            }
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+            // Short stream: zero-extend above the real bytes so bit positions
+            // line up with the regular case; the window never moves.
+            let mut buf = [0u8; 8];
+            buf[..source.len()].copy_from_slice(source);
+            Ok(SeqBitReader {
+                source,
+                ip: 0,
+                bits: u64::from_le_bytes(buf),
+                consumed: pad + (8 - source.len() as u32) * 8,
+            })
         }
     }
 
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
+    /// Next `n` bits without consuming (n <= 31). The `& 63` mirrors
+    /// libzstd's masking: defined (garbage) values for overconsumed streams.
+    #[inline(always)]
+    fn peek(&self, n: u32) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        (self.bits << (self.consumed & 63)) >> (64 - n)
+    }
+
+    #[inline(always)]
+    fn read(&mut self, n: u32) -> u64 {
+        let v = self.peek(n);
+        self.consumed += n;
+        v
+    }
+
+    /// Exact number of unread bits; negative when overconsumed.
+    fn remaining(&self) -> isize {
+        self.ip as isize * 8 + 64 - self.consumed as isize
+    }
+
+    /// Move the window backwards by the consumed whole bytes. Mirrors
+    /// BIT_reloadDStream: fast path when at least 8 bytes remain below the
+    /// window, cautious clamp near the stream start (kept out of line so the
+    /// fast path can inline and the reader fields stay in registers).
+    #[inline(always)]
+    fn reload(&mut self) -> Reload {
+        if self.consumed > 64 {
+            // Stream overconsumed; feeding zeroes would move ip below the
+            // stream start, so freeze the window instead
+            return Reload::Overflow;
+        }
+        if self.ip >= 8 {
+            // SAFETY: ip only ever decreases from its initial value len-8, so
+            // ip+8 <= source.len() holds on this path
+            let p = self.source.as_ptr();
+            self.ip -= (self.consumed >> 3) as usize;
+            self.consumed &= 7;
+            self.bits = unsafe { p.add(self.ip).cast::<u64>().read_unaligned() };
+            return Reload::Unfinished;
+        }
+        self.reload_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reload_slow(&mut self) -> Reload {
+        let nb = ((self.consumed >> 3) as usize).min(self.ip);
+        self.ip -= nb;
+        self.consumed -= (nb * 8) as u32;
+        if nb > 0 && self.source.len() >= 8 {
+            self.bits = u64::from_le_bytes(self.source[self.ip..][..8].try_into().unwrap());
+        }
+        if self.ip == 0 {
+            Reload::EndOfBuffer
+        } else {
+            Reload::Unfinished
+        }
+    }
+}
+
+/// Pack a sequence decoding table: one u64 per FSE state carrying everything
+/// the decode loop needs for a symbol, so a single load serves a stream.
+/// Layout: `[base_value: u32][add_bits: u8][next_state_base: u16][nb_bits: u8]`.
+fn pack_seq_table(table: &FSETable, codes: &[(u32, u8)], out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(table.decode.len());
+    for e in &table.decode {
+        let sym = e.symbol as usize;
+        let (base, add) = codes[sym];
+        out.push(
+            ((base as u64) << 32)
+                | ((add as u64) << 24)
+                | ((e.base_line as u64) << 8)
+                | e.num_bits as u64,
+        );
+    }
+}
+
+/// (base value, additional bits) per literal length code.
+const LL_CODES: [(u32, u8); 36] = [
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 1),
+    (18, 1),
+    (20, 1),
+    (22, 1),
+    (24, 2),
+    (28, 2),
+    (32, 3),
+    (40, 3),
+    (48, 4),
+    (64, 6),
+    (128, 7),
+    (256, 8),
+    (512, 9),
+    (1024, 10),
+    (2048, 11),
+    (4096, 12),
+    (8192, 13),
+    (16384, 14),
+    (32768, 15),
+    (65536, 16),
+];
+
+/// (base value, additional bits) per match length code.
+const ML_CODES: [(u32, u8); 53] = [
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 0),
+    (17, 0),
+    (18, 0),
+    (19, 0),
+    (20, 0),
+    (21, 0),
+    (22, 0),
+    (23, 0),
+    (24, 0),
+    (25, 0),
+    (26, 0),
+    (27, 0),
+    (28, 0),
+    (29, 0),
+    (30, 0),
+    (31, 0),
+    (32, 0),
+    (33, 0),
+    (34, 0),
+    (35, 1),
+    (37, 1),
+    (39, 1),
+    (41, 1),
+    (43, 2),
+    (47, 2),
+    (51, 3),
+    (59, 3),
+    (67, 4),
+    (83, 4),
+    (99, 5),
+    (131, 7),
+    (259, 8),
+    (515, 9),
+    (1027, 10),
+    (2051, 11),
+    (4099, 12),
+    (8195, 13),
+    (16387, 14),
+    (32771, 15),
+    (65539, 16),
+];
+
+/// (base value, additional bits) per offset code; the base is 1 << code.
+const fn of_codes() -> [(u32, u8); 32] {
+    let mut t = [(0u32, 0u8); 32];
+    let mut i = 0;
+    while i < 32 {
+        t[i] = (1u32 << i, i as u8);
+        i += 1;
+    }
+    t
+}
+const OF_CODES: [(u32, u8); 32] = of_codes();
+
+/// A single FSE stream over the shared bit reader: the packed table plus the
+/// current state index into it.
+struct FseStream<'a> {
+    table: &'a [u64],
+    state: u32,
+}
+
+impl FseStream<'_> {
+    #[inline(always)]
+    fn entry(&self) -> u64 {
+        debug_assert!((self.state as usize) < self.table.len());
+        // SAFETY: FSE table construction guarantees every reachable state
+        // (next_state_base + the value read with nb_bits) stays below the
+        // table size, independent of the bitstream content
+        unsafe { *self.table.get_unchecked(self.state as usize) }
+    }
+
+    #[inline(always)]
+    fn update(&mut self, br: &mut SeqBitReader<'_>) {
+        let e = self.entry();
+        self.state = (((e >> 8) & 0xFFFF) as u32) + br.read((e & 0xFF) as u32) as u32;
+    }
+}
+
+/// Rebuild the packed tables whose source tables changed since the last block.
+fn pack_tables(scratch: &mut FSEScratch) {
+    if !scratch.ll_seq_valid {
+        pack_seq_table(&scratch.literal_lengths, &LL_CODES, &mut scratch.ll_seq);
+        scratch.ll_seq_valid = true;
+    }
+    if !scratch.ml_seq_valid {
+        pack_seq_table(&scratch.match_lengths, &ML_CODES, &mut scratch.ml_seq);
+        scratch.ml_seq_valid = true;
+    }
+    if !scratch.of_seq_valid {
+        pack_seq_table(&scratch.offsets, &OF_CODES, &mut scratch.of_seq);
+        scratch.of_seq_valid = true;
     }
 }
 
 fn decode_sequences_without_rle(
     section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+    pack_tables(scratch);
 
-    ll_dec.init_state(br)?;
-    of_dec.init_state(br)?;
-    ml_dec.init_state(br)?;
+    let ll_acc = scratch.literal_lengths.accuracy_log;
+    let ml_acc = scratch.match_lengths.accuracy_log;
+    let of_acc = scratch.offsets.accuracy_log;
+    if ll_acc == 0 || ml_acc == 0 || of_acc == 0 {
+        return Err(DecodeSequenceError::FSEDecoderError(
+            crate::decoding::errors::FSEDecoderError::TableIsUninitialized,
+        ));
+    }
+
+    // Initial states are read in the order ll, of, ml
+    let mut ll = FseStream {
+        table: &scratch.ll_seq,
+        state: br.read(ll_acc as u32) as u32,
+    };
+    let mut of = FseStream {
+        table: &scratch.of_seq,
+        state: br.read(of_acc as u32) as u32,
+    };
+    let mut ml = FseStream {
+        table: &scratch.ml_seq,
+        state: br.read(ml_acc as u32) as u32,
+    };
+    // Realign the window before the first sequence; the loop only reloads at
+    // sequence ends (the state reads above already consumed up to 26 bits)
+    br.reload();
 
     target.clear();
     target.reserve(section.num_sequences as usize);
+    let nseq = section.num_sequences as usize;
 
-    for _seq_idx in 0..section.num_sequences {
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
-        let of_code = of_dec.decode_symbol();
+    for idx in 0..nseq {
+        let e_ll = ll.entry();
+        let e_ml = ml.entry();
+        let e_of = of.entry();
+        let ll_add_bits = ((e_ll >> 24) & 0xFF) as u32;
+        let ml_add_bits = ((e_ml >> 24) & 0xFF) as u32;
+        let of_add_bits = ((e_of >> 24) & 0xFF) as u32;
 
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
+        let obits = br.read(of_add_bits);
+        let ml_add = br.read(ml_add_bits);
+        // of+ml+ll add bits can sum above the 57 bits guaranteed after a
+        // reload; reload mid-sequence then (libzstd's totalBits guard)
+        if ll_add_bits + ml_add_bits + of_add_bits >= 31 {
+            br.reload();
         }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
+        let ll_add = br.read(ll_add_bits);
 
         target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
+            ll: ((e_ll >> 32) as u32) + ll_add as u32,
+            ml: ((e_ml >> 32) as u32) + ml_add as u32,
+            of: ((e_of >> 32) as u32) + obits as u32,
         });
 
-        if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            ll_dec.update_state(br);
-            ml_dec.update_state(br);
-            of_dec.update_state(br);
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+        if idx + 1 < nseq {
+            ll.update(br);
+            ml.update(br);
+            of.update(br);
+            if matches!(br.reload(), Reload::Overflow) {
+                return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+            }
         }
     }
 
-    if br.bits_remaining() > 0 {
+    let rem = br.remaining();
+    if rem > 0 {
         Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
+            bits_remaining: rem,
         })
+    } else if rem < 0 {
+        Err(DecodeSequenceError::NotEnoughBytesForNumSequences)
     } else {
         Ok(())
     }
 }
 
-/// Look up the provided state value from a literal length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-fn lookup_ll_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => unreachable!("Illegal literal length code was: {}", code),
-    }
-}
+fn decode_sequences_with_rle(
+    section: &SequencesHeader,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    pack_tables(scratch);
 
-/// Look up the provided state value from a match length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-fn lookup_ml_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => unreachable!("Illegal match length code was: {}", code),
+    let ll_rle = scratch.ll_rle;
+    let ml_rle = scratch.ml_rle;
+    let of_rle = scratch.of_rle;
+
+    // Initial states are read in the order ll, of, ml (only for FSE streams)
+    let uninit = || {
+        Err(DecodeSequenceError::FSEDecoderError(
+            crate::decoding::errors::FSEDecoderError::TableIsUninitialized,
+        ))
+    };
+    let ll_state = match ll_rle {
+        None => br.read(scratch.literal_lengths.accuracy_log as u32) as u32,
+        Some(_) => 0,
+    };
+    let of_state = match of_rle {
+        None => {
+            if scratch.offsets.accuracy_log == 0 {
+                return uninit();
+            }
+            br.read(scratch.offsets.accuracy_log as u32) as u32
+        }
+        Some(_) => 0,
+    };
+    let ml_state = match ml_rle {
+        None => {
+            if scratch.match_lengths.accuracy_log == 0 {
+                return uninit();
+            }
+            br.read(scratch.match_lengths.accuracy_log as u32) as u32
+        }
+        Some(_) => 0,
+    };
+    if ll_rle.is_none() && scratch.literal_lengths.accuracy_log == 0 {
+        return uninit();
+    }
+    // Realign the window before the first sequence; the loop only reloads at
+    // sequence ends (the state reads above may have consumed up to 26 bits)
+    br.reload();
+
+    let mut ll = FseStream {
+        table: &scratch.ll_seq,
+        state: ll_state,
+    };
+    let mut ml = FseStream {
+        table: &scratch.ml_seq,
+        state: ml_state,
+    };
+    let mut of = FseStream {
+        table: &scratch.of_seq,
+        state: of_state,
+    };
+
+    // Fixed per-stream values for RLE streams, extracted once
+    let (ll_base_rle, ll_nb_rle) = match ll_rle {
+        Some(c) => LL_CODES[c as usize],
+        None => (0, 0),
+    };
+    let (ml_base_rle, ml_nb_rle) = match ml_rle {
+        Some(c) => ML_CODES[c as usize],
+        None => (0, 0),
+    };
+    let (of_base_rle, of_nb_rle) = match of_rle {
+        Some(c) => OF_CODES[c as usize],
+        None => (0, 0),
+    };
+
+    target.clear();
+    target.reserve(section.num_sequences as usize);
+    let nseq = section.num_sequences as usize;
+
+    for idx in 0..nseq {
+        let (ll_base, ll_add_bits, ml_base, ml_add_bits, of_base, of_add_bits) = (
+            match ll_rle {
+                Some(_) => ll_base_rle,
+                None => (ll.entry() >> 32) as u32,
+            },
+            match ll_rle {
+                Some(_) => ll_nb_rle as u32,
+                None => ((ll.entry() >> 24) & 0xFF) as u32,
+            },
+            match ml_rle {
+                Some(_) => ml_base_rle,
+                None => (ml.entry() >> 32) as u32,
+            },
+            match ml_rle {
+                Some(_) => ml_nb_rle as u32,
+                None => ((ml.entry() >> 24) & 0xFF) as u32,
+            },
+            match of_rle {
+                Some(_) => of_base_rle,
+                None => (of.entry() >> 32) as u32,
+            },
+            match of_rle {
+                Some(_) => of_nb_rle as u32,
+                None => ((of.entry() >> 24) & 0xFF) as u32,
+            },
+        );
+
+        let obits = br.read(of_add_bits);
+        let ml_add = br.read(ml_add_bits);
+        if ll_add_bits + ml_add_bits + of_add_bits >= 31 {
+            br.reload();
+        }
+        let ll_add = br.read(ll_add_bits);
+
+        target.push(Sequence {
+            ll: ll_base + ll_add as u32,
+            ml: ml_base + ml_add as u32,
+            of: of_base + obits as u32,
+        });
+
+        if idx + 1 < nseq {
+            if ll_rle.is_none() {
+                ll.update(br);
+            }
+            if ml_rle.is_none() {
+                ml.update(br);
+            }
+            if of_rle.is_none() {
+                of.update(br);
+            }
+            if matches!(br.reload(), Reload::Overflow) {
+                return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+            }
+        }
+    }
+
+    let rem = br.remaining();
+    if rem > 0 {
+        Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: rem,
+        })
+    } else if rem < 0 {
+        Err(DecodeSequenceError::NotEnoughBytesForNumSequences)
+    } else {
+        Ok(())
     }
 }
 
@@ -311,6 +577,7 @@ fn maybe_update_fse_tables(
             vprintln!("Used bytes: {}", bytes);
             scratch.ll_rle = None;
             scratch.ll_predefined = false;
+            scratch.ll_seq_valid = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ll table");
@@ -334,6 +601,7 @@ fn maybe_update_fse_tables(
                     &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch.ll_predefined = true;
+                scratch.ll_seq_valid = false;
             }
             scratch.ll_rle = None;
         }
@@ -353,6 +621,7 @@ fn maybe_update_fse_tables(
             bytes_read += bytes;
             scratch.of_rle = None;
             scratch.of_predefined = false;
+            scratch.of_seq_valid = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE of table");
@@ -374,6 +643,7 @@ fn maybe_update_fse_tables(
                     &OFFSET_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch.of_predefined = true;
+                scratch.of_seq_valid = false;
             }
             scratch.of_rle = None;
         }
@@ -393,6 +663,7 @@ fn maybe_update_fse_tables(
             vprintln!("Used bytes: {}", bytes);
             scratch.ml_rle = None;
             scratch.ml_predefined = false;
+            scratch.ml_seq_valid = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ml table");
@@ -414,6 +685,7 @@ fn maybe_update_fse_tables(
                     &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch.ml_predefined = true;
+                scratch.ml_seq_valid = false;
             }
             scratch.ml_rle = None;
         }
@@ -464,7 +736,7 @@ fn test_ll_default() {
     table
         .build_from_probabilities(
             LL_DEFAULT_ACC_LOG,
-            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+            &LITERALS_LENGTH_DEFAULT_DISTRIBUTION.to_vec(),
         )
         .unwrap();
 
