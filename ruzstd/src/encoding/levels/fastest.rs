@@ -5,6 +5,7 @@ use crate::{
     },
 };
 use alloc::vec::Vec;
+use core::convert::TryInto;
 
 /// Compresses a single block at [`crate::encoding::CompressionLevel::Fastest`].
 ///
@@ -16,6 +17,23 @@ use alloc::vec::Vec;
 /// - `uncompressed_data`: A block's worth of uncompressed data, taken from the
 ///   larger input
 /// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
+/// Exact uniform-run detection, word-at-a-time like libzstd's `ZSTD_isRLE`
+/// (the chunked u64 compare widens to SIMD compares on x86_64 and aarch64).
+#[inline]
+fn is_uniform(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let first = data[0];
+    let broadcast = u64::from(first) * 0x0101_0101_0101_0101;
+    let mut chunks = data.chunks_exact(8);
+    let all_eq = chunks.all(|c| u64::from_le_bytes(c.try_into().unwrap()) == broadcast);
+    if !all_eq {
+        return false;
+    }
+    chunks.remainder().iter().all(|&b| b == first)
+}
+
 #[inline]
 pub fn compress_fastest<M: Matcher>(
     state: &mut CompressState<M>,
@@ -25,7 +43,7 @@ pub fn compress_fastest<M: Matcher>(
 ) {
     let block_size = uncompressed_data.len() as u32;
     // First check to see if run length encoding can be used for the entire block
-    if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
+    if is_uniform(&uncompressed_data) {
         let rle_byte = uncompressed_data[0];
         state.matcher.commit_space(uncompressed_data);
         state.matcher.skip_matching();
