@@ -514,6 +514,29 @@ fn compress_literals(
 ) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
 
+    // Cheap reject for near-incompressible literals (libzstd's
+    // suspectUncompressible idea): building the tree, describing it and
+    // running the four streams costs most of the literals section, so when
+    // even the entropy bound cannot beat the raw copy by a margin, emit raw
+    // right away instead of encoding and throwing the result away.
+    {
+        let mut counts = [0u32; 256];
+        for &b in literals {
+            counts[b as usize] += 1;
+        }
+        let total = literals.len() as f64;
+        let mut entropy_bits = 0.0f64;
+        for &c in &counts {
+            if c > 0 {
+                entropy_bits -= c as f64 * (c as f64 / total).log2();
+            }
+        }
+        if entropy_bits + 256.0 + total * 0.08 >= total * 8.0 {
+            raw_literals(literals, writer);
+            return None;
+        }
+    }
+
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
 
     let (encoder_table, new_table) = if let Some(_table) = last_table {
