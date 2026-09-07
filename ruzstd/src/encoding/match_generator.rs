@@ -24,7 +24,7 @@ const MIN_MATCH: usize = 4;
 /// Bytes fed into the position hash.
 const MIN_HASH: usize = 5;
 /// Hash table size as a power of two.
-const HASH_LOG: u32 = 16;
+const HASH_LOG: u32 = 15;
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0x70000;
 
@@ -54,7 +54,9 @@ pub struct MatchGeneratorDriver {
 }
 
 impl MatchGeneratorDriver {
-    pub(crate) fn new(slice_size: usize) -> Self {
+    /// Create a matcher whose blocks hold `slice_size` bytes of input (the
+    /// zstd block maximum is 128 KiB).
+    pub fn new(slice_size: usize) -> Self {
         Self {
             win: Vec::with_capacity(MAX_WINDOW + slice_size),
             win_base: 0,
@@ -377,7 +379,12 @@ impl Matcher for MatchGeneratorDriver {
 
             let h = self.hash_at(idx);
             let prev = self.table[h];
-            self.table[h] = (epoch << 48) | self.pos;
+            // Index only every other position in the miss path: with a small
+            // table each slot is heavily contended, and halving the insert
+            // rate doubles how long a far repeat stays discoverable.
+            if idx & 1 == 0 {
+                self.table[h] = (epoch << 48) | self.pos;
+            }
 
             let mut matched = false;
             if prev >> 48 == epoch {
