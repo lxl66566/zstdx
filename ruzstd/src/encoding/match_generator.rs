@@ -139,10 +139,26 @@ impl MatchGeneratorDriver {
             match_len,
         });
         let match_end = start + match_len;
-        let mut p = self.win_base + start as u64;
-        while p < self.win_base + match_end as u64 {
-            self.insert_pos(p);
-            p += 1;
+        // Index the covered range: short matches keep every position (they
+        // are the majority on structured data and each lost slot can mean a
+        // missed future match); long matches fall back to a 4-byte grid
+        // anchored at the match start plus the final byte, because hashing
+        // every byte of long matches was a large share of encoder time.
+        if match_len <= 16 {
+            let mut p = self.win_base + start as u64;
+            let end = self.win_base + match_end as u64;
+            while p < end {
+                self.insert_pos(p);
+                p += 1;
+            }
+        } else {
+            let last = self.win_base + (match_end - 1) as u64;
+            let mut p = self.win_base + start as u64;
+            while p < last {
+                self.insert_pos(p);
+                p += 4;
+            }
+            self.insert_pos(last);
         }
         self.pos = self.win_base + match_end as u64;
         self.anchor = self.pos;

@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The encoder's match emitter indexes covered matches sparsely instead of
+  hashing every byte: matches up to 16 bytes keep every position (they carry
+  most of the alignment coverage on structured data), longer matches fall
+  back to a 4-byte grid anchored at the match start plus the final byte.
+  json +6% / text +5% encode throughput at -0.2% / -0.6% ratio.
 * Sequence decoding extracts each group of bitstream reads (the three
   add-bit fields and the three FSE state transitions) with a single window
   read whose bits are then split in parallel, instead of six serial
