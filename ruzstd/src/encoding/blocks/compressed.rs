@@ -2,8 +2,8 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable},
+    encoding::{EncodedSequence, Matcher},
+    fse::fse_encoder::{build_normalized_table, rle_table, FSETable},
     huff0::huff0_encoder,
 };
 
@@ -25,7 +25,6 @@ pub(crate) struct BlockTables {
 pub(crate) fn compress_block<M: Matcher>(
     matcher: &mut M,
     last_huff_table: Option<&huff0_encoder::HuffmanTable>,
-    fse_previous: &[Option<&FSETable>; 3],
     default_tables: (&FSETable, &FSETable, &FSETable),
     output: &mut Vec<u8>,
 ) -> BlockTables {
@@ -52,26 +51,25 @@ pub(crate) fn compress_block<M: Matcher>(
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        // TODO store previously used tables
-        let ll_mode = choose_table(
-            fse_previous[0],
-            default_tables.0,
-            sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
-            9,
-        );
-        let ml_mode = choose_table(
-            fse_previous[1],
-            default_tables.1,
-            sequences.iter().map(|seq| encode_match_len(seq.ml).0),
-            9,
-        );
-        let of_mode = choose_table(
-            fse_previous[2],
-            default_tables.2,
-            sequences.iter().map(|seq| encode_offset(seq.of).0),
-            8,
-        );
+        // Choose the tables with libzstd's fast-strategy heuristics: RLE
+        // when one code covers everything, predefined when the block is too
+        // small (or too skewed) to pay for a table description, otherwise a
+        // normalized custom table.
+        let ll_codes = sequences
+            .iter()
+            .map(|seq| encode_literal_length(seq.ll).0)
+            .collect::<Vec<_>>();
+        let ml_codes = sequences
+            .iter()
+            .map(|seq| encode_match_len(seq.ml).0)
+            .collect::<Vec<_>>();
+        let of_codes = sequences
+            .iter()
+            .map(|seq| encode_offset(seq.of).0)
+            .collect::<Vec<_>>();
+        let ll_mode = choose_table_fast(&ll_codes, default_tables.0, 6, 9);
+        let ml_mode = choose_table_fast(&ml_codes, default_tables.1, 6, 9);
+        let of_mode = choose_table_fast(&of_codes, default_tables.2, 5, 8);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -106,41 +104,80 @@ pub(crate) fn compress_block<M: Matcher>(
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
     Encoded(FSETable),
-    RepeateLast(&'a FSETable),
+    /// Single-code RLE mode: `code` is the wire byte, `table` the degenerate
+    /// one-state table the encoder runs on.
+    Rle { code: u8, table: FSETable },
 }
 
 impl FseTableMode<'_> {
     pub fn as_ref(&self) -> &FSETable {
         match self {
             Self::Predefined(t) => t,
-            Self::RepeateLast(t) => t,
             Self::Encoded(t) => t,
+            Self::Rle { table, .. } => table,
         }
     }
 }
 
-fn choose_table<'a>(
-    previous: Option<&'a FSETable>,
+/// Port of libzstd's ZSTD_selectEncodingType for the fast strategy (no
+/// dictionary, so repeat mode never applies): RLE when a single code covers
+/// all sequences, predefined below the dynamic-table break-even, custom
+/// normalized table otherwise.
+fn choose_table_fast<'a>(
+    codes: &[u8],
     default_table: &'a FSETable,
-    data: impl Iterator<Item = u8>,
+    default_norm_log: u32,
     max_log: u8,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
-        FseTableMode::Predefined(default_table)
+    let nb_seq = codes.len();
+    let mut counts = [0u32; 256];
+    let mut max_symbol = 0usize;
+    let mut most_frequent = 0u32;
+    for &c in codes {
+        counts[c as usize] += 1;
+        if c as usize > max_symbol {
+            max_symbol = c as usize;
+        }
+    }
+    for &c in &counts[..=max_symbol] {
+        most_frequent = most_frequent.max(c);
+    }
+    if most_frequent as usize == nb_seq {
+        // With two or fewer sequences the predefined table's description is
+        // cheaper than even the one RLE byte.
+        if nb_seq <= 2 {
+            return FseTableMode::Predefined(default_table);
+        }
+        let code = codes[0];
+        return FseTableMode::Rle {
+            code,
+            table: rle_table(code),
+        };
+    }
+    // The predefined table must cover every code that occurs.
+    let default_covers = max_symbol < 31 || default_norm_log == 6;
+    if default_covers {
+        let dynamic_min = ((1u32 << default_norm_log) * 9) >> 3;
+        if (nb_seq as u32) < dynamic_min
+            || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
+        {
+            return FseTableMode::Predefined(default_table);
+        }
+    }
+    match build_normalized_table(&mut counts, nb_seq, max_symbol, max_log, codes[nb_seq - 1]) {
+        Some(table) => FseTableMode::Encoded(table),
+        // Normalization corner case: fall back to the predefined table.
+        None => FseTableMode::Predefined(default_table),
     }
 }
 
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
         FseTableMode::Predefined(_) => {}
-        FseTableMode::RepeateLast(_) => {}
+        FseTableMode::Rle { code, .. } => {
+            // The RLE table description is a single byte: the code.
+            writer.write_bits(*code as u64, 8);
+        }
         FseTableMode::Encoded(table) => table.write_table(writer),
     }
 }
@@ -153,15 +190,15 @@ fn encode_fse_table_modes(
     fn mode_to_bits(mode: &FseTableMode<'_>) -> u8 {
         match mode {
             FseTableMode::Predefined(_) => 0,
+            FseTableMode::Rle { .. } => 1,
             FseTableMode::Encoded(_) => 2,
-            FseTableMode::RepeateLast(_) => 3,
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
 }
 
 fn encode_sequences(
-    sequences: &[crate::encoding::EncodedSequence],
+    sequences: &[EncodedSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_table: &FSETable,
     ml_table: &FSETable,

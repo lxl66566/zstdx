@@ -70,25 +70,16 @@ pub fn compress_fastest<M: Matcher>(
             state.fse_tables.ml_previous.take(),
             state.fse_tables.of_previous.take(),
         ];
-        let tables = {
-            // Borrows of the taken tables and the defaults for one call.
-            let previous = [
-                old_tables[0].as_ref(),
-                old_tables[1].as_ref(),
-                old_tables[2].as_ref(),
-            ];
-            compress_block(
-                &mut state.matcher,
-                old_huff.as_ref(),
-                &previous,
-                (
-                    &state.fse_tables.ll_default,
-                    &state.fse_tables.ml_default,
-                    &state.fse_tables.of_default,
-                ),
-                &mut compressed,
-            )
-        };
+        let tables = compress_block(
+            &mut state.matcher,
+            old_huff.as_ref(),
+            (
+                &state.fse_tables.ll_default,
+                &state.fse_tables.ml_default,
+                &state.fse_tables.of_default,
+            ),
+            &mut compressed,
+        );
         let compressed_size = compressed.len();
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not

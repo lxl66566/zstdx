@@ -242,7 +242,7 @@ impl State {
 pub fn build_table_from_data(
     data: impl Iterator<Item = u8>,
     max_log: u8,
-    avoid_0_numbit: bool,
+    _avoid_0_numbit: bool,
 ) -> FSETable {
     let mut counts = [0; 256];
     let mut max_symbol = 0;
@@ -254,10 +254,258 @@ pub fn build_table_from_data(
             max_symbol = idx;
         }
     }
-    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
+    build_table_from_counts(&counts[..=max_symbol], max_log, _avoid_0_numbit)
 }
 
-fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+/// libzstd's FSE_minTableLog: the smallest table size that can safely
+/// represent `src_size` symbols over `max_symbol` distinct values.
+fn min_table_log(src_size: usize, max_symbol: usize) -> u8 {
+    let min_bits_src = usize::BITS - src_size.leading_zeros() + 1; // highbit + 1
+    let min_bits_symbols = (usize::BITS - 1 - max_symbol.leading_zeros()) + 2;
+    min_bits_src.min(min_bits_symbols) as u8
+}
+
+/// libzstd's FSE_optimalTableLog: pick the accuracy that pays for itself at
+/// this number of symbols (fewer symbols don't justify a big table), still
+/// respecting the minimum needed to represent every symbol value.
+pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize) -> u8 {
+    debug_assert!(src_size > 1);
+    let max_bits_src = (usize::BITS - (src_size - 1).leading_zeros() - 1) - 2; // highbit - 2
+    let min_bits = min_table_log(src_size, max_symbol);
+    let mut table_log = max_log as u32;
+    if max_bits_src < table_log {
+        table_log = max_bits_src;
+    }
+    if (min_bits as u32) > table_log {
+        table_log = min_bits as u32;
+    }
+    table_log = table_log.clamp(5, 12);
+    table_log as u8
+}
+
+/// A degenerate one-state table for the sequence-table RLE wire mode: the
+/// table description is a single code byte and every transition costs zero
+/// bits, so encoding routes through the normal path unchanged.
+pub(crate) fn rle_table(code: u8) -> FSETable {
+    let mut states = core::array::from_fn(|_| SymbolStates {
+        states: Vec::new(),
+        probability: 0,
+    });
+    states[code as usize].probability = 1;
+    states[code as usize].states.push(State {
+        num_bits: 0,
+        baseline: 0,
+        last_index: 0,
+        index: 0,
+    });
+    // table_size is 1, so `symbol * table_size + state` indexes at `symbol`.
+    let mut transitions = alloc::vec![0u32; 256];
+    transitions[code as usize] = 0; // next index 0, 0 bits, baseline 0
+    FSETable {
+        table_size: 1,
+        states,
+        transitions,
+    }
+}
+
+/// libzstd's set_compressed table build for sequence code histograms: the
+/// table log comes from the full sequence count, the last sequence's code
+/// loses one count (its symbol is carried by the initial state), and the
+/// remaining counts are normalized with the ported FSE_normalizeCount.
+/// Returns None when normalization fails; the caller then falls back to the
+/// predefined table.
+pub(crate) fn build_normalized_table(
+    counts: &mut [u32; 256],
+    nb_seq: usize,
+    max_symbol: usize,
+    max_log: u8,
+    last_code: u8,
+) -> Option<FSETable> {
+    debug_assert!(nb_seq > 2);
+    let table_log = optimal_table_log(max_log, nb_seq, max_symbol);
+    let total = if counts[last_code as usize] > 1 {
+        counts[last_code as usize] -= 1;
+        nb_seq - 1
+    } else {
+        nb_seq
+    };
+    let mut norm = [0i32; 256];
+    if !normalize_count(
+        &mut norm,
+        table_log,
+        counts,
+        total,
+        max_symbol,
+        total >= 2048,
+    ) {
+        return None;
+    }
+    Some(build_table_from_probabilities(&norm[..=max_symbol], table_log))
+}
+
+/// Rounding-threshold table from libzstd's FSE_normalizeCount: fractions of a
+/// vStep that justify rounding a small probability up.
+const RTB_TABLE: [u64; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
+
+/// Port of libzstd's FSE_normalizeCount: scale `count` (total `total` over
+/// symbols 0..=max_symbol) to probabilities summing to exactly
+/// `1 << table_log`, using -1 (or 1 when `use_low_prob` is false) as the
+/// minimum weight. Returns false when even the M2 fallback cannot find a
+/// valid distribution (the caller should then avoid a custom table).
+pub(crate) fn normalize_count(
+    norm: &mut [i32],
+    table_log: u8,
+    count: &[u32],
+    total: usize,
+    max_symbol: usize,
+    use_low_prob: bool,
+) -> bool {
+    debug_assert!(norm.len() > max_symbol);
+    let low_prob: i32 = if use_low_prob { -1 } else { 1 };
+    let scale = 62 - table_log as u32;
+    let step = (1u64 << 62) / (total as u64).max(1);
+    let v_step = 1u64 << (scale - 20);
+    let mut still_to_distribute = 1i32 << table_log;
+    let mut largest = 0usize;
+    let mut largest_p = 0i32;
+    let low_threshold = (total >> table_log) as u32;
+
+    for s in 0..=max_symbol {
+        let c = count[s];
+        if c == 0 {
+            norm[s] = 0;
+            continue;
+        }
+        if c <= low_threshold {
+            norm[s] = low_prob;
+            still_to_distribute -= 1;
+        } else {
+            let scaled = c as u64 * step;
+            let mut proba = (scaled >> scale) as i32;
+            if proba < 8 {
+                let rest_to_beat = v_step * RTB_TABLE[proba as usize];
+                proba += (scaled - ((proba as u64) << scale) > rest_to_beat) as i32;
+            }
+            if proba > largest_p {
+                largest_p = proba;
+                largest = s;
+            }
+            norm[s] = proba;
+            still_to_distribute -= proba;
+        }
+    }
+    if -still_to_distribute >= norm[largest] >> 1 {
+        // Corner case: the largest symbol would need more than its fair
+        // share added back; redistribute with the secondary method.
+        normalize_m2(norm, table_log, count, total, max_symbol, low_prob)
+    } else {
+        norm[largest] += still_to_distribute;
+        true
+    }
+}
+
+/// Port of libzstd's FSE_normalizeM2 secondary normalization: assign 1 (or
+/// the low-prob weight) to all small symbols, then distribute the rest
+/// proportionally on a fixed-point staircase.
+fn normalize_m2(
+    norm: &mut [i32],
+    table_log: u8,
+    count: &[u32],
+    mut total: usize,
+    max_symbol: usize,
+    low_prob: i32,
+) -> bool {
+    const NOT_YET_ASSIGNED: i32 = -2;
+    let mut distributed: u32 = 0;
+
+    let low_threshold = (total >> table_log) as u32;
+    let mut low_one = ((total * 3) >> (table_log + 1)) as u32;
+
+    for s in 0..=max_symbol {
+        if count[s] == 0 {
+            norm[s] = 0;
+            continue;
+        }
+        if count[s] <= low_threshold {
+            norm[s] = low_prob;
+            distributed += 1;
+            total -= count[s] as usize;
+            continue;
+        }
+        if count[s] <= low_one {
+            norm[s] = 1;
+            distributed += 1;
+            total -= count[s] as usize;
+            continue;
+        }
+        norm[s] = NOT_YET_ASSIGNED;
+    }
+    let mut to_distribute = (1u32 << table_log) - distributed;
+    if to_distribute == 0 {
+        return true;
+    }
+
+    if total / to_distribute as usize > low_one as usize {
+        // risk of rounding to zero
+        low_one = ((total as u64 * 3) / (to_distribute as u64 * 2)) as u32;
+        for s in 0..=max_symbol {
+            if norm[s] == NOT_YET_ASSIGNED && count[s] <= low_one {
+                norm[s] = 1;
+                distributed += 1;
+                total -= count[s] as usize;
+            }
+        }
+        to_distribute = (1u32 << table_log) - distributed;
+    }
+
+    if distributed as usize == max_symbol + 1 {
+        // All values are poor; give the remainder to the maximum.
+        let mut max_v = 0usize;
+        let mut max_c = 0u32;
+        for s in 0..=max_symbol {
+            if count[s] > max_c {
+                max_c = count[s];
+                max_v = s;
+            }
+        }
+        norm[max_v] += to_distribute as i32;
+        return true;
+    }
+
+    if total == 0 {
+        // Everything was small; spread the remainder over positive entries.
+        let mut s = 0usize;
+        while to_distribute > 0 {
+            if norm[s] > 0 {
+                norm[s] += 1;
+                to_distribute -= 1;
+            }
+            s = (s + 1) % (max_symbol + 1);
+        }
+        return true;
+    }
+
+    let v_step_log = 62 - table_log as u32;
+    let mid = (1u64 << (v_step_log - 1)) - 1;
+    let r_step = (((1u64 << v_step_log) * to_distribute as u64) + mid) / total as u64;
+    let mut tmp_total = mid;
+    for s in 0..=max_symbol {
+        if norm[s] == NOT_YET_ASSIGNED {
+            let end = tmp_total + (count[s] as u64 * r_step);
+            let s_start = (tmp_total >> v_step_log) as u32;
+            let s_end = (end >> v_step_log) as u32;
+            let weight = s_end - s_start;
+            if weight < 1 {
+                return false;
+            }
+            norm[s] = weight as i32;
+            tmp_total = end;
+        }
+    }
+    true
+}
+
+fn build_table_from_counts(counts: &[usize], max_log: u8, _legacy_avoid_0_numbit: bool) -> FSETable {
     let mut probs = [0; 256];
     let probs = &mut probs[..counts.len()];
     let mut min_count = 0;
@@ -318,7 +566,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         probs.iter().any(|x| *x != max)
     };
     let max = probs.iter_mut().max().unwrap();
-    if avoid_0_numbit && has_second && *max > 1 << (acc_log - 1) {
+    if _legacy_avoid_0_numbit && has_second && *max > 1 << (acc_log - 1) {
         let redistribute = *max - (1 << (acc_log - 1));
         *max -= redistribute;
         let max = *max;
