@@ -63,6 +63,12 @@ This document records the changes made between versions, starting with version 0
   tail serving as the match window. Streaming speeds up 3% (small windows)
   to 125% (8MB windows); on large-window data ruzstd now matches or beats
   the zstd crate's streaming decoder.
+* The sequence decode loop reads its bitstream through a pre-shifted window
+  kept in a register (two dependent shifts per read instead of a
+  consumed-counter shift chain), and the three packed FSE tables live in one
+  fixed-slot array addressed through a single base pointer with constant
+  offsets, removing the per-iteration table-pointer reloads and bit-container
+  memory operands from the loop.
 
 # After 0.8.3
 

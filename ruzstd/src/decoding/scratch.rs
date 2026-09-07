@@ -112,14 +112,14 @@ pub struct FSEScratch {
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
     pub ml_predefined: bool,
-    /// Packed sequence-decoding views of the tables above (see
-    /// `sequence_section_decoder::pack_seq_table`); rebuilt whenever the
-    /// corresponding table content changes.
-    pub ll_seq: Vec<u64>,
+    /// Packed sequence-decoding tables for the three streams in fixed slots
+    /// (LL, then ML, then OF; see `sequence_section_decoder`), so the decode
+    /// loop addresses all three through one base pointer with constant
+    /// offsets. The per-slot valid flags track which slots need repacking
+    /// after the underlying table changed.
+    pub seq_packed: Vec<u64>,
     pub ll_seq_valid: bool,
-    pub ml_seq: Vec<u64>,
     pub ml_seq_valid: bool,
-    pub of_seq: Vec<u64>,
     pub of_seq_valid: bool,
 }
 
@@ -135,11 +135,12 @@ impl FSEScratch {
             match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
             ml_predefined: false,
-            ll_seq: Vec::new(),
+            seq_packed: alloc::vec![
+                0;
+                crate::decoding::sequence_section_decoder::SEQ_TABLE_SLOTS
+            ],
             ll_seq_valid: false,
-            ml_seq: Vec::new(),
             ml_seq_valid: false,
-            of_seq: Vec::new(),
             of_seq_valid: false,
         }
     }
