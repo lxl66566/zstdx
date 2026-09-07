@@ -136,7 +136,7 @@ fn main() {
         shapes.sort_by(|a, b| a.0.cmp(&b.0));
         println!("\n== encode: ruzstd Fastest vs zstd crate ({} iters) ==\n", iters);
         println!(
-            "{:<14}{:>9}{:>7}{:>9}{:>7}{:>9}{:>7}",
+            "{:<14}{:>9}{:>12}{:>9}{:>12}{:>9}{:>12}",
             "shape", "ruz MB/s", "ratio", "z1 MB/s", "ratio", "z3 MB/s", "ratio"
         );
         for (name, raw) in &shapes {
@@ -171,7 +171,7 @@ fn main() {
                 raw.len() as f64 / zstd::bulk::compress(&raw[..], 3).unwrap().len() as f64;
 
             println!(
-                "{:<14}{:>9.0}{:>7.2}{:>9.0}{:>7.2}{:>9.0}{:>7.2}",
+                "{:<14}{:>9.0}{:>12.2}{:>9.0}{:>12.2}{:>9.0}{:>12.2}",
                 name, ruz_enc, ruz_ratio, z1, z1_ratio, z3, z3_ratio
             );
         }
