@@ -3,47 +3,65 @@ use crate::decoding::errors::ExecuteSequencesError;
 
 /// Take the provided decoder and execute the sequences stored within
 pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    let mut literals_copy_counter = 0;
     let old_buffer_size = scratch.buffer.len();
+
+    // Reserve once for the entire block: every literal plus every match
+    // length. Each append below consumes exactly its share of this budget,
+    // so no per-sequence capacity check is needed (dict-backed appends
+    // reserve their own share internally; both sides of the budget shrink
+    // in lockstep with them, keeping the invariant).
+    let total_out: usize = scratch
+        .sequences
+        .iter()
+        .map(|seq| seq.ml as usize)
+        .sum::<usize>()
+        .saturating_add(scratch.literals_buffer.len());
+    scratch.buffer.reserve(total_out);
+
+    let DecoderScratch {
+        sequences,
+        literals_buffer,
+        buffer,
+        offset_hist,
+        ..
+    } = scratch;
+
+    let mut literals_copy_counter = 0;
     let mut seq_sum = 0;
 
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
-
+    for &seq in sequences.iter() {
         if seq.ll > 0 {
             let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
+            if high > literals_buffer.len() {
                 return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
                     wanted: high,
-                    have: scratch.literals_buffer.len(),
+                    have: literals_buffer.len(),
                 });
             }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
+            let literals = &literals_buffer[literals_copy_counter..high];
             literals_copy_counter += seq.ll as usize;
 
-            scratch.buffer.push(literals);
+            buffer.push_pre_reserved(literals);
         }
 
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
+        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
         if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset);
         }
         if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
+            buffer.repeat_pre_reserved(actual_offset as usize, seq.ml as usize)?;
         }
 
         seq_sum += seq.ml;
         seq_sum += seq.ll;
     }
-    if literals_copy_counter < scratch.literals_buffer.len() {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
+    if literals_copy_counter < literals_buffer.len() {
+        let rest_literals = &literals_buffer[literals_copy_counter..];
+        buffer.push_pre_reserved(rest_literals);
         seq_sum += rest_literals.len() as u32;
     }
 
-    let diff = scratch.buffer.len() - old_buffer_size;
+    let diff = buffer.len() - old_buffer_size;
     assert!(
         seq_sum as usize == diff,
         "Seq_sum: {} is different from the difference in buffersize: {}",

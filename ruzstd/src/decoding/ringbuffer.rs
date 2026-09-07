@@ -26,6 +26,19 @@ unsafe impl Send for RingBuffer {}
 // SAFETY: Ringbuffer does not provide unsyncronized interior mutability which makes &RingBuffer Send -> RingBuffer is Sync
 unsafe impl Sync for RingBuffer {}
 
+/// Advance a buffer position by `len` with a single conditional subtract
+/// instead of a division-based modulo. Valid while `pos < cap` and
+/// `pos + len < 2 * cap`; appends uphold this because `len <= free`.
+#[inline(always)]
+fn wrap_add(pos: usize, len: usize, cap: usize) -> usize {
+    let t = pos + len;
+    if t >= cap {
+        t - cap
+    } else {
+        t
+    }
+}
+
 impl RingBuffer {
     pub fn new() -> Self {
         RingBuffer {
@@ -138,7 +151,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 2 by writing initialized memory
         unsafe { self.buf.as_ptr().add(self.tail).write(byte) };
         // SAFETY: Upholds invariant 3 by wrapping `tail` around
-        self.tail = (self.tail + 1) % self.cap;
+        self.tail = wrap_add(self.tail, 1, self.cap);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
@@ -148,7 +161,7 @@ impl RingBuffer {
         if idx < self.len() {
             // SAFETY: Establishes invariants on memory being initialized and the range being in-bounds
             // (Invariants 2 & 3)
-            let idx = (self.head + idx) % self.cap;
+            let idx = wrap_add(self.head, idx, self.cap);
             Some(unsafe { self.buf.as_ptr().add(idx).read() })
         } else {
             None
@@ -187,7 +200,37 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_add(self.tail, len, self.cap);
+    }
+
+    /// Append `data` without ensuring capacity first.
+    ///
+    /// SAFETY: `free() >= data.len()` must hold (e.g. via a prior reserve);
+    /// otherwise this writes out of bounds.
+    pub unsafe fn extend_pre_reserved(&mut self, data: &[u8]) {
+        let len = data.len();
+        if len == 0 {
+            return;
+        }
+        debug_assert!(self.free() >= len);
+
+        let ptr = data.as_ptr();
+        let ((f1_ptr, f1_len), (f2_ptr, _)) = self.free_slice_parts();
+        let in_f1 = usize::min(len, f1_len);
+        let in_f2 = len - in_f1;
+
+        // SAFETY: `in_f1 + in_f2 = len` and both writes stay inside the free
+        // sections, upholding invariant 2.
+        unsafe {
+            if in_f1 > 0 {
+                f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
+            }
+            if in_f2 > 0 {
+                f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
+            }
+        }
+        // SAFETY: Upholds invariant 3 by wrapping `tail` around.
+        self.tail = wrap_add(self.tail, len, self.cap);
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -197,7 +240,7 @@ impl RingBuffer {
         let amount = usize::min(amount, self.len());
         // SAFETY: we maintain invariant 2 here since this will always lead to a smaller buffer
         // for amount≤len
-        self.head = (self.head + amount) % self.cap;
+        self.head = wrap_add(self.head, amount, self.cap);
     }
 
     /// Return the size of the two contiguous occupied sections of memory used
@@ -372,7 +415,7 @@ impl RingBuffer {
                 // D: Destination bytes, going to be copied from S bytes
                 // _: Uninvolved bytes in the writable section
 
-                let start = (self.head + start) % self.cap;
+                let start = wrap_add(self.head, start, self.cap);
 
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
@@ -459,7 +502,7 @@ impl RingBuffer {
             }
         }
 
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_add(self.tail, len, self.cap);
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -480,7 +523,7 @@ impl RingBuffer {
                 ptr2.write_bytes(fill_with, fill2);
             }
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_add(self.tail, fill_length, self.cap);
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -509,7 +552,7 @@ impl RingBuffer {
             };
             read.read_exact(s2)?;
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_add(self.tail, fill_length, self.cap);
         Ok(())
     }
 
@@ -570,7 +613,7 @@ impl RingBuffer {
         copy_with_checks(
             m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
         );
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_add(self.tail, len, self.cap);
     }
 }
 

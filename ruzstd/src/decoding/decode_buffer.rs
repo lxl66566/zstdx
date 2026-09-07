@@ -72,6 +72,12 @@ impl DecodeBuffer {
         self.buffer.len()
     }
 
+    /// Ensure space for `amount` more bytes; used to reserve a whole block
+    /// up front so per-sequence appends can skip capacity checks.
+    pub fn reserve(&mut self, amount: usize) {
+        self.buffer.reserve(amount);
+    }
+
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         self.buffer.extend_and_fill(fill_with, fill_length);
     }
@@ -89,7 +95,29 @@ impl DecodeBuffer {
         self.total_output_counter += data.len() as u64;
     }
 
+    /// Like `push` but for buffers whose capacity was reserved up front for
+    /// the whole block (see `execute_sequences`); skips the free-space check.
+    #[inline]
+    pub fn push_pre_reserved(&mut self, data: &[u8]) {
+        debug_assert!(self.buffer.free() >= data.len());
+        // SAFETY: the block-level reserve covers this append.
+        unsafe { self.buffer.extend_pre_reserved(data) };
+        self.total_output_counter += data.len() as u64;
+    }
+
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        self.buffer.reserve(match_length);
+        self.repeat_pre_reserved(offset, match_length)
+    }
+
+    /// Like `repeat` but for buffers whose capacity was reserved up front for
+    /// the whole block (see `execute_sequences`); skips the free-space check.
+    #[inline]
+    pub fn repeat_pre_reserved(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
         } else {
@@ -97,7 +125,7 @@ impl DecodeBuffer {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
-            self.buffer.reserve(match_length);
+            debug_assert!(self.buffer.free() >= match_length);
             if end_idx > buf_len {
                 // We need to copy in chunks.
                 self.repeat_in_chunks(offset, match_length, start_idx);

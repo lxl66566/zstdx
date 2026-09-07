@@ -8,6 +8,9 @@ This document records the changes made between versions, starting with version 0
   one (`Content_Checksum` flag set), instead of always hashing every drained byte.
 * Sequence decoding reworked into a libzstd-style 64-bit backwards bit reader
   with packed single-load FSE tables; sequences decode ~15% faster.
+* Sequence execution reserves the whole block's output up front and appends
+  without per-sequence capacity checks; ring buffer wraps with a conditional
+  subtract instead of a modulo.
 
 # After 0.8.3
 
