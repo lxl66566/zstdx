@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* RLE block detection compares 8 bytes at a time (libzstd `ZSTD_isRLE`
+  style) instead of a per-byte closure over an indexed first element, and
+  skipped (RLE) blocks index only their first position instead of every
+  byte — a uniform run hashes to one table slot, so per-byte indexing just
+  rewrote it. zeros encode 7.3x faster.
+* The encoder's block emit path is reworked to keep the hot scan loop free
+  of allocator traffic and register spills: entropy tables are taken out of
+  the compressor state by value for the duration of a block (a raw-block
+  fallback puts them back) instead of deep-cloning three FSE tables plus
+  the Huffman table per block; the built-in matcher gained a
+  `start_matching_into` buffer sink (default-implemented on the `Matcher`
+  trait, so custom matchers are unaffected) that appends literals and
+  sequences directly instead of routing every emission through a closure
+  capture; and the matcher's window reads (hash input, 4-byte probes,
+  u64 match extension) are unchecked with caller-guaranteed bounds.
+  json +24%, text +39%, skewed +6% end-to-end encode throughput.
 * The encoder's match emitter indexes covered matches sparsely instead of
   hashing every byte: matches up to 16 bytes keep every position (they carry
   most of the alignment coverage on structured data), longer matches fall
