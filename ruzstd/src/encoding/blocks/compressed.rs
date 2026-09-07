@@ -55,18 +55,16 @@ pub(crate) fn compress_block<M: Matcher>(
         // when one code covers everything, predefined when the block is too
         // small (or too skewed) to pay for a table description, otherwise a
         // normalized custom table.
-        let ll_codes = sequences
-            .iter()
-            .map(|seq| encode_literal_length(seq.ll).0)
-            .collect::<Vec<_>>();
-        let ml_codes = sequences
-            .iter()
-            .map(|seq| encode_match_len(seq.ml).0)
-            .collect::<Vec<_>>();
-        let of_codes = sequences
-            .iter()
-            .map(|seq| encode_offset(seq.of).0)
-            .collect::<Vec<_>>();
+        // One pass over the sequences produces all three code arrays; both
+        // the table selection and the bitstream encoder consume them.
+        let mut ll_codes = Vec::with_capacity(sequences.len());
+        let mut ml_codes = Vec::with_capacity(sequences.len());
+        let mut of_codes = Vec::with_capacity(sequences.len());
+        for seq in &sequences {
+            ll_codes.push(encode_literal_length(seq.ll).0);
+            ml_codes.push(encode_match_len(seq.ml).0);
+            of_codes.push(encode_offset(seq.of).0);
+        }
         let ll_mode = choose_table_fast(&ll_codes, default_tables.0, 6, 9);
         let ml_mode = choose_table_fast(&ml_codes, default_tables.1, 6, 9);
         let of_mode = choose_table_fast(&of_codes, default_tables.2, 5, 8);
@@ -79,6 +77,9 @@ pub(crate) fn compress_block<M: Matcher>(
 
         encode_sequences(
             &sequences,
+            &ll_codes,
+            &ml_codes,
+            &of_codes,
             &mut writer,
             ll_mode.as_ref(),
             ml_mode.as_ref(),
@@ -199,15 +200,31 @@ fn encode_fse_table_modes(
 
 fn encode_sequences(
     sequences: &[EncodedSequence],
+    ll_codes: &[u8],
+    ml_codes: &[u8],
+    of_codes: &[u8],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_table: &FSETable,
     ml_table: &FSETable,
     of_table: &FSETable,
 ) {
+    // The codes arrive precomputed; the extra-bit fields follow straight
+    // from the code metadata and the sequence value.
     let sequence = sequences[sequences.len() - 1];
-    let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-    let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
-    let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
+    let li = sequences.len() - 1;
+    let ll_code = ll_codes[li];
+    let (ll_add_bits, ll_num_bits) = {
+        let (base, bits) = LL_META[ll_code as usize];
+        (sequence.ll - base, bits as usize)
+    };
+    let of_code = of_codes[li];
+    let of_add_bits = sequence.of & ((1 << of_code) - 1);
+    let of_num_bits = of_code as usize;
+    let ml_code = ml_codes[li];
+    let (ml_add_bits, ml_num_bits) = {
+        let (base, bits) = ML_META[ml_code as usize];
+        (sequence.ml - base, bits as usize)
+    };
     let mut ll_state = ll_table.start_state(ll_code).index;
     let mut ml_state = ml_table.start_state(ml_code).index;
     let mut of_state = of_table.start_state(of_code).index;
@@ -228,11 +245,21 @@ fn encode_sequences(
 
     // encode backwards so the decoder reads the first sequence first
     if sequences.len() > 1 {
-        for sequence in (0..=sequences.len() - 2).rev() {
-            let sequence = sequences[sequence];
-            let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-            let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
-            let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
+        for i in (0..=sequences.len() - 2).rev() {
+            let sequence = sequences[i];
+            let ll_code = ll_codes[i];
+            let (ll_add_bits, ll_num_bits) = {
+                let (base, bits) = LL_META[ll_code as usize];
+                (sequence.ll - base, bits as usize)
+            };
+            let of_code = of_codes[i];
+            let of_add_bits = sequence.of & ((1 << of_code) - 1);
+            let of_num_bits = of_code as usize;
+            let ml_code = ml_codes[i];
+            let (ml_add_bits, ml_num_bits) = {
+                let (base, bits) = ML_META[ml_code as usize];
+                (sequence.ml - base, bits as usize)
+            };
 
             // The three state-transition bit groups (max 15 bits each) and the
             // three extra-bit groups (max 16+16+19 bits) each fit a single
