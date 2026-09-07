@@ -393,7 +393,11 @@ impl Matcher for MatchGeneratorDriver {
                     let mut cand = self.idx_of(cand_abs);
                     if self.read4(cand) == cur {
                         let mut ml = self.extend_match(idx, cand);
-                        if ml >= MIN_MATCH {
+                        // A hash match already spans 5 bytes; below 6 the
+                        // sequence overhead roughly equals the literals it
+                        // covers, and rejecting it lets the scan try the next
+                        // position where a longer match may start.
+                        if ml >= 6 {
                             let anchor_idx = self.idx_of(self.anchor);
                             let mut start = idx;
                             // Extend backwards into the pending literals; the
