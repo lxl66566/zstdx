@@ -20,6 +20,10 @@ This document records the changes made between versions, starting with version 0
 * FSE sequence encoding switches states through a flat per-symbol transition
   table instead of a linear scan, and literal/match length codes come from
   constant lookup tables for the dense low ranges.
+* The matcher is rewritten as a zstd-fast style single-probe hash matcher over
+  one contiguous window: newest-wins hash insertion, u64 chunked forward and
+  backward match extension, and escalating probe steps on literal runs.
+  Roughly 3x faster matching with better ratios on structured data.
 
 # After 0.8.3
 

@@ -80,7 +80,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             state: CompressState {
-                matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
             },
