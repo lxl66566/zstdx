@@ -25,6 +25,25 @@ pub fn decode_sequences(
 
     let mut br = SeqBitReader::new(bit_stream)?;
 
+    // BMI2 compiles the loop's variable shifts to single-uop shlx/shrx; the
+    // detection cache makes this dispatch cheap relative to a whole block.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: bmi2 was just detected at runtime
+            return unsafe {
+                if scratch.ll_rle.is_some()
+                    || scratch.ml_rle.is_some()
+                    || scratch.of_rle.is_some()
+                {
+                    decode_sequences_with_rle_bmi2(section, &mut br, scratch, target)
+                } else {
+                    decode_sequences_without_rle_bmi2(section, &mut br, scratch, target)
+                }
+            };
+        }
+    }
+
     if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
         decode_sequences_with_rle(section, &mut br, scratch, target)
     } else {
@@ -328,7 +347,30 @@ fn pack_tables(scratch: &mut FSEScratch) {
     }
 }
 
+/// Portable entry; the body lives in `#[inline(always)]` impls so the BMI2
+/// wrappers below compile a specialized copy of the same loop.
 fn decode_sequences_without_rle(
+    section: &SequencesHeader,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    decode_sequences_without_rle_impl(section, br, scratch, target)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn decode_sequences_without_rle_bmi2(
+    section: &SequencesHeader,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    decode_sequences_without_rle_impl(section, br, scratch, target)
+}
+
+#[inline(always)]
+fn decode_sequences_without_rle_impl(
     section: &SequencesHeader,
     br: &mut SeqBitReader<'_>,
     scratch: &mut FSEScratch,
@@ -429,6 +471,27 @@ fn decode_sequences_without_rle(
 }
 
 fn decode_sequences_with_rle(
+    section: &SequencesHeader,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    decode_sequences_with_rle_impl(section, br, scratch, target)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn decode_sequences_with_rle_bmi2(
+    section: &SequencesHeader,
+    br: &mut SeqBitReader<'_>,
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    decode_sequences_with_rle_impl(section, br, scratch, target)
+}
+
+#[inline(always)]
+fn decode_sequences_with_rle_impl(
     section: &SequencesHeader,
     br: &mut SeqBitReader<'_>,
     scratch: &mut FSEScratch,

@@ -43,6 +43,9 @@ This document records the changes made between versions, starting with version 0
   table entry between the symbol read and the state transition, and writes
   sequences through a raw pointer into pre-reserved capacity, cutting spills
   and redundant loads per sequence.
+* Sequence decoding dispatches to a BMI2-compiled copy of its loop at runtime
+  when the CPU supports it (x86-64 + std), turning the variable bit shifts
+  into single-uop shlx/shrx.
 
 # After 0.8.3
 
