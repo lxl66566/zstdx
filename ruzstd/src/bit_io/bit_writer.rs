@@ -346,7 +346,10 @@ mod tests {
         bw.dump();
     }
 
+    // Relies on a debug_assert inside write_bits_64, so it can only panic on
+    // debug builds; gate it to keep `cargo test --release` green.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn catches_dirty_upper_bits() {
         let mut bw = BitWriter::new();
