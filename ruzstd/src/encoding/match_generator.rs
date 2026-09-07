@@ -26,7 +26,7 @@ const MIN_HASH: usize = 5;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
 /// History kept for matching; also the window size declared in the frame header.
-const MAX_WINDOW: usize = 0x70000;
+const MAX_WINDOW: usize = 0xC0000;
 
 const EMPTY: u64 = 0;
 
