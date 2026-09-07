@@ -310,6 +310,7 @@ fn maybe_update_fse_tables(
             vprintln!("Updating ll table");
             vprintln!("Used bytes: {}", bytes);
             scratch.ll_rle = None;
+            scratch.ll_predefined = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ll table");
@@ -321,13 +322,19 @@ fn maybe_update_fse_tables(
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
             scratch.ll_rle = Some(source[0]);
+            scratch.ll_predefined = false;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
-            scratch.literal_lengths.build_from_probabilities(
-                LL_DEFAULT_ACC_LOG,
-                &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
+            // The predefined table is immutable; only (re)build it when the
+            // scratch table currently holds something else.
+            if !scratch.ll_predefined {
+                scratch.literal_lengths.build_from_probabilities(
+                    LL_DEFAULT_ACC_LOG,
+                    &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
+                )?;
+                scratch.ll_predefined = true;
+            }
             scratch.ll_rle = None;
         }
         ModeType::Repeat => {
@@ -345,6 +352,7 @@ fn maybe_update_fse_tables(
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
             scratch.of_rle = None;
+            scratch.of_predefined = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE of table");
@@ -356,13 +364,17 @@ fn maybe_update_fse_tables(
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
             scratch.of_rle = Some(of_source[0]);
+            scratch.of_predefined = false;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            scratch.offsets.build_from_probabilities(
-                OF_DEFAULT_ACC_LOG,
-                &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-            )?;
+            if !scratch.of_predefined {
+                scratch.offsets.build_from_probabilities(
+                    OF_DEFAULT_ACC_LOG,
+                    &OFFSET_DEFAULT_DISTRIBUTION,
+                )?;
+                scratch.of_predefined = true;
+            }
             scratch.of_rle = None;
         }
         ModeType::Repeat => {
@@ -380,6 +392,7 @@ fn maybe_update_fse_tables(
             vprintln!("Updating ml table");
             vprintln!("Used bytes: {}", bytes);
             scratch.ml_rle = None;
+            scratch.ml_predefined = false;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ml table");
@@ -391,13 +404,17 @@ fn maybe_update_fse_tables(
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
             scratch.ml_rle = Some(ml_source[0]);
+            scratch.ml_predefined = false;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            scratch.match_lengths.build_from_probabilities(
-                ML_DEFAULT_ACC_LOG,
-                &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
+            if !scratch.ml_predefined {
+                scratch.match_lengths.build_from_probabilities(
+                    ML_DEFAULT_ACC_LOG,
+                    &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
+                )?;
+                scratch.ml_predefined = true;
+            }
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {

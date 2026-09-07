@@ -32,14 +32,7 @@ impl DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
             },
-            fse: FSEScratch {
-                offsets: FSETable::new(MAX_OFFSET_CODE),
-                of_rle: None,
-                literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
-                ll_rle: None,
-                match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-                ml_rle: None,
-            },
+            fse: FSEScratch::new(),
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
 
@@ -63,6 +56,9 @@ impl DecoderScratch {
         self.fse.ll_rle = None;
         self.fse.ml_rle = None;
         self.fse.of_rle = None;
+        self.fse.ll_predefined = false;
+        self.fse.ml_predefined = false;
+        self.fse.of_predefined = false;
 
         self.huf.table.reset();
     }
@@ -104,10 +100,15 @@ impl Default for HuffmanScratch {
 pub struct FSEScratch {
     pub offsets: FSETable,
     pub of_rle: Option<u8>,
+    /// True while `offsets` holds the predefined distribution, so consecutive
+    /// Predefined-mode blocks can skip rebuilding it.
+    pub of_predefined: bool,
     pub literal_lengths: FSETable,
     pub ll_rle: Option<u8>,
+    pub ll_predefined: bool,
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
+    pub ml_predefined: bool,
 }
 
 impl FSEScratch {
@@ -115,10 +116,13 @@ impl FSEScratch {
         FSEScratch {
             offsets: FSETable::new(MAX_OFFSET_CODE),
             of_rle: None,
+            of_predefined: false,
             literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
             ll_rle: None,
+            ll_predefined: false,
             match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
+            ml_predefined: false,
         }
     }
 
@@ -129,6 +133,9 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
+        self.of_predefined = false;
+        self.ll_predefined = false;
+        self.ml_predefined = false;
     }
 }
 
