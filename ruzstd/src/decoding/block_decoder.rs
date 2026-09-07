@@ -12,7 +12,8 @@ use crate::decoding::errors::{
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
+use crate::decoding::sequence_execution::{execute_sequences, execute_sequences_flat};
+use crate::decoding::errors::ExecuteSequencesError;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -100,6 +101,92 @@ impl BlockDecoder {
         workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
+        let (seq_section, raw_len) = self.parse_and_decode_sections(header, workspace, &mut source)?;
+
+        if seq_section.num_sequences != 0 {
+            vprintln!("Executing sequences");
+            execute_sequences(workspace)?;
+        } else {
+            if raw_len != 0 {
+                return Err(DecompressBlockError::DecodeSequenceError(
+                    DecodeSequenceError::ExtraBits {
+                        bits_remaining: raw_len as isize * 8,
+                    },
+                ));
+            }
+            workspace.buffer.push(&workspace.literals_buffer);
+            workspace.sequences.clear();
+        }
+
+        Ok(())
+    }
+
+    /// Compressed-block fast path for slice decoding: decodes the sections as
+    /// usual but executes the sequences straight into `out[*written..]`,
+    /// bypassing the ring buffer. Returns the number of bytes produced so far.
+    pub(crate) fn decompress_block_flat(
+        &mut self,
+        header: &BlockHeader,
+        workspace: &mut DecoderScratch,
+        source: &mut &[u8],
+        out: &mut [u8],
+        written: &mut usize,
+    ) -> Result<usize, DecompressBlockError> {
+        let (seq_section, raw_len) = self.parse_and_decode_sections(header, workspace, source)?;
+
+        if seq_section.num_sequences != 0 {
+            // Budget check once per block; after it passes, every write in
+            // execute_sequences_flat is provably in bounds.
+            let total_out: usize = workspace
+                .sequences
+                .iter()
+                .map(|seq| seq.ml as usize)
+                .sum::<usize>()
+                .saturating_add(workspace.literals_buffer.len());
+            if *written + total_out > out.len() {
+                return Err(DecompressBlockError::ExecuteSequencesError(
+                    ExecuteSequencesError::TargetTooSmall,
+                ));
+            }
+            execute_sequences_flat(
+                &workspace.sequences,
+                &workspace.literals_buffer,
+                out,
+                written,
+                &mut workspace.offset_hist,
+            )?;
+        } else {
+            if raw_len != 0 {
+                return Err(DecompressBlockError::DecodeSequenceError(
+                    DecodeSequenceError::ExtraBits {
+                        bits_remaining: raw_len as isize * 8,
+                    },
+                ));
+            }
+            let literals_len = workspace.literals_buffer.len();
+            if *written + literals_len > out.len() {
+                return Err(DecompressBlockError::ExecuteSequencesError(
+                    ExecuteSequencesError::TargetTooSmall,
+                ));
+            }
+            out[*written..*written + literals_len]
+                .copy_from_slice(&workspace.literals_buffer);
+            *written += literals_len;
+            workspace.sequences.clear();
+        }
+        Ok(*written)
+    }
+
+    /// Read a compressed block's body and decode its literals and sequence
+    /// descriptions into the workspace; shared by the ring-buffer and flat
+    /// execution paths. Returns the sequence section header and the raw bytes
+    /// following it (borrowed from the workspace's block content buffer).
+    fn parse_and_decode_sections(
+        &mut self,
+        header: &BlockHeader,
+        workspace: &mut DecoderScratch,
+        source: &mut impl Read,
+    ) -> Result<(SequencesHeader, usize), DecompressBlockError> {
         workspace
             .block_content_buffer
             .resize(header.content_size as usize, 0);
@@ -179,21 +266,9 @@ impl BlockDecoder {
                 &mut workspace.fse,
                 &mut workspace.sequences,
             )?;
-            vprintln!("Executing sequences");
-            execute_sequences(workspace)?;
-        } else {
-            if !raw.is_empty() {
-                return Err(DecompressBlockError::DecodeSequenceError(
-                    DecodeSequenceError::ExtraBits {
-                        bits_remaining: raw.len() as isize * 8,
-                    },
-                ));
-            }
-            workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
         }
 
-        Ok(())
+        Ok((seq_section, raw.len()))
     }
 
     /// Reads 3 bytes from the provided reader and returns

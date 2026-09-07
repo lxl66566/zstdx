@@ -4,6 +4,7 @@
 //! decompressed independently of other frames. This module contains structures
 //! and utilities that can be used to decode a frame.
 
+use super::super::blocks::block::BlockType;
 use super::frame;
 use crate::decoding;
 use crate::decoding::dictionary::Dictionary;
@@ -431,6 +432,109 @@ impl FrameDecoder {
         }
     }
 
+    /// Decode an entire frame block-by-block straight into `out`, bypassing
+    /// the ring buffer. Valid only when no dictionary is attached; matches
+    /// reference the frame's own output as the window. Returns bytes written.
+    fn decode_frame_flat(
+        state: &mut FrameDecoderState,
+        source: &mut &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameDecoderError> {
+        use FrameDecoderError as err;
+        let mut block_dec = decoding::block_decoder::new();
+        let mut written = 0usize;
+        loop {
+            let (block_header, _) = block_dec
+                .read_block_header(&mut *source)
+                .map_err(err::FailedToReadBlockHeader)?;
+            state.bytes_read_counter += 3;
+
+            let produced_before = written;
+            match block_header.block_type {
+                BlockType::Raw => {
+                    let size = block_header.decompressed_size as usize;
+                    if written + size > out.len() {
+                        return Err(err::TargetTooSmall);
+                    }
+                    // Reading straight into the output mirrors the ring
+                    // path's read_exact error semantics on truncated input.
+                    source
+                        .read_exact(&mut out[written..][..size])
+                        .map_err(|e| err::FailedToReadBlockBody(
+                            decoding::errors::DecodeBlockContentError::ReadError {
+                                step: BlockType::Raw,
+                                source: e,
+                            },
+                        ))?;
+                    state.bytes_read_counter += size as u64;
+                    written += size;
+                }
+                BlockType::RLE => {
+                    let size = block_header.decompressed_size as usize;
+                    let mut buf = [0u8; 1];
+                    source
+                        .read_exact(&mut buf[..])
+                        .map_err(|e| err::FailedToReadBlockBody(
+                            decoding::errors::DecodeBlockContentError::ReadError {
+                                step: BlockType::RLE,
+                                source: e,
+                            },
+                        ))?;
+                    if written + size > out.len() {
+                        return Err(err::TargetTooSmall);
+                    }
+                    out[written..written + size].fill(buf[0]);
+                    state.bytes_read_counter += 1;
+                    written += size;
+                }
+                BlockType::Compressed => {
+                    block_dec
+                        .decompress_block_flat(
+                            &block_header,
+                            &mut state.decoder_scratch,
+                            source,
+                            out,
+                            &mut written,
+                        )
+                        .map_err(|e| match e {
+                            decoding::errors::DecompressBlockError::ExecuteSequencesError(
+                                decoding::errors::ExecuteSequencesError::TargetTooSmall,
+                            ) => err::TargetTooSmall,
+                            other => err::FailedToReadBlockBody(
+                                decoding::errors::DecodeBlockContentError::DecompressBlockError(
+                                    other,
+                                ),
+                            ),
+                        })?;
+                    state.bytes_read_counter += u64::from(block_header.content_size);
+                }
+                BlockType::Reserved => unreachable!("read_block_header rejects reserved"),
+            }
+
+            #[cfg(feature = "hash")]
+            state
+                .decoder_scratch
+                .buffer
+                .hash_bytes(&out[produced_before..written]);
+
+            state.block_counter += 1;
+
+            if block_header.last_block {
+                state.frame_finished = true;
+                if state.frame_header.descriptor.content_checksum_flag() {
+                    let mut chksum = [0u8; 4];
+                    source
+                        .read_exact(&mut chksum)
+                        .map_err(err::FailedToReadChecksum)?;
+                    state.bytes_read_counter += 4;
+                    state.check_sum = Some(u32::from_le_bytes(chksum));
+                }
+                break;
+            }
+        }
+        Ok(written)
+    }
+
     /// Decodes as many blocks as possible from the source slice and reads from the decodebuffer into the target slice
     /// The source slice may contain only parts of a frame but must contain at least one full block to make progress
     ///
@@ -566,6 +670,20 @@ impl FrameDecoder {
                 Err(e) => return Err(e),
             };
             loop {
+                // Frames without a dictionary take the flat path: blocks are
+                // executed straight into the caller's buffer and the ring
+                // buffer stays empty, so nothing needs draining afterwards.
+                let flat = match &self.state {
+                    Some(s) => s.using_dict.is_none(),
+                    None => false,
+                };
+                if flat {
+                    let state = self.state.as_mut().expect("state checked above");
+                    let bytes_written = Self::decode_frame_flat(state, &mut input, output)?;
+                    output = &mut output[bytes_written..];
+                    total_bytes_written += bytes_written;
+                    break;
+                }
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self
                     .read(output)

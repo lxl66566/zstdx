@@ -1,4 +1,5 @@
 use super::scratch::DecoderScratch;
+use crate::blocks::sequence_section::Sequence;
 use crate::decoding::errors::ExecuteSequencesError;
 
 /// Take the provided decoder and execute the sequences stored within
@@ -68,6 +69,88 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         seq_sum,
         diff
     );
+    Ok(())
+}
+
+/// Execute the decoded sequences directly into a flat output slice, starting
+/// at `*written`. This is the slice-decode fast path: the frame's already
+/// produced bytes live at `out[..*written]` and serve as the match window, so
+/// no ring buffer is involved.
+///
+/// The caller must ensure the block's total output (all literals plus all
+/// match lengths) fits into `out[*written..]`; the executor then knows every
+/// write stays in bounds and skips per-sequence capacity checks.
+pub(crate) fn execute_sequences_flat(
+    sequences: &[Sequence],
+    literals: &[u8],
+    out: &mut [u8],
+    written: &mut usize,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), ExecuteSequencesError> {
+    let out_ptr = out.as_mut_ptr();
+    let mut w = *written;
+    let mut lit_pos = 0usize;
+
+    for &seq in sequences {
+        let ll = seq.ll as usize;
+        if ll > 0 {
+            let high = lit_pos + ll;
+            if high > literals.len() {
+                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                    wanted: high,
+                    have: literals.len(),
+                });
+            }
+            // SAFETY: high <= literals.len() by the check above; w + ll stays
+            // below out.len() through the caller's per-block budget
+            unsafe {
+                core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), ll);
+            }
+            lit_pos = high;
+            w += ll;
+        }
+
+        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+        if actual_offset == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset);
+        }
+        let offset = actual_offset as usize;
+        if offset > w {
+            // No dictionary in the flat path, so an offset past the frame's
+            // own output is always corruption.
+            return Err(ExecuteSequencesError::DecodebufferError(
+                crate::decoding::errors::DecodeBufferError::OffsetTooBig { offset, buf_len: w },
+            ));
+        }
+        let ml = seq.ml as usize;
+        if ml > 0 {
+            // Overlapping matches grow in doubling chunks anchored at
+            // `w - offset` (same scheme as repeat_in_chunks): after `copied`
+            // appended bytes the readable span is `offset + copied` long, so
+            // every chunk reads only already-written bytes.
+            let mut copied = 0;
+            while copied < ml {
+                let chunk = (offset + copied).min(ml - copied);
+                // SAFETY: src range [w-offset, w-offset+chunk) lies inside the
+                // written region; dst end stays below the block budget
+                unsafe {
+                    core::ptr::copy(out_ptr.add(w - offset), out_ptr.add(w + copied), chunk);
+                }
+                copied += chunk;
+            }
+            w += ml;
+        }
+    }
+
+    let rest = literals.len() - lit_pos;
+    if rest > 0 {
+        // SAFETY: rest literals fit the block budget like the copies above
+        unsafe {
+            core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), rest);
+        }
+        w += rest;
+    }
+    *written = w;
     Ok(())
 }
 

@@ -9,6 +9,11 @@ fn main() {
     let path = args.next().expect("usage: corruption_smoke <file.zst> [rounds]");
     let rounds: usize = args.next().map_or(64, |s| s.parse().unwrap());
     let data = std::fs::read(&path).unwrap();
+    // Size the decode_all target from the clean input.
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(&data[..]).unwrap();
+    let mut clean = Vec::new();
+    std::io::Read::read_to_end(&mut dec, &mut clean).unwrap();
+    let raw_len = clean.len();
 
     let mut rng: u64 = 0x9E3779B97F4A7C15;
     let mut next = move || {
@@ -26,9 +31,18 @@ fn main() {
             corrupted[pos] ^= 1 + (next() as u8 % 255);
         }
         let result = std::panic::catch_unwind(move || {
-            let mut decoder = ruzstd::decoding::StreamingDecoder::new(&corrupted[..]).unwrap();
+            // A corrupted frame header (e.g. mangled magic) is a regular
+            // decode error, not a panic.
+            let Ok(mut decoder) = ruzstd::decoding::StreamingDecoder::new(&corrupted[..]) else {
+                return true;
+            };
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out).is_ok()
+            let streamed = std::io::Read::read_to_end(&mut decoder, &mut out).is_ok();
+            // Exercise the flat decode_all path against the same corruption.
+            let mut fr = ruzstd::decoding::FrameDecoder::new();
+            let mut bulk = vec![0u8; raw_len];
+            let sliced = fr.decode_all(&corrupted[..], &mut bulk).is_ok();
+            streamed && sliced
         });
         match result {
             Ok(_) => (ok + 1, err),

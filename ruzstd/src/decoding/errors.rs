@@ -684,6 +684,8 @@ pub enum ExecuteSequencesError {
     DecodebufferError(DecodeBufferError),
     NotEnoughBytesForSequence { wanted: usize, have: usize },
     ZeroOffset,
+    /// Flat-output execution ran out of space in the caller's target buffer.
+    TargetTooSmall,
 }
 
 impl core::fmt::Display for ExecuteSequencesError {
@@ -700,6 +702,9 @@ impl core::fmt::Display for ExecuteSequencesError {
             }
             ExecuteSequencesError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
+            }
+            ExecuteSequencesError::TargetTooSmall => {
+                write!(f, "Not enough space in the target buffer for this block")
             }
         }
     }

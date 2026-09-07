@@ -68,6 +68,15 @@ impl DecodeBuffer {
         self.hash_enabled = on;
     }
 
+    /// Fold already-delivered bytes into the checksum; used by the flat
+    /// output path, which bypasses the drain that normally hashes.
+    #[cfg(feature = "hash")]
+    pub fn hash_bytes(&mut self, bytes: &[u8]) {
+        if self.hash_enabled {
+            self.hash.write(bytes);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.buffer.len()
     }

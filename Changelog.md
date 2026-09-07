@@ -46,6 +46,13 @@ This document records the changes made between versions, starting with version 0
 * Sequence decoding dispatches to a BMI2-compiled copy of its loop at runtime
   when the CPU supports it (x86-64 + std), turning the variable bit shifts
   into single-uop shlx/shrx.
+* `decode_all` executes blocks straight into the caller's buffer when no
+  dictionary is attached, bypassing the ring buffer and its drain copies
+  entirely (flat output path). Slice decoding speeds up 13-35% depending on
+  shape; the ring-buffer path remains for dictionaries and streaming.
+* The corruption smoke example also fuzzes the flat `decode_all` path and no
+  longer panics itself when corruption hits the frame magic (a legitimate
+  header error).
 
 # After 0.8.3
 
