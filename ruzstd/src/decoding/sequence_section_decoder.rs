@@ -346,75 +346,24 @@ impl SeqDecoder {
     /// it. Returns `None` once all `num_sequences` sequences are decoded.
     #[inline(always)]
     pub(crate) fn next(&mut self) -> Result<Option<Sequence>, DecodeSequenceError> {
-        if self.idx == self.nseq {
-            return Ok(None);
-        }
-        let (ll_base, ll_nb) = ((self.ll_entry >> 32) as u32, ((self.ll_entry >> 24) & 0xFF) as u32);
-        let (ml_base, ml_nb) = ((self.ml_entry >> 32) as u32, ((self.ml_entry >> 24) & 0xFF) as u32);
-        let (of_base, of_nb) = ((self.of_entry >> 32) as u32, ((self.of_entry >> 24) & 0xFF) as u32);
-
-        let obits = read(&mut self.win, &mut self.consumed, of_nb);
-        let ml_add = read(&mut self.win, &mut self.consumed, ml_nb);
-        // of+ml+ll add bits can sum above the 57 bits guaranteed after a
-        // reload; reload mid-sequence then (libzstd's totalBits guard)
-        if ll_nb + ml_nb + of_nb >= 31
-            && matches!(
-                reload(
-                    self.src_ptr,
-                    self.src_len,
-                    &mut self.ip,
-                    &mut self.bits,
-                    &mut self.win,
-                    &mut self.consumed
-                ),
-                Reload::Overflow
-            )
-        {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-        let ll_add = read(&mut self.win, &mut self.consumed, ll_nb);
-        let seq = Sequence {
-            ll: ll_base + ll_add as u32,
-            ml: ml_base + ml_add as u32,
-            of: of_base + obits as u32,
-        };
-
-        self.idx += 1;
-        if self.idx < self.nseq {
-            {
-                let nb = (self.ll_entry & 0xFF) as u32;
-                let state = (((self.ll_entry >> 8) & 0xFFFF) as u32)
-                    + read(&mut self.win, &mut self.consumed, nb) as u32;
-                // SAFETY: FSE table construction keeps every reachable state
-                // below the table size (RLE fake entries transition to state
-                // 0, their own slot), independent of the bitstream content
-                self.ll_entry = unsafe { *self.tbl.add(LL_SLOT + state as usize) };
-                let nb = (self.ml_entry & 0xFF) as u32;
-                let state = (((self.ml_entry >> 8) & 0xFFFF) as u32)
-                    + read(&mut self.win, &mut self.consumed, nb) as u32;
-                // SAFETY: same invariant as the ll stream
-                self.ml_entry = unsafe { *self.tbl.add(ML_SLOT + state as usize) };
-                let nb = (self.of_entry & 0xFF) as u32;
-                let state = (((self.of_entry >> 8) & 0xFFFF) as u32)
-                    + read(&mut self.win, &mut self.consumed, nb) as u32;
-                // SAFETY: same invariant as the ll stream
-                self.of_entry = unsafe { *self.tbl.add(OF_SLOT + state as usize) };
-            }
-            if matches!(
-                reload(
-                    self.src_ptr,
-                    self.src_len,
-                    &mut self.ip,
-                    &mut self.bits,
-                    &mut self.win,
-                    &mut self.consumed
-                ),
-                Reload::Overflow
-            ) {
-                return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-            }
-        }
-        Ok(Some(seq))
+        let SeqDecoder {
+            tbl,
+            src_ptr,
+            src_len,
+            ip,
+            bits,
+            win,
+            consumed,
+            ll_entry,
+            ml_entry,
+            of_entry,
+            nseq,
+            idx,
+        } = self;
+        decode_step(
+            *tbl, *src_ptr, *src_len, ip, bits, win, consumed, ll_entry, ml_entry, of_entry, *nseq,
+            idx,
+        )
     }
 
     /// Final padding check: exactly as many bits consumed as the stream had.
@@ -430,6 +379,109 @@ impl SeqDecoder {
             Ok(())
         }
     }
+}
+
+/// Decode one sequence and advance the streams for the one after it (the
+/// body of `next`). State passes as scalars so the caller's SROA sees plain
+/// local variables. Returns `None` once all `nseq` sequences are decoded.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_step(
+    tbl: *const u64,
+    src_ptr: *const u8,
+    src_len: usize,
+    ip: &mut usize,
+    bits: &mut u64,
+    win: &mut u64,
+    consumed: &mut u32,
+    ll_entry: &mut u64,
+    ml_entry: &mut u64,
+    of_entry: &mut u64,
+    nseq: usize,
+    idx: &mut usize,
+) -> Result<Option<Sequence>, DecodeSequenceError> {
+    if *idx == nseq {
+        return Ok(None);
+    }
+    let (ll_base, ll_nb) = ((*ll_entry >> 32) as u32, ((*ll_entry >> 24) & 0xFF) as u32);
+    let (ml_base, ml_nb) = ((*ml_entry >> 32) as u32, ((*ml_entry >> 24) & 0xFF) as u32);
+    let (of_base, of_nb) = ((*of_entry >> 32) as u32, ((*of_entry >> 24) & 0xFF) as u32);
+
+    // All three add-bit widths are known before reading, so the fields (of,
+    // then ml, then ll in read order, from the top) can be extracted with a
+    // single serial window read and split in parallel off the extracted
+    // value — one dependent chain instead of three. sum <= 31 keeps the
+    // extraction shift in range, and 7 + sum + 26 transition bits <= 64
+    // means the post-reload window always covers it: the mid-sequence reload
+    // guard (libzstd's totalBits guard) only applies to the unbatched path.
+    // sum == 0 happens for all-RLE streams; nothing to read at all.
+    let sum = ll_nb + ml_nb + of_nb;
+    let (obits, ml_add, ll_add) = if sum == 0 {
+        (0, 0, 0)
+    } else if sum <= 31 {
+        let v = read(win, consumed, sum);
+        (
+            v >> (ml_nb + ll_nb),
+            (v >> ll_nb) & ((1u64 << ml_nb) - 1),
+            v & ((1u64 << ll_nb) - 1),
+        )
+    } else {
+        // Cold: fields too wide to batch. of+ml+ll add bits sum above the 57
+        // bits guaranteed after a reload; reload mid-sequence then
+        let obits = read(win, consumed, of_nb);
+        let ml_add = read(win, consumed, ml_nb);
+        if matches!(
+            reload(src_ptr, src_len, ip, bits, win, consumed),
+            Reload::Overflow
+        ) {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+        }
+        let ll_add = read(win, consumed, ll_nb);
+        (obits, ml_add, ll_add)
+    };
+    let seq = Sequence {
+        ll: ll_base + ll_add as u32,
+        ml: ml_base + ml_add as u32,
+        of: of_base + obits as u32,
+    };
+
+    *idx += 1;
+    if *idx < nseq {
+        let ll_nb_t = (*ll_entry & 0xFF) as u32;
+        let ml_nb_t = (*ml_entry & 0xFF) as u32;
+        let of_nb_t = (*of_entry & 0xFF) as u32;
+        let ll_base_t = ((*ll_entry >> 8) & 0xFFFF) as u32;
+        let ml_base_t = ((*ml_entry >> 8) & 0xFFFF) as u32;
+        let of_base_t = ((*of_entry >> 8) & 0xFFFF) as u32;
+        // Same batching for the three state transitions (ll, then ml, then
+        // of): at most 9+9+8 = 26 bits, always extractable in one read
+        let sum_t = ll_nb_t + ml_nb_t + of_nb_t;
+        let (s_ll, s_ml, s_of) = if sum_t == 0 {
+            (ll_base_t, ml_base_t, of_base_t)
+        } else {
+            let v = read(win, consumed, sum_t);
+            (
+                ll_base_t + (v >> (ml_nb_t + of_nb_t)) as u32,
+                ml_base_t + ((v >> of_nb_t) & ((1u64 << ml_nb_t) - 1)) as u32,
+                of_base_t + (v & ((1u64 << of_nb_t) - 1)) as u32,
+            )
+        };
+        // SAFETY: FSE table construction keeps every reachable state
+        // below the table size (RLE fake entries transition to state
+        // 0, their own slot), independent of the bitstream content
+        *ll_entry = unsafe { *tbl.add(LL_SLOT + s_ll as usize) };
+        // SAFETY: same invariant as the ll stream
+        *ml_entry = unsafe { *tbl.add(ML_SLOT + s_ml as usize) };
+        // SAFETY: same invariant as the ll stream
+        *of_entry = unsafe { *tbl.add(OF_SLOT + s_of as usize) };
+        if matches!(
+            reload(src_ptr, src_len, ip, bits, win, consumed),
+            Reload::Overflow
+        ) {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+        }
+    }
+    Ok(Some(seq))
 }
 
 /// Backwards bitstream reader over a 64-bit container, ported from libzstd's

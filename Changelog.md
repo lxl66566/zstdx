@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Sequence decoding extracts each group of bitstream reads (the three
+  add-bit fields and the three FSE state transitions) with a single window
+  read whose bits are then split in parallel, instead of six serial
+  load-shift-store chains per sequence. The mid-sequence reload guard only
+  applies to the rare wide-field path (all three add-bit widths sum above
+  31). skewed +5-8% (zstd-3/zstd-9), json.zst3 +3-5%, text.zst1 +2-3%,
+  rest neutral.
 * Huffman literals decoding gains a double-symbol (X2) table for the
   interleaved 4-stream fast path, ported from libzstd: each lookup emits one
   or two literals (a single unaligned u16 store) and consumes the summed bit
