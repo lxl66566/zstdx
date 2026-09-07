@@ -33,7 +33,10 @@ fn main() {
             }
         }
 
-        let raw_path = path.strip_suffix(".zst").unwrap_or(path);
+        let raw_path = match path.rfind('.') {
+            Some(i) => &path[..i],
+            None => path.as_str(),
+        };
         if let Ok(raw) = fs::read(raw_path) {
             assert_eq!(raw, reference, "decoded output mismatch for {path}");
         }
