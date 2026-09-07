@@ -280,26 +280,35 @@ const fn of_codes() -> [(u32, u8); 32] {
 const OF_CODES: [(u32, u8); 32] = of_codes();
 
 /// A single FSE stream over the shared bit reader: the packed table plus the
-/// current state index into it.
-struct FseStream<'a> {
-    table: &'a [u64],
+/// current state index into it. The table is a raw pointer instead of a slice
+/// so the decode loop carries one register per stream instead of two.
+struct FseStream {
+    table: *const u64,
     state: u32,
+    /// Entry for `state`, cached so the loop loads each table slot exactly
+    /// once per sequence (the transition needs the same fields as the output).
+    entry: u64,
 }
 
-impl FseStream<'_> {
+impl FseStream {
+    /// Load the entry for the current state. RLE streams leave `table`
+    /// dangling and must not call this.
     #[inline(always)]
-    fn entry(&self) -> u64 {
-        debug_assert!((self.state as usize) < self.table.len());
+    unsafe fn load_entry(&mut self) {
+        debug_assert!((self.state as usize) < 1 << 9);
         // SAFETY: FSE table construction guarantees every reachable state
         // (next_state_base + the value read with nb_bits) stays below the
         // table size, independent of the bitstream content
-        unsafe { *self.table.get_unchecked(self.state as usize) }
+        self.entry = unsafe { *self.table.add(self.state as usize) };
     }
 
+    /// Advance the state with the entry's transition bits and cache the next
+    /// entry. `e` must be the cached entry of the current state.
     #[inline(always)]
-    fn update(&mut self, br: &mut SeqBitReader<'_>) {
-        let e = self.entry();
+    fn transition(&mut self, e: u64, br: &mut SeqBitReader<'_>) {
         self.state = (((e >> 8) & 0xFFFF) as u32) + br.read((e & 0xFF) as u32) as u32;
+        // SAFETY: same invariant as load_entry
+        unsafe { self.load_entry() };
     }
 }
 
@@ -338,29 +347,42 @@ fn decode_sequences_without_rle(
 
     // Initial states are read in the order ll, of, ml
     let mut ll = FseStream {
-        table: &scratch.ll_seq,
+        table: scratch.ll_seq.as_ptr(),
         state: br.read(ll_acc as u32) as u32,
+        entry: 0,
     };
     let mut of = FseStream {
-        table: &scratch.of_seq,
+        table: scratch.of_seq.as_ptr(),
         state: br.read(of_acc as u32) as u32,
+        entry: 0,
     };
     let mut ml = FseStream {
-        table: &scratch.ml_seq,
+        table: scratch.ml_seq.as_ptr(),
         state: br.read(ml_acc as u32) as u32,
+        entry: 0,
     };
     // Realign the window before the first sequence; the loop only reloads at
     // sequence ends (the state reads above already consumed up to 26 bits)
     br.reload();
+    // SAFETY: states come straight from accuracy-log reads, so they are
+    // below the table sizes
+    unsafe {
+        ll.load_entry();
+        of.load_entry();
+        ml.load_entry();
+    }
 
     target.clear();
     target.reserve(section.num_sequences as usize);
     let nseq = section.num_sequences as usize;
+    // SAFETY: nseq slots were just reserved; each iteration writes exactly
+    // one Sequence and the length is only exposed on success
+    let out = target.as_mut_ptr();
 
     for idx in 0..nseq {
-        let e_ll = ll.entry();
-        let e_ml = ml.entry();
-        let e_of = of.entry();
+        let e_ll = ll.entry;
+        let e_ml = ml.entry;
+        let e_of = of.entry;
         let ll_add_bits = ((e_ll >> 24) & 0xFF) as u32;
         let ml_add_bits = ((e_ml >> 24) & 0xFF) as u32;
         let of_add_bits = ((e_of >> 24) & 0xFF) as u32;
@@ -374,21 +396,25 @@ fn decode_sequences_without_rle(
         }
         let ll_add = br.read(ll_add_bits);
 
-        target.push(Sequence {
-            ll: ((e_ll >> 32) as u32) + ll_add as u32,
-            ml: ((e_ml >> 32) as u32) + ml_add as u32,
-            of: ((e_of >> 32) as u32) + obits as u32,
-        });
+        unsafe {
+            out.add(idx).write(Sequence {
+                ll: ((e_ll >> 32) as u32) + ll_add as u32,
+                ml: ((e_ml >> 32) as u32) + ml_add as u32,
+                of: ((e_of >> 32) as u32) + obits as u32,
+            });
+        }
 
         if idx + 1 < nseq {
-            ll.update(br);
-            ml.update(br);
-            of.update(br);
+            ll.transition(e_ll, br);
+            ml.transition(e_ml, br);
+            of.transition(e_of, br);
             if matches!(br.reload(), Reload::Overflow) {
                 return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
             }
         }
     }
+    // SAFETY: nseq sequences were written above
+    unsafe { target.set_len(nseq) };
 
     let rem = br.remaining();
     if rem > 0 {
@@ -450,17 +476,33 @@ fn decode_sequences_with_rle(
     br.reload();
 
     let mut ll = FseStream {
-        table: &scratch.ll_seq,
+        table: scratch.ll_seq.as_ptr(),
         state: ll_state,
+        entry: 0,
     };
     let mut ml = FseStream {
-        table: &scratch.ml_seq,
+        table: scratch.ml_seq.as_ptr(),
         state: ml_state,
+        entry: 0,
     };
     let mut of = FseStream {
-        table: &scratch.of_seq,
+        table: scratch.of_seq.as_ptr(),
         state: of_state,
+        entry: 0,
     };
+    // SAFETY: states are either 0 (RLE, table untouched) or read straight
+    // from accuracy logs, so they are below the table sizes
+    unsafe {
+        if ll_rle.is_none() {
+            ll.load_entry();
+        }
+        if ml_rle.is_none() {
+            ml.load_entry();
+        }
+        if of_rle.is_none() {
+            of.load_entry();
+        }
+    }
 
     // Fixed per-stream values for RLE streams, extracted once
     let (ll_base_rle, ll_nb_rle) = match ll_rle {
@@ -479,34 +521,23 @@ fn decode_sequences_with_rle(
     target.clear();
     target.reserve(section.num_sequences as usize);
     let nseq = section.num_sequences as usize;
+    // SAFETY: nseq slots were just reserved; the length is only exposed on
+    // success
+    let out = target.as_mut_ptr();
 
     for idx in 0..nseq {
-        let (ll_base, ll_add_bits, ml_base, ml_add_bits, of_base, of_add_bits) = (
-            match ll_rle {
-                Some(_) => ll_base_rle,
-                None => (ll.entry() >> 32) as u32,
-            },
-            match ll_rle {
-                Some(_) => ll_nb_rle as u32,
-                None => ((ll.entry() >> 24) & 0xFF) as u32,
-            },
-            match ml_rle {
-                Some(_) => ml_base_rle,
-                None => (ml.entry() >> 32) as u32,
-            },
-            match ml_rle {
-                Some(_) => ml_nb_rle as u32,
-                None => ((ml.entry() >> 24) & 0xFF) as u32,
-            },
-            match of_rle {
-                Some(_) => of_base_rle,
-                None => (of.entry() >> 32) as u32,
-            },
-            match of_rle {
-                Some(_) => of_nb_rle as u32,
-                None => ((of.entry() >> 24) & 0xFF) as u32,
-            },
-        );
+        let (ll_base, ll_add_bits) = match ll_rle {
+            Some(_) => (ll_base_rle, ll_nb_rle as u32),
+            None => ((ll.entry >> 32) as u32, ((ll.entry >> 24) & 0xFF) as u32),
+        };
+        let (ml_base, ml_add_bits) = match ml_rle {
+            Some(_) => (ml_base_rle, ml_nb_rle as u32),
+            None => ((ml.entry >> 32) as u32, ((ml.entry >> 24) & 0xFF) as u32),
+        };
+        let (of_base, of_add_bits) = match of_rle {
+            Some(_) => (of_base_rle, of_nb_rle as u32),
+            None => ((of.entry >> 32) as u32, ((of.entry >> 24) & 0xFF) as u32),
+        };
 
         let obits = br.read(of_add_bits);
         let ml_add = br.read(ml_add_bits);
@@ -515,27 +546,31 @@ fn decode_sequences_with_rle(
         }
         let ll_add = br.read(ll_add_bits);
 
-        target.push(Sequence {
-            ll: ll_base + ll_add as u32,
-            ml: ml_base + ml_add as u32,
-            of: of_base + obits as u32,
-        });
+        unsafe {
+            out.add(idx).write(Sequence {
+                ll: ll_base + ll_add as u32,
+                ml: ml_base + ml_add as u32,
+                of: of_base + obits as u32,
+            });
+        }
 
         if idx + 1 < nseq {
             if ll_rle.is_none() {
-                ll.update(br);
+                ll.transition(ll.entry, br);
             }
             if ml_rle.is_none() {
-                ml.update(br);
+                ml.transition(ml.entry, br);
             }
             if of_rle.is_none() {
-                of.update(br);
+                of.transition(of.entry, br);
             }
             if matches!(br.reload(), Reload::Overflow) {
                 return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
             }
         }
     }
+    // SAFETY: nseq sequences were written above
+    unsafe { target.set_len(nseq) };
 
     let rem = br.remaining();
     if rem > 0 {

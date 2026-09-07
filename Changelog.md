@@ -39,6 +39,10 @@ This document records the changes made between versions, starting with version 0
 * `StreamingDecoder`'s `read` decodes until the caller's buffer can be filled
   instead of stopping at the first collectible byte, batching block decodes
   under large reads.
+* The sequence decode loop carries its FSE tables as raw pointers, caches each
+  table entry between the symbol read and the state transition, and writes
+  sequences through a raw pointer into pre-reserved capacity, cutting spills
+  and redundant loads per sequence.
 
 # After 0.8.3
 
