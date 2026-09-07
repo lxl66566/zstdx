@@ -36,7 +36,9 @@ pub(crate) fn compress_block<M: Matcher>(
     // literals section
 
     let mut writer = BitWriter::from(output);
-    if literals_vec.len() > 1024 {
+    if !literals_vec.is_empty() && crate::encoding::util::is_uniform(&literals_vec) {
+        rle_literals(&literals_vec, &mut writer);
+    } else if literals_vec.len() > 1024 {
         if let Some(table) = compress_literals(&literals_vec, last_huff_table, &mut writer) {
             tables.huff = Some(table);
         }
@@ -480,6 +482,29 @@ fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.write_bits(0b11u8, 2);
     writer.write_bits(literals.len() as u32, 20);
     writer.append_bytes(literals);
+}
+
+/// Uniform literals encode as one header plus a single content byte
+/// (Literals_Block_Type 1); the size formats mirror the raw literals ones
+/// (the smallest form spends a single size-format bit so the 5-bit size
+/// fills out the first header byte).
+fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
+    writer.write_bits(1u8, 2);
+    match literals.len() {
+        0..=31 => {
+            writer.write_bits(0u8, 1);
+            writer.write_bits(literals.len() as u32, 5);
+        }
+        32..=4095 => {
+            writer.write_bits(0b01u8, 2);
+            writer.write_bits(literals.len() as u32, 12);
+        }
+        _ => {
+            writer.write_bits(0b11u8, 2);
+            writer.write_bits(literals.len() as u32, 20);
+        }
+    }
+    writer.write_bits(literals[0], 8);
 }
 
 fn compress_literals(

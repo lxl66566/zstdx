@@ -1,4 +1,22 @@
 use alloc::vec::Vec;
+use core::convert::TryInto;
+
+/// Exact uniform-run detection, word-at-a-time like libzstd's `ZSTD_isRLE`
+/// (the chunked u64 compare widens to SIMD compares on x86_64 and aarch64).
+#[inline]
+pub(crate) fn is_uniform(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let first = data[0];
+    let broadcast = u64::from(first) * 0x0101_0101_0101_0101;
+    let mut chunks = data.chunks_exact(8);
+    let all_eq = chunks.all(|c| u64::from_le_bytes(c.try_into().unwrap()) == broadcast);
+    if !all_eq {
+        return false;
+    }
+    chunks.remainder().iter().all(|&b| b == first)
+}
 
 /// Returns the minimum number of bytes needed to represent this value, as
 /// either 1, 2, 4, or 8 bytes. A value of 0 will still return one byte.
