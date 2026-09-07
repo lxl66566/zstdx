@@ -123,9 +123,13 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             return Ok(0);
         }
 
-        // Loop until the decoder has decoded far enough for us to collect at least some bytes
-        // Returning 0 bytes here would signal an EOF which would be wrong when the decoder is not yet finished
-        while decoder.can_collect() == 0 && !decoder.is_finished() {
+        // Loop until the decoder has decoded far enough to fill the buffer,
+        // so large reads pay the per-call overhead once per buffer instead of
+        // once per block. Returning 0 bytes here would signal an EOF which
+        // would be wrong when the decoder is not yet finished; if a call makes
+        // no progress, hand back what is collectible instead of spinning.
+        while decoder.can_collect() < buf.len() && !decoder.is_finished() {
+            let collectible_before = decoder.can_collect();
             match decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1)) {
                 Ok(_) => { /*Nothing to do*/ }
                 Err(e) => {
@@ -140,6 +144,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                     }
                     return Err(err);
                 }
+            }
+            if decoder.can_collect() == collectible_before && collectible_before > 0 {
+                break;
             }
         }
 

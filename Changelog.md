@@ -36,6 +36,9 @@ This document records the changes made between versions, starting with version 0
 * Sequence encoding concatenates the three state-transition bit groups and the
   three extra-bit groups into one bit write each, halving the writer calls in
   the per-sequence loop.
+* `StreamingDecoder`'s `read` decodes until the caller's buffer can be filled
+  instead of stopping at the first collectible byte, batching block decodes
+  under large reads.
 
 # After 0.8.3
 
