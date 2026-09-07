@@ -107,7 +107,7 @@ impl FrameDecoderState {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
-        Ok(FrameDecoderState {
+        let mut state = FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
             block_counter: 0,
@@ -115,7 +115,12 @@ impl FrameDecoderState {
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
-        })
+        };
+        #[cfg(feature = "hash")]
+        state.decoder_scratch.set_checksum_enabled(
+            state.frame_header.descriptor.content_checksum_flag(),
+        );
+        Ok(state)
     }
 
     fn reset(&mut self, source: impl Read, max_window_size: u64) -> Result<(), FrameDecoderError> {
@@ -130,6 +135,9 @@ impl FrameDecoderState {
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
+        #[cfg(feature = "hash")]
+        self.decoder_scratch
+            .set_checksum_enabled(self.frame_header.descriptor.content_checksum_flag());
         Ok(())
     }
 

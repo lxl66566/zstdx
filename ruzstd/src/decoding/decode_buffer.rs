@@ -12,6 +12,10 @@ pub struct DecodeBuffer {
 
     pub window_size: usize,
     total_output_counter: u64,
+    /// Only track the xxhash when the frame actually carries a checksum;
+    /// hashing every drained byte otherwise is pure overhead.
+    #[cfg(feature = "hash")]
+    hash_enabled: bool,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
 }
@@ -39,6 +43,8 @@ impl DecodeBuffer {
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
+            hash_enabled: false,
+            #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
     }
@@ -51,8 +57,15 @@ impl DecodeBuffer {
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]
         {
+            self.hash_enabled = false;
             self.hash = twox_hash::XxHash64::with_seed(0);
         }
+    }
+
+    /// Enable incremental checksum computation over all drained bytes.
+    #[cfg(feature = "hash")]
+    pub fn set_checksum_enabled(&mut self, on: bool) {
+        self.hash_enabled = on;
     }
 
     pub fn len(&self) -> usize {
@@ -214,7 +227,7 @@ impl DecodeBuffer {
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();
         #[cfg(feature = "hash")]
-        {
+        if self.hash_enabled {
             self.hash.write(slice1);
             self.hash.write(slice2);
         }
@@ -280,7 +293,9 @@ impl DecodeBuffer {
         if n1 != 0 {
             let (written1, res1) = write_bytes(&slice1[..n1]);
             #[cfg(feature = "hash")]
-            self.hash.write(&slice1[..written1]);
+            if self.hash_enabled {
+                self.hash.write(&slice1[..written1]);
+            }
             drain_guard.amount += written1;
 
             // Apparently this is what clippy thinks is the best way of expressing this
@@ -291,7 +306,9 @@ impl DecodeBuffer {
             if written1 == n1 && n2 != 0 {
                 let (written2, res2) = write_bytes(&slice2[..n2]);
                 #[cfg(feature = "hash")]
-                self.hash.write(&slice2[..written2]);
+                if self.hash_enabled {
+                    self.hash.write(&slice2[..written2]);
+                }
                 drain_guard.amount += written2;
 
                 // Apparently this is what clippy thinks is the best way of expressing this

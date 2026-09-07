@@ -76,6 +76,11 @@ impl DecoderScratch {
             .dict_content
             .extend_from_slice(&dict.dict_content);
     }
+
+    #[cfg(feature = "hash")]
+    pub fn set_checksum_enabled(&mut self, on: bool) {
+        self.buffer.set_checksum_enabled(on);
+    }
 }
 
 pub struct HuffmanScratch {

@@ -4,6 +4,9 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The decoder only computes the xxhash checksum when the frame actually carries
+  one (`Content_Checksum` flag set), instead of always hashing every drained byte.
+
 # After 0.8.3
 
 * Avoid emitting compressed blocks when the compressed payload is not smaller
