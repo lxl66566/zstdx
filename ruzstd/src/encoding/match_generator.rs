@@ -26,7 +26,7 @@ const MIN_HASH: usize = 5;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 16;
 /// History kept for matching; also the window size declared in the frame header.
-const MAX_WINDOW: usize = 1 << 20;
+const MAX_WINDOW: usize = 0x70000;
 
 const EMPTY: u64 = 0;
 
@@ -300,7 +300,7 @@ impl Matcher for MatchGeneratorDriver {
                 self.miss_count += 1;
                 // Grow the probe step on long literal runs so incompressible
                 // data does not pay a full hash per byte.
-                self.pos += 1 + (self.miss_count >> 6).min(15) as u64;
+                self.pos += 1 + (self.miss_count >> 2).min(255) as u64;
             }
         }
         if self.anchor < self.block_end {

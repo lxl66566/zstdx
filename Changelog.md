@@ -30,6 +30,9 @@ This document records the changes made between versions, starting with version 0
 * A raw-block fallback now also rolls back the reusable Huffman and FSE tables:
   the decoder never sees the discarded block, so a later block must not reference
   entropy tables only introduced by it.
+* Matcher parameters retuned: 448 KiB window and a steeper probe-step ramp on
+  literal runs. Incompressible and skewed data compress up to twice as fast with
+  slightly better ratios.
 
 # After 0.8.3
 
