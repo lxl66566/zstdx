@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The slice path (std + hash, input >= 256 KiB, >= 2 usable CPUs) offloads
+  the frame checksum to a sidecar thread: a per-thread single-producer/
+  single-consumer ring of (pointer, len, state) tasks feeds one spinning
+  XXH64 worker with per-frame states, so the four serial accumulator chains
+  leave the compression core's critical path entirely; `finish` posts one
+  reply task and waits on it. Every post claims its ring slot by reading
+  the shared head, which keeps nested frames on the same thread in distinct
+  slots (a producer-local sequence counter lets two live frames overwrite
+  each other's tasks and kills the worker). Single-core pinning and small
+  inputs hash inline as before; output bytes are identical. 32 MiB wall
+  (4-core taskset, hash on): random +13%, text +26%, skewed +13%, zeros
+  +2.5%, json +4%; random-1M +12%.
+
 * The sequence bitstream encoder appends each sequence's add-bit payload
   with its state-transition bits in one accumulator push when the combined
   width fits (the common case), halving the per-sequence flush checks.
