@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Sequence FSE tables can now be repeated across blocks (mode 3): when the
+  previous block's table covers every live code and its estimated bit cost
+  for the current histogram stays within a fresh table's description cost
+  plus entropy bound, the block reuses it and writes no table description.
+  The comparison is libzstd's cost-based selection from the lazy
+  strategies (the fast-strategy shortcut only engages with dictionary
+  tables, which this encoder never has). Predefined and RLE table choices
+  invalidate the remembered table, so a later block can never repeat
+  against a decoder whose table was replaced. json: -2.2% instructions at
+  32 MiB, ratio 5.99 -> 6.00, json-1M +1.8%; text/skewed ratios unchanged
+  or better; all outputs cross-checked against the reference zstd decoder.
+
 * The slice path (std + hash, input >= 256 KiB, >= 2 usable CPUs) offloads
   the frame checksum to a sidecar thread: a per-thread single-producer/
   single-consumer ring of (pointer, len, state) tasks feeds one spinning
