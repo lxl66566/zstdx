@@ -14,21 +14,19 @@ use alloc::vec::Vec;
 ///   the start of this block
 /// - `last_block`: Whether or not this block is going to be the last block in the frame
 ///   (needed because this info is written into the block header)
-/// - `uncompressed_data`: A block's worth of uncompressed data, taken from the
-///   larger input
-/// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
+/// - `output`: As the block is compressed, it's appended to `output`.
+///
+/// The block data itself is the matcher's last committed space.
 #[inline]
 pub fn compress_fastest<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
-    uncompressed_data: Vec<u8>,
     output: &mut Vec<u8>,
 ) {
-    let block_size = uncompressed_data.len() as u32;
+    let block_size = state.matcher.get_last_space().len() as u32;
     // First check to see if run length encoding can be used for the entire block
-    if util::is_uniform(&uncompressed_data) {
-        let rle_byte = uncompressed_data[0];
-        state.matcher.commit_space(uncompressed_data);
+    if util::is_uniform(state.matcher.get_last_space()) {
+        let rle_byte = state.matcher.get_last_space()[0];
         state.matcher.skip_matching();
         let header = BlockHeader {
             last_block,
@@ -41,7 +39,6 @@ pub fn compress_fastest<M: Matcher>(
     } else {
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
-        state.matcher.commit_space(uncompressed_data);
         let rep = state.matcher.repcode_snapshot();
         // Take the reusable entropy tables out of the state by value: the
         // block encoder then can't touch them, so a raw fallback simply puts

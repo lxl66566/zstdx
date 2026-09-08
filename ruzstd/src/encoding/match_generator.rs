@@ -188,8 +188,9 @@ fn rep1_chain(
 
 pub struct MatchGeneratorDriver {
     /// Contiguous history: `win[0]` is absolute position `win_base`.
-    /// Capacity holds MAX_WINDOW plus one block so a full block always fits
-    /// after compaction.
+    /// Capacity holds two windows plus one block, so compaction (which keeps
+    /// MAX_WINDOW) runs at ~1x data volume amortized; blocks are read
+    /// directly into the spare tail.
     win: Vec<u8>,
     win_base: u64,
     /// Absolute end of committed data; matching runs up to `block_end`.
@@ -205,7 +206,6 @@ pub struct MatchGeneratorDriver {
     /// Repeated-offset history, kept in lockstep with the decoder's
     /// `offset_hist` so repcode probes see the same candidates it will.
     rep: [u32; 3],
-    space_pool: Vec<Vec<u8>>,
     slice_size: usize,
 }
 
@@ -228,7 +228,6 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             rep: [1, 4, 8],
-            space_pool: Vec::new(),
             slice_size,
         }
     }
@@ -270,43 +269,38 @@ impl Matcher for MatchGeneratorDriver {
         self.rep = rep;
     }
 
-    fn get_next_space(&mut self) -> Vec<u8> {
-        let size = self.slice_size;
-        match self.space_pool.pop() {
-            Some(mut v) => {
-                // Pooled buffers come from `vec![0; size]` and were only
-                // truncated since, so all bytes stay initialized; the caller
-                // overwrites what it reads and truncates to that length.
-                debug_assert!(v.capacity() >= size);
-                // SAFETY: see invariant above.
-                unsafe { v.set_len(size) };
-                v
-            }
-            None => alloc::vec![0; size],
-        }
-    }
-
-    fn get_last_space(&mut self) -> &[u8] {
-        &self.win[self.idx_of(self.block_start)..]
-    }
-
-    fn commit_space(&mut self, mut space: Vec<u8>) {
-        if self.win.len() + space.len() > self.win.capacity() {
+    fn block_tail(&mut self) -> &mut [u8] {
+        if self.win.len() + self.slice_size > self.win.capacity() {
             let keep = self.win.len().min(MAX_WINDOW);
             let drop = self.win.len() - keep;
             self.win.copy_within(drop.., 0);
             self.win.truncate(keep);
             self.win_base += drop as u64;
         }
-        self.win.extend_from_slice(&space);
+        let old = self.win.len();
+        // SAFETY: the capacity check above guarantees old + slice_size fits.
+        // The caller writes the block into the returned slice and passes the
+        // written count to commit_block, which shrinks the length back to
+        // exactly that, so the never-written tail bytes are never observed.
+        unsafe { self.win.set_len(old + self.slice_size) };
+        &mut self.win[old..]
+    }
+
+    fn get_last_space(&mut self) -> &[u8] {
+        &self.win[self.idx_of(self.block_start)..]
+    }
+
+    fn commit_block(&mut self, read_bytes: usize) {
+        let old_len = self.win.len() - self.slice_size;
+        // SAFETY: the caller wrote read_bytes bytes into the tail slice
+        // handed out by block_tail.
+        unsafe { self.win.set_len(old_len + read_bytes) };
         // Matching restarts at the head of the freshly committed block; the
         // window behind it is only a match source.
-        self.pos = self.win_base + (self.win.len() - space.len()) as u64;
+        self.pos = self.win_base + old_len as u64;
         self.block_start = self.pos;
         self.block_end = self.win_base + self.win.len() as u64;
         self.anchor = self.pos;
-        space.clear();
-        self.space_pool.push(space);
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -510,10 +504,8 @@ mod tests {
         let mut rep = [1u32, 4, 8];
         let mut reconstructed = Vec::new();
         for block in data.chunks(block_size) {
-            let mut space = driver.get_next_space();
-            space.clear();
-            space.extend_from_slice(block);
-            driver.commit_space(space);
+            driver.block_tail()[..block.len()].copy_from_slice(block);
+            driver.commit_block(block.len());
             driver.start_matching(|seq| match seq {
                 Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
                 Sequence::Triple {
@@ -592,15 +584,11 @@ mod tests {
         let mut driver = MatchGeneratorDriver::new(16);
         driver.reset(crate::encoding::CompressionLevel::Fastest);
         let pattern = [3u8, 1, 4, 1, 5, 9, 2, 6];
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(&pattern);
-        driver.commit_space(space);
+        driver.block_tail()[..pattern.len()].copy_from_slice(&pattern);
+        driver.commit_block(pattern.len());
         driver.skip_matching();
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(&pattern);
-        driver.commit_space(space);
+        driver.block_tail()[..pattern.len()].copy_from_slice(&pattern);
+        driver.commit_block(pattern.len());
         let mut got_triple = false;
         driver.start_matching(|seq| {
             if let Sequence::Triple { offset, .. } = seq {
@@ -630,10 +618,8 @@ mod tests {
         }
         let mut driver = MatchGeneratorDriver::new(128 * 1024);
         driver.reset(crate::encoding::CompressionLevel::Fastest);
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(&data);
-        driver.commit_space(space);
+        driver.block_tail()[..data.len()].copy_from_slice(&data);
+        driver.commit_block(data.len());
         let mut repcodes = 0usize;
         driver.start_matching(|seq| {
             if let Sequence::Triple { offset, .. } = seq {

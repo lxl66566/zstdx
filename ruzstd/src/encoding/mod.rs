@@ -84,21 +84,22 @@ pub struct EncodedSequence {
 /// Each one of these buffers is referred to as a *space*. One or more of these buffers represent the window
 /// the decoder will need to decode the data again.
 ///
-/// This library asks the Matcher for a new buffer using `get_next_space` to allow reusing of allocated buffers when they are no longer part of the
-/// window of data that is being used for matching.
-///
-/// The library fills the buffer with data that is to be compressed and commits them back to the matcher using `commit_space`.
+/// This library asks the Matcher for the writable tail of its window using `block_tail`, reads the next
+/// block of input into it and commits the filled byte count back with `commit_block`.
 ///
 /// Then it will either call `start_matching` or, if the space is deemed not worth compressing, `skip_matching` is called.
 ///
 /// This is repeated until no more data is left to be compressed.
 pub trait Matcher {
-    /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
-    fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
+    /// Reserve the match-window tail for the next block and return it as a
+    /// writable slice of the maximum block size. The caller fills in input
+    /// data, then hands the filled byte count to [`Matcher::commit_block`].
+    fn block_tail(&mut self) -> &mut [u8];
     /// Get a reference to the last commited space
     fn get_last_space(&mut self) -> &[u8];
-    /// Commit a space to the matcher so it can be matched against
-    fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
+    /// Commit `read` bytes written into the tail from [`Matcher::block_tail`]
+    /// as the block to match against.
+    fn commit_block(&mut self, read: usize);
     /// Just process the data in the last commited space for future matching
     fn skip_matching(&mut self);
     /// Process the data in the last commited space for future matching AND generate matches for the data

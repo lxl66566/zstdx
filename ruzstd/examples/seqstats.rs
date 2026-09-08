@@ -14,14 +14,14 @@ struct RecordingMatcher {
 }
 
 impl Matcher for RecordingMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        self.inner.get_next_space()
+    fn block_tail(&mut self) -> &mut [u8] {
+        self.inner.block_tail()
     }
     fn get_last_space(&mut self) -> &[u8] {
         self.inner.get_last_space()
     }
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.inner.commit_space(space)
+    fn commit_block(&mut self, read: usize) {
+        self.inner.commit_block(read)
     }
     fn skip_matching(&mut self) {
         self.inner.skip_matching()

@@ -151,28 +151,29 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         header.serialize(output);
         // Now compress block by block
         loop {
-            // Read a single block's worth of uncompressed data from the input
-            let mut uncompressed_data = self.state.matcher.get_next_space();
+            // Read a single block's worth of uncompressed data straight into
+            // the tail of the matcher's window (no intermediate buffer copy).
+            let tail = self.state.matcher.block_tail();
             let mut read_bytes = 0;
             let last_block;
             'read_loop: loop {
-                let new_bytes = source.read(&mut uncompressed_data[read_bytes..]).unwrap();
+                let new_bytes = source.read(&mut tail[read_bytes..]).unwrap();
                 if new_bytes == 0 {
                     last_block = true;
                     break 'read_loop;
                 }
                 read_bytes += new_bytes;
-                if read_bytes == uncompressed_data.len() {
+                if read_bytes == tail.len() {
                     last_block = false;
                     break 'read_loop;
                 }
             }
-            uncompressed_data.resize(read_bytes, 0);
+            self.state.matcher.commit_block(read_bytes);
             // As we read, hash that data too
             #[cfg(feature = "hash")]
-            self.hasher.write(&uncompressed_data);
+            self.hasher.write(self.state.matcher.get_last_space());
             // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
-            if uncompressed_data.is_empty() {
+            if read_bytes == 0 {
                 let header = BlockHeader {
                     last_block: true,
                     block_type: crate::blocks::block::BlockType::Raw,
@@ -194,10 +195,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     };
                     // Write the header, then the block
                     header.serialize(output);
-                    output.extend_from_slice(&uncompressed_data);
+                    output.extend_from_slice(self.state.matcher.get_last_space());
                 }
                 CompressionLevel::Fastest => {
-                    compress_fastest(&mut self.state, last_block, uncompressed_data, output)
+                    compress_fastest(&mut self.state, last_block, output)
                 }
                 _ => {
                     unimplemented!();
