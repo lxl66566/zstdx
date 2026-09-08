@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Encoder round seven, data-path focused: the match window holds two windows
+  plus one block of capacity so compaction copies ~1x data volume instead of
+  once per block; block input is read directly into the window tail through
+  the new `Matcher::block_tail`/`commit_block` API (replacing the
+  `get_next_space`/`commit_space` buffer ping-pong and its pooled-buffer
+  zero-fill); sequence FSE tables build from flat arrays (probability list,
+  start-state list, packed transition table) instead of 256 per-symbol
+  vectors with two sorts each; the scan loop keeps its cursors in locals
+  across emissions; and tiny literal runs copy with one unaligned u64 while
+  the position hash loads the full u64 masked to five bytes (mathematically
+  identical hash values, fewer instructions). text 2.5 -> 3.8 GiB/s, zeros
+  4.5 -> 8.2 GiB/s, json 287 -> 334 MB/s, ratios bit-identical.
 * Sequence codes are computed once per block and shared between the FSE
   table selection and the bitstream encoder, uniform literal sections
   encode with the one-byte RLE literals mode, and a cheap entropy-bound
