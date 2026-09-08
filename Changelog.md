@@ -4,6 +4,26 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Multithreaded one-shot compression: `bulk::compress_with(source,
+  &EncoderOptions)` engages a job-parallel path on std builds when
+  `workers > 1`. The input splits into jobs (twice the worker count, 1 MiB
+  floor); each job compresses through the per-thread pooled slice state
+  while borrowing a `window/8` strip of the preceding job as match history,
+  and the assembled output stays a single regular zstd frame with the total
+  size pledged in the header. Two invariants mirror libzstd's zstdmt and
+  keep jobs independent: every job starts from reset entropy tables (no
+  Repeat modes across a boundary) and from the second job on the matcher
+  gates repcode references until three literal-offset sequences have
+  rewritten the repeated-offset history. The frame checksum is hashed on
+  the calling thread while the jobs run, and finished job bytes append in
+  order as they land (condvar handshake; a worker panic resumes on the
+  caller after the assembly drains). Small inputs, single workers, raw
+  levels and single-core processes fall back to the byte-identical
+  single-thread path. Throughput on 64 MiB of text-like data scales near
+  linearly (2 workers 2.05x, 4 workers 3.95x, 8 workers 7.55x) at a ratio
+  cost below 0.1%. `compress_slice_to_vec` gained a checksum-aware sibling
+  `compress_slice_opts` used by the new entry point.
+
 * The `dict_builder` feature's raw-dictionary builder module moved from
   `ruzstd::dictionary` to `ruzstd::dict`, matching the zstd crate's naming
   and the new top-level module layout (`decoding::Dictionary` stays where
