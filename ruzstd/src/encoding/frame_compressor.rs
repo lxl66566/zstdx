@@ -75,6 +75,85 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) scratch: super::blocks::compressed::BlockScratch,
 }
 
+/// Compress an in-memory buffer into a fresh Vec with no intermediate
+/// copies: the matcher window points directly into `src` (no read pass, no
+/// window compaction, no window allocation) and blocks append straight into
+/// the output (no staging buffer). Produces the same bytes as
+/// [`super::compress`] over the same input.
+pub fn compress_slice_to_vec(src: &[u8], level: CompressionLevel) -> Vec<u8> {
+    let mut state = CompressState {
+        matcher: super::match_generator::MatchGeneratorDriver::new_direct(),
+        last_huff_table: None,
+        fse_tables: FseTables::new(),
+        scratch: Default::default(),
+    };
+    #[cfg(feature = "hash")]
+    let mut hasher = XxHash64::with_seed(0);
+    // Worst case (every block raw) is the input size plus block headers;
+    // reserving it up front keeps the output free of realloc copies, and the
+    // untouched tail of the reservation only costs address space.
+    let block_size = crate::common::MAX_BLOCK_SIZE as usize;
+    let block_overhead = 3 * (src.len() / block_size + 1);
+    let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    let header = FrameHeader {
+        frame_content_size: None,
+        single_segment: false,
+        content_checksum: cfg!(feature = "hash"),
+        dictionary_id: None,
+        window_size: Some(state.matcher.window_size()),
+    };
+    header.serialize(&mut output);
+    let max_window = state.matcher.window_size();
+    // The streaming reader cannot mark a just-filled block as last until the
+    // next read returns EOF, so an input that is an exact multiple of the
+    // block size ends with one empty raw block; emit the same shape to keep
+    // the outputs byte-identical.
+    let trailing_empty = !src.is_empty() && src.len() % block_size == 0;
+    for (i, block) in src.chunks(block_size).enumerate() {
+        let block_start = (i * block_size) as u64;
+        let block_end = block_start + block.len() as u64;
+        let last_block = block_end == src.len() as u64 && !trailing_empty;
+        let hist = block_start.saturating_sub(max_window);
+        state
+            .matcher
+            .adopt_window(&src[hist as usize..block_end as usize], hist);
+        state.matcher.set_block(block_start, block_end);
+        #[cfg(feature = "hash")]
+        hasher.write(state.matcher.get_last_space());
+        match level {
+            CompressionLevel::Uncompressed => {
+                let header = BlockHeader {
+                    last_block,
+                    block_type: crate::blocks::block::BlockType::Raw,
+                    block_size: block.len() as u32,
+                };
+                header.serialize(&mut output);
+                output.extend_from_slice(state.matcher.get_last_space());
+            }
+            CompressionLevel::Fastest => {
+                super::levels::compress_fastest(&mut state, last_block, &mut output)
+            }
+            _ => {
+                unimplemented!();
+            }
+        }
+    }
+    // A frame needs at least one block: empty input, and the exact-multiple
+    // tail above, encode one empty raw last block (mirroring the streaming
+    // path).
+    if src.is_empty() || trailing_empty {
+        let header = BlockHeader {
+            last_block: true,
+            block_type: crate::blocks::block::BlockType::Raw,
+            block_size: 0,
+        };
+        header.serialize(&mut output);
+    }
+    #[cfg(feature = "hash")]
+    output.extend_from_slice(&(hasher.finish() as u32).to_le_bytes());
+    output
+}
+
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Create a new `FrameCompressor`
     pub fn new(compression_level: CompressionLevel) -> Self {

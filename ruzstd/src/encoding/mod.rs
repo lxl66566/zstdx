@@ -9,6 +9,7 @@ pub(crate) mod util;
 mod frame_compressor;
 mod levels;
 pub use frame_compressor::FrameCompressor;
+pub use frame_compressor::compress_slice_to_vec;
 pub use match_generator::MatchGeneratorDriver;
 
 use crate::io::{Read, Write};
@@ -38,6 +39,58 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
     let mut vec = Vec::new();
     compress(source, &mut vec, level);
     vec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compress_slice_to_vec, compress_to_vec, CompressionLevel};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// The slice path (borrowed matcher window, no staging) must produce the
+    /// same bytes as the streaming path for every input shape: empty, tiny,
+    /// block-boundary straddling, window-crossing, RLE and incompressible.
+    #[test]
+    fn slice_path_matches_stream_path() {
+        let mut pseudo_random = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut inputs: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![1],
+            vec![7u8; 5],
+            vec![b'x'; 300 * 1024],
+            (0..130 * 1024).map(|_| (rand() & 0xFF) as u8).collect(),
+            (0..900 * 1024)
+                .flat_map(|i| {
+                    let pattern = [(i % 251) as u8, 7u8, 7, 7, (i % 13) as u8, 9];
+                    pattern
+                })
+                .collect(),
+        ];
+        // Straddle block and window boundaries exactly.
+        for len in [128 * 1024, 128 * 1024 + 1, 128 * 1024 - 1, 900 * 1024 + 7] {
+            inputs.push((0..len).map(|i| (i % 61) as u8).collect());
+        }
+        for input in &inputs {
+            assert_eq!(
+                compress_slice_to_vec(input, CompressionLevel::Fastest),
+                compress_to_vec(input.as_slice(), CompressionLevel::Fastest),
+                "mismatch at len {}",
+                input.len()
+            );
+            assert_eq!(
+                compress_slice_to_vec(input, CompressionLevel::Uncompressed),
+                compress_to_vec(input.as_slice(), CompressionLevel::Uncompressed),
+                "uncompressed mismatch at len {}",
+                input.len()
+            );
+        }
+    }
 }
 
 /// The compression mode used impacts the speed of compression,

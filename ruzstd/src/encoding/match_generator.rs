@@ -222,6 +222,9 @@ pub struct MatchGeneratorDriver {
     /// MAX_WINDOW) runs at ~1x data volume amortized; blocks are read
     /// directly into the spare tail.
     win: Vec<u8>,
+    /// Direct-window mode: the window points into caller-owned memory
+    /// instead of `win` (see [`MatchGeneratorDriver::adopt_window`]).
+    ext: Option<ExtWindow>,
     win_base: u64,
     /// Absolute end of committed data; matching runs up to `block_end`.
     pos: u64,
@@ -239,6 +242,29 @@ pub struct MatchGeneratorDriver {
     slice_size: usize,
 }
 
+/// Borrowed window for the slice-compression path. The caller guarantees the
+/// buffer stays alive and unmodified until the matcher is reset or dropped;
+/// only the single thread that called `adopt_window` touches it.
+struct ExtWindow {
+    data: *const u8,
+    len: usize,
+}
+
+// The pointer never escapes the matcher, and the compress_slice entry points
+// keep the borrowed buffer on the same thread's stack for the whole call.
+unsafe impl Send for MatchGeneratorDriver {}
+
+/// Resolve the active window (owned or borrowed). A free function so callers
+/// can split-borrow `win`/`ext` against `&mut table`.
+fn window_slice<'a>(win: &'a Vec<u8>, ext: &'a Option<ExtWindow>) -> &'a [u8] {
+    match ext {
+        None => win,
+        // SAFETY: the ExtWindow invariant (caller buffer alive and unchanged
+        // until reset) makes this slice valid for as long as the matcher is.
+        Some(e) => unsafe { core::slice::from_raw_parts(e.data, e.len) },
+    }
+}
+
 impl MatchGeneratorDriver {
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
     /// zstd block maximum is 128 KiB).
@@ -248,6 +274,7 @@ impl MatchGeneratorDriver {
         // ~1x data volume instead of once per block.
         Self {
             win: Vec::with_capacity(2 * MAX_WINDOW + slice_size),
+            ext: None,
             win_base: 0,
             pos: 0,
             block_end: 0,
@@ -262,6 +289,52 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Create a matcher for direct-window mode: no owned window is allocated
+    /// and blocks are handed over through [`Self::adopt_window`] instead of
+    /// [`Matcher::block_tail`].
+    pub fn new_direct() -> Self {
+        Self {
+            win: Vec::new(),
+            ext: None,
+            win_base: 0,
+            pos: 0,
+            block_end: 0,
+            anchor: 0,
+            block_start: 0,
+            table: alloc::vec![EMPTY; 1usize << HASH_LOG],
+            epoch: 1,
+            miss_count: 0,
+            rep: [1, 4, 8],
+            slice_size: 0,
+        }
+    }
+
+    /// Point the window at caller-owned memory: `data` holds the bytes at
+    /// absolute offset `base`. The caller must then declare the block to
+    /// match with [`Self::set_block`]. `data` must stay alive and unmodified
+    /// until the next `adopt_window` or `reset`.
+    pub fn adopt_window(&mut self, data: &[u8], base: u64) {
+        debug_assert!(self.ext.is_some() || self.win.is_empty());
+        debug_assert!(!data.is_empty());
+        self.ext = Some(ExtWindow {
+            data: data.as_ptr(),
+            len: data.len(),
+        });
+        self.win_base = base;
+    }
+
+    /// Declare `[start, end)` (absolute offsets inside the adopted window)
+    /// as the block to match next. Matching restarts at `start`; the history
+    /// below it is only a match source.
+    pub fn set_block(&mut self, start: u64, end: u64) {
+        debug_assert!(start >= self.win_base);
+        debug_assert!(end <= self.win_base + self.ext.as_ref().map_or(0, |e| e.len) as u64);
+        self.pos = start;
+        self.block_start = start;
+        self.block_end = end;
+        self.anchor = start;
+    }
+
     #[inline(always)]
     fn idx_of(&self, abs: u64) -> usize {
         (abs - self.win_base) as usize
@@ -270,6 +343,7 @@ impl MatchGeneratorDriver {
 
 impl Matcher for MatchGeneratorDriver {
     fn reset(&mut self, _level: CompressionLevel) {
+        self.ext = None;
         self.win.clear();
         self.win_base = 0;
         self.pos = 0;
@@ -300,6 +374,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn block_tail(&mut self) -> &mut [u8] {
+        debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
         if self.win.len() + self.slice_size > self.win.capacity() {
             let keep = self.win.len().min(MAX_WINDOW);
             let drop = self.win.len() - keep;
@@ -317,10 +392,11 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn get_last_space(&mut self) -> &[u8] {
-        &self.win[self.idx_of(self.block_start)..]
+        &window_slice(&self.win, &self.ext)[self.idx_of(self.block_start)..]
     }
 
     fn commit_block(&mut self, read_bytes: usize) {
+        debug_assert!(self.ext.is_none(), "commit_block is owned-window only");
         let old_len = self.win.len() - self.slice_size;
         // SAFETY: the caller wrote read_bytes bytes into the tail slice
         // handed out by block_tail.
@@ -362,7 +438,7 @@ impl Matcher for MatchGeneratorDriver {
         // Hot state lives in locals for the whole loop: the emit helpers
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
-        let win = &self.win[..];
+        let win = window_slice(&self.win, &self.ext);
         let table = &mut self.table[..];
         let epoch = self.epoch;
         let win_base = self.win_base;
@@ -602,8 +678,9 @@ impl Matcher for MatchGeneratorDriver {
         // future probes into the run resolve through it or the repcode
         // chain.
         let idx = (self.block_start - self.win_base) as usize;
-        if idx + HASH_READ <= self.win.len() {
-            insert_at(&self.win, &mut self.table, self.epoch, idx, self.block_start);
+        let win = window_slice(&self.win, &self.ext);
+        if idx + HASH_READ <= win.len() {
+            insert_at(win, &mut self.table, self.epoch, idx, self.block_start);
         }
         self.pos = self.block_end;
         self.anchor = self.block_end;
