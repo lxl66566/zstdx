@@ -199,6 +199,75 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         }
     }
 
+    /// Append the huffman codes for `data` in reverse symbol order (the
+    /// format reads the stream back to front). `packed` holds
+    /// `(code << 4) | num_bits` per symbol with at most 12 code bits, so
+    /// four symbols always fit the container once fewer than eight bits are
+    /// pending — the hot loop pays one flush per four symbols instead of a
+    /// container-overflow branch per symbol. Produces the same bits as one
+    /// `write_bits` call per symbol.
+    pub fn write_packed_codes_rev(&mut self, packed: &[u16; 256], data: &[u8]) {
+        let mut acc = self.partial;
+        let mut bits = self.bits_in_partial;
+        let output = self.output.as_mut();
+        let mut pos = self.bit_idx / 8;
+        // The length only catches up with pos at the end, so reserves must be
+        // sized from pos (a fixed reserve would be a no-op once capacity
+        // reaches len + N and later stores would run past the allocation).
+        for group in data.rchunks(4) {
+            // Bring the pending bits below eight so the next four codes
+            // cannot overflow the container.
+            if bits >= 8 {
+                let k = bits / 8;
+                if pos + 16 > output.capacity() {
+                    output.reserve(pos + 16 - output.len());
+                }
+                // SAFETY: the capacity check covers the 8-byte store; only
+                // the low k bytes are semantic, the overshoot is overwritten
+                // by the next store or snapped off by the final set_len.
+                unsafe {
+                    output
+                        .as_mut_ptr()
+                        .add(pos)
+                        .cast::<u64>()
+                        .write_unaligned(acc.to_le());
+                }
+                pos += k;
+                acc >>= 8 * k;
+                bits -= 8 * k;
+            }
+            for &sym in group.iter().rev() {
+                let t = packed[sym as usize] as u64;
+                acc |= (t >> 4) << bits;
+                bits += (t & 15) as usize;
+            }
+        }
+        let k = bits / 8;
+        if k > 0 {
+            if pos + 16 > output.capacity() {
+                output.reserve(pos + 16 - output.len());
+            }
+            // SAFETY: as above.
+            unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(pos)
+                    .cast::<u64>()
+                    .write_unaligned(acc.to_le());
+            }
+            pos += k;
+            acc >>= 8 * k;
+            bits -= 8 * k;
+        }
+        // SAFETY: pos matches the semantic end of the output; shrinking or
+        // growing within the reserved capacity keeps the invariant that the
+        // length equals bit_idx / 8.
+        unsafe { output.set_len(pos) };
+        self.partial = acc;
+        self.bits_in_partial = bits;
+        self.bit_idx = pos * 8;
+    }
+
     /// Returns the populated buffer that you've been writing bits into.
     ///
     /// This function consumes the writer, so it cannot be used after
@@ -378,4 +447,61 @@ mod tests {
     // fn catches_more_than_in_buf() {
     //     todo!();
     // }
+
+    #[test]
+    fn packed_codes_rev_matches_write_bits() {
+        // deterministic skewed symbols, codes up to 9 bits
+        let mut packed = [0u16; 256];
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (sym, p) in packed.iter_mut().enumerate() {
+            let nb = 1 + (next() as usize % 9);
+            let code = next() as usize & ((1 << nb) - 1);
+            *p = ((code << 4) | nb) as u16;
+        }
+        for size in [0usize, 1, 2, 3, 4, 5, 8, 31, 1025, 4096, 16384] {
+            let mut data = vec![0u8; size];
+            for b in &mut data {
+                *b = (next() % 256) as u8;
+            }
+            // Entry states the encoder really produces: fresh writer, and
+            // writers with a partial container left by preceding headers.
+            for entry_bits in [0usize, 3, 8, 17, 48, 63] {
+                let mut reference = BitWriter::new();
+                let mut batched = BitWriter::new();
+                if entry_bits > 0 {
+                    let entry = next() & ((1u64 << entry_bits.min(63)) - 1);
+                    reference.write_bits(entry, entry_bits.min(63));
+                    batched.write_bits(entry, entry_bits.min(63));
+                }
+                for symbol in data.iter().rev() {
+                    let t = packed[*symbol as usize];
+                    reference.write_bits((t >> 4) as u64, (t & 15) as usize);
+                }
+                let fill = reference.misaligned();
+                if fill == 0 {
+                    reference.write_bits(1u32, 8);
+                } else {
+                    reference.write_bits(1u32, fill);
+                }
+                batched.write_packed_codes_rev(&packed, &data);
+                let fill = batched.misaligned();
+                if fill == 0 {
+                    batched.write_bits(1u32, 8);
+                } else {
+                    batched.write_bits(1u32, fill);
+                }
+                assert_eq!(
+                    reference.dump(),
+                    batched.dump(),
+                    "stream mismatch at size {size} entry_bits {entry_bits}"
+                );
+            }
+        }
+    }
 }

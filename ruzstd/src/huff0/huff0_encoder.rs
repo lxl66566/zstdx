@@ -89,11 +89,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        for symbol in data.iter().rev() {
-            let (code, num_bits) = table.codes[*symbol as usize];
-            debug_assert!(num_bits > 0);
-            writer.write_bits(code, num_bits as usize);
-        }
+        // The batched writer performs the same bit accumulation as one
+        // write_bits call per symbol (data reversed, since the format reads
+        // the stream back to front), so the output is bit-identical.
+        writer.write_packed_codes_rev(&table.packed, data);
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
@@ -157,6 +156,11 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
+    /// Same codes packed as `(code << 4) | num_bits` so the encoding loop
+    /// loads one u16 instead of an 8-byte tuple (the table stays fully
+    /// L1-resident). Weight redistribution caps codes at 9 bits, so the
+    /// packing cannot overflow.
+    packed: [u16; 256],
 }
 
 impl HuffmanTable {
@@ -220,6 +224,7 @@ impl HuffmanTable {
         // Prepare huffman table with placeholders
         let mut table = HuffmanTable {
             codes: Vec::with_capacity(weights.len()),
+            packed: [0; 256],
         };
         for _ in 0..weights.len() {
             table.codes.push((0, 0));
@@ -247,6 +252,8 @@ impl HuffmanTable {
                 current_weight = entry.weight;
             }
             table.codes[entry.symbol as usize] = (current_code as u32, current_num_bits as u8);
+            debug_assert!(current_num_bits <= 11 && current_code <= 0xFFF);
+            table.packed[entry.symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
             current_code += 1;
         }
 
