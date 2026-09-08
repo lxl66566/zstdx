@@ -126,42 +126,43 @@ fn main() {
             }
         }
         shapes.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("\n== encode (interleaved A/B; ruz = Fastest) ==");
+        println!("\n== encode (interleaved A/B; each ruz level vs its zstd counterpart) ==");
         println!(
             "{:<16}{:>9}{:>9}   {}",
             "shape", "ruz", "zstd", "xslow  (MiB/s of each; ratio = ruz_time/zstd_time)"
         );
+        let ladder: [(&str, ruzstd::Level, i32); 4] = [
+            ("Fastest", ruzstd::Level::Fastest, 1),
+            ("Fast", ruzstd::Level::Fast, 3),
+            ("Balanced", ruzstd::Level::Balanced, 6),
+            ("Best", ruzstd::Level::Best, 12),
+        ];
         for (name, raw) in &shapes {
-            // correctness gate: our frame decodes with both sides
-            let comp = ruzstd::bulk::compress(raw, ruzstd::Level::Fastest);
-            let mut back = Vec::with_capacity(raw.len() + 16);
-            FrameDecoder::new()
-                .decode_all_to_vec(&comp, &mut back)
-                .unwrap();
-            assert_eq!(&back[..], &raw[..], "ruzstd roundtrip mismatch for {name}");
-            zstd::stream::copy_decode(&comp[..], &mut Vec::new()).unwrap();
-            let ratio = raw.len() as f64 / comp.len() as f64;
-
             let bytes = raw.len() as u64;
-            let report = ab.measure(
-                || {
-                    common::black_box(ruzstd::bulk::compress(raw, ruzstd::Level::Fastest));
-                },
-                || {
-                    common::black_box(zstd::bulk::compress(raw, 1).unwrap());
-                },
-            );
-            report.print(&format!("{name}.z1"), bytes, "", "");
-            let report = ab.measure(
-                || {
-                    common::black_box(ruzstd::bulk::compress(raw, ruzstd::Level::Fastest));
-                },
-                || {
-                    common::black_box(zstd::bulk::compress(raw, 3).unwrap());
-                },
-            );
-            report.print(&format!("{name}.z3"), bytes, "", "");
-            println!("{:<16}ruzstd ratio {ratio:.2}", "");
+            let mut ratios = String::new();
+            for (label, level, z) in ladder {
+                // correctness gate: our frame decodes with both sides
+                let comp = ruzstd::bulk::compress(raw, level);
+                let mut back = Vec::with_capacity(raw.len() + 16);
+                FrameDecoder::new()
+                    .decode_all_to_vec(&comp, &mut back)
+                    .unwrap();
+                assert_eq!(&back[..], &raw[..], "ruzstd roundtrip mismatch for {name}");
+                zstd::stream::copy_decode(&comp[..], &mut Vec::new()).unwrap();
+                let ratio = raw.len() as f64 / comp.len() as f64;
+                ratios.push_str(&format!("{label} {ratio:.2}  "));
+
+                let report = ab.measure(
+                    || {
+                        common::black_box(ruzstd::bulk::compress(raw, level));
+                    },
+                    || {
+                        common::black_box(zstd::bulk::compress(raw, z).unwrap());
+                    },
+                );
+                report.print(&format!("{name}.{label}"), bytes, "", "");
+            }
+            println!("{:<16}ruzstd ratios {ratios}", "");
         }
     }
 }
