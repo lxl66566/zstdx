@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* All hand-written `Display`/`From`/`std::error::Error` impls in
+  `decoding::errors` are now derived with thiserror (the crate's first
+  external dependency; compile-time only, and `default-features = false`
+  keeps the no_std and `rustc-dep-of-std` builds working — without `std` the
+  derive emits `core::error::Error` impls instead). Variant names, payloads
+  and message texts are byte-identical to the previous impls; the file drops
+  from 1163 to ~330 lines. `io_nostd::Error` and `GetBitsError` now implement
+  `core::error::Error` unconditionally (std re-exports the same trait) so they
+  can stay error-chain sources under no_std.
+
 * `CompressionLevel` is replaced by a root `Level` enum
   (`ruzstd::Level::{Uncompressed, Fastest}`, `#[non_exhaustive]`,
   `Level::DEFAULT = Fastest`). The `Default`/`Better`/`Best` variants never had

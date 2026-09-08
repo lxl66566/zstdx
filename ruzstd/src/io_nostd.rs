@@ -76,6 +76,12 @@ impl Error {
     }
 }
 
+// core::error::Error since 1.81; std re-exports the same trait, so one
+// unconditional impl serves both builds (error-chain sources require it even
+// under no_std). The optional inner payload is only Display, so the inner
+// source is not exposed through this trait.
+impl core::error::Error for Error {}
+
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.kind.as_str())?;

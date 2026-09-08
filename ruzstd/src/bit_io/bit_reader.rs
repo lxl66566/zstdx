@@ -104,8 +104,10 @@ pub enum GetBitsError {
     },
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for GetBitsError {}
+// core::error::Error since 1.81; std re-exports the same trait, so one
+// unconditional impl serves both builds (the derive treats GetBitsError as
+// a source, which requires the Error trait even under no_std).
+impl core::error::Error for GetBitsError {}
 
 impl core::fmt::Display for GetBitsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

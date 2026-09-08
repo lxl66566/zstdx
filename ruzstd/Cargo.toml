@@ -15,6 +15,9 @@ categories = ["compression"]
 
 [dependencies]
 fastrand = {version = "2.3.0", optional = true }
+# Compile-time only; the no_std build derives Display/From without the
+# std::error::Error impls (mirroring the previous hand-written cfg gates).
+thiserror = { version = "2", default-features = false }
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
@@ -33,7 +36,7 @@ default = ["hash", "std"]
 dict_builder = ["std", "dep:fastrand"]
 hash = []
 fuzz_exports = []
-std = []
+std = ["thiserror/std"]
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
