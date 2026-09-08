@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The decoder now verifies frame checksums with the same in-tree XXH64 as
+  the encoder (the module moved from `encoding` to the crate root).
+  `twox-hash` drops from runtime dependency to dev-dependency (kept purely
+  as the test reference), leaving ruzstd without any external runtime
+  dependencies; the `hash` feature no longer pulls in external code and
+  now also builds under `rustc-dep-of-std`. Standalone the two
+  implementations measure equal (~20 GiB/s bulk on the dev box, four
+  accumulator chains already saturate round latency; 32 B - 8 MiB inputs
+  within noise), and the checksummed decode corpus A/B confirms parity:
+  15 shapes x 2 back-to-back rounds, slice deltas +3% to -6% with a mean
+  of +0.4%, all inside the machine's noise band. `DecodeBuffer::hash`
+  narrows from `pub` to `pub(crate)` since the hasher type is no longer a
+  public dependency.
+
 * Sequence FSE tables can now be repeated across blocks (mode 3): when the
   previous block's table covers every live code and its estimated bit cost
   for the current histogram stays within a fresh table's description cost
