@@ -78,9 +78,7 @@ pub(crate) fn compress_block<M: Matcher>(
             );
             add_nbs.push((ll_nb + ml_nb + of_nb) as u8);
         }
-        let ll_mode = choose_table_fast(&packed_codes, 0, default_tables.0, 6, 9);
-        let ml_mode = choose_table_fast(&packed_codes, 8, default_tables.1, 6, 9);
-        let of_mode = choose_table_fast(&packed_codes, 16, default_tables.2, 5, 8);
+        let (ll_mode, ml_mode, of_mode) = choose_tables_fast(&packed_codes, default_tables);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -133,31 +131,78 @@ impl FseTableMode<'_> {
     }
 }
 
-/// Port of libzstd's ZSTD_selectEncodingType for the fast strategy (no
-/// dictionary, so repeat mode never applies): RLE when a single code covers
-/// all sequences, predefined below the dynamic-table break-even, custom
-/// normalized table otherwise. `shift` selects which byte of the packed code
-/// stream belongs to this table.
-fn choose_table_fast<'a>(
+/// One pass over the packed codes fills all three histograms; each table's
+/// mode is then decided from its own counts (three selection passes used to
+/// scan the code stream separately).
+fn choose_tables_fast<'a>(
     packed_codes: &[u32],
-    shift: u32,
+    default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
+) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
+    let nb_seq = packed_codes.len();
+    let mut ll_counts = [0u32; 256];
+    let mut ml_counts = [0u32; 256];
+    let mut of_counts = [0u32; 256];
+    for &packed in packed_codes {
+        ll_counts[(packed & 0xFF) as usize] += 1;
+        ml_counts[((packed >> 8) & 0xFF) as usize] += 1;
+        of_counts[(packed >> 16) as usize] += 1;
+    }
+    let first = packed_codes[0];
+    let last = packed_codes[nb_seq - 1];
+    (
+        select_from_counts(
+            &mut ll_counts,
+            nb_seq,
+            first as u8,
+            last as u8,
+            default_tables.0,
+            6,
+            9,
+        ),
+        select_from_counts(
+            &mut ml_counts,
+            nb_seq,
+            (first >> 8) as u8,
+            (last >> 8) as u8,
+            default_tables.1,
+            6,
+            9,
+        ),
+        select_from_counts(
+            &mut of_counts,
+            nb_seq,
+            (first >> 16) as u8,
+            (last >> 16) as u8,
+            default_tables.2,
+            5,
+            8,
+        ),
+    )
+}
+
+/// Per-table mode selection from a filled histogram: RLE when a single code
+/// covers all sequences, predefined below the dynamic-table break-even (or
+/// when the predefined table cannot cover the codes), custom normalized
+/// table otherwise. Port of libzstd's ZSTD_selectEncodingType for the fast
+/// strategy (no dictionary, so repeat mode never applies).
+fn select_from_counts<'a>(
+    counts: &mut [u32; 256],
+    nb_seq: usize,
+    first_code: u8,
+    last_code: u8,
     default_table: &'a FSETable,
     default_norm_log: u32,
     max_log: u8,
 ) -> FseTableMode<'a> {
-    let nb_seq = packed_codes.len();
-    let mut counts = [0u32; 256];
     let mut max_symbol = 0usize;
-    for &packed in packed_codes {
-        let c = (packed >> shift) as u8;
-        counts[c as usize] += 1;
-        if c as usize > max_symbol {
-            max_symbol = c as usize;
-        }
-    }
     let mut most_frequent = 0u32;
-    for &c in &counts[..=max_symbol] {
-        most_frequent = most_frequent.max(c);
+    for (i, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            max_symbol = i;
+            if c > most_frequent {
+                most_frequent = c;
+            }
+        }
     }
     if most_frequent as usize == nb_seq {
         // With two or fewer sequences the predefined table's description is
@@ -165,10 +210,9 @@ fn choose_table_fast<'a>(
         if nb_seq <= 2 {
             return FseTableMode::Predefined(default_table);
         }
-        let code = packed_codes[0] >> shift;
         return FseTableMode::Rle {
-            code: code as u8,
-            table: rle_table(code as u8),
+            code: first_code,
+            table: rle_table(first_code),
         };
     }
     // The predefined table must cover every code that occurs.
@@ -181,13 +225,7 @@ fn choose_table_fast<'a>(
             return FseTableMode::Predefined(default_table);
         }
     }
-    match build_normalized_table(
-        &mut counts,
-        nb_seq,
-        max_symbol,
-        max_log,
-        (packed_codes[nb_seq - 1] >> shift) as u8,
-    ) {
+    match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code) {
         Some(table) => FseTableMode::Encoded(table),
         // Normalization corner case: fall back to the predefined table.
         None => FseTableMode::Predefined(default_table),
