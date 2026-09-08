@@ -417,7 +417,10 @@ fn compress_with_state(
                 header.serialize(&mut output);
                 BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
             }
-            Level::Fastest => {
+            Level::Fastest
+            | Level::Fast
+            | Level::Balanced
+            | Level::Best => {
                 super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
             }
         }
@@ -604,7 +607,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     self.hasher
                         .write_appending(output, self.state.matcher.get_last_space());
                 }
-                Level::Fastest => {
+                Level::Fastest
+                | Level::Fast
+                | Level::Balanced
+                | Level::Best => {
                     compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
                 }
             }
@@ -683,6 +689,57 @@ mod tests {
     use crate::common::MAGIC_NUM;
     use crate::decoding::FrameDecoder;
     use alloc::vec::Vec;
+
+    /// Every real level must roundtrip through both this crate's decoder
+    /// and libzstd, keep the slice and streaming paths byte-identical, and
+    /// deepen the ratio monotonically on compressible data.
+    #[test]
+    fn level_ladder_roundtrips() {
+        let mut data = Vec::with_capacity(700 * 1024);
+        let words = [
+            &b"the quick brown fox "[..],
+            &b"jumps over the lazy dog "[..],
+            &b"lorem ipsum dolor sit amet "[..],
+            b"\x00\x01\x02\x03 structured noise ",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while data.len() < 700 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(words[(state as usize) % words.len()]);
+        }
+        let levels = [
+            crate::Level::Fastest,
+            crate::Level::Fast,
+            crate::Level::Balanced,
+            crate::Level::Best,
+        ];
+        let mut sizes = Vec::new();
+        for level in levels {
+            let compressed = super::compress_slice_to_vec(&data, level);
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            assert_eq!(decoder.decode_all(&compressed, &mut out).unwrap(), data.len());
+            assert_eq!(&out[..], &data[..], "roundtrip {level:?}");
+            let mut libzstd = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut libzstd).unwrap();
+            assert_eq!(libzstd, data, "libzstd interop {level:?}");
+            let streamed = crate::encoding::compress_to_vec(data.as_slice(), level);
+            assert_eq!(streamed, compressed, "slice/stream identity {level:?}");
+            sizes.push((level, compressed.len()));
+        }
+        for pair in sizes.windows(2) {
+            assert!(
+                pair[1].1 <= pair[0].1,
+                "ratio must not worsen from {:?} to {:?}: {} > {}",
+                pair[0].0,
+                pair[1].0,
+                pair[0].1,
+                pair[1].1
+            );
+        }
+    }
 
     #[test]
     fn frame_starts_with_magic_num() {

@@ -212,7 +212,7 @@ impl FrameEncoderCore {
         // An empty block only occurs as the frame-closing block (empty
         // input or an exact block-size multiple) and is always raw; the
         // compressed path has never seen a zero-byte block.
-        if self.level == Level::Fastest && n > 0 {
+        if self.level != Level::Uncompressed && n > 0 {
             compress_fastest(&mut self.state, last, &mut self.output, &mut self.hasher);
         } else {
             let header = BlockHeader {

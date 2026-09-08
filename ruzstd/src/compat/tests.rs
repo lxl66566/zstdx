@@ -19,11 +19,12 @@ fn bulk_roundtrip() {
     assert_eq!(decompressed, data);
 
     let mut buffer = vec![0u8; compressed.len()];
-    let written = compat::bulk::compress_to_buffer(&data, &mut buffer, 1).unwrap();
+    // same level as above: distinct levels now produce distinct bytes
+    let written = compat::bulk::compress_to_buffer(&data, &mut buffer, 3).unwrap();
     assert_eq!(&buffer[..written], &compressed[..]);
     // too-small destination is an error
     let too_small = &mut buffer[..written - 1];
-    assert!(compat::bulk::compress_to_buffer(&data, too_small, 1).is_err());
+    assert!(compat::bulk::compress_to_buffer(&data, too_small, 3).is_err());
     let mut out = vec![0u8; data.len() + 16];
     let n = compat::bulk::decompress_to_buffer(&compressed, &mut out).unwrap();
     assert_eq!(&out[..n], &data[..]);

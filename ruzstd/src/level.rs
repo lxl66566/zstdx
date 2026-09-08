@@ -2,7 +2,8 @@
 //!
 //! Every variant is backed by a real implementation; levels that the original
 //! zstd expresses as numbers between 1 and 22 (default, better, best, ...)
-//! will appear here as further variants once their matchers land.
+//! map onto the nearest variant here (see [`Level::approximate_zstd`] for the
+//! exact ranges).
 
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
@@ -14,16 +15,61 @@ pub enum Level {
     /// it in a Zstandard frame.
     Uncompressed,
     /// This level is roughly equivalent to Zstd compression level 1.
+    /// A single-probe hash matcher (libzstd's `fast` strategy).
     Fastest,
+    /// This level is roughly equivalent to Zstd compression levels 3-5.
+    /// A short hash-chain matcher with one lazy step.
+    Fast,
+    /// This level is roughly equivalent to Zstd compression levels 6-9.
+    /// A deeper hash-chain matcher with two lazy steps.
+    Balanced,
+    /// This level is roughly equivalent to Zstd compression levels 12-15.
+    /// The deepest hash-chain search with extended lazy evaluation;
+    /// noticeably slower, noticeably denser.
+    Best,
 }
 
 impl Level {
     /// The level used when none is specified.
     pub const DEFAULT: Level = Level::Fastest;
+
+    /// Map a numeric libzstd level onto the nearest implemented strategy:
+    /// negatives and 1-2 stay `Fastest`, 3-5 round to `Fast`, 6-9 to
+    /// `Balanced` and everything above to `Best`.
+    pub const fn approximate_zstd(level: i32) -> Level {
+        if level > 9 {
+            Level::Best
+        } else if level >= 6 {
+            Level::Balanced
+        } else if level >= 3 {
+            Level::Fast
+        } else {
+            Level::Fastest
+        }
+    }
 }
 
 impl Default for Level {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Level;
+
+    #[test]
+    fn zstd_mapping_ranges() {
+        assert_eq!(Level::approximate_zstd(-5), Level::Fastest);
+        assert_eq!(Level::approximate_zstd(0), Level::Fastest);
+        assert_eq!(Level::approximate_zstd(1), Level::Fastest);
+        assert_eq!(Level::approximate_zstd(2), Level::Fastest);
+        assert_eq!(Level::approximate_zstd(3), Level::Fast);
+        assert_eq!(Level::approximate_zstd(5), Level::Fast);
+        assert_eq!(Level::approximate_zstd(6), Level::Balanced);
+        assert_eq!(Level::approximate_zstd(9), Level::Balanced);
+        assert_eq!(Level::approximate_zstd(10), Level::Best);
+        assert_eq!(Level::approximate_zstd(22), Level::Best);
     }
 }

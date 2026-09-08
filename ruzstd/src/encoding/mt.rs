@@ -53,17 +53,23 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
-    // the overlap duplication negligible.
+    // the overlap duplication negligible, and scales with the level's
+    // overlap so deep-search levels don't pay it per job.
+    let window = MatchGeneratorDriver::window_for_level(level);
+    // libzstd's overlap ladder adapted: window/4 for the chain levels
+    // (their deeper searches reach further back) and window/8 for the fast
+    // hash probe — matches reaching beyond the strip simply do not happen,
+    // at a ratio cost bounded by the strip size.
+    let overlap = match level {
+        Level::Fastest => window as usize / 8,
+        _ => window as usize / 4,
+    };
     let job_size = src
         .len()
         .div_ceil(workers as usize * 2)
-        .max(MIN_JOB_SIZE);
+        .max(MIN_JOB_SIZE.max(overlap * 4));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
-    // libzstd's fast-strategy overlap (window >> 3): matches reaching further
-    // back than one job simply do not happen, at a ratio cost bounded by the
-    // strip size.
-    let overlap = MatchGeneratorDriver::WINDOW_SIZE as usize / 8;
 
     #[cfg(feature = "hash")]
     let mut frame_hash = checksum.then(|| crate::xxh64::Xxh64::new(0));
@@ -77,7 +83,7 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
         single_segment: false,
         content_checksum: checksum,
         dictionary_id: None,
-        window_size: Some(MatchGeneratorDriver::WINDOW_SIZE),
+        window_size: Some(MatchGeneratorDriver::window_for_level(level)),
     }
     .serialize(&mut output);
 
@@ -254,6 +260,27 @@ mod tests {
             st.len(),
             mt.len()
         );
+    }
+
+    /// The chain levels must ride the job path too: the repcode gate plus a
+    /// fresh-table job start interact with the deeper search.
+    #[test]
+    fn mt_chain_levels_roundtrip() {
+        let data = textish(5 * 1024 * 1024);
+        for level in [crate::Level::Fast, crate::Level::Balanced] {
+            let compressed = compress_slice_mt(&data, level, true, 4);
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&compressed, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+            let st = crate::encoding::compress_slice_to_vec(&data, level);
+            assert!(
+                compressed.len() <= st.len() + st.len() / 50,
+                "mt ratio must stay near single-thread: {} vs {}",
+                compressed.len(),
+                st.len()
+            );
+        }
     }
 
     /// Inputs below the engagement threshold must fall back to the
