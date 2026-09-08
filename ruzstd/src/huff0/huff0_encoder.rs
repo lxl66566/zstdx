@@ -92,7 +92,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         // The batched writer performs the same bit accumulation as one
         // write_bits call per symbol (data reversed, since the format reads
         // the stream back to front), so the output is bit-identical.
-        writer.write_packed_codes_rev(&table.packed, data);
+        writer.write_packed_codes_rev(&table.packed, table.uniform_nb, data);
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
@@ -161,6 +161,11 @@ pub struct HuffmanTable {
     /// L1-resident). Weight redistribution caps codes at 9 bits, so the
     /// packing cannot overflow.
     packed: [u16; 256],
+    /// The common code length when every symbol shares one length (flat
+    /// alphabets such as 9..16 symbols), zero otherwise. Fixed-length codes
+    /// let the stream encoder pack two symbols per byte without the
+    /// variable-length accumulation chain.
+    uniform_nb: u8,
 }
 
 impl HuffmanTable {
@@ -225,6 +230,7 @@ impl HuffmanTable {
         let mut table = HuffmanTable {
             codes: Vec::with_capacity(weights.len()),
             packed: [0; 256],
+            uniform_nb: 0,
         };
         for _ in 0..weights.len() {
             table.codes.push((0, 0));
@@ -241,6 +247,9 @@ impl HuffmanTable {
         let mut current_code = 0;
         let mut current_weight = 0;
         let mut current_num_bits = 0;
+        let mut uniform_nb = 0u8;
+        let mut seen_first = false;
+        let mut all_same = true;
         for entry in sorted.iter() {
             // If the entry isn't the same weight as the last one we need to change a few things
             if current_weight != entry.weight {
@@ -251,10 +260,18 @@ impl HuffmanTable {
                 // Run the next update when the weight changes again
                 current_weight = entry.weight;
             }
+            if seen_first && current_num_bits != uniform_nb as usize {
+                all_same = false;
+            }
+            uniform_nb = current_num_bits as u8;
+            seen_first = true;
             table.codes[entry.symbol as usize] = (current_code as u32, current_num_bits as u8);
             debug_assert!(current_num_bits <= 11 && current_code <= 0xFFF);
             table.packed[entry.symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
             current_code += 1;
+        }
+        if all_same && sorted.len() >= 2 {
+            table.uniform_nb = uniform_nb;
         }
 
         table

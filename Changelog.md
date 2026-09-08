@@ -4,6 +4,14 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Flat huffman tables (every symbol sharing one code length, e.g. the
+  9..16-symbol alphabets of uniform data) take a dedicated bulk encoder
+  path: after byte-aligning the pending bits it packs two four-bit codes
+  per output byte straight into the destination, replacing the
+  variable-length accumulation chain. skewed gains 53% throughput
+  (47% fewer instructions); other corpora are untouched and output stays
+  bit-identical.
+
 * The three sequence-code histograms (literal length, match length, offset)
   fill in a single pass over the packed codes instead of one pass per
   table; the per-table mode decision moved into a shared helper. json

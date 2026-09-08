@@ -205,8 +205,14 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// four symbols always fit the container once fewer than eight bits are
     /// pending — the hot loop pays one flush per four symbols instead of a
     /// container-overflow branch per symbol. Produces the same bits as one
-    /// `write_bits` call per symbol.
-    pub fn write_packed_codes_rev(&mut self, packed: &[u16; 256], data: &[u8]) {
+    /// `write_bits` call per symbol. `uniform_nb` is the common code length
+    /// when the table is flat (zero otherwise); four-bit uniform codes take
+    /// a dedicated bulk path that packs two symbols per output byte.
+    pub fn write_packed_codes_rev(&mut self, packed: &[u16; 256], uniform_nb: u8, data: &[u8]) {
+        let mut data = data;
+        if uniform_nb == 4 && data.len() >= 16 && self.bits_in_partial % 4 == 0 {
+            data = self.write_uniform4_bulk(packed, data);
+        }
         let mut acc = self.partial;
         let mut bits = self.bits_in_partial;
         let output = self.output.as_mut();
@@ -266,6 +272,86 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.partial = acc;
         self.bits_in_partial = bits;
         self.bit_idx = pos * 8;
+    }
+
+    /// Bulk tail of [`write_packed_codes_rev`] for flat four-bit tables:
+    /// byte-aligns the pending bits, then packs whole 16-symbol groups as
+    /// eight bytes each (two symbols per byte, first-encoded symbol in the
+    /// low nibble) straight into the output. Returns the unconsumed prefix
+    /// for the generic loop. Caller guarantees `bits_in_partial % 4 == 0`
+    /// and `data.len() >= 16`.
+    fn write_uniform4_bulk<'a>(&mut self, packed: &[u16; 256], data: &'a [u8]) -> &'a [u8] {
+        let mut acc = self.partial;
+        let mut bits = self.bits_in_partial;
+        let mut n = data.len();
+        // Peel trailing symbols until the pending bits hit a byte border so
+        // the bulk groups start byte-aligned (at most two four-bit symbols).
+        while bits % 8 != 0 {
+            let t = packed[data[n - 1] as usize];
+            acc |= ((t >> 4) as u64) << bits;
+            bits += 4;
+            n -= 1;
+        }
+        let output = self.output.as_mut();
+        let mut pos = self.bit_idx / 8;
+        let k = bits / 8;
+        if k > 0 {
+            if pos + 16 > output.capacity() {
+                output.reserve(pos + 16 - output.len());
+            }
+            // SAFETY: the capacity check covers the 8-byte store; only the
+            // low k bytes are semantic, the overshoot is overwritten by the
+            // bulk stores or snapped off by the final set_len.
+            unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(pos)
+                    .cast::<u64>()
+                    .write_unaligned(acc.to_le());
+            }
+            pos += k;
+            acc >>= 8 * k;
+            bits -= 8 * k;
+        }
+        debug_assert_eq!(bits, 0);
+
+        let groups = n / 16;
+        let bulk_end = n - groups * 16;
+        if groups > 0 {
+            let total = groups * 8;
+            if pos + total + 16 > output.capacity() {
+                output.reserve(pos + total + 16 - output.len());
+            }
+            // SAFETY: the reserve covers every store below; positions stay
+            // within pos..pos+total. Four-bit codes cannot exceed the low
+            // nibble, so two packed codes exactly form one output byte.
+            unsafe {
+                let mut p = output.as_mut_ptr().add(pos);
+                let lut = |b: u8| (packed[b as usize] >> 4) as u8;
+                let mut i = n;
+                while i > bulk_end {
+                    // Encoding order runs back to front: data[i-1] is the
+                    // next symbol and lands in the low nibble of byte 0.
+                    *p = lut(data[i - 1]) | lut(data[i - 2]) << 4;
+                    *p.add(1) = lut(data[i - 3]) | lut(data[i - 4]) << 4;
+                    *p.add(2) = lut(data[i - 5]) | lut(data[i - 6]) << 4;
+                    *p.add(3) = lut(data[i - 7]) | lut(data[i - 8]) << 4;
+                    *p.add(4) = lut(data[i - 9]) | lut(data[i - 10]) << 4;
+                    *p.add(5) = lut(data[i - 11]) | lut(data[i - 12]) << 4;
+                    *p.add(6) = lut(data[i - 13]) | lut(data[i - 14]) << 4;
+                    *p.add(7) = lut(data[i - 15]) | lut(data[i - 16]) << 4;
+                    p = p.add(8);
+                    i -= 16;
+                }
+            }
+            pos += total;
+        }
+        // SAFETY: pos is the semantic end; see write_packed_codes_rev.
+        unsafe { output.set_len(pos) };
+        self.partial = acc;
+        self.bits_in_partial = bits;
+        self.bit_idx = pos * 8;
+        &data[..bulk_end]
     }
 
     /// Returns the populated buffer that you've been writing bits into.
@@ -464,6 +550,14 @@ mod tests {
             let code = next() as usize & ((1 << nb) - 1);
             *p = ((code << 4) | nb) as u16;
         }
+        // Flat table variant: every symbol shares a four-bit code, which is
+        // what uniform alphabets (9..16 symbols) produce; the bulk path must
+        // reproduce the generic bit accumulation for every entry alignment.
+        let mut packed_uniform = [0u16; 256];
+        for (sym, p) in packed_uniform.iter_mut().enumerate() {
+            let code = (sym * 7 + 3) & 0xF;
+            *p = ((code << 4) | 4) as u16;
+        }
         for size in [0usize, 1, 2, 3, 4, 5, 8, 31, 1025, 4096, 16384] {
             let mut data = vec![0u8; size];
             for b in &mut data {
@@ -471,36 +565,38 @@ mod tests {
             }
             // Entry states the encoder really produces: fresh writer, and
             // writers with a partial container left by preceding headers.
-            for entry_bits in [0usize, 3, 8, 17, 48, 63] {
-                let mut reference = BitWriter::new();
-                let mut batched = BitWriter::new();
-                if entry_bits > 0 {
-                    let entry = next() & ((1u64 << entry_bits.min(63)) - 1);
-                    reference.write_bits(entry, entry_bits.min(63));
-                    batched.write_bits(entry, entry_bits.min(63));
+            for entry_bits in [0usize, 3, 4, 8, 12, 17, 20, 48, 63] {
+                for (packed, uniform_nb) in [(packed, 0u8), (packed_uniform, 4u8)] {
+                    let mut reference = BitWriter::new();
+                    let mut batched = BitWriter::new();
+                    if entry_bits > 0 {
+                        let entry = next() & ((1u64 << entry_bits.min(63)) - 1);
+                        reference.write_bits(entry, entry_bits.min(63));
+                        batched.write_bits(entry, entry_bits.min(63));
+                    }
+                    for symbol in data.iter().rev() {
+                        let t = packed[*symbol as usize];
+                        reference.write_bits((t >> 4) as u64, (t & 15) as usize);
+                    }
+                    let fill = reference.misaligned();
+                    if fill == 0 {
+                        reference.write_bits(1u32, 8);
+                    } else {
+                        reference.write_bits(1u32, fill);
+                    }
+                    batched.write_packed_codes_rev(&packed, uniform_nb, &data);
+                    let fill = batched.misaligned();
+                    if fill == 0 {
+                        batched.write_bits(1u32, 8);
+                    } else {
+                        batched.write_bits(1u32, fill);
+                    }
+                    assert_eq!(
+                        reference.dump(),
+                        batched.dump(),
+                        "stream mismatch at size {size} entry_bits {entry_bits} uniform {uniform_nb}"
+                    );
                 }
-                for symbol in data.iter().rev() {
-                    let t = packed[*symbol as usize];
-                    reference.write_bits((t >> 4) as u64, (t & 15) as usize);
-                }
-                let fill = reference.misaligned();
-                if fill == 0 {
-                    reference.write_bits(1u32, 8);
-                } else {
-                    reference.write_bits(1u32, fill);
-                }
-                batched.write_packed_codes_rev(&packed, &data);
-                let fill = batched.misaligned();
-                if fill == 0 {
-                    batched.write_bits(1u32, 8);
-                } else {
-                    batched.write_bits(1u32, fill);
-                }
-                assert_eq!(
-                    reference.dump(),
-                    batched.dump(),
-                    "stream mismatch at size {size} entry_bits {entry_bits}"
-                );
             }
         }
     }
