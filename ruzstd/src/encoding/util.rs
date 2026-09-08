@@ -1,21 +1,35 @@
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-/// Exact uniform-run detection, word-at-a-time like libzstd's `ZSTD_isRLE`
-/// (the chunked u64 compare widens to SIMD compares on x86_64 and aarch64).
+/// Exact uniform-run detection, word-at-a-time like libzstd's `ZSTD_isRLE`.
+/// Batches of four u64 comparisons keep the common non-uniform exit cheap
+/// (one batch) while the independent xor/or chains pipeline: a plain
+/// early-exit loop spends one branchy compare per 8 bytes, which dominated
+/// fully-uniform blocks (zero-filled corpora tails).
 #[inline]
 pub(crate) fn is_uniform(data: &[u8]) -> bool {
-    if data.is_empty() {
+    let Some(&first) = data.first() else {
         return true;
-    }
-    let first = data[0];
+    };
     let broadcast = u64::from(first) * 0x0101_0101_0101_0101;
-    let mut chunks = data.chunks_exact(8);
-    let all_eq = chunks.all(|c| u64::from_le_bytes(c.try_into().unwrap()) == broadcast);
+    let mut batches = data.chunks_exact(32);
+    let all_eq = batches.all(|c| {
+        let diff = u64::from_le_bytes(c[0..8].try_into().unwrap()) ^ broadcast
+            | u64::from_le_bytes(c[8..16].try_into().unwrap()) ^ broadcast
+            | u64::from_le_bytes(c[16..24].try_into().unwrap()) ^ broadcast
+            | u64::from_le_bytes(c[24..32].try_into().unwrap()) ^ broadcast;
+        diff == 0
+    });
     if !all_eq {
         return false;
     }
-    chunks.remainder().iter().all(|&b| b == first)
+    let tail = batches.remainder();
+    let mut words = tail.chunks_exact(8);
+    let tail_eq = words.all(|w| u64::from_le_bytes(w.try_into().unwrap()) == broadcast);
+    if !tail_eq {
+        return false;
+    }
+    words.remainder().iter().all(|&b| b == first)
 }
 
 /// Returns the minimum number of bytes needed to represent this value, as

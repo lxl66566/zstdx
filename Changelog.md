@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The uniform-block detector compares four u64 words per branch instead of
+  one, so fully-uniform blocks (zero-filled inputs, padded corpus tails)
+  stop paying a branchy scan of the whole block while non-uniform blocks
+  still exit after the first batch. zeros +7%, text +1%, other corpora
+  neutral.
+
 * Encoder round eight: sequence codes and their add-bit payloads are
   precomputed in a single pass over the sequences (codes packed into one
   u32 stream, add bits pre-merged into one u64 per sequence), replacing the
