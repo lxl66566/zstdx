@@ -4,6 +4,31 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Flat four-bit huffman streams (uniform alphabets of 9..16 symbols, e.g.
+  low-cardinality columns) pack through an AVX-512VBMI kernel: one 64-symbol
+  chunk resolves its 256-entry code LUT with two byte permutes, reverses
+  and pair-packs nibbles with two more, replacing sixteen scalar LUT loads
+  per sixteen symbols. skewed executes 48% fewer instructions and gains
+  ~43% throughput; the scalar loop remains for sub-64-symbol tails and
+  non-x86/no-std builds, and the output is bit-identical.
+
+* New `compress_slice_to_vec` entry point compresses an in-memory buffer
+  with no intermediate copies: the matcher window borrows the input
+  directly (eliminating the read pass, window compaction and per-call
+  window allocation of the streaming path) and blocks append straight into
+  the output vector, which is sized up front. Output is byte-identical to
+  the streaming path, including its exact-block-multiple trailing empty
+  block. text gains ~40% and zeros ~60% throughput, random ~12%; the
+  matcher-bound shapes are unchanged.
+
+* Long matches index only two anchors (start+2, end-2) in the hash table
+  instead of every fourth position plus the final byte, mirroring zstd's
+  fast-strategy fill policy; short matches (<= 16 bytes) keep their dense
+  indexing. The 4-byte grid across long matches dominated encoder time on
+  highly repetitive data: text executes 31% fewer instructions and gains
+  32% throughput while its ratio improves (295.0 -> 298.6), json gains 5%
+  with its ratio nearly unchanged (6.02 -> 5.99).
+
 * The scan loop's hash-table probes read their slots unchecked as well: the
   hash masks to the table's power-of-two size, so the per-probe bounds
   checks were provably dead (the insertion side already dropped its check).
