@@ -242,6 +242,12 @@ pub struct MatchGeneratorDriver {
     /// Repeated-offset history, kept in lockstep with the decoder's
     /// `offset_hist` so repcode probes see the same candidates it will.
     rep: [u32; 3],
+    /// Literal-offset sequences still required before repcode references
+    /// are decodable: 0 means the history above is known to match the
+    /// decoder's. A job that starts mid-frame (see the mt module) cannot
+    /// know the decoder's history; three literal offsets shift it fully
+    /// into known territory because the update is a plain 3-slot shift.
+    rep_pending: u8,
     slice_size: usize,
 }
 
@@ -269,6 +275,10 @@ fn window_slice<'a>(win: &'a Vec<u8>, ext: &'a Option<ExtWindow>) -> &'a [u8] {
 }
 
 impl MatchGeneratorDriver {
+    /// The window size frames compressed with this matcher declare in their
+    /// header; usable without constructing an instance.
+    pub const WINDOW_SIZE: u64 = MAX_WINDOW as u64;
+
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
     /// zstd block maximum is 128 KiB).
     pub fn new(slice_size: usize) -> Self {
@@ -288,6 +298,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             rep: [1, 4, 8],
+            rep_pending: 0,
             slice_size,
         }
     }
@@ -308,6 +319,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             rep: [1, 4, 8],
+            rep_pending: 0,
             slice_size: 0,
         }
     }
@@ -338,6 +350,15 @@ impl MatchGeneratorDriver {
         self.anchor = start;
     }
 
+    /// Forbid repcode references until three literal-offset sequences have
+    /// rewritten the repeated-offset history. Used by multithreaded jobs
+    /// that start mid-frame: the decoder's history there is unknown, and a
+    /// repcode reference to a stale value would copy from the wrong place.
+    /// Mirrors libzstd's `ZSTD_invalidateRepCodes`.
+    pub fn gate_repcodes(&mut self) {
+        self.rep_pending = 3;
+    }
+
     #[inline(always)]
     fn idx_of(&self, abs: u64) -> usize {
         (abs - self.win_base) as usize
@@ -362,10 +383,11 @@ impl Matcher for MatchGeneratorDriver {
         self.miss_count = 0;
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
+        self.rep_pending = 0;
     }
 
     fn window_size(&self) -> u64 {
-        MAX_WINDOW as u64
+        Self::WINDOW_SIZE
     }
 
     fn repcode_snapshot(&self) -> [u32; 3] {
@@ -468,6 +490,7 @@ impl Matcher for MatchGeneratorDriver {
         let mut anchor = self.anchor;
         let mut miss_count = self.miss_count;
         let mut rep = self.rep;
+        let mut rep_pending = self.rep_pending;
         let hash_read = HASH_READ as u64;
 
         // Two-position pipeline (libzstd's ip0/ip1 interleave): the hash and
@@ -517,7 +540,15 @@ impl Matcher for MatchGeneratorDriver {
             // literals pending the probe runs at the current position,
             // otherwise one byte ahead so that byte becomes the literal.
             {
-                let probe = if pos == anchor { pos + 1 } else { pos };
+                // A gated job start must not probe repcodes (unknown decoder
+                // history); probe 0 makes the checked_sub below underflow.
+                let probe = if rep_pending != 0 {
+                    0
+                } else if pos == anchor {
+                    pos + 1
+                } else {
+                    pos
+                };
                 if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
                     if cand_abs >= win_base {
                         let mut cand = (cand_abs - win_base) as usize;
@@ -584,10 +615,22 @@ impl Matcher for MatchGeneratorDriver {
                                     win, table, epoch, anchor, win_base, insert_max, start, ml,
                                     of_value, &mut rep, literals, codes, add_bits, add_nbs,
                                 );
-                                pos = rep1_chain(
-                                    win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, codes, add_bits, add_nbs,
-                                );
+                                // A literal offset shifts the decoder's history
+                                // one slot down; after the third one a job-start
+                                // gate has fully converged and repcode use is
+                                // safe again.
+                                if rep_pending != 0 {
+                                    rep_pending -= 1;
+                                }
+                                pos = if rep_pending == 0 {
+                                    rep1_chain(
+                                        win, table, epoch, anchor, block_end, win_base,
+                                        insert_max, &mut rep, literals, codes, add_bits,
+                                        add_nbs,
+                                    )
+                                } else {
+                                    anchor
+                                };
                                 anchor = pos;
                                 miss_count = 0;
                                 continue 'restart;
@@ -600,7 +643,14 @@ impl Matcher for MatchGeneratorDriver {
             // Probe the second position through the entry prepared above.
             if pair_len == 2 {
                 let pos1 = pos + 1;
-                let probe = if pos1 == anchor { pos1 + 1 } else { pos1 };
+                // Gated job starts skip the repcode probe (see above).
+                let probe = if rep_pending != 0 {
+                    0
+                } else if pos1 == anchor {
+                    pos1 + 1
+                } else {
+                    pos1
+                };
                 if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
                     if cand_abs >= win_base {
                         let mut cand = (cand_abs - win_base) as usize;
@@ -657,10 +707,22 @@ impl Matcher for MatchGeneratorDriver {
                                     win, table, epoch, anchor, win_base, insert_max, start, ml,
                                     of_value, &mut rep, literals, codes, add_bits, add_nbs,
                                 );
-                                pos = rep1_chain(
-                                    win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, codes, add_bits, add_nbs,
-                                );
+                                // A literal offset shifts the decoder's history
+                                // one slot down; after the third one a job-start
+                                // gate has fully converged and repcode use is
+                                // safe again.
+                                if rep_pending != 0 {
+                                    rep_pending -= 1;
+                                }
+                                pos = if rep_pending == 0 {
+                                    rep1_chain(
+                                        win, table, epoch, anchor, block_end, win_base,
+                                        insert_max, &mut rep, literals, codes, add_bits,
+                                        add_nbs,
+                                    )
+                                } else {
+                                    anchor
+                                };
                                 anchor = pos;
                                 miss_count = 0;
                                 continue 'restart;
@@ -689,6 +751,7 @@ impl Matcher for MatchGeneratorDriver {
         self.anchor = block_end;
         self.miss_count = miss_count;
         self.rep = rep;
+        self.rep_pending = rep_pending;
     }
 
     fn skip_matching(&mut self) {

@@ -134,66 +134,90 @@ impl BlockChecksum for FrameHasher {
 
 /// Slice-path checksum backend: inline below the offload threshold (the
 /// sidecar thread's spawn and hand-off cost more than hashing saves on small
-/// inputs), offloaded above it.
-#[cfg(all(feature = "std", feature = "hash"))]
+/// inputs), offloaded above it, or disabled when the caller opted out of a
+/// checksum (the uniform scan still runs for the RLE path).
 pub(crate) enum SliceChecksum {
+    #[cfg(feature = "hash")]
     Inline(FrameHasher),
+    #[cfg(all(feature = "std", feature = "hash"))]
     Offload(super::async_checksum::AsyncChecksum),
+    Off,
 }
 
 #[cfg(all(feature = "std", feature = "hash"))]
 const ASYNC_MIN_INPUT: usize = 256 * 1024;
 
-#[cfg(all(feature = "std", feature = "hash"))]
 impl SliceChecksum {
-    pub(crate) fn new(src_len: usize) -> Self {
+    pub(crate) fn new(src_len: usize, checksum: bool) -> Self {
+        if !checksum {
+            return Self::Off;
+        }
+        #[cfg(all(feature = "std", feature = "hash"))]
         if src_len >= ASYNC_MIN_INPUT {
             if let Some(offload) = super::async_checksum::AsyncChecksum::new() {
                 return Self::Offload(offload);
             }
         }
-        Self::Inline(FrameHasher::new())
+        #[cfg(feature = "hash")]
+        {
+            Self::Inline(FrameHasher::new())
+        }
+        #[cfg(not(feature = "hash"))]
+        {
+            Self::Off
+        }
     }
 }
 
-#[cfg(all(feature = "std", feature = "hash"))]
 impl BlockChecksum for SliceChecksum {
     #[inline]
     fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
         match self {
+            #[cfg(feature = "hash")]
             Self::Inline(h) => h.scan_block(data),
             // The whole block is posted up front; the resume paths below see
             // a covered offset equal to the length and contribute nothing.
+            #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => {
                 h.write(data);
                 (super::util::is_uniform(data), data.len())
             }
+            Self::Off => (super::util::is_uniform(data), 0),
         }
     }
     #[inline]
     fn hash_tail(&mut self, bytes: &[u8]) {
         match self {
+            #[cfg(feature = "hash")]
             Self::Inline(h) => h.hash_tail(bytes),
+            #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => h.write(bytes),
+            Self::Off => {}
         }
     }
     #[inline]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
         match self {
+            #[cfg(feature = "hash")]
             Self::Inline(h) => h.raw_out(out, bytes, from),
+            #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => {
                 out.extend_from_slice(bytes);
                 if from < bytes.len() {
                     h.write(&bytes[from..]);
                 }
             }
+            Self::Off => out.extend_from_slice(bytes),
         }
     }
     #[inline]
     fn finish32(&mut self) -> u32 {
         match self {
+            #[cfg(feature = "hash")]
             Self::Inline(h) => h.finish32(),
+            #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => h.finish(),
+            Self::Off => 0,
         }
     }
 }
@@ -286,27 +310,45 @@ pub(crate) fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>,
     state.fse_tables.of_previous = None;
 }
 
+/// Take the per-thread pooled slice state, reset for a fresh frame at
+/// `level`. Fresh states are built (and reset) when the pool is empty.
+pub(crate) fn take_slice_state(level: Level) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    #[cfg(feature = "std")]
+    if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
+        reset_slice_state(&mut s, level);
+        return s;
+    }
+    let mut fresh = alloc::boxed::Box::new(new_slice_state());
+    reset_slice_state(&mut fresh, level);
+    fresh
+}
+
+/// Return a state taken by [`take_slice_state`] to the pool.
+pub(crate) fn return_slice_state(
+    state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+) {
+    #[cfg(feature = "std")]
+    SLICE_STATE.with(|p| *p.borrow_mut() = Some(state));
+    #[cfg(not(feature = "std"))]
+    drop(state);
+}
+
 /// Compress an in-memory buffer into a fresh Vec with no intermediate
 /// copies: the matcher window points directly into `src` (no read pass, no
 /// window compaction, no window allocation) and blocks append straight into
 /// the output (no staging buffer). Produces the same bytes as
 /// [`super::compress`] over the same input.
 pub fn compress_slice_to_vec(src: &[u8], level: Level) -> Vec<u8> {
-    #[cfg(feature = "std")]
-    let mut pooled = SLICE_STATE.with(|p| p.borrow_mut().take()).map(|mut s| {
-        reset_slice_state(&mut s, level);
-        s
-    });
-    #[cfg(feature = "std")]
-    let mut state = match pooled.take() {
-        Some(s) => s,
-        None => alloc::boxed::Box::new(new_slice_state()),
-    };
-    #[cfg(not(feature = "std"))]
-    let mut state = new_slice_state();
-    let output = compress_with_state(&mut state, src, level);
-    #[cfg(feature = "std")]
-    SLICE_STATE.with(|p| *p.borrow_mut() = Some(state));
+    compress_slice_opts(src, level, cfg!(feature = "hash"))
+}
+
+/// [`compress_slice_to_vec`] with a runtime checksum switch (the frame
+/// header flag and the trailing hash follow `checksum`, modulo the `hash`
+/// feature).
+pub fn compress_slice_opts(src: &[u8], level: Level, checksum: bool) -> Vec<u8> {
+    let mut state = take_slice_state(level);
+    let output = compress_with_state(&mut state, src, level, checksum);
+    return_slice_state(state);
     output
 }
 
@@ -314,11 +356,9 @@ fn compress_with_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
     level: Level,
+    checksum: bool,
 ) -> Vec<u8> {
-    #[cfg(all(feature = "std", feature = "hash"))]
-    let mut hasher = SliceChecksum::new(src.len());
-    #[cfg(not(all(feature = "std", feature = "hash")))]
-    let mut hasher = FrameHasher::new();
+    let mut hasher = SliceChecksum::new(src.len(), checksum);
     // Worst case (every block raw) is the input size plus block headers;
     // reserving it up front keeps the output free of realloc copies, and the
     // untouched tail of the reservation only costs address space.
@@ -328,7 +368,7 @@ fn compress_with_state(
     let header = FrameHeader {
         frame_content_size: None,
         single_segment: false,
-        content_checksum: cfg!(feature = "hash"),
+        content_checksum: checksum && cfg!(feature = "hash"),
         dictionary_id: None,
         window_size: Some(state.matcher.window_size()),
     };
@@ -375,7 +415,52 @@ fn compress_with_state(
         header.serialize(&mut output);
     }
     #[cfg(feature = "hash")]
-    output.extend_from_slice(&hasher.finish32().to_le_bytes());
+    if checksum {
+        output.extend_from_slice(&hasher.finish32().to_le_bytes());
+    }
+    output
+}
+
+/// Compress the blocks of one multithreaded job into `output`: no frame
+/// header, no checksum (the mt driver writes both around the assembled job
+/// stream). The caller resets the state per job (fresh entropy tables, so
+/// every job's first block is self-describing) and gates repcodes on every
+/// job except the first, which starts where the decoder's history matches
+/// the format default [1, 4, 8].
+///
+/// `src` is the whole frame input and must stay alive and unchanged for the
+/// call (the matcher window borrows into it); `job` is the byte range this
+/// job encodes and `overlap` the preceding history the matcher may reference.
+pub(crate) fn compress_job_blocks(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    job: core::ops::Range<usize>,
+    overlap: usize,
+    is_last_job: bool,
+) -> Vec<u8> {
+    let block_size = crate::common::MAX_BLOCK_SIZE as usize;
+    let max_window = state.matcher.window_size() as usize;
+    let mut output =
+        Vec::with_capacity(job.len() + 3 * (job.len() / block_size + 1) + 8);
+    // Uniform detection still runs (the RLE path), but the frame checksum is
+    // the mt driver's job over the whole input.
+    let mut hasher = SliceChecksum::new(0, false);
+    let mut cursor = job.start;
+    while cursor < job.end {
+        let block_end = (cursor + block_size).min(job.end);
+        let last_block = is_last_job && block_end == job.end;
+        // Candidates never precede this job's first indexed position, so the
+        // window only needs the overlap strip plus the in-job history room.
+        let hist = cursor
+            .saturating_sub(max_window)
+            .max(job.start.saturating_sub(overlap));
+        state
+            .matcher
+            .adopt_window(&src[hist..block_end], hist as u64);
+        state.matcher.set_block(cursor as u64, block_end as u64);
+        super::levels::compress_fastest(state, last_block, &mut output, &mut hasher);
+        cursor = block_end;
+    }
     output
 }
 

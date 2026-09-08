@@ -49,9 +49,10 @@ impl EncoderOptions {
     }
 
     /// Number of worker threads for compression. `0` (the default) compresses
-    /// on the calling thread; more than one worker currently fails with
-    /// [`Error::Unsupported`][crate::Error::Unsupported] until the
-    /// multithreaded backend lands.
+    /// on the calling thread. More than one worker parallelizes the one-shot
+    /// paths ([`bulk::compress_with`][crate::bulk::compress_with]) on std
+    /// builds; the streaming encoders still reject it with
+    /// [`Error::Unsupported`][crate::Error::Unsupported].
     pub const fn workers(mut self, workers: u32) -> Self {
         self.workers = workers;
         self

@@ -24,6 +24,30 @@ pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
     crate::encoding::compress_slice_to_vec(source, level)
 }
 
+/// [`compress`] with a full option set: more than one worker engages the
+/// multithreaded job path on std builds, and the checksum flag decides
+/// whether the frame carries a content checksum.
+///
+/// ```rust
+/// let data = b"the quick brown fox jumps over the lazy dog";
+/// let opts = ruzstd::EncoderOptions::new(ruzstd::Level::Fastest).checksum(true);
+/// let compressed = ruzstd::bulk::compress_with(data, &opts);
+/// let decompressed = ruzstd::bulk::decompress(&compressed, data.len()).unwrap();
+/// assert_eq!(&decompressed[..], data);
+/// ```
+pub fn compress_with(source: &[u8], options: &crate::EncoderOptions) -> alloc::vec::Vec<u8> {
+    #[cfg(feature = "std")]
+    if options.workers > 1 {
+        return crate::encoding::mt::compress_slice_mt(
+            source,
+            options.level,
+            options.checksum,
+            options.workers,
+        );
+    }
+    crate::encoding::compress_slice_opts(source, options.level, options.checksum)
+}
+
 /// Decompress a zstd stream (possibly several concatenated frames) into a
 /// fresh Vec.
 ///
