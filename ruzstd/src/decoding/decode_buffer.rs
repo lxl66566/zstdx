@@ -1,7 +1,7 @@
 use crate::io::{Error, Read, Write};
-use alloc::vec::Vec;
 #[cfg(feature = "hash")]
 use crate::xxh64::Xxh64;
+use alloc::vec::Vec;
 
 use super::ringbuffer::RingBuffer;
 use crate::decoding::errors::DecodeBufferError;

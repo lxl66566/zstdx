@@ -233,7 +233,11 @@ fn pack_tables(scratch: &mut FSEScratch) {
     if !scratch.of_seq_valid {
         match scratch.of_rle {
             Some(c) => pack_rle_entry(OF_CODES[c as usize], &mut scratch.seq_packed[OF_SLOT]),
-            None => pack_seq_table(&scratch.offsets, &OF_CODES, &mut scratch.seq_packed[OF_SLOT..]),
+            None => pack_seq_table(
+                &scratch.offsets,
+                &OF_CODES,
+                &mut scratch.seq_packed[OF_SLOT..],
+            ),
         }
         scratch.of_seq_valid = true;
     }
@@ -305,9 +309,17 @@ impl SeqDecoder {
 
         // Initial states are read in the order ll, of, ml (RLE streams have
         // accuracy_log 0, so their read is a no-op that leaves state 0)
-        let ll_state = read(&mut win, &mut consumed, scratch.literal_lengths.accuracy_log as u32) as u32;
+        let ll_state = read(
+            &mut win,
+            &mut consumed,
+            scratch.literal_lengths.accuracy_log as u32,
+        ) as u32;
         let of_state = read(&mut win, &mut consumed, scratch.offsets.accuracy_log as u32) as u32;
-        let ml_state = read(&mut win, &mut consumed, scratch.match_lengths.accuracy_log as u32) as u32;
+        let ml_state = read(
+            &mut win,
+            &mut consumed,
+            scratch.match_lengths.accuracy_log as u32,
+        ) as u32;
         // Realign the window before the first sequence; the loop only reloads
         // at sequence ends (the state reads above already consumed up to 26
         // bits)
@@ -715,10 +727,9 @@ fn maybe_update_fse_tables(
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
             if !scratch.of_predefined {
-                scratch.offsets.build_from_probabilities(
-                    OF_DEFAULT_ACC_LOG,
-                    &OFFSET_DEFAULT_DISTRIBUTION,
-                )?;
+                scratch
+                    .offsets
+                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
                 scratch.of_predefined = true;
                 scratch.of_seq_valid = false;
             }

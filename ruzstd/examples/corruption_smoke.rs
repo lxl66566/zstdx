@@ -6,7 +6,9 @@ use std::time::Duration;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: corruption_smoke <file.zst> [rounds]");
+    let path = args
+        .next()
+        .expect("usage: corruption_smoke <file.zst> [rounds]");
     let rounds: usize = args.next().map_or(64, |s| s.parse().unwrap());
     let data = std::fs::read(&path).unwrap();
     // Size the decode_all target from the clean input.

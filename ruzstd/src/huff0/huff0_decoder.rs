@@ -526,9 +526,8 @@ impl HuffmanTable {
         self.x2.resize(1 << TARGET_LOG, 0);
         let dt = &mut self.x2;
 
-        let pack = |sequence: u32, nb_bits: u32, length: u32| {
-            sequence | (nb_bits << 16) | (length << 24)
-        };
+        let pack =
+            |sequence: u32, nb_bits: u32, length: u32| sequence | (nb_bits << 16) | (length << 24);
 
         for w in 1..=max_w {
             let nb_bits = nb_bits_baseline - w as i32;

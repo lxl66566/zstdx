@@ -136,9 +136,25 @@ fn execute_decoded_flat_impl(
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
     if view.origin == 0 {
-        execute_decoded_flat_inner::<true>(dec, literals, out, written, virt_base, view, offset_hist)
+        execute_decoded_flat_inner::<true>(
+            dec,
+            literals,
+            out,
+            written,
+            virt_base,
+            view,
+            offset_hist,
+        )
     } else {
-        execute_decoded_flat_inner::<false>(dec, literals, out, written, virt_base, view, offset_hist)
+        execute_decoded_flat_inner::<false>(
+            dec,
+            literals,
+            out,
+            written,
+            virt_base,
+            view,
+            offset_hist,
+        )
     }
 }
 
@@ -212,7 +228,8 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
         w += rest;
     }
     *written = w;
-    dec.finish().map_err(DecompressBlockError::DecodeSequenceError)
+    dec.finish()
+        .map_err(DecompressBlockError::DecodeSequenceError)
 }
 
 /// Execute a single decoded sequence into the flat target: the literal copy,

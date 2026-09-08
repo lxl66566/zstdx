@@ -347,13 +347,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                         // SAFETY: the feature was just detected; the reserve
                         // covers all stores; i >= simd_stop + 63 keeps the
                         // 64-byte loads inside data.
-                        p = uniform4_pack_avx512(
-                            data,
-                            simd_stop,
-                            n,
-                            p,
-                            &tab,
-                        );
+                        p = uniform4_pack_avx512(data, simd_stop, n, p, &tab);
                         i = simd_stop;
                     }
                     simd_stop

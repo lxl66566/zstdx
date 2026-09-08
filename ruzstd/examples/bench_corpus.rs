@@ -44,12 +44,7 @@ fn main() {
         fr.decode_all_to_vec(compressed, &mut out)
             .unwrap_or_else(|e| panic!("decode {:?} failed: {e}", path));
         if let Some(raw) = raw {
-            assert_eq!(
-                &out[..],
-                &raw[..],
-                "decoded output mismatch for {:?}",
-                path
-            );
+            assert_eq!(&out[..], &raw[..], "decoded output mismatch for {:?}", path);
         }
         total_raw += out.len() as u64;
         total_comp += compressed.len() as u64;

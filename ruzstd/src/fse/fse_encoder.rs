@@ -93,11 +93,15 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
             self.writer.write_bits(diff as u64, next.num_bits as usize);
             state_1 = next.index;
 
-            self.writer.write_bits(state_2 as u64, self.acc_log() as usize);
-            self.writer.write_bits(state_1 as u64, self.acc_log() as usize);
+            self.writer
+                .write_bits(state_2 as u64, self.acc_log() as usize);
+            self.writer
+                .write_bits(state_1 as u64, self.acc_log() as usize);
         } else {
-            self.writer.write_bits(state_1 as u64, self.acc_log() as usize);
-            self.writer.write_bits(state_2 as u64, self.acc_log() as usize);
+            self.writer
+                .write_bits(state_1 as u64, self.acc_log() as usize);
+            self.writer
+                .write_bits(state_2 as u64, self.acc_log() as usize);
         }
 
         let bits_to_fill = self.writer.misaligned();
@@ -168,10 +172,7 @@ impl FSETable {
     /// stride is a shift instead of a multiply.
     pub(crate) fn transitions_flat(&self) -> (&[u32], u32) {
         debug_assert!(self.table_size.is_power_of_two());
-        (
-            &self.transitions[..],
-            self.table_size.trailing_zeros(),
-        )
+        (&self.transitions[..], self.table_size.trailing_zeros())
     }
 
     /// Index of the state encoding a block's last `symbol` starts from.
@@ -365,7 +366,10 @@ pub(crate) fn build_normalized_table(
     ) {
         return None;
     }
-    Some(build_table_from_probabilities(&norm[..=max_symbol], table_log))
+    Some(build_table_from_probabilities(
+        &norm[..=max_symbol],
+        table_log,
+    ))
 }
 
 /// Rounding-threshold table from libzstd's FSE_normalizeCount: fractions of a
@@ -530,7 +534,11 @@ fn normalize_m2(
     true
 }
 
-fn build_table_from_counts(counts: &[usize], max_log: u8, _legacy_avoid_0_numbit: bool) -> FSETable {
+fn build_table_from_counts(
+    counts: &[usize],
+    max_log: u8,
+    _legacy_avoid_0_numbit: bool,
+) -> FSETable {
     let mut probs = [0; 256];
     let probs = &mut probs[..counts.len()];
     let mut min_count = 0;
@@ -753,7 +761,10 @@ mod soa_tests {
     use alloc::vec;
 
     /// Reference: the pre-SoA construction with per-symbol state lists.
-    fn build_reference(probs: &[i32], acc_log: u8) -> (Vec<(u8, u8, usize, usize)>, Vec<usize>, usize) {
+    fn build_reference(
+        probs: &[i32],
+        acc_log: u8,
+    ) -> (Vec<(u8, u8, usize, usize)>, Vec<usize>, usize) {
         #[derive(Clone)]
         struct RState {
             num_bits: u8,
@@ -766,25 +777,45 @@ mod soa_tests {
         let mut negative_idx = (table_size - 1) as i32;
         for (symbol, prob) in probs.iter().copied().enumerate() {
             if prob == -1 {
-                sym_states[symbol].push(RState { num_bits: acc_log, baseline: 0, last_index: table_size - 1, index: negative_idx as usize });
+                sym_states[symbol].push(RState {
+                    num_bits: acc_log,
+                    baseline: 0,
+                    last_index: table_size - 1,
+                    index: negative_idx as usize,
+                });
                 negative_idx -= 1;
             }
         }
         let mut idx = 0usize;
         for (symbol, prob) in probs.iter().copied().enumerate() {
-            if prob <= 0 { continue; }
+            if prob <= 0 {
+                continue;
+            }
             for _ in 0..prob {
-                sym_states[symbol].push(RState { num_bits: 0, baseline: 0, last_index: 0, index: idx });
+                sym_states[symbol].push(RState {
+                    num_bits: 0,
+                    baseline: 0,
+                    last_index: 0,
+                    index: idx,
+                });
                 idx = next_position(idx, table_size);
-                while idx > negative_idx as usize { idx = next_position(idx, table_size); }
+                while idx > negative_idx as usize {
+                    idx = next_position(idx, table_size);
+                }
             }
         }
         for (symbol, prob) in probs.iter().copied().enumerate() {
-            if prob <= 0 { continue; }
+            if prob <= 0 {
+                continue;
+            }
             let prob = prob as u32;
             let st = &mut sym_states[symbol];
             st.sort_by_key(|l| l.index);
-            let prob_log = if prob.is_power_of_two() { prob.ilog2() } else { prob.ilog2() + 1 };
+            let prob_log = if prob.is_power_of_two() {
+                prob.ilog2()
+            } else {
+                prob.ilog2() + 1
+            };
             let rounded_up = 1u32 << prob_log;
             let double_states = rounded_up - prob;
             let single_states = prob - double_states;
@@ -811,9 +842,13 @@ mod soa_tests {
         let mut flat = Vec::new();
         let mut starts = vec![0usize; 256];
         for (symbol, st) in sym_states.iter().enumerate() {
-            if st.is_empty() { continue; }
+            if st.is_empty() {
+                continue;
+            }
             starts[symbol] = st[0].index;
-            for s in st { flat.push((symbol as u8, s.num_bits, s.baseline, s.index)); }
+            for s in st {
+                flat.push((symbol as u8, s.num_bits, s.baseline, s.index));
+            }
         }
         (flat, starts, table_size)
     }
@@ -821,7 +856,12 @@ mod soa_tests {
     #[test]
     fn soa_matches_reference() {
         let mut seed = 0x12345678u64;
-        let mut rand = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
         for case in 0..400 {
             let acc_log = 5 + (rand() % 4) as u8;
             let table_size = 1usize << acc_log;
@@ -832,7 +872,10 @@ mod soa_tests {
             let mut remaining = table_size as i32;
             for p in probs.iter_mut() {
                 if remaining <= 1 {
-                    if remaining == 1 { *p = 1; remaining -= 1; }
+                    if remaining == 1 {
+                        *p = 1;
+                        remaining -= 1;
+                    }
                     continue;
                 }
                 let r = rand();
@@ -850,7 +893,9 @@ mod soa_tests {
                 probs[0] += remaining;
             }
             let sum: i32 = probs.iter().map(|p| if *p == -1 { 1 } else { *p }).sum();
-            if sum != table_size as i32 { continue; }
+            if sum != table_size as i32 {
+                continue;
+            }
             let table = build_table_from_probabilities(&probs, acc_log);
             let (ref_flat, ref_starts, ref_ts) = build_reference(&probs, acc_log);
             assert_eq!(table.table_size, ref_ts, "case {case} ts");
@@ -863,7 +908,11 @@ mod soa_tests {
             // rebuild flat from new table transitions
             for (symbol, nb, baseline, _index) in &ref_flat {
                 let e = table.transitions[*symbol as usize * ref_ts + *baseline];
-                assert_eq!(((e >> 9) & 0xF) as u8, *nb, "case {case} sym {symbol} base {baseline} nb");
+                assert_eq!(
+                    ((e >> 9) & 0xF) as u8,
+                    *nb,
+                    "case {case} sym {symbol} base {baseline} nb"
+                );
             }
         }
     }

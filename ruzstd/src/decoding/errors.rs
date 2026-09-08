@@ -682,7 +682,10 @@ impl From<HuffmanTableError> for DecompressLiteralsError {
 #[non_exhaustive]
 pub enum ExecuteSequencesError {
     DecodebufferError(DecodeBufferError),
-    NotEnoughBytesForSequence { wanted: usize, have: usize },
+    NotEnoughBytesForSequence {
+        wanted: usize,
+        have: usize,
+    },
     ZeroOffset,
     /// Flat-output execution ran out of space in the caller's target buffer.
     TargetTooSmall,

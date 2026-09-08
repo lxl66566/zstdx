@@ -286,8 +286,14 @@ impl Xxh64 {
                 v[2] = round(v[2], b2);
                 v[3] = round(v[3], b3);
                 i += 64;
-                if (a0 ^ br) | (a1 ^ br) | (a2 ^ br) | (a3 ^ br)
-                    | (b0 ^ br) | (b1 ^ br) | (b2 ^ br) | (b3 ^ br)
+                if (a0 ^ br)
+                    | (a1 ^ br)
+                    | (a2 ^ br)
+                    | (a3 ^ br)
+                    | (b0 ^ br)
+                    | (b1 ^ br)
+                    | (b2 ^ br)
+                    | (b3 ^ br)
                     != 0
                 {
                     uniform = false;
@@ -331,7 +337,8 @@ impl Xxh64 {
     pub(crate) fn finish(&self) -> u64 {
         let mut h = if self.total >= 32 {
             let [v0, v1, v2, v3] = self.v;
-            let acc = v0.rotate_left(1)
+            let acc = v0
+                .rotate_left(1)
                 .wrapping_add(v1.rotate_left(7))
                 .wrapping_add(v2.rotate_left(12))
                 .wrapping_add(v3.rotate_left(18));
@@ -402,7 +409,31 @@ mod tests {
             data.extend_from_slice(&state.to_le_bytes());
         }
         let mut splits = Vec::new();
-        for len in [0usize, 1, 3, 4, 7, 8, 9, 15, 16, 31, 32, 33, 63, 64, 65, 71, 100, 999, 1024, 2048, 4096, 32 * 1024, 70_000] {
+        for len in [
+            0usize,
+            1,
+            3,
+            4,
+            7,
+            8,
+            9,
+            15,
+            16,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            71,
+            100,
+            999,
+            1024,
+            2048,
+            4096,
+            32 * 1024,
+            70_000,
+        ] {
             let mut reference = twox_hash::XxHash64::with_seed(0);
             reference.write(&data[..len]);
             splits.push((len, reference.finish()));

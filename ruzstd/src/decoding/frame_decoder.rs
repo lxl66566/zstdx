@@ -130,9 +130,9 @@ impl FrameDecoderState {
         };
         state.flat.reset(window_size as usize);
         #[cfg(feature = "hash")]
-        state.decoder_scratch.set_checksum_enabled(
-            state.frame_header.descriptor.content_checksum_flag(),
-        );
+        state
+            .decoder_scratch
+            .set_checksum_enabled(state.frame_header.descriptor.content_checksum_flag());
         Ok(state)
     }
 
@@ -435,28 +435,28 @@ impl FrameDecoder {
                 BlockType::Raw => {
                     let size = block_header.decompressed_size as usize;
                     let target = state.flat.block_target();
-                    source
-                        .read_exact(&mut target[..size])
-                        .map_err(|e| err::FailedToReadBlockBody(
+                    source.read_exact(&mut target[..size]).map_err(|e| {
+                        err::FailedToReadBlockBody(
                             decoding::errors::DecodeBlockContentError::ReadError {
                                 step: BlockType::Raw,
                                 source: e,
                             },
-                        ))?;
+                        )
+                    })?;
                     state.flat.advance(size);
                     state.bytes_read_counter += size as u64;
                 }
                 BlockType::RLE => {
                     let size = block_header.decompressed_size as usize;
                     let mut buf = [0u8; 1];
-                    source
-                        .read_exact(&mut buf[..])
-                        .map_err(|e| err::FailedToReadBlockBody(
+                    source.read_exact(&mut buf[..]).map_err(|e| {
+                        err::FailedToReadBlockBody(
                             decoding::errors::DecodeBlockContentError::ReadError {
                                 step: BlockType::RLE,
                                 source: e,
                             },
-                        ))?;
+                        )
+                    })?;
                     state.flat.block_target()[..size].fill(buf[0]);
                     state.flat.advance(size);
                     state.bytes_read_counter += 1;
@@ -475,11 +475,11 @@ impl FrameDecoder {
                             view.origin + block_start,
                             view,
                         )
-                        .map_err(|e| err::FailedToReadBlockBody(
-                            decoding::errors::DecodeBlockContentError::DecompressBlockError(
-                                e,
-                            ),
-                        ))?;
+                        .map_err(|e| {
+                            err::FailedToReadBlockBody(
+                                decoding::errors::DecodeBlockContentError::DecompressBlockError(e),
+                            )
+                        })?;
                     state.flat.advance(written);
                     state.bytes_read_counter += u64::from(block_header.content_size);
                 }
@@ -612,26 +612,28 @@ impl FrameDecoder {
                     // path's read_exact error semantics on truncated input.
                     source
                         .read_exact(&mut out[written..][..size])
-                        .map_err(|e| err::FailedToReadBlockBody(
-                            decoding::errors::DecodeBlockContentError::ReadError {
-                                step: BlockType::Raw,
-                                source: e,
-                            },
-                        ))?;
+                        .map_err(|e| {
+                            err::FailedToReadBlockBody(
+                                decoding::errors::DecodeBlockContentError::ReadError {
+                                    step: BlockType::Raw,
+                                    source: e,
+                                },
+                            )
+                        })?;
                     state.bytes_read_counter += size as u64;
                     written += size;
                 }
                 BlockType::RLE => {
                     let size = block_header.decompressed_size as usize;
                     let mut buf = [0u8; 1];
-                    source
-                        .read_exact(&mut buf[..])
-                        .map_err(|e| err::FailedToReadBlockBody(
+                    source.read_exact(&mut buf[..]).map_err(|e| {
+                        err::FailedToReadBlockBody(
                             decoding::errors::DecodeBlockContentError::ReadError {
                                 step: BlockType::RLE,
                                 source: e,
                             },
-                        ))?;
+                        )
+                    })?;
                     if written + size > out.len() {
                         return Err(err::TargetTooSmall);
                     }
@@ -779,28 +781,28 @@ impl FrameDecoder {
                             BlockType::Raw => {
                                 let size = block_header.decompressed_size as usize;
                                 let target = state.flat.block_target();
-                                mt_source
-                                    .read_exact(&mut target[..size])
-                                    .map_err(|e| err::FailedToReadBlockBody(
+                                mt_source.read_exact(&mut target[..size]).map_err(|e| {
+                                    err::FailedToReadBlockBody(
                                         decoding::errors::DecodeBlockContentError::ReadError {
                                             step: BlockType::Raw,
                                             source: e,
                                         },
-                                    ))?;
+                                    )
+                                })?;
                                 state.flat.advance(size);
                                 state.bytes_read_counter += size as u64;
                             }
                             BlockType::RLE => {
                                 let size = block_header.decompressed_size as usize;
                                 let mut buf = [0u8; 1];
-                                mt_source
-                                    .read_exact(&mut buf[..])
-                                    .map_err(|e| err::FailedToReadBlockBody(
+                                mt_source.read_exact(&mut buf[..]).map_err(|e| {
+                                    err::FailedToReadBlockBody(
                                         decoding::errors::DecodeBlockContentError::ReadError {
                                             step: BlockType::RLE,
                                             source: e,
                                         },
-                                    ))?;
+                                    )
+                                })?;
                                 state.flat.block_target()[..size].fill(buf[0]);
                                 state.flat.advance(size);
                                 state.bytes_read_counter += 1;
@@ -825,10 +827,11 @@ impl FrameDecoder {
                                         ),
                                     ))?;
                                 state.flat.advance(written);
-                                state.bytes_read_counter +=
-                                    u64::from(block_header.content_size);
+                                state.bytes_read_counter += u64::from(block_header.content_size);
                             }
-                            BlockType::Reserved => unreachable!("read_block_header rejects reserved"),
+                            BlockType::Reserved => {
+                                unreachable!("read_block_header rejects reserved")
+                            }
                         }
 
                         #[cfg(feature = "hash")]

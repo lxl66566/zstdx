@@ -164,7 +164,8 @@ fn run(shared: Arc<Shared>) {
                 // only after these stores.
                 unsafe {
                     let cell = &*(reply as *const FinishCell);
-                    cell.value.store(states[state_id].finish(), Ordering::Relaxed);
+                    cell.value
+                        .store(states[state_id].finish(), Ordering::Relaxed);
                     cell.done.store(true, Ordering::Release);
                 }
             }
@@ -279,7 +280,11 @@ mod tests {
                 offloaded.write(&data[i..end]);
                 i = end;
             }
-            assert_eq!(offloaded.finish(), reference.finish() as u32, "splits {len}");
+            assert_eq!(
+                offloaded.finish(),
+                reference.finish() as u32,
+                "splits {len}"
+            );
         }
 
         // two frames through the same worker: states must not leak

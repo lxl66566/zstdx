@@ -7,15 +7,15 @@ use super::literals_section_decoder::decode_literals;
 use super::sequence_section_decoder::decode_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeSequenceError;
+use crate::decoding::errors::ExecuteSequencesError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
 use crate::decoding::sequence_execution::execute_decoded_flat;
+use crate::decoding::sequence_execution::execute_sequences;
 use crate::decoding::sequence_section_decoder::SeqDecoder;
-use crate::decoding::errors::ExecuteSequencesError;
 use crate::io::Read;
 use alloc::vec::Vec;
 
@@ -113,7 +113,13 @@ impl BlockDecoder {
             sequences,
             block_content_buffer,
         } = workspace;
-        let (seq_section, raw) = self.parse_sections(header, block_content_buffer, huf, literals_buffer, &mut source)?;
+        let (seq_section, raw) = self.parse_sections(
+            header,
+            block_content_buffer,
+            huf,
+            literals_buffer,
+            &mut source,
+        )?;
 
         if seq_section.num_sequences != 0 {
             decode_sequences(&seq_section, raw, fse, sequences)?;
@@ -160,7 +166,8 @@ impl BlockDecoder {
             block_content_buffer,
             ..
         } = workspace;
-        let (seq_section, raw) = self.parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
+        let (seq_section, raw) =
+            self.parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
 
         if seq_section.num_sequences != 0 {
             let mut dec = SeqDecoder::new(&seq_section, raw, fse)?;
@@ -244,12 +251,8 @@ impl BlockDecoder {
         vprintln!("Slice for literals: {}", raw_literals.len());
 
         literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
-        let bytes_used_in_literals_section = decode_literals(
-            &section,
-            huf,
-            raw_literals,
-            literals_buffer,
-        )?;
+        let bytes_used_in_literals_section =
+            decode_literals(&section, huf, raw_literals, literals_buffer)?;
         assert!(
             section.regenerated_size == literals_buffer.len() as u32,
             "Wrong number of literals: {}, Should have been: {}",

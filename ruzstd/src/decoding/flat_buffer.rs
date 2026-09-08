@@ -15,8 +15,8 @@
 //! match sources and match destinations never collide within a buffer
 //! generation.
 
-use alloc::vec::Vec;
 use crate::common::MAX_BLOCK_SIZE;
+use alloc::vec::Vec;
 
 const MAX_BLOCK_SIZE_USIZE: usize = MAX_BLOCK_SIZE as usize;
 
@@ -157,7 +157,10 @@ impl FlatOut {
     }
 
     /// Write all pending bytes to `sink`, advancing the flush cursor.
-    pub fn flush_to_writer(&mut self, mut sink: impl crate::io::Write) -> Result<usize, crate::io::Error> {
+    pub fn flush_to_writer(
+        &mut self,
+        mut sink: impl crate::io::Write,
+    ) -> Result<usize, crate::io::Error> {
         let mut written = 0usize;
         while written < self.end - self.start {
             match sink.write(&self.buf[self.start + written..self.end]) {

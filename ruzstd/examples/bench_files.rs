@@ -50,7 +50,12 @@ fn main() {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(&out[..], &reference[..], "in-place decode mismatch for {}", path);
+        assert_eq!(
+            &out[..],
+            &reference[..],
+            "in-place decode mismatch for {}",
+            path
+        );
         println!(
             "{path}: {:.2} MiB raw, {:.1} MiB/s ({} iters, {:.4} s/iter)",
             reference.len() as f64 / (1024.0 * 1024.0),

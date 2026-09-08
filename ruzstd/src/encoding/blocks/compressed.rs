@@ -181,7 +181,10 @@ enum FseTableMode<'a> {
     Encoded(FSETable),
     /// Single-code RLE mode: `code` is the wire byte, `table` the degenerate
     /// one-state table the encoder runs on.
-    Rle { code: u8, table: FSETable },
+    Rle {
+        code: u8,
+        table: FSETable,
+    },
     /// Repeat mode: the previous block's table verbatim, no description.
     Repeat(&'a FSETable),
 }
@@ -203,7 +206,11 @@ impl FseTableMode<'_> {
 fn choose_tables_fast<'a>(
     packed_codes: &[u32],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
-    previous_tables: (&'a Option<FSETable>, &'a Option<FSETable>, &'a Option<FSETable>),
+    previous_tables: (
+        &'a Option<FSETable>,
+        &'a Option<FSETable>,
+        &'a Option<FSETable>,
+    ),
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
     let nb_seq = packed_codes.len();
     let mut ll_counts = [0u32; 256];
@@ -417,7 +424,14 @@ fn encode_sequences(
     let (mut acc, mut bits, mut pos) = writer.hot_state();
     {
         let out = writer.out();
-        hot_push(out, &mut pos, &mut acc, &mut bits, add_bits[li], add_nbs[li] as usize);
+        hot_push(
+            out,
+            &mut pos,
+            &mut acc,
+            &mut bits,
+            add_bits[li],
+            add_nbs[li] as usize,
+        );
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
@@ -428,9 +442,12 @@ fn encode_sequences(
                 let of_code = (packed >> 16) as u8;
 
                 // SAFETY: see the row-index argument above.
-                let e_of = unsafe { *of_rows.get_unchecked(((of_code as usize) << of_shift) | of_state) };
-                let e_ml = unsafe { *ml_rows.get_unchecked(((ml_code as usize) << ml_shift) | ml_state) };
-                let e_ll = unsafe { *ll_rows.get_unchecked(((ll_code as usize) << ll_shift) | ll_state) };
+                let e_of =
+                    unsafe { *of_rows.get_unchecked(((of_code as usize) << of_shift) | of_state) };
+                let e_ml =
+                    unsafe { *ml_rows.get_unchecked(((ml_code as usize) << ml_shift) | ml_state) };
+                let e_ll =
+                    unsafe { *ll_rows.get_unchecked(((ll_code as usize) << ll_shift) | ll_state) };
                 debug_assert!(of_state < of_table.table_size);
                 debug_assert!(ml_state < ml_table.table_size);
                 debug_assert!(ll_state < ll_table.table_size);
@@ -459,7 +476,14 @@ fn encode_sequences(
                 let add_nb = add_nbs[i] as usize;
                 let trans_nb = of_nb + ml_nb + ll_nb;
                 if trans_nb + add_nb <= 56 {
-                    hot_push(out, &mut pos, &mut acc, &mut bits, trans | (add << trans_nb), trans_nb + add_nb);
+                    hot_push(
+                        out,
+                        &mut pos,
+                        &mut acc,
+                        &mut bits,
+                        trans | (add << trans_nb),
+                        trans_nb + add_nb,
+                    );
                 } else {
                     hot_push(out, &mut pos, &mut acc, &mut bits, trans, trans_nb);
                     hot_push(out, &mut pos, &mut acc, &mut bits, add, add_nb);
@@ -774,8 +798,8 @@ fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
                         entropy_bits -= c as f64 * entropy_log2(c as f64 / total_f);
                     }
                 }
-                let bits_per_byte =
-                    entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+                let bits_per_byte = entropy_bits / total_f
+                    + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
                 if bits_per_byte + 256.0 / total as f64 + 0.08 + 0.12 >= 8.0 {
                     return true;
                 }
@@ -793,7 +817,8 @@ fn compress_literals(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
     gate_hold: &mut bool,
-) -> Option<huff0_encoder::HuffmanTable> {    let reset_idx = writer.index();
+) -> Option<huff0_encoder::HuffmanTable> {
+    let reset_idx = writer.index();
 
     if sampled_gate_rejects(literals, gate_hold) {
         raw_literals(literals, writer);
@@ -923,7 +948,10 @@ mod tests {
             6,
             9,
         );
-        assert!(matches!(mode, FseTableMode::Repeat(_)), "stable distribution must repeat");
+        assert!(
+            matches!(mode, FseTableMode::Repeat(_)),
+            "stable distribution must repeat"
+        );
 
         // A new symbol the previous table has no state for disqualifies
         // repeat entirely, whatever the cost.
@@ -951,16 +979,7 @@ mod tests {
             other.push(30 + (i % 5) as u8);
         }
         let mut counts = counts_from(&other);
-        let mode = select_from_counts(
-            &mut counts,
-            nb_seq,
-            first,
-            30,
-            &default,
-            Some(&prev),
-            6,
-            9,
-        );
+        let mode = select_from_counts(&mut counts, nb_seq, first, 30, &default, Some(&prev), 6, 9);
         assert!(
             matches!(mode, FseTableMode::Encoded(_)),
             "drifted distribution must rebuild"

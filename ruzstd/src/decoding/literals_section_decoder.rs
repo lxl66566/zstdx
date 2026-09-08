@@ -267,13 +267,7 @@ fn decompress_4streams_interleaved(
             // SAFETY: each reload consumes at most 7 bytes and the iteration
             // count is bounded by ip[0]/7, so ip[s] + 8 never crosses into the
             // next stream (streams sit back to back inside `region`).
-            let window = unsafe {
-                region
-                    .as_ptr()
-                    .add(ip[$s])
-                    .cast::<u64>()
-                    .read_unaligned()
-            };
+            let window = unsafe { region.as_ptr().add(ip[$s]).cast::<u64>().read_unaligned() };
             bits[$s] = (window | 1) << (ctz & 7);
             op[$s] += 5;
         }};
@@ -332,16 +326,7 @@ fn decompress_4streams_interleaved(
     }
 
     // Finish each stream with the scalar decoder, bounded by its segment end.
-    finish_streams(
-        table,
-        region,
-        stream_bounds,
-        &seg_end,
-        &ip,
-        &bits,
-        &op,
-        out,
-    )?;
+    finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
 
     Ok(())
 }
@@ -512,13 +497,7 @@ fn decompress_4streams_interleaved_x2(
             // SAFETY: same reload discipline as the X1 loop - each reload
             // consumes at most 7 bytes and the iteration count is bounded by
             // ip[0]/7, so the 8 byte read stays inside `region`.
-            let window = unsafe {
-                region
-                    .as_ptr()
-                    .add(ip[$s])
-                    .cast::<u64>()
-                    .read_unaligned()
-            };
+            let window = unsafe { region.as_ptr().add(ip[$s]).cast::<u64>().read_unaligned() };
             bits[$s] = (window | 1) << (ctz & 7);
         }};
     }
@@ -581,16 +560,7 @@ fn decompress_4streams_interleaved_x2(
         }
     }
 
-    finish_streams(
-        table,
-        region,
-        stream_bounds,
-        &seg_end,
-        &ip,
-        &bits,
-        &op,
-        out,
-    )?;
+    finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
 
     Ok(())
 }
