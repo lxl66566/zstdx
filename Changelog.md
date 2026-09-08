@@ -4,6 +4,27 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Parallel decoding of complete in-memory inputs: `bulk::decompress_with`
+  and `bulk::decompress_to_buffer_with` with `DecoderOptions::threads(n)`
+  engage a segment-parallel decoder on std builds. A pre-scan walks the
+  block headers and splits the input at *restart points* — blocks whose
+  entropy state is fully self-describing (literals not Treeless, no FSE
+  stream in Repeat mode). Job-based encoders emit exactly those at every
+  job boundary (libzstd `-T` output and this crate's multithreaded
+  compressor alike), and frame starts are restart points by definition, so
+  concatenated multi-frame inputs parallelize as well. Stage A (worker
+  pool) decodes each segment's literals and FSE sequences into staging and
+  computes its exact output size; stage B (calling thread, in input order)
+  executes them into the output, carrying the repcode history across
+  segments — repcode resolution is the only cross-sequence state and it
+  never touches stage A. Output buffers are sized segment by segment (the
+  Vec variants grow exactly), staged segments are bounded to the worker
+  count, and dictionary frames, malformed input, single-restart inputs and
+  single-core processes fall back to the sequential decoder, which also
+  owns error reporting. 64 MiB of previously-encoded data decodes 2.06x
+  faster with 4 threads (2.1x at 8; the serial execution stage bounds the
+  speedup).
+
 * Multithreaded one-shot compression: `bulk::compress_with(source,
   &EncoderOptions)` engages a job-parallel path on std builds when
   `workers > 1`. The input splits into jobs (twice the worker count, 1 MiB
