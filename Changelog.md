@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Literal blocks whose alphabet stays within sixteen symbols histogram
+  through an AVX-512 kernel: sixteen per-slot byte compares with popcount
+  accumulation over four 64-byte chunks at a time, entered once the slot
+  set is established and left for the four-lane scalar pass whenever a
+  seventeenth symbol appears (the popcount sum doubles as the coverage
+  test). skewed executes 18% fewer instructions and gains ~28% throughput
+  (1917 -> 2455 MiB/s); wider alphabets bail on the first offending chunk,
+  costing one chunk per block. Counts are exact, so block bytes are
+  unchanged.
+
 * Near-incompressible literal blocks reject through a strided entropy
   sample (1024 draws, Miller-Madow corrected, distinct-symbol prescreen)
   before the exact four-lane histogram runs, with a sticky per-stream hint
