@@ -11,7 +11,6 @@
 //! reset just bumps the epoch instead of clearing the table.
 
 use alloc::vec::Vec;
-use core::convert::TryInto;
 
 use super::CompressionLevel;
 use super::Matcher;
@@ -29,6 +28,163 @@ const HASH_LOG: u32 = 15;
 const MAX_WINDOW: usize = 0xC0000;
 
 const EMPTY: u64 = 0;
+
+/// Hash the 5 bytes at `idx`. Caller guarantees `idx + 5 <= win.len()` (the
+/// scanning and emit loops bound-check once per loop, not per position).
+///
+/// Five bytes skip the frequent 4-byte boilerplate fragments so probes land
+/// on structural repeats instead of recent junk.
+#[inline(always)]
+fn hash_at(win: &[u8], idx: usize) -> usize {
+    // SAFETY: caller guarantees idx + 5 <= win.len(); unaligned reads
+    // because positions are byte-granular.
+    unsafe {
+        let p = win.as_ptr().add(idx);
+        let v = (p.cast::<u32>().read_unaligned() as u64) | ((p.add(4).read() as u64) << 32);
+        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG))
+            & ((1 << HASH_LOG) - 1)
+    }
+}
+
+/// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
+#[inline(always)]
+fn read4(win: &[u8], idx: usize) -> u32 {
+    // SAFETY: see contract above; unaligned because byte-granular.
+    unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
+}
+
+/// Longest common prefix of `win[i..]` and `win[j..]` in u64 chunks. `i` is
+/// the current scan position and `j` a candidate strictly before it, so
+/// bounding by `i` also bounds `j`.
+#[inline(always)]
+fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
+    let limit = win.len() - i;
+    let base = win.as_ptr();
+    let mut len = 0;
+    // SAFETY: i and j are valid indices and i + len + 8 <= win.len() bounds
+    // the reads on both sides (j <= i).
+    unsafe {
+        while len + 8 <= limit {
+            let a = base.add(i + len).cast::<u64>().read_unaligned();
+            let b = base.add(j + len).cast::<u64>().read_unaligned();
+            if a == b {
+                len += 8;
+            } else {
+                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+            }
+        }
+    }
+    while len < limit && win[i + len] == win[j + len] {
+        len += 1;
+    }
+    len
+}
+
+/// Store `abs` as the newest position for its hash. Caller guarantees `idx`
+/// has at least `MIN_HASH` bytes of window behind it.
+#[inline(always)]
+fn insert_at(win: &[u8], table: &mut [u64], epoch: u64, idx: usize, abs: u64) {
+    let h = hash_at(win, idx);
+    table[h] = (epoch << 48) | abs;
+}
+
+/// Emit the sequence for a match covering `match_len` bytes at window index
+/// `start`, update the repeated-offset history, index the covered range and
+/// return the new cursor (which is also the new anchor). Everything hot is
+/// passed explicitly so the scan loop keeps its cursors in registers across
+/// the call instead of reloading them from the matcher struct.
+#[allow(clippy::too_many_arguments)]
+fn emit_seq(
+    win: &[u8],
+    table: &mut [u64],
+    epoch: u64,
+    anchor: u64,
+    win_base: u64,
+    insert_max: u64,
+    start: usize,
+    match_len: usize,
+    of_value: u32,
+    rep: &mut [u32; 3],
+    literals: &mut Vec<u8>,
+    sequences: &mut Vec<super::EncodedSequence>,
+) -> u64 {
+    let anchor_idx = (anchor - win_base) as usize;
+    let ll = (start - anchor_idx) as u32;
+    literals.extend_from_slice(&win[anchor_idx..start]);
+    do_offset_history(of_value, ll, rep);
+    sequences.push(super::EncodedSequence {
+        ll,
+        ml: match_len as u32,
+        of: of_value,
+    });
+    let match_end = start + match_len;
+    // Index the covered range: short matches keep every position (they carry
+    // most of the alignment coverage on structured data); long matches fall
+    // back to a 4-byte grid anchored at the match start plus the final byte,
+    // because hashing every byte of long matches was a large share of encoder
+    // time. The insert bound is hoisted: a position is insertable while 5
+    // window bytes start at it.
+    if match_len <= 16 {
+        let end = (win_base + match_end as u64).min(insert_max);
+        let mut p = win_base + start as u64;
+        while p < end {
+            insert_at(win, table, epoch, (p - win_base) as usize, p);
+            p += 1;
+        }
+    } else {
+        let first = win_base + start as u64;
+        let last = (win_base + (match_end - 1) as u64).min(insert_max);
+        let mut p = first;
+        while p < last {
+            insert_at(win, table, epoch, (p - win_base) as usize, p);
+            p += 4;
+        }
+        if last > first {
+            insert_at(win, table, epoch, (last - win_base) as usize, last);
+        }
+    }
+    win_base + match_end as u64
+}
+
+/// Probe continuations at the second repeated offset immediately after a
+/// match (zstd fast's rep_offset2 loop). Alternating-period data chains
+/// rep0/rep1 matches back to back with zero literals; emitting with
+/// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates distances
+/// on its own. Returns the cursor after the last chained match.
+#[allow(clippy::too_many_arguments)]
+fn rep1_chain(
+    win: &[u8],
+    table: &mut [u64],
+    epoch: u64,
+    pos: u64,
+    block_end: u64,
+    win_base: u64,
+    insert_max: u64,
+    rep: &mut [u32; 3],
+    literals: &mut Vec<u8>,
+    sequences: &mut Vec<super::EncodedSequence>,
+) -> u64 {
+    let mut pos = pos;
+    while block_end - pos >= MIN_MATCH as u64 {
+        let Some(cand_abs) = pos.checked_sub(rep[1] as u64) else {
+            break;
+        };
+        if cand_abs < win_base {
+            break;
+        }
+        let pidx = (pos - win_base) as usize;
+        let cand = (cand_abs - win_base) as usize;
+        if read4(win, cand) != read4(win, pidx) {
+            break;
+        }
+        let ml = extend_match(win, pidx, cand);
+        debug_assert!(ml >= MIN_MATCH);
+        pos = emit_seq(
+            win, table, epoch, pos, win_base, insert_max, pidx, ml, 1, rep, literals, sequences,
+        );
+    }
+    pos
+}
 
 pub struct MatchGeneratorDriver {
     /// Contiguous history: `win[0]` is absolute position `win_base`.
@@ -80,162 +236,6 @@ impl MatchGeneratorDriver {
     #[inline(always)]
     fn idx_of(&self, abs: u64) -> usize {
         (abs - self.win_base) as usize
-    }
-
-    /// Hash the 5 bytes at `idx`. Caller guarantees `idx + 5 <= win.len()`
-    /// (the scanning and emit loops bound-check once per loop, not per
-    /// position).
-    ///
-    /// Five bytes skip the frequent 4-byte boilerplate fragments so probes
-    /// land on structural repeats instead of recent junk.
-    #[inline(always)]
-    fn hash_at(&self, idx: usize) -> usize {
-        // SAFETY: caller guarantees idx + 5 <= win.len(); unaligned reads
-        // because positions are byte-granular.
-        unsafe {
-            let p = self.win.as_ptr().add(idx);
-            let v = (p.cast::<u32>().read_unaligned() as u64) | ((p.add(4).read() as u64) << 32);
-            (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG))
-                & ((1 << HASH_LOG) - 1)
-        }
-    }
-
-    /// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
-    #[inline(always)]
-    fn read4(&self, idx: usize) -> u32 {
-        // SAFETY: see contract above; unaligned because byte-granular.
-        unsafe { self.win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
-    }
-
-    /// Store `abs` as the newest position for its hash.
-    #[inline(always)]
-    fn insert_pos(&mut self, abs: u64) {
-        let idx = self.idx_of(abs);
-        if idx + MIN_HASH > self.win.len() {
-            return;
-        }
-        let h = self.hash_at(idx);
-        self.table[h] = (self.epoch << 48) | abs;
-    }
-
-    /// Unchecked variant of [`Self::insert_pos`]: the caller guarantees
-    /// `abs` has at least `MIN_HASH` bytes of window behind it.
-    #[inline(always)]
-    fn insert_pos_inline(&mut self, abs: u64) {
-        let h = self.hash_at(self.idx_of(abs));
-        self.table[h] = (self.epoch << 48) | abs;
-    }
-
-    /// Longest common prefix of `win[i..]` and `win[j..]` in u64 chunks.
-    /// `i` is the current scan position and `j` a candidate strictly before
-    /// it, so bounding by `i` also bounds `j`.
-    #[inline(always)]
-    fn extend_match(&self, i: usize, j: usize) -> usize {
-        let limit = self.win.len() - i;
-        let base = self.win.as_ptr();
-        let mut len = 0;
-        // SAFETY: i and j are valid indices and i + len + 8 <= win.len()
-        // bounds the reads on both sides (j <= i).
-        unsafe {
-            while len + 8 <= limit {
-                let a = base.add(i + len).cast::<u64>().read_unaligned();
-                let b = base.add(j + len).cast::<u64>().read_unaligned();
-                if a == b {
-                    len += 8;
-                } else {
-                    return len + ((a ^ b).trailing_zeros() >> 3) as usize;
-                }
-            }
-        }
-        while len < limit && self.win[i + len] == self.win[j + len] {
-            len += 1;
-        }
-        len
-    }
-
-    /// Emit the sequence for a match covering `match_len` bytes at window
-    /// index `start`, update the repeated-offset history, index the covered
-    /// range and advance the cursors past it. Appends straight into the
-    /// collection buffers: going through the [`Sequence`] callback instead
-    /// keeps both buffer pointers live across the whole call and the
-    /// resulting register pressure stalls the scan loop on stack
-    /// spill-reload chains.
-    fn emit_match_into(
-        &mut self,
-        start: usize,
-        match_len: usize,
-        of_value: u32,
-        literals: &mut Vec<u8>,
-        sequences: &mut Vec<super::EncodedSequence>,
-    ) {
-        let anchor_idx = self.idx_of(self.anchor);
-        let ll = (start - anchor_idx) as u32;
-        literals.extend_from_slice(&self.win[anchor_idx..start]);
-        do_offset_history(of_value, ll, &mut self.rep);
-        sequences.push(super::EncodedSequence {
-            ll,
-            ml: match_len as u32,
-            of: of_value,
-        });
-        let match_end = start + match_len;
-        // Index the covered range: short matches keep every position (they
-        // carry most of the alignment coverage on structured data); long
-        // matches fall back to a 4-byte grid anchored at the match start
-        // plus the final byte, because hashing every byte of long matches
-        // was a large share of encoder time. The insert bound is hoisted:
-        // a position is insertable while 5 window bytes start at it.
-        let insert_max = self.win_base + self.win.len() as u64 - MIN_HASH as u64;
-        if match_len <= 16 {
-            let end = (self.win_base + match_end as u64).min(insert_max);
-            let mut p = self.win_base + start as u64;
-            while p < end {
-                self.insert_pos_inline(p);
-                p += 1;
-            }
-        } else {
-            let first = self.win_base + start as u64;
-            let last = (self.win_base + (match_end - 1) as u64).min(insert_max);
-            let mut p = first;
-            while p < last {
-                self.insert_pos_inline(p);
-                p += 4;
-            }
-            if last > first {
-                self.insert_pos_inline(last);
-            }
-        }
-        self.pos = self.win_base + match_end as u64;
-        self.anchor = self.pos;
-        self.miss_count = 0;
-    }
-
-    /// Probe continuations at the second repeated offset immediately after a
-    /// match (zstd fast's rep_offset2 loop). Alternating-period data chains
-    /// rep0/rep1 matches back to back with zero literals; emitting with
-    /// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates
-    /// distances on its own.
-    fn emit_immediate_rep1_chain(
-        &mut self,
-        literals: &mut Vec<u8>,
-        sequences: &mut Vec<super::EncodedSequence>,
-    ) {
-        while self.block_end - self.pos >= MIN_MATCH as u64 {
-            let Some(cand_abs) = self.pos.checked_sub(self.rep[1] as u64) else {
-                break;
-            };
-            if cand_abs < self.win_base {
-                break;
-            }
-            let pidx = self.idx_of(self.pos);
-            let cand = self.idx_of(cand_abs);
-            let cur = self.read4(pidx);
-            if self.read4(cand) != cur {
-                break;
-            }
-            let ml = self.extend_match(pidx, cand);
-            debug_assert!(ml >= MIN_MATCH);
-            self.emit_match_into(pidx, ml, 1, literals, sequences);
-        }
     }
 }
 
@@ -335,14 +335,29 @@ impl Matcher for MatchGeneratorDriver {
         literals: &mut Vec<u8>,
         sequences: &mut Vec<super::EncodedSequence>,
     ) {
+        // Hot state lives in locals for the whole loop: the emit helpers
+        // used to take `&mut self`, which forced a reload of every cursor
+        // from memory after each match.
+        let win = &self.win[..];
+        let table = &mut self.table[..];
         let epoch = self.epoch;
+        let win_base = self.win_base;
+        let block_end = self.block_end;
+        // saturating: tiny first blocks never reach an emit, so the bound is
+        // never consulted when win.len() < MIN_HASH.
+        let insert_max = win_base + win.len().saturating_sub(MIN_HASH) as u64;
         let max_window = MAX_WINDOW as u64;
-        while self.pos < self.block_end {
-            let idx = self.idx_of(self.pos);
-            if self.block_end - self.pos < MIN_HASH as u64 {
+        let mut pos = self.pos;
+        let mut anchor = self.anchor;
+        let mut miss_count = self.miss_count;
+        let mut rep = self.rep;
+
+        while pos < block_end {
+            if block_end - pos < MIN_HASH as u64 {
                 break;
             }
-            let cur = self.read4(idx);
+            let idx = (pos - win_base) as usize;
+            let cur = read4(win, idx);
 
             // Repcode probe (mirrors zstd's fast strategy: rep[0] only; the
             // weaker rep1/rep2 candidates steal positions from longer hash
@@ -351,93 +366,109 @@ impl Matcher for MatchGeneratorDriver {
             // runs at the current position, otherwise one byte ahead so that
             // byte becomes the literal. The backward extension guard below
             // never consumes that literal either way.
-            let probe = if self.pos == self.anchor {
-                self.pos + 1
-            } else {
-                self.pos
-            };
-            if let Some(cand_abs) = probe.checked_sub(self.rep[0] as u64) {
-                if cand_abs >= self.win_base {
-                    let mut cand = self.idx_of(cand_abs);
-                    let pidx = self.idx_of(probe);
-                    let pcur = self.read4(pidx);
-                    if self.read4(cand) == pcur {
-                        let mut ml = self.extend_match(pidx, cand);
+            let probe = if pos == anchor { pos + 1 } else { pos };
+            if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
+                if cand_abs >= win_base {
+                    let mut cand = (cand_abs - win_base) as usize;
+                    let pidx = (probe - win_base) as usize;
+                    let pcur = read4(win, pidx);
+                    if read4(win, cand) == pcur {
+                        let mut ml = extend_match(win, pidx, cand);
                         if ml >= MIN_MATCH {
-                            let anchor_idx = self.idx_of(self.anchor);
+                            let anchor_idx = (anchor - win_base) as usize;
                             let mut start = pidx;
                             // Extend backwards into the pending literals; the
                             // offset (pidx - cand) stays constant.
                             while start > anchor_idx + 1
                                 && cand > 0
-                                && self.win[cand - 1] == self.win[start - 1]
+                                && win[cand - 1] == win[start - 1]
                             {
                                 cand -= 1;
                                 start -= 1;
                                 ml += 1;
                             }
-                            self.emit_match_into(start, ml, 1, literals, sequences);
-                            self.emit_immediate_rep1_chain(literals, sequences);
+                            anchor = emit_seq(
+                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
+                                &mut rep, literals, sequences,
+                            );
+                            pos = rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base, insert_max,
+                                &mut rep, literals, sequences,
+                            );
+                            // The chain's matches advance the cursor too.
+                            anchor = pos;
+                            miss_count = 0;
                             continue;
                         }
                     }
                 }
             }
 
-            let h = self.hash_at(idx);
-            let prev = self.table[h];
+            let h = hash_at(win, idx);
+            let prev = table[h];
             // Index only every other position in the miss path: with a small
             // table each slot is heavily contended, and halving the insert
             // rate doubles how long a far repeat stays discoverable.
             if idx & 1 == 0 {
-                self.table[h] = (epoch << 48) | self.pos;
+                table[h] = (epoch << 48) | pos;
             }
 
             let mut matched = false;
             if prev >> 48 == epoch {
                 let cand_abs = prev & ((1u64 << 48) - 1);
-                if cand_abs >= self.win_base && self.pos - cand_abs <= max_window {
-                    let mut cand = self.idx_of(cand_abs);
-                    if self.read4(cand) == cur {
-                        let mut ml = self.extend_match(idx, cand);
+                if cand_abs >= win_base && pos - cand_abs <= max_window {
+                    let mut cand = (cand_abs - win_base) as usize;
+                    if read4(win, cand) == cur {
+                        let mut ml = extend_match(win, idx, cand);
                         // A hash match already spans 5 bytes; below 6 the
                         // sequence overhead roughly equals the literals it
                         // covers, and rejecting it lets the scan try the next
                         // position where a longer match may start.
                         if ml >= 6 {
-                            let anchor_idx = self.idx_of(self.anchor);
+                            let anchor_idx = (anchor - win_base) as usize;
                             let mut start = idx;
                             // Extend backwards into the pending literals; the
                             // offset (idx - cand) stays constant.
                             while start > anchor_idx
                                 && cand > 0
-                                && self.win[cand - 1] == self.win[start - 1]
+                                && win[cand - 1] == win[start - 1]
                             {
                                 cand -= 1;
                                 start -= 1;
                                 ml += 1;
                             }
                             let of_value = (start - cand + 3) as u32;
-                            self.emit_match_into(start, ml, of_value, literals, sequences);
-                            self.emit_immediate_rep1_chain(literals, sequences);
+                            anchor = emit_seq(
+                                win, table, epoch, anchor, win_base, insert_max, start, ml,
+                                of_value, &mut rep, literals, sequences,
+                            );
+                            pos = rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base, insert_max,
+                                &mut rep, literals, sequences,
+                            );
+                            // The chain's matches advance the cursor too.
+                            anchor = pos;
+                            miss_count = 0;
                             matched = true;
                         }
                     }
                 }
             }
             if !matched {
-                self.miss_count += 1;
+                miss_count += 1;
                 // Grow the probe step on long literal runs so incompressible
                 // data does not pay a full hash per byte.
-                self.pos += 1 + (self.miss_count >> 2).min(255) as u64;
+                pos += 1 + (miss_count >> 2).min(255) as u64;
             }
         }
-        if self.anchor < self.block_end {
-            let tail = self.idx_of(self.anchor)..self.idx_of(self.block_end);
-            literals.extend_from_slice(&self.win[tail]);
-            self.anchor = self.block_end;
+        if anchor < block_end {
+            let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
+            literals.extend_from_slice(&win[tail]);
         }
-        self.pos = self.block_end;
+        self.pos = block_end;
+        self.anchor = block_end;
+        self.miss_count = miss_count;
+        self.rep = rep;
     }
 
     fn skip_matching(&mut self) {
@@ -446,7 +477,10 @@ impl Matcher for MatchGeneratorDriver {
         // rewrites one table entry. The first position covers that slot;
         // future probes into the run resolve through it or the repcode
         // chain.
-        self.insert_pos(self.block_start);
+        let idx = (self.block_start - self.win_base) as usize;
+        if idx + MIN_HASH <= self.win.len() {
+            insert_at(&self.win, &mut self.table, self.epoch, idx, self.block_start);
+        }
         self.pos = self.block_end;
         self.anchor = self.block_end;
     }
