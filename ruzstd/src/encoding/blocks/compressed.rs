@@ -227,9 +227,9 @@ fn encode_sequences(
         let (base, bits) = ML_META[ml_code as usize];
         (sequence.ml - base, bits as usize)
     };
-    let mut ll_state = ll_table.start_state(ll_code).index;
-    let mut ml_state = ml_table.start_state(ml_code).index;
-    let mut of_state = of_table.start_state(of_code).index;
+    let mut ll_state = ll_table.start_index(ll_code);
+    let mut ml_state = ml_table.start_index(ml_code);
+    let mut of_state = of_table.start_index(of_code);
 
     write_add_bits(
         writer,

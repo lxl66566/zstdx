@@ -30,15 +30,17 @@ fn tables_equal() {
 
 #[cfg(any(test, feature = "fuzz_exports"))]
 fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
+    let ts = enc_table.table_size;
     for (idx, dec_state) in dec_table.decode.iter().enumerate() {
-        let enc_states = &enc_table.states[dec_state.symbol as usize];
-        let enc_state = enc_states
-            .states
+        let base = dec_state.symbol as usize * ts;
+        // The transition row holds one entry per state range; find the entry
+        // targeting this state index and compare its wire parameters.
+        let entry = enc_table.transitions[base..base + ts]
             .iter()
-            .find(|state| state.index == idx)
+            .find(|e| (**e >> 13) as usize == idx)
             .unwrap();
-        assert_eq!(enc_state.baseline, dec_state.base_line as usize);
-        assert_eq!(enc_state.num_bits, dec_state.num_bits);
+        assert_eq!((*entry & 0x1FF) as usize, dec_state.base_line as usize);
+        assert_eq!(((*entry >> 9) & 0xF) as u8, dec_state.num_bits);
     }
 }
 
