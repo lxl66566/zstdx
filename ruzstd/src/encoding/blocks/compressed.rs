@@ -591,12 +591,30 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.write_bits(literals[0], 8);
 }
 
+/// log2 for the entropy bound; the 8% margin swallows the approximation.
+#[cfg(feature = "std")]
+#[inline(always)]
+fn entropy_log2(x: f64) -> f64 {
+    x.log2()
+}
+
+/// `f64::log2` needs std; the bound only rejects, so a linear-mantissa
+/// approximation (error < 0.086) is fine here. Inputs are normal numbers:
+/// counts are >= 1 and totals are <= 128 KiB per block.
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+fn entropy_log2(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+    let frac = (bits & ((1u64 << 52) - 1)) as f64 / (1u64 << 52) as f64;
+    exp as f64 + frac
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
-) -> Option<huff0_encoder::HuffmanTable> {
-    let reset_idx = writer.index();
+) -> Option<huff0_encoder::HuffmanTable> {    let reset_idx = writer.index();
 
     // One histogram feeds both the entropy-bound reject and the table build:
     // literals used to be scanned twice, once per consumer. Four
@@ -636,7 +654,7 @@ fn compress_literals(
         let mut entropy_bits = 0.0f64;
         for &c in &counts[..=max_symbol] {
             if c > 0 {
-                entropy_bits -= c as f64 * (c as f64 / total).log2();
+                entropy_bits -= c as f64 * entropy_log2(c as f64 / total);
             }
         }
         if entropy_bits + 256.0 + total * 0.08 >= total * 8.0 {
