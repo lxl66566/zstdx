@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The bit writer's 64-bit flush stores one unaligned u64 into the reserved
+  output vector instead of calling memcpy for eight bytes, removing a call
+  per flushed container from every entropy-coded block. Output is
+  bit-identical; json/text/skewed gain 1-2% each.
+
 * The uniform-block detector compares four u64 words per branch instead of
   one, so fully-uniform blocks (zero-filled inputs, padded corpus tails)
   stop paying a branchy scan of the whole block while non-uniform blocks

@@ -137,10 +137,21 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let bits_free_in_partial = 64 - self.bits_in_partial;
         let part = bits << (64 - bits_free_in_partial);
         let merged = self.partial | part;
-        // Put the 8 bytes into the output buffer
-        self.output
-            .as_mut()
-            .extend_from_slice(&merged.to_le_bytes());
+        // One unaligned u64 store beats a memcpy call for 8 bytes; the extra
+        // bytes past a vector's length get overwritten by later stores.
+        let output = self.output.as_mut();
+        output.reserve(8);
+        let len = output.len();
+        // SAFETY: reserve covered the 8 bytes; only the low bytes are
+        // semantically part of the output once bit_idx advances.
+        unsafe {
+            output
+                .as_mut_ptr()
+                .add(len)
+                .cast::<u64>()
+                .write_unaligned(merged.to_le());
+            output.set_len(len + 8);
+        }
         self.bit_idx += 64;
         self.partial = 0;
         self.bits_in_partial = 0;
