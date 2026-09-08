@@ -15,10 +15,7 @@ fn main() {
             continue;
         }
         let raw = fs::read(&path).unwrap();
-        let comp = ruzstd::encoding::compress_slice_to_vec(
-            &raw[..],
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
+        let comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
         fs::write(format!("{out_dir}/{name}.zst"), &comp).unwrap();
     }
 }

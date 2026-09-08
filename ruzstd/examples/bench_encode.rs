@@ -21,7 +21,7 @@ fn main() {
         }
         let raw = fs::read(&path).unwrap();
         let iters = 3;
-        let comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+        let comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
         // roundtrip check
         let mut fr = ruzstd::decoding::FrameDecoder::new();
         let mut back = Vec::with_capacity(raw.len() + 16);
@@ -31,7 +31,7 @@ fn main() {
         for _ in 0..iters {
             std::hint::black_box(ruzstd::encoding::compress_slice_to_vec(
                 &raw[..],
-                ruzstd::encoding::CompressionLevel::Fastest,
+                ruzstd::Level::Fastest,
             ));
         }
         let el = t.elapsed().as_secs_f64() / iters as f64;

@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* `CompressionLevel` is replaced by a root `Level` enum
+  (`ruzstd::Level::{Uncompressed, Fastest}`, `#[non_exhaustive]`,
+  `Level::DEFAULT = Fastest`). The `Default`/`Better`/`Best` variants never had
+  implementations and panicked at runtime when reached, so they are gone;
+  further variants arrive as their strategies land. The CLI previously
+  defaulted to the panicking `Default` variant (level 2) and now maps 1..=4 to
+  `Fastest` with `Fastest` as the default. Codegen is unchanged except that
+  the per-block level dispatch loses its dead `unimplemented!()` arm (verified
+  by instruction-stream diff of the release assembly: 249 global symbols
+  compared, only `compress_slice_to_vec` differs, at exactly that dispatch).
+
 * The decoder now verifies frame checksums with the same in-tree XXH64 as
   the encoder (the module moved from `encoding` to the crate root).
   `twox-hash` drops from runtime dependency to dev-dependency (kept purely

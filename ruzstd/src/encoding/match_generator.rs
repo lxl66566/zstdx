@@ -13,9 +13,9 @@
 use alloc::vec::Vec;
 
 use super::seq_codes::{decode_packed, encode_literal_length, encode_match_len, encode_offset};
-use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
+use crate::Level;
 // Shared with the decoder so both sides agree on offset-history semantics.
 use crate::decoding::sequence_execution::do_offset_history;
 
@@ -43,14 +43,8 @@ fn hash_at(win: &[u8], idx: usize) -> usize {
     // ahead (the scan tail guard and the emit insert bound); unaligned
     // because positions are byte-granular.
     unsafe {
-        let v = win
-            .as_ptr()
-            .add(idx)
-            .cast::<u64>()
-            .read_unaligned()
-            & 0xFFFF_FFFF_FF;
-        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG))
-            & ((1 << HASH_LOG) - 1)
+        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0xFFFF_FFFF_FF;
+        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
     }
 }
 
@@ -351,7 +345,7 @@ impl MatchGeneratorDriver {
 }
 
 impl Matcher for MatchGeneratorDriver {
-    fn reset(&mut self, _level: CompressionLevel) {
+    fn reset(&mut self, _level: Level) {
         self.ext = None;
         self.win.clear();
         self.win_base = 0;
@@ -732,7 +726,7 @@ mod tests {
     /// original from the emitted sequences.
     fn match_and_reconstruct(data: &[u8], block_size: usize) -> Vec<u8> {
         let mut driver = MatchGeneratorDriver::new(block_size);
-        driver.reset(crate::encoding::CompressionLevel::Fastest);
+        driver.reset(crate::Level::Fastest);
         // Offset history mirrors the decoder's per-frame scratch.
         let mut rep = [1u32, 4, 8];
         let mut reconstructed = Vec::new();
@@ -747,12 +741,11 @@ mod tests {
                     match_len,
                 } => {
                     reconstructed.extend_from_slice(literals);
-                    let actual =
-                        crate::decoding::sequence_execution::do_offset_history(
-                            offset as u32,
-                            literals.len() as u32,
-                            &mut rep,
-                        );
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    );
                     // Matches may overlap their own output (offset < match_len).
                     let start = reconstructed.len() - actual as usize;
                     for i in 0..match_len {
@@ -815,7 +808,7 @@ mod tests {
     #[test]
     fn skip_matching_indexes_for_later_blocks() {
         let mut driver = MatchGeneratorDriver::new(16);
-        driver.reset(crate::encoding::CompressionLevel::Fastest);
+        driver.reset(crate::Level::Fastest);
         let pattern = [3u8, 1, 4, 1, 5, 9, 2, 6];
         driver.block_tail()[..pattern.len()].copy_from_slice(&pattern);
         driver.commit_block(pattern.len());
@@ -830,7 +823,10 @@ mod tests {
                 got_triple = true;
             }
         });
-        assert!(got_triple, "second block must match the skipped first block");
+        assert!(
+            got_triple,
+            "second block must match the skipped first block"
+        );
     }
 
     #[test]
@@ -850,7 +846,7 @@ mod tests {
             data.push(0xF0 ^ i as u8);
         }
         let mut driver = MatchGeneratorDriver::new(128 * 1024);
-        driver.reset(crate::encoding::CompressionLevel::Fastest);
+        driver.reset(crate::Level::Fastest);
         driver.block_tail()[..data.len()].copy_from_slice(&data);
         driver.commit_block(data.len());
         let mut repcodes = 0usize;
@@ -861,7 +857,10 @@ mod tests {
                 }
             }
         });
-        assert!(repcodes > 0, "repeated structure must produce repcode matches");
+        assert!(
+            repcodes > 0,
+            "repeated structure must produce repcode matches"
+        );
         assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
     }
 }

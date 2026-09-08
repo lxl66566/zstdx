@@ -9,10 +9,7 @@ fn bench(name: &str, data: &[u8], iters: usize) {
     // IMPL=ruzstd|zstd restricts the timed loop to one implementation.
     let impl_sel = std::env::var("IMPL").unwrap_or_default();
     // roundtrip check
-    let comp = ruzstd::encoding::compress_slice_to_vec(
-        data,
-        ruzstd::encoding::CompressionLevel::Fastest,
-    );
+    let comp = ruzstd::encoding::compress_slice_to_vec(data, ruzstd::Level::Fastest);
     let mut fr = ruzstd::decoding::FrameDecoder::new();
     let mut back = Vec::with_capacity(data.len() + 16);
     fr.decode_all_to_vec(&comp, &mut back).unwrap();
@@ -24,7 +21,7 @@ fn bench(name: &str, data: &[u8], iters: usize) {
         for _ in 0..iters {
             std::hint::black_box(ruzstd::encoding::compress_slice_to_vec(
                 data,
-                ruzstd::encoding::CompressionLevel::Fastest,
+                ruzstd::Level::Fastest,
             ));
         }
         el_ruzstd = t.elapsed().as_secs_f64() / iters as f64;

@@ -5,9 +5,10 @@ use core::convert::TryInto;
 
 use super::{
     block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, CompressionLevel, Matcher,
+    match_generator::MatchGeneratorDriver, Matcher,
 };
 use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
+use crate::Level;
 
 use crate::io::{Read, Write};
 
@@ -205,11 +206,11 @@ impl BlockChecksum for SliceChecksum {
 ///
 /// # Examples
 /// ```
-/// use ruzstd::encoding::{FrameCompressor, CompressionLevel};
+/// use ruzstd::{encoding::FrameCompressor, Level};
 /// let mock_data: &[_] = &[0x1, 0x2, 0x3, 0x4];
 /// let mut output = std::vec::Vec::new();
 /// // Initialize a compressor.
-/// let mut compressor = FrameCompressor::new(CompressionLevel::Uncompressed);
+/// let mut compressor = FrameCompressor::new(Level::Uncompressed);
 /// compressor.set_source(mock_data);
 /// compressor.set_drain(&mut output);
 ///
@@ -219,7 +220,7 @@ impl BlockChecksum for SliceChecksum {
 pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
-    compression_level: CompressionLevel,
+    compression_level: Level,
     state: CompressState<M>,
     hasher: FrameHasher,
 }
@@ -277,7 +278,7 @@ fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
 
 /// Reset a pooled state for a new frame: the matcher's epoch bump retires
 /// stale hash entries and the entropy tables return to their defaults.
-fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: CompressionLevel) {
+fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: Level) {
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
@@ -290,7 +291,7 @@ fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: Com
 /// window compaction, no window allocation) and blocks append straight into
 /// the output (no staging buffer). Produces the same bytes as
 /// [`super::compress`] over the same input.
-pub fn compress_slice_to_vec(src: &[u8], level: CompressionLevel) -> Vec<u8> {
+pub fn compress_slice_to_vec(src: &[u8], level: Level) -> Vec<u8> {
     #[cfg(feature = "std")]
     let mut pooled = SLICE_STATE.with(|p| p.borrow_mut().take()).map(|mut s| {
         reset_slice_state(&mut s, level);
@@ -312,7 +313,7 @@ pub fn compress_slice_to_vec(src: &[u8], level: CompressionLevel) -> Vec<u8> {
 fn compress_with_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
-    level: CompressionLevel,
+    level: Level,
 ) -> Vec<u8> {
     #[cfg(all(feature = "std", feature = "hash"))]
     let mut hasher = SliceChecksum::new(src.len());
@@ -348,25 +349,17 @@ fn compress_with_state(
             .adopt_window(&src[hist as usize..block_end as usize], hist);
         state.matcher.set_block(block_start, block_end);
         match level {
-            CompressionLevel::Uncompressed => {
+            Level::Uncompressed => {
                 let header = BlockHeader {
                     last_block,
                     block_type: crate::blocks::block::BlockType::Raw,
                     block_size: block.len() as u32,
                 };
                 header.serialize(&mut output);
-                BlockChecksum::raw_out(
-                    &mut hasher,
-                    &mut output,
-                    state.matcher.get_last_space(),
-                    0,
-                );
+                BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
             }
-            CompressionLevel::Fastest => {
+            Level::Fastest => {
                 super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
-            }
-            _ => {
-                unimplemented!();
             }
         }
     }
@@ -388,7 +381,7 @@ fn compress_with_state(
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Create a new `FrameCompressor`
-    pub fn new(compression_level: CompressionLevel) -> Self {
+    pub fn new(compression_level: Level) -> Self {
         Self {
             uncompressed_data: None,
             compressed_data: None,
@@ -406,7 +399,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
 
 impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Create a new `FrameCompressor` with a custom matching algorithm implementation
-    pub fn new_with_matcher(matcher: M, compression_level: CompressionLevel) -> Self {
+    pub fn new_with_matcher(matcher: M, compression_level: Level) -> Self {
         Self {
             uncompressed_data: None,
             compressed_data: None,
@@ -495,7 +488,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             }
 
             match self.compression_level {
-                CompressionLevel::Uncompressed => {
+                Level::Uncompressed => {
                     let header = BlockHeader {
                         last_block,
                         block_type: crate::blocks::block::BlockType::Raw,
@@ -506,11 +499,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     self.hasher
                         .write_appending(output, self.state.matcher.get_last_space());
                 }
-                CompressionLevel::Fastest => {
+                Level::Fastest => {
                     compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
-                }
-                _ => {
-                    unimplemented!();
                 }
             }
             drain.write_all(output).unwrap();
@@ -527,8 +517,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // Because we only have the data as a reader, we need to read all of it to calculate the checksum
             // Possible TODO: create a wrapper around self.uncompressed data that hashes the data as it's read?
             let content_checksum = self.hasher.finish();
-            drain.write_all(&content_checksum.to_le_bytes())
-                .unwrap();
+            drain.write_all(&content_checksum.to_le_bytes()).unwrap();
         }
     }
 
@@ -569,17 +558,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Before calling [FrameCompressor::compress] you can replace the compression level
-    pub fn set_compression_level(
-        &mut self,
-        compression_level: CompressionLevel,
-    ) -> CompressionLevel {
+    pub fn set_compression_level(&mut self, compression_level: Level) -> Level {
         let old = self.compression_level;
         self.compression_level = compression_level;
         old
     }
 
     /// Get the current compression level
-    pub fn compression_level(&self) -> CompressionLevel {
+    pub fn compression_level(&self) -> Level {
         self.compression_level
     }
 }
@@ -597,7 +583,7 @@ mod tests {
     fn frame_starts_with_magic_num() {
         let mock_data = [1_u8, 2, 3].as_slice();
         let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
         compressor.set_source(mock_data);
         compressor.set_drain(&mut output);
 
@@ -609,7 +595,7 @@ mod tests {
     fn very_simple_raw_compress() {
         let mock_data = [1_u8, 2, 3].as_slice();
         let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
         compressor.set_source(mock_data);
         compressor.set_drain(&mut output);
 
@@ -624,7 +610,7 @@ mod tests {
         mock_data.extend(vec![2; 1 << 17]);
         mock_data.extend(vec![3; (1 << 17) - 1]);
         let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
         compressor.set_source(mock_data.as_slice());
         compressor.set_drain(&mut output);
 
@@ -644,7 +630,7 @@ mod tests {
     fn rle_compress() {
         let mock_data = vec![0; 1 << 19];
         let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
         compressor.set_source(mock_data.as_slice());
         compressor.set_drain(&mut output);
 
@@ -673,10 +659,7 @@ mod tests {
             data.push(b'0' + (state % 10) as u8);
             data.push(b'0' + ((state >> 8) % 10) as u8);
         }
-        let output = crate::encoding::compress_slice_to_vec(
-            &data[..],
-            super::CompressionLevel::Fastest,
-        );
+        let output = crate::encoding::compress_slice_to_vec(&data[..], crate::Level::Fastest);
 
         let mut decoder = FrameDecoder::new();
         let mut decoded = Vec::with_capacity(data.len());
@@ -692,7 +675,7 @@ mod tests {
     fn aaa_compress() {
         let mock_data = vec![0, 1, 3, 4, 5];
         let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
         compressor.set_source(mock_data.as_slice());
         compressor.set_drain(&mut output);
 
@@ -718,7 +701,7 @@ mod tests {
         //    would differ from the one stored in the frame data, causing assert_eq to fail.
         let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
 
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
 
         // --- Frame 1 ---
         let mut compressed1 = Vec::new();
@@ -807,20 +790,14 @@ mod tests {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Uncompressed,
-            )
+            crate::encoding::compress_to_vec(input.as_slice(), crate::Level::Uncompressed)
         }
 
         fn encode_ruzstd_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Fastest,
-            )
+            crate::encoding::compress_to_vec(input.as_slice(), crate::Level::Fastest)
         }
 
         fn decode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {

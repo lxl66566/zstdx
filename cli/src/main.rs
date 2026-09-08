@@ -11,7 +11,7 @@ use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{ContextCompat, WrapErr};
-use ruzstd::encoding::CompressionLevel;
+use ruzstd::Level;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -39,15 +39,12 @@ enum Commands {
         /// more time to compress but result in a smaller file, and vice versa.
         ///
         /// - 0: Uncompressed
-        /// - 1: Fastest
-        /// - 2: Default
-        /// - 3: Better
-        /// - 4: Best
+        /// - 1..=4: Fastest (further levels arrive with their strategies)
         #[arg(
             short,
             long,
             value_name = "COMPRESSION_LEVEL",
-            default_value_t = 2,
+            default_value_t = 1,
             verbatim_doc_comment
         )]
         level: u8,
@@ -103,12 +100,11 @@ fn main() -> color_eyre::Result<()> {
 
 fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: ruzstd::encoding::CompressionLevel = match level {
-        0 => CompressionLevel::Uncompressed,
-        1 => CompressionLevel::Fastest,
-        2 => CompressionLevel::Default,
-        3 => CompressionLevel::Better,
-        4 => CompressionLevel::Best,
+    let compression_level: ruzstd::Level = match level {
+        0 => Level::Uncompressed,
+        // Levels 1..=4 currently share the fast matcher; further variants
+        // arrive as their strategies are implemented.
+        1..=4 => Level::Fastest,
         _ => {
             unimplemented!("unsupported compression level: {}", level);
         }

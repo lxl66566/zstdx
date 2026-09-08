@@ -10,7 +10,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 
-/// Compresses a single block at [`crate::encoding::CompressionLevel::Fastest`].
+/// Compresses a single block at [`crate::Level::Fastest`].
 ///
 /// # Parameters
 /// - `state`: [`CompressState`] so the compressor can refer to data before

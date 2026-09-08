@@ -1,9 +1,8 @@
 //! Temporary analysis: sequence-choice statistics and entropy lower bound
 //! for our matcher on a corpus file. Not part of the published examples.
 
-use ruzstd::encoding::{
-    CompressionLevel, EncodedSequence, MatchGeneratorDriver, Matcher, Sequence,
-};
+use ruzstd::encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence};
+use ruzstd::Level;
 use std::fs;
 use std::io::Write;
 
@@ -45,7 +44,7 @@ impl Matcher for RecordingMatcher {
         });
         self.triples.extend(seqs.iter().map(|s| (s.ll, s.ml, s.of)));
     }
-    fn reset(&mut self, level: CompressionLevel) {
+    fn reset(&mut self, level: Level) {
         self.inner.reset(level)
     }
     fn window_size(&self) -> u64 {
@@ -61,10 +60,42 @@ impl Matcher for RecordingMatcher {
 
 fn ll_code(len: u32) -> (u8, u32) {
     const LL_META: [(u32, u8); 36] = [
-        (0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0),
-        (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (16, 1), (18, 1), (20, 1), (22, 1), (24, 2),
-        (28, 2), (32, 3), (40, 3), (48, 4), (64, 6), (128, 7), (256, 8), (512, 9), (1024, 10),
-        (2048, 11), (4096, 12), (8192, 13), (16384, 14), (32768, 15), (65536, 16),
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, 0),
+        (5, 0),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+        (9, 0),
+        (10, 0),
+        (11, 0),
+        (12, 0),
+        (13, 0),
+        (14, 0),
+        (15, 0),
+        (16, 1),
+        (18, 1),
+        (20, 1),
+        (22, 1),
+        (24, 2),
+        (28, 2),
+        (32, 3),
+        (40, 3),
+        (48, 4),
+        (64, 6),
+        (128, 7),
+        (256, 8),
+        (512, 9),
+        (1024, 10),
+        (2048, 11),
+        (4096, 12),
+        (8192, 13),
+        (16384, 14),
+        (32768, 15),
+        (65536, 16),
     ];
     let mut code = 35;
     while code > 0 && LL_META[code].0 > len {
@@ -75,12 +106,59 @@ fn ll_code(len: u32) -> (u8, u32) {
 
 fn ml_code(len: u32) -> (u8, u32) {
     const ML_META: [(u32, u8); 53] = [
-        (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0),
-        (13, 0), (14, 0), (15, 0), (16, 0), (17, 0), (18, 0), (19, 0), (20, 0), (21, 0), (22, 0),
-        (23, 0), (24, 0), (25, 0), (26, 0), (27, 0), (28, 0), (29, 0), (30, 0), (31, 0), (32, 0),
-        (33, 0), (34, 0), (35, 1), (37, 1), (39, 1), (41, 1), (43, 2), (47, 2), (51, 3), (59, 3),
-        (67, 4), (83, 4), (99, 5), (131, 7), (259, 8), (515, 9), (1027, 10), (2051, 11),
-        (4099, 12), (8195, 13), (16387, 14), (32771, 15), (65539, 16),
+        (3, 0),
+        (4, 0),
+        (5, 0),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+        (9, 0),
+        (10, 0),
+        (11, 0),
+        (12, 0),
+        (13, 0),
+        (14, 0),
+        (15, 0),
+        (16, 0),
+        (17, 0),
+        (18, 0),
+        (19, 0),
+        (20, 0),
+        (21, 0),
+        (22, 0),
+        (23, 0),
+        (24, 0),
+        (25, 0),
+        (26, 0),
+        (27, 0),
+        (28, 0),
+        (29, 0),
+        (30, 0),
+        (31, 0),
+        (32, 0),
+        (33, 0),
+        (34, 0),
+        (35, 1),
+        (37, 1),
+        (39, 1),
+        (41, 1),
+        (43, 2),
+        (47, 2),
+        (51, 3),
+        (59, 3),
+        (67, 4),
+        (83, 4),
+        (99, 5),
+        (131, 7),
+        (259, 8),
+        (515, 9),
+        (1027, 10),
+        (2051, 11),
+        (4099, 12),
+        (8195, 13),
+        (16387, 14),
+        (32771, 15),
+        (65539, 16),
     ];
     let mut code = 52;
     while code > 0 && ML_META[code].0 > len {
@@ -109,7 +187,7 @@ fn main() {
         triples: Vec::new(),
     };
     let mut compressor =
-        ruzstd::encoding::FrameCompressor::new_with_matcher(matcher, CompressionLevel::Fastest);
+        ruzstd::encoding::FrameCompressor::new_with_matcher(matcher, Level::Fastest);
     compressor.set_source(raw.as_slice());
     struct Sink(Vec<u8>);
     impl Write for Sink {
@@ -182,5 +260,9 @@ fn main() {
     println!("ll hist: {llh:?}");
     println!("ml hist: {mlh:?}");
     println!("of hist: {ofh:?}");
-    let _ = EncodedSequence { ll: 0, ml: 0, of: 0 };
+    let _ = EncodedSequence {
+        ll: 0,
+        ml: 0,
+        of: 0,
+    };
 }

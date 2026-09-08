@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+use ruzstd::{encoding::compress_to_vec, Level};
 
 const ITERATIONS: usize = 50;
 
@@ -19,7 +19,7 @@ fn main() {
         let mut compressed = Vec::new();
         let started = Instant::now();
         for _ in 0..ITERATIONS {
-            compressed = compress_to_vec(data.as_slice(), CompressionLevel::Fastest);
+            compressed = compress_to_vec(data.as_slice(), Level::Fastest);
         }
         let avg_nanos = started.elapsed().as_nanos() / ITERATIONS as u128;
         println!("{name},{},{},{avg_nanos}", data.len(), compressed.len());

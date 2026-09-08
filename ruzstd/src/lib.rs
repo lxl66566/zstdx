@@ -40,6 +40,10 @@ pub mod decoding;
 pub mod dictionary;
 pub mod encoding;
 
+pub mod level;
+
+pub use level::Level;
+
 pub(crate) mod blocks;
 
 #[cfg(feature = "hash")]

@@ -67,13 +67,13 @@ for clarification.
 The easiest is to use the provided `compress`/`compress_to_vec` functions
 
 ```rust, no_run
-use ruzstd::encoding::{compress, compress_to_vec, CompressionLevel};
+use ruzstd::{encoding::{compress, compress_to_vec}, Level};
 let data: &[u8] = todo!();
 // Either
 let mut compressed = Vec::new();
-compress(data, &mut compressed, CompressionLevel::Fastest);
+compress(data, &mut compressed, Level::Fastest);
 // or
-let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+let compressed = compress_to_vec(data, Level::Fastest);
  ```
 
  Or you can use the `FrameDecoder` manually to compress data. This allows you to process encoded data while it is being encoded instead of collecting into a big vector.

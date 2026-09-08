@@ -6,7 +6,7 @@
 //! Measures, per corpus entry:
 //! - decode: ruzstd decode_all (slice API), ruzstd StreamingDecoder (64KiB reads),
 //!   zstd::bulk::decode_all, zstd::stream (64KiB reads)
-//! - encode: ruzstd CompressionLevel::Fastest, zstd level 1 and 3
+//! - encode: ruzstd Level::Fastest, zstd level 1 and 3
 //! All decode outputs are verified against the raw file on the first pass.
 
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
@@ -59,11 +59,17 @@ fn main() {
         entries.push((name, compressed, raw));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    assert!(!entries.is_empty(), "no corpus entries matched filter {filter:?}");
+    assert!(
+        !entries.is_empty(),
+        "no corpus entries matched filter {filter:?}"
+    );
 
     let iters = ITERS;
 
-    println!("== decode: ruzstd vs zstd crate ({} iters, warmup {WARMUP}) ==\n", iters);
+    println!(
+        "== decode: ruzstd vs zstd crate ({} iters, warmup {WARMUP}) ==\n",
+        iters
+    );
     println!(
         "{:<14}{:>9}{:>9}{:>9}{:>9}{:>9}",
         "file", "ruz-slice", "ruz-strm", "zstd-slice", "zstd-strm", "MiB/s of"
@@ -119,7 +125,12 @@ fn main() {
 
         println!(
             "{:<14}{:>9.0}{:>9.0}{:>9.0}{:>9.0}{:>9.0}",
-            name, ruz_slice, ruz_strm, z_slice, z_strm, raw.len() as f64 / (1024.0 * 1024.0)
+            name,
+            ruz_slice,
+            ruz_strm,
+            z_slice,
+            z_strm,
+            raw.len() as f64 / (1024.0 * 1024.0)
         );
     }
 
@@ -134,16 +145,20 @@ fn main() {
             }
         }
         shapes.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("\n== encode: ruzstd Fastest vs zstd crate ({} iters) ==\n", iters);
+        println!(
+            "\n== encode: ruzstd Fastest vs zstd crate ({} iters) ==\n",
+            iters
+        );
         println!(
             "{:<14}{:>9}{:>12}{:>9}{:>12}{:>9}{:>12}",
             "shape", "ruz MB/s", "ratio", "z1 MB/s", "ratio", "z3 MB/s", "ratio"
         );
         for (name, raw) in &shapes {
             // ruzstd Fastest (one-shot slice path, mirrors zstd bulk)
-            let mut comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+            let mut comp =
+                ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
             let t = bench(iters, || {
-                comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+                comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
             });
             let ruz_enc = mibs(raw.len() as u64, t);
             let ruz_ratio = raw.len() as f64 / comp.len() as f64;

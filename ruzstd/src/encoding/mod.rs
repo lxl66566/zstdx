@@ -1,9 +1,9 @@
 //! Structures and utilities used for compressing/encoding data into the Zstd format.
 
-pub(crate) mod block_header;
-pub(crate) mod blocks;
 #[cfg(all(feature = "std", feature = "hash"))]
 pub(crate) mod async_checksum;
+pub(crate) mod block_header;
+pub(crate) mod blocks;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 pub(crate) mod seq_codes;
@@ -11,21 +11,22 @@ pub(crate) mod util;
 
 mod frame_compressor;
 mod levels;
-pub use frame_compressor::FrameCompressor;
 pub use frame_compressor::compress_slice_to_vec;
+pub use frame_compressor::FrameCompressor;
 pub use match_generator::MatchGeneratorDriver;
 
 use crate::io::{Read, Write};
+use crate::Level;
 use alloc::vec::Vec;
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress, CompressionLevel};
+/// use ruzstd::{encoding::compress, Level};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let mut target = Vec::new();
-/// compress(data, &mut target, CompressionLevel::Fastest);
+/// compress(data, &mut target, Level::Fastest);
 /// ```
-pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel) {
+pub fn compress<R: Read, W: Write>(source: R, target: W, level: Level) {
     let mut frame_enc = FrameCompressor::new(level);
     frame_enc.set_source(source);
     frame_enc.set_drain(target);
@@ -34,11 +35,11 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 
 /// Convenience function to compress some source into a Vec without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+/// use ruzstd::{encoding::compress_to_vec, Level};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
-/// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+/// let compressed = compress_to_vec(data, Level::Fastest);
 /// ```
-pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
+pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
     let mut vec = Vec::new();
     compress(source, &mut vec, level);
     vec
@@ -46,7 +47,8 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_slice_to_vec, compress_to_vec, CompressionLevel};
+    use super::{compress_slice_to_vec, compress_to_vec};
+    use crate::Level;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -81,45 +83,19 @@ mod tests {
         }
         for input in &inputs {
             assert_eq!(
-                compress_slice_to_vec(input, CompressionLevel::Fastest),
-                compress_to_vec(input.as_slice(), CompressionLevel::Fastest),
+                compress_slice_to_vec(input, Level::Fastest),
+                compress_to_vec(input.as_slice(), Level::Fastest),
                 "mismatch at len {}",
                 input.len()
             );
             assert_eq!(
-                compress_slice_to_vec(input, CompressionLevel::Uncompressed),
-                compress_to_vec(input.as_slice(), CompressionLevel::Uncompressed),
+                compress_slice_to_vec(input, Level::Uncompressed),
+                compress_to_vec(input.as_slice(), Level::Uncompressed),
                 "uncompressed mismatch at len {}",
                 input.len()
             );
         }
     }
-}
-
-/// The compression mode used impacts the speed of compression,
-/// and resulting compression ratios. Faster compression will result
-/// in worse compression ratios, and vice versa.
-#[derive(Copy, Clone, Debug)]
-pub enum CompressionLevel {
-    /// This level does not compress the data at all, and simply wraps
-    /// it in a Zstandard frame.
-    Uncompressed,
-    /// This level is roughly equivalent to Zstd compression level 1
-    Fastest,
-    /// This level is roughly equivalent to Zstd level 3,
-    /// or the one used by the official compressor when no level
-    /// is specified.
-    ///
-    /// UNIMPLEMENTED
-    Default,
-    /// This level is roughly equivalent to Zstd level 7.
-    ///
-    /// UNIMPLEMENTED
-    Better,
-    /// This level is roughly equivalent to Zstd level 11.
-    ///
-    /// UNIMPLEMENTED
-    Best,
 }
 
 /// A sequence as emitted into the encoder's collection buffers by
@@ -220,7 +196,7 @@ pub trait Matcher {
         }
     }
     /// Reset this matcher so it can be used for the next new frame
-    fn reset(&mut self, level: CompressionLevel);
+    fn reset(&mut self, level: Level);
     /// The size of the window the decoder will need to execute all sequences produced by this matcher
     ///
     /// May change after a call to reset with a different compression level

@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::encoding::{compress_to_vec, CompressionLevel};
+use crate::{encoding::compress_to_vec, Level};
 
 #[test]
 fn fastest_does_not_expand_incompressible_blocks_past_raw_size() {
@@ -14,8 +14,8 @@ fn fastest_does_not_expand_incompressible_max_size_blocks() {
 
 fn assert_fastest_does_not_exceed_raw(len: usize) {
     let data = xorshift(len);
-    let raw = compress_to_vec(data.as_slice(), CompressionLevel::Uncompressed);
-    let fastest = compress_to_vec(data.as_slice(), CompressionLevel::Fastest);
+    let raw = compress_to_vec(data.as_slice(), Level::Uncompressed);
+    let fastest = compress_to_vec(data.as_slice(), Level::Fastest);
 
     assert!(
         fastest.len() <= raw.len(),
