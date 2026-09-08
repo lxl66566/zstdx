@@ -147,12 +147,14 @@ fn emit_seq(
         of: of_value,
     });
     let match_end = start + match_len;
-    // Index the covered range: short matches keep every position (they carry
-    // most of the alignment coverage on structured data); long matches fall
-    // back to a 4-byte grid anchored at the match start plus the final byte,
-    // because hashing every byte of long matches was a large share of encoder
-    // time. The insert bound is hoisted: a position is insertable while 5
-    // window bytes start at it.
+    // Short matches keep every position (they carry the alignment coverage on
+    // structured data). Long matches only index two anchors (zstd fast's fill
+    // policy): one just inside the start, one just before the end — the scan
+    // loop already indexes the positions it probes, so interior coverage only
+    // needs seed points for the phases the scan skips over, and hashing a
+    // 4-byte grid across long matches dominated encoder time. Both anchors
+    // need HASH_READ bytes of window ahead; a match reaching the insert bound
+    // simply leaves them out.
     if match_len <= 16 {
         let end = (win_base + match_end as u64).min(insert_max);
         let mut p = win_base + start as u64;
@@ -161,15 +163,14 @@ fn emit_seq(
             p += 1;
         }
     } else {
-        let first = win_base + start as u64;
-        let last = (win_base + (match_end - 1) as u64).min(insert_max);
-        let mut p = first;
-        while p < last {
-            insert_at(win, table, epoch, (p - win_base) as usize, p);
-            p += 4;
-        }
-        if last > first {
-            insert_at(win, table, epoch, (last - win_base) as usize, last);
+        let base = win_base + start as u64;
+        let hi = base + match_len as u64 - 2;
+        if hi <= insert_max {
+            let lo = base + 2;
+            insert_at(win, table, epoch, (lo - win_base) as usize, lo);
+            if hi > lo {
+                insert_at(win, table, epoch, (hi - win_base) as usize, hi);
+            }
         }
     }
     win_base + match_end as u64
@@ -405,16 +406,12 @@ impl Matcher for MatchGeneratorDriver {
                 cur1 = read4(win, idx1);
             }
             // Store after both lookups so each probe sees the pre-store
-            // entry (newest-wins). Only every other position is indexed:
-            // halving the insert rate doubles how long a far repeat stays
-            // discoverable in the contended small table.
-            if idx0 & 1 == 0 {
-                // SAFETY: as above.
-                unsafe {
-                    *table.get_unchecked_mut(h0) = (epoch << 48) | pos;
-                }
+            // entry (newest-wins).
+            // SAFETY: as above.
+            unsafe {
+                *table.get_unchecked_mut(h0) = (epoch << 48) | pos;
             }
-            if pair_len == 2 && idx1 & 1 == 0 {
+            if pair_len == 2 {
                 // SAFETY: as above.
                 unsafe {
                     *table.get_unchecked_mut(h1) = (epoch << 48) | (pos + 1);
