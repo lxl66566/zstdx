@@ -4,6 +4,26 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Compression levels beyond `Fastest`: `Level::Fast` (≈ zstd 3-5), `Level::Balanced`
+  (≈ 6-9) and `Level::Best` (≈ 12-15) join the ladder, each backed by a real
+  hash-chain matcher inside `MatchGeneratorDriver` (per-level hash-log,
+  window, chain-table size, search depth and lazy depth, following
+  libzstd's `clevels.h`). The chain walk prefers repcode candidates,
+  extends matches backwards into pending literals (keeping one literal
+  pending for repcode emissions — a zero-literal repcode resolves to a
+  repcode swap on the decoder side), defers emission across lazy steps
+  when a longer match starts nearby, and fully chain-indexes covered
+  ranges (a coarse grid inside long matches). `Fastest` keeps its
+  byte-identical single-probe fast loop; `Level::approximate_zstd` maps
+  numeric levels (1-2 → Fastest, 3-5 → Fast, 6-9 → Balanced, 10-22 →
+  Best) and the compat layer now uses it instead of flattening every
+  level to Fastest. On 32 MiB of repetitive text the ladder reaches
+  0.0043/0.0041/0.0041 (zstd 3/6/12: 0.0045/0.0041/0.0039) at
+  2300/1600/1000 MiB/s; on short-match synthetic data it trails zstd's
+  corresponding levels by 5-25% (no optimal parser yet). Multithreaded
+  jobs overlap chain levels at window/4 to hold the ratio within 2% of
+  the single-thread path.
+
 * Parallel decoding of complete in-memory inputs: `bulk::decompress_with`
   and `bulk::decompress_to_buffer_with` with `DecoderOptions::threads(n)`
   engage a segment-parallel decoder on std builds. A pre-scan walks the
