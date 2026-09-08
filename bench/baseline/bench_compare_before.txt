@@ -1,0 +1,27 @@
+== decode: ruzstd vs zstd crate (5 iters, warmup 1) ==
+
+file          ruz-slice ruz-strmzstd-slicezstd-strm MiB/s of
+json.zst1          1320     1213     1172     1635       32
+json.zst3          1154      991     1023     1350       32
+json.zst9          1356     1163     1166     1558       32
+random.zst1       10640    10898     3976     8920       32
+random.zst3       10858     9938     3894     7625       32
+random.zst9       10810     8563     3909     7206       32
+skewed.zst1        2442     2462     1474     2201       32
+skewed.zst3         951      871      948     1066       32
+skewed.zst9         496      427      597      622       32
+text.zst1          1136     1018     1385     1784       32
+text.zst3          7649     7033     2922     8321       32
+text.zst9         10262     8236     3047     8784       32
+zeros.zst1        13969    14244     3547    10419       32
+zeros.zst3        14016    11981     3842    11237       32
+zeros.zst9        14645    10596     3989    10479       32
+
+== encode: ruzstd Fastest vs zstd crate (5 iters) ==
+
+shape          ruz MB/s       ratio  z1 MB/s       ratio  z3 MB/s       ratio
+json.raw            466        6.05      865        6.17      528        5.34
+random.raw         2249        1.00     3043        1.00     2965        1.00
+skewed.raw         4557        2.00     1213        2.00      221        1.92
+text.raw           8042      196.58      708        5.24     7566      222.70
+zeros.raw         19777    32357.22    13950    32171.08     9675    32171.08

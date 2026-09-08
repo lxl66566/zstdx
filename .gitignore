@@ -7,4 +7,5 @@ Cargo.lock
 fuzz_decodecorpus
 perf.data*
 ruzstd/fuzz/corpus
+/bench/corpus
 .idea
