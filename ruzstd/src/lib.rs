@@ -52,7 +52,7 @@ pub mod compat;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
-pub mod dictionary;
+pub mod dict;
 pub mod encoding;
 
 pub mod error;

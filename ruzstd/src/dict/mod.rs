@@ -26,7 +26,7 @@ mod cover;
 mod frequency;
 mod reservoir;
 
-use crate::dictionary::reservoir::create_sample;
+use crate::dict::reservoir::create_sample;
 use alloc::vec;
 use core::cmp::Reverse;
 use cover::*;
@@ -71,7 +71,7 @@ pub(super) struct DictParams {
 /// // Create a roughly 1mb dictionary, training off of file in `sample_files`
 /// let input_folder = "sample_files/";
 /// let mut output = File::create("output.dict").unwrap();
-/// ruzstd::dictionary::create_raw_dict_from_dir(input_folder, &mut output, 1_000_000);
+/// ruzstd::dict::create_raw_dict_from_dir(input_folder, &mut output, 1_000_000);
 /// ```
 pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
     path: P,

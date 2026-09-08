@@ -8,7 +8,7 @@
 //! <https://github.com/facebook/zstd/tree/dev/lib/dictBuilder>
 
 use super::DictParams;
-use crate::dictionary::frequency::estimate_frequency;
+use crate::dict::frequency::estimate_frequency;
 use core::convert::TryInto;
 use std::collections::HashMap;
 use std::vec::Vec;

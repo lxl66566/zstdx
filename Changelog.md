@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The `dict_builder` feature's raw-dictionary builder module moved from
+  `ruzstd::dictionary` to `ruzstd::dict`, matching the zstd crate's naming
+  and the new top-level module layout (`decoding::Dictionary` stays where
+  it is; it parses dictionaries rather than building them).
+
 * The benchmark examples now measure through a shared interleaved A/B
   harness (`examples/common/mod.rs`, pulled in via `#[path]`): both sides
   alternate round by round so slow machine drift (thermal, clocks,
