@@ -57,8 +57,11 @@ impl MatchGeneratorDriver {
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
     /// zstd block maximum is 128 KiB).
     pub fn new(slice_size: usize) -> Self {
+        // Two windows of capacity: compacting down to MAX_WINDOW then only
+        // after another MAX_WINDOW of input means the copy_within runs at
+        // ~1x data volume instead of once per block.
         Self {
-            win: Vec::with_capacity(MAX_WINDOW + slice_size),
+            win: Vec::with_capacity(2 * MAX_WINDOW + slice_size),
             win_base: 0,
             pos: 0,
             block_end: 0,
