@@ -617,6 +617,169 @@ fn entropy_log2(x: f64) -> f64 {
     exp as f64 + frac
 }
 
+/// Exact literal histogram. Blocks whose alphabet stays within sixteen
+/// symbols run an AVX-512 kernel (sixteen per-slot mask compares plus
+/// popcounts per 64 bytes, coverage-checked through a 256-entry membership
+/// LUT); anything wider falls back to the four-lane scalar pass keyed by
+/// position mod 4, whose sub-histograms keep concurrent increments in
+/// different cache lines. Returns the highest symbol with a nonzero count.
+fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if literals.len() >= 64
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("popcnt")
+        {
+            // SAFETY: the features were just detected; every access stays
+            // inside `literals` (the loop guards i + 64 <= len).
+            if let Some(max) = unsafe { histogram_small_alpha_avx512(literals, counts) } {
+                return max;
+            }
+        }
+    }
+    let mut c0 = [0usize; 256];
+    let mut c1 = [0usize; 256];
+    let mut c2 = [0usize; 256];
+    let mut c3 = [0usize; 256];
+    let mut chunks = literals.chunks_exact(4);
+    for chunk in &mut chunks {
+        c0[chunk[0] as usize] += 1;
+        c1[chunk[1] as usize] += 1;
+        c2[chunk[2] as usize] += 1;
+        c3[chunk[3] as usize] += 1;
+    }
+    for &b in chunks.remainder() {
+        c0[b as usize] += 1;
+    }
+    for i in 0..256 {
+        counts[i] = c0[i] + c1[i] + c2[i] + c3[i];
+    }
+    let mut max_symbol = 255;
+    while counts[max_symbol] == 0 {
+        max_symbol -= 1;
+    }
+    max_symbol
+}
+
+/// AVX-512 histogram for at-most-16-symbol alphabets. The slot set grows
+/// from uncovered bytes (cold scalar absorb); a seventeenth distinct symbol
+/// aborts with `None` and leaves `counts` untouched for the scalar fallback.
+/// Published counts are exact, so the block encode is byte-identical to the
+/// scalar path.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512bw,avx512vbmi,popcnt")]
+unsafe fn histogram_small_alpha_avx512(
+    literals: &[u8],
+    counts: &mut [usize; 256],
+) -> Option<usize> {
+    use core::arch::x86_64::*;
+
+    let mut slots = [0u8; 16];
+    let mut nslots = 0usize;
+    // 0 marks a byte already covered by a slot.
+    let mut lut = [1u8; 256];
+    let mut acc = [0u32; 16];
+
+    let mask7f = _mm512_set1_epi8(0x7F);
+    let load_lut = |lut: &[u8; 256]| {
+        (
+            _mm512_loadu_si512(lut.as_ptr().cast()),
+            _mm512_loadu_si512(lut.as_ptr().add(64).cast()),
+            _mm512_loadu_si512(lut.as_ptr().add(128).cast()),
+            _mm512_loadu_si512(lut.as_ptr().add(192).cast()),
+        )
+    };
+    let (mut lut01, mut lut01b, mut lut23, mut lut23b) = load_lut(&lut);
+
+    let mut i = 0usize;
+    while i + 64 <= literals.len() {
+        // Steady state: sixteen established slots. Fixed-bound slot loop in
+        // four-chunk batches amortizes the symbol broadcasts, and full
+        // coverage reduces to the popcount sum: every byte matches at most
+        // one slot (the slots are distinct), so a sum below 256 means a
+        // seventeenth symbol — bail for the scalar fallback.
+        if nslots == 16 && i + 256 <= literals.len() {
+            while i + 256 <= literals.len() {
+                // SAFETY: guarded by the loop condition.
+                let a = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
+                let b = _mm512_loadu_si512(literals.as_ptr().add(i + 64).cast());
+                let c = _mm512_loadu_si512(literals.as_ptr().add(i + 128).cast());
+                let d = _mm512_loadu_si512(literals.as_ptr().add(i + 192).cast());
+                let mut covered = 0u32;
+                for s in 0..16 {
+                    let sym = _mm512_set1_epi8(slots[s] as i8);
+                    let n = _mm512_cmpeq_epi8_mask(a, sym).count_ones()
+                        + _mm512_cmpeq_epi8_mask(b, sym).count_ones()
+                        + _mm512_cmpeq_epi8_mask(c, sym).count_ones()
+                        + _mm512_cmpeq_epi8_mask(d, sym).count_ones();
+                    covered += n;
+                    acc[s] += n;
+                }
+                if covered != 256 {
+                    return None;
+                }
+                i += 256;
+            }
+            continue;
+        }
+        // SAFETY: the loop guard bounds this 64-byte load.
+        let v = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
+        // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
+        // pair, bit 7 blends between the pairs (same pattern as the uniform4
+        // pack kernel).
+        let lo7 = _mm512_and_si512(v, mask7f);
+        let lutv = _mm512_mask_blend_epi8(
+            _mm512_movepi8_mask(v),
+            _mm512_permutex2var_epi8(lut01, lo7, lut01b),
+            _mm512_permutex2var_epi8(lut23, lo7, lut23b),
+        );
+        if _mm512_test_epi8_mask(lutv, lutv) == 0 {
+            for s in 0..nslots {
+                let m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(slots[s] as i8));
+                acc[s] += m.count_ones();
+            }
+        } else {
+            // Absorb the chunk by hand, growing the slot set from its novel
+            // bytes. A fresh byte past sixteen slots means the alphabet is
+            // too wide for this kernel.
+            for j in 0..64 {
+                let b = literals[i + j];
+                if lut[b as usize] != 0 {
+                    if nslots == 16 {
+                        return None;
+                    }
+                    lut[b as usize] = 0;
+                    slots[nslots] = b;
+                    nslots += 1;
+                }
+                let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
+                acc[slot] += 1;
+            }
+            (lut01, lut01b, lut23, lut23b) = load_lut(&lut);
+        }
+        i += 64;
+    }
+    for &b in &literals[i..] {
+        if lut[b as usize] != 0 {
+            if nslots == 16 {
+                return None;
+            }
+            lut[b as usize] = 0;
+            slots[nslots] = b;
+            nslots += 1;
+        }
+        let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
+        acc[slot] += 1;
+    }
+    let mut max_symbol = 0usize;
+    for s in 0..nslots {
+        counts[slots[s] as usize] = acc[s] as usize;
+        max_symbol = max_symbol.max(slots[s] as usize);
+    }
+    Some(max_symbol)
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -672,32 +835,9 @@ fn compress_literals(
     *gate_hold = true;
 
     // One histogram feeds both the entropy-bound reject and the table build:
-    // literals used to be scanned twice, once per consumer. Four
-    // sub-histograms keyed by position mod 4 keep concurrent increments in
-    // different cache lines, avoiding same-counter store-forwarding
-    // serialization on small alphabets; the merge costs 256 adds per block.
-    let mut c0 = [0usize; 256];
-    let mut c1 = [0usize; 256];
-    let mut c2 = [0usize; 256];
-    let mut c3 = [0usize; 256];
-    let mut chunks = literals.chunks_exact(4);
-    for chunk in &mut chunks {
-        c0[chunk[0] as usize] += 1;
-        c1[chunk[1] as usize] += 1;
-        c2[chunk[2] as usize] += 1;
-        c3[chunk[3] as usize] += 1;
-    }
-    for &b in chunks.remainder() {
-        c0[b as usize] += 1;
-    }
+    // literals used to be scanned twice, once per consumer.
     let mut counts = [0usize; 256];
-    for i in 0..256 {
-        counts[i] = c0[i] + c1[i] + c2[i] + c3[i];
-    }
-    let mut max_symbol = 255;
-    while counts[max_symbol] == 0 {
-        max_symbol -= 1;
-    }
+    let max_symbol = histogram_literals(literals, &mut counts);
 
     // Cheap reject for near-incompressible literals (libzstd's
     // suspectUncompressible idea): building the tree, describing it and
