@@ -1,56 +1,34 @@
-//! Small-payload encode benchmark: ruzstd `compress_slice_to_vec` vs the
-//! zstd crate's bulk path, per-call throughput including allocator effects.
+//! Small-payload encode benchmark: ruzstd `bulk::compress` vs the zstd
+//! crate's bulk path, per-call throughput including allocator effects.
+//!
 //! Usage: cargo run --release --example bench_small [-- filter...]
+//! Env: `IMPL=ruzstd|zstd` restricts to one implementation, `SIZE=<bytes>`
+//! restricts to one payload size, `BENCH_BUDGET_MS` sets the budget.
+//! Rounds batch ~4 MiB of calls so tiny payloads don't measure timer
+//! overhead (see `examples/common`).
+
+#[path = "common/mod.rs"]
+mod common;
+
+use common::{black_box, Ab};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
-
-fn bench(name: &str, data: &[u8], iters: usize) {
-    // IMPL=ruzstd|zstd restricts the timed loop to one implementation.
-    let impl_sel = std::env::var("IMPL").unwrap_or_default();
-    // roundtrip check
-    let comp = ruzstd::encoding::compress_slice_to_vec(data, ruzstd::Level::Fastest);
-    let mut fr = ruzstd::decoding::FrameDecoder::new();
-    let mut back = Vec::with_capacity(data.len() + 16);
-    fr.decode_all_to_vec(&comp, &mut back).unwrap();
-    assert_eq!(&back[..], data);
-
-    let mut el_ruzstd = f64::NAN;
-    if impl_sel != "zstd" {
-        let t = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(ruzstd::encoding::compress_slice_to_vec(
-                data,
-                ruzstd::Level::Fastest,
-            ));
-        }
-        el_ruzstd = t.elapsed().as_secs_f64() / iters as f64;
-    }
-
-    let zcomp = zstd::bulk::compress(data, 1).unwrap();
-    let mut el_zstd = f64::NAN;
-    if impl_sel != "ruzstd" {
-        let t = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(zstd::bulk::compress(data, 1).unwrap());
-        }
-        el_zstd = t.elapsed().as_secs_f64() / iters as f64;
-    }
-
-    println!(
-        "{name:<14} {:>7} B  ruzstd {:>8.0} MiB/s ratio {:>6.2} | zstd1 {:>8.0} MiB/s ratio {:>6.2}",
-        data.len(),
-        data.len() as f64 / (1024.0 * 1024.0) / el_ruzstd,
-        data.len() as f64 / comp.len() as f64,
-        data.len() as f64 / (1024.0 * 1024.0) / el_zstd,
-        data.len() as f64 / zcomp.len() as f64,
-    );
-}
 
 fn main() {
     let filters: Vec<String> = std::env::args().skip(1).collect();
+    let impl_sel = std::env::var("IMPL").unwrap_or_default();
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("../bench/corpus");
+
+    let ab = Ab::default();
+    println!(
+        "small-payload encode (interleaved A/B, budget {:.0} ms/side)",
+        ab.min_secs * 1000.0
+    );
+    println!(
+        "{:<16}{:>9}{:>9}  {}",
+        "shape", "ruz", "zstd1", "xslow  (MiB/s)"
+    );
     for shape in ["json", "text", "skewed", "random"] {
         if !filters.is_empty() && !filters.iter().any(|f| shape.contains(f.as_str())) {
             continue;
@@ -64,12 +42,47 @@ fn main() {
                     continue;
                 }
             }
-            // ITERS overrides the default cadence so profilers get a long run.
-            let iters = std::env::var("ITERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| (64 * 1024 * 1024 / size).clamp(200, 20000));
-            bench(&format!("{shape}-{}K", size / 1024), &raw[..size], iters);
+            let data = &raw[..size];
+            // correctness gate
+            let comp = ruzstd::bulk::compress(data, ruzstd::Level::Fastest);
+            let mut back = Vec::with_capacity(data.len() + 16);
+            ruzstd::decoding::FrameDecoder::new()
+                .decode_all_to_vec(&comp, &mut back)
+                .unwrap();
+            assert_eq!(&back[..], data);
+
+            let batch = (4 * 1024 * 1024 / size).clamp(1, 100_000);
+            let name = format!("{shape}-{}K", size / 1024);
+            let bytes = (size * batch) as u64;
+            if impl_sel == "zstd" {
+                let stats = common::measure_solo(|| {
+                    for _ in 0..batch {
+                        black_box(zstd::bulk::compress(data, 1).unwrap());
+                    }
+                });
+                println!("{name:<16}{:>9}{:>9.0}", "", stats.mibs(bytes));
+            } else if impl_sel == "ruzstd" {
+                let stats = common::measure_solo(|| {
+                    for _ in 0..batch {
+                        black_box(ruzstd::bulk::compress(data, ruzstd::Level::Fastest));
+                    }
+                });
+                println!("{name:<16}{:>9.0}{:>9}", stats.mibs(bytes), "");
+            } else {
+                let report = ab.measure(
+                    || {
+                        for _ in 0..batch {
+                            black_box(ruzstd::bulk::compress(data, ruzstd::Level::Fastest));
+                        }
+                    },
+                    || {
+                        for _ in 0..batch {
+                            black_box(zstd::bulk::compress(data, 1).unwrap());
+                        }
+                    },
+                );
+                report.print(&name, bytes, "", "");
+            }
         }
     }
 }

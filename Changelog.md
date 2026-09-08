@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The benchmark examples now measure through a shared interleaved A/B
+  harness (`examples/common/mod.rs`, pulled in via `#[path]`): both sides
+  alternate round by round so slow machine drift (thermal, clocks,
+  background load) hits them equally and the per-round time ratio is the
+  primary output; each side runs after one warmup round and until a time
+  budget (500 ms default, `BENCH_BUDGET_MS` overrides), with median/min/max
+  and median-absolute-deviation stats instead of bare means. `bench_compare`
+  reworks its decode cells into slice/stream pairs and its encode cells
+  against zstd levels 1 and 3; `bench_small` batches ~4 MiB of calls per
+  round so small payloads don't measure timer overhead (keeping the IMPL and
+  SIZE env knobs for profiling); `bench_encode` measures against zstd -1.
+  A full `bench_compare` pass stays under roughly two minutes at the
+  default budget.
+
 * A zstd-crate compatibility layer at `ruzstd::compat` (std builds): the
   `zstd` crate's module layout, type names, numeric levels and `io::Result`
   signatures on top of the pure-Rust implementation, so `zstd::` imports

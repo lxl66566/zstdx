@@ -1,44 +1,60 @@
-//! Encode-only benchmark with phase timing: matcher vs entropy coding.
+//! Encode-only benchmark of the ruzstd fast path over the corpus, with the
+//! zstd crate's level 1 as the interleaved reference.
+//!
 //! Usage: cargo run --release --example bench_encode [-- filter...]
-//! Only corpora whose file name contains one of the filters are benchmarked.
+//! `BENCH_BUDGET_MS` sets the per-side budget (default 500).
 
+#[path = "common/mod.rs"]
+mod common;
+
+use common::{black_box, Ab};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
 
 fn main() {
     let filters: Vec<String> = std::env::args().skip(1).collect();
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("../bench/corpus");
+
+    let ab = Ab::default();
+    println!(
+        "encode (interleaved A/B vs zstd -1, budget {:.0} ms/side)",
+        ab.min_secs * 1000.0
+    );
+    println!(
+        "{:<16}{:>9}{:>9}  {}",
+        "shape", "ruz", "zstd1", "xslow  (MiB/s; ruz ratio)"
+    );
     for entry in fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
         if !name.ends_with(".raw") {
             continue;
         }
-        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f)) {
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
             continue;
         }
         let raw = fs::read(&path).unwrap();
-        let iters = 3;
-        let comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
-        // roundtrip check
-        let mut fr = ruzstd::decoding::FrameDecoder::new();
+
+        // correctness gate
+        let comp = ruzstd::bulk::compress(&raw, ruzstd::Level::Fastest);
         let mut back = Vec::with_capacity(raw.len() + 16);
-        fr.decode_all_to_vec(&comp, &mut back).unwrap();
+        ruzstd::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&comp, &mut back)
+            .unwrap();
         assert_eq!(&back[..], &raw[..]);
-        let t = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(ruzstd::encoding::compress_slice_to_vec(
-                &raw[..],
-                ruzstd::Level::Fastest,
-            ));
-        }
-        let el = t.elapsed().as_secs_f64() / iters as f64;
-        println!(
-            "{name:<12} {:.0} MiB/s  ratio {:.2}",
-            raw.len() as f64 / (1024.0 * 1024.0) / el,
-            raw.len() as f64 / comp.len() as f64
+        zstd::stream::copy_decode(&comp[..], &mut Vec::new()).unwrap();
+        let ratio = raw.len() as f64 / comp.len() as f64;
+
+        let report = ab.measure(
+            || {
+                black_box(ruzstd::bulk::compress(&raw, ruzstd::Level::Fastest));
+            },
+            || {
+                black_box(zstd::bulk::compress(&raw, 1).unwrap());
+            },
         );
+        report.print(&name, raw.len() as u64, "", "");
+        println!("{:<16}ruzstd ratio {ratio:.2}", "");
     }
 }

@@ -1,42 +1,24 @@
 //! Head-to-head benchmark: ruzstd vs the zstd crate (libzstd bindings).
 //!
 //! Usage: cargo run --release --example bench_compare [--] [filter]
-//! `filter` selects shapes by substring (e.g. `text` or `text.zst3`).
+//! `filter` selects shapes by substring (e.g. `text` or `text.zst3`);
+//! `BENCH_BUDGET_MS` sets the per-side measurement budget (default 500).
 //!
-//! Measures, per corpus entry:
-//! - decode: ruzstd decode_all (slice API), ruzstd StreamingDecoder (64KiB reads),
-//!   zstd::bulk::decode_all, zstd::stream (64KiB reads)
-//! - encode: ruzstd Level::Fastest, zstd level 1 and 3
-//! All decode outputs are verified against the raw file on the first pass.
+//! Every cell is an interleaved A/B measurement (see `examples/common`):
+//! both sides alternate round by round so machine drift cancels, and the
+//! reported ratio is the per-round median. Decode cells compare the slice
+//! and streaming paths; encode cells compare our Fastest level against
+//! zstd levels 1 and 3. All outputs are verified against the raw file
+//! before anything is timed.
 
+#[path = "common/mod.rs"]
+mod common;
+
+use common::Ab;
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use std::fs;
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-#[inline(never)]
-fn black_box<T>(v: T) -> T {
-    std::hint::black_box(v)
-}
-
-const WARMUP: usize = 1;
-const ITERS: usize = 5;
-
-fn bench<F: FnMut()>(iters: usize, mut f: F) -> f64 {
-    for _ in 0..WARMUP {
-        f();
-    }
-    let start = Instant::now();
-    for _ in 0..iters {
-        f();
-    }
-    start.elapsed().as_secs_f64() / iters as f64
-}
-
-fn mibs(bytes: u64, secs: f64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0) / secs
-}
+use std::path::PathBuf;
 
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_default();
@@ -64,78 +46,77 @@ fn main() {
         "no corpus entries matched filter {filter:?}"
     );
 
-    let iters = ITERS;
-
+    let ab = Ab::default();
     println!(
-        "== decode: ruzstd vs zstd crate ({} iters, warmup {WARMUP}) ==\n",
-        iters
+        "== decode (interleaved A/B, budget {:.0} ms/side) ==",
+        ab.min_secs * 1000.0
     );
     println!(
-        "{:<14}{:>9}{:>9}{:>9}{:>9}{:>9}",
-        "file", "ruz-slice", "ruz-strm", "zstd-slice", "zstd-strm", "MiB/s of"
+        "{:<16}{:>9}{:>9}   {}",
+        "file", "ruz", "zstd", "xslow  (MiB/s of each; ratio = ruz_time/zstd_time)"
     );
     for (name, compressed, raw) in &entries {
-        // --- ruzstd slice decode, exact-size buffer
+        // correctness gate before anything is timed
         let mut fr = FrameDecoder::new();
         let mut out = vec![0u8; raw.len()];
         fr.decode_all(compressed, &mut out).expect("ruzstd decode");
         assert_eq!(&out[..], &raw[..], "ruzstd decoded wrong bytes for {name}");
-
-        let t = bench(iters, || {
-            fr.decode_all(compressed, &mut out).unwrap();
-        });
-        let ruz_slice = mibs(raw.len() as u64, t);
-
-        // --- ruzstd streaming decode (64KiB chunks into reused Vec)
-        let mut sink = vec![0u8; 64 * 1024];
-        let t = bench(iters, || {
-            let mut dec = StreamingDecoder::new(&compressed[..]).unwrap();
-            let mut total = 0usize;
-            loop {
-                let n = dec.read(&mut sink).unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n;
-            }
-            assert_eq!(total, raw.len());
-        });
-        let ruz_strm = mibs(raw.len() as u64, t);
-
-        // --- zstd crate bulk decode (ZSTD_decompress, exact size known)
-        let t = bench(iters, || {
-            black_box(zstd::bulk::decompress(&compressed[..], raw.len()).unwrap());
-        });
-        let z_slice = mibs(raw.len() as u64, t);
-
-        // --- zstd crate streaming decode (64KiB chunks, single frame stream decoder reused)
-        let t = bench(iters, || {
-            let mut dec = zstd::stream::read::Decoder::new(&compressed[..]).unwrap();
-            let mut total = 0usize;
-            loop {
-                let n = dec.read(&mut sink).unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n;
-            }
-            assert_eq!(total, raw.len());
-        });
-        let z_strm = mibs(raw.len() as u64, t);
-
-        println!(
-            "{:<14}{:>9.0}{:>9.0}{:>9.0}{:>9.0}{:>9.0}",
-            name,
-            ruz_slice,
-            ruz_strm,
-            z_slice,
-            z_strm,
-            raw.len() as f64 / (1024.0 * 1024.0)
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(
+            &decoded[..],
+            &raw[..],
+            "zstd decoded wrong bytes for {name}"
         );
+
+        let bytes = raw.len() as u64;
+        // slice path
+        let mut fr = FrameDecoder::new();
+        let mut out = vec![0u8; raw.len()];
+        let report = ab.measure(
+            || {
+                fr.decode_all(compressed, &mut out).unwrap();
+                common::black_box(&out);
+            },
+            || {
+                common::black_box(zstd::bulk::decompress(compressed, raw.len()).unwrap());
+            },
+        );
+        report.print(&format!("{name}.sl"), bytes, "", "");
+
+        // streaming path (64 KiB reads)
+        let report = ab.measure(
+            || {
+                let mut dec = StreamingDecoder::new(&compressed[..]).unwrap();
+                let mut sink = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                loop {
+                    let n = dec.read(&mut sink).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                assert_eq!(total, raw.len());
+            },
+            || {
+                let mut dec = zstd::stream::read::Decoder::new(&compressed[..]).unwrap();
+                let mut sink = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                loop {
+                    let n = dec.read(&mut sink).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                assert_eq!(total, raw.len());
+            },
+        );
+        report.print(&format!("{name}.st"), bytes, "", "");
     }
 
-    if filter.is_empty() || Path::new(&filter).exists() {
-        // encode bench only on raw files
+    if filter.is_empty() {
         let mut shapes: Vec<(String, Vec<u8>)> = Vec::new();
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
@@ -145,50 +126,42 @@ fn main() {
             }
         }
         shapes.sort_by(|a, b| a.0.cmp(&b.0));
+        println!("\n== encode (interleaved A/B; ruz = Fastest) ==");
         println!(
-            "\n== encode: ruzstd Fastest vs zstd crate ({} iters) ==\n",
-            iters
-        );
-        println!(
-            "{:<14}{:>9}{:>12}{:>9}{:>12}{:>9}{:>12}",
-            "shape", "ruz MB/s", "ratio", "z1 MB/s", "ratio", "z3 MB/s", "ratio"
+            "{:<16}{:>9}{:>9}   {}",
+            "shape", "ruz", "zstd", "xslow  (MiB/s of each; ratio = ruz_time/zstd_time)"
         );
         for (name, raw) in &shapes {
-            // ruzstd Fastest (one-shot slice path, mirrors zstd bulk)
-            let mut comp =
-                ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
-            let t = bench(iters, || {
-                comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::Level::Fastest);
-            });
-            let ruz_enc = mibs(raw.len() as u64, t);
-            let ruz_ratio = raw.len() as f64 / comp.len() as f64;
-            // roundtrip sanity via libzstd
-            let mut fr = FrameDecoder::new();
+            // correctness gate: our frame decodes with both sides
+            let comp = ruzstd::bulk::compress(raw, ruzstd::Level::Fastest);
             let mut back = Vec::with_capacity(raw.len() + 16);
-            fr.decode_all_to_vec(&comp, &mut back).unwrap();
+            FrameDecoder::new()
+                .decode_all_to_vec(&comp, &mut back)
+                .unwrap();
             assert_eq!(&back[..], &raw[..], "ruzstd roundtrip mismatch for {name}");
             zstd::stream::copy_decode(&comp[..], &mut Vec::new()).unwrap();
+            let ratio = raw.len() as f64 / comp.len() as f64;
 
-            // zstd level 1
-            let t = bench(iters, || {
-                black_box(zstd::bulk::compress(&raw[..], 1).unwrap());
-            });
-            let z1 = mibs(raw.len() as u64, t);
-            let z1_ratio =
-                raw.len() as f64 / zstd::bulk::compress(&raw[..], 1).unwrap().len() as f64;
-
-            // zstd level 3
-            let t = bench(iters, || {
-                black_box(zstd::bulk::compress(&raw[..], 3).unwrap());
-            });
-            let z3 = mibs(raw.len() as u64, t);
-            let z3_ratio =
-                raw.len() as f64 / zstd::bulk::compress(&raw[..], 3).unwrap().len() as f64;
-
-            println!(
-                "{:<14}{:>9.0}{:>12.2}{:>9.0}{:>12.2}{:>9.0}{:>12.2}",
-                name, ruz_enc, ruz_ratio, z1, z1_ratio, z3, z3_ratio
+            let bytes = raw.len() as u64;
+            let report = ab.measure(
+                || {
+                    common::black_box(ruzstd::bulk::compress(raw, ruzstd::Level::Fastest));
+                },
+                || {
+                    common::black_box(zstd::bulk::compress(raw, 1).unwrap());
+                },
             );
+            report.print(&format!("{name}.z1"), bytes, "", "");
+            let report = ab.measure(
+                || {
+                    common::black_box(ruzstd::bulk::compress(raw, ruzstd::Level::Fastest));
+                },
+                || {
+                    common::black_box(zstd::bulk::compress(raw, 3).unwrap());
+                },
+            );
+            report.print(&format!("{name}.z3"), bytes, "", "");
+            println!("{:<16}ruzstd ratio {ratio:.2}", "");
         }
     }
 }
