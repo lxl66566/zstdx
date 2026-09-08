@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The scan loop's hash-table probes read their slots unchecked as well: the
+  hash masks to the table's power-of-two size, so the per-probe bounds
+  checks were provably dead (the insertion side already dropped its check).
+  json executes another 2% fewer instructions and text gains 4% throughput
+  with no corpus regressing in either A/B order; output stays bit-identical.
+
 * The matcher's index insertion stores its hash-table slot unchecked: the
   hash already masks to the table's power-of-two size, so the bounds check
   on every inserted position was provably dead. json executes 2.3% and text

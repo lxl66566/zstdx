@@ -387,7 +387,9 @@ impl Matcher for MatchGeneratorDriver {
         'restart: while block_end.saturating_sub(pos) >= hash_read {
             let idx0 = (pos - win_base) as usize;
             let h0 = hash_at(win, idx0);
-            let prev0 = table[h0];
+            // SAFETY: the hash masks to HASH_LOG bits and the table always
+            // holds 1 << HASH_LOG slots (see insert_at).
+            let prev0 = unsafe { *table.get_unchecked(h0) };
             let cur0 = read4(win, idx0);
             let mut pair_len = 1u64;
             let mut idx1 = idx0;
@@ -398,7 +400,8 @@ impl Matcher for MatchGeneratorDriver {
                 pair_len = 2;
                 idx1 = idx0 + 1;
                 h1 = hash_at(win, idx1);
-                prev1 = table[h1];
+                // SAFETY: as above.
+                prev1 = unsafe { *table.get_unchecked(h1) };
                 cur1 = read4(win, idx1);
             }
             // Store after both lookups so each probe sees the pre-store
@@ -406,10 +409,16 @@ impl Matcher for MatchGeneratorDriver {
             // halving the insert rate doubles how long a far repeat stays
             // discoverable in the contended small table.
             if idx0 & 1 == 0 {
-                table[h0] = (epoch << 48) | pos;
+                // SAFETY: as above.
+                unsafe {
+                    *table.get_unchecked_mut(h0) = (epoch << 48) | pos;
+                }
             }
             if pair_len == 2 && idx1 & 1 == 0 {
-                table[h1] = (epoch << 48) | (pos + 1);
+                // SAFETY: as above.
+                unsafe {
+                    *table.get_unchecked_mut(h1) = (epoch << 48) | (pos + 1);
+                }
             }
 
             // Probe the first position. Repcode candidate first (mirrors
