@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The `--no-default-features` build compiles again: the literals entropy
+  precheck used `f64::log2`, which is std-only; no_std builds now use a
+  linear-mantissa approximation (error < 0.086 against the 8% reject
+  margin). std builds are unchanged.
+
 * Flat four-bit huffman streams (uniform alphabets of 9..16 symbols, e.g.
   low-cardinality columns) pack through an AVX-512VBMI kernel: one 64-symbol
   chunk resolves its 256-entry code LUT with two byte permutes, reverses
