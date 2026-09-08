@@ -75,18 +75,65 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) scratch: super::blocks::compressed::BlockScratch,
 }
 
+/// Per-thread pool for the slice entry point: the hash table, the three
+/// default FSE tables and the block scratch are identical for every frame,
+/// so rebuilding them per call dominates small inputs. The state is taken
+/// out for the duration of the call, so reentrant compression (the drain of
+/// a nested compressor) cannot observe the borrow.
+#[cfg(feature = "std")]
+std::thread_local! {
+    static SLICE_STATE: core::cell::RefCell<Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
+    CompressState {
+        matcher: MatchGeneratorDriver::new_direct(),
+        last_huff_table: None,
+        fse_tables: FseTables::new(),
+        scratch: Default::default(),
+    }
+}
+
+/// Reset a pooled state for a new frame: the matcher's epoch bump retires
+/// stale hash entries and the entropy tables return to their defaults.
+fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: CompressionLevel) {
+    state.matcher.reset(level);
+    state.last_huff_table = None;
+    state.fse_tables.ll_previous = None;
+    state.fse_tables.ml_previous = None;
+    state.fse_tables.of_previous = None;
+}
+
 /// Compress an in-memory buffer into a fresh Vec with no intermediate
 /// copies: the matcher window points directly into `src` (no read pass, no
 /// window compaction, no window allocation) and blocks append straight into
 /// the output (no staging buffer). Produces the same bytes as
 /// [`super::compress`] over the same input.
 pub fn compress_slice_to_vec(src: &[u8], level: CompressionLevel) -> Vec<u8> {
-    let mut state = CompressState {
-        matcher: super::match_generator::MatchGeneratorDriver::new_direct(),
-        last_huff_table: None,
-        fse_tables: FseTables::new(),
-        scratch: Default::default(),
+    #[cfg(feature = "std")]
+    let mut pooled = SLICE_STATE.with(|p| p.borrow_mut().take()).map(|mut s| {
+        reset_slice_state(&mut s, level);
+        s
+    });
+    #[cfg(feature = "std")]
+    let mut state = match pooled.take() {
+        Some(s) => s,
+        None => alloc::boxed::Box::new(new_slice_state()),
     };
+    #[cfg(not(feature = "std"))]
+    let mut state = new_slice_state();
+    let output = compress_with_state(&mut state, src, level);
+    #[cfg(feature = "std")]
+    SLICE_STATE.with(|p| *p.borrow_mut() = Some(state));
+    output
+}
+
+fn compress_with_state(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    level: CompressionLevel,
+) -> Vec<u8> {
     #[cfg(feature = "hash")]
     let mut hasher = XxHash64::with_seed(0);
     // Worst case (every block raw) is the input size plus block headers;
@@ -131,7 +178,7 @@ pub fn compress_slice_to_vec(src: &[u8], level: CompressionLevel) -> Vec<u8> {
                 output.extend_from_slice(state.matcher.get_last_space());
             }
             CompressionLevel::Fastest => {
-                super::levels::compress_fastest(&mut state, last_block, &mut output)
+                super::levels::compress_fastest(state, last_block, &mut output)
             }
             _ => {
                 unimplemented!();
