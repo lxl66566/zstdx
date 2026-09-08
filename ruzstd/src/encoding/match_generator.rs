@@ -274,8 +274,12 @@ impl Matcher for MatchGeneratorDriver {
         let size = self.slice_size;
         match self.space_pool.pop() {
             Some(mut v) => {
-                v.clear();
-                v.resize(size, 0);
+                // Pooled buffers come from `vec![0; size]` and were only
+                // truncated since, so all bytes stay initialized; the caller
+                // overwrites what it reads and truncates to that length.
+                debug_assert!(v.capacity() >= size);
+                // SAFETY: see invariant above.
+                unsafe { v.set_len(size) };
                 v
             }
             None => alloc::vec![0; size],
