@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* New high-level one-shot API: `ruzstd::{compress, decompress}` and
+  `ruzstd::bulk::{compress, decompress, decompress_to_buffer}`.
+  `bulk::compress` forwards to the pooled slice fast path unchanged;
+  `bulk::decompress` starts from a capacity hint (0 = auto) and doubles until
+  the decoded data fits, transparently consuming concatenated and skippable
+  frames. Configuration moves into builder option sets:
+  `EncoderOptions::{checksum, pledged_size, workers}` (more than one worker
+  currently fails with `Error::Unsupported` until the multithreaded backend
+  lands) and `DecoderOptions::{max_window_size, dictionary}`. The new
+  `ruzstd::{Error, Result}` umbrella converts frame corruption, dictionary
+  and io errors via `?`, and implements `From<Error> for std::io::Error`.
+  `Dictionary` gains a compact `Debug` (id + content length; the entropy
+  tables are omitted).
+
 * All hand-written `Display`/`From`/`std::error::Error` impls in
   `decoding::errors` are now derived with thiserror (the crate's first
   external dependency; compile-time only, and `default-features = false`

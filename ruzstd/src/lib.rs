@@ -1,5 +1,17 @@
 //! A pure Rust implementation of the [Zstandard compression format](https://www.rfc-editor.org/rfc/rfc8878.pdf).
 //!
+//! ## High-level API
+//! For most users these are the entry points:
+//! - one-shot: [`compress`]/[`decompress`] (or [`bulk`] for buffer-to-buffer
+//!   variants)
+//! - streaming: the `stream` module with `io::Read`/`io::Write` shaped
+//!   encoders and decoders
+//! - configuration: [`Level`], [`EncoderOptions`], [`DecoderOptions`]
+//!
+//! Code written against the `zstd` crate (the libzstd bindings) ports with
+//! minimal changes through the `compat` module, which mirrors its shapes
+//! (numeric levels, `io::Result`) on top of the same implementation.
+//!
 //! ## Decompression
 //! The [decoding] module contains the code for decompression.
 //! Decompression can be achieved by using the [`decoding::StreamingDecoder`]
@@ -33,6 +45,7 @@ macro_rules! vprintln {
 }
 
 mod bit_io;
+pub mod bulk;
 mod common;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
@@ -40,9 +53,14 @@ pub mod decoding;
 pub mod dictionary;
 pub mod encoding;
 
+pub mod error;
 pub mod level;
+pub mod options;
 
+pub use bulk::{compress, decompress};
+pub use error::{Error, Feature, ParameterError, Result};
 pub use level::Level;
+pub use options::{DecoderOptions, EncoderOptions};
 
 pub(crate) mod blocks;
 

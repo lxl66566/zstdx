@@ -39,6 +39,17 @@ pub struct Dictionary {
 /// This 4 byte (little endian) magic number refers to the start of a dictionary
 pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
+// The entropy tables would dominate any Debug output; the identity of a
+// dictionary is its id and content.
+impl core::fmt::Debug for Dictionary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Dictionary")
+            .field("id", &self.id)
+            .field("content_bytes", &self.dict_content.len())
+            .finish()
+    }
+}
+
 impl Dictionary {
     /// Parses the dictionary from `raw` and set the tables
     /// it returns the dict_id for checking with the frame's `dict_id``
