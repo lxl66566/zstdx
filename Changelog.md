@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The chain levels grow their probe step on long literal runs (the fast
+  strategy's miss-acceleration policy), so incompressible data no longer
+  pays a full chain walk per byte: random 32 MiB compresses at ~2.1 GiB/s
+  on every level, with `Best` faster than libzstd's level 12 (2118 vs
+  918 MiB/s) at identical (stored) ratios.
+
 * Compression levels beyond `Fastest`: `Level::Fast` (≈ zstd 3-5), `Level::Balanced`
   (≈ 6-9) and `Level::Best` (≈ 12-15) join the ladder, each backed by a real
   hash-chain matcher inside `MatchGeneratorDriver` (per-level hash-log,
