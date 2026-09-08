@@ -62,10 +62,11 @@ impl EncoderOptions {
 /// Parameters of a decoder, applied when the decoder is constructed.
 ///
 /// The dictionary is stored raw and parsed when a decoder takes the options.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DecoderOptions {
     pub(crate) max_window_size: Option<u64>,
     pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
+    pub(crate) threads: u32,
 }
 
 impl DecoderOptions {
@@ -73,6 +74,7 @@ impl DecoderOptions {
         Self {
             max_window_size: None,
             dictionary: None,
+            threads: 0,
         }
     }
 
@@ -87,6 +89,16 @@ impl DecoderOptions {
     /// Attach a zstd dictionary for decoding.
     pub fn dictionary(mut self, dict: &[u8]) -> Self {
         self.dictionary = Some(dict.to_vec());
+        self
+    }
+
+    /// Number of worker threads for decoding. `0` (the default) decodes on
+    /// the calling thread; more than one engages the parallel decoder on std
+    /// builds for one-shot inputs with restart points (job-based encoders
+    /// such as libzstd's `-T` mode and this crate's multithreaded compressor
+    /// emit them; other inputs fall back to the sequential decoder).
+    pub const fn threads(mut self, threads: u32) -> Self {
+        self.threads = threads;
         self
     }
 }

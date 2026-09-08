@@ -149,6 +149,8 @@ const ASYNC_MIN_INPUT: usize = 256 * 1024;
 
 impl SliceChecksum {
     pub(crate) fn new(src_len: usize, checksum: bool) -> Self {
+        #[cfg(not(all(feature = "std", feature = "hash")))]
+        let _ = src_len;
         if !checksum {
             return Self::Off;
         }
@@ -169,11 +171,11 @@ impl SliceChecksum {
     }
 }
 
+#[cfg(feature = "hash")]
 impl BlockChecksum for SliceChecksum {
     #[inline]
     fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
         match self {
-            #[cfg(feature = "hash")]
             Self::Inline(h) => h.scan_block(data),
             // The whole block is posted up front; the resume paths below see
             // a covered offset equal to the length and contribute nothing.
@@ -188,7 +190,6 @@ impl BlockChecksum for SliceChecksum {
     #[inline]
     fn hash_tail(&mut self, bytes: &[u8]) {
         match self {
-            #[cfg(feature = "hash")]
             Self::Inline(h) => h.hash_tail(bytes),
             #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => h.write(bytes),
@@ -198,7 +199,6 @@ impl BlockChecksum for SliceChecksum {
     #[inline]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
         match self {
-            #[cfg(feature = "hash")]
             Self::Inline(h) => h.raw_out(out, bytes, from),
             #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => {
@@ -213,12 +213,31 @@ impl BlockChecksum for SliceChecksum {
     #[inline]
     fn finish32(&mut self) -> u32 {
         match self {
-            #[cfg(feature = "hash")]
             Self::Inline(h) => h.finish32(),
             #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => h.finish(),
             Self::Off => 0,
         }
+    }
+}
+
+/// Without the `hash` feature only the `Off` variant exists: uniform
+/// detection still runs (the RLE path needs it).
+#[cfg(not(feature = "hash"))]
+impl BlockChecksum for SliceChecksum {
+    #[inline]
+    fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
+        (super::util::is_uniform(data), 0)
+    }
+    #[inline]
+    fn hash_tail(&mut self, _bytes: &[u8]) {}
+    #[inline]
+    fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], _from: usize) {
+        out.extend_from_slice(bytes);
+    }
+    #[inline]
+    fn finish32(&mut self) -> u32 {
+        0
     }
 }
 
@@ -431,6 +450,7 @@ fn compress_with_state(
 /// `src` is the whole frame input and must stay alive and unchanged for the
 /// call (the matcher window borrows into it); `job` is the byte range this
 /// job encodes and `overlap` the preceding history the matcher may reference.
+#[cfg(feature = "std")]
 pub(crate) fn compress_job_blocks(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],

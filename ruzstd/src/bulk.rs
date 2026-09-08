@@ -79,6 +79,50 @@ pub fn decompress_to_buffer(source: &[u8], destination: &mut [u8]) -> Result<usi
         .map_err(Into::into)
 }
 
+/// [`decompress_to_buffer`] with a full option set: more than one decode
+/// thread engages the parallel decoder on std builds (see
+/// [`DecoderOptions::threads`][crate::DecoderOptions::threads]).
+pub fn decompress_to_buffer_with(
+    source: &[u8],
+    destination: &mut [u8],
+    options: &crate::DecoderOptions,
+) -> Result<usize> {
+    #[cfg(feature = "std")]
+    if options.threads > 1 && options.dictionary.is_none() {
+        let max = options
+            .max_window_size
+            .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
+        return crate::decoding::mt::decode_all_mt(source, destination, options.threads, max)
+            .map_err(Into::into);
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = options;
+    decompress_to_buffer(source, destination)
+}
+
+/// [`decompress`] with a full option set (see
+/// [`decompress_to_buffer_with`] for the decode-thread switch).
+pub fn decompress_with(
+    source: &[u8],
+    capacity: usize,
+    options: &crate::DecoderOptions,
+) -> Result<alloc::vec::Vec<u8>> {
+    #[cfg(feature = "std")]
+    if options.threads > 1 && options.dictionary.is_none() {
+        let max = options
+            .max_window_size
+            .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
+        let mut out = alloc::vec::Vec::with_capacity(capacity.max(64 * 1024));
+        match crate::decoding::mt::decode_to_vec_mt(source, &mut out, options.threads, max) {
+            Ok(()) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = options;
+    decompress(source, capacity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

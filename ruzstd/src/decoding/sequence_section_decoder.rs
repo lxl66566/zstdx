@@ -40,6 +40,38 @@ unsafe fn decode_sequences_impl_bmi2(
     decode_sequences_impl(section, source, scratch, target)
 }
 
+/// Appending variant used by the segment decoder: the block's sequences land
+/// behind whatever the caller already collected for earlier blocks of the
+/// segment (see decoding::mt).
+#[cfg(feature = "std")]
+pub(crate) fn decode_sequences_into(
+    section: &SequencesHeader,
+    source: &[u8],
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    // BMI2: as above.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: bmi2 was just detected at runtime
+            return unsafe { decode_sequences_into_impl_bmi2(section, source, scratch, target) };
+        }
+    }
+    decode_sequences_into_impl(section, source, scratch, target)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn decode_sequences_into_impl_bmi2(
+    section: &SequencesHeader,
+    source: &[u8],
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    decode_sequences_into_impl(section, source, scratch, target)
+}
+
 /// Two-pass decode into the caller's vector (the ring-buffer execution path).
 /// The flat output path instead fuses decoding with execution sequence by
 /// sequence (see `sequence_execution::execute_decoded_flat`).
@@ -50,22 +82,35 @@ fn decode_sequences_impl(
     scratch: &mut FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
+    target.clear();
+    decode_sequences_into_impl(section, source, scratch, target)
+}
+
+/// The appending core shared by both entry points: appends exactly
+/// `num_sequences` sequences behind the target's current length.
+#[inline(always)]
+fn decode_sequences_into_impl(
+    section: &SequencesHeader,
+    source: &[u8],
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
     let mut dec = SeqDecoder::new(section, source, scratch)?;
     let nseq = section.num_sequences as usize;
-    target.clear();
+    let start = target.len();
     target.reserve(nseq);
-    // SAFETY: nseq slots were just reserved; each iteration writes exactly
-    // one Sequence
+    // SAFETY: start + nseq slots were just reserved; each iteration writes
+    // exactly one Sequence
     let out = target.as_mut_ptr();
     let mut idx = 0;
     while let Some(seq) = dec.next()? {
-        unsafe { *out.add(idx) = seq };
+        unsafe { *out.add(start + idx) = seq };
         idx += 1;
     }
     // SAFETY: idx sequences were written (idx == nseq; next() returns None
     // only at the end). Length is exposed before finish() so an error there
     // sees the same target state the historical loop left behind.
-    unsafe { target.set_len(idx) };
+    unsafe { target.set_len(start + idx) };
     dec.finish()
 }
 

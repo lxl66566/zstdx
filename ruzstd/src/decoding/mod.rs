@@ -14,6 +14,8 @@ pub(crate) mod dictionary;
 pub(crate) mod flat_buffer;
 pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
+#[cfg(feature = "std")]
+pub(crate) mod mt;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;
