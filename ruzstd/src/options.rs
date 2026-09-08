@@ -10,8 +10,7 @@
 //!     .checksum(false);
 //! ```
 
-use crate::decoding::dictionary::Dictionary;
-use crate::{Level, Result};
+use crate::Level;
 
 /// Parameters of an encoder, applied when the encoder is constructed.
 ///
@@ -61,11 +60,11 @@ impl EncoderOptions {
 
 /// Parameters of a decoder, applied when the decoder is constructed.
 ///
-/// Not `Clone`: an attached dictionary owns its decoded entropy tables.
-#[derive(Debug, Default)]
+/// The dictionary is stored raw and parsed when a decoder takes the options.
+#[derive(Debug, Clone, Default)]
 pub struct DecoderOptions {
     pub(crate) max_window_size: Option<u64>,
-    pub(crate) dictionary: Option<Dictionary>,
+    pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
 }
 
 impl DecoderOptions {
@@ -84,9 +83,9 @@ impl DecoderOptions {
         self
     }
 
-    /// Parse `dict` as a zstd dictionary and attach it to the decoder.
-    pub fn dictionary(mut self, dict: &[u8]) -> Result<Self> {
-        self.dictionary = Some(Dictionary::decode_dict(dict)?);
-        Ok(self)
+    /// Attach a zstd dictionary for decoding.
+    pub fn dictionary(mut self, dict: &[u8]) -> Self {
+        self.dictionary = Some(dict.to_vec());
+        self
     }
 }

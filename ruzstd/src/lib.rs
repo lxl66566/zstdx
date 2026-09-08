@@ -9,8 +9,8 @@
 //! - configuration: [`Level`], [`EncoderOptions`], [`DecoderOptions`]
 //!
 //! Code written against the `zstd` crate (the libzstd bindings) ports with
-//! minimal changes through the `compat` module, which mirrors its shapes
-//! (numeric levels, `io::Result`) on top of the same implementation.
+//! minimal changes through [`compat`], which mirrors its shapes (numeric
+//! levels, `io::Result`) on top of the same implementation.
 //!
 //! ## Decompression
 //! The [decoding] module contains the code for decompression.
@@ -47,6 +47,8 @@ macro_rules! vprintln {
 mod bit_io;
 pub mod bulk;
 mod common;
+#[cfg(feature = "std")]
+pub mod compat;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]

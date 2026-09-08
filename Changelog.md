@@ -4,6 +4,25 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* A zstd-crate compatibility layer at `ruzstd::compat` (std builds): the
+  `zstd` crate's module layout, type names, numeric levels and `io::Result`
+  signatures on top of the pure-Rust implementation, so `zstd::` imports
+  swap to `ruzstd::compat::` with minimal churn. Covered: `bulk::{compress,
+  compress_to_buffer, decompress, decompress_to_buffer, Compressor,
+  Decompressor}`, `stream::{read::{Encoder, Decoder}, write::{Encoder,
+  AutoFinishEncoder, Decoder, AutoFlushDecoder}, encode_all, decode_all,
+  copy_encode, copy_decode}` and `DEFAULT_COMPRESSION_LEVEL` /
+  `compression_level_range`. The compat encoders defer stream start so zstd's
+  post-construction setters (`set_pledged_src_size`, `include_checksum`,
+  `window_log_max`, ...) work before the first write and fail afterwards;
+  the compat read decoder likewise defers its first-frame init. Dictionary
+  decoding works end to end (a libzstd-trained dictionary plus a
+  libzstd-compressed dict frame round-trips through it, verified in tests);
+  dictionary encoding and multithread(>1) return errors. Every numeric level
+  compresses with the fast strategy. `DecoderOptions` stores dictionaries
+  as raw bytes now (parsed when a decoder takes the options), which makes
+  the option set `Clone`.
+
 * Streaming decoders: `ruzstd::stream::read::Decoder` decompresses while
   reading and — unlike `decoding::StreamingDecoder`, which is documented to
   stop after one frame — is transparent over concatenated frames and

@@ -214,7 +214,9 @@ impl<W: Write> Decoder<W> {
         if let Some(max) = options.max_window_size {
             inner.set_max_window_size(max);
         }
-        if let Some(dict) = options.dictionary {
+        if let Some(dict) = &options.dictionary {
+            let dict =
+                crate::decoding::Dictionary::decode_dict(dict).map_err(crate::Error::Dictionary)?;
             inner.add_dict(dict)?;
         }
         Ok(Self {
@@ -224,6 +226,18 @@ impl<W: Write> Decoder<W> {
             inited: false,
             checksummed: false,
         })
+    }
+
+    /// Upper bound on the window size of frames not yet decoded; values
+    /// above the format maximum are clamped.
+    pub fn set_max_window_size(&mut self, max: u64) -> Result<()> {
+        self.inner.set_max_window_size(max);
+        Ok(())
+    }
+
+    /// Recommended size of write batches: one full block.
+    pub fn recommended_input_size() -> usize {
+        crate::common::MAX_BLOCK_SIZE as usize
     }
 
     /// Acquires a reference to the underlying writer.

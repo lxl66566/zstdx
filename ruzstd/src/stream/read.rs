@@ -113,7 +113,9 @@ impl<R: Read> Decoder<R> {
         if let Some(max) = options.max_window_size {
             decoder.set_max_window_size(max);
         }
-        if let Some(dict) = options.dictionary {
+        if let Some(dict) = &options.dictionary {
+            let dict =
+                crate::decoding::Dictionary::decode_dict(dict).map_err(crate::Error::Dictionary)?;
             decoder.add_dict(dict)?;
         }
         Self::init_first_frame(&mut source, &mut decoder)?;
@@ -123,6 +125,11 @@ impl<R: Read> Decoder<R> {
             single_frame: false,
             finished: false,
         })
+    }
+
+    /// Recommended size for read batches: one full block.
+    pub fn recommended_output_size() -> usize {
+        crate::common::MAX_BLOCK_SIZE as usize
     }
 
     /// Restrict decoding to the first frame; reads return `Ok(0)` once it is
