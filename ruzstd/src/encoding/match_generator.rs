@@ -20,8 +20,6 @@ use crate::decoding::sequence_execution::do_offset_history;
 
 /// Shortest match worth encoding; matches the format's MINMATCH range.
 const MIN_MATCH: usize = 4;
-/// Bytes fed into the position hash.
-const MIN_HASH: usize = 5;
 /// The hash reads a full u64, so insertable/scannable positions need this
 /// many window bytes ahead to stay in bounds.
 const HASH_READ: usize = 8;
@@ -372,115 +370,210 @@ impl Matcher for MatchGeneratorDriver {
         let mut anchor = self.anchor;
         let mut miss_count = self.miss_count;
         let mut rep = self.rep;
+        let hash_read = HASH_READ as u64;
 
-        while pos < block_end {
-            if block_end - pos < HASH_READ as u64 {
-                break;
+        // Two-position pipeline (libzstd's ip0/ip1 interleave): the hash and
+        // table entry of the next position are prepared before the current
+        // one is probed, so the hash multiply and table-load latencies of
+        // both positions overlap instead of chaining behind every probe. A
+        // pair advances by the miss step once both positions miss; the
+        // second position is dropped at the block tail.
+        // The miss step can jump past the block end, so the guard must
+        // saturate instead of relying on pos < block_end.
+        'restart: while block_end.saturating_sub(pos) >= hash_read {
+            let idx0 = (pos - win_base) as usize;
+            let h0 = hash_at(win, idx0);
+            let prev0 = table[h0];
+            let cur0 = read4(win, idx0);
+            let mut pair_len = 1u64;
+            let mut idx1 = idx0;
+            let mut h1 = h0;
+            let mut prev1 = prev0;
+            let mut cur1 = cur0;
+            if block_end - pos - 1 >= hash_read {
+                pair_len = 2;
+                idx1 = idx0 + 1;
+                h1 = hash_at(win, idx1);
+                prev1 = table[h1];
+                cur1 = read4(win, idx1);
             }
-            let idx = (pos - win_base) as usize;
-            let cur = read4(win, idx);
+            // Store after both lookups so each probe sees the pre-store
+            // entry (newest-wins). Only every other position is indexed:
+            // halving the insert rate doubles how long a far repeat stays
+            // discoverable in the contended small table.
+            if idx0 & 1 == 0 {
+                table[h0] = (epoch << 48) | pos;
+            }
+            if pair_len == 2 && idx1 & 1 == 0 {
+                table[h1] = (epoch << 48) | (pos + 1);
+            }
 
-            // Repcode probe (mirrors zstd's fast strategy: rep[0] only; the
-            // weaker rep1/rep2 candidates steal positions from longer hash
-            // matches). A repcode match needs at least one pending literal so
-            // of_value 1 stays encodable: with literals pending the probe
-            // runs at the current position, otherwise one byte ahead so that
-            // byte becomes the literal. The backward extension guard below
-            // never consumes that literal either way.
-            let probe = if pos == anchor { pos + 1 } else { pos };
-            if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
-                if cand_abs >= win_base {
-                    let mut cand = (cand_abs - win_base) as usize;
-                    let pidx = (probe - win_base) as usize;
-                    let pcur = read4(win, pidx);
-                    if read4(win, cand) == pcur {
-                        let mut ml = extend_match(win, pidx, cand);
-                        if ml >= MIN_MATCH {
-                            let anchor_idx = (anchor - win_base) as usize;
-                            let mut start = pidx;
-                            // Extend backwards into the pending literals; the
-                            // offset (pidx - cand) stays constant.
-                            while start > anchor_idx + 1
-                                && cand > 0
-                                && win[cand - 1] == win[start - 1]
-                            {
-                                cand -= 1;
-                                start -= 1;
-                                ml += 1;
+            // Probe the first position. Repcode candidate first (mirrors
+            // zstd's fast strategy: rep[0] only); a repcode match needs at
+            // least one pending literal so of_value 1 stays encodable: with
+            // literals pending the probe runs at the current position,
+            // otherwise one byte ahead so that byte becomes the literal.
+            {
+                let probe = if pos == anchor { pos + 1 } else { pos };
+                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
+                    if cand_abs >= win_base {
+                        let mut cand = (cand_abs - win_base) as usize;
+                        let pidx = (probe - win_base) as usize;
+                        let pcur = read4(win, pidx);
+                        if read4(win, cand) == pcur {
+                            let mut ml = extend_match(win, pidx, cand);
+                            if ml >= MIN_MATCH {
+                                let anchor_idx = (anchor - win_base) as usize;
+                                let mut start = pidx;
+                                // Extend backwards into the pending literals;
+                                // the offset (pidx - cand) stays constant.
+                                while start > anchor_idx + 1
+                                    && cand > 0
+                                    && win[cand - 1] == win[start - 1]
+                                {
+                                    cand -= 1;
+                                    start -= 1;
+                                    ml += 1;
+                                }
+                                anchor = emit_seq(
+                                    win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
+                                    &mut rep, literals, sequences,
+                                );
+                                pos = rep1_chain(
+                                    win, table, epoch, anchor, block_end, win_base, insert_max,
+                                    &mut rep, literals, sequences,
+                                );
+                                // The chain's matches advance the cursor too.
+                                anchor = pos;
+                                miss_count = 0;
+                                continue 'restart;
                             }
-                            anchor = emit_seq(
-                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                &mut rep, literals, sequences,
-                            );
-                            pos = rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base, insert_max,
-                                &mut rep, literals, sequences,
-                            );
-                            // The chain's matches advance the cursor too.
-                            anchor = pos;
-                            miss_count = 0;
-                            continue;
+                        }
+                    }
+                }
+
+                if prev0 >> 48 == epoch {
+                    let cand_abs = prev0 & ((1u64 << 48) - 1);
+                    if cand_abs >= win_base && pos - cand_abs <= max_window {
+                        let mut cand = (cand_abs - win_base) as usize;
+                        if read4(win, cand) == cur0 {
+                            let mut ml = extend_match(win, idx0, cand);
+                            // A hash match already spans 5 bytes; below 6 the
+                            // sequence overhead roughly equals the literals
+                            // it covers, and rejecting it lets the scan try
+                            // the next position where a longer match may
+                            // start.
+                            if ml >= 6 {
+                                let anchor_idx = (anchor - win_base) as usize;
+                                let mut start = idx0;
+                                // Extend backwards into the pending literals;
+                                // the offset (idx0 - cand) stays constant.
+                                while start > anchor_idx
+                                    && cand > 0
+                                    && win[cand - 1] == win[start - 1]
+                                {
+                                    cand -= 1;
+                                    start -= 1;
+                                    ml += 1;
+                                }
+                                let of_value = (start - cand + 3) as u32;
+                                anchor = emit_seq(
+                                    win, table, epoch, anchor, win_base, insert_max, start, ml,
+                                    of_value, &mut rep, literals, sequences,
+                                );
+                                pos = rep1_chain(
+                                    win, table, epoch, anchor, block_end, win_base, insert_max,
+                                    &mut rep, literals, sequences,
+                                );
+                                anchor = pos;
+                                miss_count = 0;
+                                continue 'restart;
+                            }
                         }
                     }
                 }
             }
 
-            let h = hash_at(win, idx);
-            let prev = table[h];
-            // Index only every other position in the miss path: with a small
-            // table each slot is heavily contended, and halving the insert
-            // rate doubles how long a far repeat stays discoverable.
-            if idx & 1 == 0 {
-                table[h] = (epoch << 48) | pos;
-            }
-
-            let mut matched = false;
-            if prev >> 48 == epoch {
-                let cand_abs = prev & ((1u64 << 48) - 1);
-                if cand_abs >= win_base && pos - cand_abs <= max_window {
-                    let mut cand = (cand_abs - win_base) as usize;
-                    if read4(win, cand) == cur {
-                        let mut ml = extend_match(win, idx, cand);
-                        // A hash match already spans 5 bytes; below 6 the
-                        // sequence overhead roughly equals the literals it
-                        // covers, and rejecting it lets the scan try the next
-                        // position where a longer match may start.
-                        if ml >= 6 {
-                            let anchor_idx = (anchor - win_base) as usize;
-                            let mut start = idx;
-                            // Extend backwards into the pending literals; the
-                            // offset (idx - cand) stays constant.
-                            while start > anchor_idx
-                                && cand > 0
-                                && win[cand - 1] == win[start - 1]
-                            {
-                                cand -= 1;
-                                start -= 1;
-                                ml += 1;
+            // Probe the second position through the entry prepared above.
+            if pair_len == 2 {
+                let pos1 = pos + 1;
+                let probe = if pos1 == anchor { pos1 + 1 } else { pos1 };
+                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
+                    if cand_abs >= win_base {
+                        let mut cand = (cand_abs - win_base) as usize;
+                        let pidx = (probe - win_base) as usize;
+                        let pcur = read4(win, pidx);
+                        if read4(win, cand) == pcur {
+                            let mut ml = extend_match(win, pidx, cand);
+                            if ml >= MIN_MATCH {
+                                let anchor_idx = (anchor - win_base) as usize;
+                                let mut start = pidx;
+                                while start > anchor_idx + 1
+                                    && cand > 0
+                                    && win[cand - 1] == win[start - 1]
+                                {
+                                    cand -= 1;
+                                    start -= 1;
+                                    ml += 1;
+                                }
+                                anchor = emit_seq(
+                                    win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
+                                    &mut rep, literals, sequences,
+                                );
+                                pos = rep1_chain(
+                                    win, table, epoch, anchor, block_end, win_base, insert_max,
+                                    &mut rep, literals, sequences,
+                                );
+                                anchor = pos;
+                                miss_count = 0;
+                                continue 'restart;
                             }
-                            let of_value = (start - cand + 3) as u32;
-                            anchor = emit_seq(
-                                win, table, epoch, anchor, win_base, insert_max, start, ml,
-                                of_value, &mut rep, literals, sequences,
-                            );
-                            pos = rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base, insert_max,
-                                &mut rep, literals, sequences,
-                            );
-                            // The chain's matches advance the cursor too.
-                            anchor = pos;
-                            miss_count = 0;
-                            matched = true;
+                        }
+                    }
+                }
+
+                if prev1 >> 48 == epoch {
+                    let cand_abs = prev1 & ((1u64 << 48) - 1);
+                    if cand_abs >= win_base && pos1 - cand_abs <= max_window {
+                        let mut cand = (cand_abs - win_base) as usize;
+                        if read4(win, cand) == cur1 {
+                            let mut ml = extend_match(win, idx1, cand);
+                            if ml >= 6 {
+                                let anchor_idx = (anchor - win_base) as usize;
+                                let mut start = idx1;
+                                while start > anchor_idx
+                                    && cand > 0
+                                    && win[cand - 1] == win[start - 1]
+                                {
+                                    cand -= 1;
+                                    start -= 1;
+                                    ml += 1;
+                                }
+                                let of_value = (start - cand + 3) as u32;
+                                anchor = emit_seq(
+                                    win, table, epoch, anchor, win_base, insert_max, start, ml,
+                                    of_value, &mut rep, literals, sequences,
+                                );
+                                pos = rep1_chain(
+                                    win, table, epoch, anchor, block_end, win_base, insert_max,
+                                    &mut rep, literals, sequences,
+                                );
+                                anchor = pos;
+                                miss_count = 0;
+                                continue 'restart;
+                            }
                         }
                     }
                 }
             }
-            if !matched {
-                miss_count += 1;
-                // Grow the probe step on long literal runs so incompressible
-                // data does not pay a full hash per byte.
-                pos += 1 + (miss_count >> 2).min(255) as u64;
-            }
+
+            // Both positions missed: grow the probe step on long literal
+            // runs so incompressible data does not pay a full hash per byte.
+            // The step scales the whole pair so the probes-per-byte density
+            // matches the single-position loop at every step size.
+            miss_count += pair_len as usize;
+            let step = 1 + (miss_count >> 2).min(255) as u64;
+            pos += pair_len * step;
         }
         if anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;

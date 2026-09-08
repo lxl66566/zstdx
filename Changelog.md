@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The scan loop interleaves two adjacent positions (libzstd's ip0/ip1
+  pipeline): hashes and table entries for both are prepared before either
+  is probed, overlapping the hash multiply and table load latencies, and a
+  fully-missed pair advances by twice the miss step so probe density on
+  incompressible data is unchanged. json gains 2% throughput and 6%
+  ratio (5.67 -> 6.02, near zstd -1's 6.11) because the pair-step skips
+  over short-match starts the way the ml>=6 gate does; text gains 2%
+  throughput at -1.3% ratio; other corpora are unchanged.
+
 * The bit writer's 64-bit flush stores one unaligned u64 into the reserved
   output vector instead of calling memcpy for eight bytes, removing a call
   per flushed container from every entropy-coded block. Output is

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::{EncodedSequence, Matcher},
+    encoding::Matcher,
     fse::fse_encoder::{build_normalized_table, rle_table, FSETable},
     huff0::huff0_encoder,
 };
