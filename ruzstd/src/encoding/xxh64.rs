@@ -37,6 +37,7 @@ fn read32(b: &[u8]) -> u32 {
 }
 
 /// Streaming XXH64 (seed 0 is all the frame checksum needs; kept general).
+#[derive(Clone, Copy)]
 pub(crate) struct Xxh64 {
     v: [u64; 4],
     total: u64,

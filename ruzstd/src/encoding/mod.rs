@@ -2,6 +2,8 @@
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
+#[cfg(all(feature = "std", feature = "hash"))]
+pub(crate) mod async_checksum;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 pub(crate) mod seq_codes;

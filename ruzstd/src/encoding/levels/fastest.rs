@@ -4,8 +4,8 @@ use crate::{
         block_header::BlockHeader,
         blocks::compress_block,
         blocks::compressed::BlockOutcome,
-        frame_compressor::{CompressState, FrameHasher},
-        util, Matcher,
+        frame_compressor::{BlockChecksum, CompressState},
+        Matcher,
     },
 };
 use alloc::vec::Vec;
@@ -18,23 +18,23 @@ use alloc::vec::Vec;
 /// - `last_block`: Whether or not this block is going to be the last block in the frame
 ///   (needed because this info is written into the block header)
 /// - `output`: As the block is compressed, it's appended to `output`.
-/// - `hasher`: Frame checksum accumulator; this function feeds it exactly
-///   the block's input bytes on every path, fusing the absorb into the raw
-///   block copy where there is one.
+/// - `checksum`: Frame checksum backend; this function feeds it exactly the
+///   block's input bytes on every path, fusing the absorb into the raw block
+///   copy where the backend hashes inline.
 ///
 /// The block data itself is the matcher's last committed space.
 #[inline]
-pub fn compress_fastest<M: Matcher>(
+pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
     state: &mut CompressState<M>,
     last_block: bool,
     output: &mut Vec<u8>,
-    hasher: &mut FrameHasher,
+    hasher: &mut C,
 ) {
     let block_size = state.matcher.get_last_space().len() as u32;
     // The uniform scan doubles as the checksum pass: RLE blocks come out
     // fully hashed, anything else resumes at the first mismatch (fused into
     // the raw copy when the block ends up raw).
-    let (uniform, hashed) = hasher.scan_uniform(state.matcher.get_last_space());
+    let (uniform, hashed) = hasher.scan_block(state.matcher.get_last_space());
     if uniform {
         let rle_byte = state.matcher.get_last_space()[0];
         state.matcher.skip_matching();
@@ -113,7 +113,7 @@ pub fn compress_fastest<M: Matcher>(
             }
             .serialize_into(&mut prefix);
             output[start..start + 3].copy_from_slice(&prefix);
-            hasher.write(&state.matcher.get_last_space()[hashed..]);
+            hasher.hash_tail(&state.matcher.get_last_space()[hashed..]);
         } else {
             output.truncate(start);
             state.matcher.restore_repcode(rep);
@@ -128,7 +128,7 @@ pub fn compress_fastest<M: Matcher>(
             };
             // Write the header, then the block (hashing as it goes)
             header.serialize(output);
-            hasher.write_appending_from(output, state.matcher.get_last_space(), hashed);
+            hasher.raw_out(output, state.matcher.get_last_space(), hashed);
         }
     }
 }

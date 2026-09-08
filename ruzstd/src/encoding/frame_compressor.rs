@@ -98,6 +98,105 @@ impl FrameHasher {
     }
 }
 
+/// Frame-checksum backend shared by the block paths: check a block for a
+/// uniform run while absorbing it, absorb whatever the scan did not cover,
+/// copy a raw block out while absorbing from the scan's offset, and produce
+/// the frame checksum. The inline [`FrameHasher`] implements all four by
+/// itself; the offloaded implementation (std + hash) runs the absorbs on a
+/// sidecar thread and its `scan_block` returns the block's full length as
+/// the covered offset, which turns the resume paths into no-ops.
+pub(crate) trait BlockChecksum {
+    fn scan_block(&mut self, data: &[u8]) -> (bool, usize);
+    fn hash_tail(&mut self, bytes: &[u8]);
+    fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize);
+    fn finish32(&mut self) -> u32;
+}
+
+impl BlockChecksum for FrameHasher {
+    #[inline(always)]
+    fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
+        self.scan_uniform(data)
+    }
+    #[inline(always)]
+    fn hash_tail(&mut self, bytes: &[u8]) {
+        self.write(bytes);
+    }
+    #[inline(always)]
+    fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
+        self.write_appending_from(out, bytes, from);
+    }
+    #[inline(always)]
+    fn finish32(&mut self) -> u32 {
+        self.finish()
+    }
+}
+
+/// Slice-path checksum backend: inline below the offload threshold (the
+/// sidecar thread's spawn and hand-off cost more than hashing saves on small
+/// inputs), offloaded above it.
+#[cfg(all(feature = "std", feature = "hash"))]
+pub(crate) enum SliceChecksum {
+    Inline(FrameHasher),
+    Offload(super::async_checksum::AsyncChecksum),
+}
+
+#[cfg(all(feature = "std", feature = "hash"))]
+const ASYNC_MIN_INPUT: usize = 256 * 1024;
+
+#[cfg(all(feature = "std", feature = "hash"))]
+impl SliceChecksum {
+    pub(crate) fn new(src_len: usize) -> Self {
+        if src_len >= ASYNC_MIN_INPUT {
+            if let Some(offload) = super::async_checksum::AsyncChecksum::new() {
+                return Self::Offload(offload);
+            }
+        }
+        Self::Inline(FrameHasher::new())
+    }
+}
+
+#[cfg(all(feature = "std", feature = "hash"))]
+impl BlockChecksum for SliceChecksum {
+    #[inline]
+    fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
+        match self {
+            Self::Inline(h) => h.scan_block(data),
+            // The whole block is posted up front; the resume paths below see
+            // a covered offset equal to the length and contribute nothing.
+            Self::Offload(h) => {
+                h.write(data);
+                (super::util::is_uniform(data), data.len())
+            }
+        }
+    }
+    #[inline]
+    fn hash_tail(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Inline(h) => h.hash_tail(bytes),
+            Self::Offload(h) => h.write(bytes),
+        }
+    }
+    #[inline]
+    fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
+        match self {
+            Self::Inline(h) => h.raw_out(out, bytes, from),
+            Self::Offload(h) => {
+                out.extend_from_slice(bytes);
+                if from < bytes.len() {
+                    h.write(&bytes[from..]);
+                }
+            }
+        }
+    }
+    #[inline]
+    fn finish32(&mut self) -> u32 {
+        match self {
+            Self::Inline(h) => h.finish32(),
+            Self::Offload(h) => h.finish(),
+        }
+    }
+}
+
 /// An interface for compressing arbitrary data with the ZStandard compression algorithm.
 ///
 /// `FrameCompressor` will generally be used by:
@@ -215,6 +314,9 @@ fn compress_with_state(
     src: &[u8],
     level: CompressionLevel,
 ) -> Vec<u8> {
+    #[cfg(all(feature = "std", feature = "hash"))]
+    let mut hasher = SliceChecksum::new(src.len());
+    #[cfg(not(all(feature = "std", feature = "hash")))]
     let mut hasher = FrameHasher::new();
     // Worst case (every block raw) is the input size plus block headers;
     // reserving it up front keeps the output free of realloc copies, and the
@@ -253,7 +355,12 @@ fn compress_with_state(
                     block_size: block.len() as u32,
                 };
                 header.serialize(&mut output);
-                hasher.write_appending(&mut output, state.matcher.get_last_space());
+                BlockChecksum::raw_out(
+                    &mut hasher,
+                    &mut output,
+                    state.matcher.get_last_space(),
+                    0,
+                );
             }
             CompressionLevel::Fastest => {
                 super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
@@ -275,7 +382,7 @@ fn compress_with_state(
         header.serialize(&mut output);
     }
     #[cfg(feature = "hash")]
-    output.extend_from_slice(&hasher.finish().to_le_bytes());
+    output.extend_from_slice(&hasher.finish32().to_le_bytes());
     output
 }
 
