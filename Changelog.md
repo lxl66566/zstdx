@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The matcher now emits sequences straight into the packed streams the
+  sequence-section encoder consumes (`Matcher::start_matching_codes`, a new
+  default trait method): each match computes its literal-length/match-length/
+  offset codes and merged add-bits payload once, at the emit where the raw
+  values are hot, instead of pushing a 12-byte (ll, ml, of) triple that the
+  block encoder later re-read and re-encoded in a separate pass. The raw
+  triple only survives in the public callback API, reconstructed from the
+  packed form. json drops 3.5% instructions at 32 MiB (5.85G -> 5.65G, ~+2%
+  throughput), text/random ~0.7%, output bytes identical.
+
 * The frame checksum moved in-tree (spec-exact XXH64 with two 32-byte
   chunks per iteration, keeping eight accumulator chains in flight) and is
   now fused into passes that read the block anyway: the RLE uniform scan

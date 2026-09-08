@@ -4,6 +4,7 @@ pub(crate) mod block_header;
 pub(crate) mod blocks;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
+pub(crate) mod seq_codes;
 pub(crate) mod util;
 #[cfg(feature = "hash")]
 pub(crate) mod xxh64;
@@ -189,6 +190,34 @@ pub trait Matcher {
                 });
             }
         });
+    }
+    /// Packed variant of [`Matcher::start_matching_into`] and the block
+    /// encoder's hot path: literals accumulate in `literals` while each match
+    /// appends one packed code triple `ll | ml << 8 | of << 16` to `codes`,
+    /// its merged add-bits payload to `add_bits` (ll add in the low bits,
+    /// then ml, then of) and the payload width to `add_nbs`. This is exactly
+    /// the representation the sequence-section encoder consumes, so the raw
+    /// (ll, ml, of) triples never round-trip through a separate buffer.
+    /// `codes.len()` is the sequence count; a block that produces no
+    /// sequences may leave `literals` empty (see
+    /// [`Matcher::start_matching_into`]).
+    fn start_matching_codes(
+        &mut self,
+        literals: &mut Vec<u8>,
+        codes: &mut Vec<u32>,
+        add_bits: &mut Vec<u64>,
+        add_nbs: &mut Vec<u8>,
+    ) {
+        let mut sequences = Vec::new();
+        self.start_matching_into(literals, &mut sequences);
+        for seq in sequences {
+            let (lc, la, ln) = seq_codes::encode_literal_length(seq.ll);
+            let (mc, ma, mn) = seq_codes::encode_match_len(seq.ml);
+            let (oc, oa, _) = seq_codes::encode_offset(seq.of);
+            codes.push(lc as u32 | (mc as u32) << 8 | (oc as u32) << 16);
+            add_bits.push(la as u64 | ((ma as u64) << ln) | ((oa as u64) << (ln + mn)));
+            add_nbs.push((ln + mn + oc as usize) as u8);
+        }
     }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);

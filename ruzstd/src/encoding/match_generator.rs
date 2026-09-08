@@ -12,6 +12,7 @@
 
 use alloc::vec::Vec;
 
+use super::seq_codes::{decode_packed, encode_literal_length, encode_match_len, encode_offset};
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
@@ -103,7 +104,9 @@ fn insert_at(win: &[u8], table: &mut [u64], epoch: u64, idx: usize, abs: u64) {
 /// `start`, update the repeated-offset history, index the covered range and
 /// return the new cursor (which is also the new anchor). Everything hot is
 /// passed explicitly so the scan loop keeps its cursors in registers across
-/// the call instead of reloading them from the matcher struct.
+/// the call instead of reloading them from the matcher struct. The sequence
+/// is pushed straight into the packed code/add-bits streams the block
+/// encoder consumes — the raw (ll, ml, of) triple never gets its own buffer.
 #[allow(clippy::too_many_arguments)]
 fn emit_seq(
     win: &[u8],
@@ -117,7 +120,9 @@ fn emit_seq(
     of_value: u32,
     rep: &mut [u32; 3],
     literals: &mut Vec<u8>,
-    sequences: &mut Vec<super::EncodedSequence>,
+    codes: &mut Vec<u32>,
+    add_bits: &mut Vec<u64>,
+    add_nbs: &mut Vec<u8>,
 ) -> u64 {
     let anchor_idx = (anchor - win_base) as usize;
     let ll = (start - anchor_idx) as u32;
@@ -141,11 +146,12 @@ fn emit_seq(
         }
     }
     do_offset_history(of_value, ll, rep);
-    sequences.push(super::EncodedSequence {
-        ll,
-        ml: match_len as u32,
-        of: of_value,
-    });
+    let (lc, la, ln) = encode_literal_length(ll);
+    let (mc, ma, mn) = encode_match_len(match_len as u32);
+    let (oc, oa, on) = encode_offset(of_value);
+    codes.push(lc as u32 | (mc as u32) << 8 | (oc as u32) << 16);
+    add_bits.push(la as u64 | ((ma as u64) << ln) | ((oa as u64) << (ln + mn)));
+    add_nbs.push((ln + mn + on) as u8);
     let match_end = start + match_len;
     // Short matches keep every position (they carry the alignment coverage on
     // structured data). Long matches only index two anchors (zstd fast's fill
@@ -192,7 +198,9 @@ fn rep1_chain(
     insert_max: u64,
     rep: &mut [u32; 3],
     literals: &mut Vec<u8>,
-    sequences: &mut Vec<super::EncodedSequence>,
+    codes: &mut Vec<u32>,
+    add_bits: &mut Vec<u64>,
+    add_nbs: &mut Vec<u8>,
 ) -> u64 {
     let mut pos = pos;
     while block_end - pos >= MIN_MATCH as u64 {
@@ -210,7 +218,8 @@ fn rep1_chain(
         let ml = extend_match(win, pidx, cand);
         debug_assert!(ml >= MIN_MATCH);
         pos = emit_seq(
-            win, table, epoch, pos, win_base, insert_max, pidx, ml, 1, rep, literals, sequences,
+            win, table, epoch, pos, win_base, insert_max, pidx, ml, 1, rep, literals, codes,
+            add_bits, add_nbs,
         );
     }
     pos
@@ -411,21 +420,24 @@ impl Matcher for MatchGeneratorDriver {
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         let mut literals = Vec::new();
-        let mut sequences = Vec::new();
-        self.start_matching_into(&mut literals, &mut sequences);
+        let mut codes = Vec::new();
+        let mut add_bits = Vec::new();
+        let mut add_nbs = Vec::new();
+        self.start_matching_codes(&mut literals, &mut codes, &mut add_bits, &mut add_nbs);
         // Rebuild the interleaved callback order from the collected
         // buffers: each sequence's ll literals came right before it.
         // Zero-sequence blocks staged nothing; their literals are the block
         // itself, handed over straight from the window.
-        let zero_seq = sequences.is_empty();
+        let zero_seq = codes.is_empty();
         let mut offset = 0usize;
-        for seq in sequences {
-            let lits = &literals[offset..offset + seq.ll as usize];
-            offset += seq.ll as usize;
+        for (&packed, &add) in codes.iter().zip(add_bits.iter()) {
+            let (ll, ml, of) = decode_packed(packed, add);
+            let lits = &literals[offset..offset + ll as usize];
+            offset += ll as usize;
             handle_sequence(Sequence::Triple {
                 literals: lits,
-                offset: seq.of as usize,
-                match_len: seq.ml as usize,
+                offset: of as usize,
+                match_len: ml as usize,
             });
         }
         if zero_seq {
@@ -439,10 +451,12 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn start_matching_into(
+    fn start_matching_codes(
         &mut self,
         literals: &mut Vec<u8>,
-        sequences: &mut Vec<super::EncodedSequence>,
+        codes: &mut Vec<u32>,
+        add_bits: &mut Vec<u64>,
+        add_nbs: &mut Vec<u8>,
     ) {
         // Hot state lives in locals for the whole loop: the emit helpers
         // used to take `&mut self`, which forced a reload of every cursor
@@ -532,11 +546,11 @@ impl Matcher for MatchGeneratorDriver {
                                 }
                                 anchor = emit_seq(
                                     win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 pos = rep1_chain(
                                     win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 // The chain's matches advance the cursor too.
                                 anchor = pos;
@@ -574,11 +588,11 @@ impl Matcher for MatchGeneratorDriver {
                                 let of_value = (start - cand + 3) as u32;
                                 anchor = emit_seq(
                                     win, table, epoch, anchor, win_base, insert_max, start, ml,
-                                    of_value, &mut rep, literals, sequences,
+                                    of_value, &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 pos = rep1_chain(
                                     win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 anchor = pos;
                                 miss_count = 0;
@@ -613,11 +627,11 @@ impl Matcher for MatchGeneratorDriver {
                                 }
                                 anchor = emit_seq(
                                     win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 pos = rep1_chain(
                                     win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 anchor = pos;
                                 miss_count = 0;
@@ -647,11 +661,11 @@ impl Matcher for MatchGeneratorDriver {
                                 let of_value = (start - cand + 3) as u32;
                                 anchor = emit_seq(
                                     win, table, epoch, anchor, win_base, insert_max, start, ml,
-                                    of_value, &mut rep, literals, sequences,
+                                    of_value, &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 pos = rep1_chain(
                                     win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, sequences,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
                                 );
                                 anchor = pos;
                                 miss_count = 0;
@@ -670,7 +684,7 @@ impl Matcher for MatchGeneratorDriver {
             let step = 1 + (miss_count >> 2).min(255) as u64;
             pos += pair_len * step;
         }
-        if !sequences.is_empty() && anchor < block_end {
+        if !codes.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
             literals.extend_from_slice(&win[tail]);
         }

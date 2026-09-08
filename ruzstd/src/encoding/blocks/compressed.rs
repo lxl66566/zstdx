@@ -30,13 +30,13 @@ pub(crate) enum BlockOutcome {
     Raw,
 }
 
-/// Reusable per-block scratch buffers, pooled in the compressor state: each
-/// block's literals, sequences and precomputed code streams used to be fresh
-/// Vecs, paying an allocate-and-double chain per block.
+/// Reusable per-block scratch buffers, pooled in the compressor state: the
+/// literals and the matcher-emitted packed code streams (codes, merged
+/// add-bits payloads, payload widths) used to be fresh Vecs, paying an
+/// allocate-and-double chain per block.
 #[derive(Default)]
 pub(crate) struct BlockScratch {
     literals: Vec<u8>,
-    sequences: Vec<crate::encoding::EncodedSequence>,
     packed_codes: Vec<u32>,
     add_bits: Vec<u64>,
     add_nbs: Vec<u8>,
@@ -59,24 +59,22 @@ pub(crate) fn compress_block<M: Matcher>(
     // the pooled buffers keep that capacity after the first blocks.
     let BlockScratch {
         literals: literals_vec,
-        sequences,
         packed_codes,
         add_bits,
         add_nbs,
         literals_gate_hold,
     } = scratch;
     literals_vec.clear();
-    sequences.clear();
     packed_codes.clear();
     add_bits.clear();
     add_nbs.clear();
-    matcher.start_matching_into(literals_vec, sequences);
+    matcher.start_matching_codes(literals_vec, packed_codes, add_bits, add_nbs);
 
     // A zero-sequence block stages no literals (the matcher skips the
     // whole-block copy); its literals are the block itself, read straight
     // from the window. Same bytes, so every entropy decision below — and
     // thus the output — matches the staged path.
-    let zero_seq = sequences.is_empty();
+    let zero_seq = packed_codes.is_empty();
     let literals: &[u8] = if zero_seq {
         matcher.get_last_space()
     } else {
@@ -114,31 +112,18 @@ pub(crate) fn compress_block<M: Matcher>(
 
     // sequences section
 
-    if sequences.is_empty() {
+    if packed_codes.is_empty() {
         writer.write_bits(0u8, 8);
     } else {
-        encode_seqnum(sequences.len(), &mut writer);
+        encode_seqnum(packed_codes.len(), &mut writer);
 
         // Choose the tables with libzstd's fast-strategy heuristics: RLE
         // when one code covers everything, predefined when the block is too
         // small (or too skewed) to pay for a table description, otherwise a
-        // normalized custom table.
-        // One pass over the sequences produces the packed codes and the
-        // pre-merged add-bit payloads; table selection, table description and
-        // the bitstream encoder all consume them, so the per-code metadata is
-        // looked up exactly once per sequence.
-        for seq in sequences.iter() {
-            let (ll_code, ll_add, ll_nb) = encode_literal_length(seq.ll);
-            let (ml_code, ml_add, ml_nb) = encode_match_len(seq.ml);
-            let (of_code, of_add, of_nb) = encode_offset(seq.of);
-            packed_codes.push(ll_code as u32 | (ml_code as u32) << 8 | (of_code as u32) << 16);
-            add_bits.push(
-                ll_add as u64
-                    | ((ml_add as u64) << ll_nb)
-                    | ((of_add as u64) << (ll_nb + ml_nb)),
-            );
-            add_nbs.push((ll_nb + ml_nb + of_nb) as u8);
-        }
+        // normalized custom table. The matcher already emitted the packed
+        // codes and pre-merged add-bit payloads, so the per-code metadata is
+        // computed exactly once per sequence and every consumer (table
+        // selection, table description, bitstream encoder) reads the streams.
         let (ll_mode, ml_mode, of_mode) = choose_tables_fast(&packed_codes, default_tables);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -148,7 +133,7 @@ pub(crate) fn compress_block<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            sequences.len(),
+            packed_codes.len(),
             &packed_codes,
             &add_bits,
             &add_nbs,
@@ -464,142 +449,6 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
         }
         _ => unreachable!(),
     }
-}
-
-/// Per-code metadata for literal lengths: (base value, extra bit count).
-const fn ll_meta() -> [(u32, u8); 36] {
-    let mut t = [(0u32, 0u8); 36];
-    let mut code = 0usize;
-    while code <= 15 {
-        t[code] = (code as u32, 0);
-        code += 1;
-    }
-    let rest = [
-        (16u32, 1u8), (18, 1), (20, 1), (22, 1), (24, 2), (28, 2), (32, 3), (40, 3), (48, 4),
-        (64, 6), (128, 7), (256, 8), (512, 9), (1024, 10), (2048, 11), (4096, 12), (8192, 13),
-        (16384, 14), (32768, 15), (65536, 16),
-    ];
-    let mut i = 0;
-    while i < rest.len() {
-        t[16 + i] = rest[i];
-        i += 1;
-    }
-    t
-}
-const LL_META: [(u32, u8); 36] = ll_meta();
-
-/// Literal-length code for the dense low range; mirrors the ladder below.
-const fn ll_code_lut() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let mut len = 0usize;
-    while len < 64 {
-        let mut code = 35;
-        while code > 0 {
-            if LL_META[code].0 as usize <= len {
-                break;
-            }
-            code -= 1;
-        }
-        t[len] = code as u8;
-        len += 1;
-    }
-    t
-}
-const LL_CODE_LUT: [u8; 64] = ll_code_lut();
-
-#[inline]
-fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    if len < 64 {
-        let code = LL_CODE_LUT[len as usize] as usize;
-        let (base, bits) = LL_META[code];
-        return (code as u8, len - base, bits as usize);
-    }
-    match len {
-        64..=127 => (25, len - 64, 6),
-        128..=255 => (26, len - 128, 7),
-        256..=511 => (27, len - 256, 8),
-        512..=1023 => (28, len - 512, 9),
-        1024..=2047 => (29, len - 1024, 10),
-        2048..=4095 => (30, len - 2048, 11),
-        4096..=8191 => (31, len - 4096, 12),
-        8192..=16383 => (32, len - 8192, 13),
-        16384..=32767 => (33, len - 16384, 14),
-        32768..=65535 => (34, len - 32768, 15),
-        65536..=131071 => (35, len - 65536, 16),
-        _ => unreachable!(),
-    }
-}
-
-/// Per-code metadata for match lengths: (base value, extra bit count).
-const fn ml_meta() -> [(u32, u8); 53] {
-    let mut t = [(0u32, 0u8); 53];
-    let mut code = 0usize;
-    // codes 0..=31 encode len = code + 3 directly
-    while code < 32 {
-        t[code] = (code as u32 + 3, 0);
-        code += 1;
-    }
-    let rest = [
-        (35u32, 1u8), (37, 1), (39, 1), (41, 1), (43, 2), (47, 2), (51, 3), (59, 3), (67, 4),
-        (83, 4), (99, 5), (131, 7), (259, 8), (515, 9), (1027, 10), (2051, 11), (4099, 12),
-        (8195, 13), (16387, 14), (32771, 15), (65539, 16),
-    ];
-    let mut i = 0;
-    while i < rest.len() {
-        t[32 + i] = rest[i];
-        i += 1;
-    }
-    t
-}
-const ML_META: [(u32, u8); 53] = ml_meta();
-
-/// Match-length code for the dense low range (len < 131).
-const fn ml_code_lut() -> [u8; 131] {
-    let mut t = [0u8; 131];
-    let mut len = 0usize;
-    while len < 131 {
-        let mut code = 52;
-        while code > 0 {
-            if ML_META[code].0 as usize <= len {
-                break;
-            }
-            code -= 1;
-        }
-        t[len] = code as u8;
-        len += 1;
-    }
-    t
-}
-const ML_CODE_LUT: [u8; 131] = ml_code_lut();
-
-#[inline]
-fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    debug_assert!(len >= 3, "match lengths below 3 cannot be encoded");
-    if len < 131 {
-        let code = ML_CODE_LUT[len as usize] as usize;
-        let (base, bits) = ML_META[code];
-        return (code as u8, len - base, bits as usize);
-    }
-    match len {
-        131..=258 => (43, len - 131, 7),
-        259..=514 => (44, len - 259, 8),
-        515..=1026 => (45, len - 515, 9),
-        1027..=2050 => (46, len - 1027, 10),
-        2051..=4098 => (47, len - 2051, 11),
-        4099..=8194 => (48, len - 4099, 12),
-        8195..=16386 => (49, len - 8195, 13),
-        16387..=32770 => (50, len - 16387, 14),
-        32771..=65538 => (51, len - 32771, 15),
-        65539..=131074 => (52, len - 65539, 16),
-        _ => unreachable!(),
-    }
-}
-
-#[inline]
-fn encode_offset(len: u32) -> (u8, u32, usize) {
-    let log = len.ilog2();
-    let lower = len & ((1 << log) - 1);
-    (log as u8, lower, log as usize)
 }
 
 fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
