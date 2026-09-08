@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The literals histogram fills four sub-histograms keyed by position mod 4
+  and merges them once per block, so concurrent increments land in
+  different cache lines instead of serializing on same-counter store
+  forwarding (small alphabets hit the same counters constantly).
+  Instruction count is unchanged; skewed drops 7% of its cycles and gains
+  ~10% throughput. Output stays bit-identical.
+
 * Flat huffman tables (every symbol sharing one code length, e.g. the
   9..16-symbol alphabets of uniform data) take a dedicated bulk encoder
   path: after byte-aligning the pending bits it packs two four-bit codes

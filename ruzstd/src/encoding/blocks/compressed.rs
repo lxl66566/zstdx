@@ -522,10 +522,27 @@ fn compress_literals(
     let reset_idx = writer.index();
 
     // One histogram feeds both the entropy-bound reject and the table build:
-    // literals used to be scanned twice, once per consumer.
+    // literals used to be scanned twice, once per consumer. Four
+    // sub-histograms keyed by position mod 4 keep concurrent increments in
+    // different cache lines, avoiding same-counter store-forwarding
+    // serialization on small alphabets; the merge costs 256 adds per block.
+    let mut c0 = [0usize; 256];
+    let mut c1 = [0usize; 256];
+    let mut c2 = [0usize; 256];
+    let mut c3 = [0usize; 256];
+    let mut chunks = literals.chunks_exact(4);
+    for chunk in &mut chunks {
+        c0[chunk[0] as usize] += 1;
+        c1[chunk[1] as usize] += 1;
+        c2[chunk[2] as usize] += 1;
+        c3[chunk[3] as usize] += 1;
+    }
+    for &b in chunks.remainder() {
+        c0[b as usize] += 1;
+    }
     let mut counts = [0usize; 256];
-    for &b in literals {
-        counts[b as usize] += 1;
+    for i in 0..256 {
+        counts[i] = c0[i] + c1[i] + c2[i] + c3[i];
     }
     let mut max_symbol = 255;
     while counts[max_symbol] == 0 {
