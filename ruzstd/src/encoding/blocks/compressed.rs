@@ -21,19 +21,42 @@ pub(crate) struct BlockTables {
     pub(crate) of: Option<FSETable>,
 }
 
+/// Reusable per-block scratch buffers, pooled in the compressor state: each
+/// block's literals, sequences and precomputed code streams used to be fresh
+/// Vecs, paying an allocate-and-double chain per block.
+#[derive(Default)]
+pub(crate) struct BlockScratch {
+    literals: Vec<u8>,
+    sequences: Vec<crate::encoding::EncodedSequence>,
+    packed_codes: Vec<u32>,
+    add_bits: Vec<u64>,
+    add_nbs: Vec<u8>,
+}
+
 /// A block of [`crate::common::BlockType::Compressed`]
 pub(crate) fn compress_block<M: Matcher>(
     matcher: &mut M,
     last_huff_table: Option<&huff0_encoder::HuffmanTable>,
     default_tables: (&FSETable, &FSETable, &FSETable),
     output: &mut Vec<u8>,
+    scratch: &mut BlockScratch,
 ) -> BlockTables {
     let mut tables = BlockTables::default();
     // Typical block shape: a few KB of literals and a few thousand sequences;
-    // starting there skips the early reallocation-doubling chain.
-    let mut literals_vec = Vec::with_capacity(4096);
-    let mut sequences = Vec::with_capacity(2048);
-    matcher.start_matching_into(&mut literals_vec, &mut sequences);
+    // the pooled buffers keep that capacity after the first blocks.
+    let BlockScratch {
+        literals: literals_vec,
+        sequences,
+        packed_codes,
+        add_bits,
+        add_nbs,
+    } = scratch;
+    literals_vec.clear();
+    sequences.clear();
+    packed_codes.clear();
+    add_bits.clear();
+    add_nbs.clear();
+    matcher.start_matching_into(literals_vec, sequences);
 
     // literals section
 
@@ -63,10 +86,7 @@ pub(crate) fn compress_block<M: Matcher>(
         // pre-merged add-bit payloads; table selection, table description and
         // the bitstream encoder all consume them, so the per-code metadata is
         // looked up exactly once per sequence.
-        let mut packed_codes = Vec::with_capacity(sequences.len());
-        let mut add_bits = Vec::with_capacity(sequences.len());
-        let mut add_nbs = Vec::with_capacity(sequences.len());
-        for seq in &sequences {
+        for seq in sequences.iter() {
             let (ll_code, ll_add, ll_nb) = encode_literal_length(seq.ll);
             let (ml_code, ml_add, ml_nb) = encode_match_len(seq.ml);
             let (of_code, of_add, of_nb) = encode_offset(seq.of);

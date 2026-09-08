@@ -37,8 +37,6 @@ pub fn compress_fastest<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
     } else {
-        // Compress as a standard compressed block
-        let mut compressed = Vec::new();
         let rep = state.matcher.repcode_snapshot();
         // Take the reusable entropy tables out of the state by value: the
         // block encoder then can't touch them, so a raw fallback simply puts
@@ -50,6 +48,11 @@ pub fn compress_fastest<M: Matcher>(
             state.fse_tables.ml_previous.take(),
             state.fse_tables.of_previous.take(),
         ];
+        // Reserve the three-byte block header and compress straight into
+        // `output`; the header is patched in place once the compressed size
+        // is known, saving the per-block staging copy of the whole content.
+        let start = output.len();
+        output.extend_from_slice(&[0u8; 3]);
         let tables = compress_block(
             &mut state.matcher,
             old_huff.as_ref(),
@@ -58,13 +61,15 @@ pub fn compress_fastest<M: Matcher>(
                 &state.fse_tables.ml_default,
                 &state.fse_tables.of_default,
             ),
-            &mut compressed,
+            output,
+            &mut state.scratch,
         );
-        let compressed_size = compressed.len();
+        let compressed_size = output.len() - start - 3;
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
+            output.truncate(start);
             state.matcher.restore_repcode(rep);
             state.last_huff_table = old_huff;
             state.fse_tables.ll_previous = old_tables[0].take();
@@ -97,14 +102,14 @@ pub fn compress_fastest<M: Matcher>(
                 Some(new) => Some(new),
                 None => old_tables[2].take(),
             };
-            let header = BlockHeader {
+            let mut prefix = [0u8; 3];
+            BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Compressed,
                 block_size: compressed_size as u32,
-            };
-            // Write the header, then the block
-            header.serialize(output);
-            output.extend(compressed);
+            }
+            .serialize_into(&mut prefix);
+            output[start..start + 3].copy_from_slice(&prefix);
         }
     }
 }

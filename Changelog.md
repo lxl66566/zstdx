@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Compressed blocks encode straight into the frame output: the block writer
+  reserves the three-byte header, encodes the content in place and patches
+  the header once the compressed size is known, removing the per-block
+  staging vector and its full-content copy on adoption. The per-block
+  literals, sequence and precomputed-code buffers moved into pooled
+  compressor state (`BlockScratch`), so steady-state blocks run without the
+  allocate-and-double chain. random executes 6.8% fewer instructions (raw
+  fallback blocks used to copy their whole content), json and skewed gain
+  2-3% each; output stays bit-identical.
+
 * The sequence bitstream encoder keeps its bit accumulator in locals behind
   a small hot-push helper (one unaligned u64 store per flush instead of two
   writer-method round-trips per sequence) and reads the FSE transition rows

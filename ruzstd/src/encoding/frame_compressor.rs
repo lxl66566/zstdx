@@ -70,6 +70,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// Pooled per-block scratch (literals, sequences, code streams): reused
+    /// across blocks so steady-state blocks run allocation-free.
+    pub(crate) scratch: super::blocks::compressed::BlockScratch,
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -83,6 +86,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                scratch: Default::default(),
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -100,6 +104,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                scratch: Default::default(),
             },
             compression_level,
             #[cfg(feature = "hash")]
