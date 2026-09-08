@@ -42,6 +42,9 @@ pub mod encoding;
 
 pub(crate) mod blocks;
 
+#[cfg(feature = "hash")]
+pub(crate) mod xxh64;
+
 #[cfg(feature = "fuzz_exports")]
 pub mod fse;
 #[cfg(feature = "fuzz_exports")]

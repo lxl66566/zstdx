@@ -19,7 +19,7 @@ use core::marker::PhantomData;
 use core::slice;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use super::xxh64::Xxh64;
+use crate::xxh64::Xxh64;
 
 /// Ring capacity in tasks. A 32 MiB frame posts ~260 tasks; the producer
 /// backpressures on a full ring (the worker drains it far faster than the
@@ -245,7 +245,7 @@ impl Drop for AsyncChecksum {
 #[cfg(test)]
 mod tests {
     use super::AsyncChecksum;
-    use crate::encoding::xxh64::Xxh64;
+    use crate::xxh64::Xxh64;
     use alloc::vec::Vec;
 
     /// The offloaded checksum must equal the inline one for whole writes,

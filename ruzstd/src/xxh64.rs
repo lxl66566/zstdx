@@ -1,7 +1,13 @@
-//! XXH64 for the frame content checksum, spec-exact and in-tree so the raw
-//! block write can absorb input bytes while it copies them (the hash pass
-//! otherwise costs a full read of every incompressible block). The bulk loop
-//! keeps zstd's four independent accumulator chains live at once; a vector
+//! XXH64 for the frame content checksum, spec-exact and in-tree; the single
+//! implementation serving the encoder's checksum and the decoder's
+//! verification alike (`twox-hash` stays as a dev-dependency, purely as the
+//! test reference). The bulk loop keeps zstd's four independent accumulator
+//! chains live at once, two 32-byte chunks per iteration: standalone this
+//! ties twox-hash within noise (~20 GiB/s bulk on the dev box, four chains
+//! already saturate round latency), but the unroll pays where the hash is
+//! fused into a loop that also copies or scans the same bytes (raw-block
+//! write, uniform scan) - there eight chains in flight shorten the
+//! dependency tail that competes with the surrounding work. A vector
 //! version would serialize them behind `vpmullq` latency and lose.
 
 const PRIME1: u64 = 11400714785074694791;
@@ -367,7 +373,7 @@ mod tests {
     use core::hash::Hasher;
 
     /// Empty and single-byte inputs hit the no-bulk tail paths; values from
-    /// twox-hash, which the decoder's checksum verification still uses.
+    /// twox-hash, the dev-dependency reference implementation.
     #[test]
     fn tiny_inputs_match_twox() {
         let mut reference = twox_hash::XxHash64::with_seed(0);

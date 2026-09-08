@@ -17,14 +17,14 @@ use crate::io::{Read, Write};
 /// removes the separate hash read pass over incompressible data.
 pub(crate) struct FrameHasher {
     #[cfg(feature = "hash")]
-    inner: super::xxh64::Xxh64,
+    inner: crate::xxh64::Xxh64,
 }
 
 #[cfg(feature = "hash")]
 impl FrameHasher {
     pub(crate) fn new() -> Self {
         Self {
-            inner: super::xxh64::Xxh64::new(0),
+            inner: crate::xxh64::Xxh64::new(0),
         }
     }
     #[inline(always)]

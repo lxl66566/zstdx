@@ -1,7 +1,7 @@
 use crate::io::{Error, Read, Write};
 use alloc::vec::Vec;
 #[cfg(feature = "hash")]
-use core::hash::Hasher;
+use crate::xxh64::Xxh64;
 
 use super::ringbuffer::RingBuffer;
 use crate::decoding::errors::DecodeBufferError;
@@ -17,7 +17,7 @@ pub struct DecodeBuffer {
     #[cfg(feature = "hash")]
     hash_enabled: bool,
     #[cfg(feature = "hash")]
-    pub hash: twox_hash::XxHash64,
+    pub(crate) hash: Xxh64,
 }
 
 impl Read for DecodeBuffer {
@@ -45,7 +45,7 @@ impl DecodeBuffer {
             #[cfg(feature = "hash")]
             hash_enabled: false,
             #[cfg(feature = "hash")]
-            hash: twox_hash::XxHash64::with_seed(0),
+            hash: Xxh64::new(0),
         }
     }
 
@@ -58,7 +58,7 @@ impl DecodeBuffer {
         #[cfg(feature = "hash")]
         {
             self.hash_enabled = false;
-            self.hash = twox_hash::XxHash64::with_seed(0);
+            self.hash = Xxh64::new(0);
         }
     }
 

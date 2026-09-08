@@ -8,8 +8,6 @@ pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
-#[cfg(feature = "hash")]
-pub(crate) mod xxh64;
 
 mod frame_compressor;
 mod levels;

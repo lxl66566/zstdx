@@ -288,8 +288,6 @@ impl FrameDecoder {
     /// Only a sensible value after all decoded bytes have been collected/read from the FrameDecoder
     #[cfg(feature = "hash")]
     pub fn get_calculated_checksum(&self) -> Option<u32> {
-        use core::hash::Hasher;
-
         let state = self.state.as_ref()?;
         let cksum_64bit = state.decoder_scratch.buffer.hash.finish();
         //truncate to lower 32bit because reasons...
