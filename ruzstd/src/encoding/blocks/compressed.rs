@@ -376,8 +376,21 @@ fn encode_sequences(
                 ml_state = (e_ml >> 13) as usize;
                 ll_state = (e_ll >> 13) as usize;
 
-                hot_push(out, &mut pos, &mut acc, &mut bits, trans, of_nb + ml_nb + ll_nb);
-                hot_push(out, &mut pos, &mut acc, &mut bits, add_bits[i], add_nbs[i] as usize);
+                // Transition bits then add bits are adjacent in the stream;
+                // one combined push keeps the writer's flush path once per
+                // sequence whenever the payload fits the accumulator. The 56
+                // cap keeps a post-flush (bits < 8) accumulator from dropping
+                // payload; wider pairs fall back to two pushes of the same
+                // bits.
+                let add = add_bits[i];
+                let add_nb = add_nbs[i] as usize;
+                let trans_nb = of_nb + ml_nb + ll_nb;
+                if trans_nb + add_nb <= 56 {
+                    hot_push(out, &mut pos, &mut acc, &mut bits, trans | (add << trans_nb), trans_nb + add_nb);
+                } else {
+                    hot_push(out, &mut pos, &mut acc, &mut bits, trans, trans_nb);
+                    hot_push(out, &mut pos, &mut acc, &mut bits, add, add_nb);
+                }
             }
         }
     }
