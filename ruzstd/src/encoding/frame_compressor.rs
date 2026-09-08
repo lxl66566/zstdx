@@ -267,7 +267,7 @@ std::thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
+pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
     CompressState {
         matcher: MatchGeneratorDriver::new_direct(),
         last_huff_table: None,
@@ -278,7 +278,7 @@ fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
 
 /// Reset a pooled state for a new frame: the matcher's epoch bump retires
 /// stale hash entries and the entropy tables return to their defaults.
-fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: Level) {
+pub(crate) fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: Level) {
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;

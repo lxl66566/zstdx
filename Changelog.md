@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Streaming encoders: `ruzstd::stream::write::Encoder` (io::Write in,
+  compressed out, with `auto_finish`/`on_finish`/`finish`/`try_finish`/
+  `do_finish`, and `flush` emitting the staged partial block early) and
+  `ruzstd::stream::read::Encoder` (io::Read over a compressed reader). Both
+  share an incremental core built from the same matcher/block-encoder
+  building blocks as `FrameCompressor`; without intermediate flushes the
+  output is byte-identical to `encoding::compress` over the same bytes (the
+  byte-equality is asserted by tests across write chunkings of 1 B, 7 KiB,
+  block-size and everything-at-once). `EncoderOptions::{pledged_size,
+  checksum, workers}` are honored: pledged sizes land in the frame header,
+  checksum(false) omits the 4-byte trailer, and workers > 1 fails with
+  `Error::Unsupported` until the multithreaded backend lands. The pooled
+  slice fast path is untouched; release assembly of all pre-existing symbols
+  is unchanged.
+
 * New high-level one-shot API: `ruzstd::{compress, decompress}` and
   `ruzstd::bulk::{compress, decompress, decompress_to_buffer}`.
   `bulk::compress` forwards to the pooled slice fast path unchanged;

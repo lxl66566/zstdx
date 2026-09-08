@@ -9,11 +9,13 @@ pub(crate) mod match_generator;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
 
-mod frame_compressor;
+pub(crate) mod frame_compressor;
 mod levels;
 pub use frame_compressor::compress_slice_to_vec;
 pub use frame_compressor::FrameCompressor;
 pub use match_generator::MatchGeneratorDriver;
+
+pub(crate) use levels::compress_fastest;
 
 use crate::io::{Read, Write};
 use crate::Level;

@@ -70,3 +70,12 @@ impl From<Error> for std::io::Error {
         }
     }
 }
+
+// The no_std io::Error is constructed from a kind plus a boxed Display, so
+// the umbrella error rides inside it.
+#[cfg(not(feature = "std"))]
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        io::Error::new(io::ErrorKind::Other, alloc::boxed::Box::new(e))
+    }
+}

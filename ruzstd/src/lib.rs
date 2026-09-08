@@ -4,8 +4,8 @@
 //! For most users these are the entry points:
 //! - one-shot: [`compress`]/[`decompress`] (or [`bulk`] for buffer-to-buffer
 //!   variants)
-//! - streaming: the `stream` module with `io::Read`/`io::Write` shaped
-//!   encoders and decoders
+//! - streaming: [`stream`] with `io::Read`/`io::Write` shaped encoders and
+//!   decoders
 //! - configuration: [`Level`], [`EncoderOptions`], [`DecoderOptions`]
 //!
 //! Code written against the `zstd` crate (the libzstd bindings) ports with
@@ -56,6 +56,7 @@ pub mod encoding;
 pub mod error;
 pub mod level;
 pub mod options;
+pub mod stream;
 
 pub use bulk::{compress, decompress};
 pub use error::{Error, Feature, ParameterError, Result};
