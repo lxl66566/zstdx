@@ -31,6 +31,10 @@ pub(crate) struct BlockScratch {
     packed_codes: Vec<u32>,
     add_bits: Vec<u64>,
     add_nbs: Vec<u8>,
+    /// Sticky heuristic: the previous block's literals cleared the exact
+    /// entropy bound, so the strided gate below is skipped until a block
+    /// proves otherwise. Pure cost hint; every outcome stays reachable.
+    literals_gate_hold: bool,
 }
 
 /// A block of [`crate::common::BlockType::Compressed`]
@@ -50,6 +54,7 @@ pub(crate) fn compress_block<M: Matcher>(
         packed_codes,
         add_bits,
         add_nbs,
+        literals_gate_hold,
     } = scratch;
     literals_vec.clear();
     sequences.clear();
@@ -61,10 +66,12 @@ pub(crate) fn compress_block<M: Matcher>(
     // literals section
 
     let mut writer = BitWriter::from(output);
-    if !literals_vec.is_empty() && crate::encoding::util::is_uniform(&literals_vec) {
+    if !literals_vec.is_empty() && crate::encoding::util::is_uniform(literals_vec) {
         rle_literals(&literals_vec, &mut writer);
     } else if literals_vec.len() > 1024 {
-        if let Some(table) = compress_literals(&literals_vec, last_huff_table, &mut writer) {
+        if let Some(table) =
+            compress_literals(literals_vec, last_huff_table, &mut writer, literals_gate_hold)
+        {
             tables.huff = Some(table);
         }
     } else {
@@ -614,7 +621,55 @@ fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
+    gate_hold: &mut bool,
 ) -> Option<huff0_encoder::HuffmanTable> {    let reset_idx = writer.index();
+
+    // Strided entropy gate before the exact histogram: one sampled count
+    // per `stride` bytes decides incompressibility at a fraction of the
+    // full pass. Blocks below the stride cutoff go straight to the exact
+    // path (sampling them would be the same pass). The distinct-symbol
+    // prescreen skips the estimate for small alphabets (an alphabet wider
+    // than 208 symbols is necessary to reach the reject floor, and the
+    // prescreen only ever defers to the exact path); the estimate itself
+    // carries the Miller-Madow bias correction plus a noise margin, so only
+    // literals within ~2% of raw size can encode larger than before.
+    if !*gate_hold {
+        let total = literals.len();
+        if total >= 8192 {
+            let stride = total >> 10;
+            let mut sample = [0u32; 256];
+            let mut distinct = 0usize;
+            let mut n = 0usize;
+            let mut i = 0;
+            while i < total {
+                let c = &mut sample[literals[i] as usize];
+                if *c == 0 {
+                    distinct += 1;
+                }
+                *c += 1;
+                n += 1;
+                i += stride;
+            }
+            if distinct > 208 {
+                let total_f = n as f64;
+                let mut entropy_bits = 0.0f64;
+                for &c in &sample {
+                    if c > 0 {
+                        entropy_bits -= c as f64 * entropy_log2(c as f64 / total_f);
+                    }
+                }
+                let bits_per_byte =
+                    entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+                if bits_per_byte + 256.0 / total as f64 + 0.08 + 0.12 >= 8.0 {
+                    raw_literals(literals, writer);
+                    return None;
+                }
+            }
+        }
+    }
+    // The exact bound below passed for this block's literals: keep skipping
+    // the gate until a block fails it (or the frame resets the scratch).
+    *gate_hold = true;
 
     // One histogram feeds both the entropy-bound reject and the table build:
     // literals used to be scanned twice, once per consumer. Four
