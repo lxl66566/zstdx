@@ -29,8 +29,10 @@ pub(crate) fn compress_block<M: Matcher>(
     output: &mut Vec<u8>,
 ) -> BlockTables {
     let mut tables = BlockTables::default();
-    let mut literals_vec = Vec::new();
-    let mut sequences = Vec::new();
+    // Typical block shape: a few KB of literals and a few thousand sequences;
+    // starting there skips the early reallocation-doubling chain.
+    let mut literals_vec = Vec::with_capacity(4096);
+    let mut sequences = Vec::with_capacity(2048);
     matcher.start_matching_into(&mut literals_vec, &mut sequences);
 
     // literals section

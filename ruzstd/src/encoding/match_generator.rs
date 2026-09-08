@@ -22,6 +22,9 @@ use crate::decoding::sequence_execution::do_offset_history;
 const MIN_MATCH: usize = 4;
 /// Bytes fed into the position hash.
 const MIN_HASH: usize = 5;
+/// The hash reads a full u64, so insertable/scannable positions need this
+/// many window bytes ahead to stay in bounds.
+const HASH_READ: usize = 8;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
 /// History kept for matching; also the window size declared in the frame header.
@@ -33,14 +36,20 @@ const EMPTY: u64 = 0;
 /// scanning and emit loops bound-check once per loop, not per position).
 ///
 /// Five bytes skip the frequent 4-byte boilerplate fragments so probes land
-/// on structural repeats instead of recent junk.
+/// on structural repeats instead of recent junk. The full u64 load feeds the
+/// multiplier directly: bits above the fifth byte only add input entropy.
 #[inline(always)]
 fn hash_at(win: &[u8], idx: usize) -> usize {
-    // SAFETY: caller guarantees idx + 5 <= win.len(); unaligned reads
+    // SAFETY: callers only hash positions with HASH_READ bytes of window
+    // ahead (the scan tail guard and the emit insert bound); unaligned
     // because positions are byte-granular.
     unsafe {
-        let p = win.as_ptr().add(idx);
-        let v = (p.cast::<u32>().read_unaligned() as u64) | ((p.add(4).read() as u64) << 32);
+        let v = win
+            .as_ptr()
+            .add(idx)
+            .cast::<u64>()
+            .read_unaligned()
+            & 0xFFFF_FFFF_FF;
         (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG))
             & ((1 << HASH_LOG) - 1)
     }
@@ -110,7 +119,25 @@ fn emit_seq(
 ) -> u64 {
     let anchor_idx = (anchor - win_base) as usize;
     let ll = (start - anchor_idx) as u32;
-    literals.extend_from_slice(&win[anchor_idx..start]);
+    // Most sequences carry only a handful of literals; an out-of-line memcpy
+    // per match costs more than the copy itself.
+    let lits = &win[anchor_idx..start];
+    // SAFETY: both sides are within the window / buffer; unaligned because
+    // byte-granular. The 8-byte read may overlap the match that follows the
+    // literals, so it stays in bounds whenever 8 bytes from the anchor fit
+    // the window; the write may spill up to 7 bytes past the new length, but
+    // reserve(8) covers them and later pushes overwrite them.
+    unsafe {
+        if lits.len() <= 8 && anchor_idx + 8 <= win.len() {
+            literals.reserve(8);
+            let dst = literals.as_mut_ptr().add(literals.len());
+            let v = lits.as_ptr().cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(v);
+            literals.set_len(literals.len() + lits.len());
+        } else {
+            literals.extend_from_slice(lits);
+        }
+    }
     do_offset_history(of_value, ll, rep);
     sequences.push(super::EncodedSequence {
         ll,
@@ -338,8 +365,8 @@ impl Matcher for MatchGeneratorDriver {
         let win_base = self.win_base;
         let block_end = self.block_end;
         // saturating: tiny first blocks never reach an emit, so the bound is
-        // never consulted when win.len() < MIN_HASH.
-        let insert_max = win_base + win.len().saturating_sub(MIN_HASH) as u64;
+        // never consulted when win.len() < HASH_READ.
+        let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         let max_window = MAX_WINDOW as u64;
         let mut pos = self.pos;
         let mut anchor = self.anchor;
@@ -347,7 +374,7 @@ impl Matcher for MatchGeneratorDriver {
         let mut rep = self.rep;
 
         while pos < block_end {
-            if block_end - pos < MIN_HASH as u64 {
+            if block_end - pos < HASH_READ as u64 {
                 break;
             }
             let idx = (pos - win_base) as usize;
@@ -472,7 +499,7 @@ impl Matcher for MatchGeneratorDriver {
         // future probes into the run resolve through it or the repcode
         // chain.
         let idx = (self.block_start - self.win_base) as usize;
-        if idx + MIN_HASH <= self.win.len() {
+        if idx + HASH_READ <= self.win.len() {
             insert_at(&self.win, &mut self.table, self.epoch, idx, self.block_start);
         }
         self.pos = self.block_end;
