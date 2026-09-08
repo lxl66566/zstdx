@@ -21,6 +21,15 @@ pub(crate) struct BlockTables {
     pub(crate) of: Option<FSETable>,
 }
 
+/// Outcome of encoding one compressed block. `Encoded` carries the entropy
+/// tables the caller should remember for later blocks; `Raw` means nothing
+/// was written and the caller should emit the raw block it would have
+/// fallen back to anyway (the encoder proved the block cannot shrink).
+pub(crate) enum BlockOutcome {
+    Encoded(BlockTables),
+    Raw,
+}
+
 /// Reusable per-block scratch buffers, pooled in the compressor state: each
 /// block's literals, sequences and precomputed code streams used to be fresh
 /// Vecs, paying an allocate-and-double chain per block.
@@ -44,7 +53,7 @@ pub(crate) fn compress_block<M: Matcher>(
     default_tables: (&FSETable, &FSETable, &FSETable),
     output: &mut Vec<u8>,
     scratch: &mut BlockScratch,
-) -> BlockTables {
+) -> BlockOutcome {
     let mut tables = BlockTables::default();
     // Typical block shape: a few KB of literals and a few thousand sequences;
     // the pooled buffers keep that capacity after the first blocks.
@@ -67,19 +76,35 @@ pub(crate) fn compress_block<M: Matcher>(
     // whole-block copy); its literals are the block itself, read straight
     // from the window. Same bytes, so every entropy decision below — and
     // thus the output — matches the staged path.
-    let literals: &[u8] = if sequences.is_empty() {
+    let zero_seq = sequences.is_empty();
+    let literals: &[u8] = if zero_seq {
         matcher.get_last_space()
     } else {
         &literals_vec[..]
     };
 
+    // Early raw exit: a zero-sequence block whose literals fail the strided
+    // entropy sample encodes to raw literals plus an empty sequence section,
+    // which is larger than the block itself — the caller's raw fallback is
+    // the certain outcome. Signalling it here skips the encode-and-discard
+    // writes (the block bytes are then copied and hashed exactly once, in
+    // the raw writer).
+    if zero_seq && literals.len() > 1024 {
+        if sampled_gate_rejects(literals, literals_gate_hold) {
+            return BlockOutcome::Raw;
+        }
+    }
+
     // literals section
 
+    // A zero-sequence block's literals are the block itself, whose uniform
+    // check already ran before the RLE block decision — never uniform here.
     let mut writer = BitWriter::from(output);
-    if !literals.is_empty() && crate::encoding::util::is_uniform(literals) {
+    if !literals.is_empty() && !zero_seq && crate::encoding::util::is_uniform(literals) {
         rle_literals(literals, &mut writer);
     } else if literals.len() > 1024 {
-        if let Some(table) = compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold)
+        if let Some(table) =
+            compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold)
         {
             tables.huff = Some(table);
         }
@@ -144,7 +169,7 @@ pub(crate) fn compress_block<M: Matcher>(
         }
     }
     writer.flush();
-    tables
+    BlockOutcome::Encoded(tables)
 }
 
 #[derive(Clone)]
@@ -789,22 +814,18 @@ unsafe fn histogram_small_alpha_avx512(
     Some(max_symbol)
 }
 
-fn compress_literals(
-    literals: &[u8],
-    last_table: Option<&huff0_encoder::HuffmanTable>,
-    writer: &mut BitWriter<&mut Vec<u8>>,
-    gate_hold: &mut bool,
-) -> Option<huff0_encoder::HuffmanTable> {    let reset_idx = writer.index();
-
-    // Strided entropy gate before the exact histogram: one sampled count
-    // per `stride` bytes decides incompressibility at a fraction of the
-    // full pass. Blocks below the stride cutoff go straight to the exact
-    // path (sampling them would be the same pass). The distinct-symbol
-    // prescreen skips the estimate for small alphabets (an alphabet wider
-    // than 208 symbols is necessary to reach the reject floor, and the
-    // prescreen only ever defers to the exact path); the estimate itself
-    // carries the Miller-Madow bias correction plus a noise margin, so only
-    // literals within ~2% of raw size can encode larger than before.
+/// Strided entropy gate before the exact histogram: one sampled count per
+/// `stride` bytes decides incompressibility at a fraction of the full pass.
+/// Blocks below the stride cutoff go straight to the exact path (sampling
+/// them would be the same pass). The distinct-symbol prescreen skips the
+/// estimate for small alphabets (an alphabet wider than 208 symbols is
+/// necessary to reach the reject floor, and the prescreen only ever defers
+/// to the exact path); the estimate itself carries the Miller-Madow bias
+/// correction plus a noise margin, so only literals within ~2% of raw size
+/// can encode larger than before. Passing sets `gate_hold` so the next
+/// block skips the sample; rejecting leaves it, exactly like the inline
+/// path did.
+fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
     if !*gate_hold {
         let total = literals.len();
         if total >= 8192 {
@@ -833,8 +854,7 @@ fn compress_literals(
                 let bits_per_byte =
                     entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
                 if bits_per_byte + 256.0 / total as f64 + 0.08 + 0.12 >= 8.0 {
-                    raw_literals(literals, writer);
-                    return None;
+                    return true;
                 }
             }
         }
@@ -842,6 +862,20 @@ fn compress_literals(
     // The exact bound below passed for this block's literals: keep skipping
     // the gate until a block fails it (or the frame resets the scratch).
     *gate_hold = true;
+    false
+}
+
+fn compress_literals(
+    literals: &[u8],
+    last_table: Option<&huff0_encoder::HuffmanTable>,
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    gate_hold: &mut bool,
+) -> Option<huff0_encoder::HuffmanTable> {    let reset_idx = writer.index();
+
+    if sampled_gate_rejects(literals, gate_hold) {
+        raw_literals(literals, writer);
+        return None;
+    }
 
     // One histogram feeds both the entropy-bound reject and the table build:
     // literals used to be scanned twice, once per consumer.

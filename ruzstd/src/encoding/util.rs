@@ -6,7 +6,11 @@ use core::convert::TryInto;
 /// (one batch) while the independent xor/or chains pipeline: a plain
 /// early-exit loop spends one branchy compare per 8 bytes, which dominated
 /// fully-uniform blocks (zero-filled corpora tails).
-#[inline]
+///
+/// Out-of-line on purpose: inlining it into the (large) block-encoding
+/// callers cost the loop its data pointer, which then reloaded from the
+/// stack every 32 bytes and halved the scan throughput.
+#[inline(never)]
 pub(crate) fn is_uniform(data: &[u8]) -> bool {
     let Some(&first) = data.first() else {
         return true;

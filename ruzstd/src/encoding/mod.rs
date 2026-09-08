@@ -5,6 +5,8 @@ pub(crate) mod blocks;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 pub(crate) mod util;
+#[cfg(feature = "hash")]
+pub(crate) mod xxh64;
 
 mod frame_compressor;
 mod levels;

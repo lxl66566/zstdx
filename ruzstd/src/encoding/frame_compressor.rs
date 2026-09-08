@@ -2,11 +2,6 @@
 
 use alloc::vec::Vec;
 use core::convert::TryInto;
-#[cfg(feature = "hash")]
-use twox_hash::XxHash64;
-
-#[cfg(feature = "hash")]
-use core::hash::Hasher;
 
 use super::{
     block_header::BlockHeader, frame_header::FrameHeader, levels::*,
@@ -15,6 +10,93 @@ use super::{
 use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
 
 use crate::io::{Read, Write};
+
+/// Frame checksum accumulator. With the `hash` feature it is an XXH64 over
+/// the frame content; without it a no-op so the block paths share one shape.
+/// The raw-block writers feed it while they copy (`write_appending`), which
+/// removes the separate hash read pass over incompressible data.
+pub(crate) struct FrameHasher {
+    #[cfg(feature = "hash")]
+    inner: super::xxh64::Xxh64,
+}
+
+#[cfg(feature = "hash")]
+impl FrameHasher {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: super::xxh64::Xxh64::new(0),
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
+        self.inner.write(bytes);
+    }
+    #[inline(always)]
+    pub(crate) fn write_appending(&mut self, out: &mut Vec<u8>, bytes: &[u8]) {
+        self.inner.write_appending(out, bytes);
+    }
+    #[inline(always)]
+    pub(crate) fn write_appending_from(
+        &mut self,
+        out: &mut Vec<u8>,
+        bytes: &[u8],
+        hash_from: usize,
+    ) {
+        self.inner.write_appending_from(out, bytes, hash_from);
+    }
+    /// Uniform scan fused with the checksum absorb: RLE blocks come out
+    /// fully hashed in the scan's single pass; anything else returns the
+    /// resume offset for the outcome paths. Misaligned streams (streaming
+    /// reader) fall back to a plain scan that hashes from zero.
+    #[inline(always)]
+    pub(crate) fn scan_uniform(&mut self, data: &[u8]) -> (bool, usize) {
+        if self.inner.mem_is_empty() {
+            self.inner.scan_uniform_absorbing(data)
+        } else {
+            let uniform = super::util::is_uniform(data);
+            if uniform {
+                self.inner.write(data);
+                (true, data.len())
+            } else {
+                (false, 0)
+            }
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn finish(&self) -> u32 {
+        self.inner.finish() as u32
+    }
+}
+
+#[cfg(not(feature = "hash"))]
+impl FrameHasher {
+    pub(crate) fn new() -> Self {
+        Self {}
+    }
+    #[inline(always)]
+    pub(crate) fn write(&mut self, _bytes: &[u8]) {}
+    #[inline(always)]
+    pub(crate) fn write_appending(&mut self, out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(bytes);
+    }
+    #[inline(always)]
+    pub(crate) fn write_appending_from(
+        &mut self,
+        out: &mut Vec<u8>,
+        bytes: &[u8],
+        _hash_from: usize,
+    ) {
+        out.extend_from_slice(bytes);
+    }
+    #[inline(always)]
+    pub(crate) fn scan_uniform(&mut self, data: &[u8]) -> (bool, usize) {
+        (super::util::is_uniform(data), 0)
+    }
+    #[inline(always)]
+    pub(crate) fn finish(&self) -> u32 {
+        0
+    }
+}
 
 /// An interface for compressing arbitrary data with the ZStandard compression algorithm.
 ///
@@ -40,8 +122,7 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
     state: CompressState<M>,
-    #[cfg(feature = "hash")]
-    hasher: XxHash64,
+    hasher: FrameHasher,
 }
 
 pub(crate) struct FseTables {
@@ -134,8 +215,7 @@ fn compress_with_state(
     src: &[u8],
     level: CompressionLevel,
 ) -> Vec<u8> {
-    #[cfg(feature = "hash")]
-    let mut hasher = XxHash64::with_seed(0);
+    let mut hasher = FrameHasher::new();
     // Worst case (every block raw) is the input size plus block headers;
     // reserving it up front keeps the output free of realloc copies, and the
     // untouched tail of the reservation only costs address space.
@@ -165,8 +245,6 @@ fn compress_with_state(
             .matcher
             .adopt_window(&src[hist as usize..block_end as usize], hist);
         state.matcher.set_block(block_start, block_end);
-        #[cfg(feature = "hash")]
-        hasher.write(state.matcher.get_last_space());
         match level {
             CompressionLevel::Uncompressed => {
                 let header = BlockHeader {
@@ -175,10 +253,10 @@ fn compress_with_state(
                     block_size: block.len() as u32,
                 };
                 header.serialize(&mut output);
-                output.extend_from_slice(state.matcher.get_last_space());
+                hasher.write_appending(&mut output, state.matcher.get_last_space());
             }
             CompressionLevel::Fastest => {
-                super::levels::compress_fastest(state, last_block, &mut output)
+                super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
             }
             _ => {
                 unimplemented!();
@@ -197,7 +275,7 @@ fn compress_with_state(
         header.serialize(&mut output);
     }
     #[cfg(feature = "hash")]
-    output.extend_from_slice(&(hasher.finish() as u32).to_le_bytes());
+    output.extend_from_slice(&hasher.finish().to_le_bytes());
     output
 }
 
@@ -214,8 +292,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 fse_tables: FseTables::new(),
                 scratch: Default::default(),
             },
-            #[cfg(feature = "hash")]
-            hasher: XxHash64::with_seed(0),
+            hasher: FrameHasher::new(),
         }
     }
 }
@@ -233,8 +310,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 scratch: Default::default(),
             },
             compression_level,
-            #[cfg(feature = "hash")]
-            hasher: XxHash64::with_seed(0),
+            hasher: FrameHasher::new(),
         }
     }
 
@@ -263,10 +339,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
-        #[cfg(feature = "hash")]
-        {
-            self.hasher = XxHash64::with_seed(0);
-        }
+        self.hasher = FrameHasher::new();
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
         // As the frame is compressed, it's stored here
@@ -300,9 +373,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 }
             }
             self.state.matcher.commit_block(read_bytes);
-            // As we read, hash that data too
-            #[cfg(feature = "hash")]
-            self.hasher.write(self.state.matcher.get_last_space());
             // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
             if read_bytes == 0 {
                 let header = BlockHeader {
@@ -324,12 +394,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_type: crate::blocks::block::BlockType::Raw,
                         block_size: read_bytes.try_into().unwrap(),
                     };
-                    // Write the header, then the block
+                    // Write the header, then the block (hashing as it goes)
                     header.serialize(output);
-                    output.extend_from_slice(self.state.matcher.get_last_space());
+                    self.hasher
+                        .write_appending(output, self.state.matcher.get_last_space());
                 }
                 CompressionLevel::Fastest => {
-                    compress_fastest(&mut self.state, last_block, output)
+                    compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
                 }
                 _ => {
                     unimplemented!();
@@ -349,8 +420,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // Because we only have the data as a reader, we need to read all of it to calculate the checksum
             // Possible TODO: create a wrapper around self.uncompressed data that hashes the data as it's read?
             let content_checksum = self.hasher.finish();
-            drain
-                .write_all(&(content_checksum as u32).to_le_bytes())
+            drain.write_all(&content_checksum.to_le_bytes())
                 .unwrap();
         }
     }
