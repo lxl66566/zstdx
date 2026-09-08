@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The sequence bitstream encoder appends each sequence's add-bit payload
+  with its state-transition bits in one accumulator push when the combined
+  width fits (the common case), halving the per-sequence flush checks.
+  json drops 0.4% instructions; wider pairs fall back to the two-push path
+  and the emitted bits are identical everywhere.
+
 * The matcher now emits sequences straight into the packed streams the
   sequence-section encoder consumes (`Matcher::start_matching_codes`, a new
   default trait method): each match computes its literal-length/match-length/
