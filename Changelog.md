@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Near-incompressible literal blocks reject through a strided entropy
+  sample (1024 draws, Miller-Madow corrected, distinct-symbol prescreen)
+  before the exact four-lane histogram runs, with a sticky per-stream hint
+  that skips the sample once a block clears the exact bound. random
+  executes 43% fewer instructions and gains ~43% throughput (1450 ->
+  2060 MiB/s); other shapes are within measurement noise. The reject floor
+  sits ~0.2 bits/byte left of the exact bound's, so only literals within
+  ~2% of raw size can encode slightly larger; the benchmark corpora are
+  byte-identical.
+
 * The `--no-default-features` build compiles again: the literals entropy
   precheck used `f64::log2`, which is std-only; no_std builds now use a
   linear-mantissa approximation (error < 0.086 against the 8% reject
