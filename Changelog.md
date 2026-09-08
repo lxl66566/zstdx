@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* `compress_slice_to_vec` pools its encoder state in a thread-local (hash
+  table, default FSE tables, block scratch): per-call rebuilds of those
+  dominated small inputs. 1 KiB payloads compress 3-7x faster (json 152 ->
+  444, random 268 -> 1938 MiB/s), 4 KiB gains 30-80%; large inputs are
+  unchanged. A new `bench_small` example tracks 1 KiB-1 MiB payloads
+  against the zstd crate's bulk path.
+
 * Literal blocks whose alphabet stays within sixteen symbols histogram
   through an AVX-512 kernel: sixteen per-slot byte compares with popcount
   accumulation over four 64-byte chunks at a time, entered once the slot
