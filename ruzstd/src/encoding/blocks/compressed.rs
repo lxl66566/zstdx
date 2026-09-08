@@ -59,19 +59,28 @@ pub(crate) fn compress_block<M: Matcher>(
         // when one code covers everything, predefined when the block is too
         // small (or too skewed) to pay for a table description, otherwise a
         // normalized custom table.
-        // One pass over the sequences produces all three code arrays; both
-        // the table selection and the bitstream encoder consume them.
-        let mut ll_codes = Vec::with_capacity(sequences.len());
-        let mut ml_codes = Vec::with_capacity(sequences.len());
-        let mut of_codes = Vec::with_capacity(sequences.len());
+        // One pass over the sequences produces the packed codes and the
+        // pre-merged add-bit payloads; table selection, table description and
+        // the bitstream encoder all consume them, so the per-code metadata is
+        // looked up exactly once per sequence.
+        let mut packed_codes = Vec::with_capacity(sequences.len());
+        let mut add_bits = Vec::with_capacity(sequences.len());
+        let mut add_nbs = Vec::with_capacity(sequences.len());
         for seq in &sequences {
-            ll_codes.push(encode_literal_length(seq.ll).0);
-            ml_codes.push(encode_match_len(seq.ml).0);
-            of_codes.push(encode_offset(seq.of).0);
+            let (ll_code, ll_add, ll_nb) = encode_literal_length(seq.ll);
+            let (ml_code, ml_add, ml_nb) = encode_match_len(seq.ml);
+            let (of_code, of_add, of_nb) = encode_offset(seq.of);
+            packed_codes.push(ll_code as u32 | (ml_code as u32) << 8 | (of_code as u32) << 16);
+            add_bits.push(
+                ll_add as u64
+                    | ((ml_add as u64) << ll_nb)
+                    | ((of_add as u64) << (ll_nb + ml_nb)),
+            );
+            add_nbs.push((ll_nb + ml_nb + of_nb) as u8);
         }
-        let ll_mode = choose_table_fast(&ll_codes, default_tables.0, 6, 9);
-        let ml_mode = choose_table_fast(&ml_codes, default_tables.1, 6, 9);
-        let of_mode = choose_table_fast(&of_codes, default_tables.2, 5, 8);
+        let ll_mode = choose_table_fast(&packed_codes, 0, default_tables.0, 6, 9);
+        let ml_mode = choose_table_fast(&packed_codes, 8, default_tables.1, 6, 9);
+        let of_mode = choose_table_fast(&packed_codes, 16, default_tables.2, 5, 8);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -80,10 +89,10 @@ pub(crate) fn compress_block<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            &sequences,
-            &ll_codes,
-            &ml_codes,
-            &of_codes,
+            sequences.len(),
+            &packed_codes,
+            &add_bits,
+            &add_nbs,
             &mut writer,
             ll_mode.as_ref(),
             ml_mode.as_ref(),
@@ -127,23 +136,26 @@ impl FseTableMode<'_> {
 /// Port of libzstd's ZSTD_selectEncodingType for the fast strategy (no
 /// dictionary, so repeat mode never applies): RLE when a single code covers
 /// all sequences, predefined below the dynamic-table break-even, custom
-/// normalized table otherwise.
+/// normalized table otherwise. `shift` selects which byte of the packed code
+/// stream belongs to this table.
 fn choose_table_fast<'a>(
-    codes: &[u8],
+    packed_codes: &[u32],
+    shift: u32,
     default_table: &'a FSETable,
     default_norm_log: u32,
     max_log: u8,
 ) -> FseTableMode<'a> {
-    let nb_seq = codes.len();
+    let nb_seq = packed_codes.len();
     let mut counts = [0u32; 256];
     let mut max_symbol = 0usize;
-    let mut most_frequent = 0u32;
-    for &c in codes {
+    for &packed in packed_codes {
+        let c = (packed >> shift) as u8;
         counts[c as usize] += 1;
         if c as usize > max_symbol {
             max_symbol = c as usize;
         }
     }
+    let mut most_frequent = 0u32;
     for &c in &counts[..=max_symbol] {
         most_frequent = most_frequent.max(c);
     }
@@ -153,10 +165,10 @@ fn choose_table_fast<'a>(
         if nb_seq <= 2 {
             return FseTableMode::Predefined(default_table);
         }
-        let code = codes[0];
+        let code = packed_codes[0] >> shift;
         return FseTableMode::Rle {
-            code,
-            table: rle_table(code),
+            code: code as u8,
+            table: rle_table(code as u8),
         };
     }
     // The predefined table must cover every code that occurs.
@@ -169,7 +181,13 @@ fn choose_table_fast<'a>(
             return FseTableMode::Predefined(default_table);
         }
     }
-    match build_normalized_table(&mut counts, nb_seq, max_symbol, max_log, codes[nb_seq - 1]) {
+    match build_normalized_table(
+        &mut counts,
+        nb_seq,
+        max_symbol,
+        max_log,
+        (packed_codes[nb_seq - 1] >> shift) as u8,
+    ) {
         Some(table) => FseTableMode::Encoded(table),
         // Normalization corner case: fall back to the predefined table.
         None => FseTableMode::Predefined(default_table),
@@ -203,71 +221,43 @@ fn encode_fse_table_modes(
 }
 
 fn encode_sequences(
-    sequences: &[EncodedSequence],
-    ll_codes: &[u8],
-    ml_codes: &[u8],
-    of_codes: &[u8],
+    nb_seq: usize,
+    packed_codes: &[u32],
+    add_bits: &[u64],
+    add_nbs: &[u8],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_table: &FSETable,
     ml_table: &FSETable,
     of_table: &FSETable,
 ) {
-    // The codes arrive precomputed; the extra-bit fields follow straight
-    // from the code metadata and the sequence value.
-    let sequence = sequences[sequences.len() - 1];
-    let li = sequences.len() - 1;
-    let ll_code = ll_codes[li];
-    let (ll_add_bits, ll_num_bits) = {
-        let (base, bits) = LL_META[ll_code as usize];
-        (sequence.ll - base, bits as usize)
-    };
-    let of_code = of_codes[li];
-    let of_add_bits = sequence.of & ((1 << of_code) - 1);
-    let of_num_bits = of_code as usize;
-    let ml_code = ml_codes[li];
-    let (ml_add_bits, ml_num_bits) = {
-        let (base, bits) = ML_META[ml_code as usize];
-        (sequence.ml - base, bits as usize)
-    };
+    // The codes and pre-merged add-bit payloads arrive precomputed; the
+    // transitions still need each table's entry for the running states.
+    let li = nb_seq - 1;
+    let packed = packed_codes[li];
+    let ll_code = packed as u8;
+    let ml_code = (packed >> 8) as u8;
+    let of_code = (packed >> 16) as u8;
     let mut ll_state = ll_table.start_index(ll_code);
     let mut ml_state = ml_table.start_index(ml_code);
     let mut of_state = of_table.start_index(of_code);
 
-    write_add_bits(
-        writer,
-        ll_add_bits,
-        ll_num_bits,
-        ml_add_bits,
-        ml_num_bits,
-        of_add_bits,
-        of_num_bits,
-    );
+    writer.write_bits(add_bits[li], add_nbs[li] as usize);
 
     let ll_size = ll_table.table_size;
     let ml_size = ml_table.table_size;
     let of_size = of_table.table_size;
 
     // encode backwards so the decoder reads the first sequence first
-    if sequences.len() > 1 {
-        for i in (0..=sequences.len() - 2).rev() {
-            let sequence = sequences[i];
-            let ll_code = ll_codes[i];
-            let (ll_add_bits, ll_num_bits) = {
-                let (base, bits) = LL_META[ll_code as usize];
-                (sequence.ll - base, bits as usize)
-            };
-            let of_code = of_codes[i];
-            let of_add_bits = sequence.of & ((1 << of_code) - 1);
-            let of_num_bits = of_code as usize;
-            let ml_code = ml_codes[i];
-            let (ml_add_bits, ml_num_bits) = {
-                let (base, bits) = ML_META[ml_code as usize];
-                (sequence.ml - base, bits as usize)
-            };
+    if nb_seq > 1 {
+        for i in (0..=nb_seq - 2).rev() {
+            let packed = packed_codes[i];
+            let ll_code = packed as u8;
+            let ml_code = (packed >> 8) as u8;
+            let of_code = (packed >> 16) as u8;
 
-            // The three state-transition bit groups (max 15 bits each) and the
-            // three extra-bit groups (max 16+16+19 bits) each fit a single
-            // u64 write; concatenating them keeps the writer's hot path.
+            // The three state-transition bit groups (max 15 bits each) fit a
+            // single u64 write; concatenating them keeps the writer's hot
+            // path.
             let e_of = of_table.transition(of_code, of_state);
             let e_ml = ml_table.transition(ml_code, ml_state);
             let e_ll = ll_table.transition(ll_code, ll_state);
@@ -283,15 +273,7 @@ fn encode_sequences(
             ml_state = (e_ml >> 13) as usize;
             ll_state = (e_ll >> 13) as usize;
 
-            write_add_bits(
-                writer,
-                ll_add_bits,
-                ll_num_bits,
-                ml_add_bits,
-                ml_num_bits,
-                of_add_bits,
-                of_num_bits,
-            );
+            writer.write_bits(add_bits[i], add_nbs[i] as usize);
         }
     }
     writer.write_bits(ml_state as u64, ml_size.ilog2() as usize);
@@ -304,24 +286,6 @@ fn encode_sequences(
     } else {
         writer.write_bits(1u32, bits_to_fill);
     }
-}
-
-/// Write the per-sequence literal-length, match-length and offset extra bits
-/// with one concatenated bit write (max 51 bits). Bit order matches the
-/// decoder: ll first, then ml, then of.
-fn write_add_bits(
-    writer: &mut BitWriter<&mut Vec<u8>>,
-    ll_add_bits: u32,
-    ll_num_bits: usize,
-    ml_add_bits: u32,
-    ml_num_bits: usize,
-    of_add_bits: u32,
-    of_num_bits: usize,
-) {
-    let add = ll_add_bits as u64
-        | ((ml_add_bits as u64) << ll_num_bits)
-        | ((of_add_bits as u64) << (ll_num_bits + ml_num_bits));
-    writer.write_bits(add, ll_num_bits + ml_num_bits + of_num_bits);
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
@@ -387,6 +351,7 @@ const fn ll_code_lut() -> [u8; 64] {
 }
 const LL_CODE_LUT: [u8; 64] = ll_code_lut();
 
+#[inline]
 fn encode_literal_length(len: u32) -> (u8, u32, usize) {
     if len < 64 {
         let code = LL_CODE_LUT[len as usize] as usize;
@@ -451,6 +416,7 @@ const fn ml_code_lut() -> [u8; 131] {
 }
 const ML_CODE_LUT: [u8; 131] = ml_code_lut();
 
+#[inline]
 fn encode_match_len(len: u32) -> (u8, u32, usize) {
     debug_assert!(len >= 3, "match lengths below 3 cannot be encoded");
     if len < 131 {
@@ -473,6 +439,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
     }
 }
 
+#[inline]
 fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);

@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Encoder round eight: sequence codes and their add-bit payloads are
+  precomputed in a single pass over the sequences (codes packed into one
+  u32 stream, add bits pre-merged into one u64 per sequence), replacing the
+  three separate code arrays, the per-sequence out-of-line encoder-helper
+  calls, and the metadata re-lookups in the bitstream encoder. json +3%
+  throughput, all other corpora neutral, output bit-identical.
+
 * Encoder round seven, data-path focused: the match window holds two windows
   plus one block of capacity so compaction copies ~1x data volume instead of
   once per block; block input is read directly into the window tail through
