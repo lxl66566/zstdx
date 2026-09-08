@@ -329,6 +329,37 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 let mut p = output.as_mut_ptr().add(pos);
                 let lut = |b: u8| (packed[b as usize] >> 4) as u8;
                 let mut i = n;
+                // AVX-512 packs whole 64-symbol chunks (four groups) with
+                // byte-permutes instead of per-symbol LUT loads.
+                #[cfg(all(target_arch = "x86_64", feature = "std"))]
+                let simd_end = {
+                    const CHUNK: usize = 64;
+                    let full = groups / 4;
+                    let simd_stop = n - full * CHUNK;
+                    if full > 0
+                        && std::is_x86_feature_detected!("avx512bw")
+                        && std::is_x86_feature_detected!("avx512vbmi")
+                    {
+                        let mut tab = [0u8; 256];
+                        for (b, t) in tab.iter_mut().enumerate() {
+                            *t = lut(b as u8);
+                        }
+                        // SAFETY: the feature was just detected; the reserve
+                        // covers all stores; i >= simd_stop + 63 keeps the
+                        // 64-byte loads inside data.
+                        p = uniform4_pack_avx512(
+                            data,
+                            simd_stop,
+                            n,
+                            p,
+                            &tab,
+                        );
+                        i = simd_stop;
+                    }
+                    simd_stop
+                };
+                #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+                let simd_end = n;
                 while i > bulk_end {
                     // Encoding order runs back to front: data[i-1] is the
                     // next symbol and lands in the low nibble of byte 0.
@@ -405,6 +436,63 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bits_in_partial = bits;
         self.bit_idx = pos * 8;
     }
+}
+
+/// Pack 4-bit huffman codes for `data[stop..end]` (a multiple of 64 bytes)
+/// into `dst`, walking the data back to front: output byte `j` of each
+/// 64-symbol chunk holds `code(data[i-1-2j]) | code(data[i-2-2j]) << 4`,
+/// exactly like the scalar tail of [`BitWriter::write_packed_codes_rev`].
+/// `tab` is the per-symbol 4-bit code table. Returns the advanced dst.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512bw,avx512vbmi")]
+unsafe fn uniform4_pack_avx512(
+    data: &[u8],
+    stop: usize,
+    end: usize,
+    mut dst: *mut u8,
+    tab: &[u8; 256],
+) -> *mut u8 {
+    use core::arch::x86_64::*;
+
+    let lut01 = _mm512_loadu_si512(tab.as_ptr().cast());
+    let lut01b = _mm512_loadu_si512(tab.as_ptr().add(64).cast());
+    let lut23 = _mm512_loadu_si512(tab.as_ptr().add(128).cast());
+    let lut23b = _mm512_loadu_si512(tab.as_ptr().add(192).cast());
+    // Within a 64-symbol chunk (local 0..63, chunk base i): the low nibble of
+    // output byte j reads local 63-2j, the high nibble local 62-2j; the upper
+    // half of the permute indices is unused (only the low 32 bytes store).
+    let mut idx_lo = [0u8; 64];
+    let mut idx_hi = [0u8; 64];
+    for j in 0..32 {
+        idx_lo[j] = (63 - 2 * j) as u8;
+        idx_hi[j] = (63 - 2 * j - 1) as u8;
+    }
+    let idx_lo = _mm512_loadu_si512(idx_lo.as_ptr().cast());
+    let idx_hi = _mm512_loadu_si512(idx_hi.as_ptr().cast());
+    let mask7f = _mm512_set1_epi8(0x7F);
+    let mask_f0 = _mm512_set1_epi8(0xF0u8 as i8);
+
+    let mut i = end;
+    while i > stop {
+        i -= 64;
+        let v = _mm512_loadu_si512(data.as_ptr().add(i).cast());
+        // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
+        // pair, bit 7 blends between the pairs.
+        let lo7 = _mm512_and_si512(v, mask7f);
+        let codes = _mm512_mask_blend_epi8(
+            _mm512_movepi8_mask(v),
+            _mm512_permutex2var_epi8(lut01, lo7, lut01b),
+            _mm512_permutex2var_epi8(lut23, lo7, lut23b),
+        );
+        let lo = _mm512_permutexvar_epi8(idx_lo, codes);
+        let hi = _mm512_and_si512(
+            _mm512_slli_epi16(_mm512_permutexvar_epi8(idx_hi, codes), 4),
+            mask_f0,
+        );
+        _mm256_storeu_si256(dst.cast(), _mm512_castsi512_si256(_mm512_or_si512(lo, hi)));
+        dst = dst.add(32);
+    }
+    dst
 }
 
 #[cfg(test)]
