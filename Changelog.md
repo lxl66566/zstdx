@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The frame checksum moved in-tree (spec-exact XXH64 with two 32-byte
+  chunks per iteration, keeping eight accumulator chains in flight) and is
+  now fused into passes that read the block anyway: the RLE uniform scan
+  absorbs while it compares (uniform blocks hash in their only pass; any
+  mismatch returns a resume offset), the raw block copy absorbs the
+  remaining range while it copies, and a zero-sequence block whose
+  literals fail the strided entropy sample skips the encode-and-discard
+  round trip entirely (nothing written, raw emitted straight away - the
+  outcome the size fallback would have chosen). With the hash feature on,
+  zeros gains 22% at 32 MiB (14.8 -> 18.1 GiB/s) and random ~10% at small
+  payloads while staying byte-identical everywhere; without it, random
+  gains 4% and text 1%. Two inlining pitfalls fixed along the way: the
+  uniform scan outlined (its data pointer used to reload from the stack
+  every 32 bytes inside the enlarged caller) and the literals gate now
+  runs before any literal is written for zero-sequence blocks.
+
 * Zero-sequence blocks no longer stage their literals in the block scratch:
   the matcher skips the whole-block copy and the block encoder reads the
   bytes straight from the window (the callback path hands the window slice
