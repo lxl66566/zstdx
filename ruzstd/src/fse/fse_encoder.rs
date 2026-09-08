@@ -143,6 +143,18 @@ impl FSETable {
         self.transitions[symbol as usize * self.table_size + idx]
     }
 
+    /// Flat transition rows for hot encoder loops, as `(rows, row_shift)`:
+    /// entry `code << row_shift | state` holds the same packed transition as
+    /// [`transition`]. `table_size` is always a power of two, so the row
+    /// stride is a shift instead of a multiply.
+    pub(crate) fn transitions_flat(&self) -> (&[u32], u32) {
+        debug_assert!(self.table_size.is_power_of_two());
+        (
+            &self.transitions[..],
+            self.table_size.trailing_zeros(),
+        )
+    }
+
     /// Index of the state encoding a block's last `symbol` starts from.
     #[inline(always)]
     pub(crate) fn start_index(&self, symbol: u8) -> usize {

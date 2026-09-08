@@ -4,6 +4,14 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The sequence bitstream encoder keeps its bit accumulator in locals behind
+  a small hot-push helper (one unaligned u64 store per flush instead of two
+  writer-method round-trips per sequence) and reads the FSE transition rows
+  through a flat unchecked `code << log | state` index — the row stride is a
+  power-of-two shift, not a runtime multiply, and codes/states cannot leave
+  the table by construction. json executes 1.4% fewer instructions and gains
+  ~3% throughput; output stays bit-identical.
+
 * The literals histogram fills four sub-histograms keyed by position mod 4
   and merges them once per block, so concurrent increments land in
   different cache lines instead of serializing on same-counter store

@@ -270,6 +270,14 @@ fn encode_sequences(
 ) {
     // The codes and pre-merged add-bit payloads arrive precomputed; the
     // transitions still need each table's entry for the running states.
+    // Rows are flat `code << shift | state` (table_size is a power of two),
+    // replacing the runtime-stride multiply and bounds check of the indexed
+    // accessor. Codes are u8 and states cycle below table_size by table
+    // construction, so the row index cannot leave the flat array.
+    let (ll_rows, ll_shift) = ll_table.transitions_flat();
+    let (ml_rows, ml_shift) = ml_table.transitions_flat();
+    let (of_rows, of_shift) = of_table.transitions_flat();
+
     let li = nb_seq - 1;
     let packed = packed_codes[li];
     let ll_code = packed as u8;
@@ -279,44 +287,59 @@ fn encode_sequences(
     let mut ml_state = ml_table.start_index(ml_code);
     let mut of_state = of_table.start_index(of_code);
 
-    writer.write_bits(add_bits[li], add_nbs[li] as usize);
+    let ml_log = ml_table.table_size.ilog2() as usize;
+    let of_log = of_table.table_size.ilog2() as usize;
+    let ll_log = ll_table.table_size.ilog2() as usize;
 
-    let ll_size = ll_table.table_size;
-    let ml_size = ml_table.table_size;
-    let of_size = of_table.table_size;
+    // The accumulator stays in locals for the whole loop; routing the two
+    // per-sequence writes through the writer used to reload and store its
+    // fields each time. Flushes leave fewer than eight bits pending, so
+    // neither push (≤45 transition bits, ≤51 add bits) can overflow.
+    let (mut acc, mut bits, mut pos) = writer.hot_state();
+    {
+        let out = writer.out();
+        hot_push(out, &mut pos, &mut acc, &mut bits, add_bits[li], add_nbs[li] as usize);
 
-    // encode backwards so the decoder reads the first sequence first
-    if nb_seq > 1 {
-        for i in (0..=nb_seq - 2).rev() {
-            let packed = packed_codes[i];
-            let ll_code = packed as u8;
-            let ml_code = (packed >> 8) as u8;
-            let of_code = (packed >> 16) as u8;
+        // encode backwards so the decoder reads the first sequence first
+        if nb_seq > 1 {
+            for i in (0..=nb_seq - 2).rev() {
+                let packed = packed_codes[i];
+                let ll_code = packed as u8;
+                let ml_code = (packed >> 8) as u8;
+                let of_code = (packed >> 16) as u8;
 
-            // The three state-transition bit groups (max 15 bits each) fit a
-            // single u64 write; concatenating them keeps the writer's hot
-            // path.
-            let e_of = of_table.transition(of_code, of_state);
-            let e_ml = ml_table.transition(ml_code, ml_state);
-            let e_ll = ll_table.transition(ll_code, ll_state);
-            let of_diff = (of_state - (e_of & 0x1FF) as usize) as u64;
-            let ml_diff = (ml_state - (e_ml & 0x1FF) as usize) as u64;
-            let ll_diff = (ll_state - (e_ll & 0x1FF) as usize) as u64;
-            let of_nb = ((e_of >> 9) & 0xF) as usize;
-            let ml_nb = ((e_ml >> 9) & 0xF) as usize;
-            let ll_nb = ((e_ll >> 9) & 0xF) as usize;
-            let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
-            writer.write_bits(trans, of_nb + ml_nb + ll_nb);
-            of_state = (e_of >> 13) as usize;
-            ml_state = (e_ml >> 13) as usize;
-            ll_state = (e_ll >> 13) as usize;
+                // SAFETY: see the row-index argument above.
+                let e_of = unsafe { *of_rows.get_unchecked(((of_code as usize) << of_shift) | of_state) };
+                let e_ml = unsafe { *ml_rows.get_unchecked(((ml_code as usize) << ml_shift) | ml_state) };
+                let e_ll = unsafe { *ll_rows.get_unchecked(((ll_code as usize) << ll_shift) | ll_state) };
+                debug_assert!(of_state < of_table.table_size);
+                debug_assert!(ml_state < ml_table.table_size);
+                debug_assert!(ll_state < ll_table.table_size);
 
-            writer.write_bits(add_bits[i], add_nbs[i] as usize);
+                // The three state-transition bit groups (max 15 bits each) fit a
+                // single u64 write; concatenating them keeps the writer's hot
+                // path.
+                let of_diff = (of_state - (e_of & 0x1FF) as usize) as u64;
+                let ml_diff = (ml_state - (e_ml & 0x1FF) as usize) as u64;
+                let ll_diff = (ll_state - (e_ll & 0x1FF) as usize) as u64;
+                let of_nb = ((e_of >> 9) & 0xF) as usize;
+                let ml_nb = ((e_ml >> 9) & 0xF) as usize;
+                let ll_nb = ((e_ll >> 9) & 0xF) as usize;
+                let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
+                of_state = (e_of >> 13) as usize;
+                ml_state = (e_ml >> 13) as usize;
+                ll_state = (e_ll >> 13) as usize;
+
+                hot_push(out, &mut pos, &mut acc, &mut bits, trans, of_nb + ml_nb + ll_nb);
+                hot_push(out, &mut pos, &mut acc, &mut bits, add_bits[i], add_nbs[i] as usize);
+            }
         }
     }
-    writer.write_bits(ml_state as u64, ml_size.ilog2() as usize);
-    writer.write_bits(of_state as u64, of_size.ilog2() as usize);
-    writer.write_bits(ll_state as u64, ll_size.ilog2() as usize);
+    writer.set_hot_state(acc, bits, pos);
+
+    writer.write_bits(ml_state as u64, ml_log);
+    writer.write_bits(of_state as u64, of_log);
+    writer.write_bits(ll_state as u64, ll_log);
 
     let bits_to_fill = writer.misaligned();
     if bits_to_fill == 0 {
@@ -324,6 +347,40 @@ fn encode_sequences(
     } else {
         writer.write_bits(1u32, bits_to_fill);
     }
+}
+
+/// Append the low `nb` bits of `v` to a hot accumulator, flushing whole
+/// bytes with one unaligned u64 store whenever the pending bits could
+/// overflow the container. Produces the same bits as `write_bits`; callers
+/// keep `bits` below 64 so the shift cannot drop payload.
+#[inline(always)]
+fn hot_push(
+    out: &mut Vec<u8>,
+    pos: &mut usize,
+    acc: &mut u64,
+    bits: &mut usize,
+    v: u64,
+    nb: usize,
+) {
+    if *bits + nb >= 64 {
+        let k = *bits / 8;
+        if *pos + 16 > out.capacity() {
+            out.reserve(*pos + 16 - out.len());
+        }
+        // SAFETY: the capacity check covers the store; bytes past the
+        // semantic end are overwritten by later stores or cut by set_len.
+        unsafe {
+            out.as_mut_ptr()
+                .add(*pos)
+                .cast::<u64>()
+                .write_unaligned(acc.to_le());
+        }
+        *pos += k;
+        *acc >>= 8 * k;
+        *bits -= 8 * k;
+    }
+    *acc |= v << *bits;
+    *bits += nb;
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {

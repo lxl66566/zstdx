@@ -376,6 +376,35 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             8 - (idx % 8)
         }
     }
+
+    /// Hot-loop bit state as `(partial, bits_in_partial, byte_position)` so
+    /// batched writers can keep the accumulator in registers instead of
+    /// round-tripping it through the writer's fields on every push. The
+    /// output buffer's length equals the byte position at this point.
+    pub(crate) fn hot_state(&self) -> (u64, usize, usize) {
+        (self.partial, self.bits_in_partial, self.bit_idx / 8)
+    }
+
+    /// Direct output access for the batched-writer flush stores.
+    pub(crate) fn out(&mut self) -> &mut Vec<u8> {
+        self.output.as_mut()
+    }
+
+    /// Restore state produced by a batched loop that started from
+    /// [`hot_state`]: `pos` is the new semantic end (the caller's stores may
+    /// have written past it within reserved capacity), with `bits` pending
+    /// bits left in `partial`.
+    pub(crate) fn set_hot_state(&mut self, partial: u64, bits: usize, pos: usize) {
+        let output = self.output.as_mut();
+        debug_assert!(pos <= output.capacity());
+        // SAFETY: the batched loop reserved pos + slack and only advanced pos
+        // over bytes it wrote, so growing (or snapping off overshoot) within
+        // the capacity keeps the length == bit_idx / 8 invariant.
+        unsafe { output.set_len(pos) };
+        self.partial = partial;
+        self.bits_in_partial = bits;
+        self.bit_idx = pos * 8;
+    }
 }
 
 #[cfg(test)]
