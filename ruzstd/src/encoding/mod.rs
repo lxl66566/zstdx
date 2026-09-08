@@ -160,11 +160,13 @@ pub trait Matcher {
     /// Buffer-based variant of [`Matcher::start_matching`]: the block's
     /// literals accumulate in `literals` and each match appends one
     /// [`EncodedSequence`] whose `ll` counts the literals emitted right
-    /// before it (the interleaving is fully reconstructable). The default
-    /// implementation wraps [`Matcher::start_matching`]; the built-in
-    /// matcher overrides it so its hot emit path appends to the buffers
-    /// directly instead of routing through a closure capture, which spills
-    /// matcher state to the stack around every call.
+    /// before it (the interleaving is fully reconstructable). A block that
+    /// produces no sequences may leave `literals` empty; its literals are
+    /// then the whole block, available through [`Matcher::get_last_space`].
+    /// The default implementation wraps [`Matcher::start_matching`]; the
+    /// built-in matcher overrides it so its hot emit path appends to the
+    /// buffers directly instead of routing through a closure capture, which
+    /// spills matcher state to the stack around every call.
     fn start_matching_into(
         &mut self,
         literals: &mut Vec<u8>,

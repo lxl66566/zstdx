@@ -63,19 +63,28 @@ pub(crate) fn compress_block<M: Matcher>(
     add_nbs.clear();
     matcher.start_matching_into(literals_vec, sequences);
 
+    // A zero-sequence block stages no literals (the matcher skips the
+    // whole-block copy); its literals are the block itself, read straight
+    // from the window. Same bytes, so every entropy decision below — and
+    // thus the output — matches the staged path.
+    let literals: &[u8] = if sequences.is_empty() {
+        matcher.get_last_space()
+    } else {
+        &literals_vec[..]
+    };
+
     // literals section
 
     let mut writer = BitWriter::from(output);
-    if !literals_vec.is_empty() && crate::encoding::util::is_uniform(literals_vec) {
-        rle_literals(&literals_vec, &mut writer);
-    } else if literals_vec.len() > 1024 {
-        if let Some(table) =
-            compress_literals(literals_vec, last_huff_table, &mut writer, literals_gate_hold)
+    if !literals.is_empty() && crate::encoding::util::is_uniform(literals) {
+        rle_literals(literals, &mut writer);
+    } else if literals.len() > 1024 {
+        if let Some(table) = compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold)
         {
             tables.huff = Some(table);
         }
     } else {
-        raw_literals(&literals_vec, &mut writer);
+        raw_literals(literals, &mut writer);
     }
 
     // sequences section

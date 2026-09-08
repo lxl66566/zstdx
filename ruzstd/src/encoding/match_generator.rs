@@ -415,6 +415,9 @@ impl Matcher for MatchGeneratorDriver {
         self.start_matching_into(&mut literals, &mut sequences);
         // Rebuild the interleaved callback order from the collected
         // buffers: each sequence's ll literals came right before it.
+        // Zero-sequence blocks staged nothing; their literals are the block
+        // itself, handed over straight from the window.
+        let zero_seq = sequences.is_empty();
         let mut offset = 0usize;
         for seq in sequences {
             let lits = &literals[offset..offset + seq.ll as usize];
@@ -425,9 +428,15 @@ impl Matcher for MatchGeneratorDriver {
                 match_len: seq.ml as usize,
             });
         }
-        handle_sequence(Sequence::Literals {
-            literals: &literals[offset..],
-        });
+        if zero_seq {
+            handle_sequence(Sequence::Literals {
+                literals: self.get_last_space(),
+            });
+        } else {
+            handle_sequence(Sequence::Literals {
+                literals: &literals[offset..],
+            });
+        }
     }
 
     fn start_matching_into(
@@ -661,10 +670,13 @@ impl Matcher for MatchGeneratorDriver {
             let step = 1 + (miss_count >> 2).min(255) as u64;
             pos += pair_len * step;
         }
-        if anchor < block_end {
+        if !sequences.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
             literals.extend_from_slice(&win[tail]);
         }
+        // A zero-sequence block stages nothing: its literals are exactly the
+        // block, which the caller reads through get_last_space() instead of
+        // paying a whole-block copy into and out of the scratch buffer.
         self.pos = block_end;
         self.anchor = block_end;
         self.miss_count = miss_count;
