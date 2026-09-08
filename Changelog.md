@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Zero-sequence blocks no longer stage their literals in the block scratch:
+  the matcher skips the whole-block copy and the block encoder reads the
+  bytes straight from the window (the callback path hands the window slice
+  over as the trailing `Literals`). Blocks that compress to nothing - every
+  random or skewed block - drop one full write+read pass; output bytes are
+  unchanged. random gains ~13% at 64 KiB-1 MiB payloads in a clean process
+  (7061 -> 8013, 8210 -> 9332 MiB/s), skewed ~4% at 32 MiB (2473 -> 2560
+  MiB/s).
+
 * `compress_slice_to_vec` pools its encoder state in a thread-local (hash
   table, default FSE tables, block scratch): per-call rebuilds of those
   dominated small inputs. 1 KiB payloads compress 3-7x faster (json 152 ->
