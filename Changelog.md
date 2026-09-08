@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The three sequence-code histograms (literal length, match length, offset)
+  fill in a single pass over the packed codes instead of one pass per
+  table; the per-table mode decision moved into a shared helper. json
+  executes 0.7% fewer instructions; output is bit-identical.
+
+* Huffman stream encoding batches four symbols between bit-container
+  flushes (one unaligned u64 store per four symbols instead of a
+  container-overflow branch per symbol), driven by a packed
+  `(code << 4) | num_bits` u16 code table that keeps the whole table in
+  one cache line pair. skewed gains 71% and json 4% throughput; output is
+  bit-identical.
+
+* The literals histogram is computed once and shared between the entropy
+  precheck and the huffman table build (both used to scan the full
+  literals buffer separately). skewed gains 17% throughput; output is
+  bit-identical.
+
 * The scan loop interleaves two adjacent positions (libzstd's ip0/ip1
   pipeline): hashes and table entries for both are prepared before either
   is probed, overlapping the hash multiply and table load latencies, and a
