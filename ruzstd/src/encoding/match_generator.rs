@@ -1005,6 +1005,7 @@ impl MatchGeneratorDriver {
         let mut anchor = self.anchor;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
+        let mut miss_count = self.miss_count;
 
         // Chain-walk search from the hash head at window index `idx`,
         // returning the longest match's (length, candidate window index).
@@ -1087,9 +1088,14 @@ impl MatchGeneratorDriver {
             }
 
             if best_len < MIN_MATCH {
-                pos += 1;
+                // Grow the probe step on long literal runs (same policy as
+                // the fast loop) so incompressible data does not pay a full
+                // chain walk per byte.
+                miss_count += 1;
+                pos += 1 + (miss_count >> 2).min(255) as u64;
                 continue;
             }
+            miss_count = 0;
 
             // Lazy evaluation: a longer match starting a few positions later
             // is worth the literals skipped on the way. Long-enough matches
@@ -1161,6 +1167,7 @@ impl MatchGeneratorDriver {
         }
         self.pos = block_end;
         self.anchor = block_end;
+        self.miss_count = miss_count;
         self.rep = rep;
         self.rep_pending = rep_pending;
     }
