@@ -140,10 +140,10 @@ fn main() {
             "shape", "ruz MB/s", "ratio", "z1 MB/s", "ratio", "z3 MB/s", "ratio"
         );
         for (name, raw) in &shapes {
-            // ruzstd Fastest
-            let mut comp = ruzstd::encoding::compress_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+            // ruzstd Fastest (one-shot slice path, mirrors zstd bulk)
+            let mut comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
             let t = bench(iters, || {
-                comp = ruzstd::encoding::compress_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+                comp = ruzstd::encoding::compress_slice_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
             });
             let ruz_enc = mibs(raw.len() as u64, t);
             let ruz_ratio = raw.len() as f64 / comp.len() as f64;
