@@ -79,3 +79,10 @@ impl From<Error> for io::Error {
         io::Error::new(io::ErrorKind::Other, alloc::boxed::Box::new(e))
     }
 }
+
+/// Convert the umbrella error into the io error of the active build. A plain
+/// `.into()` is ambiguous at call sites because the no_std io::Error also has
+/// an inherent `from(ErrorKind)` constructor that shadows the trait method.
+pub(crate) fn into_io(e: Error) -> io::Error {
+    e.into()
+}

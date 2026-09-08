@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Streaming decoders: `ruzstd::stream::read::Decoder` decompresses while
+  reading and — unlike `decoding::StreamingDecoder`, which is documented to
+  stop after one frame — is transparent over concatenated frames and
+  skippable frames (`single_frame()` restores the one-frame behavior; a
+  4-byte magic peek distinguishes a clean frame boundary from a truncated
+  magic). `ruzstd::stream::write::Decoder` decodes compressed bytes written
+  to it into an underlying writer (`auto_flush()` wraps it to flush the
+  writer per write). The write decoder stages input and only hands a block
+  to the FrameDecoder once the block header, body and — behind the last
+  block of a checksummed frame — the 4-byte trailer are fully staged,
+  because a starved block read would poison the decoder state. One-shot
+  conveniences over the same machinery: `ruzstd::stream::{encode_all,
+  decode_all, copy_encode, copy_decode}`. A `crate::error::into_io` helper
+  sidesteps the no_std io::Error's inherent `from(ErrorKind)` shadowing the
+  `From<crate::Error>` impl at `.map_err` call sites.
+
 * Streaming encoders: `ruzstd::stream::write::Encoder` (io::Write in,
   compressed out, with `auto_finish`/`on_finish`/`finish`/`try_finish`/
   `do_finish`, and `flush` emitting the staged partial block early) and

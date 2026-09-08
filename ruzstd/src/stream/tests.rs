@@ -218,3 +218,120 @@ fn interop_with_zstd_crate() {
     zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
     assert_eq!(decoded, data);
 }
+
+/// A concatenated stream: three frames of different shapes with skippable
+/// frames wedged between them.
+#[cfg(test)]
+fn multi_frame_stream() -> (Vec<u8>, Vec<u8>) {
+    let a = bulk::compress(b"first frame", Level::Fastest);
+    let b = bulk::compress(vec![7u8; 200 * 1024].as_slice(), Level::Uncompressed);
+    let c = bulk::compress(&[], Level::Fastest);
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&a);
+    stream.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+    stream.extend_from_slice(&300u32.to_le_bytes());
+    stream.extend(core::iter::repeat_n(0xAB, 300));
+    stream.extend_from_slice(&b);
+    stream.extend_from_slice(&0x184D2A5Fu32.to_le_bytes());
+    stream.extend_from_slice(&0u32.to_le_bytes());
+    stream.extend_from_slice(&c);
+    let mut plain = Vec::new();
+    plain.extend_from_slice(b"first frame");
+    plain.extend(core::iter::repeat_n(7u8, 200 * 1024));
+    (stream, plain)
+}
+
+#[test]
+fn read_decoder_is_transparent_over_frames() {
+    let (stream, plain) = multi_frame_stream();
+    let mut dec = read::Decoder::new(stream.as_slice()).unwrap();
+    let mut out = Vec::new();
+    crate::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+    assert_eq!(out, plain);
+
+    // single_frame stops after the first frame
+    let mut dec = read::Decoder::new(stream.as_slice())
+        .unwrap()
+        .single_frame();
+    let mut out = Vec::new();
+    crate::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+    assert_eq!(out, b"first frame");
+}
+
+#[test]
+fn write_decoder_is_transparent_over_frames() {
+    let (stream, plain) = multi_frame_stream();
+    let mut sink = Vec::new();
+    {
+        let mut dec = write::Decoder::new(&mut sink).unwrap();
+        for chunk in stream.chunks(9 * 1024) {
+            dec.write_all(chunk).unwrap();
+        }
+        dec.flush().unwrap();
+    }
+    assert_eq!(sink, plain);
+}
+
+#[test]
+fn one_liner_functions_roundtrip() {
+    let data: Vec<u8> = (0..150 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+    let compressed = crate::stream::encode_all(data.as_slice(), Level::Fastest).unwrap();
+    assert_eq!(
+        crate::stream::decode_all(compressed.as_slice()).unwrap(),
+        data
+    );
+    let mut sink = Vec::new();
+    crate::stream::copy_decode(compressed.as_slice(), &mut sink).unwrap();
+    assert_eq!(sink, data);
+    let mut re_encoded = Vec::new();
+    crate::stream::copy_encode(data.as_slice(), &mut re_encoded, Level::Fastest).unwrap();
+    assert_eq!(
+        crate::stream::decode_all(re_encoded.as_slice()).unwrap(),
+        data
+    );
+}
+
+#[test]
+fn truncated_stream_is_an_error() {
+    let data: Vec<u8> = (0..100 * 1024).map(|i| (i % 97) as u8).collect();
+    let compressed = bulk::compress(&data, Level::Fastest);
+    let truncated = &compressed[..compressed.len() - 5];
+    assert!(
+        read::Decoder::new(truncated).is_err() || {
+            let mut dec = match read::Decoder::new(truncated) {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let mut out = Vec::new();
+            crate::io::Read::read_to_end(&mut dec, &mut out).is_err()
+        }
+    );
+    // garbage magic
+    let bad = [0u8, 1, 2, 3, 4, 5, 6, 7];
+    assert!(read::Decoder::new(bad.as_slice()).is_err());
+    // clean empty stream is an error at construction (libzstd parity)
+    assert!(read::Decoder::new(b"".as_slice()).is_err());
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn decoders_decode_libzstd_frames() {
+    let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 211) as u8).collect();
+    let compressed = zstd::stream::encode_all(data.as_slice(), 3).unwrap();
+
+    let mut out = Vec::new();
+    crate::io::Read::read_to_end(
+        &mut read::Decoder::new(compressed.as_slice()).unwrap(),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, data);
+
+    let mut sink = Vec::new();
+    {
+        let mut dec = write::Decoder::new(&mut sink).unwrap();
+        dec.write_all(&compressed).unwrap();
+        dec.flush().unwrap();
+    }
+    assert_eq!(sink, data);
+}
