@@ -92,7 +92,11 @@ fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
 #[inline(always)]
 fn insert_at(win: &[u8], table: &mut [u64], epoch: u64, idx: usize, abs: u64) {
     let h = hash_at(win, idx);
-    table[h] = (epoch << 48) | abs;
+    // SAFETY: the hash masks down to HASH_LOG bits and the table always
+    // holds 1 << HASH_LOG slots, so the index cannot leave it.
+    unsafe {
+        *table.get_unchecked_mut(h) = (epoch << 48) | abs;
+    }
 }
 
 /// Emit the sequence for a match covering `match_len` bytes at window index

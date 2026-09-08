@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The matcher's index insertion stores its hash-table slot unchecked: the
+  hash already masks to the table's power-of-two size, so the bounds check
+  on every inserted position was provably dead. json executes 2.3% and text
+  5.4% fewer instructions (text's long matches pay the most insertions);
+  output stays bit-identical.
+
 * Compressed blocks encode straight into the frame output: the block writer
   reserves the three-byte header, encodes the content in place and patches
   the header once the compressed size is known, removing the per-block
