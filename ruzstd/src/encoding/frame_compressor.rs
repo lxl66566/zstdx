@@ -657,6 +657,38 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn fse_repeat_tables_roundtrip() {
+        // Multi-block payload (>= 2 x 128 KiB) with drifting-but-similar
+        // sequence statistics, so later blocks reuse earlier blocks' FSE
+        // tables (repeat mode). Both decoders must reproduce it exactly.
+        let mut data = alloc::vec![];
+        let template = b"{\"id\":123456,\"name\":\"user\",\"tags\":[\"a\",\"b\"],\"score\":42}\n";
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while data.len() < 600 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(template);
+            data.push(b'0' + (state % 10) as u8);
+            data.push(b'0' + ((state >> 8) % 10) as u8);
+        }
+        let output = crate::encoding::compress_slice_to_vec(
+            &data[..],
+            super::CompressionLevel::Fastest,
+        );
+
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(data.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(data, decoded);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
     fn aaa_compress() {
         let mock_data = vec![0, 1, 3, 4, 5];
         let mut output: Vec<u8> = Vec::new();

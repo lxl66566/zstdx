@@ -3,7 +3,7 @@ use crate::{
     encoding::{
         block_header::BlockHeader,
         blocks::compress_block,
-        blocks::compressed::BlockOutcome,
+        blocks::compressed::{BlockOutcome, PrevTable},
         frame_compressor::{BlockChecksum, CompressState},
         Matcher,
     },
@@ -71,6 +71,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 &state.fse_tables.ml_default,
                 &state.fse_tables.of_default,
             ),
+            (&old_tables[0], &old_tables[1], &old_tables[2]),
             output,
             &mut state.scratch,
         );
@@ -93,17 +94,23 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 Some(new) => Some(new),
                 None => old_huff,
             };
+            // `Clear` drops the remembered table: the block overwrote the
+            // decoder's table with a predefined or RLE one, so repeating the
+            // old custom table in a later block would desync the streams.
             state.fse_tables.ll_previous = match tables.ll {
-                Some(new) => Some(new),
-                None => old_tables[0].take(),
+                PrevTable::New(new) => Some(new),
+                PrevTable::Keep => old_tables[0].take(),
+                PrevTable::Clear => None,
             };
             state.fse_tables.ml_previous = match tables.ml {
-                Some(new) => Some(new),
-                None => old_tables[1].take(),
+                PrevTable::New(new) => Some(new),
+                PrevTable::Keep => old_tables[1].take(),
+                PrevTable::Clear => None,
             };
             state.fse_tables.of_previous = match tables.of {
-                Some(new) => Some(new),
-                None => old_tables[2].take(),
+                PrevTable::New(new) => Some(new),
+                PrevTable::Keep => old_tables[2].take(),
+                PrevTable::Clear => None,
             };
             let mut prefix = [0u8; 3];
             BlockHeader {
@@ -121,6 +128,8 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             state.fse_tables.ll_previous = old_tables[0].take();
             state.fse_tables.ml_previous = old_tables[1].take();
             state.fse_tables.of_previous = old_tables[2].take();
+            // (raw fallback: the decoder never saw a sequence section, so
+            // the remembered tables stay exactly as they were)
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,

@@ -3,22 +3,33 @@ use alloc::vec::Vec;
 use crate::{
     bit_io::BitWriter,
     encoding::Matcher,
-    fse::fse_encoder::{build_normalized_table, rle_table, FSETable},
+    fse::fse_encoder::{approx_log2, build_normalized_table, rle_table, FSETable},
     huff0::huff0_encoder,
 };
 
-/// Entropy-table outcomes of encoding one compressed block. `Some(table)`
-/// means the block was encoded with a freshly built table the caller should
-/// remember for later blocks; `None` keeps whatever the caller had.
+/// What one sequence table's block mode means for the caller's remembered
+/// copy: a freshly written table to adopt, no change (the decoder's table
+/// state is untouched — zero-sequence and raw-fallback blocks), or
+/// invalidation (the block overwrote the decoder's table with a predefined
+/// or RLE one, so an older custom table can no longer be repeated).
+#[derive(Default)]
+pub(crate) enum PrevTable {
+    New(FSETable),
+    #[default]
+    Keep,
+    Clear,
+}
+
+/// Entropy-table outcomes of encoding one compressed block.
 ///
 /// `compress_block` never touches caller-owned state, so a raw-block
 /// fallback just drops these instead of restoring snapshots.
 #[derive(Default)]
 pub(crate) struct BlockTables {
     pub(crate) huff: Option<huff0_encoder::HuffmanTable>,
-    pub(crate) ll: Option<FSETable>,
-    pub(crate) ml: Option<FSETable>,
-    pub(crate) of: Option<FSETable>,
+    pub(crate) ll: PrevTable,
+    pub(crate) ml: PrevTable,
+    pub(crate) of: PrevTable,
 }
 
 /// Outcome of encoding one compressed block. `Encoded` carries the entropy
@@ -51,6 +62,7 @@ pub(crate) fn compress_block<M: Matcher>(
     matcher: &mut M,
     last_huff_table: Option<&huff0_encoder::HuffmanTable>,
     default_tables: (&FSETable, &FSETable, &FSETable),
+    previous_tables: (&Option<FSETable>, &Option<FSETable>, &Option<FSETable>),
     output: &mut Vec<u8>,
     scratch: &mut BlockScratch,
 ) -> BlockOutcome {
@@ -124,7 +136,8 @@ pub(crate) fn compress_block<M: Matcher>(
         // codes and pre-merged add-bit payloads, so the per-code metadata is
         // computed exactly once per sequence and every consumer (table
         // selection, table description, bitstream encoder) reads the streams.
-        let (ll_mode, ml_mode, of_mode) = choose_tables_fast(&packed_codes, default_tables);
+        let (ll_mode, ml_mode, of_mode) =
+            choose_tables_fast(&packed_codes, default_tables, previous_tables);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -143,14 +156,18 @@ pub(crate) fn compress_block<M: Matcher>(
             of_mode.as_ref(),
         );
 
-        if let FseTableMode::Encoded(table) = ll_mode {
-            tables.ll = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = ml_mode {
-            tables.ml = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = of_mode {
-            tables.of = Some(table)
+        for (slot, mode) in [
+            (&mut tables.ll, ll_mode),
+            (&mut tables.ml, ml_mode),
+            (&mut tables.of, of_mode),
+        ] {
+            *slot = match mode {
+                FseTableMode::Encoded(table) => PrevTable::New(table),
+                FseTableMode::Repeat(_) => PrevTable::Keep,
+                // The decoder's table for this stream is now the predefined
+                // or RLE one; an older custom table can never be repeated.
+                FseTableMode::Predefined(_) | FseTableMode::Rle { .. } => PrevTable::Clear,
+            };
         }
     }
     writer.flush();
@@ -165,6 +182,8 @@ enum FseTableMode<'a> {
     /// Single-code RLE mode: `code` is the wire byte, `table` the degenerate
     /// one-state table the encoder runs on.
     Rle { code: u8, table: FSETable },
+    /// Repeat mode: the previous block's table verbatim, no description.
+    Repeat(&'a FSETable),
 }
 
 impl FseTableMode<'_> {
@@ -173,6 +192,7 @@ impl FseTableMode<'_> {
             Self::Predefined(t) => t,
             Self::Encoded(t) => t,
             Self::Rle { table, .. } => table,
+            Self::Repeat(t) => t,
         }
     }
 }
@@ -183,6 +203,7 @@ impl FseTableMode<'_> {
 fn choose_tables_fast<'a>(
     packed_codes: &[u32],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
+    previous_tables: (&'a Option<FSETable>, &'a Option<FSETable>, &'a Option<FSETable>),
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
     let nb_seq = packed_codes.len();
     let mut ll_counts = [0u32; 256];
@@ -202,6 +223,7 @@ fn choose_tables_fast<'a>(
             first as u8,
             last as u8,
             default_tables.0,
+            previous_tables.0.as_ref(),
             6,
             9,
         ),
@@ -211,6 +233,7 @@ fn choose_tables_fast<'a>(
             (first >> 8) as u8,
             (last >> 8) as u8,
             default_tables.1,
+            previous_tables.1.as_ref(),
             6,
             9,
         ),
@@ -220,6 +243,7 @@ fn choose_tables_fast<'a>(
             (first >> 16) as u8,
             (last >> 16) as u8,
             default_tables.2,
+            previous_tables.2.as_ref(),
             5,
             8,
         ),
@@ -228,15 +252,19 @@ fn choose_tables_fast<'a>(
 
 /// Per-table mode selection from a filled histogram: RLE when a single code
 /// covers all sequences, predefined below the dynamic-table break-even (or
-/// when the predefined table cannot cover the codes), custom normalized
-/// table otherwise. Port of libzstd's ZSTD_selectEncodingType for the fast
-/// strategy (no dictionary, so repeat mode never applies).
+/// when the predefined table cannot cover the codes), repeat when the
+/// previous block's table codes this histogram no worse than a fresh table's
+/// description plus entropy bound, custom normalized table otherwise. Port
+/// of libzstd's ZSTD_selectEncodingType: the repeat comparison follows the
+/// cost-based path the lazy+ strategies use (the fast-strategy shortcut only
+/// engages with dictionary-provided tables, which this encoder never has).
 fn select_from_counts<'a>(
     counts: &mut [u32; 256],
     nb_seq: usize,
     first_code: u8,
     last_code: u8,
     default_table: &'a FSETable,
+    previous: Option<&'a FSETable>,
     default_norm_log: u32,
     max_log: u8,
 ) -> FseTableMode<'a> {
@@ -271,6 +299,18 @@ fn select_from_counts<'a>(
             return FseTableMode::Predefined(default_table);
         }
     }
+    if let Some(prev) = previous {
+        if let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol) {
+            // The bound understates a fresh table's bitstream and the
+            // description term is under two percent of the comparison, so
+            // the estimate leans toward rebuilding: ratio-safe.
+            let fresh_bits =
+                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+            if repeat_bits <= fresh_bits {
+                return FseTableMode::Repeat(prev);
+            }
+        }
+    }
     match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code) {
         Some(table) => FseTableMode::Encoded(table),
         // Normalization corner case: fall back to the predefined table.
@@ -278,9 +318,41 @@ fn select_from_counts<'a>(
     }
 }
 
+/// Bits the previous table needs for this histogram: one occurrence costs
+/// log2(table_size / prob). `None` when a live symbol has no state in the
+/// table, which rules the table out entirely.
+fn repeat_bit_cost(prev: &FSETable, counts: &[u32; 256], max_symbol: usize) -> Option<f64> {
+    let mut bits = 0.0f64;
+    for (s, &c) in counts.iter().enumerate().take(max_symbol + 1) {
+        if c > 0 {
+            bits += c as f64 * prev.symbol_bit_cost(s as u8)?;
+        }
+    }
+    Some(bits)
+}
+
+/// Shannon bound of the histogram in bits — the floor a freshly normalized
+/// table approaches but never reaches.
+fn entropy_bound_bits(counts: &[u32; 256], nb_seq: usize, max_symbol: usize) -> f64 {
+    let mut bits = 0.0f64;
+    for &c in &counts[..=max_symbol] {
+        if c > 0 {
+            bits -= c as f64 * entropy_log2(c as f64 / nb_seq as f64);
+        }
+    }
+    bits
+}
+
+/// Fresh-table description size in bits. The NCount wire format spends
+/// roughly six bits per live symbol plus a header and tail padding; the
+/// estimate only shifts a comparison term that stays below two percent.
+fn description_bits(max_symbol: usize) -> f64 {
+    (max_symbol as f64 + 1.0) * 6.0 + 8.0
+}
+
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
-        FseTableMode::Predefined(_) => {}
+        FseTableMode::Predefined(_) | FseTableMode::Repeat(_) => {}
         FseTableMode::Rle { code, .. } => {
             // The RLE table description is a single byte: the code.
             writer.write_bits(*code as u64, 8);
@@ -299,6 +371,7 @@ fn encode_fse_table_modes(
             FseTableMode::Predefined(_) => 0,
             FseTableMode::Rle { .. } => 1,
             FseTableMode::Encoded(_) => 2,
+            FseTableMode::Repeat(_) => 3,
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
@@ -494,23 +567,11 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.write_bits(literals[0], 8);
 }
 
-/// log2 for the entropy bound; the 8% margin swallows the approximation.
-#[cfg(feature = "std")]
+/// log2 for the entropy bound and repeat-table costs; shared approximation
+/// (see [`approx_log2`]).
 #[inline(always)]
 fn entropy_log2(x: f64) -> f64 {
-    x.log2()
-}
-
-/// `f64::log2` needs std; the bound only rejects, so a linear-mantissa
-/// approximation (error < 0.086) is fine here. Inputs are normal numbers:
-/// counts are >= 1 and totals are <= 128 KiB per block.
-#[cfg(not(feature = "std"))]
-#[inline(always)]
-fn entropy_log2(x: f64) -> f64 {
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
-    let frac = (bits & ((1u64 << 52) - 1)) as f64 / (1u64 << 52) as f64;
-    exp as f64 + frac
+    approx_log2(x)
 }
 
 /// Exact literal histogram. Blocks whose alphabet stays within sixteen
@@ -818,5 +879,91 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fse::fse_encoder::default_ll_table;
+
+    fn counts_from(symbols: &[u8]) -> [u32; 256] {
+        let mut counts = [0u32; 256];
+        for &s in symbols {
+            counts[s as usize] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn repeat_selection_by_cost_and_coverage() {
+        let default = default_ll_table();
+        // Two near-identical distributions: reusing the table must beat
+        // rebuilding it (description cost saved).
+        let mut symbols = alloc::vec![];
+        let mut state = 0x1234_5678u64;
+        for _ in 0..4000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            symbols.push(2 + (state >> 33) as u8 % 7);
+        }
+        let nb_seq = symbols.len();
+        let first = symbols[0];
+        let last = symbols[nb_seq - 1];
+        let prev_counts = counts_from(&symbols);
+        let prev = build_normalized_table(&mut prev_counts.clone(), nb_seq, 8, 9, last).unwrap();
+
+        let mut counts = counts_from(&symbols);
+        let mode = select_from_counts(
+            &mut counts,
+            nb_seq,
+            first,
+            last,
+            &default,
+            Some(&prev),
+            6,
+            9,
+        );
+        assert!(matches!(mode, FseTableMode::Repeat(_)), "stable distribution must repeat");
+
+        // A new symbol the previous table has no state for disqualifies
+        // repeat entirely, whatever the cost.
+        let mut shifted = alloc::vec![40u8; 2];
+        shifted.extend_from_slice(&symbols[..nb_seq - 2]);
+        let mut counts = counts_from(&shifted);
+        let mode = select_from_counts(
+            &mut counts,
+            nb_seq,
+            first,
+            last,
+            &default,
+            Some(&prev),
+            6,
+            9,
+        );
+        assert!(
+            matches!(mode, FseTableMode::Encoded(_)),
+            "uncovered symbol must rebuild"
+        );
+
+        // A wildly different distribution makes the old table too costly.
+        let mut other = alloc::vec![];
+        for i in 0..nb_seq {
+            other.push(30 + (i % 5) as u8);
+        }
+        let mut counts = counts_from(&other);
+        let mode = select_from_counts(
+            &mut counts,
+            nb_seq,
+            first,
+            30,
+            &default,
+            Some(&prev),
+            6,
+            9,
+        );
+        assert!(
+            matches!(mode, FseTableMode::Encoded(_)),
+            "drifted distribution must rebuild"
+        );
     }
 }

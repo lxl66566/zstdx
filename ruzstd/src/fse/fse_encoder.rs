@@ -117,6 +117,25 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     }
 }
 
+/// log2 for entropy and table-cost estimates. `f64::log2` needs std; the
+/// no-std fallback is a linear-mantissa approximation (error < 0.086),
+/// which every consumer tolerates: the estimates only steer selections
+/// between options whose costs differ by percent-level margins.
+#[inline(always)]
+pub(crate) fn approx_log2(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.log2()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let bits = x.to_bits();
+        let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+        let frac = (bits & ((1u64 << 52) - 1)) as f64 / (1u64 << 52) as f64;
+        exp as f64 + frac
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FSETable {
     /// Normalized probability per symbol: positive weight, -1 for the
@@ -163,6 +182,20 @@ impl FSETable {
 
     pub fn acc_log(&self) -> u8 {
         self.table_size.ilog2() as u8
+    }
+
+    /// Per-occurrence bit cost of `symbol` for repeat-table selection:
+    /// log2(table_size / prob). `None` when the symbol has no state, which
+    /// disqualifies the table from being repeated for a histogram that uses
+    /// it. The -1 low-probability wire form behaves like a single state.
+    pub(crate) fn symbol_bit_cost(&self, symbol: u8) -> Option<f64> {
+        let p = self.probs[symbol as usize];
+        if p == 0 {
+            return None;
+        }
+        Some(approx_log2(
+            self.table_size as f64 / p.unsigned_abs() as f64,
+        ))
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
