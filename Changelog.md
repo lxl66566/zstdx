@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The fused flat decode loop addresses active-segment match sources as a
+  plain `dst - offset` pointer (virtual distances are physical distances
+  inside the linear active segment — the buffer-base indirection cancels),
+  and moves the wrapped-history copy — sources at or below the segment
+  boundary — into a cold outlined function, dropping the four-segment
+  mapping state from the hot loop's live set. The per-sequence bounds
+  checks merge into one budget: `w + ll + ml` against the target plus one
+  `end + 16 <= out_len` gate shared by both wildcopy overshoots. Streaming
+  decode on the 32 MiB corpus: json.zst1 1656 → ~1690 MiB/s (+2%),
+  skewed.zst3 1183 → ~1220 (+3%), other shapes unchanged within noise.
+
 * `do_offset_history` resolves and updates the repcode history from a
   single slot index (`code - 1 + ll0`, where slot 3 is the `rep0 - 1`
   pseudo-slot folded onto `scratch[0]`), replacing the two chained match

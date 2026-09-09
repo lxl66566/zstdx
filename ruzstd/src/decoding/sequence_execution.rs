@@ -168,28 +168,21 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
-    use crate::decoding::errors::{DecompressBlockError, ExecuteSequencesError};
+    use crate::decoding::errors::DecompressBlockError;
     use super::sequence_section_decoder::decode_step;
 
     let out_ptr = out.as_mut_ptr();
     let out_len = out.len();
-    // `out` is the slice buf[block_start..] of the backing buffer; recover
-    // the buffer base so match sources (absolute offsets) address correctly.
-    // With a slice-decode target (virt_base == origin) this is `out` itself.
+    // `out` is the slice buf[block_start..] of the backing buffer. Within the
+    // active segment virtual distances equal physical ones, so the fused loop
+    // only needs this one offset to tell active-segment match sources from
+    // ones reaching into the wrapped-away history (handled out of line). With
+    // a slice-decode target (virt_base == origin) this is `out` itself.
     let block_start = if NOWRAP {
         virt_base
     } else {
         virt_base.saturating_sub(view.origin)
     };
-    // SAFETY: subtracting within the same allocation; the caller guarantees
-    // out is the slice starting block_start bytes into the buffer
-    let base = unsafe { out_ptr.sub(block_start) };
-    let crate::decoding::flat_buffer::FlatView {
-        origin,
-        prev_origin,
-        seg_a_end,
-        out_len: seg_out_len,
-    } = view;
     let mut w = *written;
     let mut lit_pos = 0usize;
 
@@ -230,12 +223,9 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
             out_ptr,
             out_len,
             &mut w,
-            base,
+            block_start,
             virt_base,
-            origin,
-            prev_origin,
-            seg_a_end,
-            seg_out_len,
+            view,
             offset_hist,
         )
         .map_err(DecompressBlockError::ExecuteSequencesError)?;
@@ -377,6 +367,10 @@ unsafe fn wildcopy_literals(
 
 /// Execute a single decoded sequence into the flat target: the literal copy,
 /// offset-history resolution, and the match copy.
+///
+/// Bounds are one merged budget: `end = w + ll + ml` must stay inside the
+/// target, and `end + 16 <= out_len` gates the wildcopy overshoot of BOTH
+/// copies at once (neither copy's cursor ever passes `end`).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn exec_one_flat<const NOWRAP: bool>(
@@ -386,20 +380,19 @@ fn exec_one_flat<const NOWRAP: bool>(
     out_ptr: *mut u8,
     out_len: usize,
     w: &mut usize,
-    base: *mut u8,
+    block_start: usize,
     virt_base: usize,
-    origin: usize,
-    prev_origin: usize,
-    seg_a_end: usize,
-    seg_out_len: usize,
+    view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let ll = seq.ll as usize;
     let ml = seq.ml as usize;
-    if *w + ll + ml > out_len {
+    let end = *w + ll + ml;
+    if end > out_len {
         return Err(ExecuteSequencesError::TargetTooSmall);
     }
+    let wild = end + 16 <= out_len;
     if ll > 0 {
         let high = *lit_pos + ll;
         if high > literals.len() {
@@ -414,7 +407,7 @@ fn exec_one_flat<const NOWRAP: bool>(
         // SAFETY: bounds as documented; the overshoot is overwritten in
         // address order by later sequences before it is ever read.
         unsafe {
-            if *w + ll + 16 <= out_len {
+            if wild {
                 wildcopy_literals(out_ptr, literals.as_ptr(), *w, *lit_pos, ll);
             } else {
                 core::ptr::copy_nonoverlapping(
@@ -425,7 +418,6 @@ fn exec_one_flat<const NOWRAP: bool>(
             }
         }
         *lit_pos = high;
-        *w += ll;
     }
 
     let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
@@ -433,10 +425,12 @@ fn exec_one_flat<const NOWRAP: bool>(
         return Err(ExecuteSequencesError::ZeroOffset);
     }
     let offset = actual_offset as usize;
-    let cur_v = virt_base + *w;
+    let pos = end - ml;
+    // No dictionary in the flat path, so an offset past the frame's own
+    // output is always corruption. Checked even for ml == 0 to reject
+    // corrupt frames eagerly.
+    let cur_v = virt_base + pos;
     if offset > cur_v {
-        // No dictionary in the flat path, so an offset past the frame's
-        // own output is always corruption.
         return Err(ExecuteSequencesError::DecodebufferError(
             crate::decoding::errors::DecodeBufferError::OffsetTooBig {
                 offset,
@@ -445,82 +439,107 @@ fn exec_one_flat<const NOWRAP: bool>(
         ));
     }
     if ml > 0 {
-        // Wildcopy budget: the 16-byte overshoot must stay inside `out`.
-        let wild = *w + ml + 16 <= out_len;
-        if NOWRAP {
-            // No wrap has happened: virtual addresses are physical offsets,
-            // so source and destination address through one linear space.
+        // Source inside the active segment: virtual distances are physical
+        // distances there, so the source sits exactly `offset` bytes behind
+        // the destination and the whole match runs as one linear copy. The
+        // never-wrapped instantiation is always this case.
+        if !NOWRAP && offset > block_start + pos {
+            copy_wrapped_match(view, virt_base, out_ptr, pos, offset, ml, wild)?;
+        } else {
             // SAFETY: budget checked; the doubling in the exact path and the
             // distance rules in wildcopy_match keep reads behind the cursor
             unsafe {
-                let src = base.add(cur_v - offset);
+                let dst = out_ptr.add(pos);
+                let src = dst.sub(offset);
                 if wild {
-                    wildcopy_match(out_ptr.add(*w), src, ml);
+                    wildcopy_match(dst, src, ml);
                 } else {
                     let mut copied = 0;
                     while copied < ml {
                         let chunk = (offset + copied).min(ml - copied);
-                        core::ptr::copy(src, out_ptr.add(*w + copied), chunk);
+                        core::ptr::copy(src, dst.add(copied), chunk);
                         copied += chunk;
                     }
                 }
             }
-        } else {
-            // Copy `ml` bytes from the virtual source `cur_v - offset`,
-            // splitting at the physical segment boundary. Sources inside the
-            // active segment run as one contiguous wildcopy (the segment is
-            // linear and the source stays behind the write cursor); sources
-            // in the wrapped-away previous segment, or runs crossing the
-            // boundary, keep the exact doubling path.
-            let mut src_v = cur_v - offset;
-            let mut dst = *w;
-            let mut remaining = ml;
-            while remaining > 0 {
-                // Map into the active segment, or into the previous segment
-                // below its physical end; anything lower is out of window.
-                let (src_abs, seg_end, active) = if src_v >= origin {
-                    (src_v - origin, seg_out_len, true)
-                } else if src_v >= prev_origin {
-                    (src_v - prev_origin, seg_a_end, false)
-                } else {
-                    return Err(ExecuteSequencesError::DecodebufferError(
-                        crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                            offset,
-                            buf_len: cur_v,
-                        },
-                    ));
-                };
-                let chunk = remaining.min(seg_end - src_abs);
-                if active && wild {
-                    // The whole rest of the match lies in the active segment
-                    // (virtual addresses up to the destination), so finish it
-                    // in one wildcopy.
-                    // SAFETY: same contract as the NOWRAP branch
-                    unsafe {
-                        wildcopy_match(out_ptr.add(dst), base.add(src_abs), remaining);
-                    }
-                    break;
-                }
-                // Already-written bytes behind the anchor, as a virtual
-                // distance (positive: the source is always behind dst).
-                let readable = virt_base + dst - src_v;
-                let mut copied = 0;
-                while copied < chunk {
-                    let c = (readable + copied).min(chunk - copied);
-                    // SAFETY: src range [src_abs, src_abs + c) ends at or
-                    // before the write cursor (c <= readable + copied); dst
-                    // end stays below the block budget
-                    unsafe {
-                        core::ptr::copy(base.add(src_abs), out_ptr.add(dst + copied), c);
-                    }
-                    copied += c;
-                }
-                src_v += chunk;
-                dst += chunk;
-                remaining -= chunk;
-            }
         }
-        *w += ml;
+    }
+    *w = end;
+    Ok(())
+}
+
+/// Match copy for a source at or below the active segment (see `FlatView`):
+/// either the wrapped-away previous segment or a run crossing the segment
+/// boundary, split at the physical edges with doubling out of already-written
+/// bytes. Out of line and cold — the segment-mapping state is loop-invariant
+/// but keeping it live in the fused loop costs every sequence register
+/// pressure, while this path is rare outside long-offset-heavy frames.
+#[cold]
+fn copy_wrapped_match(
+    view: crate::decoding::flat_buffer::FlatView,
+    virt_base: usize,
+    out_ptr: *mut u8,
+    pos: usize,
+    offset: usize,
+    ml: usize,
+    wild: bool,
+) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
+    use crate::decoding::errors::{DecodeBufferError, ExecuteSequencesError};
+    let crate::decoding::flat_buffer::FlatView {
+        origin,
+        prev_origin,
+        seg_a_end,
+        out_len: seg_out_len,
+    } = view;
+    let block_start = virt_base.saturating_sub(origin);
+    // SAFETY: out is the slice starting block_start bytes into the buffer
+    let base = unsafe { out_ptr.sub(block_start) };
+    let mut src_v = virt_base + pos - offset;
+    let mut dst = pos;
+    let mut remaining = ml;
+    while remaining > 0 {
+        // Map into the active segment, or into the previous segment below
+        // its physical end; anything lower is out of window.
+        let (src_abs, seg_end, active) = if src_v >= origin {
+            (src_v - origin, seg_out_len, true)
+        } else if src_v >= prev_origin {
+            (src_v - prev_origin, seg_a_end, false)
+        } else {
+            return Err(ExecuteSequencesError::DecodebufferError(
+                DecodeBufferError::OffsetTooBig {
+                    offset,
+                    buf_len: virt_base + pos,
+                },
+            ));
+        };
+        let chunk = remaining.min(seg_end - src_abs);
+        if active && wild {
+            // The whole rest of the match lies in the active segment
+            // (virtual addresses up to the destination), so finish it in
+            // one wildcopy.
+            // SAFETY: same contract as the fused loop's wildcopy
+            unsafe {
+                wildcopy_match(out_ptr.add(dst), base.add(src_abs), remaining);
+            }
+            break;
+        }
+        // Already-written bytes behind the anchor, as a virtual distance
+        // (positive: the source is always behind dst).
+        let readable = virt_base + dst - src_v;
+        let mut copied = 0;
+        while copied < chunk {
+            let c = (readable + copied).min(chunk - copied);
+            // SAFETY: src range [src_abs, src_abs + c) ends at or before the
+            // write cursor (c <= readable + copied); dst end stays below the
+            // block budget
+            unsafe {
+                core::ptr::copy(base.add(src_abs), out_ptr.add(dst + copied), c);
+            }
+            copied += c;
+        }
+        src_v += chunk;
+        dst += chunk;
+        remaining -= chunk;
     }
     Ok(())
 }
@@ -582,7 +601,7 @@ mod tests {
     }
 
     /// Reference: the spec's offset-code table, as the match-tree
-    /// implementation spelled it before the slot-index rewrite.
+    /// implementation spelled it before the branch-free rewrite.
     fn reference(of: u32, ll: u32, s: &mut [u32; 3]) -> u32 {
         let actual = if ll > 0 {
             match of {
@@ -612,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_indexed_history_matches_reference() {
+    fn branch_free_history_matches_reference() {
         for ll in [0u32, 1, 7] {
             for of in 1u32..300 {
                 for seed in 0..8u32 {
