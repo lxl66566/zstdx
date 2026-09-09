@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The single-table emit helpers (`emit_seq`, `emit_seq_chain`,
+  `rep1_chain`) move from twelve-to-fourteen-argument free functions into
+  a shared `TableEmit` context (head table, output streams, per-block
+  constants), mirroring the dfast emit context, so their arguments stop
+  spilling through the stack on every call. The fast and chain scan
+  loops keep their own table accesses on a raw pointer, which holds the
+  pointer in a register instead of reloading the context field per
+  access. Output is byte-identical at every level; interleaved A/B
+  against zstd -1: json at Fastest gains a further 466 → 481-488 MiB/s
+  (1.85× → ~1.8×, 6-7% cumulative with the select probes), text ~1%
+  faster, Fast/Balanced unchanged within noise.
+
 * The Fastest level's scan loop resolves probe validity through a select
   (libzstd's selectAddr trick) instead of a three-comparison chain: stale
   hash-table entries alias the scanning position itself, and the byte

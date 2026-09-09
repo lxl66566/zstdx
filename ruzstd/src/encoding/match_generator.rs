@@ -194,15 +194,16 @@ fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
     len
 }
 
-/// Store `abs` as the newest position for its hash. Caller guarantees `idx`
-/// has at least `MIN_HASH` bytes of window behind it.
+/// Store `abs` as the newest position for its hash; `tag` is the caller's
+/// `epoch << 48`. Caller guarantees `idx` has at least `MIN_HASH` bytes of
+/// window behind it.
 #[inline(always)]
-fn insert_at(win: &[u8], table: &mut [u64], epoch: u64, idx: usize, abs: u64) {
+fn insert_at(win: &[u8], table: &mut [u64], tag: u64, idx: usize, abs: u64) {
     let h = hash_at(win, idx);
     // SAFETY: the hash masks down to HASH_LOG bits and the table always
     // holds 1 << HASH_LOG slots, so the index cannot leave it.
     unsafe {
-        *table.get_unchecked_mut(h) = (epoch << 48) | abs;
+        *table.get_unchecked_mut(h) = tag | abs;
     }
 }
 
@@ -255,140 +256,153 @@ fn push_seq_packed(
     (ll, start + match_len)
 }
 
-/// Emit the sequence for a match covering `match_len` bytes at window index
-/// `start`, update the repeated-offset history, index the covered range and
-/// return the new cursor (which is also the new anchor). Everything hot is
-/// passed explicitly so the scan loop keeps its cursors in registers across
-/// the call instead of reloading them from the matcher struct. The sequence
-/// is pushed straight into the packed code/add-bits streams the block
-/// encoder consumes — the raw (ll, ml, of) triple never gets its own buffer.
-#[allow(clippy::too_many_arguments)]
-fn emit_seq(
-    win: &[u8],
-    table: &mut [u64],
-    epoch: u64,
-    anchor: u64,
+/// Shared mutable state of the single-table strategies (fast and chain):
+/// the head hash table, the output streams and the per-block constants,
+/// bundled so the emit helpers stay inside the register argument budget
+/// (their former twelve-to-fourteen-argument free signatures moved several
+/// arguments through the stack on every call).
+struct TableEmit<'a> {
+    table: &'a mut [u64],
+    literals: &'a mut Vec<u8>,
+    seqs: &'a mut Vec<SeqWord>,
+    /// `epoch << 48`, the constant half of every table entry this frame
+    /// writes.
+    tag: u64,
     win_base: u64,
+    /// Last absolute position whose hash reads stay inside the window.
     insert_max: u64,
-    start: usize,
-    match_len: usize,
-    of_value: u32,
-    rep: &mut [u32; 3],
-    literals: &mut Vec<u8>,
-    seqs: &mut Vec<SeqWord>,
-) -> u64 {
-    let (_ll, match_end) = push_seq_packed(
-        win, win_base, anchor, start, match_len, of_value, rep, literals, seqs,
-    );
-    // Short matches keep every position (they carry the alignment coverage on
-    // structured data). Long matches only index two anchors (zstd fast's fill
-    // policy): one just inside the start, one just before the end — the scan
-    // loop already indexes the positions it probes, so interior coverage only
-    // needs seed points for the phases the scan skips over, and hashing a
-    // 4-byte grid across long matches dominated encoder time. Both anchors
-    // need HASH_READ bytes of window ahead; a match reaching the insert bound
-    // simply leaves them out.
-    if match_len <= 16 {
-        let end = (win_base + match_end as u64).min(insert_max);
-        let mut p = win_base + start as u64;
-        while p < end {
-            insert_at(win, table, epoch, (p - win_base) as usize, p);
-            p += 1;
-        }
-    } else {
-        let base = win_base + start as u64;
-        let hi = base + match_len as u64 - 2;
-        if hi <= insert_max {
-            let lo = base + 2;
-            insert_at(win, table, epoch, (lo - win_base) as usize, lo);
-            if hi > lo {
-                insert_at(win, table, epoch, (hi - win_base) as usize, hi);
+}
+
+impl TableEmit<'_> {
+    /// Emit the sequence for a match covering `match_len` bytes at window
+    /// index `start`, update the repeated-offset history, index the covered
+    /// range and return the new cursor (which is also the new anchor). The
+    /// sequence is pushed straight into the packed code/add-bits streams the
+    /// block encoder consumes — the raw (ll, ml, of) triple never gets its
+    /// own buffer.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        win: &[u8],
+        anchor: u64,
+        start: usize,
+        match_len: usize,
+        of_value: u32,
+        rep: &mut [u32; 3],
+    ) -> u64 {
+        let (_ll, match_end) = push_seq_packed(
+            win,
+            self.win_base,
+            anchor,
+            start,
+            match_len,
+            of_value,
+            rep,
+            self.literals,
+            self.seqs,
+        );
+        // Short matches keep every position (they carry the alignment coverage on
+        // structured data). Long matches only index two anchors (zstd fast's fill
+        // policy): one just inside the start, one just before the end — the scan
+        // loop already indexes the positions it probes, so interior coverage only
+        // needs seed points for the phases the scan skips over, and hashing a
+        // 4-byte grid across long matches dominated encoder time. Both anchors
+        // need HASH_READ bytes of window ahead; a match reaching the insert bound
+        // simply leaves them out.
+        if match_len <= 16 {
+            let end = (self.win_base + match_end as u64).min(self.insert_max);
+            let mut p = self.win_base + start as u64;
+            while p < end {
+                insert_at(win, self.table, self.tag, (p - self.win_base) as usize, p);
+                p += 1;
+            }
+        } else {
+            let base = self.win_base + start as u64;
+            let hi = base + match_len as u64 - 2;
+            if hi <= self.insert_max {
+                let lo = base + 2;
+                insert_at(win, self.table, self.tag, (lo - self.win_base) as usize, lo);
+                if hi > lo {
+                    insert_at(win, self.table, self.tag, (hi - self.win_base) as usize, hi);
+                }
             }
         }
+        self.win_base + match_end as u64
     }
-    win_base + match_end as u64
-}
 
-/// [`emit_seq`] for the chain strategies: the covered range is indexed with
-/// complete hash head plus chain links (a coarse grid for long matches, so
-/// huge runs cannot dominate the hash work), keeping later chain walks
-/// connected to same-hash predecessors.
-#[allow(clippy::too_many_arguments)]
-fn emit_seq_chain(
-    win: &[u8],
-    table: &mut [u64],
-    chain: &mut [u64],
-    epoch: u64,
-    anchor: u64,
-    win_base: u64,
-    insert_max: u64,
-    hash_log: u32,
-    start: usize,
-    match_len: usize,
-    of_value: u32,
-    rep: &mut [u32; 3],
-    literals: &mut Vec<u8>,
-    seqs: &mut Vec<SeqWord>,
-) -> u64 {
-    let (_ll, match_end) = push_seq_packed(
-        win, win_base, anchor, start, match_len, of_value, rep, literals, seqs,
-    );
-    let chain_mask = chain.len() - 1;
-    let step = (if match_len <= 64 { 1 } else { 4 }) as u64;
-    let end_abs = (win_base + match_end as u64).min(insert_max);
-    let mut p = win_base + start as u64;
-    while p < end_abs {
-        let i = (p - win_base) as usize;
-        let h = hash_at_log(win, i, hash_log);
-        // SAFETY: h is masked to hash_log bits, i to the chain table size.
-        unsafe {
-            let head = *table.get_unchecked(h);
-            *chain.get_unchecked_mut(i & chain_mask) = head;
-            *table.get_unchecked_mut(h) = (epoch << 48) | p;
-        }
-        p += step;
-    }
-    win_base + match_end as u64
-}
-
-/// Probe continuations at the second repeated offset immediately after a
-/// match (zstd fast's rep_offset2 loop). Alternating-period data chains
-/// rep0/rep1 matches back to back with zero literals; emitting with
-/// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates distances
-/// on its own. Returns the cursor after the last chained match.
-#[allow(clippy::too_many_arguments)]
-fn rep1_chain(
-    win: &[u8],
-    table: &mut [u64],
-    epoch: u64,
-    pos: u64,
-    block_end: u64,
-    win_base: u64,
-    insert_max: u64,
-    rep: &mut [u32; 3],
-    literals: &mut Vec<u8>,
-    seqs: &mut Vec<SeqWord>,
-) -> u64 {
-    let mut pos = pos;
-    while block_end - pos >= MIN_MATCH as u64 {
-        let Some(cand_abs) = pos.checked_sub(rep[1] as u64) else {
-            break;
-        };
-        if cand_abs < win_base {
-            break;
-        }
-        let pidx = (pos - win_base) as usize;
-        let cand = (cand_abs - win_base) as usize;
-        if read4(win, cand) != read4(win, pidx) {
-            break;
-        }
-        let ml = extend_match(win, pidx, cand);
-        debug_assert!(ml >= MIN_MATCH);
-        pos = emit_seq(
-            win, table, epoch, pos, win_base, insert_max, pidx, ml, 1, rep, literals, seqs,
+    /// [`TableEmit::emit`] for the chain strategies: the covered range is
+    /// indexed with complete hash head plus chain links (a coarse grid for
+    /// long matches, so huge runs cannot dominate the hash work), keeping
+    /// later chain walks connected to same-hash predecessors.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_chain(
+        &mut self,
+        win: &[u8],
+        chain: &mut [u64],
+        hash_log: u32,
+        anchor: u64,
+        start: usize,
+        match_len: usize,
+        of_value: u32,
+        rep: &mut [u32; 3],
+    ) -> u64 {
+        let (_ll, match_end) = push_seq_packed(
+            win,
+            self.win_base,
+            anchor,
+            start,
+            match_len,
+            of_value,
+            rep,
+            self.literals,
+            self.seqs,
         );
+        let chain_mask = chain.len() - 1;
+        let step = (if match_len <= 64 { 1 } else { 4 }) as u64;
+        let end_abs = (self.win_base + match_end as u64).min(self.insert_max);
+        let mut p = self.win_base + start as u64;
+        while p < end_abs {
+            let i = (p - self.win_base) as usize;
+            let h = hash_at_log(win, i, hash_log);
+            // SAFETY: h is masked to hash_log bits, i to the chain table size.
+            unsafe {
+                let head = *self.table.get_unchecked(h);
+                *chain.get_unchecked_mut(i & chain_mask) = head;
+                *self.table.get_unchecked_mut(h) = self.tag | p;
+            }
+            p += step;
+        }
+        self.win_base + match_end as u64
     }
-    pos
+
+    /// Probe continuations at the second repeated offset immediately after a
+    /// match (zstd fast's rep_offset2 loop). Alternating-period data chains
+    /// rep0/rep1 matches back to back with zero literals; emitting with
+    /// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates distances
+    /// on its own. Returns the cursor after the last chained match.
+    #[inline]
+    fn rep1_chain(&mut self, win: &[u8], pos: u64, block_end: u64, rep: &mut [u32; 3]) -> u64 {
+        let mut pos = pos;
+        while block_end - pos >= MIN_MATCH as u64 {
+            let Some(cand_abs) = pos.checked_sub(rep[1] as u64) else {
+                break;
+            };
+            if cand_abs < self.win_base {
+                break;
+            }
+            let pidx = (pos - self.win_base) as usize;
+            let cand = (cand_abs - self.win_base) as usize;
+            if read4(win, cand) != read4(win, pidx) {
+                break;
+            }
+            let ml = extend_match(win, pidx, cand);
+            debug_assert!(ml >= MIN_MATCH);
+            pos = self.emit(win, pos, pidx, ml, 1, rep);
+        }
+        pos
+    }
 }
 
 /// Shared mutable state of the dfast strategy: the two tables, the output
@@ -845,7 +859,13 @@ impl Matcher for MatchGeneratorDriver {
                     }
                 }
                 Strategy::Fast => {
-                    insert_at(win, &mut self.table, self.epoch, idx, self.block_start);
+                    insert_at(
+                        win,
+                        &mut self.table,
+                        self.epoch << 48,
+                        idx,
+                        self.block_start,
+                    );
                 }
             }
         }
@@ -861,13 +881,29 @@ impl MatchGeneratorDriver {
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
         let win = window_slice(&self.win, &self.ext);
-        let table = &mut self.table[..];
         let epoch = self.epoch;
+        let tag = epoch << 48;
         let win_base = self.win_base;
         let block_end = self.block_end;
         // saturating: tiny first blocks never reach an emit, so the bound is
         // never consulted when win.len() < HASH_READ.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
+        // The scan's own table accesses go through a raw pointer: routing
+        // them through the emit context's slice field kept the pointer
+        // stack-resident (a re-load per access; see the dfast loop's note on
+        // the same SROA failure).
+        // SAFETY: derived here, before the context below takes its borrow;
+        // both address the same memory, and the loop and the emit helpers
+        // never access a slot concurrently. The table is never resized.
+        let table_ptr: *mut u64 = self.table.as_mut_ptr();
+        let mut emit = TableEmit {
+            table: &mut self.table[..],
+            literals,
+            seqs,
+            tag,
+            win_base,
+            insert_max,
+        };
         let max_window = MAX_WINDOW as u64;
         let mut pos = self.pos;
         let mut anchor = self.anchor;
@@ -910,7 +946,7 @@ impl MatchGeneratorDriver {
             let h0 = hash_at(win, idx0);
             // SAFETY: the hash masks to HASH_LOG bits and the table always
             // holds 1 << HASH_LOG slots (see insert_at).
-            let prev0 = unsafe { *table.get_unchecked(h0) };
+            let prev0 = unsafe { *table_ptr.add(h0) };
             let cur0 = read4(win, idx0);
             let mut pair_len = 1u64;
             let mut idx1 = idx0;
@@ -922,19 +958,19 @@ impl MatchGeneratorDriver {
                 idx1 = idx0 + 1;
                 h1 = hash_at(win, idx1);
                 // SAFETY: as above.
-                prev1 = unsafe { *table.get_unchecked(h1) };
+                prev1 = unsafe { *table_ptr.add(h1) };
                 cur1 = read4(win, idx1);
             }
             // Store after both lookups so each probe sees the pre-store
             // entry (newest-wins).
             // SAFETY: as above.
             unsafe {
-                *table.get_unchecked_mut(h0) = (epoch << 48) | pos;
+                *table_ptr.add(h0) = tag | pos;
             }
             if pair_len == 2 {
                 // SAFETY: as above.
                 unsafe {
-                    *table.get_unchecked_mut(h1) = (epoch << 48) | (pos + 1);
+                    *table_ptr.add(h1) = tag | (pos + 1);
                 }
             }
 
@@ -975,14 +1011,8 @@ impl MatchGeneratorDriver {
                                 start -= 1;
                                 ml += 1;
                             }
-                            anchor = emit_seq(
-                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                &mut rep, literals, seqs,
-                            );
-                            pos = rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base, insert_max,
-                                &mut rep, literals, seqs,
-                            );
+                            anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
+                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
                             // The chain's matches advance the cursor too.
                             anchor = pos;
                             miss_count = 0;
@@ -1014,10 +1044,7 @@ impl MatchGeneratorDriver {
                             ml += 1;
                         }
                         let of_value = (start - cand0 + 3) as u32;
-                        anchor = emit_seq(
-                            win, table, epoch, anchor, win_base, insert_max, start, ml,
-                            of_value, &mut rep, literals, seqs,
-                        );
+                        anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
                         // A literal offset shifts the decoder's history
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
@@ -1026,10 +1053,7 @@ impl MatchGeneratorDriver {
                             rep_pending -= 1;
                         }
                         pos = if rep_pending == 0 {
-                            rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base,
-                                insert_max, &mut rep, literals, seqs,
-                            )
+                            emit.rep1_chain(win, anchor, block_end, &mut rep)
                         } else {
                             anchor
                         };
@@ -1069,14 +1093,8 @@ impl MatchGeneratorDriver {
                                 start -= 1;
                                 ml += 1;
                             }
-                            anchor = emit_seq(
-                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                &mut rep, literals, seqs,
-                            );
-                            pos = rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base, insert_max,
-                                &mut rep, literals, seqs,
-                            );
+                            anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
+                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
                             anchor = pos;
                             miss_count = 0;
                             continue 'restart;
@@ -1100,10 +1118,7 @@ impl MatchGeneratorDriver {
                             ml += 1;
                         }
                         let of_value = (start - cand1 + 3) as u32;
-                        anchor = emit_seq(
-                            win, table, epoch, anchor, win_base, insert_max, start, ml,
-                            of_value, &mut rep, literals, seqs,
-                        );
+                        anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
                         // A literal offset shifts the decoder's history
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
@@ -1112,10 +1127,7 @@ impl MatchGeneratorDriver {
                             rep_pending -= 1;
                         }
                         pos = if rep_pending == 0 {
-                            rep1_chain(
-                                win, table, epoch, anchor, block_end, win_base,
-                                insert_max, &mut rep, literals, seqs,
-                            )
+                            emit.rep1_chain(win, anchor, block_end, &mut rep)
                         } else {
                             anchor
                         };
@@ -1134,9 +1146,9 @@ impl MatchGeneratorDriver {
             let step = 1 + (miss_count >> 2).min(255) as u64;
             pos += pair_len * step;
         }
-        if !seqs.is_empty() && anchor < block_end {
+        if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
-            literals.extend_from_slice(&win[tail]);
+            emit.literals.extend_from_slice(&win[tail]);
         }
         // A zero-sequence block stages nothing: its literals are exactly the
         // block, which the caller reads through get_last_space() instead of
@@ -1410,10 +1422,10 @@ impl MatchGeneratorDriver {
     /// a longer match may start there — libzstd's lazy family.
     fn start_matching_chain(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         let win = window_slice(&self.win, &self.ext);
-        let table = &mut self.table[..];
         let chain = &mut self.chain[..];
         let chain_mask = chain.len() - 1;
         let epoch = self.epoch;
+        let tag = epoch << 48;
         let win_base = self.win_base;
         let block_end = self.block_end;
         let hash_log = self.params.hash_log;
@@ -1421,6 +1433,21 @@ impl MatchGeneratorDriver {
         let lazy_depth = self.params.lazy_depth;
         let max_window = self.params.window as u64;
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
+        // The scan's own table accesses go through a raw pointer (see the
+        // fast loop's note on the same SROA failure); emits go through the
+        // context.
+        // SAFETY: derived here, before the context below takes its borrow;
+        // both address the same memory, and the loop and the emit helpers
+        // never access a slot concurrently. The table is never resized.
+        let table_ptr: *mut u64 = self.table.as_mut_ptr();
+        let mut emit = TableEmit {
+            table: &mut self.table[..],
+            literals,
+            seqs,
+            tag,
+            win_base,
+            insert_max,
+        };
         let hash_read = HASH_READ as u64;
         let mut pos = self.pos;
         let mut anchor = self.anchor;
@@ -1432,11 +1459,11 @@ impl MatchGeneratorDriver {
         // returning the longest match's (length, candidate window index).
         // Every candidate is read4-verified, so stale chain links (see the
         // sparse fill in rep1_chain) only cost probes, never correctness.
-        let search = |win: &[u8], table: &[u64], chain: &[u64], idx: usize| -> (usize, usize) {
+        let search = |win: &[u8], chain: &[u64], idx: usize| -> (usize, usize) {
             // SAFETY: hash_at_log masks to hash_log bits and the table holds
             // 1 << hash_log slots.
             let h = hash_at_log(win, idx, hash_log);
-            let mut entry = unsafe { *table.get_unchecked(h) };
+            let mut entry = unsafe { *table_ptr.add(h) };
             let cur4 = read4(win, idx);
             let pos_abs = win_base + idx as u64;
             let mut best_len = 0usize;
@@ -1471,7 +1498,7 @@ impl MatchGeneratorDriver {
 
         while block_end.saturating_sub(pos) >= hash_read {
             let idx = (pos - win_base) as usize;
-            let (mut best_len, mut best_cand) = search(win, table, chain, idx);
+            let (mut best_len, mut best_cand) = search(win, chain, idx);
 
             // Repcode probe first when armed: with literals pending it runs
             // at the current position, otherwise one byte ahead so that
@@ -1503,9 +1530,9 @@ impl MatchGeneratorDriver {
             // SAFETY: both indices are masked to their tables' sizes.
             unsafe {
                 let h = hash_at_log(win, idx, hash_log);
-                let head = *table.get_unchecked(h);
+                let head = *table_ptr.add(h);
                 *chain.get_unchecked_mut(idx & chain_mask) = head;
-                *table.get_unchecked_mut(h) = (epoch << 48) | pos;
+                *table_ptr.add(h) = tag | pos;
             }
 
             if best_len < MIN_MATCH {
@@ -1529,7 +1556,7 @@ impl MatchGeneratorDriver {
                         break;
                     }
                     let idx2 = (p2 - win_base) as usize;
-                    let (len2, cand2) = search(win, table, chain, idx2);
+                    let (len2, cand2) = search(win, chain, idx2);
                     if len2 > best_len {
                         best_len = len2;
                         best_cand = cand2;
@@ -1565,26 +1592,22 @@ impl MatchGeneratorDriver {
             } else {
                 (start - cand + 3) as u32
             };
-            anchor = emit_seq_chain(
-                win, table, chain, epoch, anchor, win_base, insert_max, hash_log, start, ml,
-                of_value, &mut rep, literals, seqs,
+            anchor = emit.emit_chain(
+                win, chain, hash_log, anchor, start, ml, of_value, &mut rep,
             );
             if rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
             if rep_pending == 0 {
-                pos = rep1_chain(
-                    win, table, epoch, anchor, block_end, win_base, insert_max, &mut rep,
-                    literals, seqs,
-                );
+                pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
             } else {
                 pos = anchor;
             }
             anchor = pos;
         }
-        if !seqs.is_empty() && anchor < block_end {
+        if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
-            literals.extend_from_slice(&win[tail]);
+            emit.literals.extend_from_slice(&win[tail]);
         }
         self.pos = block_end;
         self.anchor = block_end;
