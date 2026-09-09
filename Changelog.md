@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* `decompress_literals` validates the number of literals it appended
+  against the section's regenerated size instead of the output buffer's
+  total length. The absolute comparison assumed an empty target, which
+  holds for the sequential block decoder (it clears the buffer per block)
+  but not for the parallel segment stager, whose literals buffer
+  accumulates across a segment's blocks — every huffman-coded section
+  after the first in a segment was rejected as a count mismatch. This
+  made multithreaded decode fail on 7 of the 11 corpus files (all
+  json/skewed variants and text.zst1; only shapes whose blocks use raw or
+  RLE literals survived), silently falling back was not possible because
+  the error aborted the whole decode.
+
 * The interleaved 4-stream huffman fast loops (X1 and X2) keep their per
   stream state as raw pointers instead of region/output offsets, folding
   the region and out base pointers into `ip[]`/`op[]`. This drops the two

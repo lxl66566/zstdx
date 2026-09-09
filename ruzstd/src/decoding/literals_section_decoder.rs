@@ -46,6 +46,7 @@ fn decompress_literals(
 ) -> Result<u32, DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 
+    let start_len = target.len();
     let compressed_size = section.compressed_size.ok_or(err::MissingCompressedSize)? as usize;
     let num_streams = section.num_streams.ok_or(err::MissingNumStreams)?;
 
@@ -184,9 +185,9 @@ fn decompress_literals(
         bytes_read += source.len() as u32;
     }
 
-    if target.len() != section.regenerated_size as usize {
+    if target.len() - start_len != section.regenerated_size as usize {
         return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
-            decoded: target.len(),
+            decoded: target.len() - start_len,
             expected: section.regenerated_size as usize,
         });
     }
