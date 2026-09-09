@@ -630,34 +630,41 @@ fn copy_wrapped_match(
 /// (`code - 1 + ll0`), where slot 3 — code 3 with no literals — is the
 /// `rep0 - 1` pseudo-slot, folded onto `scratch[0]` with a conditional
 /// subtract after the shared load. The same slot picks the history
-/// rotation in one branch: 0 keeps everything (code 1 with literals), 1
-/// swaps the two most recent codes, anything else — including real
-/// offsets, whose slot is always >= 3 — rotates all three.
+/// rotation: 0 keeps everything (code 1 with literals), anything else —
+/// including real offsets, whose slot is always >= 3 — rotates all three.
+///
+/// Entirely select-based, no data-dependent branches: repcodes flip too
+/// often on structured input for the `<= 3` test and the rotation match to
+/// predict, and both sat among the largest branch-miss clusters of the
+/// fused decode loop. The slot load stays in bounds for non-repcodes by
+/// masking the (garbage) index, whose loaded value the selects then
+/// discard.
 pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     let idx = offset_value
         .wrapping_sub(1)
         .wrapping_add((lit_len == 0) as u32);
+    // idx in 0..=3 exactly for repcodes; (idx & 3) with 3 folded back to 0
+    // is the pseudo-slot mapping
+    let slot = (idx & 3) as usize;
+    let slot = if slot == 3 { 0 } else { slot };
     let actual_offset = if offset_value <= 3 {
         // A malformed dictionary can seed scratch[0] with 0; saturate so this
         // resolves to 0 (rejected upstream as ZeroOffset) instead of
         // underflowing. See #115.
-        scratch[(if idx == 3 { 0 } else { idx }) as usize].saturating_sub((idx == 3) as u32)
+        scratch[slot].saturating_sub((idx == 3) as u32)
     } else {
-        offset_value - 3
+        offset_value.wrapping_sub(3)
     };
 
-    match idx {
-        0 => {}
-        1 => {
-            scratch[1] = scratch[0];
-            scratch[0] = actual_offset;
-        }
-        _ => {
-            scratch[2] = scratch[1];
-            scratch[1] = scratch[0];
-            scratch[0] = actual_offset;
-        }
-    }
+    // Rotation as selects: slot 0 keeps everything, slot 1 swaps the two
+    // most recent codes (slot 2 untouched), anything else — including real
+    // offsets, whose slot is always >= 3 — rotates all three. Ordered so
+    // every read sees the pre-update values.
+    let keep = idx == 0;
+    let rotate_all = idx >= 2;
+    scratch[2] = if rotate_all { scratch[1] } else { scratch[2] };
+    scratch[1] = if keep { scratch[1] } else { scratch[0] };
+    scratch[0] = if keep { scratch[0] } else { actual_offset };
 
     actual_offset
 }

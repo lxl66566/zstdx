@@ -361,18 +361,18 @@ impl SeqDecoder {
         let mut win = br.bits.wrapping_shl(consumed);
 
         // Initial states are read in the order ll, of, ml (RLE streams have
-        // accuracy_log 0, so their read is a no-op that leaves state 0)
-        let ll_state = read(
+        // accuracy_log 0, so their read yields a masked zero state)
+        let ll_state = read_state(
             &mut win,
             &mut consumed,
             scratch.literal_lengths.accuracy_log as u32,
-        ) as u32;
-        let of_state = read(&mut win, &mut consumed, scratch.offsets.accuracy_log as u32) as u32;
-        let ml_state = read(
+        );
+        let of_state = read_state(&mut win, &mut consumed, scratch.offsets.accuracy_log as u32);
+        let ml_state = read_state(
             &mut win,
             &mut consumed,
             scratch.match_lengths.accuracy_log as u32,
-        ) as u32;
+        );
         // Realign the window before the first sequence; the loop only reloads
         // at sequence ends (the state reads above already consumed up to 26
         // bits)
@@ -464,26 +464,25 @@ pub(crate) fn decode_step(
     // extraction shift in range, and 7 + sum + 26 transition bits <= 64
     // means the post-reload window always covers it: the mid-sequence reload
     // guard (libzstd's totalBits guard) only applies to the unbatched path.
-    // sum == 0 happens for all-RLE streams; nothing to read at all.
+    // All fields are masked, so a zero-width total (rep0-heavy sequences)
+    // needs no branch: every mask is zero exactly then.
     let sum = ll_nb + ml_nb + of_nb;
-    let (obits, ml_add, ll_add) = if sum == 0 {
-        (0, 0, 0)
-    } else if sum <= 31 {
+    let (obits, ml_add, ll_add) = if sum <= 31 {
         let v = read(win, consumed, sum);
         (
-            v >> (ml_nb + ll_nb),
+            (v >> (ml_nb + ll_nb)) & ((1u64 << of_nb) - 1),
             (v >> ll_nb) & ((1u64 << ml_nb) - 1),
             v & ((1u64 << ll_nb) - 1),
         )
     } else {
         // Cold: fields too wide to batch. of+ml+ll add bits sum above the 57
         // bits guaranteed after a reload; reload mid-sequence then
-        let obits = read(win, consumed, of_nb);
-        let ml_add = read(win, consumed, ml_nb);
+        let obits = read(win, consumed, of_nb) & ((1u64 << of_nb) - 1);
+        let ml_add = read(win, consumed, ml_nb) & ((1u64 << ml_nb) - 1);
         if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
         }
-        let ll_add = read(win, consumed, ll_nb);
+        let ll_add = read(win, consumed, ll_nb) & ((1u64 << ll_nb) - 1);
         (obits, ml_add, ll_add)
     };
     let seq = Sequence {
@@ -501,18 +500,15 @@ pub(crate) fn decode_step(
         let ml_base_t = ((ml_entry >> 8) & 0xFFFF) as u32;
         let of_base_t = ((of_entry >> 8) & 0xFFFF) as u32;
         // Same batching for the three state transitions (ll, then ml, then
-        // of): at most 9+9+8 = 26 bits, always extractable in one read
+        // of): at most 9+9+8 = 26 bits, always extractable in one read, with
+        // every field masked so a zero-width total needs no branch
         let sum_t = ll_nb_t + ml_nb_t + of_nb_t;
-        let (s_ll, s_ml, s_of) = if sum_t == 0 {
-            (ll_base_t, ml_base_t, of_base_t)
-        } else {
-            let v = read(win, consumed, sum_t);
-            (
-                ll_base_t + (v >> (ml_nb_t + of_nb_t)) as u32,
-                ml_base_t + ((v >> of_nb_t) & ((1u64 << ml_nb_t) - 1)) as u32,
-                of_base_t + (v & ((1u64 << of_nb_t) - 1)) as u32,
-            )
-        };
+        let v = read(win, consumed, sum_t);
+        let (s_ll, s_ml, s_of) = (
+            ll_base_t + (((v >> (ml_nb_t + of_nb_t)) & ((1u64 << ll_nb_t) - 1)) as u32),
+            ml_base_t + (((v >> of_nb_t) & ((1u64 << ml_nb_t) - 1)) as u32),
+            of_base_t + ((v & ((1u64 << of_nb_t) - 1)) as u32),
+        );
         *ll_state = s_ll;
         *ml_state = s_ml;
         *of_state = s_of;
@@ -586,15 +582,27 @@ enum Reload {
 /// shortens the per-read dependency chain to two shifts — the serial
 /// bottleneck of the decode loop — and reads past the container naturally
 /// yield zeroes (the surrounding checks turn that into an error).
+///
+/// Zero-width reads are branchless: `wrapping_shr` lets the hardware's free
+/// count masking turn `n == 0` into a shift by zero, returning the unmasked
+/// window while advancing nothing. Callers extract their fields under masks
+/// (bzhi), and every such mask is zero exactly when the field's width is
+/// zero, so the garbage never escapes — the `sum == 0` special cases the
+/// decode loop used to carry were a branch on data (all-zero-width reads are
+/// the rep0-heavy norm on structured input) and mispredicted constantly.
 #[inline(always)]
 fn read(win: &mut u64, consumed: &mut u32, n: u32) -> u64 {
-    if n == 0 {
-        return 0;
-    }
-    let v = *win >> (64 - n);
+    let v = (*win).wrapping_shr(64 - n);
     *win <<= n;
     *consumed += n;
     v
+}
+
+/// Read an initial FSE state: the accuracy log doubles as the mask width,
+/// which zeroes the result for RLE streams (accuracy log 0).
+#[inline(always)]
+fn read_state(win: &mut u64, consumed: &mut u32, log: u32) -> u32 {
+    (read(win, consumed, log) & ((1u64 << log) - 1)) as u32
 }
 
 /// Move the window backwards by the consumed whole bytes. Mirrors

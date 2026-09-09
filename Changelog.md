@@ -25,6 +25,21 @@ This document records the changes made between versions, starting with version 0
   the pack/unpack ops land on the serial FSE chain and cost more than the
   spills they remove.
 
+* The fused sequence loop's bitstream reads and repcode resolution lost
+  their data-dependent branches. Zero-width reads (the `sum == 0` /
+  `sum_t == 0` fast cases, taken constantly on rep0-heavy structured
+  input) now run through a branchless `read` whose `wrapping_shr` turns
+  `n == 0` into a hardware-masked shift by zero, returning the raw window;
+  every field extraction gains a bzhi mask that is zero exactly when the
+  field's width is zero, so the garbage never escapes. The offset history
+  resolves and rotates entirely through selects (cmov) instead of the
+  `<= 3` test and the rotation match, keeping the history load in bounds
+  for real offsets by masking the index. Interleaved A/B on the streaming
+  path: skewed.zst3 +4.5%, random.zst3 +1.9%, others flat (json.zst1
+  branch-misses -4%, text -1..3%); the decoder-side FSE branches turn out
+  to be a minority of the loop's mispredictions — the copy executor holds
+  most of them (see PERF3), which a chunk-pair restructure halved but
+  could not convert to wall time on this machine.
 * New `bench_matrix` example: the head-to-head comparison widened to the
   full decode/encode × bulk/streaming × single-/multi-thread matrix.
   Five modes (`dec-st`, `dec-mt`, `enc-st`, `enc-mt`, `enc-stream`) run
