@@ -193,8 +193,8 @@ mod tests {
     /// repcodes and entropy coding all engage across job boundaries.
     fn textish(len: usize) -> Vec<u8> {
         let words: Vec<&[u8]> = vec![
-            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ",
-            b"dog ", b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
+            b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
         ];
         let mut state = 7u64;
         let mut out = Vec::with_capacity(len);
@@ -221,15 +221,18 @@ mod tests {
         for (name, data) in shapes() {
             for workers in [2u32, 4] {
                 for checksum in [true, false] {
-                    let compressed =
-                        compress_slice_mt(&data, Level::Fastest, checksum, workers);
+                    let compressed = compress_slice_mt(&data, Level::Fastest, checksum, workers);
                     // our decoder, exact-size output slice
                     let mut out = vec![0u8; data.len()];
                     let mut decoder = FrameDecoder::new();
                     let n = decoder
                         .decode_all(&compressed, &mut out)
                         .unwrap_or_else(|e| panic!("{name}/{workers}/{checksum}: {e}"));
-                    assert_eq!((n, &out[..n]), (data.len(), &data[..]), "{name}/{workers}/{checksum}");
+                    assert_eq!(
+                        (n, &out[..n]),
+                        (data.len(), &data[..]),
+                        "{name}/{workers}/{checksum}"
+                    );
                     // libzstd decodes the assembled frame too
                     let mut decoded = Vec::new();
                     zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();

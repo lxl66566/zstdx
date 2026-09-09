@@ -76,8 +76,13 @@ struct SegmentPlan {
 
 /// How stage B walks a block whose stage A staging is done.
 enum BlockPlan {
-    Raw { body: Range<usize> },
-    Rle { byte: u8, len: usize },
+    Raw {
+        body: Range<usize>,
+    },
+    Rle {
+        byte: u8,
+        len: usize,
+    },
     Compressed {
         lits: Range<usize>,
         seqs: Range<usize>,
@@ -356,7 +361,8 @@ fn decode_segment(
                 )
                 .map_err(DecompressBlockError::from)
                 .map_err(block_body_err)?;
-                let match_bytes: usize = sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
+                let match_bytes: usize =
+                    sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
                 out_size += literals.len() - lits_start + match_bytes;
                 blocks.push(BlockPlan::Compressed {
                     lits: lits_start..literals.len(),
@@ -422,12 +428,10 @@ unsafe fn execute_segment(
                         return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                     }
                     if lit_pos + ll > lits.end {
-                        return Err(exec_err(
-                            ExecuteSequencesError::NotEnoughBytesForSequence {
-                                wanted: lit_pos + ll,
-                                have: lits.end,
-                            },
-                        ));
+                        return Err(exec_err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                            wanted: lit_pos + ll,
+                            have: lits.end,
+                        }));
                     }
                     // SAFETY: the budget check bounds the write; the literal
                     // range was checked above
@@ -491,7 +495,10 @@ unsafe fn execute_segment(
             }
         }
     }
-    debug_assert_eq!(w, seg.out_size, "stage A size accounting must match execution");
+    debug_assert_eq!(
+        w, seg.out_size,
+        "stage A size accounting must match execution"
+    );
     Ok(())
 }
 
@@ -696,8 +703,8 @@ mod tests {
 
     fn textish(len: usize) -> Vec<u8> {
         let words: Vec<&[u8]> = vec![
-            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ",
-            b"dog ", b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
+            b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
         ];
         let mut state = 7u64;
         let mut out = Vec::with_capacity(len);
@@ -718,10 +725,8 @@ mod tests {
     fn mt_frames_decode_identically() {
         let data = textish(8 * 1024 * 1024);
         for workers in [2u32, 4] {
-            let compressed = bulk::compress_with(
-                &data,
-                &EncoderOptions::new(Level::Fastest).workers(workers),
-            );
+            let compressed =
+                bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(workers));
             let mut out = vec![0u8; data.len()];
             let n = decode_all_mt(&compressed, &mut out, workers, MAX_WINDOW).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]));
@@ -732,7 +737,10 @@ mod tests {
 
             let mut seq = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            assert_eq!(decoder.decode_all(&compressed, &mut seq).unwrap(), data.len());
+            assert_eq!(
+                decoder.decode_all(&compressed, &mut seq).unwrap(),
+                data.len()
+            );
             assert_eq!(seq, out);
 
             let mut libzstd = Vec::new();
@@ -830,10 +838,8 @@ mod tests {
     #[test]
     fn slice_too_small_and_fallback() {
         let data = textish(4 * 1024 * 1024);
-        let compressed = bulk::compress_with(
-            &data,
-            &EncoderOptions::new(Level::Fastest).workers(4),
-        );
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4));
         let mut small = vec![0u8; data.len() - 1];
         assert!(decode_all_mt(&compressed, &mut small, 4, MAX_WINDOW).is_err());
 
@@ -851,10 +857,8 @@ mod tests {
     #[test]
     fn corrupt_input_errors() {
         let data = textish(4 * 1024 * 1024);
-        let mut compressed = bulk::compress_with(
-            &data,
-            &EncoderOptions::new(Level::Fastest).workers(4),
-        );
+        let mut compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4));
         // Smash bytes in a middle segment's compressed body.
         let mid = compressed.len() / 2;
         compressed[mid] ^= 0xFF;

@@ -15,8 +15,8 @@
 use alloc::vec::Vec;
 
 use super::seq_codes::{decode_packed, pack_seq};
-use super::SeqWord;
 use super::Matcher;
+use super::SeqWord;
 use super::Sequence;
 use crate::Level;
 // Shared with the decoder so both sides agree on offset-history semantics.
@@ -432,8 +432,12 @@ impl DfastEmit<'_> {
         // SAFETY: both hashes are masked to their tables' sizes.
         unsafe {
             let tag = self.tag | (self.win_base + idx as u64);
-            *self.long.get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = tag;
-            *self.small.get_unchecked_mut(hash_at_log(win, idx, self.small_log)) = tag;
+            *self
+                .long
+                .get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = tag;
+            *self
+                .small
+                .get_unchecked_mut(hash_at_log(win, idx, self.small_log)) = tag;
         }
     }
 
@@ -473,7 +477,9 @@ impl DfastEmit<'_> {
         if match_end >= 2 && match_end - 2 <= self.insert_max_idx {
             // SAFETY: masked to the long table size.
             unsafe {
-                *self.long.get_unchecked_mut(hash8_at_log(win, match_end - 2, self.long_log)) =
+                *self
+                    .long
+                    .get_unchecked_mut(hash8_at_log(win, match_end - 2, self.long_log)) =
                     self.tag | (self.win_base + (match_end - 2) as u64);
             }
         }
@@ -1035,10 +1041,7 @@ impl MatchGeneratorDriver {
                         let mut start = idx0;
                         // Extend backwards into the pending literals;
                         // the offset (idx0 - cand) stays constant.
-                        while start > anchor_idx
-                            && cand0 > 0
-                            && win[cand0 - 1] == win[start - 1]
-                        {
+                        while start > anchor_idx && cand0 > 0 && win[cand0 - 1] == win[start - 1] {
                             cand0 -= 1;
                             start -= 1;
                             ml += 1;
@@ -1109,10 +1112,7 @@ impl MatchGeneratorDriver {
                     if ml >= 6 {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
-                        while start > anchor_idx
-                            && cand1 > 0
-                            && win[cand1 - 1] == win[start - 1]
-                        {
+                        while start > anchor_idx && cand1 > 0 && win[cand1 - 1] == win[start - 1] {
                             cand1 -= 1;
                             start -= 1;
                             ml += 1;
@@ -1274,9 +1274,8 @@ impl MatchGeneratorDriver {
                             if read4(win, cand) == read4(win, probe) {
                                 let ml = extend_match(win, probe, cand);
                                 debug_assert!(ml >= MIN_MATCH);
-                                anchor_idx = emit.emit(
-                                    win, anchor_idx, ip_idx, probe, ml, 1, &mut rep,
-                                );
+                                anchor_idx =
+                                    emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
                                 ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
                                 // The chain's matches advance the anchor too.
                                 anchor_idx = ip_idx;
@@ -1403,8 +1402,7 @@ impl MatchGeneratorDriver {
             break;
         }
         if !emit.seqs.is_empty() && anchor_idx < block_len {
-            emit.literals
-                .extend_from_slice(&win[anchor_idx..block_len]);
+            emit.literals.extend_from_slice(&win[anchor_idx..block_len]);
         }
         self.pos = self.block_end;
         self.anchor = self.block_end;
@@ -1575,11 +1573,7 @@ impl MatchGeneratorDriver {
             // one literal pending: of_value 1 with a zero literal length
             // resolves to a repcode *swap* on the decoder side, not rep0.
             let anchor_idx = (anchor - win_base) as usize;
-            let floor = if rep_hit {
-                anchor_idx + 1
-            } else {
-                anchor_idx
-            };
+            let floor = if rep_hit { anchor_idx + 1 } else { anchor_idx };
             let mut cand = best_cand;
             let mut ml = best_len;
             while start > floor && cand > 0 && win[cand - 1] == win[start - 1] {
@@ -1592,9 +1586,7 @@ impl MatchGeneratorDriver {
             } else {
                 (start - cand + 3) as u32
             };
-            anchor = emit.emit_chain(
-                win, chain, hash_log, anchor, start, ml, of_value, &mut rep,
-            );
+            anchor = emit.emit_chain(win, chain, hash_log, anchor, start, ml, of_value, &mut rep);
             if rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }

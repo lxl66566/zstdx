@@ -5,9 +5,9 @@ pub(crate) mod async_checksum;
 pub(crate) mod block_header;
 pub(crate) mod blocks;
 pub(crate) mod frame_header;
+pub(crate) mod match_generator;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
-pub(crate) mod match_generator;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
 

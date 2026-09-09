@@ -331,7 +331,9 @@ pub(crate) fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>,
 
 /// Take the per-thread pooled slice state, reset for a fresh frame at
 /// `level`. Fresh states are built (and reset) when the pool is empty.
-pub(crate) fn take_slice_state(level: Level) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+pub(crate) fn take_slice_state(
+    level: Level,
+) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
         reset_slice_state(&mut s, level);
@@ -343,9 +345,7 @@ pub(crate) fn take_slice_state(level: Level) -> alloc::boxed::Box<CompressState<
 }
 
 /// Return a state taken by [`take_slice_state`] to the pool.
-pub(crate) fn return_slice_state(
-    state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
-) {
+pub(crate) fn return_slice_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
     #[cfg(feature = "std")]
     SLICE_STATE.with(|p| *p.borrow_mut() = Some(state));
     #[cfg(not(feature = "std"))]
@@ -417,10 +417,7 @@ fn compress_with_state(
                 header.serialize(&mut output);
                 BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
             }
-            Level::Fastest
-            | Level::Fast
-            | Level::Balanced
-            | Level::Best => {
+            Level::Fastest | Level::Fast | Level::Balanced | Level::Best => {
                 super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
             }
         }
@@ -463,8 +460,7 @@ pub(crate) fn compress_job_blocks(
 ) -> Vec<u8> {
     let block_size = crate::common::MAX_BLOCK_SIZE as usize;
     let max_window = state.matcher.window_size() as usize;
-    let mut output =
-        Vec::with_capacity(job.len() + 3 * (job.len() / block_size + 1) + 8);
+    let mut output = Vec::with_capacity(job.len() + 3 * (job.len() / block_size + 1) + 8);
     // Uniform detection still runs (the RLE path), but the frame checksum is
     // the mt driver's job over the whole input.
     let mut hasher = SliceChecksum::new(0, false);
@@ -607,10 +603,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     self.hasher
                         .write_appending(output, self.state.matcher.get_last_space());
                 }
-                Level::Fastest
-                | Level::Fast
-                | Level::Balanced
-                | Level::Best => {
+                Level::Fastest | Level::Fast | Level::Balanced | Level::Best => {
                     compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
                 }
             }
@@ -720,7 +713,10 @@ mod tests {
             let compressed = super::compress_slice_to_vec(&data, level);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            assert_eq!(decoder.decode_all(&compressed, &mut out).unwrap(), data.len());
+            assert_eq!(
+                decoder.decode_all(&compressed, &mut out).unwrap(),
+                data.len()
+            );
             assert_eq!(&out[..], &data[..], "roundtrip {level:?}");
             let mut libzstd = Vec::new();
             zstd::stream::copy_decode(compressed.as_slice(), &mut libzstd).unwrap();
