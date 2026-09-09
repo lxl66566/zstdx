@@ -366,10 +366,16 @@ impl TableEmit<'_> {
         while p < end_abs {
             let i = (p - self.win_base) as usize;
             let h = hash_at_log(win, i, hash_log);
-            // SAFETY: h is masked to hash_log bits, i to the chain table size.
+            // SAFETY: h is masked to hash_log bits, p to the chain table
+            // size. The chain slot key is the ABSOLUTE position — the walk
+            // side resolves candidates absolutely: a window-relative index
+            // diverges from it once win_base stops being a multiple of the
+            // chain size (window compaction in streaming, per-block adopted
+            // windows in bulk, job-relative windows in MT), scrambling every
+            // walk past its first hop.
             unsafe {
                 let head = *self.table.get_unchecked(h);
-                *chain.get_unchecked_mut(i & chain_mask) = head;
+                *chain.get_unchecked_mut(p as usize & chain_mask) = head;
                 *self.table.get_unchecked_mut(h) = self.tag | p;
             }
             p += step;
@@ -846,11 +852,15 @@ impl Matcher for MatchGeneratorDriver {
             match self.params.strategy {
                 Strategy::Chain(log) => {
                     let h = hash_at_log(win, idx, log);
-                    // SAFETY: h is masked to log bits, idx to the chain size.
+                    // SAFETY: h is masked to log bits, the absolute block
+                    // start to the chain size (absolute key; see
+                    // emit_chain's note on the walk side's indexing).
                     unsafe {
                         let head = *self.table.get_unchecked(h);
                         let chain_mask = self.chain.len() - 1;
-                        *self.chain.get_unchecked_mut(idx & chain_mask) = head;
+                        *self
+                            .chain
+                            .get_unchecked_mut(self.block_start as usize & chain_mask) = head;
                         *self.table.get_unchecked_mut(h) = (self.epoch << 48) | self.block_start;
                     }
                 }
@@ -1524,12 +1534,13 @@ impl MatchGeneratorDriver {
             }
 
             // Insert this position behind the probe (newest-wins), linking
-            // the chain to the previous head.
+            // the chain to the previous head. The chain slot key is the
+            // absolute position — what the walk resolves candidates with.
             // SAFETY: both indices are masked to their tables' sizes.
             unsafe {
                 let h = hash_at_log(win, idx, hash_log);
                 let head = *table_ptr.add(h);
-                *chain.get_unchecked_mut(idx & chain_mask) = head;
+                *chain.get_unchecked_mut(pos as usize & chain_mask) = head;
                 *table_ptr.add(h) = tag | pos;
             }
 

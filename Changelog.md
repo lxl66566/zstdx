@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The chain strategies' table links diverged from their walks: inserts
+  keyed the chain by the window-relative index while walks resolved
+  candidates by absolute position, and the two only coincide while
+  `win_base == 0`. Every real driver advances `win_base` — the owned
+  window compacts after two windows in streaming, the bulk path adopts a
+  `[block_start - window, block_end]` window per block, MT jobs adopt
+  job-relative bases — so from the first advance the walks followed links
+  from unrelated chains: read4 gating kept the output valid but the
+  search effectively ran on truncated scrambled chains, burning full
+  search depth on rejected candidates. All three insert sites
+  (`emit_chain`, the scan's own insert, RLE blocks' `skip_matching`) now
+  key by absolute position like the walk. Consequences: streaming Best
+  recovers bulk parity (18 -> ~23 MiB/s on json with the old ladder, and
+  its output becomes byte-identical to bulk bar the frame header), and
+  the bulk chain levels' speed/ratio points were artifacts of the broken
+  search (the retune follows separately).
+
 * A match source below the active segment (a wrapped-away previous-segment
   reference) resolves as one linear in-buffer copy instead of the generic
   segment walk: the previous segment physically sits `seg_a_end - offset`
