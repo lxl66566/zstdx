@@ -85,23 +85,30 @@ const FAST_PARAMS: LevelParams = LevelParams {
 
 /// The chain table is position-indexed, so its log doubles as the match
 /// reach; pinning it to the window makes every in-window position linked
-/// (no reach truncation). A/B on the 32 MiB corpus: matching zstd-6's C18
-/// truncates chains at 256 KiB and collapses skewed (0.97→2.2xslow), while
-/// the full-coverage 1 MiB window beats the old W21+C20 on both speed
-/// (json 1.14→1.07) and ratio (far-offset codes disappear).
+/// (no reach truncation). The window stays 1 MiB across the chain levels
+/// (zstd's ladder below 16 does the same): on the 32 MiB corpus a 4 MiB
+/// window only ever finds farther — not longer — matches, whose offset
+/// codes cost more than the length saves (json and skewed both lose ratio
+/// AND walk speed to the extra cache misses). Depth 8/H20 sits at the
+/// speed knee of the real-chain walk (16 attempts, zstd-9's searchLog).
 const BALANCED_PARAMS: LevelParams = LevelParams {
-    hash_log: 17,
+    hash_log: 20,
     window: 1 << 20,
     strategy: Strategy::Chain(20),
-    search_depth: 16,
+    search_depth: 8,
     lazy_depth: 2,
 };
 
+/// Best deepens the search instead of widening the window: depth 24 with
+/// two more lazy steps buys json ratio 5.64→5.70 over Balanced at ~60% of
+/// its speed, while every window growth measured (2–4 MiB) lost on both
+/// axes (see BALANCED_PARAMS). H21 halves the per-slot chain length,
+/// which the deeper walks need to terminate on chain ends.
 const BEST_PARAMS: LevelParams = LevelParams {
-    hash_log: 18,
-    window: 1 << 22,
-    strategy: Strategy::Chain(21),
-    search_depth: 64,
+    hash_log: 21,
+    window: 1 << 20,
+    strategy: Strategy::Chain(20),
+    search_depth: 24,
     lazy_depth: 4,
 };
 
@@ -1465,14 +1472,13 @@ impl MatchGeneratorDriver {
 
         // Chain-walk search from the hash head at window index `idx`,
         // returning the longest match's (length, candidate window index).
-        // Every candidate is read4-verified, so stale chain links (see the
+        // Every candidate is beat-checked, so stale chain links (see the
         // sparse fill in rep1_chain) only cost probes, never correctness.
         let search = |win: &[u8], chain: &[u64], idx: usize| -> (usize, usize) {
             // SAFETY: hash_at_log masks to hash_log bits and the table holds
             // 1 << hash_log slots.
             let h = hash_at_log(win, idx, hash_log);
             let mut entry = unsafe { *table_ptr.add(h) };
-            let cur4 = read4(win, idx);
             let pos_abs = win_base + idx as u64;
             let mut best_len = 0usize;
             let mut best_cand = usize::MAX;
@@ -1486,7 +1492,16 @@ impl MatchGeneratorDriver {
                     break;
                 }
                 let cand = (cand_abs - win_base) as usize;
-                if read4(win, cand) == cur4 {
+                // Beat-check (libzstd's "potentially better" read): the 4
+                // bytes ending at best_len+1 decide whether the candidate
+                // can strictly improve, so most hash collisions reject on
+                // one load instead of a full extend. With no best yet the
+                // probe sits at 0, the plain first-4 compare. The probe
+                // stays inside the block: still looping means best_len is
+                // short of the block end (the break below fires otherwise),
+                // so [probe, probe+4) ends at most at the block end.
+                let probe = best_len.saturating_sub(3);
+                if read4(win, cand + probe) == read4(win, idx + probe) {
                     let ml = extend_match(win, idx, cand);
                     if ml > best_len {
                         best_len = ml;

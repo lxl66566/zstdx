@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The chain search now beat-checks candidates (libzstd's "potentially
+  better" read): the 4 bytes ending at best_len+1 decide whether a
+  candidate can strictly improve, so hash collisions reject on one load
+  instead of a full extend. With the walks following real chains since
+  the indexing fix, the search depths the ladder claimed are finally
+  paid in full — so the chain levels are retuned against the honest
+  cost: Balanced H17/d16/W1MiB -> H20/d8/W1MiB and Best
+  H18/d64/W4MiB -> H21/d24/W1MiB (the wider window only ever found
+  farther, not longer, matches and lost ratio and speed on every shape;
+  hash growth shortens per-slot chains, which real walks need to
+  terminate). 32 MiB corpus, ST bulk: json Best 23->83 MiB/s (ratio
+  5.66->5.70), skewed Best 12->36 (1.817->1.867), text Best 1665->1652
+  (364.5->363.3); json Balanced 98->134 (5.68->5.64, trading
+  0.7% ratio for 37% speed), skewed Balanced 24->44 (1.848->1.865). Streaming Best reaches bulk parity (18 -> 78
+  MiB/s on json, was 4.3x slower than bulk).
+
 * The chain strategies' table links diverged from their walks: inserts
   keyed the chain by the window-relative index while walks resolved
   candidates by absolute position, and the two only coincide while
