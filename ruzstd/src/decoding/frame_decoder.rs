@@ -474,6 +474,7 @@ impl FrameDecoder {
                             &mut written,
                             view.origin + block_start,
                             view,
+                            true,
                         )
                         .map_err(|e| {
                             err::FailedToReadBlockBody(
@@ -656,6 +657,7 @@ impl FrameDecoder {
                                 seg_a_end: out.len(),
                                 out_len: out.len(),
                             },
+                            false,
                         )
                         .map_err(|e| match e {
                             decoding::errors::DecompressBlockError::ExecuteSequencesError(
@@ -820,6 +822,7 @@ impl FrameDecoder {
                                         &mut written,
                                         view.origin + block_start,
                                         view,
+                                        true,
                                     )
                                     .map_err(|e| err::FailedToReadBlockBody(
                                         decoding::errors::DecodeBlockContentError::DecompressBlockError(

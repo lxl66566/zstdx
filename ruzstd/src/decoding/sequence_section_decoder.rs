@@ -103,7 +103,8 @@ fn decode_sequences_into_impl(
     // exactly one Sequence
     let out = target.as_mut_ptr();
     let mut idx = 0;
-    while let Some(seq) = dec.next()? {
+    while dec.rem > 0 {
+        let seq = dec.next()?;
         unsafe { *out.add(start + idx) = seq };
         idx += 1;
     }
@@ -300,20 +301,29 @@ fn pack_rle_entry((base, add): (u32, u8), slot: &mut u64) {
 /// state in this struct lets callers execute each sequence the moment it is
 /// decoded (the flat output path) or collect them into a vector (the
 /// ring-buffer path) from the same code.
+///
+/// The carried stream state is the three FSE states plus the shifted bit
+/// window — deliberately NOT the packed table entries or the raw `bits`
+/// container: the entries reload from the tables each step (same three
+/// loads, issued where the transitions produce them), and `bits` is never
+/// read across a sequence boundary (reload always rebuilds the window from
+/// memory; see `reload`). Both removals exist to keep the fused decode and
+/// execution loop register-resident: carrying entries alongside the
+/// executor's cursor set spilled every sequence.
 pub(crate) struct SeqDecoder {
     /// Base of the packed tables in their fixed slots (see `pack_tables`).
     pub(crate) tbl: *const u64,
     pub(crate) src_ptr: *const u8,
-    pub(crate) src_len: usize,
     pub(crate) ip: usize,
-    pub(crate) bits: u64,
+    /// Bit window, pre-shifted by the bits consumed so far (`win` always
+    /// equals `bits_at_last_reload << consumed`, see `read`).
     pub(crate) win: u64,
     pub(crate) consumed: u32,
-    pub(crate) ll_entry: u64,
-    pub(crate) ml_entry: u64,
-    pub(crate) of_entry: u64,
-    pub(crate) nseq: usize,
-    pub(crate) idx: usize,
+    pub(crate) ll_state: u32,
+    pub(crate) ml_state: u32,
+    pub(crate) of_state: u32,
+    /// Sequences left to decode; `next` refuses when it reaches zero.
+    pub(crate) rem: usize,
 }
 
 impl SeqDecoder {
@@ -345,12 +355,10 @@ impl SeqDecoder {
         // next() call (the tables only change through maybe_update_fse_tables)
         let tbl = scratch.seq_packed.as_ptr();
         let src_ptr = br.source.as_ptr();
-        let src_len = br.source.len();
         let mut ip = br.ip;
-        let mut bits = br.bits;
         let mut consumed = br.consumed;
         // wrapping: degenerate short streams clamp with consumed == 64 (error path)
-        let mut win = bits.wrapping_shl(consumed);
+        let mut win = br.bits.wrapping_shl(consumed);
 
         // Initial states are read in the order ll, of, ml (RLE streams have
         // accuracy_log 0, so their read is a no-op that leaves state 0)
@@ -368,58 +376,38 @@ impl SeqDecoder {
         // Realign the window before the first sequence; the loop only reloads
         // at sequence ends (the state reads above already consumed up to 26
         // bits)
-        let _ = reload(
-            src_ptr,
-            src_len,
-            &mut ip,
-            &mut bits,
-            &mut win,
-            &mut consumed,
-        );
-
-        // SAFETY: states come straight from accuracy-log reads (0 for RLE),
-        // so they are below the table sizes; RLE slots hold the fake entry
-        let ll_entry = unsafe { *tbl.add(LL_SLOT + ll_state as usize) };
-        let ml_entry = unsafe { *tbl.add(ML_SLOT + ml_state as usize) };
-        let of_entry = unsafe { *tbl.add(OF_SLOT + of_state as usize) };
+        let _ = reload(src_ptr, &mut ip, &mut win, &mut consumed);
 
         Ok(SeqDecoder {
             tbl,
             src_ptr,
-            src_len,
             ip,
-            bits,
             win,
             consumed,
-            ll_entry,
-            ml_entry,
-            of_entry,
-            nseq: section.num_sequences as usize,
-            idx: 0,
+            ll_state,
+            ml_state,
+            of_state,
+            rem: section.num_sequences as usize,
         })
     }
 
     /// Decode the next sequence and advance the streams for the one after
-    /// it. Returns `None` once all `num_sequences` sequences are decoded.
+    /// it; the caller checks `rem` first (it counts down to zero).
     #[inline(always)]
-    pub(crate) fn next(&mut self) -> Result<Option<Sequence>, DecodeSequenceError> {
+    pub(crate) fn next(&mut self) -> Result<Sequence, DecodeSequenceError> {
         let SeqDecoder {
             tbl,
             src_ptr,
-            src_len,
             ip,
-            bits,
             win,
             consumed,
-            ll_entry,
-            ml_entry,
-            of_entry,
-            nseq,
-            idx,
+            ll_state,
+            ml_state,
+            of_state,
+            rem,
         } = self;
         decode_step(
-            *tbl, *src_ptr, *src_len, ip, bits, win, consumed, ll_entry, ml_entry, of_entry, *nseq,
-            idx,
+            *tbl, *src_ptr, ip, win, consumed, ll_state, ml_state, of_state, rem,
         )
     }
 
@@ -439,32 +427,35 @@ impl SeqDecoder {
 }
 
 /// Decode one sequence and advance the streams for the one after it (the
-/// body of `next`). State passes as scalars so the caller's SROA sees plain
-/// local variables; the flat executor calls this directly with loop-local
-/// state to keep it register-resident (see `sequence_execution`). Returns
-/// `None` once all `nseq` sequences are decoded.
+/// body of `next`). The caller guarantees `*rem > 0`; `rem` counts down and
+/// the last sequence skips the state transitions and the reload (they would
+/// read past the stream's end). State passes as scalars so the caller's SROA
+/// sees plain local variables; the flat executor calls this directly with
+/// loop-local state to keep it register-resident (see `sequence_execution`).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn decode_step(
     tbl: *const u64,
     src_ptr: *const u8,
-    src_len: usize,
     ip: &mut usize,
-    bits: &mut u64,
     win: &mut u64,
     consumed: &mut u32,
-    ll_entry: &mut u64,
-    ml_entry: &mut u64,
-    of_entry: &mut u64,
-    nseq: usize,
-    idx: &mut usize,
-) -> Result<Option<Sequence>, DecodeSequenceError> {
-    if *idx == nseq {
-        return Ok(None);
-    }
-    let (ll_base, ll_nb) = ((*ll_entry >> 32) as u32, ((*ll_entry >> 24) & 0xFF) as u32);
-    let (ml_base, ml_nb) = ((*ml_entry >> 32) as u32, ((*ml_entry >> 24) & 0xFF) as u32);
-    let (of_base, of_nb) = ((*of_entry >> 32) as u32, ((*of_entry >> 24) & 0xFF) as u32);
+    ll_state: &mut u32,
+    ml_state: &mut u32,
+    of_state: &mut u32,
+    rem: &mut usize,
+) -> Result<Sequence, DecodeSequenceError> {
+    // SAFETY: FSE table construction keeps every reachable state below the
+    // table size (RLE streams sit at state 0, their own fake slot),
+    // independent of the bitstream content
+    let ll_entry = unsafe { *tbl.add(LL_SLOT + *ll_state as usize) };
+    // SAFETY: same invariant as the ll stream
+    let ml_entry = unsafe { *tbl.add(ML_SLOT + *ml_state as usize) };
+    // SAFETY: same invariant as the ll stream
+    let of_entry = unsafe { *tbl.add(OF_SLOT + *of_state as usize) };
+    let (ll_base, ll_nb) = ((ll_entry >> 32) as u32, ((ll_entry >> 24) & 0xFF) as u32);
+    let (ml_base, ml_nb) = ((ml_entry >> 32) as u32, ((ml_entry >> 24) & 0xFF) as u32);
+    let (of_base, of_nb) = ((of_entry >> 32) as u32, ((of_entry >> 24) & 0xFF) as u32);
 
     // All three add-bit widths are known before reading, so the fields (of,
     // then ml, then ll in read order, from the top) can be extracted with a
@@ -489,10 +480,7 @@ pub(crate) fn decode_step(
         // bits guaranteed after a reload; reload mid-sequence then
         let obits = read(win, consumed, of_nb);
         let ml_add = read(win, consumed, ml_nb);
-        if matches!(
-            reload(src_ptr, src_len, ip, bits, win, consumed),
-            Reload::Overflow
-        ) {
+        if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
         }
         let ll_add = read(win, consumed, ll_nb);
@@ -504,14 +492,14 @@ pub(crate) fn decode_step(
         of: of_base + obits as u32,
     };
 
-    *idx += 1;
-    if *idx < nseq {
-        let ll_nb_t = (*ll_entry & 0xFF) as u32;
-        let ml_nb_t = (*ml_entry & 0xFF) as u32;
-        let of_nb_t = (*of_entry & 0xFF) as u32;
-        let ll_base_t = ((*ll_entry >> 8) & 0xFFFF) as u32;
-        let ml_base_t = ((*ml_entry >> 8) & 0xFFFF) as u32;
-        let of_base_t = ((*of_entry >> 8) & 0xFFFF) as u32;
+    *rem -= 1;
+    if *rem > 0 {
+        let ll_nb_t = (ll_entry & 0xFF) as u32;
+        let ml_nb_t = (ml_entry & 0xFF) as u32;
+        let of_nb_t = (of_entry & 0xFF) as u32;
+        let ll_base_t = ((ll_entry >> 8) & 0xFFFF) as u32;
+        let ml_base_t = ((ml_entry >> 8) & 0xFFFF) as u32;
+        let of_base_t = ((of_entry >> 8) & 0xFFFF) as u32;
         // Same batching for the three state transitions (ll, then ml, then
         // of): at most 9+9+8 = 26 bits, always extractable in one read
         let sum_t = ll_nb_t + ml_nb_t + of_nb_t;
@@ -525,22 +513,14 @@ pub(crate) fn decode_step(
                 of_base_t + (v & ((1u64 << of_nb_t) - 1)) as u32,
             )
         };
-        // SAFETY: FSE table construction keeps every reachable state
-        // below the table size (RLE fake entries transition to state
-        // 0, their own slot), independent of the bitstream content
-        *ll_entry = unsafe { *tbl.add(LL_SLOT + s_ll as usize) };
-        // SAFETY: same invariant as the ll stream
-        *ml_entry = unsafe { *tbl.add(ML_SLOT + s_ml as usize) };
-        // SAFETY: same invariant as the ll stream
-        *of_entry = unsafe { *tbl.add(OF_SLOT + s_of as usize) };
-        if matches!(
-            reload(src_ptr, src_len, ip, bits, win, consumed),
-            Reload::Overflow
-        ) {
+        *ll_state = s_ll;
+        *ml_state = s_ml;
+        *of_state = s_of;
+        if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
         }
     }
-    Ok(Some(seq))
+    Ok(seq)
 }
 
 /// Backwards bitstream reader over a 64-bit container, ported from libzstd's
@@ -618,17 +598,14 @@ fn read(win: &mut u64, consumed: &mut u32, n: u32) -> u64 {
 }
 
 /// Move the window backwards by the consumed whole bytes. Mirrors
-/// BIT_reloadDStream: fast path when at least 8 bytes remain below the
-/// window, clamped out-of-line path near the stream start.
+/// BIT_reloadDStream, except the raw container never leaves this function:
+/// both paths rebuild the window straight from memory, and when `nb == 0`
+/// clamps the retreat the existing window is already correct (`win` always
+/// equals `bits_at_last_reload << consumed`; `read` keeps the two in sync),
+/// so nothing needs preserving — which is what lets the decode loop carry
+/// only `win` and drop `bits` from its state entirely.
 #[inline(always)]
-fn reload(
-    src_ptr: *const u8,
-    src_len: usize,
-    ip: &mut usize,
-    bits: &mut u64,
-    win: &mut u64,
-    consumed: &mut u32,
-) -> Reload {
+fn reload(src_ptr: *const u8, ip: &mut usize, win: &mut u64, consumed: &mut u32) -> Reload {
     if *consumed > 64 {
         // Stream overconsumed; feeding zeroes would move ip below the
         // stream start, so freeze the window instead
@@ -639,34 +616,34 @@ fn reload(
         // ip+8 <= src_len holds on this path
         *ip -= (*consumed >> 3) as usize;
         *consumed &= 7;
-        *bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
-        *win = *bits << *consumed;
+        let bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
+        *win = bits << *consumed;
         return Reload::Unfinished;
     }
-    reload_slow(src_ptr, src_len, ip, bits, win, consumed)
+    reload_slow(src_ptr, ip, win, consumed)
 }
 
-/// Clamped reload for windows near the stream start, kept out of line so the
-/// hot path can inline on the decoder's local state.
+/// Clamped reload for windows near the stream start. Inlined but cold-placed:
+/// it runs once per block at most (the final bytes of a sequence section), so
+/// a real call here would force every loop-carried value of the fused decode
+/// loop into a stack home — measured as several stores per sequence.
 #[cold]
-#[inline(never)]
-fn reload_slow(
-    src_ptr: *const u8,
-    src_len: usize,
-    ip: &mut usize,
-    bits: &mut u64,
-    win: &mut u64,
-    consumed: &mut u32,
-) -> Reload {
+#[inline(always)]
+fn reload_slow(src_ptr: *const u8, ip: &mut usize, win: &mut u64, consumed: &mut u32) -> Reload {
     let nb = ((*consumed >> 3) as usize).min(*ip);
-    *ip -= nb;
-    *consumed -= (nb * 8) as u32;
-    if nb > 0 && src_len >= 8 {
-        // SAFETY: ip started at len-8 and only decreased, so ip+8 <= src_len
-        *bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
+    if nb > 0 {
+        // ip >= 1 here, so the stream holds at least 9 bytes and the 8-byte
+        // read below stays inside it (ip started at len-8 and only decreased)
+        *ip -= nb;
+        *consumed -= (nb * 8) as u32;
+        // SAFETY: ip + 8 <= src_len as proven above
+        let bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
+        // wrapping: consumed can reach 64 here (error path detects it later)
+        *win = bits.wrapping_shl(*consumed);
     }
-    // wrapping: short streams can clamp with consumed == 64 (error path)
-    *win = (*bits).wrapping_shl(*consumed);
+    // nb == 0: the retreat clamps at the stream start; `win` already equals
+    // bits << consumed, so the window drains in place (reads past its end
+    // yield zeroes) and the accounting in `finish` flags the mismatch.
     if *ip == 0 {
         Reload::EndOfBuffer
     } else {

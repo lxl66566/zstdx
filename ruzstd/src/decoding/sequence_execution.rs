@@ -85,9 +85,12 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// streaming buffer's first generation) runs a monomorphized copy of the loop
 /// without the two-generation mapping branches.
 ///
-/// Bounds are checked per sequence (`written + ll + ml <= out.len()`), which
-/// replaces the two-pass path's whole-block budget precheck. Commits
-/// `*written` and validates the bitstream padding (`dec.finish`) on success.
+/// `headroom` says the target slice holds at least the block's decompressed
+/// size plus 16 bytes of slack beyond it (the flat streaming/MT buffers
+/// guarantee this per block, see `FlatOut::ensure_block_space`). The
+/// monomorphized HEADROOM instantiation drops the per-sequence budget check
+/// and lets every copy wildcopy unconditionally; slice targets sized exactly
+/// to the frame keep the checks.
 pub(crate) fn execute_decoded_flat(
     dec: &mut super::sequence_section_decoder::SeqDecoder,
     literals: &[u8],
@@ -96,6 +99,7 @@ pub(crate) fn execute_decoded_flat(
     virt_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
+    headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
     // BMI2 compiles the decoder's variable shifts to single-uop shlx/shrx;
     // the detection cache makes this dispatch cheap relative to a block.
@@ -104,11 +108,29 @@ pub(crate) fn execute_decoded_flat(
         if std::is_x86_feature_detected!("bmi2") {
             // SAFETY: bmi2 was just detected at runtime
             return unsafe {
-                execute_decoded_flat_bmi2(dec, literals, out, written, virt_base, view, offset_hist)
+                execute_decoded_flat_bmi2(
+                    dec,
+                    literals,
+                    out,
+                    written,
+                    virt_base,
+                    view,
+                    offset_hist,
+                    headroom,
+                )
             };
         }
     }
-    execute_decoded_flat_impl(dec, literals, out, written, virt_base, view, offset_hist)
+    execute_decoded_flat_impl(
+        dec,
+        literals,
+        out,
+        written,
+        virt_base,
+        view,
+        offset_hist,
+        headroom,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -121,8 +143,18 @@ unsafe fn execute_decoded_flat_bmi2(
     virt_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
+    headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
-    execute_decoded_flat_impl(dec, literals, out, written, virt_base, view, offset_hist)
+    execute_decoded_flat_impl(
+        dec,
+        literals,
+        out,
+        written,
+        virt_base,
+        view,
+        offset_hist,
+        headroom,
+    )
 }
 
 #[inline(always)]
@@ -134,9 +166,32 @@ fn execute_decoded_flat_impl(
     virt_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
+    headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
     if view.origin == 0 {
-        execute_decoded_flat_inner::<true>(
+        if headroom {
+            execute_decoded_flat_inner::<true, true>(
+                dec,
+                literals,
+                out,
+                written,
+                virt_base,
+                view,
+                offset_hist,
+            )
+        } else {
+            execute_decoded_flat_inner::<true, false>(
+                dec,
+                literals,
+                out,
+                written,
+                virt_base,
+                view,
+                offset_hist,
+            )
+        }
+    } else if headroom {
+        execute_decoded_flat_inner::<false, true>(
             dec,
             literals,
             out,
@@ -146,7 +201,7 @@ fn execute_decoded_flat_impl(
             offset_hist,
         )
     } else {
-        execute_decoded_flat_inner::<false>(
+        execute_decoded_flat_inner::<false, false>(
             dec,
             literals,
             out,
@@ -159,7 +214,7 @@ fn execute_decoded_flat_impl(
 }
 
 #[inline(always)]
-fn execute_decoded_flat_inner<const NOWRAP: bool>(
+fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
     dec: &mut super::sequence_section_decoder::SeqDecoder,
     literals: &[u8],
     out: &mut [u8],
@@ -168,63 +223,76 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
-    use crate::decoding::errors::DecompressBlockError;
     use super::sequence_section_decoder::decode_step;
+    use crate::decoding::errors::DecompressBlockError;
 
-    let out_ptr = out.as_mut_ptr();
-    let out_len = out.len();
+    let out_base = out.as_mut_ptr();
+    let out_end = out_base.wrapping_add(out.len());
+    let lit_base = literals.as_ptr();
+    let lit_end = lit_base.wrapping_add(literals.len());
     // `out` is the slice buf[block_start..] of the backing buffer. Within the
-    // active segment virtual distances equal physical ones, so the fused loop
-    // only needs this one offset to tell active-segment match sources from
-    // ones reaching into the wrapped-away history (handled out of line). With
-    // a slice-decode target (virt_base == origin) this is `out` itself.
+    // active segment virtual distances equal physical ones. Two folded bases
+    // carry everything the loop needs of the virtual/physical mapping:
+    // `vbase_op` is the virtual address of out[0] (the offset bound check is
+    // `offset > op + vbase_op`, i.e. `offset > virt_base + pos`), and
+    // `wrap_base` is the backing buffer's base (the wrapped-source check is
+    // `offset + wrap_base > op`, i.e. `offset > block_start + pos`; unused in
+    // the never-wrapped instantiation). The full `view` mapping only feeds
+    // the cold wrapped-match path.
     let block_start = if NOWRAP {
         virt_base
     } else {
         virt_base.saturating_sub(view.origin)
     };
-    let mut w = *written;
-    let mut lit_pos = 0usize;
+    let vbase_op = virt_base.wrapping_sub(out_base as usize);
+    let wrap_base = (out_base as usize).wrapping_sub(block_start);
 
     // The decode state runs as loop locals instead of `dec.next()` calls:
     // fields stored through the `&mut` per iteration pinned the bit window
-    // and the three table entries to memory (SROA could not promote them),
+    // and the three stream states to memory (SROA could not promote them),
     // which showed as a stack round-trip on every sequence. On success the
     // locals are written back for `finish`; an error aborts the frame, so a
     // stale struct is never observed.
     let super::sequence_section_decoder::SeqDecoder {
         tbl,
         src_ptr,
-        src_len,
         mut ip,
-        mut bits,
         mut win,
         mut consumed,
-        mut ll_entry,
-        mut ml_entry,
-        mut of_entry,
-        nseq,
-        mut idx,
+        mut ll_state,
+        mut ml_state,
+        mut of_state,
+        mut rem,
     } = *dec;
 
-    while idx != nseq {
-        let seq = match decode_step(
-            tbl, src_ptr, src_len, &mut ip, &mut bits, &mut win, &mut consumed, &mut ll_entry,
-            &mut ml_entry, &mut of_entry, nseq, &mut idx,
-        ) {
-            Ok(Some(seq)) => seq,
-            Ok(None) => break,
-            Err(e) => return Err(DecompressBlockError::DecodeSequenceError(e)),
-        };
-        exec_one_flat::<NOWRAP>(
+    // Output and literal cursors as pointers: the bases fold into them, and
+    // `w`/`lit_pos` stop being separate live values.
+    let mut op = out_base.wrapping_add(*written);
+    let mut lit = lit_base;
+
+    while rem != 0 {
+        let seq = decode_step(
+            tbl,
+            src_ptr,
+            &mut ip,
+            &mut win,
+            &mut consumed,
+            &mut ll_state,
+            &mut ml_state,
+            &mut of_state,
+            &mut rem,
+        )
+        .map_err(DecompressBlockError::DecodeSequenceError)?;
+        exec_one_flat::<NOWRAP, HEADROOM>(
             seq,
-            literals,
-            &mut lit_pos,
-            out_ptr,
-            out_len,
-            &mut w,
-            block_start,
-            virt_base,
+            &mut op,
+            out_base,
+            out_end,
+            &mut lit,
+            lit_base,
+            lit_end,
+            vbase_op,
+            wrap_base,
             view,
             offset_hist,
         )
@@ -232,28 +300,28 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     }
 
     dec.ip = ip;
-    dec.bits = bits;
     dec.win = win;
     dec.consumed = consumed;
-    dec.ll_entry = ll_entry;
-    dec.ml_entry = ml_entry;
-    dec.of_entry = of_entry;
-    dec.idx = idx;
+    dec.ll_state = ll_state;
+    dec.ml_state = ml_state;
+    dec.of_state = of_state;
+    dec.rem = rem;
 
-    let rest = literals.len() - lit_pos;
+    let rest = lit_end as usize - lit as usize;
     if rest > 0 {
-        if w + rest > out_len {
+        if !HEADROOM && op as usize + rest > out_end as usize {
             return Err(DecompressBlockError::ExecuteSequencesError(
                 ExecuteSequencesError::TargetTooSmall,
             ));
         }
-        // SAFETY: budget checked above; rest literals fit like the copies above
+        // SAFETY: budget checked above (or guaranteed by HEADROOM); rest
+        // literals fit like the copies above
         unsafe {
-            core::ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out_ptr.add(w), rest);
+            core::ptr::copy_nonoverlapping(lit, op, rest);
+            op = op.add(rest);
         }
-        w += rest;
     }
-    *written = w;
+    *written = op as usize - out_base as usize;
     dec.finish()
         .map_err(DecompressBlockError::DecodeSequenceError)
 }
@@ -265,7 +333,8 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
 /// readable/writable bytes (the wildcopy budget checks provide them).
 #[inline(always)]
 unsafe fn copy8(dst: *mut u8, src: *const u8) {
-    dst.cast::<u64>().write_unaligned(src.cast::<u64>().read_unaligned());
+    dst.cast::<u64>()
+        .write_unaligned(src.cast::<u64>().read_unaligned());
 }
 
 /// Inline 16-byte copy (see [`copy8`]).
@@ -340,65 +409,64 @@ unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
     }
 }
 
-/// Copy `ll` literals from `literals[lit_pos..]` to `out[w..]` with inline
-/// 16-byte chunks and the same overshoot contract as [`wildcopy_match`].
-/// Reads may run up to 15 bytes past the literals' end, so the caller must
-/// keep that inside the literals buffer's allocation (16 bytes reserved).
+/// Copy `ll` literals from `*lit` to `*op` with inline 16-byte chunks and
+/// the same overshoot contract as [`wildcopy_match`]. Reads may run up to 15
+/// bytes past the literals' end, so the caller must keep that inside the
+/// literals buffer's allocation (16 bytes reserved).
 #[inline(always)]
-unsafe fn wildcopy_literals(
-    out: *mut u8,
-    literals: *const u8,
-    w: usize,
-    lit_pos: usize,
-    ll: usize,
-) {
-    copy16(out.add(w), literals.add(lit_pos));
+unsafe fn wildcopy_literals(d0: *mut u8, s0: *const u8, ll: usize) {
+    copy16(d0, s0);
     if ll > 16 {
-        let end = w + ll;
-        let mut d = w + 16;
-        let mut s = lit_pos + 16;
+        let end = d0.add(ll);
+        let mut d = d0.add(16);
+        let mut s = s0.add(16);
         while d < end {
-            copy16(out.add(d), literals.add(s));
-            d += 16;
-            s += 16;
+            copy16(d, s);
+            d = d.add(16);
+            s = s.add(16);
         }
     }
 }
 
 /// Execute a single decoded sequence into the flat target: the literal copy,
-/// offset-history resolution, and the match copy.
+/// offset-history resolution, and the match copy. `op`/`lit` are the output
+/// and literal cursors; `vbase_op`/`wrap_base` are the executor's folded
+/// bases (see `execute_decoded_flat_inner`).
 ///
-/// Bounds are one merged budget: `end = w + ll + ml` must stay inside the
-/// target, and `end + 16 <= out_len` gates the wildcopy overshoot of BOTH
-/// copies at once (neither copy's cursor ever passes `end`).
+/// Without HEADROOM, bounds are one merged budget: `op + ll + ml` must stay
+/// inside the target, and it plus 16 gates the wildcopy overshoot of BOTH
+/// copies at once (neither copy's cursor ever passes the sequence end). With
+/// HEADROOM both hold by construction and every copy wildcopies.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn exec_one_flat<const NOWRAP: bool>(
+fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     seq: Sequence,
-    literals: &[u8],
-    lit_pos: &mut usize,
-    out_ptr: *mut u8,
-    out_len: usize,
-    w: &mut usize,
-    block_start: usize,
-    virt_base: usize,
+    op: &mut *mut u8,
+    out_base: *mut u8,
+    out_end: *mut u8,
+    lit: &mut *const u8,
+    lit_base: *const u8,
+    lit_end: *const u8,
+    vbase_op: usize,
+    wrap_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let ll = seq.ll as usize;
     let ml = seq.ml as usize;
-    let end = *w + ll + ml;
-    if end > out_len {
+    let opa = *op as usize;
+    let end = opa + ll + ml;
+    let enda = out_end as usize;
+    if !HEADROOM && end > enda {
         return Err(ExecuteSequencesError::TargetTooSmall);
     }
-    let wild = end + 16 <= out_len;
+    let wild = HEADROOM || end + 16 <= enda;
     if ll > 0 {
-        let high = *lit_pos + ll;
-        if high > literals.len() {
+        if *lit as usize + ll > lit_end as usize {
             return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                wanted: high,
-                have: literals.len(),
+                wanted: (*lit as usize - lit_base as usize) + ll,
+                have: lit_end as usize - lit_base as usize,
             });
         }
         // Wildcopy when the 16-byte overshoot stays inside `out` (the
@@ -408,16 +476,12 @@ fn exec_one_flat<const NOWRAP: bool>(
         // address order by later sequences before it is ever read.
         unsafe {
             if wild {
-                wildcopy_literals(out_ptr, literals.as_ptr(), *w, *lit_pos, ll);
+                wildcopy_literals(*op, *lit, ll);
             } else {
-                core::ptr::copy_nonoverlapping(
-                    literals.as_ptr().add(*lit_pos),
-                    out_ptr.add(*w),
-                    ll,
-                );
+                core::ptr::copy_nonoverlapping(*lit, *op, ll);
             }
+            *lit = (*lit).add(ll);
         }
-        *lit_pos = high;
     }
 
     let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
@@ -425,11 +489,14 @@ fn exec_one_flat<const NOWRAP: bool>(
         return Err(ExecuteSequencesError::ZeroOffset);
     }
     let offset = actual_offset as usize;
-    let pos = end - ml;
+    // Virtual position of the match destination: op still points at the
+    // sequence start, so the literal length belongs in every address below.
+    let dst_a = opa + ll;
+    let pos = dst_a - out_base as usize;
     // No dictionary in the flat path, so an offset past the frame's own
     // output is always corruption. Checked even for ml == 0 to reject
     // corrupt frames eagerly.
-    let cur_v = virt_base + pos;
+    let cur_v = dst_a.wrapping_add(vbase_op);
     if offset > cur_v {
         return Err(ExecuteSequencesError::DecodebufferError(
             crate::decoding::errors::DecodeBufferError::OffsetTooBig {
@@ -443,13 +510,21 @@ fn exec_one_flat<const NOWRAP: bool>(
         // distances there, so the source sits exactly `offset` bytes behind
         // the destination and the whole match runs as one linear copy. The
         // never-wrapped instantiation is always this case.
-        if !NOWRAP && offset > block_start + pos {
-            copy_wrapped_match(view, virt_base, out_ptr, pos, offset, ml, wild)?;
+        if !NOWRAP && offset.wrapping_add(wrap_base) > dst_a {
+            copy_wrapped_match(
+                view,
+                vbase_op + out_base as usize,
+                out_base,
+                pos,
+                offset,
+                ml,
+                wild,
+            )?;
         } else {
             // SAFETY: budget checked; the doubling in the exact path and the
             // distance rules in wildcopy_match keep reads behind the cursor
             unsafe {
-                let dst = out_ptr.add(pos);
+                let dst = (*op).add(ll);
                 let src = dst.sub(offset);
                 if wild {
                     wildcopy_match(dst, src, ml);
@@ -464,7 +539,9 @@ fn exec_one_flat<const NOWRAP: bool>(
             }
         }
     }
-    *w = end;
+    // SAFETY: the merged budget check above proved ll + ml stays inside the
+    // target slice (or HEADROOM guarantees it)
+    unsafe { *op = (*op).add(ll + ml) };
     Ok(())
 }
 

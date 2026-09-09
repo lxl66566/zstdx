@@ -24,6 +24,10 @@ const MAX_BLOCK_SIZE_USIZE: usize = MAX_BLOCK_SIZE as usize;
 /// nominal block end without touching the history segment.
 const WRAP_SLACK: usize = 64;
 
+/// Wildcopy overshoot the block target must absorb beyond a full block
+/// (16-byte chunks copying past the sequence end).
+pub(crate) const WILDCOPY_SLACK: usize = 16;
+
 /// Read-only window mapping handed to the sequence executor: virtual
 /// addresses are global frame positions; the active segment maps
 /// `v >= origin` to `v - origin`, the wrapped-away previous segment maps
@@ -99,12 +103,17 @@ impl FlatOut {
     /// flush the pending bytes (`start < end`); in that case no header should
     /// have been consumed from the source yet.
     ///
+    /// On success the block target `buf[end..]` holds at least
+    /// `MAX_BLOCK_SIZE + WILDCOPY_SLACK` bytes beyond the cursor, letting the
+    /// sequence executor drop its per-sequence bounds checks (the HEADROOM
+    /// instantiation of `execute_decoded_flat`).
+    ///
     /// With `force`, the buffer grows past the steady-state size instead of
     /// returning false — used by the All strategy, which promises to decode
     /// every block before the caller reads (the ring path satisfies this by
     /// growing without bound too).
     pub fn ensure_block_space(&mut self, force: bool) -> bool {
-        if self.end + MAX_BLOCK_SIZE_USIZE <= self.buf.len() {
+        if self.end + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK <= self.buf.len() {
             return true;
         }
         if self.start == self.end && self.end >= self.window + MAX_BLOCK_SIZE_USIZE {
@@ -129,7 +138,7 @@ impl FlatOut {
             // must flush first and wrap later.
             let target = (2 * cap).max(2 * MAX_BLOCK_SIZE_USIZE).max(needed);
             self.buf.resize(target, 0);
-            return self.end + MAX_BLOCK_SIZE_USIZE <= self.buf.len();
+            return self.end + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK <= self.buf.len();
         }
         false
     }

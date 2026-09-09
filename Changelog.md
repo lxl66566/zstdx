@@ -4,6 +4,27 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The fused sequence decoder carries the three FSE states instead of the
+  packed table entries, and drops `bits` and `src_len` from its carried
+  stream state entirely: the reload always rebuilds the bit window straight
+  from memory (the `nb == 0` clamp path is provably idempotent on the
+  window, and `ip >= 1` implies the stream spans a full 8-byte read), so
+  the raw container never crosses a sequence boundary. The executor's
+  output/literal cursors become raw pointers with folded bases — the
+  virtual-address check reads `op + vbase_op`, the wrapped-source check
+  `offset + wrap_base > op` — and the sequence countdown replaces the
+  idx/nseq pair. The clamped reload inlines as a cold block instead of a
+  call, which had forced every loop-carried value into a stack home.
+  Together with a `HEADROOM` instantiation for targets that guarantee a
+  block's size plus 16 bytes of slack (the flat streaming/MT buffers, via
+  `ensure_block_space`; exactly-sized slice targets keep the checks), the
+  per-sequence budget check and wildcopy gate vanish from the streaming
+  loop. Interleaved A/B on the streaming path: json.zst1/3/9 +4.7/+6.3/
+  +4.7%, text.zst1/3/9 +5.8/+7.4/+4.0%, skewed.zst9 +5.5%, others flat.
+  State-packing the three FSE states into one u32 was tried and reverted:
+  the pack/unpack ops land on the serial FSE chain and cost more than the
+  spills they remove.
+
 * New `bench_matrix` example: the head-to-head comparison widened to the
   full decode/encode × bulk/streaming × single-/multi-thread matrix.
   Five modes (`dec-st`, `dec-mt`, `enc-st`, `enc-mt`, `enc-stream`) run

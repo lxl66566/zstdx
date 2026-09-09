@@ -156,6 +156,7 @@ impl BlockDecoder {
         written: &mut usize,
         virt_base: usize,
         view: crate::decoding::flat_buffer::FlatView,
+        headroom: bool,
     ) -> Result<usize, DecompressBlockError> {
         let DecoderScratch {
             huf,
@@ -183,6 +184,7 @@ impl BlockDecoder {
                 virt_base,
                 view,
                 offset_hist,
+                headroom,
             )?;
         } else {
             if !raw.is_empty() {
