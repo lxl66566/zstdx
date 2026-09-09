@@ -528,61 +528,38 @@ fn exec_one_flat<const NOWRAP: bool>(
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
+///
+/// The repcode domain (`offset_value <= 3`) is handled ZSTD_decodeSequence
+/// style: the code plus the literal-length-0 flag forms a slot index
+/// (`code - 1 + ll0`), where slot 3 — code 3 with no literals — is the
+/// `rep0 - 1` pseudo-slot, folded onto `scratch[0]` with a conditional
+/// subtract after the shared load. The same slot picks the history
+/// rotation in one branch: 0 keeps everything (code 1 with literals), 1
+/// swaps the two most recent codes, anything else — including real
+/// offsets, whose slot is always >= 3 — rotates all three.
 pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let actual_offset = if lit_len > 0 {
-        match offset_value {
-            1..=3 => scratch[offset_value as usize - 1],
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
+    let idx = offset_value
+        .wrapping_sub(1)
+        .wrapping_add((lit_len == 0) as u32);
+    let actual_offset = if offset_value <= 3 {
+        // A malformed dictionary can seed scratch[0] with 0; saturate so this
+        // resolves to 0 (rejected upstream as ZeroOffset) instead of
+        // underflowing. See #115.
+        scratch[(if idx == 3 { 0 } else { idx }) as usize].saturating_sub((idx == 3) as u32)
     } else {
-        match offset_value {
-            1..=2 => scratch[offset_value as usize],
-            // A malformed dictionary can seed scratch[0] with 0; saturate so this
-            // resolves to 0 (rejected upstream as ZeroOffset) instead of
-            // underflowing. See #115.
-            3 => scratch[0].saturating_sub(1),
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
+        offset_value - 3
     };
 
-    //update history
-    if lit_len > 0 {
-        match offset_value {
-            1 => {
-                //nothing
-            }
-            2 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
+    match idx {
+        0 => {}
+        1 => {
+            scratch[1] = scratch[0];
+            scratch[0] = actual_offset;
         }
-    } else {
-        match offset_value {
-            1 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            2 => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
+        _ => {
+            scratch[2] = scratch[1];
+            scratch[1] = scratch[0];
+            scratch[0] = actual_offset;
         }
     }
 
@@ -602,5 +579,61 @@ mod tests {
         // than panicking (debug) or wrapping to u32::MAX (release). See #115.
         let mut scratch = [0u32, 4, 8];
         assert_eq!(do_offset_history(3, 0, &mut scratch), 0);
+    }
+
+    /// Reference: the spec's offset-code table, as the match-tree
+    /// implementation spelled it before the slot-index rewrite.
+    fn reference(of: u32, ll: u32, s: &mut [u32; 3]) -> u32 {
+        let actual = if ll > 0 {
+            match of {
+                1..=3 => s[of as usize - 1],
+                _ => of - 3,
+            }
+        } else {
+            match of {
+                1..=2 => s[of as usize],
+                3 => s[0].saturating_sub(1),
+                _ => of - 3,
+            }
+        };
+        match (ll > 0, of) {
+            (true, 1) => {}
+            (true, 2) | (false, 1) => {
+                s[1] = s[0];
+                s[0] = actual;
+            }
+            _ => {
+                s[2] = s[1];
+                s[1] = s[0];
+                s[0] = actual;
+            }
+        }
+        actual
+    }
+
+    #[test]
+    fn slot_indexed_history_matches_reference() {
+        for ll in [0u32, 1, 7] {
+            for of in 1u32..300 {
+                for seed in 0..8u32 {
+                    let mut a = [seed + 1, seed * 3 + 4, seed * 5 + 8];
+                    let mut b = a;
+                    let ra = do_offset_history(of, ll, &mut a);
+                    let rb = reference(of, ll, &mut b);
+                    assert_eq!((ra, a), (rb, b), "of={of} ll={ll} seed={seed}");
+                }
+            }
+        }
+        // The zero-seeded pseudo-slot must saturate identically (see #115).
+        for of in 1u32..6 {
+            let mut a = [0u32, 4, 8];
+            let mut b = a;
+            assert_eq!(
+                do_offset_history(of, 0, &mut a),
+                reference(of, 0, &mut b),
+                "of={of}"
+            );
+            assert_eq!(a, b, "of={of}");
+        }
     }
 }

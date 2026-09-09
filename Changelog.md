@@ -4,6 +4,14 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* `do_offset_history` resolves and updates the repcode history from a
+  single slot index (`code - 1 + ll0`, where slot 3 is the `rep0 - 1`
+  pseudo-slot folded onto `scratch[0]`), replacing the two chained match
+  trees with one branch; behavior is byte-for-byte identical (exhaustively
+  tested against the old implementation). Throughput is neutral within
+  noise on the corpus; the win is fewer instructions per sequence on
+  repcode-dense streams.
+
 * The single-table emit helpers (`emit_seq`, `emit_seq_chain`,
   `rep1_chain`) move from twelve-to-fourteen-argument free functions into
   a shared `TableEmit` context (head table, output streams, per-block
