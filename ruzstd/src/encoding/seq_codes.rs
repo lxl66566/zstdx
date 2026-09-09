@@ -1,8 +1,25 @@
 //! Literal-length / match-length / offset code computation shared by the
-//! matcher's emit path and the block encoder. The matcher pushes the packed
-//! per-sequence streams (`code << 16 | ml << 8 | ll`, merged add-bits payload,
-//! total add-bit count) directly, so the block encoder never re-reads the raw
-//! (ll, ml, of) triples.
+//! matcher's emit path and the block encoder. The matcher pushes one packed
+//! [`SeqWord`](super::SeqWord) per sequence (`code << 16 | ml << 8 | ll`,
+//! merged add-bits payload, total add-bit count), so the block encoder never
+//! re-reads the raw (ll, ml, of) triples.
+
+use super::SeqWord;
+
+/// Pack one (ll, ml, of-wire) triple into the word the block encoder
+/// consumes: the three code bytes plus the code-specific add bits merged
+/// into a single payload and width.
+#[inline(always)]
+pub(crate) fn pack_seq(ll: u32, ml: u32, of: u32) -> SeqWord {
+    let (lc, la, ln) = encode_literal_length(ll);
+    let (mc, ma, mn) = encode_match_len(ml);
+    let (oc, oa, on) = encode_offset(of);
+    SeqWord {
+        codes: lc as u32 | (mc as u32) << 8 | (oc as u32) << 16,
+        add: la as u64 | ((ma as u64) << ln) | ((oa as u64) << (ln + mn)),
+        add_nb: (ln + mn + on) as u8,
+    }
+}
 
 /// Per-code metadata for literal lengths: (base value, extra bit count).
 const fn ll_meta() -> [(u32, u8); 36] {

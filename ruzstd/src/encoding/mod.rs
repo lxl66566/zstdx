@@ -24,6 +24,8 @@ use crate::io::{Read, Write};
 use crate::Level;
 use alloc::vec::Vec;
 
+use seq_codes::pack_seq;
+
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
 /// use ruzstd::{encoding::compress, Level};
@@ -114,6 +116,19 @@ pub struct EncodedSequence {
     pub of: u32,
 }
 
+/// One matcher-emitted sequence in the exact representation the
+/// sequence-section encoder consumes: the packed code triple
+/// `ll | ml << 8 | of << 16`, the merged add-bits payload (ll add in the
+/// low bits, then ml, then of) and its total width. One buffer of these
+/// replaces three parallel streams, so the matcher's emit path pays a
+/// single push per sequence.
+#[derive(Clone, Copy)]
+pub(crate) struct SeqWord {
+    pub(crate) codes: u32,
+    pub(crate) add: u64,
+    pub(crate) add_nb: u8,
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -173,31 +188,17 @@ pub trait Matcher {
         });
     }
     /// Packed variant of [`Matcher::start_matching_into`] and the block
-    /// encoder's hot path: literals accumulate in `literals` while each match
-    /// appends one packed code triple `ll | ml << 8 | of << 16` to `codes`,
-    /// its merged add-bits payload to `add_bits` (ll add in the low bits,
-    /// then ml, then of) and the payload width to `add_nbs`. This is exactly
-    /// the representation the sequence-section encoder consumes, so the raw
-    /// (ll, ml, of) triples never round-trip through a separate buffer.
-    /// `codes.len()` is the sequence count; a block that produces no
-    /// sequences may leave `literals` empty (see
-    /// [`Matcher::start_matching_into`]).
-    fn start_matching_codes(
-        &mut self,
-        literals: &mut Vec<u8>,
-        codes: &mut Vec<u32>,
-        add_bits: &mut Vec<u64>,
-        add_nbs: &mut Vec<u8>,
-    ) {
+    /// encoder's hot path: literals accumulate in `literals` while each
+    /// match appends one [`SeqWord`] to `seqs` — the exact representation
+    /// the sequence-section encoder consumes, so the raw (ll, ml, of)
+    /// triples never round-trip through a separate buffer. `seqs.len()` is
+    /// the sequence count; a block that produces no sequences may leave
+    /// `literals` empty (see [`Matcher::start_matching_into`]).
+    fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         let mut sequences = Vec::new();
         self.start_matching_into(literals, &mut sequences);
         for seq in sequences {
-            let (lc, la, ln) = seq_codes::encode_literal_length(seq.ll);
-            let (mc, ma, mn) = seq_codes::encode_match_len(seq.ml);
-            let (oc, oa, _) = seq_codes::encode_offset(seq.of);
-            codes.push(lc as u32 | (mc as u32) << 8 | (oc as u32) << 16);
-            add_bits.push(la as u64 | ((ma as u64) << ln) | ((oa as u64) << (ln + mn)));
-            add_nbs.push((ln + mn + oc as usize) as u8);
+            seqs.push(pack_seq(seq.ll, seq.ml, seq.of));
         }
     }
     /// Reset this matcher so it can be used for the next new frame

@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The matcher's per-sequence emit path pays one buffer push instead of
+  three: the packed code triple, merged add-bits payload and payload width
+  now live in one `SeqWord` word per sequence (`Matcher::start_matching_codes`
+  and the block encoder consume the single stream). The dfast strategy's
+  emit helpers take a shared context (tables, streams, per-block constants)
+  instead of a fourteen-argument signature, the push helper and code packer
+  are always-inlined, zero-literal sequences skip the literal copy outright,
+  and probe validity (epoch, window age, window buffer) resolves through a
+  select that aliases invalid candidates to the scanning position — the byte
+  compare then rejects them with one predictable branch instead of a
+  three-comparison chain (libzstd's selectAddr trick). All levels emit
+  byte-identical output; json at Fast gains a further 17% on top of the
+  dfast matcher (314 → 366 MiB/s, 0.57× → 0.76× of zstd -3 per standalone
+  A/B; bench ratio 1.57 → 1.32) and skewed.Fast 152 → 161 MiB/s.
+
 * The Fast level now uses a port of libzstd's double-fast (dfast) matcher:
   two single-probe tables — an 8-byte long hash (2^17 slots) and a 5-byte
   short hash (2^16) — with a two-position pipeline, short-hit upgrades by

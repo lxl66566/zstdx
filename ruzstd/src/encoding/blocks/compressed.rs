@@ -48,9 +48,7 @@ pub(crate) enum BlockOutcome {
 #[derive(Default)]
 pub(crate) struct BlockScratch {
     literals: Vec<u8>,
-    packed_codes: Vec<u32>,
-    add_bits: Vec<u64>,
-    add_nbs: Vec<u8>,
+    seqs: Vec<crate::encoding::SeqWord>,
     /// Sticky heuristic: the previous block's literals cleared the exact
     /// entropy bound, so the strided gate below is skipped until a block
     /// proves otherwise. Pure cost hint; every outcome stays reachable.
@@ -71,22 +69,18 @@ pub(crate) fn compress_block<M: Matcher>(
     // the pooled buffers keep that capacity after the first blocks.
     let BlockScratch {
         literals: literals_vec,
-        packed_codes,
-        add_bits,
-        add_nbs,
+        seqs,
         literals_gate_hold,
     } = scratch;
     literals_vec.clear();
-    packed_codes.clear();
-    add_bits.clear();
-    add_nbs.clear();
-    matcher.start_matching_codes(literals_vec, packed_codes, add_bits, add_nbs);
+    seqs.clear();
+    matcher.start_matching_codes(literals_vec, seqs);
 
     // A zero-sequence block stages no literals (the matcher skips the
     // whole-block copy); its literals are the block itself, read straight
     // from the window. Same bytes, so every entropy decision below — and
     // thus the output — matches the staged path.
-    let zero_seq = packed_codes.is_empty();
+    let zero_seq = seqs.is_empty();
     let literals: &[u8] = if zero_seq {
         matcher.get_last_space()
     } else {
@@ -124,10 +118,10 @@ pub(crate) fn compress_block<M: Matcher>(
 
     // sequences section
 
-    if packed_codes.is_empty() {
+    if seqs.is_empty() {
         writer.write_bits(0u8, 8);
     } else {
-        encode_seqnum(packed_codes.len(), &mut writer);
+        encode_seqnum(seqs.len(), &mut writer);
 
         // Choose the tables with libzstd's fast-strategy heuristics: RLE
         // when one code covers everything, predefined when the block is too
@@ -136,8 +130,7 @@ pub(crate) fn compress_block<M: Matcher>(
         // codes and pre-merged add-bit payloads, so the per-code metadata is
         // computed exactly once per sequence and every consumer (table
         // selection, table description, bitstream encoder) reads the streams.
-        let (ll_mode, ml_mode, of_mode) =
-            choose_tables_fast(&packed_codes, default_tables, previous_tables);
+        let (ll_mode, ml_mode, of_mode) = choose_tables_fast(seqs, default_tables, previous_tables);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -146,10 +139,8 @@ pub(crate) fn compress_block<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            packed_codes.len(),
-            &packed_codes,
-            &add_bits,
-            &add_nbs,
+            seqs.len(),
+            seqs,
             &mut writer,
             ll_mode.as_ref(),
             ml_mode.as_ref(),
@@ -204,7 +195,7 @@ impl FseTableMode<'_> {
 /// mode is then decided from its own counts (three selection passes used to
 /// scan the code stream separately).
 fn choose_tables_fast<'a>(
-    packed_codes: &[u32],
+    seqs: &[crate::encoding::SeqWord],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
     previous_tables: (
         &'a Option<FSETable>,
@@ -212,17 +203,18 @@ fn choose_tables_fast<'a>(
         &'a Option<FSETable>,
     ),
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
-    let nb_seq = packed_codes.len();
+    let nb_seq = seqs.len();
     let mut ll_counts = [0u32; 256];
     let mut ml_counts = [0u32; 256];
     let mut of_counts = [0u32; 256];
-    for &packed in packed_codes {
+    for &word in seqs {
+        let packed = word.codes;
         ll_counts[(packed & 0xFF) as usize] += 1;
         ml_counts[((packed >> 8) & 0xFF) as usize] += 1;
         of_counts[(packed >> 16) as usize] += 1;
     }
-    let first = packed_codes[0];
-    let last = packed_codes[nb_seq - 1];
+    let first = seqs[0].codes;
+    let last = seqs[nb_seq - 1].codes;
     (
         select_from_counts(
             &mut ll_counts,
@@ -386,9 +378,7 @@ fn encode_fse_table_modes(
 
 fn encode_sequences(
     nb_seq: usize,
-    packed_codes: &[u32],
-    add_bits: &[u64],
-    add_nbs: &[u8],
+    seqs: &[crate::encoding::SeqWord],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_table: &FSETable,
     ml_table: &FSETable,
@@ -405,7 +395,7 @@ fn encode_sequences(
     let (of_rows, of_shift) = of_table.transitions_flat();
 
     let li = nb_seq - 1;
-    let packed = packed_codes[li];
+    let packed = seqs[li].codes;
     let ll_code = packed as u8;
     let ml_code = (packed >> 8) as u8;
     let of_code = (packed >> 16) as u8;
@@ -429,14 +419,14 @@ fn encode_sequences(
             &mut pos,
             &mut acc,
             &mut bits,
-            add_bits[li],
-            add_nbs[li] as usize,
+            seqs[li].add,
+            seqs[li].add_nb as usize,
         );
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
             for i in (0..=nb_seq - 2).rev() {
-                let packed = packed_codes[i];
+                let packed = seqs[i].codes;
                 let ll_code = packed as u8;
                 let ml_code = (packed >> 8) as u8;
                 let of_code = (packed >> 16) as u8;
@@ -472,8 +462,8 @@ fn encode_sequences(
                 // cap keeps a post-flush (bits < 8) accumulator from dropping
                 // payload; wider pairs fall back to two pushes of the same
                 // bits.
-                let add = add_bits[i];
-                let add_nb = add_nbs[i] as usize;
+                let add = seqs[i].add;
+                let add_nb = seqs[i].add_nb as usize;
                 let trans_nb = of_nb + ml_nb + ll_nb;
                 if trans_nb + add_nb <= 56 {
                     hot_push(
