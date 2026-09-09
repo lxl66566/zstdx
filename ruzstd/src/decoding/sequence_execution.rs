@@ -169,6 +169,7 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
     use crate::decoding::errors::{DecompressBlockError, ExecuteSequencesError};
+    use super::sequence_section_decoder::decode_step;
 
     let out_ptr = out.as_mut_ptr();
     let out_len = out.len();
@@ -192,10 +193,36 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     let mut w = *written;
     let mut lit_pos = 0usize;
 
-    while let Some(seq) = dec
-        .next()
-        .map_err(DecompressBlockError::DecodeSequenceError)?
-    {
+    // The decode state runs as loop locals instead of `dec.next()` calls:
+    // fields stored through the `&mut` per iteration pinned the bit window
+    // and the three table entries to memory (SROA could not promote them),
+    // which showed as a stack round-trip on every sequence. On success the
+    // locals are written back for `finish`; an error aborts the frame, so a
+    // stale struct is never observed.
+    let super::sequence_section_decoder::SeqDecoder {
+        tbl,
+        src_ptr,
+        src_len,
+        mut ip,
+        mut bits,
+        mut win,
+        mut consumed,
+        mut ll_entry,
+        mut ml_entry,
+        mut of_entry,
+        nseq,
+        mut idx,
+    } = *dec;
+
+    while idx != nseq {
+        let seq = match decode_step(
+            tbl, src_ptr, src_len, &mut ip, &mut bits, &mut win, &mut consumed, &mut ll_entry,
+            &mut ml_entry, &mut of_entry, nseq, &mut idx,
+        ) {
+            Ok(Some(seq)) => seq,
+            Ok(None) => break,
+            Err(e) => return Err(DecompressBlockError::DecodeSequenceError(e)),
+        };
         exec_one_flat::<NOWRAP>(
             seq,
             literals,
@@ -214,6 +241,15 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
         .map_err(DecompressBlockError::ExecuteSequencesError)?;
     }
 
+    dec.ip = ip;
+    dec.bits = bits;
+    dec.win = win;
+    dec.consumed = consumed;
+    dec.ll_entry = ll_entry;
+    dec.ml_entry = ml_entry;
+    dec.of_entry = of_entry;
+    dec.idx = idx;
+
     let rest = literals.len() - lit_pos;
     if rest > 0 {
         if w + rest > out_len {
@@ -230,6 +266,113 @@ fn execute_decoded_flat_inner<const NOWRAP: bool>(
     *written = w;
     dec.finish()
         .map_err(DecompressBlockError::DecodeSequenceError)
+}
+
+/// Inline 8-byte copy: variable-length libc calls cost ~15-25 cycles of
+/// PLT and prologue each, which dominated the fused loop on sequence-dense
+/// payloads (millions of ~5-byte copies per 32 MiB). Fixed 8/16-byte
+/// load-store pairs have no such overhead. Both pointers must allow 8
+/// readable/writable bytes (the wildcopy budget checks provide them).
+#[inline(always)]
+unsafe fn copy8(dst: *mut u8, src: *const u8) {
+    dst.cast::<u64>().write_unaligned(src.cast::<u64>().read_unaligned());
+}
+
+/// Inline 16-byte copy (see [`copy8`]).
+#[inline(always)]
+unsafe fn copy16(dst: *mut u8, src: *const u8) {
+    dst.cast::<u128>()
+        .write_unaligned(src.cast::<u128>().read_unaligned());
+}
+
+/// libzstd's dec32/dec64 tables for spreading a sub-8 offset.
+const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
+const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
+
+/// Copy 8 bytes from `*src` to `*dst` so that the source distance afterwards
+/// is at least 8, letting the 8-byte chunk loop proceed without reading
+/// unwritten bytes (libzstd's `ZSTD_overlapCopy8`). The distance `dst - src`
+/// must be in 1..16; both cursors advance by 8. Pointers (not indices) so the
+/// distance is computed in one address space regardless of which segments the
+/// caller's buffers belong to.
+#[inline(always)]
+unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
+    let offset = (*dst as usize).wrapping_sub(*src as usize);
+    debug_assert!((1..16).contains(&offset));
+    if offset < 8 {
+        let d = *dst;
+        let s = *src;
+        // The first four bytes go one at a time: with offset < 4 each store
+        // feeds the next load (overlapping-copy semantics), so a wide load
+        // here would read unwritten bytes.
+        *d = *s;
+        *d.add(1) = *s.add(1);
+        *d.add(2) = *s.add(2);
+        *d.add(3) = *s.add(3);
+        let s2 = s.add(DEC32[offset]);
+        // This load only touches bytes at or below d+4 that the stores above
+        // (or earlier output) have already written.
+        d.add(4)
+            .cast::<u32>()
+            .write_unaligned(s2.cast::<u32>().read_unaligned());
+        *src = s2.add(8 - DEC64[offset]);
+    } else {
+        copy8(*dst, *src);
+        *src = src.add(8);
+    }
+    *dst = dst.add(8);
+}
+
+/// Wildcopy `ml` bytes from `src0` to `dst0` in 16/8-byte inline chunks,
+/// overshooting the end by up to 16 bytes. A distance >= 16 uses 16-byte
+/// chunks (the source stays 16 bytes behind the write cursor); below 16 the
+/// offset is first spread to >= 8 and 8-byte chunks follow. The caller
+/// guarantees the overshoot stays inside the output buffer (budget check
+/// `end + 16 <= out_len`); the garbage it leaves beyond the sequence end is
+/// always overwritten in address order by the next sequence's literals or
+/// match before anything can read it.
+#[inline(always)]
+unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
+    let end = d.add(ml);
+    if (d as usize).wrapping_sub(s as usize) >= 16 {
+        while d < end {
+            copy16(d, s);
+            d = d.add(16);
+            s = s.add(16);
+        }
+    } else {
+        overlap_copy8(&mut d, &mut s);
+        while d < end {
+            copy8(d, s);
+            d = d.add(8);
+            s = s.add(8);
+        }
+    }
+}
+
+/// Copy `ll` literals from `literals[lit_pos..]` to `out[w..]` with inline
+/// 16-byte chunks and the same overshoot contract as [`wildcopy_match`].
+/// Reads may run up to 15 bytes past the literals' end, so the caller must
+/// keep that inside the literals buffer's allocation (16 bytes reserved).
+#[inline(always)]
+unsafe fn wildcopy_literals(
+    out: *mut u8,
+    literals: *const u8,
+    w: usize,
+    lit_pos: usize,
+    ll: usize,
+) {
+    copy16(out.add(w), literals.add(lit_pos));
+    if ll > 16 {
+        let end = w + ll;
+        let mut d = w + 16;
+        let mut s = lit_pos + 16;
+        while d < end {
+            copy16(out.add(d), literals.add(s));
+            d += 16;
+            s += 16;
+        }
+    }
 }
 
 /// Execute a single decoded sequence into the flat target: the literal copy,
@@ -265,10 +408,21 @@ fn exec_one_flat<const NOWRAP: bool>(
                 have: literals.len(),
             });
         }
-        // SAFETY: high <= literals.len() by the check above; w + ll stays
-        // below out_len through the budget check
+        // Wildcopy when the 16-byte overshoot stays inside `out` (the
+        // literal buffer has 16 reserved bytes behind its length); exact
+        // libc copy otherwise (short tail near the frame end).
+        // SAFETY: bounds as documented; the overshoot is overwritten in
+        // address order by later sequences before it is ever read.
         unsafe {
-            core::ptr::copy_nonoverlapping(literals.as_ptr().add(*lit_pos), out_ptr.add(*w), ll);
+            if *w + ll + 16 <= out_len {
+                wildcopy_literals(out_ptr, literals.as_ptr(), *w, *lit_pos, ll);
+            } else {
+                core::ptr::copy_nonoverlapping(
+                    literals.as_ptr().add(*lit_pos),
+                    out_ptr.add(*w),
+                    ll,
+                );
+            }
         }
         *lit_pos = high;
         *w += ll;
@@ -291,42 +445,43 @@ fn exec_one_flat<const NOWRAP: bool>(
         ));
     }
     if ml > 0 {
+        // Wildcopy budget: the 16-byte overshoot must stay inside `out`.
+        let wild = *w + ml + 16 <= out_len;
         if NOWRAP {
             // No wrap has happened: virtual addresses are physical offsets,
-            // so the anchor is a plain pointer. Overlapping matches grow in
-            // doubling chunks anchored at the match source (same scheme as
-            // repeat_in_chunks): after `copied` appended bytes the readable
-            // span is `offset + copied` long, so every chunk reads only
-            // already-written bytes.
-            // SAFETY: cur_v - offset >= 0 was checked above and the doubling
-            // cap keeps reads inside the already-written region
-            let src = unsafe { base.add(cur_v - offset) };
-            let mut copied = 0;
-            while copied < ml {
-                let chunk = (offset + copied).min(ml - copied);
-                // SAFETY: src range [src, src + chunk) lies inside the
-                // written region; dst end stays below the budget
-                unsafe {
-                    core::ptr::copy(src, out_ptr.add(*w + copied), chunk);
+            // so source and destination address through one linear space.
+            // SAFETY: budget checked; the doubling in the exact path and the
+            // distance rules in wildcopy_match keep reads behind the cursor
+            unsafe {
+                let src = base.add(cur_v - offset);
+                if wild {
+                    wildcopy_match(out_ptr.add(*w), src, ml);
+                } else {
+                    let mut copied = 0;
+                    while copied < ml {
+                        let chunk = (offset + copied).min(ml - copied);
+                        core::ptr::copy(src, out_ptr.add(*w + copied), chunk);
+                        copied += chunk;
+                    }
                 }
-                copied += chunk;
             }
         } else {
             // Copy `ml` bytes from the virtual source `cur_v - offset`,
-            // splitting at the physical segment boundary. Within a segment
-            // the doubling scheme applies: the source anchor stays fixed and
-            // each chunk is capped by the already-written span behind the
-            // anchor, so reads never run ahead of the write cursor.
+            // splitting at the physical segment boundary. Sources inside the
+            // active segment run as one contiguous wildcopy (the segment is
+            // linear and the source stays behind the write cursor); sources
+            // in the wrapped-away previous segment, or runs crossing the
+            // boundary, keep the exact doubling path.
             let mut src_v = cur_v - offset;
             let mut dst = *w;
             let mut remaining = ml;
             while remaining > 0 {
                 // Map into the active segment, or into the previous segment
                 // below its physical end; anything lower is out of window.
-                let (src_abs, seg_end) = if src_v >= origin {
-                    (src_v - origin, seg_out_len)
+                let (src_abs, seg_end, active) = if src_v >= origin {
+                    (src_v - origin, seg_out_len, true)
                 } else if src_v >= prev_origin {
-                    (src_v - prev_origin, seg_a_end)
+                    (src_v - prev_origin, seg_a_end, false)
                 } else {
                     return Err(ExecuteSequencesError::DecodebufferError(
                         crate::decoding::errors::DecodeBufferError::OffsetTooBig {
@@ -336,6 +491,16 @@ fn exec_one_flat<const NOWRAP: bool>(
                     ));
                 };
                 let chunk = remaining.min(seg_end - src_abs);
+                if active && wild {
+                    // The whole rest of the match lies in the active segment
+                    // (virtual addresses up to the destination), so finish it
+                    // in one wildcopy.
+                    // SAFETY: same contract as the NOWRAP branch
+                    unsafe {
+                        wildcopy_match(out_ptr.add(dst), base.add(src_abs), remaining);
+                    }
+                    break;
+                }
                 // Already-written bytes behind the anchor, as a virtual
                 // distance (positive: the source is always behind dst).
                 let readable = virt_base + dst - src_v;

@@ -302,18 +302,18 @@ fn pack_rle_entry((base, add): (u32, u8), slot: &mut u64) {
 /// ring-buffer path) from the same code.
 pub(crate) struct SeqDecoder {
     /// Base of the packed tables in their fixed slots (see `pack_tables`).
-    tbl: *const u64,
-    src_ptr: *const u8,
-    src_len: usize,
-    ip: usize,
-    bits: u64,
-    win: u64,
-    consumed: u32,
-    ll_entry: u64,
-    ml_entry: u64,
-    of_entry: u64,
-    nseq: usize,
-    idx: usize,
+    pub(crate) tbl: *const u64,
+    pub(crate) src_ptr: *const u8,
+    pub(crate) src_len: usize,
+    pub(crate) ip: usize,
+    pub(crate) bits: u64,
+    pub(crate) win: u64,
+    pub(crate) consumed: u32,
+    pub(crate) ll_entry: u64,
+    pub(crate) ml_entry: u64,
+    pub(crate) of_entry: u64,
+    pub(crate) nseq: usize,
+    pub(crate) idx: usize,
 }
 
 impl SeqDecoder {
@@ -440,10 +440,12 @@ impl SeqDecoder {
 
 /// Decode one sequence and advance the streams for the one after it (the
 /// body of `next`). State passes as scalars so the caller's SROA sees plain
-/// local variables. Returns `None` once all `nseq` sequences are decoded.
+/// local variables; the flat executor calls this directly with loop-local
+/// state to keep it register-resident (see `sequence_execution`). Returns
+/// `None` once all `nseq` sequences are decoded.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn decode_step(
+pub(crate) fn decode_step(
     tbl: *const u64,
     src_ptr: *const u8,
     src_len: usize,

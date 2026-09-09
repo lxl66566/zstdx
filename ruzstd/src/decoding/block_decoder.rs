@@ -170,6 +170,10 @@ impl BlockDecoder {
             self.parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
 
         if seq_section.num_sequences != 0 {
+            // The flat executor's inline 16-byte literal copies may read up
+            // to 15 bytes past the final literal; keep that inside the
+            // allocation (the bytes themselves are never used).
+            literals_buffer.reserve(16);
             let mut dec = SeqDecoder::new(&seq_section, raw, fse)?;
             execute_decoded_flat(
                 &mut dec,
