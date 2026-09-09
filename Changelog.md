@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The sequential fallback of `decode_to_vec_mt` retries with doubling
+  capacity like `bulk::decompress`, honoring the same append contract as
+  the parallel path for a fresh output vec (a plain
+  `FrameDecoder::decode_all_to_vec` errors with `TargetTooSmall` on a
+  zero-capacity vec because the frame size cannot fit). The doubling is
+  tracked explicitly: re-reserving the current capacity is a no-op once
+  spare capacity covers it, which would spin. Adds a regression test that
+  multithreaded-decodes libzstd single-thread output of semi-structured
+  records (huffman literals in back-to-back blocks, the shape whose
+  accumulated-buffer staging the old check rejected) at levels 1/3/9.
+
 * `decompress_literals` validates the number of literals it appended
   against the section's regenerated size instead of the output buffer's
   total length. The absolute comparison assumed an empty target, which

@@ -663,9 +663,25 @@ pub fn decode_to_vec_mt(
         unsafe { output.set_len(start_len + written) };
         Ok(())
     } else {
-        let mut decoder = FrameDecoder::new();
-        decoder.set_max_window_size(max_window_size);
-        decoder.decode_all_to_vec(input, output)
+        // The parallel path grows `output` segment by segment; the
+        // sequential fallback must honor the same append contract for a
+        // fresh Vec, so retry with doubling capacity like bulk::decompress.
+        // The tracked bound doubles explicitly: `reserve` is a no-op while
+        // spare capacity already covers the request, so re-reserving a
+        // constant would spin.
+        let mut capacity = output.capacity().max(64 * 1024);
+        loop {
+            let mut decoder = FrameDecoder::new();
+            decoder.set_max_window_size(max_window_size);
+            match decoder.decode_all_to_vec(input, output) {
+                Ok(()) => return Ok(()),
+                Err(FrameDecoderError::TargetTooSmall) => {
+                    capacity *= 2;
+                    output.reserve(capacity - output.len());
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -674,6 +690,7 @@ mod tests {
     use super::{decode_all_mt, decode_to_vec_mt};
     use crate::decoding::FrameDecoder;
     use crate::{bulk, EncoderOptions, Level};
+    use alloc::format;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -748,6 +765,46 @@ mod tests {
         let mut out = Vec::new();
         decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
         assert_eq!(out, data);
+    }
+
+    /// Semi-structured records make libzstd emit Huffman-coded literals in
+    /// back-to-back blocks, so segments stage several Huffman sections into
+    /// one accumulated literals buffer (the absolute-length check in
+    /// `decompress_literals` used to reject the second one).
+    #[test]
+    fn zstd_crate_output_decodes_semi_structured() {
+        let mut state = 12345u64;
+        let mut data = Vec::with_capacity(8 * 1024 * 1024);
+        let mut id = 0u64;
+        while data.len() < 8 * 1024 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let user = (state >> 33) % 5000;
+            let event = match (state >> 45) % 5 {
+                0 => "click",
+                1 => "view",
+                2 => "purchase",
+                3 => "error",
+                _ => "login",
+            };
+            let payload_len = ((state >> 25) % 24) as usize;
+            data.extend_from_slice(
+                format!("{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"payload\":\"",
+                    1700000000 + id)
+                    .as_bytes(),
+            );
+            data.resize(data.len() + payload_len, b'x');
+            data.extend_from_slice(b"\",\"score\":0.5}\n");
+            id += 1;
+        }
+        for level in [1, 3, 9] {
+            let compressed = zstd::bulk::compress(&data, level).unwrap();
+            let mut out = Vec::new();
+            decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+            assert_eq!(out, data, "level {level}");
+            let mut placed = vec![0u8; data.len()];
+            let n = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW).unwrap();
+            assert_eq!(&placed[..n], &data[..], "level {level}");
+        }
     }
 
     /// A skippable frame between two real frames contributes no output.
