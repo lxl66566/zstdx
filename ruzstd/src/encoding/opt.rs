@@ -554,6 +554,7 @@ impl Finder<'_, '_> {
     /// Collect every candidate at `idx` whose length strictly improves on the
     /// previous one, repcodes first (`ZSTD_insertBtAndGetAllMatches`).
     /// Returns the match count; `length_to_beat` starts at `min_match`.
+    #[allow(clippy::too_many_arguments)]
     fn get_all_matches(
         &mut self,
         matches: &mut [Match],
@@ -905,9 +906,9 @@ fn run_once<const ULTRA: bool>(
                 opt[pos_i].litlen = litlen + pos_i as u32;
                 pos_i += 1;
             }
-            for m in 0..nb {
-                let off = matches[m].off;
-                let end = matches[m].len as usize;
+            for &cand in &matches[..nb] {
+                let off = cand.off;
+                let end = cand.len as usize;
                 while pos_i <= end {
                     let price = opt[0].price + state.match_price::<ULTRA>(off, pos_i as u32);
                     opt[pos_i] = Optimal {
@@ -1097,10 +1098,10 @@ fn run_once<const ULTRA: bool>(
             opt[store_start] = next_stretch;
             stretch_pos -= (next_stretch.litlen + next_stretch.mlen) as usize;
         }
-        for p in store_start..=store_end {
-            let litlen_s = opt[p].litlen;
-            let mlen_s = opt[p].mlen;
-            let off_s = opt[p].off;
+        for entry in &opt[store_start..=store_end] {
+            let litlen_s = entry.litlen;
+            let mlen_s = entry.mlen;
+            let off_s = entry.off;
             if mlen_s == 0 {
                 // Leading literals of the series: not a sequence.
                 pos = anchor + litlen_s as u64;
