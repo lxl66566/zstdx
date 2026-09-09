@@ -344,9 +344,11 @@ unsafe fn copy16(dst: *mut u8, src: *const u8) {
         .write_unaligned(src.cast::<u128>().read_unaligned());
 }
 
-/// libzstd's dec32/dec64 tables for spreading a sub-8 offset.
+/// libzstd's dec32 table for spreading a sub-8 offset, and the matching
+/// net source adjustment `8 - dec64` (entries 5..8 move the source BACK —
+/// signed, the usize form of the subtraction underflows).
 const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
-const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
+const DEC_BACK: [isize; 8] = [0, 0, 0, 1, 0, -1, -2, -3];
 
 /// Copy 8 bytes from `*src` to `*dst` so that the source distance afterwards
 /// is at least 8, letting the 8-byte chunk loop proceed without reading
@@ -374,7 +376,7 @@ unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
         d.add(4)
             .cast::<u32>()
             .write_unaligned(s2.cast::<u32>().read_unaligned());
-        *src = s2.add(8 - DEC64[offset]);
+        *src = s2.offset(DEC_BACK[offset]);
     } else {
         copy8(*dst, *src);
         *src = src.add(8);

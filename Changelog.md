@@ -25,6 +25,12 @@ This document records the changes made between versions, starting with version 0
   the pack/unpack ops land on the serial FSE chain and cost more than the
   spills they remove.
 
+* `overlap_copy8` computed its post-spread source as `s2 + (8 - dec64)`
+  in usize; for spread offsets 5-7 the adjustment is negative and the
+  subtraction underflowed — a debug-build panic (12 corpus tests fail)
+  and a wrapped-but-accidentally-correct pointer in release. The table
+  is now the signed `8 - dec64` applied via `offset`, matching libzstd's
+  `*ip -= dec64table[offset]` directly.
 * The fused sequence loop's bitstream reads and repcode resolution lost
   their data-dependent branches. Zero-width reads (the `sum == 0` /
   `sum_t == 0` fast cases, taken constantly on rep0-heavy structured
