@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The Balanced level pins its chain-table log to its window (W20 + C20 +
+  H17, was W21 + C20): the chain table is position-indexed, so its log is
+  also the match reach, and the old pairing silently dropped links past
+  1 MiB inside the 2 MiB window. With reach equal to the window every
+  in-window position stays linked, and matches beyond 1 MiB — whose offset
+  codes cost more than they save — disappear from the output. Interleaved
+  A/B against zstd -6 on the 32 MiB corpus: json 165 → 177 MiB/s
+  (1.14× → 1.06×) and skewed 110 → 152 MiB/s (0.97× → 0.70×, ahead on
+  both speed and ratio now); compressed sizes shrink slightly on both
+  (json −0.8%, skewed −0.4%), text unchanged in size and ~1% slower.
+  Smaller tables in zstd-6's shape (C18/H19) were measured and rejected:
+  reach truncation collapses skewed to 2.2×. Only Balanced output bytes
+  change; other levels are byte-identical.
+
 * The matcher's per-sequence emit path pays one buffer push instead of
   three: the packed code triple, merged add-bits payload and payload width
   now live in one `SeqWord` word per sequence (`Matcher::start_matching_codes`

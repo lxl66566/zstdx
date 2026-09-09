@@ -83,9 +83,15 @@ const FAST_PARAMS: LevelParams = LevelParams {
     lazy_depth: 0,
 };
 
+/// The chain table is position-indexed, so its log doubles as the match
+/// reach; pinning it to the window makes every in-window position linked
+/// (no reach truncation). A/B on the 32 MiB corpus: matching zstd-6's C18
+/// truncates chains at 256 KiB and collapses skewed (0.97→2.2xslow), while
+/// the full-coverage 1 MiB window beats the old W21+C20 on both speed
+/// (json 1.14→1.07) and ratio (far-offset codes disappear).
 const BALANCED_PARAMS: LevelParams = LevelParams {
     hash_log: 17,
-    window: 1 << 21,
+    window: 1 << 20,
     strategy: Strategy::Chain(20),
     search_depth: 16,
     lazy_depth: 2,
