@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The flat decoder's sequence executor copies literals and matches with
+  inline 16/8-byte chunks (libzstd's wildcopy scheme, budget-gated 16 bytes
+  before the output end with an exact-copy tail path) instead of one libc
+  memcpy/memmove call per sequence: sequence-dense payloads paid millions
+  of ~5-byte PLT calls per 32 MiB. Sub-16 offsets go through a port of
+  ZSTD_overlapCopy8 (dec32/dec64 tables) whose leading four bytes copy one
+  at a time so each store feeds the next load. Offsets below 16 in the
+  wrapped streaming view run 8-byte chunks when the source stays inside the
+  active segment and exact copies across the segment boundary. Decode of
+  json/skewed/text at levels 1-9 gains 23-45% (e.g. skewed.zst9 481 →
+  673 MiB/s, json.zst1 streaming 0.61× → 0.76× of the zstd crate), with
+  incompressible and run-length payloads unchanged.
+
 * The chain levels grow their probe step on long literal runs (the fast
   strategy's miss-acceleration policy), so incompressible data no longer
   pays a full chain walk per byte: random 32 MiB compresses at ~2.1 GiB/s
