@@ -2,6 +2,10 @@ use super::scratch::DecoderScratch;
 use crate::blocks::sequence_section::Sequence;
 use crate::decoding::errors::ExecuteSequencesError;
 
+/// Largest decompressed block; a single sequence's match can never exceed it
+/// (ll + ml fit one block's content).
+const MAX_BLOCK_USIZE: usize = crate::common::MAX_BLOCK_SIZE as usize;
+
 /// Take the provided decoder and execute the sequences stored within
 pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
     let old_buffer_size = scratch.buffer.len();
@@ -548,11 +552,13 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
 }
 
 /// Match copy for a source at or below the active segment (see `FlatView`):
-/// either the wrapped-away previous segment or a run crossing the segment
-/// boundary, split at the physical edges with doubling out of already-written
-/// bytes. Out of line and cold — the segment-mapping state is loop-invariant
+/// the common case resolves inline at the top as one linear copy (see the
+/// fast path below); sources crossing the segment boundary fall to the
+/// generic walk, split at the physical edges with doubling out of already
+/// written bytes. Out of line — the segment-mapping state is loop-invariant
 /// but keeping it live in the fused loop costs every sequence register
-/// pressure, while this path is rare outside long-offset-heavy frames.
+/// pressure, and the straddling path is rare outside long-offset-heavy
+/// frames.
 #[cold]
 fn copy_wrapped_match(
     view: crate::decoding::flat_buffer::FlatView,
@@ -571,6 +577,31 @@ fn copy_wrapped_match(
         out_len: seg_out_len,
     } = view;
     let block_start = virt_base.saturating_sub(origin);
+    // Fast path: a source entirely inside the previous segment is still one
+    // linear in-buffer copy. The previous segment physically sits
+    // `seg_a_end - offset` ABOVE the destination — the wrap margin keeps
+    // every in-window source at least MAX_BLOCK_SIZE above the write cursor
+    // (so the copy never overlaps and a sequence's ml can never exceed the
+    // distance), and its bytes at least 16 under the physical buffer end
+    // (so wildcopy overshoot stays in the allocation). `d` is how far the
+    // source reaches below the segment start: d >= ml means no straddle.
+    // Offsets past the guaranteed window (only possible beyond the frame's
+    // window bound) fall through to the generic walk below, which rejects
+    // out-of-window sources.
+    let d = offset - block_start - pos;
+    if d >= ml && offset + MAX_BLOCK_USIZE <= seg_a_end {
+        // SAFETY: bounds as documented above
+        unsafe {
+            let dst = out_ptr.add(pos);
+            let src = dst.add(seg_a_end - offset);
+            if wild {
+                wildcopy_match(dst, src, ml);
+            } else {
+                core::ptr::copy_nonoverlapping(src, dst, ml);
+            }
+        }
+        return Ok(());
+    }
     // SAFETY: out is the slice starting block_start bytes into the buffer
     let base = unsafe { out_ptr.sub(block_start) };
     let mut src_v = virt_base + pos - offset;

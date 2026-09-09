@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* A match source below the active segment (a wrapped-away previous-segment
+  reference) resolves as one linear in-buffer copy instead of the generic
+  segment walk: the previous segment physically sits `seg_a_end - offset`
+  above the destination, and the wrap margin keeps every in-window source
+  at least MAX_BLOCK_SIZE above the write cursor (never overlapping, ml
+  never exceeding the distance) and its bytes at least 16 under the buffer
+  end (wildcopy overshoot safe). Only sources straddling the wrap boundary
+  or past the window bound keep the generic path. The fast path lives at
+  the top of the out-of-line `copy_wrapped_match`, leaving the fused loop's
+  codegen untouched — an inline version shifted its layout and cost
+  json.zst1 ~1%. Interleaved A/B streaming: skewed.zst9 +4.8% (wrapped
+  matches are 99.99% of its far-offset references; the walk was 15.6% of
+  cycles), json.zst1/skewed.zst3 +0.9%, others flat.
+
 * The fused sequence decoder carries the three FSE states instead of the
   packed table entries, and drops `bits` and `src_len` from its carried
   stream state entirely: the reload always rebuilds the bit window straight
