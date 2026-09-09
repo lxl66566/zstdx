@@ -8,9 +8,12 @@
 //! slice entry point guarantees stable for the whole call, and `Drop` drains
 //! the ring before the handle can outlive the buffer.
 //!
-//! The worker spins: block cadence on the engaging payloads is a few
-//! microseconds, far below any park/wake latency, and the single-core-pinned
-//! case never engages (see [`AsyncChecksum::new`]).
+//! The worker spins under a bounded budget and then parks on a condvar: the
+//! block cadence on the engaging payloads (tens of microseconds between raw
+//! blocks) fits inside the budget, so steady state never pays a wake, while
+//! genuinely idle stretches — the rest of the process — stop burning a core
+//! instead of spinning forever. The head flip is published under the wake
+//! mutex so a parked worker cannot miss a post.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -18,6 +21,7 @@ use core::cell::RefCell;
 use core::marker::PhantomData;
 use core::slice;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use crate::xxh64::Xxh64;
 
@@ -29,6 +33,15 @@ const RING: usize = 512;
 const KIND_ABSORB: usize = 0;
 const KIND_RESET: usize = 1;
 const KIND_FINISH: usize = 2;
+
+/// Spin iterations before the worker parks. One iteration is an acquire
+/// load plus `PAUSE`, roughly 10 ns, so the budget covers ~300 µs of
+/// idling: above the cadence of a worker-saturated pipeline (one 128 KiB
+/// block hashes in ~50-100 µs scalar, and the cadence cannot drop below
+/// that), so the engaging payloads never pay a wake, while an uncontended
+/// lock-and-notify per post (~20 ns, once per block) stays invisible on
+/// the producer and idle stretches stop burning a core after ~300 µs.
+const SPIN_BUDGET: u32 = 32768;
 
 struct Slot {
     ptr: AtomicPtr<u8>,
@@ -44,6 +57,11 @@ struct Shared {
     tail: AtomicU64,
     slots: [Slot; RING],
     running: AtomicBool,
+    /// Parking lot for an idle worker. Guards the head flip (producer side)
+    /// against the `head <= done` recheck (worker side), so a post can never
+    /// be missed by a worker heading into `wait`.
+    wake: Mutex<()>,
+    wake_cond: Condvar,
 }
 
 struct Producer {
@@ -87,9 +105,14 @@ impl Producer {
         slot.len.store(len, Ordering::Relaxed);
         slot.state_id.store(self.state_id, Ordering::Relaxed);
         // The kind store publishes the payload fields to the consumer that
-        // acquires it; the head store publishes the slot itself.
+        // acquires it; the head store publishes the slot itself, under the
+        // wake mutex so a parked worker observes it before sleeping again.
         slot.kind.store(kind, Ordering::Release);
-        self.shared.head.store(seq + 1, Ordering::Release);
+        {
+            let _guard = self.shared.wake.lock().unwrap();
+            self.shared.head.store(seq + 1, Ordering::Release);
+        }
+        self.shared.wake_cond.notify_one();
         self.posted_upto = seq + 1;
     }
 
@@ -125,6 +148,8 @@ fn worker_shared() -> Option<Arc<Shared>> {
                     }
                 }; RING],
                 running: AtomicBool::new(true),
+                wake: Mutex::new(()),
+                wake_cond: Condvar::new(),
             });
             let worker_shared = shared.clone();
             std::thread::Builder::new()
@@ -144,8 +169,21 @@ fn run(shared: Arc<Shared>) {
     let mut states: Vec<Xxh64> = Vec::new();
     let mut done = 0u64;
     while shared.running.load(Ordering::Relaxed) {
+        let mut spins = 0u32;
         while shared.head.load(Ordering::Acquire) <= done {
-            spin();
+            if spins < SPIN_BUDGET {
+                spins += 1;
+                spin();
+                continue;
+            }
+            // Idle past the budget: park until a post flips head under the
+            // wake mutex and notifies. The recheck under the lock is what
+            // makes the handoff lossless.
+            let mut guard = shared.wake.lock().unwrap();
+            while shared.head.load(Ordering::Acquire) <= done {
+                guard = shared.wake_cond.wait(guard).unwrap();
+            }
+            break;
         }
         let slot = &shared.slots[(done % RING as u64) as usize];
         let kind = slot.kind.load(Ordering::Acquire);
@@ -300,5 +338,21 @@ mod tests {
         hb.write(&b);
         assert_eq!(ha.finish(), ra.finish() as u32);
         assert_eq!(hb.finish(), rb.finish() as u32);
+    }
+
+    /// Posts separated by idle gaps past the spin budget must park the
+    /// worker and still be absorbed exactly once: the parked handoff cannot
+    /// drop or duplicate a block.
+    #[test]
+    fn posts_across_park_wake_are_exact() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let mut reference = Xxh64::new(0);
+        reference.write(&data);
+        let mut offloaded = AsyncChecksum::new().unwrap();
+        for chunk in data.chunks(1024) {
+            offloaded.write(chunk);
+            std::thread::sleep(core::time::Duration::from_millis(2));
+        }
+        assert_eq!(offloaded.finish(), reference.finish() as u32);
     }
 }

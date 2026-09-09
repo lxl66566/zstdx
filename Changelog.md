@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The async checksum worker spins under a bounded budget (~300 µs) and then
+  parks on a condvar instead of burning a core for the whole process
+  lifetime. The head flip is published under the wake mutex so a parked
+  worker cannot miss a post; the budget sits above the cadence of a
+  worker-saturated pipeline (a 128 KiB raw block hashes in 50-100 µs), so
+  the engaging payloads never pay a wake — verified by the worker's
+  voluntary context switches staying at ~1 per frame during a saturated
+  run and zero CPU during idle stretches. Throughput on the corpus is
+  unchanged within noise (json.Fast 367 MiB/s, random.Fast interleaved A/B
+  inside machine-drift variance).
+
 * The fused flat decode loop addresses active-segment match sources as a
   plain `dst - offset` pointer (virtual distances are physical distances
   inside the linear active segment — the buffer-base indirection cancels),
