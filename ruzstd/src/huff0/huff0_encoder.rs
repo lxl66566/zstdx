@@ -182,25 +182,16 @@ impl HuffmanTable {
 
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
-        let zeros = counts.iter().filter(|x| **x == 0).count();
-        let mut weights = distribute_weights(counts.len() - zeros);
-        let limit = weights.len().ilog2() as usize + 2;
-        redistribute_weights(&mut weights, limit);
-
-        weights.reverse();
-        let mut counts_sorted = counts.iter().enumerate().collect::<Vec<_>>();
-        counts_sorted.sort_by_key(|(_, c1)| *c1);
-
-        let mut weights_distributed = alloc::vec![0; counts.len()];
-        for (idx, count) in counts_sorted {
-            if *count == 0 {
-                weights_distributed[idx] = 0;
-            } else {
-                weights_distributed[idx] = weights.pop().unwrap();
-            }
-        }
-
-        Self::build_from_weights(&weights_distributed)
+        // Optimal length-limited code lengths from the actual magnitudes;
+        // the rank-only assignment this replaces lost noticeably on skewed
+        // literal distributions (json digits/quotes).
+        let lengths = package_merge_lengths(counts, MAX_CODE_LENGTH);
+        let max_len = lengths.iter().copied().max().unwrap_or(1);
+        let weights: Vec<usize> = lengths
+            .iter()
+            .map(|&len| if len == 0 { 0 } else { max_len - len + 1 })
+            .collect();
+        Self::build_from_weights(&weights)
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
@@ -316,156 +307,132 @@ fn huffman() {
     assert_eq!(table.codes[5], (1, 4));
 }
 
-/// Distributes weights that add up to a clean power of two
-fn distribute_weights(amount: usize) -> Vec<usize> {
-    assert!(amount >= 2);
-    assert!(amount <= 256);
-    let mut weights = Vec::new();
+/// Maximum Huffman code length the literals section can carry.
+const MAX_CODE_LENGTH: usize = 11;
 
-    // This is the trivial power of two we always need
-    weights.push(1);
-    weights.push(1);
-
-    // This is the weight we are adding right now
-    let mut target_weight = 1;
-    // Counts how many times we have added weights
-    let mut weight_counter = 2;
-
-    // We always add a power of 2 new weights so that the weights that we add equal
-    // the weights are already in the vec if raised to the power of two.
-    // This means we double the weights in the vec -> results in a new power of two
-    //
-    // Example: [1, 1]      -> [1,1,2]       (2^1 + 2^1 == 2^2)
-    //
-    // Example: [1, 1]      -> [1,1,1,1]     (2^1 + 2^1 == 2^1 + 2^1)
-    //          [1,1,1,1]   -> [1,1,1,1,3]   (2^1 + 2^1 + 2^1 + 2^1 == 2^3)
-    while weights.len() < amount {
-        let mut add_new = 1 << (weight_counter - target_weight);
-        let available_space = amount - weights.len();
-
-        // If the amount of new weights needed to get to the next power of two would exceed amount
-        // We instead add 1 of a bigger weight and start the cycle again
-        if add_new > available_space {
-            // TODO we could maybe instead do this until add_new <= available_space?
-            //  target_weight += 1
-            //  add_new /= 2
-            target_weight = weight_counter;
-            add_new = 1;
-        }
-
-        for _ in 0..add_new {
-            weights.push(target_weight);
-        }
-        weight_counter += 1;
+/// Boundary package-merge (Larmore-Hirschberg): optimal length-limited code
+/// lengths. Zero-count symbols get length 0; the returned lengths for used
+/// symbols are Kraft-exact (sum of 2^-len == 1) and never exceed `max_len`.
+/// Requires `max_len >= log2(symbol count)` and at least two used symbols.
+fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
+    #[derive(Clone, Copy)]
+    enum Node {
+        Leaf(u16),
+        Pkg(u32, u32),
+    }
+    #[derive(Clone, Copy)]
+    struct Ent {
+        weight: u64,
+        node: u32,
     }
 
-    assert_eq!(amount, weights.len());
-
-    weights
-}
-
-/// Sometimes distribute_weights generates weights that require too many bits to encode
-/// This redistributes the weights to have less variance by raising the lower weights while still maintaining the
-/// required attributes of the weight distribution
-fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
-    let weight_sum_log = weights
-        .iter()
-        .copied()
-        .map(|x| 1 << x)
-        .sum::<usize>()
-        .ilog2() as usize;
-
-    // Nothing needs to be done, this is already fine
-    if weight_sum_log < max_num_bits {
-        return;
-    }
-
-    // We need to decrease the weight difference by the difference between weight_sum_log and max_num_bits
-    let decrease_weights_by = weight_sum_log - max_num_bits + 1;
-
-    // To do that we raise the lower weights up by that difference, recording how much weight we added in the process
-    let mut added_weights = 0;
-    for weight in weights.iter_mut() {
-        if *weight < decrease_weights_by {
-            for add in *weight..decrease_weights_by {
-                added_weights += 1 << add;
-            }
-            *weight = decrease_weights_by;
+    let mut lengths = alloc::vec![0usize; counts.len()];
+    let mut leaves: Vec<Ent> = Vec::new();
+    let mut arena: Vec<Node> = Vec::new();
+    for (sym, &count) in counts.iter().enumerate() {
+        if count > 0 {
+            arena.push(Node::Leaf(sym as u16));
+            leaves.push(Ent {
+                weight: count as u64,
+                node: (arena.len() - 1) as u32,
+            });
         }
     }
+    let n = leaves.len();
+    assert!(n >= 2, "single-symbol alphabets go through the RLE path");
+    assert!(max_len >= n.next_power_of_two().ilog2() as usize);
+    leaves.sort_by_key(|e| (e.weight, e.node));
+    let take = 2 * (n - 1);
 
-    // Then we reduce weights until the added weights are equaled out
-    while added_weights > 0 {
-        // Find the highest weight that is still lower or equal to the added weight
-        let mut current_idx = 0;
-        let mut current_weight = 0;
-        for (idx, weight) in weights.iter().copied().enumerate() {
-            if 1 << (weight - 1) > added_weights {
-                break;
-            }
-            if weight > current_weight {
-                current_weight = weight;
-                current_idx = idx;
+    // Level lists: level 0 is the leaves alone; every further level merges
+    // the leaves with packages formed from consecutive pairs of the previous
+    // level, keeping the cheapest `take` items.
+    let mut lists: Vec<Vec<Ent>> = Vec::with_capacity(max_len);
+    let mut first = leaves.clone();
+    first.truncate(take);
+    lists.push(first);
+    for _ in 1..max_len {
+        let prev = lists.last().unwrap();
+        let mut packages: Vec<Ent> = Vec::with_capacity(n - 1);
+        let mut i = 0;
+        while i + 1 < prev.len() && packages.len() < n - 1 {
+            let id = arena.len() as u32;
+            arena.push(Node::Pkg(prev[i].node, prev[i + 1].node));
+            packages.push(Ent {
+                weight: prev[i].weight + prev[i + 1].weight,
+                node: id,
+            });
+            i += 2;
+        }
+        packages.sort_by_key(|e| (e.weight, e.node));
+        // Intermediate levels can hold fewer than `take` items; only the
+        // top level is guaranteed full (L >= log2 n).
+        let mut merged: Vec<Ent> = Vec::with_capacity(take);
+        let mut li = 0;
+        let mut pi = 0;
+        while merged.len() < take && (li < leaves.len() || pi < packages.len()) {
+            let pick_leaf = pi >= packages.len()
+                || (li < leaves.len()
+                    && (leaves[li].weight, leaves[li].node)
+                        <= (packages[pi].weight, packages[pi].node));
+            if pick_leaf {
+                merged.push(leaves[li]);
+                li += 1;
+            } else {
+                merged.push(packages[pi]);
+                pi += 1;
             }
         }
-
-        // Reduce that weight by 1
-        added_weights -= 1 << (current_weight - 1);
-        weights[current_idx] -= 1;
+        lists.push(merged);
     }
 
-    // At the end we normalize the weights so that they start at 1 again
-    if weights[0] > 1 {
-        let offset = weights[0] - 1;
-        for weight in weights.iter_mut() {
-            *weight -= offset;
-        }
-    }
-}
-
-#[test]
-fn weights() {
-    // assert_eq!(distribute_weights(5).as_slice(), &[1, 1, 2, 3, 4]);
-    for amount in 2..=256 {
-        let mut weights = distribute_weights(amount);
-        assert_eq!(weights.len(), amount);
-        let sum = weights
-            .iter()
-            .copied()
-            .map(|weight| 1 << weight)
-            .sum::<usize>();
-        assert!(sum.is_power_of_two());
-
-        for num_bit_limit in (amount.ilog2() as usize + 1)..=11 {
-            redistribute_weights(&mut weights, num_bit_limit);
-            let sum = weights
-                .iter()
-                .copied()
-                .map(|weight| 1 << weight)
-                .sum::<usize>();
-            assert!(sum.is_power_of_two());
-            assert!(
-                sum.ilog2() <= 11,
-                "Max bits too big: sum: {} {weights:?}",
-                sum
-            );
-
-            let codes = HuffmanTable::build_from_weights(&weights).codes;
-            for (code, num_bits) in codes.iter().copied() {
-                for (code2, num_bits2) in codes.iter().copied() {
-                    if num_bits == 0 || num_bits2 == 0 || (code, num_bits) == (code2, num_bits2) {
-                        continue;
-                    }
-                    if num_bits <= num_bits2 {
-                        let code2_shifted = code2 >> (num_bits2 - num_bits);
-                        assert_ne!(
-                            code, code2_shifted,
-                            "{code:b},{num_bits:} is prefix of {code2:b},{num_bits2:}"
-                        );
-                    }
+    // Walk the solution back down: every leaf encountered at level k adds one
+    // length unit; packages expand into their children one level below.
+    let mut active: Vec<u32> = lists.last().unwrap().iter().map(|e| e.node).collect();
+    for _ in (0..max_len).rev() {
+        let mut next = Vec::with_capacity(active.len());
+        for id in active {
+            match arena[id as usize] {
+                Node::Leaf(sym) => lengths[sym as usize] += 1,
+                Node::Pkg(a, b) => {
+                    next.push(a);
+                    next.push(b);
                 }
             }
         }
+        active = next;
+    }
+    debug_assert_eq!(
+        lengths
+            .iter()
+            .map(|&l| if l == 0 { 0 } else { 1usize << (max_len - l) })
+            .sum::<usize>(),
+        1 << max_len,
+        "package-merge lengths must be Kraft-exact"
+    );
+    lengths
+}
+
+#[test]
+fn package_merge_optimality() {
+    // {A:1, B:1, C:2} with limit 2: optimal lengths [2, 2, 1].
+    let lengths = package_merge_lengths(&[1, 1, 2], 2);
+    assert_eq!(lengths.as_slice(), &[2, 2, 1]);
+    // A classic Huffman shape: fibonacci counts produce consecutive lengths.
+    let counts = [1, 1, 2, 3, 5, 8];
+    let lengths = package_merge_lengths(&counts, 11);
+    let cost: usize = counts.iter().zip(&lengths).map(|(c, l)| c * l).sum();
+    assert_eq!(cost, 1 * 5 + 1 * 5 + 2 * 4 + 3 * 3 + 5 * 2 + 8 * 1);
+    // Every alphabet size produces Kraft-exact, bounded lengths.
+    for amount in 2..=256usize {
+        let counts: Vec<usize> = (0..amount).map(|i| amount - i).collect();
+        let lengths = package_merge_lengths(&counts, 11);
+        assert!(lengths.iter().all(|&l| l <= 11));
+        let kraft: usize = lengths
+            .iter()
+            .map(|&l| if l == 0 { 0 } else { 1usize << (11 - l) })
+            .sum();
+        assert_eq!(kraft, 1 << 11);
     }
 }
 
@@ -475,9 +442,17 @@ fn counts() {
     let table = HuffmanTable::build_from_counts(counts).codes;
 
     assert_eq!(table[1].1, 0);
-    assert!(table[3].1 >= table[0].1);
-    assert!(table[0].1 >= table[2].1);
-    assert!(table[2].1 >= table[4].1);
+    // Optimal lengths: strictly larger counts never get longer codes.
+    let mut sorted: Vec<(usize, u8)> = counts
+        .iter()
+        .zip(table.iter())
+        .filter(|(c, _)| **c > 0)
+        .map(|(c, (_, nb))| (*c, *nb))
+        .collect();
+    sorted.sort_by_key(|(c, _)| *c);
+    for pair in sorted.windows(2) {
+        assert!(pair[1].1 <= pair[0].1, "{sorted:?}");
+    }
 
     let counts = &[3, 0, 4, 0, 7, 2, 2, 2, 0, 2, 2, 1, 5];
     let table = HuffmanTable::build_from_counts(counts).codes;
@@ -485,23 +460,26 @@ fn counts() {
     assert_eq!(table[1].1, 0);
     assert_eq!(table[3].1, 0);
     assert_eq!(table[8].1, 0);
-    assert!(table[11].1 >= table[5].1);
-    assert!(table[5].1 >= table[6].1);
-    assert!(table[6].1 >= table[7].1);
-    assert!(table[7].1 >= table[9].1);
-    assert!(table[9].1 >= table[10].1);
-    assert!(table[10].1 >= table[0].1);
-    assert!(table[0].1 >= table[2].1);
-    assert!(table[2].1 >= table[12].1);
-    assert!(table[12].1 >= table[4].1);
+    let mut sorted: Vec<(usize, u8)> = counts
+        .iter()
+        .zip(table.iter())
+        .filter(|(c, _)| **c > 0)
+        .map(|(c, (_, nb))| (*c, *nb))
+        .collect();
+    sorted.sort_by_key(|(c, _)| *c);
+    for pair in sorted.windows(2) {
+        assert!(pair[1].1 <= pair[0].1, "{sorted:?}");
+    }
 }
 
 #[test]
 fn from_data() {
-    let counts = &[3, 0, 4, 1, 5];
-    let table = HuffmanTable::build_from_counts(counts).codes;
-
     let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2];
+    let mut counts = [0usize; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let table = HuffmanTable::build_from_counts(&counts[..=4]).codes;
     let table2 = HuffmanTable::build_from_data(data).codes;
 
     assert_eq!(table, table2);

@@ -32,6 +32,14 @@ This document records the changes made between versions, starting with version 0
   random at parity. Speed: json Opt ≈ zstd-16 (7.8 MiB/s), text Opt
   313 MiB/s vs libzstd's ~440.
 
+* The literals Huffman table now gets optimal length-limited code
+  lengths (boundary package-merge, Larmore-Hirschberg) instead of the
+  rank-only weight ladder: the old scheme depended on count order
+  but not magnitude, losing heavily on skewed literal histograms.
+  Every level benefits; 32 MiB corpus ratios before -> after:
+  json fastest 6.05 -> 6.20, json ultra 7.33 -> 7.52, text fastest
+  196.6 -> 206.0, text best 242.0 -> 245.5.
+
 * The chain search now beat-checks candidates (libzstd's "potentially
   better" read): the 4 bytes ending at best_len+1 decide whether a
   candidate can strictly improve, so hash collisions reject on one load
