@@ -23,9 +23,9 @@ pub enum Level {
     /// This level is roughly equivalent to Zstd compression levels 6-9.
     /// A deeper hash-chain matcher with two lazy steps.
     Balanced,
-    /// This level is roughly equivalent to Zstd compression levels 12-15.
-    /// The deepest hash-chain search with extended lazy evaluation;
-    /// noticeably slower, noticeably denser.
+    /// This level is roughly equivalent to Zstd compression levels 10-15.
+    /// The optimal parser in its cheapest setting: noticeably denser than
+    /// `Balanced` at a fraction of `Opt`'s cost.
     Best,
     /// This level is roughly equivalent to Zstd compression levels 16-17.
     /// An optimal-price parser over binary-tree matches (libzstd's

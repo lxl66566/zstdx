@@ -40,6 +40,13 @@ This document records the changes made between versions, starting with version 0
   json fastest 6.05 -> 6.20, json ultra 7.33 -> 7.52, text fastest
   196.6 -> 206.0, text best 242.0 -> 245.5.
 
+* `Level::Best` (≈zstd 10-15) now runs the optimal parser in its
+  cheapest setting (16 tree compares, targetLength 32) instead of a
+  depth-24 hash-chain search: the chain matcher could not reach the
+  tier's ratio at any depth. json Best 5.77 -> 6.88 (zstd-12: 6.14),
+  text Best 245.5 -> 270.8 (zstd-12: 256.1), skewed Best 1.87 ->
+  1.996, at 12-19 MiB/s depending on shape.
+
 * The chain search now beat-checks candidates (libzstd's "potentially
   better" read): the 4 bytes ending at best_len+1 decide whether a
   candidate can strictly improve, so hash collisions reject on one load

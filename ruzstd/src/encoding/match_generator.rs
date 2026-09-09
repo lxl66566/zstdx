@@ -103,17 +103,25 @@ const BALANCED_PARAMS: LevelParams = LevelParams {
     lazy_depth: 2,
 };
 
-/// Best deepens the search instead of widening the window: depth 24 with
-/// two more lazy steps buys json ratio 5.64→5.70 over Balanced at ~60% of
-/// its speed, while every window growth measured (2–4 MiB) lost on both
-/// axes (see BALANCED_PARAMS). H21 halves the per-slot chain length,
-/// which the deeper walks need to terminate on chain ends.
+/// Level Best, roughly zstd 10-15: the optimal parser in its cheapest
+/// setting (libzstd uses btopt for these levels on smaller inputs; the
+/// hash-chain variant this replaces could not reach the tier's ratio at
+/// any search depth).
+const BEST_KNOBS: OptKnobs = OptKnobs {
+    search_log: 4,
+    sufficient_len: 32,
+    min_match: 4,
+    mls: 4,
+    bt_log: 20,
+    hash3_log: 0,
+    ultra: false,
+};
 const BEST_PARAMS: LevelParams = LevelParams {
-    hash_log: 21,
+    hash_log: 20,
     window: 1 << 20,
-    strategy: Strategy::Chain(20),
-    search_depth: 24,
-    lazy_depth: 4,
+    strategy: Strategy::Opt(BEST_KNOBS),
+    search_depth: 0,
+    lazy_depth: 0,
 };
 
 /// Level Opt, roughly zstd 16-17 (btopt): whole-bit prices with the
