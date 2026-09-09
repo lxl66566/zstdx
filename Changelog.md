@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The Fast level now uses a port of libzstd's double-fast (dfast) matcher:
+  two single-probe tables — an 8-byte long hash (2^17 slots) and a 5-byte
+  short hash (2^16) — with a two-position pipeline, short-hit upgrades by
+  the next position's long probe, libzstd's complementary four-anchor
+  insertion after each match, an immediate rep-offset2 chain that
+  re-seeds both tables, and a miss step that only grows every 256 skipped
+  positions. This replaces the hash-chain + lazy search, which paid a
+  per-byte chain insertion (2.5 MiB of hot tables and double searching)
+  at what is libzstd level 3's dfast algorithm class. json at Fast gains
+  80% (175 → 314 MiB/s, ratio 5.47 → 5.33, above zstd-3's 5.31), highly
+  repetitive text 154% (3.1 → 7.9 GiB/s, now faster than zstd -3), skewed
+  10%; other levels are byte-for-byte unchanged. The strategy selection
+  is now an enum (`Fast`/`Dfast`/`Chain`) instead of an optional
+  chain-table log.
+
 * The flat decoder's sequence executor copies literals and matches with
   inline 16/8-byte chunks (libzstd's wildcopy scheme, budget-gated 16 bytes
   before the output end with an exact-copy tail path) instead of one libc

@@ -4,10 +4,12 @@
 //! sequences as instructions for the decoder. A sequence basically tells the decoder
 //! "Go back X bytes and copy Y bytes to the end of your decode buffer".
 //!
-//! This is a port of the official zstd `fast` strategy: one contiguous window buffer,
-//! a single-probe u32 hash table with newest-wins overwrite semantics, forward match
-//! extension in u64 chunks plus backward extension into pending literals. Positions are
-//! tracked as absolute u64 offsets; hash slots carry `(epoch << 48) | position` so a
+//! This is a port of the official zstd matcher family: one contiguous
+//! window buffer, single-probe u32 hash tables (newest-wins overwrite
+//! semantics, dfast's second short-hash table for the Fast level), hash
+//! chains for the levels above, forward match extension in u64 chunks plus
+//! backward extension into pending literals. Positions are tracked as
+//! absolute u64 offsets; table slots carry `(epoch << 48) | position` so a
 //! reset just bumps the epoch instead of clearing the table.
 
 use alloc::vec::Vec;
@@ -34,18 +36,30 @@ const EMPTY: u64 = 0;
 /// carry the epoch (see [`MatchGeneratorDriver::reset`]).
 const POS_MASK: u64 = (1u64 << 48) - 1;
 
+/// Which search loop the matcher runs. The `chain` buffer is the second
+/// table for the two-table strategies and empty for [`Strategy::Fast`].
+#[derive(Clone, Copy, PartialEq)]
+enum Strategy {
+    /// One single-probe table keyed by a 5-byte hash (level Fastest,
+    /// libzstd's `fast`).
+    Fast,
+    /// Two single-probe tables: an 8-byte long hash in `table` and a
+    /// 5-byte short hash in `chain` (level Fast, libzstd's `dfast`).
+    /// The payload is the short-table log.
+    Dfast(u32),
+    /// Head table plus chain links walked up to the level's search depth
+    /// with lazy deferral (levels above Fast, libzstd's `lazy` family).
+    /// The payload is the chain-table log.
+    Chain(u32),
+}
+
 /// Per-level search parameters, following libzstd's `clevels.h` ladder.
-/// `chain_log == None` selects the single-probe `fast` strategy; otherwise
-/// matching walks a hash chain up to `search_depth` candidates and defers
-/// emission across up to `lazy_depth` further positions when a longer match
-/// may start there.
 #[derive(Clone, Copy, PartialEq)]
 struct LevelParams {
     hash_log: u32,
     /// Match window; also the window declared in the frame header.
     window: usize,
-    /// Hash-chain table size as a power of two; `None` for the fast strategy.
-    chain_log: Option<u32>,
+    strategy: Strategy,
     search_depth: u32,
     lazy_depth: u32,
 }
@@ -53,23 +67,25 @@ struct LevelParams {
 const FASTEST_PARAMS: LevelParams = LevelParams {
     hash_log: HASH_LOG,
     window: MAX_WINDOW,
-    chain_log: None,
+    strategy: Strategy::Fast,
     search_depth: 1,
     lazy_depth: 0,
 };
 
+/// libzstd level 3: H17 (long) C16 (short) with a 1 MiB window (the level's
+/// W21 is A/B-pending; the smaller window also keeps the frame header as-is).
 const FAST_PARAMS: LevelParams = LevelParams {
-    hash_log: 16,
+    hash_log: 17,
     window: 1 << 20,
-    chain_log: Some(18),
-    search_depth: 4,
-    lazy_depth: 1,
+    strategy: Strategy::Dfast(16),
+    search_depth: 0,
+    lazy_depth: 0,
 };
 
 const BALANCED_PARAMS: LevelParams = LevelParams {
     hash_log: 17,
     window: 1 << 21,
-    chain_log: Some(20),
+    strategy: Strategy::Chain(20),
     search_depth: 16,
     lazy_depth: 2,
 };
@@ -77,7 +93,7 @@ const BALANCED_PARAMS: LevelParams = LevelParams {
 const BEST_PARAMS: LevelParams = LevelParams {
     hash_log: 18,
     window: 1 << 22,
-    chain_log: Some(21),
+    strategy: Strategy::Chain(21),
     search_depth: 64,
     lazy_depth: 4,
 };
@@ -119,11 +135,29 @@ fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     }
 }
 
+/// Hash the 8 bytes at `idx` into the dfast long table (libzstd's
+/// `prime8bytes` multiply). Same read contract as [`hash_at_log`].
+#[inline(always)]
+fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
+    // SAFETY: same contract as hash_at_log.
+    unsafe {
+        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned();
+        (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) as usize >> (64 - log)) & ((1usize << log) - 1)
+    }
+}
+
 /// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
 #[inline(always)]
 fn read4(win: &[u8], idx: usize) -> u32 {
     // SAFETY: see contract above; unaligned because byte-granular.
     unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
+}
+
+/// Read 8 window bytes at `idx`. Caller guarantees `idx + 8 <= win.len()`.
+#[inline(always)]
+fn read8(win: &[u8], idx: usize) -> u64 {
+    // SAFETY: see contract above; unaligned because byte-granular.
+    unsafe { win.as_ptr().add(idx).cast::<u64>().read_unaligned() }
 }
 
 /// Longest common prefix of `win[i..]` and `win[j..]` in u64 chunks. `i` is
@@ -358,6 +392,137 @@ fn rep1_chain(
     pos
 }
 
+/// Insert `idx` into both dfast tables. Caller guarantees `idx + HASH_READ`
+/// bytes of window.
+#[inline(always)]
+fn insert_dfast(
+    win: &[u8],
+    long: &mut [u64],
+    small: &mut [u64],
+    epoch: u64,
+    win_base: u64,
+    idx: usize,
+) {
+    let hl = hash8_at_log(win, idx, long.len().trailing_zeros());
+    let hs = hash_at_log(win, idx, small.len().trailing_zeros());
+    // SAFETY: both hashes are masked to their tables' sizes.
+    unsafe {
+        *long.get_unchecked_mut(hl) = (epoch << 48) | (win_base + idx as u64);
+        *small.get_unchecked_mut(hs) = (epoch << 48) | (win_base + idx as u64);
+    }
+}
+
+/// [`emit_seq`] for the dfast strategy: matched ranges seed libzstd's
+/// complementary anchors instead of indexing every covered position — both
+/// tables take the position two past the scan position the match was found
+/// at, the long table the match end minus two, the small table the match
+/// end minus one. Anchors past `insert_max_idx` (within HASH_READ of the
+/// window end) are dropped; the scan tail never probes them. Returns the
+/// new anchor as a window index.
+#[allow(clippy::too_many_arguments)]
+fn emit_seq_dfast(
+    win: &[u8],
+    long: &mut [u64],
+    small: &mut [u64],
+    epoch: u64,
+    win_base: u64,
+    anchor_idx: usize,
+    insert_max_idx: usize,
+    curr_idx: usize,
+    start: usize,
+    match_len: usize,
+    of_value: u32,
+    rep: &mut [u32; 3],
+    literals: &mut Vec<u8>,
+    codes: &mut Vec<u32>,
+    add_bits: &mut Vec<u64>,
+    add_nbs: &mut Vec<u8>,
+) -> usize {
+    let (_ll, match_end) = push_seq_packed(
+        win,
+        win_base,
+        win_base + anchor_idx as u64,
+        start,
+        match_len,
+        of_value,
+        rep,
+        literals,
+        codes,
+        add_bits,
+        add_nbs,
+    );
+    if curr_idx + 2 <= insert_max_idx {
+        insert_dfast(win, long, small, epoch, win_base, curr_idx + 2);
+    }
+    if match_end >= 2 && match_end - 2 <= insert_max_idx {
+        let hl = hash8_at_log(win, match_end - 2, long.len().trailing_zeros());
+        // SAFETY: masked to the long table size.
+        unsafe {
+            *long.get_unchecked_mut(hl) = (epoch << 48) | (win_base + (match_end - 2) as u64);
+        }
+    }
+    if match_end >= 1 && match_end - 1 <= insert_max_idx {
+        let hs = hash_at_log(win, match_end - 1, small.len().trailing_zeros());
+        // SAFETY: masked to the small table size.
+        unsafe {
+            *small.get_unchecked_mut(hs) = (epoch << 48) | (win_base + (match_end - 1) as u64);
+        }
+    }
+    match_end
+}
+
+/// [`rep1_chain`] for the dfast strategy: each repcode position goes into
+/// both tables (no complementary anchors — libzstd's offset_2 loop only
+/// re-seeds the position it consumes). Returns the cursor as a window
+/// index, which is also the new anchor.
+#[allow(clippy::too_many_arguments)]
+fn rep1_chain_dfast(
+    win: &[u8],
+    long: &mut [u64],
+    small: &mut [u64],
+    epoch: u64,
+    pos_idx: usize,
+    ilimit_idx: usize,
+    win_base: u64,
+    rep: &mut [u32; 3],
+    literals: &mut Vec<u8>,
+    codes: &mut Vec<u32>,
+    add_bits: &mut Vec<u64>,
+    add_nbs: &mut Vec<u8>,
+) -> usize {
+    let mut pos = pos_idx;
+    while pos <= ilimit_idx {
+        let Some(cand_abs) = (win_base + pos as u64).checked_sub(rep[1] as u64) else {
+            break;
+        };
+        if cand_abs < win_base {
+            break;
+        }
+        let cand = (cand_abs - win_base) as usize;
+        if read4(win, cand) != read4(win, pos) {
+            break;
+        }
+        let ml = extend_match(win, pos, cand);
+        debug_assert!(ml >= MIN_MATCH);
+        insert_dfast(win, long, small, epoch, win_base, pos);
+        let (_ll, match_end) = push_seq_packed(
+            win,
+            win_base,
+            win_base + pos as u64,
+            pos,
+            ml,
+            1,
+            rep,
+            literals,
+            codes,
+            add_bits,
+            add_nbs,
+        );
+        pos = match_end;
+    }
+    pos
+}
+
 pub struct MatchGeneratorDriver {
     /// Contiguous history: `win[0]` is absolute position `win_base`.
     /// Capacity holds two windows plus one block, so compaction (which keeps
@@ -376,8 +541,9 @@ pub struct MatchGeneratorDriver {
     /// Absolute start of the last committed block (for `get_last_space`).
     block_start: u64,
     table: Vec<u64>,
-    /// Hash-chain links for the chain strategies (position-masked, epoch
-    /// tagged like `table`); empty for the fast strategy.
+    /// Second search table for the two-table strategies (the dfast short
+    /// hash or the chain links; see [`Strategy`]), epoch-tagged like
+    /// `table`; empty for the fast strategy.
     chain: Vec<u64>,
     epoch: u64,
     miss_count: usize,
@@ -481,9 +647,10 @@ impl MatchGeneratorDriver {
             if params.hash_log != self.params.hash_log {
                 self.table = alloc::vec![EMPTY; 1usize << params.hash_log];
             }
-            self.chain = match params.chain_log {
-                Some(log) => alloc::vec![EMPTY; 1usize << log],
-                None => Vec::new(),
+            self.chain = match params.strategy {
+                Strategy::Fast => Vec::new(),
+                Strategy::Dfast(small_log) => alloc::vec![EMPTY; 1usize << small_log],
+                Strategy::Chain(chain_log) => alloc::vec![EMPTY; 1usize << chain_log],
             };
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
@@ -653,10 +820,10 @@ impl Matcher for MatchGeneratorDriver {
         add_bits: &mut Vec<u64>,
         add_nbs: &mut Vec<u8>,
     ) {
-        if self.params.chain_log.is_none() {
-            self.start_matching_fast(literals, codes, add_bits, add_nbs);
-        } else {
-            self.start_matching_chain(literals, codes, add_bits, add_nbs);
+        match self.params.strategy {
+            Strategy::Fast => self.start_matching_fast(literals, codes, add_bits, add_nbs),
+            Strategy::Dfast(_) => self.start_matching_dfast(literals, codes, add_bits, add_nbs),
+            Strategy::Chain(_) => self.start_matching_chain(literals, codes, add_bits, add_nbs),
         }
     }
 
@@ -669,17 +836,30 @@ impl Matcher for MatchGeneratorDriver {
         let idx = (self.block_start - self.win_base) as usize;
         let win = window_slice(&self.win, &self.ext);
         if idx + HASH_READ <= win.len() {
-            if let Some(log) = self.params.chain_log {
-                let h = hash_at_log(win, idx, log);
-                // SAFETY: h is masked to log bits, idx to the chain size.
-                unsafe {
-                    let head = *self.table.get_unchecked(h);
-                    let chain_mask = self.chain.len() - 1;
-                    *self.chain.get_unchecked_mut(idx & chain_mask) = head;
-                    *self.table.get_unchecked_mut(h) = (self.epoch << 48) | self.block_start;
+            match self.params.strategy {
+                Strategy::Chain(log) => {
+                    let h = hash_at_log(win, idx, log);
+                    // SAFETY: h is masked to log bits, idx to the chain size.
+                    unsafe {
+                        let head = *self.table.get_unchecked(h);
+                        let chain_mask = self.chain.len() - 1;
+                        *self.chain.get_unchecked_mut(idx & chain_mask) = head;
+                        *self.table.get_unchecked_mut(h) = (self.epoch << 48) | self.block_start;
+                    }
                 }
-            } else {
-                insert_at(win, &mut self.table, self.epoch, idx, self.block_start);
+                Strategy::Dfast(small_log) => {
+                    let hl = hash8_at_log(win, idx, self.params.hash_log);
+                    let hs = hash_at_log(win, idx, small_log);
+                    // SAFETY: both hashes masked to their tables' sizes.
+                    unsafe {
+                        let tag = (self.epoch << 48) | self.block_start;
+                        *self.table.get_unchecked_mut(hl) = tag;
+                        *self.chain.get_unchecked_mut(hs) = tag;
+                    }
+                }
+                Strategy::Fast => {
+                    insert_at(win, &mut self.table, self.epoch, idx, self.block_start);
+                }
             }
         }
         self.pos = self.block_end;
@@ -974,6 +1154,254 @@ impl MatchGeneratorDriver {
         self.miss_count = miss_count;
         self.rep = rep;
         self.rep_pending = rep_pending;
+    }
+
+    /// The double-hash strategy loop (level [`Level::Fast`], libzstd's
+    /// dfast): one 8-byte long-hash probe and one 5-byte short-hash probe
+    /// per position — no chain walk, no lazy deferral. A two-position
+    /// pipeline overlaps the hash multiplies and table loads, a short hit
+    /// is upgraded by the long probe prepared for the next position, and
+    /// matched ranges re-seed both tables through a few anchors (see
+    /// [`emit_seq_dfast`]). The miss step only grows every 256 skipped
+    /// positions (libzstd's `kSearchStrength`).
+    #[allow(clippy::too_many_lines)]
+    fn start_matching_dfast(
+        &mut self,
+        literals: &mut Vec<u8>,
+        codes: &mut Vec<u32>,
+        add_bits: &mut Vec<u64>,
+        add_nbs: &mut Vec<u8>,
+    ) {
+        let win = window_slice(&self.win, &self.ext);
+        let long = &mut self.table[..];
+        let small = &mut self.chain[..];
+        let long_log = long.len().trailing_zeros();
+        let small_log = small.len().trailing_zeros();
+        let epoch = self.epoch;
+        let win_base = self.win_base;
+        let block_len = (self.block_end - win_base) as usize;
+        // Probing hashes 8 bytes, so the last probeable window index; the
+        // insert bound coincides with it (the window ends at the block).
+        let ilimit_idx = block_len.saturating_sub(HASH_READ);
+        let insert_max_idx = win.len().saturating_sub(HASH_READ);
+        let max_window = self.params.window as u64;
+        let mut rep = self.rep;
+        let mut rep_pending = self.rep_pending;
+        let mut anchor_idx = (self.anchor - win_base) as usize;
+        let mut ip_idx = (self.pos - win_base) as usize;
+
+        // Outer loop: one pass per emitted match; re-entering resets the
+        // miss step. The inner loop walks single positions until a match
+        // or the block tail.
+        'outer: loop {
+            // The short-match upgrade probes at ip + 1, so a pass needs a
+            // full position pair inside the block.
+            if ip_idx + 1 > ilimit_idx {
+                break;
+            }
+            let mut step = 1usize;
+            let mut next_step = ip_idx + 256;
+            let mut ip1_idx = ip_idx + 1;
+            let mut hl0 = hash8_at_log(win, ip_idx, long_log);
+            // SAFETY: masked to the long table size.
+            let mut entry_l0 = unsafe { *long.get_unchecked(hl0) };
+
+            loop {
+                let hs0 = hash_at_log(win, ip_idx, small_log);
+                // SAFETY: masked to the small table size.
+                let entry_s0 = unsafe { *small.get_unchecked(hs0) };
+                // Insert after both lookups, before probing (newest-wins).
+                // SAFETY: both hashes masked to their tables' sizes.
+                unsafe {
+                    let tag = (epoch << 48) | (win_base + ip_idx as u64);
+                    *long.get_unchecked_mut(hl0) = tag;
+                    *small.get_unchecked_mut(hs0) = tag;
+                }
+
+                // Repcode pre-probe one byte ahead: the probed byte stays a
+                // pending literal, so of_value 1 encodes rep0 instead of a
+                // swap, and no backward extension may consume it. Gated job
+                // starts skip the probe (unknown decoder history).
+                if rep_pending == 0 {
+                    let probe = ip_idx + 1;
+                    if let Some(cand_abs) = (win_base + probe as u64).checked_sub(rep[0] as u64) {
+                        if cand_abs >= win_base {
+                            let cand = (cand_abs - win_base) as usize;
+                            if read4(win, cand) == read4(win, probe) {
+                                let ml = extend_match(win, probe, cand);
+                                debug_assert!(ml >= MIN_MATCH);
+                                anchor_idx = emit_seq_dfast(
+                                    win, long, small, epoch, win_base, anchor_idx, insert_max_idx,
+                                    ip_idx, probe, ml, 1, &mut rep, literals, codes, add_bits,
+                                    add_nbs,
+                                );
+                                ip_idx = rep1_chain_dfast(
+                                    win, long, small, epoch, anchor_idx, ilimit_idx, win_base,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
+                                );
+                                // The chain's matches advance the anchor too.
+                                anchor_idx = ip_idx;
+                                continue 'outer;
+                            }
+                        }
+                    }
+                }
+
+                let hl1 = hash8_at_log(win, ip1_idx, long_log);
+
+                // Long probe: a full 8-byte match at the long-hash candidate.
+                {
+                    let cand_abs = entry_l0 & POS_MASK;
+                    if entry_l0 >> 48 == epoch
+                        && cand_abs >= win_base
+                        && win_base + ip_idx as u64 - cand_abs <= max_window
+                    {
+                        let cand = (cand_abs - win_base) as usize;
+                        if read8(win, cand) == read8(win, ip_idx) {
+                            let mut start = ip_idx;
+                            let mut c = cand;
+                            let mut ml = extend_match(win, ip_idx, cand);
+                            // Backward catch-up into the pending literals;
+                            // the offset (start - c) stays constant.
+                            while start > anchor_idx && c > 0 && win[c - 1] == win[start - 1] {
+                                c -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            let of_value = (start - c + 3) as u32;
+                            anchor_idx = emit_seq_dfast(
+                                win, long, small, epoch, win_base, anchor_idx, insert_max_idx,
+                                ip_idx, start, ml, of_value, &mut rep, literals, codes, add_bits,
+                                add_nbs,
+                            );
+                            if step < 4 {
+                                // ip1 lies inside the covered range whenever
+                                // step < 4 (matches are at least 4 long), so
+                                // indexing it cannot pollute later probes.
+                                // SAFETY: masked to the long table size.
+                                unsafe {
+                                    *long.get_unchecked_mut(hl1) =
+                                        (epoch << 48) | (win_base + ip1_idx as u64);
+                                }
+                            }
+                            // A literal offset shifts the decoder's history
+                            // one slot down; after the third one a job-start
+                            // gate has fully converged and repcode use is
+                            // safe again.
+                            if rep_pending != 0 {
+                                rep_pending -= 1;
+                            }
+                            ip_idx = if rep_pending == 0 {
+                                rep1_chain_dfast(
+                                    win, long, small, epoch, anchor_idx, ilimit_idx, win_base,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
+                                )
+                            } else {
+                                anchor_idx
+                            };
+                            // The chain's matches advance the anchor too.
+                            anchor_idx = ip_idx;
+                            continue 'outer;
+                        }
+                    }
+                }
+
+                // SAFETY: masked to the long table size.
+                let entry_l1 = unsafe { *long.get_unchecked(hl1) };
+
+                // Short probe: 4 bytes at the short-hash candidate, upgraded
+                // by the long probe prepared for the next position.
+                {
+                    let cand_abs = entry_s0 & POS_MASK;
+                    if entry_s0 >> 48 == epoch
+                        && cand_abs >= win_base
+                        && win_base + ip_idx as u64 - cand_abs <= max_window
+                    {
+                        let cand = (cand_abs - win_base) as usize;
+                        if read4(win, cand) == read4(win, ip_idx) {
+                            let mut start = ip_idx;
+                            let mut c = cand;
+                            let mut ml = extend_match(win, ip_idx, cand);
+                            let c1_abs = entry_l1 & POS_MASK;
+                            if entry_l1 >> 48 == epoch
+                                && c1_abs >= win_base
+                                && win_base + ip1_idx as u64 - c1_abs <= max_window
+                            {
+                                let c1 = (c1_abs - win_base) as usize;
+                                if read8(win, c1) == read8(win, ip1_idx) {
+                                    let l1len = extend_match(win, ip1_idx, c1);
+                                    if l1len > ml {
+                                        start = ip1_idx;
+                                        c = c1;
+                                        ml = l1len;
+                                    }
+                                }
+                            }
+                            while start > anchor_idx && c > 0 && win[c - 1] == win[start - 1] {
+                                c -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            let of_value = (start - c + 3) as u32;
+                            anchor_idx = emit_seq_dfast(
+                                win, long, small, epoch, win_base, anchor_idx, insert_max_idx,
+                                ip_idx, start, ml, of_value, &mut rep, literals, codes, add_bits,
+                                add_nbs,
+                            );
+                            if step < 4 {
+                                // SAFETY: masked to the long table size; see
+                                // the long probe above.
+                                unsafe {
+                                    *long.get_unchecked_mut(hl1) =
+                                        (epoch << 48) | (win_base + ip1_idx as u64);
+                                }
+                            }
+                            if rep_pending != 0 {
+                                rep_pending -= 1;
+                            }
+                            ip_idx = if rep_pending == 0 {
+                                rep1_chain_dfast(
+                                    win, long, small, epoch, anchor_idx, ilimit_idx, win_base,
+                                    &mut rep, literals, codes, add_bits, add_nbs,
+                                )
+                            } else {
+                                anchor_idx
+                            };
+                            // The chain's matches advance the anchor too.
+                            anchor_idx = ip_idx;
+                            continue 'outer;
+                        }
+                    }
+                }
+
+                // Miss: advance the pair; the step only grows every 256
+                // skipped positions, so compressible data keeps probing
+                // every byte while incompressible runs accelerate.
+                if ip1_idx >= next_step {
+                    step += 1;
+                    next_step += 256;
+                }
+                ip_idx = ip1_idx;
+                ip1_idx += step;
+                hl0 = hl1;
+                entry_l0 = entry_l1;
+                if ip1_idx > ilimit_idx {
+                    break;
+                }
+            }
+            // The pair left the block: nothing left to probe.
+            break;
+        }
+        if !codes.is_empty() && anchor_idx < block_len {
+            literals.extend_from_slice(&win[anchor_idx..block_len]);
+        }
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
+        self.rep = rep;
+        self.rep_pending = rep_pending;
+        // dfast tracks misses through the per-match step counter, not the
+        // cross-block miss count.
+        self.miss_count = 0;
     }
 
     /// The hash-chain strategy loop (levels above [`Level::Fastest`]):
