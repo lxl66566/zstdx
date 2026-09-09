@@ -876,6 +876,27 @@ impl MatchGeneratorDriver {
         let mut rep_pending = self.rep_pending;
         let hash_read = HASH_READ as u64;
 
+        // Resolve a table entry to a window index: invalid entries (wrong
+        // epoch, or older than the level window / the live window buffer)
+        // alias the scanning position itself, whose bytes always compare
+        // equal — the byte compare plus `cand != ip` then rejects them with
+        // one predictable branch instead of a three-way check per probe
+        // (libzstd's selectAddr trick). Entries are always strictly older
+        // than the scanning position: the pair reads both entries before
+        // its stores, and every insert sits at or behind the cursor when it
+        // happens.
+        //
+        // SAFETY: none needed — the select keeps the index inside the
+        // window either way.
+        let resolve = |entry: u64, lo: u64, ip: usize| -> usize {
+            let cand_abs = entry & POS_MASK;
+            if (entry >> 48 == epoch) & (cand_abs >= lo) {
+                (cand_abs - win_base) as usize
+            } else {
+                ip
+            }
+        };
+
         // Two-position pipeline (libzstd's ip0/ip1 interleave): the hash and
         // table entry of the next position are prepared before the current
         // one is probed, so the hash multiply and table-load latencies of
@@ -923,8 +944,12 @@ impl MatchGeneratorDriver {
             // literals pending the probe runs at the current position,
             // otherwise one byte ahead so that byte becomes the literal.
             {
+                // Absolute lower bound of rep[0] candidates; rep[0] only
+                // changes inside emits, which re-enter the loop.
+                let rep0_lim = win_base + rep[0] as u64;
                 // A gated job start must not probe repcodes (unknown decoder
-                // history); probe 0 makes the checked_sub below underflow.
+                // history); probe 0 sits below the bound, which folds the
+                // underflow guard into the same single comparison.
                 let probe = if rep_pending != 0 {
                     0
                 } else if pos == anchor {
@@ -932,92 +957,85 @@ impl MatchGeneratorDriver {
                 } else {
                     pos
                 };
-                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
-                    if cand_abs >= win_base {
-                        let mut cand = (cand_abs - win_base) as usize;
-                        let pidx = (probe - win_base) as usize;
-                        let pcur = read4(win, pidx);
-                        if read4(win, cand) == pcur {
-                            let mut ml = extend_match(win, pidx, cand);
-                            if ml >= MIN_MATCH {
-                                let anchor_idx = (anchor - win_base) as usize;
-                                let mut start = pidx;
-                                // Extend backwards into the pending literals;
-                                // the offset (pidx - cand) stays constant.
-                                while start > anchor_idx + 1
-                                    && cand > 0
-                                    && win[cand - 1] == win[start - 1]
-                                {
-                                    cand -= 1;
-                                    start -= 1;
-                                    ml += 1;
-                                }
-                                anchor = emit_seq(
-                                    win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                    &mut rep, literals, seqs,
-                                );
-                                pos = rep1_chain(
-                                    win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, seqs,
-                                );
-                                // The chain's matches advance the cursor too.
-                                anchor = pos;
-                                miss_count = 0;
-                                continue 'restart;
+                if probe >= rep0_lim {
+                    let mut cand = (probe - rep0_lim) as usize;
+                    let pidx = (probe - win_base) as usize;
+                    if read4(win, cand) == read4(win, pidx) {
+                        let mut ml = extend_match(win, pidx, cand);
+                        if ml >= MIN_MATCH {
+                            let anchor_idx = (anchor - win_base) as usize;
+                            let mut start = pidx;
+                            // Extend backwards into the pending literals;
+                            // the offset (pidx - cand) stays constant.
+                            while start > anchor_idx + 1
+                                && cand > 0
+                                && win[cand - 1] == win[start - 1]
+                            {
+                                cand -= 1;
+                                start -= 1;
+                                ml += 1;
                             }
+                            anchor = emit_seq(
+                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
+                                &mut rep, literals, seqs,
+                            );
+                            pos = rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base, insert_max,
+                                &mut rep, literals, seqs,
+                            );
+                            // The chain's matches advance the cursor too.
+                            anchor = pos;
+                            miss_count = 0;
+                            continue 'restart;
                         }
                     }
                 }
 
-                if prev0 >> 48 == epoch {
-                    let cand_abs = prev0 & ((1u64 << 48) - 1);
-                    if cand_abs >= win_base && pos - cand_abs <= max_window {
-                        let mut cand = (cand_abs - win_base) as usize;
-                        if read4(win, cand) == cur0 {
-                            let mut ml = extend_match(win, idx0, cand);
-                            // A hash match already spans 5 bytes; below 6 the
-                            // sequence overhead roughly equals the literals
-                            // it covers, and rejecting it lets the scan try
-                            // the next position where a longer match may
-                            // start.
-                            if ml >= 6 {
-                                let anchor_idx = (anchor - win_base) as usize;
-                                let mut start = idx0;
-                                // Extend backwards into the pending literals;
-                                // the offset (idx0 - cand) stays constant.
-                                while start > anchor_idx
-                                    && cand > 0
-                                    && win[cand - 1] == win[start - 1]
-                                {
-                                    cand -= 1;
-                                    start -= 1;
-                                    ml += 1;
-                                }
-                                let of_value = (start - cand + 3) as u32;
-                                anchor = emit_seq(
-                                    win, table, epoch, anchor, win_base, insert_max, start, ml,
-                                    of_value, &mut rep, literals, seqs,
-                                );
-                                // A literal offset shifts the decoder's history
-                                // one slot down; after the third one a job-start
-                                // gate has fully converged and repcode use is
-                                // safe again.
-                                if rep_pending != 0 {
-                                    rep_pending -= 1;
-                                }
-                                pos = if rep_pending == 0 {
-                                    rep1_chain(
-                                        win, table, epoch, anchor, block_end, win_base,
-                                        insert_max, &mut rep, literals, seqs,
-                                    )
-                                } else {
-                                    anchor
-                                };
-                                anchor = pos;
-                                miss_count = 0;
-                                continue 'restart;
-                            }
+                let lo = pos.saturating_sub(max_window).max(win_base);
+                let mut cand0 = resolve(prev0, lo, idx0);
+                if cand0 != idx0 && read4(win, cand0) == cur0 {
+                    let mut ml = extend_match(win, idx0, cand0);
+                    // A hash match already spans 5 bytes; below 6 the
+                    // sequence overhead roughly equals the literals
+                    // it covers, and rejecting it lets the scan try
+                    // the next position where a longer match may
+                    // start.
+                    if ml >= 6 {
+                        let anchor_idx = (anchor - win_base) as usize;
+                        let mut start = idx0;
+                        // Extend backwards into the pending literals;
+                        // the offset (idx0 - cand) stays constant.
+                        while start > anchor_idx
+                            && cand0 > 0
+                            && win[cand0 - 1] == win[start - 1]
+                        {
+                            cand0 -= 1;
+                            start -= 1;
+                            ml += 1;
                         }
+                        let of_value = (start - cand0 + 3) as u32;
+                        anchor = emit_seq(
+                            win, table, epoch, anchor, win_base, insert_max, start, ml,
+                            of_value, &mut rep, literals, seqs,
+                        );
+                        // A literal offset shifts the decoder's history
+                        // one slot down; after the third one a job-start
+                        // gate has fully converged and repcode use is
+                        // safe again.
+                        if rep_pending != 0 {
+                            rep_pending -= 1;
+                        }
+                        pos = if rep_pending == 0 {
+                            rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base,
+                                insert_max, &mut rep, literals, seqs,
+                            )
+                        } else {
+                            anchor
+                        };
+                        anchor = pos;
+                        miss_count = 0;
+                        continue 'restart;
                     }
                 }
             }
@@ -1025,6 +1043,8 @@ impl MatchGeneratorDriver {
             // Probe the second position through the entry prepared above.
             if pair_len == 2 {
                 let pos1 = pos + 1;
+                // Absolute lower bound of rep[0] candidates (see above).
+                let rep0_lim = win_base + rep[0] as u64;
                 // Gated job starts skip the repcode probe (see above).
                 let probe = if rep_pending != 0 {
                     0
@@ -1033,82 +1053,75 @@ impl MatchGeneratorDriver {
                 } else {
                     pos1
                 };
-                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
-                    if cand_abs >= win_base {
-                        let mut cand = (cand_abs - win_base) as usize;
-                        let pidx = (probe - win_base) as usize;
-                        let pcur = read4(win, pidx);
-                        if read4(win, cand) == pcur {
-                            let mut ml = extend_match(win, pidx, cand);
-                            if ml >= MIN_MATCH {
-                                let anchor_idx = (anchor - win_base) as usize;
-                                let mut start = pidx;
-                                while start > anchor_idx + 1
-                                    && cand > 0
-                                    && win[cand - 1] == win[start - 1]
-                                {
-                                    cand -= 1;
-                                    start -= 1;
-                                    ml += 1;
-                                }
-                                anchor = emit_seq(
-                                    win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
-                                    &mut rep, literals, seqs,
-                                );
-                                pos = rep1_chain(
-                                    win, table, epoch, anchor, block_end, win_base, insert_max,
-                                    &mut rep, literals, seqs,
-                                );
-                                anchor = pos;
-                                miss_count = 0;
-                                continue 'restart;
+                if probe >= rep0_lim {
+                    let mut cand = (probe - rep0_lim) as usize;
+                    let pidx = (probe - win_base) as usize;
+                    if read4(win, cand) == read4(win, pidx) {
+                        let mut ml = extend_match(win, pidx, cand);
+                        if ml >= MIN_MATCH {
+                            let anchor_idx = (anchor - win_base) as usize;
+                            let mut start = pidx;
+                            while start > anchor_idx + 1
+                                && cand > 0
+                                && win[cand - 1] == win[start - 1]
+                            {
+                                cand -= 1;
+                                start -= 1;
+                                ml += 1;
                             }
+                            anchor = emit_seq(
+                                win, table, epoch, anchor, win_base, insert_max, start, ml, 1,
+                                &mut rep, literals, seqs,
+                            );
+                            pos = rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base, insert_max,
+                                &mut rep, literals, seqs,
+                            );
+                            anchor = pos;
+                            miss_count = 0;
+                            continue 'restart;
                         }
                     }
                 }
 
-                if prev1 >> 48 == epoch {
-                    let cand_abs = prev1 & ((1u64 << 48) - 1);
-                    if cand_abs >= win_base && pos1 - cand_abs <= max_window {
-                        let mut cand = (cand_abs - win_base) as usize;
-                        if read4(win, cand) == cur1 {
-                            let mut ml = extend_match(win, idx1, cand);
-                            if ml >= 6 {
-                                let anchor_idx = (anchor - win_base) as usize;
-                                let mut start = idx1;
-                                while start > anchor_idx
-                                    && cand > 0
-                                    && win[cand - 1] == win[start - 1]
-                                {
-                                    cand -= 1;
-                                    start -= 1;
-                                    ml += 1;
-                                }
-                                let of_value = (start - cand + 3) as u32;
-                                anchor = emit_seq(
-                                    win, table, epoch, anchor, win_base, insert_max, start, ml,
-                                    of_value, &mut rep, literals, seqs,
-                                );
-                                // A literal offset shifts the decoder's history
-                                // one slot down; after the third one a job-start
-                                // gate has fully converged and repcode use is
-                                // safe again.
-                                if rep_pending != 0 {
-                                    rep_pending -= 1;
-                                }
-                                pos = if rep_pending == 0 {
-                                    rep1_chain(
-                                        win, table, epoch, anchor, block_end, win_base,
-                                        insert_max, &mut rep, literals, seqs,
-                                    )
-                                } else {
-                                    anchor
-                                };
-                                anchor = pos;
-                                miss_count = 0;
-                                continue 'restart;
-                            }
+                let lo1 = pos1.saturating_sub(max_window).max(win_base);
+                let mut cand1 = resolve(prev1, lo1, idx1);
+                if cand1 != idx1 && read4(win, cand1) == cur1 {
+                    let mut ml = extend_match(win, idx1, cand1);
+                    if ml >= 6 {
+                        let anchor_idx = (anchor - win_base) as usize;
+                        let mut start = idx1;
+                        while start > anchor_idx
+                            && cand1 > 0
+                            && win[cand1 - 1] == win[start - 1]
+                        {
+                            cand1 -= 1;
+                            start -= 1;
+                            ml += 1;
                         }
+                        let of_value = (start - cand1 + 3) as u32;
+                        anchor = emit_seq(
+                            win, table, epoch, anchor, win_base, insert_max, start, ml,
+                            of_value, &mut rep, literals, seqs,
+                        );
+                        // A literal offset shifts the decoder's history
+                        // one slot down; after the third one a job-start
+                        // gate has fully converged and repcode use is
+                        // safe again.
+                        if rep_pending != 0 {
+                            rep_pending -= 1;
+                        }
+                        pos = if rep_pending == 0 {
+                            rep1_chain(
+                                win, table, epoch, anchor, block_end, win_base,
+                                insert_max, &mut rep, literals, seqs,
+                            )
+                        } else {
+                            anchor
+                        };
+                        anchor = pos;
+                        miss_count = 0;
+                        continue 'restart;
                     }
                 }
             }

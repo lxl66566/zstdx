@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The Fastest level's scan loop resolves probe validity through a select
+  (libzstd's selectAddr trick) instead of a three-comparison chain: stale
+  hash-table entries alias the scanning position itself, and the byte
+  compare plus one `cand != ip` branch rejects them. The repcode
+  pre-probe folds its checked subtraction and window-base comparison into
+  a single `probe >= win_base + rep[0]` bound computed once per scan
+  iteration. Output is byte-identical at every level; interleaved A/B
+  against zstd -1 on the 32 MiB corpus: json 455 → 466 MiB/s
+  (1.90× → 1.85×), skewed 2724 → 2915 MiB/s, text ~1% faster.
+
 * The Balanced level pins its chain-table log to its window (W20 + C20 +
   H17, was W21 + C20): the chain table is position-indexed, so its log is
   also the match reach, and the old pairing silently dropped links past
