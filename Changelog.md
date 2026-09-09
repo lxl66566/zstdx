@@ -4,6 +4,24 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* New `bench_matrix` example: the head-to-head comparison widened to the
+  full decode/encode × bulk/streaming × single-/multi-thread matrix.
+  Five modes (`dec-st`, `dec-mt`, `enc-st`, `enc-mt`, `enc-stream`) run
+  interleaved A/B against the zstd crate over the corpus ladder, with
+  per-cell roundtrip gates, size/ratio reporting, a checksum-overhead
+  row, worker-count scaling for the multithreaded encoder on both sides
+  (fresh contexts per call, plus a warm reused zstd context as a
+  reference line), and solo scaling rows for our parallel decoder, which
+  libzstd has no counterpart for. The zstd dev-dependency gains the
+  `zstdmt` feature so the multithreaded columns compile.
+  First results (32 MiB corpus, libzstd 1.5.7): bulk decode leads on all
+  11 files, streaming decode trails 1.05-1.40x on compressed shapes,
+  encode Best leads every shape, json.Fastest/Fast trail 1.78x/1.35x,
+  multithreaded encode is 2-4.5x ahead at >=8 workers, and the parallel
+  decoder currently scales to 1.0x at best — the serial execution stage
+  caps it. Along the way the correctness gates exposed two multithreaded
+  decode bugs (see the two fixes below).
+
 * The sequential fallback of `decode_to_vec_mt` retries with doubling
   capacity like `bulk::decompress`, honoring the same append contract as
   the parallel path for a fresh output vec (a plain
