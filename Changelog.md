@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The interleaved 4-stream huffman fast loops (X1 and X2) keep their per
+  stream state as raw pointers instead of region/output offsets, folding
+  the region and out base pointers into `ip[]`/`op[]`. This drops the two
+  base pointers from the loop's live set (14 hot values, fitting the GPR
+  file) and removes the indexed addressing on every table lookup and
+  output write. The X2 inner loop drops from 290 to 259 instructions and
+  the X1 loop from 217 to 200; throughput is equal to slightly ahead
+  (json.zst1 +0.5-1%, text +0.5-1%, rest within noise), and the loop sits
+  at its practical floor — the remaining gap to libzstd's handwritten asm
+  is an ALU-bound vs load-port-bound split of the same work (~0.75 vs
+  ~0.7 cycles per byte on this core).
+
 * The async checksum worker spins under a bounded budget (~300 µs) and then
   parks on a condvar instead of burning a core for the whole process
   lifetime. The head flip is published under the wake mutex so a parked

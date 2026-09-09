@@ -227,49 +227,62 @@ fn decompress_4streams_interleaved(
     let segment = total_out.div_ceil(4);
     let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
+    // Stream state runs on raw pointers (see the X2 loop): folding the
+    // region/out bases into ip[]/op[] keeps the fast loop's live values down
+    // at 14 so the reload section stays spill-free.
+
     // initialize the four bit windows. Reading is backwards from the stream end;
     // the padding and final 1 marker of the last byte are shifted out.
-    let mut ip = [0usize; 4];
+    let base = region.as_ptr();
+    let mut ip = [base; 4];
     let mut bits = [0u64; 4];
     for s in 0..4 {
-        let end = stream_bounds[s].1;
-        let p = end - 8;
+        let p = stream_bounds[s].1 - 8;
         let last_byte = region[p + 7];
         let skip = if last_byte != 0 {
             1 + last_byte.leading_zeros()
         } else {
             0
         };
-        ip[s] = p;
+        ip[s] = unsafe { base.add(p) };
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
-    // stream k starts writing at k * segment (stream 4 takes the remainder)
-    let mut op = [0, segment, 2 * segment, 3 * segment];
 
     let out_start = target.len();
     target.resize(out_start + total_out, 0);
     let out = &mut target[out_start..];
+    // stream k starts writing at k * segment (stream 4 takes the remainder)
+    let out_base = out.as_mut_ptr();
+    let mut op = [
+        out_base,
+        unsafe { out_base.add(segment) },
+        unsafe { out_base.add(2 * segment) },
+        unsafe { out_base.add(3 * segment) },
+    ];
+    let out_end = unsafe { out_base.add(total_out) };
 
     macro_rules! decode_sym {
         ($s:literal, $k:literal) => {{
             // SAFETY: `bits >> shift` is below 2^tl == packed.len() by
-            // construction, and `op[s] + k` stays below the iteration bound
+            // construction, and the write lands below the iteration bound
             // precomputed from the output size.
             let entry = unsafe { *packed.get_unchecked((bits[$s] >> shift) as usize) };
-            unsafe { *out.get_unchecked_mut(op[$s] + $k) = (entry >> 8) as u8 };
+            unsafe { *op[$s].add($k) = (entry >> 8) as u8 };
             bits[$s] <<= entry & 0x3F;
         }};
     }
     macro_rules! reload {
         ($s:literal) => {{
             let ctz = bits[$s].trailing_zeros() as usize;
-            ip[$s] -= ctz >> 3;
             // SAFETY: each reload consumes at most 7 bytes and the iteration
-            // count is bounded by ip[0]/7, so ip[s] + 8 never crosses into the
-            // next stream (streams sit back to back inside `region`).
-            let window = unsafe { region.as_ptr().add(ip[$s]).cast::<u64>().read_unaligned() };
-            bits[$s] = (window | 1) << (ctz & 7);
-            op[$s] += 5;
+            // count is bounded by ip[0]'s distance to the region start, so
+            // the 8 byte read never crosses below `region` (streams sit
+            // back to back inside it).
+            unsafe {
+                ip[$s] = ip[$s].sub(ctz >> 3);
+                bits[$s] = (ip[$s].cast::<u64>().read_unaligned() | 1) << (ctz & 7);
+                op[$s] = op[$s].add(5);
+            }
         }};
     }
 
@@ -277,7 +290,8 @@ fn decompress_4streams_interleaved(
         // Each iteration produces 5 output symbols per stream and consumes at most
         // 7 bytes (11 bits * 5 = 55 bits) per stream. Run only as many iterations as
         // both bounds safely allow, then re-check.
-        let iters = (ip[0] / 7).min((total_out - op[3]) / 5);
+        let iters =
+            ((ip[0] as usize - base as usize) / 7).min((out_end as usize - op[3] as usize) / 5);
         if iters == 0 {
             break;
         }
@@ -288,7 +302,7 @@ fn decompress_4streams_interleaved(
                 expected: -(tl as isize),
             });
         }
-        let olimit = op[3] + iters * 5;
+        let olimit = unsafe { op[3].add(iters * 5) };
 
         loop {
             // Decode 5 symbols in each of the 4 streams, fully unrolled so the
@@ -324,6 +338,10 @@ fn decompress_4streams_interleaved(
             }
         }
     }
+
+    // hand the pointer state back to the scalar tail as region/out offsets
+    let ip = ip.map(|p| p as usize - base as usize);
+    let op = op.map(|p| p as usize - out_base as usize);
 
     // Finish each stream with the scalar decoder, bounded by its segment end.
     finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
@@ -454,27 +472,43 @@ fn decompress_4streams_interleaved_x2(
     let segment = total_out.div_ceil(4);
     let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
+    // Stream state is kept as raw pointers instead of offsets: folding the
+    // region/out bases into ip[]/op[] leaves 14 live values in the fast loop
+    // (bits x4, ip x4, op x4, dt), which fits the GPR file and keeps the
+    // reload section spill-free.
+
     // initialize the four bit windows (same layout as the X1 loop)
-    let mut ip = [0usize; 4];
+    let base = region.as_ptr();
+    let mut ip = [base; 4];
     let mut bits = [0u64; 4];
     for s in 0..4 {
-        let end = stream_bounds[s].1;
-        let p = end - 8;
+        let p = stream_bounds[s].1 - 8;
         let last_byte = region[p + 7];
         let skip = if last_byte != 0 {
             1 + last_byte.leading_zeros()
         } else {
             0
         };
-        ip[s] = p;
+        ip[s] = unsafe { base.add(p) };
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
-    let mut op = [0, segment, 2 * segment, 3 * segment];
 
     let out_start = target.len();
     target.resize(out_start + total_out, 0);
     let out = &mut target[out_start..];
-    let out_ptr = out.as_mut_ptr();
+    let out_base = out.as_mut_ptr();
+    let mut op = [
+        out_base,
+        unsafe { out_base.add(segment) },
+        unsafe { out_base.add(2 * segment) },
+        unsafe { out_base.add(3 * segment) },
+    ];
+    let oend = [
+        unsafe { out_base.add(seg_end[0]) },
+        unsafe { out_base.add(seg_end[1]) },
+        unsafe { out_base.add(seg_end[2]) },
+        unsafe { out_base.add(seg_end[3]) },
+    ];
 
     macro_rules! decode_sym_x2 {
         ($s:literal) => {{
@@ -484,21 +518,23 @@ fn decompress_4streams_interleaved_x2(
             // never passes `seg_end[s]`.
             let entry = unsafe { *dt.get_unchecked((bits[$s] >> 53) as usize) };
             unsafe {
-                (out_ptr.add(op[$s]) as *mut u16).write_unaligned(entry as u16);
+                (op[$s] as *mut u16).write_unaligned(entry as u16);
+                op[$s] = op[$s].add((entry >> 24) as usize);
             }
-            op[$s] += (entry >> 24) as usize;
             bits[$s] <<= (entry >> 16) & 0x3F;
         }};
     }
     macro_rules! reload_x2 {
         ($s:literal) => {{
             let ctz = bits[$s].trailing_zeros() as usize;
-            ip[$s] -= ctz >> 3;
             // SAFETY: same reload discipline as the X1 loop - each reload
             // consumes at most 7 bytes and the iteration count is bounded by
-            // ip[0]/7, so the 8 byte read stays inside `region`.
-            let window = unsafe { region.as_ptr().add(ip[$s]).cast::<u64>().read_unaligned() };
-            bits[$s] = (window | 1) << (ctz & 7);
+            // ip[0]'s distance to the region start, so the 8 byte read stays
+            // inside `region` (streams sit back to back).
+            unsafe {
+                ip[$s] = ip[$s].sub(ctz >> 3);
+                bits[$s] = (ip[$s].cast::<u64>().read_unaligned() | 1) << (ctz & 7);
+            }
         }};
     }
 
@@ -507,11 +543,11 @@ fn decompress_4streams_interleaved_x2(
         // (7 bytes) and at most 10 output bytes per stream. Bound iterations by
         // the input left in the first stream and by EVERY stream's remaining
         // output segment.
-        let iters = (ip[0] / 7)
-            .min((seg_end[0] - op[0]) / 10)
-            .min((seg_end[1] - op[1]) / 10)
-            .min((seg_end[2] - op[2]) / 10)
-            .min((seg_end[3] - op[3]) / 10);
+        let iters = ((ip[0] as usize - base as usize) / 7)
+            .min((oend[0] as usize - op[0] as usize) / 10)
+            .min((oend[1] as usize - op[1] as usize) / 10)
+            .min((oend[2] as usize - op[2] as usize) / 10)
+            .min((oend[3] as usize - op[3] as usize) / 10);
         if iters == 0 {
             break;
         }
@@ -523,7 +559,7 @@ fn decompress_4streams_interleaved_x2(
             });
         }
         // each iteration advances op[3] by at least 5 bytes
-        let olimit = op[3] + iters * 5;
+        let olimit = unsafe { op[3].add(iters * 5) };
 
         loop {
             // Decode 5 lookups in each of the 4 streams, column-major so the
@@ -560,6 +596,9 @@ fn decompress_4streams_interleaved_x2(
         }
     }
 
+    // hand the pointer state back to the scalar tail as region/out offsets
+    let ip = ip.map(|p| p as usize - base as usize);
+    let op = op.map(|p| p as usize - out_base as usize);
     finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
 
     Ok(())
