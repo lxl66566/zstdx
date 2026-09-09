@@ -417,7 +417,12 @@ fn compress_with_state(
                 header.serialize(&mut output);
                 BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
             }
-            Level::Fastest | Level::Fast | Level::Balanced | Level::Best => {
+            Level::Fastest
+            | Level::Fast
+            | Level::Balanced
+            | Level::Best
+            | Level::Opt
+            | Level::Ultra => {
                 super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
             }
         }
@@ -603,7 +608,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     self.hasher
                         .write_appending(output, self.state.matcher.get_last_space());
                 }
-                Level::Fastest | Level::Fast | Level::Balanced | Level::Best => {
+                Level::Fastest
+                | Level::Fast
+                | Level::Balanced
+                | Level::Best
+                | Level::Opt
+                | Level::Ultra => {
                     compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
                 }
             }
@@ -707,6 +717,8 @@ mod tests {
             crate::Level::Fast,
             crate::Level::Balanced,
             crate::Level::Best,
+            crate::Level::Opt,
+            crate::Level::Ultra,
         ];
         let mut sizes = Vec::new();
         for level in levels {

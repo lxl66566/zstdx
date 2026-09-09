@@ -8,6 +8,7 @@ pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
+pub(crate) mod opt;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
 

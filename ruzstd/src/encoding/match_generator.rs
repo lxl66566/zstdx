@@ -14,6 +14,7 @@
 
 use alloc::vec::Vec;
 
+use super::opt::{OptKnobs, OptScratch, OptState};
 use super::seq_codes::{decode_packed, pack_seq};
 use super::Matcher;
 use super::SeqWord;
@@ -23,10 +24,10 @@ use crate::Level;
 use crate::decoding::sequence_execution::do_offset_history;
 
 /// Shortest match worth encoding; matches the format's MINMATCH range.
-const MIN_MATCH: usize = 4;
+pub(super) const MIN_MATCH: usize = 4;
 /// The hash reads a full u64, so insertable/scannable positions need this
 /// many window bytes ahead to stay in bounds.
-const HASH_READ: usize = 8;
+pub(super) const HASH_READ: usize = 8;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
 /// History kept for matching; also the window size declared in the frame header.
@@ -52,6 +53,9 @@ enum Strategy {
     /// with lazy deferral (levels above Fast, libzstd's `lazy` family).
     /// The payload is the chain-table log.
     Chain(u32),
+    /// Optimal-price parser over a binary match tree (levels Opt/Ultra,
+    /// libzstd's btopt/btultra). The `chain` buffer holds the tree ring.
+    Opt(OptKnobs),
 }
 
 /// Per-level search parameters, following libzstd's `clevels.h` ladder.
@@ -112,12 +116,54 @@ const BEST_PARAMS: LevelParams = LevelParams {
     lazy_depth: 4,
 };
 
+/// Level Opt, roughly zstd 16-17 (btopt): whole-bit prices with the
+/// skip/early-abort heuristics and a 4-byte main hash. The tree ring
+/// matches the 1 MiB window so every in-window position stays linked.
+const OPT_KNOBS: OptKnobs = OptKnobs {
+    search_log: 5,
+    sufficient_len: 64,
+    min_match: 4,
+    mls: 4,
+    bt_log: 20,
+    hash3_log: 0,
+    ultra: false,
+};
+const OPT_PARAMS: LevelParams = LevelParams {
+    hash_log: 20,
+    window: 1 << 20,
+    strategy: Strategy::Opt(OPT_KNOBS),
+    search_depth: 0,
+    lazy_depth: 0,
+};
+
+/// Level Ultra, roughly zstd 18-22 (btultra/btultra2): fractional prices,
+/// 3-byte matches via the hash3 table, and the 2-pass first-block
+/// statistics seeding.
+const ULTRA_KNOBS: OptKnobs = OptKnobs {
+    search_log: 7,
+    sufficient_len: 256,
+    min_match: 3,
+    mls: 3,
+    bt_log: 20,
+    hash3_log: 17,
+    ultra: true,
+};
+const ULTRA_PARAMS: LevelParams = LevelParams {
+    hash_log: 21,
+    window: 1 << 20,
+    strategy: Strategy::Opt(ULTRA_KNOBS),
+    search_depth: 0,
+    lazy_depth: 0,
+};
+
 fn params_for_level(level: Level) -> LevelParams {
     match level {
         Level::Uncompressed | Level::Fastest => FASTEST_PARAMS,
         Level::Fast => FAST_PARAMS,
         Level::Balanced => BALANCED_PARAMS,
         Level::Best => BEST_PARAMS,
+        Level::Opt => OPT_PARAMS,
+        Level::Ultra => ULTRA_PARAMS,
     }
 }
 
@@ -215,11 +261,11 @@ fn insert_at(win: &[u8], table: &mut [u64], tag: u64, idx: usize, abs: u64) {
 }
 
 /// Push one sequence's literals and packed code/add-bits streams, and
-/// update the repeated-offset history. Shared by the fast and chain emit
-/// paths; returns the literal length and the window-relative match end.
+/// update the repeated-offset history. Shared by the fast, chain and opt
+/// emit paths; returns the literal length and the window-relative match end.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn push_seq_packed(
+pub(super) fn push_seq_packed(
     win: &[u8],
     win_base: u64,
     anchor: u64,
@@ -571,8 +617,19 @@ pub struct MatchGeneratorDriver {
     table: Vec<u64>,
     /// Second search table for the two-table strategies (the dfast short
     /// hash or the chain links; see [`Strategy`]), epoch-tagged like
-    /// `table`; empty for the fast strategy.
+    /// `table`; empty for the fast strategy. The opt strategies keep their
+    /// binary-tree ring here.
     chain: Vec<u64>,
+    /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
+    /// (libzstd's hashTable3); empty otherwise.
+    hash3: Vec<u64>,
+    /// Price statistics for the opt strategies, persisting across blocks.
+    opt_state: OptState,
+    /// DP scratch for the opt strategies (~130 KiB; allocated on demand).
+    opt_scratch: Option<OptScratch>,
+    /// Tree fill point for the opt strategies: positions below it are
+    /// already inserted into the binary tree.
+    next_update: u64,
     epoch: u64,
     miss_count: usize,
     params: LevelParams,
@@ -634,6 +691,10 @@ impl MatchGeneratorDriver {
             block_start: 0,
             table: alloc::vec![EMPTY; 1usize << HASH_LOG],
             chain: Vec::new(),
+            hash3: Vec::new(),
+            opt_state: OptState::new(),
+            opt_scratch: None,
+            next_update: 0,
             // Epoch 0 is the never-valid state of a zeroed table.
             epoch: 1,
             miss_count: 0,
@@ -658,6 +719,10 @@ impl MatchGeneratorDriver {
             block_start: 0,
             table: alloc::vec![EMPTY; 1usize << HASH_LOG],
             chain: Vec::new(),
+            hash3: Vec::new(),
+            opt_state: OptState::new(),
+            opt_scratch: None,
+            next_update: 0,
             epoch: 1,
             miss_count: 0,
             params: FASTEST_PARAMS,
@@ -679,7 +744,18 @@ impl MatchGeneratorDriver {
                 Strategy::Fast => Vec::new(),
                 Strategy::Dfast(small_log) => alloc::vec![EMPTY; 1usize << small_log],
                 Strategy::Chain(chain_log) => alloc::vec![EMPTY; 1usize << chain_log],
+                // The tree ring: two link slots per ring position.
+                Strategy::Opt(knobs) => alloc::vec![EMPTY; 2usize << knobs.bt_log],
             };
+            self.hash3 = match params.strategy {
+                Strategy::Opt(knobs) if knobs.hash3_log > 0 => {
+                    alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+                }
+                _ => Vec::new(),
+            };
+            if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
+                self.opt_scratch = Some(OptScratch::new());
+            }
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
             // the capacity. Direct-window matchers (slice size zero) never
@@ -752,12 +828,18 @@ impl Matcher for MatchGeneratorDriver {
             if !self.chain.is_empty() {
                 self.chain.fill(EMPTY);
             }
+            if !self.hash3.is_empty() {
+                self.hash3.fill(EMPTY);
+            }
             self.epoch = 1;
         }
         self.miss_count = 0;
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
         self.rep_pending = 0;
+        // The opt parser re-seeds its statistics and re-fills its tree.
+        self.next_update = 0;
+        self.opt_state.reset();
     }
 
     fn window_size(&self) -> u64 {
@@ -844,6 +926,7 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Fast => self.start_matching_fast(literals, seqs),
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
             Strategy::Chain(_) => self.start_matching_chain(literals, seqs),
+            Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
         }
     }
 
@@ -852,11 +935,14 @@ impl Matcher for MatchGeneratorDriver {
         // uniform run hashes to the same slot, so indexing each byte just
         // rewrites one table entry. The first position covers that slot;
         // future probes into the run resolve through it or the repcode
-        // chain.
+        // chain. The opt strategies skip even that: their tree fills
+        // lazily from `next_update`, which stays at the block start and
+        // covers the run on the next block's fill.
         let idx = (self.block_start - self.win_base) as usize;
         let win = window_slice(&self.win, &self.ext);
         if idx + HASH_READ <= win.len() {
             match self.params.strategy {
+                Strategy::Opt(_) => {}
                 Strategy::Chain(log) => {
                     let h = hash_at_log(win, idx, log);
                     // SAFETY: h is masked to log bits, the absolute block
@@ -1633,6 +1719,77 @@ impl MatchGeneratorDriver {
         self.rep = rep;
         self.rep_pending = rep_pending;
     }
+
+    /// Bridge into the optimal parser (levels Opt/Ultra): hands over the
+    /// window, the epoch-tagged tables and the persistent price state, then
+    /// stores back the cursors the parser advanced.
+    fn start_matching_opt(
+        &mut self,
+        knobs: OptKnobs,
+        literals: &mut Vec<u8>,
+        seqs: &mut Vec<SeqWord>,
+    ) {
+        let win = window_slice(&self.win, &self.ext);
+        let win_base = self.win_base;
+        let block_start = self.block_start;
+        let block_end = self.block_end;
+        let max_window = self.params.window as u64;
+        let mut epoch = self.epoch;
+        let mut next_update = self.next_update;
+        let mut rep = self.rep;
+        let mut rep_pending = self.rep_pending;
+        let Some(scratch) = self.opt_scratch.as_mut() else {
+            unreachable!("opt scratch allocated by apply_level")
+        };
+        // Disjoint field borrows: the window (win/ext) against the tables.
+        if knobs.ultra {
+            super::opt::run_block::<true>(
+                &knobs,
+                win,
+                win_base,
+                block_start,
+                block_end,
+                max_window,
+                &mut epoch,
+                &mut self.table,
+                &mut self.chain,
+                &mut self.hash3,
+                &mut next_update,
+                &mut self.opt_state,
+                scratch,
+                &mut rep,
+                &mut rep_pending,
+                literals,
+                seqs,
+            );
+        } else {
+            super::opt::run_block::<false>(
+                &knobs,
+                win,
+                win_base,
+                block_start,
+                block_end,
+                max_window,
+                &mut epoch,
+                &mut self.table,
+                &mut self.chain,
+                &mut self.hash3,
+                &mut next_update,
+                &mut self.opt_state,
+                scratch,
+                &mut rep,
+                &mut rep_pending,
+                literals,
+                seqs,
+            );
+        }
+        self.epoch = epoch;
+        self.next_update = next_update;
+        self.rep = rep;
+        self.rep_pending = rep_pending;
+        self.pos = block_end;
+        self.anchor = block_end;
+    }
 }
 
 #[cfg(test)]
@@ -1728,9 +1885,58 @@ mod tests {
         let mut data = Vec::with_capacity(3 << 20);
         for i in 0..(3 << 20) / 64 {
             data.push((i % 251) as u8);
-            data.extend_from_slice(&[7u8; 63]);
+            data.extend(&[7u8; 63]);
         }
         assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
+    }
+
+    #[test]
+    fn opt_levels_reconstruct() {
+        let mut data = Vec::with_capacity(700 * 1024);
+        let words = [
+            &b"the quick brown fox "[..],
+            &b"jumps over the lazy dog "[..],
+            &b"lorem ipsum dolor sit amet "[..],
+            b"\x00\x01\x02\x03 structured noise ",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while data.len() < 700 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(words[(state as usize) % words.len()]);
+        }
+        for level in [crate::Level::Best, crate::Level::Opt, crate::Level::Ultra] {
+            let mut driver = MatchGeneratorDriver::new(128 * 1024);
+            driver.reset(level);
+            let mut rep = [1u32, 4, 8];
+            let mut reconstructed = Vec::new();
+            for block in data.chunks(128 * 1024) {
+                driver.block_tail()[..block.len()].copy_from_slice(block);
+                driver.commit_block(block.len());
+                driver.start_matching(|seq| match seq {
+                    Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                    Sequence::Triple {
+                        literals,
+                        offset,
+                        match_len,
+                    } => {
+                        reconstructed.extend_from_slice(literals);
+                        let actual = crate::decoding::sequence_execution::do_offset_history(
+                            offset as u32,
+                            literals.len() as u32,
+                            &mut rep,
+                        );
+                        let start = reconstructed.len() - actual as usize;
+                        for i in 0..match_len {
+                            let b = reconstructed[start + i];
+                            reconstructed.push(b);
+                        }
+                    }
+                });
+            }
+            assert_eq!(reconstructed, data, "reconstruct {level:?}");
+        }
     }
 
     #[test]

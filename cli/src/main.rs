@@ -38,8 +38,11 @@ enum Commands {
         /// How thoroughly the file should be compressed. A higher level will take
         /// more time to compress but result in a smaller file, and vice versa.
         ///
+        /// Maps onto the nearest implemented strategy tier:
+        ///
         /// - 0: Uncompressed
-        /// - 1..=4: Fastest (further levels arrive with their strategies)
+        /// - 1-2: Fastest, 3-5: Fast, 6-9: Balanced
+        /// - 10-15: Best, 16-17: Opt, 18+: Ultra
         #[arg(
             short,
             long,
@@ -102,12 +105,8 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     info!("compressing {input:?} to {output:?}");
     let compression_level: ruzstd::Level = match level {
         0 => Level::Uncompressed,
-        // Levels 1..=4 currently share the fast matcher; further variants
-        // arrive as their strategies are implemented.
-        1..=4 => Level::Fastest,
-        _ => {
-            unimplemented!("unsupported compression level: {}", level);
-        }
+        // Numeric levels map onto the nearest implemented strategy tier.
+        _ => Level::approximate_zstd(level as i32),
     };
     let source_file = File::open(input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;

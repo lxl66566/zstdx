@@ -4,6 +4,34 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* New levels `Level::Opt` (≈zstd 16-17, btopt) and `Level::Ultra`
+  (≈zstd 18-22, btultra/btultra2): a full port of libzstd's optimal
+  parser (`zstd_opt.c`) — the lazy-filled binary match tree
+  (insertBt1 / insertBtAndGetAllMatches with epoch-tagged absolute
+  positions), the forward DP over stretches with adaptive
+  fractional-bit price statistics persisting across blocks
+  (rescaleFreqs seeding/downscaling, updateStats), the btultra
+  match+1-literal recheck, and the 2-pass first-block statistics
+  seeding (libzstd rewinds its window limits between passes; the epoch
+  bump invalidates the pass-1 tree instead). `approximate_zstd` maps
+  numeric levels 16-17 to Opt and 18+ to Ultra, and the CLI now
+  accepts every level instead of `unimplemented!()` past 4. Two port
+  subtleties were correctness-critical: `ZSTD_count` returns the
+  delta from its start pointers (a resumed count must replace, not
+  add to, the carried prefix), and libzstd's rep history is updated
+  exactly once per series by the path traversal — emission-time
+  sequence updates (`push_seq_packed`'s history fold) are the
+  decoder-equivalent and replace it. Insert-side tree counts cap at
+  the 4096-position DP window: re-filling regions the parser skipped
+  (long matches at far offsets) otherwise re-counts hundreds of KB
+  per candidate against stale hash heads — text went 45 -> 313 MiB/s
+  (level Opt) with byte-identical output. 32 MiB corpus, ratio =
+  raw/compressed: json Opt 7.57 vs zstd-16 7.28, json Ultra 7.52 vs
+  zstd-19 7.49 (and zstd-19 forced to the same 1 MiB window: 7.53);
+  text Opt 271.5 vs 272.0, text Ultra 275.9 vs 276.7; skewed and
+  random at parity. Speed: json Opt ≈ zstd-16 (7.8 MiB/s), text Opt
+  313 MiB/s vs libzstd's ~440.
+
 * The chain search now beat-checks candidates (libzstd's "potentially
   better" read): the 4 bytes ending at best_len+1 decide whether a
   candidate can strictly improve, so hash collisions reject on one load

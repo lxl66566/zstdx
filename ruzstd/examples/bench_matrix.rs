@@ -34,11 +34,13 @@ use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
 
-const LADDER: [(&str, Level, i32); 4] = [
+const LADDER: [(&str, Level, i32); 6] = [
     ("fastest", Level::Fastest, 1),
     ("fast", Level::Fast, 3),
     ("balanced", Level::Balanced, 6),
     ("best", Level::Best, 12),
+    ("opt", Level::Opt, 16),
+    ("ultra", Level::Ultra, 19),
 ];
 
 const SHAPES: [&str; 5] = ["json", "text", "skewed", "random", "zeros"];
