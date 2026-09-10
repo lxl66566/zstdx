@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The job-start seed scan is vectorized with AVX-512: 64-candidate blocks
+  scanned from the anchor down, eight overlapping 64-byte loads per block
+  assembling one occupancy bit per position, taken highest-first — the
+  byte-wise walk's exact nearest-first order, so the chosen seed (and the
+  output) is unchanged. On strips with no repeat (random-like shapes) the
+  scan walks the whole window and drops from ~0.45 ms to ~0.06-0.13 ms
+  per job (4-7x); repeating shapes still stop at the first qualifying
+  block. An equivalence unit test sweeps planted hits across residue
+  classes mod 8, block-grid boundaries, the scalar tail and the agree
+  bound against a naive walk. Non-x86-64 and pre-AVX-512 builds keep the
+  scalar path, which also lost its redundant 4-byte prefilter (a matching
+  u64's low half is that u32).
+
 * Every multithreaded job now starts from cleared head tables: the pooled
   matcher state carries whatever earlier jobs — on this frame or a
   previous one — left, and a leftover entry that decodes into the window

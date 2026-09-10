@@ -62,6 +62,11 @@ const SEED_MATCHES: u8 = 3;
 /// matching (broken period, or a repeated block that ended) must not pay a
 /// dead compare for the rest of the job.
 const SEED_BUDGET: u32 = 8192;
+/// Strip length below which the seed scan stays scalar: the AVX-512 block
+/// walk's lowest block reads up to byte 63 + 71, and `last + 8 >= 136`
+/// keeps every such load inside data. Shorter strips are cheap anyway.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+const SEED_SCAN_MIN: usize = 128;
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xC0000;
 
@@ -1043,24 +1048,11 @@ impl MatchGeneratorDriver {
     /// `last` is the strip's final insertable index; the anchor bytes
     /// `[last, last + 8)` abut the job start.
     fn acquire_seed(&mut self, data: &[u8], last: usize) {
-        let a4 = read4(data, last);
         let a8 = read8(data, last);
-        let mut u = last;
-        while u > 0 {
-            u -= 1;
-            if read4(data, u) != a4 || read8(data, u) != a8 {
-                continue;
-            }
-            let mut k = 1;
-            while u >= k && k <= SEED_AGREE && data[last - k] == data[u - k] {
-                k += 1;
-            }
-            if k > SEED_AGREE {
-                self.seed_offset = (last - u) as u32;
-                self.seed_hits = 0;
-                self.seed_budget = SEED_BUDGET;
-                return;
-            }
+        if let Some(u) = seed_scan(data, last, a8) {
+            self.seed_offset = (last - u) as u32;
+            self.seed_hits = 0;
+            self.seed_budget = SEED_BUDGET;
         }
     }
 }
@@ -1112,6 +1104,89 @@ unsafe fn clear_table_avx512(t: &mut [u32]) {
 /// Slot count above which the job-start table clear goes non-temporal
 /// (4 MiB of u32 slots): smaller tables profit more from staying cached.
 const NT_CLEAR_MIN: usize = 1 << 20;
+
+/// Nearest `u < last` with the anchor's 8 bytes and [`SEED_AGREE`]
+/// agreeing bytes before it (see [`MatchGeneratorDriver::acquire_seed`]).
+/// The 8-byte compare subsumes the 4-byte prefilter the scalar walk used
+/// to run first: a matching u64's low half is the u32 at the same index.
+fn seed_scan(data: &[u8], last: usize, a8: u64) -> Option<usize> {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if last >= SEED_SCAN_MIN && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: the feature was just detected; every load stays inside
+        // data (see the bound derivation in the callee).
+        return unsafe { seed_scan_avx512(data, last, a8) };
+    }
+    let mut u = last;
+    while u > 0 {
+        u -= 1;
+        if read8(data, u) == a8 && seed_agrees(data, u, last) {
+            return Some(u);
+        }
+    }
+    None
+}
+
+/// Whether the [`SEED_AGREE`] bytes before `u` equal those before `last`:
+/// positions below [`SEED_AGREE`] never qualify (the `u >= k` bound).
+fn seed_agrees(data: &[u8], u: usize, last: usize) -> bool {
+    let mut k = 1;
+    while u >= k && k <= SEED_AGREE && data[u - k] == data[last - k] {
+        k += 1;
+    }
+    k > SEED_AGREE
+}
+
+/// AVX-512 seed scan: 64-candidate blocks from the anchor down, eight
+/// overlapping unaligned 64-byte loads per block. Load `j` compares the
+/// broadcast anchor against the positions `b + j + 8t`, so the eight 8-bit
+/// masks assemble into one occupancy bit per candidate; blocks run top-down
+/// and set bits are taken highest first — exactly the scalar walk's
+/// nearest-first order, byte-for-byte. The top block starts at `last - 63`
+/// (its highest lane is the anchor itself, skipped by the `u < last`
+/// check); every load's final byte lands at `b + 7 + 64 <= last + 8 ==
+/// data.len()`, which [`SEED_SCAN_MIN`] guarantees for the lowest block
+/// too. The positions below the final block's start run scalar.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let pat = _mm512_set1_epi64(a8 as i64);
+    let bottom = (last - 63) & 63;
+    let mut b = last - 63;
+    loop {
+        let mut occ = 0u64;
+        for j in 0..8 {
+            // SAFETY: b + j + 64 <= data.len() for every block (top block:
+            // last - 63 + 7 + 64 == last + 8; lower blocks read lower).
+            let v = _mm512_loadu_si512(data.as_ptr().add(b + j).cast());
+            // Load j's lane t compares the position b + j + 8t; spread its
+            // mask bit t to occupancy bit j + 8t (== u - b). The per-bit
+            // loop only runs on nonzero masks — pure overhead on
+            // non-repeating data.
+            let mut m = _mm512_cmpeq_epi64_mask(v, pat) as u64;
+            while m != 0 {
+                let t = m.trailing_zeros();
+                m &= m - 1;
+                occ |= 1 << (j + 8 * t as usize);
+            }
+        }
+        while occ != 0 {
+            let bit = 63 - occ.leading_zeros();
+            occ ^= 1 << bit;
+            let u = b + bit as usize;
+            if u < last && seed_agrees(data, u, last) {
+                return Some(u);
+            }
+        }
+        if b == bottom {
+            break;
+        }
+        b -= 64;
+    }
+    (0..bottom)
+        .rev()
+        .find(|&u| read8(data, u) == a8 && seed_agrees(data, u, last))
+}
 
 impl Matcher for MatchGeneratorDriver {
     fn reset(&mut self, level: Level) {
@@ -2387,6 +2462,129 @@ mod tests {
         assert_eq!(unpack_pos(pack_pos(0xFFFF_FFFF), 1 << 40), None);
         assert_eq!(unpack_pos(pack_pos(1000), 10), None);
         assert_eq!(unpack_pos(0, 1 << 40), None);
+    }
+
+    /// The seed scan must return exactly the nearest qualifying position a
+    /// naive byte-wise walk would find, on every path: the AVX-512 block
+    /// walk (residue classes mod 8, block boundaries, the anchor's trivial
+    /// self-match), the scalar tail below the last block, and strips too
+    /// short for the block scheme.
+    #[test]
+    fn seed_scan_matches_naive_walk() {
+        let qualify = |data: &[u8], u: usize, last: usize| -> bool {
+            u >= 48 && data[u - 48..u] == data[last - 48..last]
+        };
+        let naive = |data: &[u8], last: usize| -> Option<usize> {
+            let a8 = super::read8(data, last);
+            (0..last)
+                .rev()
+                .find(|&u| super::read8(data, u) == a8 && qualify(data, u, last))
+        };
+        let check = |data: &[u8]| {
+            let last = data.len() - 8;
+            let expect = naive(data, last);
+            assert_eq!(
+                super::seed_scan(data, last, super::read8(data, last)),
+                expect,
+                "dispatched scan at len {}",
+                data.len()
+            );
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if last >= super::SEED_SCAN_MIN && std::is_x86_feature_detected!("avx512f") {
+                assert_eq!(
+                    // SAFETY: feature detected above; bounds argued at the
+                    // definition.
+                    unsafe { super::seed_scan_avx512(data, last, super::read8(data, last)) },
+                    expect,
+                    "avx512 scan at len {}",
+                    data.len()
+                );
+            }
+        };
+
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // A 56-byte pattern planted as the anchor window `[last-48,
+        // last+8)` and, disjoint from it, as the candidate window
+        // `[hit-48, hit+8)`; everything else random. `hit` sweeps the
+        // interesting offsets: residue classes mod 8, the block-grid
+        // boundaries and the bottom tail (< 64).
+        let len = 700;
+        let last = len - 8;
+        let mut data = alloc::vec![0u8; len];
+        for hit in [
+            last - 56,
+            last - 57,
+            last - 63,
+            last - 64,
+            last - 65,
+            last - 72,
+            last - 119,
+            last - 120,
+            last - 128,
+            65,
+            64,
+            63,
+            48,
+        ] {
+            for b in data.iter_mut() {
+                *b = rng() as u8;
+            }
+            let pat: alloc::vec::Vec<u8> = (0..56).map(|_| rng() as u8).collect();
+            data[hit - 48..hit + 8].copy_from_slice(&pat);
+            data[last - 48..].copy_from_slice(&pat);
+            check(&data);
+            assert_eq!(
+                super::seed_scan(&data, last, super::read8(&data, last)),
+                Some(hit),
+                "planted hit {hit}"
+            );
+        }
+        // A candidate below the agree bound never qualifies: the planted
+        // anchor window alone must yield no seed.
+        for b in data.iter_mut() {
+            *b = rng() as u8;
+        }
+        let pat: alloc::vec::Vec<u8> = (0..56).map(|_| rng() as u8).collect();
+        data[last - 48..].copy_from_slice(&pat);
+        check(&data);
+        assert_eq!(
+            super::seed_scan(&data, last, super::read8(&data, last)),
+            None
+        );
+        // All-same bytes: every position trivially matches, nearest wins and
+        // the anchor itself is excluded.
+        let flat = alloc::vec![0x5Au8; len];
+        check(&flat);
+        assert_eq!(
+            super::seed_scan(&flat, last, super::read8(&flat, last)),
+            Some(last - 1)
+        );
+        // Exact periods across all residue classes mod 8: the scan must find
+        // the period (or a multiple) exactly like the naive walk.
+        for period in [200, 201, 202, 203, 204, 205, 206, 207, 256, 257] {
+            let unit: alloc::vec::Vec<u8> = (0..period).map(|_| rng() as u8).collect();
+            let mut tiled = alloc::vec![0u8; 0];
+            while tiled.len() < len {
+                tiled.extend_from_slice(&unit);
+            }
+            tiled.truncate(len);
+            check(&tiled);
+        }
+        // No repeat at all, at sizes just around the block-scheme minimum.
+        for l in [48, 56, 63, 64, 120, 127, 128, 129, 136, len] {
+            let mut data = alloc::vec![0u8; l];
+            for b in data.iter_mut() {
+                *b = rng() as u8;
+            }
+            // A u64-rng strip of this size has no 8-byte recurrence.
+            check(&data);
+        }
     }
 
     /// Stale u32 entries from an earlier frame must die on the domain
