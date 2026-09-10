@@ -4,8 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
-* Docs and CI pass: new `.github/workflows/docs.yml` builds the mdbook (`mdbook build
-  docs`) and deploys `docs/book` to GitHub Pages on pushes to `master` (+ `workflow_dispatch`),
+- New `zstdx-gungraun` workspace member: deterministic valgrind instruction-count
+  benchmarks comparing zstdx against the `zstd` crate on identical 1 MiB corpus
+  slices (see the crate's Readme). Three bench binaries - `decode` (libzstd- and
+  zstdx-produced frames, bulk path), `encode` (all six ladder levels vs the
+  matching libzstd levels) and `stream` (streaming decode and encode) - pair the
+  implementations per corpus shape with `compare_by_id`, so every `zc*` benchmark
+  prints a `zstdx | libzstd` instruction delta. Setup expressions produce the
+  frames and run cross-implementation roundtrip gates outside the measured
+  region; counts are machine-independent and immune to CPU drift, complementing
+  the wall-clock A/B harness in `zstdx-bench`. Benches only run under valgrind
+  (`test = false`, lib `bench = false`), so Windows `cargo test`/`clippy` are
+  unaffected; the workspace gains a `[profile.bench]` with `debug = true`,
+  `strip = false` for callgrind symbol attribution.
+
+- Docs and CI pass: new `.github/workflows/docs.yml` builds the mdbook (`mdbook build
+docs`) and deploys `docs/book` to GitHub Pages on pushes to `master` (+ `workflow_dispatch`),
   mirroring youpipe's docs workflow (OIDC permissions, `pages` concurrency group,
   upload/deploy-pages split). The handbook under `docs/src` is rewritten in accurate
   English - every contiguous paragraph is a single physical line, CJK removed, all
@@ -24,7 +38,7 @@ This document records the changes made between versions, starting with version 0
   MT encode leads 2-8x with ratio within 0.5% of ST everywhere, and the Best tier is
   now the largest encoder deficit (x2.4-29 slower than zstd while leading ratio).
 
-* Toolchain hygiene pass: root-level `clippy.toml` (msrv 1.89, complexity and
+- Toolchain hygiene pass: root-level `clippy.toml` (msrv 1.89, complexity and
   line-width thresholds), nightly `rustfmt.toml` (crate-granularity import
   merging, `StdExternalCrate` grouping, comment wrapping) and `.tombi.toml`
   (TOML alignment). Workspace-level `[workspace.lints]` turn on clippy `all` +
@@ -42,7 +56,7 @@ This document records the changes made between versions, starting with version 0
   AVX-512 intrinsics, `unsafe fn` bodies now carry explicit `unsafe` blocks,
   and the bench harness's `env::set_var` call is annotated.
 
-* `decoding::StreamingDecoder` decodes concatenated frames and skips
+- `decoding::StreamingDecoder` decodes concatenated frames and skips
   skippable frames transparently, matching `FrameDecoder::decode_all` and the
   reference decoders (libzstd and the zstd crate were probed as the oracle on
   every stream shape). Trailing bytes that do not start a frame surface as an
@@ -52,7 +66,7 @@ This document records the changes made between versions, starting with version 0
   Found by the new consistency assertion in the `decode` fuzz target
   (crash-b5593b58, regression test in `src/tests/multi_frame.rs`).
 
-* The FSE encoder's packed transition entries widen their baseline and
+- The FSE encoder's packed transition entries widen their baseline and
   target-index fields from 9 to 12 bits each. Tables with accuracy logs above
   9 - only reachable through the fuzz exports' `round_trip`, which passes
   max_log 22 - silently truncated baselines, so the encoder emitted state
@@ -63,7 +77,7 @@ This document records the changes made between versions, starting with version 0
   `roundtrip` unit test now replays the fuzz artifacts again, following their
   move to `crates/zstdx-fuzz`.
 
-* The flat sequence executor's `headroom` instantiation skipped the
+- The flat sequence executor's `headroom` instantiation skipped the
   per-sequence budget check `op + ll + ml <= out_end`, trusting the streaming
   buffer's block-maximum reservation. A corrupt sequence section can claim
   more output than the block maximum and march the cursor out of the
@@ -74,7 +88,7 @@ This document records the changes made between versions, starting with version 0
   dec-st bench matrix shows no regression from the restored check. Found by
   the `decode` fuzz target (crash-01de01).
 
-* The fuzz targets move from `crates/zstdx/fuzz` to their own
+- The fuzz targets move from `crates/zstdx/fuzz` to their own
   `crates/zstdx-fuzz` crate (excluded from the workspace, as cargo-fuzz
   requires). `libfuzzer-sys` now comes from crates.io and the reference
   side is the same zstd 0.13 binding the bench crate uses. Encoder coverage
@@ -87,10 +101,10 @@ This document records the changes made between versions, starting with version 0
   `interop` target that still used the zstd 0.5 API (and duplicated the
   uncompressed path into its "compressed" helper).
 
-* The benchmark and dev-tool examples leave the library for a new
+- The benchmark and dev-tool examples leave the library for a new
   `zstdx-bench` workspace crate with subcommands: `matrix` (the full
   cross-matrix, now filterable by `--mode/--shape/--level/--workers/
-  --mt-workers`), `small`, `files` (budget-based decode of explicit files,
+--mt-workers`), `small`, `files` (budget-based decode of explicit files,
   replacing `bench_corpus` and the fixed-iteration `bench_files`), `prof`
   (merged `dec_prof`/`enc_prof`/`enc_stream_prof`), `dump` (merged
   `dump_comp`/`dump_all_levels`), `corrupt`, `mtcheck`, `seqstats` and
@@ -102,23 +116,23 @@ This document records the changes made between versions, starting with version 0
   `--no-default-features` check no longer recompiles example code over the
   release artifacts.
 
-* The repository is reshaped into a cargo workspace with every crate under
+- The repository is reshaped into a cargo workspace with every crate under
   `crates/`: the library now lives at `crates/zstdx`, the CLI at
   `crates/cli`. The root member list uses the `crates/*` glob so future
   crates need no root-manifest edit.
 
-* The crate is renamed: `ruzstd` is now `zstdx` (CLI: `zstdx-cli`, fuzz:
+- The crate is renamed: `ruzstd` is now `zstdx` (CLI: `zstdx-cli`, fuzz:
   `zstdx-fuzz`). All code, manifests, docs and CI copy use the new name;
   historical entries below keep the name they were written under.
 
-* New `docs/` mdBook consolidating the branch's untracked working notes into a
+- New `docs/` mdBook consolidating the branch's untracked working notes into a
   themed handbook: a status overview, the head-to-head benchmark archive with
   measurement methodology, per-area optimization records (decoding, encoding,
   matchers/levels, mt/streaming), a todo list cross-checked against this
   changelog, the falsified-directions list and per-area pitfall notes. The
   root-level working documents stay in place as archives.
 
-* The streaming encoders accept `workers > 1`: input accumulates in one
+- The streaming encoders accept `workers > 1`: input accumulates in one
   contiguous buffer (the previous burst's window strip followed by the
   unencoded bytes) and once at least one full round of workers' worth of
   job-sized slices is pending, a burst encodes them in parallel through
@@ -146,7 +160,7 @@ This document records the changes made between versions, starting with version 0
   (json/text at the fast and best levels, parity at balanced) and
   3-4x our own single-threaded streaming on the json shapes.
 
-* The job-start seed scan is vectorized with AVX-512: 64-candidate blocks
+- The job-start seed scan is vectorized with AVX-512: 64-candidate blocks
   scanned from the anchor down, eight overlapping 64-byte loads per block
   assembling one occupancy bit per position, taken highest-first — the
   byte-wise walk's exact nearest-first order, so the chosen seed (and the
@@ -159,7 +173,7 @@ This document records the changes made between versions, starting with version 0
   scalar path, which also lost its redundant 4-byte prefilter (a matching
   u64's low half is that u32).
 
-* Every multithreaded job now starts from cleared head tables: the pooled
+- Every multithreaded job now starts from cleared head tables: the pooled
   matcher state carries whatever earlier jobs — on this frame or a
   previous one — left, and a leftover entry that decodes into the window
   with matching bytes acts as a legal candidate whose presence depends on
@@ -174,7 +188,7 @@ This document records the changes made between versions, starting with version 0
   so stale link slots are unreachable. Clears of 4 MiB and above use
   non-temporal stores to skip the ownership read and spare the cache.
 
-* The dfast and chain multithreaded-job strip prefills now fill their
+- The dfast and chain multithreaded-job strip prefills now fill their
   tables on a stride-3 grid (like the fast strategy and libzstd's
   dictionary-content load for fast/dfast) instead of every position. The
   chain strategy deviates from libzstd's dense dictionary fill on
@@ -188,7 +202,7 @@ This document records the changes made between versions, starting with version 0
   +68%, zeros.fast +110%, json/random/skewed.balanced +5-28%; output
   drift within ±0.13% (mostly improvements).
 
-* The fast, dfast and chain match tables now hold u32 entries: each slot
+- The fast, dfast and chain match tables now hold u32 entries: each slot
   stores its absolute position biased by one and truncated to 32 bits
   (zero remains the never-written sentinel), and readers rebuild the
   high bits from the scanning position, unwrapping one 4 GiB cycle when
@@ -205,7 +219,7 @@ This document records the changes made between versions, starting with version 0
   skewed.fast +5%; Fastest levels, zeros and the opt strategies
   unchanged.
 
-* The dfast miss step is now stateless: instead of a per-match
+- The dfast miss step is now stateless: instead of a per-match
   step/next-step counter pair bumped every 256 skipped positions, the
   probe pair advances by `1 + (distance since the last match) >> 8` —
   the same one-step-per-256-bytes growth grid with no branch and two
@@ -218,7 +232,7 @@ This document records the changes made between versions, starting with version 0
   json +1.7%, skewed +0.8%, text +2.6%, random and zeros unchanged;
   output sizes byte-identical everywhere.
 
-* The dfast backfill insert — indexing the prepared second probe
+- The dfast backfill insert — indexing the prepared second probe
   position after a match was emitted — was gated on `step < 4`, a
   proxy for "the match covered the probe position" that misses every
   long match found once the miss step has grown past 3: those matches
@@ -227,7 +241,7 @@ This document records the changes made between versions, starting with version 0
   moved the anchor past the probe position), which no longer leans on
   the assumption that match length bounds the step.
 
-* Multithreaded compression now holds the single-threaded ratio. The
+- Multithreaded compression now holds the single-threaded ratio. The
   overlap strip between jobs is the full level window and its positions
   are actually indexed into the search tables (`prefill_window`; before,
   the strip was borrowed as window but never indexed, so no sequence
@@ -252,7 +266,7 @@ This document records the changes made between versions, starting with version 0
   1.00, Balanced 2.70 -> 1.00; on the 32 MiB corpus every level and
   shape stays within +0.16% of single-threaded.
 
-* New levels `Level::Opt` (≈zstd 16-17, btopt) and `Level::Ultra`
+- New levels `Level::Opt` (≈zstd 16-17, btopt) and `Level::Ultra`
   (≈zstd 18-22, btultra/btultra2): a full port of libzstd's optimal
   parser (`zstd_opt.c`) — the lazy-filled binary match tree
   (insertBt1 / insertBtAndGetAllMatches with epoch-tagged absolute
@@ -280,7 +294,7 @@ This document records the changes made between versions, starting with version 0
   random at parity. Speed: json Opt ≈ zstd-16 (7.8 MiB/s), text Opt
   313 MiB/s vs libzstd's ~440.
 
-* The literals Huffman table now gets optimal length-limited code
+- The literals Huffman table now gets optimal length-limited code
   lengths (boundary package-merge, Larmore-Hirschberg) instead of the
   rank-only weight ladder: the old scheme depended on count order
   but not magnitude, losing heavily on skewed literal histograms.
@@ -288,14 +302,14 @@ This document records the changes made between versions, starting with version 0
   json fastest 6.05 -> 6.20, json ultra 7.33 -> 7.52, text fastest
   196.6 -> 206.0, text best 242.0 -> 245.5.
 
-* `Level::Best` (≈zstd 10-15) now runs the optimal parser in its
+- `Level::Best` (≈zstd 10-15) now runs the optimal parser in its
   cheapest setting (16 tree compares, targetLength 32) instead of a
   depth-24 hash-chain search: the chain matcher could not reach the
   tier's ratio at any depth. json Best 5.77 -> 6.88 (zstd-12: 6.14),
   text Best 245.5 -> 270.8 (zstd-12: 256.1), skewed Best 1.87 ->
   1.996, at 12-19 MiB/s depending on shape.
 
-* The chain search now beat-checks candidates (libzstd's "potentially
+- The chain search now beat-checks candidates (libzstd's "potentially
   better" read): the 4 bytes ending at best_len+1 decide whether a
   candidate can strictly improve, so hash collisions reject on one load
   instead of a full extend. With the walks following real chains since
@@ -311,7 +325,7 @@ This document records the changes made between versions, starting with version 0
   0.7% ratio for 37% speed), skewed Balanced 24->44 (1.848->1.865). Streaming Best reaches bulk parity (18 -> 78
   MiB/s on json, was 4.3x slower than bulk).
 
-* The chain strategies' table links diverged from their walks: inserts
+- The chain strategies' table links diverged from their walks: inserts
   keyed the chain by the window-relative index while walks resolved
   candidates by absolute position, and the two only coincide while
   `win_base == 0`. Every real driver advances `win_base` — the owned
@@ -328,7 +342,7 @@ This document records the changes made between versions, starting with version 0
   the bulk chain levels' speed/ratio points were artifacts of the broken
   search (the retune follows separately).
 
-* A match source below the active segment (a wrapped-away previous-segment
+- A match source below the active segment (a wrapped-away previous-segment
   reference) resolves as one linear in-buffer copy instead of the generic
   segment walk: the previous segment physically sits `seg_a_end - offset`
   above the destination, and the wrap margin keeps every in-window source
@@ -342,7 +356,7 @@ This document records the changes made between versions, starting with version 0
   matches are 99.99% of its far-offset references; the walk was 15.6% of
   cycles), json.zst1/skewed.zst3 +0.9%, others flat.
 
-* The fused sequence decoder carries the three FSE states instead of the
+- The fused sequence decoder carries the three FSE states instead of the
   packed table entries, and drops `bits` and `src_len` from its carried
   stream state entirely: the reload always rebuilds the bit window straight
   from memory (the `nb == 0` clamp path is provably idempotent on the
@@ -363,13 +377,13 @@ This document records the changes made between versions, starting with version 0
   the pack/unpack ops land on the serial FSE chain and cost more than the
   spills they remove.
 
-* `overlap_copy8` computed its post-spread source as `s2 + (8 - dec64)`
+- `overlap_copy8` computed its post-spread source as `s2 + (8 - dec64)`
   in usize; for spread offsets 5-7 the adjustment is negative and the
   subtraction underflowed — a debug-build panic (12 corpus tests fail)
   and a wrapped-but-accidentally-correct pointer in release. The table
   is now the signed `8 - dec64` applied via `offset`, matching libzstd's
   `*ip -= dec64table[offset]` directly.
-* The fused sequence loop's bitstream reads and repcode resolution lost
+- The fused sequence loop's bitstream reads and repcode resolution lost
   their data-dependent branches. Zero-width reads (the `sum == 0` /
   `sum_t == 0` fast cases, taken constantly on rep0-heavy structured
   input) now run through a branchless `read` whose `wrapping_shr` turns
@@ -384,7 +398,7 @@ This document records the changes made between versions, starting with version 0
   to be a minority of the loop's mispredictions — the copy executor holds
   most of them (see PERF3), which a chunk-pair restructure halved but
   could not convert to wall time on this machine.
-* New `bench_matrix` example: the head-to-head comparison widened to the
+- New `bench_matrix` example: the head-to-head comparison widened to the
   full decode/encode × bulk/streaming × single-/multi-thread matrix.
   Five modes (`dec-st`, `dec-mt`, `enc-st`, `enc-mt`, `enc-stream`) run
   interleaved A/B against the zstd crate over the corpus ladder, with
@@ -402,7 +416,7 @@ This document records the changes made between versions, starting with version 0
   caps it. Along the way the correctness gates exposed two multithreaded
   decode bugs (see the two fixes below).
 
-* The sequential fallback of `decode_to_vec_mt` retries with doubling
+- The sequential fallback of `decode_to_vec_mt` retries with doubling
   capacity like `bulk::decompress`, honoring the same append contract as
   the parallel path for a fresh output vec (a plain
   `FrameDecoder::decode_all_to_vec` errors with `TargetTooSmall` on a
@@ -413,7 +427,7 @@ This document records the changes made between versions, starting with version 0
   records (huffman literals in back-to-back blocks, the shape whose
   accumulated-buffer staging the old check rejected) at levels 1/3/9.
 
-* `decompress_literals` validates the number of literals it appended
+- `decompress_literals` validates the number of literals it appended
   against the section's regenerated size instead of the output buffer's
   total length. The absolute comparison assumed an empty target, which
   holds for the sequential block decoder (it clears the buffer per block)
@@ -425,7 +439,7 @@ This document records the changes made between versions, starting with version 0
   RLE literals survived), silently falling back was not possible because
   the error aborted the whole decode.
 
-* The interleaved 4-stream huffman fast loops (X1 and X2) keep their per
+- The interleaved 4-stream huffman fast loops (X1 and X2) keep their per
   stream state as raw pointers instead of region/output offsets, folding
   the region and out base pointers into `ip[]`/`op[]`. This drops the two
   base pointers from the loop's live set (14 hot values, fitting the GPR
@@ -437,7 +451,7 @@ This document records the changes made between versions, starting with version 0
   is an ALU-bound vs load-port-bound split of the same work (~0.75 vs
   ~0.7 cycles per byte on this core).
 
-* The async checksum worker spins under a bounded budget (~300 µs) and then
+- The async checksum worker spins under a bounded budget (~300 µs) and then
   parks on a condvar instead of burning a core for the whole process
   lifetime. The head flip is published under the wake mutex so a parked
   worker cannot miss a post; the budget sits above the cadence of a
@@ -448,7 +462,7 @@ This document records the changes made between versions, starting with version 0
   unchanged within noise (json.Fast 367 MiB/s, random.Fast interleaved A/B
   inside machine-drift variance).
 
-* The fused flat decode loop addresses active-segment match sources as a
+- The fused flat decode loop addresses active-segment match sources as a
   plain `dst - offset` pointer (virtual distances are physical distances
   inside the linear active segment — the buffer-base indirection cancels),
   and moves the wrapped-history copy — sources at or below the segment
@@ -459,7 +473,7 @@ This document records the changes made between versions, starting with version 0
   decode on the 32 MiB corpus: json.zst1 1656 → ~1690 MiB/s (+2%),
   skewed.zst3 1183 → ~1220 (+3%), other shapes unchanged within noise.
 
-* `do_offset_history` resolves and updates the repcode history from a
+- `do_offset_history` resolves and updates the repcode history from a
   single slot index (`code - 1 + ll0`, where slot 3 is the `rep0 - 1`
   pseudo-slot folded onto `scratch[0]`), replacing the two chained match
   trees with one branch; behavior is byte-for-byte identical (exhaustively
@@ -467,7 +481,7 @@ This document records the changes made between versions, starting with version 0
   noise on the corpus; the win is fewer instructions per sequence on
   repcode-dense streams.
 
-* The single-table emit helpers (`emit_seq`, `emit_seq_chain`,
+- The single-table emit helpers (`emit_seq`, `emit_seq_chain`,
   `rep1_chain`) move from twelve-to-fourteen-argument free functions into
   a shared `TableEmit` context (head table, output streams, per-block
   constants), mirroring the dfast emit context, so their arguments stop
@@ -479,7 +493,7 @@ This document records the changes made between versions, starting with version 0
   (1.85× → ~1.8×, 6-7% cumulative with the select probes), text ~1%
   faster, Fast/Balanced unchanged within noise.
 
-* The Fastest level's scan loop resolves probe validity through a select
+- The Fastest level's scan loop resolves probe validity through a select
   (libzstd's selectAddr trick) instead of a three-comparison chain: stale
   hash-table entries alias the scanning position itself, and the byte
   compare plus one `cand != ip` branch rejects them. The repcode
@@ -489,7 +503,7 @@ This document records the changes made between versions, starting with version 0
   against zstd -1 on the 32 MiB corpus: json 455 → 466 MiB/s
   (1.90× → 1.85×), skewed 2724 → 2915 MiB/s, text ~1% faster.
 
-* The Balanced level pins its chain-table log to its window (W20 + C20 +
+- The Balanced level pins its chain-table log to its window (W20 + C20 +
   H17, was W21 + C20): the chain table is position-indexed, so its log is
   also the match reach, and the old pairing silently dropped links past
   1 MiB inside the 2 MiB window. With reach equal to the window every
@@ -503,7 +517,7 @@ This document records the changes made between versions, starting with version 0
   reach truncation collapses skewed to 2.2×. Only Balanced output bytes
   change; other levels are byte-identical.
 
-* The matcher's per-sequence emit path pays one buffer push instead of
+- The matcher's per-sequence emit path pays one buffer push instead of
   three: the packed code triple, merged add-bits payload and payload width
   now live in one `SeqWord` word per sequence (`Matcher::start_matching_codes`
   and the block encoder consume the single stream). The dfast strategy's
@@ -518,7 +532,7 @@ This document records the changes made between versions, starting with version 0
   dfast matcher (314 → 366 MiB/s, 0.57× → 0.76× of zstd -3 per standalone
   A/B; bench ratio 1.57 → 1.32) and skewed.Fast 152 → 161 MiB/s.
 
-* The Fast level now uses a port of libzstd's double-fast (dfast) matcher:
+- The Fast level now uses a port of libzstd's double-fast (dfast) matcher:
   two single-probe tables — an 8-byte long hash (2^17 slots) and a 5-byte
   short hash (2^16) — with a two-position pipeline, short-hit upgrades by
   the next position's long probe, libzstd's complementary four-anchor
@@ -533,7 +547,7 @@ This document records the changes made between versions, starting with version 0
   is now an enum (`Fast`/`Dfast`/`Chain`) instead of an optional
   chain-table log.
 
-* The flat decoder's sequence executor copies literals and matches with
+- The flat decoder's sequence executor copies literals and matches with
   inline 16/8-byte chunks (libzstd's wildcopy scheme, budget-gated 16 bytes
   before the output end with an exact-copy tail path) instead of one libc
   memcpy/memmove call per sequence: sequence-dense payloads paid millions
@@ -546,13 +560,13 @@ This document records the changes made between versions, starting with version 0
   673 MiB/s, json.zst1 streaming 0.61× → 0.76× of the zstd crate), with
   incompressible and run-length payloads unchanged.
 
-* The chain levels grow their probe step on long literal runs (the fast
+- The chain levels grow their probe step on long literal runs (the fast
   strategy's miss-acceleration policy), so incompressible data no longer
   pays a full chain walk per byte: random 32 MiB compresses at ~2.1 GiB/s
   on every level, with `Best` faster than libzstd's level 12 (2118 vs
   918 MiB/s) at identical (stored) ratios.
 
-* Compression levels beyond `Fastest`: `Level::Fast` (≈ zstd 3-5), `Level::Balanced`
+- Compression levels beyond `Fastest`: `Level::Fast` (≈ zstd 3-5), `Level::Balanced`
   (≈ 6-9) and `Level::Best` (≈ 12-15) join the ladder, each backed by a real
   hash-chain matcher inside `MatchGeneratorDriver` (per-level hash-log,
   window, chain-table size, search depth and lazy depth, following
@@ -572,10 +586,10 @@ This document records the changes made between versions, starting with version 0
   jobs overlap chain levels at window/4 to hold the ratio within 2% of
   the single-thread path.
 
-* Parallel decoding of complete in-memory inputs: `bulk::decompress_with`
+- Parallel decoding of complete in-memory inputs: `bulk::decompress_with`
   and `bulk::decompress_to_buffer_with` with `DecoderOptions::threads(n)`
   engage a segment-parallel decoder on std builds. A pre-scan walks the
-  block headers and splits the input at *restart points* — blocks whose
+  block headers and splits the input at _restart points_ — blocks whose
   entropy state is fully self-describing (literals not Treeless, no FSE
   stream in Repeat mode). Job-based encoders emit exactly those at every
   job boundary (libzstd `-T` output and this crate's multithreaded
@@ -593,8 +607,8 @@ This document records the changes made between versions, starting with version 0
   faster with 4 threads (2.1x at 8; the serial execution stage bounds the
   speedup).
 
-* Multithreaded one-shot compression: `bulk::compress_with(source,
-  &EncoderOptions)` engages a job-parallel path on std builds when
+- Multithreaded one-shot compression: `bulk::compress_with(source,
+&EncoderOptions)` engages a job-parallel path on std builds when
   `workers > 1`. The input splits into jobs (twice the worker count, 1 MiB
   floor); each job compresses through the per-thread pooled slice state
   while borrowing a `window/8` strip of the preceding job as match history,
@@ -613,12 +627,12 @@ This document records the changes made between versions, starting with version 0
   cost below 0.1%. `compress_slice_to_vec` gained a checksum-aware sibling
   `compress_slice_opts` used by the new entry point.
 
-* The `dict_builder` feature's raw-dictionary builder module moved from
+- The `dict_builder` feature's raw-dictionary builder module moved from
   `ruzstd::dictionary` to `ruzstd::dict`, matching the zstd crate's naming
   and the new top-level module layout (`decoding::Dictionary` stays where
   it is; it parses dictionaries rather than building them).
 
-* The benchmark examples now measure through a shared interleaved A/B
+- The benchmark examples now measure through a shared interleaved A/B
   harness (`examples/common/mod.rs`, pulled in via `#[path]`): both sides
   alternate round by round so slow machine drift (thermal, clocks,
   background load) hits them equally and the per-round time ratio is the
@@ -632,14 +646,14 @@ This document records the changes made between versions, starting with version 0
   A full `bench_compare` pass stays under roughly two minutes at the
   default budget.
 
-* A zstd-crate compatibility layer at `ruzstd::compat` (std builds): the
+- A zstd-crate compatibility layer at `ruzstd::compat` (std builds): the
   `zstd` crate's module layout, type names, numeric levels and `io::Result`
   signatures on top of the pure-Rust implementation, so `zstd::` imports
   swap to `ruzstd::compat::` with minimal churn. Covered: `bulk::{compress,
-  compress_to_buffer, decompress, decompress_to_buffer, Compressor,
-  Decompressor}`, `stream::{read::{Encoder, Decoder}, write::{Encoder,
-  AutoFinishEncoder, Decoder, AutoFlushDecoder}, encode_all, decode_all,
-  copy_encode, copy_decode}` and `DEFAULT_COMPRESSION_LEVEL` /
+compress_to_buffer, decompress, decompress_to_buffer, Compressor,
+Decompressor}`, `stream::{read::{Encoder, Decoder}, write::{Encoder,
+AutoFinishEncoder, Decoder, AutoFlushDecoder}, encode_all, decode_all,
+copy_encode, copy_decode}` and `DEFAULT_COMPRESSION_LEVEL` /
   `compression_level_range`. The compat encoders defer stream start so zstd's
   post-construction setters (`set_pledged_src_size`, `include_checksum`,
   `window_log_max`, ...) work before the first write and fail afterwards;
@@ -651,7 +665,7 @@ This document records the changes made between versions, starting with version 0
   as raw bytes now (parsed when a decoder takes the options), which makes
   the option set `Clone`.
 
-* Streaming decoders: `ruzstd::stream::read::Decoder` decompresses while
+- Streaming decoders: `ruzstd::stream::read::Decoder` decompresses while
   reading and — unlike `decoding::StreamingDecoder`, which is documented to
   stop after one frame — is transparent over concatenated frames and
   skippable frames (`single_frame()` restores the one-frame behavior; a
@@ -663,11 +677,11 @@ This document records the changes made between versions, starting with version 0
   block of a checksummed frame — the 4-byte trailer are fully staged,
   because a starved block read would poison the decoder state. One-shot
   conveniences over the same machinery: `ruzstd::stream::{encode_all,
-  decode_all, copy_encode, copy_decode}`. A `crate::error::into_io` helper
+decode_all, copy_encode, copy_decode}`. A `crate::error::into_io` helper
   sidesteps the no_std io::Error's inherent `from(ErrorKind)` shadowing the
   `From<crate::Error>` impl at `.map_err` call sites.
 
-* Streaming encoders: `ruzstd::stream::write::Encoder` (io::Write in,
+- Streaming encoders: `ruzstd::stream::write::Encoder` (io::Write in,
   compressed out, with `auto_finish`/`on_finish`/`finish`/`try_finish`/
   `do_finish`, and `flush` emitting the staged partial block early) and
   `ruzstd::stream::read::Encoder` (io::Read over a compressed reader). Both
@@ -676,13 +690,13 @@ This document records the changes made between versions, starting with version 0
   output is byte-identical to `encoding::compress` over the same bytes (the
   byte-equality is asserted by tests across write chunkings of 1 B, 7 KiB,
   block-size and everything-at-once). `EncoderOptions::{pledged_size,
-  checksum, workers}` are honored: pledged sizes land in the frame header,
+checksum, workers}` are honored: pledged sizes land in the frame header,
   checksum(false) omits the 4-byte trailer, and workers > 1 fails with
   `Error::Unsupported` until the multithreaded backend lands. The pooled
   slice fast path is untouched; release assembly of all pre-existing symbols
   is unchanged.
 
-* New high-level one-shot API: `ruzstd::{compress, decompress}` and
+- New high-level one-shot API: `ruzstd::{compress, decompress}` and
   `ruzstd::bulk::{compress, decompress, decompress_to_buffer}`.
   `bulk::compress` forwards to the pooled slice fast path unchanged;
   `bulk::decompress` starts from a capacity hint (0 = auto) and doubles until
@@ -696,7 +710,7 @@ This document records the changes made between versions, starting with version 0
   `Dictionary` gains a compact `Debug` (id + content length; the entropy
   tables are omitted).
 
-* All hand-written `Display`/`From`/`std::error::Error` impls in
+- All hand-written `Display`/`From`/`std::error::Error` impls in
   `decoding::errors` are now derived with thiserror (the crate's first
   external dependency; compile-time only, and `default-features = false`
   keeps the no_std and `rustc-dep-of-std` builds working — without `std` the
@@ -706,7 +720,7 @@ This document records the changes made between versions, starting with version 0
   `core::error::Error` unconditionally (std re-exports the same trait) so they
   can stay error-chain sources under no_std.
 
-* `CompressionLevel` is replaced by a root `Level` enum
+- `CompressionLevel` is replaced by a root `Level` enum
   (`ruzstd::Level::{Uncompressed, Fastest}`, `#[non_exhaustive]`,
   `Level::DEFAULT = Fastest`). The `Default`/`Better`/`Best` variants never had
   implementations and panicked at runtime when reached, so they are gone;
@@ -717,7 +731,7 @@ This document records the changes made between versions, starting with version 0
   by instruction-stream diff of the release assembly: 249 global symbols
   compared, only `compress_slice_to_vec` differs, at exactly that dispatch).
 
-* The decoder now verifies frame checksums with the same in-tree XXH64 as
+- The decoder now verifies frame checksums with the same in-tree XXH64 as
   the encoder (the module moved from `encoding` to the crate root).
   `twox-hash` drops from runtime dependency to dev-dependency (kept purely
   as the test reference), leaving ruzstd without any external runtime
@@ -731,7 +745,7 @@ This document records the changes made between versions, starting with version 0
   narrows from `pub` to `pub(crate)` since the hasher type is no longer a
   public dependency.
 
-* Sequence FSE tables can now be repeated across blocks (mode 3): when the
+- Sequence FSE tables can now be repeated across blocks (mode 3): when the
   previous block's table covers every live code and its estimated bit cost
   for the current histogram stays within a fresh table's description cost
   plus entropy bound, the block reuses it and writes no table description.
@@ -743,7 +757,7 @@ This document records the changes made between versions, starting with version 0
   32 MiB, ratio 5.99 -> 6.00, json-1M +1.8%; text/skewed ratios unchanged
   or better; all outputs cross-checked against the reference zstd decoder.
 
-* The slice path (std + hash, input >= 256 KiB, >= 2 usable CPUs) offloads
+- The slice path (std + hash, input >= 256 KiB, >= 2 usable CPUs) offloads
   the frame checksum to a sidecar thread: a per-thread single-producer/
   single-consumer ring of (pointer, len, state) tasks feeds one spinning
   XXH64 worker with per-frame states, so the four serial accumulator chains
@@ -756,13 +770,13 @@ This document records the changes made between versions, starting with version 0
   (4-core taskset, hash on): random +13%, text +26%, skewed +13%, zeros
   +2.5%, json +4%; random-1M +12%.
 
-* The sequence bitstream encoder appends each sequence's add-bit payload
+- The sequence bitstream encoder appends each sequence's add-bit payload
   with its state-transition bits in one accumulator push when the combined
   width fits (the common case), halving the per-sequence flush checks.
   json drops 0.4% instructions; wider pairs fall back to the two-push path
   and the emitted bits are identical everywhere.
 
-* The matcher now emits sequences straight into the packed streams the
+- The matcher now emits sequences straight into the packed streams the
   sequence-section encoder consumes (`Matcher::start_matching_codes`, a new
   default trait method): each match computes its literal-length/match-length/
   offset codes and merged add-bits payload once, at the emit where the raw
@@ -772,7 +786,7 @@ This document records the changes made between versions, starting with version 0
   packed form. json drops 3.5% instructions at 32 MiB (5.85G -> 5.65G, ~+2%
   throughput), text/random ~0.7%, output bytes identical.
 
-* The frame checksum moved in-tree (spec-exact XXH64 with two 32-byte
+- The frame checksum moved in-tree (spec-exact XXH64 with two 32-byte
   chunks per iteration, keeping eight accumulator chains in flight) and is
   now fused into passes that read the block anyway: the RLE uniform scan
   absorbs while it compares (uniform blocks hash in their only pass; any
@@ -788,7 +802,7 @@ This document records the changes made between versions, starting with version 0
   every 32 bytes inside the enlarged caller) and the literals gate now
   runs before any literal is written for zero-sequence blocks.
 
-* Zero-sequence blocks no longer stage their literals in the block scratch:
+- Zero-sequence blocks no longer stage their literals in the block scratch:
   the matcher skips the whole-block copy and the block encoder reads the
   bytes straight from the window (the callback path hands the window slice
   over as the trailing `Literals`). Blocks that compress to nothing - every
@@ -797,14 +811,14 @@ This document records the changes made between versions, starting with version 0
   (7061 -> 8013, 8210 -> 9332 MiB/s), skewed ~4% at 32 MiB (2473 -> 2560
   MiB/s).
 
-* `compress_slice_to_vec` pools its encoder state in a thread-local (hash
+- `compress_slice_to_vec` pools its encoder state in a thread-local (hash
   table, default FSE tables, block scratch): per-call rebuilds of those
   dominated small inputs. 1 KiB payloads compress 3-7x faster (json 152 ->
   444, random 268 -> 1938 MiB/s), 4 KiB gains 30-80%; large inputs are
   unchanged. A new `bench_small` example tracks 1 KiB-1 MiB payloads
   against the zstd crate's bulk path.
 
-* Literal blocks whose alphabet stays within sixteen symbols histogram
+- Literal blocks whose alphabet stays within sixteen symbols histogram
   through an AVX-512 kernel: sixteen per-slot byte compares with popcount
   accumulation over four 64-byte chunks at a time, entered once the slot
   set is established and left for the four-lane scalar pass whenever a
@@ -814,7 +828,7 @@ This document records the changes made between versions, starting with version 0
   costing one chunk per block. Counts are exact, so block bytes are
   unchanged.
 
-* Near-incompressible literal blocks reject through a strided entropy
+- Near-incompressible literal blocks reject through a strided entropy
   sample (1024 draws, Miller-Madow corrected, distinct-symbol prescreen)
   before the exact four-lane histogram runs, with a sticky per-stream hint
   that skips the sample once a block clears the exact bound. random
@@ -824,12 +838,12 @@ This document records the changes made between versions, starting with version 0
   ~2% of raw size can encode slightly larger; the benchmark corpora are
   byte-identical.
 
-* The `--no-default-features` build compiles again: the literals entropy
+- The `--no-default-features` build compiles again: the literals entropy
   precheck used `f64::log2`, which is std-only; no_std builds now use a
   linear-mantissa approximation (error < 0.086 against the 8% reject
   margin). std builds are unchanged.
 
-* Flat four-bit huffman streams (uniform alphabets of 9..16 symbols, e.g.
+- Flat four-bit huffman streams (uniform alphabets of 9..16 symbols, e.g.
   low-cardinality columns) pack through an AVX-512VBMI kernel: one 64-symbol
   chunk resolves its 256-entry code LUT with two byte permutes, reverses
   and pair-packs nibbles with two more, replacing sixteen scalar LUT loads
@@ -837,7 +851,7 @@ This document records the changes made between versions, starting with version 0
   ~43% throughput; the scalar loop remains for sub-64-symbol tails and
   non-x86/no-std builds, and the output is bit-identical.
 
-* New `compress_slice_to_vec` entry point compresses an in-memory buffer
+- New `compress_slice_to_vec` entry point compresses an in-memory buffer
   with no intermediate copies: the matcher window borrows the input
   directly (eliminating the read pass, window compaction and per-call
   window allocation of the streaming path) and blocks append straight into
@@ -846,7 +860,7 @@ This document records the changes made between versions, starting with version 0
   block. text gains ~40% and zeros ~60% throughput, random ~12%; the
   matcher-bound shapes are unchanged.
 
-* Long matches index only two anchors (start+2, end-2) in the hash table
+- Long matches index only two anchors (start+2, end-2) in the hash table
   instead of every fourth position plus the final byte, mirroring zstd's
   fast-strategy fill policy; short matches (<= 16 bytes) keep their dense
   indexing. The 4-byte grid across long matches dominated encoder time on
@@ -854,19 +868,19 @@ This document records the changes made between versions, starting with version 0
   32% throughput while its ratio improves (295.0 -> 298.6), json gains 5%
   with its ratio nearly unchanged (6.02 -> 5.99).
 
-* The scan loop's hash-table probes read their slots unchecked as well: the
+- The scan loop's hash-table probes read their slots unchecked as well: the
   hash masks to the table's power-of-two size, so the per-probe bounds
   checks were provably dead (the insertion side already dropped its check).
   json executes another 2% fewer instructions and text gains 4% throughput
   with no corpus regressing in either A/B order; output stays bit-identical.
 
-* The matcher's index insertion stores its hash-table slot unchecked: the
+- The matcher's index insertion stores its hash-table slot unchecked: the
   hash already masks to the table's power-of-two size, so the bounds check
   on every inserted position was provably dead. json executes 2.3% and text
   5.4% fewer instructions (text's long matches pay the most insertions);
   output stays bit-identical.
 
-* Compressed blocks encode straight into the frame output: the block writer
+- Compressed blocks encode straight into the frame output: the block writer
   reserves the three-byte header, encodes the content in place and patches
   the header once the compressed size is known, removing the per-block
   staging vector and its full-content copy on adoption. The per-block
@@ -876,7 +890,7 @@ This document records the changes made between versions, starting with version 0
   fallback blocks used to copy their whole content), json and skewed gain
   2-3% each; output stays bit-identical.
 
-* The sequence bitstream encoder keeps its bit accumulator in locals behind
+- The sequence bitstream encoder keeps its bit accumulator in locals behind
   a small hot-push helper (one unaligned u64 store per flush instead of two
   writer-method round-trips per sequence) and reads the FSE transition rows
   through a flat unchecked `code << log | state` index — the row stride is a
@@ -884,14 +898,14 @@ This document records the changes made between versions, starting with version 0
   the table by construction. json executes 1.4% fewer instructions and gains
   ~3% throughput; output stays bit-identical.
 
-* The literals histogram fills four sub-histograms keyed by position mod 4
+- The literals histogram fills four sub-histograms keyed by position mod 4
   and merges them once per block, so concurrent increments land in
   different cache lines instead of serializing on same-counter store
   forwarding (small alphabets hit the same counters constantly).
   Instruction count is unchanged; skewed drops 7% of its cycles and gains
   ~10% throughput. Output stays bit-identical.
 
-* Flat huffman tables (every symbol sharing one code length, e.g. the
+- Flat huffman tables (every symbol sharing one code length, e.g. the
   9..16-symbol alphabets of uniform data) take a dedicated bulk encoder
   path: after byte-aligning the pending bits it packs two four-bit codes
   per output byte straight into the destination, replacing the
@@ -899,24 +913,24 @@ This document records the changes made between versions, starting with version 0
   (47% fewer instructions); other corpora are untouched and output stays
   bit-identical.
 
-* The three sequence-code histograms (literal length, match length, offset)
+- The three sequence-code histograms (literal length, match length, offset)
   fill in a single pass over the packed codes instead of one pass per
   table; the per-table mode decision moved into a shared helper. json
   executes 0.7% fewer instructions; output is bit-identical.
 
-* Huffman stream encoding batches four symbols between bit-container
+- Huffman stream encoding batches four symbols between bit-container
   flushes (one unaligned u64 store per four symbols instead of a
   container-overflow branch per symbol), driven by a packed
   `(code << 4) | num_bits` u16 code table that keeps the whole table in
   one cache line pair. skewed gains 71% and json 4% throughput; output is
   bit-identical.
 
-* The literals histogram is computed once and shared between the entropy
+- The literals histogram is computed once and shared between the entropy
   precheck and the huffman table build (both used to scan the full
   literals buffer separately). skewed gains 17% throughput; output is
   bit-identical.
 
-* The scan loop interleaves two adjacent positions (libzstd's ip0/ip1
+- The scan loop interleaves two adjacent positions (libzstd's ip0/ip1
   pipeline): hashes and table entries for both are prepared before either
   is probed, overlapping the hash multiply and table load latencies, and a
   fully-missed pair advances by twice the miss step so probe density on
@@ -925,25 +939,25 @@ This document records the changes made between versions, starting with version 0
   over short-match starts the way the ml>=6 gate does; text gains 2%
   throughput at -1.3% ratio; other corpora are unchanged.
 
-* The bit writer's 64-bit flush stores one unaligned u64 into the reserved
+- The bit writer's 64-bit flush stores one unaligned u64 into the reserved
   output vector instead of calling memcpy for eight bytes, removing a call
   per flushed container from every entropy-coded block. Output is
   bit-identical; json/text/skewed gain 1-2% each.
 
-* The uniform-block detector compares four u64 words per branch instead of
+- The uniform-block detector compares four u64 words per branch instead of
   one, so fully-uniform blocks (zero-filled inputs, padded corpus tails)
   stop paying a branchy scan of the whole block while non-uniform blocks
   still exit after the first batch. zeros +7%, text +1%, other corpora
   neutral.
 
-* Encoder round eight: sequence codes and their add-bit payloads are
+- Encoder round eight: sequence codes and their add-bit payloads are
   precomputed in a single pass over the sequences (codes packed into one
   u32 stream, add bits pre-merged into one u64 per sequence), replacing the
   three separate code arrays, the per-sequence out-of-line encoder-helper
   calls, and the metadata re-lookups in the bitstream encoder. json +3%
   throughput, all other corpora neutral, output bit-identical.
 
-* Encoder round seven, data-path focused: the match window holds two windows
+- Encoder round seven, data-path focused: the match window holds two windows
   plus one block of capacity so compaction copies ~1x data volume instead of
   once per block; block input is read directly into the window tail through
   the new `Matcher::block_tail`/`commit_block` API (replacing the
@@ -955,13 +969,13 @@ This document records the changes made between versions, starting with version 0
   the position hash loads the full u64 masked to five bytes (mathematically
   identical hash values, fewer instructions). text 2.5 -> 3.8 GiB/s, zeros
   4.5 -> 8.2 GiB/s, json 287 -> 334 MB/s, ratios bit-identical.
-* Sequence codes are computed once per block and shared between the FSE
+- Sequence codes are computed once per block and shared between the FSE
   table selection and the bitstream encoder, uniform literal sections
   encode with the one-byte RLE literals mode, and a cheap entropy-bound
   check skips Huffman attempts on near-incompressible literals instead of
   encoding them and discarding the result (random-bytes encode 2.4x
   faster, ratios unchanged).
-* The match window widens from 448 KiB to 768 KiB so repository-tile-sized
+- The match window widens from 448 KiB to 768 KiB so repository-tile-sized
   repetition periods stay matchable; hash matches now require 6 bytes (a
   5-byte match's sequence overhead roughly equals the literals it covers,
   and rejecting it lets the scan find the longer match that starts next);
@@ -974,12 +988,12 @@ This document records the changes made between versions, starting with version 0
   discount). json ratio 5.22 -> 5.70 at +27% throughput, skewed ratio
   2.00 (= zstd -1) at +81%, text ratio 6.56 -> 239 where the wider window
   unlocks cross-tile matches.
-* RLE block detection compares 8 bytes at a time (libzstd `ZSTD_isRLE`
+- RLE block detection compares 8 bytes at a time (libzstd `ZSTD_isRLE`
   style) instead of a per-byte closure over an indexed first element, and
   skipped (RLE) blocks index only their first position instead of every
   byte — a uniform run hashes to one table slot, so per-byte indexing just
   rewrote it. zeros encode 7.3x faster.
-* The encoder's block emit path is reworked to keep the hot scan loop free
+- The encoder's block emit path is reworked to keep the hot scan loop free
   of allocator traffic and register spills: entropy tables are taken out of
   the compressor state by value for the duration of a block (a raw-block
   fallback puts them back) instead of deep-cloning three FSE tables plus
@@ -990,19 +1004,19 @@ This document records the changes made between versions, starting with version 0
   capture; and the matcher's window reads (hash input, 4-byte probes,
   u64 match extension) are unchecked with caller-guaranteed bounds.
   json +24%, text +39%, skewed +6% end-to-end encode throughput.
-* The encoder's match emitter indexes covered matches sparsely instead of
+- The encoder's match emitter indexes covered matches sparsely instead of
   hashing every byte: matches up to 16 bytes keep every position (they carry
   most of the alignment coverage on structured data), longer matches fall
   back to a 4-byte grid anchored at the match start plus the final byte.
   json +6% / text +5% encode throughput at -0.2% / -0.6% ratio.
-* Sequence decoding extracts each group of bitstream reads (the three
+- Sequence decoding extracts each group of bitstream reads (the three
   add-bit fields and the three FSE state transitions) with a single window
   read whose bits are then split in parallel, instead of six serial
   load-shift-store chains per sequence. The mid-sequence reload guard only
   applies to the rare wide-field path (all three add-bit widths sum above
   31). skewed +5-8% (zstd-3/zstd-9), json.zst3 +3-5%, text.zst1 +2-3%,
   rest neutral.
-* Huffman literals decoding gains a double-symbol (X2) table for the
+- Huffman literals decoding gains a double-symbol (X2) table for the
   interleaved 4-stream fast path, ported from libzstd: each lookup emits one
   or two literals (a single unaligned u16 store) and consumes the summed bit
   count, halving the serial load-shift chain on skewed distributions. The
@@ -1012,76 +1026,76 @@ This document records the changes made between versions, starting with version 0
   long-code tables the wider entries and variable advance lose to the plain
   single-symbol loop). skewed ~+15%/+43% (zstd-3/zstd-1), json +1-4%,
   text +0-2%.
-* FSE decoding-table construction precomputes per-symbol spread constants
+- FSE decoding-table construction precomputes per-symbol spread constants
   (slice baselines/strides/bit counts) so the per-entry fill is a counter,
   compare, and multiply-add; the per-entry `highest_bit_set` scans and the
   division move to a once-per-symbol pass.
-* The decoder only computes the xxhash checksum when the frame actually carries
+- The decoder only computes the xxhash checksum when the frame actually carries
   one (`Content_Checksum` flag set), instead of always hashing every drained byte.
-* Sequence decoding reworked into a libzstd-style 64-bit backwards bit reader
+- Sequence decoding reworked into a libzstd-style 64-bit backwards bit reader
   with packed single-load FSE tables; sequences decode ~15% faster.
-* Sequence execution reserves the whole block's output up front and appends
+- Sequence execution reserves the whole block's output up front and appends
   without per-sequence capacity checks; ring buffer wraps with a conditional
   subtract instead of a modulo.
-* Interleaved Huffman decoding accesses its tables and output through
+- Interleaved Huffman decoding accesses its tables and output through
   unchecked reads/writes; the loop bounds already guarantee they are in range.
-* Fix encoder panics on degenerate single-symbol FSE distributions: the table
+- Fix encoder panics on degenerate single-symbol FSE distributions: the table
   keeps the full weight for the lone symbol instead of redistributing to a
   nonexistent second maximum, and trailing zero probabilities no longer read
   past the end of the symbol array when writing the table description.
-* FSE sequence encoding switches states through a flat per-symbol transition
+- FSE sequence encoding switches states through a flat per-symbol transition
   table instead of a linear scan, and literal/match length codes come from
   constant lookup tables for the dense low ranges.
-* The matcher is rewritten as a zstd-fast style single-probe hash matcher over
+- The matcher is rewritten as a zstd-fast style single-probe hash matcher over
   one contiguous window: newest-wins hash insertion, u64 chunked forward and
   backward match extension, and escalating probe steps on literal runs.
   Roughly 3x faster matching with better ratios on structured data.
-* The matcher now emits repcode sequences: matches at the current repeated
+- The matcher now emits repcode sequences: matches at the current repeated
   offset are encoded as offset code 1 instead of a full offset, and a raw-block
   fallback rolls the repeated-offset history back to match the decoder.
-* A raw-block fallback now also rolls back the reusable Huffman and FSE tables:
+- A raw-block fallback now also rolls back the reusable Huffman and FSE tables:
   the decoder never sees the discarded block, so a later block must not reference
   entropy tables only introduced by it.
-* Matcher parameters retuned: 448 KiB window and a steeper probe-step ramp on
+- Matcher parameters retuned: 448 KiB window and a steeper probe-step ramp on
   literal runs. Incompressible and skewed data compress up to twice as fast with
   slightly better ratios.
-* Sequence encoding concatenates the three state-transition bit groups and the
+- Sequence encoding concatenates the three state-transition bit groups and the
   three extra-bit groups into one bit write each, halving the writer calls in
   the per-sequence loop.
-* `StreamingDecoder`'s `read` decodes until the caller's buffer can be filled
+- `StreamingDecoder`'s `read` decodes until the caller's buffer can be filled
   instead of stopping at the first collectible byte, batching block decodes
   under large reads.
-* The sequence decode loop carries its FSE tables as raw pointers, caches each
+- The sequence decode loop carries its FSE tables as raw pointers, caches each
   table entry between the symbol read and the state transition, and writes
   sequences through a raw pointer into pre-reserved capacity, cutting spills
   and redundant loads per sequence.
-* Sequence decoding dispatches to a BMI2-compiled copy of its loop at runtime
+- Sequence decoding dispatches to a BMI2-compiled copy of its loop at runtime
   when the CPU supports it (x86-64 + std), turning the variable bit shifts
   into single-uop shlx/shrx.
-* `decode_all` executes blocks straight into the caller's buffer when no
+- `decode_all` executes blocks straight into the caller's buffer when no
   dictionary is attached, bypassing the ring buffer and its drain copies
   entirely (flat output path). Slice decoding speeds up 13-35% depending on
   shape; the ring-buffer path remains for dictionaries and streaming.
-* The corruption smoke example also fuzzes the flat `decode_all` path and no
+- The corruption smoke example also fuzzes the flat `decode_all` path and no
   longer panics itself when corruption hits the frame magic (a legitimate
   header error).
-* The matcher probes the second repeated offset immediately after every
+- The matcher probes the second repeated offset immediately after every
   emitted match (zstd fast's rep_offset2 loop); alternating-period data now
   chains repcode matches with zero literals (json ratio +6%).
-* Dictionary-free streaming decode executes blocks into a flat windowed
+- Dictionary-free streaming decode executes blocks into a flat windowed
   buffer (libzstd's outBuff model) instead of the ring buffer: blocks decode
   straight into the buffer, flushes hand out bytes without retaining a
   window, and a full buffer wraps to its start with the previous segment's
   tail serving as the match window. Streaming speeds up 3% (small windows)
   to 125% (8MB windows); on large-window data ruzstd now matches or beats
   the zstd crate's streaming decoder.
-* The sequence decode loop reads its bitstream through a pre-shifted window
+- The sequence decode loop reads its bitstream through a pre-shifted window
   kept in a register (two dependent shifts per read instead of a
   consumed-counter shift chain), and the three packed FSE tables live in one
   fixed-slot array addressed through a single base pointer with constant
   offsets, removing the per-iteration table-pointer reloads and bit-container
   memory operands from the loop.
-* Sequence decoding and flat-path sequence execution are fused into one loop
+- Sequence decoding and flat-path sequence execution are fused into one loop
   (the libzstd model): each sequence is executed the moment it is decoded
   instead of round-tripping it through the sequence vector. RLE streams now
   decode through a one-state fake table packed like any FSE table, so the
@@ -1092,58 +1106,66 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.8.3
 
-* Avoid emitting compressed blocks when the compressed payload is not smaller
+- Avoid emitting compressed blocks when the compressed payload is not smaller
   than the raw block.
-* Fix Dictionary decoding. It should not panic on invalid inputs.
-* Make the decode window size limit configurable via `FrameDecoder::set_max_window_size`/`max_window_size`, `StreamingDecoder::new_with_max_window_size`, and the `DEFAULT_MAX_WINDOW_SIZE` constant. The default stays 100mb.
-* Apply the window size limit to the first frame of a stream, not just later frames.
-* **Breaking** `FrameDecoderError::WindowSizeTooBig` gained a `max` field and now reports the effective limit.
+- Fix Dictionary decoding. It should not panic on invalid inputs.
+- Make the decode window size limit configurable via `FrameDecoder::set_max_window_size`/`max_window_size`, `StreamingDecoder::new_with_max_window_size`, and the `DEFAULT_MAX_WINDOW_SIZE` constant. The default stays 100mb.
+- Apply the window size limit to the first frame of a stream, not just later frames.
+- **Breaking** `FrameDecoderError::WindowSizeTooBig` gained a `max` field and now reports the effective limit.
 
 # After 0.8.2
-* Introduce the `rust-version` field
-* Fix checksum generation when repeatedly using the encoder
-* Expose decoding::Dictionary as public
-* Add Debug derive to CompressionLevel enum
-* Make RLE and Raw block decoding more efficient and not use intermediary buffer on the stack
+
+- Introduce the `rust-version` field
+- Fix checksum generation when repeatedly using the encoder
+- Expose decoding::Dictionary as public
+- Add Debug derive to CompressionLevel enum
+- Make RLE and Raw block decoding more efficient and not use intermediary buffer on the stack
 
 # After 0.8.1
-* The CLI has been refactored to use `clap`
-* The MatchDriverGenerator has been made public so users can name it as `M` in `FrameCompressor<R,W,M>`
+
+- The CLI has been refactored to use `clap`
+- The MatchDriverGenerator has been made public so users can name it as `M` in `FrameCompressor<R,W,M>`
 
 # After 0.8.0
-* The compressor now includes a `content_checksum` when the `hash` feature is enabled
-* Dictionary generation has been added
+
+- The compressor now includes a `content_checksum` when the `hash` feature is enabled
+- Dictionary generation has been added
 
 # After 0.7.3
-* Add initial compression support
-* **Breaking** Refactor modules to reflect that this is now also a compression library
+
+- Add initial compression support
+- **Breaking** Refactor modules to reflect that this is now also a compression library
 
 # After 0.7.2
-* Soundness fix in decoding::RingBuffer. The lengths of the diferent regions where sometimes calculated wrongly, resulting in reads of heap memory not belonging to that ringbuffer
-    * Fixed by https://github.com/paolobarbolini
-    * Affected versions: 0.7.0 up to and including 0.7.2
 
-* Added convenience functions to FrameDecoder to decode multiple frames from a buffer (https://github.com/philipc)
+- Soundness fix in decoding::RingBuffer. The lengths of the diferent regions where sometimes calculated wrongly, resulting in reads of heap memory not belonging to that ringbuffer
+  - Fixed by https://github.com/paolobarbolini
+  - Affected versions: 0.7.0 up to and including 0.7.2
+
+- Added convenience functions to FrameDecoder to decode multiple frames from a buffer (https://github.com/philipc)
 
 # After 0.7.1
 
-* Remove byteorder dependency (https://github.com/workingjubilee)
-* Preparations to become a std dependency (https://github.com/workingjubilee)
+- Remove byteorder dependency (https://github.com/workingjubilee)
+- Preparations to become a std dependency (https://github.com/workingjubilee)
 
 # After 0.7.0
-* Fix for drain_to functions into limited targets (https://github.com/michaelkirk)
+
+- Fix for drain_to functions into limited targets (https://github.com/michaelkirk)
 
 # After 0.6.0
-* Small fix in the zstd binary, progress tracking was slighty off for skippable frames resulting in an error only when the last frame in a file was skippable
-* Small performance improvement by reorganizing code with `#[cold]` annotations
-* Documentation for `StreamDecoder` mentioning the limitations around multiple frames (https://github.com/Sorseg)
-* Documentation around skippable frames (https://github.com/Sorseg)
-* **Breaking** `StreamDecoder` API changes to get access to the inner parts (https://github.com/ifd3f)
-* Big internal documentation contribution (https://github.com/zleyyij)
-* Dropped derive_more as a dependency (https://github.com/xd009642)
-* Small improvement by removing the error cases from the reverse bitreader (and making sure invalid requests can't even happen)
+
+- Small fix in the zstd binary, progress tracking was slighty off for skippable frames resulting in an error only when the last frame in a file was skippable
+- Small performance improvement by reorganizing code with `#[cold]` annotations
+- Documentation for `StreamDecoder` mentioning the limitations around multiple frames (https://github.com/Sorseg)
+- Documentation around skippable frames (https://github.com/Sorseg)
+- **Breaking** `StreamDecoder` API changes to get access to the inner parts (https://github.com/ifd3f)
+- Big internal documentation contribution (https://github.com/zleyyij)
+- Dropped derive_more as a dependency (https://github.com/xd009642)
+- Small improvement by removing the error cases from the reverse bitreader (and making sure invalid requests can't even happen)
 
 # After 0.5.0
-* Make the hashing checksum optional (thanks to [@tamird](https://github.com/tamird))
-    * breaking change as the public API changes based on features
-* The FrameDecoder is now Send + Sync (RingBuffer impls these traits now)
+
+- Make the hashing checksum optional (thanks to [@tamird](https://github.com/tamird))
+  - breaking change as the public API changes based on features
+- The FrameDecoder is now Send + Sync (RingBuffer impls these traits now)
