@@ -516,13 +516,6 @@ impl Finder<'_, '_> {
     fn update_tree(&mut self, target_idx: usize) {
         debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
         let mut idx = ((*self.next_update).max(self.win_base) - self.win_base) as usize;
-        #[cfg(feature = "std")]
-        if target_idx > idx + 10000 {
-            std::eprintln!(
-                "BIGFILL from {idx} to {target_idx} (span {})",
-                target_idx - idx
-            );
-        }
         while idx < target_idx {
             let forward = self.insert_bt1(idx).max(1);
             idx += forward;
@@ -698,14 +691,6 @@ impl Finder<'_, '_> {
             *larger = EMPTY;
         }
         // Skip re-indexing the interior of long repetitive stretches.
-        #[cfg(feature = "std")]
-        if match_end - 8 < *self.next_update {
-            std::eprintln!(
-                "REGRESS next_update {} -> {} (search idx {idx}, match_end {match_end})",
-                *self.next_update,
-                match_end - 8
-            );
-        }
         *self.next_update = match_end - 8;
         mnum
     }
