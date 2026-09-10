@@ -1469,9 +1469,14 @@ impl MatchGeneratorDriver {
             }
 
             // Both positions missed: grow the probe step on long literal
-            // runs so incompressible data does not pay a full hash per byte.
-            // The step scales the whole pair so the probes-per-byte density
-            // matches the single-position loop at every step size.
+            // runs so incompressible data does not pay a full hash per
+            // byte. The step scales the whole pair so the probes-per-byte
+            // density matches the single-position loop at every step size.
+            // Faster-growing than libzstd's anchor-distance grid: our
+            // single-probe table loses its far matches to overwrites when
+            // incompressible gaps are probed densely (measured: json at
+            // Fastest +9% size), and skipping is what keeps sparse-match
+            // corpora fast.
             miss_count += pair_len as usize;
             let step = 1 + (miss_count >> 2).min(255) as u64;
             pos += pair_len * step;
@@ -1499,8 +1504,8 @@ impl MatchGeneratorDriver {
     /// pipeline overlaps the hash multiplies and table loads, a short hit
     /// is upgraded by the long probe prepared for the next position, and
     /// matched ranges re-seed both tables through a few anchors (see
-    /// [`DfastEmit::emit`]). The miss step only grows every 256 skipped
-    /// positions (libzstd's `kSearchStrength`).
+    /// [`DfastEmit::emit`]). The miss step grows with the literal run
+    /// (one per 256 B, libzstd's `kSearchStrength` grid).
     #[allow(clippy::too_many_lines)]
     fn start_matching_dfast(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         let win = window_slice(&self.win, &self.ext);
@@ -1575,8 +1580,6 @@ impl MatchGeneratorDriver {
             if ip_idx + 1 > limit_idx {
                 break;
             }
-            let mut step = 1usize;
-            let mut next_step = ip_idx + 256;
             let mut ip1_idx = ip_idx + 1;
             let mut hl0 = hash8_at_log(win, ip_idx, long_log);
             // SAFETY: hl0 is masked to the long table size.
@@ -1763,15 +1766,11 @@ impl MatchGeneratorDriver {
                     }
                 }
 
-                // Miss: advance the pair; the step only grows every 256
-                // skipped positions, so compressible data keeps probing
+                // Miss: advance the pair; the step grows with the literal
+                // run (one per 256 B), so compressible data keeps probing
                 // every byte while incompressible runs accelerate.
-                if ip1_idx >= next_step {
-                    step += 1;
-                    next_step += 256;
-                }
                 ip_idx = ip1_idx;
-                ip1_idx += step;
+                ip1_idx += 1 + ((ip1_idx - anchor_idx) >> 8);
                 hl0 = hl1;
                 entry_l0 = entry_l1;
                 if ip1_idx > limit_idx {
@@ -1791,9 +1790,6 @@ impl MatchGeneratorDriver {
         self.seed_offset = seed_offset;
         self.seed_hits = seed_hits;
         self.seed_budget = seed_budget;
-        // dfast tracks misses through the per-match step counter, not the
-        // cross-block miss count.
-        self.miss_count = 0;
     }
 
     /// The hash-chain strategy loop (levels above [`Level::Fastest`]):
@@ -1957,7 +1953,10 @@ impl MatchGeneratorDriver {
             if best_len < MIN_MATCH || !pays_for_offset(best_len, idx, best_cand, rep_hit) {
                 // Grow the probe step on long literal runs (same policy as
                 // the fast loop) so incompressible data does not pay a full
-                // chain walk per byte.
+                // chain walk per byte. Faster-growing than libzstd's
+                // anchor-distance grid: our per-probe chain walk is dearer,
+                // and skipping over sparse-match gaps is what keeps the
+                // Balanced levels fast on them.
                 miss_count += 1;
                 pos += 1 + (miss_count >> 2).min(255) as u64;
                 continue;

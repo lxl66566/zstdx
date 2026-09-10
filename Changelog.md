@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The dfast miss step is now stateless: instead of a per-match
+  step/next-step counter pair bumped every 256 skipped positions, the
+  probe pair advances by `1 + (distance since the last match) >> 8` —
+  the same one-step-per-256-bytes growth grid with no branch and two
+  fewer live values, and the cross-block `miss_count` reset the loop
+  never read is gone. The fast and chain loops keep their
+  miss-count-driven step on purpose: their per-probe cost and table
+  density differ from libzstd's anchor-distance grid, where porting
+  the formula was measured as a size and speed regression. Fast level
+  on the 32 MiB corpus, medians of three interleaved old/new runs:
+  json +1.7%, skewed +0.8%, text +2.6%, random and zeros unchanged;
+  output sizes byte-identical everywhere.
+
 * The dfast backfill insert — indexing the prepared second probe
   position after a match was emitted — was gated on `step < 4`, a
   proxy for "the match covered the probe position" that misses every
