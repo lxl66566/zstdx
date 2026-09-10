@@ -25,9 +25,9 @@ jobs:
         - name: cargo hack test
           run: cargo hack test --workspace --feature-powerset --exclude-features rustc-dep-of-std
         - name: Verify MSRV (cli)
-          run: cargo msrv verify --path cli/
+          run: cargo msrv verify --path crates/cli
         - name: Verify MSRV (lib)
-          run: cargo msrv verify --path ruzstd/
+          run: cargo msrv verify --path crates/zstdx
 
   nightly-stuff:
     name: nightly lint, miri

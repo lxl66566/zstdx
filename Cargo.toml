@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ruzstd", "cli"]
+members = ["crates/*"]
 
 [profile.release]
 codegen-units = 1

@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The repository is reshaped into a cargo workspace with every crate under
+  `crates/`: the library now lives at `crates/zstdx`, the CLI at
+  `crates/cli`. The root member list uses the `crates/*` glob so future
+  crates need no root-manifest edit.
+
 * The crate is renamed: `ruzstd` is now `zstdx` (CLI: `zstdx-cli`, fuzz:
   `zstdx-fuzz`). All code, manifests, docs and CI copy use the new name;
   historical entries below keep the name they were written under.

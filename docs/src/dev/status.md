@@ -50,7 +50,7 @@
 optimal parser（`c726dfd`）、package-merge Huffman（`aa07308`）、Best 换核
 （`b39a192`）、MT ratio 保持（`a37ebaa`）刷新。
 
-## 代码结构（ruzstd/src）
+## 代码结构（crates/zstdx/src）
 
 | 模块 | 内容 |
 |---|---|

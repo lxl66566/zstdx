@@ -6,7 +6,7 @@ Cargo.lock
 /orig-zstd
 fuzz_decodecorpus
 perf.data*
-ruzstd/fuzz/corpus
+crates/zstdx/fuzz/corpus
 /bench/corpus
 .idea
 /docs/book

@@ -10,7 +10,7 @@ cd corpus
 if [ ! -f text.raw ]; then
     : > text.raw
     for i in $(seq 1 40); do
-        cat ../../ruzstd/src/*.rs ../../ruzstd/src/*/*.rs ../../Readme.md ../../LICENSE >> text.raw 2>/dev/null || true
+        cat ../../crates/zstdx/src/*.rs ../../crates/zstdx/src/*/*.rs ../../Readme.md ../../LICENSE >> text.raw 2>/dev/null || true
     done
     truncate -s 32M text.raw
 fi

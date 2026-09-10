@@ -18,7 +18,7 @@ skewed（16 字母表）/ random（不可压）/ zeros。解码用 zstd CLI 预�
   +1）；要 usize 算完再 cast。
 - zeros 是免费噪声标定格（代码路径零重叠仍漂 ±2.6%）。
 
-## 工具（ruzstd/examples）
+## 工具（crates/zstdx/examples）
 
 | 工具 | 用途 |
 |---|---|
