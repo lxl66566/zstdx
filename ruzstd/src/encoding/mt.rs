@@ -24,7 +24,9 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use super::frame_compressor::{compress_job_blocks, return_slice_state, take_slice_state};
+use super::frame_compressor::{
+    compress_job_blocks, reset_slice_state, return_slice_state, take_slice_state, CompressState,
+};
 use super::frame_header::FrameHeader;
 use super::match_generator::MatchGeneratorDriver;
 use crate::common::MAX_BLOCK_SIZE;
@@ -35,7 +37,23 @@ use crate::Level;
 const MIN_MT_INPUT: usize = 2 * 1024 * 1024;
 /// Job size floor: smaller jobs multiply the overlap duplication without
 /// improving load balance.
-const MIN_JOB_SIZE: usize = 1024 * 1024;
+pub(crate) const MIN_JOB_SIZE: usize = 1024 * 1024;
+/// Job size ceiling: a huge known input would otherwise scale the job size
+/// and with it the streaming burst buffer (which holds a whole burst) into
+/// memory failure. libzstd's zstdmt caps its job size the same way.
+pub(crate) const MAX_JOB_SIZE: usize = 1024 * 1024 * 1024;
+
+/// Job size for an input of `len` bytes at `workers` threads: twice as many
+/// jobs as workers keeps the tail balanced, the floor keeps the overlap
+/// duplication negligible and scales with the level's overlap, and the
+/// ceiling bounds the buffering. The bulk and streaming mt paths share this
+/// so a pledged stream matches the bulk output byte for byte.
+pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
+    debug_assert!(workers >= 2);
+    len.div_ceil(workers as u64 * 2)
+        .max(MIN_JOB_SIZE.max(overlap) as u64)
+        .min(MAX_JOB_SIZE as u64) as usize
+}
 
 /// Compress `src` into one frame using up to `workers` threads.
 ///
@@ -63,10 +81,7 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
     // fit inside it — the text corpus's ~800K period against a 1 MiB window
     // collapsed the multithreaded ratio by an order of magnitude.
     let overlap = window as usize;
-    let job_size = src
-        .len()
-        .div_ceil(workers as usize * 2)
-        .max(MIN_JOB_SIZE.max(overlap));
+    let job_size = job_size_for(src.len() as u64, workers, overlap);
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -150,9 +165,29 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
     output
 }
 
+/// Compress one job through `state`, resetting it for the job: fresh
+/// entropy tables, and the repcode gate unless the job starts the frame
+/// (the decoder's repeated-offset history is the format default only there).
+pub(crate) fn run_job_with(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    job: Range<usize>,
+    overlap: usize,
+    is_last_job: bool,
+    level: Level,
+    gate: bool,
+) -> Vec<u8> {
+    reset_slice_state(state, level);
+    if gate {
+        state.matcher.gate_repcodes();
+    }
+    compress_job_blocks(state, src, job, overlap, is_last_job)
+}
+
 /// Compress one job on the calling (worker) thread through the per-thread
 /// pooled state, so steady-state jobs reuse their hash table allocation.
-fn run_job(
+/// Shared by the streaming burst driver.
+pub(crate) fn run_job(
     src: &[u8],
     job: Range<usize>,
     overlap: usize,
@@ -161,10 +196,7 @@ fn run_job(
     gate: bool,
 ) -> Vec<u8> {
     let mut state = take_slice_state(level);
-    if gate {
-        state.matcher.gate_repcodes();
-    }
-    let output = compress_job_blocks(&mut state, src, job, overlap, is_last_job);
+    let output = run_job_with(&mut state, src, job, overlap, is_last_job, level, gate);
     return_slice_state(state);
     output
 }
