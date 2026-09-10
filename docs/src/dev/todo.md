@@ -15,7 +15,7 @@
    MT 路径补齐并复核 mismatch 报错行为。
 3. **广域矩阵重测**：编码侧数字停在乱链修复前后（矩阵 §3/§4/§5），其后落地了
    opt parser（Best 换核）、u32 表项、MT ratio 保持、stride-3 prefill、流式 MT；
-   §4 MT 表明确作废。bench_matrix 工具就绪，跑一轮更新
+   §4 MT 表明确作废。zstdx-bench `matrix` 工具就绪，跑一轮更新
    [矩阵页](../bench/matrix.md)与[快照](snapshot.md)。
 
 ## P1 · 编码速度

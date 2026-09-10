@@ -1,0 +1,67 @@
+//! Benchmark and dev-tool harness for the zstdx crate, kept out of the
+//! library so dev-only dependencies never leak into it.
+//!
+//! Every timing subcommand shares the interleaved A/B harness in `common`
+//! and is correctness-gated before anything is timed. The corpus lives in
+//! `bench/corpus` at the repository root (`bench/gen_corpus.sh` regenerates
+//! it). Time control: `--budget-ms` on the timing subcommands (default 500
+//! ms per side; the `BENCH_BUDGET_MS` env var of the old examples still
+//! works).
+
+mod cmd;
+mod common;
+mod corpus;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "zstdx-bench", about = "zstdx benchmark and dev tools")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Cross-matrix vs the zstd crate: decode/encode x bulk/stream x st/mt.
+    /// The heavyweight tool; run sections or single shapes/levels instead of
+    /// `all` when iterating.
+    Matrix(cmd::matrix::Args),
+    /// Small-payload encode (1 KiB - 1 MiB) vs the zstd crate, per-call
+    /// throughput including allocator effects.
+    Small(cmd::small::Args),
+    /// Decode explicit .zst files with a time budget, verifying against the
+    /// raw counterpart when one is found next to the file.
+    Files(cmd::files::Args),
+    /// Solo profiling loops for `perf` attribution: decode, bulk encode, or
+    /// streaming encode of one file, no reference side.
+    Prof(cmd::prof::Args),
+    /// Compress every corpus shape so two builds can be compared byte for
+    /// byte (`cmp -r`); the regression gate for optimizations that must not
+    /// change the encoder's output.
+    Dump(cmd::dump::Args),
+    /// Random-corruption smoke test: flipped bytes must error, never panic.
+    Corrupt(cmd::corrupt::Args),
+    /// Multithreaded decode validation: every file in a directory decoded
+    /// with several worker counts, byte-compared against the zstd CLI.
+    Mtcheck(cmd::mtcheck::Args),
+    /// Sequence statistics and entropy lower bound of our matcher on one
+    /// corpus file.
+    Seqstats(cmd::seqstats::Args),
+    /// Micro-benchmark of the matcher's `prefill_window` per strategy.
+    Prefill(cmd::prefill::Args),
+}
+
+fn main() {
+    match Cli::parse().command {
+        Command::Matrix(args) => cmd::matrix::run(&args),
+        Command::Small(args) => cmd::small::run(&args),
+        Command::Files(args) => cmd::files::run(&args),
+        Command::Prof(args) => cmd::prof::run(args),
+        Command::Dump(args) => cmd::dump::run(&args),
+        Command::Corrupt(args) => cmd::corrupt::run(&args),
+        Command::Mtcheck(args) => cmd::mtcheck::run(&args),
+        Command::Seqstats(args) => cmd::seqstats::run(&args),
+        Command::Prefill(args) => cmd::prefill::run(&args),
+    }
+}

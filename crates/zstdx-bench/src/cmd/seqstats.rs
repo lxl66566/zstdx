@@ -1,8 +1,10 @@
-//! Temporary analysis: sequence-choice statistics and entropy lower bound
-//! for our matcher on a corpus file. Not part of the published examples.
+//! Sequence-choice statistics and entropy lower bound for our matcher on a
+//! corpus file: per-symbol histograms of the ll/ml/of codes and the
+//! theoretical minimum sequence-section size they imply.
 
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use zstdx::encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence};
 use zstdx::Level;
 
@@ -178,9 +180,13 @@ fn entropy(hist: &[u64], total: u64) -> f64 {
     h * total as f64
 }
 
-fn main() {
-    let path = std::env::args().nth(1).expect("corpus file");
-    let raw = fs::read(&path).unwrap();
+#[derive(clap::Args)]
+pub struct Args {
+    pub file: PathBuf,
+}
+
+pub fn run(args: &Args) {
+    let raw = fs::read(&args.file).unwrap();
 
     let matcher = RecordingMatcher {
         inner: MatchGeneratorDriver::new(128 * 1024),
@@ -203,7 +209,7 @@ fn main() {
     compressor.set_drain(sink);
     compressor.compress();
     let sink = compressor.take_drain().unwrap();
-    let _ = fs::write("target/seqstats_out.zst", &sink.0).unwrap();
+    fs::write("target/seqstats_out.zst", &sink.0).unwrap();
     let rec = compressor.replace_matcher(RecordingMatcher {
         inner: MatchGeneratorDriver::new(128 * 1024),
         triples: Vec::new(),
@@ -219,7 +225,7 @@ fn main() {
     for (ll, ml, of) in &rec.triples {
         let (lc, lnb) = ll_code(*ll);
         let (mc, mnb) = ml_code(*ml);
-        let olog = (*of as u32).ilog2();
+        let olog = of.ilog2();
         llh[lc as usize] += 1;
         mlh[mc as usize] += 1;
         ofh[olog as usize] += 1;

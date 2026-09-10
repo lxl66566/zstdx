@@ -18,22 +18,30 @@ skewed（16 字母表）/ random（不可压）/ zeros。解码用 zstd CLI 预�
   +1）；要 usize 算完再 cast。
 - zeros 是免费噪声标定格（代码路径零重叠仍漂 ±2.6%）。
 
-## 工具（crates/zstdx/examples）
+## 工具（crates/zstdx-bench）
 
-| 工具 | 用途 |
+独立 crate（`cargo run --release -p zstdx-bench -- <子命令>`），bench/dev 工具不再
+寄生在 zstdx 的 examples 里（也消除 no-default-features 检查重编 example 覆盖
+release 构建的坑）。重矩阵不常跑，日常迭代用筛选跑局部。
+
+| 子命令 | 用途 |
 |---|---|
-| `bench_matrix` | 广域矩阵：dec/enc × bulk/stream/MT 五模式，交错 A/B + roundtrip 门 |
-| `bench_compare` | 常规对位：解码 slice/stream 对 + 编码对 zstd 1/3/6/12 |
-| `bench_small` | 1KiB-1MiB 小负载，IMPL/SIZE env 钉死单实现单尺寸 |
-| `bench_encode` | 编码 vs zstd -1 |
-| `ab_fast` / `ab_mt` / `ab_prefill` | 单级 A/B（RUZ_BULK/RUZ_CKSUM 开关） |
-| `enc_prof` / `dec_prof` | 单侧 profiling（配 perf IP 直方图） |
-| `dump_all_levels` | 全级别输出字节快照（确定性回归探针） |
-| `stream_cmp` | 小 chunk 读触发 wrap 的流式对拍 |
-| `corruption_smoke` | 随机损坏冒烟（0 panic），覆盖 flat 路径 |
+| `matrix` | 广域矩阵：`--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` 五段，交错 A/B + roundtrip 门；`--shape/--level/--workers/--mt-workers` 筛格子，`--budget-ms` 控每侧预算 |
+| `small` | 1KiB-1MiB 小负载；`--size`/`--impl` 钉死单尺寸单实现（profiler 定位用）|
+| `files` | 任意 .zst 文件解码计时（预算制；自动按任意 `zst*` 后缀找 `.raw`/裸 stem 参照校验）|
+| `prof` | 单侧 profiling 循环：`prof dec <f> [n]` / `prof enc <lvl> <n> <f...>` / `prof enc-stream <lvl> <n> <f>`；`RUZ_CKSUM` env 切校验和路径 |
+| `dump` | 语料字节快照，确定性回归探针：两 build 各 dump 一目录 `diff -r`；`--all-levels` 全 6 档（tag l1/l3/l6/l12/l16/l19）|
+| `corrupt` | 随机损坏冒烟（0 panic），覆盖流式 + flat 路径 |
+| `mtcheck` | MT 解码 vs zstd CLI 对拍（`--workers` 选档）|
+| `seqstats` | 序列统计与熵下界 |
+| `prefill` | prefill_window micro（`--shape/--level` 选档）|
 
-公共 harness（`examples/common/mod.rs`）：逐轮交错、warmup、时间预算
-（`BENCH_BUDGET_MS`，默认 500ms）、median/mad 统计。
+公共 harness（crate 内 `src/common.rs`）：逐轮交错、warmup、时间预算（`--budget-ms`，
+默认 500ms/side；等价旧 BENCH_BUDGET_MS env，env 仍生效）、median/mad 统计。
+
+已删的一次性工具（均被覆盖）：bench_compare / bench_encode（matrix `dec-st`/`enc-st`
++ 筛选）、bench_corpus（files）、ab_fast / ab_mt（matrix + 筛选）、compression_ratio
+（small）、stream_cmp（fuzz decode 的小块流式读）、criterion decode_all（files）。
 
 ## 判据纪律
 

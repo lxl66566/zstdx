@@ -57,13 +57,16 @@
 
 ## 基础设施
 
-- **交错 A/B harness**（`examples/common/mod.rs`）：逐轮交替、warmup、时间预算
-  （BENCH_BUDGET_MS）、median/mad 统计。`dc82c29`
-- **bench 工具族**：bench_compare（slice/stream 对 + 四级对位）、bench_small
-  （IMPL/SIZE 钉死）、bench_encode、bench_matrix（dec/enc × bulk/stream/MT 全矩阵
-  + roundtrip 门 + checksum 开销行 + 双侧 worker 扩展性）。`c922b34` `b1dd010`
-- **确定性回归探针**：dump_all_levels 字节级快照对比（"不该改输出的改动"的免费
-  A/B 信号）+ corruption_smoke（随机损坏 0 panic，覆盖 flat 路径）。`318d8f7`
+- **交错 A/B harness**：逐轮交替、warmup、时间预算（`--budget-ms`/BENCH_BUDGET_MS）、
+  median/mad 统计；随工具族迁入 zstdx-bench crate（`src/common.rs`）。`dc82c29`
+- **bench 工具族**（现集合为 `crates/zstdx-bench`，子命令见
+  [方法论](../bench/methodology.md)）：matrix（dec/enc × bulk/stream/MT 全矩阵
+  + roundtrip 门 + checksum 开销行 + 双侧 worker 扩展性，`--shape/--level/
+  --workers/--mt-workers` 筛选）、small、files、prof（dec/enc/enc-stream）、
+  dump（确定性快照）、corrupt、mtcheck、seqstats、prefill。matrix 起源 `c922b34`
+  `b1dd010`，整合提交见 Changelog。
+- **确定性回归探针**：dump 字节级快照对比（"不该改输出的改动"的免费 A/B 信号）
+  + corrupt（随机损坏 0 panic，覆盖 flat 路径）。`318d8f7`
 - corpus 生成器入库跟踪。
-- profiling 临时工具（未跟踪）：enc_prof / dec_prof / ab_fast / ab_mt / ab_prefill /
-  dump_all_levels / stream_cmp / mtcheck。
+- profiling 临时工具（enc/dec/enc-stream、mtcheck、prefill、seqstats）转正为
+  zstdx-bench 子命令（原未跟踪 examples）。

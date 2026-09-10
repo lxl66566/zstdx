@@ -32,7 +32,8 @@
   警告；且它会把 example 重编译为 no-std 并**覆盖 target/release 下的默认构建**
   （AVX-512 内核被 cfg 掉、xxhash 消失），之后的测量全部失真——测量前重建默认
   构建并用 `nm ... | grep <内核符号>` 验证。no-default 检查须带 `-p zstdx`
-  （根目录构建时 cli 会把 hash feature 带回）。
+  （根目录构建时 cli 会把 hash feature 带回）。（examples 已移出 zstdx，此风险
+  消除。）
 - **`cargo test` 的管道退出码是 tail 的**：`cargo test | tail` 时 cargo 失败被
   `&&` 链吞掉、成功标记照打。测试门必须 `cargo test > log; echo $?` 落盘查退出码
   与 FAILED 计数；`2>&1 | tail -N` 也会把输出文件截成最后 N 行（重跑浪费一轮）。

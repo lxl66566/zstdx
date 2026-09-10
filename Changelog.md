@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The benchmark and dev-tool examples leave the library for a new
+  `zstdx-bench` workspace crate with subcommands: `matrix` (the full
+  cross-matrix, now filterable by `--mode/--shape/--level/--workers/
+  --mt-workers`), `small`, `files` (budget-based decode of explicit files,
+  replacing `bench_corpus` and the fixed-iteration `bench_files`), `prof`
+  (merged `dec_prof`/`enc_prof`/`enc_stream_prof`), `dump` (merged
+  `dump_comp`/`dump_all_levels`), `corrupt`, `mtcheck`, `seqstats` and
+  `prefill`. Timing subcommands take `--budget-ms` (the `BENCH_BUDGET_MS`
+  env var still works). The superseded one-off examples (`bench_compare`,
+  `bench_encode`, `ab_fast`, `ab_mt`, `compression_ratio`, `stream_cmp`)
+  and the criterion bench are dropped, along with the library's
+  criterion/rand and the CLI's unused dev-dependencies; a
+  `--no-default-features` check no longer recompiles example code over the
+  release artifacts.
+
 * The repository is reshaped into a cargo workspace with every crate under
   `crates/`: the library now lives at `crates/zstdx`, the CLI at
   `crates/cli`. The root member list uses the `crates/*` glob so future

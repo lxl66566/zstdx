@@ -31,7 +31,8 @@
 - `debug_assert_eq!(written, before)` 参数写反，挂 3 个 debug 测试。
 - corruption_smoke 损坏命中帧魔数时 panic：BadMagicNumber 是合法错误，示例应
   let-else 返回而非 unwrap。
-- bench_files 的 strip_suffix 只认 `.zst`，`.zstN` 会拿压缩文件当参照报"校验失败"。
+- bench_files 的 strip_suffix 只认 `.zst`，`.zstN` 会拿压缩文件当参照报"校验失败"
+  （已修：zstdx-bench `files` 按任意 `zst*` 后缀剥扩展名并尝试裸 stem 与 `.raw`）。
 
 ## profile 与归因
 

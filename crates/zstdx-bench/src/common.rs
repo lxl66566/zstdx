@@ -1,4 +1,4 @@
-//! Shared benchmark harness for the example binaries.
+//! Shared measurement harness for the bench subcommands.
 //!
 //! Design goals for machines with noticeable performance drift:
 //! - **Interleaving**: A and B alternate round by round, so slow drift
@@ -6,16 +6,15 @@
 //!   per-round ratio is the primary output.
 //! - **Warmup**: one unmeasured round each before timing starts.
 //! - **Time budget**: rounds accumulate until each side ran for
-//!   `min_secs` (default 0.5 s, override with `BENCH_BUDGET_MS`), so the
-//!   total wall time is bounded without fixing an iteration count.
+//!   `min_secs` (default 0.5 s, override with `--budget-ms` or the
+//!   `BENCH_BUDGET_MS` env var), so the total wall time is bounded without
+//!   fixing an iteration count.
 //! - **Robust stats**: median/min/max plus the median absolute deviation of
 //!   the ratios; medians absorb spikes, min approximates the noise floor.
 //!
 //! One round should take at least a few milliseconds: batch enough
 //! iterations inside the closures when the payload is tiny, otherwise the
 //! per-round `Instant::now()` overhead pollutes the sample.
-
-#![allow(dead_code)]
 
 use std::time::Instant;
 
@@ -60,7 +59,7 @@ pub struct AbReport {
 
 impl AbReport {
     /// One line: `<name>  a  b  ratio ±mad [min..max] n=rounds`.
-    pub fn print(&self, name: &str, bytes: u64, a: &str, b: &str) {
+    pub fn print(&self, name: &str, bytes: u64) {
         println!(
             "{name:<16}{a_mibs:>9.0} {b_mibs:>9.0}  x{ratio:>6.3} ±{mad:.3}  [{lo:.3}..{hi:.3}]  n={rounds}",
             a_mibs = self.a.mibs(bytes),
@@ -91,15 +90,24 @@ impl Default for Ab {
     }
 }
 
-/// Per-side measurement budget in seconds; `BENCH_BUDGET_MS` overrides the
-/// default of 500 ms (e.g. `BENCH_BUDGET_MS=2000` for a longer, quieter
-/// run, or `100` for a quick smoke comparison).
+/// Per-side measurement budget in seconds; the `--budget-ms` flag maps here
+/// via `apply_budget`, `BENCH_BUDGET_MS` overrides the default of 500 ms
+/// (e.g. 2000 for a longer, quieter run, or 100 for a quick smoke pass).
 pub fn budget_secs() -> f64 {
     std::env::var("BENCH_BUDGET_MS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map(|ms| ms / 1000.0)
         .unwrap_or(0.5)
+}
+
+/// Turn a `--budget-ms` flag into the env-based budget consumed by
+/// `budget_secs`. Must run before any `Ab` is constructed.
+pub fn apply_budget(ms: Option<f64>) {
+    if let Some(ms) = ms {
+        assert!(ms > 0.0, "--budget-ms must be positive");
+        std::env::set_var("BENCH_BUDGET_MS", format!("{ms}"));
+    }
 }
 
 impl Ab {
@@ -164,6 +172,11 @@ pub fn measure_solo<F: FnMut()>(mut f: F) -> Stats {
         }
     }
     Stats::from_samples(times)
+}
+
+/// Selection filter: empty selection means "no restriction".
+pub fn want<T: PartialEq>(selected: &[T], v: &T) -> bool {
+    selected.is_empty() || selected.contains(v)
 }
 
 #[inline(never)]

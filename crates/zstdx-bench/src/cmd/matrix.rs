@@ -1,20 +1,20 @@
 //! Cross-matrix benchmark: zstdx vs the zstd crate over decode/encode ×
 //! bulk/streaming × single-/multi-thread at the corpus shapes.
 //!
-//! Usage: `cargo run --release --example bench_matrix [--] [mode]` where mode
-//! is one of `dec-st`, `dec-mt`, `enc-st`, `enc-mt`, `enc-stream` (default:
-//! all in sequence). `BENCH_BUDGET_MS` sets the per-side budget (see
-//! `examples/common`); every cell is correctness-gated (roundtrip against
-//! the raw file) before anything is timed.
+//! This is the heavyweight tool; narrow it with `--shape`, `--level`,
+//! `--workers` and `--mode` instead of running `all` while iterating.
+//! `--budget-ms` sets the per-side budget (see `common`); every cell is
+//! correctness-gated (roundtrip against the raw file) before anything is
+//! timed.
 //!
-//! Cells and verdicts:
+//! Sections and verdicts:
 //! - `dec-st` interleaves both sides' bulk and streaming (64 KiB) decoders
 //!   over the zst1/zst3/zst9 corpus variants. The streaming rows carry the
 //!   real comparison: the zstd crate's bulk API is a slow per-chunk wrapper.
 //! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo;
 //!   libzstd exposes no multithreaded decode, so the zstd column is its
 //!   single-threaded streaming speed as a reference line.
-//! - `enc-st` pairs the four ladder levels with zstd levels 1/3/6/12,
+//! - `enc-st` pairs the ladder levels with zstd levels 1/3/6/12/16/19,
 //!   checksums off on both sides (our checksum overhead is measured in a
 //!   dedicated row); sizes and ratios are printed per cell.
 //! - `enc-mt` interleaves both sides at equal worker counts with fresh
@@ -22,42 +22,65 @@
 //!   reused context is reported once as a reference line).
 //! - `enc-stream` compares the streaming encoders with 64 KiB pulls:
 //!   single-threaded zstdx vs zstd interleaved, then multithreaded
-//!   (8 workers) zstdx vs zstd interleaved.
+//!   (`--mt-workers`, default 8) zstdx vs zstd interleaved, each followed
+//!   by our bulk mt path over the same bytes as the ceiling reference.
 
-#[path = "common/mod.rs"]
-mod common;
-
-use common::{black_box, measure_solo, Ab};
-use std::fs;
+use crate::common::{apply_budget, black_box, measure_solo, want, Ab};
+use crate::corpus::{
+    assert_roundtrip, gate_ruz_dec, gate_ruz_enc, gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc,
+    load, load_raw, LevelName, Shape, LADDER, SHAPES,
+};
 use std::io::Read as _;
-use std::path::PathBuf;
 use zstdx::decoding::{FrameDecoder, StreamingDecoder};
 use zstdx::{DecoderOptions, EncoderOptions, Level};
 
-const LADDER: [(&str, Level, i32); 6] = [
-    ("fastest", Level::Fastest, 1),
-    ("fast", Level::Fast, 3),
-    ("balanced", Level::Balanced, 6),
-    ("best", Level::Best, 12),
-    ("opt", Level::Opt, 16),
-    ("ultra", Level::Ultra, 19),
+/// Curated decode set: the informative level/shape combinations (the
+/// omitted variants are redundant with their neighbours).
+const DEC_FILES: [(&str, Shape); 11] = [
+    ("json.zst1", Shape::Json),
+    ("json.zst3", Shape::Json),
+    ("json.zst9", Shape::Json),
+    ("text.zst1", Shape::Text),
+    ("text.zst3", Shape::Text),
+    ("text.zst9", Shape::Text),
+    ("skewed.zst1", Shape::Skewed),
+    ("skewed.zst3", Shape::Skewed),
+    ("skewed.zst9", Shape::Skewed),
+    ("random.zst3", Shape::Random),
+    ("zeros.zst3", Shape::Zeros),
 ];
 
-const SHAPES: [&str; 5] = ["json", "text", "skewed", "random", "zeros"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MatrixMode {
+    All,
+    DecSt,
+    DecMt,
+    EncSt,
+    EncMt,
+    EncStream,
+}
 
-const DEC_FILES: [&str; 11] = [
-    "json.zst1",
-    "json.zst3",
-    "json.zst9",
-    "text.zst1",
-    "text.zst3",
-    "text.zst9",
-    "skewed.zst1",
-    "skewed.zst3",
-    "skewed.zst9",
-    "random.zst3",
-    "zeros.zst3",
-];
+#[derive(clap::Args)]
+pub struct Args {
+    /// Matrix section to run
+    #[arg(long, value_enum, default_value_t = MatrixMode::All)]
+    pub mode: MatrixMode,
+    /// Corpus shapes to include (comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub shape: Vec<Shape>,
+    /// Encoder levels to include (comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub level: Vec<LevelName>,
+    /// Worker counts for the scaling sweeps
+    #[arg(long, value_delimiter = ',')]
+    pub workers: Vec<u32>,
+    /// Fixed worker count for the mt and streaming-mt sections
+    #[arg(long, default_value_t = 8)]
+    pub mt_workers: u32,
+    /// Per-side measurement budget in milliseconds
+    #[arg(long)]
+    pub budget_ms: Option<f64>,
+}
 
 /// Report name padded past `AbReport::print`'s name column so the numeric
 /// columns line up despite the longer mode-prefixed names.
@@ -65,82 +88,48 @@ fn pad(name: &str) -> String {
     format!("{name:<24}")
 }
 
-fn corpus_dir() -> PathBuf {
-    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    dir.push("../bench/corpus");
-    dir
+fn shapes_selected(args: &Args) -> Vec<Shape> {
+    SHAPES
+        .iter()
+        .copied()
+        .filter(|s| want(&args.shape, s))
+        .collect()
 }
 
-fn load(name: &str) -> (Vec<u8>, Vec<u8>) {
-    let dir = corpus_dir();
-    let compressed = fs::read(dir.join(name)).unwrap();
-    let raw = fs::read(dir.join(format!("{}.raw", name.split('.').next().unwrap()))).unwrap();
-    (compressed, raw)
+/// Filter a level subset down to the selection; `(name, our level, zstd level)`.
+fn ladder_subset(args: &Args, of: &[LevelName]) -> Vec<(LevelName, Level, i32)> {
+    of.iter()
+        .filter(|l| want(&args.level, l))
+        .map(|l| {
+            let (level, z) = l.pair();
+            (*l, level, z)
+        })
+        .collect()
 }
 
-fn load_raw(shape: &str) -> Vec<u8> {
-    fs::read(corpus_dir().join(format!("{shape}.raw"))).unwrap()
+fn label_name(shape: Shape, level: LevelName) -> String {
+    pad(&format!("{}.{}", shape.raw_name(), level_name(level)))
 }
 
-fn gate_ruz_dec(compressed: &[u8], raw: &[u8], label: &str) {
-    let mut out = vec![0u8; raw.len()];
-    FrameDecoder::new()
-        .decode_all(compressed, &mut out)
-        .unwrap_or_else(|e| panic!("zstdx decode gate failed for {label}: {e}"));
-    assert_eq!(&out[..], raw, "zstdx gate mismatch for {label}");
-}
-
-fn gate_ruz_mt_dec(compressed: &[u8], raw: &[u8], threads: u32, label: &str) {
-    let mut out = vec![0u8; raw.len()];
-    zstdx::bulk::decompress_to_buffer_with(
-        compressed,
-        &mut out,
-        &DecoderOptions::new().threads(threads),
-    )
-    .unwrap_or_else(|e| panic!("zstdx MT decode gate failed for {label}: {e}"));
-    assert_eq!(&out[..], raw, "zstdx MT gate mismatch for {label}");
-}
-
-fn gate_zstd_dec(compressed: &[u8], raw: &[u8], label: &str) {
-    let mut decoded = Vec::new();
-    zstd::stream::copy_decode(compressed, &mut decoded).unwrap();
-    assert_eq!(&decoded[..], raw, "zstd gate mismatch for {label}");
-}
-
-fn gate_ruz_enc(raw: &[u8], level: Level, label: &str) -> Vec<u8> {
-    let comp = zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false));
-    let mut back = Vec::with_capacity(raw.len() + 16);
-    FrameDecoder::new()
-        .decode_all_to_vec(&comp, &mut back)
-        .unwrap();
-    assert_eq!(&back[..], raw, "zstdx encode gate mismatch for {label}");
-    comp
-}
-
-fn gate_zstd_enc(raw: &[u8], level: i32, label: &str) -> Vec<u8> {
-    let comp = zstd::bulk::compress(raw, level).unwrap();
-    let mut back = Vec::new();
-    zstd::stream::copy_decode(&comp[..], &mut back).unwrap();
-    assert_eq!(&back[..], raw, "zstd encode gate mismatch for {label}");
-    comp
-}
-
-fn assert_roundtrip(comp: &[u8], raw: &[u8], label: &str) {
-    let mut back = Vec::new();
-    zstd::stream::copy_decode(comp, &mut back).unwrap();
-    assert_eq!(&back[..], raw, "roundtrip mismatch for {label}");
-    let mut back2 = Vec::with_capacity(raw.len() + 16);
-    FrameDecoder::new()
-        .decode_all_to_vec(comp, &mut back2)
-        .unwrap();
-    assert_eq!(&back2[..], raw, "zstdx roundtrip mismatch for {label}");
+fn level_name(level: LevelName) -> &'static str {
+    match level {
+        LevelName::Fastest => "fastest",
+        LevelName::Fast => "fast",
+        LevelName::Balanced => "balanced",
+        LevelName::Best => "best",
+        LevelName::Opt => "opt",
+        LevelName::Ultra => "ultra",
+    }
 }
 
 // ---------- decode, single-thread, bulk vs streaming ----------
 
-fn t1_dec_st(ab: &Ab) {
+fn t1_dec_st(ab: &Ab, args: &Args) {
     println!("== T1 decode ST (interleaved A/B; MiB/s of raw; xslow = ruz_time/zstd_time) ==");
-    for f in DEC_FILES {
+    for (f, shape) in DEC_FILES {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let (comp, raw) = load(f);
         let bytes = raw.len() as u64;
         gate_ruz_dec(&comp, &raw, f);
@@ -158,7 +147,7 @@ fn t1_dec_st(ab: &Ab) {
                 black_box(zstd::bulk::decompress(&comp, raw.len()).unwrap());
             },
         )
-        .print(&pad(&format!("{f}.bulk")), bytes, "", "");
+        .print(&pad(&format!("{f}.bulk")), bytes);
 
         // streaming path, 64 KiB reads
         ab.measure(
@@ -189,15 +178,27 @@ fn t1_dec_st(ab: &Ab) {
                 assert_eq!(total, raw.len());
             },
         )
-        .print(&pad(&format!("{f}.stream")), bytes, "", "");
+        .print(&pad(&format!("{f}.stream")), bytes);
     }
 }
 
 // ---------- decode, our MT scaling (zstd has no MT decode API) ----------
 
-fn t2_dec_mt() {
+fn t2_dec_mt(args: &Args) {
     println!("== T2 decode MT scaling (solo; MiB/s; zstd has no MT decode counterpart) ==");
-    for f in ["json.zst3", "text.zst3", "skewed.zst9", "random.zst3"] {
+    let workers: Vec<u32> = [2u32, 4, 8, 16]
+        .into_iter()
+        .filter(|w| want(&args.workers, w))
+        .collect();
+    for (f, shape) in [
+        ("json.zst3", Shape::Json),
+        ("text.zst3", Shape::Text),
+        ("skewed.zst9", Shape::Skewed),
+        ("random.zst3", Shape::Random),
+    ] {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let (comp, raw) = load(f);
         let bytes = raw.len() as u64;
         gate_ruz_dec(&comp, &raw, f);
@@ -232,13 +233,13 @@ fn t2_dec_mt() {
         );
         let zref_mibs = zref.mibs(bytes);
 
-        for threads in [2u32, 4, 8, 16] {
+        for threads in &workers {
             let mut out = vec![0u8; raw.len()];
             let stats = measure_solo(|| {
                 zstdx::bulk::decompress_to_buffer_with(
                     &comp,
                     &mut out,
-                    &DecoderOptions::new().threads(threads),
+                    &DecoderOptions::new().threads(*threads),
                 )
                 .unwrap();
                 black_box(&out);
@@ -256,16 +257,19 @@ fn t2_dec_mt() {
 
 // ---------- encode, single-thread bulk, ladder vs zstd levels ----------
 
-fn t3_enc_st(ab: &Ab) {
+fn t3_enc_st(ab: &Ab, args: &Args) {
     println!("== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==");
-    for shape in SHAPES {
+    for shape in shapes_selected(args) {
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (label, level, z) in LADDER {
+        for (name, level, z) in ladder_subset(args, &LADDER) {
+            let label = level_name(name);
             let rc = gate_ruz_enc(&raw, level, label);
             let zc = gate_zstd_enc(&raw, z, label);
             println!(
-                "sizes {shape}.{label:<9} ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
+                "sizes {}.{}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
+                shape.raw_name(),
+                label,
                 rc.len(),
                 raw.len() as f64 / rc.len() as f64,
                 zc.len(),
@@ -282,13 +286,19 @@ fn t3_enc_st(ab: &Ab) {
                     black_box(zstd::bulk::compress(&raw, z).unwrap());
                 },
             )
-            .print(&label_name(shape, label), bytes, "", "");
+            .print(&label_name(shape, name), bytes);
         }
     }
 
+    if !want(&args.level, &LevelName::Fast) {
+        return;
+    }
     // checksum overhead on our side (A = off, B = on; ratio < 1 means on is slower)
     println!("-- checksum overhead (ours; A/B = off/on time ratio) --");
-    for shape in ["json", "text"] {
+    for shape in shapes_selected(args) {
+        if !matches!(shape, Shape::Json | Shape::Text) {
+            continue;
+        }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
         ab.measure(
@@ -305,12 +315,11 @@ fn t3_enc_st(ab: &Ab) {
                 ));
             },
         )
-        .print(&pad(&format!("{shape}.fast.cksum-on/off")), bytes, "", "");
+        .print(
+            &pad(&format!("{}.fast.cksum-on/off", shape.raw_name())),
+            bytes,
+        );
     }
-}
-
-fn label_name(shape: &str, level: &str) -> String {
-    pad(&format!("{shape}.{level}"))
 }
 
 // ---------- encode, MT bulk ----------
@@ -323,32 +332,42 @@ fn zstd_mt_comp(raw: &[u8], z: i32, workers: u32) -> Vec<u8> {
     c.compress(raw).unwrap()
 }
 
-fn t4_enc_mt(ab: &Ab) {
+fn t4_enc_mt(ab: &Ab, args: &Args) {
     println!("== T4 encode MT bulk, checksums off (interleaved A/B at equal worker counts) ==");
+    let sweep: Vec<u32> = [2u32, 4, 8, 16, 32]
+        .into_iter()
+        .filter(|w| want(&args.workers, w))
+        .collect();
+    let mt = args.mt_workers;
 
     // worker scaling on the two CPU-bound shapes
-    for shape in ["json", "text"] {
+    for shape in [Shape::Json, Shape::Text] {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
         let rc = gate_ruz_enc(&raw, Level::Fast, "mt");
         let zc = gate_zstd_enc(&raw, 3, "mt");
         println!(
-            "sizes {shape}.fast-mt   ruz {:>9} (r {:7.2})   zstd(st) {:>9} (r {:7.2})",
+            "sizes {}.fast-mt   ruz {:>9} (r {:7.2})   zstd(st) {:>9} (r {:7.2})",
+            shape.raw_name(),
             rc.len(),
             raw.len() as f64 / rc.len() as f64,
             zc.len(),
             raw.len() as f64 / zc.len() as f64,
         );
-        for w in [2u32, 4, 8, 16, 32] {
+        for w in &sweep {
             let a = zstdx::bulk::compress_with(
                 &raw,
-                &EncoderOptions::new(Level::Fast).checksum(false).workers(w),
+                &EncoderOptions::new(Level::Fast).checksum(false).workers(*w),
             );
-            let b = zstd_mt_comp(&raw, 3, w);
+            let b = zstd_mt_comp(&raw, 3, *w);
             assert_roundtrip(&a, &raw, "ruz-mt");
             assert_roundtrip(&b, &raw, "zstd-mt");
             println!(
-                "sizes {shape}.fast-mt{w:<2} ruz {:>9} (r {:7.2})   zstd-mt {:>9} (r {:7.2})",
+                "sizes {}.fast-mt{w:<2} ruz {:>9} (r {:7.2})   zstd-mt {:>9} (r {:7.2})",
+                shape.raw_name(),
                 a.len(),
                 raw.len() as f64 / a.len() as f64,
                 b.len(),
@@ -358,31 +377,36 @@ fn t4_enc_mt(ab: &Ab) {
                 || {
                     black_box(zstdx::bulk::compress_with(
                         &raw,
-                        &EncoderOptions::new(Level::Fast).checksum(false).workers(w),
+                        &EncoderOptions::new(Level::Fast).checksum(false).workers(*w),
                     ));
                 },
                 || {
-                    black_box(zstd_mt_comp(&raw, 3, w));
+                    black_box(zstd_mt_comp(&raw, 3, *w));
                 },
             )
-            .print(&pad(&format!("{shape}.fast.mt{w}")), bytes, "", "");
+            .print(&pad(&format!("{}.fast.mt{w}", shape.raw_name())), bytes);
         }
     }
 
-    // fixed 16 workers across shapes and levels
-    for shape in ["json", "text", "skewed"] {
+    // fixed worker count across shapes and levels
+    for shape in [Shape::Json, Shape::Text, Shape::Skewed] {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (label, level, z) in LADDER.iter().take(3) {
+        for (name, level, z) in ladder_subset(args, &LADDER[..3]) {
+            let label = level_name(name);
             let a = zstdx::bulk::compress_with(
                 &raw,
-                &EncoderOptions::new(*level).checksum(false).workers(16),
+                &EncoderOptions::new(level).checksum(false).workers(mt),
             );
-            let b = zstd_mt_comp(&raw, *z, 16);
+            let b = zstd_mt_comp(&raw, z, mt);
             assert_roundtrip(&a, &raw, label);
             assert_roundtrip(&b, &raw, label);
             println!(
-                "sizes {shape}.{label}.mt16 ruz {:>9} (r {:7.2})   zstd-mt {:>9} (r {:7.2})",
+                "sizes {}.{label}.mt{mt} ruz {:>9} (r {:7.2})   zstd-mt {:>9} (r {:7.2})",
+                shape.raw_name(),
                 a.len(),
                 raw.len() as f64 / a.len() as f64,
                 b.len(),
@@ -392,14 +416,14 @@ fn t4_enc_mt(ab: &Ab) {
                 || {
                     black_box(zstdx::bulk::compress_with(
                         &raw,
-                        &EncoderOptions::new(*level).checksum(false).workers(16),
+                        &EncoderOptions::new(level).checksum(false).workers(mt),
                     ));
                 },
                 || {
-                    black_box(zstd_mt_comp(&raw, *z, 16));
+                    black_box(zstd_mt_comp(&raw, z, mt));
                 },
             )
-            .print(&pad(&format!("{shape}.{label}.mt16")), bytes, "", "");
+            .print(&pad(&format!("{}.{label}.mt{mt}", shape.raw_name())), bytes);
         }
     }
 
@@ -407,7 +431,7 @@ fn t4_enc_mt(ab: &Ab) {
     println!(
         "-- zstd warm-pool reference (context reused across rounds; zstdx has no such API) --"
     );
-    let raw = load_raw("json");
+    let raw = load_raw(Shape::Json);
     let bytes = raw.len() as u64;
     let mut warm = zstd::bulk::Compressor::new(3).unwrap();
     warm.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(16))
@@ -422,18 +446,21 @@ fn t4_enc_mt(ab: &Ab) {
     );
 }
 
-// ---------- encode, streaming, single-thread ----------
+// ---------- encode, streaming ----------
 
-fn t5_enc_stream(ab: &Ab) {
+fn t5_enc_stream(ab: &Ab, args: &Args) {
     println!("== T5 encode streaming ST, checksums off (interleaved A/B; 64 KiB pulls) ==");
-    for shape in ["json", "text"] {
+    for shape in [Shape::Json, Shape::Text] {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (label, level, z) in [
-            ("fastest", Level::Fastest, 1),
-            ("fast", Level::Fast, 3),
-            ("best", Level::Best, 12),
-        ] {
+        for (name, level, z) in ladder_subset(
+            args,
+            &[LevelName::Fastest, LevelName::Fast, LevelName::Best],
+        ) {
+            let label = level_name(name);
             // gate: both sides' streaming outputs must roundtrip to the raw input
             let mut comp = Vec::new();
             let mut enc = zstdx::stream::read::Encoder::with_options(
@@ -450,7 +477,8 @@ fn t5_enc_stream(ab: &Ab) {
             zenc.finish();
             assert_roundtrip(&zcomp, &raw, label);
             println!(
-                "sizes {shape}.{label}.stream  ruz {}   zstd {}",
+                "sizes {}.{label}.stream  ruz {}   zstd {}",
+                shape.raw_name(),
                 comp.len(),
                 zcomp.len()
             );
@@ -481,26 +509,34 @@ fn t5_enc_stream(ab: &Ab) {
                     enc.finish();
                 },
             )
-            .print(&pad(&format!("{shape}.{label}.stream")), bytes, "", "");
+            .print(&pad(&format!("{}.{label}.stream", shape.raw_name())), bytes);
         }
     }
 
     // multithreaded streaming, both sides
-    println!("== T5b encode streaming MT(8), checksums off (interleaved A/B; 64 KiB pulls) ==");
-    for shape in ["json", "text"] {
+    let mt = args.mt_workers;
+    println!("== T5b encode streaming MT({mt}), checksums off (interleaved A/B; 64 KiB pulls) ==");
+    for shape in [Shape::Json, Shape::Text] {
+        if !want(&args.shape, &shape) {
+            continue;
+        }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (label, level, z) in [
-            ("fastest", Level::Fastest, 1),
-            ("fast", Level::Fast, 3),
-            ("balanced", Level::Balanced, 6),
-            ("best", Level::Best, 12),
-        ] {
+        for (name, level, z) in ladder_subset(
+            args,
+            &[
+                LevelName::Fastest,
+                LevelName::Fast,
+                LevelName::Balanced,
+                LevelName::Best,
+            ],
+        ) {
+            let label = level_name(name);
             // gate: both sides' multithreaded streaming outputs must roundtrip
             let mut comp = Vec::new();
             let mut enc = zstdx::stream::read::Encoder::with_options(
                 &raw[..],
-                EncoderOptions::new(level).checksum(false).workers(8),
+                EncoderOptions::new(level).checksum(false).workers(mt),
             )
             .unwrap();
             enc.read_to_end(&mut comp).unwrap();
@@ -508,12 +544,13 @@ fn t5_enc_stream(ab: &Ab) {
             assert_roundtrip(&comp, &raw, label);
             let mut zcomp = Vec::new();
             let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
-            zenc.multithread(8).unwrap();
+            zenc.multithread(mt).unwrap();
             zenc.read_to_end(&mut zcomp).unwrap();
             zenc.finish();
             assert_roundtrip(&zcomp, &raw, label);
             println!(
-                "sizes {shape}.{label}.stream-mt8  ruz {}   zstd {}",
+                "sizes {}.{label}.stream-mt{mt}  ruz {}   zstd {}",
+                shape.raw_name(),
                 comp.len(),
                 zcomp.len()
             );
@@ -522,7 +559,7 @@ fn t5_enc_stream(ab: &Ab) {
                 || {
                     let mut enc = zstdx::stream::read::Encoder::with_options(
                         &raw[..],
-                        EncoderOptions::new(level).checksum(false).workers(8),
+                        EncoderOptions::new(level).checksum(false).workers(mt),
                     )
                     .unwrap();
                     let mut sink = vec![0u8; 64 * 1024];
@@ -535,7 +572,7 @@ fn t5_enc_stream(ab: &Ab) {
                 },
                 || {
                     let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
-                    enc.multithread(8).unwrap();
+                    enc.multithread(mt).unwrap();
                     let mut sink = vec![0u8; 64 * 1024];
                     loop {
                         if enc.read(&mut sink).unwrap() == 0 {
@@ -545,65 +582,72 @@ fn t5_enc_stream(ab: &Ab) {
                     enc.finish();
                 },
             )
-            .print(&pad(&format!("{shape}.{label}.stream-mt8")), bytes, "", "");
+            .print(
+                &pad(&format!("{}.{label}.stream-mt{mt}", shape.raw_name())),
+                bytes,
+            );
         }
 
         // ceiling reference: our bulk mt path over the same bytes (the
         // streaming burst pipeline should approach it)
-        for (label, level) in [
-            ("fastest", Level::Fastest),
-            ("fast", Level::Fast),
-            ("balanced", Level::Balanced),
-            ("best", Level::Best),
-        ] {
+        for (name, level, _) in ladder_subset(
+            args,
+            &[
+                LevelName::Fastest,
+                LevelName::Fast,
+                LevelName::Balanced,
+                LevelName::Best,
+            ],
+        ) {
+            let label = level_name(name);
             let comp = zstdx::bulk::compress_with(
                 &raw,
-                &EncoderOptions::new(level).checksum(false).workers(8),
+                &EncoderOptions::new(level).checksum(false).workers(mt),
             );
             assert_roundtrip(&comp, &raw, label);
             let stats = measure_solo(|| {
                 black_box(zstdx::bulk::compress_with(
                     &raw,
-                    &EncoderOptions::new(level).checksum(false).workers(8),
+                    &EncoderOptions::new(level).checksum(false).workers(mt),
                 ));
             });
             println!(
-                "{:<32}{:>8.0}  (zstdx {shape}.{label} bulk mt8 ceiling)",
+                "{:<32}{:>8.0}  (zstdx {}.{label} bulk mt{mt} ceiling)",
                 "ref",
-                stats.mibs(bytes)
+                stats.mibs(bytes),
+                shape.raw_name()
             );
         }
     }
 }
 
-fn main() {
+pub fn run(args: &Args) {
+    apply_budget(args.budget_ms);
     println!(
-        "# bench_matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
+        "# bench matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
         zstd::zstd_safe::version_string(),
         zstd::zstd_safe::version_number(),
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1),
     );
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let ab = Ab::default();
-    match mode.as_str() {
-        "dec-st" => t1_dec_st(&ab),
-        "dec-mt" => t2_dec_mt(),
-        "enc-st" => t3_enc_st(&ab),
-        "enc-mt" => t4_enc_mt(&ab),
-        "enc-stream" => t5_enc_stream(&ab),
-        "all" => {
-            t1_dec_st(&ab);
+    match args.mode {
+        MatrixMode::DecSt => t1_dec_st(&ab, args),
+        MatrixMode::DecMt => t2_dec_mt(args),
+        MatrixMode::EncSt => t3_enc_st(&ab, args),
+        MatrixMode::EncMt => t4_enc_mt(&ab, args),
+        MatrixMode::EncStream => t5_enc_stream(&ab, args),
+        MatrixMode::All => {
+            t1_dec_st(&ab, args);
             println!();
-            t2_dec_mt();
+            t2_dec_mt(args);
             println!();
-            t3_enc_st(&ab);
+            t3_enc_st(&ab, args);
             println!();
-            t4_enc_mt(&ab);
+            t4_enc_mt(&ab, args);
             println!();
-            t5_enc_stream(&ab);
+            t5_enc_stream(&ab, args);
         }
-        m => panic!("unknown mode {m}"),
     }
 }
