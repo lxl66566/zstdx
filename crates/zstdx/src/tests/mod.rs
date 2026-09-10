@@ -746,6 +746,7 @@ pub mod dict_test;
 #[cfg(feature = "std")]
 pub mod encode_corpus;
 pub mod fuzz_regressions;
+pub mod multi_frame;
 
 #[cfg(feature = "std")]
 #[test]

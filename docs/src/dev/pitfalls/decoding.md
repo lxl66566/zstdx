@@ -33,6 +33,16 @@
   let-else 返回而非 unwrap。
 - bench_files 的 strip_suffix 只认 `.zst`，`.zstN` 会拿压缩文件当参照报"校验失败"
   （已修：zstdx-bench `files` 按任意 `zst*` 后缀剥扩展名并尝试裸 stem 与 `.raw`）。
+- **流式单帧即止 vs flat 解所有帧**：StreamingDecoder 首帧 `is_finished` 后 read
+  返回 Ok(0)，`decode_all` 却循环解所有帧——同一多帧输入两路径结果不同（fuzz
+  decode target 的新对拍断言抓到；旧 target 只 read_to_end 从未暴露）。语义以
+  libzstd/zstd crate 实测为准：两路都解所有帧、透明跳 skippable、尾部任何垃圾
+  字节（≥1，含 1-3 字节部分 magic）都报错、空内容帧不得当 EOF。修：帧尾续帧
+  原语（预读 4 字节 magic 区分干净 EOF 与部分尾巴）下沉 `decoding::frame_source`，
+  `stream::read::Decoder` 与 StreamingDecoder 共用；**续帧判断必须在 read 的填充
+  循环内**而非仅入口——空帧结束当次 read 时 can_collect==0 会误报 EOF。
+  另注：该 crash 第二帧 FHD=0x38 置保留位，libzstd 拒绝而 zstdx 宽容接受——
+  帧头严格度差异是独立问题（见 todo）。
 
 ## profile 与归因
 

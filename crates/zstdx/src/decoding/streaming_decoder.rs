@@ -3,7 +3,7 @@
 use core::borrow::BorrowMut;
 
 use crate::decoding::errors::FrameDecoderError;
-use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+use crate::decoding::{frame_source, BlockDecodingStrategy, FrameDecoder};
 #[cfg(not(feature = "std"))]
 use crate::io::ErrorKind;
 use crate::io::{Error, Read};
@@ -13,19 +13,15 @@ use crate::io::{Error, Read};
 /// This decoder implements `io::Read`, so you can interact with it by calling
 /// `io::Read::read_to_end` / `io::Read::read_exact` or passing this to another library / module as a source for the decoded content
 ///
+/// The stream may contain any number of concatenated frames, with skippable
+/// frames in between; they are decoded transparently, as the reference
+/// decoders do. Reads return `Ok(0)` once the last frame is drained; trailing
+/// bytes that do not start a valid frame surface as an error.
+///
 /// If you need more control over how decompression takes place, you can use
 /// the lower level [FrameDecoder], which allows for greater control over how
 /// decompression takes place but the implementor must call
 /// [FrameDecoder::decode_blocks] repeatedly to decode the entire frame.
-///
-/// ## Caveat
-/// [StreamingDecoder] expects the underlying stream to only contain a single frame,
-/// yet the specification states that a single archive may contain multiple frames.
-///
-/// To decode all the frames in a finite stream, the calling code needs to recreate
-/// the instance of the decoder and handle
-/// [crate::decoding::errors::ReadFrameHeaderError::SkipFrame]
-/// errors by skipping forward the `length` amount of bytes, see <https://github.com/KillingSpark/zstd-rs/issues/57>
 ///
 /// ```no_run
 /// // `read_to_end` is not implemented by the no_std implementation.
@@ -52,7 +48,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         mut source: READ,
         mut decoder: DEC,
     ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
-        decoder.borrow_mut().init(&mut source)?;
+        frame_source::init_first_frame(&mut source, decoder.borrow_mut())?;
         Ok(StreamingDecoder { decoder, source })
     }
 }
@@ -62,7 +58,7 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
         mut source: READ,
     ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
         let mut decoder = FrameDecoder::new();
-        decoder.init(&mut source)?;
+        frame_source::init_first_frame(&mut source, &mut decoder)?;
         Ok(StreamingDecoder { decoder, source })
     }
 
@@ -75,7 +71,7 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
         let mut decoder = FrameDecoder::new();
         decoder.set_max_window_size(max_window_size);
-        decoder.init(&mut source)?;
+        frame_source::init_first_frame(&mut source, &mut decoder)?;
         Ok(StreamingDecoder { decoder, source })
     }
 }
@@ -118,32 +114,30 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, DEC> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let decoder = self.decoder.borrow_mut();
-        if decoder.is_finished() && decoder.can_collect() == 0 {
-            //No more bytes can ever be decoded
-            return Ok(0);
-        }
+        let source = &mut self.source;
 
         // Loop until the decoder has decoded far enough to fill the buffer,
         // so large reads pay the per-call overhead once per buffer instead of
         // once per block. Returning 0 bytes here would signal an EOF which
         // would be wrong when the decoder is not yet finished; if a call makes
         // no progress, hand back what is collectible instead of spinning.
-        while decoder.can_collect() < buf.len() && !decoder.is_finished() {
-            let collectible_before = decoder.can_collect();
-            match decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1)) {
-                Ok(_) => { /*Nothing to do*/ }
-                Err(e) => {
-                    let err;
-                    #[cfg(feature = "std")]
-                    {
-                        err = Error::other(e);
+        while decoder.can_collect() < buf.len() {
+            if decoder.is_finished() {
+                if decoder.can_collect() == 0 {
+                    // The stream may hold more frames behind this one; a
+                    // clean end of the source ends the whole stream.
+                    match frame_source::init_next_frame(&mut *source, decoder) {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(0),
+                        Err(e) => return Err(into_read_error(e)),
                     }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        err = Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
-                    }
-                    return Err(err);
                 }
+                break;
+            }
+            let collectible_before = decoder.can_collect();
+            match decoder.decode_blocks(&mut *source, BlockDecodingStrategy::UptoBlocks(1)) {
+                Ok(_) => { /*Nothing to do*/ }
+                Err(e) => return Err(into_read_error(e)),
             }
             if decoder.can_collect() == collectible_before && collectible_before > 0 {
                 break;
@@ -151,5 +145,16 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         }
 
         decoder.read(buf)
+    }
+}
+
+fn into_read_error(e: FrameDecoderError) -> Error {
+    #[cfg(feature = "std")]
+    {
+        Error::other(e)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        Error::new(ErrorKind::Other, alloc::boxed::Box::new(e))
     }
 }

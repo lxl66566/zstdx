@@ -57,6 +57,9 @@
 
 ## 搁置（有明确结论，勿盲目重启）
 
+- **帧头严格度对齐 libzstd**：FHD 保留位（bits 4-3）非零时 libzstd 拒绝
+  （"unsupported frame parameter"）而 zstdx 宽容接受（fuzz crash-b5593b58 第二帧
+  FHD=0x38 即此形状）。收紧=行为变化，需过一遍 interop 语料确认无误伤再动。
 - **流式解码 decode_step 重构**（json/skewed 残余 1.05-1.3×）：寄存器墙已证
   （活跃值 ~20 > 15 GPR；结构改造三连证伪），除非先减活跃值否则无空间；下一量级
   需 libzstd 式 8 深序列环形缓冲流水类算法级变化，先评估收益/风险比。

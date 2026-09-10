@@ -1,7 +1,7 @@
 //! io::Read-shaped streaming types.
 
 use super::encoder_core::FrameEncoderCore;
-use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+use crate::decoding::frame_source;
 use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 use crate::io::{Error, Read};
 use crate::{DecoderOptions, EncoderOptions, Level, Result};
@@ -77,10 +77,9 @@ impl<R: Read> Read for Encoder<R> {
 
 /// Decompress a zstd stream while reading from it.
 ///
-/// Unlike [`crate::decoding::StreamingDecoder`] (which is documented to
-/// decode a single frame), this decoder is transparent over concatenated
-/// frames and skippable frames; call [`Decoder::single_frame`] to stop after
-/// the first instead.
+/// Like [`crate::decoding::StreamingDecoder`], this decoder is transparent
+/// over concatenated frames and skippable frames; it additionally offers
+/// [`Decoder::single_frame`] to stop after the first one.
 ///
 /// ```rust
 /// use zstdx::stream::read::Decoder;
@@ -157,14 +156,7 @@ impl<R: Read> Decoder<R> {
     }
 
     fn init_first_frame(source: &mut R, decoder: &mut FrameDecoder) -> Result<()> {
-        let mut peek = PrefixedReader::new(source);
-        if !peek.peek_magic()? {
-            return Err(FrameDecoderError::ReadFrameHeaderError(
-                ReadFrameHeaderError::MagicNumberReadError(eof_error()),
-            )
-            .into());
-        }
-        decoder.reset(&mut peek)?;
+        frame_source::init_first_frame(source, decoder)?;
         Ok(())
     }
 
@@ -179,7 +171,9 @@ impl<R: Read> Decoder<R> {
                 return self.decoder.read(buf);
             }
             if self.decoder.is_finished() {
-                if self.single_frame || !self.init_next_frame()? {
+                let next = frame_source::init_next_frame(&mut self.source, &mut self.decoder)
+                    .map_err(|e| crate::error::into_io(crate::Error::Frame(e)));
+                if self.single_frame || !next? {
                     self.finished = true;
                     return Ok(0);
                 }
@@ -190,128 +184,10 @@ impl<R: Read> Decoder<R> {
                 .map_err(|e| crate::error::into_io(crate::Error::Frame(e)))?;
         }
     }
-
-    /// Initialize the next frame from the source. Returns `false` on a clean
-    /// end of stream; consumes skippable frames transparently.
-    fn init_next_frame(&mut self) -> Result<bool> {
-        loop {
-            let mut peek = PrefixedReader::new(&mut self.source);
-            if !peek.peek_magic()? {
-                return Ok(false);
-            }
-            if (0x184D2A50..=0x184D2A5F).contains(&peek.magic()) {
-                peek.skip_skippable()?;
-                continue;
-            }
-            self.decoder.reset(&mut peek)?;
-            return Ok(true);
-        }
-    }
 }
 
 impl<R: Read> Read for Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         self.pump(buf)
-    }
-}
-
-fn eof_error() -> Error {
-    Error::from(crate::io::ErrorKind::UnexpectedEof)
-}
-
-/// Serves the four magic-number bytes it read ahead, then the inner reader.
-/// The frame-header parser reads exact amounts, so nothing beyond the prefix
-/// is ever taken from the inner reader on behalf of the caller.
-struct PrefixedReader<'a, R: Read> {
-    inner: &'a mut R,
-    magic: [u8; 4],
-    /// Magic bytes already read from the inner reader.
-    filled: usize,
-    /// Magic bytes already handed out through [`Read`].
-    served: usize,
-}
-
-impl<'a, R: Read> PrefixedReader<'a, R> {
-    fn new(inner: &'a mut R) -> Self {
-        Self {
-            inner,
-            magic: [0; 4],
-            filled: 0,
-            served: 0,
-        }
-    }
-
-    /// Read the magic number strictly. `Ok(false)` means the inner reader
-    /// ended cleanly before the first byte (a frame boundary); a partial
-    /// magic number surfaces as the same error the header parser produces.
-    fn peek_magic(&mut self) -> Result<bool> {
-        while self.filled < 4 {
-            match self.inner.read(&mut self.magic[self.filled..]) {
-                Ok(0) if self.filled == 0 => return Ok(false),
-                Ok(0) => {
-                    return Err(FrameDecoderError::ReadFrameHeaderError(
-                        ReadFrameHeaderError::MagicNumberReadError(eof_error()),
-                    )
-                    .into())
-                }
-                Ok(n) => self.filled += n,
-                Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    return Err(FrameDecoderError::ReadFrameHeaderError(
-                        ReadFrameHeaderError::MagicNumberReadError(e),
-                    )
-                    .into())
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn magic(&self) -> u32 {
-        u32::from_le_bytes(self.magic)
-    }
-
-    /// Skip a skippable frame behind the (already peeked) magic number.
-    fn skip_skippable(&mut self) -> Result<()> {
-        // The header parser never runs for this frame, so the peeked magic
-        // must not be served as frame bytes: discard the prefix first.
-        self.served = self.filled;
-        let mut len_bytes = [0u8; 4];
-        self.read_exact(&mut len_bytes)?;
-        let mut left = u32::from_le_bytes(len_bytes) as usize;
-        let mut trash = [0u8; 8 * 1024];
-        while left > 0 {
-            let take = left.min(trash.len());
-            let n = self.read(&mut trash[..take])?;
-            if n == 0 {
-                return Err(FrameDecoderError::FailedToSkipFrame.into());
-            }
-            left -= n;
-        }
-        Ok(())
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.read(&mut buf[filled..])? {
-                0 => return Err(eof_error()),
-                n => filled += n,
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<R: Read> Read for PrefixedReader<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        let outstanding = self.filled - self.served;
-        if outstanding > 0 {
-            let take = outstanding.min(buf.len());
-            buf[..take].copy_from_slice(&self.magic[self.served..self.served + take]);
-            self.served += take;
-            return Ok(take);
-        }
-        self.inner.read(buf)
     }
 }

@@ -2,6 +2,11 @@ use crate::common::{MAGIC_NUM, MAX_WINDOW_SIZE, MIN_WINDOW_SIZE};
 use crate::decoding::errors::{FrameDescriptorError, FrameHeaderError, ReadFrameHeaderError};
 use crate::io::Read;
 
+/// Skippable frames have a magic number in this interval
+pub(crate) fn is_skippable_magic(magic_num: u32) -> bool {
+    (0x184D2A50..=0x184D2A5F).contains(&magic_num)
+}
+
 /// Read a single serialized frame from the reader and return a tuple containing the parsed frame and the number of bytes read.
 pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     use ReadFrameHeaderError as err;
@@ -11,8 +16,7 @@ pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFram
     let mut bytes_read = 4;
     let magic_num = u32::from_le_bytes(buf);
 
-    // Skippable frames have a magic number in this interval
-    if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
+    if is_skippable_magic(magic_num) {
         r.read_exact(&mut buf)
             .map_err(err::FrameDescriptorReadError)?;
         let skip_size = u32::from_le_bytes(buf);

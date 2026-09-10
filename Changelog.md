@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* `decoding::StreamingDecoder` decodes concatenated frames and skips
+  skippable frames transparently, matching `FrameDecoder::decode_all` and the
+  reference decoders (libzstd and the zstd crate were probed as the oracle on
+  every stream shape). Trailing bytes that do not start a frame surface as an
+  error instead of a silent EOF after the first frame; a zero-content frame no
+  longer reads as end of stream. The frame-boundary logic now lives in the
+  internal `decoding::frame_source` module, shared with `stream::read::Decoder`.
+  Found by the new consistency assertion in the `decode` fuzz target
+  (crash-b5593b58, regression test in `src/tests/multi_frame.rs`).
+
 * The benchmark and dev-tool examples leave the library for a new
   `zstdx-bench` workspace crate with subcommands: `matrix` (the full
   cross-matrix, now filterable by `--mode/--shape/--level/--workers/
