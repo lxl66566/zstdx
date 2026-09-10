@@ -1,86 +1,116 @@
-# 性能比较 · 当前快照
+# Perf vs zstd crate · current snapshot (2026-09-11)
 
-> 对比对象：zstd crate 0.13.3（libzstd 1.5.7 binding）。所有数字来自交错 A/B；
-> 各条目**数据时点不一**（括号内标注 commit），完整原始表见[广域矩阵数据](matrix.md)。
-> ⚠️ 广域矩阵最后一次完整测量在乱链修复前后（`b1dd010`/`4ff2b7b`），其后落地了
-> optimal parser、u32 表项、MT ratio 保持、stride-3 prefill、流式 MT 等，编码侧
-> 多数格子已过时；**矩阵重测本身在[待办](../todo.md)首位**。
+> Fresh full pass at `96867c5`, one day, one machine, one corpus. Raw tables + per-section commands: [matrix.md](matrix.md). Comparison target: zstd crate 0.13.3 / libzstd 1.5.7 (zstdmt), rustc 1.100.0-nightly, AMD Zen4-class 32C (Eng Sample 100-000000870-32_Y). Caveats: ±10% noise, sustained clocks ~70-77% of max boost, per-side budget 1.5-2s; dec-st/enc-st double-passed, mt/stream sections single-pass.
 
-## 一句话结论
+## Headline
 
-- **解码**：bulk 全胜（注意 zstd 的 bulk 包装本身慢）；流式 text/random/zeros 领先
-  或持平，json/skewed 落后 1.05-1.4×。
-- **编码**：text/skewed/zeros 多档速度领先；json 低档落后 1.3-1.8×；
-  ratio 已全档对位（Best/Opt 反超、Ultra 基本持平），但 Best/Opt/Ultra **速度**落后。
-- **MT 编码**：速度 2-4.5× 领先 zstd-mt；ratio 崩塌已修复（`a37ebaa`），mt16 各格
-  回到 ST ±0.5%。
-- **MT 解码**：独占维度（libzstd 无），但暂为负资产（0.66-1.0×），stage B 并行化是
-  最大待办。
-- **流式编码 MT8**：json 类 0.29-1.11×，text 类持平至 2.2× 快，best 档 2.4× 落后。
+- **Decode ST bulk**: we win 10/11 cells (x 0.21-0.80), parity on skewed.zst9 (1.00); absolute 636-11157 MiB/s ours. Caveat kept from methodology: zstd's bulk API is a slow wrapper — the honest decode gap is the streaming column.
+- **Decode ST streaming**: zstd wins every compressible shape — json x1.26-1.36, skewed x1.11-1.31, text x1.04-1.22; we win random (x0.80, 10872 vs 8706 MiB/s) and hold zeros (1.00). text.zst9 is near-parity (1.04, 11588 vs 12099).
+- **Encode ST**: we win text (fastest/fast/balanced: x0.67-0.93), skewed (fastest x0.45, balanced x0.055 at 1935 vs 105 MiB/s), zeros (x0.016-0.27); we lose json at every level (x1.15-1.78 except ultra) and random at low levels (x1.27-1.43). **Best level is now the biggest encoder deficit**: x4.52 json / x2.44 text / x3.52 skewed / x29 random (historical 2026-09-10: Best led at x0.48-0.69) — the opt-parser core bought ratio (json 6.83 vs 6.08, text 404.8 vs 383.9, skewed 2.00 vs 1.84) at 2.4-29x speed. Ultra (vs zstd-19) wins speed on 4/5 shapes (json x0.71, skewed x0.44, random x0.46, zeros x0.016; text x0.92) with ratio parity.
+- **Encode MT**: big win at equal workers where it matters — json.fast mt16 x0.31 (3203 vs 985 MiB/s), text.fast mt8/mt16 x0.13-0.14 (~16000/13751 vs ~2000), skewed mt8 0.21-0.77. Losses: json.fastest.mt8 x1.37 (zstd-l1-mt8 hits 4121), text.balanced.mt16 x1.28 (but zstd-mt ratio collapses to 212.6 vs our 360.9 there). Ratio preservation is ours alone: every mt cell within 0.5% of our ST; zstd-mt loses 1.4-8x ratio on text (189 vs 333 at fast, 39.8 vs 309 at fastest). Our cold-pool mt16 beats zstd's warm-pool reference (3203 vs 1608 MiB/s).
+- **Streaming encode ST**: text wins (fastest x0.29 with a 17x ratio win — zstd collapses to ratio 18.3 vs our 309; fast x0.84); json loses (fastest x1.64, fast x1.18, best x4.00 — bounded by the Best core, not the pipeline).
+- **Streaming encode MT8**: json fast/balanced win big (x0.27/x0.50), text fast x0.42; fastest parity on both (x1.03/x1.00); best loses x2.3-2.6 (same Best-core deficit). Stream reaches 61-80% (json) / 19-63% (text) of our own bulk-mt8 ceiling.
+- **Decode MT** (our exclusive dimension, libzstd has none): still a negative asset — no scaling (text/random 0.93-0.98x ST), skewed.zst9 anti-scales to 0.69x ST at every width; best case json.zst3 mt16 = 1.29x ST, still below the zstd ST streaming reference (0.93x).
 
-## 解码（时点：`b1dd010` 矩阵 + 各批次交错 A/B 累计）
+## Decode ST (2 passes; MiB/s of raw; x = ours_time/zstd_time, <1 = we faster)
 
-| 场景 | 状态 |
-|---|---|
-| bulk（slice API） | 11/11 全胜（xslow 0.22-1.00） |
-| streaming json | 落后 1.28-1.39×；D3-D5 批次后累计收窄至 ~1.2× |
-| streaming skewed | zst1 1.09× / zst3 1.23× / zst9 1.40×；收窄至 zst9 ~1.3× |
-| streaming text | 1.05-1.22×（zst9 已近追平） |
-| streaming random / zeros | 0.80×（反超）/ 1.00× |
-| MT 解码 | 无扩展性：json mt8 打平 ST，skewed.zst9 恒 0.66×（stage B 串行占 45-80%） |
+| file | bulk ours | bulk zstd | bulk x | stream ours | stream zstd | stream x |
+|---|---:|---:|---:|---:|---:|---:|
+| json.zst1 | 1738 | 1186 | 0.68 | 1736 | 2190 | 1.26 |
+| json.zst3 | 1428 | 1072 | 0.75 | 1380 | 1872 | 1.36 |
+| json.zst9 | 1720 | 1144 | 0.67 | 1646 | 2138 | 1.30 |
+| text.zst1 | 5428 | 2007 | 0.37 | 6230 | 7583 | 1.22 |
+| text.zst3 | 8226 | 2222 | 0.27 | 10418 | 11105 | 1.07 |
+| text.zst9 | 9003 | 2284 | 0.25 | 11588 | 12099 | 1.04 |
+| skewed.zst1 | 2268 | 1420 | 0.63 | 2546 | 2824 | 1.11 |
+| skewed.zst3 | 1230 | 986 | 0.80 | 1260 | 1526 | 1.21 |
+| skewed.zst9 | 636 | 638 | 1.00 | 602 | 788 | 1.31 |
+| random.zst3 | 8688 | 2034 | 0.23 | 10872 | 8706 | 0.80 |
+| zeros.zst3 | 11157 | 2292 | 0.21 | 12851 | 12896 | 1.00 |
 
-## 编码 ST（bulk）
+## Encode ST bulk (2 passes; checksums off; x = ours_time/zstd_time)
 
-各格取已知最新（时点不一，绝对值不可跨行比较）：
+| level | shape | ours MiB/s | ours ratio | zstd MiB/s | zstd ratio | x |
+|---|---|---:|---:|---:|---:|---:|
+| fastest | json | 477 | 6.15 | 852 | 6.11 | 1.78 |
+| fastest | text | 11279 | 309.17 | 10455 | 308.94 | 0.93 |
+| fastest | skewed | 2665 | 2.00 | 1210 | 2.00 | 0.45 |
+| fastest | random | 1482 | 1.00 | 1966 | 1.00 | 1.33 |
+| fastest | zeros | 49130 | 32483 | 13278 | 32171 | 0.27 |
+| fast | json | 371 | 5.36 | 480 | 5.29 | 1.29 |
+| fast | text | 10821 | 332.97 | 7189 | 332.90 | 0.67 |
+| fast | skewed | 164 | 1.92 | 225 | 1.92 | 1.37 |
+| fast | random | 1291 | 1.00 | 1841 | 1.00 | 1.43 |
+| fast | zeros | 48518 | 32483 | 8650 | 32171 | 0.18 |
+| balanced | json | 149 | 6.08 | 185 | 5.76 | 1.24 |
+| balanced | text | 3168 | 361.45 | 2748 | 370.17 | 0.87 |
+| balanced | skewed | 1935 | 2.00 | 105 | 1.86 | 0.055 |
+| balanced | random | 1284 | 1.00 | 1639 | 1.00 | 1.27 |
+| balanced | zeros | 46475 | 32483 | 2779 | 32202 | 0.060 |
+| best | json | 12 | 6.83 | 54 | 6.08 | 4.52 |
+| best | text | 358 | 404.78 | 872 | 383.85 | 2.44 |
+| best | skewed | 6 | 2.00 | 24 | 1.84 | 3.52 |
+| best | random | 22 | 1.00 | 632 | 1.00 | 29.2 |
+| best | zeros | 42649 | 32483 | 959 | 32202 | 0.023 |
+| opt | json | 8 | 7.46 | 10 | 7.10 | 1.15 |
+| opt | text | 470 | 408.76 | 528 | 406.09 | 1.12 |
+| opt | skewed | 7 | 2.00 | 8 | 2.00 | 1.10 |
+| opt | random | 22 | 1.00 | 21 | 1.00 | 0.96 |
+| opt | zeros | 43128 | 32483 | 1050 | 32202 | 0.024 |
+| ultra | json | 4 | 7.44 | 3 | 7.42 | 0.71 |
+| ultra | text | 290 | 411.58 | 266 | 413.98 | 0.92 |
+| ultra | skewed | 4 | 2.00 | 2 | 2.00 | 0.44 |
+| ultra | random | 16 | 1.00 | 8 | 1.00 | 0.46 |
+| ultra | zeros | 40880 | 32483 | 649 | 32202 | 0.016 |
 
-| 格 | 速度 | ratio | 时点/出处 |
-|---|---|---|---|
-| json.Fastest | 1.78× 落后（476 vs 849 MiB/s） | 6.00-6.20 vs 6.11 | `b1dd010` / `aa07308` 后 |
-| json.Fast | 1.35× 落后（350 vs 472） | **5.33 反超** zstd-3 的 5.29 | `b1dd010` |
-| json.Balanced | 乱链修复后 1.41× 落后（133 vs 185）；`a37ebaa` prefill 后 ratio **5.66→6.08**（反超 zstd-9 的 5.76） | ↑ | `4ff2b7b` / Changelog `a37ebaa` |
-| skewed.Balanced | `a37ebaa` 后 42→2139 MiB/s（ratio 1.86→2.00 反超） | ↑ | Changelog `a37ebaa` |
-| json.Best | 0.69× 领先（82 vs 56）→ 换 opt 核后 12-19 MiB/s，ratio **6.88 反超** zstd-12 的 6.14 | ↑ | `4ff2b7b` / `b39a192` |
-| skewed.Best | 0.67× 领先；ratio 1.996 反超 zstd-19 的 1.84（opt 核后） | ↑ | `4ff2b7b` / `b39a192` |
-| text.Fastest/Fast | 0.85× / 0.67× 领先 | 298-329 vs 308-333 | `b1dd010` |
-| skewed.Fastest/Fast | 0.44× 大幅领先 / 1.44× 落后 | 2.00 持平 | `b1dd010` |
-| random 低档 | 1.18-1.46× 落后（raw 块逐块开销，待 profile） | 1.00 持平 | `b1dd010` |
-| zeros 全档 | 0.02-0.27× 大幅领先 | 32k 持平 | `b1dd010` |
-| Opt/Ultra | json Opt ≈ zstd-16（7.8 MiB/s）；text Opt 313 vs ~440 落后 | json Opt **7.57 反超** 7.28；json Ultra 7.52 vs 7.49 持平 | `c726dfd` |
+Ratio verdict: we now match or beat zstd at every ST level on json (6.15/6.11 fastest → 7.44/7.42 ultra), on text except balanced/ultra (marginal losses 361 vs 370, 411.6 vs 414.0), on skewed everywhere except fast (tie), and tie on random/zeros. Checksum on/off (ours): json.fast 1.00-1.03, text.fast 0.91-0.93 (on faster).
 
-历史战果（vs zstd crate L1，ENCPERF 终态，Windows 原生相位）：json 287→447 MiB/s
-（比率逼近 6.00 vs 6.11）、skewed 434→2951（反超 2.35×）、text 2500→9480、
-zeros 4500→18573（反超 1.41×）、random 1120→2328（含校验和反超）。
+## Encode MT bulk (1 pass; cold pool per call both sides; MiB/s)
 
-## MT 编码
+| cell | ours mt8 | zstd mt8 | x8 | ours mt16 | zstd mt16 | x16 | ratio ours mt16 | ratio zstd mt16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| json.fastest | 3025 | 4121 | 1.37 | 4414 | 1642 | 0.38 | 6.14 | 6.11 |
+| json.fast | 2306 | 1042 | 0.45 | 3203 | 985 | 0.31 | 5.37 | 5.31 |
+| json.balanced | 560 | 541 | 0.98 | 532 | 531 | 1.00 | 6.09 | 5.76 |
+| text.fastest | 18218 | 11109 | 0.61 | 16392 | 1980 | 0.12 | 307.82 | 39.78 |
+| text.fast | 16014 | 2040 | 0.13 | 13751 | 1921 | 0.14 | 332.43 | 189.16 |
+| text.balanced | 2691 | 1640 | 0.61 | 1229 | 1582 | 1.28 | 360.85 | 212.55 |
+| skewed.fastest | 3904 | 3027 | 0.77 | 3365 | 1378 | 0.41 | 2.00 | 2.00 |
+| skewed.fast | 1055 | 618 | 0.58 | 1569 | 613 | 0.39 | 1.92 | 1.92 |
+| skewed.balanced | 1656 | 345 | 0.21 | 762 | 345 | 0.46 | 2.00 | 1.86 |
 
-- 速度（`b1dd010`，冷线程池对冷线程池）：mt4 起全面领先，mt8/16 达 2-4.5×
-  （json.Fast mt16 2981 vs 980 MiB/s）；mt32 回退（调度颠簸，job 收益见顶）。
-  zstd mt16 warm-pool 参考 1512 MiB/s，仍慢于我们冷池。
-- ratio：text 类周期语料曾崩塌（328.8→19.7 @mt16，zstd-mt 189）。
-  **已修复**（`a37ebaa`）：overlap=window + 条带 prefill 索引 + gain 门 + job 起点
-  周期种子；周期语料三档 mt/st 2.7-2.8→1.00，32MiB 全语料各格回到 ST ±0.5%。
-  ⚠️ 矩阵 §4 的 MT 表作废，重测在待办。
+MT ratio preservation (ours vs own ST, all cells within ±0.5%): fixed since `a37ebaa`; the old text mt16 collapse (historical r 19.7 @ `b1dd010`) is gone (332.43 now). zstd warm-pool json.fast mt16 reference: 1608 MiB/s.
 
-## 流式编码 MT8（时点：`27b91cf`）
+## Streaming encode (1 pass; 64KiB pulls; json/text only)
 
-ruz mt8 vs zstd stream-mt8（x = 我方时间/对方时间，<1 快）：
+| cell | ST ours | ST zstd | ST x | MT8 ours | MT8 zstd | MT8 x |
+|---|---:|---:|---:|---:|---:|---:|
+| json.fastest | 475 | 776 | 1.64 | 1865 | 1921 | 1.03 |
+| json.fast | 374 | 440 | 1.18 | 1433 | 391 | 0.27 |
+| json.balanced | — | — | — | 450 | 222 | 0.50 |
+| json.best | 12 | 48 | 4.00 | 32 | 82 | 2.58 |
+| text.fastest | 6010 | 1767 | 0.29 | 4459 | 4481 | 1.00 |
+| text.fast | 6481 | 5463 | 0.84 | 3676 | 1543 | 0.42 |
+| text.balanced | — | — | — | 1273 | 1213 | 0.96 |
+| text.best | 340 | 799 | 2.36 | 275 | 631 | 2.30 |
 
-| 格 | x | | 格 | x |
-|---|---|---|---|---|
-| json.fast | **0.29** | | text.fast | 0.46 |
-| json.balanced | 0.52 | | text.balanced | 1.04 |
-| json.fastest | 1.11 | | text.fastest | 1.00 |
-| json.best | 2.45 | | text.best | 2.40 |
+Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309) — 17x ratio + 3.4x speed. Bulk-mt8 ceilings and stream/ceiling ratios in [matrix.md](matrix.md).
 
-best 档落后是底层 Best 档编码速度差距（流式已达自身 bulk 上限 79%/60%），非管线问题。
-对自身流式 ST：json 类 3.7-3.8× 加速；text 快档 0.55-0.68×（高冗余数据 ST 近免费，
-zstd 同病）。
+## Decode MT scaling (1 pass; our solo dimension; MiB/s)
 
-## 其他口径
+| file | ours ST | mt2 | mt4 | mt8 | mt16 | zstd ST stream ref |
+|---|---:|---:|---:|---:|---:|---:|
+| json.zst3 | 1359 | 1323 | 1648 | 1549 | 1747 | 1879 |
+| text.zst3 | 10681 | 10285 | 10250 | 9955 | 10314 | 11181 |
+| skewed.zst9 | 637 | 438 | 441 | 441 | 438 | 788 |
+| random.zst3 | 9720 | 9511 | 9523 | 9507 | 9445 | 8777 |
 
-- 小语料（vs zstd crate bulk L1，ENCPERF）：skewed-1K 6.3×、random-64K 0.93×
-  （从 0.30× 追平）、random-1M 0.99×；json/text 的 64K/1M 仍落后 ~2×（待办 P1）。
-- 未知尺寸流式编码 text.Fastest：zstd 输出 1.84MB（ratio 18.2，bulk 308.9），
-  我们保持 112K（298.7）——同一 API 形状下 16× 压缩率 + 3.8× 速度双胜（`b1dd010`）。
-- 校验和开销（hash on/off）：json.Fast 1.036、text.Fast ≈1.05；sidecar 卸载后
-  random/text/skewed 追平或反超 no-hash（ENCPERF）。
+## Top open deficits (from this run)
+
+- Best-level encoder core speed: x2.4-29 behind zstd-12 across shapes; also caps json/text best streaming (bulk and stream MT both x2.3-4.0).
+- json ST encode speed at fastest/fast/balanced/opt: x1.15-1.78 behind.
+- random ST encode at fastest/fast/balanced: x1.27-1.43 behind (raw-block per-block overhead); random.best catastrophic (x29).
+- skewed.fast ST: x1.37 behind (only skewed cell we lose besides best).
+- Streaming decode on compressible shapes: x1.04-1.36 behind (text.zst9 near-parity).
+- MT decode scaling: none (skewed.zst9 0.69x anti-scaling).
+- json.fastest/text.balanced MT cells: x1.28-1.37 behind at one width each.

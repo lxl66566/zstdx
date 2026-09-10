@@ -4,6 +4,26 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Docs and CI pass: new `.github/workflows/docs.yml` builds the mdbook (`mdbook build
+  docs`) and deploys `docs/book` to GitHub Pages on pushes to `master` (+ `workflow_dispatch`),
+  mirroring youpipe's docs workflow (OIDC permissions, `pages` concurrency group,
+  upload/deploy-pages split). The handbook under `docs/src` is rewritten in accurate
+  English - every contiguous paragraph is a single physical line, CJK removed, all
+  figures and commit hashes preserved, `book.toml` retitled ("zstdx Development Handbook",
+  `language = "en"`). New `dev/comparison.md` contrasts zstdx with official zstd v1.6.0
+  across encoder front-end, entropy coding, decoder and systems architecture, splitting
+  differences into own-approaches / zstdx-only / gaps with code-verified citations on
+  both sides: the optimal parser (`opt.rs` vs `zstd_opt.c`) and the Huffman X1/X2 decode
+  fast loops are faithful ports; MT seed offsets, packed `SeqWord` sequence collection,
+  AVX-512 encode kernels, package-merge Huffman construction and the restart-point
+  parallel decoder are zstdx-only; LDM, block splitting, superblocks and encode-side
+  dictionaries remain absent. Benchmark pages (`dev/bench/snapshot.md`, `matrix.md`)
+  refreshed from a fresh interleaved-A/B matrix run at this commit (5 shapes, decode
+  zst1/3/9, all ST encode tiers, mt8/16, streaming, roundtrip gates on): decode bulk
+  wins 10/11 cells, streaming decode still trails on compressible shapes (x1.04-1.36),
+  MT encode leads 2-8x with ratio within 0.5% of ST everywhere, and the Best tier is
+  now the largest encoder deficit (x2.4-29 slower than zstd while leading ratio).
+
 * Toolchain hygiene pass: root-level `clippy.toml` (msrv 1.89, complexity and
   line-width thresholds), nightly `rustfmt.toml` (crate-granularity import
   merging, `StdExternalCrate` grouping, comment wrapping) and `.tombi.toml`
