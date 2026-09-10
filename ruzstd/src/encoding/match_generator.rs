@@ -1681,10 +1681,10 @@ impl MatchGeneratorDriver {
                         let of_value = (start - c + 3) as u32;
                         anchor_idx =
                             emit.emit(win, anchor_idx, ip_idx, start, ml, of_value, &mut rep);
-                        if step < 4 {
-                            // ip1 lies inside the covered range whenever
-                            // step < 4 (matches are at least 4 long), so
-                            // indexing it cannot pollute later probes.
+                        if ip1_idx < anchor_idx {
+                            // The emit moved the anchor past ip1, so the
+                            // match covers it: indexing it cannot pollute
+                            // later probes.
                             // SAFETY: hl1 is masked to the long table size.
                             unsafe {
                                 *long_ptr.add(hl1) = tag | (win_base + ip1_idx as u64);
@@ -1739,7 +1739,10 @@ impl MatchGeneratorDriver {
                         let of_value = (start - c + 3) as u32;
                         anchor_idx =
                             emit.emit(win, anchor_idx, ip_idx, start, ml, of_value, &mut rep);
-                        if step < 4 {
+                        if ip1_idx < anchor_idx {
+                            // The emit moved the anchor past ip1, so the
+                            // match covers it: indexing it cannot pollute
+                            // later probes.
                             // SAFETY: hl1 is masked to the long table size;
                             // see the long probe above.
                             unsafe {

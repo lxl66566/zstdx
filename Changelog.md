@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The dfast backfill insert — indexing the prepared second probe
+  position after a match was emitted — was gated on `step < 4`, a
+  proxy for "the match covered the probe position" that misses every
+  long match found once the miss step has grown past 3: those matches
+  cover the probe position but skipped the insert, leaving covered
+  positions unindexed. The gate is now the exact predicate (the emit
+  moved the anchor past the probe position), which no longer leans on
+  the assumption that match length bounds the step.
+
 * Multithreaded compression now holds the single-threaded ratio. The
   overlap strip between jobs is the full level window and its positions
   are actually indexed into the search tables (`prefill_window`; before,
