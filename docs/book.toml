@@ -1,7 +1,7 @@
 [book]
-title    = "zstd-rs 开发手册（ext 分支）"
+title    = "zstdx Development Handbook"
 authors  = ["lxl66566"]
-language = "zh"
+language = "en"
 src      = "src"
 
 [build]

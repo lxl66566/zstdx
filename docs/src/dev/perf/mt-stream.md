@@ -1,86 +1,44 @@
-# 性能优化 · 多线程与流式
+# Performance Optimization · Multithreading and Streaming
 
-## MT 编码（bulk slice 路径）`fd931a1`
+## MT encoding (bulk slice path) `fd931a1`
 
-**job 模型**：单帧 overlap job（stage-2；frame-per-job 被否——多帧输出对解码侧是
-负担）。输入切 job（共享公式 `job_size_for`：下限 1MiB、随 workers 均分、上限
-1GiB——libzstd zstdmt 同款 cap）；`std::thread::scope` + 原子计数取任务 + condvar
-汇合；worker state 走 thread_local 池跨调用复用；主线程写帧头（FCS=总长）+ 顺序拼
-job 块流 + 校验和并行吸收；worker panic 由调用线程在拼装排空后恢复。
+**job model**: single-frame overlap jobs (stage-2; frame-per-job was rejected — multi-frame output is a burden on the decode side). Input is split into jobs (shared formula `job_size_for`: floor 1MiB, split evenly by workers, cap 1GiB — the same cap as libzstd zstdmt); `std::thread::scope` + atomic-counter task pickup + condvar join; worker state goes through the thread_local pool for reuse across calls; the main thread writes the frame header (FCS=total length) + assembles the job block streams in order + absorbs checksums in parallel; worker panics are recovered by the calling thread after assembly drains.
 
-**job 独立性三条件**（每 job 起始处，zstdmt 同源核实）：
+**three conditions for job independence** (at each job start, cross-checked against zstdmt):
 
-1. 熵表复位（last_huff/三个 previous = None → 块头显式表达，合法）；
-2. repcode 哨兵 `rep=[u32::MAX;3]`（probe 必然越界失败，3 个字面 offset 序列后与
-   解码器 rep 状态自然收敛；热循环加 `rep_pending` 门控后 ST 输出字节不变）；
-3. overlap 前缀 prefill（见下）。
+1. entropy tables reset (last_huff/the three previous = None → expressed explicitly in the block header, legal);
+2. repcode sentinel `rep=[u32::MAX;3]` (the probe is guaranteed to fail out-of-bounds; after 3 literal-offset sequences it converges naturally with the decoder's rep state; ST output stays byte-identical once the hot loop got the `rep_pending` gate);
+3. overlap prefix prefill (see below).
 
-**ratio 保持**（曾为最大缺陷：text 周期语料 mt16 ratio 328.8→19.7，zstd-mt 189）：
+**ratio preservation** (once the biggest defect: text periodic corpus mt16 ratio 328.8→19.7, zstd-mt 189):
 
-- overlap=window 且条带**真正 prefill 进表**——原先条带只借作窗口但插入路径只插
-  job 内位置，跨 job 匹配数学上不可能。`a37ebaa`
-- fast/dfast/chain 条带填表走 **stride-3 网格**（`4bba04a`；chain 偏离 libzstd 的
-  稠密字典填表是有意的：我们的条带=全窗，稠密填表 ≈ 半个 job 的扫描时长）；chain
-  store 加 gain 门防条带洪泛出 5 字节垃圾匹配。
-- **job 起点周期种子**：prefill 时对条带尾做后向扫描找最近长重复距离 O，job 开头
-  直探 `pos-O`（3 次后 rep[0]=O 由 repcode 链接管；8192 探针预算退休死种子）。
-  周期语料三档 mt/st 2.7-2.8→1.00。`a37ebaa`
-- **确定性**：每 job 清 head 表（pooled 状态残留使输出依赖 worker 调度，±0.06%
-  跳变；u32 不清表设计埋的雷，稠密填表曾掩盖）；chain 链表可不清（归纳可证：
-  候选只来自已清 head 或本 job 链接值）→ 清表减半；≥4MiB 清表用 NT store。
-  `a6cf8a6`
-- **种子扫描 AVX-512**：occupancy 位图（64B 块 × 8 交叠 load 组装每位置一 bit，
-  自顶向下取位 = 标量最近优先的精确等价，输出不变）；random 类 0.45→0.06-0.13
-  ms/job（4-7×）。`e1c6d67`
+- overlap=window and strips **actually prefilled into the tables** — previously strips were only borrowed as the window while the insertion path inserted only in-job positions, making cross-job matches mathematically impossible. `a37ebaa`
+- fast/dfast/chain strip table-filling on a **stride-3 grid** (`4bba04a`; chain deviating from libzstd's dense dictionary filling is intentional: our strips = the full window, dense filling ≈ half a job's scan duration); chain stores got the gain gate to keep strips from flooding in 5-byte garbage matches.
+- **periodic seed at job start**: during prefill, a backward scan over the strip tail finds the nearest long-repeat distance O and the job start directly probes `pos-O` (after 3 hits rep[0]=O and the repcode chain takes over; dead seeds retire after an 8192-probe budget). Periodic corpora across three levels mt/st 2.7-2.8→1.00. `a37ebaa`
+- **determinism**: head tables are cleared per job (pooled state residue made output depend on worker scheduling, ±0.06% jitter; a landmine buried by the u32 no-clear design, previously masked by dense filling); chain lists need no clearing (provable by induction: candidates come only from cleared heads or this job's linked values) → clearing halved; clears ≥4MiB use NT stores. `a6cf8a6`
+- **AVX-512 seed scan**: occupancy bitmap (64B chunks × 8 overlapping loads assemble one bit per position, taking bits top-down = exact equivalent of the scalar nearest-first order, output unchanged); random-class 0.45→0.06-0.13 ms/job (4-7×). `e1c6d67`
 
-战果：64MiB 文本 2/4/8 workers = 2.05×/3.95×/7.55×（比率损失 <0.1%）；32MiB
-矩阵 mt8/16 速度 2-4.5× 领先 zstd-mt，ratio 修复后 mt16 各格回到 ST ±0.5%。
+Results: 64MiB text 2/4/8 workers = 2.05×/3.95×/7.55× (ratio loss <0.1%); 32MiB matrix mt8/16 speed 2-4.5× ahead of zstd-mt, and after the ratio fix every mt16 cell returned to ST ±0.5%.
 
-## MT 解码（独占维度：libzstd 无 MT 解码）`3219947`
+## MT decoding (exclusive dimension: libzstd has no MT decode) `3219947`
 
-- **restart-point 分段**：预扫块头，在熵状态自描述处（literals 非 Treeless、无
-  Repeat FSE 流）切分段；job 型编码器（zstd `-T` 与我们 MT 编码器）在每个 job 边界
-  恰好产生这些点；多帧输入 = 干净起点单元的特例，统一 unit 派发器。
-- stage A（worker 池）并行熵解码产打包序列流 + 精确输出尺寸；stage B（调用线程，
-  按输入序）执行进输出、携带 rep 历史——repcode 是唯一跨序列状态且不触 stage A。
-- 字典帧、malformed、单 restart、单核 → 串行回退（错误报告归串行路径）。
-- **现状**：64MiB 2.06×(4T)/2.10×(8T) 后再无扩展；stage B 串行占 45-80%
-  （skewed.zst9 匹配拷贝占 80%），stage A 并行只添乱。stage B 并行化
-  （reachback 分析 + rep 历史前缀扫描）是最大待办——做好即从 0.66-1.0× 负资产
-  跳到独占领先。
+- **restart-point segmentation**: block headers are pre-scanned and segments cut where entropy state is self-describing (literals not Treeless, no Repeat FSE streams); job-style encoders (zstd `-T` and our MT encoder) produce exactly these points at every job boundary; multi-frame input = a special case of clean-start units, unified in one unit dispatcher.
+- stage A (worker pool) entropy-decodes in parallel, producing packed sequence streams + exact output sizes; stage B (calling thread, in input order) executes into the output and carries the rep history — the repcode is the only cross-sequence state and never touches stage A.
+- dictionary frames, malformed, single restart, single core → serial fallback (error reporting belongs to the serial path).
+- **current status**: 64MiB 2.06×(4T)/2.10×(8T) with no scaling beyond; stage B serial occupies 45-80% (skewed.zst9 match copies 80%), and stage A parallelism only adds noise. Parallelizing stage B (reachback analysis + rep history prefix scan) is the biggest TODO — done well it jumps from a 0.66-1.0× liability to exclusive leadership.
 
-## 流式编解码（ST）
+## Streaming encode/decode (ST)
 
-- 流式编码器（write::Encoder / read::Encoder）共享增量核心，与 bulk 同
-  matcher/块编码器积木；无中间 flush 时输出与 `encoding::compress` 字节一致
-  （跨 write 分块断言）。`51ec2fc`
-- 流式解码 flat outBuff 模型与 `StreamingDecoder` read 粒度优化见解码侧页。
-- read/write Decoder 对多帧与 skippable 帧透明（`single_frame()` 恢复单帧语义）；
-  write 侧按块头+体+trailer 完整暂存才交 FrameDecoder（饥饿读会毒化状态）。
+- streaming encoders (write::Encoder / read::Encoder) share the incremental core and the same matcher/block-encoder building blocks as bulk; with no intermediate flush the output is byte-identical to `encoding::compress` (asserted across write chunkings). `51ec2fc`
+- for the streaming-decode flat outBuff model and `StreamingDecoder` read-granularity optimizations, see the decoding page.
+- read/write Decoders are transparent to multi-frame and skippable frames (`single_frame()` restores single-frame semantics); the write side stages a complete block header+body+trailer before handing to FrameDecoder (starved reads would poison the state).
 
-## 流式编码 MT（burst 模型）`44e11e5` `27b91cf`
+## Streaming encoding MT (burst model) `44e11e5` `27b91cf`
 
-- `FrameEncoderCore` 改 enum `Single(Box<FrameEncoderCoreSt>) | Mt(MtEncoderCore)`
-  （std 门控），read/write 路径零改动；no_std workers>1 保持 Unsupported；路由
-  （单核 / raw 级 / Uncompressed → Single）与 bulk 一致。
-- 单连续缓冲 `[上一 burst 保留的 window 条带][未编码数据]`（无 memcpy 滑窗）+
-  **绝对对齐 job 网格**（job k = job_start + k·job_size）→ 无 flush 时输出与
-  write 分块方式无关（确定性；flush 是文档化例外，rebase 网格）。
-- 攒够 max(workers,2) 个完整 job 触发 burst：scope 并行 + 主线程并行吸收校验和 +
-  顺序拼装 + poison 传播；单 job 收尾内联不 spawn。
-- **pledged**：共享 bulk job-size 公式切 job + hold-back 最后一个 job 给 finish
-  标 last → 与 bulk MT 字节一致（32MiB 实测 sizes 全等）。代价：该 job 在 finish
-  内联单线程跑——fast 档慢 0.55-0.78×，best 档反而快 1.24-1.28×（大 job 摊薄
-  per-job 固定成本）。hold-back 必须带 `pos <= n` 守卫（超写 pledge 时 pending
-  无界增长）。
-- **encoder 持有跨 burst worker-state 池**（`Mutex<Vec<Box<CompressState>>>`）：
-  thread::scope 每 burst 新线程，thread_local 池永远 miss（Balanced 8MiB 表 +
-  首触缺页），deep 档因此 +22-30%。panic 的 state 可能 mid-compress 垃圾——丢弃
-  不归还。
-- 战果：json.fast 3.5× vs zstd stream-mt8；json 类对自身流式 ST 3.7-3.8×；
-  完整数据见[矩阵页](../bench/matrix.md)。
-- **残余结构性差距**（均已验证非 bug，见待办）：read::Encoder 泵 16KiB 双拷贝
-  （直读未初始化缓冲违背 Read trait 契约，已评估放弃）；每 burst spawn 8 线程
-  （~0.5-2ms/burst，持久线程池属设计外重构）；unpledged 1MiB job 的 strip 全量
-  prefill（每字节成本 1× vs bulk 0.5×；加大 job 伤小流并行度与首输出延迟，
-  维持设计值）。
+- `FrameEncoderCore` becomes enum `Single(Box<FrameEncoderCoreSt>) | Mt(MtEncoderCore)` (std-gated), zero changes to the read/write paths; no_std workers>1 stays Unsupported; routing (single core / raw level / Uncompressed → Single) matches bulk.
+- one contiguous buffer `[window strip retained from the previous burst][unencoded data]` (no memcpy sliding window) + **absolutely aligned job grid** (job k = job_start + k·job_size) → without flush, output is independent of how writes are chunked (deterministic; flush is a documented exception that rebases the grid).
+- a burst fires once max(workers,2) complete jobs have accumulated: scope parallelism + main thread absorbs checksums in parallel + in-order assembly + poison propagation; a single-job tail runs inline without spawning.
+- **pledged**: jobs cut with the shared bulk job-size formula + holding back the last job so finish can mark it last → byte-identical to bulk MT (32MiB measured, sizes fully equal). Cost: that job runs inline single-threaded inside finish — fast tier 0.55-0.78× slower, best tier actually 1.24-1.28× faster (big jobs amortize per-job fixed costs). hold-back must carry the `pos <= n` guard (on pledge overshoot, pending grows unboundedly).
+- **encoder-owned cross-burst worker-state pool** (`Mutex<Vec<Box<CompressState>>>`): thread::scope spawns fresh threads every burst so the thread_local pool always misses (Balanced 8MiB tables + first-touch page faults); the deep tier gains +22-30% from this. A panicked state may be mid-compress garbage — discard, do not return it.
+- results: json.fast 3.5× vs zstd stream-mt8; json-class 3.7-3.8× vs its own streaming ST; full data in the [matrix page](../bench/matrix.md).
+- **remaining structural gaps** (all verified as non-bugs, see the TODO): read::Encoder pumping double-copies 16KiB (reading directly into an uninitialized buffer violates the Read trait contract; evaluated and dropped); 8 threads spawned per burst (~0.5-2ms/burst; a persistent thread pool is an out-of-scope redesign); unpledged 1MiB jobs pay full-strip prefill (per-byte cost 1× vs bulk 0.5×; larger jobs hurt small-stream parallelism and first-output latency, so the design values stay).

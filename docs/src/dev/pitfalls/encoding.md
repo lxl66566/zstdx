@@ -1,114 +1,48 @@
-# 踩坑记录 · 编码侧
+# Pitfall Log · Encoding
 
-## 匹配器
+## Matcher
 
-- **commit_space 把 pos 游标设到块尾 → matcher 全空转**（所有块退化纯 literals），
-  而重建型单测照常通过——必须配 skip_matching 索引有效性断言与 repcode 发射断言。
-- 后向扩展后 offset 必须用最终位置差 `start - cand`。
-- **rep1_chain 返回后必须 `anchor_idx = ip_idx`**（三处发射路径都要），否则链覆盖
-  区被下一序列再计一次字面量 → 解码 TargetTooSmall（从 fast 老代码移植时丢过这行）。
-- chain 循环 repcode 向后扩展必须保留 ≥1 字面量（floor=anchor+1）：ll=0 时
-  of_value 1 是 rep 交换语义（`do_offset_history` 的 ll==0 分支），周期数据必炸。
-- chain 循环 pos==anchor 时不探测 repcode 会输自家 Fastest 8 倍——须镜像 fast 的
-  probe=pos+1 语义。
-- **索引域分裂（重大教训）**：chain 表 insert 用窗口索引、walk 用绝对位置，二者
-  只在 `win_base == 0` 时一致；任何真实驱动（流式压实、bulk 逐块 adopt、MT job
-  基址）推进 win_base 后，walk 全部跑在截断乱链上（有效 depth ~2-5）——"速度
-  领先"是少烧 probe 的假象、ratio 亦偏差，且流式 4× 崩坏同源。
-  **(a) 流式 vs bulk 输出不一致就是搜索状态分歧的烟雾报警（字节级相同断言此前
-  只验过 Fast/Fastest）；(b) 索引域必须在 insert/lookup 两侧写同一条不变式注释。**
-- u32 表项（`327bc99`）两坑：跨帧 stale 条目数值 > pos 且无 4GiB 周期可回退时
-  `cand - 2^32` 必须 `checked_sub`（release 回绕成巨索引 OOB 读——首版 bench 带着
-  bug 跑了一轮才复核发现）；`!u32::MAX as u64` 优先级陷阱（一元 `!` 先于 `as`，
-  = 0，hi 恒零且静默）。**位运算助手函数必须配跨 2^32 边界的往返测试。**
-- **u32 不清表的非确定性**：pooled 状态残留 + stride-3 网格只写 1/3 槽位 → 同输入
-  同进程连跑尺寸跳变（json.Balanced 5514733/5515064 交替）——`327bc99` 起就有的
-  潜在隐患，稠密填表此前掩盖了它。修：每 job 清 head 表（C 同款）；chain 链表
-  可不清（归纳可证：链槽只在候选位置被读，候选只来自已清 head 或本 job 链接值）。
-  替代方案全被否：frame-epoch 清表（调度相关）、job 静态绑定（丢负载均衡）、
-  entry 打标签（热路径付费）。
-- **raw 块回退是状态发散温床**：编码器任何跨块状态（rep / 复用熵表）都必须与
-  "解码端实际收到的内容"对账——raw 回退要回滚 rep + 复用表，否则下一块
-  Treeless/Repeat 引用解码端从未收到的表。
-- `ip1_idx - anchor_idx` 下溢（emit 返回的新 anchor 可越过 ip1）：release 静默、
-  debug panic 打断 MT worker → join 永等。修：改精确谓词，无减法。
-- matcher scratch 驱动复现 MT job 场景：块必须 ≤128K（ml>131074 会 unreachable），
-  adopt_window 只到 block_end（否则 extend_match 越块出巨 ml）。
+- **commit_space set the pos cursor to the block end → matcher fully idle** (all blocks degraded to pure literals), while rebuild-style unit tests kept passing — must be paired with skip_matching index-validity assertions and repcode emission assertions.
+- After backward extension, the offset must use the final position difference `start - cand`.
+- **After rep1_chain returns, `anchor_idx = ip_idx` is mandatory** (in all three emission paths), otherwise the chain-covered region gets its literals counted once more by the next sequence → decode TargetTooSmall (this line was lost once when porting from the old fast code).
+- In the chain loop, repcode backward extension must keep ≥1 literal (floor=anchor+1): at ll=0, of_value 1 is rep-swap semantics (the ll==0 branch of `do_offset_history`); periodic data is guaranteed to blow up.
+- In the chain loop, not probing repcodes when pos==anchor loses to our own Fastest by 8× — must mirror fast's probe=pos+1 semantics.
+- **Index-domain split (major lesson)**: chain-table insert used window indices while the walk used absolute positions; the two agree only when `win_base == 0`; once any real driver (streaming compaction, bulk per-block adopt, MT job base) advances win_base, the walk runs entirely on truncated, tangled chains (effective depth ~2-5) — the "speed lead" was an artifact of burning fewer probes, the ratio was off too, and the 4× streaming collapse shares the same root cause. **(a) Streaming vs bulk output divergence is the smoke alarm for search-state divergence (the byte-identical assertion had previously only been checked for Fast/Fastest); (b) the index domain must carry the same invariant comment on both the insert and lookup sides.**
+- Two pitfalls of u32 table entries (`327bc99`): for cross-frame stale entries whose value > pos with no 4GiB period to fall back through, `cand - 2^32` must be `checked_sub` (release wraps into a huge index and reads OOB — the first bench run carried the bug for a full round before re-verification caught it); the `!u32::MAX as u64` precedence trap (unary `!` binds before `as`, yielding 0; hi stays zero, silently). **Bit-manipulation helpers must come with round-trip tests across the 2^32 boundary.**
+- **Non-determinism from not clearing u32 tables**: pooled state residue + a stride-3 grid writing only 1/3 of the slots → same input, same process, sizes jump between consecutive runs (json.Balanced alternating 5514733/5515064) — a latent hazard present since `327bc99`, previously masked by dense table filling. Fix: clear the head table per job (same as C); chain lists may be left uncleared (provable by induction: chain slots are only read at candidate positions, and candidates come only from cleared heads or this job's linked values). All alternatives were rejected: frame-epoch clearing (schedule-dependent), statically binding jobs (loses load balancing), tagging entries (pays on the hot path).
+- **Raw-block fallback is a breeding ground for state divergence**: any cross-block encoder state (rep / reused entropy tables) must be reconciled against "what the decoder actually received" — a raw fallback must roll back rep + the reused table, otherwise the next block's Treeless/Repeat references a table the decoder never received.
+- `ip1_idx - anchor_idx` underflow (the new anchor returned by emit can move past ip1): silent in release; the debug panic interrupts an MT worker → join waits forever. Fix: switch to an exact predicate with no subtraction.
+- Matcher-scratch driver reproducing MT job scenarios: blocks must be ≤128K (ml>131074 hits unreachable), adopt_window only up to block_end (otherwise extend_match crosses the block and yields a huge ml).
 
-## 熵编码 / 位流
+## Entropy coding / bitstream
 
-- **Rust 运算符优先级**：`1u64 << 62 / total` 解析为 `1 << (62/total)`（`/` 高于
-  `<<`），归一化 step 全错 → 比率 -28%。**移植 C 的 `f(a,b)` 形式函数调用时必须
-  手动加括号。**
-- **literals 5 位尺寸格式的 size_format 只占 1 bit**（zstd 规范：1-bit form 时
-  bit3 是尺寸的一部分）；按 2 bit 写会错位整个后续块。Compressed 类型 sf=2/3 是
-  14/18 位尺寸（4/5 字节头），与 Raw/RLE 布局不同。
-- packed 码流抽取须逐段掩码：`(packed >> 8)` 带着 of 字段高位（可达 0xFFFF），
-  强转 `usize` 前必须 `& 0xFF`——只有强转 `u8` 时截断才天然等价。
-- `SeqWord.codes` 三字段是 **FSE code 不是原始值**（ml 是 ML code，ml-3 只在 ml<15
-  成立）；解码诊断要用 META 基数或走重构路径。
-- FSE -1 符号三坑：对拍输入的正概率和必须 = `table_size - count(-1)`（否则生成
-  畸形测试输入误报）；SoA 构建时 -1 符号被 `prob <= 0` 过滤，其 start 状态必须
-  在分配时显式写入；transitions 打包的 baseline（9 位）要求 baseline < 512，扩
-  acc_log 须同步扩打包位宽。
-- of_value 语义：非 rep 匹配 = offset+3，rep 匹配 ∈ {1,2,3}；诊断打印 offset 时
-  307203 = 307200+3，别当独立常数。
-- python 解析帧结构的坑（nbSeq 位宽、`+` 优先于 `|`、sort 混内核符号）见
-  [工程方法论](workflow.md)。
+- **Rust operator precedence**: `1u64 << 62 / total` parses as `1 << (62/total)` (`/` binds tighter than `<<`), every normalization step wrong → ratio -28%. **When porting C's `f(a,b)`-style function calls, add parentheses manually.**
+- **In the literals 5-bit size format, size_format occupies only 1 bit** (zstd spec: in the 1-bit form, bit3 is part of the size); writing it as 2 bits misaligns the entire rest of the block. For the Compressed type, sf=2/3 are 14/18-bit sizes (4/5-byte headers), a layout different from Raw/RLE.
+- Packed-bitstream extraction must mask per segment: `(packed >> 8)` still carries the of field's high bits (up to 0xFFFF); you must `& 0xFF` before casting to `usize` — only a cast to `u8` makes truncation naturally equivalent.
+- The three fields of `SeqWord.codes` are **FSE codes, not raw values** (ml is the ML code; ml-3 holds only when ml<15); decode diagnostics must use the META base or go through the reconstruction path.
+- Three pitfalls of the FSE -1 symbol: the positive-probability sum of cross-check inputs must equal `table_size - count(-1)` (otherwise you generate malformed test inputs and false-positive); during SoA construction the -1 symbol is filtered out by `prob <= 0`, so its start state must be written explicitly at allocation time; the baseline packed into transitions (9 bits) requires baseline < 512, and widening acc_log must widen the packed width in lockstep.
+- of_value semantics: non-rep match = offset+3, rep match ∈ {1,2,3}; when diagnostics print offsets, 307203 = 307200+3 — do not treat it as an independent constant.
+- For pitfalls of parsing frame structure with python (nbSeq bit width, `+` binding tighter than `|`, sort mixing in kernel symbols), see [engineering methodology](workflow.md).
 
-## 内存安全
+## Memory safety
 
-- **reserve 基准是 len 不是写入位置**：批量位写循环中 `pos` 常领先 `len`
-  （set_len 延迟到收尾）；`reserve(固定值)` 一旦 capacity 足即 no-op → 后续 store
-  越界破坏堆元数据（延迟爆 `realloc(): invalid next size`）。必须
-  `reserve(pos + N - len)`。
-- 哈希载荷改 u64 后，扫描尾部守卫（`block_end - pos < 8`）与插入上界（`len - 8`）
-  必须同步收紧，防读 `set_len` 留下的未初始化尾部。
-- 小 literal u64 拷贝：读端必须 `anchor_idx + 8 <= win.len()` 守卫（写端溢出无害，
-  读端越界侵入非法内存）。
-- 循环守卫用 `saturating_sub`：miss 步进可越过 block_end，无符号减法回绕巨值。
-- insert_max 减法：首块 <5 字节时 `win_base + win.len() - MIN_HASH` 下溢 → 惰性
-  计算或 saturating_sub。
+- **The reserve baseline is len, not the write position**: in bulk bit-write loops `pos` often runs ahead of `len` (set_len deferred to the end); `reserve(fixed value)` becomes a no-op once capacity suffices → later stores run out of bounds and corrupt heap metadata (delayed explosion as `realloc(): invalid next size`). Must use `reserve(pos + N - len)`.
+- After the hash payload became u64, the scan tail guard (`block_end - pos < 8`) and the insert upper bound (`len - 8`) must be tightened in lockstep to avoid reading the uninitialized tail left by `set_len`.
+- Small-literal u64 copy: the read side must be guarded with `anchor_idx + 8 <= win.len()` (write-side overflow is harmless; read-side OOB intrudes into illegal memory).
+- Loop guards use `saturating_sub`: miss stepping can cross block_end, and unsigned subtraction wraps into a huge value.
+- insert_max subtraction: when the first block is <5 bytes, `win_base + win.len() - MIN_HASH` underflows → compute lazily or use saturating_sub.
 
-## SPSC 校验和环
+## SPSC checksum ring
 
-- **"单生产者"指单线程不是单帧**：嵌套/交叠帧（reentrant compress、同线程双帧
-  测试）会交错进同一环；任何"建帧时缓存 next_seq 起点"的方案都会让两个活帧认领
-  同一 seq 互相覆盖（内层 RESET 被踩 → worker 越界 panic → 主线程 FinishCell
-  自旋死锁卡满核）。正确：**每 post 从共享 head 现读 seq 认领**（单线程内 post
-  非重入，读取即认领），生产者本地只留 drain 阈值。
-- **worker panic = 隐性死锁**：worker panic 后主线程所有 wait 变永久自旋且卡满核；
-  排查先看 `--test-threads=1 --nocapture` 里的 worker panic 输出，再 pkill。
-- 内存序：slot 载荷 Relaxed → kind Release → head Release；消费侧 head Acquire →
-  kind Acquire → 载荷 Relaxed，链式 happens-before；环回绕由 wait_free_slot 守卫
-  （与帧身份无关，天然支持交错）。
+- **"Single producer" means single thread, not single frame**: nested/overlapping frames (reentrant compress, two-frame same-thread tests) interleave into the same ring; any scheme that "caches the next_seq starting point at frame creation" lets two live frames claim the same seq and overwrite each other (the inner RESET gets clobbered → worker panics OOB → the main thread spins forever in FinishCell, pegging all cores). Correct: **each post reads the seq fresh from the shared head and claims it** (within a single thread, post is non-reentrant — reading is claiming); the producer keeps only the drain threshold locally.
+- **Worker panic = hidden deadlock**: after a worker panics, every main-thread wait becomes a permanent spin pegging all cores; when investigating, first look for worker panic output under `--test-threads=1 --nocapture`, then pkill.
+- Memory ordering: slot payload Relaxed → kind Release → head Release; consumer side head Acquire → kind Acquire → payload Relaxed, a chained happens-before; ring wraparound is guarded by wait_free_slot (independent of frame identity, naturally supports interleaving).
 
-## 其他
+## Misc
 
-- 流式 128KB 尾部空块怪癖：Stream 读满 tail 无法预知 EOF，必二次读取触发 0，多发
-  一个 3 字节 raw last 块；slice 路径要输出逐位一致必须显式镜像 trailing_empty。
-- **opt.rs（zstd_opt 移植）细节**：`#[cfg(feature="std")]` 的调试 eprintln 会随
-  默认 feature 编进 release（曾静默刷屏 stderr）；`ZSTD_count` 返回指针差——续数
-  要**替换**不能累加；rep history 由路径遍历每 series 更新一次（发射侧 per-seq
-  更新是解码器等价语义，二者取一，重复更新必炸）；插树计数 cap 在 DP 窗（4096
-  位）——否则对 parser 跳过的区域按 stale head 重计数（text 45→313 MiB/s 的教训）。
-- 语料生成窄整数：`(i as u8 + 1)` 在 i=255 处 debug 加法溢出 panic（u8 先截断后
-  +1）；要 usize 算完再 cast。
-- gain 门的语义偏差：C 的 +7 是"是否用后续候选**替换**已持有匹配"的裕度，不是
-  store 门；我们把门放 store 决策上（比 C 严）是刻意的（我们的表更密），但要知道
-  代价是 text 中短距匹配误杀。
-- **FSE 转移表打包位宽暗约束**：u32 entry 的 baseline 只留 9 位（表 ≤512 状态），
-  生产 acc_log ≤9（huff0 权重表 6、序列表 9）从不越界；fuzz_exports `round_trip`
-  的 max_log=22 构出 log10 表 → baseline≥512 静默截断 → 编码器写出超位宽 diff
-  （fuzz 下 debug 断言炸，release 静默错位流）。修：布局加宽为 12+4+12
-  （`optimal_table_log` 本就 clamp 5..=12），`build_table_from_counts` clamp 到 12 +
-  `build_table_from_probabilities` debug_assert 双保险。**教训：位域打包的隐式上限
-  必须在构造入口强制；"生产用不到"的参数范围迟早被 fuzz 或后续扩展踩中。**
-- **ST 编码输出依赖进程内历史（matcher 状态池残留）**：thread_local 匹配器状态池
-  跨帧残留（327bc99 u32 不清表设计），同输入在不同进程内历史下可产出**不同但均
-  合法**的帧（Level::Fast、24B 输入实测：流式 37B raw 块 vs bulk 35B）。症状：
-  单进程内复现"时过时不过"。约束：跨 build 字节对比必须新鲜进程（dump 工具即此
-  用途）；对拍 oracle 用双侧解码合法性而非字节一致（encode_stream fuzz 即此）。
-  MT job 的同类问题已由 a6cf8a6 清表修复（踩坑 20 的 ST 变体）。若将来要 libzstd
-  式"同输入同输出"确定性：reset 清表（速度代价）或 frame-epoch 方案（见 WORK.md
-  踩坑 20 论证）。
+- Streaming 128KB trailing-empty-block quirk: when Stream fills the tail it cannot know EOF in advance, must do a second read that triggers 0, and emits one extra 3-byte raw last block; the slice path must explicitly mirror trailing_empty for bit-identical output.
+- **opt.rs (zstd_opt port) details**: debug eprintln under `#[cfg(feature="std")]` gets compiled into release builds with the default feature (once silently flooded stderr); `ZSTD_count` returns a pointer difference — when continuing a count you must **replace**, not accumulate; rep history is updated once per series by the path walk (emitter-side per-seq updates are the decoder-equivalent semantics — pick one; duplicate updates always blow up); the insert-into-tree counting cap belongs in the DP window (4096 slots) — otherwise regions skipped by the parser get re-counted from stale heads (the lesson behind text 45→313 MiB/s).
+- Corpus-generation narrow integers: `(i as u8 + 1)` panics on debug addition overflow at i=255 (u8 truncates first, then +1); compute in usize and cast afterwards.
+- Gain-gate semantic drift: C's +7 is the margin for "whether a later candidate **replaces** the already-held match", not a store gate; putting the gate on the store decision (stricter than C) is deliberate (our tables are denser), but know the cost: short-distance matches in text get falsely killed.
+- **Hidden constraint on the FSE transition-table packed width**: the u32 entry's baseline keeps only 9 bits (tables ≤512 states); production acc_log ≤9 (huff0 weight table 6, sequence table 9) never overflows; fuzz_exports `round_trip` with max_log=22 builds a log10 table → baseline≥512 silently truncated → the encoder writes diffs exceeding the packed width (debug asserts blow up under fuzz; release silently emits a misaligned stream). Fix: widen the layout to 12+4+12 (`optimal_table_log` already clamps to 5..=12), `build_table_from_counts` clamping to 12 plus a `build_table_from_probabilities` debug_assert as double insurance. **Lesson: implicit limits in bitfield packing must be enforced at the construction entry; parameter ranges "production never uses" will sooner or later be stepped on by fuzz or later extensions.**
+- **ST encoding output depends on in-process history (matcher state-pool residue)**: the thread_local matcher state pool persists across frames (the `327bc99` don't-clear-u32-tables design); the same input can produce **different but each valid** frames under different in-process histories (Level::Fast, 24B input measured: streaming 37B raw block vs bulk 35B). Symptom: within a single process, "passes sometimes, fails sometimes". Constraints: cross-build byte comparisons must use a fresh process (that is the dump tool's purpose); the cross-check oracle uses two-sided decode validity rather than byte equality (that is what encode_stream fuzz does). The same problem for MT jobs was fixed by table clearing in a6cf8a6 (the ST variant of pitfall 20). If libzstd-style "same input, same output" determinism is ever wanted: reset with table clearing (speed cost) or the frame-epoch scheme (see the pitfall-20 argument in WORK.md).

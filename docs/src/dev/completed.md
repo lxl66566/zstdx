@@ -1,79 +1,63 @@
-# 已完成 · 功能与基础设施
+# Completed · Features and Infrastructure
 
-> 性能优化的完整清单已按主题并入[性能优化](../perf/decoding.md)各页（每项带
-> commit 与实测效果）；逐条变更记录以 `Changelog.md` 为准。本页记录功能、API、
-> 正确性里程碑与基础设施。
+> The full performance-optimization list has been merged by topic into the [performance optimization](../perf/decoding.md) pages (each entry carries its commit and measured effect); per-change records are authoritative in `Changelog.md`. This page records features, API, correctness milestones, and infrastructure.
 
-## API 面
+## API surface
 
-| 项 | commit |
+| Item | commit |
 |---|---|
-| 根级 `Level` 枚举替代 CompressionLevel（删除从未实现的 Default/Better/Best 死变体） | `55daf71` |
-| 高层一次性 API：`zstdx::{compress,decompress}`、`bulk::*`、`Error/Result` 伞、Encoder/DecoderOptions | `d35902b` |
-| 流式编码器（write/read Encoder，`auto_finish`/`flush`/pledged/checksum/workers） | `51ec2fc` |
-| 流式解码器（read/write Decoder，多帧 + skippable 透明）+ `encode_all/decode_all/copy_encode/copy_decode` | `b21d937` |
-| zstd-crate 兼容层 `zstdx::compat`（bulk/stream 全套；词典解码端到端验证） | `4b60239` |
-| CLI：clap 重构；全部数字级别可接受 | `c726dfd` 期 |
-| 错误 thiserror 派生（首个外部依赖，compile-time only，no_std 兼容） | `72f3c04` |
-| 解码器校验和树内化（编解码共用 xxh64；twox 降 dev-dep；运行时零外部依赖） | `81d2119` |
-| dict_builder 模块改名 `zstdx::dict`（对齐 zstd crate 命名） | `7ad9e7a` |
+| root-level `Level` enum replacing CompressionLevel (removed the dead Default/Better/Best variants that were never implemented) | `55daf71` |
+| high-level one-shot API: `zstdx::{compress,decompress}`, `bulk::*`, the `Error/Result` umbrella, Encoder/DecoderOptions | `d35902b` |
+| streaming encoder (write/read Encoder, `auto_finish`/`flush`/pledged/checksum/workers) | `51ec2fc` |
+| streaming decoder (read/write Decoder, multi-frame + skippable transparency) + `encode_all/decode_all/copy_encode/copy_decode` | `b21d937` |
+| zstd-crate compat layer `zstdx::compat` (full bulk/stream suite; dictionary decode verified end-to-end) | `4b60239` |
+| CLI: clap rework; all numeric levels accepted | during `c726dfd` |
+| errors via thiserror derive (first external dependency, compile-time only, no_std compatible) | `72f3c04` |
+| decoder checksum moved in-tree (xxh64 shared by encode/decode; twox demoted to dev-dep; zero external deps at runtime) | `81d2119` |
+| dict_builder module renamed `zstdx::dict` (aligned with zstd crate naming) | `7ad9e7a` |
 
-## 级别阶梯与编码功能
+## Level ladder and encoding features
 
-| 项 | commit |
+| Item | commit |
 |---|---|
-| Fast/Balanced/Best 三档落地（hash-chain matcher + clevels 对位参数） | `f8cc66d` |
-| Fast 换 dfast 匹配器 | `19077f3` |
-| Best 换 optimal parser 低配（16 compares / targetLength 32） | `b39a192` |
-| Opt/Ultra：btopt/btultra 最优解析全量移植 | `c726dfd` |
-| boundary package-merge 最优限长 Huffman | `aa07308` |
-| 序列 FSE 表 repeat 模式（mode 3） | `7769bf8` |
-| 帧校验和（hash feature 默认开）+ pledged_size + workers 选项 | 早期 |
-| MT 编码 ratio 保持（overlap prefill + gain 门 + 周期种子） | `a37ebaa` |
-| 流式编码 MT（burst 模型，workers>1） | `44e11e5` + `27b91cf` |
+| Fast/Balanced/Best tiers landed (hash-chain matcher + clevels-aligned parameters) | `f8cc66d` |
+| Fast switched to the dfast matcher | `19077f3` |
+| Best switched to a low-spec optimal parser (16 compares / targetLength 32) | `b39a192` |
+| Opt/Ultra: full port of btopt/btultra optimal parsing | `c726dfd` |
+| boundary package-merge optimal length-limited Huffman | `aa07308` |
+| sequence FSE table repeat mode (mode 3) | `7769bf8` |
+| frame checksum (hash feature on by default) + pledged_size + workers options | early |
+| MT encode ratio retention (overlap prefill + gain gate + periodic seeds) | `a37ebaa` |
+| streaming encode MT (burst model, workers>1) | `44e11e5` + `27b91cf` |
 
-## 多线程
+## Multithreading
 
-| 项 | commit |
+| Item | commit |
 |---|---|
-| bulk MT 编码（overlap job、2/4/8 workers 2.05×/3.95×/7.55×） | `fd931a1` |
-| 分段并行解码（restart-point 切分、stage A/B） | `3219947` |
-| 校验和 sidecar 卸载 + worker 有界自旋停泊 | `df33295` `70b5fd4` |
+| bulk MT encoding (overlap jobs, 2/4/8 workers at 2.05×/3.95×/7.55×) | `fd931a1` |
+| segment-parallel decoding (restart-point splitting, stage A/B) | `3219947` |
+| checksum sidecar offload + bounded-spin worker parking | `df33295` `70b5fd4` |
 
-## 正确性里程碑
+## Correctness milestones
 
 | bug | commit |
 |---|---|
-| 解码端帧校验和自动验证（此前靠调用方比对 getter） | `81d2119` |
-| 退化单符号 FSE 分布 panic + write_table 尾部零概率越界 | `b650cad` |
-| raw 块回退不回滚 rep + 复用熵表（后续块引用解码端从未收到的表） | `61d63a9` |
-| overlap_copy8 offset 5-7 的 usize 下溢（debug 挂 12 测试，release 侥幸正确） | `590177e` |
-| MT 解码 literals 计数校验 bug（11 语料 7 个 MT 失败而仓库测试全绿） | `3964a62` |
-| decode_to_vec_mt 串行回退对空 Vec 报错/死循环 | `21fae62` |
-| chain 表 insert（窗口索引）/walk（绝对位置）索引域分裂（乱链） | `36203c1` |
-| MT 输出非确定性（pooled 表残留；每 job 清 head 表） | `a6cf8a6` |
-| dfast backfill 插入谓词（step<4 代理漏插长匹配覆盖区） | `06b67dc` |
-| opt.rs 调试打印随默认 feature 进 release | `8233b2f` |
+| decoder-side frame checksum auto-verification (previously the caller compared via getters) | `81d2119` |
+| degenerate single-symbol FSE distribution panic + write_table trailing zero-probability out-of-bounds | `b650cad` |
+| raw-block fallback not rolling back rep + reusing entropy tables (later blocks referencing tables the decoder never received) | `61d63a9` |
+| usize underflow in overlap_copy8 offsets 5-7 (12 tests failing in debug, release accidentally correct) | `590177e` |
+| MT decode literals count validation bug (7 of 11 corpora failed under MT while repo tests were all green) | `3964a62` |
+| decode_to_vec_mt serial fallback erroring/hanging on an empty Vec | `21fae62` |
+| chain table insert (window index) / walk (absolute position) index-domain split (tangled chains) | `36203c1` |
+| nondeterministic MT output (residue in pooled tables; head tables cleared per job) | `a6cf8a6` |
+| dfast backfill insertion predicate (the step<4 proxy missed insertions over long-match-covered regions) | `06b67dc` |
+| opt.rs debug prints shipped in release via a default feature | `8233b2f` |
 
-## 基础设施
+## Infrastructure
 
-- **交错 A/B harness**：逐轮交替、warmup、时间预算（`--budget-ms`/BENCH_BUDGET_MS）、
-  median/mad 统计；随工具族迁入 zstdx-bench crate（`src/common.rs`）。`dc82c29`
-- **bench 工具族**（现集合为 `crates/zstdx-bench`，子命令见
-  [方法论](../bench/methodology.md)）：matrix（dec/enc × bulk/stream/MT 全矩阵
-  + roundtrip 门 + checksum 开销行 + 双侧 worker 扩展性，`--shape/--level/
-  --workers/--mt-workers` 筛选）、small、files、prof（dec/enc/enc-stream）、
-  dump（确定性快照）、corrupt、mtcheck、seqstats、prefill。matrix 起源 `c922b34`
-  `b1dd010`，整合提交见 Changelog。
-- **确定性回归探针**：dump 字节级快照对比（"不该改输出的改动"的免费 A/B 信号）
-  + corrupt（随机损坏 0 panic，覆盖 flat 路径）。`318d8f7`
-- corpus 生成器入库跟踪。
-- profiling 临时工具（enc/dec/enc-stream、mtcheck、prefill、seqstats）转正为
-  zstdx-bench 子命令（原未跟踪 examples）。
-- **lint/fmt 工具链**：workspace lints（clippy `all`+`pedantic`，cast 家族、
-  `inline_always`、`unreadable_literal` 等 codec 固有噪音显式 allow）+
-  `clippy.toml`（msrv 1.89）+ nightly `rustfmt.toml`（crate 级 import 合并、
-  StdExternalCrate 分组、注释折行）+ `.tombi.toml`（TOML 对齐）；成员 crate 经
-  `[lints] workspace = true` 继承，fuzz crate 内联。全树 clippy/fmt 零告警。
-  同批：全 crate 升 edition 2024（rust-version 1.87→1.89，AVX-512 intrinsics
-  stable；`unsafe fn` 体内显式 `unsafe` 块）。
+- **Interleaved A/B harness**: round-by-round alternation, warmup, time budget (`--budget-ms`/BENCH_BUDGET_MS), median/mad statistics; migrated into the zstdx-bench crate together with the tool family (`src/common.rs`). `dc82c29`
+- **bench tool family** (now the collection in `crates/zstdx-bench`, subcommands in [methodology](../bench/methodology.md)): matrix (full dec/enc × bulk/stream/MT matrix + roundtrip gate + checksum overhead row + both-side worker scalability, filtered by `--shape/--level/--workers/--mt-workers`), small, files, prof (dec/enc/enc-stream), dump (deterministic snapshots), corrupt, mtcheck, seqstats, prefill. matrix originated in `c922b34` `b1dd010`; consolidation commits in the Changelog.
+- **Deterministic regression probe**: dump byte-level snapshot comparison (a free A/B signal for "changes that must not alter output") + corrupt (random corruption, 0 panic, covers the flat path). `318d8f7`
+- corpus generator tracked in the repo.
+- ad-hoc profiling tools (enc/dec/enc-stream, mtcheck, prefill, seqstats) promoted to zstdx-bench subcommands (previously untracked examples).
+- **lint/fmt toolchain**: workspace lints (clippy `all`+`pedantic`, with explicit allows for codec-inherent noise such as the cast family, `inline_always`, `unreadable_literal`) + `clippy.toml` (msrv 1.89) + nightly `rustfmt.toml` (crate-level import merging, StdExternalCrate grouping, comment wrapping) + `.tombi.toml` (TOML alignment); member crates inherit via `[lints] workspace = true`, fuzz crate inline. Zero clippy/fmt warnings tree-wide. Same batch: all crates bumped to edition 2024 (rust-version 1.87→1.89, AVX-512 intrinsics stable; explicit `unsafe` blocks inside `unsafe fn` bodies).

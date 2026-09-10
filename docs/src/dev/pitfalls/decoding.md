@@ -1,71 +1,25 @@
-# 踩坑记录 · 解码侧
+# Pitfall Log · Decoding
 
-## 已修 bug（模式可复发）
+## Fixed bugs (patterns can recur)
 
-- **X2 跨块残留**：Compressed 块选 X1 时不清 x2 表，后续 Treeless 块拿过期表走 X2
-  → BitstreamReadMismatch。修：`build_table_from_weights` 开头 `x2.clear()`。
-  另：X2 选择需 80% 成对门槛——text 的 tl=11 表仅 55-61% 可成对，无门槛曾致 -2.7%。
-- **flat 流式调试四连坑**：① grow 后不复查空间就 return → 越界 panic/segfault；
-  ② doubling 锚点误写成随 copied 滑动 → overlap match 读到未写字节（锚点必须固定，
-  chunk ≤ readable+copied）；③ 双重偏移——`out = buf[end..]` 切片指针已偏移，match
-  源又用绝对偏移，需恢复物理基准（slice 路径 block_start=0 巧合正确，掩盖了问题）；
-  ④ wrap 时 `origin += end` 而非 `= end`，否则虚拟坐标回退（两代 FlatView 各修一次）。
-- **wildcopy 三坑**：① overlapCopy8 前 4 字节必须逐字节（offset<4 时 store 喂
-  load），u32 整读坏文件；② wildcopy 助手首次用 (输出相对 dst, 物理 src) 两套坐标
-  算距离 → `d - s` 混空间，改为全指针（offset≥16 的分支不依赖距离，多数文件侥幸
-  通过——恰是难查的原因）；③ 测试走 `decode_blocks(All)`（state.flat 会 wrap）而
-  `decode_all_to_vec` 不 wrap——**复现必须用测试的真实路径**。
-- **overlap_copy8 下溢**：`s2 + (8 - dec64)` 在 spread offset 5-7 时调整值为负，
-  usize 下溢——debug panic（挂 12 个语料测试）、release wrapping 侥幸正确。改有
-  符号表 + `offset()`，对齐 libzstd `*ip -= dec64table[offset]` 语义。
-- **MT 解码 literals 计数**：收尾校验用缓冲总长而非增量——ST 每块 clear 无事，
-  MT stage A 按段累积 → 段内第 2+ 个 huffman literals 块全误报，11 个语料文件
-  7 个 MT 解码失败而仓库测试（textish 语料，Raw/RLE 字面量侥幸通过）全绿。
-  **教训：仓库测试语料形状会系统性掩盖某类 bug**；新增 semi-structured 回归测试。
-- **decode_to_vec_mt 串行回退容量**：并行路径逐段增长，回退路径对空 Vec 报
-  TargetTooSmall；翻倍重试必须**显式跟踪翻倍值**——`reserve(cap)` 在 spare≥cap 时
-  是 no-op，否则死循环（调试时一度误判 flat 解码器死循环，实为重试循环每轮重跑
-  完整解码）。
-- FSE 逐符号预计算的 assert 误报：幂概率符号 `nb_d` 可能 = acc+1 但无 double 状态、
-  永不被使用 → 断言应为 `num_double == 0 || nb_d <= acc`（第一版因此回退重做）。
-- `debug_assert_eq!(written, before)` 参数写反，挂 3 个 debug 测试。
-- corruption_smoke 损坏命中帧魔数时 panic：BadMagicNumber 是合法错误，示例应
-  let-else 返回而非 unwrap。
-- bench_files 的 strip_suffix 只认 `.zst`，`.zstN` 会拿压缩文件当参照报"校验失败"
-  （已修：zstdx-bench `files` 按任意 `zst*` 后缀剥扩展名并尝试裸 stem 与 `.raw`）。
-- **流式单帧即止 vs flat 解所有帧**：StreamingDecoder 首帧 `is_finished` 后 read
-  返回 Ok(0)，`decode_all` 却循环解所有帧——同一多帧输入两路径结果不同（fuzz
-  decode target 的新对拍断言抓到；旧 target 只 read_to_end 从未暴露）。语义以
-  libzstd/zstd crate 实测为准：两路都解所有帧、透明跳 skippable、尾部任何垃圾
-  字节（≥1，含 1-3 字节部分 magic）都报错、空内容帧不得当 EOF。修：帧尾续帧
-  原语（预读 4 字节 magic 区分干净 EOF 与部分尾巴）下沉 `decoding::frame_source`，
-  `stream::read::Decoder` 与 StreamingDecoder 共用；**续帧判断必须在 read 的填充
-  循环内**而非仅入口——空帧结束当次 read 时 can_collect==0 会误报 EOF。
-  另注：该 crash 第二帧 FHD=0x38 置保留位，libzstd 拒绝而 zstdx 宽容接受——
-  帧头严格度差异是独立问题（见 todo）。
+- **X2 cross-block residue**: when a Compressed block selects X1 the x2 table is not cleared, so a later Treeless block picks up the stale table and goes through X2 → BitstreamReadMismatch. Fix: `x2.clear()` at the top of `build_table_from_weights`. Also: X2 selection needs an 80% pairwise threshold — text's tl=11 table is only 55-61% pairable; lacking the threshold once cost -2.7%.
+- **Four pitfalls while debugging flat streaming**: ① returning after grow without re-checking space → out-of-bounds panic/segfault; ② the doubling anchor was mistakenly written to slide with `copied` → overlap match read unwritten bytes (the anchor must be fixed, chunk ≤ readable+copied); ③ double offset — the `out = buf[end..]` slice pointer is already offset while the match source still used absolute offsets; the physical base must be restored (the slice path's block_start=0 was correct by coincidence, masking the problem); ④ on wrap use `origin += end` not `= end`, otherwise virtual coordinates regress (fixed once apiece across the two FlatView generations).
+- **Three wildcopy pitfalls**: ① the first 4 bytes of overlapCopy8 must be copied byte-by-byte (at offset<4 stores feed loads); whole-u32 reads corrupt the file; ② the wildcopy helper initially computed the distance from two coordinate systems ((output-relative dst, physical src)) → `d - s` mixed spaces; switched to all-pointers (the offset≥16 branch does not depend on the distance, so most files passed by luck — exactly why this was hard to find); ③ tests went through `decode_blocks(All)` (state.flat wraps) while `decode_all_to_vec` does not wrap — **reproduction must use the test's real path**.
+- **overlap_copy8 underflow**: with spread offsets 5-7 the adjustment value in `s2 + (8 - dec64)` is negative and the usize underflows — debug panic (breaking 12 corpus tests), release wrapping was accidentally correct. Switched to a signed table + `offset()`, aligning with libzstd's `*ip -= dec64table[offset]` semantics.
+- **MT decode literals counting**: the final validation used the buffer's total length instead of the delta — ST clears per block so nothing happened, but MT stage A accumulates per segment → every 2nd+ huffman literals block within a segment was falsely reported; 7 of 11 corpus files failed MT decode while the repo tests (textish corpus, Raw/RLE literals passing by luck) were all green. **Lesson: the shape of the repo test corpora can systematically mask a class of bugs**; added a semi-structured regression test.
+- **decode_to_vec_mt serial-fallback capacity**: the parallel path grows segment by segment while the fallback path reports TargetTooSmall on an empty Vec; the doubling retry must **explicitly track the doubled value** — `reserve(cap)` is a no-op when spare ≥ cap, otherwise it loops forever (during debugging this was once misdiagnosed as the flat decoder looping, when the retry loop was actually re-running the full decode every round).
+- FSE per-symbol precompute assert false positive: a power-of-two-probability symbol can yield `nb_d` = acc+1 while having no double state and never being used → the assert should be `num_double == 0 || nb_d <= acc` (the first version was reverted and redone because of this).
+- `debug_assert_eq!(written, before)` had its arguments swapped, breaking 3 debug tests.
+- corruption_smoke panicked when corruption hit the frame magic: BadMagicNumber is a legitimate error; the example should return via let-else instead of unwrap.
+- bench_files's strip_suffix only recognized `.zst`; with `.zstN` it used the compressed file as the reference and reported "checksum mismatch" (fixed: zstdx-bench `files` strips any `zst*` suffix and tries the bare stem and `.raw`).
+- **Streaming stops after one frame vs flat decodes all frames**: after the first frame's `is_finished`, StreamingDecoder's read returned Ok(0) while `decode_all` looped decoding all frames — the same multi-frame input gave different results on the two paths (caught by a new cross-check assertion in the fuzz decode target; the old target only did read_to_end and never exposed it). Semantics follow what libzstd/the zstd crate actually do: both paths decode all frames, transparently skip skippable frames, error on any trailing garbage bytes (≥1, including 1-3-byte partial magic), and must not treat an empty content frame as EOF. Fix: the frame-tail continuation primitive (pre-read 4 magic bytes to distinguish clean EOF from a partial tail) was pushed down into `decoding::frame_source`, shared by `stream::read::Decoder` and StreamingDecoder; **the continuation check must live inside read's fill loop**, not just at entry — when an empty frame ends the current read, can_collect==0 falsely reports EOF. Side note: that crash's second frame had FHD=0x38 setting a reserved bit; libzstd rejects it while zstdx leniently accepts — frame-header strictness differences are a separate issue (see todo).
 
-## profile 与归因
+## Profile and attribution
 
-- **AMD 分支 miss 采样 skid 极大**：`ex_ret_brn_misp` 样本落在基本块中间（前后
-  ±10 条无法归属），ibs_op 无 miss 过滤——**归属靠 stub 二分 + perf stat 总量**，
-  不信 annotate/script 的 miss 归属。
-- **stub 二分纪律**：stub 后必须校验 exit code + 输出长度（曾把越界读段错误的半程
-  残值当数字，cycles 假降 13×）；stub 要保真实偏移（`%4096` 小偏移会让访存模式
-  全变、wrapped 全消失，混杂无效）。
-- **拷空 exec 归因法**：依次 stub 掉拷贝循环分解 miss 来源——解码侧仅 10%，
-  执行器（拷贝循环+门控）占 88%，推翻"解码侧分支是大头"的旧假设。
-- **10GB/s 级负载（text.zst3/z9）墙钟不可信**（轮内 0.82-1.25）：看 cycles 或只信
-  <9GB/s 负载的交错中位数。
-- **.st 热路径可能是 WRAP 实例化**：流式 2MB 后 wrap，携带全套视图值（每序列 ~12
-  次栈往返）；cold outline 后仍可能有残留溢出（活跃值 ~20 > 15 GPR）——annotate
-  前先确认热的是哪份实例化。
-- perf 揭示 xxh64 absorb 8.15% 后排查排除：8 链 ~20GB/s 已快于 zstd 标量 4 链，
-  非差距来源——热点高 ≠ 有肉，先对照已知极限。
-- **flat 五连坑之五：HEADROOM 把「预算检查」与「wildcopy 常量化」捆绑**：headroom
-  实例化把逐序列 `op+ll+ml ≤ out_end` 预算检查一并跳过，而 `ensure_block_space`
-  只保证 128KiB+slack 的映射——损坏序列段的总输出可超块最大值，op 一路写出分配
-  → SIGSEGV（夜间版 copy_nonoverlapping 前置检查先以 overlap 报警，重放为段错误，
-  artifacts 测试直接崩测试进程）。修：预算检查无条件保留（对齐 libzstd 的
-  `op+ll+ml > oend` 拒绝），headroom 只决定 wildcopy 策略；dec-st 矩阵复测无回归。
-  **教训：安全检查与优化开关不能共享一个布尔——优化该免掉的是检查的成本，不是
-  检查本身。**
+- **AMD branch-miss sampling skid is huge**: `ex_ret_brn_misp` samples land in the middle of basic blocks (±10 instructions either side cannot be attributed) and ibs_op has no miss filtering — **attribution relies on stub bisection + perf stat totals**; do not trust annotate/script's miss attribution.
+- **Stub bisection discipline**: after stubbing, verify the exit code + output length (once took the half-run leftover values of an out-of-bounds-read segfault as numbers; cycles falsely dropped 13×); stubs must preserve real offsets (a `%4096` small offset changes the whole memory-access pattern and makes the wrapped cases vanish entirely, invalidating the mix).
+- **Empty-copy exec attribution**: stub out the copy loops one by one to decompose the miss sources — the decode side is only 10% while the executor (copy loops + gating) accounts for 88%, overturning the old assumption that "decode-side branches are the bulk".
+- **Wall-clock is untrustworthy for 10GB/s-class loads (text.zst3/z9)** (within-run 0.82-1.25): look at cycles, or trust only interleaved medians of <9GB/s loads.
+- **The .st hot path may be the WRAP instantiation**: streaming wraps after 2MB, carrying the full set of view values (~12 stack round-trips per sequence); even after cold outlining there can be residual spills (~20 live values > 15 GPRs) — before annotate, first confirm which instantiation is the hot one.
+- After perf showed xxh64 absorb at 8.15%, investigation ruled it out: the 8-lane version at ~20GB/s is already faster than zstd's scalar 4-lane, so it is not the gap source — a high hotspot ≠ there is meat to take; first compare against known limits.
+- **Fifth of the five flat pitfalls: HEADROOM bundled the "budget check" with "wildcopy constant-ization"**: the headroom instantiation skipped the per-sequence `op+ll+ml ≤ out_end` budget check along with it, while `ensure_block_space` only guarantees a 128KiB+slack mapping — a corrupted sequence segment's total output can exceed the block maximum and op writes straight past the allocation → SIGSEGV (nightly's copy_nonoverlapping precondition check flagged it as overlap first, replaying as a segfault; the artifacts test crashed the test process outright). Fix: keep the budget check unconditionally (aligning with libzstd's `op+ll+ml > oend` rejection); headroom only decides the wildcopy strategy; dec-st matrix re-run showed no regression. **Lesson: a safety check and an optimization switch must not share a single boolean — what the optimization should eliminate is the check's cost, not the check itself.**

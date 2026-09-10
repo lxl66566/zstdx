@@ -1,43 +1,43 @@
 # Summary
 
-[引言](intro.md)
+[Introduction](intro.md)
 
 ---
 
-# 面向用户（预留）
+# For Users (Reserved)
 
-- [用户文档（预留）](user.md)
+- [User Documentation (Reserved)](user.md)
 
 ---
 
-# 开发记录
+# Development Records
 
-- [现状总览](dev/status.md)
+- [Current Status](dev/status.md)
 
-## 性能比较
+## Performance Comparisons
 
-- [当前快照](dev/bench/snapshot.md)
-- [广域矩阵数据](dev/bench/matrix.md)
-- [基准测试方法论](dev/bench/methodology.md)
+- [Current Snapshot](dev/bench/snapshot.md)
+- [Wide Matrix Data](dev/bench/matrix.md)
+- [Benchmark Methodology](dev/bench/methodology.md)
 
-## 性能优化
+## Performance Optimization
 
-- [解码侧](dev/perf/decoding.md)
-- [编码侧](dev/perf/encoding.md)
-- [匹配器与压缩级别](dev/perf/matchers.md)
-- [多线程与流式](dev/perf/mt-stream.md)
+- [Decoding Side](dev/perf/decoding.md)
+- [Encoding Side](dev/perf/encoding.md)
+- [Matchers and Compression Levels](dev/perf/matchers.md)
+- [Multithreading and Streaming](dev/perf/mt-stream.md)
 
-## 已完成
+## Completed
 
-- [功能与基础设施记录](dev/completed.md)
+- [Features and Infrastructure Record](dev/completed.md)
 
-## 剩余改进项
+## Remaining Improvements
 
-- [待办清单](dev/todo.md)
-- [已证伪方向（勿重试）](dev/negative.md)
+- [Todo List](dev/todo.md)
+- [Disproven Directions (Do Not Retry)](dev/negative.md)
 
-## 踩坑记录
+## Pitfalls
 
-- [解码侧](dev/pitfalls/decoding.md)
-- [编码侧](dev/pitfalls/encoding.md)
-- [工程与基准方法论](dev/pitfalls/workflow.md)
+- [Decoding Side](dev/pitfalls/decoding.md)
+- [Encoding Side](dev/pitfalls/encoding.md)
+- [Engineering and Benchmark Methodology](dev/pitfalls/workflow.md)
