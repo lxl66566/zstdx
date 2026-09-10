@@ -99,3 +99,11 @@
 - bench 工具自坑：mibs 公式忘乘轮数（`raw.len()/elapsed` ≠ `raw.len()*n/elapsed`）；
   过滤参数子串不匹配静默跑空进程（utime≈0 是信号）；x 因子 `%.3f` 在极端值处
   不可读（看 MiB/s 列）；zeros 是免费噪声标定格。
+- **全局 `core.fsmonitor=true` 会吞掉工具写入的文件变更**：python 脚本/cargo fmt
+  改文件后 fsmonitor 守护进程未报告 → git 认为文件"未变更"（blob 实际已不同）→
+  status 不显示 dirty、pathspec commit 静默提交旧内容（曾在 fix 提交里丢掉全部
+  源码改动，`git show --stat` 文件数对不上才暴露）。**本仓库 git 命令一律
+  `git -c core.fsmonitor=false`，提交后必查 stat 文件数**。连带：pathspec commit
+  会把索引重置为 HEAD+已提交路径，之前 staged 的 `git mv` 改名整体掉出索引；
+  被 .gitignore 忽略但历史上强制跟踪的文件（fuzz artifacts）重暂存时必须
+  `git add -f`，否则改名会被提交成纯删除。

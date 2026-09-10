@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# cargo-fuzz crate with its own workspace
+exclude = ["crates/zstdx-fuzz"]
 
 [profile.release]
 codegen-units = 1

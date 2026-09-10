@@ -104,3 +104,11 @@
   （`optimal_table_log` 本就 clamp 5..=12），`build_table_from_counts` clamp 到 12 +
   `build_table_from_probabilities` debug_assert 双保险。**教训：位域打包的隐式上限
   必须在构造入口强制；"生产用不到"的参数范围迟早被 fuzz 或后续扩展踩中。**
+- **ST 编码输出依赖进程内历史（matcher 状态池残留）**：thread_local 匹配器状态池
+  跨帧残留（327bc99 u32 不清表设计），同输入在不同进程内历史下可产出**不同但均
+  合法**的帧（Level::Fast、24B 输入实测：流式 37B raw 块 vs bulk 35B）。症状：
+  单进程内复现"时过时不过"。约束：跨 build 字节对比必须新鲜进程（dump 工具即此
+  用途）；对拍 oracle 用双侧解码合法性而非字节一致（encode_stream fuzz 即此）。
+  MT job 的同类问题已由 a6cf8a6 清表修复（踩坑 20 的 ST 变体）。若将来要 libzstd
+  式"同输入同输出"确定性：reset 清表（速度代价）或 frame-epoch 方案（见 WORK.md
+  踩坑 20 论证）。

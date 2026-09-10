@@ -9,7 +9,7 @@ fn test_all_artifacts() {
 
     let mut frame_dec = FrameDecoder::new();
 
-    for file in fs::read_dir("./fuzz/artifacts/decode").unwrap() {
+    for file in fs::read_dir("../zstdx-fuzz/artifacts/decode").unwrap() {
         let file_name = file.unwrap().path();
 
         let fnstr = file_name.to_str().unwrap().to_owned();

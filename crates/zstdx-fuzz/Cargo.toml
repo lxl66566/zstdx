@@ -1,21 +1,21 @@
-
 [package]
 name = "zstdx-fuzz"
 version = "0.0.1"
-authors = ["Automatically generated"]
+edition = "2021"
 publish = false
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-zstd = "0.5.1+zstd.1.4.4"
+libfuzzer-sys = "0.4"
+# reference implementation for the interop targets; same binding the
+# zstdx-bench crate compares against
+zstd = "0.13.2"
 
 [dependencies.zstdx]
-path = ".."
+path = "../zstdx"
 features = ["fuzz_exports"]
-[dependencies.libfuzzer-sys]
-git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -32,6 +32,10 @@ path = "fuzz_targets/decode_dict.rs"
 [[bin]]
 name = "encode"
 path = "fuzz_targets/encode.rs"
+
+[[bin]]
+name = "encode_stream"
+path = "fuzz_targets/encode_stream.rs"
 
 [[bin]]
 name = "interop"

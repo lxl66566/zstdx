@@ -36,6 +36,19 @@ This document records the changes made between versions, starting with version 0
   dec-st bench matrix shows no regression from the restored check. Found by
   the `decode` fuzz target (crash-01de01).
 
+* The fuzz targets move from `crates/zstdx/fuzz` to their own
+  `crates/zstdx-fuzz` crate (excluded from the workspace, as cargo-fuzz
+  requires). `libfuzzer-sys` now comes from crates.io and the reference
+  side is the same zstd 0.13 binding the bench crate uses. Encoder coverage
+  spans the whole ladder and the streaming path: `encode` picks the level
+  from the input and checks both decoders, the new `encode_stream` drives
+  the write encoder with input-derived chunk sizes and checks the output
+  through both our decoder and the reference (the outputs are only
+  byte-identical in a fresh process, see the encoder pitfalls), and `interop` sweeps all
+  libzstd levels into both of our decode paths. This replaces a stale
+  `interop` target that still used the zstd 0.5 API (and duplicated the
+  uncompressed path into its "compressed" helper).
+
 * The benchmark and dev-tool examples leave the library for a new
   `zstdx-bench` workspace crate with subcommands: `matrix` (the full
   cross-matrix, now filterable by `--mode/--shape/--level/--workers/
