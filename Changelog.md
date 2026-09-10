@@ -25,6 +25,17 @@ This document records the changes made between versions, starting with version 0
   `roundtrip` unit test now replays the fuzz artifacts again, following their
   move to `crates/zstdx-fuzz`.
 
+* The flat sequence executor's `headroom` instantiation skipped the
+  per-sequence budget check `op + ll + ml <= out_end`, trusting the streaming
+  buffer's block-maximum reservation. A corrupt sequence section can claim
+  more output than the block maximum and march the cursor out of the
+  allocation: nightly's `copy_nonoverlapping` precondition check surfaced it
+  as an overlapping copy under fuzzing, replays segfaulted. The budget check
+  now runs in both instantiations, matching libzstd's per-sequence `oend`
+  rejection; `headroom` only selects the unconditional wildcopy strategy. The
+  dec-st bench matrix shows no regression from the restored check. Found by
+  the `decode` fuzz target (crash-01de01).
+
 * The benchmark and dev-tool examples leave the library for a new
   `zstdx-bench` workspace crate with subcommands: `matrix` (the full
   cross-matrix, now filterable by `--mode/--shape/--level/--workers/

@@ -61,3 +61,11 @@
   前先确认热的是哪份实例化。
 - perf 揭示 xxh64 absorb 8.15% 后排查排除：8 链 ~20GB/s 已快于 zstd 标量 4 链，
   非差距来源——热点高 ≠ 有肉，先对照已知极限。
+- **flat 五连坑之五：HEADROOM 把「预算检查」与「wildcopy 常量化」捆绑**：headroom
+  实例化把逐序列 `op+ll+ml ≤ out_end` 预算检查一并跳过，而 `ensure_block_space`
+  只保证 128KiB+slack 的映射——损坏序列段的总输出可超块最大值，op 一路写出分配
+  → SIGSEGV（夜间版 copy_nonoverlapping 前置检查先以 overlap 报警，重放为段错误，
+  artifacts 测试直接崩测试进程）。修：预算检查无条件保留（对齐 libzstd 的
+  `op+ll+ml > oend` 拒绝），headroom 只决定 wildcopy 策略；dec-st 矩阵复测无回归。
+  **教训：安全检查与优化开关不能共享一个布尔——优化该免掉的是检查的成本，不是
+  检查本身。**

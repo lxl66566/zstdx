@@ -89,12 +89,14 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// streaming buffer's first generation) runs a monomorphized copy of the loop
 /// without the two-generation mapping branches.
 ///
-/// `headroom` says the target slice holds at least the block's decompressed
-/// size plus 16 bytes of slack beyond it (the flat streaming/MT buffers
-/// guarantee this per block, see `FlatOut::ensure_block_space`). The
-/// monomorphized HEADROOM instantiation drops the per-sequence budget check
-/// and lets every copy wildcopy unconditionally; slice targets sized exactly
-/// to the frame keep the checks.
+/// `headroom` says the backing allocation holds at least the block maximum
+/// plus wildcopy slack beyond the cursor (the flat streaming/MT buffers
+/// guarantee this per block, see `FlatOut::ensure_block_space`), so the
+/// monomorphized HEADROOM instantiation wildcopies unconditionally. The
+/// per-sequence budget check `op + ll + ml <= out_end` runs in BOTH
+/// instantiations: a corrupt sequence section may claim more output than the
+/// block maximum, and only that check keeps the cursor inside the allocation
+/// (matching libzstd's `op + ll + ml > oend` rejection).
 pub(crate) fn execute_decoded_flat(
     dec: &mut super::sequence_section_decoder::SeqDecoder,
     literals: &[u8],
@@ -313,13 +315,12 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
 
     let rest = lit_end as usize - lit as usize;
     if rest > 0 {
-        if !HEADROOM && op as usize + rest > out_end as usize {
+        if op as usize + rest > out_end as usize {
             return Err(DecompressBlockError::ExecuteSequencesError(
                 ExecuteSequencesError::TargetTooSmall,
             ));
         }
-        // SAFETY: budget checked above (or guaranteed by HEADROOM); rest
-        // literals fit like the copies above
+        // SAFETY: budget checked above; plain copy, no overshoot
         unsafe {
             core::ptr::copy_nonoverlapping(lit, op, rest);
             op = op.add(rest);
@@ -439,10 +440,12 @@ unsafe fn wildcopy_literals(d0: *mut u8, s0: *const u8, ll: usize) {
 /// and literal cursors; `vbase_op`/`wrap_base` are the executor's folded
 /// bases (see `execute_decoded_flat_inner`).
 ///
-/// Without HEADROOM, bounds are one merged budget: `op + ll + ml` must stay
-/// inside the target, and it plus 16 gates the wildcopy overshoot of BOTH
-/// copies at once (neither copy's cursor ever passes the sequence end). With
-/// HEADROOM both hold by construction and every copy wildcopies.
+/// Bounds are one merged budget per sequence: `op + ll + ml` must stay inside
+/// the target — corruption can pack more output into a sequence section than
+/// the block maximum, and this check is what rejects it (as libzstd does).
+/// HEADROOM then only decides the copy strategy: with it, the 16-byte
+/// wildcopy overshoot is guaranteed by the backing allocation's slack, so
+/// every copy wildcopies unconditionally.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
@@ -464,7 +467,7 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     let opa = *op as usize;
     let end = opa + ll + ml;
     let enda = out_end as usize;
-    if !HEADROOM && end > enda {
+    if end > enda {
         return Err(ExecuteSequencesError::TargetTooSmall);
     }
     let wild = HEADROOM || end + 16 <= enda;
@@ -546,7 +549,7 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
         }
     }
     // SAFETY: the merged budget check above proved ll + ml stays inside the
-    // target slice (or HEADROOM guarantees it)
+    // target slice
     unsafe { *op = (*op).add(ll + ml) };
     Ok(())
 }
