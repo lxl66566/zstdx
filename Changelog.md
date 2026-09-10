@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The fast, dfast and chain match tables now hold u32 entries: each slot
+  stores its absolute position biased by one and truncated to 32 bits
+  (zero remains the never-written sentinel), and readers rebuild the
+  high bits from the scanning position, unwrapping one 4 GiB cycle when
+  the value lands above it. Stale entries from an earlier frame that
+  cannot unwrap die on the spot; the rest is disposed of by the
+  window-range check and byte compare already behind every probe. This
+  halves the tables' working set (16 MiB to 8 MiB at Balanced, matching
+  libzstd) and the bytes every multithreaded job prefill writes, and
+  retires the per-frame epoch machinery for these strategies (the opt
+  parser keeps its epoch-tagged u64 tables in dedicated fields). Output
+  sizes are byte-identical across the whole corpus matrix; medians of
+  interleaved old/new solo runs on the 32 MiB corpus: json.balanced
+  +18%, text.balanced +20%, skewed.balanced +9%, random.balanced +4%,
+  skewed.fast +5%; Fastest levels, zeros and the opt strategies
+  unchanged.
+
 * The dfast miss step is now stateless: instead of a per-match
   step/next-step counter pair bumped every 256 skipped positions, the
   probe pair advances by `1 + (distance since the last match) >> 8` —

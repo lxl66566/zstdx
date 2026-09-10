@@ -5,12 +5,17 @@
 //! "Go back X bytes and copy Y bytes to the end of your decode buffer".
 //!
 //! This is a port of the official zstd matcher family: one contiguous
-//! window buffer, single-probe u32 hash tables (newest-wins overwrite
+//! window buffer, single-probe hash tables (newest-wins overwrite
 //! semantics, dfast's second short-hash table for the Fast level), hash
 //! chains for the levels above, forward match extension in u64 chunks plus
 //! backward extension into pending literals. Positions are tracked as
-//! absolute u64 offsets; table slots carry `(epoch << 48) | position` so a
-//! reset just bumps the epoch instead of clearing the table.
+//! absolute u64 offsets. The fast/dfast/chain table slots are u32: the
+//! position biased by one and truncated (zero stays the never-written
+//! sentinel), with the high bits reconstructed from the scanning position
+//! and a window-range check at read time — half the working set of the
+//! former u64 slots. The opt strategies keep their own u64 tables with an
+//! `(epoch << 48) | position` tag; a reset bumps that epoch instead of
+//! clearing them, while the u32 tables need no clearing at all.
 
 use alloc::vec::Vec;
 
@@ -53,10 +58,41 @@ const SEED_BUDGET: u32 = 8192;
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xC0000;
 
+// The opt strategies' never-valid table entry; their positions live in
+// the low 48 bits with the epoch in the high 16 (see
+// [`MatchGeneratorDriver::reset`]).
 const EMPTY: u64 = 0;
-/// Positions in table/chain entries live in the low 48 bits; the high 16
-/// carry the epoch (see [`MatchGeneratorDriver::reset`]).
-const POS_MASK: u64 = (1u64 << 48) - 1;
+
+/// Encode an absolute position as a fast/dfast/chain table entry. The +1
+/// bias keeps a zeroed slot dead (no position maps to zero), so fresh and
+/// unwritten slots never resolve; position `2^32 - 1` collides with the
+/// sentinel — one dead insert per 4 GiB cycle, pure noise.
+#[inline(always)]
+fn pack_pos(abs: u64) -> u32 {
+    (abs as u32).wrapping_add(1)
+}
+
+/// Decode a fast/dfast/chain entry against the scanning position `pos`:
+/// the entry's high bits were truncated, so rebuild them from `pos` and
+/// unwrap one 4 GiB cycle when the value landed above it. Live entries are
+/// strictly older than `pos`, so a reconstruction at or above it wraps —
+/// and a wrap that underflows unmasks a stale entry from an earlier frame
+/// (whose positions share no domain with `pos`); those die like empty
+/// slots. The caller's window-range check and the byte compare behind it
+/// decide the rest.
+#[inline(always)]
+fn unpack_pos(entry: u32, pos: u64) -> Option<u64> {
+    if entry == 0 {
+        return None;
+    }
+    let cand = (pos & !(u32::MAX as u64)) + entry as u64 - 1;
+    let cand = if cand >= pos {
+        cand.checked_sub(1 << 32)?
+    } else {
+        cand
+    };
+    Some(cand)
+}
 
 /// Which search loop the matcher runs. The `chain` buffer is the second
 /// table for the two-table strategies and empty for [`Strategy::Fast`].
@@ -291,16 +327,15 @@ fn pays_for_offset(ml: usize, idx: usize, cand: usize, rep_hit: bool) -> bool {
     rep_hit || ml * 4 >= (idx - cand).ilog2() as usize + 7
 }
 
-/// Store `abs` as the newest position for its hash; `tag` is the caller's
-/// `epoch << 48`. Caller guarantees `idx` has at least `MIN_HASH` bytes of
-/// window behind it.
+/// Store `abs` as the newest position for its hash. Caller guarantees
+/// `idx` has at least `MIN_HASH` bytes of window behind it.
 #[inline(always)]
-fn insert_at(win: &[u8], table: &mut [u64], tag: u64, idx: usize, abs: u64) {
+fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64) {
     let h = hash_at(win, idx);
     // SAFETY: the hash masks down to HASH_LOG bits and the table always
     // holds 1 << HASH_LOG slots, so the index cannot leave it.
     unsafe {
-        *table.get_unchecked_mut(h) = tag | abs;
+        *table.get_unchecked_mut(h) = pack_pos(abs);
     }
 }
 
@@ -359,12 +394,9 @@ pub(super) fn push_seq_packed(
 /// (their former twelve-to-fourteen-argument free signatures moved several
 /// arguments through the stack on every call).
 struct TableEmit<'a> {
-    table: &'a mut [u64],
+    table: &'a mut [u32],
     literals: &'a mut Vec<u8>,
     seqs: &'a mut Vec<SeqWord>,
-    /// `epoch << 48`, the constant half of every table entry this frame
-    /// writes.
-    tag: u64,
     win_base: u64,
     /// Last absolute position whose hash reads stay inside the window.
     insert_max: u64,
@@ -411,7 +443,7 @@ impl TableEmit<'_> {
             let end = (self.win_base + match_end as u64).min(self.insert_max);
             let mut p = self.win_base + start as u64;
             while p < end {
-                insert_at(win, self.table, self.tag, (p - self.win_base) as usize, p);
+                insert_at(win, self.table, (p - self.win_base) as usize, p);
                 p += 1;
             }
         } else {
@@ -419,9 +451,9 @@ impl TableEmit<'_> {
             let hi = base + match_len as u64 - 2;
             if hi <= self.insert_max {
                 let lo = base + 2;
-                insert_at(win, self.table, self.tag, (lo - self.win_base) as usize, lo);
+                insert_at(win, self.table, (lo - self.win_base) as usize, lo);
                 if hi > lo {
-                    insert_at(win, self.table, self.tag, (hi - self.win_base) as usize, hi);
+                    insert_at(win, self.table, (hi - self.win_base) as usize, hi);
                 }
             }
         }
@@ -437,7 +469,7 @@ impl TableEmit<'_> {
     fn emit_chain(
         &mut self,
         win: &[u8],
-        chain: &mut [u64],
+        chain: &mut [u32],
         hash_log: u32,
         anchor: u64,
         start: usize,
@@ -473,7 +505,7 @@ impl TableEmit<'_> {
             unsafe {
                 let head = *self.table.get_unchecked(h);
                 *chain.get_unchecked_mut(p as usize & chain_mask) = head;
-                *self.table.get_unchecked_mut(h) = self.tag | p;
+                *self.table.get_unchecked_mut(h) = pack_pos(p);
             }
             p += step;
         }
@@ -513,13 +545,10 @@ impl TableEmit<'_> {
 /// inside the register argument budget (their former fourteen-argument
 /// signatures moved several arguments through the stack on every call).
 struct DfastEmit<'a> {
-    long: &'a mut [u64],
-    small: &'a mut [u64],
+    long: &'a mut [u32],
+    small: &'a mut [u32],
     literals: &'a mut Vec<u8>,
     seqs: &'a mut Vec<SeqWord>,
-    /// `epoch << 48`, the constant half of every table entry this frame
-    /// writes.
-    tag: u64,
     win_base: u64,
     /// Last window index whose hash reads stay inside the window.
     insert_max_idx: usize,
@@ -534,13 +563,13 @@ impl DfastEmit<'_> {
     fn insert_both(&mut self, win: &[u8], idx: usize) {
         // SAFETY: both hashes are masked to their tables' sizes.
         unsafe {
-            let tag = self.tag | (self.win_base + idx as u64);
+            let entry = pack_pos(self.win_base + idx as u64);
             *self
                 .long
-                .get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = tag;
+                .get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = entry;
             *self
                 .small
-                .get_unchecked_mut(hash_at_log(win, idx, self.small_log)) = tag;
+                .get_unchecked_mut(hash_at_log(win, idx, self.small_log)) = entry;
         }
     }
 
@@ -583,7 +612,7 @@ impl DfastEmit<'_> {
                 *self
                     .long
                     .get_unchecked_mut(hash8_at_log(win, match_end - 2, self.long_log)) =
-                    self.tag | (self.win_base + (match_end - 2) as u64);
+                    pack_pos(self.win_base + (match_end - 2) as u64);
             }
         }
         if match_end >= 1 && match_end - 1 <= self.insert_max_idx {
@@ -592,7 +621,7 @@ impl DfastEmit<'_> {
                 *self
                     .small
                     .get_unchecked_mut(hash_at_log(win, match_end - 1, self.small_log)) =
-                    self.tag | (self.win_base + (match_end - 1) as u64);
+                    pack_pos(self.win_base + (match_end - 1) as u64);
             }
         }
         match_end
@@ -658,12 +687,18 @@ pub struct MatchGeneratorDriver {
     anchor: u64,
     /// Absolute start of the last committed block (for `get_last_space`).
     block_start: u64,
-    table: Vec<u64>,
+    /// Head hash table for the fast/dfast/chain strategies; u32 entries
+    /// (see [`pack_pos`]).
+    table: Vec<u32>,
     /// Second search table for the two-table strategies (the dfast short
-    /// hash or the chain links; see [`Strategy`]), epoch-tagged like
-    /// `table`; empty for the fast strategy. The opt strategies keep their
-    /// binary-tree ring here.
-    chain: Vec<u64>,
+    /// hash or the chain links; see [`Strategy`]), u32 entries like
+    /// `table`; empty for the fast strategy.
+    chain: Vec<u32>,
+    /// Head hash table for the opt strategies, epoch-tagged u64 entries.
+    opt_table: Vec<u64>,
+    /// The opt strategies' binary-tree ring: two u64 link slots per ring
+    /// position; empty outside opt.
+    bt: Vec<u64>,
     /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
     /// (libzstd's hashTable3); empty otherwise.
     hash3: Vec<u64>,
@@ -749,8 +784,10 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            table: alloc::vec![EMPTY; 1usize << HASH_LOG],
+            table: alloc::vec![0u32; 1usize << HASH_LOG],
             chain: Vec::new(),
+            opt_table: Vec::new(),
+            bt: Vec::new(),
             hash3: Vec::new(),
             opt_state: OptState::new(),
             opt_scratch: None,
@@ -780,8 +817,10 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            table: alloc::vec![EMPTY; 1usize << HASH_LOG],
+            table: alloc::vec![0u32; 1usize << HASH_LOG],
             chain: Vec::new(),
+            opt_table: Vec::new(),
+            bt: Vec::new(),
             hash3: Vec::new(),
             opt_state: OptState::new(),
             opt_scratch: None,
@@ -803,22 +842,39 @@ impl MatchGeneratorDriver {
     fn apply_level(&mut self, level: Level) {
         let params = params_for_level(level);
         if params != self.params {
-            if params.hash_log != self.params.hash_log {
-                self.table = alloc::vec![EMPTY; 1usize << params.hash_log];
-            }
-            self.chain = match params.strategy {
-                Strategy::Fast => Vec::new(),
-                Strategy::Dfast(small_log) => alloc::vec![EMPTY; 1usize << small_log],
-                Strategy::Chain(chain_log) => alloc::vec![EMPTY; 1usize << chain_log],
-                // The tree ring: two link slots per ring position.
-                Strategy::Opt(knobs) => alloc::vec![EMPTY; 2usize << knobs.bt_log],
-            };
-            self.hash3 = match params.strategy {
-                Strategy::Opt(knobs) if knobs.hash3_log > 0 => {
-                    alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+            // Exactly one table family is live per strategy; switching
+            // families drops the other's buffers.
+            match params.strategy {
+                Strategy::Fast => {
+                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    self.chain = Vec::new();
                 }
-                _ => Vec::new(),
-            };
+                Strategy::Dfast(small_log) => {
+                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    self.chain = alloc::vec![0u32; 1usize << small_log];
+                }
+                Strategy::Chain(chain_log) => {
+                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    self.chain = alloc::vec![0u32; 1usize << chain_log];
+                }
+                Strategy::Opt(knobs) => {
+                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                    // The tree ring: two link slots per ring position.
+                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                    self.hash3 = if knobs.hash3_log > 0 {
+                        alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+                    } else {
+                        Vec::new()
+                    };
+                    self.table = Vec::new();
+                    self.chain = Vec::new();
+                }
+            }
+            if !matches!(params.strategy, Strategy::Opt(_)) {
+                self.opt_table = Vec::new();
+                self.bt = Vec::new();
+                self.hash3 = Vec::new();
+            }
             if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
                 self.opt_scratch = Some(OptScratch::new());
             }
@@ -885,7 +941,6 @@ impl MatchGeneratorDriver {
         if data.len() < HASH_READ {
             return;
         }
-        let tag = self.epoch << 48;
         let last = data.len() - HASH_READ;
         match self.params.strategy {
             Strategy::Opt(_) => {
@@ -898,7 +953,7 @@ impl MatchGeneratorDriver {
                 let table = &mut self.table[..];
                 let mut idx = 0;
                 while idx < last {
-                    insert_at(data, table, tag, idx, base + idx as u64);
+                    insert_at(data, table, idx, base + idx as u64);
                     idx += FAST_PREFILL_STRIDE;
                 }
                 self.acquire_seed(data, last);
@@ -910,7 +965,7 @@ impl MatchGeneratorDriver {
                 for idx in 0..last {
                     // SAFETY: both hashes are masked to their tables' sizes.
                     unsafe {
-                        let entry = tag | (base + idx as u64);
+                        let entry = pack_pos(base + idx as u64);
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_log(data, idx, small_log)) = entry;
                     }
@@ -933,7 +988,7 @@ impl MatchGeneratorDriver {
                         let h = hash_at_log(data, idx, hash_log);
                         let head = *table.get_unchecked(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table.get_unchecked_mut(h) = tag | abs;
+                        *table.get_unchecked_mut(h) = pack_pos(abs);
                     }
                 }
                 // The head table's first hop is as burial-prone as the fast
@@ -990,16 +1045,14 @@ impl Matcher for MatchGeneratorDriver {
         self.block_end = 0;
         self.anchor = 0;
         self.block_start = 0;
-        // Stale entries from previous frames fail the epoch check.
+        // Stale opt-table entries from previous frames fail the epoch check;
+        // the u32 tables need no reset (entries decode against the scanning
+        // position and die on the window-range check).
         self.epoch += 1;
         if self.epoch > 0xFFFF {
-            self.table.fill(EMPTY);
-            if !self.chain.is_empty() {
-                self.chain.fill(EMPTY);
-            }
-            if !self.hash3.is_empty() {
-                self.hash3.fill(EMPTY);
-            }
+            self.opt_table.fill(EMPTY);
+            self.bt.fill(EMPTY);
+            self.hash3.fill(EMPTY);
             self.epoch = 1;
         }
         self.miss_count = 0;
@@ -1126,7 +1179,7 @@ impl Matcher for MatchGeneratorDriver {
                         *self
                             .chain
                             .get_unchecked_mut(self.block_start as usize & chain_mask) = head;
-                        *self.table.get_unchecked_mut(h) = (self.epoch << 48) | self.block_start;
+                        *self.table.get_unchecked_mut(h) = pack_pos(self.block_start);
                     }
                 }
                 Strategy::Dfast(small_log) => {
@@ -1134,19 +1187,13 @@ impl Matcher for MatchGeneratorDriver {
                     let hs = hash_at_log(win, idx, small_log);
                     // SAFETY: both hashes masked to their tables' sizes.
                     unsafe {
-                        let tag = (self.epoch << 48) | self.block_start;
-                        *self.table.get_unchecked_mut(hl) = tag;
-                        *self.chain.get_unchecked_mut(hs) = tag;
+                        let entry = pack_pos(self.block_start);
+                        *self.table.get_unchecked_mut(hl) = entry;
+                        *self.chain.get_unchecked_mut(hs) = entry;
                     }
                 }
                 Strategy::Fast => {
-                    insert_at(
-                        win,
-                        &mut self.table,
-                        self.epoch << 48,
-                        idx,
-                        self.block_start,
-                    );
+                    insert_at(win, &mut self.table, idx, self.block_start);
                 }
             }
         }
@@ -1162,8 +1209,6 @@ impl MatchGeneratorDriver {
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
         let win = window_slice(&self.win, &self.ext);
-        let epoch = self.epoch;
-        let tag = epoch << 48;
         let win_base = self.win_base;
         let block_end = self.block_end;
         // saturating: tiny first blocks never reach an emit, so the bound is
@@ -1176,12 +1221,11 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u64 = self.table.as_mut_ptr();
+        let table_ptr: *mut u32 = self.table.as_mut_ptr();
         let mut emit = TableEmit {
             table: &mut self.table[..],
             literals,
             seqs,
-            tag,
             win_base,
             insert_max,
         };
@@ -1196,24 +1240,21 @@ impl MatchGeneratorDriver {
         let mut seed_budget = self.seed_budget;
         let hash_read = HASH_READ as u64;
 
-        // Resolve a table entry to a window index: invalid entries (wrong
-        // epoch, or older than the level window / the live window buffer)
-        // alias the scanning position itself, whose bytes always compare
+        // Resolve a table entry to a window index: invalid entries (empty,
+        // or older than the level window / the live window buffer) alias
+        // the scanning position itself, whose bytes always compare
         // equal — the byte compare plus `cand != ip` then rejects them with
         // one predictable branch instead of a three-way check per probe
-        // (libzstd's selectAddr trick). Entries are always strictly older
-        // than the scanning position: the pair reads both entries before
-        // its stores, and every insert sits at or behind the cursor when it
-        // happens.
+        // (libzstd's selectAddr trick). `unpack_pos` keeps the result
+        // strictly below `pos`, so the surviving index cannot leave the
+        // window.
         //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
-        let resolve = |entry: u64, lo: u64, ip: usize| -> usize {
-            let cand_abs = entry & POS_MASK;
-            if (entry >> 48 == epoch) & (cand_abs >= lo) {
-                (cand_abs - win_base) as usize
-            } else {
-                ip
+        let resolve = |entry: u32, pos_abs: u64, lo: u64, ip: usize| -> usize {
+            match unpack_pos(entry, pos_abs) {
+                Some(cand_abs) if cand_abs >= lo => (cand_abs - win_base) as usize,
+                _ => ip,
             }
         };
 
@@ -1249,12 +1290,12 @@ impl MatchGeneratorDriver {
             // entry (newest-wins).
             // SAFETY: as above.
             unsafe {
-                *table_ptr.add(h0) = tag | pos;
+                *table_ptr.add(h0) = pack_pos(pos);
             }
             if pair_len == 2 {
                 // SAFETY: as above.
                 unsafe {
-                    *table_ptr.add(h1) = tag | (pos + 1);
+                    *table_ptr.add(h1) = pack_pos(pos + 1);
                 }
             }
 
@@ -1358,7 +1399,7 @@ impl MatchGeneratorDriver {
                 }
 
                 let lo = pos.saturating_sub(max_window).max(win_base);
-                let mut cand0 = resolve(prev0, lo, idx0);
+                let mut cand0 = resolve(prev0, pos, lo, idx0);
                 if cand0 != idx0 && read4(win, cand0) == cur0 {
                     let mut ml = extend_match(win, idx0, cand0);
                     // A hash match already spans 5 bytes; below 6 the
@@ -1436,7 +1477,7 @@ impl MatchGeneratorDriver {
                 }
 
                 let lo1 = pos1.saturating_sub(max_window).max(win_base);
-                let mut cand1 = resolve(prev1, lo1, idx1);
+                let mut cand1 = resolve(prev1, pos1, lo1, idx1);
                 if cand1 != idx1 && read4(win, cand1) == cur1 {
                     let mut ml = extend_match(win, idx1, cand1);
                     if ml >= 6 {
@@ -1511,7 +1552,6 @@ impl MatchGeneratorDriver {
         let win = window_slice(&self.win, &self.ext);
         let long_log = self.table.len().trailing_zeros();
         let small_log = self.chain.len().trailing_zeros();
-        let epoch = self.epoch;
         let win_base = self.win_base;
         let block_len = (self.block_end - win_base) as usize;
         // Probing hashes 8 bytes, so the last probeable window index; the
@@ -1536,38 +1576,34 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its
         // borrows; both address the same memory, and the loop and the
         // emit helpers never access a slot concurrently.
-        let long_ptr: *mut u64 = self.table.as_mut_ptr();
-        let small_ptr: *mut u64 = self.chain.as_mut_ptr();
-        let tag = epoch << 48;
+        let long_ptr: *mut u32 = self.table.as_mut_ptr();
+        let small_ptr: *mut u32 = self.chain.as_mut_ptr();
         let mut emit = DfastEmit {
             long: &mut self.table[..],
             small: &mut self.chain[..],
             literals,
             seqs,
-            tag,
             win_base,
             insert_max_idx,
             long_log,
             small_log,
         };
 
-        // Resolve a table entry to a window index: invalid entries (wrong
-        // epoch, or older than the level window / the live window buffer)
-        // alias the scanning position itself, whose bytes always compare
-        // equal — the byte compare plus `cand != ip_idx` then rejects them
-        // with predictable branches instead of a three-way check per probe
-        // (libzstd's selectAddr trick). Entries are always strictly older
-        // than the scanning position: every insert happens at or ahead of
-        // the cursor, and reads see the pre-insert value.
+        // Resolve a table entry to a window index: invalid entries (empty,
+        // or older than the level window / the live window buffer) alias
+        // the scanning position itself, whose bytes always compare equal —
+        // the byte compare plus `cand != ip_idx` then rejects them with
+        // predictable branches instead of a three-way check per probe
+        // (libzstd's selectAddr trick). `unpack_pos` keeps the result
+        // strictly below `pos_abs`, so the surviving index cannot leave
+        // the window.
         //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
-        let resolve = |entry: u64, lo: u64, ip: usize| -> usize {
-            let cand_abs = entry & POS_MASK;
-            if (entry >> 48 == epoch) & (cand_abs >= lo) {
-                (cand_abs - win_base) as usize
-            } else {
-                ip
+        let resolve = |entry: u32, pos_abs: u64, lo: u64, ip: usize| -> usize {
+            match unpack_pos(entry, pos_abs) {
+                Some(cand_abs) if cand_abs >= lo => (cand_abs - win_base) as usize,
+                _ => ip,
             }
         };
 
@@ -1596,9 +1632,9 @@ impl MatchGeneratorDriver {
                 // Insert after both lookups, before probing (newest-wins).
                 // SAFETY: both hashes masked to their tables' sizes.
                 unsafe {
-                    let tagged = tag | pos_abs;
-                    *long_ptr.add(hl0) = tagged;
-                    *small_ptr.add(hs0) = tagged;
+                    let entry = pack_pos(pos_abs);
+                    *long_ptr.add(hl0) = entry;
+                    *small_ptr.add(hs0) = entry;
                 }
 
                 // Repcode pre-probe one byte ahead: the probed byte stays a
@@ -1669,7 +1705,7 @@ impl MatchGeneratorDriver {
 
                 // Long probe: a full 8-byte match at the long-hash candidate.
                 {
-                    let cand = resolve(entry_l0, lo, ip_idx);
+                    let cand = resolve(entry_l0, pos_abs, lo, ip_idx);
                     if cand != ip_idx && read8(win, cand) == read8(win, ip_idx) {
                         let mut start = ip_idx;
                         let mut c = cand;
@@ -1690,7 +1726,7 @@ impl MatchGeneratorDriver {
                             // later probes.
                             // SAFETY: hl1 is masked to the long table size.
                             unsafe {
-                                *long_ptr.add(hl1) = tag | (win_base + ip1_idx as u64);
+                                *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
                             }
                         }
                         // A literal offset shifts the decoder's history one
@@ -1717,15 +1753,14 @@ impl MatchGeneratorDriver {
                 // Short probe: 4 bytes at the short-hash candidate, upgraded
                 // by the long probe prepared for the next position.
                 {
-                    let cand = resolve(entry_s0, lo, ip_idx);
+                    let cand = resolve(entry_s0, pos_abs, lo, ip_idx);
                     if cand != ip_idx && read4(win, cand) == read4(win, ip_idx) {
                         let mut start = ip_idx;
                         let mut c = cand;
                         let mut ml = extend_match(win, ip_idx, cand);
-                        let lo1 = (win_base + ip1_idx as u64)
-                            .saturating_sub(max_window)
-                            .max(win_base);
-                        let c1 = resolve(entry_l1, lo1, ip1_idx);
+                        let pos1_abs = win_base + ip1_idx as u64;
+                        let lo1 = pos1_abs.saturating_sub(max_window).max(win_base);
+                        let c1 = resolve(entry_l1, pos1_abs, lo1, ip1_idx);
                         if c1 != ip1_idx && read8(win, c1) == read8(win, ip1_idx) {
                             let l1len = extend_match(win, ip1_idx, c1);
                             if l1len > ml {
@@ -1749,7 +1784,7 @@ impl MatchGeneratorDriver {
                             // SAFETY: hl1 is masked to the long table size;
                             // see the long probe above.
                             unsafe {
-                                *long_ptr.add(hl1) = tag | (win_base + ip1_idx as u64);
+                                *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
                             }
                         }
                         if rep_pending != 0 {
@@ -1801,8 +1836,6 @@ impl MatchGeneratorDriver {
         let win = window_slice(&self.win, &self.ext);
         let chain = &mut self.chain[..];
         let chain_mask = chain.len() - 1;
-        let epoch = self.epoch;
-        let tag = epoch << 48;
         let win_base = self.win_base;
         let block_end = self.block_end;
         let hash_log = self.params.hash_log;
@@ -1816,12 +1849,11 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u64 = self.table.as_mut_ptr();
+        let table_ptr: *mut u32 = self.table.as_mut_ptr();
         let mut emit = TableEmit {
             table: &mut self.table[..],
             literals,
             seqs,
-            tag,
             win_base,
             insert_max,
         };
@@ -1839,21 +1871,25 @@ impl MatchGeneratorDriver {
         // returning the longest match's (length, candidate window index).
         // Every candidate is beat-checked, so stale chain links (see the
         // sparse fill in rep1_chain) only cost probes, never correctness.
-        let search = |win: &[u8], chain: &[u64], idx: usize| -> (usize, usize) {
+        let search = |win: &[u8], chain: &[u32], idx: usize| -> (usize, usize) {
             // SAFETY: hash_at_log masks to hash_log bits and the table holds
             // 1 << hash_log slots.
             let h = hash_at_log(win, idx, hash_log);
             let mut entry = unsafe { *table_ptr.add(h) };
             let pos_abs = win_base + idx as u64;
+            // Oldest usable candidate age: within the level window and
+            // inside the live window buffer.
+            let lo = pos_abs.saturating_sub(max_window).max(win_base);
             let mut best_len = 0usize;
             let mut best_cand = usize::MAX;
             let mut tried = 0usize;
             while tried < search_depth {
-                if entry >> 48 != epoch {
+                // An empty or out-of-window link ends the walk (the link
+                // targets only grow older).
+                let Some(cand_abs) = unpack_pos(entry, pos_abs) else {
                     break;
-                }
-                let cand_abs = entry & POS_MASK;
-                if cand_abs < win_base || pos_abs - cand_abs > max_window {
+                };
+                if cand_abs < lo {
                     break;
                 }
                 let cand = (cand_abs - win_base) as usize;
@@ -1947,7 +1983,7 @@ impl MatchGeneratorDriver {
                 let h = hash_at_log(win, idx, hash_log);
                 let head = *table_ptr.add(h);
                 *chain.get_unchecked_mut(pos as usize & chain_mask) = head;
-                *table_ptr.add(h) = tag | pos;
+                *table_ptr.add(h) = pack_pos(pos);
             }
 
             if best_len < MIN_MATCH || !pays_for_offset(best_len, idx, best_cand, rep_hit) {
@@ -2069,8 +2105,8 @@ impl MatchGeneratorDriver {
                 block_end,
                 max_window,
                 &mut epoch,
-                &mut self.table,
-                &mut self.chain,
+                &mut self.opt_table,
+                &mut self.bt,
                 &mut self.hash3,
                 &mut next_update,
                 &mut self.opt_state,
@@ -2089,8 +2125,8 @@ impl MatchGeneratorDriver {
                 block_end,
                 max_window,
                 &mut epoch,
-                &mut self.table,
-                &mut self.chain,
+                &mut self.opt_table,
+                &mut self.bt,
                 &mut self.hash3,
                 &mut next_update,
                 &mut self.opt_state,
@@ -2112,7 +2148,7 @@ impl MatchGeneratorDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::MatchGeneratorDriver;
+    use super::{pack_pos, unpack_pos, MatchGeneratorDriver};
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
 
@@ -2254,6 +2290,92 @@ mod tests {
                 });
             }
             assert_eq!(reconstructed, data, "reconstruct {level:?}");
+        }
+    }
+
+    #[test]
+    fn pos_entry_roundtrip_across_cycles() {
+        // A live entry always resolves back to its position, even across a
+        // 4 GiB cycle boundary; a value numerically above the scan position
+        // with no cycle to unwrap into is dead (stale cross-frame entry).
+        for abs in [0u64, 1, 7, 0xFFFF_FFFE, 5_000_000_000, 1 << 40] {
+            for delta in [1u64, 2, 0x123, 0xFFFF_F000] {
+                let pos = abs + delta;
+                assert_eq!(unpack_pos(pack_pos(abs), pos), Some(abs), "{abs}+{delta}");
+            }
+        }
+        // 2^32 - 1 collides with the empty sentinel: one dead position per
+        // 4 GiB cycle, by design.
+        assert_eq!(unpack_pos(pack_pos(0xFFFF_FFFF), 1 << 40), None);
+        assert_eq!(unpack_pos(pack_pos(1000), 10), None);
+        assert_eq!(unpack_pos(0, 1 << 40), None);
+    }
+
+    /// Stale u32 entries from an earlier frame must die on the domain
+    /// check: their values share no position domain with the new frame's
+    /// scan, and the wrap reconstruction must reject the ones numerically
+    /// above it instead of underflowing into an out-of-bounds window index.
+    /// Regression for a pooled-driver double-frame compression.
+    #[test]
+    fn stale_entries_survive_frame_reset() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Frame 1: > 1 MiB so the tables end holding positions far above
+        // frame 2's scan. Frame 2: small and structured, so its probes hit
+        // stale slots from the first position on.
+        let mut long = Vec::with_capacity(3 << 20);
+        while long.len() < 3 << 20 {
+            long.extend_from_slice(&rng().to_le_bytes());
+            long.extend_from_slice(b"stable filler segment; ");
+        }
+        let mut small = Vec::new();
+        for i in 0..64 {
+            small.extend_from_slice(&block_label(i % 7));
+            small.push(rng() as u8);
+        }
+        for level in [
+            crate::Level::Fastest,
+            crate::Level::Fast,
+            crate::Level::Balanced,
+        ] {
+            let mut driver = MatchGeneratorDriver::new(128 * 1024);
+            for data in [&long, &small] {
+                driver.reset(level);
+                let mut rep = [1u32, 4, 8];
+                let mut reconstructed = Vec::new();
+                for block in data.chunks(128 * 1024) {
+                    driver.block_tail()[..block.len()].copy_from_slice(block);
+                    driver.commit_block(block.len());
+                    driver.start_matching(|seq| match seq {
+                        Sequence::Literals { literals } => {
+                            reconstructed.extend_from_slice(literals)
+                        }
+                        Sequence::Triple {
+                            literals,
+                            offset,
+                            match_len,
+                        } => {
+                            reconstructed.extend_from_slice(literals);
+                            let actual = crate::decoding::sequence_execution::do_offset_history(
+                                offset as u32,
+                                literals.len() as u32,
+                                &mut rep,
+                            );
+                            let start = reconstructed.len() - actual as usize;
+                            for i in 0..match_len {
+                                let b = reconstructed[start + i];
+                                reconstructed.push(b);
+                            }
+                        }
+                    });
+                }
+                assert_eq!(reconstructed, *data, "reconstruct {level:?}");
+            }
         }
     }
 
