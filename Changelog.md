@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* New `docs/` mdBook consolidating the branch's untracked working notes into a
+  themed handbook: a status overview, the head-to-head benchmark archive with
+  measurement methodology, per-area optimization records (decoding, encoding,
+  matchers/levels, mt/streaming), a todo list cross-checked against this
+  changelog, the falsified-directions list and per-area pitfall notes. The
+  root-level working documents stay in place as archives.
+
 * The streaming encoders accept `workers > 1`: input accumulates in one
   contiguous buffer (the previous burst's window strip followed by the
   unencoded bytes) and once at least one full round of workers' worth of
