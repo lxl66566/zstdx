@@ -1,10 +1,11 @@
 //! io::Read-shaped streaming types.
 
 use super::encoder_core::FrameEncoderCore;
-use crate::decoding::frame_source;
-use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
-use crate::io::{Error, Read};
-use crate::{DecoderOptions, EncoderOptions, Level, Result};
+use crate::{
+    DecoderOptions, EncoderOptions, Level, Result,
+    decoding::{BlockDecodingStrategy, FrameDecoder, frame_source},
+    io::{Error, Read},
+};
 
 /// Compress data pulled from an underlying [`Read`] and expose the encoded
 /// frame through [`Read`].
@@ -13,9 +14,9 @@ use crate::{DecoderOptions, EncoderOptions, Level, Result};
 /// return `Ok(0)`.
 ///
 /// ```rust
-/// use zstdx::stream::read::Encoder;
-/// use zstdx::Level;
 /// use std::io::Read;
+///
+/// use zstdx::{Level, stream::read::Encoder};
 ///
 /// let mut enc = Encoder::new(b"the quick brown fox".as_slice(), Level::Fastest).unwrap();
 /// let mut compressed = Vec::new();
@@ -34,6 +35,8 @@ impl<R: Read> Encoder<R> {
     }
 
     /// Create an encoder from a builder option set.
+    // options are consumed builder data; by value keeps the chaining API
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(source: R, options: EncoderOptions) -> Result<Self> {
         Ok(Self {
             source: Some(source),
@@ -82,8 +85,9 @@ impl<R: Read> Read for Encoder<R> {
 /// [`Decoder::single_frame`] to stop after the first one.
 ///
 /// ```rust
-/// use zstdx::stream::read::Decoder;
 /// use std::io::Read;
+///
+/// use zstdx::stream::read::Decoder;
 ///
 /// let compressed = zstdx::bulk::compress(b"a b c b a", zstdx::Level::Fastest);
 /// let mut dec = Decoder::new(&compressed[..]).unwrap();
@@ -93,7 +97,7 @@ impl<R: Read> Read for Encoder<R> {
 /// ```
 pub struct Decoder<R: Read> {
     source: R,
-    decoder: FrameDecoder,
+    inner: FrameDecoder,
     single_frame: bool,
     /// True once the last allowed frame is decoded and drained.
     finished: bool,
@@ -107,6 +111,8 @@ impl<R: Read> Decoder<R> {
     }
 
     /// Create a decoder from a builder option set.
+    // options are consumed builder data; by value keeps the chaining API
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(mut source: R, options: DecoderOptions) -> Result<Self> {
         let mut decoder = FrameDecoder::new();
         if let Some(max) = options.max_window_size {
@@ -120,7 +126,7 @@ impl<R: Read> Decoder<R> {
         Self::init_first_frame(&mut source, &mut decoder)?;
         Ok(Self {
             source,
-            decoder,
+            inner: decoder,
             single_frame: false,
             finished: false,
         })
@@ -167,11 +173,11 @@ impl<R: Read> Decoder<R> {
             if self.finished {
                 return Ok(0);
             }
-            if self.decoder.can_collect() > 0 {
-                return self.decoder.read(buf);
+            if self.inner.can_collect() > 0 {
+                return self.inner.read(buf);
             }
-            if self.decoder.is_finished() {
-                let next = frame_source::init_next_frame(&mut self.source, &mut self.decoder)
+            if self.inner.is_finished() {
+                let next = frame_source::init_next_frame(&mut self.source, &mut self.inner)
                     .map_err(|e| crate::error::into_io(crate::Error::Frame(e)));
                 if self.single_frame || !next? {
                     self.finished = true;
@@ -179,7 +185,7 @@ impl<R: Read> Decoder<R> {
                 }
                 continue;
             }
-            self.decoder
+            self.inner
                 .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1))
                 .map_err(|e| crate::error::into_io(crate::Error::Frame(e)))?;
         }

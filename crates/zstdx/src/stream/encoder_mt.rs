@@ -18,15 +18,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use super::encoder_core::StreamChecksum;
-use crate::blocks::block::BlockType;
-use crate::encoding::block_header::BlockHeader;
-use crate::encoding::frame_compressor::{
-    new_slice_state, BlockChecksum as _, CompressState, FrameHasher,
+use crate::{
+    EncoderOptions, Level,
+    blocks::block::BlockType,
+    encoding::{
+        block_header::BlockHeader,
+        frame_compressor::{BlockChecksum as _, CompressState, FrameHasher, new_slice_state},
+        frame_header::FrameHeader,
+        match_generator::MatchGeneratorDriver,
+        mt::{MIN_JOB_SIZE, job_size_for, run_job_with},
+    },
 };
-use crate::encoding::frame_header::FrameHeader;
-use crate::encoding::match_generator::MatchGeneratorDriver;
-use crate::encoding::mt::{job_size_for, run_job_with, MIN_JOB_SIZE};
-use crate::{EncoderOptions, Level};
 
 pub(crate) struct MtEncoderCore {
     level: Level,
@@ -202,7 +204,7 @@ impl MtEncoderCore {
             Some(n) if self.pos <= n => {
                 let pledged_jobs = (n - self.job_start).div_ceil(self.job_size as u64);
                 complete.min(pledged_jobs.saturating_sub(1) as usize)
-            }
+            },
             _ => complete,
         }
     }
@@ -311,7 +313,7 @@ impl MtEncoderCore {
                                     *slots[id].lock().unwrap() = Some(Vec::new());
                                     ready.notify_all();
                                     return;
-                                }
+                                },
                             }
                             ready.notify_all();
                         }

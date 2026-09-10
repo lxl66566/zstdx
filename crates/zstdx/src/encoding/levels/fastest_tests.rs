@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{encoding::compress_to_vec, Level};
+use crate::{Level, encoding::compress_to_vec};
 
 #[test]
 fn fastest_does_not_expand_incompressible_blocks_past_raw_size() {
@@ -26,7 +26,7 @@ fn assert_fastest_does_not_exceed_raw(len: usize) {
 }
 
 fn xorshift(len: usize) -> Vec<u8> {
-    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    let mut state = 0x1234_5678_9abc_def0u64;
     let mut data = Vec::with_capacity(len);
     while data.len() < len {
         state ^= state << 13;

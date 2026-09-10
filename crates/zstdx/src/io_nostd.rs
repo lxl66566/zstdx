@@ -110,8 +110,8 @@ pub trait Read {
                 Ok(n) => {
                     let tmp = buf;
                     buf = &mut tmp[n..];
-                }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                },
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
                 Err(e) => return Err(e),
             }
         }
@@ -215,9 +215,9 @@ pub trait Write {
             match self.write(buf) {
                 Ok(0) => {
                     return Err(Error::from(ErrorKind::WriteAllEof));
-                }
+                },
                 Ok(n) => buf = &buf[n..],
-                Err(ref e) if e.is_interrupted() => {}
+                Err(ref e) if e.is_interrupted() => {},
                 Err(e) => return Err(e),
             }
         }

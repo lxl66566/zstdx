@@ -3,14 +3,17 @@
 //! shape (concatenated frames, skippable frames, trailing garbage).
 
 #![cfg(test)]
-use alloc::string::{String, ToString};
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
-use crate::decoding::errors::FrameDecoderError;
-use crate::decoding::{FrameDecoder, StreamingDecoder};
-use crate::io::Read;
-use crate::Level;
+use crate::{
+    Level,
+    decoding::{FrameDecoder, StreamingDecoder, errors::FrameDecoderError},
+    io::Read,
+};
 
 /// Decode through the streaming path with deliberately awkward read sizes so
 /// block boundaries and frame boundaries are crossed mid-read.
@@ -38,7 +41,7 @@ fn flat_decode(input: &[u8]) -> Result<Vec<u8>, String> {
             Err(FrameDecoderError::TargetTooSmall) => {
                 out.reserve(step);
                 step *= 2;
-            }
+            },
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -53,12 +56,8 @@ fn expect_consistent(input: &[u8]) {
 fn expect_consistent_error(input: &[u8]) {
     let streamed = stream_decode(input);
     let flat = flat_decode(input);
-    assert!(
-        streamed.is_err(),
-        "streamed decode must fail: {:?}",
-        streamed
-    );
-    assert!(flat.is_err(), "flat decode must fail: {:?}", flat);
+    assert!(streamed.is_err(), "streamed decode must fail: {streamed:?}");
+    assert!(flat.is_err(), "flat decode must fail: {flat:?}");
 }
 
 #[cfg(feature = "std")]
@@ -82,7 +81,7 @@ fn frame(data: &[u8]) -> Vec<u8> {
 }
 
 fn skippable(payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x50, 0x2A, 0x4D, 0x18];
+    let mut out = vec![0x50, 0x2a, 0x4d, 0x18];
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(payload);
     out
@@ -162,7 +161,7 @@ fn empty_frame_is_not_end_of_stream() {
 #[test]
 fn trailing_bytes_are_an_error() {
     for extra in 1..8 {
-        let input = concat(&[&frame(b"aaaa"), &[0xABu8; 8][..extra]]);
+        let input = concat(&[&frame(b"aaaa"), &[0xabu8; 8][..extra]]);
         expect_consistent_error(&input);
         #[cfg(feature = "std")]
         expect_reference_error(&input);

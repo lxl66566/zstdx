@@ -1,26 +1,27 @@
+use alloc::vec::Vec;
+
 use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
-        block_header::BlockHeader,
-        blocks::compress_block,
-        blocks::compressed::{BlockOutcome, PrevTable},
-        frame_compressor::{BlockChecksum, CompressState},
         Matcher,
+        block_header::BlockHeader,
+        blocks::{
+            compress_block,
+            compressed::{BlockOutcome, PrevTable},
+        },
+        frame_compressor::{BlockChecksum, CompressState},
     },
 };
-use alloc::vec::Vec;
 
 /// Compresses a single block at [`crate::Level::Fastest`].
 ///
 /// # Parameters
-/// - `state`: [`CompressState`] so the compressor can refer to data before
-///   the start of this block
-/// - `last_block`: Whether or not this block is going to be the last block in the frame
-///   (needed because this info is written into the block header)
+/// - `state`: [`CompressState`] so the compressor can refer to data before the start of this block
+/// - `last_block`: Whether or not this block is going to be the last block in the frame (needed
+///   because this info is written into the block header)
 /// - `output`: As the block is compressed, it's appended to `output`.
-/// - `checksum`: Frame checksum backend; this function feeds it exactly the
-///   block's input bytes on every path, fusing the absorb into the raw block
-///   copy where the backend hashes inline.
+/// - `checksum`: Frame checksum backend; this function feeds it exactly the block's input bytes on
+///   every path, fusing the absorb into the raw block copy where the backend hashes inline.
 ///
 /// The block data itself is the matcher's last committed space.
 #[inline]

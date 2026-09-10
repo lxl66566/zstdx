@@ -7,12 +7,11 @@
 //! the strip's positions actually sit in the search tables), keeping the
 //! assembled output a single regular zstd frame. Two invariants make the
 //! jobs independent of each other (mirroring libzstd's zstdmt):
-//! - every job starts from reset entropy tables, so its first block is fully
-//!   self-describing (no Repeat modes across a job boundary);
-//! - every job except the first gates repcode references until three
-//!   literal-offset sequences have rewritten the repeated-offset history
-//!   (see [`MatchGeneratorDriver::gate_repcodes`]): the decoder's history at
-//!   a job boundary is unknown, but each literal offset shifts it down one
+//! - every job starts from reset entropy tables, so its first block is fully self-describing (no
+//!   Repeat modes across a job boundary);
+//! - every job except the first gates repcode references until three literal-offset sequences have
+//!   rewritten the repeated-offset history (see [`MatchGeneratorDriver::gate_repcodes`]): the
+//!   decoder's history at a job boundary is unknown, but each literal offset shifts it down one
 //!   slot, so after three of them the matcher and decoder agree again.
 //!
 //! The frame checksum is hashed over the whole input on the calling thread
@@ -20,17 +19,20 @@
 //! soon as they land, overlapping the final copy with the late jobs.
 
 use alloc::vec::Vec;
-use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use std::sync::{Condvar, Mutex};
 
-use super::frame_compressor::{
-    compress_job_blocks, reset_slice_state, return_slice_state, take_slice_state, CompressState,
+use super::{
+    frame_compressor::{
+        CompressState, compress_job_blocks, reset_slice_state, return_slice_state, take_slice_state,
+    },
+    frame_header::FrameHeader,
+    match_generator::MatchGeneratorDriver,
 };
-use super::frame_header::FrameHeader;
-use super::match_generator::MatchGeneratorDriver;
-use crate::common::MAX_BLOCK_SIZE;
-use crate::Level;
+use crate::{Level, common::MAX_BLOCK_SIZE};
 
 /// Below this size the thread spawn and the ordered assembly cost more than
 /// the parallelism saves.
@@ -108,32 +110,34 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
-                if poison.lock().unwrap().is_some() {
-                    break;
-                }
-                let id = next_job.fetch_add(1, Ordering::Relaxed);
-                if id >= n_jobs {
-                    break;
-                }
-                let start = id * job_size;
-                let end = (start + job_size).min(src.len());
-                // The first job starts where the decoder's repeated-offset
-                // history is still the format default [1, 4, 8].
-                let gate = id > 0;
-                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_job(src, start..end, overlap, end == src.len(), level, gate)
-                }));
-                match attempt {
-                    Ok(bytes) => *slots[id].lock().unwrap() = Some(bytes),
-                    Err(payload) => {
-                        *poison.lock().unwrap() = Some(payload);
-                        // Release the slot so the ordered assembly below can
-                        // run to completion before the panic is resumed.
-                        *slots[id].lock().unwrap() = Some(Vec::new());
+            scope.spawn(|| {
+                loop {
+                    if poison.lock().unwrap().is_some() {
+                        break;
                     }
+                    let id = next_job.fetch_add(1, Ordering::Relaxed);
+                    if id >= n_jobs {
+                        break;
+                    }
+                    let start = id * job_size;
+                    let end = (start + job_size).min(src.len());
+                    // The first job starts where the decoder's repeated-offset
+                    // history is still the format default [1, 4, 8].
+                    let gate = id > 0;
+                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(src, start..end, overlap, end == src.len(), level, gate)
+                    }));
+                    match attempt {
+                        Ok(bytes) => *slots[id].lock().unwrap() = Some(bytes),
+                        Err(payload) => {
+                            *poison.lock().unwrap() = Some(payload);
+                            // Release the slot so the ordered assembly below can
+                            // run to completion before the panic is resumed.
+                            *slots[id].lock().unwrap() = Some(Vec::new());
+                        },
+                    }
+                    ready.notify_all();
                 }
-                ready.notify_all();
             });
         }
 
@@ -203,21 +207,20 @@ pub(crate) fn run_job(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::compress_slice_mt;
-    use crate::decoding::FrameDecoder;
-    use crate::Level;
-    use alloc::vec;
-    use alloc::vec::Vec;
+    use crate::{Level, decoding::FrameDecoder};
 
     fn lcg(len: usize) -> Vec<u8> {
-        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut state = 0x1234_5678_9abc_def0u64;
         let mut rand = move || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state
         };
-        (0..len).map(|_| (rand() & 0xFF) as u8).collect()
+        (0..len).map(|_| (rand() & 0xff) as u8).collect()
     }
 
     /// Text-like data: repeating vocabulary with variation, so matches,
@@ -301,7 +304,7 @@ mod tests {
     #[test]
     fn mt_chain_levels_roundtrip() {
         let data = textish(5 * 1024 * 1024);
-        for level in [crate::Level::Fast, crate::Level::Balanced] {
+        for level in [Level::Fast, Level::Balanced] {
             let compressed = compress_slice_mt(&data, level, true, 4);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();

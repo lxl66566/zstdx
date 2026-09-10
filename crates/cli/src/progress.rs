@@ -1,5 +1,4 @@
 // ! Utilities for displaying a progress monitor to track compression/decompression/whatever else
-//!
 //! This implementation relies heavily on the `indicatif` crate, see <https://docs.rs/indicatif>cargo hack check --feature-powerset --exclude-features rustc-dep-of-std
 
 use std::{fmt::Write, io::Read, time::Duration};
@@ -144,7 +143,7 @@ mod tests {
         assert_eq!(&fmt_duration(Duration::from_secs(5 * 60)), "5m");
         assert_eq!(&fmt_duration(Duration::from_secs(3 * 60 * 60)), "3h");
         assert_eq!(
-            &fmt_duration(Duration::from_secs(1 * 60 * 60 + 20 * 60 + 30)),
+            &fmt_duration(Duration::from_secs(60 * 60 + 20 * 60 + 30)),
             "1h 20m 30s"
         );
     }

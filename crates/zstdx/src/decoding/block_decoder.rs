@@ -1,23 +1,27 @@
-use super::super::blocks::block::BlockHeader;
-use super::super::blocks::block::BlockType;
-use super::super::blocks::literals_section::LiteralsSection;
-use super::super::blocks::literals_section::LiteralsSectionType;
-use super::super::blocks::sequence_section::SequencesHeader;
-use super::literals_section_decoder::decode_literals;
-use super::sequence_section_decoder::decode_sequences;
-use crate::common::MAX_BLOCK_SIZE;
-use crate::decoding::errors::DecodeSequenceError;
-use crate::decoding::errors::ExecuteSequencesError;
-use crate::decoding::errors::{
-    BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
-    DecompressBlockError,
-};
-use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_decoded_flat;
-use crate::decoding::sequence_execution::execute_sequences;
-use crate::decoding::sequence_section_decoder::SeqDecoder;
-use crate::io::Read;
 use alloc::vec::Vec;
+
+use super::{
+    super::blocks::{
+        block::{BlockHeader, BlockType},
+        literals_section::{LiteralsSection, LiteralsSectionType},
+        sequence_section::SequencesHeader,
+    },
+    literals_section_decoder::decode_literals,
+    sequence_section_decoder::decode_sequences,
+};
+use crate::{
+    common::MAX_BLOCK_SIZE,
+    decoding::{
+        errors::{
+            BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
+            DecodeSequenceError, DecompressBlockError, ExecuteSequencesError,
+        },
+        scratch::DecoderScratch,
+        sequence_execution::{execute_decoded_flat, execute_sequences},
+        sequence_section_decoder::SeqDecoder,
+    },
+    io::Read,
+};
 
 pub struct BlockDecoder {
     header_buffer: [u8; 3],
@@ -28,7 +32,8 @@ enum DecoderState {
     ReadyToDecodeNextHeader,
     ReadyToDecodeNextBody,
     #[allow(dead_code)]
-    Failed, //TODO put "self.internal_state = DecoderState::Failed;" everywhere an unresolvable error occurs
+    Failed, /* TODO put "self.internal_state = DecoderState::Failed;" everywhere an
+             * unresolvable error occurs */
 }
 
 /// Create a new [BlockDecoder].
@@ -43,15 +48,17 @@ impl BlockDecoder {
     pub fn decode_block_content(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch, /* reuse this as often as possible. Not only if the
+                                         * trees are reused but also reuse the allocations when
+                                         * building new trees */
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {
-            DecoderState::ReadyToDecodeNextBody => { /* Happy :) */ }
+            DecoderState::ReadyToDecodeNextBody => { /* Happy :) */ },
             DecoderState::Failed => return Err(DecodeBlockContentError::DecoderStateIsFailed),
             DecoderState::ReadyToDecodeNextHeader => {
                 return Err(DecodeBlockContentError::ExpectedHeaderOfPreviousBlock)
-            }
+            },
         }
 
         let block_type = header.block_type;
@@ -71,7 +78,7 @@ impl BlockDecoder {
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
 
                 Ok(1)
-            }
+            },
             BlockType::Raw => {
                 workspace
                     .buffer
@@ -83,25 +90,29 @@ impl BlockDecoder {
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))
-            }
+            },
 
             BlockType::Reserved => {
-                panic!("How did you even get this. The decoder should error out if it detects a reserved-type block");
-            }
+                panic!(
+                    "How did you even get this. The decoder should error out if it detects a \
+                     reserved-type block"
+                );
+            },
 
             BlockType::Compressed => {
-                self.decompress_block(header, workspace, source)?;
+                Self::decompress_block(header, workspace, source)?;
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.content_size))
-            }
+            },
         }
     }
 
     fn decompress_block(
-        &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch, /* reuse this as often as possible. Not only if the
+                                         * trees are reused but also reuse the allocations when
+                                         * building new trees */
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
         let DecoderScratch {
@@ -113,7 +124,7 @@ impl BlockDecoder {
             sequences,
             block_content_buffer,
         } = workspace;
-        let (seq_section, raw) = self.parse_sections(
+        let (seq_section, raw) = Self::parse_sections(
             header,
             block_content_buffer,
             huf,
@@ -148,7 +159,6 @@ impl BlockDecoder {
     /// `execute_decoded_flat`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decompress_block_flat(
-        &mut self,
         header: &BlockHeader,
         workspace: &mut DecoderScratch,
         source: &mut impl Read,
@@ -168,7 +178,7 @@ impl BlockDecoder {
             ..
         } = workspace;
         let (seq_section, raw) =
-            self.parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
+            Self::parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
 
         if seq_section.num_sequences != 0 {
             // The flat executor's inline 16-byte literal copies may read up
@@ -215,7 +225,6 @@ impl BlockDecoder {
     /// path can fuse it with execution. Takes the scratch fields individually
     /// so the returned borrow coexists with further field borrows.
     fn parse_sections<'a>(
-        &mut self,
         header: &BlockHeader,
         block_content_buffer: &'a mut Vec<u8>,
         huf: &mut super::scratch::HuffmanScratch,
@@ -265,7 +274,10 @@ impl BlockDecoder {
             literals_buffer.len(),
             section.regenerated_size
         );
-        assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
+        assert_eq!(
+            bytes_used_in_literals_section,
+            upper_limit_for_literals as u32
+        );
 
         let raw = &raw[upper_limit_for_literals..];
         vprintln!("Slice for sequences with headers: {}", raw.len());
@@ -279,12 +291,12 @@ impl BlockDecoder {
             raw.len()
         );
 
-        assert!(
+        assert_eq!(
             u32::from(bytes_in_literals_header)
                 + bytes_used_in_literals_section
                 + u32::from(bytes_in_sequence_header)
-                + raw.len() as u32
-                == header.content_size
+                + raw.len() as u32,
+            header.content_size
         );
         vprintln!("Slice for sequences: {}", raw.len());
 
@@ -297,10 +309,12 @@ impl BlockDecoder {
         &mut self,
         mut r: impl Read,
     ) -> Result<(BlockHeader, u8), BlockHeaderReadError> {
-        //match self.internal_state {
+        // match self.internal_state {
         //    DecoderState::ReadyToDecodeNextHeader => {/* Happy :) */},
-        //    DecoderState::Failed => return Err(format!("Cant decode next block if failed along the way. Results will be nonsense")),
-        //    DecoderState::ReadyToDecodeNextBody => return Err(format!("Cant decode next block header, while expecting to decode the body of the previous block. Results will be nonsense")),
+        //    DecoderState::Failed => return Err(format!("Cant decode next block if failed along the
+        // way. Results will be nonsense")),    DecoderState::ReadyToDecodeNextBody =>
+        // return Err(format!("Cant decode next block header, while expecting to decode the body of
+        // the previous block. Results will be nonsense")),
         //}
 
         r.read_exact(&mut self.header_buffer[0..3])?;
@@ -312,16 +326,15 @@ impl BlockDecoder {
 
         let block_size = self.block_content_size()?;
         let decompressed_size = match btype {
-            BlockType::Raw => block_size,
-            BlockType::RLE => block_size,
-            BlockType::Reserved => 0, //should be caught above, this is an error state
-            BlockType::Compressed => 0, //unknown but will be smaller than 128kb (or window_size if that is smaller than 128kb)
+            BlockType::Raw | BlockType::RLE => block_size,
+            // Reserved is rejected above; Compressed is only known after decoding
+            BlockType::Reserved | BlockType::Compressed => 0,
         };
         let content_size = match btype {
-            BlockType::Raw => block_size,
-            BlockType::Compressed => block_size,
+            BlockType::Raw | BlockType::Compressed => block_size,
             BlockType::RLE => 1,
-            BlockType::Reserved => 0, //should be caught above, this is an error state
+            // Reserved is rejected above, this is an error state
+            BlockType::Reserved => 0,
         };
 
         let last_block = self.is_last();
@@ -329,7 +342,7 @@ impl BlockDecoder {
         self.reset_buffer();
         self.internal_state = DecoderState::ReadyToDecodeNextBody;
 
-        //just return 3. Blockheaders always take 3 bytes
+        // just return 3. Blockheaders always take 3 bytes
         Ok((
             BlockHeader {
                 last_block,

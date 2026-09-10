@@ -1,16 +1,17 @@
 #[test]
 fn test_dict_parsing() {
-    use crate::decoding::dictionary::Dictionary;
     use alloc::vec;
+
+    use crate::decoding::dictionary::Dictionary;
     let mut raw = vec![0u8; 8];
 
     // correct magic num
     raw[0] = 0x37;
-    raw[1] = 0xA4;
+    raw[1] = 0xa4;
     raw[2] = 0x30;
-    raw[3] = 0xEC;
+    raw[3] = 0xec;
 
-    //dict-id
+    // dict-id
     let dict_id = 0x47232101;
     raw[4] = 0x01;
     raw[5] = 0x21;
@@ -28,12 +29,12 @@ fn test_dict_parsing() {
     ];
     raw.extend(&raw_tables[..]);
 
-    //offset history 3,10,0x00ABCDEF
+    // offset history 3,10,0x00ABCDEF
     raw.extend(vec![3, 0, 0, 0]);
     raw.extend(vec![10, 0, 0, 0]);
-    raw.extend(vec![0xEF, 0xCD, 0xAB, 0]);
+    raw.extend(vec![0xef, 0xcd, 0xab, 0]);
 
-    //just some random bytes
+    // just some random bytes
     let raw_content = vec![
         1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 123, 3, 234, 23, 234, 34, 23, 234, 34, 34, 234, 234,
     ];
@@ -41,51 +42,39 @@ fn test_dict_parsing() {
 
     let dict = Dictionary::decode_dict(&raw).unwrap();
 
-    if dict.id != dict_id {
-        panic!(
-            "Dict-id did not get parsed correctly. Is: {}, Should be: {}",
-            dict.id, dict_id
-        );
-    }
-
-    if !dict.dict_content.eq(&raw_content) {
-        panic!(
-            "dict content did not get parsed correctly. Is: {:?}, Should be: {:?}",
-            dict.dict_content, raw_content
-        );
-    }
-
-    if !dict.offset_hist.eq(&[3, 10, 0x00ABCDEF]) {
-        panic!(
-            "offset history did not get parsed correctly. Is: {:?}, Should be: {:?}",
-            dict.offset_hist,
-            [3, 10, 0x00ABCDEF]
-        );
-    }
+    assert_eq!(dict.id, dict_id, "Dict-id did not get parsed correctly");
+    assert_eq!(
+        dict.dict_content, raw_content,
+        "dict content did not get parsed correctly"
+    );
+    assert_eq!(
+        dict.offset_hist,
+        [3, 10, 0x00abcdef],
+        "offset history did not get parsed correctly"
+    );
 
     // test magic num checking
     raw[0] = 1;
     raw[1] = 1;
     raw[2] = 1;
     raw[3] = 1;
-    match Dictionary::decode_dict(&raw) {
-        Ok(_) => panic!("The dict got decoded but the magic num was incorrect!"),
-        Err(_) => { /* This is what should happen*/ }
-    }
+    assert!(
+        Dictionary::decode_dict(&raw).is_err(),
+        "The dict got decoded but the magic num was incorrect!"
+    );
 }
 
 #[test]
 fn test_dict_decoding() {
     extern crate std;
-    use crate::decoding::BlockDecodingStrategy;
-    use crate::decoding::FrameDecoder;
-    use alloc::borrow::ToOwned;
-    use alloc::string::{String, ToString};
-    use alloc::vec::Vec;
-    use std::fs;
-    use std::io::BufReader;
-    use std::io::Read;
-    use std::println;
+    use alloc::{borrow::ToOwned, string::String, vec::Vec};
+    use std::{
+        fs,
+        io::{BufReader, Read},
+        println,
+    };
+
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let mut success_counter = 0;
     let mut fail_counter_diff = 0;
@@ -102,7 +91,7 @@ fn test_dict_decoding() {
     let dict: Vec<u8> = dict.bytes().map(|x| x.unwrap()).collect();
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -116,6 +105,8 @@ fn test_dict_decoding() {
         let file_size = metadata.len();
 
         let p = String::from(f.path().to_str().unwrap());
+        // corpus files are generated with a lowercase .zst suffix
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         if !p.ends_with(".zst") {
             continue;
         }
@@ -136,21 +127,21 @@ fn test_dict_decoding() {
         match frame_dec.get_checksum_from_data() {
             Some(chksum) => {
                 #[cfg(feature = "hash")]
-                if frame_dec.get_calculated_checksum().unwrap() != chksum {
+                if frame_dec.get_calculated_checksum().unwrap() == chksum {
+                    println!("Checksums are ok!\n");
+                } else {
                     println!(
                         "Checksum did not match! From data: {}, calculated while decoding: {}\n",
                         chksum,
                         frame_dec.get_calculated_checksum().unwrap()
                     );
-                } else {
-                    println!("Checksums are ok!\n");
                 }
                 #[cfg(not(feature = "hash"))]
                 println!(
                     "Checksum feature not enabled, skipping. From data: {}\n",
                     chksum
                 );
-            }
+            },
             None => println!("No checksums to test\n"),
         }
 
@@ -191,7 +182,7 @@ fn test_dict_decoding() {
         for idx in 0..min {
             if original[idx] != result[idx] {
                 counter += 1;
-                //println!(
+                // println!(
                 //    "Original {} not equal to result {} at byte: {}",
                 //    original[idx], result[idx], idx,
                 //);
@@ -207,13 +198,23 @@ fn test_dict_decoding() {
         if success {
             success_counter += 1;
         } else {
-            failed.push(p.clone().to_string());
+            failed.push(p.clone());
         }
         total_counter += 1;
 
         let dur = end_time.as_micros() as usize;
-        let speed = result.len() / if dur == 0 { 1 } else { dur };
-        let speed_read = file_size as usize / if dur == 0 { 1 } else { dur };
+        let speed = result.len()
+            / if dur == 0 {
+                1
+            } else {
+                dur
+            };
+        let speed_read = file_size as usize
+            / if dur == 0 {
+                1
+            } else {
+                dur
+            };
         println!("SPEED: {speed}");
         println!("SPEED_read: {speed_read}");
         speeds.push(speed);
@@ -224,7 +225,8 @@ fn test_dict_decoding() {
     println!("Summary:");
     println!("###################");
     println!(
-        "Total: {total_counter}, Success: {success_counter}, WrongSize: {fail_counter_size}, WrongBytecount: {fail_counter_bytes_read}, Diffs: {fail_counter_diff}"
+        "Total: {total_counter}, Success: {success_counter}, WrongSize: {fail_counter_size}, \
+         WrongBytecount: {fail_counter_bytes_read}, Diffs: {fail_counter_diff}"
     );
     println!("Failed files: ");
     for f in &failed {
@@ -258,5 +260,5 @@ fn test_dict_decoding() {
         );
     }
 
-    assert!(failed.is_empty());
+    assert!(failed.is_empty(), "failed files: {failed:?}");
 }

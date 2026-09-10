@@ -10,14 +10,21 @@
 
 use alloc::vec::Vec;
 
-use crate::blocks::block::BlockType;
-use crate::common::MAX_BLOCK_SIZE;
-use crate::encoding::block_header::BlockHeader;
-use crate::encoding::frame_compressor::{BlockChecksum, CompressState, FrameHasher, FseTables};
-use crate::encoding::frame_header::FrameHeader;
-use crate::encoding::match_generator::MatchGeneratorDriver;
-use crate::encoding::{compress_fastest, util, Matcher};
-use crate::{EncoderOptions, Error, Level, Result};
+use crate::{
+    EncoderOptions, Error, Level, Result,
+    blocks::block::BlockType,
+    common::MAX_BLOCK_SIZE,
+    encoding::{
+        Matcher,
+        block_header::BlockHeader,
+        blocks::compressed::BlockScratch,
+        compress_fastest,
+        frame_compressor::{BlockChecksum, CompressState, FrameHasher, FseTables},
+        frame_header::FrameHeader,
+        match_generator::MatchGeneratorDriver,
+        util,
+    },
+};
 
 /// Checksum backend that can be switched off at runtime: the streaming API
 /// exposes the checksum as an option, so unlike the one-shot paths (which fix
@@ -35,12 +42,14 @@ impl BlockChecksum for StreamChecksum {
             Self::Off => (util::is_uniform(data), 0),
         }
     }
+
     #[inline]
     fn hash_tail(&mut self, bytes: &[u8]) {
         if let Self::On(h) = self {
-            h.hash_tail(bytes)
+            h.hash_tail(bytes);
         }
     }
+
     #[inline]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
         match self {
@@ -48,6 +57,7 @@ impl BlockChecksum for StreamChecksum {
             Self::Off => out.extend_from_slice(bytes),
         }
     }
+
     #[inline]
     fn finish32(&mut self) -> u32 {
         match self {
@@ -82,7 +92,7 @@ impl FrameEncoderCoreSt {
             matcher: MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize),
             last_huff_table: None,
             fse_tables: FseTables::new(),
-            scratch: Default::default(),
+            scratch: BlockScratch::default(),
         };
         state.matcher.reset(options.level);
         let checksum = options.checksum && cfg!(feature = "hash");
@@ -223,6 +233,8 @@ pub(crate) enum FrameEncoderCore {
 }
 
 impl FrameEncoderCore {
+    // Infallible under std; the Err arm exists only for no_std + workers > 1.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
         if options.workers > 1 {
             // Same engagement conditions as the bulk mt path: raw-block

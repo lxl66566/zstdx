@@ -1,8 +1,8 @@
 //! Use [BitWriter] to write an arbitrary amount of bits into a buffer.
 use alloc::vec::Vec;
 
-/// An interface for writing an arbitrary number of bits into a buffer. Write new bits into the buffer with `write_bits`, and
-/// obtain the output using `dump`.
+/// An interface for writing an arbitrary number of bits into a buffer. Write new bits into the
+/// buffer with `write_bits`, and obtain the output using `dump`.
 #[derive(Debug)]
 pub(crate) struct BitWriter<V: AsMut<Vec<u8>>> {
     /// The buffer that's filled with bits
@@ -38,7 +38,8 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         }
     }
 
-    /// Get the current index. Can be used to reset to this index or to later change the bits at this index
+    /// Get the current index. Can be used to reset to this index or to later change the bits at
+    /// this index
     pub fn index(&self) -> usize {
         self.bit_idx + self.bits_in_partial
     }
@@ -53,7 +54,8 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     }
 
     /// Change the bits at the index. `bits` contains the ǹum_bits` new bits that should be written
-    /// Instead of the current content. `bits` *MUST* only contain zeroes in the upper bits outside of the `0..num_bits` range.
+    /// Instead of the current content. `bits` *MUST* only contain zeroes in the upper bits outside
+    /// of the `0..num_bits` range.
     pub fn change_bits(&mut self, idx: usize, bits: impl Into<u64>, num_bits: usize) {
         self.change_bits_64(idx, bits.into(), num_bits);
     }
@@ -72,7 +74,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             // We don't support only changing a few bits in the middle of a byte
             assert!(bits_in_first_byte <= num_bits);
             // Zero out the upper bits that will be changed while keeping the lower bits intact
-            self.output.as_mut()[idx / 8] &= 0xFFu8 >> bits_in_first_byte;
+            self.output.as_mut()[idx / 8] &= 0xffu8 >> bits_in_first_byte;
             // Shift the bits up and put them in the now zeroed out bits
             let new_bits = (bits << (8 - bits_in_first_byte)) as u8;
             self.output.as_mut()[idx / 8] |= new_bits;
@@ -94,24 +96,27 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             idx += 1;
         }
 
-        // Deal with leftover bits that wont fill a full byte, keeping the upper bits of the original byte intact
+        // Deal with leftover bits that wont fill a full byte, keeping the upper bits of the
+        // original byte intact
         if num_bits > 0 {
-            self.output.as_mut()[idx] &= 0xFFu8 << num_bits;
+            self.output.as_mut()[idx] &= 0xffu8 << num_bits;
             self.output.as_mut()[idx] |= bits as u8;
         }
     }
 
     /// Simply append bytes to the buffer. Only works if the buffer was already byte aligned
     pub fn append_bytes(&mut self, data: &[u8]) {
-        if self.misaligned() != 0 {
-            panic!("Don't append bytes when writer is misaligned")
-        }
+        assert!(
+            self.misaligned() == 0,
+            "Don't append bytes when writer is misaligned"
+        );
         self.flush();
         self.output.as_mut().extend_from_slice(data);
         self.bit_idx += data.len() * 8;
     }
 
-    /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte aligned
+    /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte
+    /// aligned
     pub fn flush(&mut self) {
         assert!(self.bits_in_partial.is_multiple_of(8));
         let full_bytes = self.bits_in_partial / 8;
@@ -123,7 +128,8 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += full_bytes * 8;
     }
 
-    /// Write the lower `num_bits` from `bits` into the writer. `bits` *MUST* only contain zeroes in the upper bits outside of the `0..num_bits` range.
+    /// Write the lower `num_bits` from `bits` into the writer. `bits` *MUST* only contain zeroes in
+    /// the upper bits outside of the `0..num_bits` range.
     pub fn write_bits(&mut self, bits: impl Into<u64>, num_bits: usize) {
         self.write_bits_64(bits.into(), num_bits);
     }
@@ -159,7 +165,8 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let mut num_bits = num_bits - bits_free_in_partial;
         let mut bits = bits >> bits_free_in_partial;
 
-        // While we are at it push full bytes into the output buffer instead of polluting the partial buffer
+        // While we are at it push full bytes into the output buffer instead of polluting the
+        // partial buffer
         while num_bits / 8 > 0 {
             let byte = bits as u8;
             self.output.as_mut().push(byte);
@@ -210,7 +217,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// a dedicated bulk path that packs two symbols per output byte.
     pub fn write_packed_codes_rev(&mut self, packed: &[u16; 256], uniform_nb: u8, data: &[u8]) {
         let mut data = data;
-        if uniform_nb == 4 && data.len() >= 16 && self.bits_in_partial % 4 == 0 {
+        if uniform_nb == 4 && data.len() >= 16 && self.bits_in_partial.is_multiple_of(4) {
             data = self.write_uniform4_bulk(packed, data);
         }
         let mut acc = self.partial;
@@ -286,7 +293,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let mut n = data.len();
         // Peel trailing symbols until the pending bits hit a byte border so
         // the bulk groups start byte-aligned (at most two four-bit symbols).
-        while bits % 8 != 0 {
+        while !bits.is_multiple_of(8) {
             let t = packed[data[n - 1] as usize];
             acc |= ((t >> 4) as u64) << bits;
             bits += 4;
@@ -332,7 +339,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 // AVX-512 packs whole 64-symbol chunks (four groups) with
                 // byte-permutes instead of per-symbol LUT loads.
                 #[cfg(all(target_arch = "x86_64", feature = "std"))]
-                let simd_end = {
+                {
                     const CHUNK: usize = 64;
                     let full = groups / 4;
                     let simd_stop = n - full * CHUNK;
@@ -350,10 +357,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                         p = uniform4_pack_avx512(data, simd_stop, n, p, &tab);
                         i = simd_stop;
                     }
-                    simd_stop
-                };
-                #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-                let simd_end = n;
+                }
                 while i > bulk_end {
                     // Encoding order runs back to front: data[i-1] is the
                     // next symbol and lands in the low nibble of byte 0.
@@ -384,9 +388,12 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// This function consumes the writer, so it cannot be used after
     /// dumping
     pub fn dump(mut self) -> V {
-        if self.misaligned() != 0 {
-            panic!("`dump` was called on a bit writer but an even number of bytes weren't written into the buffer. Was: {}", self.index())
-        }
+        assert!(
+            self.misaligned() == 0,
+            "`dump` was called on a bit writer but an even number of bytes weren't written into \
+             the buffer. Was: {}",
+            self.index()
+        );
         self.flush();
         debug_assert_eq!(self.partial, 0);
         self.output
@@ -446,53 +453,56 @@ unsafe fn uniform4_pack_avx512(
     mut dst: *mut u8,
     tab: &[u8; 256],
 ) -> *mut u8 {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    let lut01 = _mm512_loadu_si512(tab.as_ptr().cast());
-    let lut01b = _mm512_loadu_si512(tab.as_ptr().add(64).cast());
-    let lut23 = _mm512_loadu_si512(tab.as_ptr().add(128).cast());
-    let lut23b = _mm512_loadu_si512(tab.as_ptr().add(192).cast());
-    // Within a 64-symbol chunk (local 0..63, chunk base i): the low nibble of
-    // output byte j reads local 63-2j, the high nibble local 62-2j; the upper
-    // half of the permute indices is unused (only the low 32 bytes store).
-    let mut idx_lo = [0u8; 64];
-    let mut idx_hi = [0u8; 64];
-    for j in 0..32 {
-        idx_lo[j] = (63 - 2 * j) as u8;
-        idx_hi[j] = (63 - 2 * j - 1) as u8;
-    }
-    let idx_lo = _mm512_loadu_si512(idx_lo.as_ptr().cast());
-    let idx_hi = _mm512_loadu_si512(idx_hi.as_ptr().cast());
-    let mask7f = _mm512_set1_epi8(0x7F);
-    let mask_f0 = _mm512_set1_epi8(0xF0u8 as i8);
+        let lut01 = _mm512_loadu_si512(tab.as_ptr().cast());
+        let lut01b = _mm512_loadu_si512(tab.as_ptr().add(64).cast());
+        let lut23 = _mm512_loadu_si512(tab.as_ptr().add(128).cast());
+        let lut23b = _mm512_loadu_si512(tab.as_ptr().add(192).cast());
+        // Within a 64-symbol chunk (local 0..63, chunk base i): the low nibble of
+        // output byte j reads local 63-2j, the high nibble local 62-2j; the upper
+        // half of the permute indices is unused (only the low 32 bytes store).
+        let mut idx_lo = [0u8; 64];
+        let mut idx_hi = [0u8; 64];
+        for j in 0..32 {
+            idx_lo[j] = (63 - 2 * j) as u8;
+            idx_hi[j] = (63 - 2 * j - 1) as u8;
+        }
+        let idx_lo = _mm512_loadu_si512(idx_lo.as_ptr().cast());
+        let idx_hi = _mm512_loadu_si512(idx_hi.as_ptr().cast());
+        let mask7f = _mm512_set1_epi8(0x7f);
+        let mask_f0 = _mm512_set1_epi8(0xf0u8 as i8);
 
-    let mut i = end;
-    while i > stop {
-        i -= 64;
-        let v = _mm512_loadu_si512(data.as_ptr().add(i).cast());
-        // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
-        // pair, bit 7 blends between the pairs.
-        let lo7 = _mm512_and_si512(v, mask7f);
-        let codes = _mm512_mask_blend_epi8(
-            _mm512_movepi8_mask(v),
-            _mm512_permutex2var_epi8(lut01, lo7, lut01b),
-            _mm512_permutex2var_epi8(lut23, lo7, lut23b),
-        );
-        let lo = _mm512_permutexvar_epi8(idx_lo, codes);
-        let hi = _mm512_and_si512(
-            _mm512_slli_epi16(_mm512_permutexvar_epi8(idx_hi, codes), 4),
-            mask_f0,
-        );
-        _mm256_storeu_si256(dst.cast(), _mm512_castsi512_si256(_mm512_or_si512(lo, hi)));
-        dst = dst.add(32);
+        let mut i = end;
+        while i > stop {
+            i -= 64;
+            let v = _mm512_loadu_si512(data.as_ptr().add(i).cast());
+            // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
+            // pair, bit 7 blends between the pairs.
+            let lo7 = _mm512_and_si512(v, mask7f);
+            let codes = _mm512_mask_blend_epi8(
+                _mm512_movepi8_mask(v),
+                _mm512_permutex2var_epi8(lut01, lo7, lut01b),
+                _mm512_permutex2var_epi8(lut23, lo7, lut23b),
+            );
+            let lo = _mm512_permutexvar_epi8(idx_lo, codes);
+            let hi = _mm512_and_si512(
+                _mm512_slli_epi16(_mm512_permutexvar_epi8(idx_hi, codes), 4),
+                mask_f0,
+            );
+            _mm256_storeu_si256(dst.cast(), _mm512_castsi512_si256(_mm512_or_si512(lo, hi)));
+            dst = dst.add(32);
+        }
+        dst
     }
-    dst
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BitWriter;
     use alloc::vec;
+
+    use super::BitWriter;
 
     #[test]
     fn from_existing() {
@@ -508,13 +518,13 @@ mod tests {
     fn change_bits() {
         let mut writer = BitWriter::new();
         writer.write_bits(0u32, 24);
-        writer.change_bits(8, 0xFFu8, 8);
-        assert_eq!(vec![0, 0xFF, 0], writer.dump());
+        writer.change_bits(8, 0xffu8, 8);
+        assert_eq!(vec![0, 0xff, 0], writer.dump());
 
         let mut writer = BitWriter::new();
         writer.write_bits(0u32, 24);
-        writer.change_bits(6, 0x0FFFu16, 12);
-        assert_eq!(vec![0b11000000, 0xFF, 0b00000011], writer.dump());
+        writer.change_bits(6, 0x0fffu16, 12);
+        assert_eq!(vec![0b11000000, 0xff, 0b00000011], writer.dump());
     }
 
     #[test]
@@ -525,7 +535,12 @@ mod tests {
         bw.write_bits(0b1111u8, 4);
         bw.write_bits(0b0000u8, 4);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer returned a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer returned a vec that wasn't one byte, vec was {} \
+             elements long",
+            output.len()
+        );
         assert_eq!(
             0b0000_1111, output[0],
             "4 bits and 4 bits written into buffer"
@@ -539,7 +554,12 @@ mod tests {
         bw.write_bits(0b111u8, 3);
         bw.write_bits(0b0_0000u8, 5);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} \
+             elements long",
+            output.len()
+        );
         assert_eq!(0b0000_0111, output[0], "3 and 5 bits written into buffer");
     }
 
@@ -550,7 +570,12 @@ mod tests {
         bw.write_bits(0b1u8, 1);
         bw.write_bits(0u8, 7);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} \
+             elements long",
+            output.len()
+        );
         assert_eq!(0b0000_0001, output[0], "1 and 7 bits written into buffer");
     }
 
@@ -560,7 +585,12 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_bits(1u8, 8);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} \
+             elements long",
+            output.len()
+        );
         assert_eq!(1, output[0], "1 and 7 bits written into buffer");
     }
 
@@ -581,7 +611,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_bits(0x0100u16, 16);
         bw.write_bits(69u8, 8);
-        assert_eq!(vec![0, 1, 69], bw.dump())
+        assert_eq!(vec![0, 1, 69], bw.dump());
     }
 
     #[test]
@@ -614,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "`dump` was called on a bit writer")]
     fn catches_unaligned_dump() {
         // Write a single bit in then dump it, making sure
         // the correct error is returned
@@ -627,7 +657,7 @@ mod tests {
     // debug builds; gate it to keep `cargo test --release` green.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic]
+    #[should_panic(expected = "bits.ilog2() <= num_bits as u32")]
     fn catches_dirty_upper_bits() {
         let mut bw = BitWriter::new();
         bw.write_bits(10u8, 1);
@@ -636,8 +666,8 @@ mod tests {
     #[test]
     fn add_multiple_aligned() {
         let mut bw = BitWriter::new();
-        bw.write_bits(0x00_0F_F0_FFu32, 32);
-        assert_eq!(vec![0xFF, 0xF0, 0x0F, 0x00], bw.dump());
+        bw.write_bits(0x00_0f_f0_ffu32, 32);
+        assert_eq!(vec![0xff, 0xf0, 0x0f, 0x00], bw.dump());
     }
 
     // #[test]
@@ -649,14 +679,14 @@ mod tests {
     fn packed_codes_rev_matches_write_bits() {
         // deterministic skewed symbols, codes up to 9 bits
         let mut packed = [0u16; 256];
-        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut state = 0x0123_4567_89ab_cdefu64;
         let mut next = move || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state
         };
-        for (sym, p) in packed.iter_mut().enumerate() {
+        for p in &mut packed {
             let nb = 1 + (next() as usize % 9);
             let code = next() as usize & ((1 << nb) - 1);
             *p = ((code << 4) | nb) as u16;
@@ -666,7 +696,7 @@ mod tests {
         // reproduce the generic bit accumulation for every entry alignment.
         let mut packed_uniform = [0u16; 256];
         for (sym, p) in packed_uniform.iter_mut().enumerate() {
-            let code = (sym * 7 + 3) & 0xF;
+            let code = (sym * 7 + 3) & 0xf;
             *p = ((code << 4) | 4) as u16;
         }
         for size in [0usize, 1, 2, 3, 4, 5, 8, 31, 1025, 4096, 16384] {
@@ -705,7 +735,8 @@ mod tests {
                     assert_eq!(
                         reference.dump(),
                         batched.dump(),
-                        "stream mismatch at size {size} entry_bits {entry_bits} uniform {uniform_nb}"
+                        "stream mismatch at size {size} entry_bits {entry_bits} uniform \
+                         {uniform_nb}"
                     );
                 }
             }

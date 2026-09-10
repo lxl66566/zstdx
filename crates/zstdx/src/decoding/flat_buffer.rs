@@ -15,8 +15,9 @@
 //! match sources and match destinations never collide within a buffer
 //! generation.
 
-use crate::common::MAX_BLOCK_SIZE;
 use alloc::vec::Vec;
+
+use crate::common::MAX_BLOCK_SIZE;
 
 const MAX_BLOCK_SIZE_USIZE: usize = MAX_BLOCK_SIZE as usize;
 
@@ -178,7 +179,7 @@ impl FlatOut {
                 Err(e) => {
                     self.start += written;
                     return Err(e);
-                }
+                },
             }
         }
         self.start += written;

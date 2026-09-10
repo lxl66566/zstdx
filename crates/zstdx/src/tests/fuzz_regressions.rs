@@ -1,11 +1,9 @@
 #[test]
 fn test_all_artifacts() {
     extern crate std;
-    use crate::decoding::BlockDecodingStrategy;
-    use crate::decoding::FrameDecoder;
-    use std::borrow::ToOwned;
-    use std::fs;
-    use std::fs::File;
+    use std::{borrow::ToOwned, fs, fs::File};
+
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let mut frame_dec = FrameDecoder::new();
 
@@ -19,7 +17,7 @@ fn test_all_artifacts() {
 
         let mut f = File::open(file_name.clone()).unwrap();
 
-        /* ignore errors. It just should never panic on invalid input */
+        // ignore errors. It just should never panic on invalid input
         let _: Result<_, _> = frame_dec
             .reset(&mut f)
             .and_then(|()| frame_dec.decode_blocks(&mut f, BlockDecodingStrategy::All));

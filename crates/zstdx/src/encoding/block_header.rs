@@ -1,5 +1,6 @@
-use crate::blocks::block::BlockType;
 use alloc::vec::Vec;
+
+use crate::blocks::block::BlockType;
 
 #[derive(Debug)]
 pub struct BlockHeader {
@@ -8,12 +9,10 @@ pub struct BlockHeader {
     pub last_block: bool,
     /// Influences the meaning of `block_size`.
     pub block_type: BlockType,
-    /// - For `Raw` blocks, this is the size of the block's
-    ///   content in bytes.
-    /// - For `RLE` blocks, there will be a single byte follwing
-    ///   the header, repeated `block_size` times.
-    /// - For `Compressed` blocks, this is the length of
-    ///   the compressed data.
+    /// - For `Raw` blocks, this is the size of the block's content in bytes.
+    /// - For `RLE` blocks, there will be a single byte follwing the header, repeated `block_size`
+    ///   times.
+    /// - For `Compressed` blocks, this is the length of the compressed data.
     ///
     /// **This value must not be greater than 21 bits in length.**
     pub block_size: u32,
@@ -47,15 +46,16 @@ impl BlockHeader {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::BlockHeader;
     use crate::{blocks::block::BlockType, decoding::block_decoder};
-    use alloc::vec::Vec;
 
     #[test]
     fn block_header_serialize() {
         let header = BlockHeader {
             last_block: true,
-            block_type: super::BlockType::Compressed,
+            block_type: BlockType::Compressed,
             block_size: 69,
         };
         let mut serialized_header = Vec::new();

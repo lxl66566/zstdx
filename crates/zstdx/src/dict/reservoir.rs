@@ -1,8 +1,10 @@
-use super::cover::K;
 use alloc::vec::Vec;
 use core::f64::consts::E;
-use fastrand;
 use std::{io, vec};
+
+use fastrand;
+
+use super::cover::K;
 
 /// Creates a representative sample of `input` of `size` bytes.
 pub fn create_sample<R: io::Read>(input: &mut R, size: usize) -> Vec<u8> {
@@ -95,7 +97,7 @@ impl Reservoir {
             } else {
                 // Drop the next chunk
                 num_bytes_read = source.read(&mut dumpster).unwrap() as u64;
-                //source.seek_relative(self.k.into()).unwrap();
+                // source.seek_relative(self.k.into()).unwrap();
             }
             if num_bytes_read == 0 {
                 break;
@@ -109,8 +111,9 @@ impl Reservoir {
 
 #[cfg(test)]
 mod tests {
-    use super::Reservoir;
     use alloc::vec;
+
+    use super::Reservoir;
 
     #[test]
     fn initial_fill() {

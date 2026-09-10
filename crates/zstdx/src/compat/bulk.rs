@@ -1,9 +1,9 @@
 //! Buffer-to-buffer compression mirroring `zstd::bulk`.
 
+use std::{io, vec::Vec};
+
 use super::map_level;
 use crate::decoding::frame::read_frame_header;
-use std::io;
-use std::vec::Vec;
 
 /// Compresses a single block of data to a Vec.
 pub fn compress(data: &[u8], level: i32) -> io::Result<Vec<u8>> {

@@ -14,9 +14,11 @@
 
 use alloc::vec::Vec;
 
-use super::match_generator::{push_seq_packed, HASH_READ};
-use super::seq_codes::{encode_literal_length, encode_match_len};
-use super::SeqWord;
+use super::{
+    SeqWord,
+    match_generator::{HASH_READ, push_seq_packed},
+    seq_codes::{encode_literal_length, encode_match_len},
+};
 use crate::decoding::sequence_execution::do_offset_history;
 
 /// Prices are fixed-point with 1/256-bit resolution (BITCOST_ACCURACY = 8).
@@ -165,7 +167,11 @@ const BASE_OFF_FREQS: [u32; 32] = [
 fn downscale_stats(table: &mut [u32], shift: u32, base1: bool) -> u32 {
     let mut sum = 0;
     for stat in table.iter_mut() {
-        let base = if base1 { 1 } else { (*stat > 0) as u32 };
+        let base = if base1 {
+            1
+        } else {
+            (*stat > 0) as u32
+        };
         *stat = base + (*stat >> shift);
         sum += *stat;
     }
@@ -347,7 +353,7 @@ fn hash4_at(win: &[u8], idx: usize, log: u32) -> usize {
 #[inline(always)]
 fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
     debug_assert!((1..64).contains(&log));
-    let v = read8(win, idx) & 0xFF_FFFF_FFFF;
+    let v = read8(win, idx) & 0xff_ffff_ffff;
     (((v << 24).wrapping_mul(889523592379)) >> (64 - log)) as usize
 }
 
@@ -483,7 +489,7 @@ impl Finder<'_, '_> {
                     *smaller = self.tag | ca;
                     common_smaller = ml;
                     if ca <= bt_low {
-                        smaller = &mut dummy;
+                        smaller = &raw mut dummy;
                         break;
                     }
                     let node = 2 * (ca as usize & self.bt_mask);
@@ -493,7 +499,7 @@ impl Finder<'_, '_> {
                     *larger = self.tag | ca;
                     common_larger = ml;
                     if ca <= bt_low {
-                        larger = &mut dummy;
+                        larger = &raw mut dummy;
                         break;
                     }
                     let node = 2 * (ca as usize & self.bt_mask);
@@ -605,23 +611,25 @@ impl Finder<'_, '_> {
         }
 
         // Small-match table (Ultra's min_match == 3 only).
-        if self.min_match == 3 && best_len < 3 && !self.hash3.is_empty() {
-            if let Some(cand_abs) = self.find_hash3(idx, next_update3) {
-                if cand_abs >= floor && pos - cand_abs < (1 << 18) {
-                    let cand = (cand_abs - self.win_base) as usize;
-                    let mlen = count_from(self.win, idx, cand, 0, self.block_end_idx);
-                    if mlen >= 3 {
-                        matches[mnum] = Match {
-                            off: (pos - cand_abs + 3) as u32,
-                            len: mlen as u32,
-                        };
-                        mnum += 1;
-                        best_len = mlen;
-                        if mlen > self.sufficient_len || idx + mlen >= self.block_end_idx {
-                            *self.next_update = pos + 1;
-                            return mnum;
-                        }
-                    }
+        if self.min_match == 3
+            && best_len < 3
+            && !self.hash3.is_empty()
+            && let Some(cand_abs) = self.find_hash3(idx, next_update3)
+            && cand_abs >= floor
+            && pos - cand_abs < (1 << 18)
+        {
+            let cand = (cand_abs - self.win_base) as usize;
+            let mlen = count_from(self.win, idx, cand, 0, self.block_end_idx);
+            if mlen >= 3 {
+                matches[mnum] = Match {
+                    off: (pos - cand_abs + 3) as u32,
+                    len: mlen as u32,
+                };
+                mnum += 1;
+                best_len = mlen;
+                if mlen > self.sufficient_len || idx + mlen >= self.block_end_idx {
+                    *self.next_update = pos + 1;
+                    return mnum;
                 }
             }
         }
@@ -669,7 +677,7 @@ impl Finder<'_, '_> {
                     *smaller = self.tag | ca;
                     common_smaller = ml;
                     if ca <= bt_low {
-                        smaller = &mut dummy;
+                        smaller = &raw mut dummy;
                         break;
                     }
                     let node = 2 * (ca as usize & self.bt_mask);
@@ -679,7 +687,7 @@ impl Finder<'_, '_> {
                     *larger = self.tag | ca;
                     common_larger = ml;
                     if ca <= bt_low {
-                        larger = &mut dummy;
+                        larger = &raw mut dummy;
                         break;
                     }
                     let node = 2 * (ca as usize & self.bt_mask);
@@ -749,7 +757,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         // Drop the pass-1 tree (libzstd rewinds its window limits instead; the
         // epoch tag achieves the same invalidation for free).
         *epoch += 1;
-        if *epoch > 0xFFFF {
+        if *epoch > 0xffff {
             table.fill(EMPTY);
             bt.fill(EMPTY);
             hash3.fill(EMPTY);
@@ -781,6 +789,9 @@ pub(crate) fn run_block<const ULTRA: bool>(
 /// The caller guarantees the tables match the knobs' logs, the window covers
 /// `[win_base, block_end]`, and `bt.len() >= 2`.
 #[allow(clippy::too_many_arguments)]
+// One parse/match/emit pass over a dozen pieces of shared state; splitting
+// it would thread that state through every helper signature.
+#[allow(clippy::too_many_lines)]
 fn run_once<const ULTRA: bool>(
     knobs: &OptKnobs,
     win: &[u8],
@@ -1051,7 +1062,7 @@ fn run_once<const ULTRA: bool>(
         }
 
         // ---- shortest path (libzstd's _shortestPath) ----
-        debug_assert!(opt[0].mlen == 0);
+        debug_assert_eq!(opt[0].mlen, 0);
         debug_assert!(last_pos >= last_stretch.mlen as usize);
         debug_assert_eq!(cur, last_pos - last_stretch.mlen as usize);
         if last_stretch.mlen == 0 {

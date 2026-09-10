@@ -19,7 +19,7 @@ pub fn run(args: &Args) {
     std::io::Read::read_to_end(&mut dec, &mut clean).unwrap();
     let raw_len = clean.len();
 
-    let mut rng: u64 = 0x9E3779B97F4A7C15;
+    let mut rng: u64 = 0x9e3779b97f4a7c15;
     let mut next = move || {
         rng ^= rng << 13;
         rng ^= rng >> 7;

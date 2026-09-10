@@ -199,8 +199,8 @@ pub(crate) fn encode_offset(len: u32) -> (u8, u32, usize) {
 /// per-field widths are stored.
 #[inline]
 pub(crate) fn decode_packed(packed: u32, add: u64) -> (u32, u32, u32) {
-    let ll_code = (packed & 0xFF) as usize;
-    let ml_code = ((packed >> 8) & 0xFF) as usize;
+    let ll_code = (packed & 0xff) as usize;
+    let ml_code = ((packed >> 8) & 0xff) as usize;
     let of_code = (packed >> 16) as usize;
     let ll_nb = LL_META[ll_code].1 as u64;
     let ml_nb = ML_META[ml_code].1 as u64;
@@ -212,8 +212,9 @@ pub(crate) fn decode_packed(packed: u32, add: u64) -> (u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::vec::Vec;
+
+    use super::*;
 
     /// decode_packed must invert the three encoders for every encodable
     /// value; the add payload layout is what the reconstruction relies on.

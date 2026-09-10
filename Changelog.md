@@ -4,6 +4,24 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Toolchain hygiene pass: root-level `clippy.toml` (msrv 1.89, complexity and
+  line-width thresholds), nightly `rustfmt.toml` (crate-granularity import
+  merging, `StdExternalCrate` grouping, comment wrapping) and `.tombi.toml`
+  (TOML alignment). Workspace-level `[workspace.lints]` turn on clippy `all` +
+  `pedantic` for every member crate via `[lints] workspace = true`
+  (`zstdx-fuzz` duplicates them inline - separate workspace); the cast family,
+  `inline_always`, `unreadable_literal`, `must_use_candidate` /
+  `return_self_not_must_use`, `missing_safety_doc` and `similar_names` are
+  allowed explicitly as codec-inherent noise. The whole tree is now clippy-
+  and rustfmt-clean (~2400 findings fixed or allowed), and the stricter lints
+  surfaced real bugs: edition-2018 `assert!`/`panic!` messages whose `{var}`
+  placeholders printed literally (7 sites - fixed with explicit args and
+  rendered moot by the edition bump), a dead `State::last_index` field, a
+  duplicated `#[test]`, and a broken unused-format-string panic. All crates
+  move to edition 2024; rust-version goes 1.87 -> 1.89 for the stabilized
+  AVX-512 intrinsics, `unsafe fn` bodies now carry explicit `unsafe` blocks,
+  and the bench harness's `env::set_var` call is annotated.
+
 * `decoding::StreamingDecoder` decodes concatenated frames and skips
   skippable frames transparently, matching `FrameDecoder::decode_all` and the
   reference decoders (libzstd and the zstd crate were probed as the oracle on

@@ -5,11 +5,13 @@
 //! omitted (the derive's no_std mode) exactly like the hand-written cfg gates
 //! they replaced.
 
-use crate::bit_io::GetBitsError;
-use crate::blocks::block::BlockType;
-use crate::blocks::literals_section::LiteralsSectionType;
-use crate::io::Error;
 use alloc::vec::Vec;
+
+use crate::{
+    bit_io::GetBitsError,
+    blocks::{block::BlockType, literals_section::LiteralsSectionType},
+    io::Error,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -104,7 +106,10 @@ pub enum BlockHeaderReadError {
 pub enum DecompressBlockError {
     #[error("Error while reading the block content: {0}")]
     BlockContentReadError(#[from] Error),
-    #[error("Malformed section header. Says literals would be this long: {expected_len} but there are only {remaining_bytes} bytes left")]
+    #[error(
+        "Malformed section header. Says literals would be this long: {expected_len} but there are \
+         only {remaining_bytes} bytes left"
+    )]
     MalformedSectionHeader {
         expected_len: usize,
         remaining_bytes: usize,
@@ -126,7 +131,10 @@ pub enum DecompressBlockError {
 pub enum DecodeBlockContentError {
     #[error("Can't decode next block if failed along the way. Results will be nonsense")]
     DecoderStateIsFailed,
-    #[error("Can't decode next block body, while expecting to decode the header of the previous block. Results will be nonsense")]
+    #[error(
+        "Can't decode next block body, while expecting to decode the header of the previous \
+         block. Results will be nonsense"
+    )]
     ExpectedHeaderOfPreviousBlock,
     #[error("Error while reading bytes for {step}: {source}")]
     ReadError { step: BlockType, source: Error },
@@ -186,7 +194,10 @@ pub enum FrameDecoderError {
     FailedToSkipFrame,
     #[error("Target must have at least as many bytes as the contentsize of the frame reports")]
     TargetTooSmall,
-    #[error("Frame header specified dictionary id 0x{dict_id:X} that wasnt provided by add_dict() or reset_with_dict()")]
+    #[error(
+        "Frame header specified dictionary id 0x{dict_id:X} that wasnt provided by add_dict() or \
+         reset_with_dict()"
+    )]
     DictNotProvided { dict_id: u32 },
 }
 
@@ -197,7 +208,10 @@ pub enum DecompressLiteralsError {
         "compressed size was none even though it must be set to something for compressed literals"
     )]
     MissingCompressedSize,
-    #[error("num_streams was none even though it must be set to something (1 or 4) for compressed literals")]
+    #[error(
+        "num_streams was none even though it must be set to something (1 or 4) for compressed \
+         literals"
+    )]
     MissingNumStreams,
     #[error("{0:?}")]
     GetBitsError(#[from] GetBitsError),
@@ -211,7 +225,10 @@ pub enum DecompressLiteralsError {
     MissingBytesForJumpHeader { got: usize },
     #[error("Need at least {needed} bytes to decode literals. Have: {got} bytes")]
     MissingBytesForLiterals { got: usize, needed: usize },
-    #[error("Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption")]
+    #[error(
+        "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} \
+         bits. Probably caused by data corruption"
+    )]
     ExtraPadding { skipped_bits: i32 },
     #[error("Bitstream was read till: {read_til}, should have been: {expected}")]
     BitstreamReadMismatch { read_til: isize, expected: isize },
@@ -242,7 +259,10 @@ pub enum DecodeSequenceError {
     FSEDecoderError(#[from] FSEDecoderError),
     #[error("{0:?}")]
     FSETableError(#[from] FSETableError),
-    #[error("Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption")]
+    #[error(
+        "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} \
+         bits. Probably caused by data corruption"
+    )]
     ExtraPadding { skipped_bits: i32 },
     #[error("Do not support offsets bigger than 1<<32; got: {offset_code}")]
     UnsupportedOffset { offset_code: u8 },
@@ -300,7 +320,10 @@ pub enum FSETableError {
     AccLogTooBig { got: u8, max: u8 },
     #[error("{0:?}")]
     GetBitsError(#[from] GetBitsError),
-    #[error("The counter ({got}) exceeded the expected sum: {expected_sum}. This means an error or corrupted data \n {symbol_probabilities:?}")]
+    #[error(
+        "The counter ({got}) exceeded the expected sum: {expected_sum}. This means an error or \
+         corrupted data \n {symbol_probabilities:?}"
+    )]
     ProbabilityCounterMismatch {
         got: u32,
         expected_sum: u32,
@@ -330,12 +353,18 @@ pub enum HuffmanTableError {
     FSETableError(#[from] FSETableError),
     #[error("Source needs to have at least one byte")]
     SourceIsEmpty,
-    #[error("Header says there should be {expected_bytes} bytes for the weights but there are only {got_bytes} bytes in the stream")]
+    #[error(
+        "Header says there should be {expected_bytes} bytes for the weights but there are only \
+         {got_bytes} bytes in the stream"
+    )]
     NotEnoughBytesForWeights {
         got_bytes: usize,
         expected_bytes: u8,
     },
-    #[error("Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption")]
+    #[error(
+        "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} \
+         bits. Probably caused by data corruption"
+    )]
     ExtraPadding { skipped_bits: i32 },
     #[error("More than 255 weights decoded (got {got} weights). Stream is probably corrupted")]
     TooManyWeights { got: usize },
@@ -345,7 +374,10 @@ pub enum HuffmanTableError {
     LeftoverIsNotAPowerOf2 { got: u32 },
     #[error("Not enough bytes in stream to decompress weights. Is: {have}, Should be: {need}")]
     NotEnoughBytesToDecompressWeights { have: usize, need: usize },
-    #[error("FSE table used more bytes: {used} than were meant to be used for the whole stream of huffman weights ({available_bytes})")]
+    #[error(
+        "FSE table used more bytes: {used} than were meant to be used for the whole stream of \
+         huffman weights ({available_bytes})"
+    )]
     FSETableUsedTooManyBytes { used: usize, available_bytes: u8 },
     #[error("Source needs to have at least {need} bytes, got: {got}")]
     NotEnoughBytesInSource { got: usize, need: usize },

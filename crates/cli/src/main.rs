@@ -1,20 +1,17 @@
 extern crate zstdx;
 mod progress;
-use progress::ProgressMonitor;
-
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-use std::path::PathBuf;
-
-use progress::fmt_size;
+use std::{
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+};
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{ContextCompat, WrapErr};
+use progress::{ProgressMonitor, fmt_size};
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zstdx::Level;
 
 #[derive(Parser)]
@@ -84,7 +81,7 @@ fn main() -> color_eyre::Result<()> {
         } => {
             let output_file = output_file.unwrap_or_else(|| add_extension(&input_file, ".zst"));
             compress(input_file, output_file, level)?;
-        }
+        },
         Commands::Decompress {
             input_file,
             output_file,
@@ -96,14 +93,14 @@ fn main() -> color_eyre::Result<()> {
                     .into(),
             );
             decompress(input_file, output_file)?;
-        }
+        },
     }
     Ok(())
 }
 
 fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: zstdx::Level = match level {
+    let compression_level: Level = match level {
         0 => Level::Uncompressed,
         // Numeric levels map onto the nearest implemented strategy tier.
         _ => Level::approximate_zstd(level as i32),

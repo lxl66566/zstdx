@@ -1,8 +1,10 @@
 //! Streaming types mirroring `zstd::stream` (read/write submodules and the
 //! one-shot functions).
 
-use std::io::{self, Read as _};
-use std::vec::Vec;
+use std::{
+    io::{self, Read as _},
+    vec::Vec,
+};
 
 use super::map_level;
 use crate::{DecoderOptions, EncoderOptions};
@@ -45,14 +47,13 @@ impl<W: io::Write> EncoderState<W> {
     }
 
     fn do_finish(&mut self) -> io::Result<()> {
-        match &mut self.encoder {
-            Some(encoder) => encoder.do_finish().map_err(io::Error::from),
-            None => {
-                // empty stream: finish a never-started encoder to emit the
-                // empty frame
-                let encoder = self.materialize()?;
-                encoder.do_finish().map_err(io::Error::from)
-            }
+        if let Some(encoder) = &mut self.encoder {
+            encoder.do_finish().map_err(io::Error::from)
+        } else {
+            // empty stream: finish a never-started encoder to emit the
+            // empty frame
+            let encoder = self.materialize()?;
+            encoder.do_finish().map_err(io::Error::from)
         }
     }
 
@@ -76,7 +77,7 @@ pub mod write {
     /// Infallible in practice (kept `io::Result` for source compatibility);
     /// parameters must be set before the first write.
     pub struct Encoder<W: io::Write> {
-        state: super::EncoderState<W>,
+        state: EncoderState<W>,
     }
 
     impl<W: io::Write> Encoder<W> {
@@ -84,7 +85,7 @@ pub mod write {
         /// value compresses with the fast strategy.
         pub fn new(writer: W, level: i32) -> io::Result<Self> {
             Ok(Self {
-                state: super::EncoderState::new(writer, level),
+                state: EncoderState::new(writer, level),
             })
         }
 
@@ -146,6 +147,9 @@ pub mod write {
         }
 
         /// Finishes the stream, handing back the encoder on failure.
+        // the Err variant hands the encoder back to the caller; boxing it would
+        // deviate from the mirrored zstd-crate signature
+        #[allow(clippy::result_large_err)]
         pub fn try_finish(mut self) -> Result<W, (Self, io::Error)> {
             match self.do_finish() {
                 Ok(()) => Ok(self.state.take_writer()),

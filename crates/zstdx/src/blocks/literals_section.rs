@@ -1,23 +1,24 @@
 //! Utilities and representations for the first half of a block, the literals section.
 //! It contains data that is then copied from by the sequences section.
-use crate::bit_io::BitReader;
-use crate::decoding::errors::LiteralsSectionParseError;
+use crate::{bit_io::BitReader, decoding::errors::LiteralsSectionParseError};
 
 /// A compressed block consists of two sections, a literals section, and a sequences section.
 ///
-/// This is the first of those two sections. A literal is just any arbitrary data, and it is copied by the sequences section
+/// This is the first of those two sections. A literal is just any arbitrary data, and it is copied
+/// by the sequences section
 pub struct LiteralsSection {
     /// - If this block is of type [LiteralsSectionType::Raw], then the data is `regenerated_bytes`
     ///   bytes long, and it contains the raw literals data to be used during the second section,
     ///   the sequences section.
-    /// - If this block is of type [LiteralsSectionType::RLE],
-    ///   then the literal consists of a single byte repeated `regenerated_size` times.
-    /// - For types [LiteralsSectionType::Compressed] or [LiteralsSectionType::Treeless],
-    ///   then this is the size of the decompressed data.
+    /// - If this block is of type [LiteralsSectionType::RLE], then the literal consists of a
+    ///   single byte repeated `regenerated_size` times.
+    /// - For types [LiteralsSectionType::Compressed] or [LiteralsSectionType::Treeless], then this
+    ///   is the size of the decompressed data.
     pub regenerated_size: u32,
-    /// - For types [LiteralsSectionType::Raw] and [LiteralsSectionType::RLE], this value is not present.
-    /// - For types [LiteralsSectionType::Compressed] and [LiteralsSectionType::Treeless], this value will
-    ///   be set to the size of the compressed data.
+    /// - For types [LiteralsSectionType::Raw] and [LiteralsSectionType::RLE], this value is not
+    ///   present.
+    /// - For types [LiteralsSectionType::Compressed] and [LiteralsSectionType::Treeless], this
+    ///   value will be set to the size of the compressed data.
     pub compressed_size: Option<u32>,
     /// This value will be either 1 stream or 4 streams if the literal is of type
     /// [LiteralsSectionType::Compressed] or [LiteralsSectionType::Treeless], and it
@@ -63,7 +64,7 @@ impl LiteralsSection {
     }
 
     /// Given the first byte of a header, determine the size of the whole header, from 1 to 5 bytes.
-    pub fn header_bytes_needed(&self, first_byte: u8) -> Result<u8, LiteralsSectionParseError> {
+    pub fn header_bytes_needed(first_byte: u8) -> Result<u8, LiteralsSectionParseError> {
         let ls_type: LiteralsSectionType = Self::section_type(first_byte)?;
         let size_format = (first_byte >> 2) & 0x3;
         match ls_type {
@@ -73,43 +74,43 @@ impl LiteralsSection {
                         // size_format actually only uses one bit
                         // regenerated_size uses 5 bits
                         Ok(1)
-                    }
+                    },
                     1 => {
                         // size_format uses 2 bit
                         // regenerated_size uses 12 bits
                         Ok(2)
-                    }
+                    },
                     3 => {
                         // size_format uses 2 bit
                         // regenerated_size uses 20 bits
                         Ok(3)
-                    }
+                    },
                     _ => panic!(
                         "This is a bug in the program. There should only be values between 0..3"
                     ),
                 }
-            }
+            },
             LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
                 match size_format {
                     0 | 1 => {
                         // Only differ in num_streams
                         // both regenerated and compressed sizes use 10 bit
                         Ok(3)
-                    }
+                    },
                     2 => {
                         // both regenerated and compressed sizes use 14 bit
                         Ok(4)
-                    }
+                    },
                     3 => {
                         // both regenerated and compressed sizes use 18 bit
                         Ok(5)
-                    }
+                    },
 
                     _ => panic!(
                         "This is a bug in the program. There should only be values between 0..3"
                     ),
                 }
-            }
+            },
         }
     }
 
@@ -120,7 +121,7 @@ impl LiteralsSection {
         self.ls_type = Self::section_type(block_type)?;
         let size_format = br.get_bits(2)? as u8;
 
-        let byte_needed = self.header_bytes_needed(raw[0])?;
+        let byte_needed = Self::header_bytes_needed(raw[0])?;
         if raw.len() < byte_needed as usize {
             return Err(LiteralsSectionParseError::NotEnoughBytes {
                 have: raw.len(),
@@ -137,13 +138,13 @@ impl LiteralsSection {
                         // regenerated_size uses 5 bits
                         self.regenerated_size = u32::from(raw[0]) >> 3;
                         Ok(1)
-                    }
+                    },
                     1 => {
                         // size_format uses 2 bit
                         // regenerated_size uses 12 bits
                         self.regenerated_size = (u32::from(raw[0]) >> 4) + (u32::from(raw[1]) << 4);
                         Ok(2)
-                    }
+                    },
                     3 => {
                         // size_format uses 2 bit
                         // regenerated_size uses 20 bits
@@ -151,24 +152,24 @@ impl LiteralsSection {
                             + (u32::from(raw[1]) << 4)
                             + (u32::from(raw[2]) << 12);
                         Ok(3)
-                    }
+                    },
                     _ => panic!(
                         "This is a bug in the program. There should only be values between 0..3"
                     ),
                 }
-            }
+            },
             LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
                 match size_format {
                     0 => {
                         self.num_streams = Some(1);
-                    }
+                    },
                     1..=3 => {
                         self.num_streams = Some(4);
-                    }
+                    },
                     _ => panic!(
                         "This is a bug in the program. There should only be values between 0..3"
                     ),
-                };
+                }
 
                 match size_format {
                     0 | 1 => {
@@ -183,7 +184,7 @@ impl LiteralsSection {
                         self.compressed_size =
                             Some(u32::from(raw[1] >> 6) + (u32::from(raw[2]) << 2));
                         Ok(3)
-                    }
+                    },
                     2 => {
                         // both regenerated and compressed sizes use 14 bit
 
@@ -196,14 +197,14 @@ impl LiteralsSection {
                         self.compressed_size =
                             Some((u32::from(raw[2]) >> 2) + (u32::from(raw[3]) << 6));
                         Ok(4)
-                    }
+                    },
                     3 => {
                         // both regenerated and compressed sizes use 18 bit
 
                         // 4 from first, full second, six from third byte
                         self.regenerated_size = (u32::from(raw[0]) >> 4)
                             + (u32::from(raw[1]) << 4)
-                            + ((u32::from(raw[2]) & 0x3F) << 12);
+                            + ((u32::from(raw[2]) & 0x3f) << 12);
 
                         // 2 from third, full fourth, full fifth byte
                         self.compressed_size = Some(
@@ -212,13 +213,13 @@ impl LiteralsSection {
                                 + (u32::from(raw[4]) << 10),
                         );
                         Ok(5)
-                    }
+                    },
 
                     _ => panic!(
                         "This is a bug in the program. There should only be values between 0..3"
                     ),
                 }
-            }
+            },
         }
     }
 

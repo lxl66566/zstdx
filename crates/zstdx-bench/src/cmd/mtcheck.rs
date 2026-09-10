@@ -3,8 +3,8 @@
 //! CLI output.
 
 use std::path::PathBuf;
-use zstdx::bulk::decompress_with;
-use zstdx::options::DecoderOptions;
+
+use zstdx::{bulk::decompress_with, options::DecoderOptions};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -18,7 +18,7 @@ pub struct Args {
 pub fn run(args: &Args) {
     let mut files: Vec<_> = std::fs::read_dir(&args.dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             p.extension()
@@ -45,11 +45,11 @@ pub fn run(args: &Args) {
                         println!("BAD  {name} t{workers}");
                         fail += 1;
                     }
-                }
+                },
                 Err(e) => {
                     println!("ERR  {} t{workers}: {e}", f.display());
                     fail += 1;
-                }
+                },
             }
         }
         println!("done {}", f.display());

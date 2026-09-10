@@ -4,9 +4,10 @@
 //! fast path (borrowed matcher window, blocks append straight into the
 //! output) and [`decompress`] uses the flat decode path.
 
-use crate::decoding::errors::FrameDecoderError;
-use crate::decoding::FrameDecoder;
-use crate::{Level, Result};
+use crate::{
+    Level, Result,
+    decoding::{FrameDecoder, errors::FrameDecoderError},
+};
 
 /// Compress `source` into a fresh zstd frame.
 ///
@@ -125,12 +126,12 @@ pub fn decompress_with(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
-    use alloc::vec;
-    use alloc::vec::Vec;
 
     fn shapes() -> Vec<Vec<u8>> {
-        let mut pseudo_random = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
         let mut rand = move || {
             pseudo_random ^= pseudo_random << 13;
             pseudo_random ^= pseudo_random >> 7;
@@ -142,7 +143,7 @@ mod tests {
             vec![1],
             vec![7u8; 5],
             vec![b'x'; 300 * 1024],
-            (0..130 * 1024).map(|_| (rand() & 0xFF) as u8).collect(),
+            (0..130 * 1024).map(|_| (rand() & 0xff) as u8).collect(),
             (0..900 * 1024).map(|i| (i % 61) as u8).collect(),
         ]
     }

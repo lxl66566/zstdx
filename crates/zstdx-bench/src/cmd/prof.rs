@@ -3,14 +3,16 @@
 //!
 //! Modes (the arguments after the mode mirror the old standalone tools):
 //! - `prof dec <file.zst> [iters=5]`: streaming decode with 64 KiB reads.
-//! - `prof enc <zstd-level> <iters> <file...>`: bulk encode; `RUZ_CKSUM`
-//!   in the environment switches to the checksummed bulk path.
-//! - `prof enc-stream <zstd-level> <iters> <file>`: streaming encode with
-//!   64 KiB writes.
+//! - `prof enc <zstd-level> <iters> <file...>`: bulk encode; `RUZ_CKSUM` in the environment
+//!   switches to the checksummed bulk path.
+//! - `prof enc-stream <zstd-level> <iters> <file>`: streaming encode with 64 KiB writes.
 
-use std::fs;
-use std::io::{Read as _, Write as _};
-use std::time::Instant;
+use std::{
+    fs,
+    io::{Read as _, Write as _},
+    time::Instant,
+};
+
 use zstdx::decoding::StreamingDecoder;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -45,7 +47,7 @@ fn num<T: std::str::FromStr>(args: &[String], i: usize, what: &str) -> T {
 
 fn run_dec(rest: &[String]) {
     let path = arg(rest, 0, "file");
-    let iters: u64 = rest.get(1).map(|s| s.parse().unwrap()).unwrap_or(5);
+    let iters: u64 = rest.get(1).map_or(5, |s| s.parse().unwrap());
     let compressed = fs::read(path).unwrap();
     let raw_len = {
         let mut d = StreamingDecoder::new(&compressed[..]).unwrap();
@@ -136,7 +138,7 @@ fn run_enc_stream(rest: &[String]) {
     );
 }
 
-pub fn run(args: Args) {
+pub fn run(args: &Args) {
     match args.mode {
         ProfMode::Dec => run_dec(&args.rest),
         ProfMode::Enc => run_enc(&args.rest),

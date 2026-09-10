@@ -73,9 +73,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         Self::encode_stream(self.table, self.writer, src4);
 
         // Sanity check, if this doesn't hold we produce a broken stream
-        assert!(size1 <= u16::MAX as usize);
-        assert!(size2 <= u16::MAX as usize);
-        assert!(size3 <= u16::MAX as usize);
+        assert!(u16::try_from(size1).is_ok());
+        assert!(u16::try_from(size2).is_ok());
+        assert!(u16::try_from(size3).is_ok());
 
         // Update the jumptable with the real sizes
         self.writer.change_bits(size_idx, size1 as u16, 16);
@@ -104,15 +104,19 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     pub(super) fn weights(&self) -> Vec<u8> {
         let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        let weights = self
-            .table
+
+        self.table
             .codes
             .iter()
             .copied()
-            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>();
-
-        weights
+            .map(|(_, nb)| {
+                if nb == 0 {
+                    0
+                } else {
+                    max - nb + 1
+                }
+            })
+            .collect::<Vec<u8>>()
     }
 
     fn write_table(&mut self) {
@@ -133,9 +137,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             self.writer.change_bits(size_idx, encoded_len as u8, 8);
         } else {
             self.writer.write_bits(weights.len() as u8 + 127, 8);
-            let pairs = weights.chunks_exact(2);
-            let remainder = pairs.remainder();
-            for pair in pairs.into_iter() {
+            let (pairs, remainder) = weights.as_chunks::<2>();
+            for pair in pairs {
                 let weight1 = pair[0];
                 let weight2 = pair[1];
                 assert!(weight1 < 16);
@@ -154,7 +157,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
 #[derive(Clone)]
 pub struct HuffmanTable {
-    /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
+    /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount
+    /// of bits in the u8
     codes: Vec<(u32, u8)>,
     /// Same codes packed as `(code << 4) | num_bits` so the encoding loop
     /// loads one u16 instead of an 8-byte tuple (the table stays fully
@@ -169,6 +173,8 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    // Only the round-trip helpers (huff0::round_trip*) need raw-count tables.
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
         let mut max = 0;
@@ -189,17 +195,23 @@ impl HuffmanTable {
         let max_len = lengths.iter().copied().max().unwrap_or(1);
         let weights: Vec<usize> = lengths
             .iter()
-            .map(|&len| if len == 0 { 0 } else { max_len - len + 1 })
+            .map(|&len| {
+                if len == 0 {
+                    0
+                } else {
+                    max_len - len + 1
+                }
+            })
             .collect();
         Self::build_from_weights(&weights)
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
-        let mut sorted = Vec::with_capacity(weights.len());
         struct SortEntry {
             symbol: u8,
             weight: usize,
         }
+        let mut sorted = Vec::with_capacity(weights.len());
 
         // TODO this doesn't need to be a temporary Vec, it could be done in a [_; 264]
         // only non-zero weights are interesting here
@@ -229,9 +241,7 @@ impl HuffmanTable {
 
         // Determine the number of bits needed for codes with the lowest weight
         let weight_sum = sorted.iter().map(|e| 1 << (e.weight - 1)).sum::<usize>();
-        if !weight_sum.is_power_of_two() {
-            panic!("This is an internal error");
-        }
+        assert!(weight_sum.is_power_of_two(), "This is an internal error");
         let max_num_bits = highest_bit_set(weight_sum) - 1; // this is a log_2 of a clean power of two
 
         // Starting at the symbols with the lowest weight we update the placeholders in the table
@@ -241,10 +251,11 @@ impl HuffmanTable {
         let mut uniform_nb = 0u8;
         let mut seen_first = false;
         let mut all_same = true;
-        for entry in sorted.iter() {
+        for entry in &sorted {
             // If the entry isn't the same weight as the last one we need to change a few things
             if current_weight != entry.weight {
-                // The code shifts by the difference of the weights to allow for enough unique values
+                // The code shifts by the difference of the weights to allow for enough unique
+                // values
                 current_code >>= entry.weight - current_weight;
                 // Encoding a symbol of this weight will take less bits than the previous weight
                 current_num_bits = max_num_bits - entry.weight + 1;
@@ -257,7 +268,7 @@ impl HuffmanTable {
             uniform_nb = current_num_bits as u8;
             seen_first = true;
             table.codes[entry.symbol as usize] = (current_code as u32, current_num_bits as u8);
-            debug_assert!(current_num_bits <= 11 && current_code <= 0xFFF);
+            debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
             table.packed[entry.symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
             current_code += 1;
         }
@@ -397,7 +408,7 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
                 Node::Pkg(a, b) => {
                     next.push(a);
                     next.push(b);
-                }
+                },
             }
         }
         active = next;
@@ -405,7 +416,11 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
     debug_assert_eq!(
         lengths
             .iter()
-            .map(|&l| if l == 0 { 0 } else { 1usize << (max_len - l) })
+            .map(|&l| if l == 0 {
+                0
+            } else {
+                1usize << (max_len - l)
+            })
             .sum::<usize>(),
         1 << max_len,
         "package-merge lengths must be Kraft-exact"
@@ -422,7 +437,15 @@ fn package_merge_optimality() {
     let counts = [1, 1, 2, 3, 5, 8];
     let lengths = package_merge_lengths(&counts, 11);
     let cost: usize = counts.iter().zip(&lengths).map(|(c, l)| c * l).sum();
-    assert_eq!(cost, 1 * 5 + 1 * 5 + 2 * 4 + 3 * 3 + 5 * 2 + 8 * 1);
+    // hand-computed optimum: count * code_length per symbol
+    assert_eq!(
+        cost,
+        [1, 1, 2, 3, 5, 8]
+            .iter()
+            .zip([5, 5, 4, 3, 2, 1])
+            .map(|(c, l)| c * l)
+            .sum::<usize>()
+    );
     // Every alphabet size produces Kraft-exact, bounded lengths.
     for amount in 2..=256usize {
         let counts: Vec<usize> = (0..amount).map(|i| amount - i).collect();
@@ -430,7 +453,13 @@ fn package_merge_optimality() {
         assert!(lengths.iter().all(|&l| l <= 11));
         let kraft: usize = lengths
             .iter()
-            .map(|&l| if l == 0 { 0 } else { 1usize << (11 - l) })
+            .map(|&l| {
+                if l == 0 {
+                    0
+                } else {
+                    1usize << (11 - l)
+                }
+            })
             .sum();
         assert_eq!(kraft, 1 << 11);
     }
@@ -451,9 +480,8 @@ fn counts() {
         .collect();
     sorted.sort_by_key(|(c, _)| *c);
     for pair in sorted.windows(2) {
-        assert!(pair[1].1 <= pair[0].1, "{sorted:?}");
+        assert!(pair[1].1 <= pair[0].1, "sorted = {sorted:?}");
     }
-
     let counts = &[3, 0, 4, 0, 7, 2, 2, 2, 0, 2, 2, 1, 5];
     let table = HuffmanTable::build_from_counts(counts).codes;
 
@@ -468,7 +496,7 @@ fn counts() {
         .collect();
     sorted.sort_by_key(|(c, _)| *c);
     for pair in sorted.windows(2) {
-        assert!(pair[1].1 <= pair[0].1, "{sorted:?}");
+        assert!(pair[1].1 <= pair[0].1, "sorted = {sorted:?}");
     }
 }
 

@@ -1,17 +1,20 @@
-//! The [StreamingDecoder] wraps a [FrameDecoder] and provides a Read impl that decodes data when necessary
+//! The [StreamingDecoder] wraps a [FrameDecoder] and provides a Read impl that decodes data when
+//! necessary
 
 use core::borrow::BorrowMut;
 
-use crate::decoding::errors::FrameDecoderError;
-use crate::decoding::{frame_source, BlockDecodingStrategy, FrameDecoder};
 #[cfg(not(feature = "std"))]
 use crate::io::ErrorKind;
-use crate::io::{Error, Read};
+use crate::{
+    decoding::{BlockDecodingStrategy, FrameDecoder, errors::FrameDecoderError, frame_source},
+    io::{Error, Read},
+};
 
 /// High level Zstandard frame decoder that can be used to decompress a given Zstandard frame.
 ///
 /// This decoder implements `io::Read`, so you can interact with it by calling
-/// `io::Read::read_to_end` / `io::Read::read_exact` or passing this to another library / module as a source for the decoded content
+/// `io::Read::read_to_end` / `io::Read::read_exact` or passing this to another library / module as
+/// a source for the decoded content
 ///
 /// The stream may contain any number of concatenated frames, with skippable
 /// frames in between; they are decoded transparently, as the reference
@@ -27,8 +30,8 @@ use crate::io::{Error, Read};
 /// // `read_to_end` is not implemented by the no_std implementation.
 /// #[cfg(feature = "std")]
 /// {
-///     use std::fs::File;
-///     use std::io::Read;
+///     use std::{fs::File, io::Read};
+///
 ///     use zstdx::decoding::StreamingDecoder;
 ///
 ///     // Read a Zstandard archive from the filesystem then decompress it into a vec.
@@ -136,7 +139,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             }
             let collectible_before = decoder.can_collect();
             match decoder.decode_blocks(&mut *source, BlockDecodingStrategy::UptoBlocks(1)) {
-                Ok(_) => { /*Nothing to do*/ }
+                Ok(_) => { /*Nothing to do*/ },
                 Err(e) => return Err(into_read_error(e)),
             }
             if decoder.can_collect() == collectible_before && collectible_before > 0 {

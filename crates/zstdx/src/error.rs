@@ -5,9 +5,12 @@
 //! the [`bulk`][crate::bulk] and [`stream`][crate::stream] entry points use,
 //! so `?` converts both frame corruption and io failures into one type.
 
-use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
-use crate::io;
 use core::fmt;
+
+use crate::{
+    decoding::errors::{DictionaryDecodeError, FrameDecoderError},
+    io,
+};
 
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 

@@ -6,8 +6,10 @@
 //! `--size` to one payload size so profilers attribute samples to a single
 //! code path.
 
-use crate::common::{apply_budget, black_box, measure_solo, want, Ab};
-use crate::corpus::{load_raw, Shape};
+use crate::{
+    common::{Ab, apply_budget, black_box, measure_solo, want},
+    corpus::{Shape, load_raw},
+};
 
 /// Zeros is skipped: RLE payloads say nothing about the small-call paths.
 const SMALL_SHAPES: [Shape; 4] = [Shape::Json, Shape::Text, Shape::Skewed, Shape::Random];
@@ -74,7 +76,7 @@ pub fn run(args: &Args) {
                         }
                     });
                     println!("{name:<16}{:>9}{:>9.0}", "", stats.mibs(bytes));
-                }
+                },
                 Some(Impl::Zstdx) => {
                     let stats = measure_solo(|| {
                         for _ in 0..batch {
@@ -82,7 +84,7 @@ pub fn run(args: &Args) {
                         }
                     });
                     println!("{name:<16}{:>9.0}{:>9}", stats.mibs(bytes), "");
-                }
+                },
                 None => {
                     let report = ab.measure(
                         || {
@@ -97,7 +99,7 @@ pub fn run(args: &Args) {
                         },
                     );
                     report.print(&name, bytes);
-                }
+                },
             }
         }
     }

@@ -1,15 +1,14 @@
 #[test]
 fn test_decode_corpus_files() {
     extern crate std;
-    use crate::decoding::BlockDecodingStrategy;
-    use crate::decoding::FrameDecoder;
-    use alloc::borrow::ToOwned;
-    use alloc::string::{String, ToString};
-    use alloc::vec::Vec;
-    use std::fs;
-    use std::io::BufReader;
-    use std::io::Read;
-    use std::println;
+    use alloc::{borrow::ToOwned, string::String, vec::Vec};
+    use std::{
+        fs,
+        io::{BufReader, Read},
+        println,
+    };
+
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let mut success_counter = 0;
     let mut fail_counter_diff = 0;
@@ -29,7 +28,7 @@ fn test_decode_corpus_files() {
     }
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -41,6 +40,8 @@ fn test_decode_corpus_files() {
         let file_size = metadata.len();
 
         let p = String::from(f.path().to_str().unwrap());
+        // corpus files are generated with a lowercase .zst suffix
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         if !p.ends_with(".zst") {
             continue;
         }
@@ -61,23 +62,23 @@ fn test_decode_corpus_files() {
         match frame_dec.get_checksum_from_data() {
             Some(chksum) => {
                 #[cfg(feature = "hash")]
-                if frame_dec.get_calculated_checksum().unwrap() != chksum {
+                if frame_dec.get_calculated_checksum().unwrap() == chksum {
+                    println!("Checksums are ok!\n");
+                } else {
                     println!(
                         "Checksum did not match! From data: {}, calculated while decoding: {}\n",
                         chksum,
                         frame_dec.get_calculated_checksum().unwrap()
                     );
                     fail_counter_chksum += 1;
-                    failed.push(p.clone().to_string());
-                } else {
-                    println!("Checksums are ok!\n");
+                    failed.push(p.clone());
                 }
                 #[cfg(not(feature = "hash"))]
                 println!(
                     "Checksum feature not enabled, skipping. From data: {}\n",
                     chksum
                 );
-            }
+            },
             None => println!("No checksums to test\n"),
         }
 
@@ -118,7 +119,7 @@ fn test_decode_corpus_files() {
         for idx in 0..min {
             if original[idx] != result[idx] {
                 counter += 1;
-                //println!(
+                // println!(
                 //    "Original {} not equal to result {} at byte: {}",
                 //    original[idx], result[idx], idx,
                 //);
@@ -134,13 +135,23 @@ fn test_decode_corpus_files() {
         if success {
             success_counter += 1;
         } else {
-            failed.push(p.clone().to_string());
+            failed.push(p.clone());
         }
         total_counter += 1;
 
         let dur = end_time.as_micros() as usize;
-        let speed = result.len() / if dur == 0 { 1 } else { dur };
-        let speed_read = file_size as usize / if dur == 0 { 1 } else { dur };
+        let speed = result.len()
+            / if dur == 0 {
+                1
+            } else {
+                dur
+            };
+        let speed_read = file_size as usize
+            / if dur == 0 {
+                1
+            } else {
+                dur
+            };
         println!("SPEED: {speed}");
         println!("SPEED_read: {speed_read}");
         speeds.push(speed);
@@ -151,7 +162,9 @@ fn test_decode_corpus_files() {
     println!("Summary:");
     println!("###################");
     println!(
-        "Total: {total_counter}, Success: {success_counter}, WrongSize: {fail_counter_size}, WrongBytecount: {fail_counter_bytes_read}, WrongChecksum: {fail_counter_chksum}, Diffs: {fail_counter_diff}"
+        "Total: {total_counter}, Success: {success_counter}, WrongSize: {fail_counter_size}, \
+         WrongBytecount: {fail_counter_bytes_read}, WrongChecksum: {fail_counter_chksum}, Diffs: \
+         {fail_counter_diff}"
     );
     println!("Failed files: ");
     for f in &failed {
@@ -185,5 +198,5 @@ fn test_decode_corpus_files() {
         );
     }
 
-    assert!(failed.is_empty());
+    assert!(failed.is_empty(), "failed files: {failed:?}");
 }

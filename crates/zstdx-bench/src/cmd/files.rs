@@ -7,11 +7,14 @@
 //! verified against it. Timing then loops in-place decodes into an
 //! exact-size buffer until the budget is spent.
 
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use zstdx::decoding::{FrameDecoder, errors::FrameDecoderError};
+
 use crate::common::{apply_budget, black_box, measure_solo};
-use std::fs;
-use std::path::{Path, PathBuf};
-use zstdx::decoding::errors::FrameDecoderError;
-use zstdx::decoding::FrameDecoder;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -33,7 +36,7 @@ fn decode_to_vec(fr: &mut FrameDecoder, compressed: &[u8]) -> Vec<u8> {
             Err(FrameDecoderError::TargetTooSmall) => {
                 step *= 2;
                 out.reserve(step);
-            }
+            },
             Err(e) => panic!("decode failed: {e}"),
         }
     }

@@ -14,23 +14,23 @@ pub(crate) mod util;
 
 pub(crate) mod frame_compressor;
 mod levels;
-pub use frame_compressor::compress_slice_opts;
-pub use frame_compressor::compress_slice_to_vec;
-pub use frame_compressor::FrameCompressor;
-pub use match_generator::MatchGeneratorDriver;
-
-pub(crate) use levels::compress_fastest;
-
-use crate::io::{Read, Write};
-use crate::Level;
 use alloc::vec::Vec;
 
+pub use frame_compressor::{FrameCompressor, compress_slice_opts, compress_slice_to_vec};
+pub(crate) use levels::compress_fastest;
+pub use match_generator::MatchGeneratorDriver;
 use seq_codes::pack_seq;
 
-/// Convenience function to compress some source into a target without reusing any resources of the compressor
+use crate::{
+    Level,
+    io::{Read, Write},
+};
+
+/// Convenience function to compress some source into a target without reusing any resources of the
+/// compressor
 /// ```rust
-/// use zstdx::{encoding::compress, Level};
-/// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
+/// use zstdx::{Level, encoding::compress};
+/// let data: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// let mut target = Vec::new();
 /// compress(data, &mut target, Level::Fastest);
 /// ```
@@ -41,10 +41,11 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: Level) {
     frame_enc.compress();
 }
 
-/// Convenience function to compress some source into a Vec without reusing any resources of the compressor
+/// Convenience function to compress some source into a Vec without reusing any resources of the
+/// compressor
 /// ```rust
-/// use zstdx::{encoding::compress_to_vec, Level};
-/// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
+/// use zstdx::{Level, encoding::compress_to_vec};
+/// let data: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// let compressed = compress_to_vec(data, Level::Fastest);
 /// ```
 pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
@@ -55,17 +56,17 @@ pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::{compress_slice_to_vec, compress_to_vec};
     use crate::Level;
-    use alloc::vec;
-    use alloc::vec::Vec;
 
     /// The slice path (borrowed matcher window, no staging) must produce the
     /// same bytes as the streaming path for every input shape: empty, tiny,
     /// block-boundary straddling, window-crossing, RLE and incompressible.
     #[test]
     fn slice_path_matches_stream_path() {
-        let mut pseudo_random = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
         let mut rand = move || {
             pseudo_random ^= pseudo_random << 13;
             pseudo_random ^= pseudo_random >> 7;
@@ -77,12 +78,9 @@ mod tests {
             vec![1],
             vec![7u8; 5],
             vec![b'x'; 300 * 1024],
-            (0..130 * 1024).map(|_| (rand() & 0xFF) as u8).collect(),
+            (0..130 * 1024).map(|_| (rand() & 0xff) as u8).collect(),
             (0..900 * 1024)
-                .flat_map(|i| {
-                    let pattern = [(i % 251) as u8, 7u8, 7, 7, (i % 13) as u8, 9];
-                    pattern
-                })
+                .flat_map(|i| [(i % 251) as u8, 7u8, 7, 7, (i % 13) as u8, 9])
                 .collect(),
         ];
         // Straddle block and window boundaries exactly.
@@ -124,23 +122,24 @@ pub struct EncodedSequence {
 /// replaces three parallel streams, so the matcher's emit path pays a
 /// single push per sequence.
 #[derive(Clone, Copy)]
-pub(crate) struct SeqWord {
+pub struct SeqWord {
     pub(crate) codes: u32,
     pub(crate) add: u64,
     pub(crate) add_nb: u8,
 }
 
-/// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
-/// making their own tradeoffs between runtime, memory usage and compression ratio
+/// Trait used by the encoder that users can use to extend the matching facilities with their own
+/// algorithm making their own tradeoffs between runtime, memory usage and compression ratio
 ///
-/// This trait operates on buffers that represent the chunks of data the matching algorithm wants to work on.
-/// Each one of these buffers is referred to as a *space*. One or more of these buffers represent the window
-/// the decoder will need to decode the data again.
+/// This trait operates on buffers that represent the chunks of data the matching algorithm wants to
+/// work on. Each one of these buffers is referred to as a *space*. One or more of these buffers
+/// represent the window the decoder will need to decode the data again.
 ///
-/// This library asks the Matcher for the writable tail of its window using `block_tail`, reads the next
-/// block of input into it and commits the filled byte count back with `commit_block`.
+/// This library asks the Matcher for the writable tail of its window using `block_tail`, reads the
+/// next block of input into it and commits the filled byte count back with `commit_block`.
 ///
-/// Then it will either call `start_matching` or, if the space is deemed not worth compressing, `skip_matching` is called.
+/// Then it will either call `start_matching` or, if the space is deemed not worth compressing,
+/// `skip_matching` is called.
 ///
 /// This is repeated until no more data is left to be compressed.
 pub trait Matcher {
@@ -155,7 +154,8 @@ pub trait Matcher {
     fn commit_block(&mut self, read: usize);
     /// Just process the data in the last commited space for future matching
     fn skip_matching(&mut self);
-    /// Process the data in the last commited space for future matching AND generate matches for the data
+    /// Process the data in the last commited space for future matching AND generate matches for the
+    /// data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Buffer-based variant of [`Matcher::start_matching`]: the block's
     /// literals accumulate in `literals` and each match appends one
@@ -185,7 +185,7 @@ pub trait Matcher {
                     ml: match_len as u32,
                     of: offset as u32,
                 });
-            }
+            },
         });
     }
     /// Packed variant of [`Matcher::start_matching_into`] and the block
@@ -204,7 +204,8 @@ pub trait Matcher {
     }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: Level);
-    /// The size of the window the decoder will need to execute all sequences produced by this matcher
+    /// The size of the window the decoder will need to execute all sequences produced by this
+    /// matcher
     ///
     /// May change after a call to reset with a different compression level
     fn window_size(&self) -> u64;

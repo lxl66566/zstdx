@@ -2,12 +2,17 @@
 //! re-initialization): peek the next frame's magic number, skip skippable
 //! frames, and replay the peeked bytes in front of the source.
 
-use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
-use crate::decoding::frame::is_skippable_magic;
-use crate::decoding::FrameDecoder;
-use crate::io::{Error, ErrorKind, Read};
+use crate::{
+    decoding::{
+        FrameDecoder,
+        errors::{FrameDecoderError, ReadFrameHeaderError},
+        frame::is_skippable_magic,
+    },
+    io::{Error, ErrorKind, Read},
+};
 
 /// Where the decoder stands when asking for the next frame.
+#[derive(Clone, Copy)]
 enum StreamPosition {
     /// No frame was decoded yet; an exhausted source is an error (an empty
     /// stream is not a stream of frames, as in the reference decoders).
@@ -104,14 +109,14 @@ impl<'a, R: Read> PrefixedReader<'a, R> {
                     return Err(FrameDecoderError::ReadFrameHeaderError(
                         ReadFrameHeaderError::MagicNumberReadError(eof_error()),
                     ))
-                }
+                },
                 Ok(n) => self.filled += n,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {},
                 Err(e) => {
                     return Err(FrameDecoderError::ReadFrameHeaderError(
                         ReadFrameHeaderError::MagicNumberReadError(e),
                     ))
-                }
+                },
             }
         }
         Ok(true)
@@ -153,13 +158,13 @@ impl<'a, R: Read> PrefixedReader<'a, R> {
                     return Err(FrameDecoderError::ReadFrameHeaderError(
                         ReadFrameHeaderError::MagicNumberReadError(eof_error()),
                     ))
-                }
+                },
                 Ok(n) => filled += n,
                 Err(e) => {
                     return Err(FrameDecoderError::ReadFrameHeaderError(
                         ReadFrameHeaderError::MagicNumberReadError(e),
                     ))
-                }
+                },
             }
         }
         Ok(())

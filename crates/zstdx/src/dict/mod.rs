@@ -9,27 +9,23 @@
 
 // The algorithm is summarized here
 // 1. The text is split into "epochs", or chunks from the original source
-// 2. From within each epoch, we select the "segment", or 1 KiB contiguous section
-//    that's predicted to be the best option to include in the dictionary. Concatenated,
-//    these segments form the dictionary.
+// 2. From within each epoch, we select the "segment", or 1 KiB contiguous section that's predicted
+//    to be the best option to include in the dictionary. Concatenated, these segments form the
+//    dictionary.
 //
 // This segment scoring algorithm operates as follows:
 // For a given epoch:
-//  - Run a reservoir sampler over the entire epoch, creating a
-//    reservoir of n/t, where `t` is the desired number of occurances
-//    we want the most common k-mers to have
-//  - Have the ability to estimate
-//    the frequency of a given k-mer: `f(w: k-mer)` calculates
-//    the frequency of w in the reservoir using a rolling karp-rabin hash
+//  - Run a reservoir sampler over the entire epoch, creating a reservoir of n/t, where `t` is the
+//    desired number of occurances we want the most common k-mers to have
+//  - Have the ability to estimate the frequency of a given k-mer: `f(w: k-mer)` calculates the
+//    frequency of w in the reservoir using a rolling karp-rabin hash
 //  - The score of a segment is the sum of `f(w)` called on every kmer within the segment
 mod cover;
 mod frequency;
 mod reservoir;
 
-use crate::dict::reservoir::create_sample;
 use alloc::vec;
 use core::cmp::Reverse;
-use cover::*;
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
@@ -38,6 +34,10 @@ use std::{
     path::{Path, PathBuf},
     vec::Vec,
 };
+
+use cover::*;
+
+use crate::dict::reservoir::create_sample;
 
 /// A set of values that are used during dictionary construction.
 ///
@@ -49,8 +49,8 @@ pub(super) struct DictParams {
     /// As found under "4. Experiments - Varying Segment Size" in the original paper, a
     /// segment size of 2 kiB was effective.
     ///
-    /// "We explored a range of \[`segment_size`\] values and found the performance of LMC is insensitive
-    /// to \[`segment_size`\]. We fix \[`segment_size`\] to 2kiB
+    /// "We explored a range of \[`segment_size`\] values and found the performance of LMC is
+    /// insensitive to \[`segment_size`\]. We fix \[`segment_size`\] to 2kiB
     ///
     /// Reasonable range: [16, 2048+]
     pub segment_size: u32,
@@ -116,12 +116,12 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// The completed dictionary is written to `output`.
 ///
 /// - `source` will be used as training data for the entire dictionary.
-/// - `source_size` influences how the data is divided and sampled and is measured
-///   in bytes. While this does not need to be exact, estimates should attempt to be
-///   larger than the actual collection size.
+/// - `source_size` influences how the data is divided and sampled and is measured in bytes. While
+///   this does not need to be exact, estimates should attempt to be larger than the actual
+///   collection size.
 /// - `output` is where the completed dictionary will be written.
-/// - `dict_size` determines how large the complete dictionary should be. The completed
-///   dictionary will be this size or smaller.
+/// - `dict_size` determines how large the complete dictionary should be. The completed dictionary
+///   will be this size or smaller.
 ///
 /// This function uses `BufRead` internally, the provided reader need not be buffered.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
@@ -165,7 +165,7 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let (_, epoch_size) = compute_epoch_info(&params, dict_size, source_size / K);
     let num_epochs = source_size / epoch_size;
     vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
-    //let mut current_epoch = vec![0; epoch_size];
+    // let mut current_epoch = vec![0; epoch_size];
     let mut current_epoch = vec![0; 100];
     let mut epoch_counter = 0;
     let mut ctx = Context {

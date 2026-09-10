@@ -1,6 +1,9 @@
-use crate::bit_io::{BitReader, BitReaderReversed};
-use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
+
+use crate::{
+    bit_io::{BitReader, BitReaderReversed},
+    decoding::errors::{FSEDecoderError, FSETableError},
+};
 
 pub struct FSEDecoder<'table> {
     /// An FSE state value represents an index in the FSE table.
@@ -27,8 +30,9 @@ impl<'t> FSEDecoder<'t> {
         self.state.symbol
     }
 
-    /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
-    /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
+    /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be
+    /// called to read the first symbol and `update_state` can be called to prepare to read the
+    /// next symbol.
     pub fn init_state(&mut self, bits: &mut BitReaderReversed<'_>) -> Result<(), FSEDecoderError> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
@@ -47,7 +51,7 @@ impl<'t> FSEDecoder<'t> {
         let new_state = base_line + add as u32;
         self.state = self.table.decode[new_state as usize];
 
-        //println!("Update: {}, {} -> {}", base_line, add,  self.state);
+        // println!("Update: {}, {} -> {}", base_line, add,  self.state);
     }
 }
 
@@ -57,28 +61,29 @@ impl<'t> FSEDecoder<'t> {
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#fse-table-description>
 #[derive(Debug, Clone)]
 pub struct FSETable {
-    /// The maximum symbol in the table (inclusive). Limits the probabilities length to max_symbol + 1.
+    /// The maximum symbol in the table (inclusive). Limits the probabilities length to max_symbol
+    /// + 1.
     max_symbol: u8,
     /// The actual table containing the decoded symbol and the compression data
     /// connected to that symbol.
-    pub decode: Vec<Entry>, //used to decode symbols, and calculate the next state
+    pub decode: Vec<Entry>, // used to decode symbols, and calculate the next state
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
     /// This value is used so that the decoder knows how many bits to read from the bitstream.
     pub accuracy_log: u8,
-    /// In this context, probability refers to the likelihood that a symbol occurs in the given data.
-    /// Given this info, the encoder can assign shorter codes to symbols that appear more often,
-    /// and longer codes that appear less often, then the decoder can use the probability
-    /// to determine what code was assigned to what symbol.
+    /// In this context, probability refers to the likelihood that a symbol occurs in the given
+    /// data. Given this info, the encoder can assign shorter codes to symbols that appear more
+    /// often, and longer codes that appear less often, then the decoder can use the
+    /// probability to determine what code was assigned to what symbol.
     ///
-    /// The probability of a single symbol is a value representing the proportion of times the symbol
-    /// would fall within the data.
+    /// The probability of a single symbol is a value representing the proportion of times the
+    /// symbol would fall within the data.
     ///
     /// If a symbol probability is set to `-1`, it means that the probability of a symbol
     /// occurring in the data is less than one.
-    pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
-    /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1) and so on
-    /// up until the highest possible symbol (255).
+    pub symbol_probabilities: Vec<i32>, // used while building the decode Vector
+    /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1)
+    /// and so on up until the highest possible symbol (255).
     symbol_counter: Vec<u32>,
     /// Per-symbol spread constants for the entry fill pass, parallel to
     /// `symbol_probabilities`. Only indices with a positive probability are
@@ -91,9 +96,11 @@ impl FSETable {
     pub fn new(max_symbol: u8) -> FSETable {
         FSETable {
             max_symbol,
-            symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
-            symbol_counter: Vec::with_capacity(256), //will never be more than 256 symbols because u8
-            decode: Vec::new(),                      //depending on acc_log.
+            symbol_probabilities: Vec::with_capacity(256), /* will never be more than 256 symbols
+                                                            * because u8 */
+            symbol_counter: Vec::with_capacity(256), /* will never be more than 256 symbols
+                                                      * because u8 */
+            decode: Vec::new(), // depending on acc_log.
             accuracy_log: 0,
             symbol_info: [SymbolSpreadInfo::DEFAULT; 256],
         }
@@ -158,19 +165,16 @@ impl FSETable {
         if self.decode.len() < table_size {
             self.decode.reserve(table_size - self.decode.len());
         }
-        //fill with dummy entries
-        self.decode.resize(
-            table_size,
-            Entry {
-                base_line: 0,
-                num_bits: 0,
-                symbol: 0,
-            },
-        );
+        // fill with dummy entries
+        self.decode.resize(table_size, Entry {
+            base_line: 0,
+            num_bits: 0,
+            symbol: 0,
+        });
 
         let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
 
-        //first scan for all -1 probabilities and place them at the top of the table
+        // first scan for all -1 probabilities and place them at the top of the table
         for symbol in 0..self.symbol_probabilities.len() {
             if self.symbol_probabilities[symbol] == -1 {
                 negative_idx -= 1;
@@ -181,7 +185,7 @@ impl FSETable {
             }
         }
 
-        //then place in a semi-random order all of the other symbols
+        // then place in a semi-random order all of the other symbols
         let mut position = 0;
         for idx in 0..self.symbol_probabilities.len() {
             let symbol = idx as u8;
@@ -189,7 +193,7 @@ impl FSETable {
                 continue;
             }
 
-            //for each probability point the symbol gets on slot
+            // for each probability point the symbol gets on slot
             let prob = self.symbol_probabilities[idx];
             for _ in 0..prob {
                 let entry = &mut self.decode[position];
@@ -198,7 +202,7 @@ impl FSETable {
                 position = next_position(position, table_size);
                 while position >= negative_idx {
                     position = next_position(position, table_size);
-                    //everything above negative_idx is already taken
+                    // everything above negative_idx is already taken
                 }
             }
         }
@@ -244,8 +248,9 @@ impl FSETable {
         Ok(())
     }
 
-    /// Read the accuracy log and the probability table from the source and return the number of bytes
-    /// read. If the size of the table is larger than the provided `max_log`, return an error.
+    /// Read the accuracy log and the probability table from the source and return the number of
+    /// bytes read. If the size of the table is larger than the provided `max_log`, return an
+    /// error.
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
         self.symbol_probabilities.clear(); //just clear, we will fill a probability for each entry anyways. No need to force new allocs here
 
@@ -282,7 +287,7 @@ impl FSETable {
             } else {
                 unchecked_value
             };
-            //println!("{}, {}, {}", self.symbol_probablilities.len(), unchecked_value, value);
+            // println!("{}, {}, {}", self.symbol_probablilities.len(), unchecked_value, value);
 
             let prob = (value as i32) - 1;
 
@@ -292,11 +297,11 @@ impl FSETable {
                     probability_counter += prob as u32;
                 } else {
                     // probability -1 counts as 1
-                    assert!(prob == -1);
+                    assert_eq!(prob, -1);
                     probability_counter += 1;
                 }
             } else {
-                //fast skip further zero probabilities
+                // fast skip further zero probabilities
                 loop {
                     let skip_amount = br.get_bits(2)? as usize;
 
@@ -353,7 +358,7 @@ fn highest_bit_set(x: u32) -> u32 {
     u32::BITS - x.leading_zeros()
 }
 
-//utility functions for building the decoding table from probabilities
+// utility functions for building the decoding table from probabilities
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
 fn next_position(mut p: usize, table_size: usize) -> usize {

@@ -1,14 +1,13 @@
 //! Structures that wrap around various decoders to make decoding easier.
 
-use super::super::blocks::sequence_section::Sequence;
-use super::decode_buffer::DecodeBuffer;
-use crate::decoding::dictionary::Dictionary;
-use crate::fse::FSETable;
-use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
 
-use crate::blocks::sequence_section::{
-    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
+use super::{super::blocks::sequence_section::Sequence, decode_buffer::DecodeBuffer};
+use crate::{
+    blocks::sequence_section::{MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE},
+    decoding::dictionary::Dictionary,
+    fse::FSETable,
+    huff0::HuffmanTable,
 };
 
 /// A block level decoding buffer.
@@ -103,6 +102,9 @@ impl Default for HuffmanScratch {
     }
 }
 
+// Deliberate design: the three FSE tables each track their own
+// predefined/RLE/ready/seq-valid state as plain flags.
+#[allow(clippy::struct_excessive_bools)]
 pub struct FSEScratch {
     pub offsets: FSETable,
     pub of_rle: Option<u8>,

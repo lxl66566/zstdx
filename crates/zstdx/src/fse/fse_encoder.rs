@@ -1,5 +1,6 @@
-use crate::bit_io::BitWriter;
 use alloc::vec::Vec;
+
+use crate::bit_io::BitWriter;
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
     pub(super) table: FSETable,
@@ -84,7 +85,8 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         }
 
         // Determine if we have an even or odd number of symbols to encode
-        // If odd we need to encode the last states transition and encode the final states in the flipped order
+        // If odd we need to encode the last states transition and encode the final states in the
+        // flipped order
         if idx == 1 {
             let state = state_1;
             let x = data[0];
@@ -134,7 +136,7 @@ pub(crate) fn approx_log2(x: f64) -> f64 {
     #[cfg(not(feature = "std"))]
     {
         let bits = x.to_bits();
-        let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+        let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
         let frac = (bits & ((1u64 << 52) - 1)) as f64 / (1u64 << 52) as f64;
         exp as f64 + frac
     }
@@ -254,8 +256,6 @@ pub(crate) struct State {
     pub(crate) num_bits: u8,
     /// The first index targeted by this state
     pub(crate) baseline: usize,
-    /// The last index targeted by this state (baseline + the maximum number with numbits bits allows)
-    pub(crate) last_index: usize,
     /// Index of this state in the decoding table
     pub(crate) index: usize,
 }
@@ -263,12 +263,11 @@ pub(crate) struct State {
 impl FSETable {
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> State {
         let e = self.transition(symbol, idx);
-        let num_bits = ((e >> 12) & 0xF) as u8;
-        let baseline = (e & 0xFFF) as usize;
+        let num_bits = ((e >> 12) & 0xf) as u8;
+        let baseline = (e & 0xfff) as usize;
         State {
             num_bits,
             baseline,
-            last_index: baseline + ((1 << num_bits) - 1),
             index: (e >> 16) as usize,
         }
     }
@@ -277,7 +276,7 @@ impl FSETable {
 pub fn build_table_from_data(
     data: impl Iterator<Item = u8>,
     max_log: u8,
-    _avoid_0_numbit: bool,
+    avoid_0_numbit: bool,
 ) -> FSETable {
     let mut counts = [0; 256];
     let mut max_symbol = 0;
@@ -289,7 +288,7 @@ pub fn build_table_from_data(
             max_symbol = idx;
         }
     }
-    build_table_from_counts(&counts[..=max_symbol], max_log, _avoid_0_numbit)
+    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
 /// libzstd's FSE_minTableLog: the smallest table size that can safely
@@ -390,7 +389,11 @@ pub(crate) fn normalize_count(
     use_low_prob: bool,
 ) -> bool {
     debug_assert!(norm.len() > max_symbol);
-    let low_prob: i32 = if use_low_prob { -1 } else { 1 };
+    let low_prob: i32 = if use_low_prob {
+        -1
+    } else {
+        1
+    };
     let scale = 62 - table_log as u32;
     let step = (1u64 << 62) / (total as u64).max(1);
     let v_step = 1u64 << (scale - 20);
@@ -491,9 +494,9 @@ fn normalize_m2(
         // All values are poor; give the remainder to the maximum.
         let mut max_v = 0usize;
         let mut max_c = 0u32;
-        for s in 0..=max_symbol {
-            if count[s] > max_c {
-                max_c = count[s];
+        for (s, &c) in count.iter().enumerate().take(max_symbol + 1) {
+            if c > max_c {
+                max_c = c;
                 max_v = s;
             }
         }
@@ -534,11 +537,7 @@ fn normalize_m2(
     true
 }
 
-fn build_table_from_counts(
-    counts: &[usize],
-    max_log: u8,
-    _legacy_avoid_0_numbit: bool,
-) -> FSETable {
+fn build_table_from_counts(counts: &[usize], max_log: u8, legacy_avoid_0_numbit: bool) -> FSETable {
     let mut probs = [0; 256];
     let probs = &mut probs[..counts.len()];
     let mut min_count = 0;
@@ -563,7 +562,7 @@ fn build_table_from_counts(
         let divisor = max_prob / (probs.len() as i32);
         for prob in probs.iter_mut() {
             if *prob > 0 {
-                *prob = (*prob / divisor).max(1)
+                *prob = (*prob / divisor).max(1);
             }
         }
     }
@@ -601,7 +600,7 @@ fn build_table_from_counts(
         probs.iter().any(|x| *x != max)
     };
     let max = probs.iter_mut().max().unwrap();
-    if _legacy_avoid_0_numbit && has_second && *max > 1 << (acc_log - 1) {
+    if legacy_avoid_0_numbit && has_second && *max > 1 << (acc_log - 1) {
         let redistribute = *max - (1 << (acc_log - 1));
         *max -= redistribute;
         let max = *max;
@@ -620,8 +619,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // Entry packing gives 12 bits each to baseline and target index.
     debug_assert!(
         (1..=12).contains(&acc_log),
-        "acc_log {} exceeds the transition packing",
-        acc_log
+        "acc_log {acc_log} exceeds the transition packing"
     );
     let table_size = 1usize << acc_log;
     let mut probs_full = [0i32; 256];
@@ -681,8 +679,8 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // index sort + sequential walk): the first `double` states of a symbol
     // emit one extra bit and their baselines wrap mod table_size; the state
     // right after the wrap is the encoding start state.
-    for i in 0..table_size {
-        let symbol = owner[i] as usize;
+    for (i, &owner_symbol) in owner.iter().enumerate() {
+        let symbol = owner_symbol as usize;
         let prob = probs_full[symbol];
         if prob <= 0 {
             continue;
@@ -713,7 +711,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             start[symbol] = i as u16;
         }
         prev_baseline[symbol] = b;
-        baseline[symbol] = if k + 1 <= double_states {
+        baseline[symbol] = if k < double_states {
             (b + width) % table_size
         } else {
             b + width
@@ -765,14 +763,16 @@ pub(crate) fn default_of_table() -> FSETable {
 
 #[cfg(test)]
 mod soa_tests {
-    use super::*;
     use alloc::vec;
 
+    use super::*;
+
+    /// Flattened reference table: `(symbol, num_bits, baseline, index)` rows
+    /// in per-symbol baseline order, per-symbol start indices, table size.
+    type RefTable = (Vec<(u8, u8, usize, usize)>, Vec<usize>, usize);
+
     /// Reference: the pre-SoA construction with per-symbol state lists.
-    fn build_reference(
-        probs: &[i32],
-        acc_log: u8,
-    ) -> (Vec<(u8, u8, usize, usize)>, Vec<usize>, usize) {
+    fn build_reference(probs: &[i32], acc_log: u8) -> RefTable {
         #[derive(Clone)]
         struct RState {
             num_bits: u8,
@@ -878,7 +878,7 @@ mod soa_tests {
             // -1 weights occupy one table slot each, so positives must sum to
             // table_size minus the number of -1 entries.
             let mut remaining = table_size as i32;
-            for p in probs.iter_mut() {
+            for p in &mut probs {
                 if remaining <= 1 {
                     if remaining == 1 {
                         *p = 1;
@@ -900,16 +900,25 @@ mod soa_tests {
             if remaining > 0 {
                 probs[0] += remaining;
             }
-            let sum: i32 = probs.iter().map(|p| if *p == -1 { 1 } else { *p }).sum();
+            let sum: i32 = probs
+                .iter()
+                .map(|p| {
+                    if *p == -1 {
+                        1
+                    } else {
+                        *p
+                    }
+                })
+                .sum();
             if sum != table_size as i32 {
                 continue;
             }
             let table = build_table_from_probabilities(&probs, acc_log);
             let (ref_flat, ref_starts, ref_ts) = build_reference(&probs, acc_log);
             assert_eq!(table.table_size, ref_ts, "case {case} ts");
-            for s in 0..nsym {
+            for (s, &start) in ref_starts.iter().enumerate().take(nsym) {
                 assert_eq!(
-                    table.start[s], ref_starts[s] as u16,
+                    table.start[s], start as u16,
                     "case {case} start {s} probs {probs:?} acc {acc_log}"
                 );
             }
@@ -917,7 +926,7 @@ mod soa_tests {
             for (symbol, nb, baseline, _index) in &ref_flat {
                 let e = table.transitions[*symbol as usize * ref_ts + *baseline];
                 assert_eq!(
-                    ((e >> 12) & 0xF) as u8,
+                    ((e >> 12) & 0xf) as u8,
                     *nb,
                     "case {case} sym {symbol} base {baseline} nb"
                 );

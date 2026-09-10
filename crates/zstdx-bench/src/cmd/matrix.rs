@@ -8,31 +8,34 @@
 //! timed.
 //!
 //! Sections and verdicts:
-//! - `dec-st` interleaves both sides' bulk and streaming (64 KiB) decoders
-//!   over the zst1/zst3/zst9 corpus variants. The streaming rows carry the
-//!   real comparison: the zstd crate's bulk API is a slow per-chunk wrapper.
-//! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo;
-//!   libzstd exposes no multithreaded decode, so the zstd column is its
-//!   single-threaded streaming speed as a reference line.
-//! - `enc-st` pairs the ladder levels with zstd levels 1/3/6/12/16/19,
-//!   checksums off on both sides (our checksum overhead is measured in a
-//!   dedicated row); sizes and ratios are printed per cell.
-//! - `enc-mt` interleaves both sides at equal worker counts with fresh
-//!   contexts per call (the zstd crate has no per-call pool API; a warm
-//!   reused context is reported once as a reference line).
-//! - `enc-stream` compares the streaming encoders with 64 KiB pulls:
-//!   single-threaded zstdx vs zstd interleaved, then multithreaded
-//!   (`--mt-workers`, default 8) zstdx vs zstd interleaved, each followed
-//!   by our bulk mt path over the same bytes as the ceiling reference.
+//! - `dec-st` interleaves both sides' bulk and streaming (64 KiB) decoders over the zst1/zst3/zst9
+//!   corpus variants. The streaming rows carry the real comparison: the zstd crate's bulk API is a
+//!   slow per-chunk wrapper.
+//! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo; libzstd exposes no
+//!   multithreaded decode, so the zstd column is its single-threaded streaming speed as a reference
+//!   line.
+//! - `enc-st` pairs the ladder levels with zstd levels 1/3/6/12/16/19, checksums off on both sides
+//!   (our checksum overhead is measured in a dedicated row); sizes and ratios are printed per cell.
+//! - `enc-mt` interleaves both sides at equal worker counts with fresh contexts per call (the zstd
+//!   crate has no per-call pool API; a warm reused context is reported once as a reference line).
+//! - `enc-stream` compares the streaming encoders with 64 KiB pulls: single-threaded zstdx vs zstd
+//!   interleaved, then multithreaded (`--mt-workers`, default 8) zstdx vs zstd interleaved, each
+//!   followed by our bulk mt path over the same bytes as the ceiling reference.
 
-use crate::common::{apply_budget, black_box, measure_solo, want, Ab};
-use crate::corpus::{
-    assert_roundtrip, gate_ruz_dec, gate_ruz_enc, gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc,
-    load, load_raw, LevelName, Shape, LADDER, SHAPES,
-};
 use std::io::Read as _;
-use zstdx::decoding::{FrameDecoder, StreamingDecoder};
-use zstdx::{DecoderOptions, EncoderOptions, Level};
+
+use zstdx::{
+    DecoderOptions, EncoderOptions, Level,
+    decoding::{FrameDecoder, StreamingDecoder},
+};
+
+use crate::{
+    common::{Ab, apply_budget, black_box, measure_solo, want},
+    corpus::{
+        LADDER, LevelName, SHAPES, Shape, assert_roundtrip, gate_ruz_dec, gate_ruz_enc,
+        gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw,
+    },
+};
 
 /// Curated decode set: the informative level/shape combinations (the
 /// omitted variants are redundant with their neighbours).
@@ -456,10 +459,11 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
         }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(
-            args,
-            &[LevelName::Fastest, LevelName::Fast, LevelName::Best],
-        ) {
+        for (name, level, z) in ladder_subset(args, &[
+            LevelName::Fastest,
+            LevelName::Fast,
+            LevelName::Best,
+        ]) {
             let label = level_name(name);
             // gate: both sides' streaming outputs must roundtrip to the raw input
             let mut comp = Vec::new();
@@ -522,15 +526,12 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
         }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(
-            args,
-            &[
-                LevelName::Fastest,
-                LevelName::Fast,
-                LevelName::Balanced,
-                LevelName::Best,
-            ],
-        ) {
+        for (name, level, z) in ladder_subset(args, &[
+            LevelName::Fastest,
+            LevelName::Fast,
+            LevelName::Balanced,
+            LevelName::Best,
+        ]) {
             let label = level_name(name);
             // gate: both sides' multithreaded streaming outputs must roundtrip
             let mut comp = Vec::new();
@@ -590,15 +591,12 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
 
         // ceiling reference: our bulk mt path over the same bytes (the
         // streaming burst pipeline should approach it)
-        for (name, level, _) in ladder_subset(
-            args,
-            &[
-                LevelName::Fastest,
-                LevelName::Fast,
-                LevelName::Balanced,
-                LevelName::Best,
-            ],
-        ) {
+        for (name, level, _) in ladder_subset(args, &[
+            LevelName::Fastest,
+            LevelName::Fast,
+            LevelName::Balanced,
+            LevelName::Best,
+        ]) {
             let label = level_name(name);
             let comp = zstdx::bulk::compress_with(
                 &raw,
@@ -627,9 +625,7 @@ pub fn run(args: &Args) {
         "# bench matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
         zstd::zstd_safe::version_string(),
         zstd::zstd_safe::version_number(),
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
     );
     let ab = Ab::default();
     match args.mode {
@@ -648,6 +644,6 @@ pub fn run(args: &Args) {
             t4_enc_mt(&ab, args);
             println!();
             t5_enc_stream(&ab, args);
-        }
+        },
     }
 }

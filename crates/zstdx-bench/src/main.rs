@@ -57,7 +57,7 @@ fn main() {
         Command::Matrix(args) => cmd::matrix::run(&args),
         Command::Small(args) => cmd::small::run(&args),
         Command::Files(args) => cmd::files::run(&args),
-        Command::Prof(args) => cmd::prof::run(args),
+        Command::Prof(args) => cmd::prof::run(&args),
         Command::Dump(args) => cmd::dump::run(&args),
         Command::Corrupt(args) => cmd::corrupt::run(&args),
         Command::Mtcheck(args) => cmd::mtcheck::run(&args),

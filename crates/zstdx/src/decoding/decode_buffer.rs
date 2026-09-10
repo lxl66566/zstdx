@@ -1,10 +1,12 @@
-use crate::io::{Error, Read, Write};
-#[cfg(feature = "hash")]
-use crate::xxh64::Xxh64;
 use alloc::vec::Vec;
 
 use super::ringbuffer::RingBuffer;
-use crate::decoding::errors::DecodeBufferError;
+#[cfg(feature = "hash")]
+use crate::xxh64::Xxh64;
+use crate::{
+    decoding::errors::DecodeBufferError,
+    io::{Error, Read, Write},
+};
 
 pub struct DecodeBuffer {
     buffer: RingBuffer,
@@ -95,7 +97,7 @@ impl DecodeBuffer {
         &mut self,
         read: R,
         fill_length: usize,
-    ) -> Result<(), crate::io::Error> {
+    ) -> Result<(), Error> {
         self.buffer.extend_from_reader(read, fill_length)
     }
 
@@ -141,8 +143,7 @@ impl DecodeBuffer {
             } else {
                 // can just copy parts of the existing buffer
                 // SAFETY: Requirements checked:
-                // 1. start_idx + match_length must be <= self.buffer.len()
-                //      We know that:
+                // 1. start_idx + match_length must be <= self.buffer.len() We know that:
                 //      1. start_idx = self.buffer.len() - offset
                 //      2. end_idx = start_idx + match_length
                 //      3. end_idx <= self.buffer.len()
@@ -151,7 +152,7 @@ impl DecodeBuffer {
                 // 2. explicitly reserved enough memory for the whole match_length
                 unsafe {
                     self.buffer
-                        .extend_from_within_unchecked(start_idx, match_length)
+                        .extend_from_within_unchecked(start_idx, match_length);
                 };
             }
 
@@ -170,11 +171,10 @@ impl DecodeBuffer {
         let mut copied = 0;
         while copied < match_length {
             // SAFETY: Requirements checked:
-            // 1. start_idx + chunk must be <= self.buffer.len()
-            //      chunk <= offset + copied, and buffer.len() == start_idx + offset + copied
-            //      at this point (start of the first iteration has copied == 0 and
-            //      buffer.len() == start_idx + offset, and both sides grow by the same
-            //      amount each iteration). Thus start_idx + chunk <= buffer.len().
+            // 1. start_idx + chunk must be <= self.buffer.len() chunk <= offset + copied, and
+            //    buffer.len() == start_idx + offset + copied at this point (start of the first
+            //    iteration has copied == 0 and buffer.len() == start_idx + offset, and both sides
+            //    grow by the same amount each iteration). Thus start_idx + chunk <= buffer.len().
             //
             // 2. explicitly reserved enough memory for the whole match_length
             let chunk = usize::min(offset + copied, match_length - copied);
@@ -206,12 +206,11 @@ impl DecodeBuffer {
 
                 self.total_output_counter += bytes_from_dict as u64;
                 return self.repeat(self.buffer.len(), match_length - bytes_from_dict);
-            } else {
-                let low = self.dict_content.len() - bytes_from_dict;
-                let high = low + match_length;
-                let dict_slice = &self.dict_content[low..high];
-                self.buffer.extend(dict_slice);
             }
+            let low = self.dict_content.len() - bytes_from_dict;
+            let high = low + match_length;
+            let dict_slice = &self.dict_content[low..high];
+            self.buffer.extend(dict_slice);
             Ok(())
         } else {
             Err(DecodeBufferError::OffsetTooBig {
@@ -230,15 +229,17 @@ impl DecodeBuffer {
         }
     }
 
-    //How many bytes can be drained if the window_size does not have to be maintained
+    // How many bytes can be drained if the window_size does not have to be maintained
     pub fn can_drain(&self) -> usize {
         self.buffer.len()
     }
 
-    /// Drain as much as possible while retaining enough so that decoding si still possible with the required window_size
-    /// At best call only if can_drain_to_window_size reports a 'high' number of bytes to reduce allocations
+    /// Drain as much as possible while retaining enough so that decoding si still possible with the
+    /// required window_size At best call only if can_drain_to_window_size reports a 'high'
+    /// number of bytes to reduce allocations
     pub fn drain_to_window_size(&mut self) -> Option<Vec<u8>> {
-        //TODO investigate if it is possible to return the std::vec::Drain iterator directly without collecting here
+        // TODO investigate if it is possible to return the std::vec::Drain iterator directly
+        // without collecting here
         match self.can_drain_to_window_size() {
             None => None,
             Some(can_drain) => {
@@ -249,7 +250,7 @@ impl DecodeBuffer {
                 })
                 .ok()?;
                 Some(vec)
-            }
+            },
         }
     }
 
@@ -294,17 +295,14 @@ impl DecodeBuffer {
     }
 
     /// Semantics of write_bytes:
-    /// Should dump as many of the provided bytes as possible to whatever sink until no bytes are left or an error is encountered
-    /// Return how many bytes have actually been dumped to the sink.
+    /// Should dump as many of the provided bytes as possible to whatever sink until no bytes are
+    /// left or an error is encountered Return how many bytes have actually been dumped to the
+    /// sink.
     fn drain_to(
         &mut self,
         amount: usize,
         mut write_bytes: impl FnMut(&[u8]) -> (usize, Result<(), Error>),
     ) -> Result<usize, Error> {
-        if amount == 0 {
-            return Ok(0);
-        }
-
         struct DrainGuard<'a> {
             buffer: &'a mut RingBuffer,
             amount: usize,
@@ -316,6 +314,10 @@ impl DecodeBuffer {
                     self.buffer.drop_first_n(self.amount);
                 }
             }
+        }
+
+        if amount == 0 {
+            return Ok(0);
         }
 
         let mut drain_guard = DrainGuard {
@@ -338,8 +340,9 @@ impl DecodeBuffer {
             // Apparently this is what clippy thinks is the best way of expressing this
             res1?;
 
-            // Only if the first call to write_bytes was not a partial write we can continue with slice2
-            // Partial writes SHOULD never happen without res1 being an error, but lets just protect against it anyways.
+            // Only if the first call to write_bytes was not a partial write we can continue with
+            // slice2 Partial writes SHOULD never happen without res1 being an error,
+            // but lets just protect against it anyways.
             if written1 == n1 && n2 != 0 {
                 let (written2, res2) = write_bytes(&slice2[..n2]);
                 #[cfg(feature = "hash")]
@@ -380,8 +383,7 @@ mod tests {
     use crate::io::{Error, ErrorKind, Write};
 
     extern crate std;
-    use alloc::vec;
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn short_writer() {
@@ -391,7 +393,7 @@ mod tests {
         }
 
         impl Write for ShortWriter {
-            fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, Error> {
+            fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
                 if buf.len() > self.write_len {
                     self.buf.extend_from_slice(&buf[..self.write_len]);
                     Ok(self.write_len)
@@ -401,7 +403,7 @@ mod tests {
                 }
             }
 
-            fn flush(&mut self) -> std::result::Result<(), Error> {
+            fn flush(&mut self) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -439,7 +441,7 @@ mod tests {
         }
 
         impl Write for WouldblockWriter {
-            fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, Error> {
+            fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
                 if self.last_blocked < self.block_every {
                     self.buf.extend_from_slice(buf);
                     self.last_blocked += 1;
@@ -450,7 +452,7 @@ mod tests {
                 }
             }
 
-            fn flush(&mut self) -> std::result::Result<(), Error> {
+            fn flush(&mut self) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -475,14 +477,10 @@ mod tests {
                         if written == 0 {
                             break;
                         }
-                    }
+                    },
                     Err(e) => {
-                        if e.kind() == ErrorKind::WouldBlock {
-                            continue;
-                        } else {
-                            panic!("Unexpected error {:?}", e);
-                        }
-                    }
+                        assert!(e.kind() == ErrorKind::WouldBlock, "Unexpected error {e:?}");
+                    },
                 }
             }
             assert_eq!(decode_buf.len(), 100);
@@ -495,14 +493,10 @@ mod tests {
                     if written == 0 {
                         break;
                     }
-                }
+                },
                 Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        continue;
-                    } else {
-                        panic!("Unexpected error {:?}", e);
-                    }
-                }
+                    assert!(e.kind() == ErrorKind::WouldBlock, "Unexpected error {e:?}");
+                },
             }
         }
         assert_eq!(short_writer.buf.len(), repeats * 50 + 100);

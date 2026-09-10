@@ -3,7 +3,7 @@
 
 // --- FRAMES ---
 /// This magic number is included at the start of a single Zstandard frame
-pub const MAGIC_NUM: u32 = 0xFD2F_B528;
+pub const MAGIC_NUM: u32 = 0xfd2f_b528;
 /// Window size refers to the minimum amount of memory needed to decode any given frame.
 ///
 /// The minimum window size is defined as 1 KB

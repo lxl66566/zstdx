@@ -29,7 +29,7 @@ fn tables_equal() {
 }
 
 #[cfg(any(test, feature = "fuzz_exports"))]
-fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
+fn check_tables(dec_table: &FSETable, enc_table: &fse_encoder::FSETable) {
     let ts = enc_table.table_size;
     for (idx, dec_state) in dec_table.decode.iter().enumerate() {
         let base = dec_state.symbol as usize * ts;
@@ -39,8 +39,8 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
             .iter()
             .find(|e| (**e >> 16) as usize == idx)
             .unwrap();
-        assert_eq!((*entry & 0xFFF) as usize, dec_state.base_line as usize);
-        assert_eq!(((*entry >> 12) & 0xF) as u8, dec_state.num_bits);
+        assert_eq!((*entry & 0xfff) as usize, dec_state.base_line as usize);
+        assert_eq!(((*entry >> 12) & 0xf) as u8, dec_state.num_bits);
     }
 }
 
@@ -80,8 +80,9 @@ fn roundtrip() {
 /// Asserts that the decoded data equals the input
 #[cfg(any(test, feature = "fuzz_exports"))]
 pub fn round_trip(data: &[u8]) {
-    use crate::bit_io::{BitReaderReversed, BitWriter};
     use fse_encoder::FSEEncoder;
+
+    use crate::bit_io::{BitReaderReversed, BitWriter};
 
     if data.len() < 2 {
         return;
@@ -119,10 +120,9 @@ pub fn round_trip(data: &[u8]) {
             break;
         }
     }
-    if skipped_bits > 8 {
-        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-        panic!("Corrupted end marker");
-    }
+    // if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or
+    // corrupted data
+    assert!(skipped_bits <= 8, "Corrupted end marker");
     decoder.init_state(&mut br).unwrap();
     let mut decoded = alloc::vec::Vec::new();
 

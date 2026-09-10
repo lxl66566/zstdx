@@ -1,6 +1,5 @@
 use super::scratch::DecoderScratch;
-use crate::blocks::sequence_section::Sequence;
-use crate::decoding::errors::ExecuteSequencesError;
+use crate::{blocks::sequence_section::Sequence, decoding::errors::ExecuteSequencesError};
 
 /// Largest decompressed block; a single sequence's match can never exceed it
 /// (ll + ml fit one block's content).
@@ -69,9 +68,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     let diff = buffer.len() - old_buffer_size;
     assert!(
         seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
+        "Seq_sum: {seq_sum} is different from the difference in buffersize: {diff}"
     );
     Ok(())
 }
@@ -338,15 +335,19 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
 /// readable/writable bytes (the wildcopy budget checks provide them).
 #[inline(always)]
 unsafe fn copy8(dst: *mut u8, src: *const u8) {
-    dst.cast::<u64>()
-        .write_unaligned(src.cast::<u64>().read_unaligned());
+    unsafe {
+        dst.cast::<u64>()
+            .write_unaligned(src.cast::<u64>().read_unaligned());
+    }
 }
 
 /// Inline 16-byte copy (see [`copy8`]).
 #[inline(always)]
 unsafe fn copy16(dst: *mut u8, src: *const u8) {
-    dst.cast::<u128>()
-        .write_unaligned(src.cast::<u128>().read_unaligned());
+    unsafe {
+        dst.cast::<u128>()
+            .write_unaligned(src.cast::<u128>().read_unaligned());
+    }
 }
 
 /// libzstd's dec32 table for spreading a sub-8 offset, and the matching
@@ -363,30 +364,32 @@ const DEC_BACK: [isize; 8] = [0, 0, 0, 1, 0, -1, -2, -3];
 /// caller's buffers belong to.
 #[inline(always)]
 unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
-    let offset = (*dst as usize).wrapping_sub(*src as usize);
-    debug_assert!((1..16).contains(&offset));
-    if offset < 8 {
-        let d = *dst;
-        let s = *src;
-        // The first four bytes go one at a time: with offset < 4 each store
-        // feeds the next load (overlapping-copy semantics), so a wide load
-        // here would read unwritten bytes.
-        *d = *s;
-        *d.add(1) = *s.add(1);
-        *d.add(2) = *s.add(2);
-        *d.add(3) = *s.add(3);
-        let s2 = s.add(DEC32[offset]);
-        // This load only touches bytes at or below d+4 that the stores above
-        // (or earlier output) have already written.
-        d.add(4)
-            .cast::<u32>()
-            .write_unaligned(s2.cast::<u32>().read_unaligned());
-        *src = s2.offset(DEC_BACK[offset]);
-    } else {
-        copy8(*dst, *src);
-        *src = src.add(8);
+    unsafe {
+        let offset = (*dst as usize).wrapping_sub(*src as usize);
+        debug_assert!((1..16).contains(&offset));
+        if offset < 8 {
+            let d = *dst;
+            let s = *src;
+            // The first four bytes go one at a time: with offset < 4 each store
+            // feeds the next load (overlapping-copy semantics), so a wide load
+            // here would read unwritten bytes.
+            *d = *s;
+            *d.add(1) = *s.add(1);
+            *d.add(2) = *s.add(2);
+            *d.add(3) = *s.add(3);
+            let s2 = s.add(DEC32[offset]);
+            // This load only touches bytes at or below d+4 that the stores above
+            // (or earlier output) have already written.
+            d.add(4)
+                .cast::<u32>()
+                .write_unaligned(s2.cast::<u32>().read_unaligned());
+            *src = s2.offset(DEC_BACK[offset]);
+        } else {
+            copy8(*dst, *src);
+            *src = src.add(8);
+        }
+        *dst = dst.add(8);
     }
-    *dst = dst.add(8);
 }
 
 /// Wildcopy `ml` bytes from `src0` to `dst0` in 16/8-byte inline chunks,
@@ -399,19 +402,21 @@ unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
 /// match before anything can read it.
 #[inline(always)]
 unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
-    let end = d.add(ml);
-    if (d as usize).wrapping_sub(s as usize) >= 16 {
-        while d < end {
-            copy16(d, s);
-            d = d.add(16);
-            s = s.add(16);
-        }
-    } else {
-        overlap_copy8(&mut d, &mut s);
-        while d < end {
-            copy8(d, s);
-            d = d.add(8);
-            s = s.add(8);
+    unsafe {
+        let end = d.add(ml);
+        if (d as usize).wrapping_sub(s as usize) >= 16 {
+            while d < end {
+                copy16(d, s);
+                d = d.add(16);
+                s = s.add(16);
+            }
+        } else {
+            overlap_copy8(&mut d, &mut s);
+            while d < end {
+                copy8(d, s);
+                d = d.add(8);
+                s = s.add(8);
+            }
         }
     }
 }
@@ -422,15 +427,17 @@ unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
 /// literals buffer's allocation (16 bytes reserved).
 #[inline(always)]
 unsafe fn wildcopy_literals(d0: *mut u8, s0: *const u8, ll: usize) {
-    copy16(d0, s0);
-    if ll > 16 {
-        let end = d0.add(ll);
-        let mut d = d0.add(16);
-        let mut s = s0.add(16);
-        while d < end {
-            copy16(d, s);
-            d = d.add(16);
-            s = s.add(16);
+    unsafe {
+        copy16(d0, s0);
+        if ll > 16 {
+            let end = d0.add(ll);
+            let mut d = d0.add(16);
+            let mut s = s0.add(16);
+            while d < end {
+                copy16(d, s);
+                d = d.add(16);
+                s = s.add(16);
+            }
         }
     }
 }
@@ -460,7 +467,7 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     wrap_base: usize,
     view: crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
-) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
+) -> Result<(), ExecuteSequencesError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let ll = seq.ll as usize;
     let ml = seq.ml as usize;
@@ -571,7 +578,7 @@ fn copy_wrapped_match(
     offset: usize,
     ml: usize,
     wild: bool,
-) -> Result<(), crate::decoding::errors::ExecuteSequencesError> {
+) -> Result<(), ExecuteSequencesError> {
     use crate::decoding::errors::{DecodeBufferError, ExecuteSequencesError};
     let crate::decoding::flat_buffer::FlatView {
         origin,
@@ -658,8 +665,8 @@ fn copy_wrapped_match(
 }
 
 /// Update the most recently used offsets to reflect the provided offset value, and return the
-/// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
-/// before you get a functional number.
+/// "actual" offset needed because offsets are not stored in a raw way, some transformations are
+/// needed before you get a functional number.
 ///
 /// The repcode domain (`offset_value <= 3`) is handled ZSTD_decodeSequence
 /// style: the code plus the literal-length-0 flag forms a slot index
@@ -682,7 +689,11 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     // idx in 0..=3 exactly for repcodes; (idx & 3) with 3 folded back to 0
     // is the pseudo-slot mapping
     let slot = (idx & 3) as usize;
-    let slot = if slot == 3 { 0 } else { slot };
+    let slot = if slot == 3 {
+        0
+    } else {
+        slot
+    };
     let actual_offset = if offset_value <= 3 {
         // A malformed dictionary can seed scratch[0] with 0; saturate so this
         // resolves to 0 (rejected upstream as ZeroOffset) instead of
@@ -698,9 +709,21 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     // every read sees the pre-update values.
     let keep = idx == 0;
     let rotate_all = idx >= 2;
-    scratch[2] = if rotate_all { scratch[1] } else { scratch[2] };
-    scratch[1] = if keep { scratch[1] } else { scratch[0] };
-    scratch[0] = if keep { scratch[0] } else { actual_offset };
+    scratch[2] = if rotate_all {
+        scratch[1]
+    } else {
+        scratch[2]
+    };
+    scratch[1] = if keep {
+        scratch[1]
+    } else {
+        scratch[0]
+    };
+    scratch[0] = if keep {
+        scratch[0]
+    } else {
+        actual_offset
+    };
 
     actual_offset
 }
@@ -736,16 +759,16 @@ mod tests {
             }
         };
         match (ll > 0, of) {
-            (true, 1) => {}
+            (true, 1) => {},
             (true, 2) | (false, 1) => {
                 s[1] = s[0];
                 s[0] = actual;
-            }
+            },
             _ => {
                 s[2] = s[1];
                 s[1] = s[0];
                 s[0] = actual;
-            }
+            },
         }
         actual
     }

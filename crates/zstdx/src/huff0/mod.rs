@@ -13,8 +13,9 @@ pub mod huff0_encoder;
 /// Asserts that the decoded data equals the input
 #[cfg(any(test, feature = "fuzz_exports"))]
 pub fn round_trip(data: &[u8]) {
-    use crate::bit_io::{BitReaderReversed, BitWriter};
     use alloc::vec::Vec;
+
+    use crate::bit_io::{BitReaderReversed, BitWriter};
 
     if data.len() < 2 {
         return;
@@ -41,10 +42,9 @@ pub fn round_trip(data: &[u8]) {
             break;
         }
     }
-    if skipped_bits > 8 {
-        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-        panic!("Corrupted end marker");
-    }
+    // if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or
+    // corrupted data
+    assert!(skipped_bits <= 8, "Corrupted end marker");
 
     decoder.init_state(&mut br);
     let mut decoded = Vec::new();
@@ -59,8 +59,9 @@ pub fn round_trip(data: &[u8]) {
 /// one table lookup at a time (1 or 2 symbols per lookup).
 #[cfg(any(test, feature = "fuzz_exports"))]
 pub fn round_trip_x2(data: &[u8]) {
-    use crate::bit_io::{BitReaderReversed, BitWriter};
     use alloc::vec::Vec;
+
+    use crate::bit_io::{BitReaderReversed, BitWriter};
 
     if data.len() < 2 {
         return;
@@ -92,9 +93,7 @@ pub fn round_trip_x2(data: &[u8]) {
             break;
         }
     }
-    if skipped_bits > 8 {
-        panic!("Corrupted end marker");
-    }
+    assert!(skipped_bits <= 8, "Corrupted end marker");
 
     let mut decoded = Vec::new();
     while decoded.len() < data.len() {
@@ -109,7 +108,7 @@ pub fn round_trip_x2(data: &[u8]) {
             break;
         }
         let entry = dt[br.peek_bits_refilled(11) as usize];
-        let nb = ((entry >> 16) & 0x3F) as u8;
+        let nb = ((entry >> 16) & 0x3f) as u8;
         let len = (entry >> 24) as usize;
         br.consume(nb);
         decoded.push(entry as u8);

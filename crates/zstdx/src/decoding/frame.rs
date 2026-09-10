@@ -1,13 +1,16 @@
-use crate::common::{MAGIC_NUM, MAX_WINDOW_SIZE, MIN_WINDOW_SIZE};
-use crate::decoding::errors::{FrameDescriptorError, FrameHeaderError, ReadFrameHeaderError};
-use crate::io::Read;
+use crate::{
+    common::{MAGIC_NUM, MAX_WINDOW_SIZE, MIN_WINDOW_SIZE},
+    decoding::errors::{FrameDescriptorError, FrameHeaderError, ReadFrameHeaderError},
+    io::Read,
+};
 
 /// Skippable frames have a magic number in this interval
 pub(crate) fn is_skippable_magic(magic_num: u32) -> bool {
-    (0x184D2A50..=0x184D2A5F).contains(&magic_num)
+    (0x184d2a50..=0x184d2a5f).contains(&magic_num)
 }
 
-/// Read a single serialized frame from the reader and return a tuple containing the parsed frame and the number of bytes read.
+/// Read a single serialized frame from the reader and return a tuple containing the parsed frame
+/// and the number of bytes read.
 pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     use ReadFrameHeaderError as err;
     let mut buf = [0u8; 4];
@@ -222,7 +225,7 @@ impl FrameDescriptor {
                 } else {
                     Ok(0)
                 }
-            }
+            },
             1 => Ok(2),
             2 => Ok(4),
             3 => Ok(8),
@@ -230,9 +233,9 @@ impl FrameDescriptor {
         }
     }
 
-    /// Read the size of the `Dictionary_ID` field from the frame header descriptor, returning the size in bytes.
-    /// If this value is zero, then the dictionary id is not present within the header,
-    /// and "It's up to the decoder to know which dictionary to use."
+    /// Read the size of the `Dictionary_ID` field from the frame header descriptor, returning the
+    /// size in bytes. If this value is zero, then the dictionary id is not present within the
+    /// header, and "It's up to the decoder to know which dictionary to use."
     pub fn dictionary_id_bytes(&self) -> Result<u8, FrameDescriptorError> {
         match self.dict_id_flag() {
             0 => Ok(0),

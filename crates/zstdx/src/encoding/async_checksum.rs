@@ -15,12 +15,13 @@
 //! instead of spinning forever. The head flip is published under the wake
 //! mutex so a parked worker cannot miss a post.
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::marker::PhantomData;
-use core::slice;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    cell::RefCell,
+    marker::PhantomData,
+    slice,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+};
 use std::sync::{Condvar, Mutex};
 
 use crate::xxh64::Xxh64;
@@ -101,7 +102,7 @@ impl Producer {
         let seq = self.shared.head.load(Ordering::Relaxed);
         self.shared.wait_free_slot(seq);
         let slot = &self.shared.slots[(seq % RING as u64) as usize];
-        slot.ptr.store(ptr as *mut u8, Ordering::Relaxed);
+        slot.ptr.store(ptr.cast_mut(), Ordering::Relaxed);
         slot.len.store(len, Ordering::Relaxed);
         slot.state_id.store(self.state_id, Ordering::Relaxed);
         // The kind store publishes the payload fields to the consumer that
@@ -154,7 +155,7 @@ fn worker_shared() -> Option<Arc<Shared>> {
             let worker_shared = shared.clone();
             std::thread::Builder::new()
                 .name("zstdx-xxh64".into())
-                .spawn(move || run(worker_shared))
+                .spawn(move || run(&worker_shared))
                 .ok()?;
             *w = Some(shared);
         }
@@ -162,7 +163,7 @@ fn worker_shared() -> Option<Arc<Shared>> {
     })
 }
 
-fn run(shared: Arc<Shared>) {
+fn run(shared: &Arc<Shared>) {
     // One checksum state per concurrent frame; ids come from a global
     // counter and are stable for the process lifetime, so the vector only
     // ever grows.
@@ -194,19 +195,22 @@ fn run(shared: Arc<Shared>) {
                     states.resize(state_id + 1, Xxh64::new(0));
                 }
                 states[state_id] = Xxh64::new(0);
-            }
+            },
             KIND_FINISH => {
                 let reply = slot.ptr.load(Ordering::Relaxed);
                 // SAFETY: the reply cell outlives this task — the producer
                 // stack that owns it spins until `done` flips, which happens
                 // only after these stores.
                 unsafe {
-                    let cell = &*(reply as *const FinishCell);
+                    // The reply cell is a stack local (properly aligned); the
+                    // byte-typed ring slot only smuggles the address.
+                    #[allow(clippy::cast_ptr_alignment)] // alignment by construction, see above
+                    let cell = &*reply.cast::<FinishCell>();
                     cell.value
                         .store(states[state_id].finish(), Ordering::Relaxed);
                     cell.done.store(true, Ordering::Release);
                 }
-            }
+            },
             _ => {
                 let ptr = slot.ptr.load(Ordering::Relaxed);
                 let len = slot.len.load(Ordering::Relaxed);
@@ -215,7 +219,7 @@ fn run(shared: Arc<Shared>) {
                 // immutable for the call and Drop drains before release).
                 let bytes = unsafe { slice::from_raw_parts(ptr, len) };
                 states[state_id].write(bytes);
-            }
+            },
         }
         done += 1;
         shared.tail.store(done, Ordering::Release);
@@ -265,7 +269,7 @@ impl AsyncChecksum {
             done: AtomicBool::new(false),
         };
         self.producer
-            .post(KIND_FINISH, core::ptr::addr_of!(cell) as *const u8, 0);
+            .post(KIND_FINISH, core::ptr::addr_of!(cell).cast::<u8>(), 0);
         while !cell.done.load(Ordering::Acquire) {
             spin();
         }
@@ -283,15 +287,16 @@ impl Drop for AsyncChecksum {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::AsyncChecksum;
     use crate::xxh64::Xxh64;
-    use alloc::vec::Vec;
 
     /// The offloaded checksum must equal the inline one for whole writes,
     /// arbitrary splits and multiple frames through the same worker.
     #[test]
     fn offloaded_checksum_matches_inline() {
-        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut state = 0x1234_5678_9abc_def0u64;
         let mut rand = move || {
             state ^= state << 13;
             state ^= state >> 7;

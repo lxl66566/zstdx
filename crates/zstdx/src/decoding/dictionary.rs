@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-use crate::decoding::errors::DictionaryDecodeError;
-use crate::decoding::scratch::FSEScratch;
-use crate::decoding::scratch::HuffmanScratch;
+use crate::decoding::{
+    errors::DictionaryDecodeError,
+    scratch::{FSEScratch, HuffmanScratch},
+};
 
 /// Zstandard includes support for "raw content" dictionaries, that store bytes optionally used
 /// during sequence execution.
@@ -37,7 +38,7 @@ pub struct Dictionary {
 }
 
 /// This 4 byte (little endian) magic number refers to the start of a dictionary
-pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+pub const MAGIC_NUM: [u8; 4] = [0x37, 0xa4, 0x30, 0xec];
 
 // The entropy tables would dominate any Debug output; the identity of a
 // dictionary is its id and content.
@@ -46,7 +47,7 @@ impl core::fmt::Debug for Dictionary {
         f.debug_struct("Dictionary")
             .field("id", &self.id)
             .field("content_bytes", &self.dict_content.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -142,15 +143,16 @@ fn truncated_dictionary() {
     use alloc::vec;
 
     // First case: Valid dictionary magic number, but missing the 4-byte dictionary ID.
-    let raw = [0x37, 0xA4, 0x30, 0xEC];
+    let raw = [0x37, 0xa4, 0x30, 0xec];
     let _ = Dictionary::decode_dict(&raw);
 
-    // Second case: Valid dictionary magic number, non-zero dictionary ID, table bytes known to parse successfully. But fewer than 12 bytes remain for the 3 offset-history u32 values..
+    // Second case: Valid dictionary magic number, non-zero dictionary ID, table bytes known to
+    // parse successfully. But fewer than 12 bytes remain for the 3 offset-history u32 values..
     let mut raw = vec![0u8; 8];
     raw[0] = 0x37;
-    raw[1] = 0xA4;
+    raw[1] = 0xa4;
     raw[2] = 0x30;
-    raw[3] = 0xEC;
+    raw[3] = 0xec;
     raw[4] = 0x01;
     raw[5] = 0x21;
     raw[6] = 0x23;
@@ -168,7 +170,7 @@ fn truncated_dictionary() {
     raw.extend_from_slice(&raw_tables);
 
     // Fewer than 12 bytes remain for the 3 offset-history u32 values.
-    raw.extend_from_slice(&[3, 0, 0, 0, 10, 0, 0, 0, 0xEF, 0xCD, 0xAB]);
+    raw.extend_from_slice(&[3, 0, 0, 0, 10, 0, 0, 0, 0xef, 0xcd, 0xab]);
 
     let _ = Dictionary::decode_dict(&raw);
 }

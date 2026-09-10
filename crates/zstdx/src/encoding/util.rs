@@ -16,8 +16,8 @@ pub(crate) fn is_uniform(data: &[u8]) -> bool {
         return true;
     };
     let broadcast = u64::from(first) * 0x0101_0101_0101_0101;
-    let mut batches = data.chunks_exact(32);
-    let all_eq = batches.all(|c| {
+    let (batches, tail) = data.as_chunks::<32>();
+    let all_eq = batches.iter().all(|c| {
         let diff = u64::from_le_bytes(c[0..8].try_into().unwrap()) ^ broadcast
             | u64::from_le_bytes(c[8..16].try_into().unwrap()) ^ broadcast
             | u64::from_le_bytes(c[16..24].try_into().unwrap()) ^ broadcast
@@ -27,13 +27,12 @@ pub(crate) fn is_uniform(data: &[u8]) -> bool {
     if !all_eq {
         return false;
     }
-    let tail = batches.remainder();
-    let mut words = tail.chunks_exact(8);
-    let tail_eq = words.all(|w| u64::from_le_bytes(w.try_into().unwrap()) == broadcast);
+    let (words, rem) = tail.as_chunks::<8>();
+    let tail_eq = words.iter().all(|w| u64::from_le_bytes(*w) == broadcast);
     if !tail_eq {
         return false;
     }
-    words.remainder().iter().all(|&b| b == first)
+    rem.iter().all(|&b| b == first)
 }
 
 /// Returns the minimum number of bytes needed to represent this value, as
@@ -67,9 +66,9 @@ pub fn minify_val(val: u64) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_min_size;
-    use super::minify_val;
     use alloc::vec;
+
+    use super::{find_min_size, minify_val};
 
     #[test]
     fn min_size_detection() {
@@ -88,9 +87,8 @@ mod tests {
         assert_eq!(minify_val(0xff), vec![0xff]);
         assert_eq!(minify_val(0xff_ff), vec![0xff, 0xff]);
         assert_eq!(minify_val(0xff_ff_ff_ff), vec![0xff, 0xff, 0xff, 0xff]);
-        assert_eq!(
-            minify_val(0xffff_ffff_ffff_ffff),
-            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-        );
+        assert_eq!(minify_val(0xffff_ffff_ffff_ffff), vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+        ]);
     }
 }

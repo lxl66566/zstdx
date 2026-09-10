@@ -142,6 +142,8 @@ impl Xxh64 {
     /// the prefix's checksum was already absorbed elsewhere (the fused
     /// uniform scan). `hash_from` must be a multiple of 32 (or the length),
     /// and the buffer must be empty when it is nonzero.
+    // i/p/q/d/e mirror the reference C implementation's pointer/index names.
+    #[allow(clippy::many_single_char_names)]
     pub(crate) fn write_appending_from(
         &mut self,
         out: &mut Vec<u8>,
@@ -375,9 +377,10 @@ impl Xxh64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Xxh64;
     use alloc::vec::Vec;
     use core::hash::Hasher;
+
+    use super::Xxh64;
 
     /// Empty and single-byte inputs hit the no-bulk tail paths; values from
     /// twox-hash, the dev-dependency reference implementation.
@@ -400,7 +403,7 @@ mod tests {
     /// fused append path and the plain write path must agree with it.
     #[test]
     fn matches_twox_over_lengths_and_splits() {
-        let mut state = 0x123456789ABCDEF0u64;
+        let mut state = 0x123456789abcdef0u64;
         let mut data = Vec::with_capacity(70_000);
         while data.len() < 70_000 {
             state ^= state << 13;
@@ -475,7 +478,7 @@ mod tests {
             }
             let m = &mismatched[..];
 
-            let (is_uniform, hashed) = {
+            let (is_uniform, _) = {
                 let mut scan = Xxh64::new(0);
                 let r = scan.scan_uniform_absorbing(u);
                 assert!(r.0, "uniform at len {len}");

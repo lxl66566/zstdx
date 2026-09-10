@@ -4,13 +4,14 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use super::{
-    block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, Matcher,
+    Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
+    match_generator::MatchGeneratorDriver,
 };
-use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
-use crate::Level;
-
-use crate::io::{Read, Write};
+use crate::{
+    Level,
+    fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table},
+    io::{Read, Write},
+};
 
 /// Frame checksum accumulator. With the `hash` feature it is an XXH64 over
 /// the frame content; without it a no-op so the block paths share one shape.
@@ -28,14 +29,17 @@ impl FrameHasher {
             inner: crate::xxh64::Xxh64::new(0),
         }
     }
+
     #[inline(always)]
     pub(crate) fn write(&mut self, bytes: &[u8]) {
         self.inner.write(bytes);
     }
+
     #[inline(always)]
     pub(crate) fn write_appending(&mut self, out: &mut Vec<u8>, bytes: &[u8]) {
         self.inner.write_appending(out, bytes);
     }
+
     #[inline(always)]
     pub(crate) fn write_appending_from(
         &mut self,
@@ -45,6 +49,7 @@ impl FrameHasher {
     ) {
         self.inner.write_appending_from(out, bytes, hash_from);
     }
+
     /// Uniform scan fused with the checksum absorb: RLE blocks come out
     /// fully hashed in the scan's single pass; anything else returns the
     /// resume offset for the outcome paths. Misaligned streams (streaming
@@ -63,6 +68,7 @@ impl FrameHasher {
             }
         }
     }
+
     #[inline(always)]
     pub(crate) fn finish(&self) -> u32 {
         self.inner.finish() as u32
@@ -74,12 +80,15 @@ impl FrameHasher {
     pub(crate) fn new() -> Self {
         Self {}
     }
+
     #[inline(always)]
     pub(crate) fn write(&mut self, _bytes: &[u8]) {}
+
     #[inline(always)]
     pub(crate) fn write_appending(&mut self, out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(bytes);
     }
+
     #[inline(always)]
     pub(crate) fn write_appending_from(
         &mut self,
@@ -89,10 +98,12 @@ impl FrameHasher {
     ) {
         out.extend_from_slice(bytes);
     }
+
     #[inline(always)]
     pub(crate) fn scan_uniform(&mut self, data: &[u8]) -> (bool, usize) {
         (super::util::is_uniform(data), 0)
     }
+
     #[inline(always)]
     pub(crate) fn finish(&self) -> u32 {
         0
@@ -118,14 +129,17 @@ impl BlockChecksum for FrameHasher {
     fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
         self.scan_uniform(data)
     }
+
     #[inline(always)]
     fn hash_tail(&mut self, bytes: &[u8]) {
         self.write(bytes);
     }
+
     #[inline(always)]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
         self.write_appending_from(out, bytes, from);
     }
+
     #[inline(always)]
     fn finish32(&mut self) -> u32 {
         self.finish()
@@ -155,10 +169,10 @@ impl SliceChecksum {
             return Self::Off;
         }
         #[cfg(all(feature = "std", feature = "hash"))]
-        if src_len >= ASYNC_MIN_INPUT {
-            if let Some(offload) = super::async_checksum::AsyncChecksum::new() {
-                return Self::Offload(offload);
-            }
+        if src_len >= ASYNC_MIN_INPUT
+            && let Some(offload) = super::async_checksum::AsyncChecksum::new()
+        {
+            return Self::Offload(offload);
         }
         #[cfg(feature = "hash")]
         {
@@ -183,19 +197,21 @@ impl BlockChecksum for SliceChecksum {
             Self::Offload(h) => {
                 h.write(data);
                 (super::util::is_uniform(data), data.len())
-            }
+            },
             Self::Off => (super::util::is_uniform(data), 0),
         }
     }
+
     #[inline]
     fn hash_tail(&mut self, bytes: &[u8]) {
         match self {
             Self::Inline(h) => h.hash_tail(bytes),
             #[cfg(all(feature = "std", feature = "hash"))]
             Self::Offload(h) => h.write(bytes),
-            Self::Off => {}
+            Self::Off => {},
         }
     }
+
     #[inline]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], from: usize) {
         match self {
@@ -206,10 +222,11 @@ impl BlockChecksum for SliceChecksum {
                 if from < bytes.len() {
                     h.write(&bytes[from..]);
                 }
-            }
+            },
             Self::Off => out.extend_from_slice(bytes),
         }
     }
+
     #[inline]
     fn finish32(&mut self) -> u32 {
         match self {
@@ -229,12 +246,15 @@ impl BlockChecksum for SliceChecksum {
     fn scan_block(&mut self, data: &[u8]) -> (bool, usize) {
         (super::util::is_uniform(data), 0)
     }
+
     #[inline]
     fn hash_tail(&mut self, _bytes: &[u8]) {}
+
     #[inline]
     fn raw_out(&mut self, out: &mut Vec<u8>, bytes: &[u8], _from: usize) {
         out.extend_from_slice(bytes);
     }
+
     #[inline]
     fn finish32(&mut self) -> u32 {
         0
@@ -249,7 +269,7 @@ impl BlockChecksum for SliceChecksum {
 ///
 /// # Examples
 /// ```
-/// use zstdx::{encoding::FrameCompressor, Level};
+/// use zstdx::{Level, encoding::FrameCompressor};
 /// let mock_data: &[_] = &[0x1, 0x2, 0x3, 0x4];
 /// let mut output = std::vec::Vec::new();
 /// // Initialize a compressor.
@@ -299,11 +319,11 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) scratch: super::blocks::compressed::BlockScratch,
 }
 
-/// Per-thread pool for the slice entry point: the hash table, the three
-/// default FSE tables and the block scratch are identical for every frame,
-/// so rebuilding them per call dominates small inputs. The state is taken
-/// out for the duration of the call, so reentrant compression (the drain of
-/// a nested compressor) cannot observe the borrow.
+// Per-thread pool for the slice entry point: the hash table, the three
+// default FSE tables and the block scratch are identical for every frame,
+// so rebuilding them per call dominates small inputs. The state is taken
+// out for the duration of the call, so reentrant compression (the drain of
+// a nested compressor) cannot observe the borrow.
 #[cfg(feature = "std")]
 std::thread_local! {
     static SLICE_STATE: core::cell::RefCell<Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>> =
@@ -315,7 +335,7 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         matcher: MatchGeneratorDriver::new_direct(),
         last_huff_table: None,
         fse_tables: FseTables::new(),
-        scratch: Default::default(),
+        scratch: super::blocks::compressed::BlockScratch::default(),
     }
 }
 
@@ -397,7 +417,7 @@ fn compress_with_state(
     // next read returns EOF, so an input that is an exact multiple of the
     // block size ends with one empty raw block; emit the same shape to keep
     // the outputs byte-identical.
-    let trailing_empty = !src.is_empty() && src.len() % block_size == 0;
+    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
     for (i, block) in src.chunks(block_size).enumerate() {
         let block_start = (i * block_size) as u64;
         let block_end = block_start + block.len() as u64;
@@ -416,15 +436,15 @@ fn compress_with_state(
                 };
                 header.serialize(&mut output);
                 BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
-            }
+            },
             Level::Fastest
             | Level::Fast
             | Level::Balanced
             | Level::Best
             | Level::Opt
             | Level::Ultra => {
-                super::levels::compress_fastest(state, last_block, &mut output, &mut hasher)
-            }
+                compress_fastest(state, last_block, &mut output, &mut hasher);
+            },
         }
     }
     // A frame needs at least one block: empty input, and the exact-multiple
@@ -491,7 +511,7 @@ pub(crate) fn compress_job_blocks(
             .matcher
             .adopt_window(&src[hist..block_end], hist as u64);
         state.matcher.set_block(cursor as u64, block_end as u64);
-        super::levels::compress_fastest(state, last_block, &mut output, &mut hasher);
+        compress_fastest(state, last_block, &mut output, &mut hasher);
         cursor = block_end;
     }
     output
@@ -508,7 +528,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
-                scratch: Default::default(),
+                scratch: super::blocks::compressed::BlockScratch::default(),
             },
             hasher: FrameHasher::new(),
         }
@@ -525,7 +545,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
-                scratch: Default::default(),
+                scratch: super::blocks::compressed::BlockScratch::default(),
             },
             compression_level,
             hasher: FrameHasher::new(),
@@ -546,13 +566,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
-    /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
+    /// Compress the uncompressed data from the provided source as one Zstd frame and write it to
+    /// the provided drain
     ///
-    /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.
-    /// Also [Write::write_all] will be called on the drain after each block has been encoded.
+    /// This will repeatedly call [Read::read] on the source to fill up blocks until the source
+    /// returns 0 on the read call. Also [Write::write_all] will be called on the drain after
+    /// each block has been encoded.
     ///
-    /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
-    /// [Read::take] function
+    /// To avoid endlessly encoding from a potentially endless source (like a network socket) you
+    /// can use the [Read::take] function
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
@@ -591,7 +613,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 }
             }
             self.state.matcher.commit_block(read_bytes);
-            // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
+            // Special handling is needed for compression of a totally empty file (why you'd want to
+            // do that, I don't know)
             if read_bytes == 0 {
                 let header = BlockHeader {
                     last_block: true,
@@ -616,15 +639,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     header.serialize(output);
                     self.hasher
                         .write_appending(output, self.state.matcher.get_last_space());
-                }
+                },
                 Level::Fastest
                 | Level::Fast
                 | Level::Balanced
                 | Level::Best
                 | Level::Opt
                 | Level::Ultra => {
-                    compress_fastest(&mut self.state, last_block, output, &mut self.hasher)
-                }
+                    compress_fastest(&mut self.state, last_block, output, &mut self.hasher);
+                },
             }
             drain.write_all(output).unwrap();
             output.clear();
@@ -637,8 +660,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // and a 32 bit hash is written at the end of the data.
         #[cfg(feature = "hash")]
         {
-            // Because we only have the data as a reader, we need to read all of it to calculate the checksum
-            // Possible TODO: create a wrapper around self.uncompressed data that hashes the data as it's read?
+            // Because we only have the data as a reader, we need to read all of it to calculate the
+            // checksum Possible TODO: create a wrapper around self.uncompressed data
+            // that hashes the data as it's read?
             let content_checksum = self.hasher.finish();
             drain.write_all(&content_checksum.to_le_bytes()).unwrap();
         }
@@ -695,12 +719,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::FrameCompressor;
-    use crate::common::MAGIC_NUM;
-    use crate::decoding::FrameDecoder;
-    use alloc::vec::Vec;
+    use crate::{common::MAGIC_NUM, decoding::FrameDecoder};
 
     /// Every real level must roundtrip through both this crate's decoder
     /// and libzstd, keep the slice and streaming paths byte-identical, and
@@ -714,7 +736,7 @@ mod tests {
             &b"lorem ipsum dolor sit amet "[..],
             b"\x00\x01\x02\x03 structured noise ",
         ];
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
         while data.len() < 700 * 1024 {
             state ^= state << 13;
             state ^= state >> 7;
@@ -822,14 +844,13 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn fse_repeat_tables_roundtrip() {
         // Multi-block payload (>= 2 x 128 KiB) with drifting-but-similar
         // sequence statistics, so later blocks reuse earlier blocks' FSE
         // tables (repeat mode). Both decoders must reproduce it exactly.
         let mut data = alloc::vec![];
         let template = b"{\"id\":123456,\"name\":\"user\",\"tags\":[\"a\",\"b\"],\"score\":42}\n";
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
         while data.len() < 600 * 1024 {
             state ^= state << 13;
             state ^= state >> 7;
@@ -875,25 +896,9 @@ mod tests {
     fn checksum_two_frames_reused_compressor() {
         // Compress the same data twice using the same compressor and verify that:
         // 1. The checksum written in each frame matches what the decoder calculates.
-        // 2. The hasher is correctly reset between frames (no cross-contamination).
-        //    If the hasher were NOT reset, the second frame's calculated checksum
-        //    would differ from the one stored in the frame data, causing assert_eq to fail.
-        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
-
-        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
-
-        // --- Frame 1 ---
-        let mut compressed1 = Vec::new();
-        compressor.set_source(data.as_slice());
-        compressor.set_drain(&mut compressed1);
-        compressor.compress();
-
-        // --- Frame 2 (reuse the same compressor) ---
-        let mut compressed2 = Vec::new();
-        compressor.set_source(data.as_slice());
-        compressor.set_drain(&mut compressed2);
-        compressor.compress();
-
+        // 2. The hasher is correctly reset between frames (no cross-contamination). If the hasher
+        //    were NOT reset, the second frame's calculated checksum would differ from the one
+        //    stored in the frame data, causing assert_eq to fail.
         fn decode_and_collect(compressed: &[u8]) -> (Vec<u8>, Option<u32>, Option<u32>) {
             let mut decoder = FrameDecoder::new();
             let mut source = compressed;
@@ -911,6 +916,21 @@ mod tests {
                 decoder.get_calculated_checksum(),
             )
         }
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+
+        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
+
+        // --- Frame 1 ---
+        let mut compressed1 = Vec::new();
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut compressed1);
+        compressor.compress();
+
+        // --- Frame 2 (reuse the same compressor) ---
+        let mut compressed2 = Vec::new();
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut compressed2);
+        compressor.compress();
 
         let (decoded1, chksum_from_data1, chksum_calculated1) = decode_and_collect(&compressed1);
         assert_eq!(decoded1, data, "frame 1: decoded data mismatch");
@@ -930,7 +950,8 @@ mod tests {
         // If state leaked across frames, the second calculated checksum would differ.
         assert_eq!(
             chksum_from_data1, chksum_from_data2,
-            "frame 1 and frame 2 should have the same checksum (same data, hash must reset per frame)"
+            "frame 1 and frame 2 should have the same checksum (same data, hash must reset per \
+             frame)"
         );
     }
 
@@ -938,7 +959,7 @@ mod tests {
     #[test]
     fn fuzz_targets() {
         use std::io::Read;
-        fn decode_zstdx(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn decode_zstdx(data: &mut dyn Read) -> Vec<u8> {
             let mut decoder = crate::decoding::StreamingDecoder::new(data).unwrap();
             let mut result: Vec<u8> = Vec::new();
             decoder.read_to_end(&mut result).expect("Decoding failed");
@@ -946,7 +967,7 @@ mod tests {
         }
 
         fn decode_zstdx_writer(mut data: impl Read) -> Vec<u8> {
-            let mut decoder = crate::decoding::FrameDecoder::new();
+            let mut decoder = FrameDecoder::new();
             decoder.reset(&mut data).unwrap();
             let mut result = vec![];
             while !decoder.is_finished() || decoder.can_collect() > 0 {
@@ -965,14 +986,14 @@ mod tests {
             zstd::stream::encode_all(std::io::Cursor::new(data), 3)
         }
 
-        fn encode_zstdx_uncompressed(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn encode_zstdx_uncompressed(data: &mut dyn Read) -> Vec<u8> {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
             crate::encoding::compress_to_vec(input.as_slice(), crate::Level::Uncompressed)
         }
 
-        fn encode_zstdx_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn encode_zstdx_compressed(data: &mut dyn Read) -> Vec<u8> {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
@@ -993,8 +1014,8 @@ mod tests {
                     let compressed = encode_zstd(data).unwrap();
                     let decoded = decode_zstdx(&mut compressed.as_slice());
                     let decoded2 = decode_zstdx_writer(&mut compressed.as_slice());
-                    assert!(
-                        decoded == data,
+                    assert_eq!(
+                        decoded, data,
                         "Decoded data did not match the original input during decompression"
                     );
                     assert_eq!(

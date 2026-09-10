@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use crate::{
     bit_io::BitWriter,
     encoding::Matcher,
-    fse::fse_encoder::{approx_log2, build_normalized_table, rle_table, FSETable},
+    fse::fse_encoder::{FSETable, approx_log2, build_normalized_table, rle_table},
     huff0::huff0_encoder,
 };
 
@@ -12,6 +12,9 @@ use crate::{
 /// state is untouched — zero-sequence and raw-fallback blocks), or
 /// invalidation (the block overwrote the decoder's table with a predefined
 /// or RLE one, so an older custom table can no longer be repeated).
+// Kept inline on purpose: the encoder state pools these tables to avoid a
+// heap allocation per block.
+#[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 pub(crate) enum PrevTable {
     New(FSETable),
@@ -36,6 +39,9 @@ pub(crate) struct BlockTables {
 /// tables the caller should remember for later blocks; `Raw` means nothing
 /// was written and the caller should emit the raw block it would have
 /// fallen back to anyway (the encoder proved the block cannot shrink).
+// BlockTables is returned by value into the pooled encoder state; boxing
+// would add a per-block allocation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum BlockOutcome {
     Encoded(BlockTables),
     Raw,
@@ -93,10 +99,8 @@ pub(crate) fn compress_block<M: Matcher>(
     // the certain outcome. Signalling it here skips the encode-and-discard
     // writes (the block bytes are then copied and hashed exactly once, in
     // the raw writer).
-    if zero_seq && literals.len() > 1024 {
-        if sampled_gate_rejects(literals, literals_gate_hold) {
-            return BlockOutcome::Raw;
-        }
+    if zero_seq && literals.len() > 1024 && sampled_gate_rejects(literals, literals_gate_hold) {
+        return BlockOutcome::Raw;
     }
 
     // literals section
@@ -183,10 +187,9 @@ enum FseTableMode<'a> {
 impl FseTableMode<'_> {
     pub fn as_ref(&self) -> &FSETable {
         match self {
-            Self::Predefined(t) => t,
+            Self::Predefined(t) | Self::Repeat(t) => t,
             Self::Encoded(t) => t,
             Self::Rle { table, .. } => table,
-            Self::Repeat(t) => t,
         }
     }
 }
@@ -209,8 +212,8 @@ fn choose_tables_fast<'a>(
     let mut of_counts = [0u32; 256];
     for &word in seqs {
         let packed = word.codes;
-        ll_counts[(packed & 0xFF) as usize] += 1;
-        ml_counts[((packed >> 8) & 0xFF) as usize] += 1;
+        ll_counts[(packed & 0xff) as usize] += 1;
+        ml_counts[((packed >> 8) & 0xff) as usize] += 1;
         of_counts[(packed >> 16) as usize] += 1;
     }
     let first = seqs[0].codes;
@@ -298,16 +301,16 @@ fn select_from_counts<'a>(
             return FseTableMode::Predefined(default_table);
         }
     }
-    if let Some(prev) = previous {
-        if let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol) {
-            // The bound understates a fresh table's bitstream and the
-            // description term is under two percent of the comparison, so
-            // the estimate leans toward rebuilding: ratio-safe.
-            let fresh_bits =
-                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
-            if repeat_bits <= fresh_bits {
-                return FseTableMode::Repeat(prev);
-            }
+    if let Some(prev) = previous
+        && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
+    {
+        // The bound understates a fresh table's bitstream and the
+        // description term is under two percent of the comparison, so
+        // the estimate leans toward rebuilding: ratio-safe.
+        let fresh_bits =
+            entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+        if repeat_bits <= fresh_bits {
+            return FseTableMode::Repeat(prev);
         }
     }
     match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code) {
@@ -351,11 +354,11 @@ fn description_bits(max_symbol: usize) -> f64 {
 
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
-        FseTableMode::Predefined(_) | FseTableMode::Repeat(_) => {}
+        FseTableMode::Predefined(_) | FseTableMode::Repeat(_) => {},
         FseTableMode::Rle { code, .. } => {
             // The RLE table description is a single byte: the code.
             writer.write_bits(*code as u64, 8);
-        }
+        },
         FseTableMode::Encoded(table) => table.write_table(writer),
     }
 }
@@ -445,12 +448,12 @@ fn encode_sequences(
                 // The three state-transition bit groups (max 12 bits each:
                 // nb <= acc_log <= 12) fit a single u64 write; concatenating
                 // them keeps the writer's hot path.
-                let of_diff = (of_state - (e_of & 0xFFF) as usize) as u64;
-                let ml_diff = (ml_state - (e_ml & 0xFFF) as usize) as u64;
-                let ll_diff = (ll_state - (e_ll & 0xFFF) as usize) as u64;
-                let of_nb = ((e_of >> 12) & 0xF) as usize;
-                let ml_nb = ((e_ml >> 12) & 0xF) as usize;
-                let ll_nb = ((e_ll >> 12) & 0xF) as usize;
+                let of_diff = (of_state - (e_of & 0xfff) as usize) as u64;
+                let ml_diff = (ml_state - (e_ml & 0xfff) as usize) as u64;
+                let ll_diff = (ll_state - (e_ll & 0xfff) as usize) as u64;
+                let of_nb = ((e_of >> 12) & 0xf) as usize;
+                let ml_nb = ((e_ml >> 12) & 0xf) as usize;
+                let ll_nb = ((e_ll >> 12) & 0xf) as usize;
                 let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
                 of_state = (e_of >> 16) as usize;
                 ml_state = (e_ml >> 16) as usize;
@@ -530,23 +533,23 @@ fn hot_push(
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
-    const UPPER_LIMIT: usize = 0xFFFF + 0x7F00;
+    const UPPER_LIMIT: usize = 0xffff + 0x7f00;
     match seqnum {
         1..=127 => writer.write_bits(seqnum as u32, 8),
-        128..=0x7FFF => {
+        128..=0x7fff => {
             let upper = ((seqnum >> 8) | 0x80) as u8;
             let lower = seqnum as u8;
             writer.write_bits(upper, 8);
             writer.write_bits(lower, 8);
-        }
+        },
         0x8000..=UPPER_LIMIT => {
-            let encode = seqnum - 0x7F00;
+            let encode = seqnum - 0x7f00;
             let upper = (encode >> 8) as u8;
             let lower = encode as u8;
             writer.write_bits(255u8, 8);
             writer.write_bits(upper, 8);
             writer.write_bits(lower, 8);
-        }
+        },
         _ => unreachable!(),
     }
 }
@@ -568,15 +571,15 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
         0..=31 => {
             writer.write_bits(0u8, 1);
             writer.write_bits(literals.len() as u32, 5);
-        }
+        },
         32..=4095 => {
             writer.write_bits(0b01u8, 2);
             writer.write_bits(literals.len() as u32, 12);
-        }
+        },
         _ => {
             writer.write_bits(0b11u8, 2);
             writer.write_bits(literals.len() as u32, 20);
-        }
+        },
     }
     writer.write_bits(literals[0], 8);
 }
@@ -613,14 +616,14 @@ fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
     let mut c1 = [0usize; 256];
     let mut c2 = [0usize; 256];
     let mut c3 = [0usize; 256];
-    let mut chunks = literals.chunks_exact(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = literals.as_chunks::<4>();
+    for chunk in chunks {
         c0[chunk[0] as usize] += 1;
         c1[chunk[1] as usize] += 1;
         c2[chunk[2] as usize] += 1;
         c3[chunk[3] as usize] += 1;
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         c0[b as usize] += 1;
     }
     for i in 0..256 {
@@ -638,117 +641,122 @@ fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
 /// aborts with `None` and leaves `counts` untouched for the scalar fallback.
 /// Published counts are exact, so the block encode is byte-identical to the
 /// scalar path.
+// SIMD kernel: single-letter names track lane-parallel vectors (v0..v3 are
+// four 64-byte loads); longer names would obscure the lane symmetry.
+#[allow(clippy::many_single_char_names)]
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512bw,avx512vbmi,popcnt")]
 unsafe fn histogram_small_alpha_avx512(
     literals: &[u8],
     counts: &mut [usize; 256],
 ) -> Option<usize> {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    let mut slots = [0u8; 16];
-    let mut nslots = 0usize;
-    // 0 marks a byte already covered by a slot.
-    let mut lut = [1u8; 256];
-    let mut acc = [0u32; 16];
+        let mut slots = [0u8; 16];
+        let mut nslots = 0usize;
+        // 0 marks a byte already covered by a slot.
+        let mut lut = [1u8; 256];
+        let mut acc = [0u32; 16];
 
-    let mask7f = _mm512_set1_epi8(0x7F);
-    let load_lut = |lut: &[u8; 256]| {
-        (
-            _mm512_loadu_si512(lut.as_ptr().cast()),
-            _mm512_loadu_si512(lut.as_ptr().add(64).cast()),
-            _mm512_loadu_si512(lut.as_ptr().add(128).cast()),
-            _mm512_loadu_si512(lut.as_ptr().add(192).cast()),
-        )
-    };
-    let (mut lut01, mut lut01b, mut lut23, mut lut23b) = load_lut(&lut);
+        let mask7f = _mm512_set1_epi8(0x7f);
+        let load_lut = |lut: &[u8; 256]| {
+            (
+                _mm512_loadu_si512(lut.as_ptr().cast()),
+                _mm512_loadu_si512(lut.as_ptr().add(64).cast()),
+                _mm512_loadu_si512(lut.as_ptr().add(128).cast()),
+                _mm512_loadu_si512(lut.as_ptr().add(192).cast()),
+            )
+        };
+        let (mut lut01, mut lut01b, mut lut23, mut lut23b) = load_lut(&lut);
 
-    let mut i = 0usize;
-    while i + 64 <= literals.len() {
-        // Steady state: sixteen established slots. Fixed-bound slot loop in
-        // four-chunk batches amortizes the symbol broadcasts, and full
-        // coverage reduces to the popcount sum: every byte matches at most
-        // one slot (the slots are distinct), so a sum below 256 means a
-        // seventeenth symbol — bail for the scalar fallback.
-        if nslots == 16 && i + 256 <= literals.len() {
-            while i + 256 <= literals.len() {
-                // SAFETY: guarded by the loop condition.
-                let a = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
-                let b = _mm512_loadu_si512(literals.as_ptr().add(i + 64).cast());
-                let c = _mm512_loadu_si512(literals.as_ptr().add(i + 128).cast());
-                let d = _mm512_loadu_si512(literals.as_ptr().add(i + 192).cast());
-                let mut covered = 0u32;
-                for s in 0..16 {
-                    let sym = _mm512_set1_epi8(slots[s] as i8);
-                    let n = _mm512_cmpeq_epi8_mask(a, sym).count_ones()
-                        + _mm512_cmpeq_epi8_mask(b, sym).count_ones()
-                        + _mm512_cmpeq_epi8_mask(c, sym).count_ones()
-                        + _mm512_cmpeq_epi8_mask(d, sym).count_ones();
-                    covered += n;
-                    acc[s] += n;
-                }
-                if covered != 256 {
-                    return None;
-                }
-                i += 256;
-            }
-            continue;
-        }
-        // SAFETY: the loop guard bounds this 64-byte load.
-        let v = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
-        // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
-        // pair, bit 7 blends between the pairs (same pattern as the uniform4
-        // pack kernel).
-        let lo7 = _mm512_and_si512(v, mask7f);
-        let lutv = _mm512_mask_blend_epi8(
-            _mm512_movepi8_mask(v),
-            _mm512_permutex2var_epi8(lut01, lo7, lut01b),
-            _mm512_permutex2var_epi8(lut23, lo7, lut23b),
-        );
-        if _mm512_test_epi8_mask(lutv, lutv) == 0 {
-            for s in 0..nslots {
-                let m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(slots[s] as i8));
-                acc[s] += m.count_ones();
-            }
-        } else {
-            // Absorb the chunk by hand, growing the slot set from its novel
-            // bytes. A fresh byte past sixteen slots means the alphabet is
-            // too wide for this kernel.
-            for j in 0..64 {
-                let b = literals[i + j];
-                if lut[b as usize] != 0 {
-                    if nslots == 16 {
+        let mut i = 0usize;
+        while i + 64 <= literals.len() {
+            // Steady state: sixteen established slots. Fixed-bound slot loop in
+            // four-chunk batches amortizes the symbol broadcasts, and full
+            // coverage reduces to the popcount sum: every byte matches at most
+            // one slot (the slots are distinct), so a sum below 256 means a
+            // seventeenth symbol — bail for the scalar fallback.
+            if nslots == 16 && i + 256 <= literals.len() {
+                while i + 256 <= literals.len() {
+                    // SAFETY: guarded by the loop condition.
+                    let a = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
+                    let b = _mm512_loadu_si512(literals.as_ptr().add(i + 64).cast());
+                    let c = _mm512_loadu_si512(literals.as_ptr().add(i + 128).cast());
+                    let d = _mm512_loadu_si512(literals.as_ptr().add(i + 192).cast());
+                    let mut covered = 0u32;
+                    for s in 0..16 {
+                        let sym = _mm512_set1_epi8(slots[s] as i8);
+                        let n = _mm512_cmpeq_epi8_mask(a, sym).count_ones()
+                            + _mm512_cmpeq_epi8_mask(b, sym).count_ones()
+                            + _mm512_cmpeq_epi8_mask(c, sym).count_ones()
+                            + _mm512_cmpeq_epi8_mask(d, sym).count_ones();
+                        covered += n;
+                        acc[s] += n;
+                    }
+                    if covered != 256 {
                         return None;
                     }
-                    lut[b as usize] = 0;
-                    slots[nslots] = b;
-                    nslots += 1;
+                    i += 256;
                 }
-                let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
-                acc[slot] += 1;
+                continue;
             }
-            (lut01, lut01b, lut23, lut23b) = load_lut(&lut);
-        }
-        i += 64;
-    }
-    for &b in &literals[i..] {
-        if lut[b as usize] != 0 {
-            if nslots == 16 {
-                return None;
+            // SAFETY: the loop guard bounds this 64-byte load.
+            let v = _mm512_loadu_si512(literals.as_ptr().add(i).cast());
+            // 256-entry byte LUT: bits 0..6 select within a 128-byte permute
+            // pair, bit 7 blends between the pairs (same pattern as the uniform4
+            // pack kernel).
+            let lo7 = _mm512_and_si512(v, mask7f);
+            let lutv = _mm512_mask_blend_epi8(
+                _mm512_movepi8_mask(v),
+                _mm512_permutex2var_epi8(lut01, lo7, lut01b),
+                _mm512_permutex2var_epi8(lut23, lo7, lut23b),
+            );
+            if _mm512_test_epi8_mask(lutv, lutv) == 0 {
+                for s in 0..nslots {
+                    let m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(slots[s] as i8));
+                    acc[s] += m.count_ones();
+                }
+            } else {
+                // Absorb the chunk by hand, growing the slot set from its novel
+                // bytes. A fresh byte past sixteen slots means the alphabet is
+                // too wide for this kernel.
+                for j in 0..64 {
+                    let b = literals[i + j];
+                    if lut[b as usize] != 0 {
+                        if nslots == 16 {
+                            return None;
+                        }
+                        lut[b as usize] = 0;
+                        slots[nslots] = b;
+                        nslots += 1;
+                    }
+                    let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
+                    acc[slot] += 1;
+                }
+                (lut01, lut01b, lut23, lut23b) = load_lut(&lut);
             }
-            lut[b as usize] = 0;
-            slots[nslots] = b;
-            nslots += 1;
+            i += 64;
         }
-        let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
-        acc[slot] += 1;
+        for &b in &literals[i..] {
+            if lut[b as usize] != 0 {
+                if nslots == 16 {
+                    return None;
+                }
+                lut[b as usize] = 0;
+                slots[nslots] = b;
+                nslots += 1;
+            }
+            let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
+            acc[slot] += 1;
+        }
+        let mut max_symbol = 0usize;
+        for s in 0..nslots {
+            counts[slots[s] as usize] = acc[s] as usize;
+            max_symbol = max_symbol.max(slots[s] as usize);
+        }
+        Some(max_symbol)
     }
-    let mut max_symbol = 0usize;
-    for s in 0..nslots {
-        counts[slots[s] as usize] = acc[s] as usize;
-        max_symbol = max_symbol.max(slots[s] as usize);
-    }
-    Some(max_symbol)
 }
 
 /// Strided entropy gate before the exact histogram: one sampled count per
@@ -841,13 +849,13 @@ fn compress_literals(
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_symbol]);
 
-    let (encoder_table, new_table) = if let Some(_table) = last_table {
-        if let Some(diff) = _table.can_encode(&new_encoder_table) {
+    let (encoder_table, new_table) = if let Some(table) = last_table {
+        if let Some(diff) = table.can_encode(&new_encoder_table) {
             // TODO this is a very simple heuristic, maybe we should try to do better
             if diff > 5 {
                 (&new_encoder_table, true)
             } else {
-                (_table, false)
+                (table, false)
             }
         } else {
             (&new_encoder_table, true)
@@ -877,15 +885,16 @@ fn compress_literals(
     let index_before = writer.index();
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
     if size_format == 0 {
-        encoder.encode(literals, new_table)
+        encoder.encode(literals, new_table);
     } else {
-        encoder.encode4x(literals, new_table)
-    };
+        encoder.encode4x(literals, new_table);
+    }
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);
     let total_len = (writer.index() - reset_idx) / 8;
 
-    // If encoded len is bigger than the raw literals we are better off just writing the raw literals here
+    // If encoded len is bigger than the raw literals we are better off just writing the raw
+    // literals here
     if total_len >= literals.len() {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);

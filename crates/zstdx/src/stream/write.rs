@@ -1,12 +1,16 @@
 //! io::Write-shaped streaming encoders and decoders.
 
-use super::encoder_core::FrameEncoderCore;
-use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
-use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 use alloc::vec::Vec;
 
-use crate::io::{Error, Write};
-use crate::{DecoderOptions, EncoderOptions, Level, Result};
+use super::encoder_core::FrameEncoderCore;
+use crate::{
+    DecoderOptions, EncoderOptions, Level, Result,
+    decoding::{
+        BlockDecodingStrategy, FrameDecoder,
+        errors::{FrameDecoderError, ReadFrameHeaderError},
+    },
+    io::{Error, Write},
+};
 
 /// Compress data and write it to an underlying [`Write`].
 ///
@@ -16,9 +20,9 @@ use crate::{DecoderOptions, EncoderOptions, Level, Result};
 /// like the libzstd bindings.
 ///
 /// ```rust
-/// use zstdx::stream::write::Encoder;
-/// use zstdx::Level;
 /// use std::io::Write;
+///
+/// use zstdx::{Level, stream::write::Encoder};
 ///
 /// let mut enc = Encoder::new(Vec::new(), Level::Fastest).unwrap();
 /// enc.write_all(b"the quick brown fox").unwrap();
@@ -38,6 +42,8 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Create an encoder from a builder option set.
+    // options are consumed builder data; by value keeps the chaining API
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(writer: W, options: EncoderOptions) -> Result<Self> {
         Ok(Self {
             writer: Some(writer),
@@ -70,6 +76,9 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Finish the stream, handing back the encoder on failure.
+    // the Err variant hands the encoder back to the caller; boxing it would
+    // change the public signature
+    #[allow(clippy::result_large_err)]
     pub fn try_finish(mut self) -> Result<W, (Self, crate::Error)> {
         match self.do_finish() {
             Ok(()) => Ok(self.writer.take().unwrap()),
@@ -112,18 +121,14 @@ impl<W: Write> Encoder<W> {
 
 impl<W: Write> Write for Encoder<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        if self.core.is_finished() {
-            panic!("write after finish");
-        }
+        assert!(!self.core.is_finished(), "write after finish");
         self.core.write(buf);
         self.drain()?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> Result<(), Error> {
-        if self.core.is_finished() {
-            panic!("flush after finish");
-        }
+        assert!(!self.core.is_finished(), "flush after finish");
         // Emit the staged partial block early so a reader can make progress;
         // the inner writer is flushed afterwards.
         self.core.flush_block();
@@ -179,8 +184,9 @@ impl<W: Write, F: FnMut(Result<W>)> Drop for AutoFinishEncoder<W, F> {
 /// processed as far as it arrives, so decoding cost follows the writes.
 ///
 /// ```rust
-/// use zstdx::stream::write::Decoder;
 /// use std::io::Write;
+///
+/// use zstdx::stream::write::Decoder;
 ///
 /// let compressed = zstdx::bulk::compress(b"payload", zstdx::Level::Fastest);
 /// let mut sink = Vec::new();
@@ -209,6 +215,8 @@ impl<W: Write> Decoder<W> {
     }
 
     /// Create a decoder from a builder option set.
+    // options are consumed builder data; by value keeps the chaining API
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(writer: W, options: DecoderOptions) -> Result<Self> {
         let mut inner = FrameDecoder::new();
         if let Some(max) = options.max_window_size {
@@ -270,10 +278,10 @@ impl<W: Write> Decoder<W> {
     fn pump(&mut self) -> Result<()> {
         loop {
             if !self.inited {
-                match self.init_frame()? {
-                    true => continue,
-                    false => return Ok(()),
+                if !self.init_frame()? {
+                    return Ok(());
                 }
+                continue;
             }
             if self.inner.is_finished() {
                 self.inner.collect_to_writer(&mut self.writer)?;
@@ -284,7 +292,7 @@ impl<W: Write> Decoder<W> {
                 continue;
             }
             match self.next_block_need()? {
-                Some(need) if self.input.len() >= need => {}
+                Some(need) if self.input.len() >= need => {},
                 _ => return Ok(()),
             }
             let read_before = self.inner.bytes_read_from_source();
@@ -319,9 +327,13 @@ impl<W: Write> Decoder<W> {
                         crate::decoding::errors::BlockHeaderReadError::FoundReservedBlock,
                     ),
                 ))
-            }
+            },
         };
-        let trailer = if last && self.checksummed { 4 } else { 0 };
+        let trailer = if last && self.checksummed {
+            4
+        } else {
+            0
+        };
         Ok(Some(3 + body + trailer))
     }
 
@@ -346,7 +358,7 @@ impl<W: Write> Decoder<W> {
                     }
                     self.input.drain(..total);
                     continue;
-                }
+                },
                 Err(e) => {
                     let starved = matches!(&e,
                         ReadFrameHeaderError::MagicNumberReadError(io)
@@ -359,7 +371,7 @@ impl<W: Write> Decoder<W> {
                         return Ok(false);
                     }
                     return Err(FrameDecoderError::ReadFrameHeaderError(e).into());
-                }
+                },
             };
             let mut source = &self.input[..];
             self.inner.reset(&mut source).map_err(crate::Error::Frame)?;

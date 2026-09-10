@@ -104,3 +104,9 @@ impl DecoderOptions {
         self
     }
 }
+
+impl Default for DecoderOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}

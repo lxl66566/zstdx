@@ -1,16 +1,17 @@
 //! Tests for the streaming encoders: byte-equality with the one-shot paths,
 //! option plumbing, drop behavior and interop with the reference decoder.
 
-use crate::encoding;
-use crate::io::Write as _;
-use crate::stream::{read, write};
-use crate::{bulk, EncoderOptions, Level};
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
+
+use crate::{
+    EncoderOptions, Level, bulk, encoding,
+    io::Write as _,
+    stream::{read, write},
+};
 
 #[cfg(test)]
 fn shapes() -> Vec<Vec<u8>> {
-    let mut pseudo_random = 0x9E37_79B9_7F4A_7C15u64;
+    let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
     let mut rand = move || {
         pseudo_random ^= pseudo_random << 13;
         pseudo_random ^= pseudo_random >> 7;
@@ -22,7 +23,7 @@ fn shapes() -> Vec<Vec<u8>> {
         alloc::vec![1],
         alloc::vec![7u8; 5],
         alloc::vec![b'x'; 300 * 1024],
-        (0..128 * 1024).map(|_| (rand() & 0xFF) as u8).collect(),
+        (0..128 * 1024).map(|_| (rand() & 0xff) as u8).collect(),
         (0..900 * 1024).map(|i| (i % 61) as u8).collect(),
         // exact block multiple: the trailing empty last block case
         alloc::vec![b'y'; 128 * 1024],
@@ -159,14 +160,14 @@ fn on_finish_reports_result_and_writer() {
 fn flush_forces_partial_block() {
     // Incompressible payload: a flushed partial block is visible in the
     // sink as roughly its own size of bytes.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut rand = move || {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         state
     };
-    let data: Vec<u8> = (0..10 * 1024).map(|_| (rand() & 0xFF) as u8).collect();
+    let data: Vec<u8> = (0..10 * 1024).map(|_| (rand() & 0xff) as u8).collect();
     let mut sink = Vec::new();
     let mut enc = write::Encoder::new(&mut sink, Level::Fastest).unwrap();
     enc.write_all(&data).unwrap();
@@ -236,11 +237,11 @@ fn multi_frame_stream() -> (Vec<u8>, Vec<u8>) {
     let c = bulk::compress(&[], Level::Fastest);
     let mut stream = Vec::new();
     stream.extend_from_slice(&a);
-    stream.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+    stream.extend_from_slice(&0x184d2a50u32.to_le_bytes());
     stream.extend_from_slice(&300u32.to_le_bytes());
-    stream.extend(core::iter::repeat_n(0xAB, 300));
+    stream.extend(core::iter::repeat_n(0xab, 300));
     stream.extend_from_slice(&b);
-    stream.extend_from_slice(&0x184D2A5Fu32.to_le_bytes());
+    stream.extend_from_slice(&0x184d2a5fu32.to_le_bytes());
     stream.extend_from_slice(&0u32.to_le_bytes());
     stream.extend_from_slice(&c);
     let mut plain = Vec::new();
@@ -306,9 +307,8 @@ fn truncated_stream_is_an_error() {
     let truncated = &compressed[..compressed.len() - 5];
     assert!(
         read::Decoder::new(truncated).is_err() || {
-            let mut dec = match read::Decoder::new(truncated) {
-                Ok(d) => d,
-                Err(_) => return,
+            let Ok(mut dec) = read::Decoder::new(truncated) else {
+                return;
             };
             let mut out = Vec::new();
             crate::io::Read::read_to_end(&mut dec, &mut out).is_err()
@@ -326,19 +326,20 @@ fn truncated_stream_is_an_error() {
 // path under an exact pledge, flush and read-side (pump_from) coverage.
 #[cfg(feature = "std")]
 mod mt {
-    use super::*;
-    use crate::io::Read as _;
     use alloc::format;
 
+    use super::*;
+    use crate::io::Read as _;
+
     fn lcg(len: usize) -> Vec<u8> {
-        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut state = 0x1234_5678_9abc_def0u64;
         let mut rand = move || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state
         };
-        (0..len).map(|_| (rand() & 0xFF) as u8).collect()
+        (0..len).map(|_| (rand() & 0xff) as u8).collect()
     }
 
     /// Text-like data: repeating vocabulary with variation, so matches,
@@ -453,12 +454,8 @@ mod mt {
         let data = textish(7 * 1024 * 1024 + 999);
         for workers in [2u32, 4] {
             for checksum in [true, false] {
-                let bulk_mt = crate::encoding::mt::compress_slice_mt(
-                    &data,
-                    Level::Fastest,
-                    checksum,
-                    workers,
-                );
+                let bulk_mt =
+                    encoding::mt::compress_slice_mt(&data, Level::Fastest, checksum, workers);
                 let streamed = encode_write(
                     &data,
                     1024 * 1024,

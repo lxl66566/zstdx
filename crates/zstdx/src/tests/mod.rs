@@ -1,6 +1,5 @@
 #[cfg(test)]
 use alloc::vec;
-
 #[cfg(test)]
 use alloc::vec::Vec;
 
@@ -29,7 +28,7 @@ fn assure_error_impl() {
     // not a real test just there to throw an compiler error if Error is not derived correctly
 
     use crate::decoding::errors::FrameDecoderError;
-    let _err: &dyn std::error::Error = &FrameDecoderError::NotYetInitialized;
+    let _: &dyn std::error::Error = &FrameDecoderError::NotYetInitialized;
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -46,32 +45,31 @@ fn assure_decoder_send_sync() {
 
 #[test]
 fn skippable_frame() {
-    use crate::decoding::errors;
-    use crate::decoding::frame;
+    use crate::decoding::{errors, frame};
 
     let mut content = vec![];
-    content.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+    content.extend_from_slice(&0x184d2a50u32.to_le_bytes());
     content.extend_from_slice(&300u32.to_le_bytes());
     assert_eq!(8, content.len());
     let err = frame::read_frame_header(content.as_slice());
     assert!(matches!(
         err,
         Err(errors::ReadFrameHeaderError::SkipFrame {
-            magic_number: 0x184D2A50u32,
+            magic_number: 0x184d2a50u32,
             length: 300
         })
     ));
 
     content.clear();
-    content.extend_from_slice(&0x184D2A5Fu32.to_le_bytes());
-    content.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    content.extend_from_slice(&0x184d2a5fu32.to_le_bytes());
+    content.extend_from_slice(&0xffffffffu32.to_le_bytes());
     assert_eq!(8, content.len());
     let err = frame::read_frame_header(content.as_slice());
     assert!(matches!(
         err,
         Err(errors::ReadFrameHeaderError::SkipFrame {
-            magic_number: 0x184D2A5Fu32,
-            length: 0xFFFFFFFF
+            magic_number: 0x184d2a5fu32,
+            length: 0xffffffff
         })
     ));
 }
@@ -79,8 +77,9 @@ fn skippable_frame() {
 #[cfg(test)]
 #[test]
 fn test_frame_header_reading() {
-    use crate::decoding::frame;
     use std::fs;
+
+    use crate::decoding::frame;
 
     let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
     let (_frame, _) = frame::read_frame_header(&mut content).unwrap();
@@ -88,9 +87,9 @@ fn test_frame_header_reading() {
 
 #[test]
 fn test_block_header_reading() {
-    use crate::decoding;
-    use crate::decoding::frame;
     use std::fs;
+
+    use crate::{decoding, decoding::frame};
 
     let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
     let (_frame, _) = frame::read_frame_header(&mut content).unwrap();
@@ -102,22 +101,11 @@ fn test_block_header_reading() {
 
 #[test]
 fn test_frame_decoder() {
-    use crate::decoding::BlockDecodingStrategy;
-    use crate::decoding::FrameDecoder;
     use std::fs;
 
-    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
-    struct NullWriter(());
-    impl std::io::Write for NullWriter {
-        fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> Result<(), std::io::Error> {
-            Ok(())
-        }
-    }
-    let mut _null_target = NullWriter(());
+    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
 
     let mut frame_dec = FrameDecoder::new();
     frame_dec.reset(&mut content).unwrap();
@@ -128,10 +116,12 @@ fn test_frame_decoder() {
 
 #[test]
 fn test_decode_from_to() {
+    use std::{
+        fs::File,
+        io::{BufReader, Read},
+    };
+
     use crate::decoding::FrameDecoder;
-    use std::fs::File;
-    use std::io::BufReader;
-    use std::io::Read;
     let f = BufReader::new(File::open("./decodecorpus_files/z000088.zst").unwrap());
     let mut frame_dec = FrameDecoder::new();
 
@@ -145,69 +135,61 @@ fn test_decode_from_to() {
         .decode_from_to(source1, target.as_mut_slice())
         .unwrap();
 
-    //second part explicitely without checksum
+    // second part explicitely without checksum
     let source2 = &content[read1..content.len() - 4];
     let (read2, written2) = frame_dec
         .decode_from_to(source2, &mut target[written1..])
         .unwrap();
 
-    //must have decoded until checksum
-    assert!(read1 + read2 == content.len() - 4);
+    // must have decoded until checksum
+    assert_eq!(read1 + read2, content.len() - 4);
 
-    //insert checksum separatly to test that this is handled correctly
+    // insert checksum separatly to test that this is handled correctly
     let chksum_source = &content[read1 + read2..];
     let (read3, written3) = frame_dec
         .decode_from_to(chksum_source, &mut target[written1 + written2..])
         .unwrap();
 
-    //this must result in these values because just the checksum was processed
-    assert!(read3 == 4);
-    assert!(written3 == 0);
+    // this must result in these values because just the checksum was processed
+    assert_eq!(read3, 4);
+    assert_eq!(written3, 0);
 
     let read = read1 + read2 + read3;
     let written = written1 + written2;
 
     let result = &target.as_slice()[..written];
 
-    if read != content.len() {
-        panic!(
-            "Byte counter: {} was wrong. Should be: {}",
-            read,
-            content.len()
-        );
-    }
+    assert_eq!(
+        read,
+        content.len(),
+        "Byte counter was wrong (decoded bytes != input length)"
+    );
 
     match frame_dec.get_checksum_from_data() {
         Some(chksum) => {
             #[cfg(feature = "hash")]
-            if frame_dec.get_calculated_checksum().unwrap() != chksum {
+            if frame_dec.get_calculated_checksum().unwrap() == chksum {
+                std::println!("Checksums are ok!\n");
+            } else {
                 std::println!(
                     "Checksum did not match! From data: {}, calculated while decoding: {}\n",
                     chksum,
                     frame_dec.get_calculated_checksum().unwrap()
                 );
-            } else {
-                std::println!("Checksums are ok!\n");
             }
             #[cfg(not(feature = "hash"))]
             std::println!(
                 "Checksum feature not enabled, skipping. From data: {}\n",
                 chksum
             );
-        }
+        },
         None => std::println!("No checksums to test\n"),
     }
 
     let original_f = BufReader::new(File::open("./decodecorpus_files/z000088").unwrap());
     let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
 
-    if original.len() != result.len() {
-        panic!(
-            "Result has wrong length: {}, should be: {}",
-            result.len(),
-            original.len()
-        );
-    }
+    assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
     let min = if original.len() < result.len() {
@@ -218,38 +200,26 @@ fn test_decode_from_to() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
         }
     }
-    if counter > 0 {
-        panic!("Result differs in at least {} bytes from original", counter);
-    }
+    assert_eq!(counter, 0, "Result differs from original");
 }
 
 #[test]
 fn test_specific_file() {
-    use crate::decoding::BlockDecodingStrategy;
-    use crate::decoding::FrameDecoder;
-    use std::fs;
-    use std::io::BufReader;
-    use std::io::Read;
+    use std::{
+        fs,
+        io::{BufReader, Read},
+    };
+
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let path = "./decodecorpus_files/z000068.zst";
     let mut content = fs::File::open(path).unwrap();
-
-    struct NullWriter(());
-    impl std::io::Write for NullWriter {
-        fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> Result<(), std::io::Error> {
-            Ok(())
-        }
-    }
-    let mut _null_target = NullWriter(());
 
     let mut frame_dec = FrameDecoder::new();
     frame_dec.reset(&mut content).unwrap();
@@ -280,7 +250,7 @@ fn test_specific_file() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
@@ -294,9 +264,10 @@ fn test_specific_file() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming() {
-    use std::fs;
-    use std::io::BufReader;
-    use std::io::Read;
+    use std::{
+        fs,
+        io::{BufReader, Read},
+    };
 
     let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
     let mut stream = crate::decoding::StreamingDecoder::new(&mut content).unwrap();
@@ -307,13 +278,7 @@ fn test_streaming() {
     let original_f = BufReader::new(fs::File::open("./decodecorpus_files/z000088").unwrap());
     let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
 
-    if original.len() != result.len() {
-        panic!(
-            "Result has wrong length: {}, should be: {}",
-            result.len(),
-            original.len()
-        );
-    }
+    assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
     let min = if original.len() < result.len() {
@@ -324,15 +289,13 @@ fn test_streaming() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
         }
     }
-    if counter > 0 {
-        panic!("Result differs in at least {} bytes from original", counter);
-    }
+    assert_eq!(counter, 0, "Result differs from original");
 
     // Test resetting to a new file while keeping the old decoder
 
@@ -351,13 +314,7 @@ fn test_streaming() {
 
     std::println!("Results for file:");
 
-    if original.len() != result.len() {
-        panic!(
-            "Result has wrong length: {}, should be: {}",
-            result.len(),
-            original.len()
-        );
-    }
+    assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
     let min = if original.len() < result.len() {
@@ -368,15 +325,13 @@ fn test_streaming() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
         }
     }
-    if counter > 0 {
-        panic!("Result differs in at least {} bytes from original", counter);
-    }
+    assert_eq!(counter, 0, "Result differs from original");
 }
 
 #[test]
@@ -398,7 +353,7 @@ fn test_incremental_read() {
     assert_eq!(output.map(char::from), ['a', 'b', 'c']);
 
     assert!(frame_dec.is_finished());
-    let written = frame_dec.collect_to_writer(&mut &mut output[..]).unwrap();
+    let written = frame_dec.collect_to_writer(&mut output[..]).unwrap();
     assert_eq!(written, 3);
     assert_eq!(output.map(char::from), ['d', 'e', 'f']);
 }
@@ -416,13 +371,7 @@ fn test_streaming_no_std() {
     let mut result = vec![0; original.len()];
     Read::read_exact(&mut stream, &mut result).unwrap();
 
-    if original.len() != result.len() {
-        panic!(
-            "Result has wrong length: {}, should be: {}",
-            result.len(),
-            original.len()
-        );
-    }
+    assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
     let min = if original.len() < result.len() {
@@ -433,15 +382,13 @@ fn test_streaming_no_std() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
         }
     }
-    if counter > 0 {
-        panic!("Result differs in at least {} bytes from original", counter);
-    }
+    assert_eq!(counter, 0, "Result differs from original");
 
     // Test resetting to a new file while keeping the old decoder
 
@@ -459,13 +406,7 @@ fn test_streaming_no_std() {
 
     std::println!("Results for file:");
 
-    if original.len() != result.len() {
-        panic!(
-            "Result has wrong length: {}, should be: {}",
-            result.len(),
-            original.len()
-        );
-    }
+    assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
     let min = if original.len() < result.len() {
@@ -476,24 +417,21 @@ fn test_streaming_no_std() {
     for idx in 0..min {
         if original[idx] != result[idx] {
             counter += 1;
-            //std::println!(
+            // std::println!(
             //    "Original {:3} not equal to result {:3} at byte: {}",
             //    original[idx], result[idx], idx,
             //);
         }
     }
-    if counter > 0 {
-        panic!("Result differs in at least {} bytes from original", counter);
-    }
+    assert_eq!(counter, 0, "Result differs from original");
 }
 
 #[test]
 fn test_decode_all() {
-    use crate::decoding::errors::FrameDecoderError;
-    use crate::decoding::FrameDecoder;
+    use crate::decoding::{FrameDecoder, errors::FrameDecoderError};
 
     let skip_frame = |input: &mut Vec<u8>, length: usize| {
-        input.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        input.extend_from_slice(&0x184d2a50u32.to_le_bytes());
         input.extend_from_slice(&(length as u32).to_le_bytes());
         input.resize(input.len() + length, 0);
     };
@@ -522,8 +460,7 @@ fn test_decode_all() {
     let result = decoder.decode_all(&input, &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::TargetTooSmall)),
-        "{:?}",
-        result
+        "{result:?}"
     );
 
     // decode_all with larger output length.
@@ -537,8 +474,7 @@ fn test_decode_all() {
     let result = decoder.decode_all(&input[..input.len() - 600], &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::FailedToReadBlockBody(_))),
-        "{:?}",
-        result
+        "{result:?}"
     );
 
     // decode_all with truncated skip frame.
@@ -546,8 +482,7 @@ fn test_decode_all() {
     let result = decoder.decode_all(&input[..input.len() - 1], &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::FailedToSkipFrame)),
-        "{:?}",
-        result
+        "{result:?}"
     );
 
     // decode_all_to_vec with correct output capacity.
@@ -562,8 +497,7 @@ fn test_decode_all() {
     let result = decoder.decode_all_to_vec(&input, &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::TargetTooSmall)),
-        "{:?}",
-        result
+        "{result:?}"
     );
 
     // decode_all_to_vec with larger output capacity.
@@ -614,8 +548,7 @@ fn test_large_window_decodes_when_limit_raised() {
 
 #[test]
 fn test_large_window_rejected_at_default_limit() {
-    use crate::decoding::errors::FrameDecoderError;
-    use crate::decoding::{FrameDecoder, DEFAULT_MAX_WINDOW_SIZE};
+    use crate::decoding::{DEFAULT_MAX_WINDOW_SIZE, FrameDecoder, errors::FrameDecoderError};
 
     let compressed = include_bytes!("../../test_fixtures/window_256mib.zst");
 
@@ -631,8 +564,7 @@ fn test_large_window_rejected_at_default_limit() {
             Err(FrameDecoderError::WindowSizeTooBig { requested, max })
                 if requested == 256 * 1024 * 1024 && max == DEFAULT_MAX_WINDOW_SIZE
         ),
-        "{:?}",
-        result
+        "{result:?}"
     );
 }
 
@@ -665,8 +597,7 @@ fn test_multi_frame_large_window_decodes_when_raised() {
 
 #[test]
 fn test_large_window_rejected_on_first_and_later_frames() {
-    use crate::decoding::errors::FrameDecoderError;
-    use crate::decoding::FrameDecoder;
+    use crate::decoding::{FrameDecoder, errors::FrameDecoderError};
 
     let big = include_bytes!("../../test_fixtures/window_256mib.zst"); // 256 MiB window
     let small = include_bytes!("../../test_fixtures/window_8mib.zst"); // 8 MiB window
@@ -677,8 +608,7 @@ fn test_large_window_rejected_on_first_and_later_frames() {
     let result = decoder.decode_all(big, &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::WindowSizeTooBig { .. })),
-        "first frame should be rejected: {:?}",
-        result
+        "first frame should be rejected: {result:?}"
     );
 
     // Later frame: a small-window frame decodes, then a 256 MiB-window frame is
@@ -693,25 +623,24 @@ fn test_large_window_rejected_on_first_and_later_frames() {
     let result = decoder.decode_all(&input, &mut output);
     assert!(
         matches!(result, Err(FrameDecoderError::WindowSizeTooBig { .. })),
-        "later frame should be rejected: {:?}",
-        result
+        "later frame should be rejected: {result:?}"
     );
 }
 
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming_decoder_max_window_size() {
-    use crate::decoding::errors::FrameDecoderError;
-    use crate::decoding::StreamingDecoder;
     use std::io::Read;
+
+    use crate::decoding::{StreamingDecoder, errors::FrameDecoderError};
 
     let compressed = include_bytes!("../../test_fixtures/window_256mib.zst");
     let expected = window_128_and_256mib_plaintext();
 
     // The default StreamingDecoder rejects the 256 MiB window on init.
     match StreamingDecoder::new(compressed.as_slice()) {
-        Err(FrameDecoderError::WindowSizeTooBig { .. }) => {}
-        Err(e) => panic!("expected WindowSizeTooBig, got {:?}", e),
+        Err(FrameDecoderError::WindowSizeTooBig { .. }) => {},
+        Err(e) => panic!("expected WindowSizeTooBig, got {e:?}"),
         Ok(_) => panic!("expected WindowSizeTooBig, got a decoder"),
     }
 
@@ -726,8 +655,7 @@ fn test_streaming_decoder_max_window_size() {
 
 #[test]
 fn test_max_window_size_clamped_to_format_maximum() {
-    use crate::common::MAX_WINDOW_SIZE;
-    use crate::decoding::FrameDecoder;
+    use crate::{common::MAX_WINDOW_SIZE, decoding::FrameDecoder};
 
     let mut decoder = FrameDecoder::new();
 
@@ -751,6 +679,5 @@ pub mod multi_frame;
 #[cfg(feature = "std")]
 #[test]
 fn verbose_disabled() {
-    use crate::VERBOSE;
-    assert_eq!(VERBOSE, false);
+    const { assert!(!crate::VERBOSE) }
 }

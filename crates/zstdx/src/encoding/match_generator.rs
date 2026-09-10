@@ -19,11 +19,11 @@
 
 use alloc::vec::Vec;
 
-use super::opt::{OptKnobs, OptScratch, OptState};
-use super::seq_codes::{decode_packed, pack_seq};
-use super::Matcher;
-use super::SeqWord;
-use super::Sequence;
+use super::{
+    Matcher, SeqWord, Sequence,
+    opt::{OptKnobs, OptScratch, OptState},
+    seq_codes::{decode_packed, pack_seq},
+};
 use crate::Level;
 // Shared with the decoder so both sides agree on offset-history semantics.
 use crate::decoding::sequence_execution::do_offset_history;
@@ -68,7 +68,7 @@ const SEED_BUDGET: u32 = 8192;
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 const SEED_SCAN_MIN: usize = 128;
 /// History kept for matching; also the window size declared in the frame header.
-const MAX_WINDOW: usize = 0xC0000;
+const MAX_WINDOW: usize = 0xc0000;
 
 // The opt strategies' never-valid table entry; their positions live in
 // the low 48 bits with the epoch in the high 16 (see
@@ -255,8 +255,8 @@ fn hash_at(win: &[u8], idx: usize) -> usize {
     // ahead (the scan tail guard and the emit insert bound); unaligned
     // because positions are byte-granular.
     unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0xFFFF_FFFF_FF;
-        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
+        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
+        (v.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
     }
 }
 
@@ -266,8 +266,8 @@ fn hash_at(win: &[u8], idx: usize) -> usize {
 fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at.
     unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0xFFFF_FFFF_FF;
-        (v.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) as usize >> (64 - log)) & ((1usize << log) - 1)
+        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
+        (v.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) as usize >> (64 - log)) & ((1usize << log) - 1)
     }
 }
 
@@ -278,7 +278,7 @@ fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at_log.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned();
-        (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) as usize >> (64 - log)) & ((1usize << log) - 1)
+        (v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) as usize >> (64 - log)) & ((1usize << log) - 1)
     }
 }
 
@@ -501,7 +501,11 @@ impl TableEmit<'_> {
             self.seqs,
         );
         let chain_mask = chain.len() - 1;
-        let step = (if match_len <= 64 { 1 } else { 4 }) as u64;
+        let step = (if match_len <= 64 {
+            1
+        } else {
+            4
+        }) as u64;
         let end_abs = (self.win_base + match_end as u64).min(self.insert_max);
         let mut p = self.win_base + start as u64;
         while p < end_abs {
@@ -766,7 +770,7 @@ unsafe impl Send for MatchGeneratorDriver {}
 
 /// Resolve the active window (owned or borrowed). A free function so callers
 /// can split-borrow `win`/`ext` against `&mut table`.
-fn window_slice<'a>(win: &'a Vec<u8>, ext: &'a Option<ExtWindow>) -> &'a [u8] {
+fn window_slice<'a>(win: &'a [u8], ext: Option<&'a ExtWindow>) -> &'a [u8] {
     match ext {
         None => win,
         // SAFETY: the ExtWindow invariant (caller buffer alive and unchanged
@@ -860,15 +864,15 @@ impl MatchGeneratorDriver {
                 Strategy::Fast => {
                     self.table = alloc::vec![0u32; 1usize << params.hash_log];
                     self.chain = Vec::new();
-                }
+                },
                 Strategy::Dfast(small_log) => {
                     self.table = alloc::vec![0u32; 1usize << params.hash_log];
                     self.chain = alloc::vec![0u32; 1usize << small_log];
-                }
+                },
                 Strategy::Chain(chain_log) => {
                     self.table = alloc::vec![0u32; 1usize << params.hash_log];
                     self.chain = alloc::vec![0u32; 1usize << chain_log];
-                }
+                },
                 Strategy::Opt(knobs) => {
                     self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
                     // The tree ring: two link slots per ring position.
@@ -880,7 +884,7 @@ impl MatchGeneratorDriver {
                     };
                     self.table = Vec::new();
                     self.chain = Vec::new();
-                }
+                },
             }
             if !matches!(params.strategy, Strategy::Opt(_)) {
                 self.opt_table = Vec::new();
@@ -910,7 +914,7 @@ impl MatchGeneratorDriver {
     /// until the next `adopt_window` or `reset`.
     pub fn adopt_window(&mut self, data: &[u8], base: u64) {
         debug_assert!(self.ext.is_some() || self.win.is_empty());
-        debug_assert!(!data.is_empty());
+        debug_assert_ne!(data, &[][..]);
         self.ext = Some(ExtWindow {
             data: data.as_ptr(),
             len: data.len(),
@@ -976,7 +980,7 @@ impl MatchGeneratorDriver {
         match self.params.strategy {
             Strategy::Opt(_) => {
                 self.next_update = self.next_update.min(base);
-            }
+            },
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
@@ -988,7 +992,7 @@ impl MatchGeneratorDriver {
                     idx += PREFILL_STRIDE;
                 }
                 self.acquire_seed(data, last);
-            }
+            },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
                 let long = &mut self.table[..];
@@ -1006,7 +1010,7 @@ impl MatchGeneratorDriver {
                 // The double table is as burial-prone as the fast one for
                 // period-long twins: both probes are single-candidate.
                 self.acquire_seed(data, last);
-            }
+            },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let chain_mask = self.chain.len() - 1;
@@ -1029,7 +1033,7 @@ impl MatchGeneratorDriver {
                 // The head table's first hop is as burial-prone as the fast
                 // strategy's single probe; seed the walk-independent path.
                 self.acquire_seed(data, last);
-            }
+            },
         }
     }
 
@@ -1077,13 +1081,13 @@ fn clear_table(t: &mut [u32]) {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn clear_table_avx512(t: &mut [u32]) {
-    use core::arch::x86_64::*;
-    let zero = _mm512_setzero_si512();
-    let mut p = t.as_mut_ptr();
-    let end = p.add(t.len());
-    // SAFETY: p advances only while strictly below end; the alignment head
-    // and element tail each touch disjoint in-bounds ranges.
     unsafe {
+        use core::arch::x86_64::*;
+        let zero = _mm512_setzero_si512();
+        let mut p = t.as_mut_ptr();
+        let end = p.add(t.len());
+        // SAFETY: p advances only while strictly below end; the alignment head
+        // and element tail each touch disjoint in-bounds ranges.
         while (p as usize) & 63 != 0 && p < end {
             *p = 0;
             p = p.add(1);
@@ -1149,43 +1153,45 @@ fn seed_agrees(data: &[u8], u: usize, last: usize) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
-    use core::arch::x86_64::*;
-    let pat = _mm512_set1_epi64(a8 as i64);
-    let bottom = (last - 63) & 63;
-    let mut b = last - 63;
-    loop {
-        let mut occ = 0u64;
-        for j in 0..8 {
-            // SAFETY: b + j + 64 <= data.len() for every block (top block:
-            // last - 63 + 7 + 64 == last + 8; lower blocks read lower).
-            let v = _mm512_loadu_si512(data.as_ptr().add(b + j).cast());
-            // Load j's lane t compares the position b + j + 8t; spread its
-            // mask bit t to occupancy bit j + 8t (== u - b). The per-bit
-            // loop only runs on nonzero masks — pure overhead on
-            // non-repeating data.
-            let mut m = _mm512_cmpeq_epi64_mask(v, pat) as u64;
-            while m != 0 {
-                let t = m.trailing_zeros();
-                m &= m - 1;
-                occ |= 1 << (j + 8 * t as usize);
+    unsafe {
+        use core::arch::x86_64::*;
+        let pat = _mm512_set1_epi64(a8 as i64);
+        let bottom = (last - 63) & 63;
+        let mut b = last - 63;
+        loop {
+            let mut occ = 0u64;
+            for j in 0..8 {
+                // SAFETY: b + j + 64 <= data.len() for every block (top block:
+                // last - 63 + 7 + 64 == last + 8; lower blocks read lower).
+                let v = _mm512_loadu_si512(data.as_ptr().add(b + j).cast());
+                // Load j's lane t compares the position b + j + 8t; spread its
+                // mask bit t to occupancy bit j + 8t (== u - b). The per-bit
+                // loop only runs on nonzero masks — pure overhead on
+                // non-repeating data.
+                let mut m = _mm512_cmpeq_epi64_mask(v, pat) as u64;
+                while m != 0 {
+                    let t = m.trailing_zeros();
+                    m &= m - 1;
+                    occ |= 1 << (j + 8 * t as usize);
+                }
             }
-        }
-        while occ != 0 {
-            let bit = 63 - occ.leading_zeros();
-            occ ^= 1 << bit;
-            let u = b + bit as usize;
-            if u < last && seed_agrees(data, u, last) {
-                return Some(u);
+            while occ != 0 {
+                let bit = occ.ilog2();
+                occ ^= 1 << bit;
+                let u = b + bit as usize;
+                if u < last && seed_agrees(data, u, last) {
+                    return Some(u);
+                }
             }
+            if b == bottom {
+                break;
+            }
+            b -= 64;
         }
-        if b == bottom {
-            break;
-        }
-        b -= 64;
+        (0..bottom)
+            .rev()
+            .find(|&u| read8(data, u) == a8 && seed_agrees(data, u, last))
     }
-    (0..bottom)
-        .rev()
-        .find(|&u| read8(data, u) == a8 && seed_agrees(data, u, last))
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -1202,7 +1208,7 @@ impl Matcher for MatchGeneratorDriver {
         // the u32 tables need no reset (entries decode against the scanning
         // position and die on the window-range check).
         self.epoch += 1;
-        if self.epoch > 0xFFFF {
+        if self.epoch > 0xffff {
             self.opt_table.fill(EMPTY);
             self.bt.fill(EMPTY);
             self.hash3.fill(EMPTY);
@@ -1251,7 +1257,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn get_last_space(&mut self) -> &[u8] {
-        &window_slice(&self.win, &self.ext)[self.idx_of(self.block_start)..]
+        &window_slice(&self.win, self.ext.as_ref())[self.idx_of(self.block_start)..]
     }
 
     fn commit_block(&mut self, read_bytes: usize) {
@@ -1278,7 +1284,7 @@ impl Matcher for MatchGeneratorDriver {
         // itself, handed over straight from the window.
         let zero_seq = seqs.is_empty();
         let mut offset = 0usize;
-        for &word in seqs.iter() {
+        for &word in &seqs {
             let (ll, ml, of) = decode_packed(word.codes, word.add);
             let lits = &literals[offset..offset + ll as usize];
             offset += ll as usize;
@@ -1317,10 +1323,10 @@ impl Matcher for MatchGeneratorDriver {
         // lazily from `next_update`, which stays at the block start and
         // covers the run on the next block's fill.
         let idx = (self.block_start - self.win_base) as usize;
-        let win = window_slice(&self.win, &self.ext);
+        let win = window_slice(&self.win, self.ext.as_ref());
         if idx + HASH_READ <= win.len() {
             match self.params.strategy {
-                Strategy::Opt(_) => {}
+                Strategy::Opt(_) => {},
                 Strategy::Chain(log) => {
                     let h = hash_at_log(win, idx, log);
                     // SAFETY: h is masked to log bits, the absolute block
@@ -1334,7 +1340,7 @@ impl Matcher for MatchGeneratorDriver {
                             .get_unchecked_mut(self.block_start as usize & chain_mask) = head;
                         *self.table.get_unchecked_mut(h) = pack_pos(self.block_start);
                     }
-                }
+                },
                 Strategy::Dfast(small_log) => {
                     let hl = hash8_at_log(win, idx, self.params.hash_log);
                     let hs = hash_at_log(win, idx, small_log);
@@ -1344,10 +1350,10 @@ impl Matcher for MatchGeneratorDriver {
                         *self.table.get_unchecked_mut(hl) = entry;
                         *self.chain.get_unchecked_mut(hs) = entry;
                     }
-                }
+                },
                 Strategy::Fast => {
                     insert_at(win, &mut self.table, idx, self.block_start);
-                }
+                },
             }
         }
         self.pos = self.block_end;
@@ -1361,7 +1367,7 @@ impl MatchGeneratorDriver {
         // Hot state lives in locals for the whole loop: the emit helpers
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
-        let win = window_slice(&self.win, &self.ext);
+        let win = window_slice(&self.win, self.ext.as_ref());
         let win_base = self.win_base;
         let block_end = self.block_end;
         // saturating: tiny first blocks never reach an emit, so the bound is
@@ -1431,7 +1437,7 @@ impl MatchGeneratorDriver {
             let mut h1 = h0;
             let mut prev1 = prev0;
             let mut cur1 = cur0;
-            if block_end - pos - 1 >= hash_read {
+            if block_end - pos > hash_read {
                 pair_len = 2;
                 idx1 = idx0 + 1;
                 h1 = hash_at(win, idx1);
@@ -1526,9 +1532,7 @@ impl MatchGeneratorDriver {
                             }
                             let of_value = (start - ci + 3) as u32;
                             anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
-                            if rep_pending != 0 {
-                                rep_pending -= 1;
-                            }
+                            rep_pending = rep_pending.saturating_sub(1);
                             seed_hits += 1;
                             if seed_hits >= SEED_MATCHES {
                                 seed_offset = 0;
@@ -1576,9 +1580,7 @@ impl MatchGeneratorDriver {
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
                         // safe again.
-                        if rep_pending != 0 {
-                            rep_pending -= 1;
-                        }
+                        rep_pending = rep_pending.saturating_sub(1);
                         pos = if rep_pending == 0 {
                             emit.rep1_chain(win, anchor, block_end, &mut rep)
                         } else {
@@ -1647,9 +1649,7 @@ impl MatchGeneratorDriver {
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
                         // safe again.
-                        if rep_pending != 0 {
-                            rep_pending -= 1;
-                        }
+                        rep_pending = rep_pending.saturating_sub(1);
                         pos = if rep_pending == 0 {
                             emit.rep1_chain(win, anchor, block_end, &mut rep)
                         } else {
@@ -1702,7 +1702,7 @@ impl MatchGeneratorDriver {
     /// (one per 256 B, libzstd's `kSearchStrength` grid).
     #[allow(clippy::too_many_lines)]
     fn start_matching_dfast(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
-        let win = window_slice(&self.win, &self.ext);
+        let win = window_slice(&self.win, self.ext.as_ref());
         let long_log = self.table.len().trailing_zeros();
         let small_log = self.chain.len().trailing_zeros();
         let win_base = self.win_base;
@@ -1796,19 +1796,18 @@ impl MatchGeneratorDriver {
                 // starts skip the probe (unknown decoder history).
                 if rep_pending == 0 {
                     let probe = ip_idx + 1;
-                    if let Some(cand_abs) = (win_base + probe as u64).checked_sub(rep[0] as u64) {
-                        if cand_abs >= win_base {
-                            let cand = (cand_abs - win_base) as usize;
-                            if read4(win, cand) == read4(win, probe) {
-                                let ml = extend_match(win, probe, cand);
-                                debug_assert!(ml >= MIN_MATCH);
-                                anchor_idx =
-                                    emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
-                                ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
-                                // The chain's matches advance the anchor too.
-                                anchor_idx = ip_idx;
-                                continue 'outer;
-                            }
+                    if let Some(cand_abs) = (win_base + probe as u64).checked_sub(rep[0] as u64)
+                        && cand_abs >= win_base
+                    {
+                        let cand = (cand_abs - win_base) as usize;
+                        if read4(win, cand) == read4(win, probe) {
+                            let ml = extend_match(win, probe, cand);
+                            debug_assert!(ml >= MIN_MATCH);
+                            anchor_idx = emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
+                            ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
+                            // The chain's matches advance the anchor too.
+                            anchor_idx = ip_idx;
+                            continue 'outer;
                         }
                     }
                 }
@@ -1832,9 +1831,7 @@ impl MatchGeneratorDriver {
                             let of_value = (start - c + 3) as u32;
                             anchor_idx =
                                 emit.emit(win, anchor_idx, ip_idx, start, ml, of_value, &mut rep);
-                            if rep_pending != 0 {
-                                rep_pending -= 1;
-                            }
+                            rep_pending = rep_pending.saturating_sub(1);
                             seed_hits += 1;
                             if seed_hits >= SEED_MATCHES {
                                 seed_offset = 0;
@@ -1886,9 +1883,7 @@ impl MatchGeneratorDriver {
                         // slot down; after the third one a job-start gate
                         // has fully converged and repcode use is safe
                         // again.
-                        if rep_pending != 0 {
-                            rep_pending -= 1;
-                        }
+                        rep_pending = rep_pending.saturating_sub(1);
                         ip_idx = if rep_pending == 0 {
                             emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
                         } else {
@@ -1940,9 +1935,7 @@ impl MatchGeneratorDriver {
                                 *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
                             }
                         }
-                        if rep_pending != 0 {
-                            rep_pending -= 1;
-                        }
+                        rep_pending = rep_pending.saturating_sub(1);
                         ip_idx = if rep_pending == 0 {
                             emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
                         } else {
@@ -1986,7 +1979,7 @@ impl MatchGeneratorDriver {
     /// and defer emission across up to `lazy_depth` further positions when
     /// a longer match may start there — libzstd's lazy family.
     fn start_matching_chain(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
-        let win = window_slice(&self.win, &self.ext);
+        let win = window_slice(&self.win, self.ext.as_ref());
         let chain = &mut self.chain[..];
         let chain_mask = chain.len() - 1;
         let win_base = self.win_base;
@@ -2084,19 +2077,23 @@ impl MatchGeneratorDriver {
             // free, so bias it past the chain match.
             let mut rep_hit = false;
             if rep_pending == 0 {
-                let probe = if pos == anchor { pos + 1 } else { pos };
-                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64) {
-                    if cand_abs >= win_base {
-                        let pidx = (probe - win_base) as usize;
-                        let cand = (cand_abs - win_base) as usize;
-                        if read4(win, cand) == read4(win, pidx) {
-                            let ml = extend_match(win, pidx, cand);
-                            if ml >= MIN_MATCH && ml + 3 > best_len {
-                                best_len = ml;
-                                best_cand = cand;
-                                rep_hit = true;
-                                pos = probe;
-                            }
+                let probe = if pos == anchor {
+                    pos + 1
+                } else {
+                    pos
+                };
+                if let Some(cand_abs) = probe.checked_sub(rep[0] as u64)
+                    && cand_abs >= win_base
+                {
+                    let pidx = (probe - win_base) as usize;
+                    let cand = (cand_abs - win_base) as usize;
+                    if read4(win, cand) == read4(win, pidx) {
+                        let ml = extend_match(win, pidx, cand);
+                        if ml >= MIN_MATCH && ml + 3 > best_len {
+                            best_len = ml;
+                            best_cand = cand;
+                            rep_hit = true;
+                            pos = probe;
                         }
                     }
                 }
@@ -2183,7 +2180,11 @@ impl MatchGeneratorDriver {
             // one literal pending: of_value 1 with a zero literal length
             // resolves to a repcode *swap* on the decoder side, not rep0.
             let anchor_idx = (anchor - win_base) as usize;
-            let floor = if rep_hit { anchor_idx + 1 } else { anchor_idx };
+            let floor = if rep_hit {
+                anchor_idx + 1
+            } else {
+                anchor_idx
+            };
             let mut cand = best_cand;
             let mut ml = best_len;
             while start > floor && cand > 0 && win[cand - 1] == win[start - 1] {
@@ -2236,7 +2237,7 @@ impl MatchGeneratorDriver {
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
     ) {
-        let win = window_slice(&self.win, &self.ext);
+        let win = window_slice(&self.win, self.ext.as_ref());
         let win_base = self.win_base;
         let block_start = self.block_start;
         let block_end = self.block_end;
@@ -2301,9 +2302,10 @@ impl MatchGeneratorDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_pos, unpack_pos, MatchGeneratorDriver};
-    use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    use super::{MatchGeneratorDriver, pack_pos, unpack_pos};
+    use crate::encoding::{Matcher, Sequence};
 
     fn block_label(i: usize) -> Vec<u8> {
         // "block N filler text; " without needing format! in no_std tests
@@ -2344,7 +2346,7 @@ mod tests {
                         let b = reconstructed[start + i];
                         reconstructed.push(b);
                     }
-                }
+                },
             });
         }
         reconstructed
@@ -2366,7 +2368,7 @@ mod tests {
         // Matches must reach into previous blocks through the shared window.
         let mut data = Vec::new();
         for i in 0..10 {
-            data.extend_from_slice(&[0xA5, 0x5A, 0xC3, 0x3C, 0x99, 0x66, 0xF0, 0x0F]);
+            data.extend_from_slice(&[0xa5, 0x5a, 0xc3, 0x3c, 0x99, 0x66, 0xf0, 0x0f]);
             data.extend_from_slice(&block_label(i));
         }
         assert_eq!(match_and_reconstruct(&data, 32), data);
@@ -2375,7 +2377,7 @@ mod tests {
 
     #[test]
     fn reconstructs_random() {
-        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut state = 0x1234_5678_9abc_def0u64;
         let mut data = Vec::with_capacity(300 * 1024);
         while data.len() < 300 * 1024 {
             state ^= state << 13;
@@ -2406,7 +2408,7 @@ mod tests {
             &b"lorem ipsum dolor sit amet "[..],
             b"\x00\x01\x02\x03 structured noise ",
         ];
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
         while data.len() < 700 * 1024 {
             state ^= state << 13;
             state ^= state >> 7;
@@ -2439,7 +2441,7 @@ mod tests {
                             let b = reconstructed[start + i];
                             reconstructed.push(b);
                         }
-                    }
+                    },
                 });
             }
             assert_eq!(reconstructed, data, "reconstruct {level:?}");
@@ -2451,15 +2453,15 @@ mod tests {
         // A live entry always resolves back to its position, even across a
         // 4 GiB cycle boundary; a value numerically above the scan position
         // with no cycle to unwrap into is dead (stale cross-frame entry).
-        for abs in [0u64, 1, 7, 0xFFFF_FFFE, 5_000_000_000, 1 << 40] {
-            for delta in [1u64, 2, 0x123, 0xFFFF_F000] {
+        for abs in [0u64, 1, 7, 0xffff_fffe, 5_000_000_000, 1 << 40] {
+            for delta in [1u64, 2, 0x123, 0xffff_f000] {
                 let pos = abs + delta;
                 assert_eq!(unpack_pos(pack_pos(abs), pos), Some(abs), "{abs}+{delta}");
             }
         }
         // 2^32 - 1 collides with the empty sentinel: one dead position per
         // 4 GiB cycle, by design.
-        assert_eq!(unpack_pos(pack_pos(0xFFFF_FFFF), 1 << 40), None);
+        assert_eq!(unpack_pos(pack_pos(0xffff_ffff), 1 << 40), None);
         assert_eq!(unpack_pos(pack_pos(1000), 10), None);
         assert_eq!(unpack_pos(0, 1 << 40), None);
     }
@@ -2502,7 +2504,7 @@ mod tests {
             }
         };
 
-        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut state = 0x0123_4567_89ab_cdefu64;
         let mut rng = || {
             state ^= state << 13;
             state ^= state >> 7;
@@ -2532,10 +2534,10 @@ mod tests {
             63,
             48,
         ] {
-            for b in data.iter_mut() {
+            for b in &mut data {
                 *b = rng() as u8;
             }
-            let pat: alloc::vec::Vec<u8> = (0..56).map(|_| rng() as u8).collect();
+            let pat: Vec<u8> = (0..56).map(|_| rng() as u8).collect();
             data[hit - 48..hit + 8].copy_from_slice(&pat);
             data[last - 48..].copy_from_slice(&pat);
             check(&data);
@@ -2547,10 +2549,10 @@ mod tests {
         }
         // A candidate below the agree bound never qualifies: the planted
         // anchor window alone must yield no seed.
-        for b in data.iter_mut() {
+        for b in &mut data {
             *b = rng() as u8;
         }
-        let pat: alloc::vec::Vec<u8> = (0..56).map(|_| rng() as u8).collect();
+        let pat: Vec<u8> = (0..56).map(|_| rng() as u8).collect();
         data[last - 48..].copy_from_slice(&pat);
         check(&data);
         assert_eq!(
@@ -2568,7 +2570,7 @@ mod tests {
         // Exact periods across all residue classes mod 8: the scan must find
         // the period (or a multiple) exactly like the naive walk.
         for period in [200, 201, 202, 203, 204, 205, 206, 207, 256, 257] {
-            let unit: alloc::vec::Vec<u8> = (0..period).map(|_| rng() as u8).collect();
+            let unit: Vec<u8> = (0..period).map(|_| rng() as u8).collect();
             let mut tiled = alloc::vec![0u8; 0];
             while tiled.len() < len {
                 tiled.extend_from_slice(&unit);
@@ -2579,7 +2581,7 @@ mod tests {
         // No repeat at all, at sizes just around the block-scheme minimum.
         for l in [48, 56, 63, 64, 120, 127, 128, 129, 136, len] {
             let mut data = alloc::vec![0u8; l];
-            for b in data.iter_mut() {
+            for b in &mut data {
                 *b = rng() as u8;
             }
             // A u64-rng strip of this size has no 8-byte recurrence.
@@ -2594,7 +2596,7 @@ mod tests {
     /// Regression for a pooled-driver double-frame compression.
     #[test]
     fn stale_entries_survive_frame_reset() {
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut rng = || {
             state ^= state << 13;
             state ^= state >> 7;
@@ -2629,8 +2631,8 @@ mod tests {
                     driver.commit_block(block.len());
                     driver.start_matching(|seq| match seq {
                         Sequence::Literals { literals } => {
-                            reconstructed.extend_from_slice(literals)
-                        }
+                            reconstructed.extend_from_slice(literals);
+                        },
                         Sequence::Triple {
                             literals,
                             offset,
@@ -2647,7 +2649,7 @@ mod tests {
                                 let b = reconstructed[start + i];
                                 reconstructed.push(b);
                             }
-                        }
+                        },
                     });
                 }
                 assert_eq!(reconstructed, *data, "reconstruct {level:?}");
@@ -2685,7 +2687,7 @@ mod tests {
         // by the hash probe (offset becomes rep[0]), later repeats must be
         // emitted as repcode 1 (wire offset value 1).
         let pattern: &[u8] = &[
-            0xA5, 0x5A, 0xC3, 0x3C, 0x99, 0x66, 0xF0, 0x0D, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0xa5, 0x5a, 0xc3, 0x3c, 0x99, 0x66, 0xf0, 0x0d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
             0x77, 0x88, 0x91, 0x82, 0x73, 0x64,
         ];
         let mut data = Vec::new();
@@ -2693,7 +2695,7 @@ mod tests {
             data.extend_from_slice(pattern);
             // Constant-length, varying separators keep one pending literal in
             // front of each repeat and hold the period stable.
-            data.push(0xF0 ^ i as u8);
+            data.push(0xf0 ^ i as u8);
         }
         let mut driver = MatchGeneratorDriver::new(128 * 1024);
         driver.reset(crate::Level::Fastest);
@@ -2701,10 +2703,10 @@ mod tests {
         driver.commit_block(data.len());
         let mut repcodes = 0usize;
         driver.start_matching(|seq| {
-            if let Sequence::Triple { offset, .. } = seq {
-                if offset <= 3 {
-                    repcodes += 1;
-                }
+            if let Sequence::Triple { offset, .. } = seq
+                && offset <= 3
+            {
+                repcodes += 1;
             }
         });
         assert!(

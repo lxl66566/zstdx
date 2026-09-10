@@ -70,3 +70,10 @@
 - corpus 生成器入库跟踪。
 - profiling 临时工具（enc/dec/enc-stream、mtcheck、prefill、seqstats）转正为
   zstdx-bench 子命令（原未跟踪 examples）。
+- **lint/fmt 工具链**：workspace lints（clippy `all`+`pedantic`，cast 家族、
+  `inline_always`、`unreadable_literal` 等 codec 固有噪音显式 allow）+
+  `clippy.toml`（msrv 1.89）+ nightly `rustfmt.toml`（crate 级 import 合并、
+  StdExternalCrate 分组、注释折行）+ `.tombi.toml`（TOML 对齐）；成员 crate 经
+  `[lints] workspace = true` 继承，fuzz crate 内联。全树 clippy/fmt 零告警。
+  同批：全 crate 升 edition 2024（rust-version 1.87→1.89，AVX-512 intrinsics
+  stable；`unsafe fn` 体内显式 `unsafe` 块）。

@@ -1,10 +1,12 @@
 //! Utilities for decoding Huff0 encoded huffman data.
 
-use crate::bit_io::BitReaderReversed;
-use crate::decoding::errors::HuffmanTableError;
-use crate::fse::{FSEDecoder, FSETable};
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
+
+use crate::{
+    bit_io::BitReaderReversed,
+    decoding::errors::HuffmanTableError,
+    fse::{FSEDecoder, FSETable},
+};
 
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
@@ -28,8 +30,8 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
-    /// to read the byte the internal cursor is pointing at, and `next_state` can be called to advance
-    /// the cursor until the max number of bits has been read.
+    /// to read the byte the internal cursor is pointing at, and `next_state` can be called to
+    /// advance the cursor until the max number of bits has been read.
     pub fn init_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let num_bits = self.table.max_num_bits;
         let new_bits = br.get_bits(num_bits);
@@ -40,8 +42,8 @@ impl<'t> HuffmanDecoder<'t> {
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
-        // telling you how many bits identify the current symbol.
+        // self.state stores a small section, or a window of the bit stream. The table can be
+        // indexed via this state, telling you how many bits identify the current symbol.
         let num_bits = self.table.decode[self.state as usize].num_bits;
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
@@ -60,7 +62,7 @@ impl<'t> HuffmanDecoder<'t> {
     /// the code length in the low 6 bits of a u16.
     pub fn decode_and_advance(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.packed[self.state as usize];
-        let num_bits = (entry & 0x3F) as u8;
+        let num_bits = (entry & 0x3f) as u8;
         let new_bits = br.get_bits(num_bits);
         self.state <<= num_bits;
         self.state &= self.table.packed.len() as u64 - 1;
@@ -176,134 +178,134 @@ impl HuffmanTable {
         let header = source[0];
         let mut bits_read = 8;
 
-        match header {
-            // If the header byte is less than 128, the series of weights
-            // is compressed using two interleaved FSE streams that share
-            // a distribution table.
-            0..=127 => {
-                let fse_stream = &source[1..];
-                if header as usize > fse_stream.len() {
-                    return Err(err::NotEnoughBytesForWeights {
-                        got_bytes: fse_stream.len(),
-                        expected_bytes: header,
-                    });
-                }
-                //fse decompress weights
-                let bytes_used_by_fse_header = self.fse_table.build_decoder(fse_stream, 6)?;
+        // If the header byte is less than 128, the series of weights is
+        // compressed using two interleaved FSE streams that share a
+        // distribution table.
+        if let 0..=127 = header {
+            let fse_stream = &source[1..];
+            if header as usize > fse_stream.len() {
+                return Err(err::NotEnoughBytesForWeights {
+                    got_bytes: fse_stream.len(),
+                    expected_bytes: header,
+                });
+            }
+            // fse decompress weights
+            let bytes_used_by_fse_header = self.fse_table.build_decoder(fse_stream, 6)?;
 
-                if bytes_used_by_fse_header > header as usize {
-                    return Err(err::FSETableUsedTooManyBytes {
-                        used: bytes_used_by_fse_header,
-                        available_bytes: header,
-                    });
-                }
+            if bytes_used_by_fse_header > header as usize {
+                return Err(err::FSETableUsedTooManyBytes {
+                    used: bytes_used_by_fse_header,
+                    available_bytes: header,
+                });
+            }
 
-                vprintln!(
-                    "Building fse table for huffman weights used: {}",
-                    bytes_used_by_fse_header
-                );
-                // Huffman headers are compressed using two interleaved
-                // FSE bitstreams, where the first state (decoder) handles
-                // even symbols, and the second handles odd symbols.
-                let mut dec1 = FSEDecoder::new(&self.fse_table);
-                let mut dec2 = FSEDecoder::new(&self.fse_table);
+            vprintln!(
+                "Building fse table for huffman weights used: {}",
+                bytes_used_by_fse_header
+            );
+            // Huffman headers are compressed using two interleaved
+            // FSE bitstreams, where the first state (decoder) handles
+            // even symbols, and the second handles odd symbols.
+            let mut dec1 = FSEDecoder::new(&self.fse_table);
+            let mut dec2 = FSEDecoder::new(&self.fse_table);
 
-                let compressed_start = bytes_used_by_fse_header;
-                let compressed_length = header as usize - bytes_used_by_fse_header;
+            let compressed_start = bytes_used_by_fse_header;
+            let compressed_length = header as usize - bytes_used_by_fse_header;
 
-                let compressed_weights = &fse_stream[compressed_start..];
-                if compressed_weights.len() < compressed_length {
-                    return Err(err::NotEnoughBytesToDecompressWeights {
-                        have: compressed_weights.len(),
-                        need: compressed_length,
-                    });
-                }
-                let compressed_weights = &compressed_weights[..compressed_length];
-                let mut br = BitReaderReversed::new(compressed_weights);
+            let compressed_weights = &fse_stream[compressed_start..];
+            if compressed_weights.len() < compressed_length {
+                return Err(err::NotEnoughBytesToDecompressWeights {
+                    have: compressed_weights.len(),
+                    need: compressed_length,
+                });
+            }
+            let compressed_weights = &compressed_weights[..compressed_length];
+            let mut br = BitReaderReversed::new(compressed_weights);
 
-                bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
+            bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
 
-                //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
-                let mut skipped_bits = 0;
-                loop {
-                    let val = br.get_bits(1);
-                    skipped_bits += 1;
-                    if val == 1 || skipped_bits > 8 {
-                        break;
-                    }
-                }
-                if skipped_bits > 8 {
-                    //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-                    return Err(err::ExtraPadding { skipped_bits });
-                }
-
-                dec1.init_state(&mut br)?;
-                dec2.init_state(&mut br)?;
-
-                self.weights.clear();
-
-                // The two decoders take turns decoding a single symbol and updating their state.
-                loop {
-                    let w = dec1.decode_symbol();
-                    self.weights.push(w);
-                    dec1.update_state(&mut br);
-
-                    if br.bits_remaining() <= -1 {
-                        //collect final states
-                        self.weights.push(dec2.decode_symbol());
-                        break;
-                    }
-
-                    let w = dec2.decode_symbol();
-                    self.weights.push(w);
-                    dec2.update_state(&mut br);
-
-                    if br.bits_remaining() <= -1 {
-                        //collect final states
-                        self.weights.push(dec1.decode_symbol());
-                        break;
-                    }
-                    //maximum number of weights is 255 because we use u8 symbols and the last weight is inferred from the sum of all others
-                    if self.weights.len() > 255 {
-                        return Err(err::TooManyWeights {
-                            got: self.weights.len(),
-                        });
-                    }
+            // skip the 0 padding at the end of the last byte of the bit stream and throw away
+            // the first 1 found
+            let mut skipped_bits = 0;
+            loop {
+                let val = br.get_bits(1);
+                skipped_bits += 1;
+                if val == 1 || skipped_bits > 8 {
+                    break;
                 }
             }
+            if skipped_bits > 8 {
+                // if more than 7 bits are 0, this is not the correct end of the bitstream.
+                // Either a bug or corrupted data
+                return Err(err::ExtraPadding { skipped_bits });
+            }
+
+            dec1.init_state(&mut br)?;
+            dec2.init_state(&mut br)?;
+
+            self.weights.clear();
+
+            // The two decoders take turns decoding a single symbol and updating their state.
+            loop {
+                let w = dec1.decode_symbol();
+                self.weights.push(w);
+                dec1.update_state(&mut br);
+
+                if br.bits_remaining() <= -1 {
+                    // collect final states
+                    self.weights.push(dec2.decode_symbol());
+                    break;
+                }
+
+                let w = dec2.decode_symbol();
+                self.weights.push(w);
+                dec2.update_state(&mut br);
+
+                if br.bits_remaining() <= -1 {
+                    // collect final states
+                    self.weights.push(dec1.decode_symbol());
+                    break;
+                }
+                // maximum number of weights is 255 because we use u8 symbols and the last
+                // weight is inferred from the sum of all others
+                if self.weights.len() > 255 {
+                    return Err(err::TooManyWeights {
+                        got: self.weights.len(),
+                    });
+                }
+            }
+        } else {
             // If the header byte is greater than or equal to 128,
             // weights are directly represented, where each weight is
             // encoded directly as a 4 bit field. The weights will
             // always be encoded with full bytes, meaning if there's
             // an odd number of weights, the last weight will still
             // occupy a full byte.
-            _ => {
-                // weights are directly encoded
-                let weights_raw = &source[1..];
-                let num_weights = header - 127;
-                self.weights.resize(num_weights as usize, 0);
+            // weights are directly encoded
+            let weights_raw = &source[1..];
+            let num_weights = header - 127;
+            self.weights.resize(num_weights as usize, 0);
 
-                let bytes_needed = if num_weights.is_multiple_of(2) {
-                    num_weights as usize / 2
+            let bytes_needed = if num_weights.is_multiple_of(2) {
+                num_weights as usize / 2
+            } else {
+                (num_weights as usize / 2) + 1
+            };
+
+            if weights_raw.len() < bytes_needed {
+                return Err(err::NotEnoughBytesInSource {
+                    got: weights_raw.len(),
+                    need: bytes_needed,
+                });
+            }
+
+            for idx in 0..num_weights {
+                if idx % 2 == 0 {
+                    self.weights[idx as usize] = weights_raw[idx as usize / 2] >> 4;
                 } else {
-                    (num_weights as usize / 2) + 1
-                };
-
-                if weights_raw.len() < bytes_needed {
-                    return Err(err::NotEnoughBytesInSource {
-                        got: weights_raw.len(),
-                        need: bytes_needed,
-                    });
+                    self.weights[idx as usize] = weights_raw[idx as usize / 2] & 0xf;
                 }
-
-                for idx in 0..num_weights {
-                    if idx % 2 == 0 {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] >> 4;
-                    } else {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] & 0xF;
-                    }
-                    bits_read += 4;
-                }
+                bits_read += 4;
             }
         }
 
@@ -335,7 +337,11 @@ impl HuffmanTable {
             if *w > MAX_MAX_NUM_BITS {
                 return Err(err::WeightBiggerThanMaxNumBits { got: *w });
             }
-            weight_sum += if *w > 0 { 1_u32 << (*w - 1) } else { 0 };
+            weight_sum += if *w > 0 {
+                1_u32 << (*w - 1)
+            } else {
+                0
+            };
         }
 
         if weight_sum == 0 {
@@ -345,7 +351,7 @@ impl HuffmanTable {
         let max_bits = highest_bit_set(weight_sum) as u8;
         let left_over = (1 << max_bits) - weight_sum;
 
-        //left_over must be power of two
+        // left_over must be power of two
         if !left_over.is_power_of_two() {
             return Err(err::LeftoverIsNotAPowerOf2 { got: left_over });
         }
@@ -374,16 +380,13 @@ impl HuffmanTable {
             self.bit_ranks[(*num_bits) as usize] += 1;
         }
 
-        //fill with dummy symbols
-        self.decode.resize(
-            1 << self.max_num_bits,
-            Entry {
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
+        // fill with dummy symbols
+        self.decode.resize(1 << self.max_num_bits, Entry {
+            symbol: 0,
+            num_bits: 0,
+        });
 
-        //starting codes for each rank
+        // starting codes for each rank
         self.rank_indexes.clear();
         self.rank_indexes.resize((max_bits + 1) as usize, 0);
 
@@ -516,7 +519,7 @@ impl HuffmanTable {
         // rank_val[consumed][w] = offset of the weight-w second symbols inside
         // the span of a first symbol that consumed `consumed` bits.
         let mut rank_val = [[0u32; 13]; 12];
-        for consumed in min_bits..(TARGET_LOG - min_bits + 1) {
+        for consumed in min_bits..=(TARGET_LOG - min_bits) {
             for w in 1..=max_w {
                 rank_val[consumed as usize][w] = rank_val0[w] >> consumed;
             }

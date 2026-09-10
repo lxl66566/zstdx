@@ -1,10 +1,9 @@
 //! Streaming encoders and decoders shaped after [`io::Read`]/[`io::Write`].
 //!
-//! - [`write::Encoder`] compresses what is written to it into an underlying
-//!   writer ([`write::Decoder`] decodes into one)
-//! - [`read::Encoder`] exposes compressed bytes through [`io::Read`]
-//!   ([`read::Decoder`] decompresses while reading, transparently over
-//!   concatenated frames)
+//! - [`write::Encoder`] compresses what is written to it into an underlying writer
+//!   ([`write::Decoder`] decodes into one)
+//! - [`read::Encoder`] exposes compressed bytes through [`io::Read`] ([`read::Decoder`]
+//!   decompresses while reading, transparently over concatenated frames)
 //!
 //! One-shot conveniences over the same machinery: [`encode_all`],
 //! [`decode_all`], [`copy_encode`] and [`copy_decode`].
@@ -18,8 +17,10 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use crate::io::{Read, Write};
-use crate::{Level, Result};
+use crate::{
+    Level, Result,
+    io::{Read, Write},
+};
 
 /// Compress everything `source` provides into a Vec.
 ///
@@ -59,6 +60,8 @@ pub fn copy_decode<R: Read, W: Write>(source: R, mut destination: W) -> Result<(
 }
 
 /// std::io::copy is unavailable under no_std; pump through a stack buffer.
+// the stack buffer keeps this copy loop allocation-free
+#[allow(clippy::large_stack_arrays)]
 fn copy_between<R: Read, W: Write>(source: &mut R, destination: &mut W) -> Result<()> {
     let mut buffer = [0u8; 64 * 1024];
     loop {

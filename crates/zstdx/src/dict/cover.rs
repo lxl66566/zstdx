@@ -7,16 +7,16 @@
 //! Facebook's implementation was also used as a reference.
 //! <https://github.com/facebook/zstd/tree/dev/lib/dictBuilder>
 
+use core::convert::TryInto;
+use std::{collections::HashMap, vec::Vec};
+
 use super::DictParams;
 use crate::dict::frequency::estimate_frequency;
-use core::convert::TryInto;
-use std::collections::HashMap;
-use std::vec::Vec;
 
 /// The size of each k-mer
 pub(super) const K: usize = 16;
 
-///As found under "4: Experiments - Varying k-mer Size" in the original paper,
+/// As found under "4: Experiments - Varying k-mer Size" in the original paper,
 /// "when k = 16, across all our text collections, there is a reasonable spread"
 ///
 /// Reasonable range: [6, 16]

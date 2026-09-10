@@ -1,11 +1,14 @@
 //! Tests for the zstd-crate compatibility layer, written in the shapes a
 //! ported `zstd` crate user would write.
 
+use std::{
+    format,
+    io::{Read, Write},
+    vec,
+    vec::Vec,
+};
+
 use crate::compat;
-use std::format;
-use std::io::{Read, Write};
-use std::vec;
-use std::vec::Vec;
 
 fn payload() -> Vec<u8> {
     (0..300 * 1024).map(|i| (i % 251) as u8).collect()
@@ -210,16 +213,16 @@ fn dictionary_decoding_interop() {
     let samples: Vec<Vec<u8>> = (0..64u32)
         .map(|i| {
             format!(
-                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"]}}\n",
+                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"\
+                 ]}}\n",
                 i % 7
             )
             .into_bytes()
         })
         .collect();
-    let dict = match zstd::dict::from_samples(&samples, 8 * 1024) {
-        Ok(dict) => dict,
-        // the training backend is optional in some builds; nothing to test then
-        Err(_) => return,
+    // the training backend is optional in some builds; nothing to test then
+    let Ok(dict) = zstd::dict::from_samples(&samples, 8 * 1024) else {
+        return;
     };
     let content =
         b"{\"user\":\"user_5\",\"event\":\"click\",\"score\":3,\"tags\":[\"a\",\"b\"]}".repeat(64);

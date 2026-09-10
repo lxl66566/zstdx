@@ -1,8 +1,11 @@
 //! Utilities and representations for a frame header.
-use crate::bit_io::BitWriter;
-use crate::common::MAGIC_NUM;
-use crate::encoding::util::{find_min_size, minify_val};
 use alloc::vec::Vec;
+
+use crate::{
+    bit_io::BitWriter,
+    common::MAGIC_NUM,
+    encoding::util::{find_min_size, minify_val},
+};
 
 /// A header for a single Zstandard frame.
 ///
@@ -22,8 +25,8 @@ pub struct FrameHeader {
     pub dictionary_id: Option<u64>,
     /// The minimum memory buffer required to compress a frame. If not present,
     /// `single_segment` will be set to true. If present, this value must be greater than 1KB
-    /// and less than 3.75TB. Encoders should not generate a frame that requires a window size larger than
-    /// 8mb.
+    /// and less than 3.75TB. Encoders should not generate a frame that requires a window size
+    /// larger than 8mb.
     pub window_size: Option<u64>,
 }
 
@@ -42,12 +45,16 @@ impl FrameHeader {
 
         // `Window_Descriptor
         // TODO: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#window_descriptor
-        if !self.single_segment {
-            if let Some(window_size) = self.window_size {
-                let log = window_size.next_power_of_two().ilog2();
-                let exponent = if log > 10 { log - 10 } else { 1 } as u8;
-                output.push(exponent << 3);
-            }
+        if !self.single_segment
+            && let Some(window_size) = self.window_size
+        {
+            let log = window_size.next_power_of_two().ilog2();
+            let exponent = if log > 10 {
+                log - 10
+            } else {
+                1
+            } as u8;
+            output.push(exponent << 3);
         }
 
         if let Some(id) = self.dictionary_id {
@@ -71,8 +78,8 @@ impl FrameHeader {
         // `Frame_Content_Size_flag`:
         // The Frame_Content_Size_flag specifies if
         // the Frame_Content_Size field is provided within the header.
-        // TODO: The Frame_Content_Size field isn't set at all, we should prefer to include it always.
-        // If the `Single_Segment_flag` is set and this value is zero,
+        // TODO: The Frame_Content_Size field isn't set at all, we should prefer to include it
+        // always. If the `Single_Segment_flag` is set and this value is zero,
         // the size of the FCS field is 1 byte.
         // Otherwise, the FCS field is omitted.
         // | Value | Size of field (Bytes)
@@ -114,9 +121,14 @@ impl FrameHeader {
         // `Single_Segment_flag`:
         // If this flag is set, data must be regenerated within a single continuous memory segment,
         // and the `Frame_Content_Size` field must be present in the header.
-        // If this flag is not set, the `Window_Descriptor` field must be present in the frame header.
+        // If this flag is not set, the `Window_Descriptor` field must be present in the frame
+        // header.
         if self.single_segment {
-            assert!(self.frame_content_size.is_some(), "if the `single_segment` flag is set to true, then a frame content size must be provided");
+            assert!(
+                self.frame_content_size.is_some(),
+                "if the `single_segment` flag is set to true, then a frame content size must be \
+                 provided"
+            );
             bw.write_bits(1u8, 1);
         } else {
             assert!(
@@ -148,7 +160,8 @@ impl FrameHeader {
 
 /// Identical to [`minify_val`], but it implements the following edge case:
 ///
-/// > When FCS_Field_Size is 1, 4 or 8 bytes, the value is read directly. When FCS_Field_Size is 2, the offset of 256 is added.
+/// > When FCS_Field_Size is 1, 4 or 8 bytes, the value is read directly. When FCS_Field_Size is 2,
+/// > the offset of 256 is added.
 ///
 /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size
 fn minify_val_fcs(val: u64) -> Vec<u8> {
@@ -162,9 +175,10 @@ fn minify_val_fcs(val: u64) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameHeader;
-    use crate::decoding::frame::{read_frame_header, FrameDescriptor};
     use alloc::vec::Vec;
+
+    use super::FrameHeader;
+    use crate::decoding::frame::{FrameDescriptor, read_frame_header};
 
     #[test]
     fn frame_header_descriptor_decode() {
@@ -200,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "a frame content size must be provided")]
     fn catches_single_segment_no_fcs() {
         let header = FrameHeader {
             frame_content_size: None,
@@ -215,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "a window size must be provided")]
     fn catches_single_segment_no_winsize() {
         let header = FrameHeader {
             frame_content_size: Some(7),

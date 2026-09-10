@@ -14,13 +14,12 @@
 //! sources from the already-produced output. The decoder therefore runs as
 //! a two-stage pipeline:
 //!
-//! - stage A (worker pool, parallel): decode each segment's literals and
-//!   sequences into staging buffers and compute its exact output size;
-//! - stage B (calling thread, in input order): execute the staged segments
-//!   sequentially into the output, so every match source below the current
-//!   segment start is already final. Repcode history (`offset_hist`) is
-//!   carried across segments by the executing thread — repcode *resolution*
-//!   is the only cross-sequence state and it never touches stage A.
+//! - stage A (worker pool, parallel): decode each segment's literals and sequences into staging
+//!   buffers and compute its exact output size;
+//! - stage B (calling thread, in input order): execute the staged segments sequentially into the
+//!   output, so every match source below the current segment start is already final. Repcode
+//!   history (`offset_hist`) is carried across segments by the executing thread — repcode
+//!   *resolution* is the only cross-sequence state and it never touches stage A.
 //!
 //! Segment output sizes are only known after stage A, so the output buffer
 //! is checked (or grown) segment by segment as stage B reaches them.
@@ -31,21 +30,29 @@
 //! `decode_all` paths (which leave it to the caller).
 
 use alloc::vec::Vec;
-use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::sync::{Condvar, Mutex};
 
-use super::errors::{DecodeBlockContentError, DecompressBlockError, FrameDecoderError};
-use super::frame;
-use super::literals_section_decoder::decode_literals;
-use super::scratch::{FSEScratch, HuffmanScratch};
-use super::sequence_execution::do_offset_history;
-use super::sequence_section_decoder::decode_sequences_into;
-use super::FrameDecoder;
-use crate::blocks::block::BlockType;
-use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
-use crate::blocks::sequence_section::{ModeType, Sequence, SequencesHeader};
-use crate::common::MAX_BLOCK_SIZE;
+use super::{
+    FrameDecoder,
+    errors::{DecodeBlockContentError, DecompressBlockError, FrameDecoderError},
+    frame,
+    literals_section_decoder::decode_literals,
+    scratch::{FSEScratch, HuffmanScratch},
+    sequence_execution::do_offset_history,
+    sequence_section_decoder::decode_sequences_into,
+};
+use crate::{
+    blocks::{
+        block::BlockType,
+        literals_section::{LiteralsSection, LiteralsSectionType},
+        sequence_section::{ModeType, Sequence, SequencesHeader},
+    },
+    common::MAX_BLOCK_SIZE,
+};
 
 /// Below this (compressed) input size the scan, spawn and hand-off overhead
 /// dominates; the restart-point count is the real gate, this only avoids
@@ -194,7 +201,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentP
                 }
                 cursor = end;
                 continue;
-            }
+            },
             Err(_) => return None,
         };
         if frame_header.dictionary_id().is_some() {
@@ -210,9 +217,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentP
         let mut restarts: Vec<usize> = Vec::new();
         let mut scan_cur = blocks_start;
         loop {
-            let Some(head) = input.get(scan_cur..scan_cur + 3) else {
-                return None;
-            };
+            let head = input.get(scan_cur..scan_cur + 3)?;
             let raw = u32::from_le_bytes([head[0], head[1], head[2], 0]);
             let last = raw & 1 == 1;
             let btype = match (raw >> 1) & 0x3 {
@@ -230,9 +235,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentP
                 BlockType::RLE => 1,
                 BlockType::Reserved => unreachable!(),
             };
-            let Some(body_end) = (scan_cur + 3).checked_add(body_len) else {
-                return None;
-            };
+            let body_end = (scan_cur + 3).checked_add(body_len)?;
             if body_end > input.len() {
                 return None;
             }
@@ -302,14 +305,14 @@ fn decode_segment(
                 blocks.push(BlockPlan::Raw {
                     body: blk.body.clone(),
                 });
-            }
+            },
             BlockType::RLE => {
                 out_size += blk.raw_size as usize;
                 blocks.push(BlockPlan::Rle {
                     byte: input[blk.body.start],
                     len: blk.raw_size as usize,
                 });
-            }
+            },
             BlockType::Compressed => {
                 let body = &input[blk.body.clone()];
                 let mut section = LiteralsSection::new();
@@ -368,7 +371,7 @@ fn decode_segment(
                     lits: lits_start..literals.len(),
                     seqs: seqs_start..sequences.len(),
                 });
-            }
+            },
             BlockType::Reserved => unreachable!("scan rejects reserved blocks"),
         }
     }
@@ -411,14 +414,14 @@ unsafe fn execute_segment(
                     );
                 }
                 w += body.len();
-            }
+            },
             BlockPlan::Rle { byte, len } => {
                 // SAFETY: stage A accounted the run length in out_size
                 unsafe {
                     core::ptr::write_bytes(base.add(seg_start + w), *byte, *len);
                 }
                 w += len;
-            }
+            },
             BlockPlan::Compressed { lits, seqs } => {
                 let mut lit_pos = lits.start;
                 for seq in &seg.sequences[seqs.clone()] {
@@ -492,7 +495,7 @@ unsafe fn execute_segment(
                     );
                 }
                 w += rest;
-            }
+            },
         }
     }
     debug_assert_eq!(
@@ -509,7 +512,7 @@ unsafe fn execute_segment(
 fn decode_parallel(
     input: &[u8],
     workers: u32,
-    segments: Vec<SegmentPlan>,
+    segments: &[SegmentPlan],
     place: &mut dyn FnMut(usize, usize) -> Result<*mut u8, FrameDecoderError>,
 ) -> Result<usize, FrameDecoderError> {
     let n_segments = segments.len();
@@ -562,7 +565,7 @@ fn decode_parallel(
                             // (resume_unwind replaces it after the scope).
                             *slots[id].lock().unwrap() =
                                 Some(Err(FrameDecoderError::NotYetInitialized));
-                        }
+                        },
                     }
                     ready.notify_all();
                 }
@@ -636,7 +639,7 @@ pub fn decode_all_mt(
             }
             Ok(output.as_mut_ptr())
         };
-        decode_parallel(input, workers, segments, &mut place)
+        decode_parallel(input, workers, &segments, &mut place)
     } else {
         let mut decoder = FrameDecoder::new();
         decoder.set_max_window_size(max_window_size);
@@ -664,7 +667,7 @@ pub fn decode_to_vec_mt(
             // segment so an error leaves the tail unobserved.
             Ok(output.as_mut_ptr())
         };
-        let written = decode_parallel(input, workers, segments, &mut place)?;
+        let written = decode_parallel(input, workers, &segments, &mut place)?;
         // SAFETY: every byte in [start_len, start_len + written) was written
         // by execute_segment.
         unsafe { output.set_len(start_len + written) };
@@ -685,7 +688,7 @@ pub fn decode_to_vec_mt(
                 Err(FrameDecoderError::TargetTooSmall) => {
                     capacity *= 2;
                     output.reserve(capacity - output.len());
-                }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -694,12 +697,10 @@ pub fn decode_to_vec_mt(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{format, vec, vec::Vec};
+
     use super::{decode_all_mt, decode_to_vec_mt};
-    use crate::decoding::FrameDecoder;
-    use crate::{bulk, EncoderOptions, Level};
-    use alloc::format;
-    use alloc::vec;
-    use alloc::vec::Vec;
+    use crate::{EncoderOptions, Level, bulk, decoding::FrameDecoder};
 
     fn textish(len: usize) -> Vec<u8> {
         let words: Vec<&[u8]> = vec![
@@ -796,9 +797,12 @@ mod tests {
             };
             let payload_len = ((state >> 25) % 24) as usize;
             data.extend_from_slice(
-                format!("{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"payload\":\"",
-                    1700000000 + id)
-                    .as_bytes(),
+                format!(
+                    "{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"\
+                     payload\":\"",
+                    1700000000 + id
+                )
+                .as_bytes(),
             );
             data.resize(data.len() + payload_len, b'x');
             data.extend_from_slice(b"\",\"score\":0.5}\n");
@@ -821,8 +825,8 @@ mod tests {
         let a = textish(3 * 1024 * 1024);
         let b: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 61) as u8).collect();
         let mut with_skip = bulk::compress(&a, Level::Fastest);
-        let skip_payload = [0xABu8; 64];
-        with_skip.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        let skip_payload = [0xabu8; 64];
+        with_skip.extend_from_slice(&0x184d2a50u32.to_le_bytes());
         with_skip.extend_from_slice(&(skip_payload.len() as u32).to_le_bytes());
         with_skip.extend_from_slice(&skip_payload);
         with_skip.extend_from_slice(&bulk::compress(&b, Level::Fastest));
@@ -861,8 +865,8 @@ mod tests {
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4));
         // Smash bytes in a middle segment's compressed body.
         let mid = compressed.len() / 2;
-        compressed[mid] ^= 0xFF;
-        compressed[mid + 1] ^= 0xFF;
+        compressed[mid] ^= 0xff;
+        compressed[mid + 1] ^= 0xff;
         let mut out = Vec::new();
         // Errors (or a checksum-visible mismatch caught upstream) are both
         // acceptable; a panic or hang is not.

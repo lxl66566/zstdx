@@ -29,10 +29,10 @@ pub struct Sequence {
     /// then it has special handling:
     ///
     /// The first 3 values define 3 different repeated offsets, with 1 referring to the most
-    /// recent, 2 the second recent, and so on. When the current sequence has a literal length of 0,
-    /// then the repeated offsets are shifted by 1. So an offset value of 1 refers to 2, 2 refers to 3,
-    /// and 3 refers to the most recent offset minus one. If that value is equal to zero, the data
-    /// is considered corrupted.
+    /// recent, 2 the second recent, and so on. When the current sequence has a literal length of
+    /// 0, then the repeated offsets are shifted by 1. So an offset value of 1 refers to 2, 2
+    /// refers to 3, and 3 refers to the most recent offset minus one. If that value is equal
+    /// to zero, the data is considered corrupted.
     pub of: u32,
 }
 
@@ -73,6 +73,7 @@ impl CompressionModes {
             _ => panic!("This can never happen"),
         }
     }
+
     /// Read the compression mode of the literal lengths field.
     pub fn ll_mode(self) -> ModeType {
         Self::decode_mode(self.0 >> 6)
@@ -118,7 +119,7 @@ impl SequencesHeader {
             0 => {
                 self.num_sequences = 0;
                 bytes_read += 1;
-            }
+            },
             1..=127 => {
                 if source.len() < 2 {
                     return Err(SequencesHeaderParseError::NotEnoughBytes {
@@ -129,7 +130,7 @@ impl SequencesHeader {
                 self.num_sequences = u32::from(source[0]);
                 self.modes = Some(CompressionModes(source[1]));
                 bytes_read += 2;
-            }
+            },
             128..=254 => {
                 if source.len() < 2 {
                     return Err(SequencesHeaderParseError::NotEnoughBytes {
@@ -149,7 +150,7 @@ impl SequencesHeader {
                     self.modes = Some(CompressionModes(source[2]));
                     bytes_read += 1;
                 }
-            }
+            },
             255 => {
                 if source.len() < 4 {
                     return Err(SequencesHeaderParseError::NotEnoughBytes {
@@ -157,10 +158,10 @@ impl SequencesHeader {
                         got: source.len(),
                     });
                 }
-                self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
+                self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7f00;
                 self.modes = Some(CompressionModes(source[3]));
                 bytes_read += 4;
-            }
+            },
         }
 
         Ok(bytes_read)

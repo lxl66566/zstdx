@@ -2,11 +2,12 @@
 //! corpus file: per-symbol histograms of the ll/ml/of codes and the
 //! theoretical minimum sequence-section size they imply.
 
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use zstdx::encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence};
-use zstdx::Level;
+use std::{fs, io::Write, path::PathBuf};
+
+use zstdx::{
+    Level,
+    encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence},
+};
 
 /// Delegating matcher that records every emitted sequence.
 struct RecordingMatcher {
@@ -18,15 +19,19 @@ impl Matcher for RecordingMatcher {
     fn block_tail(&mut self) -> &mut [u8] {
         self.inner.block_tail()
     }
+
     fn get_last_space(&mut self) -> &[u8] {
         self.inner.get_last_space()
     }
+
     fn commit_block(&mut self, read: usize) {
-        self.inner.commit_block(read)
+        self.inner.commit_block(read);
     }
+
     fn skip_matching(&mut self) {
-        self.inner.skip_matching()
+        self.inner.skip_matching();
     }
+
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         let mut lits = Vec::new();
         let mut seqs = Vec::new();
@@ -46,17 +51,21 @@ impl Matcher for RecordingMatcher {
         });
         self.triples.extend(seqs.iter().map(|s| (s.ll, s.ml, s.of)));
     }
+
     fn reset(&mut self, level: Level) {
-        self.inner.reset(level)
+        self.inner.reset(level);
     }
+
     fn window_size(&self) -> u64 {
         self.inner.window_size()
     }
+
     fn repcode_snapshot(&self) -> [u32; 3] {
         self.inner.repcode_snapshot()
     }
+
     fn restore_repcode(&mut self, rep: [u32; 3]) {
-        self.inner.restore_repcode(rep)
+        self.inner.restore_repcode(rep);
     }
 }
 
@@ -186,6 +195,18 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) {
+    struct Sink(Vec<u8>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     let raw = fs::read(&args.file).unwrap();
 
     let matcher = RecordingMatcher {
@@ -195,16 +216,6 @@ pub fn run(args: &Args) {
     let mut compressor =
         zstdx::encoding::FrameCompressor::new_with_matcher(matcher, Level::Fastest);
     compressor.set_source(raw.as_slice());
-    struct Sink(Vec<u8>);
-    impl Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let sink = Sink(Vec::new());
     compressor.set_drain(sink);
     compressor.compress();

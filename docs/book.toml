@@ -1,14 +1,14 @@
 [book]
-title = "zstd-rs 开发手册（ext 分支）"
-authors = ["lxl66566"]
+title    = "zstd-rs 开发手册（ext 分支）"
+authors  = ["lxl66566"]
 language = "zh"
-src = "src"
+src      = "src"
 
 [build]
-build-dir = "book"
+build-dir      = "book"
 create-missing = false
 
 [output.html]
-default-theme = "navy"
+default-theme        = "navy"
 preferred-dark-theme = "navy"
-smart-punctuation = false
+smart-punctuation    = false

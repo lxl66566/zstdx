@@ -1,14 +1,10 @@
 #[test]
 fn test_encode_corpus_files_uncompressed_our_decompressor() {
     extern crate std;
+    use alloc::{borrow::ToOwned, string::String, vec::Vec};
+    use std::{ffi::OsStr, fs, io::Read, path::PathBuf, println};
+
     use crate::encoding::FrameCompressor;
-    use alloc::borrow::ToOwned;
-    use alloc::vec::Vec;
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::io::Read;
-    use std::path::PathBuf;
-    use std::println;
 
     let mut failures: Vec<PathBuf> = Vec::new();
     let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
@@ -17,7 +13,7 @@ fn test_encode_corpus_files_uncompressed_our_decompressor() {
     }
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -45,26 +41,19 @@ fn test_encode_corpus_files_uncompressed_our_decompressor() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "Decompression of compressed file failed on the following files: {:?}",
-            failures
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "Decompression of compressed file failed on the following files: {failures:?}"
+    );
 }
 
 #[test]
 fn test_encode_corpus_files_uncompressed_original_decompressor() {
     extern crate std;
+    use alloc::{borrow::ToOwned, format, vec::Vec};
+    use std::{ffi::OsStr, fs, path::PathBuf, println, string::String};
+
     use crate::encoding::FrameCompressor;
-    use alloc::borrow::ToOwned;
-    use alloc::format;
-    use alloc::vec::Vec;
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::println;
-    use std::string::String;
 
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
     let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
@@ -73,7 +62,7 @@ fn test_encode_corpus_files_uncompressed_original_decompressor() {
     }
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -95,37 +84,28 @@ fn test_encode_corpus_files_uncompressed_original_decompressor() {
         match zstd::stream::copy_decode(compressed_file.as_slice(), &mut decompressed_output) {
             Ok(()) => {
                 if input != decompressed_output {
-                    failures.push((path.to_owned(), "Input didn't equal output".to_owned()));
+                    failures.push((path.clone(), "Input didn't equal output".to_owned()));
                 }
-            }
+            },
             Err(e) => {
-                failures.push((
-                    path.to_owned(),
-                    format!("Decompressor threw an error: {e:?}"),
-                ));
-            }
-        };
-
-        if !failures.is_empty() {
-            panic!(
-                "Decompression of the compressed file fails on the following files: {:?}",
-                failures
-            );
+                failures.push((path.clone(), format!("Decompressor threw an error: {e:?}")));
+            },
         }
+
+        assert!(
+            failures.is_empty(),
+            "Decompression of the compressed file fails on the following files: {failures:?}"
+        );
     }
 }
 
 #[test]
 fn test_encode_corpus_files_compressed_our_decompressor() {
     extern crate std;
+    use alloc::{borrow::ToOwned, string::String, vec::Vec};
+    use std::{ffi::OsStr, fs, io::Read, path::PathBuf, println};
+
     use crate::encoding::FrameCompressor;
-    use alloc::borrow::ToOwned;
-    use alloc::vec::Vec;
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::io::Read;
-    use std::path::PathBuf;
-    use std::println;
 
     let mut failures: Vec<PathBuf> = Vec::new();
     let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
@@ -134,7 +114,7 @@ fn test_encode_corpus_files_compressed_our_decompressor() {
     }
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -162,26 +142,19 @@ fn test_encode_corpus_files_compressed_our_decompressor() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "Decompression of compressed file failed on the following files: {:?}",
-            failures
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "Decompression of compressed file failed on the following files: {failures:?}"
+    );
 }
 
 #[test]
 fn test_encode_corpus_files_compressed_original_decompressor() {
     extern crate std;
+    use alloc::{borrow::ToOwned, format, vec::Vec};
+    use std::{ffi::OsStr, fs, path::PathBuf, println, string::String};
+
     use crate::encoding::FrameCompressor;
-    use alloc::borrow::ToOwned;
-    use alloc::format;
-    use alloc::vec::Vec;
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::println;
-    use std::string::String;
 
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
     let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
@@ -190,7 +163,7 @@ fn test_encode_corpus_files_compressed_original_decompressor() {
     }
 
     files.sort_by_key(|x| match x {
-        Err(_) => "".to_owned(),
+        Err(_) => String::new(),
         Ok(entry) => entry.path().to_str().unwrap().to_owned(),
     });
 
@@ -212,22 +185,17 @@ fn test_encode_corpus_files_compressed_original_decompressor() {
         match zstd::stream::copy_decode(compressed_file.as_slice(), &mut decompressed_output) {
             Ok(()) => {
                 if input != decompressed_output {
-                    failures.push((path.to_owned(), "Input didn't equal output".to_owned()));
+                    failures.push((path.clone(), "Input didn't equal output".to_owned()));
                 }
-            }
+            },
             Err(e) => {
-                failures.push((
-                    path.to_owned(),
-                    format!("Decompressor threw an error: {e:?}"),
-                ));
-            }
-        };
-
-        if !failures.is_empty() {
-            panic!(
-                "Decompression of the compressed file fails on the following files: {:?}",
-                failures
-            );
+                failures.push((path.clone(), format!("Decompressor threw an error: {e:?}")));
+            },
         }
+
+        assert!(
+            failures.is_empty(),
+            "Decompression of the compressed file fails on the following files: {failures:?}"
+        );
     }
 }

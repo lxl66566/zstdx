@@ -1,7 +1,7 @@
 /// Wraps a slice and enables reading arbitrary amounts of bits
 /// from that slice.
 pub struct BitReader<'s> {
-    idx: usize, //index counts bits already read
+    idx: usize, // index counts bits already read
     source: &'s [u8],
 }
 
@@ -19,9 +19,7 @@ impl<'s> BitReader<'s> {
     }
 
     pub fn return_bits(&mut self, n: usize) {
-        if n > self.idx {
-            panic!("Cant return this many bits");
-        }
+        assert!(n <= self.idx, "Cant return this many bits");
         self.idx -= n;
     }
 
@@ -44,38 +42,39 @@ impl<'s> BitReader<'s> {
         let bits_left_in_current_byte = 8 - (self.idx % 8);
         let bits_not_needed_in_current_byte = 8 - bits_left_in_current_byte;
 
-        //collect bits from the currently pointed to byte
+        // collect bits from the currently pointed to byte
         let mut value = u64::from(self.source[self.idx / 8] >> bits_not_needed_in_current_byte);
 
         if bits_left_in_current_byte >= n {
-            //no need for fancy stuff
+            // no need for fancy stuff
 
-            //just mask all but the needed n bit
+            // just mask all but the needed n bit
             value &= (1 << n) - 1;
             self.idx += n;
         } else {
             self.idx += bits_left_in_current_byte;
 
-            //n spans over multiple bytes
+            // n spans over multiple bytes
             let full_bytes_needed = (n - bits_left_in_current_byte) / 8;
             let bits_in_last_byte_needed = n - bits_left_in_current_byte - full_bytes_needed * 8;
 
-            assert!(
-                bits_left_in_current_byte + full_bytes_needed * 8 + bits_in_last_byte_needed == n
+            assert_eq!(
+                bits_left_in_current_byte + full_bytes_needed * 8 + bits_in_last_byte_needed,
+                n
             );
 
             let mut bit_shift = bits_left_in_current_byte; //this many bits are already set in value
 
             assert!(self.idx.is_multiple_of(8));
 
-            //collect full bytes
+            // collect full bytes
             for _ in 0..full_bytes_needed {
                 value |= u64::from(self.source[self.idx / 8]) << bit_shift;
                 self.idx += 8;
                 bit_shift += 8;
             }
 
-            assert!(n - bit_shift == bits_in_last_byte_needed);
+            assert_eq!(n - bit_shift, bits_in_last_byte_needed);
 
             if bits_in_last_byte_needed > 0 {
                 let val_las_byte =
@@ -85,7 +84,7 @@ impl<'s> BitReader<'s> {
             }
         }
 
-        assert!(self.idx == old_idx + n);
+        assert_eq!(self.idx, old_idx + n);
 
         Ok(value)
     }
@@ -118,9 +117,10 @@ impl core::fmt::Display for GetBitsError {
             } => {
                 write!(
                     f,
-                    "Cant serve this request. The reader is limited to {limit} bits, requested {num_requested_bits} bits"
+                    "Cant serve this request. The reader is limited to {limit} bits, requested \
+                     {num_requested_bits} bits"
                 )
-            }
+            },
             GetBitsError::NotEnoughRemainingBits {
                 requested,
                 remaining,
@@ -129,7 +129,7 @@ impl core::fmt::Display for GetBitsError {
                     f,
                     "Can\'t read {requested} bits, only have {remaining} bits left"
                 )
-            }
+            },
         }
     }
 }

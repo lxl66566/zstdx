@@ -1,14 +1,15 @@
-use super::super::blocks::sequence_section::ModeType;
-use super::super::blocks::sequence_section::Sequence;
-use super::super::blocks::sequence_section::SequencesHeader;
-use super::scratch::FSEScratch;
-use crate::blocks::sequence_section::{
-    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
-};
-use crate::decoding::errors::DecodeSequenceError;
-use crate::fse::FSETable;
 use alloc::vec::Vec;
 use core::convert::TryInto;
+
+use super::{
+    super::blocks::sequence_section::{ModeType, Sequence, SequencesHeader},
+    scratch::FSEScratch,
+};
+use crate::{
+    blocks::sequence_section::{MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE},
+    decoding::errors::DecodeSequenceError,
+    fse::FSETable,
+};
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
 pub fn decode_sequences(
@@ -414,14 +415,12 @@ impl SeqDecoder {
     /// Final padding check: exactly as many bits consumed as the stream had.
     pub(crate) fn finish(&self) -> Result<(), DecodeSequenceError> {
         let rem = self.ip as isize * 8 + 64 - self.consumed as isize;
-        if rem > 0 {
-            Err(DecodeSequenceError::ExtraBits {
+        match rem.cmp(&0) {
+            core::cmp::Ordering::Greater => Err(DecodeSequenceError::ExtraBits {
                 bits_remaining: rem,
-            })
-        } else if rem < 0 {
-            Err(DecodeSequenceError::NotEnoughBytesForNumSequences)
-        } else {
-            Ok(())
+            }),
+            core::cmp::Ordering::Less => Err(DecodeSequenceError::NotEnoughBytesForNumSequences),
+            core::cmp::Ordering::Equal => Ok(()),
         }
     }
 }
@@ -453,9 +452,9 @@ pub(crate) fn decode_step(
     let ml_entry = unsafe { *tbl.add(ML_SLOT + *ml_state as usize) };
     // SAFETY: same invariant as the ll stream
     let of_entry = unsafe { *tbl.add(OF_SLOT + *of_state as usize) };
-    let (ll_base, ll_nb) = ((ll_entry >> 32) as u32, ((ll_entry >> 24) & 0xFF) as u32);
-    let (ml_base, ml_nb) = ((ml_entry >> 32) as u32, ((ml_entry >> 24) & 0xFF) as u32);
-    let (of_base, of_nb) = ((of_entry >> 32) as u32, ((of_entry >> 24) & 0xFF) as u32);
+    let (ll_base, ll_nb) = ((ll_entry >> 32) as u32, ((ll_entry >> 24) & 0xff) as u32);
+    let (ml_base, ml_nb) = ((ml_entry >> 32) as u32, ((ml_entry >> 24) & 0xff) as u32);
+    let (of_base, of_nb) = ((of_entry >> 32) as u32, ((of_entry >> 24) & 0xff) as u32);
 
     // All three add-bit widths are known before reading, so the fields (of,
     // then ml, then ll in read order, from the top) can be extracted with a
@@ -493,12 +492,12 @@ pub(crate) fn decode_step(
 
     *rem -= 1;
     if *rem > 0 {
-        let ll_nb_t = (ll_entry & 0xFF) as u32;
-        let ml_nb_t = (ml_entry & 0xFF) as u32;
-        let of_nb_t = (of_entry & 0xFF) as u32;
-        let ll_base_t = ((ll_entry >> 8) & 0xFFFF) as u32;
-        let ml_base_t = ((ml_entry >> 8) & 0xFFFF) as u32;
-        let of_base_t = ((of_entry >> 8) & 0xFFFF) as u32;
+        let ll_nb_t = (ll_entry & 0xff) as u32;
+        let ml_nb_t = (ml_entry & 0xff) as u32;
+        let of_nb_t = (of_entry & 0xff) as u32;
+        let ll_base_t = ((ll_entry >> 8) & 0xffff) as u32;
+        let ml_base_t = ((ml_entry >> 8) & 0xffff) as u32;
+        let of_base_t = ((of_entry >> 8) & 0xffff) as u32;
         // Same batching for the three state transitions (ll, then ml, then
         // of): at most 9+9+8 = 26 bits, always extractable in one read, with
         // every field masked so a zero-width total needs no branch
@@ -689,7 +688,7 @@ fn maybe_update_fse_tables(
             scratch.ll_predefined = false;
             scratch.ll_seq_valid = false;
             scratch.ll_ready = true;
-        }
+        },
         ModeType::RLE => {
             vprintln!("Use RLE ll table");
             if source.is_empty() {
@@ -706,7 +705,7 @@ fn maybe_update_fse_tables(
             scratch.literal_lengths.accuracy_log = 0;
             scratch.ll_seq_valid = false;
             scratch.ll_ready = true;
-        }
+        },
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
             // The predefined table is immutable; only (re)build it when the
@@ -721,12 +720,12 @@ fn maybe_update_fse_tables(
             }
             scratch.ll_rle = None;
             scratch.ll_ready = true;
-        }
+        },
         ModeType::Repeat => {
             vprintln!("Repeat ll table");
-            /* Nothing to do */
-        }
-    };
+            // Nothing to do
+        },
+    }
 
     let of_source = &source[bytes_read..];
 
@@ -740,7 +739,7 @@ fn maybe_update_fse_tables(
             scratch.of_predefined = false;
             scratch.of_seq_valid = false;
             scratch.of_ready = true;
-        }
+        },
         ModeType::RLE => {
             vprintln!("Use RLE of table");
             if of_source.is_empty() {
@@ -755,7 +754,7 @@ fn maybe_update_fse_tables(
             scratch.offsets.accuracy_log = 0;
             scratch.of_seq_valid = false;
             scratch.of_ready = true;
-        }
+        },
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
             if !scratch.of_predefined {
@@ -767,12 +766,12 @@ fn maybe_update_fse_tables(
             }
             scratch.of_rle = None;
             scratch.of_ready = true;
-        }
+        },
         ModeType::Repeat => {
             vprintln!("Repeat of table");
-            /* Nothing to do */
-        }
-    };
+            // Nothing to do
+        },
+    }
 
     let ml_source = &source[bytes_read..];
 
@@ -786,7 +785,7 @@ fn maybe_update_fse_tables(
             scratch.ml_predefined = false;
             scratch.ml_seq_valid = false;
             scratch.ml_ready = true;
-        }
+        },
         ModeType::RLE => {
             vprintln!("Use RLE ml table");
             if ml_source.is_empty() {
@@ -801,7 +800,7 @@ fn maybe_update_fse_tables(
             scratch.match_lengths.accuracy_log = 0;
             scratch.ml_seq_valid = false;
             scratch.ml_ready = true;
-        }
+        },
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
             if !scratch.ml_predefined {
@@ -814,12 +813,12 @@ fn maybe_update_fse_tables(
             }
             scratch.ml_rle = None;
             scratch.ml_ready = true;
-        }
+        },
         ModeType::Repeat => {
             vprintln!("Repeat ml table");
-            /* Nothing to do */
-        }
-    };
+            // Nothing to do
+        },
+    }
 
     Ok(bytes_read)
 }
@@ -858,12 +857,9 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 
 #[test]
 fn test_ll_default() {
-    let mut table = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    let mut table = FSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
-        .build_from_probabilities(
-            LL_DEFAULT_ACC_LOG,
-            &LITERALS_LENGTH_DEFAULT_DISTRIBUTION.to_vec(),
-        )
+        .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
         .unwrap();
 
     #[cfg(feature = "std")]
@@ -877,26 +873,26 @@ fn test_ll_default() {
         );
     }
 
-    assert!(table.decode.len() == 64);
+    assert_eq!(table.decode.len(), 64);
 
-    //just test a few values. TODO test all values
-    assert!(table.decode[0].symbol == 0);
-    assert!(table.decode[0].num_bits == 4);
-    assert!(table.decode[0].base_line == 0);
+    // just test a few values. TODO test all values
+    assert_eq!(table.decode[0].symbol, 0);
+    assert_eq!(table.decode[0].num_bits, 4);
+    assert_eq!(table.decode[0].base_line, 0);
 
-    assert!(table.decode[19].symbol == 27);
-    assert!(table.decode[19].num_bits == 6);
-    assert!(table.decode[19].base_line == 0);
+    assert_eq!(table.decode[19].symbol, 27);
+    assert_eq!(table.decode[19].num_bits, 6);
+    assert_eq!(table.decode[19].base_line, 0);
 
-    assert!(table.decode[39].symbol == 25);
-    assert!(table.decode[39].num_bits == 4);
-    assert!(table.decode[39].base_line == 16);
+    assert_eq!(table.decode[39].symbol, 25);
+    assert_eq!(table.decode[39].num_bits, 4);
+    assert_eq!(table.decode[39].base_line, 16);
 
-    assert!(table.decode[60].symbol == 35);
-    assert!(table.decode[60].num_bits == 6);
-    assert!(table.decode[60].base_line == 0);
+    assert_eq!(table.decode[60].symbol, 35);
+    assert_eq!(table.decode[60].num_bits, 6);
+    assert_eq!(table.decode[60].base_line, 0);
 
-    assert!(table.decode[59].symbol == 24);
-    assert!(table.decode[59].num_bits == 5);
-    assert!(table.decode[59].base_line == 32);
+    assert_eq!(table.decode[59].symbol, 24);
+    assert_eq!(table.decode[59].num_bits, 5);
+    assert_eq!(table.decode[59].base_line, 32);
 }

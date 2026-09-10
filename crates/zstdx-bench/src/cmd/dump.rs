@@ -6,9 +6,9 @@
 //! Default dumps the Fastest level as `<shape>.raw.zst`; `--all-levels`
 //! dumps the whole ladder as `<shape>.raw.l<zstd-level>.zst`.
 
-use crate::corpus::{corpus_dir, LevelName, LADDER};
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
+
+use crate::corpus::{LADDER, LevelName, corpus_dir};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -25,6 +25,8 @@ pub fn run(args: &Args) {
     for entry in fs::read_dir(corpus_dir()).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        // corpus files are generated with a lowercase .raw suffix
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         if name.ends_with(".raw") {
             names.push(name);
         }

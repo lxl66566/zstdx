@@ -2,10 +2,8 @@
 //!
 //! ## High-level API
 //! For most users these are the entry points:
-//! - one-shot: [`compress`]/[`decompress`] (or [`bulk`] for buffer-to-buffer
-//!   variants)
-//! - streaming: [`stream`] with `io::Read`/`io::Write` shaped encoders and
-//!   decoders
+//! - one-shot: [`compress`]/[`decompress`] (or [`bulk`] for buffer-to-buffer variants)
+//! - streaming: [`stream`] with `io::Read`/`io::Write` shaped encoders and decoders
 //! - configuration: [`Level`], [`EncoderOptions`], [`DecoderOptions`]
 //!
 //! Code written against the `zstd` crate (the libzstd bindings) ports with
@@ -21,7 +19,6 @@
 //! The [encoding] module contains the code for compression.
 //! Compression can be achieved by using the [`encoding::compress`]/[`encoding::compress_to_vec`]
 //! functions or [`encoding::FrameCompressor`]
-//!
 #![doc = include_str!("../Readme.md")]
 #![no_std]
 #![deny(trivial_casts, trivial_numeric_casts, rust_2018_idioms)]

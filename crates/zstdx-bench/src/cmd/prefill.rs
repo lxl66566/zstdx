@@ -2,10 +2,14 @@
 //! strip fill on window-sized corpus strips (random = worst-case seed scan,
 //! text = seed found fast).
 
-use crate::common::want;
-use crate::corpus::{corpus_dir, LevelName, Shape};
 use std::time::Instant;
+
 use zstdx::encoding::{MatchGeneratorDriver, Matcher};
+
+use crate::{
+    common::want,
+    corpus::{LevelName, Shape, corpus_dir},
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -39,7 +43,8 @@ pub fn run(args: &Args) {
             }
             let dt = t.elapsed();
             println!(
-                "{name:12} {level_name:>10?} strip {strip_len}: {:>8.1} us/prefill  ({:>6.0} MiB/s)",
+                "{name:12} {level_name:>10?} strip {strip_len}: {:>8.1} us/prefill  ({:>6.0} \
+                 MiB/s)",
                 dt.as_secs_f64() * 1e6 / n as f64,
                 strip_len as f64 * n as f64 / dt.as_secs_f64() / (1 << 20) as f64
             );
