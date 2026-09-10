@@ -4,6 +4,31 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Multithreaded compression now holds the single-threaded ratio. The
+  overlap strip between jobs is the full level window and its positions
+  are actually indexed into the search tables (`prefill_window`; before,
+  the strip was borrowed as window but never indexed, so no sequence
+  could ever resolve into it). The fast strategy fills the strip on
+  libzstd's `fastHashFillStep` grid, and the chain store decision gained
+  libzstd's replacement-margin gate (`ml*4 >= ilog2(offset) + 7`):
+  the densely pre-indexed strips otherwise flood the stream with
+  five-byte matches a window back — measured on the 32 MiB corpus,
+  skewed Balanced went 1.86 -> 2.00 while its speed rose 42 -> 2139
+  MiB/s single-threaded (51x; json 5.66 -> 6.08, text 363.5 -> 361.5,
+  all MT16 cells within ~0.5% of single-thread and ahead of zstd-mt).
+  Periodic repeats still escaped every table: on clumped data a
+  period-old twin is always buried under newer same-hash recurrences,
+  and a coarser grid only trades burial for phase misalignment, so job
+  starts now probe a seed offset directly — the distance of the nearest
+  56+ byte backward repeat of the strip tail, found by one backward
+  scan at prefill. Three seed matches encode as plain literal offsets
+  (legal under the repcode gate) and rotate the repeated-offset history
+  until it holds the period, which the repcode probes then ride; a seed
+  that stops matching retires on a probe budget. Periodic corpus
+  (300 KiB period, 8 jobs): Fastest mt/st 2.70 -> 1.00, Fast 2.80 ->
+  1.00, Balanced 2.70 -> 1.00; on the 32 MiB corpus every level and
+  shape stays within +0.16% of single-threaded.
+
 * New levels `Level::Opt` (≈zstd 16-17, btopt) and `Level::Ultra`
   (≈zstd 18-22, btultra/btultra2): a full port of libzstd's optimal
   parser (`zstd_opt.c`) — the lazy-filled binary match tree

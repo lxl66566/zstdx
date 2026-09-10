@@ -3,9 +3,10 @@
 //!
 //! The input is split into jobs; each job compresses its byte range with the
 //! pooled slice machinery while borrowing an `overlap`-sized strip of the
-//! preceding job as match history (`adopt_window`), so the assembled output
-//! stays a single regular zstd frame. Two invariants make the jobs
-//! independent of each other (mirroring libzstd's zstdmt):
+//! preceding job as match history (`adopt_window` plus `prefill_window`, so
+//! the strip's positions actually sit in the search tables), keeping the
+//! assembled output a single regular zstd frame. Two invariants make the
+//! jobs independent of each other (mirroring libzstd's zstdmt):
 //! - every job starts from reset entropy tables, so its first block is fully
 //!   self-describing (no Repeat modes across a job boundary);
 //! - every job except the first gates repcode references until three
@@ -56,18 +57,16 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
     // the overlap duplication negligible, and scales with the level's
     // overlap so deep-search levels don't pay it per job.
     let window = MatchGeneratorDriver::window_for_level(level);
-    // libzstd's overlap ladder adapted: window/4 for the chain levels
-    // (their deeper searches reach further back) and window/8 for the fast
-    // hash probe — matches reaching beyond the strip simply do not happen,
-    // at a ratio cost bounded by the strip size.
-    let overlap = match level {
-        Level::Fastest => window as usize / 8,
-        _ => window as usize / 4,
-    };
+    // The full window as strip: the strip is fully indexed (see
+    // `prefill_window`), so matches reach across job borders as far as the
+    // frame window allows. A shorter strip caps the ratio at repeats that
+    // fit inside it — the text corpus's ~800K period against a 1 MiB window
+    // collapsed the multithreaded ratio by an order of magnitude.
+    let overlap = window as usize;
     let job_size = src
         .len()
         .div_ceil(workers as usize * 2)
-        .max(MIN_JOB_SIZE.max(overlap * 4));
+        .max(MIN_JOB_SIZE.max(overlap));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -281,6 +280,26 @@ mod tests {
                 compressed.len() <= st.len() + st.len() / 50,
                 "mt ratio must stay near single-thread: {} vs {}",
                 compressed.len(),
+                st.len()
+            );
+        }
+    }
+
+    /// A repeat period that fits the level's window must keep matching
+    /// across job borders: the strip is indexed, so the only ratio loss left
+    /// is the job-start entropy restarts. Data whose period exceeds the old
+    /// un-indexed strip collapsed the ratio by an order of magnitude.
+    #[test]
+    fn mt_periodic_repeat_matches_across_jobs() {
+        let unit = textish(300 * 1024);
+        let data: Vec<u8> = (0..24).flat_map(|_| unit.iter().copied()).collect();
+        for level in [Level::Fastest, Level::Fast, Level::Balanced] {
+            let st = compress_slice_mt(&data, level, true, 1);
+            let mt = compress_slice_mt(&data, level, true, 4);
+            assert!(
+                mt.len() <= st.len() + st.len() / 50,
+                "{level:?}: periodic data must match across jobs, mt {} vs st {}",
+                mt.len(),
                 st.len()
             );
         }

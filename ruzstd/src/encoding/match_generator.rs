@@ -30,6 +30,26 @@ pub(super) const MIN_MATCH: usize = 4;
 pub(super) const HASH_READ: usize = 8;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
+/// Prefill grid spacing for the fast strategy (libzstd's
+/// `fastHashFillStep`): the strip's mid-distance match coverage survives a
+/// 3x coarser grid, at a third of the fill cost. Periodic-repeat locking is
+/// NOT the grid's job — see `seed_offset`; a dense grid cannot provide it
+/// anyway, because on clumped data the twin slot's newest entry is always a
+/// recent same-hash recurrence, burying any period-old twin.
+const FAST_PREFILL_STRIDE: usize = 3;
+/// Backward bytes that must agree (beyond the 8-byte anchor) before a strip
+/// position becomes the job-start seed offset: long enough that word-level
+/// repeats (~10-15 agreeing bytes on natural text) cannot qualify, short
+/// enough that one cache line of checking settles it.
+const SEED_AGREE: usize = 48;
+/// Seed matches to emit before retiring the seed: three literal offsets
+/// both clear the repcode gate and rotate `rep` until `rep[0]` holds the
+/// seed offset, so the regular repcode probes take over from there.
+const SEED_MATCHES: u8 = 3;
+/// Probe attempts an unused seed survives: a seed whose offset stops
+/// matching (broken period, or a repeated block that ended) must not pay a
+/// dead compare for the rest of the job.
+const SEED_BUDGET: u32 = 8192;
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xC0000;
 
@@ -253,6 +273,22 @@ fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
         len += 1;
     }
     len
+}
+
+/// Whether a non-rep match clears its offset's price: literals cost ~4 bits
+/// per byte and the offset its highbit, plus a constant for the sequence
+/// code overhead (libzstd's raw approximation from its lazy gain checks).
+/// Without this gate the densely pre-indexed multithread job strips flood
+/// the stream with five-byte matches a megabyte back — high-entropy shapes
+/// lost ratio and speed alike to the emission storm.
+/// The +7 margin is libzstd's depth-2 replacement constant; at store time it
+/// costs text-like shapes ~0.5% ratio (their mid-distance four-byte matches
+/// are worth keeping) while anything looser lets the dense-table pollution
+/// back in (measured: json 5.66/5.77/5.91/6.08 at +1/+3/+5/+7, text
+/// 363.5/363.4/362.7/361.5, skewed 1.86/1.91/2.00/2.00).
+#[inline(always)]
+fn pays_for_offset(ml: usize, idx: usize, cand: usize, rep_hit: bool) -> bool {
+    rep_hit || ml * 4 >= (idx - cand).ilog2() as usize + 7
 }
 
 /// Store `abs` as the newest position for its hash; `tag` is the caller's
@@ -650,6 +686,22 @@ pub struct MatchGeneratorDriver {
     /// know the decoder's history; three literal offsets shift it fully
     /// into known territory because the update is a plain 3-slot shift.
     rep_pending: u8,
+    /// Long-repeat offset probed directly at a multithreaded job's start
+    /// (see [`Self::prefill_window`]): 0 = inactive. The fast strategy's
+    /// single-probe table cannot hold a periodic repeat's twin — on clumped
+    /// data every slot's newest entry is a recent same-hash recurrence, so
+    /// the period is unreachable through the hash path until the scan has
+    /// self-indexed a full period. The seed sidesteps the table: bytes are
+    /// compared at the exact offset, so three seed matches both encode
+    /// legally (literal offsets, no repcode gate) and rotate `rep` until it
+    /// holds the period, which the repcode probes then ride.
+    seed_offset: u32,
+    /// Seed matches emitted so far; the seed retires after
+    /// [`SEED_MATCHES`].
+    seed_hits: u8,
+    /// Probe attempts left before an unused seed retires; bounds the cost
+    /// of a seed that never matches.
+    seed_budget: u32,
     slice_size: usize,
 }
 
@@ -709,6 +761,9 @@ impl MatchGeneratorDriver {
             params: FASTEST_PARAMS,
             rep: [1, 4, 8],
             rep_pending: 0,
+            seed_offset: 0,
+            seed_hits: 0,
+            seed_budget: 0,
             slice_size,
         }
     }
@@ -736,6 +791,9 @@ impl MatchGeneratorDriver {
             params: FASTEST_PARAMS,
             rep: [1, 4, 8],
             rep_pending: 0,
+            seed_offset: 0,
+            seed_hits: 0,
+            seed_budget: 0,
             slice_size: 0,
         }
     }
@@ -813,9 +871,112 @@ impl MatchGeneratorDriver {
         self.rep_pending = 3;
     }
 
+    /// Index a strip of borrowed history — `data` holds the bytes at absolute
+    /// offset `base` — into the search tables, so a scan that starts after it
+    /// can match into it (the multithreaded job path adopts the previous
+    /// job's tail as match window; without this pass the tables hold no
+    /// position inside that window and sequences never reference it).
+    /// Positions are linked oldest-to-newest, keeping the newest-wins order
+    /// the walks rely on. The opt strategies need no explicit fill: their
+    /// tree fills lazily from `next_update`, so rewinding it to the strip
+    /// start makes the first search index the strip through the regular
+    /// tree-fill path.
+    pub fn prefill_window(&mut self, data: &[u8], base: u64) {
+        if data.len() < HASH_READ {
+            return;
+        }
+        let tag = self.epoch << 48;
+        let last = data.len() - HASH_READ;
+        match self.params.strategy {
+            Strategy::Opt(_) => {
+                self.next_update = self.next_update.min(base);
+            }
+            Strategy::Fast => {
+                // Sparse grid, oldest-to-newest, newest-wins per slot — the
+                // single-strategy table has no chain to walk, so a buried
+                // twin is unreachable (see FAST_PREFILL_STRIDE).
+                let table = &mut self.table[..];
+                let mut idx = 0;
+                while idx < last {
+                    insert_at(data, table, tag, idx, base + idx as u64);
+                    idx += FAST_PREFILL_STRIDE;
+                }
+                self.acquire_seed(data, last);
+            }
+            Strategy::Dfast(small_log) => {
+                let long_log = self.params.hash_log;
+                let long = &mut self.table[..];
+                let small = &mut self.chain[..];
+                for idx in 0..last {
+                    // SAFETY: both hashes are masked to their tables' sizes.
+                    unsafe {
+                        let entry = tag | (base + idx as u64);
+                        *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
+                        *small.get_unchecked_mut(hash_at_log(data, idx, small_log)) = entry;
+                    }
+                }
+                // The double table is as burial-prone as the fast one for
+                // period-long twins: both probes are single-candidate.
+                self.acquire_seed(data, last);
+            }
+            Strategy::Chain(_) => {
+                let hash_log = self.params.hash_log;
+                let chain_mask = self.chain.len() - 1;
+                let table = &mut self.table[..];
+                let chain = &mut self.chain[..];
+                for idx in 0..last {
+                    let abs = base + idx as u64;
+                    // SAFETY: the hash masks to hash_log bits, the absolute
+                    // position to the chain size (absolute key; see
+                    // emit_chain's note on the walk side's indexing).
+                    unsafe {
+                        let h = hash_at_log(data, idx, hash_log);
+                        let head = *table.get_unchecked(h);
+                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
+                        *table.get_unchecked_mut(h) = tag | abs;
+                    }
+                }
+                // The head table's first hop is as burial-prone as the fast
+                // strategy's single probe; seed the walk-independent path.
+                self.acquire_seed(data, last);
+            }
+        }
+    }
+
     #[inline(always)]
     fn idx_of(&self, abs: u64) -> usize {
         (abs - self.win_base) as usize
+    }
+
+    /// Scan back from the strip's tail for the nearest position whose 8
+    /// bytes equal the tail's and whose preceding [`SEED_AGREE`] bytes agree,
+    /// and install its distance as the job-start seed offset (see
+    /// `seed_offset`). Word-level repeats die at ~15 agreeing bytes, so only
+    /// a genuine long repeat — a period riding the strip, or a duplicated
+    /// block — qualifies. The offset is by construction inside the strip,
+    /// hence inside the window, so seed matches are always encodable.
+    /// `last` is the strip's final insertable index; the anchor bytes
+    /// `[last, last + 8)` abut the job start.
+    fn acquire_seed(&mut self, data: &[u8], last: usize) {
+        let a4 = read4(data, last);
+        let a8 = read8(data, last);
+        let mut u = last;
+        while u > 0 {
+            u -= 1;
+            if read4(data, u) != a4 || read8(data, u) != a8 {
+                continue;
+            }
+            let mut k = 1;
+            while u >= k && k <= SEED_AGREE && data[last - k] == data[u - k] {
+                k += 1;
+            }
+            if k > SEED_AGREE {
+                self.seed_offset = (last - u) as u32;
+                self.seed_hits = 0;
+                self.seed_budget = SEED_BUDGET;
+                return;
+            }
+        }
     }
 }
 
@@ -845,6 +1006,9 @@ impl Matcher for MatchGeneratorDriver {
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
         self.rep_pending = 0;
+        self.seed_offset = 0;
+        self.seed_hits = 0;
+        self.seed_budget = 0;
         // The opt parser re-seeds its statistics and re-fills its tree.
         self.next_update = 0;
         self.opt_state.reset();
@@ -1027,6 +1191,9 @@ impl MatchGeneratorDriver {
         let mut miss_count = self.miss_count;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
+        let mut seed_offset = self.seed_offset;
+        let mut seed_hits = self.seed_hits;
+        let mut seed_budget = self.seed_budget;
         let hash_read = HASH_READ as u64;
 
         // Resolve a table entry to a window index: invalid entries (wrong
@@ -1135,6 +1302,58 @@ impl MatchGeneratorDriver {
                             miss_count = 0;
                             continue 'restart;
                         }
+                    }
+                }
+
+                // Seed-offset probe (job starts only): direct byte compare
+                // at the prefill-detected long-repeat offset — the table
+                // cannot serve this candidate (see `seed_offset`). Emits as
+                // a plain literal-offset match, so it is legal under the
+                // repcode gate; each emit rotates `rep` toward holding the
+                // offset, and after SEED_MATCHES the repcode probes ride it
+                // without further seed help.
+                if seed_offset != 0 {
+                    let ci = (pos - seed_offset as u64 - win_base) as usize;
+                    if read4(win, ci) == cur0 {
+                        let mut ml = extend_match(win, idx0, ci);
+                        // Same bar as the hash path: below 6 the sequence
+                        // overhead eats the match, and the offset-gain gate
+                        // keeps a far seed honest about its worth.
+                        if ml >= 6 && pays_for_offset(ml, idx0, ci, false) {
+                            let anchor_idx = (anchor - win_base) as usize;
+                            let mut start = idx0;
+                            let mut ci = ci;
+                            // Extend backwards into the pending literals;
+                            // the offset stays constant.
+                            while start > anchor_idx && ci > 0 && win[ci - 1] == win[start - 1] {
+                                ci -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            let of_value = (start - ci + 3) as u32;
+                            anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
+                            if rep_pending != 0 {
+                                rep_pending -= 1;
+                            }
+                            seed_hits += 1;
+                            if seed_hits >= SEED_MATCHES {
+                                seed_offset = 0;
+                            }
+                            pos = if rep_pending == 0 {
+                                emit.rep1_chain(win, anchor, block_end, &mut rep)
+                            } else {
+                                anchor
+                            };
+                            anchor = pos;
+                            miss_count = 0;
+                            continue 'restart;
+                        }
+                    }
+                    // A seed that never pays retires on its budget instead
+                    // of comparing dead bytes for the whole job.
+                    seed_budget -= 1;
+                    if seed_budget == 0 {
+                        seed_offset = 0;
                     }
                 }
 
@@ -1269,6 +1488,9 @@ impl MatchGeneratorDriver {
         self.miss_count = miss_count;
         self.rep = rep;
         self.rep_pending = rep_pending;
+        self.seed_offset = seed_offset;
+        self.seed_hits = seed_hits;
+        self.seed_budget = seed_budget;
     }
 
     /// The double-hash strategy loop (level [`Level::Fast`], libzstd's
@@ -1297,6 +1519,9 @@ impl MatchGeneratorDriver {
         let max_window = self.params.window as u64;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
+        let mut seed_offset = self.seed_offset;
+        let mut seed_hits = self.seed_hits;
+        let mut seed_budget = self.seed_budget;
         let mut anchor_idx = (self.anchor - win_base) as usize;
         let mut ip_idx = (self.pos - win_base) as usize;
         // The scan's own table writes go through raw pointers: routing them
@@ -1393,6 +1618,47 @@ impl MatchGeneratorDriver {
                                 continue 'outer;
                             }
                         }
+                    }
+                }
+
+                // Seed-offset probe (job starts only): direct byte compare
+                // at the prefill-detected long-repeat offset — neither
+                // single-candidate table can serve it (see `seed_offset`).
+                // Mirrors the fast loop's twin block.
+                if seed_offset != 0 {
+                    let ci = (pos_abs - seed_offset as u64 - win_base) as usize;
+                    if read4(win, ci) == read4(win, ip_idx) {
+                        let mut ml = extend_match(win, ip_idx, ci);
+                        if ml >= 6 && pays_for_offset(ml, ip_idx, ci, false) {
+                            let mut start = ip_idx;
+                            let mut c = ci;
+                            while start > anchor_idx && c > 0 && win[c - 1] == win[start - 1] {
+                                c -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            let of_value = (start - c + 3) as u32;
+                            anchor_idx =
+                                emit.emit(win, anchor_idx, ip_idx, start, ml, of_value, &mut rep);
+                            if rep_pending != 0 {
+                                rep_pending -= 1;
+                            }
+                            seed_hits += 1;
+                            if seed_hits >= SEED_MATCHES {
+                                seed_offset = 0;
+                            }
+                            ip_idx = if rep_pending == 0 {
+                                emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
+                            } else {
+                                anchor_idx
+                            };
+                            anchor_idx = ip_idx;
+                            continue 'outer;
+                        }
+                    }
+                    seed_budget -= 1;
+                    if seed_budget == 0 {
+                        seed_offset = 0;
                     }
                 }
 
@@ -1519,6 +1785,9 @@ impl MatchGeneratorDriver {
         self.anchor = self.block_end;
         self.rep = rep;
         self.rep_pending = rep_pending;
+        self.seed_offset = seed_offset;
+        self.seed_hits = seed_hits;
+        self.seed_budget = seed_budget;
         // dfast tracks misses through the per-match step counter, not the
         // cross-block miss count.
         self.miss_count = 0;
@@ -1563,6 +1832,9 @@ impl MatchGeneratorDriver {
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
         let mut miss_count = self.miss_count;
+        let mut seed_offset = self.seed_offset;
+        let mut seed_hits = self.seed_hits;
+        let mut seed_budget = self.seed_budget;
 
         // Chain-walk search from the hash head at window index `idx`,
         // returning the longest match's (length, candidate window index).
@@ -1642,6 +1914,32 @@ impl MatchGeneratorDriver {
                 }
             }
 
+            // Seed-offset probe (job starts only): the prefill-detected
+            // long-repeat offset as a direct candidate, before the chain's
+            // candidates — clumped data buries the period twin too deep in
+            // the chain for the depth-limited walk to reach (see
+            // `seed_offset`). Mirrors the fast loop's twin block; the pays
+            // gate below keeps a far seed honest.
+            let mut seed_hit = false;
+            if seed_offset != 0 {
+                let ci = (pos - seed_offset as u64 - win_base) as usize;
+                if read4(win, ci) == read4(win, idx) {
+                    let ml = extend_match(win, idx, ci);
+                    if ml >= 6 && ml + 3 > best_len {
+                        best_len = ml;
+                        best_cand = ci;
+                        rep_hit = false;
+                        seed_hit = true;
+                    }
+                }
+                if !seed_hit {
+                    seed_budget -= 1;
+                    if seed_budget == 0 {
+                        seed_offset = 0;
+                    }
+                }
+            }
+
             // Insert this position behind the probe (newest-wins), linking
             // the chain to the previous head. The chain slot key is the
             // absolute position — what the walk resolves candidates with.
@@ -1653,7 +1951,7 @@ impl MatchGeneratorDriver {
                 *table_ptr.add(h) = tag | pos;
             }
 
-            if best_len < MIN_MATCH {
+            if best_len < MIN_MATCH || !pays_for_offset(best_len, idx, best_cand, rep_hit) {
                 // Grow the probe step on long literal runs (same policy as
                 // the fast loop) so incompressible data does not pay a full
                 // chain walk per byte.
@@ -1679,6 +1977,7 @@ impl MatchGeneratorDriver {
                         best_len = len2;
                         best_cand = cand2;
                         rep_hit = false;
+                        seed_hit = false;
                         lazy_shift = step;
                     } else {
                         break;
@@ -1710,6 +2009,12 @@ impl MatchGeneratorDriver {
             if rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
+            if seed_hit {
+                seed_hits += 1;
+                if seed_hits >= SEED_MATCHES {
+                    seed_offset = 0;
+                }
+            }
             if rep_pending == 0 {
                 pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
             } else {
@@ -1726,6 +2031,9 @@ impl MatchGeneratorDriver {
         self.miss_count = miss_count;
         self.rep = rep;
         self.rep_pending = rep_pending;
+        self.seed_offset = seed_offset;
+        self.seed_hits = seed_hits;
+        self.seed_budget = seed_budget;
     }
 
     /// Bridge into the optimal parser (levels Opt/Ultra): hands over the

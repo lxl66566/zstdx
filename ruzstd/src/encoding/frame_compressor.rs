@@ -469,6 +469,15 @@ pub(crate) fn compress_job_blocks(
     // Uniform detection still runs (the RLE path), but the frame checksum is
     // the mt driver's job over the whole input.
     let mut hasher = SliceChecksum::new(0, false);
+    // Index the strip before the first block adopts it: the tables start
+    // empty at the job (fresh epoch), so without this pass the strip is only
+    // a legal boundary extension no sequence can ever resolve into.
+    if job.start > 0 {
+        let strip = job.start.saturating_sub(overlap);
+        state
+            .matcher
+            .prefill_window(&src[strip..job.start], strip as u64);
+    }
     let mut cursor = job.start;
     while cursor < job.end {
         let block_end = (cursor + block_size).min(job.end);
