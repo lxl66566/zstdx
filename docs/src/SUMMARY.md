@@ -20,6 +20,10 @@
 - [Wide Matrix Data](dev/bench/matrix.md)
 - [Benchmark Methodology](dev/bench/methodology.md)
 
+## Upstream Comparison
+
+- [zstdx vs. official zstd](dev/comparison.md)
+
 ## Performance Optimization
 
 - [Decoding Side](dev/perf/decoding.md)
