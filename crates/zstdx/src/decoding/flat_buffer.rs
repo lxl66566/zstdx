@@ -203,6 +203,7 @@ impl FlatOut {
 
     /// Absolute slice for checksumming freshly decoded bytes. Both offsets
     /// must lie in the same physical segment (blocks never straddle a wrap).
+    #[cfg(feature = "hash")]
     pub fn abs_slice(&self, a: usize, b: usize) -> &[u8] {
         &self.buf[a..b]
     }

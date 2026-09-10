@@ -1107,6 +1107,7 @@ unsafe fn clear_table_avx512(t: &mut [u32]) {
 
 /// Slot count above which the job-start table clear goes non-temporal
 /// (4 MiB of u32 slots): smaller tables profit more from staying cached.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 const NT_CLEAR_MIN: usize = 1 << 20;
 
 /// Nearest `u < last` with the anchor's 8 bytes and [`SEED_AGREE`]
