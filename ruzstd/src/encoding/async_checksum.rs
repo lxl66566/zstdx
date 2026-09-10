@@ -153,7 +153,7 @@ fn worker_shared() -> Option<Arc<Shared>> {
             });
             let worker_shared = shared.clone();
             std::thread::Builder::new()
-                .name("ruzstd-xxh64".into())
+                .name("zstdx-xxh64".into())
                 .spawn(move || run(worker_shared))
                 .ok()?;
             *w = Some(shared);

@@ -1,6 +1,6 @@
 
 [package]
-name = "ruzstd-cli"
+name = "zstdx-cli"
 version = "0.8.2"
 rust-version = "1.87.0"
 authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
@@ -8,7 +8,7 @@ edition = "2018"
 license = "MIT"
 homepage = "https://github.com/KillingSpark/zstd-rs"
 repository = "https://github.com/KillingSpark/zstd-rs"
-description = "A command line interface for the `ruzstd` zstd implementation"
+description = "A command line interface for the `zstdx` zstd implementation"
 readme = "../Readme.md"
 keywords = ["zstd", "zstandard", "decompression"]
 categories = ["compression"]
@@ -22,7 +22,7 @@ indicatif = { version = "0.18.0" }
 tracing-indicatif = { version = "0.3.13" }
 console = { version = "0.16.1" }
 tracing-subscriber = { version = "0.3.20" }
-ruzstd = { path = "../ruzstd", features = ["std"] }
+zstdx = { path = "../ruzstd", features = ["std"] }
 
 [dev-dependencies]
 criterion = "0.5"

@@ -1,4 +1,4 @@
-//! Head-to-head benchmark: ruzstd vs the zstd crate (libzstd bindings).
+//! Head-to-head benchmark: zstdx vs the zstd crate (libzstd bindings).
 //!
 //! Usage: cargo run --release --example bench_compare [--] [filter]
 //! `filter` selects shapes by substring (e.g. `text` or `text.zst3`);
@@ -15,10 +15,10 @@
 mod common;
 
 use common::Ab;
-use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
+use zstdx::decoding::{FrameDecoder, StreamingDecoder};
 
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_default();
@@ -59,8 +59,8 @@ fn main() {
         // correctness gate before anything is timed
         let mut fr = FrameDecoder::new();
         let mut out = vec![0u8; raw.len()];
-        fr.decode_all(compressed, &mut out).expect("ruzstd decode");
-        assert_eq!(&out[..], &raw[..], "ruzstd decoded wrong bytes for {name}");
+        fr.decode_all(compressed, &mut out).expect("zstdx decode");
+        assert_eq!(&out[..], &raw[..], "zstdx decoded wrong bytes for {name}");
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
         assert_eq!(
@@ -131,30 +131,30 @@ fn main() {
             "{:<16}{:>9}{:>9}   {}",
             "shape", "ruz", "zstd", "xslow  (MiB/s of each; ratio = ruz_time/zstd_time)"
         );
-        let ladder: [(&str, ruzstd::Level, i32); 4] = [
-            ("Fastest", ruzstd::Level::Fastest, 1),
-            ("Fast", ruzstd::Level::Fast, 3),
-            ("Balanced", ruzstd::Level::Balanced, 6),
-            ("Best", ruzstd::Level::Best, 12),
+        let ladder: [(&str, zstdx::Level, i32); 4] = [
+            ("Fastest", zstdx::Level::Fastest, 1),
+            ("Fast", zstdx::Level::Fast, 3),
+            ("Balanced", zstdx::Level::Balanced, 6),
+            ("Best", zstdx::Level::Best, 12),
         ];
         for (name, raw) in &shapes {
             let bytes = raw.len() as u64;
             let mut ratios = String::new();
             for (label, level, z) in ladder {
                 // correctness gate: our frame decodes with both sides
-                let comp = ruzstd::bulk::compress(raw, level);
+                let comp = zstdx::bulk::compress(raw, level);
                 let mut back = Vec::with_capacity(raw.len() + 16);
                 FrameDecoder::new()
                     .decode_all_to_vec(&comp, &mut back)
                     .unwrap();
-                assert_eq!(&back[..], &raw[..], "ruzstd roundtrip mismatch for {name}");
+                assert_eq!(&back[..], &raw[..], "zstdx roundtrip mismatch for {name}");
                 zstd::stream::copy_decode(&comp[..], &mut Vec::new()).unwrap();
                 let ratio = raw.len() as f64 / comp.len() as f64;
                 ratios.push_str(&format!("{label} {ratio:.2}  "));
 
                 let report = ab.measure(
                     || {
-                        common::black_box(ruzstd::bulk::compress(raw, level));
+                        common::black_box(zstdx::bulk::compress(raw, level));
                     },
                     || {
                         common::black_box(zstd::bulk::compress(raw, z).unwrap());
@@ -162,7 +162,7 @@ fn main() {
                 );
                 report.print(&format!("{name}.{label}"), bytes, "", "");
             }
-            println!("{:<16}ruzstd ratios {ratios}", "");
+            println!("{:<16}zstdx ratios {ratios}", "");
         }
     }
 }

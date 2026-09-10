@@ -25,8 +25,8 @@ use crate::{Level, Result};
 ///
 /// ```rust
 /// let data = b"abcabcabc";
-/// let compressed = ruzstd::stream::encode_all(&data[..], ruzstd::Level::Fastest).unwrap();
-/// assert_eq!(ruzstd::stream::decode_all(&compressed[..]).unwrap(), data);
+/// let compressed = zstdx::stream::encode_all(&data[..], zstdx::Level::Fastest).unwrap();
+/// assert_eq!(zstdx::stream::decode_all(&compressed[..]).unwrap(), data);
 /// ```
 pub fn encode_all<R: Read>(source: R, level: Level) -> Result<alloc::vec::Vec<u8>> {
     let mut output = alloc::vec::Vec::new();

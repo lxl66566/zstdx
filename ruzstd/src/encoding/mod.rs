@@ -29,7 +29,7 @@ use seq_codes::pack_seq;
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::{encoding::compress, Level};
+/// use zstdx::{encoding::compress, Level};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let mut target = Vec::new();
 /// compress(data, &mut target, Level::Fastest);
@@ -43,7 +43,7 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: Level) {
 
 /// Convenience function to compress some source into a Vec without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::{encoding::compress_to_vec, Level};
+/// use zstdx::{encoding::compress_to_vec, Level};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let compressed = compress_to_vec(data, Level::Fastest);
 /// ```

@@ -12,7 +12,7 @@ fn main() {
     let rounds: usize = args.next().map_or(64, |s| s.parse().unwrap());
     let data = std::fs::read(&path).unwrap();
     // Size the decode_all target from the clean input.
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(&data[..]).unwrap();
+    let mut dec = zstdx::decoding::StreamingDecoder::new(&data[..]).unwrap();
     let mut clean = Vec::new();
     std::io::Read::read_to_end(&mut dec, &mut clean).unwrap();
     let raw_len = clean.len();
@@ -35,13 +35,13 @@ fn main() {
         let result = std::panic::catch_unwind(move || {
             // A corrupted frame header (e.g. mangled magic) is a regular
             // decode error, not a panic.
-            let Ok(mut decoder) = ruzstd::decoding::StreamingDecoder::new(&corrupted[..]) else {
+            let Ok(mut decoder) = zstdx::decoding::StreamingDecoder::new(&corrupted[..]) else {
                 return true;
             };
             let mut out = Vec::new();
             let streamed = std::io::Read::read_to_end(&mut decoder, &mut out).is_ok();
             // Exercise the flat decode_all path against the same corruption.
-            let mut fr = ruzstd::decoding::FrameDecoder::new();
+            let mut fr = zstdx::decoding::FrameDecoder::new();
             let mut bulk = vec![0u8; raw_len];
             let sliced = fr.decode_all(&corrupted[..], &mut bulk).is_ok();
             streamed && sliced

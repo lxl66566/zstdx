@@ -3,10 +3,10 @@
 //!
 //! Usage: cargo run --release --example bench_corpus [iterations]
 
-use ruzstd::decoding::FrameDecoder;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
+use zstdx::decoding::FrameDecoder;
 
 fn main() {
     let iterations: usize = std::env::args()

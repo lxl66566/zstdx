@@ -1,6 +1,6 @@
-# Ruzstd (a pure rust zstd format implementation)
+# Zstdx (a pure rust zstd format implementation)
 
-[![Released API docs](https://docs.rs/ruzstd/badge.svg)](https://docs.rs/ruzstd)
+[![Released API docs](https://docs.rs/zstdx/badge.svg)](https://docs.rs/zstdx)
 [![CI](https://github.com/killingspark/zstd-rs/workflows/CI/badge.svg)](https://github.com/killingspark/zstd-rs/actions?query=workflow%3ACI)
 
 
@@ -19,7 +19,7 @@ This crate is currently actively maintained.
 The `decoding` module provides a complete
 implementation of a Zstandard decompressor.
 
-In terms of speed, `ruzstd` is behind the original C implementation
+In terms of speed, `zstdx` is behind the original C implementation
 which has a rust binding located [here](https://github.com/gyscos/zstd-rs).
 
 Measuring with the 'time' utility the original zstd and my decoder both
@@ -67,7 +67,7 @@ for clarification.
 The easiest is to use the provided `compress`/`compress_to_vec` functions
 
 ```rust, no_run
-use ruzstd::{encoding::{compress, compress_to_vec}, Level};
+use zstdx::{encoding::{compress, compress_to_vec}, Level};
 let data: &[u8] = todo!();
 // Either
 let mut compressed = Vec::new();
@@ -87,8 +87,8 @@ Additionally to the descriptions and the docs you can have a look at the zstd / 
 The easiest is to wrap the io::Read into a StreamingDecoder which itself implements io::Read. It will decode blocks as necessary to fulfill the read requests
 
 ```rust, no_run
-use ruzstd::decoding::StreamingDecoder;
-use ruzstd::io::Read;
+use zstdx::decoding::StreamingDecoder;
+use zstdx::io::Read;
 
 let mut source: &[u8] = todo!("Get a reader from a File or any other source");
 let mut decoder = StreamingDecoder::new(&mut source).unwrap();

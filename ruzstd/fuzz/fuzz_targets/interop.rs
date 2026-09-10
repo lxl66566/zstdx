@@ -1,26 +1,26 @@
 #![no_main]
 #[macro_use]
 extern crate libfuzzer_sys;
-extern crate ruzstd;
+extern crate zstdx;
 use std::io::Read;
-use ruzstd::{encoding::compress_to_vec, Level};
+use zstdx::{encoding::compress_to_vec, Level};
 
 fn decode_ruzstd(data: &mut dyn std::io::Read) -> Vec<u8> {
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(data).unwrap();
+    let mut decoder = zstdx::decoding::StreamingDecoder::new(data).unwrap();
     let mut result: Vec<u8> = Vec::new();
     decoder.read_to_end(&mut result).expect("Decoding failed");
     result
 }
 
 fn decode_ruzstd_writer(mut data: impl Read) -> Vec<u8> {
-    let mut decoder = ruzstd::decoding::FrameDecoder::new();
+    let mut decoder = zstdx::decoding::FrameDecoder::new();
     decoder.reset(&mut data).unwrap();
     let mut result = vec![];
     while !decoder.is_finished() || decoder.can_collect() > 0 {
         decoder
             .decode_blocks(
                 &mut data,
-                ruzstd::decoding::BlockDecodingStrategy::UptoBytes(1024 * 1024),
+                zstdx::decoding::BlockDecodingStrategy::UptoBytes(1024 * 1024),
             )
             .unwrap();
         decoder.collect_to_writer(&mut result).unwrap();

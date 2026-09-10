@@ -31,7 +31,7 @@
 - `cargo build --no-default-features` 有缓存假象：必须 touch 源码确认重编译再数
   警告；且它会把 example 重编译为 no-std 并**覆盖 target/release 下的默认构建**
   （AVX-512 内核被 cfg 掉、xxhash 消失），之后的测量全部失真——测量前重建默认
-  构建并用 `nm ... | grep <内核符号>` 验证。no-default 检查须带 `-p ruzstd`
+  构建并用 `nm ... | grep <内核符号>` 验证。no-default 检查须带 `-p zstdx`
   （根目录构建时 cli 会把 hash feature 带回）。
 - **`cargo test` 的管道退出码是 tail 的**：`cargo test | tail` 时 cargo 失败被
   `&&` 链吞掉、成功标记照打。测试门必须 `cargo test > log; echo $?` 落盘查退出码

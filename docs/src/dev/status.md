@@ -30,7 +30,7 @@
 | MT 编码 | ✅ bulk（overlap job）+ 流式（burst）；workers>1；no_std 报 Unsupported |
 | MT 解码 | ✅ restart-point 分段；stage B 串行为瓶颈，暂无扩展性 |
 | 帧校验和 | ✅ 编码可选（+sidecar 线程卸载）；解码树内 xxh64 自动验证（MT 路径不校验） |
-| zstd-crate 兼容层 `ruzstd::compat` | ✅（词典解码端到端可用） |
+| zstd-crate 兼容层 `zstdx::compat` | ✅（词典解码端到端可用） |
 | 词典 | 解码 ✅；编码 ❌；`dict/` 训练半成品（有已知 bug） |
 | LDM / superblock / 可调窗口 / C FFI | ❌ |
 

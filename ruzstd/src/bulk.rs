@@ -16,8 +16,8 @@ use crate::{Level, Result};
 ///
 /// ```rust
 /// let data = b"the quick brown fox jumps over the lazy dog";
-/// let compressed = ruzstd::bulk::compress(data, ruzstd::Level::Fastest);
-/// let decompressed = ruzstd::bulk::decompress(&compressed, data.len()).unwrap();
+/// let compressed = zstdx::bulk::compress(data, zstdx::Level::Fastest);
+/// let decompressed = zstdx::bulk::decompress(&compressed, data.len()).unwrap();
 /// assert_eq!(&decompressed[..], data);
 /// ```
 pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
@@ -30,9 +30,9 @@ pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
 ///
 /// ```rust
 /// let data = b"the quick brown fox jumps over the lazy dog";
-/// let opts = ruzstd::EncoderOptions::new(ruzstd::Level::Fastest).checksum(true);
-/// let compressed = ruzstd::bulk::compress_with(data, &opts);
-/// let decompressed = ruzstd::bulk::decompress(&compressed, data.len()).unwrap();
+/// let opts = zstdx::EncoderOptions::new(zstdx::Level::Fastest).checksum(true);
+/// let compressed = zstdx::bulk::compress_with(data, &opts);
+/// let decompressed = zstdx::bulk::decompress(&compressed, data.len()).unwrap();
 /// assert_eq!(&decompressed[..], data);
 /// ```
 pub fn compress_with(source: &[u8], options: &crate::EncoderOptions) -> alloc::vec::Vec<u8> {

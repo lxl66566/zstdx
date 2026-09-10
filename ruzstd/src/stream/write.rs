@@ -16,8 +16,8 @@ use crate::{DecoderOptions, EncoderOptions, Level, Result};
 /// like the libzstd bindings.
 ///
 /// ```rust
-/// use ruzstd::stream::write::Encoder;
-/// use ruzstd::Level;
+/// use zstdx::stream::write::Encoder;
+/// use zstdx::Level;
 /// use std::io::Write;
 ///
 /// let mut enc = Encoder::new(Vec::new(), Level::Fastest).unwrap();
@@ -179,10 +179,10 @@ impl<W: Write, F: FnMut(Result<W>)> Drop for AutoFinishEncoder<W, F> {
 /// processed as far as it arrives, so decoding cost follows the writes.
 ///
 /// ```rust
-/// use ruzstd::stream::write::Decoder;
+/// use zstdx::stream::write::Decoder;
 /// use std::io::Write;
 ///
-/// let compressed = ruzstd::bulk::compress(b"payload", ruzstd::Level::Fastest);
+/// let compressed = zstdx::bulk::compress(b"payload", zstdx::Level::Fastest);
 /// let mut sink = Vec::new();
 /// let mut dec = Decoder::new(&mut sink).unwrap();
 /// dec.write_all(&compressed).unwrap();

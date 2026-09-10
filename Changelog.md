@@ -4,6 +4,10 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The crate is renamed: `ruzstd` is now `zstdx` (CLI: `zstdx-cli`, fuzz:
+  `zstdx-fuzz`). All code, manifests, docs and CI copy use the new name;
+  historical entries below keep the name they were written under.
+
 * New `docs/` mdBook consolidating the branch's untracked working notes into a
   themed handbook: a status overview, the head-to-head benchmark archive with
   measurement methodology, per-area optimization records (decoding, encoding,

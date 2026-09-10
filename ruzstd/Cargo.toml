@@ -1,5 +1,5 @@
 [package]
-name = "ruzstd"
+name = "zstdx"
 version = "0.9.1"
 rust-version = "1.87"
 authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]

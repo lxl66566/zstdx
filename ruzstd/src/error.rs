@@ -25,8 +25,8 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     /// The requested capability exists in the API surface but this build of
-    /// ruzstd does not implement it yet.
-    #[error("{feature} is not implemented by this build of ruzstd")]
+    /// zstdx does not implement it yet.
+    #[error("{feature} is not implemented by this build of zstdx")]
     Unsupported { feature: Feature },
     /// A parameter was applied to a stream that already started.
     #[error("{0}")]

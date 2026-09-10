@@ -33,7 +33,7 @@ use crate::io::{Error, Read};
 /// {
 ///     use std::fs::File;
 ///     use std::io::Read;
-///     use ruzstd::decoding::StreamingDecoder;
+///     use zstdx::decoding::StreamingDecoder;
 ///
 ///     // Read a Zstandard archive from the filesystem then decompress it into a vec.
 ///     let mut f: File = todo!("Read a .zstd archive from somewhere");

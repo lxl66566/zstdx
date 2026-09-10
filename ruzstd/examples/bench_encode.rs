@@ -1,4 +1,4 @@
-//! Encode-only benchmark of the ruzstd fast path over the corpus, with the
+//! Encode-only benchmark of the zstdx fast path over the corpus, with the
 //! zstd crate's level 1 as the interleaved reference.
 //!
 //! Usage: cargo run --release --example bench_encode [-- filter...]
@@ -37,9 +37,9 @@ fn main() {
         let raw = fs::read(&path).unwrap();
 
         // correctness gate
-        let comp = ruzstd::bulk::compress(&raw, ruzstd::Level::Fastest);
+        let comp = zstdx::bulk::compress(&raw, zstdx::Level::Fastest);
         let mut back = Vec::with_capacity(raw.len() + 16);
-        ruzstd::decoding::FrameDecoder::new()
+        zstdx::decoding::FrameDecoder::new()
             .decode_all_to_vec(&comp, &mut back)
             .unwrap();
         assert_eq!(&back[..], &raw[..]);
@@ -48,13 +48,13 @@ fn main() {
 
         let report = ab.measure(
             || {
-                black_box(ruzstd::bulk::compress(&raw, ruzstd::Level::Fastest));
+                black_box(zstdx::bulk::compress(&raw, zstdx::Level::Fastest));
             },
             || {
                 black_box(zstd::bulk::compress(&raw, 1).unwrap());
             },
         );
         report.print(&name, raw.len() as u64, "", "");
-        println!("{:<16}ruzstd ratio {ratio:.2}", "");
+        println!("{:<16}zstdx ratio {ratio:.2}", "");
     }
 }

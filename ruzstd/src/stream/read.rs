@@ -13,8 +13,8 @@ use crate::{DecoderOptions, EncoderOptions, Level, Result};
 /// return `Ok(0)`.
 ///
 /// ```rust
-/// use ruzstd::stream::read::Encoder;
-/// use ruzstd::Level;
+/// use zstdx::stream::read::Encoder;
+/// use zstdx::Level;
 /// use std::io::Read;
 ///
 /// let mut enc = Encoder::new(b"the quick brown fox".as_slice(), Level::Fastest).unwrap();
@@ -83,10 +83,10 @@ impl<R: Read> Read for Encoder<R> {
 /// the first instead.
 ///
 /// ```rust
-/// use ruzstd::stream::read::Decoder;
+/// use zstdx::stream::read::Decoder;
 /// use std::io::Read;
 ///
-/// let compressed = ruzstd::bulk::compress(b"a b c b a", ruzstd::Level::Fastest);
+/// let compressed = zstdx::bulk::compress(b"a b c b a", zstdx::Level::Fastest);
 /// let mut dec = Decoder::new(&compressed[..]).unwrap();
 /// let mut output = Vec::new();
 /// dec.read_to_end(&mut output).unwrap();

@@ -1,4 +1,4 @@
-//! Cross-matrix benchmark: ruzstd vs the zstd crate over decode/encode ×
+//! Cross-matrix benchmark: zstdx vs the zstd crate over decode/encode ×
 //! bulk/streaming × single-/multi-thread at the corpus shapes.
 //!
 //! Usage: `cargo run --release --example bench_matrix [--] [mode]` where mode
@@ -21,18 +21,18 @@
 //!   contexts per call (the zstd crate has no per-call pool API; a warm
 //!   reused context is reported once as a reference line).
 //! - `enc-stream` compares the streaming encoders with 64 KiB pulls:
-//!   single-threaded ruzstd vs zstd interleaved, then multithreaded
-//!   (8 workers) ruzstd vs zstd interleaved.
+//!   single-threaded zstdx vs zstd interleaved, then multithreaded
+//!   (8 workers) zstdx vs zstd interleaved.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{black_box, measure_solo, Ab};
-use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
-use ruzstd::{DecoderOptions, EncoderOptions, Level};
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
+use zstdx::decoding::{FrameDecoder, StreamingDecoder};
+use zstdx::{DecoderOptions, EncoderOptions, Level};
 
 const LADDER: [(&str, Level, i32); 6] = [
     ("fastest", Level::Fastest, 1),
@@ -86,19 +86,19 @@ fn gate_ruz_dec(compressed: &[u8], raw: &[u8], label: &str) {
     let mut out = vec![0u8; raw.len()];
     FrameDecoder::new()
         .decode_all(compressed, &mut out)
-        .unwrap_or_else(|e| panic!("ruzstd decode gate failed for {label}: {e}"));
-    assert_eq!(&out[..], raw, "ruzstd gate mismatch for {label}");
+        .unwrap_or_else(|e| panic!("zstdx decode gate failed for {label}: {e}"));
+    assert_eq!(&out[..], raw, "zstdx gate mismatch for {label}");
 }
 
 fn gate_ruz_mt_dec(compressed: &[u8], raw: &[u8], threads: u32, label: &str) {
     let mut out = vec![0u8; raw.len()];
-    ruzstd::bulk::decompress_to_buffer_with(
+    zstdx::bulk::decompress_to_buffer_with(
         compressed,
         &mut out,
         &DecoderOptions::new().threads(threads),
     )
-    .unwrap_or_else(|e| panic!("ruzstd MT decode gate failed for {label}: {e}"));
-    assert_eq!(&out[..], raw, "ruzstd MT gate mismatch for {label}");
+    .unwrap_or_else(|e| panic!("zstdx MT decode gate failed for {label}: {e}"));
+    assert_eq!(&out[..], raw, "zstdx MT gate mismatch for {label}");
 }
 
 fn gate_zstd_dec(compressed: &[u8], raw: &[u8], label: &str) {
@@ -108,12 +108,12 @@ fn gate_zstd_dec(compressed: &[u8], raw: &[u8], label: &str) {
 }
 
 fn gate_ruz_enc(raw: &[u8], level: Level, label: &str) -> Vec<u8> {
-    let comp = ruzstd::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false));
+    let comp = zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false));
     let mut back = Vec::with_capacity(raw.len() + 16);
     FrameDecoder::new()
         .decode_all_to_vec(&comp, &mut back)
         .unwrap();
-    assert_eq!(&back[..], raw, "ruzstd encode gate mismatch for {label}");
+    assert_eq!(&back[..], raw, "zstdx encode gate mismatch for {label}");
     comp
 }
 
@@ -133,7 +133,7 @@ fn assert_roundtrip(comp: &[u8], raw: &[u8], label: &str) {
     FrameDecoder::new()
         .decode_all_to_vec(comp, &mut back2)
         .unwrap();
-    assert_eq!(&back2[..], raw, "ruzstd roundtrip mismatch for {label}");
+    assert_eq!(&back2[..], raw, "zstdx roundtrip mismatch for {label}");
 }
 
 // ---------- decode, single-thread, bulk vs streaming ----------
@@ -235,7 +235,7 @@ fn t2_dec_mt() {
         for threads in [2u32, 4, 8, 16] {
             let mut out = vec![0u8; raw.len()];
             let stats = measure_solo(|| {
-                ruzstd::bulk::decompress_to_buffer_with(
+                zstdx::bulk::decompress_to_buffer_with(
                     &comp,
                     &mut out,
                     &DecoderOptions::new().threads(threads),
@@ -273,7 +273,7 @@ fn t3_enc_st(ab: &Ab) {
             );
             ab.measure(
                 || {
-                    black_box(ruzstd::bulk::compress_with(
+                    black_box(zstdx::bulk::compress_with(
                         &raw,
                         &EncoderOptions::new(level).checksum(false),
                     ));
@@ -293,13 +293,13 @@ fn t3_enc_st(ab: &Ab) {
         let bytes = raw.len() as u64;
         ab.measure(
             || {
-                black_box(ruzstd::bulk::compress_with(
+                black_box(zstdx::bulk::compress_with(
                     &raw,
                     &EncoderOptions::new(Level::Fast).checksum(false),
                 ));
             },
             || {
-                black_box(ruzstd::bulk::compress_with(
+                black_box(zstdx::bulk::compress_with(
                     &raw,
                     &EncoderOptions::new(Level::Fast).checksum(true),
                 ));
@@ -316,7 +316,7 @@ fn label_name(shape: &str, level: &str) -> String {
 // ---------- encode, MT bulk ----------
 
 fn zstd_mt_comp(raw: &[u8], z: i32, workers: u32) -> Vec<u8> {
-    // fresh context per call: symmetric with ruzstd's per-call worker pool
+    // fresh context per call: symmetric with zstdx's per-call worker pool
     let mut c = zstd::bulk::Compressor::new(z).unwrap();
     c.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(workers))
         .unwrap();
@@ -340,7 +340,7 @@ fn t4_enc_mt(ab: &Ab) {
             raw.len() as f64 / zc.len() as f64,
         );
         for w in [2u32, 4, 8, 16, 32] {
-            let a = ruzstd::bulk::compress_with(
+            let a = zstdx::bulk::compress_with(
                 &raw,
                 &EncoderOptions::new(Level::Fast).checksum(false).workers(w),
             );
@@ -356,7 +356,7 @@ fn t4_enc_mt(ab: &Ab) {
             );
             ab.measure(
                 || {
-                    black_box(ruzstd::bulk::compress_with(
+                    black_box(zstdx::bulk::compress_with(
                         &raw,
                         &EncoderOptions::new(Level::Fast).checksum(false).workers(w),
                     ));
@@ -374,7 +374,7 @@ fn t4_enc_mt(ab: &Ab) {
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
         for (label, level, z) in LADDER.iter().take(3) {
-            let a = ruzstd::bulk::compress_with(
+            let a = zstdx::bulk::compress_with(
                 &raw,
                 &EncoderOptions::new(*level).checksum(false).workers(16),
             );
@@ -390,7 +390,7 @@ fn t4_enc_mt(ab: &Ab) {
             );
             ab.measure(
                 || {
-                    black_box(ruzstd::bulk::compress_with(
+                    black_box(zstdx::bulk::compress_with(
                         &raw,
                         &EncoderOptions::new(*level).checksum(false).workers(16),
                     ));
@@ -405,7 +405,7 @@ fn t4_enc_mt(ab: &Ab) {
 
     // reference: libzstd keeps its worker pool inside a reused context
     println!(
-        "-- zstd warm-pool reference (context reused across rounds; ruzstd has no such API) --"
+        "-- zstd warm-pool reference (context reused across rounds; zstdx has no such API) --"
     );
     let raw = load_raw("json");
     let bytes = raw.len() as u64;
@@ -436,7 +436,7 @@ fn t5_enc_stream(ab: &Ab) {
         ] {
             // gate: both sides' streaming outputs must roundtrip to the raw input
             let mut comp = Vec::new();
-            let mut enc = ruzstd::stream::read::Encoder::with_options(
+            let mut enc = zstdx::stream::read::Encoder::with_options(
                 &raw[..],
                 EncoderOptions::new(level).checksum(false),
             )
@@ -457,7 +457,7 @@ fn t5_enc_stream(ab: &Ab) {
 
             ab.measure(
                 || {
-                    let mut enc = ruzstd::stream::read::Encoder::with_options(
+                    let mut enc = zstdx::stream::read::Encoder::with_options(
                         &raw[..],
                         EncoderOptions::new(level).checksum(false),
                     )
@@ -498,7 +498,7 @@ fn t5_enc_stream(ab: &Ab) {
         ] {
             // gate: both sides' multithreaded streaming outputs must roundtrip
             let mut comp = Vec::new();
-            let mut enc = ruzstd::stream::read::Encoder::with_options(
+            let mut enc = zstdx::stream::read::Encoder::with_options(
                 &raw[..],
                 EncoderOptions::new(level).checksum(false).workers(8),
             )
@@ -520,7 +520,7 @@ fn t5_enc_stream(ab: &Ab) {
 
             ab.measure(
                 || {
-                    let mut enc = ruzstd::stream::read::Encoder::with_options(
+                    let mut enc = zstdx::stream::read::Encoder::with_options(
                         &raw[..],
                         EncoderOptions::new(level).checksum(false).workers(8),
                     )
@@ -556,19 +556,19 @@ fn t5_enc_stream(ab: &Ab) {
             ("balanced", Level::Balanced),
             ("best", Level::Best),
         ] {
-            let comp = ruzstd::bulk::compress_with(
+            let comp = zstdx::bulk::compress_with(
                 &raw,
                 &EncoderOptions::new(level).checksum(false).workers(8),
             );
             assert_roundtrip(&comp, &raw, label);
             let stats = measure_solo(|| {
-                black_box(ruzstd::bulk::compress_with(
+                black_box(zstdx::bulk::compress_with(
                     &raw,
                     &EncoderOptions::new(level).checksum(false).workers(8),
                 ));
             });
             println!(
-                "{:<32}{:>8.0}  (ruzstd {shape}.{label} bulk mt8 ceiling)",
+                "{:<32}{:>8.0}  (zstdx {shape}.{label} bulk mt8 ceiling)",
                 "ref",
                 stats.mibs(bytes)
             );
@@ -578,7 +578,7 @@ fn t5_enc_stream(ab: &Ab) {
 
 fn main() {
     println!(
-        "# bench_matrix: ruzstd vs zstd crate (libzstd {}, binding {}), {} cores",
+        "# bench_matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
         zstd::zstd_safe::version_string(),
         zstd::zstd_safe::version_number(),
         std::thread::available_parallelism()

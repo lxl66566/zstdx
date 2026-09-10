@@ -9,14 +9,14 @@
 | 项 | commit |
 |---|---|
 | 根级 `Level` 枚举替代 CompressionLevel（删除从未实现的 Default/Better/Best 死变体） | `55daf71` |
-| 高层一次性 API：`ruzstd::{compress,decompress}`、`bulk::*`、`Error/Result` 伞、Encoder/DecoderOptions | `d35902b` |
+| 高层一次性 API：`zstdx::{compress,decompress}`、`bulk::*`、`Error/Result` 伞、Encoder/DecoderOptions | `d35902b` |
 | 流式编码器（write/read Encoder，`auto_finish`/`flush`/pledged/checksum/workers） | `51ec2fc` |
 | 流式解码器（read/write Decoder，多帧 + skippable 透明）+ `encode_all/decode_all/copy_encode/copy_decode` | `b21d937` |
-| zstd-crate 兼容层 `ruzstd::compat`（bulk/stream 全套；词典解码端到端验证） | `4b60239` |
+| zstd-crate 兼容层 `zstdx::compat`（bulk/stream 全套；词典解码端到端验证） | `4b60239` |
 | CLI：clap 重构；全部数字级别可接受 | `c726dfd` 期 |
 | 错误 thiserror 派生（首个外部依赖，compile-time only，no_std 兼容） | `72f3c04` |
 | 解码器校验和树内化（编解码共用 xxh64；twox 降 dev-dep；运行时零外部依赖） | `81d2119` |
-| dict_builder 模块改名 `ruzstd::dict`（对齐 zstd crate 命名） | `7ad9e7a` |
+| dict_builder 模块改名 `zstdx::dict`（对齐 zstd crate 命名） | `7ad9e7a` |
 
 ## 级别阶梯与编码功能
 

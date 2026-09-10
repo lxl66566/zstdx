@@ -1,4 +1,4 @@
-extern crate ruzstd;
+extern crate zstdx;
 mod progress;
 use progress::ProgressMonitor;
 
@@ -11,11 +11,11 @@ use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{ContextCompat, WrapErr};
-use ruzstd::Level;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use zstdx::Level;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -103,7 +103,7 @@ fn main() -> color_eyre::Result<()> {
 
 fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: ruzstd::Level = match level {
+    let compression_level: zstdx::Level = match level {
         0 => Level::Uncompressed,
         // Numeric levels map onto the nearest implemented strategy tier.
         _ => Level::approximate_zstd(level as i32),
@@ -114,7 +114,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let encoder_input = ProgressMonitor::new(buffered_source, source_size);
     let output: File = File::create(output).wrap_err("failed to open output file for writing")?;
 
-    ruzstd::encoding::compress(encoder_input, &output, compression_level);
+    zstdx::encoding::compress(encoder_input, &output, compression_level);
     let compressed_size = output.metadata()?.len();
     let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
     info!(
@@ -134,7 +134,7 @@ fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
     let mut output: File =
         File::create(output).wrap_err("failed to open output file for writing")?;
 
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(decoder_input)?;
+    let mut decoder = zstdx::decoding::StreamingDecoder::new(decoder_input)?;
 
     std::io::copy(&mut decoder, &mut output)?;
 

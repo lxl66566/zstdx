@@ -2,7 +2,7 @@
 //! bindings): the same module layout, type names, numeric levels and
 //! `io::Result` signatures, on top of the pure-Rust implementation.
 //!
-//! Swap `zstd::` for `ruzstd::compat::` and most code compiles unchanged.
+//! Swap `zstd::` for `zstdx::compat::` and most code compiles unchanged.
 //! Known differences, all forced by what this crate implements today:
 //!
 //! - Numeric levels map onto the implemented strategies through

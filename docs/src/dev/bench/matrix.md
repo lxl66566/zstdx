@@ -5,7 +5,7 @@
 > 来源：BENCH-MATRIX.md（`b1dd010` + §8 修订 `4ff2b7b`）、PLAN-mt-stream.md
 > （`27b91cf`）、ENCPERF.md（r15 终态）、早期优化.md（1-3 轮终态）。
 
-## A. 广域矩阵（2026-09-09，ruzstd @ `21fae62`，§3/§4/§5 的 Balanced/Best 格
+## A. 广域矩阵（2026-09-09，zstdx @ `21fae62`，§3/§4/§5 的 Balanced/Best 格
 后被证实测在乱链上，§8 有修订）
 
 交错 A/B，600ms/侧预算，两轮取稳；xslow = 我方时间/zstd 时间，>1 = 我们慢。
@@ -155,6 +155,6 @@ random-1M 0.99×；json/text 的 64K/1M 落后 ~2×。
 | random.zst1 | 7042→9327 | 8848→~10300 | 2240 / 8430 |
 | zeros.zst3 | —→13598 | —→~14000 | 2490 / 12800 |
 
-编码（ruzstd Fastest vs zstd crate L1）：json 180→236 MB/s（比率 4.25→5.23）、
+编码（zstdx Fastest vs zstd crate L1）：json 180→236 MB/s（比率 4.25→5.23）、
 random 84→450、skewed 80→281（1.97）、text 204→675（比率 299.60，旧语料形状）、
 zeros 493→695。

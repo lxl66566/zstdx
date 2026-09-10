@@ -249,7 +249,7 @@ impl BlockChecksum for SliceChecksum {
 ///
 /// # Examples
 /// ```
-/// use ruzstd::{encoding::FrameCompressor, Level};
+/// use zstdx::{encoding::FrameCompressor, Level};
 /// let mock_data: &[_] = &[0x1, 0x2, 0x3, 0x4];
 /// let mut output = std::vec::Vec::new();
 /// // Initialize a compressor.

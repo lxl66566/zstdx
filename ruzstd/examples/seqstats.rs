@@ -1,10 +1,10 @@
 //! Temporary analysis: sequence-choice statistics and entropy lower bound
 //! for our matcher on a corpus file. Not part of the published examples.
 
-use ruzstd::encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence};
-use ruzstd::Level;
 use std::fs;
 use std::io::Write;
+use zstdx::encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence};
+use zstdx::Level;
 
 /// Delegating matcher that records every emitted sequence.
 struct RecordingMatcher {
@@ -187,7 +187,7 @@ fn main() {
         triples: Vec::new(),
     };
     let mut compressor =
-        ruzstd::encoding::FrameCompressor::new_with_matcher(matcher, Level::Fastest);
+        zstdx::encoding::FrameCompressor::new_with_matcher(matcher, Level::Fastest);
     compressor.set_source(raw.as_slice());
     struct Sink(Vec<u8>);
     impl Write for Sink {

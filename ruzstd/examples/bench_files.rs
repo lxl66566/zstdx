@@ -4,9 +4,9 @@
 //! raw counterpart (same path minus .zst), then timed over `iterations` in-place
 //! decodes into an exact-size buffer. Prints per-file throughput.
 
-use ruzstd::decoding::FrameDecoder;
 use std::fs;
 use std::time::Instant;
+use zstdx::decoding::FrameDecoder;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,7 +25,7 @@ fn main() {
         loop {
             match fr.decode_all_to_vec(&compressed, &mut reference) {
                 Ok(()) => break,
-                Err(ruzstd::decoding::errors::FrameDecoderError::TargetTooSmall) => {
+                Err(zstdx::decoding::errors::FrameDecoderError::TargetTooSmall) => {
                     step *= 2;
                     reference.reserve(step);
                 }

@@ -4,7 +4,7 @@
 //! here performs io. Consuming builder methods keep construction chainable:
 //!
 //! ```rust
-//! use ruzstd::{EncoderOptions, Level};
+//! use zstdx::{EncoderOptions, Level};
 //! let opts = EncoderOptions::new(Level::Fastest)
 //!     .pledged_size(Some(12))
 //!     .checksum(false);

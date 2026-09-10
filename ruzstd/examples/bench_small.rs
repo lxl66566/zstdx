@@ -1,8 +1,8 @@
-//! Small-payload encode benchmark: ruzstd `bulk::compress` vs the zstd
+//! Small-payload encode benchmark: zstdx `bulk::compress` vs the zstd
 //! crate's bulk path, per-call throughput including allocator effects.
 //!
 //! Usage: cargo run --release --example bench_small [-- filter...]
-//! Env: `IMPL=ruzstd|zstd` restricts to one implementation, `SIZE=<bytes>`
+//! Env: `IMPL=zstdx|zstd` restricts to one implementation, `SIZE=<bytes>`
 //! restricts to one payload size, `BENCH_BUDGET_MS` sets the budget.
 //! Rounds batch ~4 MiB of calls so tiny payloads don't measure timer
 //! overhead (see `examples/common`).
@@ -44,9 +44,9 @@ fn main() {
             }
             let data = &raw[..size];
             // correctness gate
-            let comp = ruzstd::bulk::compress(data, ruzstd::Level::Fastest);
+            let comp = zstdx::bulk::compress(data, zstdx::Level::Fastest);
             let mut back = Vec::with_capacity(data.len() + 16);
-            ruzstd::decoding::FrameDecoder::new()
+            zstdx::decoding::FrameDecoder::new()
                 .decode_all_to_vec(&comp, &mut back)
                 .unwrap();
             assert_eq!(&back[..], data);
@@ -61,10 +61,10 @@ fn main() {
                     }
                 });
                 println!("{name:<16}{:>9}{:>9.0}", "", stats.mibs(bytes));
-            } else if impl_sel == "ruzstd" {
+            } else if impl_sel == "zstdx" {
                 let stats = common::measure_solo(|| {
                     for _ in 0..batch {
-                        black_box(ruzstd::bulk::compress(data, ruzstd::Level::Fastest));
+                        black_box(zstdx::bulk::compress(data, zstdx::Level::Fastest));
                     }
                 });
                 println!("{name:<16}{:>9.0}{:>9}", stats.mibs(bytes), "");
@@ -72,7 +72,7 @@ fn main() {
                 let report = ab.measure(
                     || {
                         for _ in 0..batch {
-                            black_box(ruzstd::bulk::compress(data, ruzstd::Level::Fastest));
+                            black_box(zstdx::bulk::compress(data, zstdx::Level::Fastest));
                         }
                     },
                     || {
