@@ -182,19 +182,27 @@ fn flush_forces_partial_block() {
 }
 
 #[test]
-fn workers_unsupported_until_implemented() {
-    let err = match write::Encoder::with_options(
-        Vec::new(),
-        EncoderOptions::new(Level::Fastest).workers(2),
-    ) {
-        Ok(_) => panic!("workers > 1 must be rejected until implemented"),
-        Err(e) => e,
-    };
+fn workers_option_routes() {
+    // std builds accept workers > 1 (multithreaded core, or the
+    // single-threaded fallback for raw levels and single-core processes);
+    // no_std builds keep rejecting it.
+    #[cfg(feature = "std")]
+    {
+        let data = b"stream mt smoke payload";
+        let mut sink = Vec::new();
+        let mut enc =
+            write::Encoder::with_options(&mut sink, EncoderOptions::new(Level::Fastest).workers(2))
+                .unwrap();
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(bulk::decompress(&sink, 0).unwrap(), data);
+    }
+    #[cfg(not(feature = "std"))]
     assert!(matches!(
-        err,
-        crate::Error::Unsupported {
+        write::Encoder::with_options(Vec::new(), EncoderOptions::new(Level::Fastest).workers(2)),
+        Err(crate::Error::Unsupported {
             feature: crate::Feature::Multithread
-        }
+        })
     ));
 }
 
@@ -311,6 +319,210 @@ fn truncated_stream_is_an_error() {
     assert!(read::Decoder::new(bad.as_slice()).is_err());
     // clean empty stream is an error at construction (libzstd parity)
     assert!(read::Decoder::new(b"".as_slice()).is_err());
+}
+
+// Multithreaded streaming encoders: roundtrips through both decoders,
+// output independent of the write pattern, byte-identity with the bulk mt
+// path under an exact pledge, flush and read-side (pump_from) coverage.
+#[cfg(feature = "std")]
+mod mt {
+    use super::*;
+    use crate::io::Read as _;
+    use alloc::format;
+
+    fn lcg(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..len).map(|_| (rand() & 0xFF) as u8).collect()
+    }
+
+    /// Text-like data: repeating vocabulary with variation, so matches,
+    /// repcodes and entropy coding all engage across job boundaries.
+    fn textish(len: usize) -> Vec<u8> {
+        let words: [&[u8]; 13] = [
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
+            b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
+        ];
+        let mut state = 7u64;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let w = words[((state >> 33) as usize) % words.len()];
+            let take = w.len().min(len - out.len());
+            out.extend_from_slice(&w[..take]);
+        }
+        out
+    }
+
+    fn shapes() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("text", textish(5 * 1024 * 1024 + 123)),
+            ("zeros", vec![0u8; 4 * 1024 * 1024]),
+            ("random", lcg(2 * 1024 * 1024 + 7)),
+            // exact job-size multiple: the trailing empty last block case
+            ("exact-jobs", textish(4 * 1024 * 1024)),
+            ("small", textish(100 * 1024)),
+            ("empty", Vec::new()),
+        ]
+    }
+
+    fn encode_write(
+        data: &[u8],
+        chunk: usize,
+        level: Level,
+        workers: u32,
+        checksum: bool,
+        pledged: Option<u64>,
+    ) -> Vec<u8> {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(level)
+                .workers(workers)
+                .checksum(checksum)
+                .pledged_size(pledged),
+        )
+        .unwrap();
+        for piece in data.chunks(chunk) {
+            enc.write_all(piece).unwrap();
+        }
+        enc.finish().unwrap();
+        sink
+    }
+
+    fn assert_both_decoders(comp: &[u8], data: &[u8], label: &str) {
+        assert_eq!(bulk::decompress(comp, 0).unwrap(), data, "{label}");
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(comp, &mut decoded).unwrap();
+        assert_eq!(decoded, data, "{label}");
+    }
+
+    #[test]
+    fn roundtrip_both_decoders() {
+        for (name, data) in shapes() {
+            for workers in [2u32, 4, 8] {
+                for checksum in [true, false] {
+                    let label = format!("{name}/mt{workers}/ck{checksum}");
+                    let comp =
+                        encode_write(&data, 64 * 1024, Level::Fastest, workers, checksum, None);
+                    assert_both_decoders(&comp, &data, &label);
+                }
+            }
+        }
+    }
+
+    /// Deeper levels must ride the job path too: the repcode gate and the
+    /// fresh-table job start interact with the deeper search.
+    #[test]
+    fn chain_levels_roundtrip() {
+        let data = textish(4 * 1024 * 1024);
+        for level in [Level::Fast, Level::Balanced] {
+            let comp = encode_write(&data, 128 * 1024, level, 4, true, None);
+            assert_both_decoders(&comp, &data, &format!("{level:?}"));
+        }
+    }
+
+    /// Without flushes the job grid is absolute, so the frame bytes must not
+    /// depend on how the input was written — regardless of where the bursts
+    /// land (whole-input writes burst once at the end, small writes several
+    /// times on the way).
+    #[test]
+    fn output_independent_of_write_pattern() {
+        let data = textish(5 * 1024 * 1024 + 77);
+        for workers in [2u32, 4] {
+            let reference = encode_write(&data, usize::MAX, Level::Fastest, workers, true, None);
+            for chunk in [64 * 1024, 128 * 1024, 333 * 1024, 1024 * 1024] {
+                assert_eq!(
+                    encode_write(&data, chunk, Level::Fastest, workers, true, None),
+                    reference,
+                    "workers {workers} chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    /// A stream written exactly to its pledge shares the bulk job grid (and
+    /// job flags), so the outputs must be byte-identical.
+    #[test]
+    fn pledged_stream_matches_bulk_mt() {
+        let data = textish(7 * 1024 * 1024 + 999);
+        for workers in [2u32, 4] {
+            for checksum in [true, false] {
+                let bulk_mt = crate::encoding::mt::compress_slice_mt(
+                    &data,
+                    Level::Fastest,
+                    checksum,
+                    workers,
+                );
+                let streamed = encode_write(
+                    &data,
+                    1024 * 1024,
+                    Level::Fastest,
+                    workers,
+                    checksum,
+                    Some(data.len() as u64),
+                );
+                assert_eq!(streamed, bulk_mt, "workers {workers} checksum {checksum}");
+            }
+        }
+    }
+
+    /// A flush makes the pending bytes visible early at the cost of a
+    /// re-gridded job boundary; the reassembled stream must still decode.
+    #[test]
+    fn flush_interleaved_roundtrip() {
+        let a = textish(2 * 1024 * 1024 + 5);
+        let b = lcg(1024 * 1024);
+        let mut sink = Vec::new();
+        let mut enc =
+            write::Encoder::with_options(&mut sink, EncoderOptions::new(Level::Fastest).workers(3))
+                .unwrap();
+        enc.write_all(&a).unwrap();
+        enc.flush().unwrap();
+        enc.write_all(&b).unwrap();
+        enc.flush().unwrap();
+        enc.write_all(&a).unwrap();
+        enc.finish().unwrap();
+        let mut expect = a.clone();
+        expect.extend_from_slice(&b);
+        expect.extend_from_slice(&a);
+        assert_both_decoders(&sink, &expect, "flush-interleaved");
+    }
+
+    /// The read-side encoder drives the core through pump_from's small
+    /// reads; the multithreaded bursts must stay transparent there.
+    #[test]
+    fn read_encoder_roundtrip() {
+        let data = textish(3 * 1024 * 1024 + 9);
+        for workers in [2u32, 4] {
+            let mut enc = read::Encoder::with_options(
+                data.as_slice(),
+                EncoderOptions::new(Level::Fastest)
+                    .checksum(true)
+                    .workers(workers),
+            )
+            .unwrap();
+            let mut comp = Vec::new();
+            enc.read_to_end(&mut comp).unwrap();
+            enc.finish();
+            assert_both_decoders(&comp, &data, &format!("read-side mt{workers}"));
+        }
+    }
+
+    /// Raw-block levels fall back to the single-threaded core: the output
+    /// must be byte-identical to a workers-less stream.
+    #[test]
+    fn uncompressed_level_falls_back_to_single() {
+        let data = lcg(300 * 1024);
+        let mt = encode_write(&data, 64 * 1024, Level::Uncompressed, 4, false, None);
+        let st = encode_write(&data, 64 * 1024, Level::Uncompressed, 0, false, None);
+        assert_eq!(mt, st);
+    }
 }
 
 #[cfg(feature = "std")]

@@ -4,6 +4,34 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The streaming encoders accept `workers > 1`: input accumulates in one
+  contiguous buffer (the previous burst's window strip followed by the
+  unencoded bytes) and once at least one full round of workers' worth of
+  job-sized slices is pending, a burst encodes them in parallel through
+  the bulk mt path's job machinery, assembling the blocks in order while
+  the calling thread absorbs the frame checksum. Jobs are cut on absolute
+  job-size boundaries, so without flushes the frame bytes do not depend
+  on how the input was written; a flush is the documented exception (it
+  re-grids early so the pending bytes become visible). A stream written
+  exactly to its pledged size shares the bulk job grid and flags, so its
+  output is byte-identical to `bulk::compress_with` at the same worker
+  count — the pledged final job is held back for `finish` to emit with
+  the last-block flag, which costs that one job's inline encode at the
+  end. The job-size formula shared by both mt paths gains a 1 GiB
+  ceiling (libzstd's zstdmt caps its job size the same way) so a huge
+  pledge cannot scale the streaming burst buffer into memory failure.
+  Worker states are pooled on the encoder across bursts (burst threads
+  are fresh every time, so the thread-local slice pool never carries
+  anything between them); a state whose job panicked is dropped instead
+  of pooled. Raw-block levels and single-core processes fall back to the
+  single-threaded core, and no_std builds keep rejecting workers > 1
+  with `Error::Unsupported`. `FrameEncoderCore` is now an enum
+  (`Single`/`Mt`) behind the same interface, so `stream::read` and
+  `stream::write` are unchanged. On the 32 MiB corpus the mt8 streaming
+  encoder reaches 0.5x-3.5x zstd's multithreaded streaming speed
+  (json/text at the fast and best levels, parity at balanced) and
+  3-4x our own single-threaded streaming on the json shapes.
+
 * The job-start seed scan is vectorized with AVX-512: 64-candidate blocks
   scanned from the anchor down, eight overlapping 64-byte loads per block
   assembling one occupancy bit per position, taken highest-first — the

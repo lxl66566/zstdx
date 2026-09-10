@@ -20,9 +20,9 @@
 //! - `enc-mt` interleaves both sides at equal worker counts with fresh
 //!   contexts per call (the zstd crate has no per-call pool API; a warm
 //!   reused context is reported once as a reference line).
-//! - `enc-stream` compares the single-threaded streaming encoders with
-//!   64 KiB pulls, plus zstd's multithreaded streaming as a gap reference
-//!   (our streaming encoder rejects workers > 1 for now).
+//! - `enc-stream` compares the streaming encoders with 64 KiB pulls:
+//!   single-threaded ruzstd vs zstd interleaved, then multithreaded
+//!   (8 workers) ruzstd vs zstd interleaved.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -485,27 +485,94 @@ fn t5_enc_stream(ab: &Ab) {
         }
     }
 
-    // gap reference: zstd streaming encoder can go MT, ours is ST-only
-    println!("-- zstd stream MT(8) reference (ruzstd stream encoder rejects workers>1) --");
+    // multithreaded streaming, both sides
+    println!("== T5b encode streaming MT(8), checksums off (interleaved A/B; 64 KiB pulls) ==");
     for shape in ["json", "text"] {
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        let stats = measure_solo(|| {
-            let mut enc = zstd::stream::read::Encoder::new(&raw[..], 3).unwrap();
-            enc.multithread(8).unwrap();
-            let mut sink = vec![0u8; 64 * 1024];
-            loop {
-                if enc.read(&mut sink).unwrap() == 0 {
-                    break;
-                }
-            }
+        for (label, level, z) in [
+            ("fastest", Level::Fastest, 1),
+            ("fast", Level::Fast, 3),
+            ("balanced", Level::Balanced, 6),
+            ("best", Level::Best, 12),
+        ] {
+            // gate: both sides' multithreaded streaming outputs must roundtrip
+            let mut comp = Vec::new();
+            let mut enc = ruzstd::stream::read::Encoder::with_options(
+                &raw[..],
+                EncoderOptions::new(level).checksum(false).workers(8),
+            )
+            .unwrap();
+            enc.read_to_end(&mut comp).unwrap();
             enc.finish();
-        });
-        println!(
-            "{:<24}{:>8.0}  (zstd {shape}.fast stream mt8)",
-            "ref",
-            stats.mibs(bytes)
-        );
+            assert_roundtrip(&comp, &raw, label);
+            let mut zcomp = Vec::new();
+            let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
+            zenc.multithread(8).unwrap();
+            zenc.read_to_end(&mut zcomp).unwrap();
+            zenc.finish();
+            assert_roundtrip(&zcomp, &raw, label);
+            println!(
+                "sizes {shape}.{label}.stream-mt8  ruz {}   zstd {}",
+                comp.len(),
+                zcomp.len()
+            );
+
+            ab.measure(
+                || {
+                    let mut enc = ruzstd::stream::read::Encoder::with_options(
+                        &raw[..],
+                        EncoderOptions::new(level).checksum(false).workers(8),
+                    )
+                    .unwrap();
+                    let mut sink = vec![0u8; 64 * 1024];
+                    loop {
+                        if enc.read(&mut sink).unwrap() == 0 {
+                            break;
+                        }
+                    }
+                    enc.finish();
+                },
+                || {
+                    let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
+                    enc.multithread(8).unwrap();
+                    let mut sink = vec![0u8; 64 * 1024];
+                    loop {
+                        if enc.read(&mut sink).unwrap() == 0 {
+                            break;
+                        }
+                    }
+                    enc.finish();
+                },
+            )
+            .print(&pad(&format!("{shape}.{label}.stream-mt8")), bytes, "", "");
+        }
+
+        // ceiling reference: our bulk mt path over the same bytes (the
+        // streaming burst pipeline should approach it)
+        for (label, level) in [
+            ("fastest", Level::Fastest),
+            ("fast", Level::Fast),
+            ("balanced", Level::Balanced),
+            ("best", Level::Best),
+        ] {
+            let comp = ruzstd::bulk::compress_with(
+                &raw,
+                &EncoderOptions::new(level).checksum(false).workers(8),
+            );
+            assert_roundtrip(&comp, &raw, label);
+            let stats = measure_solo(|| {
+                black_box(ruzstd::bulk::compress_with(
+                    &raw,
+                    &EncoderOptions::new(level).checksum(false).workers(8),
+                ));
+            });
+            println!(
+                "{:<32}{:>8.0}  (ruzstd {shape}.{label} bulk mt8 ceiling)",
+                "ref",
+                stats.mibs(bytes)
+            );
+        }
     }
 }
 

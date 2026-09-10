@@ -10,6 +10,8 @@
 //! [`decode_all`], [`copy_encode`] and [`copy_decode`].
 
 pub(crate) mod encoder_core;
+#[cfg(feature = "std")]
+pub(crate) mod encoder_mt;
 pub mod read;
 pub mod write;
 
