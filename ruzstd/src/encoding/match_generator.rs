@@ -35,13 +35,20 @@ pub(super) const MIN_MATCH: usize = 4;
 pub(super) const HASH_READ: usize = 8;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
-/// Prefill grid spacing for the fast strategy (libzstd's
-/// `fastHashFillStep`): the strip's mid-distance match coverage survives a
-/// 3x coarser grid, at a third of the fill cost. Periodic-repeat locking is
-/// NOT the grid's job — see `seed_offset`; a dense grid cannot provide it
-/// anyway, because on clumped data the twin slot's newest entry is always a
-/// recent same-hash recurrence, burying any period-old twin.
-const FAST_PREFILL_STRIDE: usize = 3;
+/// Prefill grid spacing (libzstd's `fastHashFillStep`, also what its
+/// dictionary-content load uses for fast/dfast): the strip's mid-distance
+/// match coverage survives a 3x coarser grid, at a third of the fill cost.
+/// Periodic-repeat locking is NOT the grid's job — see `seed_offset`; a
+/// dense grid cannot provide it anyway, because on clumped data the twin
+/// slot's newest entry is always a recent same-hash recurrence, burying any
+/// period-old twin. The chain strategy deviates from libzstd's dense
+/// dictionary fill here: its strip is the full window (libzstd's job prefix
+/// is window>>3), so a dense fill would cost half the job's scan time; the
+/// grid keeps the head table's first hop and the chain links (grid
+/// positions link to the previous same-hash grid position) while unwritten
+/// chain slots simply read as dead or stale entries, which the walk's
+/// domain check already discards.
+const PREFILL_STRIDE: usize = 3;
 /// Backward bytes that must agree (beyond the 8-byte anchor) before a strip
 /// position becomes the job-start seed offset: long enough that word-level
 /// repeats (~10-15 agreeing bytes on natural text) cannot qualify, short
@@ -949,12 +956,12 @@ impl MatchGeneratorDriver {
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
-                // twin is unreachable (see FAST_PREFILL_STRIDE).
+                // twin is unreachable (see PREFILL_STRIDE).
                 let table = &mut self.table[..];
                 let mut idx = 0;
                 while idx < last {
                     insert_at(data, table, idx, base + idx as u64);
-                    idx += FAST_PREFILL_STRIDE;
+                    idx += PREFILL_STRIDE;
                 }
                 self.acquire_seed(data, last);
             }
@@ -962,13 +969,15 @@ impl MatchGeneratorDriver {
                 let long_log = self.params.hash_log;
                 let long = &mut self.table[..];
                 let small = &mut self.chain[..];
-                for idx in 0..last {
+                let mut idx = 0;
+                while idx < last {
                     // SAFETY: both hashes are masked to their tables' sizes.
                     unsafe {
                         let entry = pack_pos(base + idx as u64);
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_log(data, idx, small_log)) = entry;
                     }
+                    idx += PREFILL_STRIDE;
                 }
                 // The double table is as burial-prone as the fast one for
                 // period-long twins: both probes are single-candidate.
@@ -979,7 +988,8 @@ impl MatchGeneratorDriver {
                 let chain_mask = self.chain.len() - 1;
                 let table = &mut self.table[..];
                 let chain = &mut self.chain[..];
-                for idx in 0..last {
+                let mut idx = 0;
+                while idx < last {
                     let abs = base + idx as u64;
                     // SAFETY: the hash masks to hash_log bits, the absolute
                     // position to the chain size (absolute key; see
@@ -990,6 +1000,7 @@ impl MatchGeneratorDriver {
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
                         *table.get_unchecked_mut(h) = pack_pos(abs);
                     }
+                    idx += PREFILL_STRIDE;
                 }
                 // The head table's first hop is as burial-prone as the fast
                 // strategy's single probe; seed the walk-independent path.

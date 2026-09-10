@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* The dfast and chain multithreaded-job strip prefills now fill their
+  tables on a stride-3 grid (like the fast strategy and libzstd's
+  dictionary-content load for fast/dfast) instead of every position. The
+  chain strategy deviates from libzstd's dense dictionary fill on
+  purpose: our job strip is the full window (libzstd's job prefix is
+  window>>3), where a dense fill costs about half the job's scan time.
+  The grid keeps the head table's first hop and links grid positions
+  oldest-to-newest; unwritten chain slots read as dead or stale entries
+  that the walk's position-domain check already discards. Periodic
+  locking never depended on the fill (it rides the job-start seed).
+  Interleaved old/new mt8 medians on the 32 MiB corpus: text.fast
+  +68%, zeros.fast +110%, json/random/skewed.balanced +5-28%; output
+  drift within ±0.13% (mostly improvements).
+
 * The fast, dfast and chain match tables now hold u32 entries: each slot
   stores its absolute position biased by one and truncated to 32 bits
   (zero remains the never-written sentinel), and readers rebuild the
