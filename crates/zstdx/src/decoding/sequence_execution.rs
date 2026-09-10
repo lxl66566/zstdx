@@ -529,7 +529,11 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
         if !NOWRAP && offset.wrapping_add(wrap_base) > dst_a {
             copy_wrapped_match(
                 view,
-                vbase_op + out_base as usize,
+                // Recovering `virt_base` from the folded `vbase_op`: the
+                // subtraction at the folding site wraps whenever the output
+                // pointer numerically exceeds the virtual base (the common
+                // case), so the re-addition must wrap back symmetrically.
+                vbase_op.wrapping_add(out_base as usize),
                 out_base,
                 pos,
                 offset,
