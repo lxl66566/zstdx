@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+* Every multithreaded job now starts from cleared head tables: the pooled
+  matcher state carries whatever earlier jobs — on this frame or a
+  previous one — left, and a leftover entry that decodes into the window
+  with matching bytes acts as a legal candidate whose presence depends on
+  which worker ran which job, so the frame bytes were not reproducible
+  (observed flipping ±0.06% on json.Balanced after the stride-3 grid
+  fill; the dense fill it replaced had been masking the same latent
+  hazard since the u32 tables dropped the per-frame reset). The clear
+  makes a job's candidates a function of its strip and scan alone, as
+  libzstd's job path does. The chain link table is left uncleared: a
+  chain slot is only read at a candidate position, and candidates arise
+  only from the cleared head table or from link values written this job,
+  so stale link slots are unreachable. Clears of 4 MiB and above use
+  non-temporal stores to skip the ownership read and spare the cache.
+
 * The dfast and chain multithreaded-job strip prefills now fill their
   tables on a stride-3 grid (like the fast strategy and libzstd's
   dictionary-content load for fast/dfast) instead of every position. The

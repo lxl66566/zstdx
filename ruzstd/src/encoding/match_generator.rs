@@ -934,17 +934,36 @@ impl MatchGeneratorDriver {
         self.rep_pending = 3;
     }
 
-    /// Index a strip of borrowed history — `data` holds the bytes at absolute
-    /// offset `base` — into the search tables, so a scan that starts after it
-    /// can match into it (the multithreaded job path adopts the previous
-    /// job's tail as match window; without this pass the tables hold no
-    /// position inside that window and sequences never reference it).
-    /// Positions are linked oldest-to-newest, keeping the newest-wins order
-    /// the walks rely on. The opt strategies need no explicit fill: their
-    /// tree fills lazily from `next_update`, so rewinding it to the strip
-    /// start makes the first search index the strip through the regular
-    /// tree-fill path.
+    /// Prepare the matcher for a multithreaded job and index a strip of
+    /// borrowed history — `data` holds the bytes at absolute offset `base` —
+    /// into the search tables, so a scan that starts after it can match into
+    /// it (the job path adopts the previous job's tail as match window;
+    /// without this pass the tables hold no position inside that window and
+    /// sequences never reference it). Grid positions are linked
+    /// oldest-to-newest, keeping the newest-wins order the walks rely on.
+    /// The opt strategies need no explicit fill: their tree fills lazily
+    /// from `next_update`, so rewinding it to the strip start makes the
+    /// first search index the strip through the regular tree-fill path.
+    ///
+    /// The u32 head tables are zeroed first, even for an empty strip: the
+    /// pooled state carries whatever earlier jobs — this frame or a
+    /// previous one — left, and a leftover entry that decodes into the
+    /// window with matching bytes is a legal-looking candidate whose
+    /// presence depends on which worker ran which job. Clearing makes the
+    /// candidates a function of this job's strip and scan alone, so the
+    /// frame bytes stay reproducible; libzstd's job path clears its tables
+    /// per job for the same reason. The chain strategy's link table needs
+    /// no clear: a chain slot is only ever read at a candidate position,
+    /// and candidates arise only from the cleared head table or from link
+    /// values written this job — stale link slots are unreachable. The
+    /// dfast `chain` buffer is a second probed head table and is cleared.
+    /// The opt tables need no clear (their entries carry the epoch, bumped
+    /// per job).
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
+        clear_table(&mut self.table);
+        if !matches!(self.params.strategy, Strategy::Chain(_)) {
+            self.chain.fill(0);
+        }
         if data.len() < HASH_READ {
             return;
         }
@@ -1045,6 +1064,54 @@ impl MatchGeneratorDriver {
         }
     }
 }
+
+/// Zero a job-start table. Large clears stream megabytes per job through
+/// the bus; non-temporal stores skip the ownership read and keep the zero
+/// lines from evicting the scan's working set, while small tables stay
+/// cache-warm for the probes that follow the clear.
+fn clear_table(t: &mut [u32]) {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if t.len() >= NT_CLEAR_MIN && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: the feature was just detected; the stores stay inside t
+        // and the fence retires them before any read.
+        unsafe { clear_table_avx512(t) };
+        return;
+    }
+    t.fill(0);
+}
+
+/// Non-temporal table clear: aligned 64-byte streaming stores plus one
+/// fence. Unaligned head and tail run as plain stores.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn clear_table_avx512(t: &mut [u32]) {
+    use core::arch::x86_64::*;
+    let zero = _mm512_setzero_si512();
+    let mut p = t.as_mut_ptr();
+    let end = p.add(t.len());
+    // SAFETY: p advances only while strictly below end; the alignment head
+    // and element tail each touch disjoint in-bounds ranges.
+    unsafe {
+        while (p as usize) & 63 != 0 && p < end {
+            *p = 0;
+            p = p.add(1);
+        }
+        let aligned_end = (end as usize - ((end as usize) & 63)) as *mut u32;
+        while p < aligned_end {
+            _mm512_stream_si512(p.cast(), zero);
+            p = p.add(16);
+        }
+        while p < end {
+            *p = 0;
+            p = p.add(1);
+        }
+        _mm_sfence();
+    }
+}
+
+/// Slot count above which the job-start table clear goes non-temporal
+/// (4 MiB of u32 slots): smaller tables profit more from staying cached.
+const NT_CLEAR_MIN: usize = 1 << 20;
 
 impl Matcher for MatchGeneratorDriver {
     fn reset(&mut self, level: Level) {
