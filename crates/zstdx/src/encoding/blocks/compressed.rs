@@ -442,19 +442,19 @@ fn encode_sequences(
                 debug_assert!(ml_state < ml_table.table_size);
                 debug_assert!(ll_state < ll_table.table_size);
 
-                // The three state-transition bit groups (max 15 bits each) fit a
-                // single u64 write; concatenating them keeps the writer's hot
-                // path.
-                let of_diff = (of_state - (e_of & 0x1FF) as usize) as u64;
-                let ml_diff = (ml_state - (e_ml & 0x1FF) as usize) as u64;
-                let ll_diff = (ll_state - (e_ll & 0x1FF) as usize) as u64;
-                let of_nb = ((e_of >> 9) & 0xF) as usize;
-                let ml_nb = ((e_ml >> 9) & 0xF) as usize;
-                let ll_nb = ((e_ll >> 9) & 0xF) as usize;
+                // The three state-transition bit groups (max 12 bits each:
+                // nb <= acc_log <= 12) fit a single u64 write; concatenating
+                // them keeps the writer's hot path.
+                let of_diff = (of_state - (e_of & 0xFFF) as usize) as u64;
+                let ml_diff = (ml_state - (e_ml & 0xFFF) as usize) as u64;
+                let ll_diff = (ll_state - (e_ll & 0xFFF) as usize) as u64;
+                let of_nb = ((e_of >> 12) & 0xF) as usize;
+                let ml_nb = ((e_ml >> 12) & 0xF) as usize;
+                let ll_nb = ((e_ll >> 12) & 0xF) as usize;
                 let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
-                of_state = (e_of >> 13) as usize;
-                ml_state = (e_ml >> 13) as usize;
-                ll_state = (e_ll >> 13) as usize;
+                of_state = (e_of >> 16) as usize;
+                ml_state = (e_ml >> 16) as usize;
+                ll_state = (e_ll >> 16) as usize;
 
                 // Transition bits then add bits are adjacent in the stream;
                 // one combined push keeps the writer's flush path once per

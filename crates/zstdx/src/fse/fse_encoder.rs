@@ -153,13 +153,13 @@ pub struct FSETable {
     pub(crate) table_size: usize,
     /// Flat encoder transition table indexed by `symbol * table_size + state`,
     /// packing the target state as
-    /// `(next_index << 13) | (num_bits << 9) | baseline`.
+    /// `(next_index << 16) | (num_bits << 12) | baseline`.
     /// Replaces a linear scan per encoded symbol.
     pub(super) transitions: Vec<u32>,
 }
 
 impl FSETable {
-    /// O(1) encoder transition: packed `(next_index << 13) | (num_bits << 9)
+    /// O(1) encoder transition: packed `(next_index << 16) | (num_bits << 12)
     /// | baseline` for encoding `symbol` while in state `idx`.
     #[inline(always)]
     pub(crate) fn transition(&self, symbol: u8, idx: usize) -> u32 {
@@ -245,9 +245,9 @@ impl FSETable {
     }
 }
 
-/// Reconstruct the state a transition entry encodes. The 9-bit baseline
-/// packing limits this to tables of at most 512 states, which every table
-/// built here satisfies.
+/// Reconstruct the state a transition entry encodes. The 12-bit field
+/// packing (see [`FSETable::transitions`]) limits tables to acc_log <= 12,
+/// which `build_table_from_probabilities` asserts and every builder enforces.
 #[derive(Debug, Clone)]
 pub(crate) struct State {
     /// How many bits the range of this state needs to be encoded as
@@ -263,13 +263,13 @@ pub(crate) struct State {
 impl FSETable {
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> State {
         let e = self.transition(symbol, idx);
-        let num_bits = ((e >> 9) & 0xF) as u8;
-        let baseline = (e & 0x1FF) as usize;
+        let num_bits = ((e >> 12) & 0xF) as u8;
+        let baseline = (e & 0xFFF) as usize;
         State {
             num_bits,
             baseline,
             last_index: baseline + ((1 << num_bits) - 1),
-            index: (e >> 13) as usize,
+            index: (e >> 16) as usize,
         }
     }
 }
@@ -573,7 +573,9 @@ fn build_table_from_counts(
     assert!(sum > 0);
     let sum = sum as usize;
     let acc_log = (sum.ilog2() as u8 + 1).max(5);
-    let acc_log = u8::min(acc_log, max_log);
+    // The transition packing (and the format itself) caps accuracy at 2^12
+    // states; wider inputs clamp here instead of truncating baselines.
+    let acc_log = u8::min(acc_log, 12).min(max_log);
 
     if sum < 1 << acc_log {
         // just raise the maximum probability as much as possible
@@ -615,6 +617,12 @@ fn build_table_from_counts(
 }
 
 pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
+    // Entry packing gives 12 bits each to baseline and target index.
+    debug_assert!(
+        (1..=12).contains(&acc_log),
+        "acc_log {} exceeds the transition packing",
+        acc_log
+    );
     let table_size = 1usize << acc_log;
     let mut probs_full = [0i32; 256];
     probs_full[..probs.len()].copy_from_slice(probs);
@@ -664,7 +672,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             continue;
         }
         let index = start[symbol] as usize;
-        let entry = (index as u32) << 13 | (acc_log as u32) << 9;
+        let entry = (index as u32) << 16 | (acc_log as u32) << 12;
         let base = symbol * table_size;
         transitions[base..base + table_size].fill(entry);
     }
@@ -699,7 +707,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             (num_bits, 1usize << num_bits)
         };
         let b = baseline[symbol];
-        let entry = ((i as u32) << 13) | ((nb as u32) << 9) | b as u32;
+        let entry = ((i as u32) << 16) | ((nb as u32) << 12) | b as u32;
         transitions[symbol * table_size + b..symbol * table_size + b + width].fill(entry);
         if b < prev_baseline[symbol] {
             start[symbol] = i as u16;
@@ -909,7 +917,7 @@ mod soa_tests {
             for (symbol, nb, baseline, _index) in &ref_flat {
                 let e = table.transitions[*symbol as usize * ref_ts + *baseline];
                 assert_eq!(
-                    ((e >> 9) & 0xF) as u8,
+                    ((e >> 12) & 0xF) as u8,
                     *nb,
                     "case {case} sym {symbol} base {baseline} nb"
                 );

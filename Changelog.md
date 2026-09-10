@@ -14,6 +14,17 @@ This document records the changes made between versions, starting with version 0
   Found by the new consistency assertion in the `decode` fuzz target
   (crash-b5593b58, regression test in `src/tests/multi_frame.rs`).
 
+* The FSE encoder's packed transition entries widen their baseline and
+  target-index fields from 9 to 12 bits each. Tables with accuracy logs above
+  9 - only reachable through the fuzz exports' `round_trip`, which passes
+  max_log 22 - silently truncated baselines, so the encoder emitted state
+  deltas that did not fit the declared bit width (a debug assertion under
+  fuzzing, silent bitstream corruption in release). `build_table_from_counts`
+  now clamps accuracy to 12 and `build_table_from_probabilities` asserts the
+  packing limit. Found by the `fse` fuzz target (crash-61378f); the
+  `roundtrip` unit test now replays the fuzz artifacts again, following their
+  move to `crates/zstdx-fuzz`.
+
 * The benchmark and dev-tool examples leave the library for a new
   `zstdx-bench` workspace crate with subcommands: `matrix` (the full
   cross-matrix, now filterable by `--mode/--shape/--level/--workers/

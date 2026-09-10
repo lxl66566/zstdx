@@ -37,10 +37,10 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
         // targeting this state index and compare its wire parameters.
         let entry = enc_table.transitions[base..base + ts]
             .iter()
-            .find(|e| (**e >> 13) as usize == idx)
+            .find(|e| (**e >> 16) as usize == idx)
             .unwrap();
-        assert_eq!((*entry & 0x1FF) as usize, dec_state.base_line as usize);
-        assert_eq!(((*entry >> 9) & 0xF) as u8, dec_state.num_bits);
+        assert_eq!((*entry & 0xFFF) as usize, dec_state.base_line as usize);
+        assert_eq!(((*entry >> 12) & 0xF) as u8, dec_state.num_bits);
     }
 }
 
@@ -63,8 +63,8 @@ fn roundtrip() {
     round_trip(&data);
 
     #[cfg(feature = "std")]
-    if std::fs::exists("fuzz/artifacts/fse").unwrap_or(false) {
-        for file in std::fs::read_dir("fuzz/artifacts/fse").unwrap() {
+    if std::fs::exists("../zstdx-fuzz/artifacts/fse").unwrap_or(false) {
+        for file in std::fs::read_dir("../zstdx-fuzz/artifacts/fse").unwrap() {
             if file.as_ref().unwrap().file_type().unwrap().is_file() {
                 let data = std::fs::read(file.unwrap().path()).unwrap();
                 round_trip(&data);

@@ -97,3 +97,10 @@
 - gain 门的语义偏差：C 的 +7 是"是否用后续候选**替换**已持有匹配"的裕度，不是
   store 门；我们把门放 store 决策上（比 C 严）是刻意的（我们的表更密），但要知道
   代价是 text 中短距匹配误杀。
+- **FSE 转移表打包位宽暗约束**：u32 entry 的 baseline 只留 9 位（表 ≤512 状态），
+  生产 acc_log ≤9（huff0 权重表 6、序列表 9）从不越界；fuzz_exports `round_trip`
+  的 max_log=22 构出 log10 表 → baseline≥512 静默截断 → 编码器写出超位宽 diff
+  （fuzz 下 debug 断言炸，release 静默错位流）。修：布局加宽为 12+4+12
+  （`optimal_table_log` 本就 clamp 5..=12），`build_table_from_counts` clamp 到 12 +
+  `build_table_from_probabilities` debug_assert 双保险。**教训：位域打包的隐式上限
+  必须在构造入口强制；"生产用不到"的参数范围迟早被 fuzz 或后续扩展踩中。**
