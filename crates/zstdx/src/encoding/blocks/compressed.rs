@@ -432,23 +432,31 @@ fn encode_sequences(
     // transitions still need each table's entry for the running states.
     // Rows are flat `code << shift | state` (table_size is a power of two),
     // replacing the runtime-stride multiply and bounds check of the indexed
-    // accessor. The per-code share of the row index is loop-invariant, so it
-    // is pre-shifted into stack offset tables once per block: the hot loop
-    // then folds it in with one L1 load instead of a variable shift, and the
-    // three shift registers (stack-reloaded per sequence under register
-    // pressure) leave the loop entirely. Codes are u8 and states cycle below
-    // table_size by table construction, so the row index cannot leave the
-    // flat array.
+    // accessor. The per-code share of the row address is loop-invariant, so
+    // it is resolved once per block into a 256-entry table of ROW POINTERS
+    // (`rows + (code << shift)`): the hot loop reaches an entry with one
+    // stack load (the pointer slot, addressed off rsp for free) plus one
+    // indexed load through it. The earlier u32 offset tables kept a third
+    // live register per channel for the row base — exactly the registers
+    // this loop does not have, so all three bases were reloaded from the
+    // stack every sequence and an `or` spliced each offset back in; the
+    // pointer tables drop both. Codes are u8 and states cycle below
+    // table_size by table construction, so both loads stay inside the flat
+    // array.
     let (ll_rows, ll_shift) = ll_table.transitions_flat();
     let (ml_rows, ml_shift) = ml_table.transitions_flat();
     let (of_rows, of_shift) = of_table.transitions_flat();
-    let mut ll_off = [0u32; 256];
-    let mut ml_off = [0u32; 256];
-    let mut of_off = [0u32; 256];
-    for c in 0..256u32 {
-        ll_off[c as usize] = c << ll_shift;
-        ml_off[c as usize] = c << ml_shift;
-        of_off[c as usize] = c << of_shift;
+    let mut ll_ptrs = [ll_rows.as_ptr(); 256];
+    let mut ml_ptrs = [ml_rows.as_ptr(); 256];
+    let mut of_ptrs = [of_rows.as_ptr(); 256];
+    for c in 0..256usize {
+        // SAFETY: c << shift stays inside the flat transitions array
+        // (256 codes × table_size entries cover every row).
+        unsafe {
+            ll_ptrs[c] = ll_rows.as_ptr().add(c << ll_shift);
+            ml_ptrs[c] = ml_rows.as_ptr().add(c << ml_shift);
+            of_ptrs[c] = of_rows.as_ptr().add(c << of_shift);
+        }
     }
 
     let li = nb_seq - 1;
@@ -491,24 +499,21 @@ fn encode_sequences(
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
-            let ll_rp = ll_rows.as_ptr();
-            let ml_rp = ml_rows.as_ptr();
-            let of_rp = of_rows.as_ptr();
-            let ll_op = ll_off.as_ptr();
-            let ml_op = ml_off.as_ptr();
-            let of_op = of_off.as_ptr();
+            let ll_pp = ll_ptrs.as_ptr();
+            let ml_pp = ml_ptrs.as_ptr();
+            let of_pp = of_ptrs.as_ptr();
             for i in (0..=nb_seq - 2).rev() {
-                // SAFETY: as above. The offset-table reads index a 256-entry
-                // array with a u8.
+                // SAFETY: as above. The pointer-table reads index a
+                // 256-entry array with a u8.
                 let (add, add_nb, e_of, e_ml, e_ll) = unsafe {
                     let w = &*sp.add(i);
                     let packed = w.codes;
                     (
                         w.add,
                         w.add_nb as usize,
-                        *of_rp.add(*of_op.add((packed >> 16) as u8 as usize) as usize | of_state),
-                        *ml_rp.add(*ml_op.add((packed >> 8) as u8 as usize) as usize | ml_state),
-                        *ll_rp.add(*ll_op.add(packed as u8 as usize) as usize | ll_state),
+                        *(*of_pp.add((packed >> 16) as u8 as usize)).add(of_state),
+                        *(*ml_pp.add((packed >> 8) as u8 as usize)).add(ml_state),
+                        *(*ll_pp.add(packed as u8 as usize)).add(ll_state),
                     )
                 };
                 debug_assert!(of_state < of_table.table_size);
