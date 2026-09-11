@@ -468,6 +468,44 @@ pub(super) fn push_seq_packed(
     (ll, start + match_len)
 }
 
+/// Index a match's covered range (the fast strategy's fill policy).
+/// Short matches keep every position (they carry the alignment coverage on
+/// structured data). Long matches only index two anchors (zstd fast's fill
+/// policy): one just inside the start, one just before the end — the scan
+/// loop already indexes the positions it probes, so interior coverage only
+/// needs seed points for the phases the scan skips over, and hashing a
+/// 4-byte grid across long matches dominated encoder time. Both anchors
+/// need HASH_READ bytes of window ahead; a match reaching the insert bound
+/// simply leaves them out. Outlined from [`TableEmit::emit`] (see there).
+#[inline(never)]
+fn insert_covered(
+    win: &[u8],
+    table: &mut [u32],
+    win_base: u64,
+    start: usize,
+    match_len: usize,
+    insert_max: u64,
+) {
+    if match_len <= 16 {
+        let end = (win_base + (start + match_len) as u64).min(insert_max);
+        let mut p = win_base + start as u64;
+        while p < end {
+            insert_at(win, table, (p - win_base) as usize, p);
+            p += 1;
+        }
+    } else {
+        let base = win_base + start as u64;
+        let hi = base + match_len as u64 - 2;
+        if hi <= insert_max {
+            let lo = base + 2;
+            insert_at(win, table, (lo - win_base) as usize, lo);
+            if hi > lo {
+                insert_at(win, table, (hi - win_base) as usize, hi);
+            }
+        }
+    }
+}
+
 /// Shared mutable state of the single-table strategies (fast and chain):
 /// the head hash table, the output streams and the per-block constants,
 /// bundled so the emit helpers stay inside the register argument budget
@@ -488,8 +526,11 @@ impl TableEmit<'_> {
     /// range and return the new cursor (which is also the new anchor). The
     /// sequence is pushed straight into the packed code/add-bits streams the
     /// block encoder consumes — the raw (ll, ml, of) triple never gets its
-    /// own buffer.
-    #[inline]
+    /// own buffer. The coverage indexing is outlined ([`insert_covered`]):
+    /// with it inline, the whole helper grew past the inliner's budget, and
+    /// every scan-loop call site paid a full spill/reload of the emit
+    /// context (literals/seqs/rep) around the call.
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
@@ -511,32 +552,14 @@ impl TableEmit<'_> {
             self.literals,
             self.seqs,
         );
-        // Short matches keep every position (they carry the alignment coverage on
-        // structured data). Long matches only index two anchors (zstd fast's fill
-        // policy): one just inside the start, one just before the end — the scan
-        // loop already indexes the positions it probes, so interior coverage only
-        // needs seed points for the phases the scan skips over, and hashing a
-        // 4-byte grid across long matches dominated encoder time. Both anchors
-        // need HASH_READ bytes of window ahead; a match reaching the insert bound
-        // simply leaves them out.
-        if match_len <= 16 {
-            let end = (self.win_base + match_end as u64).min(self.insert_max);
-            let mut p = self.win_base + start as u64;
-            while p < end {
-                insert_at(win, self.table, (p - self.win_base) as usize, p);
-                p += 1;
-            }
-        } else {
-            let base = self.win_base + start as u64;
-            let hi = base + match_len as u64 - 2;
-            if hi <= self.insert_max {
-                let lo = base + 2;
-                insert_at(win, self.table, (lo - self.win_base) as usize, lo);
-                if hi > lo {
-                    insert_at(win, self.table, (hi - self.win_base) as usize, hi);
-                }
-            }
-        }
+        insert_covered(
+            win,
+            self.table,
+            self.win_base,
+            start,
+            match_len,
+            self.insert_max,
+        );
         self.win_base + match_end as u64
     }
 

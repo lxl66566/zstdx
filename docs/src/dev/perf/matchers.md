@@ -23,6 +23,7 @@
 - window 448K→**768K**: the text corpus's tile period falls in 512K-768K, unlocking cross-tile matches. text ratio 6.46→239. `7a2a388`
 - **select-based probing** (libzstd selectAddr): invalid candidates are selected into the scan position itself; byte compare + single-branch rejection via `cand != ip` replaces the epoch/win_base/distance triple compare; the rep0 pre-probe folds into the single comparison `probe >= win_base + rep[0]`. json 455→466 MiB/s. `29bcb02`
 - `TableEmit` context struct replaces the 12-14-parameter free function (guards against parameter stack spilling); scan-side table access via raw pointers. `c528c57`
+- **emit split**: the coverage-indexing loop moved out of `TableEmit::emit` into an `#[inline(never)] insert_covered` — with it inline, emit exceeded the inliner budget and each of the scan loop's five call sites paid a full spill/reload of the emit context (literals/seqs/rep) plus a hash-constant rematerialization around the call (the call prologue/epilogue alone sampled ~9% on json.fastest). Splitting leaves emit small enough to inline at every site. Byte-identical output; gungraun json.fastest -2.7%, text.fastest -1.1% instructions.
 - output bitstream side: u64-spelling bit writes (see the encoding page); final ratio json 6.00 (vs zstd-1 6.11).
 
 ## Fast (dfast, counterpart of libzstd level 3)
