@@ -283,6 +283,17 @@ impl HuffmanTable {
         table
     }
 
+    /// Per-symbol code lengths (0 = symbol not covered by the table).
+    /// Feeds the matcher's literal-cost pricing feedback (see
+    /// `Matcher::note_literal_costs`).
+    pub(crate) fn code_lengths(&self) -> [u8; 256] {
+        let mut lens = [0u8; 256];
+        for (i, &p) in self.packed.iter().enumerate() {
+            lens[i] = (p & 0xf) as u8;
+        }
+        lens
+    }
+
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
         if other.codes.len() > self.codes.len() {
             return None;

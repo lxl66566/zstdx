@@ -111,10 +111,23 @@ pub(crate) fn compress_block<M: Matcher>(
     if !literals.is_empty() && !zero_seq && crate::encoding::util::is_uniform(literals) {
         rle_literals(literals, &mut writer);
     } else if literals.len() > 1024 {
-        if let Some(table) =
-            compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold)
-        {
-            tables.huff = Some(table);
+        match compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold) {
+            LitOutcome::Raw => {},
+            // Feed the encoding table's code lengths back to the matcher: the
+            // chain strategy's store gate prices a match against the marginal
+            // cost of the literals it displaces, and no flat constant
+            // separates cheap-literal shapes from skewed ones — see
+            // pays_for_offset_lit. Raw/RLE blocks keep the previous lengths,
+            // mirroring last_huff_table's persistence.
+            LitOutcome::Treeless => {
+                if let Some(table) = last_huff_table {
+                    matcher.note_literal_costs(&table.code_lengths());
+                }
+            },
+            LitOutcome::NewTable(table) => {
+                matcher.note_literal_costs(&table.code_lengths());
+                tables.huff = Some(table);
+            },
         }
     } else {
         raw_literals(literals, &mut writer);
@@ -810,17 +823,30 @@ fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
     false
 }
 
+/// How one block's literals went out. `Treeless` reuses the caller's
+/// remembered Huffman table (nothing to adopt); `NewTable` carries the
+/// freshly built table for the caller to remember; `Raw` means the raw
+/// literals form won (the entropy-bound rejects or the size comparison).
+// Returned by value into the pooled encoder state; boxing would add a
+// per-block allocation.
+#[allow(clippy::large_enum_variant)]
+enum LitOutcome {
+    Raw,
+    Treeless,
+    NewTable(huff0_encoder::HuffmanTable),
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
     gate_hold: &mut bool,
-) -> Option<huff0_encoder::HuffmanTable> {
+) -> LitOutcome {
     let reset_idx = writer.index();
 
     if sampled_gate_rejects(literals, gate_hold) {
         raw_literals(literals, writer);
-        return None;
+        return LitOutcome::Raw;
     }
 
     // One histogram feeds both the entropy-bound reject and the table build:
@@ -843,7 +869,7 @@ fn compress_literals(
         }
         if entropy_bits + 256.0 + total * 0.08 >= total * 8.0 {
             raw_literals(literals, writer);
-            return None;
+            return LitOutcome::Raw;
         }
     }
 
@@ -898,11 +924,11 @@ fn compress_literals(
     if total_len >= literals.len() {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
-        None
+        LitOutcome::Raw
     } else if new_table {
-        Some(new_encoder_table)
+        LitOutcome::NewTable(new_encoder_table)
     } else {
-        None
+        LitOutcome::Treeless
     }
 }
 

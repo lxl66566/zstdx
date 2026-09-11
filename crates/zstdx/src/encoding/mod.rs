@@ -217,6 +217,13 @@ pub trait Matcher {
     fn repcode_snapshot(&self) -> [u32; 3];
     /// Restore a snapshot taken by [`Matcher::repcode_snapshot`]
     fn restore_repcode(&mut self, rep: [u32; 3]);
+    /// Hint the per-symbol Huffman code lengths of the table that encoded
+    /// the previous block's literals (0 = symbol not covered). Matchers may
+    /// price a candidate match against the marginal cost of the literals it
+    /// displaces. Called once per Huffman-coded block; blocks whose literals
+    /// go raw/RLE (and fresh frames or jobs) leave the matcher's current
+    /// lengths untouched.
+    fn note_literal_costs(&mut self, _lengths: &[u8; 256]) {}
 }
 
 #[derive(PartialEq, Eq, Debug)]

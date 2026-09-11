@@ -49,6 +49,7 @@
 | lazy-walk cheapening variants (depth-1-only margins; cap 4 steps; skip the second-chance search after an empty probe; rep probe when the incumbent is already a rep) | depth-1 collapses the ratio (json 6.55→6.18, text back to 361.5); cap and empty-skip change nothing / trade 0.05 ratio for 2.5% speed; rep-vs-rep probe never alters selection (output byte-identical without it) | the alternating depth-1/depth-2 margin structure IS the gain; the walk is not deep, it is the 2-searches-per-failure baseline that costs the ~30% json instructions |
 | emit skipping positions already inserted by scan pairs (idempotent insertion) | output DIFFERS / instructions +2.6% after the fix | not unconditionally idempotent (hash-collision overwrites during backward extension; redundant reinsertion serves to restore slot values); the cost also exceeds the benefit |
 | naive Predefined/Repeat thresholds in choose_table | negligible | later handled by the cost-comparison approach (selectEncodingType port) + repeat mode; do not use naive thresholds |
+| store gate priced by average residual literal entropy (per-block feedback of bits/byte, gate `ml*cost ≥ ilog2+7`) | text.balanced 346 (−6.5% vs zstd-6), json +16% | the average anti-predicts: text's residual stream is hyper-skewed (~0.2 bits/B — the matcher hoovers up everything matchable) yet wants the LOOSE gate; the displaced literals' marginal cost (their code length under the block's Huffman table) is the right price and IS the implemented form |
 
 ## Encode side · entropy / checksum / misc
 

@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Chain-strategy store gate is now literal-cost-aware: the block encoder
+  feeds the Huffman code lengths of each block's literal table back to the
+  matcher (`Matcher::note_literal_costs`), and the gate stores a match only
+  if the literals it displaces price (at those lengths) above the offset's
+  `highbit + 7`. The flat 4-bits-per-literal constant traded json against
+  text monotonically (json 6.21/6.55, text 368.1/366.3 at margins +4/+7);
+  the swing lives in 5-byte matches at 8-32 KiB offsets, whose displaced
+  bytes are nearly absent from text's hyper-skewed residual literal stream
+  (they price at the 11-bit cap) but common in json's (they price cheap) —
+  marginal code length separates what no flat margin could. text.balanced
+  366.3→368.1 (deficit vs zstd-6 −1.05%→−0.57%) while json.balanced
+  improves further 6.55→6.66; skewed/random/zeros unchanged, speed neutral
+  (json 116→120, text 2607→2602 MiB/s). Only the chain levels consume the
+  feedback; fast/dfast seed gates keep the static margin.
+
 - Unpledged streaming-MT jobs now grow along the stream (`JobGrid::Growing`):
   the job starting at absolute offset `o` is sized by the shared bulk
   formula against a 4×`o` estimate of the final size, replacing the fixed

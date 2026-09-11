@@ -331,22 +331,58 @@ fn price_of(idx: usize, cand: usize) -> i32 {
     ((idx - cand + 1) as u32).ilog2() as i32
 }
 
+/// Assumed literal code lengths before the block encoder's first
+/// measurement arrives: the historical flat constant of the static gate
+/// (~4 bits per literal).
+const DEFAULT_LIT_LENS: [u8; 256] = [4; 256];
+
 /// Whether a non-rep match clears its offset's price: literals cost ~4 bits
 /// per byte and the offset its highbit, plus a constant for the sequence
 /// code overhead (libzstd's raw approximation from its lazy gain checks).
 /// Without this gate the densely pre-indexed multithread job strips flood
 /// the stream with five-byte matches a megabyte back — high-entropy shapes
 /// lost ratio and speed alike to the emission storm.
-/// The +7 margin is libzstd's depth-2 replacement constant; at store time it
-/// costs text-like shapes ~0.5% ratio (their mid-distance matches are worth
-/// keeping) while anything looser lets the dense-table pollution back in
-/// (measured under the gain-aware lazy walk: json 6.21/6.29/6.45/6.55 at
-/// +4/+5/+6/+7, text 368.1/367.5/367.0/366.3, skewed flat 2.00 — the whole
-/// swing is 5-byte matches in the 8-32 KiB offset band; ml-conditional
-/// margins move nothing else).
+/// The +7 margin is libzstd's depth-2 replacement constant; used here at
+/// the fast/dfast seed probes and as the constant term of the chain
+/// strategy's literal-cost-aware gate ([`pays_for_offset_lit`]).
 #[inline(always)]
 fn pays_for_offset(ml: usize, idx: usize, cand: usize, rep_hit: bool) -> bool {
     rep_hit || ml * 4 >= (idx - cand).ilog2() as usize + 7
+}
+
+/// The chain strategy's store gate: store the match only if the literals it
+/// displaces cost more than its offset's price (highbit plus the +7 margin,
+/// libzstd's depth-2 replacement constant). Literal bytes price at the code
+/// lengths of the previous block's Huffman table — the *marginal* cost,
+/// which separates the shapes the flat +7 margin traded against each other
+/// (json 6.21/6.55, text 368.1/366.3 at +4/+7; the whole swing is 5-byte
+/// matches in the 8-32 KiB offset band): text's displaced bytes are nearly
+/// absent from its hyper-skewed residual literal stream (~0.2 bits/B on
+/// average — the average itself is no discriminator) and price at the cap,
+/// while json's are common in its residual stream and price cheap. For
+/// matches longer than eight bytes the first eight price the run (the
+/// decision band is ml ≤ 7 anyway: at the 1 MiB window an 8-byte match
+/// clears even the flat-4 constant). With `lit_lens == DEFAULT_LIT_LENS`
+/// this reduces to the static +7 gate bit-for-bit.
+#[inline(always)]
+fn pays_for_offset_lit(
+    win: &[u8],
+    idx: usize,
+    ml: usize,
+    cand: usize,
+    rep_hit: bool,
+    lit_lens: &[u8; 256],
+) -> bool {
+    if rep_hit {
+        return true;
+    }
+    let price = (idx - cand).ilog2() as usize + 7;
+    let k = ml.min(8);
+    let mut cost = 0usize;
+    for &b in &win[idx..idx + k] {
+        cost += lit_lens[b as usize] as usize;
+    }
+    cost * ml >= price * k
 }
 
 /// Store `abs` as the newest position for its hash. Caller guarantees
@@ -747,6 +783,14 @@ pub struct MatchGeneratorDriver {
     /// know the decoder's history; three literal offsets shift it fully
     /// into known territory because the update is a plain 3-slot shift.
     rep_pending: u8,
+    /// Huffman code lengths of the table that encoded the previous block's
+    /// literals (fed back by the block encoder via `note_literal_costs`;
+    /// uncovered symbols priced at the 11-bit cap — they force a rebuild
+    /// and land at the longest codes). The chain strategy's store gate
+    /// prices the literals a match displaces against them. Reset per
+    /// frame/job so output bytes stay a function of the frame/job content
+    /// alone.
+    lit_lens: [u8; 256],
     /// Long-repeat offset probed directly at a multithreaded job's start
     /// (see [`Self::prefill_window`]): 0 = inactive. The fast strategy's
     /// single-probe table cannot hold a periodic repeat's twin — on clumped
@@ -824,6 +868,7 @@ impl MatchGeneratorDriver {
             params: FASTEST_PARAMS,
             rep: [1, 4, 8],
             rep_pending: 0,
+            lit_lens: DEFAULT_LIT_LENS,
             seed_offset: 0,
             seed_hits: 0,
             seed_budget: 0,
@@ -856,6 +901,7 @@ impl MatchGeneratorDriver {
             params: FASTEST_PARAMS,
             rep: [1, 4, 8],
             rep_pending: 0,
+            lit_lens: DEFAULT_LIT_LENS,
             seed_offset: 0,
             seed_hits: 0,
             seed_budget: 0,
@@ -1229,6 +1275,7 @@ impl Matcher for MatchGeneratorDriver {
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
         self.rep_pending = 0;
+        self.lit_lens = DEFAULT_LIT_LENS;
         self.seed_offset = 0;
         self.seed_hits = 0;
         self.seed_budget = 0;
@@ -1247,6 +1294,18 @@ impl Matcher for MatchGeneratorDriver {
 
     fn restore_repcode(&mut self, rep: [u32; 3]) {
         self.rep = rep;
+    }
+
+    fn note_literal_costs(&mut self, lengths: &[u8; 256]) {
+        // Uncovered symbols price at the format's 11-bit cap: emitting one
+        // forces a table rebuild and lands it at the longest codes.
+        for (i, &nb) in lengths.iter().enumerate() {
+            self.lit_lens[i] = if nb == 0 {
+                11
+            } else {
+                nb
+            };
+        }
     }
 
     fn block_tail(&mut self) -> &mut [u8] {
@@ -2023,6 +2082,7 @@ impl MatchGeneratorDriver {
         let mut seed_offset = self.seed_offset;
         let mut seed_hits = self.seed_hits;
         let mut seed_budget = self.seed_budget;
+        let lit_lens = &self.lit_lens;
 
         // Chain-walk search from the hash head at window index `idx`,
         // returning the longest match's (length, candidate window index).
@@ -2147,7 +2207,9 @@ impl MatchGeneratorDriver {
                 *table_ptr.add(h) = pack_pos(pos);
             }
 
-            if best_len < MIN_MATCH || !pays_for_offset(best_len, idx, best_cand, rep_hit) {
+            if best_len < MIN_MATCH
+                || !pays_for_offset_lit(win, idx, best_len, best_cand, rep_hit, lit_lens)
+            {
                 // Grow the probe step on long literal runs (same policy as
                 // the fast loop) so incompressible data does not pay a full
                 // chain walk per byte. Faster-growing than libzstd's
