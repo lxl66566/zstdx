@@ -137,157 +137,174 @@ enum Strategy {
     Opt(OptKnobs),
 }
 
-/// Per-level search parameters, following libzstd's `clevels.h` ladder.
+/// Per-level search parameters. One row per numeric level (0-22), modeled
+/// on libzstd's `clevels.h` large-source table and adapted to this crate's
+/// strategy family: libzstd's greedy/lazy/lazy2 map onto [`Strategy::Chain`]
+/// with `lazy_depth` 0/1/2 and `min_match` from the row's search length,
+/// and btlazy2/btopt/btultra(2) onto [`Strategy::Opt`] knobs. Deviations
+/// from the libzstd rows are documented per row.
 #[derive(Clone, Copy, PartialEq)]
 struct LevelParams {
     hash_log: u32,
     /// Match window; also the window declared in the frame header.
     window: usize,
     strategy: Strategy,
+    /// Chain-family searches per position (libzstd's `1 << searchLog`).
     search_depth: u32,
+    /// 0 = greedy, 1 = lazy, 2 = lazy2 (libzstd's deferred-position count).
     lazy_depth: u32,
+    /// Shortest hash-chain match worth emitting; libzstd's searchLength.
+    /// Repcode matches stay legal from MIN_MATCH up.
+    min_match: u32,
 }
 
-const FASTEST_PARAMS: LevelParams = LevelParams {
-    hash_log: HASH_LOG,
-    window: MAX_WINDOW,
-    strategy: Strategy::Fast,
-    search_depth: 1,
-    lazy_depth: 0,
-};
+const fn fast(hash_log: u32, window: usize) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::Fast,
+        search_depth: 1,
+        lazy_depth: 0,
+        min_match: MIN_MATCH as u32,
+    }
+}
 
-/// libzstd level 3: H17 (long) C16 (short) with the level's W21 window. The
-/// reach is the ratio lever on large real-world binaries: same-window A/B on
-/// a 100 MB ELF concat puts our dfast within 0.03% of libzstd's L3 output,
-/// while the 1 MiB window that preceded it cost 26% size there (libzstd L3
-/// capped to wlog=20 reproduces our byte count almost exactly).
-const FAST_PARAMS: LevelParams = LevelParams {
-    hash_log: 17,
-    window: 1 << 21,
-    strategy: Strategy::Dfast(16),
-    search_depth: 0,
-    lazy_depth: 0,
-};
+const fn dfast(hash_log: u32, small_log: u32, window: usize) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::Dfast(small_log),
+        search_depth: 0,
+        lazy_depth: 0,
+        min_match: MIN_MATCH as u32,
+    }
+}
 
-/// W21 matches libzstd's L6-L9 window (the 100 MB binary corpus is the
-/// evidence: most of its redundancy sits at 1-2 MiB distances, and the
-/// window — not the matcher — decides who finds it). The chain table stays
-/// 2^20: position-indexed links alias beyond 1 MiB exactly like libzstd's
-/// cLog-below-wLog chains, and the head table's newest-wins probe still
-/// serves candidates across the full window. Depth 8/H20 sits at the speed
-/// knee of the real-chain walk (16 attempts, zstd-9's searchLog).
-const BALANCED_PARAMS: LevelParams = LevelParams {
-    hash_log: 20,
-    window: 1 << 21,
-    strategy: Strategy::Chain(20),
-    search_depth: 8,
-    lazy_depth: 2,
-};
+const fn chain(
+    hash_log: u32,
+    chain_log: u32,
+    window: usize,
+    search_depth: u32,
+    lazy_depth: u32,
+) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::Chain(chain_log),
+        search_depth,
+        lazy_depth,
+        min_match: 5,
+    }
+}
 
-/// Level Best, roughly zstd 10-15: the optimal parser in its cheapest
-/// setting (libzstd uses btopt for these levels on smaller inputs; the
-/// hash-chain variant this replaces could not reach the tier's ratio at
-/// any search depth). W22 mirrors libzstd's large-input ladder, where
-/// every level above 9 — including the lazy/btlazy2 tiers this maps onto —
-/// runs a 4 MiB window.
-const BEST_KNOBS: OptKnobs = OptKnobs {
-    search_log: 4,
-    sufficient_len: 32,
-    min_match: 4,
-    mls: 4,
-    bt_log: 22,
-    hash3_log: 0,
-    ultra: false,
-};
-const BEST_PARAMS: LevelParams = LevelParams {
-    hash_log: 22,
-    window: 1 << 22,
-    strategy: Strategy::Opt(BEST_KNOBS),
-    search_depth: 0,
-    lazy_depth: 0,
-};
+const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::Opt(knobs),
+        search_depth: 0,
+        lazy_depth: 0,
+        min_match: knobs.min_match,
+    }
+}
 
-/// Level Opt, roughly zstd 16-17 (btopt): whole-bit prices with the
-/// skip/early-abort heuristics and a 4-byte main hash. libzstd's L17
-/// large-input row is exactly W23/C23/H22. The tree ring matches the
-/// window so every in-window position stays linked.
-const OPT_KNOBS: OptKnobs = OptKnobs {
-    search_log: 5,
-    sufficient_len: 64,
-    min_match: 4,
-    mls: 4,
-    bt_log: 23,
-    hash3_log: 0,
-    ultra: false,
-};
-const OPT_PARAMS: LevelParams = LevelParams {
-    hash_log: 22,
-    window: 1 << 23,
-    strategy: Strategy::Opt(OPT_KNOBS),
-    search_depth: 0,
-    lazy_depth: 0,
-};
+const fn knobs(
+    search_log: u32,
+    sufficient_len: u32,
+    min_match: u32,
+    bt_log: u32,
+    ultra: bool,
+) -> OptKnobs {
+    OptKnobs {
+        search_log,
+        sufficient_len,
+        min_match,
+        mls: min_match,
+        bt_log,
+        hash3_log: if min_match == 3 {
+            17
+        } else {
+            0
+        },
+        ultra,
+    }
+}
 
-/// Level Ultra, roughly zstd 18-22 (btultra/btultra2): fractional prices,
-/// 3-byte matches via the hash3 table, and the 2-pass first-block
-/// statistics seeding. libzstd's L18/L19 rows declare W23 with the ring at
-/// or one past the window (C23/C24); C24's extra slack only delays ring
-/// aliasing that the window floor already rejects, so C23 carries the same
-/// full-linking invariant at half the footprint.
-const ULTRA_KNOBS: OptKnobs = OptKnobs {
-    search_log: 7,
-    sufficient_len: 256,
-    min_match: 3,
-    mls: 3,
-    bt_log: 23,
-    hash3_log: 17,
-    ultra: true,
-};
-const ULTRA_PARAMS: LevelParams = LevelParams {
-    hash_log: 22,
-    window: 1 << 23,
-    strategy: Strategy::Opt(ULTRA_KNOBS),
-    search_depth: 0,
-    lazy_depth: 0,
-};
+/// The per-level parameter ladder, indexed by numeric level. Level 0 (raw
+/// blocks) never matches; its row only keeps the state reusable.
+///
+/// libzstd rows for reference (W, C, H, S, L, TL, strategy):
+/// 1: 19,13,14,fast · 2: 20,15,16,fast · 3: 21,16,17,dfast · 4: 21,18,18,dfast ·
+/// 5: 21,18,19,greedy · 6: 21,18,19,lazy · 7: 21,19,20,lazy · 8-12: lazy2 ·
+/// 13-15: btlazy2 · 16-17: btopt · 18: btultra · 19-22: btultra2.
+const LEVEL_PARAMS: [LevelParams; 23] = [
+    // 0: raw blocks.
+    fast(HASH_LOG, MAX_WINDOW),
+    // 1: libzstd L1 keeps a W19/H14 table; our H15/768 KiB row is the
+    // tuned Fastest tier (beyond-W21 expansion measured a loss).
+    fast(HASH_LOG, MAX_WINDOW),
+    fast(16, 1 << 20),
+    // 3: the tuned Fast tier; same-window A/B sits within 0.03% of
+    // libzstd's L3 dfast (H17 long / C16 short).
+    dfast(17, 16, 1 << 21),
+    dfast(18, 18, 1 << 21),
+    // Chain rows 5-12: search depths are half libzstd's 1 << searchLog
+    // (8/8/16/16/16/32/64/64 there) — the old Balanced tier calibrated
+    // depth 8 as its zstd-9 row (S4), our per-probe walk being the dearer.
+    chain(19, 18, 1 << 21, 4, 0),
+    chain(19, 18, 1 << 21, 4, 1),
+    chain(20, 19, 1 << 21, 8, 1),
+    chain(20, 19, 1 << 21, 8, 2),
+    // 9: the Balanced tier's row. libzstd's L9 is W22; the chain stays
+    // C20, aliasing beyond 1 MiB like libzstd's cLog-below-wLog chains.
+    chain(21, 20, 1 << 22, 8, 2),
+    chain(22, 21, 1 << 22, 16, 2),
+    chain(22, 21, 1 << 22, 32, 2),
+    chain(23, 22, 1 << 22, 32, 2),
+    // 13: the Best tier: the optimal parser at its cheapest. libzstd runs
+    // btlazy2 here; our opt-parser row lands denser at similar cost.
+    opt(22, 1 << 22, knobs(4, 32, 4, 22, false)),
+    opt(22, 1 << 22, knobs(5, 32, 4, 22, false)),
+    opt(22, 1 << 22, knobs(6, 32, 4, 23, false)),
+    // 16: libzstd's btopt rows begin.
+    opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
+    // 17: the Opt tier; libzstd's L17 row exactly (W23, S5, TL64, mls 4).
+    opt(22, 1 << 23, knobs(5, 64, 4, 23, false)),
+    // 18: btultra: fractional-bit prices, mls 3 (hash3 at H17).
+    opt(22, 1 << 23, knobs(6, 64, 3, 23, true)),
+    // 19: the Ultra tier. libzstd's C24 ring is byte-identical to C23
+    // here (proven), so the ring stays 23.
+    opt(22, 1 << 23, knobs(7, 256, 3, 23, true)),
+    // 20-22: libzstd widens to W25-27 with C25-27/H23-25. Our u64-tagged
+    // opt tables would cost 2-8x libzstd's u32 memory there, so the ring
+    // caps at 24 and the hash stays at 22 (H23 measured 0.06-0.13% sparser
+    // on json — pure dilution); windows widen to W24-26, the reach
+    // dll-class data needs. Beyond-window distance classes are LDM's job.
+    opt(22, 1 << 24, knobs(7, 256, 3, 23, true)),
+    opt(22, 1 << 25, knobs(7, 512, 3, 24, true)),
+    opt(22, 1 << 26, knobs(8, 999, 3, 24, true)),
+];
 
 fn params_for_level(level: Level) -> LevelParams {
-    // Uncompressed never matches; the driver only sizes tables so the state
-    // stays reusable. 0-2 share the Fastest tier, 3-5 Fast, 6-9 Balanced,
-    // 10-15 Best, 16-17 Opt, 18+ Ultra.
-    match level.as_i32() {
-        6..=9 => BALANCED_PARAMS,
-        10..=15 => BEST_PARAMS,
-        16..=17 => OPT_PARAMS,
-        18.. => ULTRA_PARAMS,
-        3..=5 => FAST_PARAMS,
-        _ => FASTEST_PARAMS,
-    }
+    LEVEL_PARAMS[level.as_i32().clamp(0, 22) as usize]
 }
 
 /// Hash a window u64 whose low 5 bytes are the hashed prefix (the full u64
 /// load feeds the multiplier directly: bits above the fifth byte only add
-/// input entropy). Five bytes skip the frequent 4-byte boilerplate fragments
-/// so probes land on structural repeats instead of recent junk.
+/// input entropy) into a table of `log` bits. Five bytes skip the frequent
+/// 4-byte boilerplate fragments so probes land on structural repeats
+/// instead of recent junk.
 #[inline(always)]
-fn hash5(v: u64) -> usize {
-    ((v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - HASH_LOG))
-        & ((1 << HASH_LOG) - 1)
+fn hash5_log(v: u64, log: u32) -> usize {
+    ((v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)) & ((1usize << log) - 1)
 }
 
-/// Hash the 5 bytes at `idx`. Caller guarantees `idx + 5 <= win.len()` (the
-/// scanning and emit loops bound-check once per loop, not per position).
-#[inline(always)]
-fn hash_at(win: &[u8], idx: usize) -> usize {
-    // SAFETY: see contract above; the hash itself is [`hash5`].
-    unsafe { hash5(win.as_ptr().add(idx).cast::<u64>().read_unaligned()) }
-}
-
-/// [`hash_at`] for a runtime hash-log (the chain strategies size their
-/// tables per level).
+/// Hash the 5 bytes at `idx` into a table of `log` bits. Caller guarantees
+/// `idx + 5 <= win.len()` (the scanning and emit loops bound-check once per
+/// loop, not per position).
 #[inline(always)]
 fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
-    // SAFETY: same contract as hash_at.
+    // SAFETY: see the contract above; the hash itself is [`hash5_log`].
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
         (v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)) & ((1usize << log) - 1)
@@ -430,15 +447,14 @@ fn lit_value(win: &[u8], idx: usize, len: usize, lit_lens: &[u8; 256]) -> i32 {
     s * len as i32 / 4
 }
 
-/// Store `abs` as the newest position for its hash. Caller guarantees
-/// `idx` has at least `MIN_HASH` bytes of window behind it.
+/// Store `abs` as the newest position for its hash into a table of `log`
+/// bits. Caller guarantees `idx` has at least 5 bytes of window behind it.
 #[inline(always)]
-fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64) {
-    let h = hash_at(win, idx);
-    // SAFETY: the hash masks down to HASH_LOG bits and the table always
-    // holds 1 << HASH_LOG slots, so the index cannot leave it.
+fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64, log: u32) {
+    // SAFETY: hash_at_log masks to log bits and the table holds
+    // 1 << log slots, so the index cannot leave it.
     unsafe {
-        *table.get_unchecked_mut(h) = pack_pos(abs);
+        *table.get_unchecked_mut(hash_at_log(win, idx, log)) = pack_pos(abs);
     }
 }
 
@@ -508,12 +524,13 @@ fn insert_covered(
     start: usize,
     match_len: usize,
     insert_max: u64,
+    log: u32,
 ) {
     if match_len <= 16 {
         let end = (win_base + (start + match_len) as u64).min(insert_max);
         let mut p = win_base + start as u64;
         while p < end {
-            insert_at(win, table, (p - win_base) as usize, p);
+            insert_at(win, table, (p - win_base) as usize, p, log);
             p += 1;
         }
     } else {
@@ -521,9 +538,9 @@ fn insert_covered(
         let hi = base + match_len as u64 - 2;
         if hi <= insert_max {
             let lo = base + 2;
-            insert_at(win, table, (lo - win_base) as usize, lo);
+            insert_at(win, table, (lo - win_base) as usize, lo, log);
             if hi > lo {
-                insert_at(win, table, (hi - win_base) as usize, hi);
+                insert_at(win, table, (hi - win_base) as usize, hi, log);
             }
         }
     }
@@ -541,6 +558,8 @@ struct TableEmit<'a> {
     win_base: u64,
     /// Last absolute position whose hash reads stay inside the window.
     insert_max: u64,
+    /// Log of `table` (the fast strategy's hash log).
+    hash_log: u32,
 }
 
 impl TableEmit<'_> {
@@ -582,6 +601,7 @@ impl TableEmit<'_> {
             start,
             match_len,
             self.insert_max,
+            self.hash_log,
         );
         self.win_base + match_end as u64
     }
@@ -957,7 +977,7 @@ impl MatchGeneratorDriver {
             // Epoch 0 is the never-valid state of a zeroed table.
             epoch: 1,
             miss_count: 0,
-            params: FASTEST_PARAMS,
+            params: LEVEL_PARAMS[1],
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -992,7 +1012,7 @@ impl MatchGeneratorDriver {
             gap_start: u64::MAX,
             epoch: 1,
             miss_count: 0,
-            params: FASTEST_PARAMS,
+            params: LEVEL_PARAMS[1],
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1140,9 +1160,10 @@ impl MatchGeneratorDriver {
                 // single-strategy table has no chain to walk, so a buried
                 // twin is unreachable (see PREFILL_STRIDE).
                 let table = &mut self.table[..];
+                let log = self.params.hash_log;
                 let mut idx = 0;
                 while idx < last {
-                    insert_at(data, table, idx, base + idx as u64);
+                    insert_at(data, table, idx, base + idx as u64, log);
                     idx += PREFILL_STRIDE;
                 }
                 self.acquire_seed(data, last);
@@ -1614,9 +1635,12 @@ impl Matcher for MatchGeneratorDriver {
         if idx + HASH_READ <= win.len() {
             match self.params.strategy {
                 Strategy::Opt(_) => {},
-                Strategy::Chain(log) => {
-                    let h = hash_at_log(win, idx, log);
-                    // SAFETY: h is masked to log bits, the absolute block
+                Strategy::Chain(_) => {
+                    // The head hash uses params.hash_log; the pattern's
+                    // payload is the chain-table log (they differ on rows
+                    // whose head table outsizes the chain table).
+                    let h = hash_at_log(win, idx, self.params.hash_log);
+                    // SAFETY: h is masked to hash_log bits, the absolute block
                     // start to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
                     unsafe {
@@ -1639,7 +1663,13 @@ impl Matcher for MatchGeneratorDriver {
                     }
                 },
                 Strategy::Fast => {
-                    insert_at(win, &mut self.table, idx, self.block_start);
+                    insert_at(
+                        win,
+                        &mut self.table,
+                        idx,
+                        self.block_start,
+                        self.params.hash_log,
+                    );
                 },
             }
         }
@@ -1675,8 +1705,9 @@ impl MatchGeneratorDriver {
         let mut idx = (from - win_base) as usize;
         match self.params.strategy {
             Strategy::Fast => {
+                let log = self.params.hash_log;
                 while idx < to {
-                    insert_at(win, &mut self.table, idx, win_base + idx as u64);
+                    insert_at(win, &mut self.table, idx, win_base + idx as u64, log);
                     idx += 1;
                 }
             },
@@ -1695,7 +1726,8 @@ impl MatchGeneratorDriver {
                     idx += 1;
                 }
             },
-            Strategy::Chain(hash_log) => {
+            Strategy::Chain(_) => {
+                let hash_log = self.params.hash_log;
                 let chain_mask = self.chain.len() - 1;
                 let table = &mut self.table[..];
                 let chain = &mut self.chain[..];
@@ -1738,14 +1770,16 @@ impl MatchGeneratorDriver {
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
         let table_ptr: *mut u32 = self.table.as_mut_ptr();
+        let hash_log = self.params.hash_log;
         let mut emit = TableEmit {
             table: &mut self.table[..],
             literals,
             seqs,
             win_base,
             insert_max,
+            hash_log,
         };
-        let max_window = MAX_WINDOW as u64;
+        let max_window = self.params.window as u64;
         let mut pos = self.pos;
         let mut anchor = self.anchor;
         let mut miss_count = self.miss_count;
@@ -1811,9 +1845,9 @@ impl MatchGeneratorDriver {
                 // One u64 load per position feeds the hash, the 4-byte
                 // probe prefilter (its low half) and the repcode compares.
                 let v0 = read8(win, idx0);
-                let h0 = hash5(v0);
-                // SAFETY: the hash masks to HASH_LOG bits and the table always
-                // holds 1 << HASH_LOG slots (see insert_at).
+                let h0 = hash5_log(v0, hash_log);
+                // SAFETY: the hash masks to hash_log bits and the table
+                // always holds 1 << hash_log slots (see insert_at).
                 let prev0 = unsafe { *table_ptr.add(h0) };
                 let cur0 = v0 as u32;
                 let mut pair_len = 1u64;
@@ -1825,7 +1859,7 @@ impl MatchGeneratorDriver {
                     pair_len = 2;
                     idx1 = idx0 + 1;
                     let v1 = read8(win, idx1);
-                    h1 = hash5(v1);
+                    h1 = hash5_log(v1, hash_log);
                     // SAFETY: as above.
                     prev1 = unsafe { *table_ptr.add(h1) };
                     cur1 = v1 as u32;
@@ -2433,6 +2467,7 @@ impl MatchGeneratorDriver {
         let hash_log = self.params.hash_log;
         let search_depth = self.params.search_depth as usize;
         let lazy_depth = self.params.lazy_depth;
+        let min_match = self.params.min_match as usize;
         let max_window = self.params.window as u64;
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
@@ -2448,6 +2483,7 @@ impl MatchGeneratorDriver {
             seqs,
             win_base,
             insert_max,
+            hash_log,
         };
         let hash_read = HASH_READ as u64;
         let mut pos = self.pos;
@@ -2583,7 +2619,9 @@ impl MatchGeneratorDriver {
                 *table_ptr.add(h) = pack_pos(pos);
             }
 
-            if best_len < MIN_MATCH
+            // Repcode matches stay legal from MIN_MATCH up regardless of the
+            // row's min_match (libzstd's rep probe also checks 4 bytes).
+            if (best_len < min_match && !(rep_hit && best_len >= MIN_MATCH))
                 || !pays_for_offset_lit(win, idx, best_len, best_cand, rep_hit, lit_lens)
             {
                 // Grow the probe step on long literal runs (same policy as
@@ -2615,7 +2653,9 @@ impl MatchGeneratorDriver {
             } else {
                 price_of((best_pos - win_base) as usize, best_cand)
             };
-            if best_len < 64 {
+            // Greedy rows (lazy_depth 0) emit the first acceptable match
+            // without probing further positions (libzstd's ZSTD_greedy).
+            if lazy_depth > 0 && best_len < 64 {
                 // The incumbent's displaced-literal value (see lit_value);
                 // recomputed whenever the incumbent changes so both sides
                 // of the walk's gain comparisons price in fed-back literal
@@ -2681,12 +2721,12 @@ impl MatchGeneratorDriver {
                         }
                         // Chain search at the stepped position.
                         let (len2, cand2) = search(win, chain, idx2);
-                        let price2 = if len2 >= MIN_MATCH {
+                        let price2 = if len2 >= min_match {
                             price_of((p2 - win_base) as usize, cand2)
                         } else {
                             0
                         };
-                        if len2 >= MIN_MATCH {
+                        if len2 >= min_match {
                             // Cheap reject: lit_value tops out at 6 bits per
                             // byte (the clamp), so a candidate whose gain
                             // cap cannot beat the incumbent skips the four

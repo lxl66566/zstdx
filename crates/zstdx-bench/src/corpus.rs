@@ -56,9 +56,9 @@ impl LevelName {
         match self {
             LevelName::Fastest => (Level::Fastest, 1),
             LevelName::Fast => (Level::Fast, 3),
-            LevelName::Balanced => (Level::Balanced, 6),
-            LevelName::Best => (Level::Best, 12),
-            LevelName::Opt => (Level::Opt, 16),
+            LevelName::Balanced => (Level::Balanced, 9),
+            LevelName::Best => (Level::Best, 13),
+            LevelName::Opt => (Level::Opt, 17),
             LevelName::Ultra => (Level::Ultra, 19),
         }
     }

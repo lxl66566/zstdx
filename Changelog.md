@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Full 1-22 level ladder: every numeric level now selects its own parameter
+  row (`LEVEL_PARAMS`), modeled on libzstd's `clevels.h` large-source table
+  and adapted to the implemented strategies — fast rows 1-2, dfast 3-4,
+  chain rows 5-12 (greedy/lazy/lazy2 via lazy_depth 0/1/2, min_match 5,
+  search depths half libzstd's `1 << searchLog` since our per-probe chain
+  walk is dearer), opt rows 13-22 (btopt/btultra/btultra2 knobs per row;
+  rows 20-22 widen windows to W24-26 with the ring capped at bt24 and hash
+  at H22 as a u64-slot memory guard). Chain-family support added: greedy
+  (lazy walk skipped), per-row min_match (repcodes stay legal at 4). Fixed
+  a latent bug the ladder exposed: skip_matching/catch_up_insertions used
+  the chain-table log as the head-table hash log (invisible while H==C).
+  Ladder A/B vs libzstd (32MiB): json chain rows -13..-17% size, rows
+  13-15 -9..-10%; text rows 1-8 far denser (window), rows 9-12 +2.6%;
+  opt rows ±0.4%. Known inversions mirror libzstd's own (json -1 vs -3).
+  Bench A/B pairings moved to same-level comparisons (Balanced↔9,
+  Best↔13, Opt↔17). All 22 levels × 5 corpora roundtrip via libzstd CLI.
+
 - `Level` is now a newtype over the numeric libzstd level (0-22) instead of
   a strategy enum: `Level::from_zstd(n)` maps exactly, negative levels clamp
   to 1, and the named tier constants alias representative levels

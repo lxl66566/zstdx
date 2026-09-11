@@ -6,17 +6,19 @@
 
 ### Compression levels
 
-| Level | ≈zstd | Matcher strategy | Window | Notes |
-|---|---|---|---|---|
-| Uncompressed | 0 | raw block | — | |
-| Fastest | 1 | fast (hash5 single-probe table) | 768 KiB | |
-| Fast | 3-5 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | W21, aligned with libzstd L3-9 |
-| Balanced | 6-9 | hash chain + lazy | 2 MiB | H20 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
-| Best | 10-15 | low-spec optimal parser | 4 MiB | W22 / H22 / C22; 16 compares / targetLength 32 |
-| Opt | 16-17 | btopt (full port) | 8 MiB | W23 / H22 / C23 (libzstd L17 row) |
-| Ultra | 18-22 | btultra(+2) (full port) | 8 MiB | W23 / H22 / C23; 2-pass first-block statistics |
+Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `clevels.h` large-source table — see `LEVEL_PARAMS` in `encoding/match_generator.rs`); `Level::from_zstd(n)` maps exactly, negative levels clamp to 1. The named tiers alias representative rows:
 
-`approximate_zstd` maps numbers 1-22 to the nearest tier; the CLI accepts all levels. Fast/Balanced run W21 and Best/Opt/Ultra W22/W23 (libzstd's own L3-19 large-input windows; landed 2026-09-12 — the 100MB-binary corpus showed the 1MiB window alone cost 26-30% (fast/balanced) to 42-44% (best/opt/ultra) ratio there; same-window outputs match libzstd within 0.03%); Fastest keeps 768KiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
+| Tier (=level) | ≈zstd | Matcher strategy | Window | Notes |
+|---|---|---|---|---|
+| Uncompressed (0) | 0 | raw block | — | |
+| Fastest (1) | 1 | fast (hash5 single-probe table) | 768 KiB | row 2: fast H16/W20 |
+| Fast (3) | 3 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | row 4: dfast H18/C18; rows 5-12: chain family (greedy→lazy→lazy2 via lazy_depth, min_match 5, depths half libzstd's 1<<S — our per-probe walk is dearer; W21→W22, H19→H23) |
+| Balanced (9) | 9 | hash chain + lazy2 | 4 MiB | H21 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
+| Best (13) | 13 | low-spec optimal parser | 4 MiB | rows 13-15 (libzstd btlazy2 territory); W22 / H22 / C22; searchLog 4-6 / targetLength 32 |
+| Opt (17) | 17 | btopt (full port) | 8 MiB | rows 16-17; W23 / H22 / C23 (libzstd L17 row exactly) |
+| Ultra (19) | 19 | btultra(+2) (full port) | 8 MiB | rows 18-22; 2-pass first-block statistics; rows 20-22 widen to W24-26 with the ring capped at 24 and hash at 22 (u64-slot memory guard; libzstd runs C25-27/H23-25 u32 there) |
+
+First ladder A/B (2026-09-12, 32MiB json/text, vs libzstd CLI at the same level): json — every row at parity or denser except dfast rows +0.2-0.3% and opt rows +0.1-0.4%; chain rows -13..-17%, rows 13-15 -9..-10%. text — rows 1-8 far denser (window), rows 9-12 +2.6-2.7% behind (libzstd's row matcher), rows 13-16 -0.4..-5%, 17-22 +0.2-0.3%. Known inversions: our deep-chain rows (10-12) sit between our opt rows 13-16 on json (the chain is that strong there; libzstd's own ladder inverts json -1 vs -3 by 15%), and greedy row 5 trails dfast row 4 on interleaved-random shapes (libzstd's -1..-5 inverts the same way). All 22 levels × 5 corpora roundtrip through libzstd CLI. Fastest keeps 768KiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
 
 ### Codec paths
 

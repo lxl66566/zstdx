@@ -54,9 +54,9 @@ pub const SLICE: usize = 1 << 20;
 pub const LADDER: [(Level, i32); 6] = [
     (Level::Fastest, 1),
     (Level::Fast, 3),
-    (Level::Balanced, 6),
-    (Level::Best, 12),
-    (Level::Opt, 16),
+    (Level::Balanced, 9),
+    (Level::Best, 13),
+    (Level::Opt, 17),
     (Level::Ultra, 19),
 ];
 

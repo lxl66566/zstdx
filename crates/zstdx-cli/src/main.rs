@@ -35,11 +35,7 @@ enum Commands {
         /// How thoroughly the file should be compressed. A higher level will take
         /// more time to compress but result in a smaller file, and vice versa.
         ///
-        /// Maps onto the nearest implemented strategy tier:
-        ///
-        /// - 0: Uncompressed
-        /// - 1-2: Fastest, 3-5: Fast, 6-9: Balanced
-        /// - 10-15: Best, 16-17: Opt, 18+: Ultra
+        /// 1-22 follow libzstd's ladder; 0 stores uncompressed.
         #[arg(
             short,
             long,

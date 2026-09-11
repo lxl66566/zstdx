@@ -61,6 +61,46 @@ mod tests {
     use super::{compress_slice_to_vec, compress_to_vec};
     use crate::Level;
 
+    /// Every numeric level 1-22 must roundtrip through its own parameter
+    /// row, and the ladder's ends must order (level 22 well below level 1).
+    /// Adjacent-level monotonicity is NOT asserted: the dfast→greedy
+    /// transition is genuinely weaker on interleaved random fragments, and
+    /// libzstd's own ladder inverts the same way on this input (its -1
+    /// output is 10% smaller than its -5).
+    #[test]
+    fn full_ladder_roundtrip() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut input: Vec<u8> = Vec::new();
+        let mut fragment = alloc::string::String::new();
+        for i in 0..2000u32 {
+            use core::fmt::Write;
+            fragment.clear();
+            let _ = write!(fragment, "level-ladder row {i} alpha beta gamma\n");
+            input.extend_from_slice(fragment.as_bytes());
+            input.extend_from_slice(&rand().to_le_bytes());
+        }
+        input.extend((0..4096u32).map(|i| (i % 61) as u8));
+        let bottom = compress_slice_to_vec(&input, Level::Fastest).len();
+        let mut top = usize::MAX;
+        for lvl in 1..=22 {
+            let level = Level::from_zstd(lvl);
+            let compressed = compress_slice_to_vec(&input, level);
+            let decompressed = crate::bulk::decompress(&compressed, input.len()).unwrap();
+            assert_eq!(decompressed, input, "roundtrip failed at level {lvl}");
+            top = compressed.len();
+        }
+        assert!(
+            top * 6 < bottom * 5,
+            "level 22 ({top}) must beat level 1 ({bottom})"
+        );
+    }
+
     /// The slice path (borrowed matcher window, no staging) must produce the
     /// same bytes as the streaming path for every input shape: empty, tiny,
     /// block-boundary straddling, window-crossing, RLE and incompressible.
