@@ -62,6 +62,7 @@
 | AVX-512 vectorization (vpmullq) of the ≤16 full-density insertion loop | hash microbench 2.2× faster, no gain on the full loop | the bottleneck is random store throughput into the 256KB table (the store floor); **approaches that only optimize hash computation are all ineffective** |
 | PGO (trained on the full corpus) | zero gain | not worth the build-chain complexity |
 | integerizing the entropy pre-check | instructions flat | 92% of time is in histogram incq; the f64 entropy computation is near 0% |
+| package-merge back-walk buffer reuse (two swapped u32 Vecs instead of a fresh Vec per level; borrow-iter and drain-iter variants) | 9 fewer malloc/free pairs per table, but text fastest/fast Ir +0.08..+0.14% at 1 MiB and text-4K wall +0.5% (within noise) | the by-value fresh-Vec pattern (`for id in active` + `active = next`) codegens measurably better — the move lets LLVM drop buffer state across iterations; allocation count is not the walk's cost |
 
 ## MT / streaming
 
