@@ -187,39 +187,42 @@ const BALANCED_PARAMS: LevelParams = LevelParams {
 /// Level Best, roughly zstd 10-15: the optimal parser in its cheapest
 /// setting (libzstd uses btopt for these levels on smaller inputs; the
 /// hash-chain variant this replaces could not reach the tier's ratio at
-/// any search depth).
+/// any search depth). W22 mirrors libzstd's large-input ladder, where
+/// every level above 9 — including the lazy/btlazy2 tiers this maps onto —
+/// runs a 4 MiB window.
 const BEST_KNOBS: OptKnobs = OptKnobs {
     search_log: 4,
     sufficient_len: 32,
     min_match: 4,
     mls: 4,
-    bt_log: 20,
+    bt_log: 22,
     hash3_log: 0,
     ultra: false,
 };
 const BEST_PARAMS: LevelParams = LevelParams {
-    hash_log: 20,
-    window: 1 << 20,
+    hash_log: 22,
+    window: 1 << 22,
     strategy: Strategy::Opt(BEST_KNOBS),
     search_depth: 0,
     lazy_depth: 0,
 };
 
 /// Level Opt, roughly zstd 16-17 (btopt): whole-bit prices with the
-/// skip/early-abort heuristics and a 4-byte main hash. The tree ring
-/// matches the 1 MiB window so every in-window position stays linked.
+/// skip/early-abort heuristics and a 4-byte main hash. libzstd's L17
+/// large-input row is exactly W23/C23/H22. The tree ring matches the
+/// window so every in-window position stays linked.
 const OPT_KNOBS: OptKnobs = OptKnobs {
     search_log: 5,
     sufficient_len: 64,
     min_match: 4,
     mls: 4,
-    bt_log: 20,
+    bt_log: 23,
     hash3_log: 0,
     ultra: false,
 };
 const OPT_PARAMS: LevelParams = LevelParams {
-    hash_log: 20,
-    window: 1 << 20,
+    hash_log: 22,
+    window: 1 << 23,
     strategy: Strategy::Opt(OPT_KNOBS),
     search_depth: 0,
     lazy_depth: 0,
@@ -227,19 +230,22 @@ const OPT_PARAMS: LevelParams = LevelParams {
 
 /// Level Ultra, roughly zstd 18-22 (btultra/btultra2): fractional prices,
 /// 3-byte matches via the hash3 table, and the 2-pass first-block
-/// statistics seeding.
+/// statistics seeding. libzstd's L18/L19 rows declare W23 with the ring at
+/// or one past the window (C23/C24); C24's extra slack only delays ring
+/// aliasing that the window floor already rejects, so C23 carries the same
+/// full-linking invariant at half the footprint.
 const ULTRA_KNOBS: OptKnobs = OptKnobs {
     search_log: 7,
     sufficient_len: 256,
     min_match: 3,
     mls: 3,
-    bt_log: 20,
+    bt_log: 23,
     hash3_log: 17,
     ultra: true,
 };
 const ULTRA_PARAMS: LevelParams = LevelParams {
-    hash_log: 21,
-    window: 1 << 20,
+    hash_log: 22,
+    window: 1 << 23,
     strategy: Strategy::Opt(ULTRA_KNOBS),
     search_depth: 0,
     lazy_depth: 0,

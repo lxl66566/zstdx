@@ -12,11 +12,11 @@
 | Fastest | 1 | fast (hash5 single-probe table) | 768 KiB | |
 | Fast | 3-5 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | W21, aligned with libzstd L3-9 |
 | Balanced | 6-9 | hash chain + lazy | 2 MiB | H20 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
-| Best | 10-15 | low-spec optimal parser | 1 MiB | 16 compares / targetLength 32 |
-| Opt | 16-17 | btopt (full port) | 1 MiB | |
-| Ultra | 18-22 | btultra(+2) (full port) | 1 MiB | 2-pass first-block statistics |
+| Best | 10-15 | low-spec optimal parser | 4 MiB | W22 / H22 / C22; 16 compares / targetLength 32 |
+| Opt | 16-17 | btopt (full port) | 8 MiB | W23 / H22 / C23 (libzstd L17 row) |
+| Ultra | 18-22 | btultra(+2) (full port) | 8 MiB | W23 / H22 / C23; 2-pass first-block statistics |
 
-`approximate_zstd` maps numbers 1-22 to the nearest tier; the CLI accepts all levels. Fast/Balanced run W21 (libzstd's own L3-9 window; landed 2026-09-12 after the 100MB-binary corpus showed the 1MiB window alone cost 26-30% ratio there — same-window outputs match libzstd within 0.03%); Fastest keeps 768KiB and Best/Opt/Ultra keep 1MiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
+`approximate_zstd` maps numbers 1-22 to the nearest tier; the CLI accepts all levels. Fast/Balanced run W21 and Best/Opt/Ultra W22/W23 (libzstd's own L3-19 large-input windows; landed 2026-09-12 — the 100MB-binary corpus showed the 1MiB window alone cost 26-30% (fast/balanced) to 42-44% (best/opt/ultra) ratio there; same-window outputs match libzstd within 0.03%); Fastest keeps 768KiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
 
 ### Codec paths
 
@@ -38,8 +38,8 @@
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz; missing MT-path checksum |
 | decode performance | bulk ahead across the board; streaming ~75-85% | streaming residue is on json/skewed, see [current snapshot](dev/bench/snapshot.md) |
 | encode features | ~60% | seven-tier ladder + MT + streaming in place; missing dictionary encode, LDM, superblock, adjustable window |
-| encode ratio | matched at every tier | Ultra json 7.52 vs zstd-19 7.49; Opt beats zstd-16; Best beats zstd-12 |
-| encode speed | wins and losses split by tier | leading on text/skewed/zeros at multiple tiers; json low tiers behind 1.3-1.8×; Best/Opt/Ultra speed behind |
+| encode ratio | matched at every tier | dll: Best/Opt denser than zstd-12/16 (4.86 vs 4.45, 5.01 vs 4.82), Ultra 7.7% behind zstd-19; json: Opt +5%, Best +11%, Ultra parity; worst cell json.ultra.bulk-mt −1.85% |
+| encode speed | wins and losses split by tier | leading on text/skewed/zeros at multiple tiers; json low tiers behind 1.3-1.8×; Best/Opt/Ultra speed behind (json Opt 0.46× after W23 — the reach/speed trade mirrors libzstd's own ladder) |
 | API/ecosystem | ~45% | bulk + streaming + compat + CLI; missing C FFI, language bindings, standard CLI argument surface |
 
 Note: `COMPARE.md`'s completeness assessment is frozen at the `4ff2b7b` point in time; its conclusions — "encode features ~40%", "json.Best ratio gap (btopt shortfall)", "MT ratio collapse" — have been superseded by the optimal parser (`c726dfd`), package-merge Huffman (`aa07308`), the Best core swap (`b39a192`), and MT ratio retention (`a37ebaa`).
