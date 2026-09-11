@@ -30,8 +30,8 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         let mut state = self.table.start_index(data[data.len() - 1]);
         for x in data[0..data.len() - 1].iter().rev().copied() {
             let next = self.table.next_state(x, state);
-            let diff = state - next.baseline;
-            self.writer.write_bits(diff as u64, next.num_bits as usize);
+            self.writer
+                .write_bits(next.diff as u64, next.num_bits as usize);
             state = next.index;
         }
         self.writer
@@ -65,16 +65,16 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
                 let state = state_1;
                 let x = data[idx + 1];
                 let next = self.table.next_state(x, state);
-                let diff = state - next.baseline;
-                self.writer.write_bits(diff as u64, next.num_bits as usize);
+                self.writer
+                    .write_bits(next.diff as u64, next.num_bits as usize);
                 state_1 = next.index;
             }
             {
                 let state = state_2;
                 let x = data[idx];
                 let next = self.table.next_state(x, state);
-                let diff = state - next.baseline;
-                self.writer.write_bits(diff as u64, next.num_bits as usize);
+                self.writer
+                    .write_bits(next.diff as u64, next.num_bits as usize);
                 state_2 = next.index;
             }
 
@@ -91,8 +91,8 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
             let state = state_1;
             let x = data[0];
             let next = self.table.next_state(x, state);
-            let diff = state - next.baseline;
-            self.writer.write_bits(diff as u64, next.num_bits as usize);
+            self.writer
+                .write_bits(next.diff as u64, next.num_bits as usize);
             state_1 = next.index;
 
             self.writer
@@ -154,15 +154,17 @@ pub struct FSETable {
     /// Sum of all probabilities (2^acc_log).
     pub(crate) table_size: usize,
     /// Flat encoder transition table indexed by `symbol * table_size + state`,
-    /// packing the target state as
-    /// `(next_index << 16) | (num_bits << 12) | baseline`.
+    /// packing the transition as
+    /// `(next_index << 16) | (num_bits << 12) | emitted_diff`, where
+    /// `emitted_diff` is the value this state emits (`state - run_baseline`,
+    /// precomputed per position at build time).
     /// Replaces a linear scan per encoded symbol.
     pub(super) transitions: Vec<u32>,
 }
 
 impl FSETable {
     /// O(1) encoder transition: packed `(next_index << 16) | (num_bits << 12)
-    /// | baseline` for encoding `symbol` while in state `idx`.
+    /// | emitted_diff` for encoding `symbol` while in state `idx`.
     #[inline(always)]
     pub(crate) fn transition(&self, symbol: u8, idx: usize) -> u32 {
         self.transitions[symbol as usize * self.table_size + idx]
@@ -247,15 +249,15 @@ impl FSETable {
     }
 }
 
-/// Reconstruct the state a transition entry encodes. The 12-bit field
-/// packing (see [`FSETable::transitions`]) limits tables to acc_log <= 12,
-/// which `build_table_from_probabilities` asserts and every builder enforces.
+/// Reconstruct the transition an entry encodes. The 12-bit field packing
+/// (see [`FSETable::transitions`]) limits tables to acc_log <= 12, which
+/// `build_table_from_probabilities` asserts and every builder enforces.
 #[derive(Debug, Clone)]
 pub(crate) struct State {
     /// How many bits the range of this state needs to be encoded as
     pub(crate) num_bits: u8,
-    /// The first index targeted by this state
-    pub(crate) baseline: usize,
+    /// The value this transition emits: the precomputed `state - baseline`
+    pub(crate) diff: usize,
     /// Index of this state in the decoding table
     pub(crate) index: usize,
 }
@@ -264,10 +266,10 @@ impl FSETable {
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> State {
         let e = self.transition(symbol, idx);
         let num_bits = ((e >> 12) & 0xf) as u8;
-        let baseline = (e & 0xfff) as usize;
+        let diff = (e & 0xfff) as usize;
         State {
             num_bits,
-            baseline,
+            diff,
             index: (e >> 16) as usize,
         }
     }
@@ -672,7 +674,10 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         let index = start[symbol] as usize;
         let entry = (index as u32) << 16 | (acc_log as u32) << 12;
         let base = symbol * table_size;
-        transitions[base..base + table_size].fill(entry);
+        // Baseline 0: the emitted value at row position p is p itself.
+        for (p, slot) in transitions[base..base + table_size].iter_mut().enumerate() {
+            *slot = entry | p as u32;
+        }
     }
 
     // Assign baselines in ascending state-index order (identical to the old
@@ -705,8 +710,17 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             (num_bits, 1usize << num_bits)
         };
         let b = baseline[symbol];
-        let entry = ((i as u32) << 16) | ((nb as u32) << 12) | b as u32;
-        transitions[symbol * table_size + b..symbol * table_size + b + width].fill(entry);
+        let entry = ((i as u32) << 16) | ((nb as u32) << 12);
+        // The run [b, b+width) emits its own offset: a row is indexed by the
+        // state itself, so the transition value `state - b` is a build-time
+        // constant per position — the hot encoders read it straight from the
+        // entry instead of subtracting the run base at runtime.
+        for (j, slot) in transitions[symbol * table_size + b..symbol * table_size + b + width]
+            .iter_mut()
+            .enumerate()
+        {
+            *slot = entry | j as u32;
+        }
         if b < prev_baseline[symbol] {
             start[symbol] = i as u16;
         }
@@ -929,6 +943,13 @@ mod soa_tests {
                     ((e >> 12) & 0xf) as u8,
                     *nb,
                     "case {case} sym {symbol} base {baseline} nb"
+                );
+                // The run's first position emits a zero diff: the low field
+                // holds `position - run_baseline`.
+                assert_eq!(
+                    e & 0xfff,
+                    0,
+                    "case {case} sym {symbol} base {baseline} diff"
                 );
             }
         }

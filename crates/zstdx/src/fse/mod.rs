@@ -34,12 +34,18 @@ fn check_tables(dec_table: &FSETable, enc_table: &fse_encoder::FSETable) {
     for (idx, dec_state) in dec_table.decode.iter().enumerate() {
         let base = dec_state.symbol as usize * ts;
         // The transition row holds one entry per state range; find the entry
-        // targeting this state index and compare its wire parameters.
-        let entry = enc_table.transitions[base..base + ts]
+        // targeting this state index and compare its wire parameters. The
+        // low field is the precomputed `position - baseline` diff.
+        let (pos, entry) = enc_table.transitions[base..base + ts]
             .iter()
-            .find(|e| (**e >> 16) as usize == idx)
+            .enumerate()
+            .find(|(_, e)| ((**e >> 16) as usize) == idx)
             .unwrap();
-        assert_eq!((*entry & 0xfff) as usize, dec_state.base_line as usize);
+        assert_eq!(
+            (*entry & 0xfff) as usize,
+            pos - dec_state.base_line as usize,
+            "wire diff at row position {pos}"
+        );
         assert_eq!(((*entry >> 12) & 0xf) as u8, dec_state.num_bits);
     }
 }

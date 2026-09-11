@@ -522,10 +522,13 @@ fn encode_sequences(
 
                 // The three state-transition bit groups (max 12 bits each:
                 // nb <= acc_log <= 12) fit a single u64 write; concatenating
-                // them keeps the writer's hot path.
-                let of_diff = (of_state - (e_of & 0xfff) as usize) as u64;
-                let ml_diff = (ml_state - (e_ml & 0xfff) as usize) as u64;
-                let ll_diff = (ll_state - (e_ll & 0xfff) as usize) as u64;
+                // them keeps the writer's hot path. The entry's low 12 bits
+                // carry the emitted value directly (the diff is precomputed
+                // per row position at table build), so the loop never
+                // subtracts the run baseline.
+                let of_diff = (e_of & 0xfff) as u64;
+                let ml_diff = (e_ml & 0xfff) as u64;
+                let ll_diff = (e_ll & 0xfff) as u64;
                 let of_nb = ((e_of >> 12) & 0xf) as usize;
                 let ml_nb = ((e_ml >> 12) & 0xf) as usize;
                 let ll_nb = ((e_ll >> 12) & 0xf) as usize;
