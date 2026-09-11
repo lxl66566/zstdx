@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Chain-strategy lazy walk gain comparisons are now literal-cost-aware: the
+  rep probe and the chain probe price a candidate at its displaced
+  literals' fed-back code lengths (first four bytes, clamped to 6 bits —
+  uncapped 11-bit prices let cap-priced bytes dominate a whole walk's local
+  decisions; clamp sweep on balanced bulk-st: json 4726875/4701990/4697420/
+  4725425, text 91243/91232/91200/91140 at none/8/6/5) minus the offset
+  highbit, replacing the flat `ml*4` scale; at the default lengths the
+  formulas reduce bit-for-bit, and cheap-reject gain caps skip the code
+  -length gathers when even the best case cannot beat the incumbent.
+  json.balanced 6.66→7.14 (+15.7%→+24.1% ahead of zstd-6), text.balanced
+  flat (368.07→367.92, −0.57%→−0.61% vs zstd-6), all other 104 ratio cells
+  bit-identical. Cost: the better pricing accepts more walk steps on json —
+  +13% matcher instructions, json wall 119→~106 MiB/s (still ×1.72 ahead of
+  zstd-6); the same exchange pattern as the lazy walk rework, at a better
+  rate.
+
 - Chain-strategy store gate is now literal-cost-aware: the block encoder
   feeds the Huffman code lengths of each block's literal table back to the
   matcher (`Matcher::note_literal_costs`), and the gate stores a match only

@@ -377,12 +377,34 @@ fn pays_for_offset_lit(
         return true;
     }
     let price = (idx - cand).ilog2() as usize + 7;
-    let k = ml.min(8);
+    let k = ml.min(6);
     let mut cost = 0usize;
     for &b in &win[idx..idx + k] {
         cost += lit_lens[b as usize] as usize;
     }
     cost * ml >= price * k
+}
+
+/// The lazy walk's displaced-literal value of a match: the bits the match
+/// saves by covering `len` bytes instead of emitting them as literals,
+/// estimated from the first four bytes (every walk candidate is at least
+/// MIN_MATCH long) at the code lengths fed back by the block encoder (see
+/// [`MatchGeneratorDriver::lit_lens`]), clamped to 6 bits per byte — the
+/// walk is a *local* selection between adjacent positions, and uncapped
+/// 11-bit prices let cap-priced bytes dominate a whole walk's decisions
+/// (measured: no clamp / 8 / 6 / 5 on balanced bulk-st sizes — json
+/// 4726875/4701990/4697420/4725425, text 91243/91232/91200/91140; the
+/// json swing dwarfs the text one at every step). With
+/// `lit_lens == DEFAULT_LIT_LENS` this is exactly `len * 4`, so the walk's
+/// gain comparisons reduce bit-for-bit to the flat-scale versions.
+#[inline(always)]
+fn lit_value(win: &[u8], idx: usize, len: usize, lit_lens: &[u8; 256]) -> i32 {
+    debug_assert!(len >= MIN_MATCH);
+    let s = (lit_lens[win[idx] as usize] as i32).min(6)
+        + (lit_lens[win[idx + 1] as usize] as i32).min(6)
+        + (lit_lens[win[idx + 2] as usize] as i32).min(6)
+        + (lit_lens[win[idx + 3] as usize] as i32).min(6);
+    s * len as i32 / 4
 }
 
 /// Store `abs` as the newest position for its hash. Caller guarantees
@@ -2240,6 +2262,11 @@ impl MatchGeneratorDriver {
                 price_of((best_pos - win_base) as usize, best_cand)
             };
             if best_len < 64 {
+                // The incumbent's displaced-literal value (see lit_value);
+                // recomputed whenever the incumbent changes so both sides
+                // of the walk's gain comparisons price in fed-back literal
+                // code lengths instead of the flat 4 bits/byte.
+                let mut best_v = lit_value(win, (best_pos - win_base) as usize, best_len, lit_lens);
                 'lazy: loop {
                     for (attempt, &(rep_mul, rep_m, search_m)) in
                         [(3i32, 1i32, 4i32), (4, 1, 7)].iter().enumerate()
@@ -2270,17 +2297,31 @@ impl MatchGeneratorDriver {
                             let ci = (cand_abs - win_base) as usize;
                             if read4(win, ci) == read4(win, idx2) {
                                 let ml = extend_match(win, idx2, ci);
-                                if ml >= MIN_MATCH
-                                    && (ml as i32) * rep_mul
-                                        > best_len as i32 * rep_mul - best_price + rep_m
-                                {
-                                    best_len = ml;
-                                    best_cand = ci;
-                                    best_pos = p2;
-                                    best_price = 0;
-                                    rep_hit = true;
-                                    seed_hit = false;
-                                    continue 'lazy;
+                                if ml >= MIN_MATCH {
+                                    // Same gain-cap cheap reject as the
+                                    // chain probe: lit_value tops out at 6
+                                    // bits per byte (the clamp).
+                                    if 6 * ml as i32 * rep_mul / 4
+                                        > best_v * rep_mul / 4 - best_price + rep_m
+                                    {
+                                        let v = lit_value(win, idx2, ml, lit_lens);
+                                        // rep_mul keeps libzstd's rep discount
+                                        // (3/4 of the byte value at depth 1);
+                                        // at the default lens v = ml*4 and this
+                                        // is the flat ml*rep_mul comparison.
+                                        if v * rep_mul / 4
+                                            > best_v * rep_mul / 4 - best_price + rep_m
+                                        {
+                                            best_len = ml;
+                                            best_cand = ci;
+                                            best_pos = p2;
+                                            best_price = 0;
+                                            best_v = v;
+                                            rep_hit = true;
+                                            seed_hit = false;
+                                            continue 'lazy;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2291,17 +2332,24 @@ impl MatchGeneratorDriver {
                         } else {
                             0
                         };
-                        if len2 >= MIN_MATCH
-                            && len2 as i32 * 4 - price2
-                                > best_len as i32 * 4 - best_price + search_m
-                        {
-                            best_len = len2;
-                            best_cand = cand2;
-                            best_pos = p2;
-                            best_price = price2;
-                            rep_hit = false;
-                            seed_hit = false;
-                            continue 'lazy;
+                        if len2 >= MIN_MATCH {
+                            // Cheap reject: lit_value tops out at 6 bits per
+                            // byte (the clamp), so a candidate whose gain
+                            // cap cannot beat the incumbent skips the four
+                            // gathers entirely.
+                            if 6 * len2 as i32 - price2 > best_v - best_price + search_m {
+                                let v2 = lit_value(win, idx2, len2, lit_lens);
+                                if v2 - price2 > best_v - best_price + search_m {
+                                    best_len = len2;
+                                    best_cand = cand2;
+                                    best_pos = p2;
+                                    best_price = price2;
+                                    best_v = v2;
+                                    rep_hit = false;
+                                    seed_hit = false;
+                                    continue 'lazy;
+                                }
+                            }
                         }
                     }
                     break;
