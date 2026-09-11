@@ -1717,6 +1717,7 @@ impl MatchGeneratorDriver {
                 // otherwise one byte ahead so that byte becomes the literal.
                 // The probe bound is window-relative (`pidx >= rep[0]` is
                 // `probe >= win_base + rep[0]` with win_base folded out).
+                let mut rep1_armed = false;
                 {
                     let anchor_idx = (anchor - win_base) as usize;
                     // A gated job start must not probe repcodes (unknown
@@ -1730,28 +1731,51 @@ impl MatchGeneratorDriver {
                     } else {
                         idx0
                     };
+                    // OR-folded repcode prefilter for the pair: both
+                    // positions' compares collapse into one unpredictable
+                    // branch (adjacent-position rep hits are correlated, so
+                    // the fold predicts no worse than either compare alone).
+                    // A taken fold whose first position misses arms the
+                    // second position's full probe — its compare is then
+                    // known good. Probe and emission order are unchanged,
+                    // so the output is byte-identical to the two-compare
+                    // form. `cur1` reuses the already-loaded second position
+                    // (read4(idx1) is its low half); 1 = never hit, covering
+                    // both the tail pair (idx1 falls back to idx0) and the
+                    // second position sitting below the window bound.
                     if pidx >= rep[0] as usize {
-                        let mut cand = pidx - rep[0] as usize;
-                        if read4(win, cand) == read4(win, pidx) {
-                            let mut ml = extend_match(win, pidx, cand);
-                            if ml >= MIN_MATCH {
-                                let mut start = pidx;
-                                // Extend backwards into the pending literals;
-                                // the offset (pidx - cand) stays constant.
-                                while start > anchor_idx + 1
-                                    && cand > 0
-                                    && win[cand - 1] == win[start - 1]
-                                {
-                                    cand -= 1;
-                                    start -= 1;
-                                    ml += 1;
+                        let r = rep[0] as usize;
+                        let a = read4(win, pidx - r) ^ read4(win, pidx);
+                        let b = if pair_len == 2 && idx1 >= r {
+                            read4(win, idx1 - r) ^ cur1
+                        } else {
+                            1
+                        };
+                        if a == 0 || b == 0 {
+                            if a == 0 {
+                                let mut cand = pidx - r;
+                                let mut ml = extend_match(win, pidx, cand);
+                                if ml >= MIN_MATCH {
+                                    let mut start = pidx;
+                                    // Extend backwards into the pending literals;
+                                    // the offset (pidx - cand) stays constant.
+                                    while start > anchor_idx + 1
+                                        && cand > 0
+                                        && win[cand - 1] == win[start - 1]
+                                    {
+                                        cand -= 1;
+                                        start -= 1;
+                                        ml += 1;
+                                    }
+                                    anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
+                                    pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
+                                    // The chain's matches advance the cursor too.
+                                    anchor = pos;
+                                    miss_count = 0;
+                                    continue $restart;
                                 }
-                                anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                                pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
-                                // The chain's matches advance the cursor too.
-                                anchor = pos;
-                                miss_count = 0;
-                                continue $restart;
+                            } else {
+                                rep1_armed = true;
                             }
                         }
                     }
@@ -1850,31 +1874,29 @@ impl MatchGeneratorDriver {
 
             // Probe the second position through the entry prepared above.
             // `pos1 == anchor` is impossible (anchor <= pos < pos + 1), so
-            // the pending-literal select folds away here.
+            // the pending-literal select folds away here. The repcode probe
+            // is armed by the folded prefilter above (which also applies the
+            // window bound and the job-start gate), so it runs compare-free.
             if pair_len == 2 {
-                // Gated job starts skip the repcode probe (see above).
-                let pidx1 = if $gated && rep_pending != 0 { 0 } else { idx1 };
-                if pidx1 >= rep[0] as usize {
-                    let mut cand = pidx1 - rep[0] as usize;
-                    if read4(win, cand) == read4(win, pidx1) {
-                        let mut ml = extend_match(win, pidx1, cand);
-                        if ml >= MIN_MATCH {
-                            let anchor_idx = (anchor - win_base) as usize;
-                            let mut start = pidx1;
-                            while start > anchor_idx + 1
-                                && cand > 0
-                                && win[cand - 1] == win[start - 1]
-                            {
-                                cand -= 1;
-                                start -= 1;
-                                ml += 1;
-                            }
-                            anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
-                            anchor = pos;
-                            miss_count = 0;
-                            continue $restart;
+                if rep1_armed {
+                    let mut cand = idx1 - rep[0] as usize;
+                    let mut ml = extend_match(win, idx1, cand);
+                    if ml >= MIN_MATCH {
+                        let anchor_idx = (anchor - win_base) as usize;
+                        let mut start = idx1;
+                        while start > anchor_idx + 1
+                            && cand > 0
+                            && win[cand - 1] == win[start - 1]
+                        {
+                            cand -= 1;
+                            start -= 1;
+                            ml += 1;
                         }
+                        anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
+                        pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
+                        anchor = pos;
+                        miss_count = 0;
+                        continue $restart;
                     }
                 }
 
