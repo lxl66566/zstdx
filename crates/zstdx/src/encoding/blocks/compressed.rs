@@ -110,7 +110,11 @@ pub(crate) fn compress_block<M: Matcher>(
     let mut writer = BitWriter::from(output);
     if !literals.is_empty() && !zero_seq && crate::encoding::util::is_uniform(literals) {
         rle_literals(literals, &mut writer);
-    } else if literals.len() > 1024 {
+    } else if !literals.is_empty() {
+        // Any size: small literal runs carry real huffman slope (json-4KiB
+        // residual literals paid a flat ~35% block tax at the old >1024
+        // raw cutoff), and compress_literals' entropy gate plus the
+        // encoded-vs-raw comparison bound the cost of trying.
         match compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold) {
             LitOutcome::Raw => {},
             // Feed the encoding table's code lengths back to the matcher: the
@@ -885,7 +889,12 @@ fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
                 }
                 let bits_per_byte = entropy_bits / total_f
                     + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
-                if bits_per_byte + 256.0 / total as f64 + 0.08 + 0.12 >= 8.0 {
+                // Margins mirror the exact gate's: a ~160-byte worst-case
+                // weight description plus ~2% stream overhead (the old
+                // +256B/+8% wrongly raw-ed compressible small-literal
+                // blocks; sub-4KiB json paid a constant ~35% size tax
+                // against libzstd).
+                if bits_per_byte + 160.0 / total as f64 + 0.02 + 0.12 >= 8.0 {
                     return true;
                 }
             }
@@ -941,7 +950,7 @@ fn compress_literals(
                 entropy_bits -= c as f64 * entropy_log2(c as f64 / total);
             }
         }
-        if entropy_bits + 256.0 + total * 0.08 >= total * 8.0 {
+        if entropy_bits + 160.0 + total * 0.02 >= total * 8.0 {
             raw_literals(literals, writer);
             return LitOutcome::Raw;
         }

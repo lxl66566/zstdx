@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Small-literal huffman: the literals encoder's hard >1024-byte cutoff
+  (everything below went out raw) is gone — any non-empty literal run now
+  attempts huffman with the entropy gate and the encoded-vs-raw comparison
+  bounding the cost — and the gate margins model the real fixed cost
+  (~160-byte weight description + ~2% stream overhead, was +256B/+8%).
+  The cutoff showed as a flat ~35% block tax on small payloads: json-4KiB
+  went from +46%/+43%/+45% vs libzstd at -1/-9/-19 to +5.3%/−0.1%/+0.9%;
+  dictionary-encoding gap on the sub-2KiB systemd fixture +13.3% →
+  +10.3%. Large-corpus outputs move ≤0.14% (the huffman feedback into the
+  chain store gate shifts a few match decisions); ladder speeds unchanged
+  within drift.
+
 - Dictionary encoding: `EncoderOptions::dictionary` (bulk, streaming,
   compat's `Compressor::with_dictionary`/`set_dictionary` and
   `write::Encoder::with_dictionary`), `FrameCompressor::set_dictionary`,
