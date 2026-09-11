@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Incompressibility gate extended to the table strategies (Fastest/Fast/
+  Balanced): the same probe + entropy-bar gate now skips the match search
+  for near-random blocks at every level. A gated block opens a `gap_start`
+  watermark instead of being indexed; the next scanning block dense-fills
+  the gap before its first probe (`catch_up_insertions`, window-clamped),
+  so skipped blocks stay match history — a later duplicate still matches
+  (unit-tested at all four strategy families). Two sampled-distinct
+  micro-screens (reject at <32 distinct after 64 samples, <96 after 512)
+  keep never-gating corpora at ~0.1-0.5% instruction overhead. random.fast
+  1469→1678 MiB/s (x1.39→1.25), random.balanced 1405→1688 (x1.29→1.09),
+  random.fastest 1652→1681 (x1.33→1.32);
+  full-ladder dump byte-identical, 120-cell ratio sweep flat. Residual:
+  each rebuild re-rolls the fast-tier layout lottery and this build parks
+  a ~7% wall loss on text.fastest at +0.1% instructions (see
+  docs/src/dev/negative.md).
+
 - Pre-match incompressibility gate for the opt strategies (Best/Opt/Ultra):
   a strided content-tag probe (47-bit content hashes, ~2000 samples per
   block, table shared across the frame) plus an exact-histogram entropy bar

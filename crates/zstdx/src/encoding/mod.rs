@@ -224,8 +224,9 @@ pub trait Matcher {
     /// search. Implementations may only override this when skipped positions
     /// stay available as match history for later blocks (the opt strategies'
     /// tree fill is lazy, so a skipped block is indexed on the next block's
-    /// fill; a skipped block could otherwise turn a later duplicate of it
-    /// raw). The default never gates.
+    /// fill; the table strategies' next scan dense-fills the gap before its
+    /// first probe — a skipped block could otherwise turn a later duplicate
+    /// of it raw). The default never gates.
     fn skip_if_incompressible(&mut self) -> bool {
         false
     }

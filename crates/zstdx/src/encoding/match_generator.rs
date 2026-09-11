@@ -841,6 +841,15 @@ pub struct MatchGeneratorDriver {
     /// Tree fill point for the opt strategies: positions below it are
     /// already inserted into the binary tree.
     next_update: u64,
+    /// Earliest absolute position not yet offered to the search tables
+    /// (u64::MAX = none pending). An incompressibility-gated block opens
+    /// the gap at its start; the next scanning block's dense catch-up
+    /// ([`Self::catch_up_insertions`]) fills it and closes it — the table
+    /// strategies' counterpart of the opt tree's lazy `next_update` fill.
+    /// Tracked from the gate side only, so the scan loops themselves never
+    /// write it (their bodies must stay byte-identical to the ungated
+    /// build; the fast tiers pay pure layout noise for any growth).
+    gap_start: u64,
     epoch: u64,
     miss_count: usize,
     params: LevelParams,
@@ -933,6 +942,7 @@ impl MatchGeneratorDriver {
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
+            gap_start: u64::MAX,
             // Epoch 0 is the never-valid state of a zeroed table.
             epoch: 1,
             miss_count: 0,
@@ -968,6 +978,7 @@ impl MatchGeneratorDriver {
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
+            gap_start: u64::MAX,
             epoch: 1,
             miss_count: 0,
             params: FASTEST_PARAMS,
@@ -1101,6 +1112,10 @@ impl MatchGeneratorDriver {
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
             self.chain.fill(0);
         }
+        // The strip (grid fill below, or nothing for opt) is the tables'
+        // entire content: any gap a previous job left open ends here, and
+        // the job's own blocks re-open it as they gate.
+        self.gap_start = u64::MAX;
         if data.len() < HASH_READ {
             return;
         }
@@ -1353,6 +1368,7 @@ impl Matcher for MatchGeneratorDriver {
         self.seed_budget = 0;
         // The opt parser re-seeds its statistics and re-fills its tree.
         self.next_update = 0;
+        self.gap_start = u64::MAX;
         self.opt_state.reset();
     }
 
@@ -1448,6 +1464,9 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        if !matches!(self.params.strategy, Strategy::Opt(_)) {
+            self.catch_up_insertions();
+        }
         match self.params.strategy {
             Strategy::Fast => self.start_matching_fast(literals, seqs),
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
@@ -1456,15 +1475,11 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    // Outlined on purpose: with the body inlined into `compress_fastest`
+    // the block loop's layout shifted and text.fastest lost 7% wall at
+    // +0.4% instructions (pure placement). One cold call per block.
+    #[inline(never)]
     fn skip_if_incompressible(&mut self) -> bool {
-        // Only the opt strategies may gate: their skipped positions stay
-        // matchable through the tree's lazy fill (next_update never
-        // advances for a skipped block), so gating costs no ratio when a
-        // later block duplicates a gated one. The table strategies would
-        // lose the block as match history.
-        if !matches!(self.params.strategy, Strategy::Opt(_)) {
-            return false;
-        }
         let win = window_slice(&self.win, self.ext.as_ref());
         let block = &win[(self.block_start - self.win_base) as usize..];
         let total = block.len();
@@ -1482,28 +1497,55 @@ impl Matcher for MatchGeneratorDriver {
         // inputs. Any match region of a stride's length or more holds a
         // sample, so only short sparse matches escape detection — those are
         // worth under a percent of the block, the price the threshold below
-        // already accepted.
+        // already accepted. A hit exits immediately: any single repeat
+        // keeps the whole block matchable.
+        //
+        // The same pass accumulates a sampled byte bitmap: distinct < 208
+        // (the literals gate's pre-screen bar) rules the entropy bar out
+        // outright, keeping low-alphabet corpora out of the exact histogram
+        // below.
         let stride = (total >> 11) | 1;
-        let mut hits = 0u32;
+        let mut bitmap = [0u64; 4];
         let mut i = 0usize;
+        // Micro-screen checkpoints: a block whose sampled distinct count is
+        // implausibly low for a max-entropy source (uniform bytes expect 57
+        // distinct at 64 samples, 221 at 512) sits far below the entropy
+        // bar — text-like alphabets (~70 symbols) and 16-letter skewed exit
+        // at the first or second checkpoint instead of paying the rest of
+        // the probe pass. Rejecting is always the conservative side, so the
+        // screens cannot mis-gate.
+        let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
         while i + HASH_READ <= total {
             let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
             let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
             let tag = h as u32;
             if probe[slot] == tag {
-                hits += 1;
-            } else {
-                probe[slot] = tag;
+                return false;
+            }
+            probe[slot] = tag;
+            let b = h as u8 as usize;
+            bitmap[b >> 6] |= 1 << (b & 63);
+            if i == screen1 {
+                screen1 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
+                    return false;
+                }
+            } else if i == screen2 {
+                screen2 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
+                    return false;
+                }
             }
             i += stride;
         }
-        if hits != 0 {
+        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if distinct < 208 {
             return false;
         }
         // Exact byte histogram (four lanes break the store-forward chain):
         // the entropy decision must not ride on a sample's noise band —
-        // a block wrongly kept below the bar forces a full opt parse plus
-        // the window catch-up fill, hundreds of times the histogram cost.
+        // a block wrongly kept below the bar forces a full scan (plus the
+        // table catch-up fill), hundreds of times the histogram cost.
         let mut lanes = [[0u32; 256]; 4];
         let (chunks, remainder) = block.as_chunks::<4>();
         for chunk in chunks {
@@ -1534,7 +1576,17 @@ impl Matcher for MatchGeneratorDriver {
         if bits_per_byte < 7.97 {
             return false;
         }
-        self.skip_matching();
+        // Advance the cursors only. The opt strategies' tree fills the
+        // skipped range lazily from `next_update`; the table strategies
+        // open the gap at the block start, and the next scan's
+        // `catch_up_insertions` restores the block as match history before
+        // any probe reads the tables — so a later duplicate of a gated
+        // block still matches.
+        if self.gap_start == u64::MAX {
+            self.gap_start = self.block_start;
+        }
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
         true
     }
 
@@ -1586,6 +1638,76 @@ impl Matcher for MatchGeneratorDriver {
 }
 
 impl MatchGeneratorDriver {
+    /// Dense catch-up fill for the table strategies: the positions an
+    /// incompressibility-gated block skipped ([`Matcher::skip_if_incompressible`])
+    /// become searchable again before the next scan reads the tables. Gated
+    /// blocks are near-certainly matchless, so this only ever runs on a
+    /// gate→scan transition — an all-random input never pays it, and mixed
+    /// input pays it once per gated streak. The fill is dense and
+    /// oldest-to-newest exactly like a scan's miss-path inserts, so the
+    /// tables end in the state a full scan would have left; positions older
+    /// than the match window cannot resolve and are skipped (the same clamp
+    /// as the opt tree's fill).
+    #[inline(never)]
+    fn catch_up_insertions(&mut self) {
+        if self.gap_start == u64::MAX {
+            return;
+        }
+        let block_start = self.block_start;
+        let win_base = self.win_base;
+        let from = self
+            .gap_start
+            .max(win_base)
+            .max(block_start.saturating_sub(self.params.window as u64));
+        let to = (block_start - win_base) as usize;
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let mut idx = (from - win_base) as usize;
+        match self.params.strategy {
+            Strategy::Fast => {
+                while idx < to {
+                    insert_at(win, &mut self.table, idx, win_base + idx as u64);
+                    idx += 1;
+                }
+            },
+            Strategy::Dfast(small_log) => {
+                let long_log = self.params.hash_log;
+                let long = &mut self.table[..];
+                let small = &mut self.chain[..];
+                while idx < to {
+                    // SAFETY: both hashes are masked to their tables' sizes
+                    // (same pair as the dfast prefill).
+                    unsafe {
+                        let entry = pack_pos(win_base + idx as u64);
+                        *long.get_unchecked_mut(hash8_at_log(win, idx, long_log)) = entry;
+                        *small.get_unchecked_mut(hash_at_log(win, idx, small_log)) = entry;
+                    }
+                    idx += 1;
+                }
+            },
+            Strategy::Chain(hash_log) => {
+                let chain_mask = self.chain.len() - 1;
+                let table = &mut self.table[..];
+                let chain = &mut self.chain[..];
+                while idx < to {
+                    let abs = win_base + idx as u64;
+                    // SAFETY: the hash masks to hash_log bits, the absolute
+                    // position to the chain size (absolute key; see
+                    // emit_chain's note on the walk side's indexing).
+                    unsafe {
+                        let h = hash_at_log(win, idx, hash_log);
+                        let head = *table.get_unchecked(h);
+                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
+                        *table.get_unchecked_mut(h) = pack_pos(abs);
+                    }
+                    idx += 1;
+                }
+            },
+            // The opt strategies fill their tree lazily from `next_update`.
+            Strategy::Opt(_) => {},
+        }
+        self.gap_start = u64::MAX;
+    }
+
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
     fn start_matching_fast(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         // Hot state lives in locals for the whole loop: the emit helpers
@@ -2631,9 +2753,9 @@ impl MatchGeneratorDriver {
         self.seed_budget = seed_budget;
     }
 
-    /// Bridge into the optimal parser (levels Opt/Ultra): hands over the
-    /// window, the epoch-tagged tables and the persistent price state, then
-    /// stores back the cursors the parser advanced.
+    /// Bridge into the optimal parser (levels Opt/Ultra): hands over
+    /// the window, the epoch-tagged tables and the persistent price state,
+    /// then stores back the cursors the parser advanced.
     fn start_matching_opt(
         &mut self,
         knobs: OptKnobs,
@@ -3082,6 +3204,64 @@ mod tests {
             got_triple,
             "second block must match the skipped first block"
         );
+    }
+
+    #[test]
+    fn gated_block_stays_match_history() {
+        // A near-random block big enough for the incompressibility gate must
+        // gate; a later duplicate must NOT gate (probe hit) and must match
+        // into the gated block — through the catch-up fill for the table
+        // strategies, the lazy tree fill for the opt strategies.
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut block = Vec::with_capacity(20_000);
+        while block.len() < 20_000 {
+            block.extend_from_slice(&rng().to_le_bytes());
+        }
+        for level in [
+            crate::Level::Fastest,
+            crate::Level::Fast,
+            crate::Level::Balanced,
+            crate::Level::Best,
+        ] {
+            let mut driver = MatchGeneratorDriver::new(128 * 1024);
+            driver.reset(level);
+            driver.block_tail()[..block.len()].copy_from_slice(&block);
+            driver.commit_block(block.len());
+            assert!(
+                driver.skip_if_incompressible(),
+                "first block must gate at {level:?}"
+            );
+            driver.block_tail()[..block.len()].copy_from_slice(&block);
+            driver.commit_block(block.len());
+            assert!(
+                !driver.skip_if_incompressible(),
+                "duplicate must stay matchable at {level:?}"
+            );
+            let mut got_triple = false;
+            driver.start_matching(|seq| {
+                if let Sequence::Triple {
+                    offset, match_len, ..
+                } = seq
+                    && !got_triple
+                {
+                    // New-offset wire value: the actual offset is the block
+                    // length, encoded as len + 3.
+                    assert_eq!(offset, block.len() + 3, "first match offset at level");
+                    assert!(match_len > 1000, "duplicate must match wholesale");
+                    got_triple = true;
+                }
+            });
+            assert!(
+                got_triple,
+                "duplicate must match the gated block at {level:?}"
+            );
+        }
     }
 
     #[test]
