@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::bit_io::BitWriter;
+use crate::{bit_io::BitWriter, encoding::seq_codes::SEQ_CODE_SPACE};
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
     pub(super) table: FSETable,
@@ -340,9 +340,10 @@ pub(crate) fn rle_table(code: u8) -> FSETable {
 /// loses one count (its symbol is carried by the initial state), and the
 /// remaining counts are normalized with the ported FSE_normalizeCount.
 /// Returns None when normalization fails; the caller then falls back to the
-/// predefined table.
+/// predefined table. `counts` is sized to the sequence-code space (wire
+/// codes never reach 64), which also caps the normalization scratch.
 pub(crate) fn build_normalized_table(
-    counts: &mut [u32; 256],
+    counts: &mut [u32; SEQ_CODE_SPACE],
     nb_seq: usize,
     max_symbol: usize,
     max_log: u8,
@@ -356,7 +357,7 @@ pub(crate) fn build_normalized_table(
     } else {
         nb_seq
     };
-    let mut norm = [0i32; 256];
+    let mut norm = [0i32; SEQ_CODE_SPACE];
     if !normalize_count(
         &mut norm,
         table_log,

@@ -6,6 +6,11 @@
 
 use super::SeqWord;
 
+/// Exclusive upper bound of every wire code value (LL ≤ 35, ML ≤ 52,
+/// OF ≤ 31): each code fits 6 bits. Sizes the encoder-side sequence-code
+/// histograms and normalization scratch, which never see a code ≥ 64.
+pub(crate) const SEQ_CODE_SPACE: usize = 64;
+
 /// Pack one (ll, ml, of-wire) triple into the word the block encoder
 /// consumes: the three code bytes plus the code-specific add bits merged
 /// into a single payload and width.
@@ -14,6 +19,9 @@ pub(crate) fn pack_seq(ll: u32, ml: u32, of: u32) -> SeqWord {
     let (lc, la, ln) = encode_literal_length(ll);
     let (mc, ma, mn) = encode_match_len(ml);
     let (oc, oa, on) = encode_offset(of);
+    debug_assert!((lc as usize) < SEQ_CODE_SPACE);
+    debug_assert!((mc as usize) < SEQ_CODE_SPACE);
+    debug_assert!((oc as usize) < SEQ_CODE_SPACE);
     SeqWord {
         codes: lc as u32 | (mc as u32) << 8 | (oc as u32) << 16,
         add: la as u64 | ((ma as u64) << ln) | ((oa as u64) << (ln + mn)),

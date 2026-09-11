@@ -42,6 +42,7 @@
 - literals entropy lower-bound pre-check (exact histogram + Shannon bound + 8% margin; skip the Huffman attempt when it cannot beat raw; histogram and table build share one scan): random 455→1178 (+159%). `a32d2c1`
 - three-table histogram fused into a single pass (one traversal of packed codes updates the ll/ml/of counters). `6690a05`
 - fused pass lane-split: 4 sub-histograms per channel (12×1KB) break store-forward serialization on repeated-code runs; gated at nb_seq ≥ 128 (12KB zero/merge doesn't pay off on tiny blocks). choose_tables_fast cycles 2.83%→2.00% on json.fast; gungraun -0.07%.
+- **sequence-code histograms sized to the 64-entry code space** (`SEQ_CODE_SPACE`; wire codes: LL ≤ 35, ML ≤ 52, OF ≤ 31): the merged histograms, mode-selection max-scan and normalization scratch cover 64 entries instead of 256, and the small-block direct path masks codes with 0x3f so the u8 index stays provably in range. The lane arrays must stay 256-wide: with 64-wide lanes the per-sequence increments lose their provably-in-range u8 index and grow three compare-and-panic pairs per sequence (+0.3% instructions, first attempt). Byte-identical output (full-ladder dump gate); gungraun json fastest/fast −0.4%/−0.5%, text −0.4%/−0.5%.
 - log2 under no_std uses a linear-mantissa approximation (error <0.086, swallowed by the 8% margin). `9121215`
 
 ## Checksum (xxh64)

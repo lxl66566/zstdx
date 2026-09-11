@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::Matcher,
+    encoding::{Matcher, seq_codes::SEQ_CODE_SPACE},
     fse::fse_encoder::{FSETable, approx_log2, build_normalized_table, rle_table},
     huff0::huff0_encoder,
 };
@@ -210,6 +210,13 @@ impl FseTableMode<'_> {
 /// One pass over the packed codes fills all three histograms; each table's
 /// mode is then decided from its own counts (three selection passes used to
 /// scan the code stream separately).
+///
+/// Wire codes never reach 64 (LL ≤ 35, ML ≤ 52, OF ≤ 31), so the merged
+/// histograms and every downstream scan cover [`SEQ_CODE_SPACE`] entries.
+/// The lane arrays keep 256 entries though: a u8 index is provably in range
+/// there, which keeps the per-sequence increments bounds-check-free (a
+/// 64-wide lane array reintroduces three compare-and-panic pairs per
+/// sequence — measured +0.3% instructions).
 fn choose_tables_fast<'a>(
     seqs: &[crate::encoding::SeqWord],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
@@ -220,13 +227,13 @@ fn choose_tables_fast<'a>(
     ),
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
     let nb_seq = seqs.len();
-    let mut ll_counts = [0u32; 256];
-    let mut ml_counts = [0u32; 256];
-    let mut of_counts = [0u32; 256];
+    let mut ll_counts = [0u32; SEQ_CODE_SPACE];
+    let mut ml_counts = [0u32; SEQ_CODE_SPACE];
+    let mut of_counts = [0u32; SEQ_CODE_SPACE];
     if nb_seq >= 128 {
         // Four lane-split sub-histograms per channel: runs of one repeated
         // code (common in ll/ml) otherwise serialize on store-forward
-        // latency. Small blocks keep the direct pass below — the 12KB
+        // latency. Small blocks keep the direct pass below — the lane
         // zero/merge overhead does not pay off there.
         let mut lanes = [[0u32; 256]; 12];
         let (chunks, remainder) = seqs.as_chunks::<4>();
@@ -244,17 +251,19 @@ fn choose_tables_fast<'a>(
             lanes[1][((packed >> 8) & 0xff) as usize] += 1;
             lanes[2][(packed >> 16) as usize] += 1;
         }
-        for i in 0..256 {
+        for i in 0..SEQ_CODE_SPACE {
             ll_counts[i] = lanes[0][i] + lanes[3][i] + lanes[6][i] + lanes[9][i];
             ml_counts[i] = lanes[1][i] + lanes[4][i] + lanes[7][i] + lanes[10][i];
             of_counts[i] = lanes[2][i] + lanes[5][i] + lanes[8][i] + lanes[11][i];
         }
     } else {
+        // 0x3f masks make the u8 codes provably in range for the 64-wide
+        // histograms (identity on real codes, which never reach 64).
         for &word in seqs {
             let packed = word.codes;
-            ll_counts[(packed & 0xff) as usize] += 1;
-            ml_counts[((packed >> 8) & 0xff) as usize] += 1;
-            of_counts[(packed >> 16) as usize] += 1;
+            ll_counts[(packed & 0x3f) as usize] += 1;
+            ml_counts[((packed >> 8) & 0x3f) as usize] += 1;
+            of_counts[((packed >> 16) & 0x3f) as usize] += 1;
         }
     }
     let first = seqs[0].codes;
@@ -302,7 +311,7 @@ fn choose_tables_fast<'a>(
 /// cost-based path the lazy+ strategies use (the fast-strategy shortcut only
 /// engages with dictionary-provided tables, which this encoder never has).
 fn select_from_counts<'a>(
-    counts: &mut [u32; 256],
+    counts: &mut [u32; SEQ_CODE_SPACE],
     nb_seq: usize,
     first_code: u8,
     last_code: u8,
@@ -364,7 +373,11 @@ fn select_from_counts<'a>(
 /// Bits the previous table needs for this histogram: one occurrence costs
 /// log2(table_size / prob). `None` when a live symbol has no state in the
 /// table, which rules the table out entirely.
-fn repeat_bit_cost(prev: &FSETable, counts: &[u32; 256], max_symbol: usize) -> Option<f64> {
+fn repeat_bit_cost(
+    prev: &FSETable,
+    counts: &[u32; SEQ_CODE_SPACE],
+    max_symbol: usize,
+) -> Option<f64> {
     let mut bits = 0.0f64;
     for (s, &c) in counts.iter().enumerate().take(max_symbol + 1) {
         if c > 0 {
@@ -376,7 +389,7 @@ fn repeat_bit_cost(prev: &FSETable, counts: &[u32; 256], max_symbol: usize) -> O
 
 /// Shannon bound of the histogram in bits — the floor a freshly normalized
 /// table approaches but never reaches.
-fn entropy_bound_bits(counts: &[u32; 256], nb_seq: usize, max_symbol: usize) -> f64 {
+fn entropy_bound_bits(counts: &[u32; SEQ_CODE_SPACE], nb_seq: usize, max_symbol: usize) -> f64 {
     let mut bits = 0.0f64;
     for &c in &counts[..=max_symbol] {
         if c > 0 {
@@ -998,8 +1011,8 @@ mod tests {
     use super::*;
     use crate::fse::fse_encoder::default_ll_table;
 
-    fn counts_from(symbols: &[u8]) -> [u32; 256] {
-        let mut counts = [0u32; 256];
+    fn counts_from(symbols: &[u8]) -> [u32; SEQ_CODE_SPACE] {
+        let mut counts = [0u32; SEQ_CODE_SPACE];
         for &s in symbols {
             counts[s as usize] += 1;
         }
