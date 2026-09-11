@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- New `zstdx-bench ratio` subcommand: a compression-ratio sweep over every
+  ladder level x bulk/streaming x single-/multi-thread (120 cells on the full
+  corpus), one deterministic pass per cell with the libzstd reference side,
+  running cells concurrently on a rayon pool so the full sweep finishes in
+  about a minute. Sizes diff cleanly across runs and builds, every zstdx
+  cell is roundtrip-gated through both decoders, and a scale-free geo-mean
+  Δ% summary (per level x mode, per mode, per shape, worst/best cells) is
+  printed last so `tail` sees the verdict. The crate also gained a Readme
+  documenting the usage of every subcommand.
+
 - Fix a decode panic on malformed frames found by fuzzing: the flat
   sequence executor folded the output's virtual base into `vbase_op` with a
   wrapping subtraction, but the cold wrapped-match path re-materialized

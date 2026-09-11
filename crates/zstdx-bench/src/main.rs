@@ -27,6 +27,9 @@ enum Command {
     /// The heavyweight tool; run sections or single shapes/levels instead of
     /// `all` when iterating.
     Matrix(cmd::matrix::Args),
+    /// Compression-ratio sweep: every level x bulk/stream x st/mt, one
+    /// deterministic pass per cell (parallel), geo-mean summary at the end.
+    Ratio(cmd::ratio::Args),
     /// Small-payload encode (1 KiB - 1 MiB) vs the zstd crate, per-call
     /// throughput including allocator effects.
     Small(cmd::small::Args),
@@ -55,6 +58,7 @@ enum Command {
 fn main() {
     match Cli::parse().command {
         Command::Matrix(args) => cmd::matrix::run(&args),
+        Command::Ratio(args) => cmd::ratio::run(&args),
         Command::Small(args) => cmd::small::run(&args),
         Command::Files(args) => cmd::files::run(&args),
         Command::Prof(args) => cmd::prof::run(&args),

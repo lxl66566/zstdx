@@ -5,5 +5,6 @@ pub mod matrix;
 pub mod mtcheck;
 pub mod prefill;
 pub mod prof;
+pub mod ratio;
 pub mod seqstats;
 pub mod small;

@@ -105,6 +105,31 @@ Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB
 | skewed.zst9 | 637 | 438 | 441 | 441 | 438 | 788 |
 | random.zst3 | 9720 | 9511 | 9523 | 9507 | 9445 | 8777 |
 
+## Compression-ratio sweep (new `zstdx-bench ratio`, 2026-09-11)
+
+Full matrix 5 shapes × 6 levels × {bulk,stream} × {st,mt4}, one deterministic
+pass per cell, checksums off; Δ% = ours/zstd ratio − 1, geo-mean. Wall 94 s
+(rayon `--parallel 8`, 32C). Raw 120-cell table in [matrix.md](matrix.md).
+Geo-mean Δ per mode: bulk-st **+1.6%**, bulk-mt
+**+13.5%**, stream-st **+11.6%**, stream-mt **+13.4%**; overall +9.9%.
+Per shape: json +4.0%, text +47%, skewed +2.5%, random ±0, zeros +2.1%.
+
+- ST bulk: denser at every level (fastest +0.34 → best +5.28, ultra +0.11);
+  worst single cell text.balanced.bulk-st −2.35% (zstd-6 wins that pairing).
+- The mt/stream margins are libzstd's losses, not our gains: zstd-mt on text
+  collapses (fastest 39.8 vs our 309, fast 189 vs 333) while our mt stays
+  within ~0.1% of our ST; zstd's unknown-size streaming at level 1 emits
+  1.84 MB (ratio 18.3) where our streaming matches our bulk (309).
+- random ties byte-exact with zstd at almost every cell (Δ 0.00%); zeros mt:
+  zstd-mt loses ~10% ratio, ours none.
+
+Directions from this sweep (details in [todo.md](../todo.md) items 12-13):
+text.Balanced −2.3% is the only sizable deficit (chain matcher vs zstd-6
+lazy2 on long-range repeats); text.Ultra −0.6% marginal; skewed opt/ultra
+residues ≤0.1%. Self-inflicted: stream-mt pays up to +0.44% vs our own bulk
+(burst job boundaries ≠ bulk splitter). Anomaly: json.opt bulk-mt is 0.44%
+denser than bulk-st — worth understanding, possibly liftable into ST.
+
 ## Top open deficits (from this run)
 
 - Best-level encoder core speed: x2.4-29 behind zstd-12 across shapes; also caps json/text best streaming (bulk and stream MT both x2.3-4.0).

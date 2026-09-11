@@ -62,6 +62,18 @@ impl LevelName {
             LevelName::Ultra => (Level::Ultra, 19),
         }
     }
+
+    /// Lowercase row/tag name shared by the bench outputs.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            LevelName::Fastest => "fastest",
+            LevelName::Fast => "fast",
+            LevelName::Balanced => "balanced",
+            LevelName::Best => "best",
+            LevelName::Opt => "opt",
+            LevelName::Ultra => "ultra",
+        }
+    }
 }
 
 pub const LADDER: [LevelName; 6] = [

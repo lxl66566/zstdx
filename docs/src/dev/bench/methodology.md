@@ -18,6 +18,7 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 
 | Subcommand | Purpose |
 |---|---|
+| `ratio` | Compression-ratio sweep: one deterministic pass per cell over every level × bulk/stream × st/mt (120 cells full corpus), zstdx vs libzstd, roundtrip-gated; cells run concurrently on a rayon pool (`--parallel`, default 8 — sizes only, ST cells still use the ST encoder), geo-mean Δ% summary printed last (tail-friendly); sizes diff cleanly across runs/builds |
 | `matrix` | Wide-coverage matrix: `--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` covers the five segments, interleaved A/B + roundtrip gate; `--shape/--level/--workers/--mt-workers` filter cells, `--budget-ms` caps the per-side budget |
 | `small` | 1KiB-1MiB small loads; `--size`/`--impl` pin a single size and a single impl (for profiler targeting) |
 | `files` | Decoding timing for arbitrary .zst files (budget-based; automatically finds the `.raw`/bare-stem reference for verification via any `zst*` suffix) |
@@ -28,7 +29,9 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 | `seqstats` | Sequence statistics and entropy lower bound |
 | `prefill` | prefill_window micro (`--shape/--level` selects) |
 
-Common harness (`src/common.rs` in the crate): per-round interleaving, warmup, time budget (`--budget-ms`, default 500ms/side; equivalent to the old BENCH_BUDGET_MS env, which still works), median/mad statistics.
+Common harness (`src/common.rs` in the crate): per-round interleaving, warmup, time budget (`--budget-ms`, default 500ms/side; equivalent to the old BENCH_BUDGET_MS env, which still works), median/mad statistics. The crate's Readme documents every subcommand's usage.
+
+Ratio-bench workflow note: run `ratio` after every encoder-touching change; it is single-pass and parallel (~1 min full sweep), and its output is fully deterministic — `diff` two captures to attribute size changes. For changes that must not alter output at all, `dump` + `cmp -r` remains the byte-exact gate.
 
 Deleted one-off tools (all covered): bench_compare / bench_encode (matrix `dec-st`/`enc-st` + filters), bench_corpus (files), ab_fast / ab_mt (matrix + filters), compression_ratio (small), stream_cmp (small-block streaming reads for fuzz decode), criterion decode_all (files).
 
