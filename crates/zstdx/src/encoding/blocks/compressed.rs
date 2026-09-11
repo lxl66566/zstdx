@@ -223,11 +223,39 @@ fn choose_tables_fast<'a>(
     let mut ll_counts = [0u32; 256];
     let mut ml_counts = [0u32; 256];
     let mut of_counts = [0u32; 256];
-    for &word in seqs {
-        let packed = word.codes;
-        ll_counts[(packed & 0xff) as usize] += 1;
-        ml_counts[((packed >> 8) & 0xff) as usize] += 1;
-        of_counts[(packed >> 16) as usize] += 1;
+    if nb_seq >= 128 {
+        // Four lane-split sub-histograms per channel: runs of one repeated
+        // code (common in ll/ml) otherwise serialize on store-forward
+        // latency. Small blocks keep the direct pass below — the 12KB
+        // zero/merge overhead does not pay off there.
+        let mut lanes = [[0u32; 256]; 12];
+        let (chunks, remainder) = seqs.as_chunks::<4>();
+        for chunk in chunks {
+            for (l, w) in lanes.chunks_exact_mut(3).zip(chunk) {
+                let packed = w.codes;
+                l[0][(packed & 0xff) as usize] += 1;
+                l[1][((packed >> 8) & 0xff) as usize] += 1;
+                l[2][(packed >> 16) as usize] += 1;
+            }
+        }
+        for &w in remainder {
+            let packed = w.codes;
+            lanes[0][(packed & 0xff) as usize] += 1;
+            lanes[1][((packed >> 8) & 0xff) as usize] += 1;
+            lanes[2][(packed >> 16) as usize] += 1;
+        }
+        for i in 0..256 {
+            ll_counts[i] = lanes[0][i] + lanes[3][i] + lanes[6][i] + lanes[9][i];
+            ml_counts[i] = lanes[1][i] + lanes[4][i] + lanes[7][i] + lanes[10][i];
+            of_counts[i] = lanes[2][i] + lanes[5][i] + lanes[8][i] + lanes[11][i];
+        }
+    } else {
+        for &word in seqs {
+            let packed = word.codes;
+            ll_counts[(packed & 0xff) as usize] += 1;
+            ml_counts[((packed >> 8) & 0xff) as usize] += 1;
+            of_counts[(packed >> 16) as usize] += 1;
+        }
     }
     let first = seqs[0].codes;
     let last = seqs[nb_seq - 1].codes;
