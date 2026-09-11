@@ -284,8 +284,8 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: Level,
-    /// Known whole-frame length (see [`Self::set_size_hint`]).
-    size_hint: Option<u64>,
+    /// Caller-declared input shape (see [`Self::set_input_shape`]).
+    input_shape: crate::InputShape,
     state: CompressState<M>,
     hasher: FrameHasher,
 }
@@ -343,14 +343,14 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
 
 /// Reset a pooled state for a new frame: the matcher's epoch bump retires
 /// stale hash entries and the entropy tables return to their defaults.
-/// `src_hint` is the whole-frame input length when known (sizes the
-/// matcher's window/tables; see [`Matcher::set_source_hint`]).
+/// `shape` carries what the caller declared about the input (length,
+/// forced window; see [`Matcher::set_input_shape`]).
 pub(crate) fn reset_slice_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     level: Level,
-    src_hint: Option<u64>,
+    shape: crate::InputShape,
 ) {
-    state.matcher.set_source_hint(src_hint);
+    state.matcher.set_input_shape(shape);
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
@@ -362,15 +362,15 @@ pub(crate) fn reset_slice_state(
 /// `level`. Fresh states are built (and reset) when the pool is empty.
 pub(crate) fn take_slice_state(
     level: Level,
-    src_hint: Option<u64>,
+    shape: crate::InputShape,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
-        reset_slice_state(&mut s, level, src_hint);
+        reset_slice_state(&mut s, level, shape);
         return s;
     }
     let mut fresh = alloc::boxed::Box::new(new_slice_state());
-    reset_slice_state(&mut fresh, level, src_hint);
+    reset_slice_state(&mut fresh, level, shape);
     fresh
 }
 
@@ -395,8 +395,24 @@ pub fn compress_slice_to_vec(src: &[u8], level: Level) -> Vec<u8> {
 /// header flag and the trailing hash follow `checksum`, modulo the `hash`
 /// feature).
 pub fn compress_slice_opts(src: &[u8], level: Level, checksum: bool) -> Vec<u8> {
-    let hint = (src.len() as u64).into();
-    let mut state = take_slice_state(level, hint);
+    compress_slice_shaped(src, level, checksum, crate::InputShape {
+        len: None,
+        window_log: None,
+    })
+}
+
+/// [`compress_slice_opts`] with caller-declared input shape: a forced
+/// window log overrides the level's row, and the exact length (always
+/// known here) downsizes the row to the source.
+pub fn compress_slice_shaped(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+) -> Vec<u8> {
+    let mut shape = shape;
+    shape.len = Some(src.len() as u64);
+    let mut state = take_slice_state(level, shape);
     let output = compress_with_state(&mut state, src, level, checksum);
     return_slice_state(state);
     output
@@ -412,7 +428,8 @@ fn compress_with_state(
     // Worst case (every block raw) is the input size plus block headers;
     // reserving it up front keeps the output free of realloc copies, and the
     // untouched tail of the reservation only costs address space.
-    let block_size = crate::common::MAX_BLOCK_SIZE as usize;
+    // A window below 128 KiB (forced or source-downsized) caps blocks too.
+    let block_size = state.matcher.block_size();
     let block_overhead = 3 * (src.len() / block_size + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     let header = FrameHeader {
@@ -486,7 +503,7 @@ pub(crate) fn compress_job_blocks(
     overlap: usize,
     is_last_job: bool,
 ) -> Vec<u8> {
-    let block_size = crate::common::MAX_BLOCK_SIZE as usize;
+    let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
     let mut output = Vec::with_capacity(job.len() + 3 * (job.len() / block_size + 1) + 8);
     // Uniform detection still runs (the RLE path), but the frame checksum is
@@ -527,7 +544,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             uncompressed_data: None,
             compressed_data: None,
             compression_level,
-            size_hint: None,
+            input_shape: crate::InputShape::default(),
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
@@ -552,7 +569,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 scratch: super::blocks::compressed::BlockScratch::default(),
             },
             compression_level,
-            size_hint: None,
+            input_shape: crate::InputShape::default(),
             hasher: FrameHasher::new(),
         }
     }
@@ -571,12 +588,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
-    /// Declare the source's total length before [`FrameCompressor::compress`]:
-    /// the matcher sizes its window and tables to it (unknown keeps the
-    /// level's defaults). Must be called after `set_source`/`set_drain` and
-    /// before `compress`; re-declared per frame.
-    pub fn set_size_hint(&mut self, hint: Option<u64>) {
-        self.size_hint = hint;
+    /// Declare the input shape (known length, forced window log) before
+    /// [`FrameCompressor::compress`]: the matcher sizes its window and tables
+    /// accordingly (unset keeps the level's defaults). Must be called after
+    /// `set_source`/`set_drain` and before `compress`; re-declared per frame.
+    pub fn set_input_shape(&mut self, shape: crate::InputShape) {
+        self.input_shape = shape;
     }
 
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to
@@ -590,7 +607,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// can use the [Read::take] function
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.set_source_hint(self.size_hint);
+        self.state.matcher.set_input_shape(self.input_shape);
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
         self.hasher = FrameHasher::new();
@@ -611,7 +628,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         loop {
             // Read a single block's worth of uncompressed data straight into
             // the tail of the matcher's window (no intermediate buffer copy).
-            let tail = self.state.matcher.block_tail();
+            // A window below 128 KiB caps the block size with it.
+            let cap = self.state.matcher.block_size();
+            let tail = &mut self.state.matcher.block_tail()[..cap];
             let mut read_bytes = 0;
             let last_block;
             'read_loop: loop {
@@ -770,8 +789,11 @@ mod tests {
             let mut libzstd = Vec::new();
             zstd::stream::copy_decode(compressed.as_slice(), &mut libzstd).unwrap();
             assert_eq!(libzstd, data, "libzstd interop {level:?}");
-            let streamed =
-                crate::encoding::compress_to_vec_sized(data.as_slice(), level, data.len() as u64);
+            let streamed = crate::encoding::compress_to_vec_shaped(
+                data.as_slice(),
+                level,
+                crate::InputShape::default().with_len(data.len() as u64),
+            );
             assert_eq!(streamed, compressed, "slice/stream identity {level:?}");
             sizes.push((level, compressed.len()));
         }

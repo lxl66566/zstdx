@@ -24,9 +24,9 @@ use super::{
     opt::{OptKnobs, OptScratch, OptState},
     seq_codes::{decode_packed, pack_seq},
 };
-use crate::Level;
 // Shared with the decoder so both sides agree on offset-history semantics.
 use crate::decoding::sequence_execution::do_offset_history;
+use crate::{InputShape, Level};
 
 /// Shortest match worth encoding; matches the format's MINMATCH range.
 pub(super) const MIN_MATCH: usize = 4;
@@ -289,15 +289,21 @@ fn params_for_level(level: Level) -> LevelParams {
     LEVEL_PARAMS[level.as_i32().clamp(0, 22) as usize]
 }
 
-/// [`params_for_level`] downsized to a known source length; raw-block
-/// frames keep the row's window untouched (their declared window never
-/// affects bytes, and staying hint-independent keeps outputs stable).
-fn params_for(level: Level, src_hint: Option<u64>) -> LevelParams {
-    let p = params_for_level(level);
+/// [`params_for_level`] adjusted to what the caller declared about the
+/// input: a forced window log overrides the row's window first, then a
+/// known length downsizes (libzstd's override-then-adjust order, so a
+/// known smaller length still clamps a forced window). Raw-block frames
+/// keep the row untouched (their declared window never affects bytes, and
+/// staying shape-independent keeps outputs stable).
+fn params_for(level: Level, shape: InputShape) -> LevelParams {
+    let mut p = params_for_level(level);
+    if let Some(wl) = shape.window_log {
+        p.window = 1usize << wl.clamp(10, 27);
+    }
     if level == Level::Uncompressed {
         p
     } else {
-        adjust_params(p, src_hint)
+        adjust_params(p, shape.len)
     }
 }
 
@@ -961,9 +967,9 @@ pub struct MatchGeneratorDriver {
     /// of a seed that never matches.
     seed_budget: u32,
     slice_size: usize,
-    /// Known whole-frame input length (see [`Matcher::set_source_hint`]);
-    /// applied at the next `reset` via [`adjust_params`].
-    src_hint: Option<u64>,
+    /// Caller-declared input shape (see [`Matcher::set_input_shape`]);
+    /// applied at the next `reset` via [`params_for`].
+    shape: InputShape,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -993,8 +999,15 @@ impl MatchGeneratorDriver {
     /// The window size frames compressed at `level` (and, when known, the
     /// source length) declare in their header; usable without constructing
     /// an instance. Must agree with the matcher's own reset call.
-    pub fn window_for_level(level: Level, src_hint: Option<u64>) -> u64 {
-        params_for(level, src_hint).window as u64
+    pub fn window_for_level(level: Level, shape: InputShape) -> u64 {
+        params_for(level, shape).window as u64
+    }
+
+    /// Largest block the frame may carry: the format caps blocks at the
+    /// declared window (RFC 8878: Block_Maximum_Size = min(window, 128K)),
+    /// so a forced or downsized window below 128 KiB shrinks the blocks.
+    pub fn block_size(&self) -> usize {
+        (crate::common::MAX_BLOCK_SIZE as usize).min(self.params.window)
     }
 
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
@@ -1025,7 +1038,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             params: LEVEL_PARAMS[1],
-            src_hint: None,
+            shape: InputShape::default(),
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1061,7 +1074,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             params: LEVEL_PARAMS[1],
-            src_hint: None,
+            shape: InputShape::default(),
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1075,7 +1088,7 @@ impl MatchGeneratorDriver {
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let params = params_for(level, self.src_hint);
+        let params = params_for(level, self.shape);
         if params != self.params {
             // Exactly one table family is live per strategy; switching
             // families drops the other's buffers.
@@ -1420,8 +1433,8 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
 }
 
 impl Matcher for MatchGeneratorDriver {
-    fn set_source_hint(&mut self, hint: Option<u64>) {
-        self.src_hint = hint;
+    fn set_input_shape(&mut self, shape: InputShape) {
+        self.shape = shape;
     }
 
     fn reset(&mut self, level: Level) {

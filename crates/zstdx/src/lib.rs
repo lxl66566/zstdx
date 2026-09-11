@@ -60,7 +60,7 @@ pub mod stream;
 pub use bulk::{compress, decompress};
 pub use error::{Error, Feature, ParameterError, Result};
 pub use level::Level;
-pub use options::{DecoderOptions, EncoderOptions};
+pub use options::{DecoderOptions, EncoderOptions, InputShape};
 
 pub(crate) mod blocks;
 

@@ -16,7 +16,9 @@ pub(crate) mod frame_compressor;
 mod levels;
 use alloc::vec::Vec;
 
-pub use frame_compressor::{FrameCompressor, compress_slice_opts, compress_slice_to_vec};
+pub use frame_compressor::{
+    FrameCompressor, compress_slice_opts, compress_slice_shaped, compress_slice_to_vec,
+};
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
 use seq_codes::pack_seq;
@@ -54,13 +56,18 @@ pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
     vec
 }
 
-/// [`compress_to_vec`] with a known source length: the matcher sizes its
-/// window and tables to the source, and the output matches
-/// [`compress_slice_to_vec`] on the same data byte for byte.
-pub fn compress_to_vec_sized<R: Read>(source: R, level: Level, len: u64) -> Vec<u8> {
+/// [`compress_to_vec`] with a caller-declared input shape: the matcher
+/// sizes its window and tables accordingly, and a bare known length makes
+/// the output match [`compress_slice_to_vec`] on the same data byte for
+/// byte.
+pub fn compress_to_vec_shaped<R: Read>(
+    source: R,
+    level: Level,
+    shape: crate::InputShape,
+) -> Vec<u8> {
     let mut vec = Vec::new();
     let mut frame_enc = FrameCompressor::new(level);
-    frame_enc.set_size_hint(Some(len));
+    frame_enc.set_input_shape(shape);
     frame_enc.set_source(source);
     frame_enc.set_drain(&mut vec);
     frame_enc.compress();
@@ -143,7 +150,11 @@ mod tests {
         for input in &inputs {
             assert_eq!(
                 compress_slice_to_vec(input, Level::Fastest),
-                super::compress_to_vec_sized(input.as_slice(), Level::Fastest, input.len() as u64),
+                super::compress_to_vec_shaped(
+                    input.as_slice(),
+                    Level::Fastest,
+                    crate::InputShape::default().with_len(input.len() as u64)
+                ),
                 "mismatch at len {}",
                 input.len()
             );
@@ -257,16 +268,24 @@ pub trait Matcher {
     }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: Level);
-    /// Declare the whole-frame input length before [`Matcher::reset`], when
-    /// known: the built-in matcher downsizes its window and tables to the
-    /// source (libzstd's `ZSTD_adjustCParams`). The hint is per frame —
+    /// Declare what the caller knows about the whole frame before
+    /// [`Matcher::reset`]: its exact length (the built-in matcher downsizes
+    /// window and tables to the source, libzstd's `ZSTD_adjustCParams`)
+    /// and/or a forced window log overriding the level's row. Per frame —
     /// implementations must not carry it across resets.
-    fn set_source_hint(&mut self, _hint: Option<u64>) {}
+    fn set_input_shape(&mut self, _shape: crate::InputShape) {}
     /// The size of the window the decoder will need to execute all sequences produced by this
     /// matcher
     ///
     /// May change after a call to reset with a different compression level
     fn window_size(&self) -> u64;
+    /// Largest block the matcher's frames may carry; the format caps blocks
+    /// at the declared window (RFC 8878: Block_Maximum_Size =
+    /// min(window, 128K)), so a window below 128 KiB must shrink blocks.
+    /// The default keeps the format maximum.
+    fn block_size(&self) -> usize {
+        crate::common::MAX_BLOCK_SIZE as usize
+    }
     /// Snapshot the repeated-offset history maintained by the matcher
     ///
     /// A block whose generated sequences are ultimately not emitted (raw block

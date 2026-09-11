@@ -455,7 +455,7 @@ mod mt {
         for workers in [2u32, 4] {
             for checksum in [true, false] {
                 let bulk_mt =
-                    encoding::mt::compress_slice_mt(&data, Level::Fastest, checksum, workers);
+                    encoding::mt::compress_slice_mt(&data, Level::Fastest, checksum, workers, None);
                 let streamed = encode_write(
                     &data,
                     1024 * 1024,

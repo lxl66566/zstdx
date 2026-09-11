@@ -100,4 +100,14 @@ mod tests {
         assert_eq!(Level::DEFAULT, Level::Fastest);
         assert_eq!(Level::Ultra.as_i32(), 19);
     }
+
+    #[test]
+    fn forced_window_log_reaches_matcher() {
+        use crate::encoding::{MatchGeneratorDriver, Matcher as _};
+
+        let mut d = MatchGeneratorDriver::new_direct();
+        d.set_input_shape(crate::InputShape::default().with_window_log(15));
+        d.reset(Level::Ultra);
+        assert_eq!(d.window_size(), 1 << 15);
+    }
 }

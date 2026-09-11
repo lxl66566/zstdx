@@ -1,5 +1,9 @@
 # Pitfall Log · Encoding
 
+## Frame format
+
+- **Block size is capped by the declared window** (RFC 8878: Block_Maximum_Size = min(window, 128K)). The srcSize adjustment can never trigger this (window ≥ ceil_log2(src) ≥ src), so only a forced window log below 128K exposed it — libzstd rejected even all-raw frames ("Data corruption detected", error 36) while our own permissive decoder accepted them. Every emission path now reads `Matcher::block_size`; when adding any window-shaping knob, grep `MAX_BLOCK_SIZE` in emission paths first.
+
 ## Matcher
 
 - **commit_space set the pos cursor to the block end → matcher fully idle** (all blocks degraded to pure literals), while rebuild-style unit tests kept passing — must be paired with skip_matching index-validity assertions and repcode emission assertions.

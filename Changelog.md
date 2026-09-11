@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Forced window log (`EncoderOptions::with_input_shape`,
+  `InputShape::with_window_log`, clamped 10..=27): overrides the level's
+  row before the length adjustment, as in libzstd's param-override order
+  (a known smaller length still clamps it). Plumbed through bulk, MT and
+  streaming paths plus the CLI-sized `FrameCompressor`. Landing it exposed
+  a spec rule the encoder had been violating on sub-128KiB windows: the
+  format caps blocks at the declared window (RFC 8878
+  Block_Maximum_Size = min(window, 128K)) — every path now sizes blocks
+  through `Matcher::block_size` (default keeps 128K); before the fix
+  libzstd rejected our small-window frames ("Data corruption detected"),
+  including all-raw ones. Verified: 7 levels x W14-20 matrices plus raw
+  and periodic inputs roundtrip through libzstd.
+
 - Source-length parameter adjustment (port of libzstd's
   `ZSTD_adjustCParams`): when the input length is known the level's row
   downsizes — window to the source's log, hash tables to windowLog+1,

@@ -66,7 +66,9 @@ pub(crate) struct MtEncoderCore {
     /// Jobs buffered before a burst fires: at least one full round of
     /// workers, amortizing the thread spawn.
     burst_jobs: usize,
-    pledged: Option<u64>,
+    /// The frame's declared shape (length = the pledge, plus the forced
+    /// window log); shared by every job so tables and the header agree.
+    shape: crate::InputShape,
     hasher: StreamChecksum,
     header: Vec<u8>,
     /// [strip of already-encoded history for the next job's matches] followed
@@ -91,7 +93,13 @@ pub(crate) struct MtEncoderCore {
 impl MtEncoderCore {
     pub(crate) fn new(options: &EncoderOptions) -> Self {
         let checksum = options.checksum && cfg!(feature = "hash");
-        let window = MatchGeneratorDriver::window_for_level(options.level, options.pledged_size);
+        // The pledge is the frame's authoritative length; the forced window
+        // log rides along so the jobs' tables and the header window agree.
+        let shape = crate::InputShape {
+            len: options.pledged_size,
+            window_log: options.input_shape.window_log,
+        };
+        let window = MatchGeneratorDriver::window_for_level(options.level, shape);
         let overlap = window as usize;
         // A pledge sizes the grid like the bulk path (byte-identical output
         // when the input matches the pledge); an open-ended stream grows
@@ -121,7 +129,8 @@ impl MtEncoderCore {
             grid,
             overlap,
             burst_jobs: (options.workers as usize).max(2),
-            pledged: options.pledged_size,
+
+            shape,
             hasher: if checksum {
                 StreamChecksum::On(FrameHasher::new())
             } else {
@@ -239,7 +248,7 @@ impl MtEncoderCore {
             JobGrid::Fixed(size) => {
                 let size = size as u64;
                 let complete = ((self.pos - self.job_start) / size) as usize;
-                let jobs = match self.pledged {
+                let jobs = match self.shape.len {
                     Some(n) if self.pos <= n => {
                         let pledged_jobs = (n - self.job_start).div_ceil(size);
                         complete.min(pledged_jobs.saturating_sub(1) as usize)
@@ -303,7 +312,7 @@ impl MtEncoderCore {
                 last_frame_block,
                 self.level,
                 self.job_start > 0,
-                self.pledged,
+                self.shape,
             );
             self.pool.lock().unwrap().push(state);
             self.output.extend_from_slice(&bytes);
@@ -320,7 +329,7 @@ impl MtEncoderCore {
             let level = self.level;
             let job_start = self.job_start;
             let bounds = &bounds[..];
-            let pledged = self.pledged;
+            let shape = self.shape;
 
             // Disjoint field borrows: the workers share `src` and the state
             // pool while the calling thread runs the checksum absorb and the
@@ -360,7 +369,7 @@ impl MtEncoderCore {
                                         last_frame_block && id + 1 == n_jobs,
                                         level,
                                         gate,
-                                        pledged,
+                                        shape,
                                     )
                                 }));
                             match attempt {

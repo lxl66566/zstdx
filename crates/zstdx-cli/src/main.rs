@@ -105,7 +105,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         File::create(output).wrap_err("failed to open output file for writing")?;
 
     let mut compressor = zstdx::encoding::FrameCompressor::new(compression_level);
-    compressor.set_size_hint(Some(source_size as u64));
+    compressor.set_input_shape(zstdx::InputShape::default().with_len(source_size as u64));
     compressor.set_source(encoder_input);
     compressor.set_drain(&output_file);
     compressor.compress();

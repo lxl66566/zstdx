@@ -12,6 +12,40 @@
 
 use crate::Level;
 
+/// Externally declared input shape: what the caller knows about the whole
+/// frame beyond the level. Applied to the level's parameter row when the
+/// encoder resets.
+///
+/// ```rust
+/// use zstdx::{EncoderOptions, InputShape, Level};
+/// let shape = InputShape::default().with_window_log(18);
+/// let opts = EncoderOptions::new(Level::Fastest).with_input_shape(shape);
+/// ```
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct InputShape {
+    /// Whole-frame byte length, when known: the window and tables downsize
+    /// to the source (libzstd's `ZSTD_adjustCParams`).
+    pub len: Option<u64>,
+    /// Forced window log (clamped to 10..=27), overriding the level's row
+    /// before the length adjustment (a known smaller length still clamps
+    /// it, as in libzstd).
+    pub window_log: Option<u32>,
+}
+
+impl InputShape {
+    /// Set a forced window log (see the field docs).
+    pub const fn with_window_log(mut self, log: u32) -> Self {
+        self.window_log = Some(log);
+        self
+    }
+
+    /// Set the known whole-frame length (see the field docs).
+    pub const fn with_len(mut self, len: u64) -> Self {
+        self.len = Some(len);
+        self
+    }
+}
+
 /// Parameters of an encoder, applied when the encoder is constructed.
 ///
 /// The default matches the crate's one-shot paths: checksum on (when the
@@ -22,6 +56,7 @@ pub struct EncoderOptions {
     pub(crate) checksum: bool,
     pub(crate) pledged_size: Option<u64>,
     pub(crate) workers: u32,
+    pub(crate) input_shape: InputShape,
 }
 
 impl EncoderOptions {
@@ -31,7 +66,19 @@ impl EncoderOptions {
             checksum: cfg!(feature = "hash"),
             pledged_size: None,
             workers: 0,
+            input_shape: InputShape {
+                len: None,
+                window_log: None,
+            },
         }
+    }
+
+    /// Override the input-shape knobs (forced window log). The pledged
+    /// size ([`Self::pledged_size`]) wins for the length when both are
+    /// set.
+    pub const fn with_input_shape(mut self, shape: InputShape) -> Self {
+        self.input_shape = shape;
+        self
     }
 
     /// Write a frame checksum (default: on with the `hash` feature, off

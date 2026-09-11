@@ -44,9 +44,18 @@ pub fn compress_with(source: &[u8], options: &crate::EncoderOptions) -> alloc::v
             options.level,
             options.checksum,
             options.workers,
+            options.input_shape.window_log,
         );
     }
-    crate::encoding::compress_slice_opts(source, options.level, options.checksum)
+    crate::encoding::compress_slice_shaped(
+        source,
+        options.level,
+        options.checksum,
+        crate::InputShape {
+            len: None,
+            window_log: options.input_shape.window_log,
+        },
+    )
 }
 
 /// Decompress a zstd stream (possibly several concatenated frames) into a
@@ -175,6 +184,41 @@ mod tests {
         let mut exact = vec![0u8; input.len()];
         decompress_to_buffer(&compressed, &mut exact).unwrap();
         assert_eq!(&exact[..], input);
+    }
+
+    /// A forced window log must shrink the declared window (and with it the
+    /// reachable history), roundtrip through libzstd, and leave the forced
+    /// frames decodable by our own decoder.
+    #[cfg(feature = "std")]
+    #[test]
+    fn forced_window_log_bounds_reach() {
+        // Period above the forced window but below the level's own: only
+        // the wide window can bridge the repeat. The unit itself must be
+        // aperiodic or any window bridges it.
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let unit: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect();
+        let input: Vec<u8> = (0..16).flat_map(|_| unit.iter().copied()).collect();
+        let wide = compress(&input, Level::Ultra);
+        let opts = crate::EncoderOptions::new(Level::Ultra)
+            .with_input_shape(crate::InputShape::default().with_window_log(15));
+        let narrow = compress_with(&input, &opts);
+        assert!(
+            narrow.len() > wide.len(),
+            "forced W15 must lose the 64K period: {} vs {}",
+            narrow.len(),
+            wide.len()
+        );
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(narrow.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(decompress(&narrow, 0).unwrap(), input);
     }
 
     #[cfg(feature = "std")]

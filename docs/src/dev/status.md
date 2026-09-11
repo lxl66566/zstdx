@@ -33,7 +33,8 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 | frame checksum | ✅ optional on encode (+sidecar thread offload); decode auto-verifies in-tree xxh64 (MT path does not verify) |
 | zstd-crate compat layer `zstdx::compat` | ✅ (dictionary decode works end-to-end) |
 | dictionaries | decode ✅; encode ❌; `dict/` training half-done (known bugs) |
-| LDM / superblock / adjustable window / C FFI | ❌ |
+| forced window log (`InputShape::with_window_log`) | ✅ all paths; blocks cap at the window (RFC 8878 Block_Maximum_Size) |
+| LDM / superblock / C FFI | ❌ |
 
 ## Completeness vs libzstd (subjective estimates, for targeting)
 

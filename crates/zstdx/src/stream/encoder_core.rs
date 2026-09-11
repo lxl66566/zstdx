@@ -72,6 +72,10 @@ pub(crate) struct FrameEncoderCoreSt {
     hasher: StreamChecksum,
     level: Level,
     checksum: bool,
+    /// Block size in effect: the 128 KiB format maximum, capped by the
+    /// declared window (a forced or downsized window below it shrinks
+    /// blocks; RFC 8878 Block_Maximum_Size).
+    block_size: usize,
     header: Vec<u8>,
     /// Input bytes of the block currently being assembled; always shorter
     /// than the block size outside [`FrameEncoderCoreSt::write`].
@@ -94,7 +98,10 @@ impl FrameEncoderCoreSt {
             fse_tables: FseTables::new(),
             scratch: BlockScratch::default(),
         };
-        state.matcher.set_source_hint(options.pledged_size);
+        state.matcher.set_input_shape(crate::InputShape {
+            len: options.pledged_size,
+            window_log: options.input_shape.window_log,
+        });
         state.matcher.reset(options.level);
         let checksum = options.checksum && cfg!(feature = "hash");
         let header = FrameHeader {
@@ -106,6 +113,7 @@ impl FrameEncoderCoreSt {
         };
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
+        let block_size = state.matcher.block_size();
         Self {
             state,
             hasher: if checksum {
@@ -115,6 +123,7 @@ impl FrameEncoderCoreSt {
             },
             level: options.level,
             checksum,
+            block_size,
             header: serialized,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
@@ -127,11 +136,11 @@ impl FrameEncoderCoreSt {
         debug_assert!(!self.finished);
         let mut data = data;
         while !data.is_empty() {
-            let space = MAX_BLOCK_SIZE as usize - self.staged.len();
+            let space = self.block_size - self.staged.len();
             let n = space.min(data.len());
             self.staged.extend_from_slice(&data[..n]);
             data = &data[n..];
-            if self.staged.len() == MAX_BLOCK_SIZE as usize {
+            if self.staged.len() == self.block_size {
                 self.encode_block(false);
             }
         }

@@ -63,21 +63,33 @@ pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
 /// [`super::compress_slice_to_vec` modulo the checksum flag`) when the input
 /// is too small, only one worker is requested, the level stores raw blocks,
 /// or the process has a single usable core.
-pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32) -> Vec<u8> {
+pub fn compress_slice_mt(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    workers: u32,
+    window_log: Option<u32>,
+) -> Vec<u8> {
     let checksum = checksum && cfg!(feature = "hash");
     if workers < 2
         || src.len() < MIN_MT_INPUT
         || level == Level::Uncompressed
         || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
     {
-        return super::compress_slice_opts(src, level, checksum);
+        return super::compress_slice_shaped(src, level, checksum, crate::InputShape {
+            len: None,
+            window_log,
+        });
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
     // the overlap duplication negligible, and scales with the level's
     // overlap so deep-search levels don't pay it per job.
-    let hint = Some(src.len() as u64);
-    let window = MatchGeneratorDriver::window_for_level(level, hint);
+    let shape = crate::InputShape {
+        len: Some(src.len() as u64),
+        window_log,
+    };
+    let window = MatchGeneratorDriver::window_for_level(level, shape);
     // The full window as strip: the strip is fully indexed (see
     // `prefill_window`), so matches reach across job borders as far as the
     // frame window allows. A shorter strip caps the ratio at repeats that
@@ -133,7 +145,7 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
                             end == src.len(),
                             level,
                             gate,
-                            hint,
+                            shape,
                         )
                     }));
                     match attempt {
@@ -181,6 +193,9 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
 /// Compress one job through `state`, resetting it for the job: fresh
 /// entropy tables, and the repcode gate unless the job starts the frame
 /// (the decoder's repeated-offset history is the format default only there).
+/// `shape` is the whole frame's declared shape (length known for bulk,
+/// pledge or none for streaming; jobs share it so tables and the header
+/// window agree).
 pub(crate) fn run_job_with(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -189,9 +204,9 @@ pub(crate) fn run_job_with(
     is_last_job: bool,
     level: Level,
     gate: bool,
-    src_hint: Option<u64>,
+    shape: crate::InputShape,
 ) -> Vec<u8> {
-    reset_slice_state(state, level, src_hint);
+    reset_slice_state(state, level, shape);
     if gate {
         state.matcher.gate_repcodes();
     }
@@ -208,9 +223,9 @@ pub(crate) fn run_job(
     is_last_job: bool,
     level: Level,
     gate: bool,
-    src_hint: Option<u64>,
+    shape: crate::InputShape,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level, src_hint);
+    let mut state = take_slice_state(level, shape);
     let output = run_job_with(
         &mut state,
         src,
@@ -219,7 +234,7 @@ pub(crate) fn run_job(
         is_last_job,
         level,
         gate,
-        src_hint,
+        shape,
     );
     return_slice_state(state);
     output
@@ -275,7 +290,8 @@ mod tests {
         for (name, data) in shapes() {
             for workers in [2u32, 4] {
                 for checksum in [true, false] {
-                    let compressed = compress_slice_mt(&data, Level::Fastest, checksum, workers);
+                    let compressed =
+                        compress_slice_mt(&data, Level::Fastest, checksum, workers, None);
                     // our decoder, exact-size output slice
                     let mut out = vec![0u8; data.len()];
                     let mut decoder = FrameDecoder::new();
@@ -299,8 +315,8 @@ mod tests {
     #[test]
     fn mt_output_is_deterministic() {
         let data = textish(3 * 1024 * 1024);
-        let a = compress_slice_mt(&data, Level::Fastest, true, 3);
-        let b = compress_slice_mt(&data, Level::Fastest, true, 3);
+        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None);
+        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None);
         assert_eq!(a, b);
     }
 
@@ -309,8 +325,8 @@ mod tests {
     #[test]
     fn mt_ratio_stays_close_to_single_thread() {
         let data = textish(6 * 1024 * 1024);
-        let st = compress_slice_mt(&data, Level::Fastest, true, 1);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4);
+        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None);
         assert!(
             mt.len() <= st.len() + st.len() / 50,
             "single {} vs multi {}",
@@ -325,7 +341,7 @@ mod tests {
     fn mt_chain_levels_roundtrip() {
         let data = textish(5 * 1024 * 1024);
         for level in [Level::Fast, Level::Balanced] {
-            let compressed = compress_slice_mt(&data, level, true, 4);
+            let compressed = compress_slice_mt(&data, level, true, 4, None);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&compressed, &mut out).unwrap();
@@ -349,8 +365,8 @@ mod tests {
         let unit = textish(300 * 1024);
         let data: Vec<u8> = (0..24).flat_map(|_| unit.iter().copied()).collect();
         for level in [Level::Fastest, Level::Fast, Level::Balanced] {
-            let st = compress_slice_mt(&data, level, true, 1);
-            let mt = compress_slice_mt(&data, level, true, 4);
+            let st = compress_slice_mt(&data, level, true, 1, None);
+            let mt = compress_slice_mt(&data, level, true, 4, None);
             assert!(
                 mt.len() <= st.len() + st.len() / 50,
                 "{level:?}: periodic data must match across jobs, mt {} vs st {}",
@@ -365,7 +381,7 @@ mod tests {
     #[test]
     fn small_inputs_fall_back_identically() {
         let data = textish(64 * 1024);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None);
         let st = crate::encoding::compress_slice_to_vec(&data, Level::Fastest);
         assert_eq!(mt, st);
     }
