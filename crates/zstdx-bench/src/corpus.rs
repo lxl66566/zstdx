@@ -131,7 +131,8 @@ pub fn gate_zstd_dec(compressed: &[u8], raw: &[u8], label: &str) {
 }
 
 pub fn gate_ruz_enc(raw: &[u8], level: Level, label: &str) -> Vec<u8> {
-    let comp = zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false));
+    let comp =
+        zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false)).unwrap();
     let mut back = Vec::with_capacity(raw.len() + 16);
     FrameDecoder::new()
         .decode_all_to_vec(&comp, &mut back)

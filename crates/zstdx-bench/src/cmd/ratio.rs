@@ -140,7 +140,7 @@ fn zstdx_encode(raw: &[u8], level: Level, mode: RatioMode, mt: u32) -> Vec<u8> {
         opts
     };
     match mode {
-        RatioMode::BulkSt | RatioMode::BulkMt => zstdx::bulk::compress_with(raw, &opts),
+        RatioMode::BulkSt | RatioMode::BulkMt => zstdx::bulk::compress_with(raw, &opts).unwrap(),
         RatioMode::StreamSt | RatioMode::StreamMt => {
             let mut enc = RuzStreamEncoder::with_options(raw, opts).unwrap();
             let mut out = Vec::new();

@@ -42,10 +42,11 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 |---|---|---|
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz; missing MT-path checksum |
 | decode performance | bulk ahead across the board; streaming ~75-85% | streaming residue is on json/skewed, see [current snapshot](dev/bench/snapshot.md) |
-| encode features | ~60% | seven-tier ladder + MT + streaming in place; missing dictionary encode, LDM, superblock, adjustable window |
-| encode ratio | matched at every tier | dll: Best/Opt denser than zstd-12/16 (4.86 vs 4.45, 5.01 vs 4.82), Ultra 7.7% behind zstd-19; json: Opt +5%, Best +11%, Ultra parity; worst cell text.balanced.bulk-st −0.61% (json.ultra.bulk-mt was −1.85%, closed to −0.13% by the Ultra job-boundary statistics seeding) |
-| encode speed | wins and losses split by tier | leading on text/skewed/zeros at multiple tiers; json low tiers behind 1.3-1.8×; Best/Opt/Ultra speed behind (json Opt 0.46× after W23 — the reach/speed trade mirrors libzstd's own ladder) |
-| API/ecosystem | ~45% | bulk + streaming + compat + CLI; missing C FFI, language bindings, standard CLI argument surface |
+| encode features | ~80% | full 1-22 ladder + dictionary encode (ST) + adjustable window + MT + streaming in place; missing dictionary training, LDM, superblock |
+| encode speed | wins and losses split by tier | 2026-09-12 ladder speed curve (json 32MiB ST, CLI): chain rows 137/67/25 MiB/s at L6/9/12 vs libzstd 423/165/82 (0.25-0.33×, the known chain/json speed story); opt rows 7/4/2 at L13/17/19 vs 54/6/3 (0.13× at the btlazy2 slot, ~0.7× at btopt+); fastest/fast 447/340 vs 1118/812; small-call side wins (4KiB L19 5.96 vs 16.20 ms incl. spawn); MT unaffected |
+| encode ratio | matched at every tier | 2026-09-12 full-ladder `ratio` sweep vs libzstd at same numeric levels (1MiB slice, all modes): json geo-mean +4.8% denser (balanced +19.6%, best +10.2%), skewed +2.8%, zeros +2.0%, random 0.00%, text +97.6% geo (window; balanced row -2.7% is the one losing cell — chain-row text residue, todo 13); 4KiB json ±1-5% after the small-literal huffman fix; dll Best/Opt denser than zstd-12/16, Ultra 7.7% behind zstd-19 |
+| encode speed | wins and losses split by tier | 2026-09-12 ladder speed curve (json 32MiB ST, CLI): chain rows 137/67/25 MiB/s at L6/9/12 vs libzstd 423/165/82 (0.25-0.33×, the known chain/json speed story); opt rows 7/4/2 at L13/17/19 vs 54/6/3 (0.13× at the btlazy2 slot, ~0.7× at btopt+); fastest/fast 447/340 vs 1118/812; small-call side wins (4KiB L19 5.96 vs 16.20 ms incl. spawn); MT unaffected |
+| API/ecosystem | ~60% | bulk + streaming + compat (incl. dictionary constructors) + CLI (levels 1-22, -D dictionaries); missing C FFI, language bindings, standard CLI argument surface |
 
 Note: `COMPARE.md`'s completeness assessment is frozen at the `4ff2b7b` point in time; its conclusions — "encode features ~40%", "json.Best ratio gap (btopt shortfall)", "MT ratio collapse" — have been superseded by the optimal parser (`c726dfd`), package-merge Huffman (`aa07308`), the Best core swap (`b39a192`), and MT ratio retention (`a37ebaa`).
 

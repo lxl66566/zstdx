@@ -280,7 +280,7 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
             );
             ab.measure(
                 || {
-                    black_box(zstdx::bulk::compress_with(
+                    black_box(compress_with_ok(
                         &raw,
                         &EncoderOptions::new(level).checksum(false),
                     ));
@@ -306,13 +306,13 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
         let bytes = raw.len() as u64;
         ab.measure(
             || {
-                black_box(zstdx::bulk::compress_with(
+                black_box(compress_with_ok(
                     &raw,
                     &EncoderOptions::new(Level::Fast).checksum(false),
                 ));
             },
             || {
-                black_box(zstdx::bulk::compress_with(
+                black_box(compress_with_ok(
                     &raw,
                     &EncoderOptions::new(Level::Fast).checksum(true),
                 ));
@@ -326,6 +326,10 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
 }
 
 // ---------- encode, MT bulk ----------
+
+fn compress_with_ok(raw: &[u8], options: &EncoderOptions) -> Vec<u8> {
+    zstdx::bulk::compress_with(raw, options).unwrap()
+}
 
 fn zstd_mt_comp(raw: &[u8], z: i32, workers: u32) -> Vec<u8> {
     // fresh context per call: symmetric with zstdx's per-call worker pool
@@ -361,7 +365,7 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
             raw.len() as f64 / zc.len() as f64,
         );
         for w in &sweep {
-            let a = zstdx::bulk::compress_with(
+            let a = compress_with_ok(
                 &raw,
                 &EncoderOptions::new(Level::Fast).checksum(false).workers(*w),
             );
@@ -378,7 +382,7 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
             );
             ab.measure(
                 || {
-                    black_box(zstdx::bulk::compress_with(
+                    black_box(compress_with_ok(
                         &raw,
                         &EncoderOptions::new(Level::Fast).checksum(false).workers(*w),
                     ));
@@ -400,7 +404,7 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
         let bytes = raw.len() as u64;
         for (name, level, z) in ladder_subset(args, &LADDER[..3]) {
             let label = level_name(name);
-            let a = zstdx::bulk::compress_with(
+            let a = compress_with_ok(
                 &raw,
                 &EncoderOptions::new(level).checksum(false).workers(mt),
             );
@@ -417,7 +421,7 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
             );
             ab.measure(
                 || {
-                    black_box(zstdx::bulk::compress_with(
+                    black_box(compress_with_ok(
                         &raw,
                         &EncoderOptions::new(level).checksum(false).workers(mt),
                     ));
@@ -598,13 +602,13 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             LevelName::Best,
         ]) {
             let label = level_name(name);
-            let comp = zstdx::bulk::compress_with(
+            let comp = compress_with_ok(
                 &raw,
                 &EncoderOptions::new(level).checksum(false).workers(mt),
             );
             assert_roundtrip(&comp, &raw, label);
             let stats = measure_solo(|| {
-                black_box(zstdx::bulk::compress_with(
+                black_box(compress_with_ok(
                     &raw,
                     &EncoderOptions::new(level).checksum(false).workers(mt),
                 ));
