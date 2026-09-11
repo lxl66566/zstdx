@@ -5,10 +5,7 @@
 //! Swap `zstd::` for `zstdx::compat::` and most code compiles unchanged.
 //! Known differences, all forced by what this crate implements today:
 //!
-//! - Numeric levels map onto the implemented strategies through
-//!   [`Level::approximate_zstd`][crate::Level::approximate_zstd]: 1-2 stay near zstd 1, 3-5 near
-//!   3-5, 6-9 near 6-9 and 10-22 near 12-15; ratios approach the requested band rather than match
-//!   it exactly.
+//! - Numeric levels map exactly through [`Level::from_zstd`][crate::Level::from_zstd].
 //! - `multithread(n)` with `n > 1` and dictionary-taking constructors fail with an error (the
 //!   native [`EncoderOptions`][crate::EncoderOptions] surface exists; the streaming backends do not
 //!   yet).
@@ -35,9 +32,15 @@ pub fn compression_level_range() -> core::ops::RangeInclusive<i32> {
     1..=22
 }
 
-/// Map a numeric libzstd level onto the nearest implemented strategy.
+/// Map a numeric libzstd level onto this crate's level. Level 0 is
+/// libzstd's "default" (3), unlike the crate-native convention where
+/// [`Level::Uncompressed`] wraps data in raw blocks.
 pub(crate) fn map_level(level: i32) -> Level {
-    Level::approximate_zstd(level)
+    if level == 0 {
+        Level::from_zstd(DEFAULT_COMPRESSION_LEVEL)
+    } else {
+        Level::from_zstd(level)
+    }
 }
 
 pub(crate) fn unsupported_io(feature: crate::Feature) -> io::Error {

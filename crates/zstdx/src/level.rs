@@ -1,65 +1,67 @@
-//! The compression levels this crate can actually produce.
+//! The compression levels this crate can produce.
 //!
-//! Every variant is backed by a real implementation; levels that the original
-//! zstd expresses as numbers between 1 and 22 (default, better, best, ...)
-//! map onto the nearest variant here (see [`Level::approximate_zstd`] for the
-//! exact ranges).
+//! A level is the numeric libzstd level (0-22); every value selects a real
+//! parameter set (see the ladder in `match_generator`). The named constants
+//! alias representative levels.
 
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.
-#[non_exhaustive]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Level {
-    /// This level does not compress the data at all, and simply wraps
-    /// it in a Zstandard frame.
-    Uncompressed,
-    /// This level is roughly equivalent to Zstd compression level 1.
-    /// A single-probe hash matcher (libzstd's `fast` strategy).
-    Fastest,
-    /// This level is roughly equivalent to Zstd compression levels 3-5.
-    /// A short hash-chain matcher with one lazy step.
-    Fast,
-    /// This level is roughly equivalent to Zstd compression levels 6-9.
-    /// A deeper hash-chain matcher with two lazy steps.
-    Balanced,
-    /// This level is roughly equivalent to Zstd compression levels 10-15.
-    /// The optimal parser in its cheapest setting: noticeably denser than
-    /// `Balanced` at a fraction of `Opt`'s cost.
-    Best,
-    /// This level is roughly equivalent to Zstd compression levels 16-17.
-    /// An optimal-price parser over binary-tree matches (libzstd's
-    /// `btopt`): whole-bit price estimates with skip heuristics.
-    Opt,
-    /// This level is roughly equivalent to Zstd compression levels 18-22.
-    /// The optimal parser at its densest (libzstd's `btultra`/`btultra2`):
-    /// fractional-bit prices, a match+1-literal recheck and a statistics
-    /// seeding pass over the first block.
-    Ultra,
-}
+///
+/// Values follow libzstd: 0 stores the data uncompressed inside a Zstandard
+/// frame, 1-22 trade speed for ratio. The crate's named tiers alias
+/// representative numeric levels: [`Level::Fastest`] = 1, [`Level::Fast`] = 3,
+/// [`Level::Balanced`] = 9, [`Level::Best`] = 13, [`Level::Opt`] = 17 and
+/// [`Level::Ultra`] = 19.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Level(u8);
 
+// The tier constants keep the enum-style PascalCase of the former enum.
+#[allow(non_upper_case_globals)]
 impl Level {
+    /// Level 9: a deeper hash-chain matcher with two lazy steps
+    /// (libzstd's `lazy2` strategy).
+    pub const Balanced: Level = Level(9);
+    /// Level 13: the optimal parser in its cheapest setting: noticeably
+    /// denser than [`Level::Balanced`] at a fraction of [`Level::Opt`]'s cost.
+    pub const Best: Level = Level(13);
     /// The level used when none is specified.
     pub const DEFAULT: Level = Level::Fastest;
+    /// Level 3: a short hash-chain matcher with one lazy step
+    /// (libzstd's `dfast` strategy).
+    pub const Fast: Level = Level(3);
+    /// Level 1: a single-probe hash matcher (libzstd's `fast` strategy).
+    pub const Fastest: Level = Level(1);
+    /// The highest libzstd level.
+    pub const MAX: Level = Level(22);
+    /// Level 17: an optimal-price parser over binary-tree matches
+    /// (libzstd's `btopt`): whole-bit price estimates with skip heuristics.
+    pub const Opt: Level = Level(17);
+    /// Level 19: the optimal parser at its densest (libzstd's
+    /// `btultra`/`btultra2`): fractional-bit prices, a match+1-literal
+    /// recheck and a statistics seeding pass over the first block.
+    pub const Ultra: Level = Level(19);
+    /// Level 0: the data is not compressed at all, just wrapped
+    /// in a Zstandard frame.
+    pub const Uncompressed: Level = Level(0);
 
-    /// Map a numeric libzstd level onto the nearest implemented strategy:
-    /// negatives and 1-2 stay `Fastest`, 3-5 round to `Fast`, 6-9 to
-    /// `Balanced`, 10-15 to `Best`, 16-17 to `Opt` and everything above to
-    /// `Ultra`.
-    pub const fn approximate_zstd(level: i32) -> Level {
-        if level > 17 {
-            Level::Ultra
-        } else if level > 15 {
-            Level::Opt
-        } else if level > 9 {
-            Level::Best
-        } else if level >= 6 {
-            Level::Balanced
-        } else if level >= 3 {
-            Level::Fast
+    /// Map a numeric libzstd level onto a level of this crate. Negatives
+    /// clamp to 1 (libzstd retunes its fast strategy's acceleration for
+    /// them, which this crate does not model separately), 0 selects
+    /// [`Level::Uncompressed`], values above 22 clamp to 22.
+    pub const fn from_zstd(level: i32) -> Level {
+        if level < 0 {
+            Level(1)
+        } else if level > 22 {
+            Level(22)
         } else {
-            Level::Fastest
+            Level(level as u8)
         }
+    }
+
+    /// The numeric libzstd level (0-22).
+    pub const fn as_i32(self) -> i32 {
+        self.0 as i32
     }
 }
 
@@ -74,20 +76,28 @@ mod tests {
     use super::Level;
 
     #[test]
-    fn zstd_mapping_ranges() {
-        assert_eq!(Level::approximate_zstd(-5), Level::Fastest);
-        assert_eq!(Level::approximate_zstd(0), Level::Fastest);
-        assert_eq!(Level::approximate_zstd(1), Level::Fastest);
-        assert_eq!(Level::approximate_zstd(2), Level::Fastest);
-        assert_eq!(Level::approximate_zstd(3), Level::Fast);
-        assert_eq!(Level::approximate_zstd(5), Level::Fast);
-        assert_eq!(Level::approximate_zstd(6), Level::Balanced);
-        assert_eq!(Level::approximate_zstd(9), Level::Balanced);
-        assert_eq!(Level::approximate_zstd(10), Level::Best);
-        assert_eq!(Level::approximate_zstd(15), Level::Best);
-        assert_eq!(Level::approximate_zstd(16), Level::Opt);
-        assert_eq!(Level::approximate_zstd(17), Level::Opt);
-        assert_eq!(Level::approximate_zstd(18), Level::Ultra);
-        assert_eq!(Level::approximate_zstd(22), Level::Ultra);
+    fn zstd_mapping_clamps() {
+        assert_eq!(Level::from_zstd(-5), Level::Fastest);
+        assert_eq!(Level::from_zstd(0), Level::Uncompressed);
+        assert_eq!(Level::from_zstd(1), Level::Fastest);
+        assert_eq!(Level::from_zstd(22), Level(22));
+        assert_eq!(Level::from_zstd(23), Level::MAX);
+        assert_eq!(Level::from_zstd(99), Level::MAX);
+    }
+
+    #[test]
+    fn tier_constants_are_ordered() {
+        let tiers = [
+            Level::Uncompressed,
+            Level::Fastest,
+            Level::Fast,
+            Level::Balanced,
+            Level::Best,
+            Level::Opt,
+            Level::Ultra,
+        ];
+        assert!(tiers.is_sorted());
+        assert_eq!(Level::DEFAULT, Level::Fastest);
+        assert_eq!(Level::Ultra.as_i32(), 19);
     }
 }

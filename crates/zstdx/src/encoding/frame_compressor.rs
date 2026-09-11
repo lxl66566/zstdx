@@ -427,24 +427,16 @@ fn compress_with_state(
             .matcher
             .adopt_window(&src[hist as usize..block_end as usize], hist);
         state.matcher.set_block(block_start, block_end);
-        match level {
-            Level::Uncompressed => {
-                let header = BlockHeader {
-                    last_block,
-                    block_type: crate::blocks::block::BlockType::Raw,
-                    block_size: block.len() as u32,
-                };
-                header.serialize(&mut output);
-                BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
-            },
-            Level::Fastest
-            | Level::Fast
-            | Level::Balanced
-            | Level::Best
-            | Level::Opt
-            | Level::Ultra => {
-                compress_fastest(state, last_block, &mut output, &mut hasher);
-            },
+        if level == Level::Uncompressed {
+            let header = BlockHeader {
+                last_block,
+                block_type: crate::blocks::block::BlockType::Raw,
+                block_size: block.len() as u32,
+            };
+            header.serialize(&mut output);
+            BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
+        } else {
+            compress_fastest(state, last_block, &mut output, &mut hasher);
         }
     }
     // A frame needs at least one block: empty input, and the exact-multiple
@@ -628,26 +620,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 break;
             }
 
-            match self.compression_level {
-                Level::Uncompressed => {
-                    let header = BlockHeader {
-                        last_block,
-                        block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: read_bytes.try_into().unwrap(),
-                    };
-                    // Write the header, then the block (hashing as it goes)
-                    header.serialize(output);
-                    self.hasher
-                        .write_appending(output, self.state.matcher.get_last_space());
-                },
-                Level::Fastest
-                | Level::Fast
-                | Level::Balanced
-                | Level::Best
-                | Level::Opt
-                | Level::Ultra => {
-                    compress_fastest(&mut self.state, last_block, output, &mut self.hasher);
-                },
+            if self.compression_level == Level::Uncompressed {
+                let header = BlockHeader {
+                    last_block,
+                    block_type: crate::blocks::block::BlockType::Raw,
+                    block_size: read_bytes.try_into().unwrap(),
+                };
+                // Write the header, then the block (hashing as it goes)
+                header.serialize(output);
+                self.hasher
+                    .write_appending(output, self.state.matcher.get_last_space());
+            } else {
+                compress_fastest(&mut self.state, last_block, output, &mut self.hasher);
             }
             drain.write_all(output).unwrap();
             output.clear();

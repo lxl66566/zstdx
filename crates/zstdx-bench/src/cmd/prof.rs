@@ -85,7 +85,7 @@ fn run_dec(rest: &[String]) {
 }
 
 fn run_enc(rest: &[String]) {
-    let level = zstdx::Level::approximate_zstd(num::<i32>(rest, 0, "zstd level"));
+    let level = zstdx::Level::from_zstd(num::<i32>(rest, 0, "zstd level"));
     let iters: usize = num(rest, 1, "iters");
     for path in &rest[2..] {
         let raw = fs::read(path).unwrap();
@@ -109,7 +109,7 @@ fn run_enc(rest: &[String]) {
 }
 
 fn run_enc_stream(rest: &[String]) {
-    let level = zstdx::Level::approximate_zstd(num::<i32>(rest, 0, "zstd level"));
+    let level = zstdx::Level::from_zstd(num::<i32>(rest, 0, "zstd level"));
     let iters: usize = num(rest, 1, "iters");
     let path = arg(rest, 2, "file");
     let raw = fs::read(path).unwrap();

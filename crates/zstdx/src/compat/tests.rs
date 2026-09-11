@@ -41,7 +41,14 @@ fn bulk_structs() {
     let mut decompressor = compat::bulk::Decompressor::new().unwrap();
     let decompressed = decompressor.decompress(&compressed, data.len()).unwrap();
     assert_eq!(decompressed, data);
+    // libzstd semantics: level 0 selects the default (3)
     compressor.set_compression_level(0).unwrap();
+    let mut at_default = compat::bulk::Compressor::new(3).unwrap();
+    assert_eq!(
+        compressor.compress(&data).unwrap(),
+        at_default.compress(&data).unwrap()
+    );
+    compressor.set_compression_level(1).unwrap();
     assert_eq!(compressor.compress(&data).unwrap(), compressed);
     assert_eq!(
         compat::bulk::Decompressor::upper_bound(&compressed),

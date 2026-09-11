@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- `Level` is now a newtype over the numeric libzstd level (0-22) instead of
+  a strategy enum: `Level::from_zstd(n)` maps exactly, negative levels clamp
+  to 1, and the named tier constants alias representative levels
+  (Fastest=1, Fast=3, Balanced=9, Best=13, Opt=17, Ultra=19). Parameter
+  selection still maps through the seven tiers in this change (outputs
+  byte-identical); the full 1-22 parameter ladder lands separately. The
+  compat layer maps level 0 to libzstd's default (3), matching the zstd
+  crate instead of the crate-native raw-block level 0.
+
 - Ultra multithreaded job-boundary statistics seeding: each job's first
   parsed block now runs a throwaway parse of the strip tail (two blocks) with
   the window re-based to the span — candidates and fills clamp inside it,

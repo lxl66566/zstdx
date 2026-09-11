@@ -216,10 +216,8 @@ pub fn run(args: &Args) {
         inner: MatchGeneratorDriver::new(128 * 1024),
         triples: Vec::new(),
     };
-    let mut compressor = zstdx::encoding::FrameCompressor::new_with_matcher(
-        matcher,
-        Level::approximate_zstd(args.level),
-    );
+    let mut compressor =
+        zstdx::encoding::FrameCompressor::new_with_matcher(matcher, Level::from_zstd(args.level));
     compressor.set_source(raw.as_slice());
     let sink = Sink(Vec::new());
     compressor.set_drain(sink);

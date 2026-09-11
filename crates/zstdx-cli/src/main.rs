@@ -100,11 +100,7 @@ fn main() -> color_eyre::Result<()> {
 
 fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: Level = match level {
-        0 => Level::Uncompressed,
-        // Numeric levels map onto the nearest implemented strategy tier.
-        _ => Level::approximate_zstd(level as i32),
-    };
+    let compression_level: Level = Level::from_zstd(level as i32);
     let source_file = File::open(input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;
     let buffered_source = BufReader::new(source_file);

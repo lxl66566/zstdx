@@ -252,13 +252,16 @@ const ULTRA_PARAMS: LevelParams = LevelParams {
 };
 
 fn params_for_level(level: Level) -> LevelParams {
-    match level {
-        Level::Uncompressed | Level::Fastest => FASTEST_PARAMS,
-        Level::Fast => FAST_PARAMS,
-        Level::Balanced => BALANCED_PARAMS,
-        Level::Best => BEST_PARAMS,
-        Level::Opt => OPT_PARAMS,
-        Level::Ultra => ULTRA_PARAMS,
+    // Uncompressed never matches; the driver only sizes tables so the state
+    // stays reusable. 0-2 share the Fastest tier, 3-5 Fast, 6-9 Balanced,
+    // 10-15 Best, 16-17 Opt, 18+ Ultra.
+    match level.as_i32() {
+        6..=9 => BALANCED_PARAMS,
+        10..=15 => BEST_PARAMS,
+        16..=17 => OPT_PARAMS,
+        18.. => ULTRA_PARAMS,
+        3..=5 => FAST_PARAMS,
+        _ => FASTEST_PARAMS,
     }
 }
 
