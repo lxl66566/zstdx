@@ -323,6 +323,14 @@ fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
     len
 }
 
+/// Offset price for the chain strategy's lazy gain comparisons (libzstd's
+/// `ZSTD_highbit32(offBase)` with offBase = offset+1): the offset-code
+/// exponent in ~bits. Repcode incumbents price 0.
+#[inline(always)]
+fn price_of(idx: usize, cand: usize) -> i32 {
+    ((idx - cand + 1) as u32).ilog2() as i32
+}
+
 /// Whether a non-rep match clears its offset's price: literals cost ~4 bits
 /// per byte and the offset its highbit, plus a constant for the sequence
 /// code overhead (libzstd's raw approximation from its lazy gain checks).
@@ -330,10 +338,12 @@ fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
 /// the stream with five-byte matches a megabyte back — high-entropy shapes
 /// lost ratio and speed alike to the emission storm.
 /// The +7 margin is libzstd's depth-2 replacement constant; at store time it
-/// costs text-like shapes ~0.5% ratio (their mid-distance four-byte matches
-/// are worth keeping) while anything looser lets the dense-table pollution
-/// back in (measured: json 5.66/5.77/5.91/6.08 at +1/+3/+5/+7, text
-/// 363.5/363.4/362.7/361.5, skewed 1.86/1.91/2.00/2.00).
+/// costs text-like shapes ~0.5% ratio (their mid-distance matches are worth
+/// keeping) while anything looser lets the dense-table pollution back in
+/// (measured under the gain-aware lazy walk: json 6.21/6.29/6.45/6.55 at
+/// +4/+5/+6/+7, text 368.1/367.5/367.0/366.3, skewed flat 2.00 — the whole
+/// swing is 5-byte matches in the 8-32 KiB offset band; ml-conditional
+/// margins move nothing else).
 #[inline(always)]
 fn pays_for_offset(ml: usize, idx: usize, cand: usize, rep_hit: bool) -> bool {
     rep_hit || ml * 4 >= (idx - cand).ilog2() as usize + 7
@@ -2150,31 +2160,92 @@ impl MatchGeneratorDriver {
             }
             miss_count = 0;
 
-            // Lazy evaluation: a longer match starting a few positions later
-            // is worth the literals skipped on the way. Long-enough matches
-            // skip straight to emission.
-            let mut lazy_shift = 0u32;
+            // Lazy evaluation, ported to libzstd lazy's alternating gain
+            // walk: each next position competes on offset-aware gain — a
+            // match's distance is priced at its highbit (~4 bits per length
+            // byte), so a much nearer match of near-equal length displaces a
+            // long-range one (the selection error that cost text ~2% ratio:
+            // pure-length comparison kept far chain candidates). A repcode
+            // probe rides along (rep offsets price ~free). The walk advances
+            // while some probe improves; a position that fails the depth-1
+            // margins gets one second-chance probe at depth-2 margins before
+            // giving up — exactly libzstd's ZSTD_lazy/ZSTD_lazy2 split.
+            // Long-enough matches skip straight to emission.
+            let mut best_pos = pos;
+            let mut best_price = if rep_hit {
+                0
+            } else {
+                price_of((best_pos - win_base) as usize, best_cand)
+            };
             if best_len < 64 {
-                for step in 1..=lazy_depth {
-                    let p2 = pos + step as u64;
-                    if block_end.saturating_sub(p2) < hash_read {
-                        break;
+                'lazy: loop {
+                    for (attempt, &(rep_mul, rep_m, search_m)) in
+                        [(3i32, 1i32, 4i32), (4, 1, 7)].iter().enumerate()
+                    {
+                        if attempt > 0 && lazy_depth < 2 {
+                            // Second-chance margins are the depth-2 strategy.
+                            break;
+                        }
+                        let p2 = pos + 1;
+                        if block_end.saturating_sub(p2) < hash_read {
+                            break 'lazy;
+                        }
+                        pos = p2;
+                        let idx2 = (p2 - win_base) as usize;
+                        // Repcode probe at the stepped position; literals are
+                        // pending by construction (the walk advanced past the
+                        // anchor), so of_value 1 stays encodable. Skipped when
+                        // the incumbent is itself a rep: rep-vs-rep only
+                        // accepts a strictly longer ride, which the depth-0
+                        // probe and rep1_chain already cover, and on
+                        // rep-dense shapes the extra read4+extend per step
+                        // visibly taxed scan speed.
+                        if rep_pending == 0
+                            && !rep_hit
+                            && let Some(cand_abs) = p2.checked_sub(rep[0] as u64)
+                            && cand_abs >= win_base
+                        {
+                            let ci = (cand_abs - win_base) as usize;
+                            if read4(win, ci) == read4(win, idx2) {
+                                let ml = extend_match(win, idx2, ci);
+                                if ml >= MIN_MATCH
+                                    && (ml as i32) * rep_mul
+                                        > best_len as i32 * rep_mul - best_price + rep_m
+                                {
+                                    best_len = ml;
+                                    best_cand = ci;
+                                    best_pos = p2;
+                                    best_price = 0;
+                                    rep_hit = true;
+                                    seed_hit = false;
+                                    continue 'lazy;
+                                }
+                            }
+                        }
+                        // Chain search at the stepped position.
+                        let (len2, cand2) = search(win, chain, idx2);
+                        let price2 = if len2 >= MIN_MATCH {
+                            price_of((p2 - win_base) as usize, cand2)
+                        } else {
+                            0
+                        };
+                        if len2 >= MIN_MATCH
+                            && len2 as i32 * 4 - price2
+                                > best_len as i32 * 4 - best_price + search_m
+                        {
+                            best_len = len2;
+                            best_cand = cand2;
+                            best_pos = p2;
+                            best_price = price2;
+                            rep_hit = false;
+                            seed_hit = false;
+                            continue 'lazy;
+                        }
                     }
-                    let idx2 = (p2 - win_base) as usize;
-                    let (len2, cand2) = search(win, chain, idx2);
-                    if len2 > best_len {
-                        best_len = len2;
-                        best_cand = cand2;
-                        rep_hit = false;
-                        seed_hit = false;
-                        lazy_shift = step;
-                    } else {
-                        break;
-                    }
+                    break;
                 }
             }
-            pos += lazy_shift as u64;
-            let mut start = (pos - win_base) as usize;
+            let mut start = (best_pos - win_base) as usize;
 
             // Backward extension into the pending literals; the offset
             // (start - cand) stays constant. A repcode emission must keep

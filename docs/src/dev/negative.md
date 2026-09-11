@@ -46,6 +46,7 @@
 | hLog16 (512KB table, 2^15 era) | speed -8-14%, ratio no gain | beyond-L2 locality |
 | full u64 hashing (no 40-bit truncation) | json wins both ways but text ratio -7% | the 40-bit mask keeps mathematical equivalence; global ratio takes priority |
 | table entry u64→u32 @Fastest 2^15 (2-bit epoch scheme) | output identical but instructions +0.09% | entry width is not a lever while the table lives in L2; contrast: at Balanced's 16MiB working set, u32 is a big win (`327bc99`) |
+| lazy-walk cheapening variants (depth-1-only margins; cap 4 steps; skip the second-chance search after an empty probe; rep probe when the incumbent is already a rep) | depth-1 collapses the ratio (json 6.55→6.18, text back to 361.5); cap and empty-skip change nothing / trade 0.05 ratio for 2.5% speed; rep-vs-rep probe never alters selection (output byte-identical without it) | the alternating depth-1/depth-2 margin structure IS the gain; the walk is not deep, it is the 2-searches-per-failure baseline that costs the ~30% json instructions |
 | emit skipping positions already inserted by scan pairs (idempotent insertion) | output DIFFERS / instructions +2.6% after the fix | not unconditionally idempotent (hash-collision overwrites during backward extension; redundant reinsertion serves to restore slot values); the cost also exceeds the benefit |
 | naive Predefined/Repeat thresholds in choose_table | negligible | later handled by the cost-comparison approach (selectEncodingType port) + repeat mode; do not use naive thresholds |
 

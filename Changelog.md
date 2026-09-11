@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Chain-strategy lazy walk reworked to libzstd lazy's offset-aware gain
+  comparison: lazy positions compete on `ml*4 - highbit(offset)` (rep
+  incumbents price 0) instead of raw length, a rep0 probe rides each lazy
+  step, and the walk advances while improving with a second-chance probe at
+  depth-2 margins (the `ZSTD_lazy`/`ZSTD_lazy2` alternating structure) —
+  before, pure-length comparison kept far chain candidates wherever the
+  offset exponent paid more than the extra length saved. Balanced json
+  ratio 6.08→6.55 (+7.7%, now +13.8% ahead of zstd-6), text 361.4→366.3
+  (deficit −2.35%→−1.05%), all bulk/stream/st/mt cells move together;
+  sequence count drops (json −11%, longer matches). Speed: json 149→120
+  MiB/s (the second-chance search per walk costs ~30% matcher instructions
+  on rep-dense shapes), text 3168→3009, skewed/random/zeros faster.
+
 - `package_merge_lengths` per-level package sort removed: packages are
   disjoint adjacent-pair sums of the (weight, node)-sorted previous level,
   so pkg[k+1] >= pkg[k] (w[2k+2] >= w[2k] and w[2k+3] >= w[2k+1]) and ties
