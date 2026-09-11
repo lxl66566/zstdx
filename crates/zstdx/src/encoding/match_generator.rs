@@ -254,21 +254,22 @@ fn params_for_level(level: Level) -> LevelParams {
     }
 }
 
+/// Hash a window u64 whose low 5 bytes are the hashed prefix (the full u64
+/// load feeds the multiplier directly: bits above the fifth byte only add
+/// input entropy). Five bytes skip the frequent 4-byte boilerplate fragments
+/// so probes land on structural repeats instead of recent junk.
+#[inline(always)]
+fn hash5(v: u64) -> usize {
+    ((v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - HASH_LOG))
+        & ((1 << HASH_LOG) - 1)
+}
+
 /// Hash the 5 bytes at `idx`. Caller guarantees `idx + 5 <= win.len()` (the
 /// scanning and emit loops bound-check once per loop, not per position).
-///
-/// Five bytes skip the frequent 4-byte boilerplate fragments so probes land
-/// on structural repeats instead of recent junk. The full u64 load feeds the
-/// multiplier directly: bits above the fifth byte only add input entropy.
 #[inline(always)]
 fn hash_at(win: &[u8], idx: usize) -> usize {
-    // SAFETY: callers only hash positions with HASH_READ bytes of window
-    // ahead (the scan tail guard and the emit insert bound); unaligned
-    // because positions are byte-granular.
-    unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
-        (v.wrapping_mul(HASH_PRIME) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
-    }
+    // SAFETY: see contract above; the hash itself is [`hash5`].
+    unsafe { hash5(win.as_ptr().add(idx).cast::<u64>().read_unaligned()) }
 }
 
 /// [`hash_at`] for a runtime hash-log (the chain strategies size their
@@ -1622,21 +1623,28 @@ impl MatchGeneratorDriver {
         let mut seed_budget = self.seed_budget;
         let hash_read = HASH_READ as u64;
 
-        // Resolve a table entry to a window index: invalid entries (empty,
-        // or older than the level window / the live window buffer) alias
-        // the scanning position itself, whose bytes always compare
-        // equal — the byte compare plus `cand != ip` then rejects them with
-        // one predictable branch instead of a three-way check per probe
-        // (libzstd's selectAddr trick). `unpack_pos` keeps the result
-        // strictly below `pos`, so the surviving index cannot leave the
-        // window.
+        // Resolve a table entry to a window index. The truncated absolute
+        // position is rebuilt as a *distance* from the scanning position:
+        // `dist = pos - (entry - 1)` wraps to a huge u64 for both the empty
+        // sentinel (dist = pos + 1 > reach) and candidates from the previous
+        // 4 GiB cycle, so the window-range check `dist <= reach` (reach =
+        // min(pos - win_base, max_window), i.e. `pos - lo`) rejects all
+        // three failure modes in one compare. Invalid entries alias the
+        // scanning position itself, whose bytes always compare equal — the
+        // byte compare plus `cand != ip` then rejects them with one
+        // predictable branch instead of a three-way check per probe
+        // (libzstd's selectAddr trick).
         //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
-        let resolve = |entry: u32, pos_abs: u64, lo: u64, ip: usize| -> usize {
-            match unpack_pos(entry, pos_abs) {
-                Some(cand_abs) if cand_abs >= lo => (cand_abs - win_base) as usize,
-                _ => ip,
+        let resolve = |entry: u32, pos_abs: u64, reach: u64, ip: usize| -> usize {
+            // dist = pos - entry + 1 without a debug panic on entry == 0
+            // (the empty sentinel wraps to dist = pos + 1 > reach).
+            let dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
+            if dist <= reach {
+                (pos_abs - win_base) as usize - dist as usize
+            } else {
+                ip
             }
         };
 
@@ -1658,14 +1666,23 @@ impl MatchGeneratorDriver {
         // scan paid for them in spill traffic — a quarter of its cycles sat
         // on stack reloads. `$gated` is a literal, so the phase-only code
         // paths are constant-folded away in the steady instantiation.
+        //
+        // A steady/tail loop split that folds `pair_len` to the constant 2
+        // (full pairs while a pair fits, then a single-position epilogue
+        // instantiation) costs 3% fewer instructions but regressed
+        // text.fastest wall by 7% — the third macro instantiation displaces
+        // the hot blocks; do not retry without a code-layout story.
         macro_rules! scan_fast {
             ($restart:lifetime, $gated:literal) => {
                 let idx0 = (pos - win_base) as usize;
-                let h0 = hash_at(win, idx0);
+                // One u64 load per position feeds the hash, the 4-byte
+                // probe prefilter (its low half) and the repcode compares.
+                let v0 = read8(win, idx0);
+                let h0 = hash5(v0);
                 // SAFETY: the hash masks to HASH_LOG bits and the table always
                 // holds 1 << HASH_LOG slots (see insert_at).
                 let prev0 = unsafe { *table_ptr.add(h0) };
-                let cur0 = read4(win, idx0);
+                let cur0 = v0 as u32;
                 let mut pair_len = 1u64;
                 let mut idx1 = idx0;
                 let mut h1 = h0;
@@ -1674,10 +1691,11 @@ impl MatchGeneratorDriver {
                 if block_end - pos > hash_read {
                     pair_len = 2;
                     idx1 = idx0 + 1;
-                    h1 = hash_at(win, idx1);
+                    let v1 = read8(win, idx1);
+                    h1 = hash5(v1);
                     // SAFETY: as above.
                     prev1 = unsafe { *table_ptr.add(h1) };
-                    cur1 = read4(win, idx1);
+                    cur1 = v1 as u32;
                 }
                 // Store after both lookups so each probe sees the pre-store
                 // entry (newest-wins).
@@ -1697,28 +1715,26 @@ impl MatchGeneratorDriver {
                 // at least one pending literal so of_value 1 stays encodable: with
                 // literals pending the probe runs at the current position,
                 // otherwise one byte ahead so that byte becomes the literal.
+                // The probe bound is window-relative (`pidx >= rep[0]` is
+                // `probe >= win_base + rep[0]` with win_base folded out).
                 {
-                    // Absolute lower bound of rep[0] candidates; rep[0] only
-                    // changes inside emits, which re-enter the loop.
-                    let rep0_lim = win_base + rep[0] as u64;
+                    let anchor_idx = (anchor - win_base) as usize;
                     // A gated job start must not probe repcodes (unknown
                     // decoder history); probe 0 sits below the bound, which
                     // folds the underflow guard into the same single
                     // comparison.
-                    let probe = if $gated && rep_pending != 0 {
+                    let pidx = if $gated && rep_pending != 0 {
                         0
-                    } else if pos == anchor {
-                        pos + 1
+                    } else if idx0 == anchor_idx {
+                        idx0 + 1
                     } else {
-                        pos
+                        idx0
                     };
-                    if probe >= rep0_lim {
-                        let mut cand = (probe - rep0_lim) as usize;
-                        let pidx = (probe - win_base) as usize;
+                    if pidx >= rep[0] as usize {
+                        let mut cand = pidx - rep[0] as usize;
                         if read4(win, cand) == read4(win, pidx) {
                             let mut ml = extend_match(win, pidx, cand);
                             if ml >= MIN_MATCH {
-                                let anchor_idx = (anchor - win_base) as usize;
                                 let mut start = pidx;
                                 // Extend backwards into the pending literals;
                                 // the offset (pidx - cand) stays constant.
@@ -1790,8 +1806,8 @@ impl MatchGeneratorDriver {
                     }
                 }
 
-                let lo = pos.saturating_sub(max_window).max(win_base);
-                let mut cand0 = resolve(prev0, pos, lo, idx0);
+                let reach = (pos - win_base).min(max_window);
+                let mut cand0 = resolve(prev0, pos, reach, idx0);
                 if cand0 != idx0 && read4(win, cand0) == cur0 {
                     let mut ml = extend_match(win, idx0, cand0);
                     // A hash match already spans 5 bytes; below 6 the
@@ -1833,26 +1849,18 @@ impl MatchGeneratorDriver {
             }
 
             // Probe the second position through the entry prepared above.
+            // `pos1 == anchor` is impossible (anchor <= pos < pos + 1), so
+            // the pending-literal select folds away here.
             if pair_len == 2 {
-                let pos1 = pos + 1;
-                // Absolute lower bound of rep[0] candidates (see above).
-                let rep0_lim = win_base + rep[0] as u64;
                 // Gated job starts skip the repcode probe (see above).
-                let probe = if $gated && rep_pending != 0 {
-                    0
-                } else if pos1 == anchor {
-                    pos1 + 1
-                } else {
-                    pos1
-                };
-                if probe >= rep0_lim {
-                    let mut cand = (probe - rep0_lim) as usize;
-                    let pidx = (probe - win_base) as usize;
-                    if read4(win, cand) == read4(win, pidx) {
-                        let mut ml = extend_match(win, pidx, cand);
+                let pidx1 = if $gated && rep_pending != 0 { 0 } else { idx1 };
+                if pidx1 >= rep[0] as usize {
+                    let mut cand = pidx1 - rep[0] as usize;
+                    if read4(win, cand) == read4(win, pidx1) {
+                        let mut ml = extend_match(win, pidx1, cand);
                         if ml >= MIN_MATCH {
                             let anchor_idx = (anchor - win_base) as usize;
-                            let mut start = pidx;
+                            let mut start = pidx1;
                             while start > anchor_idx + 1
                                 && cand > 0
                                 && win[cand - 1] == win[start - 1]
@@ -1870,8 +1878,9 @@ impl MatchGeneratorDriver {
                     }
                 }
 
-                let lo1 = pos1.saturating_sub(max_window).max(win_base);
-                let mut cand1 = resolve(prev1, pos1, lo1, idx1);
+                let pos1 = win_base + idx1 as u64;
+                let reach1 = (pos1 - win_base).min(max_window);
+                let mut cand1 = resolve(prev1, pos1, reach1, idx1);
                 if cand1 != idx1 && read4(win, cand1) == cur1 {
                     let mut ml = extend_match(win, idx1, cand1);
                     if ml >= 6 {
@@ -1997,21 +2006,24 @@ impl MatchGeneratorDriver {
             small_log,
         };
 
-        // Resolve a table entry to a window index: invalid entries (empty,
-        // or older than the level window / the live window buffer) alias
-        // the scanning position itself, whose bytes always compare equal —
-        // the byte compare plus `cand != ip_idx` then rejects them with
-        // predictable branches instead of a three-way check per probe
-        // (libzstd's selectAddr trick). `unpack_pos` keeps the result
-        // strictly below `pos_abs`, so the surviving index cannot leave
-        // the window.
+        // Resolve a table entry to a window index. Same distance trick as
+        // the fast loop's `resolve`: `dist = pos - (entry - 1)` wraps huge
+        // for the empty sentinel and previous-4-GiB-cycle entries, so
+        // `dist <= reach` (reach = min(pos - win_base, max_window)) rejects
+        // every failure mode in one compare, and invalid entries alias the
+        // scanning position itself, whose bytes always compare equal — the
+        // byte compare plus `cand != ip_idx` then rejects them with
+        // predictable branches (libzstd's selectAddr trick).
         //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
-        let resolve = |entry: u32, pos_abs: u64, lo: u64, ip: usize| -> usize {
-            match unpack_pos(entry, pos_abs) {
-                Some(cand_abs) if cand_abs >= lo => (cand_abs - win_base) as usize,
-                _ => ip,
+        let resolve = |entry: u32, pos_abs: u64, reach: u64, ip: usize| -> usize {
+            // Same double-wrapping form as the fast loop's `resolve`.
+            let dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
+            if dist <= reach {
+                (pos_abs - win_base) as usize - dist as usize
+            } else {
+                ip
             }
         };
 
@@ -2041,7 +2053,7 @@ impl MatchGeneratorDriver {
                 let pos_abs = win_base + ip_idx as u64;
                 // Oldest usable candidate age: within the level window and
                 // inside the live window buffer.
-                let lo = pos_abs.saturating_sub(max_window).max(win_base);
+                let reach = (pos_abs - win_base).min(max_window);
                 // Insert after both lookups, before probing (newest-wins).
                 // SAFETY: both hashes masked to their tables' sizes.
                 unsafe {
@@ -2053,17 +2065,19 @@ impl MatchGeneratorDriver {
                 // Repcode pre-probe one byte ahead: the probed byte stays a
                 // pending literal, so of_value 1 encodes rep0 instead of a
                 // swap, and no backward extension may consume it. Gated job
-                // starts skip the probe (unknown decoder history).
+                // starts skip the probe (unknown decoder history). The bound
+                // is window-relative: `probe >= rep[0]` is
+                // `win_base + probe >= win_base + rep[0]` with win_base
+                // folded out.
                 if !($gated && rep_pending != 0) {
                     let probe = ip_idx + 1;
-                    if let Some(cand_abs) = (win_base + probe as u64).checked_sub(rep[0] as u64)
-                        && cand_abs >= win_base
-                    {
-                        let cand = (cand_abs - win_base) as usize;
+                    if probe >= rep[0] as usize {
+                        let cand = probe - rep[0] as usize;
                         if read4(win, cand) == read4(win, probe) {
                             let ml = extend_match(win, probe, cand);
                             debug_assert!(ml >= MIN_MATCH);
-                            anchor_idx = emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
+                            anchor_idx =
+                                emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
                             ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
@@ -2115,7 +2129,7 @@ impl MatchGeneratorDriver {
 
                 // Long probe: a full 8-byte match at the long-hash candidate.
                 {
-                    let cand = resolve(entry_l0, pos_abs, lo, ip_idx);
+                    let cand = resolve(entry_l0, pos_abs, reach, ip_idx);
                     if cand != ip_idx && read8(win, cand) == read8(win, ip_idx) {
                         let mut start = ip_idx;
                         let mut c = cand;
@@ -2165,14 +2179,14 @@ impl MatchGeneratorDriver {
                 // Short probe: 4 bytes at the short-hash candidate, upgraded
                 // by the long probe prepared for the next position.
                 {
-                    let cand = resolve(entry_s0, pos_abs, lo, ip_idx);
+                    let cand = resolve(entry_s0, pos_abs, reach, ip_idx);
                     if cand != ip_idx && read4(win, cand) == read4(win, ip_idx) {
                         let mut start = ip_idx;
                         let mut c = cand;
                         let mut ml = extend_match(win, ip_idx, cand);
                         let pos1_abs = win_base + ip1_idx as u64;
-                        let lo1 = pos1_abs.saturating_sub(max_window).max(win_base);
-                        let c1 = resolve(entry_l1, pos1_abs, lo1, ip1_idx);
+                        let reach1 = (pos1_abs - win_base).min(max_window);
+                        let c1 = resolve(entry_l1, pos1_abs, reach1, ip1_idx);
                         if c1 != ip1_idx && read8(win, c1) == read8(win, ip1_idx) {
                             let l1len = extend_match(win, ip1_idx, c1);
                             if l1len > ml {
