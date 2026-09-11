@@ -17,6 +17,7 @@
 - 6 write_bits per sequence merged into 2 u64 spellings (transition bits ≤27bit, add-bits ≤51bit, one each): another +4%. `bbde2ea`
 - transition bits and add-bits merged into one hot_push (combined ≤56bit safe cap, falls back to double push beyond it). json -0.4% instructions. `2d18813`
 - **encode_sequences upfront reserve + raw pointers**: one reserve of `nb_seq*11 + 32` bytes (≤51 add bits on the last sequence, ≤87 per earlier one, plus the 8-byte flush-store overshoot) replaces the per-push capacity probe (a Vec field load + branch per sequence); the seqs stream and the three FSE transition-row tables move to raw pointers — the slice/Vec fields rode the stack through every iteration and were the function's hottest single instructions. Byte-identical output; gungraun json.fastest a further -1.3% (cumulative -4.0% with the emit split), json.fast -0.9%.
+- **encode_sequences pre-shifted row-offset tables**: the loop-invariant `code << table_log` half of each row index is precomputed once per block into three 256-entry stack tables, so the hot loop folds it in with one L1 load and the three shift registers (stack-reloaded per sequence under register pressure) leave the loop. Byte-identical output (full-ladder dump gate); gungraun json.fast -0.47%, text.fast -0.51%.
 - **table mode selection** (port of the libzstd `selectEncodingType` fast branch): RLE single-code / Predefined threshold / Encoded + normalizeCount M2 normalization + optimalTableLog + last-sequence count decrement. json ratio 5.22→5.37. `1a17db3`
 - **repeat mode (mode 3)**: when the previous block's table covers all active codes and the bit-cost estimate (Σ c·log2) ≤ new-table description + entropy lower bound, the whole table is reused with zero description bytes; a Predefined/RLE choice invalidates the remembered table (`PrevTable::{New,Keep,Clear}` three states guard against table-state desync with the decoder). json -2.2% instructions, ratio 5.99→6.00. `7769bf8`
 - RLE degenerate single-state FSE table: table_size=1 takes exactly the same path as normal modes, zero special-case branches.
@@ -38,6 +39,7 @@
 - **Miller-Madow entropy sampling rejection gate**: strided sampling (~1024 points) + Miller-Madow bias correction + distinct>208 pre-screen + sticky `gate_hold`; rejects only at ≥8 bits/byte. random instructions -43%, +43% (1450→2060, overtaking libzstd L1). `cdc70c0`
 - literals entropy lower-bound pre-check (exact histogram + Shannon bound + 8% margin; skip the Huffman attempt when it cannot beat raw; histogram and table build share one scan): random 455→1178 (+159%). `a32d2c1`
 - three-table histogram fused into a single pass (one traversal of packed codes updates the ll/ml/of counters). `6690a05`
+- fused pass lane-split: 4 sub-histograms per channel (12×1KB) break store-forward serialization on repeated-code runs; gated at nb_seq ≥ 128 (12KB zero/merge doesn't pay off on tiny blocks). choose_tables_fast cycles 2.83%→2.00% on json.fast; gungraun -0.07%.
 - log2 under no_std uses a linear-mantissa approximation (error <0.086, swallowed by the 8% margin). `9121215`
 
 ## Checksum (xxh64)

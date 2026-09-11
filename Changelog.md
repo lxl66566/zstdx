@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Sequence-section per-sequence cost cuts in `compressed.rs` (json.Fast
+  residue, todo 5): the three code histograms of `choose_tables_fast` are
+  lane-split (4 sub-histograms per channel, gated at nb_seq ≥ 128), and
+  `encode_sequences` precomputes the loop-invariant `code << table_log`
+  row-index halves into per-block stack tables, dropping the per-sequence
+  variable shifts and shift-register stack reloads. Output byte-identical
+  (full-ladder dump gate). Gungraun: json.fast −0.5%, text.fast −0.5%
+  instructions; choose_tables_fast cycles 2.83%→2.00% on json.fast.
+
 - Chain-strategy lazy walk gain comparisons are now literal-cost-aware: the
   rep probe and the chain probe price a candidate at its displaced
   literals' fed-back code lengths (first four bytes, clamped to 6 bits —
