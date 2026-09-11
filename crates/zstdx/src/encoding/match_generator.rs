@@ -35,6 +35,9 @@ pub(super) const MIN_MATCH: usize = 4;
 pub(super) const HASH_READ: usize = 8;
 /// Hash table size as a power of two.
 const HASH_LOG: u32 = 15;
+/// 5-byte window multiply prime (libzstd `prime5bytes`); only the low 64
+/// bits of the product feed the slot index.
+const HASH_PRIME: u64 = 0xc2b2_ae3d_27d4_eb4f;
 /// Prefill grid spacing (libzstd's `fastHashFillStep`, also what its
 /// dictionary-content load uses for fast/dfast): the strip's mid-distance
 /// match coverage survives a 3x coarser grid, at a third of the fill cost.
@@ -264,7 +267,7 @@ fn hash_at(win: &[u8], idx: usize) -> usize {
     // because positions are byte-granular.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
-        (v.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
+        (v.wrapping_mul(HASH_PRIME) as usize >> (64 - HASH_LOG)) & ((1 << HASH_LOG) - 1)
     }
 }
 
@@ -275,7 +278,7 @@ fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
-        (v.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) as usize >> (64 - log)) & ((1usize << log) - 1)
+        (v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)) & ((1usize << log) - 1)
     }
 }
 
