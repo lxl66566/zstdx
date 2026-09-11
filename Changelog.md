@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- `package_merge_lengths` per-level package sort removed: packages are
+  disjoint adjacent-pair sums of the (weight, node)-sorted previous level,
+  so pkg[k+1] >= pkg[k] (w[2k+2] >= w[2k] and w[2k+3] >= w[2k+1]) and ties
+  break by strictly increasing arena id — the list is provably already
+  sorted, the sort was a no-op. Verified by a 2M-random-vector brute force
+  (sortedness debug-assert + identical lengths) and the full-ladder dump
+  byte-identical gate. Each of the 10 merge levels per table drops its
+  O(n log n) compare sort; gungraun text fastest/fast -0.34% instructions,
+  skewed fastest -0.19%, text-4K small-payload +3% wall-clock.
+
 - `package_merge_lengths` scratch rework: level lists collapse from a
   `Vec<Vec<Ent>>` (two allocations per level, 11 levels per table) to two
   swapped reusable buffers - only the previous level is ever read; `Ent`

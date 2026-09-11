@@ -383,7 +383,12 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
             });
             i += 2;
         }
-        packages.sort_by_key(|e| (e.weight, e.node));
+        // No sort needed: `prev` is (weight, node)-sorted, so disjoint adjacent
+        // pair sums are weight-monotone (w[2k+2] >= w[2k] and w[2k+3] >= w[2k+1]
+        // imply pkg[k+1] >= pkg[k]); ties break by node id, which strictly
+        // increases in push order. The packages are therefore already in the
+        // exact order the removed sort produced.
+        debug_assert!(packages.is_sorted_by(|a, b| { (a.weight, a.node) <= (b.weight, b.node) }));
         // Intermediate levels can hold fewer than `take` items; only the
         // top level is guaranteed full (L >= log2 n).
         cur.clear();
