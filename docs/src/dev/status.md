@@ -38,7 +38,7 @@
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz; missing MT-path checksum |
 | decode performance | bulk ahead across the board; streaming ~75-85% | streaming residue is on json/skewed, see [current snapshot](dev/bench/snapshot.md) |
 | encode features | ~60% | seven-tier ladder + MT + streaming in place; missing dictionary encode, LDM, superblock, adjustable window |
-| encode ratio | matched at every tier | dll: Best/Opt denser than zstd-12/16 (4.86 vs 4.45, 5.01 vs 4.82), Ultra 7.7% behind zstd-19; json: Opt +5%, Best +11%, Ultra parity; worst cell json.ultra.bulk-mt −1.85% |
+| encode ratio | matched at every tier | dll: Best/Opt denser than zstd-12/16 (4.86 vs 4.45, 5.01 vs 4.82), Ultra 7.7% behind zstd-19; json: Opt +5%, Best +11%, Ultra parity; worst cell text.balanced.bulk-st −0.61% (json.ultra.bulk-mt was −1.85%, closed to −0.13% by the Ultra job-boundary statistics seeding) |
 | encode speed | wins and losses split by tier | leading on text/skewed/zeros at multiple tiers; json low tiers behind 1.3-1.8×; Best/Opt/Ultra speed behind (json Opt 0.46× after W23 — the reach/speed trade mirrors libzstd's own ladder) |
 | API/ecosystem | ~45% | bulk + streaming + compat + CLI; missing C FFI, language bindings, standard CLI argument surface |
 

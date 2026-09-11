@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Ultra multithreaded job-boundary statistics seeding: each job's first
+  parsed block now runs a throwaway parse of the strip tail (two blocks) with
+  the window re-based to the span — candidates and fills clamp inside it,
+  reproducing the empty-window frame start — purely to seed the opt parser's
+  price statistics; the real parse then re-fills the strip and runs. A
+  sequential in-order-carry decomposition (json.ultra, 4x8MiB jobs, every
+  variant roundtrip-gated) had put the entire boundary loss (~85KiB of
+  mt-vs-st) on the per-job `opt_state` reset: BASE-priced parses lock into a
+  near-offset/ll0 basin that updateStats reinforces for the whole job
+  (stats reset 104KiB vs entropy restart 1.3KiB, rep gate 2.6KiB, tree
+  refill 3.1KiB). json.ultra bulk-mt/stream-mt -1.85% -> -0.13% vs
+  libzstd-19 mt; full-ladder ST dump byte-identical (frame-start seeding
+  path unchanged); mt wall unchanged (json 4.1 MiB/s, best-of-5). Seeding
+  the same span with the strip reachable recovers nothing at any span size
+  (negative.md).
+
 - Incompressibility gate extended to the table strategies (Fastest/Fast/
   Balanced): the same probe + entropy-bar gate now skips the match search
   for near-random blocks at every level. A gated block opens a `gap_start`

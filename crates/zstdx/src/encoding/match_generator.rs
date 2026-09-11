@@ -3306,4 +3306,60 @@ mod tests {
         );
         assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
     }
+
+    /// A multithreaded job's first parsed block runs with adopted history
+    /// below it (`prefill_window` + `adopt_window` + `set_block`) and the
+    /// repcode gate armed; Ultra's strip-tail statistics seeding must not
+    /// corrupt the emitted stream or the offset history.
+    #[test]
+    fn ultra_job_boundary_reconstructs() {
+        let mut data = Vec::with_capacity(300 * 1024);
+        let words = [
+            &b"the quick brown fox "[..],
+            &b"jumps over the lazy dog "[..],
+            &b"lorem ipsum dolor sit amet "[..],
+            b"\x00\x01\x02\x03 structured noise ",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while data.len() < 300 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(words[(state as usize) % words.len()]);
+        }
+        let start = 192 * 1024;
+        let run = || {
+            let mut driver = MatchGeneratorDriver::new_direct();
+            driver.reset(crate::Level::Ultra);
+            driver.gate_repcodes();
+            driver.prefill_window(&data[..start], 0);
+            driver.adopt_window(&data, 0);
+            driver.set_block(start as u64, data.len() as u64);
+            let mut rep = [1u32, 4, 8];
+            let mut reconstructed = data[..start].to_vec();
+            driver.start_matching(|seq| match seq {
+                Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => {
+                    reconstructed.extend_from_slice(literals);
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    );
+                    let from = reconstructed.len() - actual as usize;
+                    for i in 0..match_len {
+                        let b = reconstructed[from + i];
+                        reconstructed.push(b);
+                    }
+                },
+            });
+            reconstructed
+        };
+        assert_eq!(run(), data);
+        assert_eq!(run(), data, "job parse must be deterministic");
+    }
 }

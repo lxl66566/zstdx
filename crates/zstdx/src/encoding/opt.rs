@@ -9,8 +9,9 @@
 //! block seeds from its own literal histogram plus libzstd's baseline
 //! sequence-stat tables, later blocks downscale the accumulated statistics,
 //! and every emitted sequence increments them (`ZSTD_rescaleFreqs` /
-//! `ZSTD_updateStats`). `Ultra` additionally re-parses the first block once
-//! purely to seed the statistics (`ZSTD_initStats_ultra`).
+//! `ZSTD_updateStats`). `Ultra` additionally re-parses once purely to seed
+//! the statistics (`ZSTD_initStats_ultra`): the first block at a frame start,
+//! or the strip tail preceding a multithreaded job.
 
 use alloc::vec::Vec;
 
@@ -31,6 +32,11 @@ const OPT_SIZE: usize = OPT_NUM + 3;
 const LITFREQ_ADD: u32 = 2;
 /// Blocks at or below this size price symbols from the predefined tables.
 const PREDEF_THRESHOLD: usize = 8;
+/// Job-boundary seeding span (two blocks): the strip tail parsed as a
+/// self-contained frame to seed the statistics. Longer spans measured
+/// neutral-to-worse (basin noise); two blocks match the frame-start pass's
+/// adaptation depth.
+const SEED_SPAN: u64 = 2 * crate::common::MAX_BLOCK_SIZE as u64;
 
 /// Positions in table entries live in the low 48 bits; the high 16 carry the
 /// epoch (shared convention with the other matcher strategies).
@@ -736,43 +742,82 @@ pub(crate) fn run_block<const ULTRA: bool>(
     seqs: &mut Vec<SeqWord>,
 ) {
     let block_len = (block_end - block_start) as usize;
-    // btultra2: seed statistics with a throwaway parse of the first block.
-    if ULTRA && state.lit_length_sum == 0 && block_start == 0 && block_len > PREDEF_THRESHOLD {
-        let saved_rep = *rep;
-        let saved_pending = *rep_pending;
-        run_once::<ULTRA>(
-            knobs,
-            win,
-            win_base,
-            block_start,
-            block_end,
-            max_window,
-            *epoch,
-            table,
-            bt,
-            hash3,
-            next_update,
-            state,
-            scratch,
-            rep,
-            rep_pending,
-            literals,
-            seqs,
-        );
-        *rep = saved_rep;
-        *rep_pending = saved_pending;
-        literals.clear();
-        seqs.clear();
-        // Drop the pass-1 tree (libzstd rewinds its window limits instead; the
-        // epoch tag achieves the same invalidation for free).
-        *epoch += 1;
-        if *epoch > 0xffff {
-            table.fill(EMPTY);
-            bt.fill(EMPTY);
-            hash3.fill(EMPTY);
-            *epoch = 1;
+    // btultra2: seed statistics with a throwaway parse before the first real
+    // parse of a fresh state (`ZSTD_initStats_ultra`). At the frame start the
+    // seed is the first block itself. At a multithreaded job boundary the
+    // seed is the strip tail preceding the job, parsed as a self-contained
+    // frame: prices shape the DP's parse and the parse updates the prices, so
+    // a job starting from the baseline tables locks into the near-offset/ll0
+    // basin for its whole run — seeding must reproduce the empty-window
+    // frame start whose parse shape the prices then reinforce (seeding with
+    // the strip reachable recovers none of the boundary loss; see
+    // dev/negative.md).
+    if ULTRA && state.lit_length_sum == 0 && block_len > PREDEF_THRESHOLD {
+        let frame_start = block_start == 0;
+        let seed_start = if frame_start {
+            block_start
+        } else {
+            block_start.saturating_sub(SEED_SPAN).max(win_base)
+        };
+        let seed_end = if frame_start {
+            block_end
+        } else {
+            block_start
+        };
+        if seed_end - seed_start > PREDEF_THRESHOLD as u64 {
+            let saved_rep = *rep;
+            let saved_pending = *rep_pending;
+            // Re-base the window slice to the span so candidates and fills
+            // clamp to the span itself (the empty-window frame start).
+            let seed_win = &win[(seed_start - win_base) as usize..];
+            let seed_win_base = if frame_start {
+                win_base
+            } else {
+                seed_start
+            };
+            run_once::<ULTRA>(
+                knobs,
+                seed_win,
+                seed_win_base,
+                seed_start,
+                seed_end,
+                max_window,
+                *epoch,
+                table,
+                bt,
+                hash3,
+                next_update,
+                state,
+                scratch,
+                rep,
+                rep_pending,
+                literals,
+                seqs,
+            );
+            *rep = saved_rep;
+            *rep_pending = saved_pending;
+            literals.clear();
+            seqs.clear();
+            if frame_start {
+                // Drop the pass-1 tree (libzstd rewinds its window limits
+                // instead; the epoch tag achieves the same invalidation for
+                // free).
+                *epoch += 1;
+                if *epoch > 0xffff {
+                    table.fill(EMPTY);
+                    bt.fill(EMPTY);
+                    hash3.fill(EMPTY);
+                    *epoch = 1;
+                }
+                *next_update = block_start;
+            } else {
+                // The isolated seed left the strip unindexed and its own
+                // span threaded; rewind the fill cursor so the real parse
+                // rebuilds the strip chain (re-inserting the seed span is
+                // benign: the head rejects the duplicate position).
+                *next_update = win_base;
+            }
         }
-        *next_update = block_start;
     }
     run_once::<ULTRA>(
         knobs,
