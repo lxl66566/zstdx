@@ -18,7 +18,7 @@
 6. **Balanced speed** (~1.2× vs zstd-9 on json; skewed already overtaken via prefill): shift focus to **per-probe/per-position cost** — instruction count of the chain-walk beat-check/unpack sequence and the emit path (localize with enc_prof + perf). Miss-segment strategy directions (stepping/insertion scheduling) were falsified twice and are closed.
 7. **random low tiers 1.18-1.46×**: per-block overhead of raw blocks (zstd raw blocks are near-memcpy); suspects: fixed per-block cost (decision/stage/emit), dfast miss-stepping zeroing between blocks, chain walking full 8-deep garbage chains. Profile before opening a work item.
 8. **Best/Opt/Ultra speed**: ratio already ahead/level; speed is the remaining dimension — text Opt 313 vs libzstd ~440; the per-block DP cost behind Best's 12-19 MiB/s; streaming MT per-job fixed cost at the best tier (text.best streaming 0.8× its own ST).
-9. **Small/mid payloads (4K-1M)**: json/text mid-size ~2× (per-byte cost of scan+emit+table build, not fixed overhead). Candidate: Huffman `build_from_weights` sort → 12-bucket counting sort (weights ≤11, buckets descending with symbols ascending within a bucket = strictly equivalent to current semantics; table build is ~18% on text-4K).
+9. **Small/mid payloads (4K-1M)**: json/text mid-size ~2× (per-byte cost of scan+emit+table build, not fixed overhead). Done: `build_from_weights` counting sort (2026-09-11, text-4K +5%); remaining: the package-merge cost itself (per-level Vec allocs, 12-byte Ent) and the scan/emit per-byte cost.
 
 ## P2 · Ratio and features
 

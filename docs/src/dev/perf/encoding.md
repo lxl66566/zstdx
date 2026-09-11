@@ -23,6 +23,7 @@
 ## Huffman
 
 - **boundary package-merge optimal length-limited codes** (Larmore-Hirschberg) replacing the initial rank-weight ladder (the old scheme depended on count order, not magnitude — large losses on skewed histograms): all levels benefit, json Ultra 7.33→7.52, text fastest 196.6→206.0. `aa07308`
+- `build_from_weights` counting sort: package-merge caps weights at 11, so 12 stack buckets with symbols scattered in ascending order reproduce the comparison sort's weight-ascending/symbol-ascending order exactly (byte-identical output, gate: full-ladder dump); removes the per-block heap Vec and the O(n log n) sort. text-4K small-payload encode +5% wall-clock, gungraun instruction counts drop on every text-shaped cell, no regressions elsewhere.
 - scalar 4-symbol batch accumulation: packed u16 `(code<<4)|nb` code table; flush to <8bit first, then branchlessly accumulate 4 symbols into a u64; a single unaligned store flushes whole bytes. skewed +71%, json +4%.
 - **AVX-512VBMI 4-bit code packing kernel** (uniform 9..16-symbol alphabets): 64 symbols/batch, `permutex2var_epi8`×2 indexing a 256-entry LUT + two permutes to un-interleave paired nibbles. skewed instructions -48%, throughput +43%. `2be2207`
 - RLE literals mode (all literals the same byte → type1 header + 1 content byte). Gotcha: in the 5-bit size format, size_format occupies only 1 bit (see the pitfalls notes).

@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Huffman literals table build (`build_from_weights`): the weight-ordered
+  symbol sort is now a 12-bucket counting sort over stack arrays instead of a
+  heap-allocated `Vec` + comparison sort. Package-merge caps weights at 11, so
+  bucket-major iteration with symbols scattered in ascending order reproduces
+  the previous weight-ascending/symbol-ascending order exactly (encoder output
+  stays byte-identical). Removes the per-block allocation and the O(n log n)
+  sort from every literals table build; text-4K small-payload encode gains
+  ~5% wall-clock and the deterministic instruction counts drop on every
+  text-shaped cell (no regressions elsewhere).
+
 - New `zstdx-bench ratio` subcommand: a compression-ratio sweep over every
   ladder level x bulk/streaming x single-/multi-thread (120 cells on the full
   corpus), one deterministic pass per cell with the libzstd reference side,

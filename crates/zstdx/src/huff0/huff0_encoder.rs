@@ -1,5 +1,4 @@
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 
 use crate::{
     bit_io::BitWriter,
@@ -207,72 +206,77 @@ impl HuffmanTable {
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
-        struct SortEntry {
-            symbol: u8,
-            weight: usize,
+        // Counting sort by weight. Package-merge caps weights at
+        // MAX_CODE_LENGTH, so MAX_CODE_LENGTH + 1 buckets cover every nonzero
+        // weight; scattering symbols in ascending order keeps each bucket
+        // symbol-ascending, the exact order the comparison sort produced and
+        // the code-assignment loop below requires (non-decreasing weight).
+        debug_assert!(weights.iter().all(|&w| w <= MAX_CODE_LENGTH));
+        let mut bucket_counts = [0u16; MAX_CODE_LENGTH + 1];
+        for &weight in weights {
+            bucket_counts[weight] += 1;
         }
-        let mut sorted = Vec::with_capacity(weights.len());
+        let mut bucket_start = [0u16; MAX_CODE_LENGTH + 1];
+        let mut total = 0u16;
+        for weight in 1..=MAX_CODE_LENGTH {
+            bucket_start[weight] = total;
+            total += bucket_counts[weight];
+        }
 
-        // TODO this doesn't need to be a temporary Vec, it could be done in a [_; 264]
-        // only non-zero weights are interesting here
-        for (symbol, weight) in weights.iter().copied().enumerate() {
-            if weight > 0 {
-                sorted.push(SortEntry {
-                    symbol: symbol as u8,
-                    weight,
-                });
+        let mut sorted = [0u8; 256];
+        let mut cursor = bucket_start;
+        for (symbol, &weight) in weights.iter().enumerate() {
+            if weight != 0 {
+                sorted[cursor[weight] as usize] = symbol as u8;
+                cursor[weight] += 1;
             }
         }
-        // We process symbols ordered by weight and then ordered by symbol
-        sorted.sort_by(|left, right| match left.weight.cmp(&right.weight) {
-            Ordering::Equal => left.symbol.cmp(&right.symbol),
-            other => other,
-        });
 
         // Prepare huffman table with placeholders
         let mut table = HuffmanTable {
-            codes: Vec::with_capacity(weights.len()),
+            codes: alloc::vec![(0, 0); weights.len()],
             packed: [0; 256],
             uniform_nb: 0,
         };
-        for _ in 0..weights.len() {
-            table.codes.push((0, 0));
-        }
 
         // Determine the number of bits needed for codes with the lowest weight
-        let weight_sum = sorted.iter().map(|e| 1 << (e.weight - 1)).sum::<usize>();
+        let weight_sum = (1..=MAX_CODE_LENGTH)
+            .map(|weight| (bucket_counts[weight] as usize) << (weight - 1))
+            .sum::<usize>();
         assert!(weight_sum.is_power_of_two(), "This is an internal error");
         let max_num_bits = highest_bit_set(weight_sum) - 1; // this is a log_2 of a clean power of two
 
         // Starting at the symbols with the lowest weight we update the placeholders in the table
         let mut current_code = 0;
         let mut current_weight = 0;
-        let mut current_num_bits = 0;
         let mut uniform_nb = 0u8;
         let mut seen_first = false;
         let mut all_same = true;
-        for entry in &sorted {
-            // If the entry isn't the same weight as the last one we need to change a few things
-            if current_weight != entry.weight {
-                // The code shifts by the difference of the weights to allow for enough unique
-                // values
-                current_code >>= entry.weight - current_weight;
-                // Encoding a symbol of this weight will take less bits than the previous weight
-                current_num_bits = max_num_bits - entry.weight + 1;
-                // Run the next update when the weight changes again
-                current_weight = entry.weight;
+        for weight in 1..=MAX_CODE_LENGTH {
+            let start = bucket_start[weight] as usize;
+            let end = start + bucket_counts[weight] as usize;
+            if start == end {
+                continue;
             }
-            if seen_first && current_num_bits != uniform_nb as usize {
-                all_same = false;
+            // The code shifts by the difference of the weights to allow for enough unique values
+            current_code >>= weight - current_weight;
+            // Encoding a symbol of this weight will take less bits than the previous weight
+            let current_num_bits = max_num_bits - weight + 1;
+            // Run the next update when the weight changes again
+            current_weight = weight;
+            for &symbol in &sorted[start..end] {
+                if seen_first && current_num_bits != uniform_nb as usize {
+                    all_same = false;
+                }
+                uniform_nb = current_num_bits as u8;
+                seen_first = true;
+                table.codes[symbol as usize] = (current_code as u32, current_num_bits as u8);
+                debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
+                table.packed[symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
+                current_code += 1;
             }
-            uniform_nb = current_num_bits as u8;
-            seen_first = true;
-            table.codes[entry.symbol as usize] = (current_code as u32, current_num_bits as u8);
-            debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
-            table.packed[entry.symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
-            current_code += 1;
         }
-        if all_same && sorted.len() >= 2 {
+        if all_same && total as usize >= 2 {
             table.uniform_nb = uniform_nb;
         }
 
