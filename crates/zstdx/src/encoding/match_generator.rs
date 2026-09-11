@@ -70,6 +70,14 @@ const SEED_SCAN_MIN: usize = 128;
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xc0000;
 
+/// Log of the incompressibility gate's probe table (see
+/// [`Matcher::skip_if_incompressible`]). 32K tag slots keep the overwrite
+/// rate of a block's ~2000 samples negligible.
+const GATE_PROBE_LOG: u32 = 15;
+/// Blocks below this pay little enough in the matcher that the gate's
+/// sample pass is not worth its own cost.
+const GATE_MIN_BLOCK: usize = 16384;
+
 // The opt strategies' never-valid table entry; their positions live in
 // the low 48 bits with the epoch in the high 16 (see
 // [`MatchGeneratorDriver::reset`]).
@@ -809,6 +817,13 @@ pub struct MatchGeneratorDriver {
     /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
     /// (libzstd's hashTable3); empty otherwise.
     hash3: Vec<u64>,
+    /// Content-tag table of the incompressibility gate (see
+    /// [`Matcher::skip_if_incompressible`]): slot = high hash bits of a
+    /// sampled 8-byte window, entry = its low 32 bits. Entries are
+    /// position-independent content tags, so the table is never reset: a
+    /// stale tag can only produce a spurious hit, which selects the
+    /// conservative path.
+    probe: Vec<u32>,
     /// Price statistics for the opt strategies, persisting across blocks.
     opt_state: OptState,
     /// DP scratch for the opt strategies (~130 KiB; allocated on demand).
@@ -904,6 +919,7 @@ impl MatchGeneratorDriver {
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
+            probe: Vec::new(),
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
@@ -938,6 +954,7 @@ impl MatchGeneratorDriver {
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
+            probe: Vec::new(),
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
@@ -1427,6 +1444,88 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Chain(_) => self.start_matching_chain(literals, seqs),
             Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
         }
+    }
+
+    fn skip_if_incompressible(&mut self) -> bool {
+        // Only the opt strategies may gate: their skipped positions stay
+        // matchable through the tree's lazy fill (next_update never
+        // advances for a skipped block), so gating costs no ratio when a
+        // later block duplicates a gated one. The table strategies would
+        // lose the block as match history.
+        if !matches!(self.params.strategy, Strategy::Opt(_)) {
+            return false;
+        }
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let block = &win[(self.block_start - self.win_base) as usize..];
+        let total = block.len();
+        if total < GATE_MIN_BLOCK {
+            return false;
+        }
+        if self.probe.is_empty() {
+            self.probe.resize(1 << GATE_PROBE_LOG, 0);
+        }
+        let probe = &mut self.probe;
+        // Strided repeat probe: a hit means a colliding 47-bit content hash
+        // exists somewhere in the history sampled so far — near-certainly
+        // the same 8 bytes — so the block may be matchable and must not be
+        // gated. The odd stride avoids period locking against structured
+        // inputs. Any match region of a stride's length or more holds a
+        // sample, so only short sparse matches escape detection — those are
+        // worth under a percent of the block, the price the threshold below
+        // already accepted.
+        let stride = (total >> 11) | 1;
+        let mut hits = 0u32;
+        let mut i = 0usize;
+        while i + HASH_READ <= total {
+            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
+            let tag = h as u32;
+            if probe[slot] == tag {
+                hits += 1;
+            } else {
+                probe[slot] = tag;
+            }
+            i += stride;
+        }
+        if hits != 0 {
+            return false;
+        }
+        // Exact byte histogram (four lanes break the store-forward chain):
+        // the entropy decision must not ride on a sample's noise band —
+        // a block wrongly kept below the bar forces a full opt parse plus
+        // the window catch-up fill, hundreds of times the histogram cost.
+        let mut lanes = [[0u32; 256]; 4];
+        let (chunks, remainder) = block.as_chunks::<4>();
+        for chunk in chunks {
+            lanes[0][chunk[0] as usize] += 1;
+            lanes[1][chunk[1] as usize] += 1;
+            lanes[2][chunk[2] as usize] += 1;
+            lanes[3][chunk[3] as usize] += 1;
+        }
+        for &b in remainder {
+            lanes[0][b as usize] += 1;
+        }
+        let total_f = total as f64;
+        let mut entropy_bits = 0.0f64;
+        let mut distinct = 0u32;
+        for (s, &c0) in lanes[0].iter().enumerate() {
+            let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
+            if c > 0 {
+                distinct += 1;
+                entropy_bits -= c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
+            }
+        }
+        // Miller-Madow bias correction, as in the literals entropy gate.
+        let bits_per_byte =
+            entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+        // Well past the literals gate's reject floor: huffman on literals
+        // this dense saves under 0.4% before the table description, and the
+        // probe above already ruled out matches worth more.
+        if bits_per_byte < 7.97 {
+            return false;
+        }
+        self.skip_matching();
+        true
     }
 
     fn skip_matching(&mut self) {

@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Pre-match incompressibility gate for the opt strategies (Best/Opt/Ultra):
+  a strided content-tag probe (47-bit content hashes, ~2000 samples per
+  block, table shared across the frame) plus an exact-histogram entropy bar
+  (≥7.97 bits/byte, Miller-Madow corrected) skip the match search entirely
+  and emit the block raw. The opt tree's lazy fill keeps skipped blocks
+  available as later match history, and `update_tree` now clamps its
+  catch-up fill to the live window (dead positions could neither resolve
+  nor thread). random.best 12→1574 MiB/s (libzstd-12 615), random.opt 1573
+  vs 14 (112×), random.ultra 1542 vs 6 (257×); full-corpus dump
+  byte-identical, 120-cell ratio sweep flat.
+
 - Sequence-section per-sequence cost cuts in `compressed.rs` (json.Fast
   residue, todo 5): the three code histograms of `choose_tables_fast` are
   lane-split (4 sub-histograms per channel, gated at nb_seq ≥ 128), and

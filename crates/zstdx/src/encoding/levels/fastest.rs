@@ -47,6 +47,17 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         // Write the header, then the block
         header.serialize(output);
         output.push(rle_byte);
+    } else if state.matcher.skip_if_incompressible() {
+        // Incompressible gate (opt strategies): the block goes raw without
+        // paying the match search; the checksum absorb fuses into the copy
+        // exactly like the raw fallback below.
+        let header = BlockHeader {
+            last_block,
+            block_type: crate::blocks::block::BlockType::Raw,
+            block_size,
+        };
+        header.serialize(output);
+        hasher.raw_out(output, state.matcher.get_last_space(), hashed);
     } else {
         let rep = state.matcher.repcode_snapshot();
         // Take the reusable entropy tables out of the state by value: the

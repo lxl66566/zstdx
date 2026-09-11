@@ -217,6 +217,18 @@ pub trait Matcher {
     fn repcode_snapshot(&self) -> [u32; 3];
     /// Restore a snapshot taken by [`Matcher::repcode_snapshot`]
     fn restore_repcode(&mut self, rep: [u32; 3]);
+    /// Pre-match incompressibility gate: sample the last committed block and,
+    /// when it is near-certainly raw (max-entropy bytes and no sampled
+    /// repeat anywhere in the frame's history), skip matching it and return
+    /// true — the caller then emits the block raw without paying the match
+    /// search. Implementations may only override this when skipped positions
+    /// stay available as match history for later blocks (the opt strategies'
+    /// tree fill is lazy, so a skipped block is indexed on the next block's
+    /// fill; a skipped block could otherwise turn a later duplicate of it
+    /// raw). The default never gates.
+    fn skip_if_incompressible(&mut self) -> bool {
+        false
+    }
     /// Hint the per-symbol Huffman code lengths of the table that encoded
     /// the previous block's literals (0 = symbol not covered). Matchers may
     /// price a candidate match against the marginal cost of the literals it

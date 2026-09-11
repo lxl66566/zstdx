@@ -521,7 +521,16 @@ impl Finder<'_, '_> {
     /// Fill the tree with every position in `[next_update, target)`.
     fn update_tree(&mut self, target_idx: usize) {
         debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
-        let mut idx = ((*self.next_update).max(self.win_base) - self.win_base) as usize;
+        // Positions below the match window can never resolve as candidates
+        // (`resolve` rejects them) nor be threaded into the ring (`bt_low`
+        // drops them), so inserting them is pure waste. A block the
+        // incompressibility gate skipped leaves `next_update` behind by up
+        // to the whole streak; clamp the fill to the live window instead of
+        // re-indexing dead history once a later block parses again.
+        let target_abs = self.win_base + target_idx as u64;
+        let fill_floor = target_abs.saturating_sub(self.max_window);
+        let mut idx =
+            ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
         while idx < target_idx {
             let forward = self.insert_bt1(idx).max(1);
             idx += forward;
