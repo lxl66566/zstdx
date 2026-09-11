@@ -91,7 +91,7 @@ pub(crate) struct MtEncoderCore {
 impl MtEncoderCore {
     pub(crate) fn new(options: &EncoderOptions) -> Self {
         let checksum = options.checksum && cfg!(feature = "hash");
-        let window = MatchGeneratorDriver::window_for_level(options.level);
+        let window = MatchGeneratorDriver::window_for_level(options.level, options.pledged_size);
         let overlap = window as usize;
         // A pledge sizes the grid like the bulk path (byte-identical output
         // when the input matches the pledge); an open-ended stream grows
@@ -303,6 +303,7 @@ impl MtEncoderCore {
                 last_frame_block,
                 self.level,
                 self.job_start > 0,
+                self.pledged,
             );
             self.pool.lock().unwrap().push(state);
             self.output.extend_from_slice(&bytes);
@@ -319,6 +320,7 @@ impl MtEncoderCore {
             let level = self.level;
             let job_start = self.job_start;
             let bounds = &bounds[..];
+            let pledged = self.pledged;
 
             // Disjoint field borrows: the workers share `src` and the state
             // pool while the calling thread runs the checksum absorb and the
@@ -358,6 +360,7 @@ impl MtEncoderCore {
                                         last_frame_block && id + 1 == n_jobs,
                                         level,
                                         gate,
+                                        pledged,
                                     )
                                 }));
                             match attempt {

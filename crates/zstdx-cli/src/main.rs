@@ -101,10 +101,15 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let source_size = source_file.metadata()?.len() as usize;
     let buffered_source = BufReader::new(source_file);
     let encoder_input = ProgressMonitor::new(buffered_source, source_size);
-    let output: File = File::create(output).wrap_err("failed to open output file for writing")?;
+    let output_file: File =
+        File::create(output).wrap_err("failed to open output file for writing")?;
 
-    zstdx::encoding::compress(encoder_input, &output, compression_level);
-    let compressed_size = output.metadata()?.len();
+    let mut compressor = zstdx::encoding::FrameCompressor::new(compression_level);
+    compressor.set_size_hint(Some(source_size as u64));
+    compressor.set_source(encoder_input);
+    compressor.set_drain(&output_file);
+    compressor.compress();
+    let compressed_size = output_file.metadata()?.len();
     let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
     info!(
         "{} ——> {} ({compression_ratio:.2}%)",

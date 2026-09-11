@@ -76,7 +76,8 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
     // the overlap duplication negligible, and scales with the level's
     // overlap so deep-search levels don't pay it per job.
-    let window = MatchGeneratorDriver::window_for_level(level);
+    let hint = Some(src.len() as u64);
+    let window = MatchGeneratorDriver::window_for_level(level, hint);
     // The full window as strip: the strip is fully indexed (see
     // `prefill_window`), so matches reach across job borders as far as the
     // frame window allows. A shorter strip caps the ratio at repeats that
@@ -99,7 +100,7 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
         single_segment: false,
         content_checksum: checksum,
         dictionary_id: None,
-        window_size: Some(MatchGeneratorDriver::window_for_level(level)),
+        window_size: Some(window),
     }
     .serialize(&mut output);
 
@@ -125,7 +126,15 @@ pub fn compress_slice_mt(src: &[u8], level: Level, checksum: bool, workers: u32)
                     // history is still the format default [1, 4, 8].
                     let gate = id > 0;
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_job(src, start..end, overlap, end == src.len(), level, gate)
+                        run_job(
+                            src,
+                            start..end,
+                            overlap,
+                            end == src.len(),
+                            level,
+                            gate,
+                            hint,
+                        )
                     }));
                     match attempt {
                         Ok(bytes) => *slots[id].lock().unwrap() = Some(bytes),
@@ -180,8 +189,9 @@ pub(crate) fn run_job_with(
     is_last_job: bool,
     level: Level,
     gate: bool,
+    src_hint: Option<u64>,
 ) -> Vec<u8> {
-    reset_slice_state(state, level);
+    reset_slice_state(state, level, src_hint);
     if gate {
         state.matcher.gate_repcodes();
     }
@@ -198,9 +208,19 @@ pub(crate) fn run_job(
     is_last_job: bool,
     level: Level,
     gate: bool,
+    src_hint: Option<u64>,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level);
-    let output = run_job_with(&mut state, src, job, overlap, is_last_job, level, gate);
+    let mut state = take_slice_state(level, src_hint);
+    let output = run_job_with(
+        &mut state,
+        src,
+        job,
+        overlap,
+        is_last_job,
+        level,
+        gate,
+        src_hint,
+    );
     return_slice_state(state);
     output
 }

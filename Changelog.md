@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Source-length parameter adjustment (port of libzstd's
+  `ZSTD_adjustCParams`): when the input length is known the level's row
+  downsizes — window to the source's log, hash tables to windowLog+1,
+  chain/ring cycle to windowLog. The bulk paths pass the exact size, MT
+  jobs the whole-frame length, streaming the pledge
+  (`Matcher::set_source_hint`, `FrameCompressor::set_size_hint`,
+  `compress_to_vec_sized`), the CLI file metadata; unknown sizes keep the
+  row. Raw-block frames are exempt (outputs stay hint-independent).
+  Adjusted-band A/B vs libzstd (64KiB-4MiB json/text, levels 1/3/9/13/19):
+  ratio parity throughout (chain rows -5..-15% denser); 4KiB small-call
+  speed 5.96 vs 16.20 ms (L19, incl. process spawn).
+
 - Full 1-22 level ladder: every numeric level now selects its own parameter
   row (`LEVEL_PARAMS`), modeled on libzstd's `clevels.h` large-source table
   and adapted to the implemented strategies — fast rows 1-2, dfast 3-4,

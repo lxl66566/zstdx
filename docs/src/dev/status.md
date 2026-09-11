@@ -20,6 +20,8 @@ Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `cle
 
 First ladder A/B (2026-09-12, 32MiB json/text, vs libzstd CLI at the same level): json — every row at parity or denser except dfast rows +0.2-0.3% and opt rows +0.1-0.4%; chain rows -13..-17%, rows 13-15 -9..-10%. text — rows 1-8 far denser (window), rows 9-12 +2.6-2.7% behind (libzstd's row matcher), rows 13-16 -0.4..-5%, 17-22 +0.2-0.3%. Known inversions: our deep-chain rows (10-12) sit between our opt rows 13-16 on json (the chain is that strong there; libzstd's own ladder inverts json -1 vs -3 by 15%), and greedy row 5 trails dfast row 4 on interleaved-random shapes (libzstd's -1..-5 inverts the same way). All 22 levels × 5 corpora roundtrip through libzstd CLI. Fastest keeps 768KiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
 
+Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: window ≤ srcLog, hash ≤ wlog+1, chain/ring ≤ wlog): bulk paths pass the exact size, streaming passes the pledge, the CLI passes file metadata, unknown sizes keep the row (`Matcher::set_source_hint` / `FrameCompressor::set_size_hint`). Measured on adjusted bands (64KiB-4MiB json/text): ratio parity with libzstd at every probed level (chain rows -5..-15% denser); the 4KiB band keeps a ~+40% fixed-overhead gap on json (block/header entropy coding of tiny payloads, todo 9), while small-call speed wins (4KiB L19 5.96 vs 16.20 ms/call incl. process spawn).
+
 ### Codec paths
 
 | Capability | Status |

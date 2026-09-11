@@ -284,6 +284,8 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: Level,
+    /// Known whole-frame length (see [`Self::set_size_hint`]).
+    size_hint: Option<u64>,
     state: CompressState<M>,
     hasher: FrameHasher,
 }
@@ -341,7 +343,14 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
 
 /// Reset a pooled state for a new frame: the matcher's epoch bump retires
 /// stale hash entries and the entropy tables return to their defaults.
-pub(crate) fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>, level: Level) {
+/// `src_hint` is the whole-frame input length when known (sizes the
+/// matcher's window/tables; see [`Matcher::set_source_hint`]).
+pub(crate) fn reset_slice_state(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    level: Level,
+    src_hint: Option<u64>,
+) {
+    state.matcher.set_source_hint(src_hint);
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
@@ -353,14 +362,15 @@ pub(crate) fn reset_slice_state(state: &mut CompressState<MatchGeneratorDriver>,
 /// `level`. Fresh states are built (and reset) when the pool is empty.
 pub(crate) fn take_slice_state(
     level: Level,
+    src_hint: Option<u64>,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
-        reset_slice_state(&mut s, level);
+        reset_slice_state(&mut s, level, src_hint);
         return s;
     }
     let mut fresh = alloc::boxed::Box::new(new_slice_state());
-    reset_slice_state(&mut fresh, level);
+    reset_slice_state(&mut fresh, level, src_hint);
     fresh
 }
 
@@ -385,7 +395,8 @@ pub fn compress_slice_to_vec(src: &[u8], level: Level) -> Vec<u8> {
 /// header flag and the trailing hash follow `checksum`, modulo the `hash`
 /// feature).
 pub fn compress_slice_opts(src: &[u8], level: Level, checksum: bool) -> Vec<u8> {
-    let mut state = take_slice_state(level);
+    let hint = (src.len() as u64).into();
+    let mut state = take_slice_state(level, hint);
     let output = compress_with_state(&mut state, src, level, checksum);
     return_slice_state(state);
     output
@@ -516,6 +527,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             uncompressed_data: None,
             compressed_data: None,
             compression_level,
+            size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
@@ -540,6 +552,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 scratch: super::blocks::compressed::BlockScratch::default(),
             },
             compression_level,
+            size_hint: None,
             hasher: FrameHasher::new(),
         }
     }
@@ -558,6 +571,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
+    /// Declare the source's total length before [`FrameCompressor::compress`]:
+    /// the matcher sizes its window and tables to it (unknown keeps the
+    /// level's defaults). Must be called after `set_source`/`set_drain` and
+    /// before `compress`; re-declared per frame.
+    pub fn set_size_hint(&mut self, hint: Option<u64>) {
+        self.size_hint = hint;
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to
     /// the provided drain
     ///
@@ -569,6 +590,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// can use the [Read::take] function
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
+        self.state.matcher.set_source_hint(self.size_hint);
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
         self.hasher = FrameHasher::new();
@@ -748,7 +770,8 @@ mod tests {
             let mut libzstd = Vec::new();
             zstd::stream::copy_decode(compressed.as_slice(), &mut libzstd).unwrap();
             assert_eq!(libzstd, data, "libzstd interop {level:?}");
-            let streamed = crate::encoding::compress_to_vec(data.as_slice(), level);
+            let streamed =
+                crate::encoding::compress_to_vec_sized(data.as_slice(), level, data.len() as u64);
             assert_eq!(streamed, compressed, "slice/stream identity {level:?}");
             sizes.push((level, compressed.len()));
         }

@@ -289,6 +289,49 @@ fn params_for_level(level: Level) -> LevelParams {
     LEVEL_PARAMS[level.as_i32().clamp(0, 22) as usize]
 }
 
+/// [`params_for_level`] downsized to a known source length; raw-block
+/// frames keep the row's window untouched (their declared window never
+/// affects bytes, and staying hint-independent keeps outputs stable).
+fn params_for(level: Level, src_hint: Option<u64>) -> LevelParams {
+    let p = params_for_level(level);
+    if level == Level::Uncompressed {
+        p
+    } else {
+        adjust_params(p, src_hint)
+    }
+}
+
+/// Downsize a row for a known source length — the window/table half of
+/// libzstd's `ZSTD_adjustCParams_internal`: the window clamps to the
+/// source's log (so small inputs never pay large-input reach or memory),
+/// the hash tables to windowLog+1, the chain/ring cycle to windowLog.
+/// `None` (unknown size) keeps the row untouched, like libzstd's
+/// ZSTD_CONTENTSIZE_UNKNOWN.
+fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
+    let Some(n) = src.filter(|&n| n > 0) else {
+        return p;
+    };
+    // srcLog = ceil(log2(max(n, 2^HASHLOG_MIN))), floored at the frame
+    // format's minimum window log.
+    let t = n.max(1u64 << 6);
+    let src_log = (64 - (t - 1).leading_zeros()).max(10);
+    // Non-power-of-two windows (the Fastest row's 768 KiB) round up.
+    let wlog = (64 - (p.window as u64 - 1).leading_zeros()).min(src_log);
+    p.window = 1usize << wlog;
+    p.hash_log = p.hash_log.min(wlog + 1);
+    p.strategy = match p.strategy {
+        Strategy::Dfast(small) => Strategy::Dfast(small.min(wlog + 1)),
+        Strategy::Chain(c) => Strategy::Chain(c.min(wlog)),
+        Strategy::Opt(mut knobs) => {
+            knobs.bt_log = knobs.bt_log.min(wlog);
+            knobs.hash3_log = knobs.hash3_log.min(wlog);
+            Strategy::Opt(knobs)
+        },
+        Strategy::Fast => Strategy::Fast,
+    };
+    p
+}
+
 /// Hash a window u64 whose low 5 bytes are the hashed prefix (the full u64
 /// load feeds the multiplier directly: bits above the fifth byte only add
 /// input entropy) into a table of `log` bits. Five bytes skip the frequent
@@ -918,6 +961,9 @@ pub struct MatchGeneratorDriver {
     /// of a seed that never matches.
     seed_budget: u32,
     slice_size: usize,
+    /// Known whole-frame input length (see [`Matcher::set_source_hint`]);
+    /// applied at the next `reset` via [`adjust_params`].
+    src_hint: Option<u64>,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -944,10 +990,11 @@ fn window_slice<'a>(win: &'a [u8], ext: Option<&'a ExtWindow>) -> &'a [u8] {
 }
 
 impl MatchGeneratorDriver {
-    /// The window size frames compressed at `level` declare in their
-    /// header; usable without constructing an instance.
-    pub fn window_for_level(level: Level) -> u64 {
-        params_for_level(level).window as u64
+    /// The window size frames compressed at `level` (and, when known, the
+    /// source length) declare in their header; usable without constructing
+    /// an instance. Must agree with the matcher's own reset call.
+    pub fn window_for_level(level: Level, src_hint: Option<u64>) -> u64 {
+        params_for(level, src_hint).window as u64
     }
 
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
@@ -978,6 +1025,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             params: LEVEL_PARAMS[1],
+            src_hint: None,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1013,6 +1061,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             params: LEVEL_PARAMS[1],
+            src_hint: None,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1024,9 +1073,9 @@ impl MatchGeneratorDriver {
     }
 
     /// Size the search tables for `level` (no-op when unchanged), so pooled
-    /// states re-size at most once per level change.
+    /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let params = params_for_level(level);
+        let params = params_for(level, self.src_hint);
         if params != self.params {
             // Exactly one table family is live per strategy; switching
             // families drops the other's buffers.
@@ -1371,6 +1420,10 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
 }
 
 impl Matcher for MatchGeneratorDriver {
+    fn set_source_hint(&mut self, hint: Option<u64>) {
+        self.src_hint = hint;
+    }
+
     fn reset(&mut self, level: Level) {
         self.apply_level(level);
         self.ext = None;

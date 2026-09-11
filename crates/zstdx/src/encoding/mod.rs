@@ -54,6 +54,19 @@ pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
     vec
 }
 
+/// [`compress_to_vec`] with a known source length: the matcher sizes its
+/// window and tables to the source, and the output matches
+/// [`compress_slice_to_vec`] on the same data byte for byte.
+pub fn compress_to_vec_sized<R: Read>(source: R, level: Level, len: u64) -> Vec<u8> {
+    let mut vec = Vec::new();
+    let mut frame_enc = FrameCompressor::new(level);
+    frame_enc.set_size_hint(Some(len));
+    frame_enc.set_source(source);
+    frame_enc.set_drain(&mut vec);
+    frame_enc.compress();
+    vec
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
@@ -130,7 +143,7 @@ mod tests {
         for input in &inputs {
             assert_eq!(
                 compress_slice_to_vec(input, Level::Fastest),
-                compress_to_vec(input.as_slice(), Level::Fastest),
+                super::compress_to_vec_sized(input.as_slice(), Level::Fastest, input.len() as u64),
                 "mismatch at len {}",
                 input.len()
             );
@@ -244,6 +257,11 @@ pub trait Matcher {
     }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: Level);
+    /// Declare the whole-frame input length before [`Matcher::reset`], when
+    /// known: the built-in matcher downsizes its window and tables to the
+    /// source (libzstd's `ZSTD_adjustCParams`). The hint is per frame —
+    /// implementations must not carry it across resets.
+    fn set_source_hint(&mut self, _hint: Option<u64>) {}
     /// The size of the window the decoder will need to execute all sequences produced by this
     /// matcher
     ///

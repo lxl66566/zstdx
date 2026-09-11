@@ -94,6 +94,7 @@ impl FrameEncoderCoreSt {
             fse_tables: FseTables::new(),
             scratch: BlockScratch::default(),
         };
+        state.matcher.set_source_hint(options.pledged_size);
         state.matcher.reset(options.level);
         let checksum = options.checksum && cfg!(feature = "hash");
         let header = FrameHeader {
