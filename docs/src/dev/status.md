@@ -10,13 +10,13 @@
 |---|---|---|---|---|
 | Uncompressed | 0 | raw block | — | |
 | Fastest | 1 | fast (hash5 single-probe table) | 768 KiB | |
-| Fast | 3-5 | dfast (hash8+hash5 dual-table single-probe) | 1 MiB | |
-| Balanced | 6-9 | hash chain + lazy | 1 MiB | H20 / depth 8 |
+| Fast | 3-5 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | W21, aligned with libzstd L3-9 |
+| Balanced | 6-9 | hash chain + lazy | 2 MiB | H20 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
 | Best | 10-15 | low-spec optimal parser | 1 MiB | 16 compares / targetLength 32 |
 | Opt | 16-17 | btopt (full port) | 1 MiB | |
 | Ultra | 18-22 | btultra(+2) (full port) | 1 MiB | 2-pass first-block statistics |
 
-`approximate_zstd` maps numbers 1-22 to the nearest tier; the CLI accepts all levels. The fixed window is a **deliberate trade-off**: bare window expansion to 2-4 MiB measured as a double loss (see [falsified directions](dev/negative.md)); expansion must be done together with LDM.
+`approximate_zstd` maps numbers 1-22 to the nearest tier; the CLI accepts all levels. Fast/Balanced run W21 (libzstd's own L3-9 window; landed 2026-09-12 after the 100MB-binary corpus showed the 1MiB window alone cost 26-30% ratio there — same-window outputs match libzstd within 0.03%); Fastest keeps 768KiB and Best/Opt/Ultra keep 1MiB (beyond-W21 expansion still measured as a loss — see [falsified directions](dev/negative.md); LDM remains the path for more reach).
 
 ### Codec paths
 

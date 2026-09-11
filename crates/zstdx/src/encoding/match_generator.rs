@@ -156,27 +156,29 @@ const FASTEST_PARAMS: LevelParams = LevelParams {
     lazy_depth: 0,
 };
 
-/// libzstd level 3: H17 (long) C16 (short) with a 1 MiB window (the level's
-/// W21 is A/B-pending; the smaller window also keeps the frame header as-is).
+/// libzstd level 3: H17 (long) C16 (short) with the level's W21 window. The
+/// reach is the ratio lever on large real-world binaries: same-window A/B on
+/// a 100 MB ELF concat puts our dfast within 0.03% of libzstd's L3 output,
+/// while the 1 MiB window that preceded it cost 26% size there (libzstd L3
+/// capped to wlog=20 reproduces our byte count almost exactly).
 const FAST_PARAMS: LevelParams = LevelParams {
     hash_log: 17,
-    window: 1 << 20,
+    window: 1 << 21,
     strategy: Strategy::Dfast(16),
     search_depth: 0,
     lazy_depth: 0,
 };
 
-/// The chain table is position-indexed, so its log doubles as the match
-/// reach; pinning it to the window makes every in-window position linked
-/// (no reach truncation). The window stays 1 MiB across the chain levels
-/// (zstd's ladder below 16 does the same): on the 32 MiB corpus a 4 MiB
-/// window only ever finds farther — not longer — matches, whose offset
-/// codes cost more than the length saves (json and skewed both lose ratio
-/// AND walk speed to the extra cache misses). Depth 8/H20 sits at the
-/// speed knee of the real-chain walk (16 attempts, zstd-9's searchLog).
+/// W21 matches libzstd's L6-L9 window (the 100 MB binary corpus is the
+/// evidence: most of its redundancy sits at 1-2 MiB distances, and the
+/// window — not the matcher — decides who finds it). The chain table stays
+/// 2^20: position-indexed links alias beyond 1 MiB exactly like libzstd's
+/// cLog-below-wLog chains, and the head table's newest-wins probe still
+/// serves candidates across the full window. Depth 8/H20 sits at the speed
+/// knee of the real-chain walk (16 attempts, zstd-9's searchLog).
 const BALANCED_PARAMS: LevelParams = LevelParams {
     hash_log: 20,
-    window: 1 << 20,
+    window: 1 << 21,
     strategy: Strategy::Chain(20),
     search_depth: 8,
     lazy_depth: 2,

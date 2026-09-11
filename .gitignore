@@ -10,3 +10,4 @@ crates/zstdx/fuzz/corpus
 /bench/corpus
 .idea
 /docs/book
+/bench/big

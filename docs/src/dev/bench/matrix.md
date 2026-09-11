@@ -52,6 +52,8 @@ No scaling anywhere; skewed.zst9 anti-scales to 0.69x ST at every worker count; 
 
 ## T3 encode ST bulk (checksums off both sides; 2 passes, speeds are pass medians; MiB/s of raw)
 
+> 2026-09-12: the fast/balanced rows below predate the W21 window change — json.fast is now ~387 MiB/s at libzstd-parity ratio, text.fast ~12045, json.balanced ~87-92 at +23.7% density (5516920→4711529), text.balanced ~2847; run `matrix --mode enc-st` for current numbers.
+
 Output sizes and ratios are deterministic and identical across passes. Slowest cells (json/skewed best/opt/ultra, n=3 rounds per pass) showed pass-to-pass x spread up to ~10% (json.ultra 0.69/0.73, skewed.best 3.68/3.36, random.best 30.8/27.6); all fast cells within 3%.
 
 | shape.level | ours MiB/s | ours ratio | zstd MiB/s | zstd ratio | x |
