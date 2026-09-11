@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Unpledged streaming-MT jobs now grow along the stream (`JobGrid::Growing`):
+  the job starting at absolute offset `o` is sized by the shared bulk
+  formula against a 4×`o` estimate of the final size, replacing the fixed
+  1 MiB floor grid. Boundaries stay a pure function of the absolute offset,
+  so the no-flush write-chunking independence contract is preserved (a
+  burst-time growth rule was ruled out for breaking it). At 32 MiB/4
+  workers an unpledged stream cuts 9 jobs instead of 32 (bulk cuts 8),
+  shrinking the per-boundary entropy-restart cost: json.opt stream-mt
+  −0.30%, json.ultra −0.28%, text.balanced −0.086% vs the old grid; fewer
+  jobs also amortize the per-job prefill/table-clear fixed costs. Pledged
+  streams keep the fixed bulk grid and stay byte-identical to bulk MT.
+
 - Chain-strategy lazy walk reworked to libzstd lazy's offset-aware gain
   comparison: lazy positions compete on `ml*4 - highbit(offset)` (rep
   incumbents price 0) instead of raw length, a rep0 probe rides each lazy

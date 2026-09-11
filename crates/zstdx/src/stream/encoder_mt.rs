@@ -11,7 +11,8 @@
 //! one exception, re-gridding early because making data visible early is
 //! its purpose. With a pledged size the job size follows the bulk formula,
 //! so a stream written exactly to its pledge is byte-identical to the bulk
-//! mt output.
+//! mt output; without a pledge the grid starts at the size floor and grows
+//! toward the bulk formula as data accumulates.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -30,15 +31,35 @@ use crate::{
     },
 };
 
+/// Job boundary schedule. Both variants cut jobs on absolute stream offsets
+/// alone, so without a flush the frame bytes never depend on how the input
+/// was written.
+enum JobGrid {
+    /// Pledged stream: one fixed job size from the shared bulk formula over
+    /// the pledge, so an exactly-pledged stream is byte-identical to the
+    /// bulk mt output.
+    Fixed(usize),
+    /// Unpledged stream: the job starting at absolute offset `o` spans
+    /// `job_size_for(4o, workers, overlap)` — the bulk formula against a
+    /// geometric estimate of the final size (a stream that fed `o` bytes
+    /// feeds a few times `o` more). Job sizes grow along the stream
+    /// (~1 + 2/workers per job once past the floor), so long streams
+    /// converge toward the bulk job count instead of paying a per-boundary
+    /// entropy restart at the floor forever, while short streams keep the
+    /// floor's parallelism and first-output latency.
+    Growing,
+}
+
 pub(crate) struct MtEncoderCore {
     level: Level,
     checksum: bool,
     workers: u32,
-    /// Absolute job grid: job k of the current grid covers
-    /// [job_start + k * job_size, ...). A flush re-grids by advancing
-    /// job_start to the current end.
+    /// Absolute job schedule: job boundaries derive from absolute stream
+    /// offsets alone (see [`JobGrid`]), so the frame bytes never depend on
+    /// how the input was written. A flush re-grids by advancing job_start
+    /// to the current end.
     job_start: u64,
-    job_size: usize,
+    grid: JobGrid,
     /// History strip each job borrows (and fully indexes) as match window:
     /// the level's whole window, like the bulk mt path.
     overlap: usize,
@@ -73,11 +94,15 @@ impl MtEncoderCore {
         let window = MatchGeneratorDriver::window_for_level(options.level);
         let overlap = window as usize;
         // A pledge sizes the grid like the bulk path (byte-identical output
-        // when the input matches the pledge); an open-ended stream takes the
-        // floor.
-        let job_size = match options.pledged_size {
-            Some(n) => job_size_for(n, options.workers, overlap),
-            None => MIN_JOB_SIZE.max(overlap),
+        // when the input matches the pledge); an open-ended stream grows
+        // its jobs along the stream (see JobGrid).
+        let grid = match options.pledged_size {
+            Some(n) => JobGrid::Fixed(job_size_for(n, options.workers, overlap)),
+            None => JobGrid::Growing,
+        };
+        let initial_job = match grid {
+            JobGrid::Fixed(size) => size,
+            JobGrid::Growing => MIN_JOB_SIZE.max(overlap),
         };
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
@@ -93,7 +118,7 @@ impl MtEncoderCore {
             checksum,
             workers: options.workers,
             job_start: 0,
-            job_size,
+            grid,
             overlap,
             burst_jobs: (options.workers as usize).max(2),
             pledged: options.pledged_size,
@@ -107,7 +132,7 @@ impl MtEncoderCore {
             buf_base: 0,
             pos: 0,
             hashed_end: 0,
-            output: Vec::with_capacity(job_size + 64),
+            output: Vec::with_capacity(initial_job + 64),
             header_emitted: false,
             finished: false,
             pool: Mutex::new(Vec::new()),
@@ -121,9 +146,8 @@ impl MtEncoderCore {
         }
         self.buf.extend_from_slice(data);
         self.pos += data.len() as u64;
-        let jobs = self.pending_jobs();
+        let (jobs, hi) = self.pending_jobs();
         if jobs >= self.burst_jobs {
-            let hi = self.job_start + jobs as u64 * self.job_size as u64;
             self.encode_jobs(hi, false);
         }
     }
@@ -193,42 +217,83 @@ impl MtEncoderCore {
         n
     }
 
-    /// Complete jobs on the current grid, holding back the pledged final job
-    /// for finish() (an exact pledge then emits it with the last-block flag,
+    /// End offset of the job starting at absolute offset `start`.
+    fn job_end(&self, start: u64) -> u64 {
+        let size = match self.grid {
+            JobGrid::Fixed(size) => size as u64,
+            JobGrid::Growing => {
+                job_size_for(start.saturating_mul(4), self.workers, self.overlap) as u64
+            },
+        };
+        start + size
+    }
+
+    /// Complete jobs on the current schedule, and the boundary after the
+    /// last one. A pledged grid holds back the pledged final job for
+    /// finish() (an exact pledge then emits it with the last-block flag,
     /// like the bulk path does). The hold-back lapses once the input
     /// outgrows the pledge — the header is already wrong at that point.
-    fn pending_jobs(&self) -> usize {
+    fn pending_jobs(&self) -> (usize, u64) {
         debug_assert!(self.pos >= self.job_start);
-        let complete = ((self.pos - self.job_start) / self.job_size as u64) as usize;
-        match self.pledged {
-            Some(n) if self.pos <= n => {
-                let pledged_jobs = (n - self.job_start).div_ceil(self.job_size as u64);
-                complete.min(pledged_jobs.saturating_sub(1) as usize)
+        match self.grid {
+            JobGrid::Fixed(size) => {
+                let size = size as u64;
+                let complete = ((self.pos - self.job_start) / size) as usize;
+                let jobs = match self.pledged {
+                    Some(n) if self.pos <= n => {
+                        let pledged_jobs = (n - self.job_start).div_ceil(size);
+                        complete.min(pledged_jobs.saturating_sub(1) as usize)
+                    },
+                    _ => complete,
+                };
+                (jobs, self.job_start + jobs as u64 * size)
             },
-            _ => complete,
+            JobGrid::Growing => {
+                // The boundaries are a function of absolute offset alone, so
+                // walking them here cannot depend on the write chunking.
+                let mut end = self.job_start;
+                let mut jobs = 0;
+                loop {
+                    let next = self.job_end(end);
+                    if next > self.pos {
+                        break;
+                    }
+                    end = next;
+                    jobs += 1;
+                }
+                (jobs, end)
+            },
         }
     }
 
     /// Encode the jobs covering [job_start, hi) and advance the grid: the job
     /// ending at `hi` carries the frame's last-block flag when
     /// `last_frame_block` is set (only finish passes true). `hi` must not
-    /// exceed `pos`.
+    /// exceed `pos`; when it lands mid-job (flush, or the finish tail) the
+    /// last job is short.
     fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
         debug_assert!(self.job_start < hi && hi <= self.pos);
         self.emit_header();
-        let n_jobs = (hi - self.job_start).div_ceil(self.job_size as u64) as usize;
+        // Job boundaries between job_start and hi, on the absolute schedule.
+        let mut bounds = Vec::with_capacity(self.burst_jobs + 2);
+        bounds.push(self.job_start);
+        while *bounds.last().unwrap() < hi {
+            let next = self.job_end(*bounds.last().unwrap()).min(hi);
+            bounds.push(next);
+        }
+        let n_jobs = bounds.len() - 1;
         // The shared job view starts at the next job's strip (the previous
         // job's tail), which is exactly what the buffer retained.
         let strip_lo = self.job_start.saturating_sub(self.overlap as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (self.job_start - strip_lo) as usize;
-        let last_len = (hi - self.job_start) as usize - (n_jobs - 1) * self.job_size;
 
         if n_jobs == 1 {
             // One short tail job (small inputs, a flush, or a finish without
             // a burst behind it): inline on the calling thread, no pool
             // spun up.
             self.hash_to(hi);
+            let last_len = (bounds[1] - bounds[0]) as usize;
             let mut state = Self::take_pooled_state(&self.pool);
             let bytes = run_job_with(
                 &mut state,
@@ -250,11 +315,10 @@ impl MtEncoderCore {
             let next_job = AtomicUsize::new(0);
             let poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>> =
                 Mutex::new(None);
-            let job_size = self.job_size;
             let overlap = self.overlap;
             let level = self.level;
             let job_start = self.job_start;
-            let hi_local = (hi - strip_lo) as usize;
+            let bounds = &bounds[..];
 
             // Disjoint field borrows: the workers share `src` and the state
             // pool while the calling thread runs the checksum absorb and the
@@ -277,17 +341,13 @@ impl MtEncoderCore {
                             if id >= n_jobs {
                                 break;
                             }
-                            let start = first + id * job_size;
-                            let end = if id + 1 == n_jobs {
-                                hi_local
-                            } else {
-                                start + job_size
-                            };
+                            let start = first + (bounds[id] - job_start) as usize;
+                            let end = first + (bounds[id + 1] - job_start) as usize;
                             // Every job except the frame's first starts where the
                             // decoder's repcode history is unknown (see the bulk
                             // mt path); a flush-rebased grid starts mid-frame
                             // too.
-                            let gate = job_start + id as u64 * job_size as u64 > 0;
+                            let gate = bounds[id] > 0;
                             let attempt =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     run_job_with(
@@ -375,6 +435,73 @@ impl MtEncoderCore {
         if !self.header_emitted {
             self.output.extend_from_slice(&self.header);
             self.header_emitted = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use super::*;
+    use crate::decoding::FrameDecoder;
+
+    fn textish(len: usize) -> Vec<u8> {
+        let words: [&[u8]; 13] = [
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
+            b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
+        ];
+        let mut state = 7u64;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let w = words[((state >> 33) as usize) % words.len()];
+            let take = w.len().min(len - out.len());
+            out.extend_from_slice(&w[..take]);
+        }
+        out
+    }
+
+    /// The unpledged schedule must grow job sizes along the stream while a
+    /// pledged one keeps the fixed bulk grid.
+    #[test]
+    fn growing_grid_scales_jobs_with_stream() {
+        let unpledged = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        let floor = unpledged.job_end(0);
+        assert_eq!(floor, MIN_JOB_SIZE.max(unpledged.overlap) as u64);
+        // The geometric estimate quadruples the fed size, so the job at
+        // 64 MiB is sized for a 256 MiB input: 256 MiB / (4 workers * 2).
+        assert_eq!(
+            unpledged.job_end(64 * 1024 * 1024) - 64 * 1024 * 1024,
+            32 * 1024 * 1024
+        );
+
+        let pledged = MtEncoderCore::new(
+            &EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .pledged_size(Some(64 * 1024 * 1024)),
+        );
+        assert_eq!(
+            pledged.job_end(0),
+            pledged.job_end(32 * 1024 * 1024) - 32 * 1024 * 1024
+        );
+    }
+
+    /// A long unpledged stream crosses many growth points and burst/tail
+    /// shapes; the frame must still decode to the fed bytes.
+    #[test]
+    fn growing_grid_roundtrip() {
+        let data = textish(20 * 1024 * 1024 + 31);
+        for chunk in [1024 * 1024, 300 * 1024, usize::MAX] {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+            for piece in data.chunks(chunk) {
+                core.write(piece);
+            }
+            core.finish();
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]), "chunk {chunk}");
         }
     }
 }
