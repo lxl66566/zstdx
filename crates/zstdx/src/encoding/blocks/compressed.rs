@@ -231,7 +231,7 @@ fn choose_tables_fast<'a>(
         let mut lanes = [[0u32; 256]; 12];
         let (chunks, remainder) = seqs.as_chunks::<4>();
         for chunk in chunks {
-            for (l, w) in lanes.chunks_exact_mut(3).zip(chunk) {
+            for (l, w) in lanes.as_chunks_mut::<3>().0.iter_mut().zip(chunk) {
                 let packed = w.codes;
                 l[0][(packed & 0xff) as usize] += 1;
                 l[1][((packed >> 8) & 0xff) as usize] += 1;
@@ -432,11 +432,24 @@ fn encode_sequences(
     // transitions still need each table's entry for the running states.
     // Rows are flat `code << shift | state` (table_size is a power of two),
     // replacing the runtime-stride multiply and bounds check of the indexed
-    // accessor. Codes are u8 and states cycle below table_size by table
-    // construction, so the row index cannot leave the flat array.
+    // accessor. The per-code share of the row index is loop-invariant, so it
+    // is pre-shifted into stack offset tables once per block: the hot loop
+    // then folds it in with one L1 load instead of a variable shift, and the
+    // three shift registers (stack-reloaded per sequence under register
+    // pressure) leave the loop entirely. Codes are u8 and states cycle below
+    // table_size by table construction, so the row index cannot leave the
+    // flat array.
     let (ll_rows, ll_shift) = ll_table.transitions_flat();
     let (ml_rows, ml_shift) = ml_table.transitions_flat();
     let (of_rows, of_shift) = of_table.transitions_flat();
+    let mut ll_off = [0u32; 256];
+    let mut ml_off = [0u32; 256];
+    let mut of_off = [0u32; 256];
+    for c in 0..256u32 {
+        ll_off[c as usize] = c << ll_shift;
+        ml_off[c as usize] = c << ml_shift;
+        of_off[c as usize] = c << of_shift;
+    }
 
     let li = nb_seq - 1;
     let packed = seqs[li].codes;
@@ -481,17 +494,21 @@ fn encode_sequences(
             let ll_rp = ll_rows.as_ptr();
             let ml_rp = ml_rows.as_ptr();
             let of_rp = of_rows.as_ptr();
+            let ll_op = ll_off.as_ptr();
+            let ml_op = ml_off.as_ptr();
+            let of_op = of_off.as_ptr();
             for i in (0..=nb_seq - 2).rev() {
-                // SAFETY: as above.
+                // SAFETY: as above. The offset-table reads index a 256-entry
+                // array with a u8.
                 let (add, add_nb, e_of, e_ml, e_ll) = unsafe {
                     let w = &*sp.add(i);
                     let packed = w.codes;
                     (
                         w.add,
                         w.add_nb as usize,
-                        *of_rp.add((((packed >> 16) as u8 as usize) << of_shift) | of_state),
-                        *ml_rp.add((((packed >> 8) as u8 as usize) << ml_shift) | ml_state),
-                        *ll_rp.add(((packed as u8 as usize) << ll_shift) | ll_state),
+                        *of_rp.add(*of_op.add((packed >> 16) as u8 as usize) as usize | of_state),
+                        *ml_rp.add(*ml_op.add((packed >> 8) as u8 as usize) as usize | ml_state),
+                        *ll_rp.add(*ll_op.add(packed as u8 as usize) as usize | ll_state),
                     )
                 };
                 debug_assert!(of_state < of_table.table_size);
