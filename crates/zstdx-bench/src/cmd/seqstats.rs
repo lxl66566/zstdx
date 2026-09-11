@@ -192,6 +192,9 @@ fn entropy(hist: &[u64], total: u64) -> f64 {
 #[derive(clap::Args)]
 pub struct Args {
     pub file: PathBuf,
+    /// zstd numeric level selecting the matcher strategy.
+    #[arg(long, default_value = "1")]
+    pub level: i32,
 }
 
 pub fn run(args: &Args) {
@@ -213,8 +216,10 @@ pub fn run(args: &Args) {
         inner: MatchGeneratorDriver::new(128 * 1024),
         triples: Vec::new(),
     };
-    let mut compressor =
-        zstdx::encoding::FrameCompressor::new_with_matcher(matcher, Level::Fastest);
+    let mut compressor = zstdx::encoding::FrameCompressor::new_with_matcher(
+        matcher,
+        Level::approximate_zstd(args.level),
+    );
     compressor.set_source(raw.as_slice());
     let sink = Sink(Vec::new());
     compressor.set_drain(sink);
