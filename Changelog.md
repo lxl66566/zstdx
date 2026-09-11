@@ -4,6 +4,25 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Dictionary encoding: `EncoderOptions::dictionary` (bulk, streaming,
+  compat's `Compressor::with_dictionary`/`set_dictionary` and
+  `write::Encoder::with_dictionary`), `FrameCompressor::set_dictionary`,
+  and CLI `-D` (both directions). The dictionary's content loads as match
+  history through the owned-window matcher (grid prefill + seed detection
+  reuse the MT strip machinery; repcodes start from the dictionary's
+  offset history), its Huffman/FSE tables seed the first blocks as the
+  reusable previous tables (treeless/repeat legal via the declared
+  dictID), and the window clamps by src+dict like libzstd. `bulk::
+  compress_with` is now fallible (`Result`; an invalid dictionary is the
+  error case), and the bulk decode paths no longer silently drop an
+  attached dictionary. Decoder-side Huffman tables expose their full
+  `code_lengths` (the wire omits the last symbol's weight — building
+  encoder tables from raw stored weights produced incomplete sets).
+  MT-with-dictionary falls back to single-threaded. Sizes on the real
+  `zstd --train` systemd fixture: +13% vs libzstd at -9 (sub-2KB
+  fixed-overhead band); all frames roundtrip through libzstd and our
+  decoder.
+
 - Forced window log (`EncoderOptions::with_input_shape`,
   `InputShape::with_window_log`, clamped 10..=27): overrides the level's
   row before the length adjustment, as in libzstd's param-override order

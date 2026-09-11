@@ -89,6 +89,15 @@ pub(crate) struct FrameEncoderCoreSt {
 
 impl FrameEncoderCoreSt {
     pub(crate) fn new(options: &EncoderOptions) -> Self {
+        Self::new_with_dictionary(options, None).expect("no dictionary to fail")
+    }
+
+    /// The dictionary variant is fallible (parse errors); without one this
+    /// reduces to the plain constructor.
+    pub(crate) fn new_with_dictionary(
+        options: &EncoderOptions,
+        dict: Option<&crate::encoding::dictionary::EncDictionary>,
+    ) -> Result<Self> {
         // Owned-window driver like FrameCompressor::new: the streaming core
         // feeds blocks through block_tail/commit_block, so unlike the slice
         // path (new_direct, borrowed window) the matcher must own its window.
@@ -98,23 +107,44 @@ impl FrameEncoderCoreSt {
             fse_tables: FseTables::new(),
             scratch: BlockScratch::default(),
         };
-        state.matcher.set_input_shape(crate::InputShape {
-            len: options.pledged_size,
-            window_log: options.input_shape.window_log,
-        });
-        state.matcher.reset(options.level);
+        let dict_id = match dict {
+            Some(dict) => {
+                let mut shape = crate::InputShape {
+                    len: options.pledged_size,
+                    window_log: options.input_shape.window_log,
+                };
+                // libzstd clamps the window by src + dict.
+                shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+                crate::encoding::dictionary::reset_with_dictionary(
+                    &mut state,
+                    dict,
+                    options.level,
+                    shape,
+                );
+                dict.header_id()
+            },
+            None => {
+                let shape = crate::InputShape {
+                    len: options.pledged_size,
+                    window_log: options.input_shape.window_log,
+                };
+                state.matcher.set_input_shape(shape);
+                state.matcher.reset(options.level);
+                None
+            },
+        };
         let checksum = options.checksum && cfg!(feature = "hash");
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
             single_segment: false,
             content_checksum: checksum,
-            dictionary_id: None,
+            dictionary_id: dict_id,
             window_size: Some(state.matcher.window_size()),
         };
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
         let block_size = state.matcher.block_size();
-        Self {
+        Ok(Self {
             state,
             hasher: if checksum {
                 StreamChecksum::On(FrameHasher::new())
@@ -129,7 +159,7 @@ impl FrameEncoderCoreSt {
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
             blocks: 0,
             finished: false,
-        }
+        })
     }
 
     pub(crate) fn write(&mut self, data: &[u8]) {
@@ -243,9 +273,15 @@ pub(crate) enum FrameEncoderCore {
 }
 
 impl FrameEncoderCore {
-    // Infallible under std; the Err arm exists only for no_std + workers > 1.
-    #[allow(clippy::unnecessary_wraps)]
+    // Fallible only for an invalid dictionary (no_std + workers > 1 keeps
+    // its Unsupported error; a dictionary forces the single-threaded core).
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
+        if let Some(raw) = &options.dictionary {
+            let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
+            return Ok(Self::Single(alloc::boxed::Box::new(
+                FrameEncoderCoreSt::new_with_dictionary(options, Some(&dict))?,
+            )));
+        }
         if options.workers > 1 {
             // Same engagement conditions as the bulk mt path: raw-block
             // levels and single-core processes run the single-threaded core

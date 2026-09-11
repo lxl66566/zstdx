@@ -185,6 +185,24 @@ impl HuffmanTable {
         Self::build_from_counts(&counts[..=max as usize])
     }
 
+    /// Build from the format's per-symbol code lengths (0 = symbol
+    /// absent), e.g. a dictionary table's
+    /// (`huff0_decoder::HuffmanTable::code_lengths`).
+    pub fn build_from_code_lengths(lengths: &[u8]) -> Self {
+        let max_len = lengths.iter().copied().max().unwrap_or(1) as usize;
+        let weights: Vec<usize> = lengths
+            .iter()
+            .map(|&len| {
+                if len == 0 {
+                    0
+                } else {
+                    max_len - len as usize + 1
+                }
+            })
+            .collect();
+        Self::build_from_weights(&weights)
+    }
+
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
         // Optimal length-limited code lengths from the actual magnitudes;

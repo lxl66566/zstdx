@@ -1154,6 +1154,33 @@ impl MatchGeneratorDriver {
         self.win_base = base;
     }
 
+    /// Load dictionary content as the frame's match history, for the
+    /// owned-window path (call after `reset`, before the first
+    /// `block_tail`). The dictionary occupies positions `[0, n)`; frame
+    /// data starts at `n`. `rep` is the dictionary's repeated-offset
+    /// history (already validated against the content length by the
+    /// caller). Content beyond the level's window is unreachable and
+    /// dropped. The prefill indexes the surviving content exactly like a
+    /// multithreaded job strip (grid fill, seed detection included), so
+    /// matches into the dictionary cost nothing extra at scan time.
+    pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
+        debug_assert!(self.ext.is_none() && self.win.is_empty() && self.pos == 0);
+        let keep = content.len().min(self.params.window);
+        let content = &content[content.len() - keep..];
+        self.win.clear();
+        self.win.extend_from_slice(content);
+        self.win_base = 0;
+        self.pos = keep as u64;
+        self.anchor = keep as u64;
+        self.block_start = keep as u64;
+        self.block_end = keep as u64;
+        self.rep = rep;
+        self.rep_pending = 0;
+        // The owned window is filled above; prefill over the caller's slice
+        // avoids the self-borrow (identical bytes).
+        self.prefill_window(content, 0);
+    }
+
     /// Declare `[start, end)` (absolute offsets inside the adopted window)
     /// as the block to match next. Matching restarts at `start`; the history
     /// below it is only a match source.
@@ -1435,6 +1462,12 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
 impl Matcher for MatchGeneratorDriver {
     fn set_input_shape(&mut self, shape: InputShape) {
         self.shape = shape;
+    }
+
+    /// See the inherent [`MatchGeneratorDriver::load_dictionary`] — the
+    /// trait view.
+    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
+        self.load_dictionary(content, rep)
     }
 
     fn reset(&mut self, level: Level) {

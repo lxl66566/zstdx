@@ -110,7 +110,6 @@ fn stream_write_encoder_shapes() {
 fn stream_write_encoder_unsupported_bits() {
     let mut enc = compat::stream::write::Encoder::new(Vec::new(), 3).unwrap();
     assert!(enc.multithread(4).is_err());
-    assert!(compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &[]).is_err());
 }
 
 #[test]

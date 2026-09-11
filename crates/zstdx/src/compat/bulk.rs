@@ -97,18 +97,21 @@ impl Default for Decompressor {
 #[derive(Debug)]
 pub struct Compressor {
     level: i32,
+    dict: Option<Vec<u8>>,
 }
 
 impl Compressor {
     /// Creates a new compressor.
     pub fn new(level: i32) -> io::Result<Self> {
-        Ok(Self { level })
+        Ok(Self { level, dict: None })
     }
 
-    /// Creates a compressor bound to a dictionary; dictionary encoding is
-    /// not implemented yet.
-    pub fn with_dictionary(_level: i32, _dictionary: &[u8]) -> io::Result<Self> {
-        Err(super::unsupported_io(crate::Feature::DictionaryEncoding))
+    /// Creates a compressor bound to a dictionary.
+    pub fn with_dictionary(level: i32, dictionary: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            level,
+            dict: Some(dictionary.to_vec()),
+        })
     }
 
     /// Changes the level used by subsequent `compress` calls.
@@ -117,18 +120,39 @@ impl Compressor {
         Ok(())
     }
 
-    /// Sets a dictionary for subsequent compression; not implemented yet.
-    pub fn set_dictionary(&mut self, _dictionary: &[u8]) -> io::Result<()> {
-        Err(super::unsupported_io(crate::Feature::DictionaryEncoding))
+    /// Sets a dictionary for subsequent compression (an empty slice
+    /// detaches it).
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> io::Result<()> {
+        self.dict = (!dictionary.is_empty()).then(|| dictionary.to_vec());
+        Ok(())
     }
 
     /// Compresses a single block of data.
     pub fn compress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        compress(data, self.level)
+        self.compress_inner(data).map(|(v, _)| v)
     }
 
     /// Compresses a single block into the caller's buffer.
     pub fn compress_to_buffer(&mut self, data: &[u8], destination: &mut [u8]) -> io::Result<usize> {
-        compress_to_buffer(data, destination, self.level)
+        let (compressed, _) = self.compress_inner(data)?;
+        if destination.len() < compressed.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "destination buffer too small for the compressed frame",
+            ));
+        }
+        destination[..compressed.len()].copy_from_slice(&compressed);
+        Ok(compressed.len())
+    }
+
+    fn compress_inner(&mut self, data: &[u8]) -> io::Result<(Vec<u8>, i32)> {
+        let level = self.level;
+        match &self.dict {
+            Some(dict) => {
+                let opts = crate::EncoderOptions::new(map_level(level)).dictionary(dict);
+                Ok((crate::bulk::compress_with(data, &opts)?, level))
+            },
+            None => Ok((crate::bulk::compress(data, map_level(level)), level)),
+        }
     }
 }

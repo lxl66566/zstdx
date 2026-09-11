@@ -6,11 +6,11 @@
 //! Known differences, all forced by what this crate implements today:
 //!
 //! - Numeric levels map exactly through [`Level::from_zstd`][crate::Level::from_zstd].
-//! - `multithread(n)` with `n > 1` and dictionary-taking constructors fail with an error (the
-//!   native [`EncoderOptions`][crate::EncoderOptions] surface exists; the streaming backends do not
-//!   yet).
-//! - `zstd_safe`, `zstd::dict` (trained dictionaries) and `set_parameter` have no equivalent; the
-//!   native low-level API is [`crate::encoding`]/[`crate::decoding`].
+//! - `multithread(n)` with `n > 1` on the streaming encoders fails with an error (the native
+//!   [`EncoderOptions`][crate::EncoderOptions] surface exists; the streaming backends do not yet).
+//!   Dictionary-taking constructors are supported (single-threaded).
+//! - `zstd_safe` and `zstd::dict` (trained dictionaries) have no equivalent; the native low-level
+//!   API is [`crate::encoding`]/[`crate::decoding`].
 //!
 //! [`zstd` crate]: https://docs.rs/zstd/0.13
 

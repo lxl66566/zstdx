@@ -727,7 +727,8 @@ mod tests {
         let data = textish(8 * 1024 * 1024);
         for workers in [2u32, 4] {
             let compressed =
-                bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(workers));
+                bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(workers))
+                    .unwrap();
             let mut out = vec![0u8; data.len()];
             let n = decode_all_mt(&compressed, &mut out, workers, MAX_WINDOW).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]));
@@ -843,7 +844,7 @@ mod tests {
     fn slice_too_small_and_fallback() {
         let data = textish(4 * 1024 * 1024);
         let compressed =
-            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4));
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut small = vec![0u8; data.len() - 1];
         assert!(decode_all_mt(&compressed, &mut small, 4, MAX_WINDOW).is_err());
 
@@ -862,7 +863,7 @@ mod tests {
     fn corrupt_input_errors() {
         let data = textish(4 * 1024 * 1024);
         let mut compressed =
-            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4));
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         // Smash bytes in a middle segment's compressed body.
         let mid = compressed.len() / 2;
         compressed[mid] ^= 0xff;

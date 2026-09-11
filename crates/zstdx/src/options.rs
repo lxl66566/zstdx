@@ -57,6 +57,10 @@ pub struct EncoderOptions {
     pub(crate) pledged_size: Option<u64>,
     pub(crate) workers: u32,
     pub(crate) input_shape: InputShape,
+    /// Raw zstd dictionary for compression (parsed when an encoder takes
+    /// the options). Multithreaded paths fall back to single-threaded with
+    /// a dictionary attached.
+    pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
 }
 
 impl EncoderOptions {
@@ -70,7 +74,17 @@ impl EncoderOptions {
                 len: None,
                 window_log: None,
             },
+            dictionary: None,
         }
+    }
+
+    /// Attach a raw zstd dictionary (as produced by `zstd --train`) for
+    /// compression: its content becomes the frame's match history, its
+    /// entropy tables seed the first blocks, and its id is declared in the
+    /// frame header. Invalid dictionaries fail when the encoder is built.
+    pub fn dictionary(mut self, dict: &[u8]) -> Self {
+        self.dictionary = Some(dict.to_vec());
+        self
     }
 
     /// Override the input-shape knobs (forced window log). The pledged

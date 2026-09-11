@@ -44,6 +44,9 @@ enum Commands {
             verbatim_doc_comment
         )]
         level: u8,
+        /// Zstd dictionary to compress against (as produced by `zstd --train`)
+        #[arg(short = 'D', long, value_name = "DICT")]
+        dict: Option<PathBuf>,
     },
     Decompress {
         /// .zst archive to decompress
@@ -51,6 +54,9 @@ enum Commands {
         /// Where the compressed file is written
         /// [default: <ARCHIVE_NAME>]
         output_file: Option<PathBuf>,
+        /// Zstd dictionary required to decompress
+        #[arg(short = 'D', long, value_name = "DICT")]
+        dict: Option<PathBuf>,
     },
 }
 
@@ -74,13 +80,15 @@ fn main() -> color_eyre::Result<()> {
             input_file,
             output_file,
             level,
+            dict,
         } => {
             let output_file = output_file.unwrap_or_else(|| add_extension(&input_file, ".zst"));
-            compress(input_file, output_file, level)?;
+            compress(input_file, output_file, level, dict)?;
         },
         Commands::Decompress {
             input_file,
             output_file,
+            dict,
         } => {
             let output_file = output_file.unwrap_or(
                 input_file
@@ -88,13 +96,18 @@ fn main() -> color_eyre::Result<()> {
                     .expect("input has a file name")
                     .into(),
             );
-            decompress(input_file, output_file)?;
+            decompress(input_file, output_file, dict)?;
         },
     }
     Ok(())
 }
 
-fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
+fn compress(
+    input: PathBuf,
+    output: PathBuf,
+    level: u8,
+    dict: Option<PathBuf>,
+) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
     let compression_level: Level = Level::from_zstd(level as i32);
     let source_file = File::open(input).wrap_err("failed to open input file")?;
@@ -106,6 +119,13 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
 
     let mut compressor = zstdx::encoding::FrameCompressor::new(compression_level);
     compressor.set_input_shape(zstdx::InputShape::default().with_len(source_size as u64));
+    if let Some(dict) = dict {
+        let bytes = std::fs::read(dict).wrap_err("failed to open dictionary")?;
+        // Validate up front so a malformed dictionary is a clean error
+        // instead of a panic inside compress().
+        zstdx::decoding::Dictionary::decode_dict(&bytes).wrap_err("invalid dictionary")?;
+        compressor.set_dictionary(&bytes);
+    }
     compressor.set_source(encoder_input);
     compressor.set_drain(&output_file);
     compressor.compress();
@@ -119,7 +139,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     Ok(())
 }
 
-fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
+fn decompress(input: PathBuf, output: PathBuf, dict: Option<PathBuf>) -> color_eyre::Result<()> {
     info!("extracting {input:?} to {output:?}");
     let source_file = File::open(input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;
@@ -128,7 +148,17 @@ fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
     let mut output: File =
         File::create(output).wrap_err("failed to open output file for writing")?;
 
-    let mut decoder = zstdx::decoding::StreamingDecoder::new(decoder_input)?;
+    let mut frame_decoder = zstdx::decoding::FrameDecoder::new();
+    if let Some(dict) = dict {
+        let bytes = std::fs::read(dict).wrap_err("failed to open dictionary")?;
+        let parsed =
+            zstdx::decoding::Dictionary::decode_dict(&bytes).wrap_err("invalid dictionary")?;
+        frame_decoder
+            .add_dict(parsed)
+            .wrap_err("failed to load dictionary")?;
+    }
+    let mut decoder =
+        zstdx::decoding::StreamingDecoder::new_with_decoder(decoder_input, frame_decoder)?;
 
     std::io::copy(&mut decoder, &mut output)?;
 

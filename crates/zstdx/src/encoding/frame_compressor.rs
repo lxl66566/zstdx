@@ -286,6 +286,11 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     compression_level: Level,
     /// Caller-declared input shape (see [`Self::set_input_shape`]).
     input_shape: crate::InputShape,
+    /// Raw dictionary (see [`Self::set_dictionary`]); parsed at compress
+    /// time, where a malformed dictionary panics (this compressor's error
+    /// model panics on IO already — use the option-carrying entry points
+    /// for recoverable errors).
+    dictionary: Option<Vec<u8>>,
     state: CompressState<M>,
     hasher: FrameHasher,
 }
@@ -335,6 +340,18 @@ std::thread_local! {
 pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
     CompressState {
         matcher: MatchGeneratorDriver::new_direct(),
+        last_huff_table: None,
+        fse_tables: FseTables::new(),
+        scratch: super::blocks::compressed::BlockScratch::default(),
+    }
+}
+
+/// A state whose matcher owns its window (the dictionary path stages
+/// blocks through `block_tail`, which the direct/borrowed driver cannot
+/// serve).
+pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
+    CompressState {
+        matcher: MatchGeneratorDriver::new(crate::common::MAX_BLOCK_SIZE as usize),
         last_huff_table: None,
         fse_tables: FseTables::new(),
         scratch: super::blocks::compressed::BlockScratch::default(),
@@ -485,6 +502,70 @@ fn compress_with_state(
     output
 }
 
+/// Compress `src` into one dictionary frame: like [`compress_with_state`]
+/// but through the owned-window matcher (the dictionary cannot join the
+/// borrowed zero-copy window, so blocks stage through the matcher's own
+/// buffer), with the dictionary's id in the header. `state` must have been
+/// reset through [`super::dictionary::reset_with_dictionary`].
+pub(crate) fn compress_with_state_dictionary(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    dict_id: Option<u64>,
+    checksum: bool,
+) -> Vec<u8> {
+    let mut hasher = SliceChecksum::new(src.len(), checksum);
+    let block_size = state.matcher.block_size();
+    let block_overhead = 3 * (src.len() / block_size + 1);
+    let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    let header = FrameHeader {
+        frame_content_size: None,
+        single_segment: false,
+        content_checksum: checksum && cfg!(feature = "hash"),
+        dictionary_id: dict_id,
+        window_size: Some(state.matcher.window_size()),
+    };
+    header.serialize(&mut output);
+    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
+    for (i, block) in src.chunks(block_size).enumerate() {
+        let last_block = (i + 1) * block_size >= src.len() && !trailing_empty;
+        let tail = state.matcher.block_tail();
+        tail[..block.len()].copy_from_slice(block);
+        state.matcher.commit_block(block.len());
+        compress_fastest(state, last_block, &mut output, &mut hasher);
+    }
+    if src.is_empty() || trailing_empty {
+        let header = BlockHeader {
+            last_block: true,
+            block_type: crate::blocks::block::BlockType::Raw,
+            block_size: 0,
+        };
+        header.serialize(&mut output);
+    }
+    #[cfg(feature = "hash")]
+    if checksum {
+        output.extend_from_slice(&hasher.finish32().to_le_bytes());
+    }
+    output
+}
+
+/// [`compress_slice_shaped`] with a parsed dictionary: dictionary content
+/// as match history, its entropy tables seeding the first blocks, its id
+/// in the header. Runs single-threaded through the owned-window matcher.
+pub fn compress_slice_with_dictionary(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+    dict: &super::dictionary::EncDictionary,
+) -> Vec<u8> {
+    let mut shape = shape;
+    let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
+    shape.len = Some(len);
+    let mut state = new_owned_state();
+    super::dictionary::reset_with_dictionary(&mut state, dict, level, shape);
+    compress_with_state_dictionary(&mut state, src, dict.header_id(), checksum)
+}
+
 /// Compress the blocks of one multithreaded job into `output`: no frame
 /// header, no checksum (the mt driver writes both around the assembled job
 /// stream). The caller resets the state per job (fresh entropy tables, so
@@ -545,6 +626,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             input_shape: crate::InputShape::default(),
+            dictionary: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
@@ -570,6 +652,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             compression_level,
             input_shape: crate::InputShape::default(),
+            dictionary: None,
             hasher: FrameHasher::new(),
         }
     }
@@ -596,6 +679,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.input_shape = shape;
     }
 
+    /// Attach a raw zstd dictionary for compression (content as match
+    /// history, entropy tables seeded, id in the frame header). Must be set
+    /// before `compress`; re-declared per frame.
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        self.dictionary = Some(dict.to_vec());
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to
     /// the provided drain
     ///
@@ -606,10 +696,32 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you
     /// can use the [Read::take] function
     pub fn compress(&mut self) {
-        // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.set_input_shape(self.input_shape);
-        self.state.matcher.reset(self.compression_level);
-        self.state.last_huff_table = None;
+        // Clearing buffers to allow re-using of the compressor; a dictionary
+        // (validated here — see `set_dictionary`'s panic contract) rides
+        // along as match history and seeded entropy state.
+        let dict = self
+            .dictionary
+            .as_deref()
+            .map(super::dictionary::EncDictionary::parse)
+            .map(|d| d.expect("valid dictionary"));
+        let dict_id = dict.as_ref().map_or(None, |d| d.header_id());
+        match dict {
+            Some(ref dict) => {
+                let mut shape = self.input_shape;
+                shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+                super::dictionary::reset_with_dictionary(
+                    &mut self.state,
+                    dict,
+                    self.compression_level,
+                    shape,
+                );
+            },
+            None => {
+                self.state.matcher.set_input_shape(self.input_shape);
+                self.state.matcher.reset(self.compression_level);
+                self.state.last_huff_table = None;
+            },
+        }
         self.hasher = FrameHasher::new();
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
@@ -620,7 +732,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             frame_content_size: None,
             single_segment: false,
             content_checksum: cfg!(feature = "hash"),
-            dictionary_id: None,
+            dictionary_id: dict_id,
             window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);

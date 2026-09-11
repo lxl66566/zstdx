@@ -89,12 +89,11 @@ pub mod write {
             })
         }
 
-        /// Creates an encoder bound to a dictionary; dictionary encoding is
-        /// not implemented yet.
-        pub fn with_dictionary(_writer: W, _level: i32, _dictionary: &[u8]) -> io::Result<Self> {
-            Err(super::super::unsupported_io(
-                crate::Feature::DictionaryEncoding,
-            ))
+        /// Creates an encoder bound to a dictionary.
+        pub fn with_dictionary(writer: W, level: i32, dictionary: &[u8]) -> io::Result<Self> {
+            let mut state = EncoderState::new(writer, level);
+            state.options = state.options.dictionary(dictionary);
+            Ok(Self { state })
         }
 
         /// Sets the pledged source size (written into the frame header);

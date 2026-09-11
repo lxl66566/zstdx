@@ -262,3 +262,67 @@ fn test_dict_decoding() {
 
     assert!(failed.is_empty(), "failed files: {failed:?}");
 }
+
+/// Encoder-side dictionary roundtrips and libzstd interop over the real
+/// `zstd --train` fixture: compress the raw .service files against the
+/// dictionary, decode with our decoder and with libzstd, and cross-check
+/// sizes against libzstd's own dictionary encoding of the same files.
+#[test]
+fn test_dict_encoding() {
+    extern crate std;
+    use alloc::vec::Vec;
+    use std::{fs, io::Read as _};
+
+    let dict: Vec<u8> = fs::File::open("./dict_tests/dictionary")
+        .unwrap()
+        .bytes()
+        .map(|x| x.unwrap())
+        .collect();
+
+    let mut files: Vec<_> = fs::read_dir("./dict_tests/files")
+        .unwrap()
+        .filter_map(|f| {
+            let p = f.ok()?.path();
+            (p.extension()?.to_str()? == "service").then_some(p)
+        })
+        .collect();
+    files.sort();
+    let files = &files[..files.len().min(40)];
+
+    let mut ours_smaller = 0;
+    let mut theirs_smaller = 0;
+    for path in files {
+        let data = fs::read(path).unwrap();
+        for level in [
+            crate::Level::Fastest,
+            crate::Level::Fast,
+            crate::Level::Balanced,
+        ] {
+            let opts = crate::EncoderOptions::new(level).dictionary(&dict);
+            let compressed = crate::bulk::compress_with(&data, &opts).unwrap();
+            // our decoder, dictionary attached
+            let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
+            let roundtrip =
+                crate::bulk::decompress_with(&compressed, data.len(), &dec_opts).unwrap();
+            assert_eq!(roundtrip, data, "{:?} at {level:?}", path);
+            // libzstd decodes our dictionary frames
+            let mut zdec = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+            let mut zout = alloc::vec![0u8; data.len()];
+            let n = zdec.decompress_to_buffer(&compressed, &mut zout).unwrap();
+            assert_eq!(&zout[..n], &data[..], "libzstd decode of {:?}", path);
+            // and encodes the same content for a size cross-check
+            let mut zenc = zstd::bulk::Compressor::with_dictionary(level.as_i32(), &dict).unwrap();
+            let zcomp = zenc.compress(&data).unwrap();
+            if compressed.len() <= zcomp.len() {
+                ours_smaller += 1;
+            } else {
+                theirs_smaller += 1;
+            }
+        }
+    }
+    assert!(
+        ours_smaller + theirs_smaller > 0,
+        "no dictionary comparisons ran"
+    );
+    std::println!("dict sizes: ours <= libzstd in {ours_smaller}, behind in {theirs_smaller}");
+}

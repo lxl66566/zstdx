@@ -117,6 +117,22 @@ impl HuffmanTable {
         }
     }
 
+    /// The per-symbol code-length weights the table was built from
+    /// (0 = symbol absent). Feeds encoder-side table reconstruction
+    /// (`huff0_encoder::HuffmanTable::build_from_weights`) when seeding
+    /// from a dictionary.
+    pub fn weights(&self) -> &[u8] {
+        &self.weights
+    }
+
+    /// Per-symbol code lengths including the format's inferred last symbol
+    /// (the wire omits it; `weights` above therefore lacks it). The full
+    /// symbol range, zeros for absent symbols — feed to
+    /// `huff0_encoder::HuffmanTable::build_from_code_lengths`.
+    pub fn code_lengths(&self) -> &[u8] {
+        &self.bits
+    }
+
     /// Completely empty the table then repopulate as a replica
     /// of `other`.
     pub fn reinit_from(&mut self, other: &Self) {

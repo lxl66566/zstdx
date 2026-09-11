@@ -4,6 +4,7 @@
 pub(crate) mod async_checksum;
 pub(crate) mod block_header;
 pub(crate) mod blocks;
+pub(crate) mod dictionary;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 #[cfg(feature = "std")]
@@ -18,6 +19,7 @@ use alloc::vec::Vec;
 
 pub use frame_compressor::{
     FrameCompressor, compress_slice_opts, compress_slice_shaped, compress_slice_to_vec,
+    compress_slice_with_dictionary,
 };
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
@@ -274,6 +276,12 @@ pub trait Matcher {
     /// and/or a forced window log overriding the level's row. Per frame —
     /// implementations must not carry it across resets.
     fn set_input_shape(&mut self, _shape: crate::InputShape) {}
+    /// Load dictionary content as the frame's match history after
+    /// [`Matcher::reset`], before the first block (owned-window
+    /// implementations only; the default drops it, and the encoder still
+    /// declares the dictionary id and entropy tables — sequences simply
+    /// never reference the content).
+    fn load_dictionary(&mut self, _content: &[u8], _rep: [u32; 3]) {}
     /// The size of the window the decoder will need to execute all sequences produced by this
     /// matcher
     ///

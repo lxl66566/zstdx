@@ -26,28 +26,47 @@ pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
 }
 
 /// [`compress`] with a full option set: more than one worker engages the
-/// multithreaded job path on std builds, and the checksum flag decides
-/// whether the frame carries a content checksum.
+/// multithreaded job path on std builds (single-threaded when a dictionary
+/// is attached), the checksum flag decides whether the frame carries a
+/// content checksum, and an attached dictionary is parsed here — an invalid
+/// dictionary is the one fallible case.
 ///
 /// ```rust
 /// let data = b"the quick brown fox jumps over the lazy dog";
 /// let opts = zstdx::EncoderOptions::new(zstdx::Level::Fastest).checksum(true);
-/// let compressed = zstdx::bulk::compress_with(data, &opts);
+/// let compressed = zstdx::bulk::compress_with(data, &opts).unwrap();
 /// let decompressed = zstdx::bulk::decompress(&compressed, data.len()).unwrap();
 /// assert_eq!(&decompressed[..], data);
 /// ```
-pub fn compress_with(source: &[u8], options: &crate::EncoderOptions) -> alloc::vec::Vec<u8> {
+pub fn compress_with(
+    source: &[u8],
+    options: &crate::EncoderOptions,
+) -> Result<alloc::vec::Vec<u8>> {
+    if let Some(raw) = &options.dictionary {
+        let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
+        let shape = crate::InputShape {
+            len: Some(source.len() as u64),
+            window_log: options.input_shape.window_log,
+        };
+        return Ok(crate::encoding::compress_slice_with_dictionary(
+            source,
+            options.level,
+            options.checksum,
+            shape,
+            &dict,
+        ));
+    }
     #[cfg(feature = "std")]
     if options.workers > 1 {
-        return crate::encoding::mt::compress_slice_mt(
+        return Ok(crate::encoding::mt::compress_slice_mt(
             source,
             options.level,
             options.checksum,
             options.workers,
             options.input_shape.window_log,
-        );
+        ));
     }
-    crate::encoding::compress_slice_shaped(
+    Ok(crate::encoding::compress_slice_shaped(
         source,
         options.level,
         options.checksum,
@@ -55,7 +74,7 @@ pub fn compress_with(source: &[u8], options: &crate::EncoderOptions) -> alloc::v
             len: None,
             window_log: options.input_shape.window_log,
         },
-    )
+    ))
 }
 
 /// Decompress a zstd stream (possibly several concatenated frames) into a
@@ -91,7 +110,8 @@ pub fn decompress_to_buffer(source: &[u8], destination: &mut [u8]) -> Result<usi
 
 /// [`decompress_to_buffer`] with a full option set: more than one decode
 /// thread engages the parallel decoder on std builds (see
-/// [`DecoderOptions::threads`][crate::DecoderOptions::threads]).
+/// [`DecoderOptions::threads`][crate::DecoderOptions::threads]); an
+/// attached dictionary is parsed here and used by the sequential decoder.
 pub fn decompress_to_buffer_with(
     source: &[u8],
     destination: &mut [u8],
@@ -105,13 +125,21 @@ pub fn decompress_to_buffer_with(
         return crate::decoding::mt::decode_all_mt(source, destination, options.threads, max)
             .map_err(Into::into);
     }
+    if let Some(raw) = &options.dictionary {
+        let dict =
+            crate::decoding::Dictionary::decode_dict(raw).map_err(crate::Error::Dictionary)?;
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict).map_err(crate::Error::Frame)?;
+        return decoder.decode_all(source, destination).map_err(Into::into);
+    }
     #[cfg(not(feature = "std"))]
     let _ = options;
     decompress_to_buffer(source, destination)
 }
 
 /// [`decompress`] with a full option set (see
-/// [`decompress_to_buffer_with`] for the decode-thread switch).
+/// [`decompress_to_buffer_with`] for the decode-thread switch and
+/// dictionary handling).
 pub fn decompress_with(
     source: &[u8],
     capacity: usize,
@@ -126,6 +154,21 @@ pub fn decompress_with(
         match crate::decoding::mt::decode_to_vec_mt(source, &mut out, options.threads, max) {
             Ok(()) => return Ok(out),
             Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(raw) = &options.dictionary {
+        let dict =
+            crate::decoding::Dictionary::decode_dict(raw).map_err(crate::Error::Dictionary)?;
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict).map_err(crate::Error::Frame)?;
+        let mut capacity = capacity.max(64 * 1024);
+        loop {
+            let mut out = alloc::vec::Vec::with_capacity(capacity);
+            match decoder.decode_all_to_vec(source, &mut out) {
+                Ok(()) => return Ok(out),
+                Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     #[cfg(not(feature = "std"))]
@@ -208,7 +251,7 @@ mod tests {
         let wide = compress(&input, Level::Ultra);
         let opts = crate::EncoderOptions::new(Level::Ultra)
             .with_input_shape(crate::InputShape::default().with_window_log(15));
-        let narrow = compress_with(&input, &opts);
+        let narrow = compress_with(&input, &opts).unwrap();
         assert!(
             narrow.len() > wide.len(),
             "forced W15 must lose the 64K period: {} vs {}",

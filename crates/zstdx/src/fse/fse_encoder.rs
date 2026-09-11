@@ -618,7 +618,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, legacy_avoid_0_numbit:
     build_table_from_probabilities(probs, acc_log)
 }
 
-pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
+pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
     // Entry packing gives 12 bits each to baseline and target index.
     debug_assert!(
         (1..=12).contains(&acc_log),
