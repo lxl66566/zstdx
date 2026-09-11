@@ -337,7 +337,10 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
     }
     #[derive(Clone, Copy)]
     struct Ent {
-        weight: u64,
+        // Block literals are capped far below 2^32, so package weights (sums
+        // of leaf counts) cannot overflow either; the narrow field halves
+        // sort/merge memory traffic.
+        weight: u32,
         node: u32,
     }
 
@@ -348,7 +351,7 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
         if count > 0 {
             arena.push(Node::Leaf(sym as u16));
             leaves.push(Ent {
-                weight: count as u64,
+                weight: u32::try_from(count).expect("literal count exceeds u32"),
                 node: (arena.len() - 1) as u32,
             });
         }
@@ -361,14 +364,15 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
 
     // Level lists: level 0 is the leaves alone; every further level merges
     // the leaves with packages formed from consecutive pairs of the previous
-    // level, keeping the cheapest `take` items.
-    let mut lists: Vec<Vec<Ent>> = Vec::with_capacity(max_len);
-    let mut first = leaves.clone();
-    first.truncate(take);
-    lists.push(first);
+    // level, keeping the cheapest `take` items. Only the previous level is
+    // ever read again, so two swapped buffers replace the list-of-lists
+    // (which allocated two Vecs per level).
+    let mut prev: Vec<Ent> = leaves.clone();
+    prev.truncate(take);
+    let mut packages: Vec<Ent> = Vec::with_capacity(n - 1);
+    let mut cur: Vec<Ent> = Vec::with_capacity(take);
     for _ in 1..max_len {
-        let prev = lists.last().unwrap();
-        let mut packages: Vec<Ent> = Vec::with_capacity(n - 1);
+        packages.clear();
         let mut i = 0;
         while i + 1 < prev.len() && packages.len() < n - 1 {
             let id = arena.len() as u32;
@@ -382,28 +386,28 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
         packages.sort_by_key(|e| (e.weight, e.node));
         // Intermediate levels can hold fewer than `take` items; only the
         // top level is guaranteed full (L >= log2 n).
-        let mut merged: Vec<Ent> = Vec::with_capacity(take);
+        cur.clear();
         let mut li = 0;
         let mut pi = 0;
-        while merged.len() < take && (li < leaves.len() || pi < packages.len()) {
+        while cur.len() < take && (li < leaves.len() || pi < packages.len()) {
             let pick_leaf = pi >= packages.len()
                 || (li < leaves.len()
                     && (leaves[li].weight, leaves[li].node)
                         <= (packages[pi].weight, packages[pi].node));
             if pick_leaf {
-                merged.push(leaves[li]);
+                cur.push(leaves[li]);
                 li += 1;
             } else {
-                merged.push(packages[pi]);
+                cur.push(packages[pi]);
                 pi += 1;
             }
         }
-        lists.push(merged);
+        core::mem::swap(&mut prev, &mut cur);
     }
 
     // Walk the solution back down: every leaf encountered at level k adds one
     // length unit; packages expand into their children one level below.
-    let mut active: Vec<u32> = lists.last().unwrap().iter().map(|e| e.node).collect();
+    let mut active: Vec<u32> = prev.iter().map(|e| e.node).collect();
     for _ in (0..max_len).rev() {
         let mut next = Vec::with_capacity(active.len());
         for id in active {

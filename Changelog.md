@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- `package_merge_lengths` scratch rework: level lists collapse from a
+  `Vec<Vec<Ent>>` (two allocations per level, 11 levels per table) to two
+  swapped reusable buffers - only the previous level is ever read; `Ent`
+  shrinks from 12 to 8 bytes by holding the weight as `u32` (block literals
+  are capped far below 2^32, so package weights cannot overflow). Identical
+  output and tie-breaking; gungraun instruction counts drop on every
+  literals-heavy cell (text fastest -0.7%, text fast -1.2%, skewed fastest
+  -0.5%), text-4K small-payload encode reaches +8% cumulative with the
+  counting sort.
+
 - Huffman literals table build (`build_from_weights`): the weight-ordered
   symbol sort is now a 12-bucket counting sort over stack arrays instead of a
   heap-allocated `Vec` + comparison sort. Package-merge caps weights at 11, so
