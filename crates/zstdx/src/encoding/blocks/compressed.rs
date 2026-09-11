@@ -430,30 +430,42 @@ fn encode_sequences(
     let (mut acc, mut bits, mut pos) = writer.hot_state();
     {
         let out = writer.out();
-        hot_push(
-            out,
-            &mut pos,
-            &mut acc,
-            &mut bits,
-            seqs[li].add,
-            seqs[li].add_nb as usize,
-        );
+        // One reserve covers the whole loop: the last sequence adds ≤51
+        // bits, every earlier one ≤87 (36 transition + 51 add), and each
+        // flush stores eight bytes at the running position — the per-push
+        // capacity probe (a Vec field load plus branch per sequence) goes
+        // away. The seqs/row accesses move to raw pointers for the same
+        // reason (the slice fields rode the stack through every iteration).
+        out.reserve(nb_seq * 11 + 32);
+        let out = out.as_mut_ptr();
+        let sp = seqs.as_ptr();
+        // SAFETY: the reserve above covers every flush store (≤ nb_seq*11+8
+        // bytes past the entry position, with ≤16 bytes of store overshoot).
+        // The seqs reads stay below nb_seq, the row reads inside their flat
+        // tables (see the row-index argument above).
+        unsafe {
+            let w = &*sp.add(li);
+            hot_push_raw(out, &mut pos, &mut acc, &mut bits, w.add, w.add_nb as usize);
+        }
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
+            let ll_rp = ll_rows.as_ptr();
+            let ml_rp = ml_rows.as_ptr();
+            let of_rp = of_rows.as_ptr();
             for i in (0..=nb_seq - 2).rev() {
-                let packed = seqs[i].codes;
-                let ll_code = packed as u8;
-                let ml_code = (packed >> 8) as u8;
-                let of_code = (packed >> 16) as u8;
-
-                // SAFETY: see the row-index argument above.
-                let e_of =
-                    unsafe { *of_rows.get_unchecked(((of_code as usize) << of_shift) | of_state) };
-                let e_ml =
-                    unsafe { *ml_rows.get_unchecked(((ml_code as usize) << ml_shift) | ml_state) };
-                let e_ll =
-                    unsafe { *ll_rows.get_unchecked(((ll_code as usize) << ll_shift) | ll_state) };
+                // SAFETY: as above.
+                let (add, add_nb, e_of, e_ml, e_ll) = unsafe {
+                    let w = &*sp.add(i);
+                    let packed = w.codes;
+                    (
+                        w.add,
+                        w.add_nb as usize,
+                        *of_rp.add((((packed >> 16) as u8 as usize) << of_shift) | of_state),
+                        *ml_rp.add((((packed >> 8) as u8 as usize) << ml_shift) | ml_state),
+                        *ll_rp.add(((packed as u8 as usize) << ll_shift) | ll_state),
+                    )
+                };
                 debug_assert!(of_state < of_table.table_size);
                 debug_assert!(ml_state < ml_table.table_size);
                 debug_assert!(ll_state < ll_table.table_size);
@@ -478,21 +490,22 @@ fn encode_sequences(
                 // cap keeps a post-flush (bits < 8) accumulator from dropping
                 // payload; wider pairs fall back to two pushes of the same
                 // bits.
-                let add = seqs[i].add;
-                let add_nb = seqs[i].add_nb as usize;
                 let trans_nb = of_nb + ml_nb + ll_nb;
-                if trans_nb + add_nb <= 56 {
-                    hot_push(
-                        out,
-                        &mut pos,
-                        &mut acc,
-                        &mut bits,
-                        trans | (add << trans_nb),
-                        trans_nb + add_nb,
-                    );
-                } else {
-                    hot_push(out, &mut pos, &mut acc, &mut bits, trans, trans_nb);
-                    hot_push(out, &mut pos, &mut acc, &mut bits, add, add_nb);
+                // SAFETY: the upfront reserve covers the stores (see above).
+                unsafe {
+                    if trans_nb + add_nb <= 56 {
+                        hot_push_raw(
+                            out,
+                            &mut pos,
+                            &mut acc,
+                            &mut bits,
+                            trans | (add << trans_nb),
+                            trans_nb + add_nb,
+                        );
+                    } else {
+                        hot_push_raw(out, &mut pos, &mut acc, &mut bits, trans, trans_nb);
+                        hot_push_raw(out, &mut pos, &mut acc, &mut bits, add, add_nb);
+                    }
                 }
             }
         }
@@ -514,10 +527,11 @@ fn encode_sequences(
 /// Append the low `nb` bits of `v` to a hot accumulator, flushing whole
 /// bytes with one unaligned u64 store whenever the pending bits could
 /// overflow the container. Produces the same bits as `write_bits`; callers
-/// keep `bits` below 64 so the shift cannot drop payload.
+/// keep `bits` below 64 so the shift cannot drop payload. The capacity for
+/// every store is reserved once by the caller (see `encode_sequences`).
 #[inline(always)]
-fn hot_push(
-    out: &mut Vec<u8>,
+unsafe fn hot_push_raw(
+    out: *mut u8,
     pos: &mut usize,
     acc: &mut u64,
     bits: &mut usize,
@@ -526,16 +540,10 @@ fn hot_push(
 ) {
     if *bits + nb >= 64 {
         let k = *bits / 8;
-        if *pos + 16 > out.capacity() {
-            out.reserve(*pos + 16 - out.len());
-        }
-        // SAFETY: the capacity check covers the store; bytes past the
+        // SAFETY: the caller's reserve covers the store; bytes past the
         // semantic end are overwritten by later stores or cut by set_len.
         unsafe {
-            out.as_mut_ptr()
-                .add(*pos)
-                .cast::<u64>()
-                .write_unaligned(acc.to_le());
+            out.add(*pos).cast::<u64>().write_unaligned(acc.to_le());
         }
         *pos += k;
         *acc >>= 8 * k;
