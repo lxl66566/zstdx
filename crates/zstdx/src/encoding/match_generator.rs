@@ -632,7 +632,8 @@ impl TableEmit<'_> {
     /// rep0/rep1 matches back to back with zero literals; emitting with
     /// of_value 1 at ll == 0 swaps rep0/rep1, so the loop alternates distances
     /// on its own. Returns the cursor after the last chained match.
-    #[inline]
+    /// `inline(always)` for the same budget reason as [`DfastEmit::rep_chain`].
+    #[inline(always)]
     fn rep1_chain(&mut self, win: &[u8], pos: u64, block_end: u64, rep: &mut [u32; 3]) -> u64 {
         let mut pos = pos;
         while block_end - pos >= MIN_MATCH as u64 {
@@ -746,6 +747,11 @@ impl DfastEmit<'_> {
     /// into both tables (no complementary anchors — libzstd's offset_2 loop
     /// only re-seeds the position it consumes). Returns the cursor as a
     /// window index, which is also the new anchor.
+    /// `inline(always)`: the phase-split loop instantiates its call sites
+    /// twice, which halves the inliner's budget per copy — left to its own
+    /// `#[inline]` judgment the helper flips to an outlined call in the
+    /// steady phase and every dense-match emit pays the argument setup.
+    #[inline(always)]
     fn rep_chain(
         &mut self,
         win: &[u8],
@@ -1639,94 +1645,106 @@ impl MatchGeneratorDriver {
         // second position is dropped at the block tail.
         // The miss step can jump past the block end, so the guard must
         // saturate instead of relying on pos < block_end.
-        'restart: while block_end.saturating_sub(pos) >= hash_read {
-            let idx0 = (pos - win_base) as usize;
-            let h0 = hash_at(win, idx0);
-            // SAFETY: the hash masks to HASH_LOG bits and the table always
-            // holds 1 << HASH_LOG slots (see insert_at).
-            let prev0 = unsafe { *table_ptr.add(h0) };
-            let cur0 = read4(win, idx0);
-            let mut pair_len = 1u64;
-            let mut idx1 = idx0;
-            let mut h1 = h0;
-            let mut prev1 = prev0;
-            let mut cur1 = cur0;
-            if block_end - pos > hash_read {
-                pair_len = 2;
-                idx1 = idx0 + 1;
-                h1 = hash_at(win, idx1);
-                // SAFETY: as above.
-                prev1 = unsafe { *table_ptr.add(h1) };
-                cur1 = read4(win, idx1);
-            }
-            // Store after both lookups so each probe sees the pre-store
-            // entry (newest-wins).
-            // SAFETY: as above.
-            unsafe {
-                *table_ptr.add(h0) = pack_pos(pos);
-            }
-            if pair_len == 2 {
+        //
+        // The body exists in two phases. The seeded phase carries the
+        // job-start state (`seed_offset`/`seed_hits`/`seed_budget`,
+        // `rep_pending`), which only ever winds down; once it converges the
+        // steady phase runs a body with all of it folded out. In one loop
+        // those four values stayed live across every iteration (bulk-ST and
+        // post-convergence MT scanning carried pure dead weight), and the
+        // scan paid for them in spill traffic — a quarter of its cycles sat
+        // on stack reloads. `$gated` is a literal, so the phase-only code
+        // paths are constant-folded away in the steady instantiation.
+        macro_rules! scan_fast {
+            ($restart:lifetime, $gated:literal) => {
+                let idx0 = (pos - win_base) as usize;
+                let h0 = hash_at(win, idx0);
+                // SAFETY: the hash masks to HASH_LOG bits and the table always
+                // holds 1 << HASH_LOG slots (see insert_at).
+                let prev0 = unsafe { *table_ptr.add(h0) };
+                let cur0 = read4(win, idx0);
+                let mut pair_len = 1u64;
+                let mut idx1 = idx0;
+                let mut h1 = h0;
+                let mut prev1 = prev0;
+                let mut cur1 = cur0;
+                if block_end - pos > hash_read {
+                    pair_len = 2;
+                    idx1 = idx0 + 1;
+                    h1 = hash_at(win, idx1);
+                    // SAFETY: as above.
+                    prev1 = unsafe { *table_ptr.add(h1) };
+                    cur1 = read4(win, idx1);
+                }
+                // Store after both lookups so each probe sees the pre-store
+                // entry (newest-wins).
                 // SAFETY: as above.
                 unsafe {
-                    *table_ptr.add(h1) = pack_pos(pos + 1);
+                    *table_ptr.add(h0) = pack_pos(pos);
                 }
-            }
-
-            // Probe the first position. Repcode candidate first (mirrors
-            // zstd's fast strategy: rep[0] only); a repcode match needs at
-            // least one pending literal so of_value 1 stays encodable: with
-            // literals pending the probe runs at the current position,
-            // otherwise one byte ahead so that byte becomes the literal.
-            {
-                // Absolute lower bound of rep[0] candidates; rep[0] only
-                // changes inside emits, which re-enter the loop.
-                let rep0_lim = win_base + rep[0] as u64;
-                // A gated job start must not probe repcodes (unknown decoder
-                // history); probe 0 sits below the bound, which folds the
-                // underflow guard into the same single comparison.
-                let probe = if rep_pending != 0 {
-                    0
-                } else if pos == anchor {
-                    pos + 1
-                } else {
-                    pos
-                };
-                if probe >= rep0_lim {
-                    let mut cand = (probe - rep0_lim) as usize;
-                    let pidx = (probe - win_base) as usize;
-                    if read4(win, cand) == read4(win, pidx) {
-                        let mut ml = extend_match(win, pidx, cand);
-                        if ml >= MIN_MATCH {
-                            let anchor_idx = (anchor - win_base) as usize;
-                            let mut start = pidx;
-                            // Extend backwards into the pending literals;
-                            // the offset (pidx - cand) stays constant.
-                            while start > anchor_idx + 1
-                                && cand > 0
-                                && win[cand - 1] == win[start - 1]
-                            {
-                                cand -= 1;
-                                start -= 1;
-                                ml += 1;
-                            }
-                            anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
-                            // The chain's matches advance the cursor too.
-                            anchor = pos;
-                            miss_count = 0;
-                            continue 'restart;
-                        }
+                if pair_len == 2 {
+                    // SAFETY: as above.
+                    unsafe {
+                        *table_ptr.add(h1) = pack_pos(pos + 1);
                     }
                 }
 
-                // Seed-offset probe (job starts only): direct byte compare
-                // at the prefill-detected long-repeat offset — the table
-                // cannot serve this candidate (see `seed_offset`). Emits as
-                // a plain literal-offset match, so it is legal under the
-                // repcode gate; each emit rotates `rep` toward holding the
-                // offset, and after SEED_MATCHES the repcode probes ride it
-                // without further seed help.
-                if seed_offset != 0 {
+                // Probe the first position. Repcode candidate first (mirrors
+                // zstd's fast strategy: rep[0] only); a repcode match needs
+                // at least one pending literal so of_value 1 stays encodable: with
+                // literals pending the probe runs at the current position,
+                // otherwise one byte ahead so that byte becomes the literal.
+                {
+                    // Absolute lower bound of rep[0] candidates; rep[0] only
+                    // changes inside emits, which re-enter the loop.
+                    let rep0_lim = win_base + rep[0] as u64;
+                    // A gated job start must not probe repcodes (unknown
+                    // decoder history); probe 0 sits below the bound, which
+                    // folds the underflow guard into the same single
+                    // comparison.
+                    let probe = if $gated && rep_pending != 0 {
+                        0
+                    } else if pos == anchor {
+                        pos + 1
+                    } else {
+                        pos
+                    };
+                    if probe >= rep0_lim {
+                        let mut cand = (probe - rep0_lim) as usize;
+                        let pidx = (probe - win_base) as usize;
+                        if read4(win, cand) == read4(win, pidx) {
+                            let mut ml = extend_match(win, pidx, cand);
+                            if ml >= MIN_MATCH {
+                                let anchor_idx = (anchor - win_base) as usize;
+                                let mut start = pidx;
+                                // Extend backwards into the pending literals;
+                                // the offset (pidx - cand) stays constant.
+                                while start > anchor_idx + 1
+                                    && cand > 0
+                                    && win[cand - 1] == win[start - 1]
+                                {
+                                    cand -= 1;
+                                    start -= 1;
+                                    ml += 1;
+                                }
+                                anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
+                                pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
+                                // The chain's matches advance the cursor too.
+                                anchor = pos;
+                                miss_count = 0;
+                                continue $restart;
+                            }
+                        }
+                    }
+
+                    // Seed-offset probe (job starts only): direct byte compare
+                    // at the prefill-detected long-repeat offset — the table
+                    // cannot serve this candidate (see `seed_offset`). Emits as
+                    // a plain literal-offset match, so it is legal under the
+                    // repcode gate; each emit rotates `rep` toward holding the
+                    // offset, and after SEED_MATCHES the repcode probes ride it
+                    // without further seed help.
+                    if $gated && seed_offset != 0 {
                     let ci = (pos - seed_offset as u64 - win_base) as usize;
                     if read4(win, ci) == cur0 {
                         let mut ml = extend_match(win, idx0, ci);
@@ -1758,7 +1776,7 @@ impl MatchGeneratorDriver {
                             };
                             anchor = pos;
                             miss_count = 0;
-                            continue 'restart;
+                            continue $restart;
                         }
                     }
                     // A seed that never pays retires on its budget instead
@@ -1794,15 +1812,19 @@ impl MatchGeneratorDriver {
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
                         // safe again.
-                        rep_pending = rep_pending.saturating_sub(1);
-                        pos = if rep_pending == 0 {
-                            emit.rep1_chain(win, anchor, block_end, &mut rep)
+                        if $gated {
+                            rep_pending = rep_pending.saturating_sub(1);
+                            pos = if rep_pending == 0 {
+                                emit.rep1_chain(win, anchor, block_end, &mut rep)
+                            } else {
+                                anchor
+                            };
                         } else {
-                            anchor
-                        };
+                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
+                        }
                         anchor = pos;
                         miss_count = 0;
-                        continue 'restart;
+                        continue $restart;
                     }
                 }
             }
@@ -1813,7 +1835,7 @@ impl MatchGeneratorDriver {
                 // Absolute lower bound of rep[0] candidates (see above).
                 let rep0_lim = win_base + rep[0] as u64;
                 // Gated job starts skip the repcode probe (see above).
-                let probe = if rep_pending != 0 {
+                let probe = if $gated && rep_pending != 0 {
                     0
                 } else if pos1 == anchor {
                     pos1 + 1
@@ -1840,7 +1862,7 @@ impl MatchGeneratorDriver {
                             pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
                             anchor = pos;
                             miss_count = 0;
-                            continue 'restart;
+                            continue $restart;
                         }
                     }
                 }
@@ -1863,15 +1885,19 @@ impl MatchGeneratorDriver {
                         // one slot down; after the third one a job-start
                         // gate has fully converged and repcode use is
                         // safe again.
-                        rep_pending = rep_pending.saturating_sub(1);
-                        pos = if rep_pending == 0 {
-                            emit.rep1_chain(win, anchor, block_end, &mut rep)
+                        if $gated {
+                            rep_pending = rep_pending.saturating_sub(1);
+                            pos = if rep_pending == 0 {
+                                emit.rep1_chain(win, anchor, block_end, &mut rep)
+                            } else {
+                                anchor
+                            };
                         } else {
-                            anchor
-                        };
+                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
+                        }
                         anchor = pos;
                         miss_count = 0;
-                        continue 'restart;
+                        continue $restart;
                     }
                 }
             }
@@ -1888,6 +1914,18 @@ impl MatchGeneratorDriver {
             miss_count += pair_len as usize;
             let step = 1 + (miss_count >> 2).min(255) as u64;
             pos += pair_len * step;
+            };
+        }
+        // Seeded phase: job starts only (bulk-ST skips it entirely); each
+        // emit re-checks convergence at the head, and the values only ever
+        // wind down.
+        'seeded: while (rep_pending != 0 || seed_offset != 0)
+            && block_end.saturating_sub(pos) >= hash_read
+        {
+            scan_fast!('seeded, true);
+        }
+        'restart: while block_end.saturating_sub(pos) >= hash_read {
+            scan_fast!('restart, false);
         }
         if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
@@ -1976,19 +2014,24 @@ impl MatchGeneratorDriver {
 
         // Outer loop: one pass per emitted match; re-entering resets the
         // miss step. The inner loop walks single positions until a match
-        // or the block tail.
-        'outer: loop {
-            // The short-match upgrade probes at ip + 1, so a pass needs a
-            // full position pair inside the block.
-            if ip_idx + 1 > limit_idx {
-                break;
-            }
-            let mut ip1_idx = ip_idx + 1;
-            let mut hl0 = hash8_at_log(win, ip_idx, long_log);
-            // SAFETY: hl0 is masked to the long table size.
-            let mut entry_l0 = unsafe { *long_ptr.add(hl0) };
+        // or the block tail. Like the fast loop, the body runs in two
+        // phases (see `scan_fast`): the seeded phase carries the job-start
+        // seed/gate state, the steady phase folds it out — this loop's live
+        // set is even larger (two tables, two hash logs), so the dead
+        // weight cost more here.
+        macro_rules! scan_dfast {
+            ($outer:lifetime, $gated:literal) => {
+                // The short-match upgrade probes at ip + 1, so a pass needs a
+                // full position pair inside the block.
+                if ip_idx + 1 > limit_idx {
+                    break $outer;
+                }
+                let mut ip1_idx = ip_idx + 1;
+                let mut hl0 = hash8_at_log(win, ip_idx, long_log);
+                // SAFETY: hl0 is masked to the long table size.
+                let mut entry_l0 = unsafe { *long_ptr.add(hl0) };
 
-            loop {
+                loop {
                 let hs0 = hash_at_log(win, ip_idx, small_log);
                 // SAFETY: hs0 is masked to the small table size.
                 let entry_s0 = unsafe { *small_ptr.add(hs0) };
@@ -2008,7 +2051,7 @@ impl MatchGeneratorDriver {
                 // pending literal, so of_value 1 encodes rep0 instead of a
                 // swap, and no backward extension may consume it. Gated job
                 // starts skip the probe (unknown decoder history).
-                if rep_pending == 0 {
+                if !($gated && rep_pending != 0) {
                     let probe = ip_idx + 1;
                     if let Some(cand_abs) = (win_base + probe as u64).checked_sub(rep[0] as u64)
                         && cand_abs >= win_base
@@ -2021,7 +2064,7 @@ impl MatchGeneratorDriver {
                             ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
-                            continue 'outer;
+                            continue $outer;
                         }
                     }
                 }
@@ -2030,7 +2073,7 @@ impl MatchGeneratorDriver {
                 // at the prefill-detected long-repeat offset — neither
                 // single-candidate table can serve it (see `seed_offset`).
                 // Mirrors the fast loop's twin block.
-                if seed_offset != 0 {
+                if $gated && seed_offset != 0 {
                     let ci = (pos_abs - seed_offset as u64 - win_base) as usize;
                     if read4(win, ci) == read4(win, ip_idx) {
                         let mut ml = extend_match(win, ip_idx, ci);
@@ -2056,7 +2099,7 @@ impl MatchGeneratorDriver {
                                 anchor_idx
                             };
                             anchor_idx = ip_idx;
-                            continue 'outer;
+                            continue $outer;
                         }
                     }
                     seed_budget -= 1;
@@ -2097,15 +2140,19 @@ impl MatchGeneratorDriver {
                         // slot down; after the third one a job-start gate
                         // has fully converged and repcode use is safe
                         // again.
-                        rep_pending = rep_pending.saturating_sub(1);
-                        ip_idx = if rep_pending == 0 {
-                            emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
+                        if $gated {
+                            rep_pending = rep_pending.saturating_sub(1);
+                            ip_idx = if rep_pending == 0 {
+                                emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
+                            } else {
+                                anchor_idx
+                            };
                         } else {
-                            anchor_idx
-                        };
+                            ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
+                        }
                         // The chain's matches advance the anchor too.
                         anchor_idx = ip_idx;
-                        continue 'outer;
+                        continue $outer;
                     }
                 }
 
@@ -2149,15 +2196,19 @@ impl MatchGeneratorDriver {
                                 *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
                             }
                         }
-                        rep_pending = rep_pending.saturating_sub(1);
-                        ip_idx = if rep_pending == 0 {
-                            emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
+                        if $gated {
+                            rep_pending = rep_pending.saturating_sub(1);
+                            ip_idx = if rep_pending == 0 {
+                                emit.rep_chain(win, anchor_idx, limit_idx, &mut rep)
+                            } else {
+                                anchor_idx
+                            };
                         } else {
-                            anchor_idx
-                        };
+                            ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep);
+                        }
                         // The chain's matches advance the anchor too.
                         anchor_idx = ip_idx;
-                        continue 'outer;
+                        continue $outer;
                     }
                 }
 
@@ -2173,7 +2224,16 @@ impl MatchGeneratorDriver {
                 }
             }
             // The pair left the block: nothing left to probe.
-            break;
+            break $outer;
+            };
+        }
+        // Seeded phase (job starts only; bulk-ST skips it entirely), then
+        // the steady phase — same convergence contract as `scan_fast`.
+        'seeded: while (rep_pending != 0 || seed_offset != 0) && ip_idx < limit_idx {
+            scan_dfast!('seeded, true);
+        }
+        'outer: loop {
+            scan_dfast!('outer, false);
         }
         if !emit.seqs.is_empty() && anchor_idx < block_len {
             emit.literals.extend_from_slice(&win[anchor_idx..block_len]);
