@@ -6,7 +6,7 @@
 
 - **Decode ST bulk**: we win 10/11 cells (x 0.23-0.84), parity on skewed.zst9 (1.02); absolute 648-11535 MiB/s ours. Caveat kept from methodology: zstd's bulk API is a slow wrapper — the honest decode gap is the streaming column.
 - **Decode ST streaming**: zstd wins every compressible shape — json x1.30-1.36, skewed x1.10-1.31, text x1.04-1.21; we win random (x0.80, 11082 vs 8872 MiB/s) and hold zeros (1.00). text.zst9 near-parity (1.04).
-- **Encode ST**: we win text (fastest/fast/balanced x0.60-0.83, balanced now denser than zstd-9 at 368 vs 378 and 1.6x faster), skewed (fastest x0.44, balanced x0.041 at 1808 vs 75 MiB/s), zeros (x0.017-0.26), random at balanced parity and best/opt/ultra leapfrogs (x0.16/**0.007**/**0.005** — the incompressibility gate; 1585 vs 12 MiB/s at opt). We lose json at every level (x1.21-1.67 low tiers; best x4.10; opt/ultra x1.32-1.33 vs the denser zstd-17/19 references at ratio parity) and random fastest/fast (x1.28-1.30). json.balanced is now a deliberate density trade: +19.5% denser than zstd-9 (7.11 vs 5.95) at x1.51 (W21+row).
+- **Encode ST**: we win text (fastest/fast/balanced x0.60-0.83, balanced now denser than zstd-9 at 368 vs 378 and 1.6x faster), skewed (fastest x0.44, balanced x0.041 at 1808 vs 75 MiB/s), zeros (x0.017-0.26), and random at every tier (x0.61-0.88 low tiers via the sticky gate hold, best/opt/ultra x0.09/**0.004**/**0.003**). We lose json at every level (x1.21-1.67 low tiers; best x4.10; opt/ultra x1.32-1.33 vs the denser zstd-17/19 references at ratio parity). json.balanced is now a deliberate density trade: +19.5% denser than zstd-9 (7.11 vs 5.95) at x1.51 (W21+row).
 - **Encode MT**: big win at equal workers where it matters — json.fast mt16 x0.33 (3190 vs 1044 MiB/s), text.fast mt8/mt16 x0.16-0.17 (~13000 vs ~2200), skewed 0.16-0.76. Losses: json.fastest.mt8 x1.35 (zstd-l1-mt8 hits 4282), json/text.balanced.mt16 x0.96/0.66 (zstd-mt ratio collapses there: text 378→189/39.8 vs our 368/309). Ratio preservation is ours alone: every mt cell within 0.5% of our ST. Our cold-pool mt16 beats zstd's warm-pool reference (3190 vs 1604 MiB/s).
 - **Streaming encode ST**: text wins (fastest x0.26 with a 17x ratio win — zstd collapses to ratio 18.3 vs our 309; fast x0.83); json loses (fastest x1.55, fast x1.11, best x4.17 — bounded by the Best core, not the pipeline).
 - **Streaming encode MT8 — regression fixed same day** (found by this pass, bisected to `946dd2f`; fix: quantized epoch grid + finish-tail re-slice + MADV_HUGEPAGE buffer + output cursor, see [mt-stream](../perf/mt-stream.md)): all cells recovered 15-77% (json.fastest 961→1423, json.fast 724→1248, json.balanced 175→247, text.balanced 982→1546, text.fastest 2049→2363 MiB/s re-pass) with ratio within ±0.1%. json.fast/balanced and text.balanced/best beat zstd by 1.5-3.1×; the residue (text.fastest 1.8×, json.fastest 1.26× behind zstd) is the burst model's serialized accumulate/spawn/barrier, not the schedule.
@@ -35,32 +35,32 @@
 | fastest | json | 514 | 6.14 | 856 | 6.11 | 1.67 |
 | fastest | text | 12547 | 309.17 | 10474 | 308.94 | 0.83 |
 | fastest | skewed | 2913 | 2.00 | 1272 | 2.00 | 0.44 |
-| fastest | random | 1678 | 1.00 | 2182 | 1.00 | 1.30 |
+| fastest | random | 2464 | 1.00 | 2157 | 1.00 | 0.88 |
 | fastest | zeros | 50414 | 32483 | 13296 | 32171 | 0.26 |
 | fast | json | 400 | 5.29 | 484 | 5.29 | 1.21 |
 | fast | text | 12053 | 332.97 | 7267 | 332.90 | 0.60 |
 | fast | skewed | 186 | 1.92 | 227 | 1.92 | 1.22 |
-| fast | random | 1675 | 1.00 | 2148 | 1.00 | 1.28 |
+| fast | random | 2569 | 1.00 | 2044 | 1.00 | 0.80 |
 | fast | zeros | 49967 | 32483 | 8701 | 32171 | 0.17 |
 | balanced | json | 80 | 7.11 | 122 | 5.95 | 1.51 |
 | balanced | text | 2630 | 367.89 | 1703 | 378.41 | 0.65 |
 | balanced | skewed | 1808 | 2.00 | 75 | 1.84 | 0.041 |
-| balanced | random | 1658 | 1.00 | 1660 | 1.00 | 1.00 |
+| balanced | random | 2505 | 1.00 | 1525 | 1.00 | 0.61 |
 | balanced | zeros | 46916 | 32483 | 1754 | 32202 | 0.037 |
 | best | json | 9 | 6.75 | 36 | 6.10 | 4.10 |
 | best | text | 417 | 404.78 | 742 | 385.90 | 1.78 |
 | best | skewed | 2 | 2.00 | 14 | 1.84 | 6.10 |
-| best | random | 1576 | 1.00 | 255 | 1.00 | 0.16 |
+| best | random | 2452 | 1.00 | 218 | 1.00 | 0.09 |
 | best | zeros | 43500 | 32483 | 834 | 32202 | 0.019 |
 | opt | json | 5 | 7.46 | 7 | 7.49 | 1.32 |
 | opt | text | 453 | 408.76 | 471 | 410.11 | 1.04 |
 | opt | skewed | 2 | 2.00 | 3 | 2.00 | 1.50 |
-| opt | random | 1585 | 1.00 | 12 | 1.00 | 0.007 |
+| opt | random | 2427 | 1.00 | 9 | 1.00 | 0.004 |
 | opt | zeros | 41949 | 32483 | 937 | 32202 | 0.022 |
 | ultra | json | 2 | 7.42 | 3 | 7.42 | 1.33 |
 | ultra | text | 264 | 412.58 | 276 | 413.98 | 1.05 |
 | ultra | skewed | 1 | 2.00 | 2 | 2.00 | 1.40 |
-| ultra | random | 1592 | 1.00 | 8 | 1.00 | 0.005 |
+| ultra | random | 2253 | 1.00 | 7 | 1.00 | 0.003 |
 | ultra | zeros | 40780 | 32483 | 676 | 32202 | 0.017 |
 
 Ratio verdict: denser or at parity on json at every level except opt (−0.31% vs zstd-17) and ultra (parity); text loses only balanced (−2.78%) and ultra (−0.34%, opt −0.33%); skewed wins everywhere except the near-tie fast/opt/ultra (−0.06..−0.07%); random/zeros tie or win. Checksum on/off (ours): json.fast 1.00, text.fast 0.90 (on faster).

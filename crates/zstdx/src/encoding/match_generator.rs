@@ -915,6 +915,19 @@ pub struct MatchGeneratorDriver {
     /// stale tag can only produce a spurious hit, which selects the
     /// conservative path.
     probe: Vec<u32>,
+    /// Sticky incompressibility hold: set once a block clears the exact
+    /// entropy pass, cleared by any gate rejection. While held, a block
+    /// that passes the strided repeat probe (no repeated 8-gram, >= 208
+    /// distinct sampled bytes) gates without re-running the exact
+    /// histogram. The probe still bars every matchable block; what the
+    /// skip accepts is the residual risk of a repeat-free block with
+    /// skewed bytes (entropy < 7.97) following a gated one — its loss is
+    /// the literals-only huffman saving the matcher would never have
+    /// improved on, bounded by the flat ~210-256-symbol alphabet the
+    /// probe's distinct screen forces (<= ~2%, synthetic shapes only;
+    /// natural incompressible data sits at ~8 bits/B). Same precedent as
+    /// the literals gate's `literals_gate_hold`.
+    gate_hold: bool,
     /// Price statistics for the opt strategies, persisting across blocks.
     opt_state: OptState,
     /// DP scratch for the opt strategies (~130 KiB; allocated on demand).
@@ -1031,6 +1044,7 @@ impl MatchGeneratorDriver {
             bt: Vec::new(),
             hash3: Vec::new(),
             probe: Vec::new(),
+            gate_hold: false,
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
@@ -1068,6 +1082,7 @@ impl MatchGeneratorDriver {
             bt: Vec::new(),
             hash3: Vec::new(),
             probe: Vec::new(),
+            gate_hold: false,
             opt_state: OptState::new(),
             opt_scratch: None,
             next_update: 0,
@@ -1237,6 +1252,7 @@ impl MatchGeneratorDriver {
         // entire content: any gap a previous job left open ends here, and
         // the job's own blocks re-open it as they gate.
         self.gap_start = u64::MAX;
+        self.gate_hold = false;
         if data.len() < HASH_READ {
             return;
         }
@@ -1501,6 +1517,7 @@ impl Matcher for MatchGeneratorDriver {
         // The opt parser re-seeds its statistics and re-fills its tree.
         self.next_update = 0;
         self.gap_start = u64::MAX;
+        self.gate_hold = false;
         self.opt_state.reset();
     }
 
@@ -1652,6 +1669,7 @@ impl Matcher for MatchGeneratorDriver {
             let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
             let tag = h as u32;
             if probe[slot] == tag {
+                self.gate_hold = false;
                 return false;
             }
             probe[slot] = tag;
@@ -1660,11 +1678,13 @@ impl Matcher for MatchGeneratorDriver {
             if i == screen1 {
                 screen1 = usize::MAX;
                 if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
+                    self.gate_hold = false;
                     return false;
                 }
             } else if i == screen2 {
                 screen2 = usize::MAX;
                 if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
+                    self.gate_hold = false;
                     return false;
                 }
             }
@@ -1672,41 +1692,49 @@ impl Matcher for MatchGeneratorDriver {
         }
         let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
         if distinct < 208 {
+            self.gate_hold = false;
             return false;
         }
-        // Exact byte histogram (four lanes break the store-forward chain):
-        // the entropy decision must not ride on a sample's noise band —
-        // a block wrongly kept below the bar forces a full scan (plus the
-        // table catch-up fill), hundreds of times the histogram cost.
-        let mut lanes = [[0u32; 256]; 4];
-        let (chunks, remainder) = block.as_chunks::<4>();
-        for chunk in chunks {
-            lanes[0][chunk[0] as usize] += 1;
-            lanes[1][chunk[1] as usize] += 1;
-            lanes[2][chunk[2] as usize] += 1;
-            lanes[3][chunk[3] as usize] += 1;
-        }
-        for &b in remainder {
-            lanes[0][b as usize] += 1;
-        }
-        let total_f = total as f64;
-        let mut entropy_bits = 0.0f64;
-        let mut distinct = 0u32;
-        for (s, &c0) in lanes[0].iter().enumerate() {
-            let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
-            if c > 0 {
-                distinct += 1;
-                entropy_bits -= c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
+        // The sticky hold skips the exact pass on steady-state
+        // incompressible runs (see the field's risk model); the first block
+        // of every run always pays it.
+        if !self.gate_hold {
+            // Exact byte histogram (four lanes break the store-forward chain):
+            // the entropy decision must not ride on a sample's noise band —
+            // a block wrongly kept below the bar forces a full scan (plus the
+            // table catch-up fill), hundreds of times the histogram cost.
+            let mut lanes = [[0u32; 256]; 4];
+            let (chunks, remainder) = block.as_chunks::<4>();
+            for chunk in chunks {
+                lanes[0][chunk[0] as usize] += 1;
+                lanes[1][chunk[1] as usize] += 1;
+                lanes[2][chunk[2] as usize] += 1;
+                lanes[3][chunk[3] as usize] += 1;
             }
-        }
-        // Miller-Madow bias correction, as in the literals entropy gate.
-        let bits_per_byte =
-            entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
-        // Well past the literals gate's reject floor: huffman on literals
-        // this dense saves under 0.4% before the table description, and the
-        // probe above already ruled out matches worth more.
-        if bits_per_byte < 7.97 {
-            return false;
+            for &b in remainder {
+                lanes[0][b as usize] += 1;
+            }
+            let total_f = total as f64;
+            let mut entropy_bits = 0.0f64;
+            let mut distinct = 0u32;
+            for (s, &c0) in lanes[0].iter().enumerate() {
+                let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
+                if c > 0 {
+                    distinct += 1;
+                    entropy_bits -=
+                        c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
+                }
+            }
+            // Miller-Madow bias correction, as in the literals entropy gate.
+            let bits_per_byte =
+                entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+            // Well past the literals gate's reject floor: huffman on literals
+            // this dense saves under 0.4% before the table description, and the
+            // probe above already ruled out matches worth more.
+            if bits_per_byte < 7.97 {
+                return false;
+            }
+            self.gate_hold = true;
         }
         // Advance the cursors only. The opt strategies' tree fills the
         // skipped range lazily from `next_update`; the table strategies

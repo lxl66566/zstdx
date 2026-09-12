@@ -74,12 +74,12 @@ Output sizes and ratios are deterministic and identical across passes. Slow cell
 | skewed.best | 2 | 2.00 | 14 | 1.84 | 6.10 |
 | skewed.opt | 2 | 2.00 | 3 | 2.00 | 1.50 |
 | skewed.ultra | 1 | 2.00 | 2 | 2.00 | 1.40 |
-| random.fastest | 1678 | 1.00 | 2182 | 1.00 | 1.30 |
-| random.fast | 1675 | 1.00 | 2148 | 1.00 | 1.28 |
-| random.balanced | 1658 | 1.00 | 1660 | 1.00 | 1.00 |
-| random.best | 1576 | 1.00 | 255 | 1.00 | 0.16 |
-| random.opt | 1585 | 1.00 | 12 | 1.00 | 0.007 |
-| random.ultra | 1592 | 1.00 | 8 | 1.00 | 0.005 |
+| random.fastest | 2464 | 1.00 | 2157 | 1.00 | 0.88 |
+| random.fast | 2569 | 1.00 | 2044 | 1.00 | 0.80 |
+| random.balanced | 2505 | 1.00 | 1525 | 1.00 | 0.61 |
+| random.best | 2452 | 1.00 | 218 | 1.00 | 0.09 |
+| random.opt | 2427 | 1.00 | 9 | 1.00 | 0.004 |
+| random.ultra | 2253 | 1.00 | 7 | 1.00 | 0.003 |
 | zeros.fastest | 50414 | 32483 | 13296 | 32171 | 0.26 |
 | zeros.fast | 49967 | 32483 | 8701 | 32171 | 0.17 |
 | zeros.balanced | 46916 | 32483 | 1754 | 32202 | 0.037 |
@@ -89,7 +89,7 @@ Output sizes and ratios are deterministic and identical across passes. Slow cell
 
 Checksum overhead row (ours, off/on time ratio, 2 passes): json.fast 1.00/1.00, text.fast 0.90/0.90 (checksum ON is faster on text — sidecar path).
 
-vs the 2026-09-11 tables (beyond the pairing change): json.fastest 1.78→1.67 (scan-loop work), json.fast 1.29→1.21 at ratio parity with zstd-3 (W21), json.balanced now trades speed for density (x1.24→1.51 at +19.5% density vs zstd-9, W21+row), text.balanced denser (361→368) and faster (0.87→0.65), json.opt 1.15→1.32 but vs the denser zstd-17 reference and after the C22 ring cut (solo −19.6%), random.best/opt/ultra leapfrog 6-200x (incompressibility gate, unmeasured wall until now).
+vs the 2026-09-11 tables (beyond the pairing change): json.fastest 1.78→1.67 (scan-loop work), json.fast 1.29→1.21 at ratio parity with zstd-3 (W21), json.balanced now trades speed for density (x1.24→1.51 at +19.5% density vs zstd-9, W21+row), text.balanced denser (361→368) and faster (0.87→0.65), json.opt 1.15→1.32 but vs the denser zstd-17 reference and after the C22 ring cut (solo −19.6%), random leapfrog at every tier (best/opt/ultra via the incompressibility gate; fastest/fast/balanced 1.28-1.30 losses → 0.61-0.88 wins via the sticky gate hold, same day).
 
 ## T4 encode MT bulk (checksums off; cold pool per call both sides; 1 pass; MiB/s)
 
