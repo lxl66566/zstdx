@@ -19,7 +19,7 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 | Subcommand | Purpose |
 |---|---|
 | `ratio` | Compression-ratio sweep: one deterministic pass per cell over every level × bulk/stream × st/mt (120 cells full corpus), zstdx vs libzstd, roundtrip-gated; cells run concurrently on a rayon pool (`--parallel`, default 8 — sizes only, ST cells still use the ST encoder), geo-mean Δ% summary printed last (tail-friendly); sizes diff cleanly across runs/builds |
-| `matrix` | Wide-coverage matrix: `--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` covers the five segments, interleaved A/B + roundtrip gate; `--shape/--level/--workers/--mt-workers` filter cells, `--budget-ms` caps the per-side budget |
+| `matrix` | Wide-coverage matrix: `--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` covers the five segments, interleaved A/B + roundtrip gate; `--shape/--level/--workers/--mt-workers` filter cells, `--budget-ms` caps the per-side budget; `--full-ladder` switches `enc-st` to the numeric 1-22 axis vs libzstd at the same level — extremely heavy, day-to-day runs never use it, it is a once-before-each-release gate |
 | `small` | 1KiB-1MiB small loads; `--size`/`--impl` pin a single size and a single impl (for profiler targeting) |
 | `files` | Decoding timing for arbitrary .zst files (budget-based; automatically finds the `.raw`/bare-stem reference for verification via any `zst*` suffix) |
 | `prof` | Single-side profiling loops: `prof dec <f> [n]` / `prof enc <lvl> <n> <f...>` / `prof enc-stream <lvl> <n> <f>`; `RUZ_CKSUM` env toggles the checksum path |

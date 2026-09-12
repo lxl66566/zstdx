@@ -14,8 +14,10 @@
 //! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo; libzstd exposes no
 //!   multithreaded decode, so the zstd column is its single-threaded streaming speed as a reference
 //!   line.
-//! - `enc-st` pairs the ladder levels with zstd levels 1/3/6/12/16/19, checksums off on both sides
-//!   (our checksum overhead is measured in a dedicated row); sizes and ratios are printed per cell.
+//! - `enc-st` pairs the ladder levels with libzstd at the same numeric levels (1/3/9/13/17/19),
+//!   checksums off on both sides (our checksum overhead is measured in a dedicated row); sizes and
+//!   ratios are printed per cell. `--full-ladder` swaps the axis to every numeric level 1-22 with
+//!   both sides at the same number — extremely heavy, a release-gate pass, never daily iteration.
 //! - `enc-mt` interleaves both sides at equal worker counts with fresh contexts per call (the zstd
 //!   crate has no per-call pool API; a warm reused context is reported once as a reference line).
 //! - `enc-stream` compares the streaming encoders with 64 KiB pulls: single-threaded zstdx vs zstd
@@ -32,8 +34,8 @@ use zstdx::{
 use crate::{
     common::{Ab, apply_budget, black_box, measure_solo, want},
     corpus::{
-        LADDER, LevelName, SHAPES, Shape, assert_roundtrip, gate_ruz_dec, gate_ruz_enc,
-        gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw,
+        LADDER, LevelName, LevelSel, SHAPES, Shape, assert_roundtrip, gate_ruz_dec, gate_ruz_enc,
+        gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw, want_number, want_tier,
     },
 };
 
@@ -71,15 +73,20 @@ pub struct Args {
     /// Corpus shapes to include (comma-separated)
     #[arg(long, value_enum, value_delimiter = ',')]
     pub shape: Vec<Shape>,
-    /// Encoder levels to include (comma-separated)
-    #[arg(long, value_enum, value_delimiter = ',')]
-    pub level: Vec<LevelName>,
+    /// Encoder levels to include: ladder tiers or numeric 1-22 (a number
+    /// off the tier levels requires --full-ladder)
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(LevelSel))]
+    pub level: Vec<LevelSel>,
     /// Worker counts for the scaling sweeps
     #[arg(long, value_delimiter = ',')]
     pub workers: Vec<u32>,
     /// Fixed worker count for the mt and streaming-mt sections
     #[arg(long, default_value_t = 8)]
     pub mt_workers: u32,
+    /// enc-st over every numeric level 1-22, both sides at the same number;
+    /// extremely heavy (release-gate only, never for daily iteration)
+    #[arg(long)]
+    pub full_ladder: bool,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
@@ -99,29 +106,57 @@ fn shapes_selected(args: &Args) -> Vec<Shape> {
         .collect()
 }
 
-/// Filter a level subset down to the selection; `(name, our level, zstd level)`.
-fn ladder_subset(args: &Args, of: &[LevelName]) -> Vec<(LevelName, Level, i32)> {
+/// One level cell of an encode section: row tag, our level, libzstd level.
+type LevelCell = (String, Level, i32);
+
+/// The tier axis (default): a section's ladder subset filtered by `--level`.
+fn ladder_axis(args: &Args, of: &[LevelName]) -> Vec<LevelCell> {
     of.iter()
-        .filter(|l| want(&args.level, l))
+        .filter(|l| want_tier(&args.level, l))
         .map(|l| {
-            let (level, z) = l.pair();
-            (*l, level, z)
+            let (ours, z) = l.pair();
+            (l.tag().to_owned(), ours, z)
         })
         .collect()
 }
 
-fn label_name(shape: Shape, level: LevelName) -> String {
-    pad(&format!("{}.{}", shape.raw_name(), level_name(level)))
+/// The numeric axis (`--full-ladder`): every level 1-22, both sides at the
+/// same number, filtered by `--level` (tier names select their own number).
+fn numeric_axis(args: &Args) -> Vec<LevelCell> {
+    (Level::Fastest.as_i32()..=Level::MAX.as_i32())
+        .filter(|n| want_number(&args.level, *n))
+        .map(|n| (format!("l{n}"), Level::from_zstd(n), n))
+        .collect()
 }
 
-fn level_name(level: LevelName) -> &'static str {
-    match level {
-        LevelName::Fastest => "fastest",
-        LevelName::Fast => "fast",
-        LevelName::Balanced => "balanced",
-        LevelName::Best => "best",
-        LevelName::Opt => "opt",
-        LevelName::Ultra => "ultra",
+/// The enc-st level axis: numeric 1-22 with `--full-ladder`, the tier
+/// ladder otherwise. The mt/stream sections keep their curated tier subsets.
+fn enc_axis(args: &Args) -> Vec<LevelCell> {
+    if args.full_ladder {
+        numeric_axis(args)
+    } else {
+        ladder_axis(args, &LADDER)
+    }
+}
+
+/// A numeric `--level` that misses every tier would silently select nothing
+/// on the tier axis; point at `--full-ladder` instead.
+fn validate_levels(args: &Args) {
+    if args.full_ladder {
+        return;
+    }
+    let tiers = LADDER
+        .iter()
+        .map(|t| t.pair().0.as_i32().to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+    for sel in &args.level {
+        assert!(
+            sel.tier().is_some(),
+            "--level {}: no ladder tier sits at this number (tiers: {tiers}); pass --full-ladder \
+             for the numeric 1-22 axis",
+            sel.numeric().as_i32()
+        );
     }
 }
 
@@ -265,14 +300,13 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
     for shape in shapes_selected(args) {
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(args, &LADDER) {
-            let label = level_name(name);
-            let rc = gate_ruz_enc(&raw, level, label);
-            let zc = gate_zstd_enc(&raw, z, label);
+        for (tag, level, z) in enc_axis(args) {
+            let rc = gate_ruz_enc(&raw, level, &tag);
+            let zc = gate_zstd_enc(&raw, z, &tag);
             println!(
                 "sizes {}.{}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
                 shape.raw_name(),
-                label,
+                tag,
                 rc.len(),
                 raw.len() as f64 / rc.len() as f64,
                 zc.len(),
@@ -289,11 +323,11 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
                     black_box(zstd::bulk::compress(&raw, z).unwrap());
                 },
             )
-            .print(&label_name(shape, name), bytes);
+            .print(&pad(&format!("{}.{}", shape.raw_name(), tag)), bytes);
         }
     }
 
-    if !want(&args.level, &LevelName::Fast) {
+    if !want_tier(&args.level, &LevelName::Fast) {
         return;
     }
     // checksum overhead on our side (A = off, B = on; ratio < 1 means on is slower)
@@ -402,15 +436,14 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
         }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(args, &LADDER[..3]) {
-            let label = level_name(name);
+        for (label, level, z) in ladder_axis(args, &LADDER[..3]) {
             let a = compress_with_ok(
                 &raw,
                 &EncoderOptions::new(level).checksum(false).workers(mt),
             );
             let b = zstd_mt_comp(&raw, z, mt);
-            assert_roundtrip(&a, &raw, label);
-            assert_roundtrip(&b, &raw, label);
+            assert_roundtrip(&a, &raw, &label);
+            assert_roundtrip(&b, &raw, &label);
             println!(
                 "sizes {}.{label}.mt{mt} ruz {:>9} (r {:7.2})   zstd-mt {:>9} (r {:7.2})",
                 shape.raw_name(),
@@ -463,12 +496,11 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
         }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(args, &[
+        for (label, level, z) in ladder_axis(args, &[
             LevelName::Fastest,
             LevelName::Fast,
             LevelName::Best,
         ]) {
-            let label = level_name(name);
             // gate: both sides' streaming outputs must roundtrip to the raw input
             let mut comp = Vec::new();
             let mut enc = zstdx::stream::read::Encoder::with_options(
@@ -478,12 +510,12 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             .unwrap();
             enc.read_to_end(&mut comp).unwrap();
             enc.finish();
-            assert_roundtrip(&comp, &raw, label);
+            assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
             let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
             zenc.read_to_end(&mut zcomp).unwrap();
             zenc.finish();
-            assert_roundtrip(&zcomp, &raw, label);
+            assert_roundtrip(&zcomp, &raw, &label);
             println!(
                 "sizes {}.{label}.stream  ruz {}   zstd {}",
                 shape.raw_name(),
@@ -530,13 +562,12 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
         }
         let raw = load_raw(shape);
         let bytes = raw.len() as u64;
-        for (name, level, z) in ladder_subset(args, &[
+        for (label, level, z) in ladder_axis(args, &[
             LevelName::Fastest,
             LevelName::Fast,
             LevelName::Balanced,
             LevelName::Best,
         ]) {
-            let label = level_name(name);
             // gate: both sides' multithreaded streaming outputs must roundtrip
             let mut comp = Vec::new();
             let mut enc = zstdx::stream::read::Encoder::with_options(
@@ -546,13 +577,13 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             .unwrap();
             enc.read_to_end(&mut comp).unwrap();
             enc.finish();
-            assert_roundtrip(&comp, &raw, label);
+            assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
             let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
             zenc.multithread(mt).unwrap();
             zenc.read_to_end(&mut zcomp).unwrap();
             zenc.finish();
-            assert_roundtrip(&zcomp, &raw, label);
+            assert_roundtrip(&zcomp, &raw, &label);
             println!(
                 "sizes {}.{label}.stream-mt{mt}  ruz {}   zstd {}",
                 shape.raw_name(),
@@ -595,18 +626,17 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
 
         // ceiling reference: our bulk mt path over the same bytes (the
         // streaming burst pipeline should approach it)
-        for (name, level, _) in ladder_subset(args, &[
+        for (label, level, _) in ladder_axis(args, &[
             LevelName::Fastest,
             LevelName::Fast,
             LevelName::Balanced,
             LevelName::Best,
         ]) {
-            let label = level_name(name);
             let comp = compress_with_ok(
                 &raw,
                 &EncoderOptions::new(level).checksum(false).workers(mt),
             );
-            assert_roundtrip(&comp, &raw, label);
+            assert_roundtrip(&comp, &raw, &label);
             let stats = measure_solo(|| {
                 black_box(compress_with_ok(
                     &raw,
@@ -625,6 +655,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
 
 pub fn run(args: &Args) {
     apply_budget(args.budget_ms);
+    validate_levels(args);
     println!(
         "# bench matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
         zstd::zstd_safe::version_string(),

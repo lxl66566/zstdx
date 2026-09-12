@@ -16,9 +16,10 @@ outside the library so dev-only dependencies never leak into it.
   sibling crate [`zstdx-gungraun`](../zstdx-gungraun/Readme.md).
 
 Level vocabulary everywhere: the six ladder levels `fastest/fast/balanced/
-best/opt/ultra`, bench-paired with libzstd 1/3/6/12/16/19. Corpus shapes are
-selected with `--shape`, levels with `--level` (comma-separated lists; omit
-to mean "all").
+best/opt/ultra`, bench-paired with libzstd at the same numeric levels
+1/3/9/13/17/19. Corpus shapes are selected with `--shape`, levels with
+`--level` (comma-separated lists; omit to mean "all"; `matrix --level` also
+accepts numeric levels 1-22).
 
 ## Subcommands
 
@@ -66,7 +67,15 @@ and MT vs libzstd, bulk-MT ceiling). Every cell is roundtrip-gated first.
 cargo run --release -p zstdx-bench -- matrix --mode enc-st --shape json
 cargo run --release -p zstdx-bench -- matrix --mode dec-st --budget-ms 2000
 cargo run --release -p zstdx-bench -- matrix --mode enc-mt --workers 8 --mt-workers 8
+cargo run --release -p zstdx-bench -- matrix --mode enc-st --full-ladder --shape json --level 1,7,22
 ```
+
+`--full-ladder` swaps the `enc-st` level axis to every numeric level 1-22
+with both sides at the same number (`--level` accepts tier names too, which
+then select their number; the mt/stream sections keep their tier subsets).
+The full 1-22 ladder is extremely heavy: never run it during daily
+iteration — run it once before a release. Combine with `--shape`/`--level`/
+`--budget-ms` to narrow smoke passes.
 
 ### `small` — small-payload encode
 

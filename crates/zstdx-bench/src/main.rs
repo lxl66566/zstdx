@@ -25,7 +25,8 @@ struct Cli {
 enum Command {
     /// Cross-matrix vs the zstd crate: decode/encode x bulk/stream x st/mt.
     /// The heavyweight tool; run sections or single shapes/levels instead of
-    /// `all` when iterating.
+    /// `all` when iterating. `--full-ladder` adds the numeric 1-22 enc-st
+    /// A/B (release-gate only).
     Matrix(cmd::matrix::Args),
     /// Compression-ratio sweep: every level x bulk/stream x st/mt, one
     /// deterministic pass per cell (parallel), geo-mean summary at the end.
