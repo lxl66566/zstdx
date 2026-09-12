@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Huffman literal-stream encoder: the scalar 4-symbol batch loop is replaced
+  by libzstd `HUF_CStream`'s left-aligned dual-accumulator design — each
+  table entry carries the code in the top `nb` bits of a u64 plus `nb` in
+  the low nibble, so one load feeds the container shift, the OR and the bit
+  counter; two containers alternate (two independent shift/OR chains) and
+  flush whole pending windows through one unaligned store each. A BMI2
+  runtime dispatch (house pattern from the decode side) compiles the
+  variable shifts to shrx, freeing the count from `cl` (the non-BMI2 build
+  pays one `mov`+`and` per symbol extra and regresses short-code corpora
+  ~5% Ir). Byte-identical output (full-ladder dump gate); callgrind on the
+  100MB binary corpus: huff0 stream 88.8M → 50M Ir (libzstd's own HUF path
+  is 45.7M — the 2x gap closed), dll fast total −3.7%; gungraun encode
+  json −1.1..−3.9%, text −0.4..−2.6% (fast tiers), zeros/random +0.1-0.4%
+  (the table's extra 2KB aligned-array init); wall within noise on the
+  32MiB shapes (the loop is a ~5%-of-cycles share there).
+
 - Small-literal huffman: the literals encoder's hard >1024-byte cutoff
   (everything below went out raw) is gone — any non-empty literal run now
   attempts huffman with the entropy gate and the encoded-vs-raw comparison

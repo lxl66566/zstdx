@@ -91,7 +91,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         // The batched writer performs the same bit accumulation as one
         // write_bits call per symbol (data reversed, since the format reads
         // the stream back to front), so the output is bit-identical.
-        writer.write_packed_codes_rev(&table.packed, table.uniform_nb, data);
+        writer.write_packed_codes_rev(&table.packed, &table.aligned, table.uniform_nb, data);
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
@@ -164,6 +164,10 @@ pub struct HuffmanTable {
     /// L1-resident). Weight redistribution caps codes at 9 bits, so the
     /// packing cannot overflow.
     packed: [u16; 256],
+    /// Left-aligned form for the dual-accumulator stream loop: the code in
+    /// the top `nb` bits of a u64, `nb` in the low nibble. One load feeds
+    /// the container shift, the OR and the bit counter.
+    aligned: [u64; 256],
     /// The common code length when every symbol shares one length (flat
     /// alphabets such as 9..16 symbols), zero otherwise. Fixed-length codes
     /// let the stream encoder pack two symbols per byte without the
@@ -254,6 +258,7 @@ impl HuffmanTable {
         let mut table = HuffmanTable {
             codes: alloc::vec![(0, 0); weights.len()],
             packed: [0; 256],
+            aligned: [0; 256],
             uniform_nb: 0,
         };
 
@@ -291,6 +296,8 @@ impl HuffmanTable {
                 table.codes[symbol as usize] = (current_code as u32, current_num_bits as u8);
                 debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
                 table.packed[symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
+                table.aligned[symbol as usize] =
+                    ((current_code as u64) << (64 - current_num_bits)) | current_num_bits as u64;
                 current_code += 1;
             }
         }

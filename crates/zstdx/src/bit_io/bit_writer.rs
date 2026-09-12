@@ -207,77 +207,175 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     }
 
     /// Append the huffman codes for `data` in reverse symbol order (the
-    /// format reads the stream back to front). `packed` holds
-    /// `(code << 4) | num_bits` per symbol with at most 12 code bits, so
-    /// four symbols always fit the container once fewer than eight bits are
-    /// pending — the hot loop pays one flush per four symbols instead of a
-    /// container-overflow branch per symbol. Produces the same bits as one
-    /// `write_bits` call per symbol. `uniform_nb` is the common code length
-    /// when the table is flat (zero otherwise); four-bit uniform codes take
-    /// a dedicated bulk path that packs two symbols per output byte.
-    pub fn write_packed_codes_rev(&mut self, packed: &[u16; 256], uniform_nb: u8, data: &[u8]) {
+    /// format reads the stream back to front). Produces the same bits as one
+    /// `write_bits` call per symbol. `packed` holds `(code << 4) | num_bits`
+    /// per symbol and `aligned` the left-aligned form the dual-accumulator
+    /// loop consumes (see [`write_packed_codes_dual`]). `uniform_nb` is the
+    /// common code length when the table is flat (zero otherwise); four-bit
+    /// uniform codes take a dedicated bulk path that packs two symbols per
+    /// output byte.
+    pub fn write_packed_codes_rev(
+        &mut self,
+        packed: &[u16; 256],
+        aligned: &[u64; 256],
+        uniform_nb: u8,
+        data: &[u8],
+    ) {
         let mut data = data;
         if uniform_nb == 4 && data.len() >= 16 && self.bits_in_partial.is_multiple_of(4) {
             data = self.write_uniform4_bulk(packed, data);
         }
-        let mut acc = self.partial;
-        let mut bits = self.bits_in_partial;
-        let output = self.output.as_mut();
-        let mut pos = self.bit_idx / 8;
-        // The length only catches up with pos at the end, so reserves must be
-        // sized from pos (a fixed reserve would be a no-op once capacity
-        // reaches len + N and later stores would run past the allocation).
-        for group in data.rchunks(4) {
-            // Bring the pending bits below eight so the next four codes
-            // cannot overflow the container.
-            if bits >= 8 {
-                let k = bits / 8;
-                if pos + 16 > output.capacity() {
-                    output.reserve(pos + 16 - output.len());
-                }
-                // SAFETY: the capacity check covers the 8-byte store; only
-                // the low k bytes are semantic, the overshoot is overwritten
-                // by the next store or snapped off by the final set_len.
-                unsafe {
-                    output
-                        .as_mut_ptr()
-                        .add(pos)
-                        .cast::<u64>()
-                        .write_unaligned(acc.to_le());
-                }
-                pos += k;
-                acc >>= 8 * k;
-                bits -= 8 * k;
-            }
-            for &sym in group.iter().rev() {
-                let t = packed[sym as usize] as u64;
-                acc |= (t >> 4) << bits;
-                bits += (t & 15) as usize;
+        // BMI2 compiles the loop's variable shifts to single-uop shrx, which
+        // also frees the shift count from the cl register (one masked `nb`
+        // per symbol instead of two); the detection cache amortizes the
+        // dispatch over a literals stream.
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        {
+            if std::is_x86_feature_detected!("bmi2") {
+                // SAFETY: bmi2 was just detected at runtime.
+                return unsafe { self.write_packed_codes_dual_bmi2(aligned, data) };
             }
         }
-        let k = bits / 8;
-        if k > 0 {
-            if pos + 16 > output.capacity() {
-                output.reserve(pos + 16 - output.len());
+        self.write_packed_codes_dual_impl(aligned, data);
+    }
+
+    /// Left-aligned dual-accumulator variable-length code writer (libzstd
+    /// `HUF_CStream`'s design). `aligned[sym]` holds the code in the top
+    /// `nb` bits of a u64 with `nb` in the low nibble, so a single load
+    /// feeds the container shift, the OR and the bit counter. The pending
+    /// bits grow downward from the top of the container; a flush shifts the
+    /// pending window into the low bytes, stores eight bytes and leaves the
+    /// container untouched. The OR of the raw element dirties the four low
+    /// bits, which a following `>>=` discards before it can reach the
+    /// pending window — so only each round's last add needs a cleaned
+    /// operand. Two containers alternate, giving two independent shift/OR
+    /// chains instead of one serial dependency per symbol.
+    ///
+    /// Safety of the round structure: codes are at most 11 bits
+    /// (`MAX_CODE_LENGTH`), a round is five symbols per container and a
+    /// flush leaves at most seven pending bits, so the fourth fast add ends
+    /// at 7 + 4*11 = 51 bits (dirty bits stay below bit 4, pending above
+    /// bit 13) and the clean fifth at 62 <= 64; the merged container holds
+    /// at most 7 + 55 bits and both operands are clean below their pending
+    /// windows (their last add was cleaned and `>>=` drops older dirt).
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2")]
+    unsafe fn write_packed_codes_dual_bmi2(&mut self, aligned: &[u64; 256], data: &[u8]) {
+        self.write_packed_codes_dual_impl(aligned, data);
+    }
+
+    fn write_packed_codes_dual_impl(&mut self, aligned: &[u64; 256], data: &[u8]) {
+        const ROUND: usize = 5;
+        const MAX_NB: u32 = 11;
+        let n = data.len();
+        let entry_bits = self.bits_in_partial;
+        // Entry state conversion: the writer's pending bits sit in the low
+        // bits of `partial`; the containers keep them top-aligned.
+        let mut c0 = if entry_bits == 0 {
+            0
+        } else {
+            self.partial << (64 - entry_bits)
+        };
+        let mut b0 = entry_bits;
+        let output = self.output.as_mut();
+        let mut pos = self.bit_idx / 8;
+        // One reserve covers every flush store below (n symbols of <= 11
+        // bits plus one store overshoot). Sized from pos: the length only
+        // catches up with pos at the end, a fixed reserve would be a no-op
+        // once capacity reaches len + N and later stores would run past the
+        // allocation.
+        let bound = n * MAX_NB as usize / 8 + 16;
+        if pos + bound > output.capacity() {
+            output.reserve(pos + bound - output.len());
+        }
+        let ptr = output.as_mut_ptr();
+        // Flush the pending window (top b0 bits of the container) into the
+        // output at pos. The container is left untouched: the leftover bits
+        // keep their top-aligned positions for the next round.
+        macro_rules! flush {
+            () => {
+                if b0 >= 8 {
+                    // SAFETY: the reserve above covers the store; bytes past
+                    // the semantic end are overwritten by later stores or
+                    // snapped off by the final set_len.
+                    unsafe {
+                        ptr.add(pos)
+                            .cast::<u64>()
+                            .write_unaligned((c0 >> (64 - b0)).to_le());
+                    }
+                    pos += b0 >> 3;
+                    b0 &= 7;
+                }
+            };
+        }
+        // Add the code for data[i]; the last add of a round ORs a cleaned
+        // element (low nibble masked off) so no dirt survives below the
+        // pending window.
+        macro_rules! add {
+            ($c:expr, $b:expr, $i:expr, $clean:expr) => {{
+                // SAFETY: every expansion keeps i inside 0..n (loop bounds
+                // below hold i > index and the index is the loop variable's
+                // own offset).
+                let sym = unsafe { *data.get_unchecked($i) };
+                let e = aligned[sym as usize];
+                let nb = (e & 15) as u32;
+                $c >>= nb;
+                $c |= if $clean {
+                    e & !0xf
+                } else {
+                    e
+                };
+                $b += nb as usize;
+            }};
+        }
+        let mut i = n;
+        // The entry state may hold up to 63 pending bits; bring it below
+        // eight so the round structure's bounds hold from the first add.
+        flush!();
+        let head = n % (ROUND * 2);
+        while i >= head + ROUND * 2 {
+            add!(c0, b0, i - 1, false);
+            add!(c0, b0, i - 2, false);
+            add!(c0, b0, i - 3, false);
+            add!(c0, b0, i - 4, false);
+            add!(c0, b0, i - 5, true);
+            flush!();
+            let mut c1 = 0u64;
+            let mut b1 = 0usize;
+            add!(c1, b1, i - 6, false);
+            add!(c1, b1, i - 7, false);
+            add!(c1, b1, i - 8, false);
+            add!(c1, b1, i - 9, false);
+            add!(c1, b1, i - 10, true);
+            // Merge container 1 into container 0: its pending bits are
+            // top-aligned, so one shift + OR appends them below container
+            // 0's window.
+            c0 >>= b1 as u32;
+            c0 |= c1;
+            b0 += b1;
+            flush!();
+            i -= ROUND * 2;
+        }
+        // Head tail (at most nine symbols, the stream's last-encoded ones)
+        // in rounds of at most five.
+        while i > 0 {
+            let group = ROUND.min(i);
+            for k in 0..group {
+                add!(c0, b0, i - 1 - k, k + 1 == group);
             }
-            // SAFETY: as above.
-            unsafe {
-                output
-                    .as_mut_ptr()
-                    .add(pos)
-                    .cast::<u64>()
-                    .write_unaligned(acc.to_le());
-            }
-            pos += k;
-            acc >>= 8 * k;
-            bits -= 8 * k;
+            flush!();
+            i -= group;
         }
         // SAFETY: pos matches the semantic end of the output; shrinking or
         // growing within the reserved capacity keeps the invariant that the
         // length equals bit_idx / 8.
         unsafe { output.set_len(pos) };
-        self.partial = acc;
-        self.bits_in_partial = bits;
+        self.partial = if b0 == 0 {
+            0
+        } else {
+            c0 >> (64 - b0)
+        };
+        self.bits_in_partial = b0;
         self.bit_idx = pos * 8;
     }
 
@@ -687,10 +785,20 @@ mod tests {
             state
         };
         for p in &mut packed {
-            let nb = 1 + (next() as usize % 9);
+            let nb = 1 + (next() as usize % 11);
             let code = next() as usize & ((1 << nb) - 1);
             *p = ((code << 4) | nb) as u16;
         }
+        // Left-aligned twin of `packed`, exactly as HuffmanTable builds it.
+        let aligned_from = |packed: &[u16; 256]| {
+            let mut aligned = [0u64; 256];
+            for (a, &p) in aligned.iter_mut().zip(packed.iter()) {
+                let nb = (p & 15) as u32;
+                *a = ((p as u64 >> 4) << (64 - nb)) | nb as u64;
+            }
+            aligned
+        };
+        let aligned = aligned_from(&packed);
         // Flat table variant: every symbol shares a four-bit code, which is
         // what uniform alphabets (9..16 symbols) produce; the bulk path must
         // reproduce the generic bit accumulation for every entry alignment.
@@ -707,7 +815,10 @@ mod tests {
             // Entry states the encoder really produces: fresh writer, and
             // writers with a partial container left by preceding headers.
             for entry_bits in [0usize, 3, 4, 8, 12, 17, 20, 48, 63] {
-                for (packed, uniform_nb) in [(packed, 0u8), (packed_uniform, 4u8)] {
+                for (packed, aligned, uniform_nb) in [
+                    (packed, &aligned, 0u8),
+                    (packed_uniform, &aligned_from(&packed_uniform), 4u8),
+                ] {
                     let mut reference = BitWriter::new();
                     let mut batched = BitWriter::new();
                     if entry_bits > 0 {
@@ -725,7 +836,7 @@ mod tests {
                     } else {
                         reference.write_bits(1u32, fill);
                     }
-                    batched.write_packed_codes_rev(&packed, uniform_nb, &data);
+                    batched.write_packed_codes_rev(&packed, aligned, uniform_nb, &data);
                     let fill = batched.misaligned();
                     if fill == 0 {
                         batched.write_bits(1u32, 8);
