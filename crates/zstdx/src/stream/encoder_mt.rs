@@ -347,10 +347,18 @@ impl MtEncoderCore {
             JobGrid::Growing => {
                 let aligned = self.growing_epoch_floor(hi);
                 while *bounds.last().unwrap() < aligned {
+                    // The clamp fires only on a flush-regridded grid:
+                    // job_start then sits mid-epoch, so the job holding it
+                    // crosses the epoch floor — the short job ends exactly
+                    // on the boundary and the walk re-aligns (a burst must
+                    // never straddle an epoch). On an untouched grid the
+                    // clamp is a no-op.
                     let next = self.job_end(*bounds.last().unwrap()).min(aligned);
-                    debug_assert_eq!(next, self.job_end(*bounds.last().unwrap()));
                     bounds.push(next);
                 }
+                // Whenever the epoch floor lies ahead of job_start the walk
+                // lands on it exactly (positive steps, each capped there).
+                debug_assert!(aligned <= self.job_start || *bounds.last().unwrap() == aligned);
                 let tail = hi - *bounds.last().unwrap();
                 if tail > 0 {
                     let lo = *bounds.last().unwrap();
