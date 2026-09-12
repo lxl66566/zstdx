@@ -127,7 +127,7 @@ zstd warm-pool reference (context reused, json.fast mt16): 1604 MiB/s — still 
 
 ## T5 encode streaming (64KiB pulls, checksums off; 1 pass; MiB/s of raw)
 
-> **REGRESSION (found by this re-run, bisected to `946dd2f`)**: every stream-MT cell runs at ~0.5x its 2026-09-11 speed while the zstd side is unchanged (json.fastest 961 vs 1865, json.fast 724 vs 1433, text.fastest 2049 vs 4459, json.best 17 vs 32). The growing unpledged job grid sizes jobs ~1.25x apart inside one 8-job burst; the burst barrier waits for the largest job, so utilization ≈ sum/(workers x max) ≈ 0.52 — the exact halving seen. ST streaming cells are unaffected (506/398/8 json fastest/fast/best vs 475/374/12 on 09-11, same clock state). Fix directions in todo item 3; ratio columns below remain the improved (growing-grid) sizes.
+> **REGRESSION found by this re-run, bisected to `946dd2f`, fixed same day** (quantized epoch grid + finish-tail re-slice + epoch-sized MADV_HUGEPAGE buffer reservation + cursor-based output serving; see [mt-stream](../perf/mt-stream.md)): the growing grid sized jobs ~1.25x apart inside one 8-job burst, so the burst barrier idled at utilization ≈ sum/(workers x max) ≈ 0.52 and every stream-MT cell ran at ~0.5x its 09-11 speed (json.fastest 961, json.fast 724, text.fastest 2049, json.best 17). The MT8 table below is the fixed re-pass (2026-09-12, budget 700ms — absolute MiB/s ±10% vs the 1.5-2s rows around it); ST streaming cells were never affected. Ratio columns shifted ≤0.1% (stream-mt only; mt8 json.ultra −0.32% denser, mt4 json/skewed balanced/best +0.05-0.09% sparser).
 
 ### ST (json/text only — harness scope)
 
@@ -146,16 +146,16 @@ Note: unknown-size streaming text.fastest — zstd ratio collapses to 18.3 (1.84
 
 | cell | ours | ours size | zstd | zstd size | x |
 |---|---:|---:|---:|---:|---:|
-| json.fastest.stream-mt8 | 961 | 5460674 | 1911 | 5488119 | 2.0 |
-| json.fast.stream-mt8 | 724 | 6336172 | 400 | 6324934 | 0.56 |
-| json.balanced.stream-mt8 | 175 | 4735125 | 113 | 5636749 | 0.65 |
-| json.best.stream-mt8 | 17 | 4974895 | 51 | 5498839 | 3.0 |
-| text.fastest.stream-mt8 | 2049 | 108982 | 4963 | 843554 | 2.4 |
-| text.fast.stream-mt8 | 1991 | 100920 | 1786 | 177384 | 0.90 |
-| text.balanced.stream-mt8 | 982 | 91241 | 1002 | 88698 | 1.02 |
-| text.best.stream-mt8 | 200 | 82932 | 365 | 86976 | 1.8 |
+| json.fastest.stream-mt8 | 1423 | 5461337 | 1761 | 5488119 | 1.26 |
+| json.fast.stream-mt8 | 1248 | 6334849 | 400 | 6324934 | 0.32 |
+| json.balanced.stream-mt8 | 247 | 4734402 | 114 | 5636749 | 0.46 |
+| json.best.stream-mt8 | 16 | 4970453 | 52 | 5498839 | 3.2 |
+| text.fastest.stream-mt8 | 2363 | 108968 | 4258 | 843554 | 1.80 |
+| text.fast.stream-mt8 | 2279 | 100921 | 1732 | 177384 | 0.76 |
+| text.balanced.stream-mt8 | 1546 | 91244 | 998 | 88698 | 0.65 |
+| text.best.stream-mt8 | 208 | 82935 | 365 | 86976 | 1.75 |
 
-Bulk-mt8 ceilings (ours, this run's T4): json fastest/fast/balanced = 3181/2264/235 MiB/s, text = 18829/13207/1964. Stream-MT8 reaches 30/32/74% (json) and 11/15/50% (text) of its own bulk ceiling — pre-regression (09-11) these were 61/61/80% and 24/19/46%; best-tier ceilings were not re-run this round.
+Bulk-mt8 ceilings (ours, this run's T4): json fastest/fast/balanced/best = 3257/2336/264/19 MiB/s, text = 20150/15210/2204/226. Stream-MT8 reaches 44/53/94/84% (json) and 12/15/70/92% (text) of its own bulk ceiling — pre-regression (09-11) json was 61/61/80 and text 24/19/46/…; the json fast/balanced and text balanced/best tiers now sit at or above their 09-11 ceiling fractions, while text.fastest (12%) and json.fastest (44%) are bounded by the burst model's serialized accumulate/spawn/barrier (the overlapped producer-consumer pool is the persistent-pool redesign, todo 12).
 
 ## Compression-ratio sweep (`zstdx-bench ratio`; sizes, not speeds)
 

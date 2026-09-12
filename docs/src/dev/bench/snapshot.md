@@ -9,7 +9,7 @@
 - **Encode ST**: we win text (fastest/fast/balanced x0.60-0.83, balanced now denser than zstd-9 at 368 vs 378 and 1.6x faster), skewed (fastest x0.44, balanced x0.041 at 1808 vs 75 MiB/s), zeros (x0.017-0.26), random at balanced parity and best/opt/ultra leapfrogs (x0.16/**0.007**/**0.005** — the incompressibility gate; 1585 vs 12 MiB/s at opt). We lose json at every level (x1.21-1.67 low tiers; best x4.10; opt/ultra x1.32-1.33 vs the denser zstd-17/19 references at ratio parity) and random fastest/fast (x1.28-1.30). json.balanced is now a deliberate density trade: +19.5% denser than zstd-9 (7.11 vs 5.95) at x1.51 (W21+row).
 - **Encode MT**: big win at equal workers where it matters — json.fast mt16 x0.33 (3190 vs 1044 MiB/s), text.fast mt8/mt16 x0.16-0.17 (~13000 vs ~2200), skewed 0.16-0.76. Losses: json.fastest.mt8 x1.35 (zstd-l1-mt8 hits 4282), json/text.balanced.mt16 x0.96/0.66 (zstd-mt ratio collapses there: text 378→189/39.8 vs our 368/309). Ratio preservation is ours alone: every mt cell within 0.5% of our ST. Our cold-pool mt16 beats zstd's warm-pool reference (3190 vs 1604 MiB/s).
 - **Streaming encode ST**: text wins (fastest x0.26 with a 17x ratio win — zstd collapses to ratio 18.3 vs our 309; fast x0.83); json loses (fastest x1.55, fast x1.11, best x4.17 — bounded by the Best core, not the pipeline).
-- **Streaming encode MT8 — REGRESSION**: all cells ~0.5x their 09-11 speed (json.fastest 961 vs 1865; text.fastest 2049 vs 4459; json.best 17 vs 32) while the zstd side is unchanged. Bisected to `946dd2f` (growing unpledged job grid): jobs inside one 8-job burst differ ~1.25x in size, the burst barrier waits for the largest, utilization ≈ 0.52 — the exact halving. ST streaming is unaffected; sizes are the improved growing-grid ones. Fix queued as todo item 3.
+- **Streaming encode MT8 — regression fixed same day** (found by this pass, bisected to `946dd2f`; fix: quantized epoch grid + finish-tail re-slice + MADV_HUGEPAGE buffer + output cursor, see [mt-stream](../perf/mt-stream.md)): all cells recovered 15-77% (json.fastest 961→1423, json.fast 724→1248, json.balanced 175→247, text.balanced 982→1546, text.fastest 2049→2363 MiB/s re-pass) with ratio within ±0.1%. json.fast/balanced and text.balanced/best beat zstd by 1.5-3.1×; the residue (text.fastest 1.8×, json.fastest 1.26× behind zstd) is the burst model's serialized accumulate/spawn/barrier, not the schedule.
 - **Decode MT** (our exclusive dimension, libzstd has none): still a negative asset — no scaling (text/random 0.97-1.00x ST), skewed.zst9 anti-scales to 0.72x ST; best case json.zst3 mt16 = 1.10x ST, 0.83x of the zstd ST streaming reference. random.zst3 is the one win (0.98x ST = 1.05x zstd's stream).
 
 ## Decode ST (2 passes; MiB/s of raw; x = ours_time/zstd_time, <1 = we faster)
@@ -94,7 +94,7 @@ MT ratio preservation (ours vs own ST, all cells within ±0.5%): unchanged. zstd
 | text.balanced | — | — | — | 982 | 1002 | 1.02 |
 | text.best | 268 | 690 | 2.58 | 200 | 365 | 1.8 |
 
-**MT8 column is regression-shadowed** (see Headline): pre-`946dd2f` these were 1865/1433/450/32 (json) and 4459/3676/1273/275 (text); with the burst-imbalance fixed, json.fast/balanced and text.fast would revert to clear wins. Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). Bulk-mt8 ceilings and stream/ceiling ratios in [matrix.md](matrix.md).
+**MT8 column updated by the same-day fix re-pass** (see Headline): json.fastest/fast/balanced/best now 1423/1248/247/16 (x vs zstd 1.26/0.32/0.46/3.2), text 2363/2279/1546/208 (1.80/0.76/0.65/1.75); json.fast/balanced and text.balanced are clear wins. Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). Bulk-mt8 ceilings and stream/ceiling ratios in [matrix.md](matrix.md).
 
 ## Decode MT scaling (1 pass; our solo dimension; MiB/s)
 
@@ -117,7 +117,7 @@ Directions from this sweep (details in [todo.md](../todo.md) items 12-13): text.
 
 ## Top open deficits (from this run)
 
-- **Streaming MT burst imbalance** (`946dd2f`): all stream-MT cells at ~0.5x their 09-11 speed (todo item 3) — the newest and most actionable.
+- **Streaming MT burst-model serialization** (residue after the `946dd2f` regression fix, todo 12): text.fastest 1.8× / json.fastest 1.26× behind zstd — accumulate, spawn and the barrier cannot overlap encoding; the fix is the persistent-pool redesign.
 - Best-level encoder core speed: x1.8-6.1 behind zstd-13 across shapes (was x2.4-29 vs zstd-12); also caps json/text best streaming.
 - json ST encode speed at fastest/fast/balanced/opt/ultra: x1.21-1.67 (low tiers) and x1.32-1.33 (opt/ultra at ratio parity).
 - random ST encode at fastest/fast: x1.28-1.30 behind (raw-block per-block overhead); balanced now at parity.

@@ -82,6 +82,8 @@ pub(crate) struct MtEncoderCore {
     /// Checksum absorbed up to this absolute offset.
     hashed_end: u64,
     output: Vec<u8>,
+    /// Consumed prefix of `output` (see the ST core's field).
+    out_read: usize,
     header_emitted: bool,
     finished: bool,
     /// Idle worker states owned by this encoder: burst threads are fresh
@@ -153,6 +155,7 @@ impl MtEncoderCore {
             pos: 0,
             hashed_end: 0,
             output: Vec::with_capacity(initial_job + 64),
+            out_read: 0,
             header_emitted: false,
             finished: false,
             pool: Mutex::new(Vec::new()),
@@ -215,7 +218,7 @@ impl MtEncoderCore {
     }
 
     pub(crate) fn has_output(&self) -> bool {
-        !self.output.is_empty()
+        self.out_read < self.output.len()
     }
 
     /// Hand the encoded bytes to `w`, keeping the output buffer's allocation.
@@ -223,16 +226,22 @@ impl MtEncoderCore {
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
-        let res = w.write_all(&self.output);
+        let res = w.write_all(&self.output[self.out_read..]);
         self.output.clear();
+        self.out_read = 0;
         res
     }
 
     /// Serve encoded bytes without deallocating the output buffer.
     pub(crate) fn split_output(&mut self, buf: &mut [u8]) -> usize {
-        let n = buf.len().min(self.output.len());
-        buf[..n].copy_from_slice(&self.output[..n]);
-        self.output.drain(..n);
+        let pending = &self.output[self.out_read..];
+        let n = buf.len().min(pending.len());
+        buf[..n].copy_from_slice(&pending[..n]);
+        self.out_read += n;
+        if self.out_read == self.output.len() {
+            self.output.clear();
+            self.out_read = 0;
+        }
         n
     }
 

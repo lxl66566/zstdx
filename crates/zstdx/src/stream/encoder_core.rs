@@ -81,8 +81,11 @@ pub(crate) struct FrameEncoderCoreSt {
     /// than the block size outside [`FrameEncoderCoreSt::write`].
     staged: Vec<u8>,
     /// Encoded bytes not yet consumed by the enclosing encoder, starting
-    /// with the frame header before the first block.
+    /// with the frame header before the first block. `out_read` is the
+    /// consumed prefix: serving reads advances the cursor instead of
+    /// draining, which would shift every remaining byte left per call.
     output: Vec<u8>,
+    out_read: usize,
     blocks: u64,
     finished: bool,
 }
@@ -157,6 +160,7 @@ impl FrameEncoderCoreSt {
             header: serialized,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
+            out_read: 0,
             blocks: 0,
             finished: false,
         })
@@ -207,7 +211,7 @@ impl FrameEncoderCoreSt {
     }
 
     pub(crate) fn has_output(&self) -> bool {
-        !self.output.is_empty()
+        self.out_read < self.output.len()
     }
 
     /// Hand the encoded bytes to `w`, keeping the output buffer's allocation.
@@ -215,16 +219,22 @@ impl FrameEncoderCoreSt {
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
-        let res = w.write_all(&self.output);
+        let res = w.write_all(&self.output[self.out_read..]);
         self.output.clear();
+        self.out_read = 0;
         res
     }
 
     /// Serve encoded bytes without deallocating the output buffer.
     pub(crate) fn split_output(&mut self, buf: &mut [u8]) -> usize {
-        let n = buf.len().min(self.output.len());
-        buf[..n].copy_from_slice(&self.output[..n]);
-        self.output.drain(..n);
+        let pending = &self.output[self.out_read..];
+        let n = buf.len().min(pending.len());
+        buf[..n].copy_from_slice(&pending[..n]);
+        self.out_read += n;
+        if self.out_read == self.output.len() {
+            self.output.clear();
+            self.out_read = 0;
+        }
         n
     }
 
