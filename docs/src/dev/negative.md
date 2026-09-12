@@ -18,7 +18,7 @@
 | further X2/X1 huffman loop optimization | closed | ~0.75 cyc/B is the same order as libzstd's hand-written asm; no conventional path for SIMD bit-serial huffman |
 | further FSE table-build optimization | closed | after 4.9%→1.9% every individual item is <4% |
 | xxhash AVX-512 vpmullq vector core | worse instead | vpmullq latency (≈4cyc) breaks the serial chain; twox's 4 chains already hug the scalar machine limit; **the right answer = 8-chain scalar interleaving** |
-| madvise(MADV_HUGEPAGE) | within noise | redundant on THP=always machines (rolled back; retryable on THP=madvise machines) |
+| madvise(MADV_HUGEPAGE) | within noise on THP=always; **re-evaluated + landed 2026-09-12** on the THP=madvise bench machine (scoped to the stream-mt accumulate buffer, ~3ms/32MiB of 4KiB first-touch faults, solo text.fastest 2464→3706) | the original falsification's premise was THP=always (kernel maps huge regardless); on THP=madvise machines the advice is load-bearing for densely-touched burst-scale buffers — keep it scoped per buffer, not a global policy |
 | select-ifying the wrapped branch | miss unmoved, json -2.9% | this branch (74% taken, drifting with pos) already predicts well; **stub-attribute before select-ifying** |
 | making ll>0 unconditional (copy16 even at ll==0, garbage gets overwritten) | skewed miss -62% but text +9.3% | the reordering effect of removing the branch itself hurts critical files (TAGE/BTB history) |
 | inlining the fast path into the fused loop | json -1.2% | hot-loop layout disturbed; **new code always goes into an existing out-of-line callee** |

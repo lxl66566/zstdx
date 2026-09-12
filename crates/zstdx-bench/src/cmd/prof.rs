@@ -5,7 +5,8 @@
 //! - `prof dec <file.zst> [iters=5]`: streaming decode with 64 KiB reads.
 //! - `prof enc <zstd-level> <iters> <file...>`: bulk encode; `RUZ_CKSUM` in the environment
 //!   switches to the checksummed bulk path.
-//! - `prof enc-stream <zstd-level> <iters> <file>`: streaming encode with 64 KiB writes.
+//! - `prof enc-stream <zstd-level> <iters> <file> [workers=1]`: streaming encode with 64 KiB
+//!   writes; a worker count above one selects the mt streaming core.
 
 use std::{
     fs,
@@ -112,12 +113,19 @@ fn run_enc_stream(rest: &[String]) {
     let level = zstdx::Level::from_zstd(num::<i32>(rest, 0, "zstd level"));
     let iters: usize = num(rest, 1, "iters");
     let path = arg(rest, 2, "file");
+    let workers: u32 = rest
+        .get(3)
+        .map_or(1, |w| w.parse().expect("workers must be a number"));
     let raw = fs::read(path).unwrap();
     let mut sink = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     let t0 = Instant::now();
     for _ in 0..iters {
-        let mut enc = zstdx::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        let mut enc = zstdx::stream::write::Encoder::with_options(
+            Vec::new(),
+            zstdx::EncoderOptions::new(level).workers(workers),
+        )
+        .unwrap();
         let mut off = 0usize;
         loop {
             let n = chunk.len().min(raw.len() - off);
@@ -132,7 +140,7 @@ fn run_enc_stream(rest: &[String]) {
     }
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "{path} L{level:?}: {iters} iters, out={} bytes, {:.0} MiB/s",
+        "{path} L{level:?} w{workers}: {iters} iters, out={} bytes, {:.0} MiB/s",
         sink.len(),
         iters as f64 * raw.len() as f64 / dt / (1 << 20) as f64
     );
