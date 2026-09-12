@@ -17,7 +17,8 @@ use zstdx::{EncoderOptions, Level};
 use zstdx_gungraun::{Shape, raw_slice};
 
 fn encode_zstdx(raw: &[u8], level: Level) -> usize {
-    let comp = zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false));
+    let comp =
+        zstdx::bulk::compress_with(raw, &EncoderOptions::new(level).checksum(false)).unwrap();
     black_box(comp.len())
 }
 

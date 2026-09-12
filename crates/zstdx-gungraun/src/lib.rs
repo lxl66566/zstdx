@@ -112,7 +112,8 @@ pub fn zstd_frame(shape: Shape, level: i32) -> DecodeCase {
 /// instead of producing garbage metrics.
 pub fn zstdx_frame(shape: Shape, level: Level) -> DecodeCase {
     let raw = raw_slice(shape);
-    let compressed = zstdx::bulk::compress_with(&raw, &EncoderOptions::new(level).checksum(false));
+    let compressed = zstdx::bulk::compress_with(&raw, &EncoderOptions::new(level).checksum(false))
+        .unwrap();
     let mut back = Vec::with_capacity(raw.len() + 16);
     FrameDecoder::new()
         .decode_all_to_vec(&compressed, &mut back)
