@@ -268,8 +268,9 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     opt(22, 1 << 22, knobs(6, 32, 4, 23, false)),
     // 16: libzstd's btopt rows begin.
     opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
-    // 17: the Opt tier; libzstd's L17 row exactly (W23, S5, TL64, mls 4).
-    opt(22, 1 << 23, knobs(5, 64, 4, 23, false)),
+    // 17: the Opt tier; libzstd's L17 row with the ring capped one below
+    // its C23 (shorter candidate walks: json −18% time for +0.16% dll).
+    opt(22, 1 << 23, knobs(5, 64, 4, 22, false)),
     // 18: btultra: fractional-bit prices, mls 3 (hash3 at H17).
     opt(22, 1 << 23, knobs(6, 64, 3, 23, true)),
     // 19: the Ultra tier. libzstd's C24 ring is byte-identical to C23
