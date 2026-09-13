@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Dfast emit path: `DfastEmit::emit` moves from `#[inline]` to
+  `#[inline(always)]` (the treatment `rep_chain` already documents). LLVM's
+  own judgment left the steady-phase scan-loop sites outlined, and the
+  eight-argument call — three stack-passed args, rep round-tripping `&mut`
+  memory, Vec ptr/len/cap loads through `self`, prologue/epilogue — taxed
+  every sequence with ~30% of the emit body: callgrind dll32 put the
+  outlined helper at 170 Ir/seq over 1.21M calls, 26% of the whole fast
+  encode. Inlined, the seq push and the anchor table writes fold into the
+  scan loop like libzstd's inlined storeSeq. Byte-identical output
+  (full-ladder dump gate); gungraun encode fast tier: json −8.2%, text
+  −7.5%, skewed −1.3%, random/zeros unchanged, and the fastest tier
+  bit-for-bit unchanged (`TableEmit::emit` was already `inline(always)`);
+  interleaved wall: dll100 335→359 MiB/s (fast x1.47→x1.35 vs libzstd-3),
+  json 386→421, text 11055→11616, skewed 184→199; balanced/best/opt within
+  noise (their `emit_chain` was already inlined).
+
 - Huffman literal-stream encoder: the scalar 4-symbol batch loop is replaced
   by libzstd `HUF_CStream`'s left-aligned dual-accumulator design — each
   table entry carries the code in the top `nb` bits of a u64 plus `nb` in

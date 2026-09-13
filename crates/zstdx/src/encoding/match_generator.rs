@@ -781,7 +781,14 @@ impl DfastEmit<'_> {
     /// match end minus two, the small table the match end minus one.
     /// Anchors past `insert_max_idx` are dropped; the scan tail never
     /// probes them. Returns the new anchor as a window index.
-    #[inline]
+    ///
+    /// `inline(always)` for the same budget reason as [`DfastEmit::rep_chain`]:
+    /// at a plain `#[inline]` LLVM leaves the steady-phase sites outlined,
+    /// and the eight-argument call (three stack-passed args, rep through
+    /// memory, Vec fields via `self`) taxed every sequence with ~30% of
+    /// the emit body (dll32 callgrind: 170 Ir/seq outlined, 26% of the
+    /// whole fast encode; inlining: json.fast Ir −8.2%, dll100 wall +7%).
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
