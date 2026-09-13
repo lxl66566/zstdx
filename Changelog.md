@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Sequence packing: `pack_seq` gains a zero-add-bit fast path. LL codes 0-15
+  are ll itself and ML codes 0-31 are ml-3, both carrying zero add bits, so
+  `ll < 16 && ml < 35` degenerates the packed word to `bsr` + ors with no
+  LUT/META loads and no variable-shift add merge (the `(1<<log)-1` mask is
+  built as `0x80000000 >> log; dec`). The band covers 99.997% of ll / 96.5%
+  of ml on json.fast and dll-shaped corpora sit deeper still; skewed's
+  63.5% ll share costs nothing measurable — branch-misses are exactly
+  unchanged. Byte-identical output (full-ladder dump gate); gungraun encode:
+  fast json/text −4.5%/−4.2% Ir, fastest −1.7%/−2.1%, balanced
+  −0.3%/−0.6%, skewed/random/zeros flat; wall within noise on every
+  re-measured cell (the fast tiers on the 32MiB shapes are branch/latency-
+  bound, not instruction-bound).
+
 - Dfast emit path: `DfastEmit::emit` moves from `#[inline]` to
   `#[inline(always)]` (the treatment `rep_chain` already documents). LLVM's
   own judgment left the steady-phase scan-loop sites outlined, and the

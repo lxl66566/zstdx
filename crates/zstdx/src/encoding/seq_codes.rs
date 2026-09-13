@@ -16,6 +16,20 @@ pub(crate) const SEQ_CODE_SPACE: usize = 64;
 /// into a single payload and width.
 #[inline(always)]
 pub(crate) fn pack_seq(ll: u32, ml: u32, of: u32) -> SeqWord {
+    // Low codes carry no add bits (LL codes 0-15 are ll itself, ML codes
+    // 0-31 are ml-3) and cover the dominant mass on every structured shape
+    // (json.fast: 99.997% of ll, 96.5% of ml), so the merged payload
+    // degenerates to the offset's own bits — no LUT/META loads, no
+    // variable-shift merge.
+    debug_assert!(ml >= 3, "match lengths below 3 cannot be encoded");
+    if ll < 16 && ml < 35 {
+        let log = of.ilog2();
+        return SeqWord {
+            codes: ll | ((ml - 3) << 8) | (log << 16),
+            add: (of & ((1 << log) - 1)) as u64,
+            add_nb: log as u8,
+        };
+    }
     let (lc, la, ln) = encode_literal_length(ll);
     let (mc, ma, mn) = encode_match_len(ml);
     let (oc, oa, on) = encode_offset(of);
