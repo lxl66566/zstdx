@@ -10,7 +10,8 @@ Pitfalls:
 
 - **The corpus is not comparable**: `gen_corpus.sh`'s text.raw flattens the repo's src tree — any src change changes the corpus. Historically, the two "text shape phase transitions" (the cross-tile match unlocks at ratios 299.6 and 239) both depended on the repeat period landing inside the window range; once src bloats past 768K that shape will collapse again. Consider pinning a tar snapshot.
 - Narrow-integer arithmetic in corpus generation: `(i as u8 + 1)` panics on debug overflow at i=255 (u8 truncates first, then +1); compute in usize and cast afterwards.
-- zeros is a free noise-calibration cell (drifts ±2.6% even with zero code-path overlap).
+- **zeros is a free noise-calibration cell** (drifts ±2.6% even with zero code-path overlap).
+- **gungraun's 1MiB slice under-measures deep-walk tiers**: the chain/opt tiers' 2MiB window never fills in 1MiB, so walk depth and the far-candidate memory regime barely appear — json.balanced measures ~100 Ir/B on the slice vs ~463 Ir/B on the full 32MiB file (4.6×, measured 2026-09-13). Ir deltas on those tiers validate instruction-count changes only; wall conclusions need the full corpus (`prof`/`matrix`).
 
 ## Tools (crates/zstdx-bench)
 
