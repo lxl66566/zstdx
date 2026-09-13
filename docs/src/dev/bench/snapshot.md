@@ -113,7 +113,7 @@ Full matrix 5 shapes x 6 levels x {bulk,stream} x {st,mt4}, one deterministic pa
 - The mt/stream margins are libzstd's losses, not our gains: zstd-mt on text collapses (fastest 39.8 vs our 309, fast 189 vs 333) while our mt stays within ~0.1% of our ST; zstd's unknown-size streaming at level 1 emits 1.84 MB (ratio 18.3) where our streaming matches our bulk (309).
 - random ties byte-exact with zstd at almost every cell (Δ 0.00%); zeros mt: zstd-mt loses up to ~10% ratio, ours none.
 
-Directions from this sweep (details in [todo.md](../todo.md) items 12-13): text.Balanced −2.78% is the only sizable deficit (chain matcher vs zstd-9 lazy2 on long-range repeats, window now matched); text/skewed opt/ultra residues ≤0.35%; json.opt sits −0.31% under the much-denser zstd-17 reference post-C22. Self-inflicted: stream-mt pays up to +0.44% vs our own bulk. Anomaly kept: json.opt bulk-mt 0.13% denser than bulk-st.
+Directions from this sweep (details in [todo.md](../todo.md) items 9 and 12): text.Balanced −2.78% is the only sizable deficit (chain matcher vs zstd-9 lazy2 on long-range repeats, window now matched); text/skewed opt/ultra residues ≤0.35%; json.opt sits −0.31% under the much-denser zstd-17 reference post-C22. Self-inflicted: stream-mt pays up to +0.44% vs our own bulk. Anomaly kept: json.opt bulk-mt 0.13% denser than bulk-st.
 
 ## Top open deficits (from this run)
 

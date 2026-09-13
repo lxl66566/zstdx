@@ -8,6 +8,7 @@
 |---|---|---|
 | splitting the fused loop into batch processing (decode-batch→exec-batch dual loops, 3 variants) | -15~-21% | the intermediate Vec round-trip is not the bottleneck; batch buffering breaks LLVM register residency and loses fused out-of-order overlap |
 | two-stage batch pipeline (batch 16, codegen fully on target) | cycles +9-15%, miss +14-30% | the interleaved decode/exec branch stream inside the fused loop carries the TAGE/BTB load; splitting it into two pure streams destroys history correlation — **the fused structure is a local optimum** |
+| streaming decode_step structural rework (json/skewed residue 1.05-1.3×) | register wall proven (~20 live values > 15 GPRs; the three batch reworks above are the structural attempts) | no headroom unless live values shrink first; the next order of magnitude requires an algorithm-level change (libzstd's 8-deep sequence ring-buffer pipeline) — assess benefit/risk first |
 | repcode registerization + fully branchless parsing (inside the fused loop) | json -2%/miss -22% but skewed +8-11% | register budget saturated: +3 live values necessarily evict hotter ones; branch-elimination gains < spill cost |
 | purely branchless repcode (cmov chain + `%3` fold pseudo-slot) | json regresses 5-6% | the repcode branch predicts surprisingly well; **removing branches ≠ speedup**; final version = 1 cmov on the parse side + a single branch on the update side |
 | packing 3 FSE states into one u32/u64 | regression | pack/unpack lands on the serial FSE chain, costlier than the spills it saves |

@@ -10,6 +10,7 @@
 - glibc's dynamic mmap/trim thresholds drift with the allocation sequence: pinning `MALLOC_TRIM_THRESHOLD_` actually disables zstd's adaptivity (its random-64K collapses 3×); for small corpora, either pin it or run isolated.
 - The first run after a build disturbance can read falsely low by 30%; take final numbers from multiple stable rounds.
 - In solo bench, in-process cell order is a source of allocation-layout artifacts (a table's size change moves where subsequent allocations land); decide A/B with fresh processes, or at least cross-validate across two environments.
+- BMI2 dispatch overhead is Zen4-only data (measured neutral zero-cost); re-measure on Intel before generalizing dispatch conclusions.
 
 ## cargo / git
 
