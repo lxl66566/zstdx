@@ -2735,7 +2735,19 @@ impl MatchGeneratorDriver {
             )
         };
 
-        while block_end.saturating_sub(pos) >= hash_read {
+        // The body exists in two phases (the fast loop's pattern): the
+        // seeded phase carries the job-start state (`seed_offset`/
+        // `seed_hits`/`seed_budget`, `rep_pending`), which only ever winds
+        // down; once it converges the steady phase runs a body with all of
+        // it folded out. One loop kept those four values live across every
+        // iteration — pure dead weight over bulk-ST and post-convergence
+        // scanning — and the register pressure they added spilled the chain
+        // walk's own loop values (win_base/pos_abs/reach/depth/mask
+        // reloaded from the stack on every walk step). `$gated` is a
+        // literal, so the phase-only paths constant-fold away in the steady
+        // instantiation.
+        macro_rules! scan_chain {
+            ($restart:lifetime, $gated:literal) => {
             let idx = (pos - win_base) as usize;
             // Hash and head read once per position: the search, and the
             // insert below (whose chain link wants the same previous head),
@@ -2752,7 +2764,7 @@ impl MatchGeneratorDriver {
             // encodable (mirrors the fast loop). The offset encodes nearly
             // free, so bias it past the chain match.
             let mut rep_hit = false;
-            if rep_pending == 0 {
+            if !$gated || rep_pending == 0 {
                 let probe = if pos == anchor {
                     pos + 1
                 } else {
@@ -2782,7 +2794,7 @@ impl MatchGeneratorDriver {
             // `seed_offset`). Mirrors the fast loop's twin block; the pays
             // gate below keeps a far seed honest.
             let mut seed_hit = false;
-            if seed_offset != 0 {
+            if $gated && seed_offset != 0 {
                 let ci = (pos - seed_offset as u64 - win_base) as usize;
                 if read4(win, ci) == read4(win, idx) {
                     let ml = extend_match(win, idx, ci);
@@ -2825,7 +2837,7 @@ impl MatchGeneratorDriver {
                 // Balanced levels fast on them.
                 miss_count += 1;
                 pos += 1 + (miss_count >> 2).min(255) as u64;
-                continue;
+                continue $restart;
             }
             miss_count = 0;
 
@@ -2876,7 +2888,7 @@ impl MatchGeneratorDriver {
                         // probe and rep1_chain already cover, and on
                         // rep-dense shapes the extra read4+extend per step
                         // visibly taxed scan speed.
-                        if rep_pending == 0
+                        if (!$gated || rep_pending == 0)
                             && !rep_hit
                             && let Some(cand_abs) = p2.checked_sub(rep[0] as u64)
                             && cand_abs >= win_base
@@ -2971,7 +2983,7 @@ impl MatchGeneratorDriver {
                 (start - cand + 3) as u32
             };
             anchor = emit.emit_chain(win, chain, hash_log, anchor, start, ml, of_value, &mut rep);
-            if rep_pending != 0 && of_value > 3 {
+            if $gated && rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
             if seed_hit {
@@ -2980,12 +2992,24 @@ impl MatchGeneratorDriver {
                     seed_offset = 0;
                 }
             }
-            if rep_pending == 0 {
-                pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
-            } else {
+            if $gated && rep_pending != 0 {
                 pos = anchor;
+            } else {
+                pos = emit.rep1_chain(win, anchor, block_end, &mut rep);
             }
             anchor = pos;
+            };
+        }
+        // Seeded phase: job starts only (bulk-ST skips it entirely); each
+        // emit re-checks convergence at the head, and the values only ever
+        // wind down.
+        'seeded: while (rep_pending != 0 || seed_offset != 0)
+            && block_end.saturating_sub(pos) >= hash_read
+        {
+            scan_chain!('seeded, true);
+        }
+        'restart: while block_end.saturating_sub(pos) >= hash_read {
+            scan_chain!('restart, false);
         }
         if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
