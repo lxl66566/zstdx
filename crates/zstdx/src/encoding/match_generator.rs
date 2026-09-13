@@ -103,6 +103,11 @@ fn pack_pos(abs: u64) -> u32 {
 /// (whose positions share no domain with `pos`); those die like empty
 /// slots. The caller's window-range check and the byte compare behind it
 /// decide the rest.
+///
+/// The scan loops now resolve entries as distances (see [`chain_search`]
+/// and the fast/dfast `resolve` closures), so only the entry-roundtrip
+/// tests exercise this exact form.
+#[cfg(test)]
 #[inline(always)]
 fn unpack_pos(entry: u32, pos: u64) -> Option<u64> {
     if entry == 0 {
@@ -497,6 +502,80 @@ fn lit_value(win: &[u8], idx: usize, len: usize, lit_lens: &[u8; 256]) -> i32 {
         + (lit_lens[win[idx + 2] as usize] as i32).min(6)
         + (lit_lens[win[idx + 3] as usize] as i32).min(6);
     s * len as i32 / 4
+}
+
+/// Chain-walk search from the hash head `entry` at window index `idx`,
+/// returning the longest match's (length, candidate window index) —
+/// `(0, usize::MAX)` when nothing matched. Every candidate is beat-checked,
+/// so stale chain links (see the sparse fill in rep1_chain) only cost probes,
+/// never correctness.
+///
+/// The head entry is passed in (not loaded) because the caller's insert
+/// block links its chain slot to the same value: the position is hashed and
+/// the head read exactly once per scan step (nothing writes the table
+/// between the probe and the insert). `#[inline(always)]` with the same
+/// budget rationale as [`TableEmit::rep1_chain`]: left to its own judgment
+/// the inliner outlines the body (two call sites in one scan loop), and the
+/// calling convention — a closure environment re-loaded per call plus a
+/// dozen stack round-trips — measured at ~66% of json.balanced cycles.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn chain_search(
+    win: &[u8],
+    chain: *const u32,
+    idx: usize,
+    entry: u32,
+    win_base: u64,
+    block_end: u64,
+    search_depth: usize,
+    chain_mask: usize,
+    max_window: u64,
+) -> (usize, usize) {
+    let pos_abs = win_base + idx as u64;
+    // Oldest usable candidate age: within the level window and inside the
+    // live window buffer, folded into one distance compare (below) — the
+    // same resolve form as the fast loop's.
+    let reach = (pos_abs - win_base).min(max_window);
+    let mut best_len = 0usize;
+    let mut best_cand = usize::MAX;
+    let mut tried = 0usize;
+    let mut dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
+    // `dist - 1 < reach` admits exactly dist ∈ [1, reach]: dist 0 is a stale
+    // slot holding this very position (pack_pos is injective per 4-GiB
+    // cycle, but old-cycle slots alias anything), whose candidate would
+    // byte-compare against itself; larger dist wraps huge for the empty
+    // sentinel, stale 4-GiB-cycle entries and at-or-newer-than-pos
+    // reconstructions. The walk's monotone (links target strictly older
+    // positions) keeps an out-of-window dist the exact break the old
+    // candidate-floor check was.
+    while tried < search_depth && dist - 1 < reach {
+        let cand_abs = pos_abs - dist;
+        let cand = (cand_abs - win_base) as usize;
+        // Beat-check (libzstd's "potentially better" read): the 4 bytes
+        // ending at best_len+1 decide whether the candidate can strictly
+        // improve, so most hash collisions reject on one load instead of a
+        // full extend. With no best yet the probe sits at 0, the plain
+        // first-4 compare. The probe stays inside the block: still looping
+        // means best_len is short of the block end (the break below fires
+        // otherwise), so [probe, probe+4) ends at most at the block end.
+        let probe = best_len.saturating_sub(3);
+        if read4(win, cand + probe) == read4(win, idx + probe) {
+            let ml = extend_match(win, idx, cand);
+            if ml > best_len {
+                best_len = ml;
+                best_cand = cand;
+                // Cannot be improved on within this block.
+                if pos_abs + ml as u64 >= block_end {
+                    break;
+                }
+            }
+        }
+        tried += 1;
+        // SAFETY: masked to the chain table size.
+        let entry = unsafe { *chain.add(cand_abs as usize & chain_mask) };
+        dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
+    }
+    (best_len, best_cand)
 }
 
 /// Store `abs` as the newest position for its hash into a table of `log`
@@ -2609,11 +2688,13 @@ impl MatchGeneratorDriver {
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
         // fast loop's note on the same SROA failure); emits go through the
-        // context.
+        // context. The chain-link reads share the pointer for the same
+        // reason (the walk's slot reads must not re-derive the slice).
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
         let table_ptr: *mut u32 = self.table.as_mut_ptr();
+        let chain_ptr: *const u32 = chain.as_ptr();
         let mut emit = TableEmit {
             table: &mut self.table[..],
             literals,
@@ -2633,62 +2714,35 @@ impl MatchGeneratorDriver {
         let mut seed_budget = self.seed_budget;
         let lit_lens = &self.lit_lens;
 
-        // Chain-walk search from the hash head at window index `idx`,
-        // returning the longest match's (length, candidate window index).
-        // Every candidate is beat-checked, so stale chain links (see the
-        // sparse fill in rep1_chain) only cost probes, never correctness.
-        let search = |win: &[u8], chain: &[u32], idx: usize| -> (usize, usize) {
-            // SAFETY: hash_at_log masks to hash_log bits and the table holds
-            // 1 << hash_log slots.
-            let h = hash_at_log(win, idx, hash_log);
-            let mut entry = unsafe { *table_ptr.add(h) };
-            let pos_abs = win_base + idx as u64;
-            // Oldest usable candidate age: within the level window and
-            // inside the live window buffer.
-            let lo = pos_abs.saturating_sub(max_window).max(win_base);
-            let mut best_len = 0usize;
-            let mut best_cand = usize::MAX;
-            let mut tried = 0usize;
-            while tried < search_depth {
-                // An empty or out-of-window link ends the walk (the link
-                // targets only grow older).
-                let Some(cand_abs) = unpack_pos(entry, pos_abs) else {
-                    break;
-                };
-                if cand_abs < lo {
-                    break;
-                }
-                let cand = (cand_abs - win_base) as usize;
-                // Beat-check (libzstd's "potentially better" read): the 4
-                // bytes ending at best_len+1 decide whether the candidate
-                // can strictly improve, so most hash collisions reject on
-                // one load instead of a full extend. With no best yet the
-                // probe sits at 0, the plain first-4 compare. The probe
-                // stays inside the block: still looping means best_len is
-                // short of the block end (the break below fires otherwise),
-                // so [probe, probe+4) ends at most at the block end.
-                let probe = best_len.saturating_sub(3);
-                if read4(win, cand + probe) == read4(win, idx + probe) {
-                    let ml = extend_match(win, idx, cand);
-                    if ml > best_len {
-                        best_len = ml;
-                        best_cand = cand;
-                        // Cannot be improved on within this block.
-                        if pos_abs + ml as u64 >= block_end {
-                            break;
-                        }
-                    }
-                }
-                tried += 1;
-                // SAFETY: masked to the chain table size.
-                entry = unsafe { *chain.get_unchecked(cand_abs as usize & chain_mask) };
-            }
-            (best_len, best_cand)
+        // Chain-walk search from the hash head `entry` at window index `idx`,
+        // returning the longest match's (length, candidate window index):
+        // the module-level [`chain_search`], inlined here and in the lazy
+        // walk below. The head entry is computed once by the caller (the
+        // insert block links the same value — see there).
+        let search = |win: &[u8], chain: *const u32, idx: usize, entry: u32| -> (usize, usize) {
+            chain_search(
+                win,
+                chain,
+                idx,
+                entry,
+                win_base,
+                block_end,
+                search_depth,
+                chain_mask,
+                max_window,
+            )
         };
 
         while block_end.saturating_sub(pos) >= hash_read {
             let idx = (pos - win_base) as usize;
-            let (mut best_len, mut best_cand) = search(win, chain, idx);
+            // Hash and head read once per position: the search, and the
+            // insert below (whose chain link wants the same previous head),
+            // share them — nothing writes the table in between.
+            // SAFETY: hash_at_log masks to hash_log bits and the table holds
+            // 1 << hash_log slots.
+            let h = hash_at_log(win, idx, hash_log);
+            let entry = unsafe { *table_ptr.add(h) };
+            let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry);
 
             // Repcode probe first when armed: with literals pending it runs
             // at the current position, otherwise one byte ahead so that
@@ -2748,11 +2802,11 @@ impl MatchGeneratorDriver {
             // Insert this position behind the probe (newest-wins), linking
             // the chain to the previous head. The chain slot key is the
             // absolute position — what the walk resolves candidates with.
+            // The head value is the one read before the search: nothing has
+            // written the table since.
             // SAFETY: both indices are masked to their tables' sizes.
             unsafe {
-                let h = hash_at_log(win, idx, hash_log);
-                let head = *table_ptr.add(h);
-                *chain.get_unchecked_mut(pos as usize & chain_mask) = head;
+                *chain.get_unchecked_mut(pos as usize & chain_mask) = entry;
                 *table_ptr.add(h) = pack_pos(pos);
             }
 
@@ -2857,7 +2911,11 @@ impl MatchGeneratorDriver {
                             }
                         }
                         // Chain search at the stepped position.
-                        let (len2, cand2) = search(win, chain, idx2);
+                        // SAFETY: hash_at_log masks to hash_log bits and
+                        // the table holds 1 << hash_log slots.
+                        let h2 = hash_at_log(win, idx2, hash_log);
+                        let entry2 = unsafe { *table_ptr.add(h2) };
+                        let (len2, cand2) = search(win, chain_ptr, idx2, entry2);
                         let price2 = if len2 >= min_match {
                             price_of((p2 - win_base) as usize, cand2)
                         } else {
