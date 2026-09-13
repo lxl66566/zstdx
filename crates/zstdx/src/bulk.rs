@@ -126,8 +126,7 @@ pub fn decompress_to_buffer_with(
             .map_err(Into::into);
     }
     if let Some(raw) = &options.dictionary {
-        let dict =
-            crate::decoding::Dictionary::decode_dict(raw).map_err(crate::Error::Dictionary)?;
+        let dict = crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?;
         let mut decoder = FrameDecoder::new();
         decoder.add_dict(dict).map_err(crate::Error::Frame)?;
         return decoder.decode_all(source, destination).map_err(Into::into);
@@ -157,8 +156,7 @@ pub fn decompress_with(
         }
     }
     if let Some(raw) = &options.dictionary {
-        let dict =
-            crate::decoding::Dictionary::decode_dict(raw).map_err(crate::Error::Dictionary)?;
+        let dict = crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?;
         let mut decoder = FrameDecoder::new();
         decoder.add_dict(dict).map_err(crate::Error::Frame)?;
         let mut capacity = capacity.max(64 * 1024);

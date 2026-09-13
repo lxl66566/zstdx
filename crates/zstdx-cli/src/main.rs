@@ -123,7 +123,7 @@ fn compress(
         let bytes = std::fs::read(dict).wrap_err("failed to open dictionary")?;
         // Validate up front so a malformed dictionary is a clean error
         // instead of a panic inside compress().
-        zstdx::decoding::Dictionary::decode_dict(&bytes).wrap_err("invalid dictionary")?;
+        zstdx::decoding::Dictionary::load(&bytes).wrap_err("invalid dictionary")?;
         compressor.set_dictionary(&bytes);
     }
     compressor.set_source(encoder_input);
@@ -151,8 +151,7 @@ fn decompress(input: PathBuf, output: PathBuf, dict: Option<PathBuf>) -> color_e
     let mut frame_decoder = zstdx::decoding::FrameDecoder::new();
     if let Some(dict) = dict {
         let bytes = std::fs::read(dict).wrap_err("failed to open dictionary")?;
-        let parsed =
-            zstdx::decoding::Dictionary::decode_dict(&bytes).wrap_err("invalid dictionary")?;
+        let parsed = zstdx::decoding::Dictionary::load(&bytes).wrap_err("invalid dictionary")?;
         frame_decoder
             .add_dict(parsed)
             .wrap_err("failed to load dictionary")?;

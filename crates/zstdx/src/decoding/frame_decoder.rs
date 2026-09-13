@@ -244,6 +244,13 @@ impl FrameDecoder {
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
             state.flat_active = false;
+        } else if let Some(dict) = self.dicts.get(&0) {
+            // No dictID in the frame: a registered id-0 dictionary (raw
+            // content, or a formatted one trained with --dictID=0) is still
+            // the frame's history — libzstd applies it unconditionally.
+            state.decoder_scratch.init_from_dict(dict);
+            state.using_dict = Some(0);
+            state.flat_active = false;
         }
         Ok(())
     }

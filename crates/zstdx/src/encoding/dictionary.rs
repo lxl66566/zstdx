@@ -1,14 +1,14 @@
-//! Encoder-side dictionary support: parse a raw zstd dictionary, convert
-//! its entropy tables into encoder tables, and seed a fresh
-//! [`CompressState`] with dictionary content as match history and the
-//! tables as the frame's reusable entropy state.
+//! Encoder-side dictionary support: parse a zstd dictionary (formatted, or
+//! raw content without a header), convert its entropy tables into encoder
+//! tables, and seed a fresh [`CompressState`] with dictionary content as
+//! match history and the tables as the frame's reusable entropy state.
 
 use alloc::vec::Vec;
 
 use crate::{
     Error, InputShape, Level,
-    decoding::Dictionary,
-    encoding::{MatchGeneratorDriver, frame_compressor::CompressState},
+    decoding::{Dictionary, dictionary::MAGIC_NUM},
+    encoding::frame_compressor::CompressState,
     fse::fse_encoder::{FSETable, build_table_from_probabilities},
     huff0::huff0_encoder::HuffmanTable,
 };
@@ -21,15 +21,30 @@ pub(crate) struct EncDictionary {
     /// level's window at load time).
     pub content: Vec<u8>,
     pub rep: [u32; 3],
-    huff: HuffmanTable,
-    ll: FSETable,
-    ml: FSETable,
-    of: FSETable,
+    /// Entropy tables, present only for formatted dictionaries (raw content
+    /// dictionaries seed match history alone, like libzstd's content load).
+    huff: Option<HuffmanTable>,
+    ll: Option<FSETable>,
+    ml: Option<FSETable>,
+    of: Option<FSETable>,
 }
 
 impl EncDictionary {
-    /// Parse a raw zstd dictionary (as produced by `zstd --train`).
+    /// Parse a dictionary: formatted (as produced by `zstd --train`) or raw
+    /// content (as produced by the in-tree trainer), which loads as pure
+    /// match history with the format-default repcodes.
     pub(crate) fn parse(raw: &[u8]) -> Result<Self, Error> {
+        if raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
+            return Ok(Self {
+                id: 0,
+                content: raw.to_vec(),
+                rep: [1, 4, 8],
+                huff: None,
+                ll: None,
+                ml: None,
+                of: None,
+            });
+        }
         let dict = Dictionary::decode_dict(raw)?;
         // libzstd's load check: a repcode must be 0 (unused) or point into
         // the content. The parse has no dedicated variant; surface it as the
@@ -58,10 +73,10 @@ impl EncDictionary {
             id: dict.id,
             content: dict.dict_content,
             rep: dict.offset_hist,
-            huff,
-            ll,
-            ml,
-            of,
+            huff: Some(huff),
+            ll: Some(ll),
+            ml: Some(ml),
+            of: Some(of),
         })
     }
 
@@ -94,9 +109,9 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     state.fse_tables.ml_previous = None;
     state.fse_tables.of_previous = None;
     if dict.id != 0 {
-        state.last_huff_table = Some(dict.huff.clone());
-        state.fse_tables.ll_previous = Some(dict.ll.clone());
-        state.fse_tables.ml_previous = Some(dict.ml.clone());
-        state.fse_tables.of_previous = Some(dict.of.clone());
+        state.last_huff_table = dict.huff.clone();
+        state.fse_tables.ll_previous = dict.ll.clone();
+        state.fse_tables.ml_previous = dict.ml.clone();
+        state.fse_tables.of_previous = dict.of.clone();
     }
 }

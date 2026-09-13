@@ -219,8 +219,7 @@ impl<W: Write> Decoder<W> {
             inner.set_max_window_size(max);
         }
         if let Some(dict) = &options.dictionary {
-            let dict =
-                crate::decoding::Dictionary::decode_dict(dict).map_err(crate::Error::Dictionary)?;
+            let dict = crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
             inner.add_dict(dict)?;
         }
         Ok(Self {

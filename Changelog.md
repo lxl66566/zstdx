@@ -4,6 +4,16 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Raw content dictionaries on every codec path (libzstd parity): a
+  headerless dictionary loads as pure match history with the
+  format-default repcodes — on encode `EncDictionary::parse` grows a raw
+  branch (entropy-table fields become `Option`, seeding unchanged for
+  formatted dicts), on decode `Dictionary::load` replaces the
+  `decode_dict` validation call sites and `FrameDecoder::reset` applies a
+  registered id-0 dictionary to frames that carry no dictID (raw content,
+  or formatted dicts trained with `--dictID=0`). CLI `-D` accepts them
+  both directions; libzstd decodes the resulting frames (roundtrip
+  verified against `zstd::bulk::Decompressor`).
 - zstdx-bench: `train` subcommand — trains a raw-content dictionary from
   files/directories at a given size (enables the zstdx `dict_builder`
   feature for the bench crate), or extracts a formatted dict's content

@@ -32,7 +32,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 | MT decoding | ✅ restart-point segmentation; serial stage B is the bottleneck, no scalability yet |
 | frame checksum | ✅ optional on encode (+sidecar thread offload); decode auto-verifies in-tree xxh64 (MT path does not verify) |
 | zstd-crate compat layer `zstdx::compat` | ✅ (dictionary decode works end-to-end) |
-| dictionaries | decode ✅; encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; content as match history + entropy tables seeded + dictID; MT falls back ST); `dict/` training half-done (known bugs). Dict sizes on the systemd fixture: +13% vs libzstd at -9 (sub-2KB fixed-overhead band, todo 10) |
+| dictionaries | decode ✅ (formatted + raw content: `Dictionary::load`, an id-0 dict applies to frames without dictID); encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; formatted dicts load content as match history + seed entropy tables + dictID, headerless raw content as pure match history with default repcodes — libzstd parity, frames decodable by libzstd; MT falls back ST); `dict/` training half-done (known bugs). Dict sizes on the systemd fixture: +13% vs libzstd at -9 (sub-2KB fixed-overhead band, todo 10) |
 | forced window log (`InputShape::with_window_log`) | ✅ all paths; blocks cap at the window (RFC 8878 Block_Maximum_Size) |
 | LDM / superblock / C FFI | ❌ |
 

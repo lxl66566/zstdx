@@ -52,6 +52,23 @@ impl core::fmt::Debug for Dictionary {
 }
 
 impl Dictionary {
+    /// Load a dictionary: formatted dictionaries parse their entropy tables;
+    /// content without the magic loads as a raw-content dictionary — pure
+    /// match history with the format-default repcodes, mirroring libzstd's
+    /// content-only load.
+    pub fn load(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        if raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
+            return Ok(Dictionary {
+                id: 0,
+                fse: FSEScratch::new(),
+                huf: HuffmanScratch::new(),
+                dict_content: raw.to_vec(),
+                offset_hist: [1, 4, 8],
+            });
+        }
+        Self::decode_dict(raw)
+    }
+
     /// Parses the dictionary from `raw` and set the tables
     /// it returns the dict_id for checking with the frame's `dict_id``
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {

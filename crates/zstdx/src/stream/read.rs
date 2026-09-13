@@ -115,8 +115,7 @@ impl<R: Read> Decoder<R> {
             decoder.set_max_window_size(max);
         }
         if let Some(dict) = &options.dictionary {
-            let dict =
-                crate::decoding::Dictionary::decode_dict(dict).map_err(crate::Error::Dictionary)?;
+            let dict = crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
             decoder.add_dict(dict)?;
         }
         Self::init_first_frame(&mut source, &mut decoder)?;
