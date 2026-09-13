@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- zstdx-bench: `train` subcommand — trains a raw-content dictionary from
+  files/directories at a given size (enables the zstdx `dict_builder`
+  feature for the bench crate), or extracts a formatted dict's content
+  section (`--content-of`) so content selection and entropy-table seeding
+  can be A/B'd in isolation.
 - Balanced matcher: cross-position pipelining of the lazy walk's hash+head
   read (the dfast ip0/ip1 pattern). Every chain search paid one L3-class
   random head load serialized in front of its walk; the scan body now

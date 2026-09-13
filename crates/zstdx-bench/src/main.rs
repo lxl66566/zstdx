@@ -54,6 +54,9 @@ enum Command {
     Seqstats(cmd::seqstats::Args),
     /// Micro-benchmark of the matcher's `prefill_window` per strategy.
     Prefill(cmd::prefill::Args),
+    /// Train a raw-content dictionary with the in-tree trainer, or extract
+    /// the content section of a formatted dict.
+    Train(cmd::train::Args),
 }
 
 fn main() {
@@ -68,5 +71,6 @@ fn main() {
         Command::Mtcheck(args) => cmd::mtcheck::run(&args),
         Command::Seqstats(args) => cmd::seqstats::run(&args),
         Command::Prefill(args) => cmd::prefill::run(&args),
+        Command::Train(args) => cmd::train::run(&args),
     }
 }
