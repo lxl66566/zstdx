@@ -27,7 +27,7 @@ const BITCOST_MULTIPLIER: u32 = 256;
 const MAX_PRICE: u32 = 1 << 30;
 /// DP window; matches reaching beyond this trigger immediate encoding.
 const OPT_NUM: usize = 1 << 12;
-const OPT_SIZE: usize = OPT_NUM + 3;
+pub(crate) const OPT_SIZE: usize = OPT_NUM + 3;
 /// Literal frequency scaling factor so stats adapt within a block.
 const LITFREQ_ADD: u32 = 2;
 /// Blocks at or below this size price symbols from the predefined tables.
@@ -40,8 +40,8 @@ const SEED_SPAN: u64 = 2 * crate::common::MAX_BLOCK_SIZE as u64;
 
 /// Positions in table entries live in the low 48 bits; the high 16 carry the
 /// epoch (shared convention with the other matcher strategies).
-const POS_MASK: u64 = (1u64 << 48) - 1;
-const EMPTY: u64 = 0;
+pub(crate) const POS_MASK: u64 = (1u64 << 48) - 1;
+pub(crate) const EMPTY: u64 = 0;
 
 /// Whole-bit weight: `highbit32(stat+1)` scaled (libzstd's `ZSTD_bitWeight`).
 #[inline(always)]
@@ -73,9 +73,9 @@ fn new_rep(rep: &[u32; 3], off_base: u32, ll0: bool) -> [u32; 3] {
 /// One candidate match: wire offset (repcodes 1..=3, literal offset + 3) and
 /// length (`ZSTD_match_t`).
 #[derive(Clone, Copy)]
-struct Match {
-    off: u32,
-    len: u32,
+pub(crate) struct Match {
+    pub(crate) off: u32,
+    pub(crate) len: u32,
 }
 
 /// One DP entry: the stretch ending at this relative position — `mlen` bytes
@@ -118,6 +118,12 @@ pub(crate) struct OptKnobs {
     pub mls: u32,
     /// Tree ring size as a power of two in positions (2 slots each).
     pub bt_log: u32,
+    /// Fill-side tree compares per inserted position (2^log). The optimal
+    /// parser sorts fully (`== search_log`); the btlazy2 strategy fills
+    /// shallowly — a reduced insert budget prunes the tree (EMPTY leaves)
+    /// without falsifying links, and the lazy scan does not need every
+    /// position fully threaded.
+    pub insert_log: u32,
     /// Single-probe 3-byte table; 0 disables (only Ultra uses one).
     pub hash3_log: u32,
     /// btultra family: fractional prices, match+1-literal recheck, 2-pass
@@ -329,35 +335,35 @@ impl OptState {
 
 /// Read 4 window bytes (same contract as the match_generator helpers).
 #[inline(always)]
-fn read4(win: &[u8], idx: usize) -> u32 {
+pub(crate) fn read4(win: &[u8], idx: usize) -> u32 {
     // SAFETY: callers only read positions with 4 bytes inside the window.
     unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
 }
 
 /// Read 8 window bytes.
 #[inline(always)]
-fn read8(win: &[u8], idx: usize) -> u64 {
+pub(crate) fn read8(win: &[u8], idx: usize) -> u64 {
     // SAFETY: callers only read positions with 8 bytes inside the window.
     unsafe { win.as_ptr().add(idx).cast::<u64>().read_unaligned() }
 }
 
 /// libzstd's 3-byte hash (`ZSTD_hash3`: low 24 bits times prime3bytes).
 #[inline(always)]
-fn hash3_at(win: &[u8], idx: usize, log: u32) -> usize {
+pub(crate) fn hash3_at(win: &[u8], idx: usize, log: u32) -> usize {
     debug_assert!((1..32).contains(&log));
     (((read4(win, idx) << 8).wrapping_mul(506832829)) >> (32 - log)) as usize
 }
 
 /// libzstd's 4-byte hash (`ZSTD_hash4`).
 #[inline(always)]
-fn hash4_at(win: &[u8], idx: usize, log: u32) -> usize {
+pub(crate) fn hash4_at(win: &[u8], idx: usize, log: u32) -> usize {
     debug_assert!((1..32).contains(&log));
     ((read4(win, idx).wrapping_mul(2654435761)) >> (32 - log)) as usize
 }
 
 /// libzstd's 5-byte hash (`ZSTD_hash5`: low 40 bits times prime5bytes).
 #[inline(always)]
-fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
+pub(crate) fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
     debug_assert!((1..64).contains(&log));
     let v = read8(win, idx) & 0xff_ffff_ffff;
     (((v << 24).wrapping_mul(889523592379)) >> (64 - log)) as usize
@@ -367,7 +373,7 @@ fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
 /// pre-verified bytes, bounded by window index `limit`. Returns the full
 /// length from offset zero, so callers take the result as-is (libzstd's
 /// `ZSTD_count` returns only the delta from its start pointers).
-fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+pub(crate) fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
     debug_assert!(cand <= idx && idx <= limit);
     let mut len = start;
     // SAFETY: the u64 reads stay inside [.., limit) which is at or before
@@ -392,25 +398,28 @@ fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -
 
 /// Binary-tree match finder plus the per-block constants (`ZSTD_insertBt1` /
 /// `ZSTD_insertBtAndGetAllMatches`).
-struct Finder<'a, 'b> {
-    win: &'a [u8],
-    win_base: u64,
-    block_end_idx: usize,
-    epoch: u64,
-    tag: u64,
-    max_window: u64,
-    table: &'b mut [u64],
-    table_log: u32,
-    bt: &'b mut [u64],
+pub(crate) struct Finder<'a, 'b> {
+    pub(crate) win: &'a [u8],
+    pub(crate) win_base: u64,
+    pub(crate) block_end_idx: usize,
+    pub(crate) epoch: u64,
+    pub(crate) tag: u64,
+    pub(crate) max_window: u64,
+    pub(crate) table: &'b mut [u64],
+    pub(crate) table_log: u32,
+    pub(crate) bt: &'b mut [u64],
     /// Position mask for the ring (which holds 2 slots per position).
-    bt_mask: usize,
-    hash3: &'b mut [u64],
-    hash3_log: u32,
-    min_match: usize,
-    mls: usize,
-    nb_compares: usize,
-    sufficient_len: usize,
-    next_update: &'b mut u64,
+    pub(crate) bt_mask: usize,
+    pub(crate) hash3: &'b mut [u64],
+    pub(crate) hash3_log: u32,
+    pub(crate) min_match: usize,
+    pub(crate) mls: usize,
+    pub(crate) nb_compares: usize,
+    /// Fill-side budget (see [`OptKnobs::insert_log`]); the search keeps
+    /// the full `nb_compares`.
+    pub(crate) insert_compares: usize,
+    pub(crate) sufficient_len: usize,
+    pub(crate) next_update: &'b mut u64,
 }
 
 impl Finder<'_, '_> {
@@ -453,7 +462,7 @@ impl Finder<'_, '_> {
         let mut common_larger = 0usize;
         let mut best_len = 8usize;
         let mut match_end = pos + 9;
-        let mut nb = self.nb_compares;
+        let mut nb = self.insert_compares;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
         let mut dummy = EMPTY;
         // Insert-side counts cap at the DP window: the parser can only
@@ -525,7 +534,7 @@ impl Finder<'_, '_> {
     }
 
     /// Fill the tree with every position in `[next_update, target)`.
-    fn update_tree(&mut self, target_idx: usize) {
+    pub(crate) fn update_tree(&mut self, target_idx: usize) {
         debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
         // Positions below the match window can never resolve as candidates
         // (`resolve` rejects them) nor be threaded into the ring (`bt_low`
@@ -569,7 +578,7 @@ impl Finder<'_, '_> {
     /// previous one, repcodes first (`ZSTD_insertBtAndGetAllMatches`).
     /// Returns the match count; `length_to_beat` starts at `min_match`.
     #[allow(clippy::too_many_arguments)]
-    fn get_all_matches(
+    pub(crate) fn get_all_matches(
         &mut self,
         matches: &mut [Match],
         idx: usize,
@@ -887,6 +896,7 @@ fn run_once<const ULTRA: bool>(
         min_match: knobs.min_match as usize,
         mls: knobs.mls as usize,
         nb_compares: 1usize << knobs.search_log,
+        insert_compares: 1usize << knobs.insert_log,
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
     };

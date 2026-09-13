@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 
 use super::{
     Matcher, SeqWord, Sequence,
+    btlazy::LazyScratch,
     opt::{OptKnobs, OptScratch, OptState},
     seq_codes::{decode_packed, pack_seq},
 };
@@ -140,14 +141,19 @@ enum Strategy {
     /// Optimal-price parser over a binary match tree (levels Opt/Ultra,
     /// libzstd's btopt/btultra). The `chain` buffer holds the tree ring.
     Opt(OptKnobs),
+    /// Lazy2 selection over the optimal parser's binary tree (rows 13-15,
+    /// libzstd's `btlazy2`): the tree of [`Strategy::Opt`] without the DP.
+    /// The `chain` buffer holds the tree ring.
+    BtLazy(OptKnobs),
 }
 
 /// Per-level search parameters. One row per numeric level (0-22), modeled
 /// on libzstd's `clevels.h` large-source table and adapted to this crate's
 /// strategy family: libzstd's greedy/lazy/lazy2 map onto [`Strategy::Chain`]
 /// with `lazy_depth` 0/1/2 and `min_match` from the row's search length,
-/// and btlazy2/btopt/btultra(2) onto [`Strategy::Opt`] knobs. Deviations
-/// from the libzstd rows are documented per row.
+/// btlazy2 onto [`Strategy::BtLazy`], and btopt/btultra(2) onto
+/// [`Strategy::Opt`] knobs. Deviations from the libzstd rows are documented
+/// per row.
 #[derive(Clone, Copy, PartialEq)]
 struct LevelParams {
     hash_log: u32,
@@ -213,6 +219,34 @@ const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
     }
 }
 
+const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::BtLazy(knobs),
+        search_depth: 0,
+        lazy_depth: 2,
+        min_match: knobs.mls,
+    }
+}
+
+/// btlazy2 row knobs: `min_match` stays 4 (the lazy family's accept bar and
+/// repcode compare width — libzstd's loop), while `mls` carries the row's
+/// searchLength (5: hash5 keys the tree). `sufficient_len` is the rows'
+/// targetLength, capping candidate collection on long matches.
+const fn bt_knobs(search_log: u32, insert_log: u32, bt_log: u32) -> OptKnobs {
+    OptKnobs {
+        search_log,
+        insert_log,
+        sufficient_len: 32,
+        min_match: 4,
+        mls: 5,
+        bt_log,
+        hash3_log: 0,
+        ultra: false,
+    }
+}
+
 const fn knobs(
     search_log: u32,
     sufficient_len: u32,
@@ -222,6 +256,7 @@ const fn knobs(
 ) -> OptKnobs {
     OptKnobs {
         search_log,
+        insert_log: search_log,
         sufficient_len,
         min_match,
         mls: min_match,
@@ -266,11 +301,15 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     chain(22, 21, 1 << 22, 16, 2),
     chain(22, 21, 1 << 22, 32, 2),
     chain(23, 22, 1 << 22, 32, 2),
-    // 13: the Best tier: the optimal parser at its cheapest. libzstd runs
-    // btlazy2 here; our opt-parser row lands denser at similar cost.
-    opt(22, 1 << 22, knobs(4, 32, 4, 22, false)),
-    opt(22, 1 << 22, knobs(5, 32, 4, 22, false)),
-    opt(22, 1 << 22, knobs(6, 32, 4, 23, false)),
+    // 13: the Best tier: btlazy2 — the bt tree under lazy2 selection
+    // (libzstd's L13-15 rows: W22, S4/5/6, searchLength 5, TL 32). The
+    // fill budget is split from the search (see `insert_log`): shallow
+    // inserts — the lazy scan does not need every position threaded —
+    // moved json from the old opt-parser row's x4.2 to x1.7 while the
+    // literal-aware margins kept the ratio at 6.26 (zstd-13: 6.10).
+    btlazy(22, 1 << 22, bt_knobs(4, 2, 22)),
+    btlazy(23, 1 << 22, bt_knobs(5, 2, 22)),
+    btlazy(23, 1 << 22, bt_knobs(6, 3, 23)),
     // 16: libzstd's btopt rows begin.
     opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
     // 17: the Opt tier; libzstd's L17 row with the ring capped one below
@@ -338,6 +377,11 @@ fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
             knobs.bt_log = knobs.bt_log.min(wlog);
             knobs.hash3_log = knobs.hash3_log.min(wlog);
             Strategy::Opt(knobs)
+        },
+        Strategy::BtLazy(mut knobs) => {
+            knobs.bt_log = knobs.bt_log.min(wlog);
+            knobs.hash3_log = knobs.hash3_log.min(wlog);
+            Strategy::BtLazy(knobs)
         },
         Strategy::Fast => Strategy::Fast,
     };
@@ -1022,6 +1066,8 @@ pub struct MatchGeneratorDriver {
     opt_state: OptState,
     /// DP scratch for the opt strategies (~130 KiB; allocated on demand).
     opt_scratch: Option<OptScratch>,
+    /// Candidate scratch for the btlazy2 strategy (~32 KiB; on demand).
+    lazy_scratch: Option<LazyScratch>,
     /// Tree fill point for the opt strategies: positions below it are
     /// already inserted into the binary tree.
     next_update: u64,
@@ -1137,6 +1183,7 @@ impl MatchGeneratorDriver {
             gate_hold: false,
             opt_state: OptState::new(),
             opt_scratch: None,
+            lazy_scratch: None,
             next_update: 0,
             gap_start: u64::MAX,
             // Epoch 0 is the never-valid state of a zeroed table.
@@ -1175,6 +1222,7 @@ impl MatchGeneratorDriver {
             gate_hold: false,
             opt_state: OptState::new(),
             opt_scratch: None,
+            lazy_scratch: None,
             next_update: 0,
             gap_start: u64::MAX,
             epoch: 1,
@@ -1223,14 +1271,24 @@ impl MatchGeneratorDriver {
                     self.table = Vec::new();
                     self.chain = Vec::new();
                 },
+                Strategy::BtLazy(knobs) => {
+                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                    self.hash3 = Vec::new();
+                    self.table = Vec::new();
+                    self.chain = Vec::new();
+                },
             }
-            if !matches!(params.strategy, Strategy::Opt(_)) {
+            if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
                 self.opt_table = Vec::new();
                 self.bt = Vec::new();
                 self.hash3 = Vec::new();
             }
             if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
                 self.opt_scratch = Some(OptScratch::new());
+            }
+            if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
+                self.lazy_scratch = Some(LazyScratch::new());
             }
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
@@ -1348,7 +1406,7 @@ impl MatchGeneratorDriver {
         }
         let last = data.len() - HASH_READ;
         match self.params.strategy {
-            Strategy::Opt(_) => {
+            Strategy::Opt(_) | Strategy::BtLazy(_) => {
                 self.next_update = self.next_update.min(base);
             },
             Strategy::Fast => {
@@ -1703,7 +1761,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
-        if !matches!(self.params.strategy, Strategy::Opt(_)) {
+        if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
             self.catch_up_insertions();
         }
         match self.params.strategy {
@@ -1711,6 +1769,7 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
             Strategy::Chain(_) => self.start_matching_chain(literals, seqs),
             Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
+            Strategy::BtLazy(knobs) => self.start_matching_btlazy(knobs, literals, seqs),
         }
     }
 
@@ -1852,7 +1911,7 @@ impl Matcher for MatchGeneratorDriver {
         let win = window_slice(&self.win, self.ext.as_ref());
         if idx + HASH_READ <= win.len() {
             match self.params.strategy {
-                Strategy::Opt(_) => {},
+                Strategy::Opt(_) | Strategy::BtLazy(_) => {},
                 Strategy::Chain(_) => {
                     // The head hash uses params.hash_log; the pattern's
                     // payload is the chain-table log (they differ on rows
@@ -1963,8 +2022,8 @@ impl MatchGeneratorDriver {
                     idx += 1;
                 }
             },
-            // The opt strategies fill their tree lazily from `next_update`.
-            Strategy::Opt(_) => {},
+            // The tree strategies fill their tree lazily from `next_update`.
+            Strategy::Opt(_) | Strategy::BtLazy(_) => {},
         }
         self.gap_start = u64::MAX;
     }
@@ -3152,6 +3211,47 @@ impl MatchGeneratorDriver {
         self.rep_pending = rep_pending;
         self.pos = block_end;
         self.anchor = block_end;
+    }
+
+    /// Bridge into the btlazy2 parser (rows 13-15): the same tables and
+    /// cursors as the opt bridge, no price state.
+    fn start_matching_btlazy(
+        &mut self,
+        knobs: OptKnobs,
+        literals: &mut Vec<u8>,
+        seqs: &mut Vec<SeqWord>,
+    ) {
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let mut rep = self.rep;
+        let mut rep_pending = self.rep_pending;
+        let Some(scratch) = self.lazy_scratch.as_mut() else {
+            unreachable!("btlazy scratch allocated by apply_level")
+        };
+        let lit_lens = self.lit_lens;
+        // Disjoint field borrows: the window (win/ext) against the tables.
+        super::btlazy::run_block_lazy(
+            &knobs,
+            win,
+            self.win_base,
+            self.block_start,
+            self.block_end,
+            self.params.window as u64,
+            self.epoch,
+            &mut self.opt_table,
+            &mut self.bt,
+            &mut self.hash3,
+            &mut self.next_update,
+            scratch,
+            &lit_lens,
+            &mut rep,
+            &mut rep_pending,
+            literals,
+            seqs,
+        );
+        self.rep = rep;
+        self.rep_pending = rep_pending;
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
     }
 }
 

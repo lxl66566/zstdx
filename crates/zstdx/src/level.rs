@@ -22,8 +22,8 @@ impl Level {
     /// Level 9: a deeper hash-chain matcher with two lazy steps
     /// (libzstd's `lazy2` strategy).
     pub const Balanced: Level = Level(9);
-    /// Level 13: the optimal parser in its cheapest setting: noticeably
-    /// denser than [`Level::Balanced`] at a fraction of [`Level::Opt`]'s cost.
+    /// Level 13: a binary-tree match finder with two lazy steps (libzstd's
+    /// `btlazy2` strategy): the ladder's speed rung above [`Level::Balanced`].
     pub const Best: Level = Level(13);
     /// The level used when none is specified.
     pub const DEFAULT: Level = Level::Fastest;
