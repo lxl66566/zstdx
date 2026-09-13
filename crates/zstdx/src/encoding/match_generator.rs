@@ -547,8 +547,10 @@ fn chain_search(
     // sentinel, stale 4-GiB-cycle entries and at-or-newer-than-pos
     // reconstructions. The walk's monotone (links target strictly older
     // positions) keeps an out-of-window dist the exact break the old
-    // candidate-floor check was.
-    while tried < search_depth && dist - 1 < reach {
+    // candidate-floor check was. The subtraction is wrapping for the same
+    // reason: dist 0 must wrap to u64::MAX to be rejected, not panic in
+    // debug builds.
+    while tried < search_depth && dist.wrapping_sub(1) < reach {
         let cand_abs = pos_abs - dist;
         let cand = (cand_abs - win_base) as usize;
         // Beat-check (libzstd's "potentially better" read): the 4 bytes
