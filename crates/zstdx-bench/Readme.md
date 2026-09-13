@@ -149,3 +149,14 @@ file; `--shape`/`--level` select.
 
 Times the matcher's window prefill per strategy on window-sized corpus
 strips (`--shape random,text,json` defaults; `--level` selects strategies).
+
+### `train` — dictionary trainer tooling
+
+Trains a raw-content dictionary with the in-tree trainer from files or
+directories (`--size` caps the output), or dumps the content section of a
+formatted dict (`--content-of <dict>`) so content selection and
+entropy-table seeding can be A/B'd in isolation against `zstd --train`.
+
+```bash
+cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384
+```

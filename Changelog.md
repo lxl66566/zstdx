@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Dictionary trainer reworked as a deterministic fastCover port
+  (`dict_builder` no longer pulls fastrand): fixed-seed sample shuffle
+  before concatenation (libzstd's `DiB_shuffle` — a sorted body makes
+  every epoch a cluster of similar files and the positional 75/25 split a
+  distribution shift; worth ~20% dict quality on its own), per-epoch
+  sliding-window selection scoring distinct 8-byte dmer frequencies with
+  zero-out on selection, epoch wraparound until the size-capped budget is
+  spent, and a 9-point segment-size sweep scored by compressing the
+  held-out 25% (level 3, libzstd's optimizer protocol). The reservoir
+  sampler, per-kmer Karp-Rabin rescans and the epoch-buffer/scoring bugs
+  are deleted. systemd fixture (207 sub-2KB samples, 16 KiB dict, referee
+  libzstd -9): holdout 6,030 B vs libzstd's trained content 6,085 (−0.9%),
+  full-set 23,282 vs 23,833 — the old trainer emitted 44× the requested
+  size of a repeated segment (72,437 B full-set) and was nondeterministic.
+  With our own encoder our trained dict also beats libzstd's dict by 3.9%
+  (26,532 vs 27,603 B); remaining gap is entropy-table emission, not
+  content selection.
 - Raw content dictionaries on every codec path (libzstd parity): a
   headerless dictionary loads as pure match history with the
   format-default repcodes — on encode `EncDictionary::parse` grows a raw

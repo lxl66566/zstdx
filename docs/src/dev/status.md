@@ -32,7 +32,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 | MT decoding | ✅ restart-point segmentation; serial stage B is the bottleneck, no scalability yet |
 | frame checksum | ✅ optional on encode (+sidecar thread offload); decode auto-verifies in-tree xxh64 (MT path does not verify) |
 | zstd-crate compat layer `zstdx::compat` | ✅ (dictionary decode works end-to-end) |
-| dictionaries | decode ✅ (formatted + raw content: `Dictionary::load`, an id-0 dict applies to frames without dictID); encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; formatted dicts load content as match history + seed entropy tables + dictID, headerless raw content as pure match history with default repcodes — libzstd parity, frames decodable by libzstd; MT falls back ST); `dict/` training half-done (known bugs). Dict sizes on the systemd fixture: +13% vs libzstd at -9 (sub-2KB fixed-overhead band, todo 10) |
+| dictionaries | decode ✅ (formatted + raw content: `Dictionary::load`, an id-0 dict applies to frames without dictID); encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; formatted dicts load content as match history + seed entropy tables + dictID, headerless raw content as pure match history with default repcodes — libzstd parity, frames decodable by libzstd; MT falls back ST); `dict/` training ✅ raw content (deterministic fastCover port: shuffled samples, sliding distinct-dmer scoring, k-sweep scored on a held-out split; `zstdx-bench train`; holdout parity with libzstd's dict content on the systemd fixture). Remaining: entropy-table emission for trained dicts (todo 10) |
 | forced window log (`InputShape::with_window_log`) | ✅ all paths; blocks cap at the window (RFC 8878 Block_Maximum_Size) |
 | LDM / superblock / C FFI | ❌ |
 
@@ -42,7 +42,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 |---|---|---|
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz; missing MT-path checksum |
 | decode performance | bulk ahead across the board; streaming ~75-85% | streaming residue is on json/skewed, see [current snapshot](dev/bench/snapshot.md) |
-| encode features | ~80% | full 1-22 ladder + dictionary encode (ST) + adjustable window + MT + streaming in place; missing dictionary training, LDM, superblock |
+| encode features | ~85% | full 1-22 ladder + dictionary encode (ST) + raw-content dictionary training + adjustable window + MT + streaming in place; missing trained-dict entropy-table emission, LDM, superblock |
 | encode speed | wins and losses split by tier | 2026-09-12 ladder speed curve (json 32MiB ST, CLI): chain rows 137/67/25 MiB/s at L6/9/12 vs libzstd 423/165/82 (0.25-0.33×, the known chain/json speed story); opt rows 7/4/2 at L13/17/19 vs 54/6/3 (0.13× at the btlazy2 slot, ~0.7× at btopt+); fastest/fast 447/340 vs 1118/812; small-call side wins (4KiB L19 5.96 vs 16.20 ms incl. spawn); tier-level x in the fresh [snapshot](dev/bench/snapshot.md) (Opt C22 speed cut landed; stream-MT burst-imbalance regression fixed via the epoch grid, same day) |
 | encode ratio | matched at every tier | 2026-09-12 full-ladder `ratio` sweep vs libzstd at same numeric levels (1MiB slice, all modes): json geo-mean +4.8% denser (balanced +19.6%, best +10.2%), skewed +2.8%, zeros +2.0%, random 0.00%, text +97.6% geo (window; balanced row -2.7% is the one losing cell — chain-row text residue, todo 9); 4KiB json ±1-5% after the small-literal huffman fix; dll Best/Opt denser than zstd-12/16, Ultra 7.7% behind zstd-19 |
 | API/ecosystem | ~60% | bulk + streaming + compat (incl. dictionary constructors) + CLI (levels 1-22, -D dictionaries); missing C FFI, language bindings, standard CLI argument surface |
@@ -61,7 +61,7 @@ Note: `COMPARE.md`'s completeness assessment is frozen at the `4ff2b7b` point in
 | `xxh64.rs` | in-tree checksum (shared by encode/decode; zero external deps at runtime) |
 | `bulk.rs` `stream/` | one-shot and streaming APIs (`encoder_core.rs` / `encoder_mt.rs`) |
 | `compat/` | zstd-crate compat layer |
-| `dict/` | dictionary training (feature = "dict_builder", half-done) |
+| `dict/` | raw-content dictionary training, fastCover port (feature = "dict_builder") |
 | `level.rs` `options.rs` | level enums and encode/decode options |
 
 ## Verification discipline (every commit)

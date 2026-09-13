@@ -15,6 +15,8 @@
 | errors via thiserror derive (first external dependency, compile-time only, no_std compatible) | `72f3c04` |
 | decoder checksum moved in-tree (xxh64 shared by encode/decode; twox demoted to dev-dep; zero external deps at runtime) | `81d2119` |
 | dict_builder module renamed `zstdx::dict` (aligned with zstd crate naming) | `7ad9e7a` |
+| raw content dictionaries on all codec paths (encode + decode + CLI `-D`; libzstd content-load parity) | `9bea4d3` |
+| raw-content dictionary trainer: deterministic fastCover port (shuffled samples, sliding distinct-dmer scoring with zero-out, epoch wrap, size-capped output, k-sweep scored by held-out compression; holdout parity with libzstd's trained content) | this batch |
 
 ## Level ladder and encoding features
 
