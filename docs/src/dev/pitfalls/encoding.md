@@ -45,6 +45,8 @@
 
 ## Misc
 
+- **btlazy2 selection: a repcode winner must keep its own off-base.** Collapsing the longest-rep candidate to `off_base 1` ("it's a rep") emits the wrong offset whenever the winner is the rep1/rep2 form — roundtrip fails only on rep-dense data and far into the stream (found at ~4 MiB on json). Same class as the ll0-form rule: off-base 1/2/3 each name a *different* decoder action at ll==0 (swap, rep2, rep3) and a *different* plain repcode at ll>0.
+
 - Streaming 128KB trailing-empty-block quirk: when Stream fills the tail it cannot know EOF in advance, must do a second read that triggers 0, and emits one extra 3-byte raw last block; the slice path must explicitly mirror trailing_empty for bit-identical output.
 - **opt.rs (zstd_opt port) details**: debug eprintln under `#[cfg(feature="std")]` gets compiled into release builds with the default feature (once silently flooded stderr); `ZSTD_count` returns a pointer difference — when continuing a count you must **replace**, not accumulate; rep history is updated once per series by the path walk (emitter-side per-seq updates are the decoder-equivalent semantics — pick one; duplicate updates always blow up); the insert-into-tree counting cap belongs in the DP window (4096 slots) — otherwise regions skipped by the parser get re-counted from stale heads (the lesson behind text 45→313 MiB/s).
 - Corpus-generation narrow integers: `(i as u8 + 1)` panics on debug addition overflow at i=255 (u8 truncates first, then +1); compute in usize and cast afterwards.

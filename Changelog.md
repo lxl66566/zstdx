@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Best tier (levels 13-15) re-strategied from a low-config optimal parser
+  to a btlazy2 port (`encoding/btlazy.rs`): lazy2 selection (two-deep lazy
+  walk with libzstd's alternating margins, literal-aware displaced-literal
+  pricing, rep0 probes, backward extension, offset-2 chains) over the
+  optimal parser's binary tree, with the fill's compare budget split from
+  the search's (`OptKnobs::insert_log`; opt rows keep insert == search and
+  are byte-identical). json.best 9 -> 17 MiB/s (x4.22 -> x2.21 vs zstd-13)
+  at ratio 6.27 (was 6.75; zstd-13: 6.10), text 416 -> 500 (x1.77 ->
+  x1.50) at 378 vs 386, skewed 2 -> 4 (x6.22 -> x3.76) at parity;
+  zeros/random unchanged. Levels outside 13-15 verified byte-identical
+  (full-ladder dump gate); 120-cell ratio sweep roundtrip-gated through
+  both decoders.
 - Dictionary trainer reworked as a deterministic fastCover port
   (`dict_builder` no longer pulls fastrand): fixed-seed sample shuffle
   before concatenation (libzstd's `DiB_shuffle` — a sorted body makes
