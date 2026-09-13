@@ -346,7 +346,9 @@ fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
 /// instead of recent junk.
 #[inline(always)]
 fn hash5_log(v: u64, log: u32) -> usize {
-    ((v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)) & ((1usize << log) - 1)
+    // No low mask: the >> (64 - log) already leaves exactly `log` bits, and
+    // a runtime `log` would make LLVM rebuild the mask per call.
+    (v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)
 }
 
 /// Hash the 5 bytes at `idx` into a table of `log` bits. Caller guarantees
@@ -357,7 +359,7 @@ fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: see the contract above; the hash itself is [`hash5_log`].
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
-        (v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)) & ((1usize << log) - 1)
+        v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)
     }
 }
 
@@ -368,7 +370,7 @@ fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at_log.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned();
-        (v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) as usize >> (64 - log)) & ((1usize << log) - 1)
+        v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) as usize >> (64 - log)
     }
 }
 
