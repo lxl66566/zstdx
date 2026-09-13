@@ -2676,6 +2676,7 @@ impl MatchGeneratorDriver {
     /// search depth, prefer repcode candidates (they encode nearly free),
     /// and defer emission across up to `lazy_depth` further positions when
     /// a longer match may start there — libzstd's lazy family.
+    #[allow(clippy::too_many_lines)]
     fn start_matching_chain(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         let win = window_slice(&self.win, self.ext.as_ref());
         let chain = &mut self.chain[..];
@@ -2756,6 +2757,26 @@ impl MatchGeneratorDriver {
             // 1 << hash_log slots.
             let h = hash_at_log(win, idx, hash_log);
             let entry = unsafe { *table_ptr.add(h) };
+            // Cross-position pipelining of the hash+head read (the dfast
+            // ip0/ip1 pattern): the lazy walk below usually searches pos+1
+            // first, and that head read is an L3-class random load that
+            // would otherwise serialize in front of the walk. Issued here
+            // it completes under the incumbent walk's shadow — issue
+            // placement is load-bearing: after the walk's loop the loads
+            // only decode behind its poorly-predicted exit branch and the
+            // shadow evaporates (measured: dll +4.5% pre-walk vs +0.5%
+            // post-walk). When the depth-0 rep probe advances pos the walk
+            // starts at pos+2 instead and computes fresh (the None arm).
+            // Skipped on the block tail (hashing idx+1 needs HASH_READ+1
+            // bytes ahead).
+            let mut pre1 = (0usize, 0u32);
+            let piped = block_end - pos > hash_read;
+            if piped {
+                pre1.0 = hash_at_log(win, idx + 1, hash_log);
+                // SAFETY: the hash masks to hash_log bits and the table
+                // holds 1 << hash_log slots.
+                pre1.1 = unsafe { *table_ptr.add(pre1.0) };
+            }
             let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry);
 
             // Repcode probe first when armed: with literals pending it runs
@@ -2824,6 +2845,20 @@ impl MatchGeneratorDriver {
                 *table_ptr.add(h) = pack_pos(pos);
             }
 
+            // Resolve the pipelined head for the lazy walk below: the
+            // insert above wrote table[h], so a pre-read of that very slot
+            // must observe the new head (a fresh read at search time
+            // would). The rep probe advancing pos leaves `pipe` empty —
+            // its first search sits at pos+2 and computes fresh.
+            let mut pipe: Option<u32> = None;
+            if piped && (pos - win_base) as usize == idx {
+                let (ph, mut pe) = pre1;
+                if ph == h {
+                    pe = pack_pos(pos);
+                }
+                pipe = Some(pe);
+            }
+
             // Repcode matches stay legal from MIN_MATCH up regardless of the
             // row's min_match (libzstd's rep probe also checks 4 bytes).
             if (best_len < min_match && !(rep_hit && best_len >= MIN_MATCH))
@@ -2880,6 +2915,32 @@ impl MatchGeneratorDriver {
                         }
                         pos = p2;
                         let idx2 = (p2 - win_base) as usize;
+                        // Pipelined hash+head for this position, issued one
+                        // search back under that walk's shadow (fresh for
+                        // the first step, the refresh below for the rest):
+                        // no table writes happen inside the lazy walk, and
+                        // every path to the next search steps exactly one
+                        // position. None only before the first search and
+                        // at the block tail.
+                        let entry2 = match pipe.take() {
+                            Some(pre) => pre,
+                            None => {
+                                let hf = hash_at_log(win, idx2, hash_log);
+                                // SAFETY: hash_at_log masks to hash_log
+                                // bits and the table holds 1 << hash_log
+                                // slots.
+                                unsafe { *table_ptr.add(hf) }
+                            }
+                        };
+                        // Refresh the pipeline for the next search (this
+                        // position +1); the guard equals the next attempt's
+                        // own break condition, so a skipped refresh is
+                        // never consumed.
+                        if block_end.saturating_sub(p2 + 1) >= hash_read {
+                            let hn = hash_at_log(win, idx2 + 1, hash_log);
+                            // SAFETY: as above.
+                            pipe = Some(unsafe { *table_ptr.add(hn) });
+                        }
                         // Repcode probe at the stepped position; literals are
                         // pending by construction (the walk advanced past the
                         // anchor), so of_value 1 stays encodable. Skipped when
@@ -2924,11 +2985,8 @@ impl MatchGeneratorDriver {
                                 }
                             }
                         }
-                        // Chain search at the stepped position.
-                        // SAFETY: hash_at_log masks to hash_log bits and
-                        // the table holds 1 << hash_log slots.
-                        let h2 = hash_at_log(win, idx2, hash_log);
-                        let entry2 = unsafe { *table_ptr.add(h2) };
+                        // Chain search at the stepped position, on the
+                        // pipelined hash+head read above.
                         let (len2, cand2) = search(win, chain_ptr, idx2, entry2);
                         let price2 = if len2 >= min_match {
                             price_of((p2 - win_base) as usize, cand2)

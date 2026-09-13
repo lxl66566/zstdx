@@ -4,6 +4,26 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Balanced matcher: cross-position pipelining of the lazy walk's hash+head
+  read (the dfast ip0/ip1 pattern). Every chain search paid one L3-class
+  random head load serialized in front of its walk; the scan body now
+  issues the pos+1 hash+head *before* the incumbent walk (issue placement
+  is load-bearing: after the walk's loop the loads decode behind its
+  poorly-predicted exit branch and the shadow evaporates), the insert's
+  newest-wins write is fixed up on a slot collision, and inside the walk
+  each search consumes the head issued one search back and refreshes for
+  the next — no table writes happen inside the walk and every path to the
+  next search steps exactly one position, so the refresh (guarded exactly
+  by the next attempt's break condition) is never stale and never
+  unconsumed. The depth-0 rep probe advancing pos (first search at pos+2)
+  and the block tail fall back to fresh compute. Byte-identical output
+  (full-ladder dump gate); wall solo: dll100 105-107 to 110-113 MiB/s
+  (+4.5%), json 89 to 90, text 3251 to 3295 (6-pair run, +1.4%; interleaved
+  matrix text +2.5%), skewed -2% (wasted pre-reads on long-match
+  iterations: +18% RAM hits at +0.5% Ir); gungraun balanced Ir json/text
+  +2.6%/+2.6% (the issued-early loads are the cost, the hidden latency the
+  pay), random/zeros bit-identical.
+
 - Sequence packing: `pack_seq` gains a zero-add-bit fast path. LL codes 0-15
   are ll itself and ML codes 0-31 are ml-3, both carrying zero add bits, so
   `ll < 16 && ml < 35` degenerates the packed word to `bsr` + ors with no
