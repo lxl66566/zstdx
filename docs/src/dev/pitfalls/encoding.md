@@ -35,6 +35,7 @@
 - Small-literal u64 copy: the read side must be guarded with `anchor_idx + 8 <= win.len()` (write-side overflow is harmless; read-side OOB intrudes into illegal memory).
 - Loop guards use `saturating_sub`: miss stepping can cross block_end, and unsigned subtraction wraps into a huge value.
 - insert_max subtraction: when the first block is <5 bytes, `win_base + win.len() - MIN_HASH` underflows → compute lazily or use saturating_sub.
+- **Distance-resolve of u32 table entries must exclude dist 0**: a stale slot can hold `pack_pos(pos)` of the *current* scan position — pooled tables reuse residue across frames (`327bc99`'s don't-clear design), and an old-cycle slot can alias anything. `dist = pos - entry + 1` then degenerates to 0, `dist <= reach` admits it, and the candidate byte-compares **against itself** — read4/extend trivially "match", the walk returns a zero-offset candidate, and the store gate's `(idx - cand).ilog2()` panics. The old `unpack_pos` wrap check (`cand >= pos → step one 4-GiB cycle back`) rejected this implicitly; the unsigned form `dist - 1 < reach` (admits exactly [1, reach]) restores it at zero extra cost. Surfaced only in the interleaved matrix's timing loop (pooled state across rounds), never in fresh-process dumps — pool residue is a real input dimension the dump gate cannot see.
 
 ## SPSC checksum ring
 
