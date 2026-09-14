@@ -125,6 +125,8 @@ json.fast stream ST is now at parity (was x1.11). The text fast/balanced/best st
 
 Full matrix 5 shapes x 6 levels x {bulk,stream} x {st,mt4}, one deterministic pass per cell, checksums off; Δ% = ours/zstd ratio − 1, geo-mean. Wall 141 s. Every cell byte-count identical to the 09-12 sweep (byte-identical-output lands). Geo-mean Δ over 120 cells **+9.02%**; per mode: bulk-st **+1.73%**, bulk-mt **+11.42%**, stream-st **+11.81%**, stream-mt **+11.46%**; per shape: json +4.78%, text +40.22%, skewed +2.75%, random ±0, zeros +1.99%.
 
+> 2026-09-14 later note: a same-code re-run (753136d, ours-side sizes byte-identical by construction) prints geo-mean +8.23% / json +3.49% / skewed +1.41% — the drift is on the reference side of the Δ or its cell set, unresolved; build-vs-build cell diffs (the sweep's actual regression gate) stay exact, which is what the 09-14 prefill-cap/seed lands were gated on.
+
 Losing cells (Δ < 0, complete list): text.balanced **−2.73..−2.79%** (all four modes — the one sizable deficit); text.opt −0.30..−0.35%; text.ultra −0.29..−0.34%; json.opt −0.18..−0.31% (vs the much-denser zstd-17); json.ultra mt −0.13%; json.fast mt −0.17..−0.19%; skewed fast/opt/ultra −0.01..−0.07%. random ties byte-exact at every cell; zeros mt wins up to +11%.
 
 The mt/stream margins are libzstd's losses, not our gains: zstd-mt on text collapses (fastest 39.8 vs our 309, fast 189 vs 333) while our mt stays within ~0.1% of our ST; zstd's unknown-size streaming at level 1 emits 1.84 MB (ratio 18.3) where our streaming matches our bulk (309).
