@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use super::{
     Matcher, SeqWord, Sequence,
     btlazy::LazyScratch,
+    ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
     seq_codes::{decode_packed, pack_seq},
 };
@@ -117,7 +118,7 @@ const EMPTY: u64 = 0;
 /// unwritten slots never resolve; position `2^32 - 1` collides with the
 /// sentinel — one dead insert per 4 GiB cycle, pure noise.
 #[inline(always)]
-fn pack_pos(abs: u64) -> u32 {
+pub(super) fn pack_pos(abs: u64) -> u32 {
     (abs as u32).wrapping_add(1)
 }
 
@@ -195,6 +196,9 @@ struct LevelParams {
     /// Parse the frame's cold-start head through the btlazy2 driver before
     /// this row's chain takes over (see [`HEAD_LIMIT`]).
     dubt_head: bool,
+    /// Run the gear-hash long-distance matcher as an extra candidate
+    /// source for the chain scan (see [`super::ldm`]).
+    ldm: bool,
 }
 
 const fn fast(hash_log: u32, window: usize) -> LevelParams {
@@ -206,6 +210,7 @@ const fn fast(hash_log: u32, window: usize) -> LevelParams {
         lazy_depth: 0,
         min_match: MIN_MATCH as u32,
         dubt_head: false,
+        ldm: false,
     }
 }
 
@@ -218,6 +223,7 @@ const fn dfast(hash_log: u32, small_log: u32, window: usize) -> LevelParams {
         lazy_depth: 0,
         min_match: MIN_MATCH as u32,
         dubt_head: false,
+        ldm: false,
     }
 }
 
@@ -236,12 +242,20 @@ const fn chain(
         lazy_depth,
         min_match: 5,
         dubt_head: false,
+        ldm: false,
     }
 }
 
 /// `chain` with the cold-start DUBT head enabled (row 9).
 const fn with_head(mut p: LevelParams) -> LevelParams {
     p.dubt_head = true;
+    p
+}
+
+/// `chain` with the gear-hash long-distance matcher as an extra candidate
+/// source (see [`super::ldm`]).
+const fn with_ldm(mut p: LevelParams) -> LevelParams {
+    p.ldm = true;
     p
 }
 
@@ -254,6 +268,7 @@ const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         lazy_depth: 0,
         min_match: knobs.min_match,
         dubt_head: false,
+        ldm: false,
     }
 }
 
@@ -266,6 +281,7 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         lazy_depth: 2,
         min_match: knobs.mls,
         dubt_head: false,
+        ldm: false,
     }
 }
 
@@ -525,7 +541,7 @@ fn read8(win: &[u8], idx: usize) -> u64 {
 /// the current scan position and `j` a candidate strictly before it, so
 /// bounding by `i` also bounds `j`.
 #[inline(always)]
-fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
+pub(super) fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
     let limit = win.len() - i;
     let base = win.as_ptr();
     let mut len = 0;
@@ -1230,6 +1246,12 @@ pub struct MatchGeneratorDriver {
     shape: InputShape,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
+    /// Gear-hash long-distance matcher state for chain rows with
+    /// [`LevelParams::ldm`] (see [`super::ldm`]); `None` elsewhere.
+    ldm: Option<LdmState>,
+    /// Long-distance candidates of the block being scanned (regenerated
+    /// per block by [`Self::ldm_generate`]).
+    ldm_seqs: Vec<LdmSeq>,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -1304,6 +1326,8 @@ impl MatchGeneratorDriver {
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             dubt_head: HeadPhase::Off,
+            ldm: None,
+            ldm_seqs: Vec::new(),
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1345,6 +1369,8 @@ impl MatchGeneratorDriver {
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             dubt_head: HeadPhase::Off,
+            ldm: None,
+            ldm_seqs: Vec::new(),
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1412,6 +1438,19 @@ impl MatchGeneratorDriver {
             if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
                 self.lazy_scratch = Some(LazyScratch::new());
             }
+            let ldm_wanted = params.ldm && matches!(params.strategy, Strategy::Chain(_));
+            let ldm_sized = self
+                .ldm
+                .as_ref()
+                .is_some_and(|l| l.window() == params.window as u64);
+            self.ldm = match (ldm_wanted, ldm_sized) {
+                (true, true) => self.ldm.take(),
+                (true, false) => Some(LdmState::new(
+                    (params.window as u64).ilog2(),
+                    params.window as u64,
+                )),
+                (false, _) => None,
+            };
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
             // the capacity. Direct-window matchers (slice size zero) never
@@ -1541,6 +1580,15 @@ impl MatchGeneratorDriver {
         // the job's own blocks re-open it as they gate.
         self.gap_start = u64::MAX;
         self.gate_hold = false;
+        // LDM job boundary: entries from earlier jobs must not shape this
+        // one's output (pooled matchers), and the strip is the job's
+        // candidate history — same content the grid fill indexes below.
+        if let Some(ldm) = &mut self.ldm {
+            ldm.restart(base);
+            if data.len() >= super::ldm::MIN_MATCH_LENGTH {
+                ldm.fill(data, base, base, base + data.len() as u64);
+            }
+        }
         if data.len() < HASH_READ {
             return;
         }
@@ -1838,6 +1886,9 @@ impl Matcher for MatchGeneratorDriver {
         } else {
             HeadPhase::Off
         };
+        if let Some(ldm) = &mut self.ldm {
+            ldm.restart(0);
+        }
         self.opt_state.reset();
     }
 
@@ -1934,6 +1985,9 @@ impl Matcher for MatchGeneratorDriver {
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         if self.head_block() {
+            // The head parses through the btlazy2 driver; its bytes stay
+            // LDM-indexed so later chain blocks can match far into them.
+            self.ldm_fill_block();
             self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
             self.finish_head();
             return;
@@ -1944,7 +1998,10 @@ impl Matcher for MatchGeneratorDriver {
         match self.params.strategy {
             Strategy::Fast => self.start_matching_fast(literals, seqs),
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
-            Strategy::Chain(_) => self.start_matching_chain(literals, seqs),
+            Strategy::Chain(_) => {
+                self.ldm_generate();
+                self.start_matching_chain(literals, seqs);
+            },
             Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
             Strategy::BtLazy(knobs) => self.start_matching_btlazy(knobs, literals, seqs),
         }
@@ -2071,6 +2128,7 @@ impl Matcher for MatchGeneratorDriver {
         if self.gap_start == u64::MAX {
             self.gap_start = self.block_start;
         }
+        self.ldm_fill_block();
         self.pos = self.block_end;
         self.anchor = self.block_end;
         true
@@ -2127,12 +2185,41 @@ impl Matcher for MatchGeneratorDriver {
                 },
             }
         }
+        self.ldm_fill_block();
         self.pos = self.block_end;
         self.anchor = self.block_end;
     }
 }
 
 impl MatchGeneratorDriver {
+    /// LDM-index a block the scan will not parse (incompressibility-gated,
+    /// RLE-skipped, or parsed by the DUBT head): the bytes stay matchable
+    /// far-distance history for later blocks, and the rolling hash stays
+    /// fed to the block end.
+    fn ldm_fill_block(&mut self) {
+        if let Some(ldm) = &mut self.ldm {
+            let win = window_slice(&self.win, self.ext.as_ref());
+            ldm.fill(win, self.win_base, self.block_start, self.block_end);
+        }
+    }
+
+    /// Generate this block's long-distance candidates into
+    /// [`Self::ldm_seqs`] ahead of the chain scan.
+    #[inline(never)]
+    fn ldm_generate(&mut self) {
+        self.ldm_seqs.clear();
+        if let Some(ldm) = &mut self.ldm {
+            let win = window_slice(&self.win, self.ext.as_ref());
+            ldm.generate(
+                &mut self.ldm_seqs,
+                win,
+                self.win_base,
+                self.pos,
+                self.block_end,
+            );
+        }
+    }
+
     /// Dense catch-up fill for the table strategies: the positions an
     /// incompressibility-gated block skipped ([`Matcher::skip_if_incompressible`])
     /// become searchable again before the next scan reads the tables. Gated
