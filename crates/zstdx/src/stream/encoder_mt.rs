@@ -14,9 +14,16 @@
 //! mt output; without a pledge the job size grows along the stream in
 //! equal-size epochs (see [`JobGrid::Growing`]).
 
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    slice,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use std::{
+    any::Any,
+    sync::{Condvar, Mutex},
+    thread::JoinHandle,
+};
 
 use super::encoder_core::StreamChecksum;
 use crate::{
@@ -49,6 +56,138 @@ enum JobGrid {
     /// function of absolute offset — bursts fire exactly on epoch
     /// completion, so a burst is one epoch and never a straddle.
     Growing,
+}
+
+/// Frozen job source handed to the worker pool: the backing buffer is not
+/// mutated, moved or dropped for the burst's lifetime — the posting thread
+/// only resumes buffer work after the pool quiesces (every worker has left
+/// the burst's job loop), the same freeze thread::scope used to provide.
+struct FrozenSrc {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the pointer is dereferenced only while the burst is posted, and
+// the posting thread guarantees the freeze above for that whole window.
+unsafe impl Send for FrozenSrc {}
+unsafe impl Sync for FrozenSrc {}
+
+/// One burst of jobs posted to the pool: everything a worker needs to run
+/// its share. Slots and the poison slot mirror the former scope-based
+/// burst; `exited` counts workers still inside this burst's job loop, and
+/// reaching zero is the pool's quiesce point.
+struct BurstCtx {
+    src: FrozenSrc,
+    /// Window index of `job_start` inside `src`.
+    first: usize,
+    /// Absolute job boundaries, `bounds.len() == n_jobs + 1`.
+    bounds: Vec<u64>,
+    n_jobs: usize,
+    job_start: u64,
+    overlap: usize,
+    level: Level,
+    last_frame_block: bool,
+    shape: crate::InputShape,
+    slots: Vec<Mutex<Option<Vec<u8>>>>,
+    ready: Condvar,
+    next_job: AtomicUsize,
+    poison: Mutex<Option<alloc::boxed::Box<dyn Any + Send>>>,
+    exited: AtomicUsize,
+    quiesce: Mutex<()>,
+    quiesce_cv: Condvar,
+}
+
+struct PoolInner {
+    shutdown: bool,
+    /// Burst generation: a worker picks the posted ctx up when `generation` moves
+    /// past the generation it last served, and parks otherwise.
+    generation: u64,
+    ctx: Option<Arc<BurstCtx>>,
+}
+
+/// State shared between the encoder and its pool threads: burst
+/// coordination plus the reusable encoder states (also serving the
+/// single-job inline path, exactly like the former plain Vec pool).
+struct PoolShared {
+    inner: Mutex<PoolInner>,
+    wake: Condvar,
+    states: Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+}
+
+/// Pool worker body: serve every posted burst until shutdown. The job loop
+/// is the former thread::scope body verbatim (pooled state per burst,
+/// atomic job pickup, poison check before each job); the only addition is
+/// the `exited` countdown that marks the burst quiesced.
+fn pool_worker(shared: Arc<PoolShared>) {
+    let mut seen = 0u64;
+    loop {
+        let ctx;
+        {
+            let mut inner = shared.inner.lock().unwrap();
+            while !inner.shutdown && inner.generation == seen {
+                inner = shared.wake.wait(inner).unwrap();
+            }
+            if inner.shutdown {
+                return;
+            }
+            seen = inner.generation;
+            ctx = inner.ctx.clone().unwrap();
+        }
+        let mut state = take_pooled_state(&shared.states);
+        let mut poisoned = false;
+        loop {
+            if ctx.poison.lock().unwrap().is_some() {
+                break;
+            }
+            let id = ctx.next_job.fetch_add(1, Ordering::Relaxed);
+            if id >= ctx.n_jobs {
+                break;
+            }
+            let start = ctx.first + (ctx.bounds[id] - ctx.job_start) as usize;
+            let end = ctx.first + (ctx.bounds[id + 1] - ctx.job_start) as usize;
+            // Every job except the frame's first starts where the decoder's
+            // repcode history is unknown (see the bulk mt path); a
+            // flush-rebased grid starts mid-frame too.
+            let gate = ctx.bounds[id] > 0;
+            // SAFETY: the posting thread freezes the source for the whole
+            // burst (see FrozenSrc).
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let src = unsafe { slice::from_raw_parts(ctx.src.ptr, ctx.src.len) };
+                run_job_with(
+                    &mut state,
+                    src,
+                    start..end,
+                    ctx.overlap,
+                    ctx.last_frame_block && id + 1 == ctx.n_jobs,
+                    ctx.level,
+                    gate,
+                    ctx.shape,
+                )
+            }));
+            match attempt {
+                Ok(bytes) => *ctx.slots[id].lock().unwrap() = Some(bytes),
+                Err(payload) => {
+                    *ctx.poison.lock().unwrap() = Some(payload);
+                    // Release the slot so the ordered assembly below can run
+                    // to completion before the panic is resumed. The state
+                    // may be mid-compress garbage, so it is dropped rather
+                    // than pooled.
+                    poisoned = true;
+                    *ctx.slots[id].lock().unwrap() = Some(Vec::new());
+                    ctx.ready.notify_all();
+                    break;
+                },
+            }
+            ctx.ready.notify_all();
+        }
+        if !poisoned {
+            shared.states.lock().unwrap().push(state);
+        }
+        if ctx.exited.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _g = ctx.quiesce.lock().unwrap();
+            ctx.quiesce_cv.notify_all();
+        }
+    }
 }
 
 pub(crate) struct MtEncoderCore {
@@ -86,11 +225,14 @@ pub(crate) struct MtEncoderCore {
     out_read: usize,
     header_emitted: bool,
     finished: bool,
-    /// Idle worker states owned by this encoder: burst threads are fresh
-    /// every time (thread::scope), so the thread-local slice pool never
-    /// carries anything across bursts — this one does, sparing every burst
-    /// the hash-table allocations and their first-touch page faults.
-    pool: Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+    /// Pool coordination state (reusable encoder states included), shared
+    /// with the worker threads. Workers spawn lazily at the first
+    /// multi-job burst; until then this is only the state pool.
+    shared: Arc<PoolShared>,
+    /// Persistent burst workers, spawned once (thread::scope used to pay a
+    /// spawn+join of the whole set per burst, ~0.5-2 ms each). Joined on
+    /// drop via shutdown.
+    pool_threads: Vec<JoinHandle<()>>,
 }
 
 impl MtEncoderCore {
@@ -158,7 +300,16 @@ impl MtEncoderCore {
             out_read: 0,
             header_emitted: false,
             finished: false,
-            pool: Mutex::new(Vec::new()),
+            shared: Arc::new(PoolShared {
+                inner: Mutex::new(PoolInner {
+                    shutdown: false,
+                    generation: 0,
+                    ctx: None,
+                }),
+                wake: Condvar::new(),
+                states: Mutex::new(Vec::new()),
+            }),
+            pool_threads: Vec::new(),
         }
     }
 
@@ -388,7 +539,7 @@ impl MtEncoderCore {
             // spun up.
             self.hash_to(hi);
             let last_len = (bounds[1] - bounds[0]) as usize;
-            let mut state = Self::take_pooled_state(&self.pool);
+            let mut state = take_pooled_state(&self.shared.states);
             let bytes = run_job_with(
                 &mut state,
                 &self.buf[..(hi - self.buf_base) as usize],
@@ -399,97 +550,66 @@ impl MtEncoderCore {
                 self.job_start > 0,
                 self.shape,
             );
-            self.pool.lock().unwrap().push(state);
+            self.shared.states.lock().unwrap().push(state);
             self.output.extend_from_slice(&bytes);
         } else {
-            let src = &self.buf[..(hi - self.buf_base) as usize];
-            let threads = (self.workers as usize).min(n_jobs);
-            let slots: Vec<Mutex<Option<Vec<u8>>>> =
-                (0..n_jobs).map(|_| Mutex::new(None)).collect();
-            let ready = Condvar::new();
-            let next_job = AtomicUsize::new(0);
-            let poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>> =
-                Mutex::new(None);
-            let overlap = self.overlap;
-            let level = self.level;
-            let job_start = self.job_start;
-            let bounds = &bounds[..];
-            let shape = self.shape;
-
-            // Disjoint field borrows: the workers share `src` and the state
-            // pool while the calling thread runs the checksum absorb and the
-            // ordered assembly.
-            let output = &mut self.output;
-            let hasher = &mut self.hasher;
-            let pool = &self.pool;
-            let unhashed = &self.buf
-                [(self.hashed_end - self.buf_base) as usize..(hi - self.buf_base) as usize];
-
-            std::thread::scope(|scope| {
-                for _ in 0..threads {
-                    scope.spawn(|| {
-                        let mut state = Self::take_pooled_state(pool);
-                        loop {
-                            if poison.lock().unwrap().is_some() {
-                                break;
-                            }
-                            let id = next_job.fetch_add(1, Ordering::Relaxed);
-                            if id >= n_jobs {
-                                break;
-                            }
-                            let start = first + (bounds[id] - job_start) as usize;
-                            let end = first + (bounds[id + 1] - job_start) as usize;
-                            // Every job except the frame's first starts where the
-                            // decoder's repcode history is unknown (see the bulk
-                            // mt path); a flush-rebased grid starts mid-frame
-                            // too.
-                            let gate = bounds[id] > 0;
-                            let attempt =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    run_job_with(
-                                        &mut state,
-                                        src,
-                                        start..end,
-                                        overlap,
-                                        last_frame_block && id + 1 == n_jobs,
-                                        level,
-                                        gate,
-                                        shape,
-                                    )
-                                }));
-                            match attempt {
-                                Ok(bytes) => *slots[id].lock().unwrap() = Some(bytes),
-                                Err(payload) => {
-                                    *poison.lock().unwrap() = Some(payload);
-                                    // Release the slot so the ordered assembly
-                                    // below can run to completion before the
-                                    // panic is resumed. The state may be
-                                    // mid-compress garbage, so it is dropped
-                                    // rather than pooled (the early return
-                                    // skips the push below).
-                                    *slots[id].lock().unwrap() = Some(Vec::new());
-                                    ready.notify_all();
-                                    return;
-                                },
-                            }
-                            ready.notify_all();
-                        }
-                        pool.lock().unwrap().push(state);
-                    });
-                }
-                hasher.hash_tail(unhashed);
-                // Ordered assembly on the calling thread: each job's blocks
-                // append as soon as they land.
-                for slot in &slots {
-                    let mut guard = slot.lock().unwrap();
-                    while guard.is_none() {
-                        guard = ready.wait(guard).unwrap();
-                    }
-                    output.extend_from_slice(&guard.take().unwrap());
-                }
+            let pool_size = self.ensure_workers(n_jobs);
+            // SAFETY: posted for the burst and frozen until the pool
+            // quiesces below (see FrozenSrc).
+            let src =
+                unsafe { slice::from_raw_parts(self.buf.as_ptr(), (hi - self.buf_base) as usize) };
+            let ctx = Arc::new(BurstCtx {
+                src: FrozenSrc {
+                    ptr: src.as_ptr(),
+                    len: src.len(),
+                },
+                first,
+                bounds,
+                n_jobs,
+                job_start: self.job_start,
+                overlap: self.overlap,
+                level: self.level,
+                last_frame_block,
+                shape: self.shape,
+                slots: (0..n_jobs).map(|_| Mutex::new(None)).collect(),
+                ready: Condvar::new(),
+                next_job: AtomicUsize::new(0),
+                poison: Mutex::new(None),
+                exited: AtomicUsize::new(pool_size),
+                quiesce: Mutex::new(()),
+                quiesce_cv: Condvar::new(),
             });
-            self.hashed_end = hi;
-            if let Some(payload) = poison.into_inner().unwrap() {
+            {
+                let mut inner = self.shared.inner.lock().unwrap();
+                // The previous burst quiesced before this call returned, so
+                // no worker still holds an older ctx.
+                debug_assert!(inner.ctx.is_none());
+                inner.generation += 1;
+                inner.ctx = Some(ctx.clone());
+            }
+            self.shared.wake.notify_all();
+
+            // Checksum absorb on the calling thread while the workers
+            // encode; then ordered assembly: each job's blocks append as
+            // soon as they land.
+            self.hash_to(hi);
+            for slot in &ctx.slots {
+                let mut guard = slot.lock().unwrap();
+                while guard.is_none() {
+                    guard = ctx.ready.wait(guard).unwrap();
+                }
+                self.output.extend_from_slice(&guard.take().unwrap());
+            }
+            // Quiesce: every worker has left the burst's job loop, so the
+            // source buffer may be mutated, moved or dropped again.
+            {
+                let mut guard = ctx.quiesce.lock().unwrap();
+                while ctx.exited.load(Ordering::Acquire) != 0 {
+                    guard = ctx.quiesce_cv.wait(guard).unwrap();
+                }
+            }
+            self.shared.inner.lock().unwrap().ctx = None;
+            if let Some(payload) = ctx.poison.lock().unwrap().take() {
                 std::panic::resume_unwind(payload);
             }
         }
@@ -532,20 +652,49 @@ impl MtEncoderCore {
         self.hashed_end = end;
     }
 
-    /// Take a worker state from the pool, or build a fresh one.
-    fn take_pooled_state(
-        pool: &Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
-    ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
-        pool.lock()
-            .unwrap()
-            .pop()
-            .unwrap_or_else(|| alloc::boxed::Box::new(new_slice_state()))
+    /// Spawn the persistent pool workers on the first multi-job burst and
+    /// return the live thread count (the `exited` countdown's size).
+    fn ensure_workers(&mut self, n_jobs: usize) -> usize {
+        if self.pool_threads.is_empty() {
+            let n = (self.workers as usize).min(n_jobs).max(1);
+            for _ in 0..n {
+                let shared = self.shared.clone();
+                self.pool_threads.push(
+                    std::thread::Builder::new()
+                        .spawn(move || pool_worker(shared))
+                        .unwrap(),
+                );
+            }
+        }
+        self.pool_threads.len()
     }
 
     fn emit_header(&mut self) {
         if !self.header_emitted {
             self.output.extend_from_slice(&self.header);
             self.header_emitted = true;
+        }
+    }
+}
+
+/// Take a worker state from the pool, or build a fresh one.
+fn take_pooled_state(
+    pool: &Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    pool.lock()
+        .unwrap()
+        .pop()
+        .unwrap_or_else(|| alloc::boxed::Box::new(new_slice_state()))
+}
+
+impl Drop for MtEncoderCore {
+    fn drop(&mut self) {
+        if !self.pool_threads.is_empty() {
+            self.shared.inner.lock().unwrap().shutdown = true;
+            self.shared.wake.notify_all();
+            for handle in self.pool_threads.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 }
