@@ -1082,6 +1082,14 @@ pub struct MatchGeneratorDriver {
     /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
     /// (libzstd's hashTable3); empty otherwise.
     hash3: Vec<u64>,
+    /// The DUBT finder's hash heads for the btlazy2 strategy: u32
+    /// position entries (see [`super::dubt`]), like libzstd's btlazy2
+    /// tables. The random-access working set is window-sized, so entry
+    /// width dominates its cache/TLB behavior.
+    dubt_table: Vec<u32>,
+    /// The DUBT finder's two-slot tree ring for the btlazy2 strategy, u32
+    /// entries like `dubt_table`; empty outside btlazy2.
+    dubt_bt: Vec<u32>,
     /// Content-tag table of the incompressibility gate (see
     /// [`Matcher::skip_if_incompressible`]): slot = high hash bits of a
     /// sampled 8-byte window, entry = its low 32 bits. Entries are
@@ -1219,6 +1227,8 @@ impl MatchGeneratorDriver {
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
+            dubt_table: Vec::new(),
+            dubt_bt: Vec::new(),
             probe: Vec::new(),
             gate_hold: false,
             opt_state: OptState::new(),
@@ -1258,6 +1268,8 @@ impl MatchGeneratorDriver {
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
+            dubt_table: Vec::new(),
+            dubt_bt: Vec::new(),
             probe: Vec::new(),
             gate_hold: false,
             opt_state: OptState::new(),
@@ -1312,8 +1324,10 @@ impl MatchGeneratorDriver {
                     self.chain = Vec::new();
                 },
                 Strategy::BtLazy(knobs) => {
-                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
-                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                    self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
+                    self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
+                    self.opt_table = Vec::new();
+                    self.bt = Vec::new();
                     self.hash3 = Vec::new();
                     self.table = Vec::new();
                     self.chain = Vec::new();
@@ -1323,6 +1337,10 @@ impl MatchGeneratorDriver {
                 self.opt_table = Vec::new();
                 self.bt = Vec::new();
                 self.hash3 = Vec::new();
+            }
+            if !matches!(params.strategy, Strategy::BtLazy(_)) {
+                self.dubt_table = Vec::new();
+                self.dubt_bt = Vec::new();
             }
             if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
                 self.opt_scratch = Some(OptScratch::new());
@@ -1440,7 +1458,7 @@ impl MatchGeneratorDriver {
         // strip are never read — their owners can no longer resolve as
         // candidates.
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
-            self.opt_table.fill(EMPTY);
+            self.dubt_table.fill(0);
         }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
             self.chain.fill(0);
@@ -1720,11 +1738,15 @@ impl Matcher for MatchGeneratorDriver {
         // no tag: its rows clear both tables, since frame positions restart
         // at zero and old absolute positions would alias the new window.
         self.epoch += 1;
-        if self.epoch > 0xffff || matches!(self.params.strategy, Strategy::BtLazy(_)) {
+        if self.epoch > 0xffff {
             self.opt_table.fill(EMPTY);
             self.bt.fill(EMPTY);
             self.hash3.fill(EMPTY);
             self.epoch = 1;
+        }
+        if matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            self.dubt_table.fill(0);
+            self.dubt_bt.fill(0);
         }
         self.miss_count = 0;
         // Matches the decoder's per-frame offset_hist reset.
@@ -3313,8 +3335,8 @@ impl MatchGeneratorDriver {
             self.block_start,
             self.block_end,
             self.params.window as u64,
-            &mut self.opt_table,
-            &mut self.bt,
+            &mut self.dubt_table,
+            &mut self.dubt_bt,
             &mut self.next_update,
             scratch,
             &lit_lens,

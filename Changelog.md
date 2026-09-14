@@ -11,6 +11,18 @@ This document records the changes made between versions, starting with version 0
   batched probing is output-neutral yet +3.8% instructions and −10..14%
   wall (json's miss runs are 1-2 pairs; batching never amortizes). No
   code change; the scan loop stands.
+- Best tier (btlazy2) DUBT finder converted to u32 entries like libzstd
+  (truncated positions rebuilt against the scanning position), halving
+  the strategy's random-access working set from 96 to 48 MiB: the
+  skewed.best cell was memory-latency-bound on the doubled footprint
+  (~460 cycles per tree visit, 200M L1 + 100M dTLB misses per 32 MiB
+  pass). Interleaved matrix: skewed.best x2.865 -> x2.16-2.22, json.best
+  x1.627 -> x1.38-1.50, text.best x1.184 -> x0.82-0.94 (ahead of
+  libzstd); compressed output byte-identical (full-ladder dump gate).
+- btlazy2 selection hoists the per-position literal-cost scale out of the
+  candidate loops (all candidates of a search share it; LLVM did not
+  hoist the four gathers behind the matches-array loop): driver
+  instructions -23% on skewed, output byte-identical.
 - MT decode checksum verification moved off the serial post-pass into
   stage B: the executor absorbs each executed segment's output range into
   the frame's xxh64 stream the moment it is final (bytes hot in its

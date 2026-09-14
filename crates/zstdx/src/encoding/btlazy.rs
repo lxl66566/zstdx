@@ -28,19 +28,25 @@ fn lazy_price(off: u32) -> i32 {
     }
 }
 
-/// Displaced-literal value of a match: the bits it saves by covering `len`
-/// bytes instead of emitting them, estimated from the first four bytes at
-/// the code lengths fed back by the block encoder (see the driver's
-/// `lit_lens`), clamped to 6 bits per byte — a local selection must not
-/// let cap-priced bytes dominate its decisions. With the default flat
-/// lens this is exactly `len * 4`, libzstd's raw-gain scale.
+/// Displaced-literal value scale of one scan position: the sum of the
+/// first four bytes' code lengths fed back by the block encoder (see the
+/// driver's `lit_lens`), clamped to 6 bits per byte — a local selection
+/// must not let cap-priced bytes dominate its decisions. Every candidate
+/// of a search at the position prices its length against the same scale;
+/// with the default flat lens this is 16, libzstd's raw `ml*4` gain.
 #[inline(always)]
-fn lazy_value(win: &[u8], idx: usize, len: usize, lit_lens: &[u8; 256]) -> i32 {
-    debug_assert!(len >= MIN_MATCH);
-    let s = (lit_lens[win[idx] as usize] as i32).min(6)
+fn lit_scale(win: &[u8], idx: usize, lit_lens: &[u8; 256]) -> i32 {
+    (lit_lens[win[idx] as usize] as i32).min(6)
         + (lit_lens[win[idx + 1] as usize] as i32).min(6)
         + (lit_lens[win[idx + 2] as usize] as i32).min(6)
-        + (lit_lens[win[idx + 3] as usize] as i32).min(6);
+        + (lit_lens[win[idx + 3] as usize] as i32).min(6)
+}
+
+/// Displaced-literal value of a match of `len` bytes at a position whose
+/// scale is `s`.
+#[inline(always)]
+fn scale_value(s: i32, len: usize) -> i32 {
+    debug_assert!(len >= MIN_MATCH);
     s * len as i32 / 4
 }
 
@@ -95,8 +101,8 @@ pub(crate) fn run_block_lazy(
     block_start: u64,
     block_end: u64,
     max_window: u64,
-    table: &mut [u64],
-    bt: &mut [u64],
+    table: &mut [u32],
+    bt: &mut [u32],
     next_update: &mut u64,
     scratch: &mut LazyScratch,
     lit_lens: &[u8; 256],
@@ -145,11 +151,11 @@ pub(crate) fn run_block_lazy(
             if nb > 0 {
                 // All candidates share the position, so the value scales
                 // with length alone; the price separates the offsets.
+                let scale = lit_scale(win, idx, lit_lens);
                 best = matches[0];
-                let mut bs =
-                    lazy_value(win, idx, best.len as usize, lit_lens) - lazy_price(best.off);
+                let mut bs = scale_value(scale, best.len as usize) - lazy_price(best.off);
                 for &m in &matches[1..nb] {
-                    let s = lazy_value(win, idx, m.len as usize, lit_lens) - lazy_price(m.off);
+                    let s = scale_value(scale, m.len as usize) - lazy_price(m.off);
                     if s > bs {
                         bs = s;
                         best = m;
@@ -164,12 +170,14 @@ pub(crate) fn run_block_lazy(
                 pos
             };
             if let Some(ml) = rep_probe(win, win_base, block_end_idx, probe, rep[0]) {
-                let v = lazy_value(win, (probe - win_base) as usize, ml, lit_lens);
+                let v = scale_value(lit_scale(win, (probe - win_base) as usize, lit_lens), ml);
                 // An empty incumbent (no tree candidate) prices 0 — the
-                // baseline the rep probe must beat (lazy_value would read
-                // past its MIN_MATCH contract on the len-0 sentinel).
+                // baseline the rep probe must beat (the scale function
+                // would read past its MIN_MATCH contract on the len-0
+                // sentinel).
                 let incumbent = if best.len > 0 {
-                    lazy_value(win, idx, best.len as usize, lit_lens) - lazy_price(best.off)
+                    scale_value(lit_scale(win, idx, lit_lens), best.len as usize)
+                        - lazy_price(best.off)
                 } else {
                     0
                 };
@@ -191,11 +199,9 @@ pub(crate) fn run_block_lazy(
         }
         miss = 0;
         let mut best_pos = pos;
-        let mut best_v = lazy_value(
-            win,
-            (best_pos - win_base) as usize,
+        let mut best_v = scale_value(
+            lit_scale(win, (best_pos - win_base) as usize, lit_lens),
             best.len as usize,
-            lit_lens,
         );
         let mut best_p = lazy_price(best.off);
 
@@ -226,6 +232,7 @@ pub(crate) fn run_block_lazy(
                         // Best repcode (longest; its off-base carries which
                         // repcode form won) and best non-rep (by
                         // value-minus-price) of the position.
+                        let scale2 = lit_scale(win, idx2, lit_lens);
                         let mut rep_m_best = Match { off: 0, len: 0 };
                         let mut cand = Match { off: 0, len: 0 };
                         let mut ss = i32::MIN;
@@ -236,8 +243,7 @@ pub(crate) fn run_block_lazy(
                                     rep_m_best = m;
                                 }
                             } else {
-                                let s = lazy_value(win, idx2, m.len as usize, lit_lens)
-                                    - lazy_price(m.off);
+                                let s = scale_value(scale2, m.len as usize) - lazy_price(m.off);
                                 if s > ss {
                                     ss = s;
                                     cand = m;
@@ -245,7 +251,7 @@ pub(crate) fn run_block_lazy(
                             }
                         }
                         if rep_m_best.len > 0 {
-                            let v = lazy_value(win, idx2, rep_m_best.len as usize, lit_lens);
+                            let v = scale_value(scale2, rep_m_best.len as usize);
                             if v * rep_mul / 4 > best_v * rep_mul / 4 - best_p + rep_m {
                                 best = rep_m_best;
                                 best_pos = p2;
@@ -254,7 +260,7 @@ pub(crate) fn run_block_lazy(
                             }
                         }
                         if ss != i32::MIN {
-                            let v = lazy_value(win, idx2, cand.len as usize, lit_lens);
+                            let v = scale_value(scale2, cand.len as usize);
                             let p = lazy_price(cand.off);
                             if v - p > best_v - best_p + search_m {
                                 best = cand;
