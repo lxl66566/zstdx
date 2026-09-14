@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Docs: the streaming-MT "checksum absorb off the calling thread" plan
+  (todo 12) is falsified and withdrawn — XXH64 admits no chunk-level
+  merge, and pool-pickup / sidecar-thread / fused-pump absorbs all
+  measure neutral-to-worse vs the existing fire-time calling-thread
+  absorb (which already overlaps the burst span); the fastest-tier
+  checksum residue is a resource tax, not a placement tax. No code
+  change; the placement stays.
 - MT decode staging buffers are pooled globally (256 MiB cap): every
   decode call used to map fresh multi-megabyte staging vectors per
   segment and pay their whole first-touch fault cost again (the encoder
