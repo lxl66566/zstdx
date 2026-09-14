@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Docs: the two open fastest-tier angles (todo 3) are falsified and
+  withdrawn — miss-run stepping (and its dense-insert / parse-statistic
+  gate variants) wins json on both axes (−3.2% size, +8.8% speed) but
+  regresses text's short-match coverage at every setting, and search-side
+  batched probing is output-neutral yet +3.8% instructions and −10..14%
+  wall (json's miss runs are 1-2 pairs; batching never amortizes). No
+  code change; the scan loop stands.
 - MT decode checksum verification moved off the serial post-pass into
   stage B: the executor absorbs each executed segment's output range into
   the frame's xxh64 stream the moment it is final (bytes hot in its
