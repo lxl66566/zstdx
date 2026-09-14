@@ -6,10 +6,9 @@
 
 ## P0 · Structural
 
-1. **Parallelize MT decode stage B** (reachback analysis + rep history prefix scan)
-   - Leapfrog dimension: libzstd has no MT decode; done well this jumps from a 0.71-1.11× liability to exclusive leadership.
-   - Status: mt2-16 has no scalability (serial stage B accounts for 45-80%; match copies 80% on skewed.zst9; fresh numbers in the [snapshot](bench/snapshot.md)).
-   - Approach: predict per-segment reachback depth to choose split points; replay rep prefixes ahead of time using stage A's sequence stream.
+1. **MT decode stage B** — parallelization falsified, residue landed (2026-09-15)
+   - Piece watermarks with exact per-sequence source gating were built and byte-correct, but shallow near-boundary reads (~100-400 B offsets) chain pieces serially — see [negative.md](negative.md); the serial-B + A/B-overlap structure stays. Landed instead: wildcopy staged execution, pooled staging buffers, zero-seq block fix (json.zst3 mt4 1.03→1.56×, skewed.zst9 0.71→1.24× on the 32 MiB matrix).
+   - Open: an encoder-side "deep-offset ramp" at job boundaries would make our own frames' stage B parallel-decodable (offsets at cut points guaranteed ≥ ramp depth); ratio cost of suppressing near matches at job starts is unmeasured.
 2. **MT decode path checksum verification**: explicitly unverified today (ST auto-verifies since `81d2119`); complete it and re-check the mismatch error behavior.
 
 ## P1 · Decoding speed
