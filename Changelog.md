@@ -4,6 +4,11 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- MT decode: a zero-sequence compressed block mid-segment (our own MT
+  encoder emits them on small-alphabet data at balanced levels) aborted
+  stage A with `MissingCompressionMode`. Stage A now skips sequence
+  decoding for them like the sequential path, keeping the scratch tables
+  and rejecting trailing bytes after the header with the same error.
 - btlazy: the depth-0 rep probe priced the empty incumbent through
   `lazy_value`'s MIN_MATCH contract (`{off: 0, len: 0}` sentinel from a
   candidate-less tree search) — `full_ladder_roundtrip` failed its debug

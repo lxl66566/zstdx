@@ -356,17 +356,32 @@ fn decode_segment(
                     .map_err(DecompressBlockError::from)
                     .map_err(block_body_err)? as usize;
                 let seqs_start = sequences.len();
-                decode_sequences_into(
-                    &seq_header,
-                    &seq_raw_all[seq_header_len..],
-                    &mut scratch.fse,
-                    &mut sequences,
-                )
-                .map_err(DecompressBlockError::from)
-                .map_err(block_body_err)?;
-                let match_bytes: usize =
-                    sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
-                out_size += literals.len() - lits_start + match_bytes;
+                if seq_header.num_sequences != 0 {
+                    decode_sequences_into(
+                        &seq_header,
+                        &seq_raw_all[seq_header_len..],
+                        &mut scratch.fse,
+                        &mut sequences,
+                    )
+                    .map_err(DecompressBlockError::from)
+                    .map_err(block_body_err)?;
+                    let match_bytes: usize =
+                        sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
+                    out_size += literals.len() - lits_start + match_bytes;
+                } else {
+                    // Zero-sequence block: the FSE tables stay untouched (the
+                    // scratch carries them across blocks). The sequential
+                    // path rejects trailing bytes after the header.
+                    let rest = &seq_raw_all[seq_header_len..];
+                    if !rest.is_empty() {
+                        return Err(block_body_err(DecompressBlockError::DecodeSequenceError(
+                            crate::decoding::errors::DecodeSequenceError::ExtraBits {
+                                bits_remaining: rest.len() as isize * 8,
+                            },
+                        )));
+                    }
+                    out_size += literals.len() - lits_start;
+                }
                 blocks.push(BlockPlan::Compressed {
                     lits: lits_start..literals.len(),
                     seqs: seqs_start..sequences.len(),
@@ -856,6 +871,32 @@ mod tests {
         let n = decode_all_mt(&tiny_c, &mut a, 4, MAX_WINDOW).unwrap();
         assert_eq!(n, decoder.decode_all(&tiny_c, &mut b).unwrap());
         assert_eq!(a, b);
+    }
+
+    /// A zero-sequence compressed block mid-segment (our MT encoder emits
+    /// them on small-alphabet data at balanced levels) must stage exactly
+    /// like the sequential path: FSE tables untouched, literals appended,
+    /// no mode byte in the section.
+    #[test]
+    fn zero_sequence_blocks_decode() {
+        let mut state = 7u64;
+        let alphabet: Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let mut data = Vec::with_capacity(8 * 1024 * 1024);
+        while data.len() < 8 * 1024 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push(alphabet[((state >> 33) as usize) % 16]);
+        }
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::from_zstd(9)).workers(4))
+                .unwrap();
+        let mut out = vec![0u8; data.len()];
+        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        assert_eq!(&out[..n], &data[..]);
+        let mut vec_out = Vec::new();
+        decode_to_vec_mt(&compressed, &mut vec_out, 4, MAX_WINDOW).unwrap();
+        assert_eq!(vec_out, data);
     }
 
     /// Corrupt input must surface an error, not silent garbage.

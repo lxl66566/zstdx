@@ -27,6 +27,7 @@ Results: 64MiB text 2/4/8 workers = 2.05×/3.95×/7.55× (ratio loss <0.1%); 32M
 - **restart-point segmentation**: block headers are pre-scanned and segments cut where entropy state is self-describing (literals not Treeless, no Repeat FSE streams); job-style encoders (zstd `-T` and our MT encoder) produce exactly these points at every job boundary; multi-frame input = a special case of clean-start units, unified in one unit dispatcher.
 - stage A (worker pool) entropy-decodes in parallel, producing packed sequence streams + exact output sizes; stage B (calling thread, in input order) executes into the output and carries the rep history — the repcode is the only cross-sequence state and never touches stage A.
 - dictionary frames, malformed, single restart, single core → serial fallback (error reporting belongs to the serial path).
+- pitfall: zero-sequence compressed blocks mid-segment (our MT encoder emits them on small-alphabet data at balanced levels) used to abort stage A with `MissingCompressionMode` — the serial path never builds FSE tables for them; stage A must skip the sequence decode too (2026-09-15 fix, regression test in `mt.rs`).
 - **current status**: 64MiB 2.06×(4T)/2.10×(8T) with no scaling beyond; stage B serial occupies 45-80% (skewed.zst9 match copies 80%), and stage A parallelism only adds noise. Parallelizing stage B (reachback analysis + rep history prefix scan) is the biggest TODO — done well it jumps from a 0.66-1.0× liability to exclusive leadership.
 
 ## Streaming encode/decode (ST)
