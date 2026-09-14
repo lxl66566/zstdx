@@ -1,5 +1,7 @@
 # Perf vs zstd crate · current snapshot (2026-09-14)
 
+> **Addendum 2026-09-14 (post-pass, `0d45b5c`)**: the Best tier moved to libzstd's DUBT finder after this pass — json.best x1.627 (was x2.16) at ratio 6.25, text.best x1.184 (was x1.60) at −0.45% vs zstd-13, skewed x2.87 (was x3.71); json.best stream ST x1.69 (was x4.05), stream-mt8 **x0.93 — ahead of zstd** (was x3.31), text.best stream x1.79 (was x2.60). The 120-cell ratio sweep re-ran clean: geo-mean +8.27% (was +8.23%), best cells +0.62-0.77% denser than zstd. Full re-pass pending the next snapshot day.
+
 > Fresh full pass at `ad57445` (one day, one machine, one corpus, same flags as the 09-12 pass; the six intervening encoder-perf commits are all byte-identical-output, so every ratio column reproduces exactly and only speed moved). Raw tables + per-section commands: [matrix.md](matrix.md). Comparison target: zstd crate / libzstd 1.5.7 (zstdmt), rustc 1.100.0-nightly, AMD Zen4-class 32C (Eng Sample 100-000000870-32_Y). Ladder pairs numeric levels (fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19). Caveats: ±10% noise between runs; per-side budget 1.5-2s; dec-st/enc-st/enc-stream double-passed, enc-mt/dec-mt single-pass.
 
 ## Headline
