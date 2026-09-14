@@ -199,6 +199,11 @@ struct LevelParams {
     /// Run the gear-hash long-distance matcher as an extra candidate
     /// source for the chain scan (see [`super::ldm`]).
     ldm: bool,
+    /// Chain search-domain override (the walk's reach), for rows whose
+    /// far distance classes ride LDM candidates instead of the window:
+    /// the window (frame header, buffer, LDM reach) stays the row's
+    /// `window`; `None` keeps search domain == window.
+    chain_reach: Option<usize>,
 }
 
 const fn fast(hash_log: u32, window: usize) -> LevelParams {
@@ -211,6 +216,7 @@ const fn fast(hash_log: u32, window: usize) -> LevelParams {
         min_match: MIN_MATCH as u32,
         dubt_head: false,
         ldm: false,
+        chain_reach: None,
     }
 }
 
@@ -224,6 +230,7 @@ const fn dfast(hash_log: u32, small_log: u32, window: usize) -> LevelParams {
         min_match: MIN_MATCH as u32,
         dubt_head: false,
         ldm: false,
+        chain_reach: None,
     }
 }
 
@@ -243,6 +250,7 @@ const fn chain(
         min_match: 5,
         dubt_head: false,
         ldm: false,
+        chain_reach: None,
     }
 }
 
@@ -259,6 +267,13 @@ const fn with_ldm(mut p: LevelParams) -> LevelParams {
     p
 }
 
+/// `chain` with the search domain (walk reach) narrowed below the window:
+/// LDM candidates carry the classes beyond it.
+const fn with_chain_reach(mut p: LevelParams, reach: usize) -> LevelParams {
+    p.chain_reach = Some(reach);
+    p
+}
+
 const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
     LevelParams {
         hash_log,
@@ -269,6 +284,7 @@ const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         min_match: knobs.min_match,
         dubt_head: false,
         ldm: false,
+        chain_reach: None,
     }
 }
 
@@ -282,6 +298,7 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         min_match: knobs.mls,
         dubt_head: false,
         ldm: false,
+        chain_reach: None,
     }
 }
 
@@ -400,7 +417,12 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     // DUBT tree: the chain's newest-first selection accepts nearer-shorter
     // candidates while no cross-tile history exists yet (the text
     // cold-start deficit), which the tree's oldest-first order closes.
-    with_head(chain(21, 20, 1 << 22, 8, 2)),
+    // LDM adds the gear-hash candidate source for the window's far
+    // distance classes (see [`super::ldm`]).
+    with_ldm(with_head(with_chain_reach(
+        chain(21, 20, 1 << 26, 8, 2),
+        1 << 22,
+    ))),
     chain(22, 21, 1 << 22, 16, 2),
     chain(22, 21, 1 << 22, 32, 2),
     chain(23, 22, 1 << 22, 32, 2),
@@ -469,6 +491,7 @@ fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
     // Non-power-of-two windows (the Fastest row's 768 KiB) round up.
     let wlog = (64 - (p.window as u64 - 1).leading_zeros()).min(src_log);
     p.window = 1usize << wlog;
+    p.chain_reach = p.chain_reach.map(|r| r.min(p.window));
     p.hash_log = p.hash_log.min(wlog + 1);
     p.strategy = match p.strategy {
         Strategy::Dfast(small) => Strategy::Dfast(small.min(wlog + 1)),
@@ -1285,6 +1308,17 @@ impl MatchGeneratorDriver {
         params_for(level, shape).window as u64
     }
 
+    /// The multithreaded job strip: the dense matchers' search domain.
+    /// LDM rows keep a wide frame window (their far reach) but only the
+    /// chain's domain needs cross-job strip coverage — within a job the
+    /// LDM table accumulates over the job's own span, and distances beyond
+    /// the strip are a bounded per-job loss against the strip-fill and
+    /// job-size cost a full-window strip would charge.
+    pub fn strip_for_level(level: Level, shape: InputShape) -> u64 {
+        let p = params_for(level, shape);
+        p.chain_reach.unwrap_or(p.window) as u64
+    }
+
     /// Largest block the frame may carry: the format caps blocks at the
     /// declared window (RFC 8878: Block_Maximum_Size = min(window, 128K)),
     /// so a forced or downsized window below 128 KiB shrinks the blocks.
@@ -2000,7 +2034,11 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
             Strategy::Chain(_) => {
                 self.ldm_generate();
-                self.start_matching_chain(literals, seqs);
+                if self.params.ldm {
+                    self.start_matching_chain::<true>(literals, seqs);
+                } else {
+                    self.start_matching_chain::<false>(literals, seqs);
+                }
             },
             Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
             Strategy::BtLazy(knobs) => self.start_matching_btlazy(knobs, literals, seqs),
@@ -3005,7 +3043,11 @@ impl MatchGeneratorDriver {
     /// and defer emission across up to `lazy_depth` further positions when
     /// a longer match may start there — libzstd's lazy family.
     #[allow(clippy::too_many_lines)]
-    fn start_matching_chain(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+    fn start_matching_chain<const LDM: bool>(
+        &mut self,
+        literals: &mut Vec<u8>,
+        seqs: &mut Vec<SeqWord>,
+    ) {
         let win = window_slice(&self.win, self.ext.as_ref());
         let chain = &mut self.chain[..];
         let chain_mask = chain.len() - 1;
@@ -3015,7 +3057,7 @@ impl MatchGeneratorDriver {
         let search_depth = self.params.search_depth as usize;
         let lazy_depth = self.params.lazy_depth;
         let min_match = self.params.min_match as usize;
-        let max_window = self.params.window as u64;
+        let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
         // fast loop's note on the same SROA failure); emits go through the
@@ -3044,6 +3086,11 @@ impl MatchGeneratorDriver {
         let mut seed_hits = self.seed_hits;
         let mut seed_budget = self.seed_budget;
         let lit_lens = &self.lit_lens;
+        // Long-distance candidates of this block ([`Self::ldm_generate`]):
+        // `ldm_i` is the first unconsumed one; covered candidates (their
+        // split lies behind the anchor) are dropped as emissions advance.
+        let ldm_seqs = &self.ldm_seqs[..];
+        let mut ldm_i = 0usize;
 
         // Chain-walk search from the hash head `entry` at window index `idx`,
         // returning the longest match's (length, candidate window index):
@@ -3076,7 +3123,7 @@ impl MatchGeneratorDriver {
         // literal, so the phase-only paths constant-fold away in the steady
         // instantiation.
         macro_rules! scan_chain {
-            ($restart:lifetime, $gated:literal) => {
+            ($restart:lifetime, $gated:literal, $ldm:expr) => {
             let idx = (pos - win_base) as usize;
             // Hash and head read once per position: the search, and the
             // insert below (whose chain link wants the same previous head),
@@ -3106,6 +3153,34 @@ impl MatchGeneratorDriver {
                 pre1.1 = unsafe { *table_ptr.add(pre1.0) };
             }
             let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry);
+
+            // Long-distance candidate ([`super::ldm`]): a split whose far
+            // 64-byte-window twin the sparse table retained. Probed before
+            // the rep probe (which may advance pos past the split) and
+            // after the chain search — a plain length competition; the
+            // store gate and the lazy walk price the far offset. The live
+            // length re-derivation cannot fall below MIN_MATCH_LENGTH
+            // against the same bytes generation verified.
+            if $ldm && ldm_i < ldm_seqs.len() {
+                while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < anchor {
+                    ldm_i += 1;
+                }
+                if ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split == pos {
+                    let seq = ldm_seqs[ldm_i];
+                    ldm_i += 1;
+                    let cand_abs = pos - seq.offset as u64;
+                    if cand_abs >= win_base {
+                        let ci = (cand_abs - win_base) as usize;
+                        if read4(win, ci) == read4(win, idx) {
+                            let ml = extend_match(win, idx, ci);
+                            if ml > best_len {
+                                best_len = ml;
+                                best_cand = ci;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Repcode probe first when armed: with literals pending it runs
             // at the current position, otherwise one byte ahead so that
@@ -3199,7 +3274,15 @@ impl MatchGeneratorDriver {
                 // and skipping over sparse-match gaps is what keeps the
                 // Balanced levels fast on them.
                 miss_count += 1;
-                pos += 1 + (miss_count >> 2).min(255) as u64;
+                let step = 1 + (miss_count >> 2).min(255) as u64;
+                if $ldm && ldm_i < ldm_seqs.len() {
+                    // Never step over an unconsumed split: its candidate
+                    // dies with the position (the scan is its only
+                    // consumer).
+                    pos = (pos + step).min(ldm_seqs[ldm_i].split);
+                } else {
+                    pos += step;
+                }
                 continue $restart;
             }
             miss_count = 0;
@@ -3392,10 +3475,10 @@ impl MatchGeneratorDriver {
         'seeded: while (rep_pending != 0 || seed_offset != 0)
             && block_end.saturating_sub(pos) >= hash_read
         {
-            scan_chain!('seeded, true);
+            scan_chain!('seeded, true, LDM);
         }
         'restart: while block_end.saturating_sub(pos) >= hash_read {
-            scan_chain!('restart, false);
+            scan_chain!('restart, false, LDM);
         }
         if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
@@ -3602,6 +3685,41 @@ mod tests {
         v
     }
 
+    /// [`match_and_reconstruct`] at the default block size, recording every
+    /// emitted sequence's offset.
+    fn match_and_reconstruct_collecting_offsets(data: &[u8], offsets: &mut Vec<usize>) -> Vec<u8> {
+        let mut driver = MatchGeneratorDriver::new(128 * 1024);
+        driver.reset(crate::Level::Balanced);
+        let mut rep = [1u32, 4, 8];
+        let mut reconstructed = Vec::new();
+        for block in data.chunks(128 * 1024) {
+            driver.block_tail()[..block.len()].copy_from_slice(block);
+            driver.commit_block(block.len());
+            driver.start_matching(|seq| match seq {
+                Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => {
+                    reconstructed.extend_from_slice(literals);
+                    offsets.push(offset);
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    );
+                    let start = reconstructed.len() - actual as usize;
+                    for i in 0..match_len {
+                        let b = reconstructed[start + i];
+                        reconstructed.push(b);
+                    }
+                },
+            });
+        }
+        reconstructed
+    }
+
     /// Feed `data` through the matcher one block at a time and reconstruct the
     /// original from the emitted sequences.
     fn match_and_reconstruct(data: &[u8], block_size: usize) -> Vec<u8> {
@@ -3698,6 +3816,51 @@ mod tests {
             data.extend(&[7u8; 63]);
         }
         assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
+    }
+
+    #[test]
+    /// Far repeats beyond the chain reach must ride LDM candidates: two
+    /// copies of a random block 5 MiB apart inside filler, compressed at
+    /// the balanced row (window W26, chain reach W22). The parse is only
+    /// legal if some sequence references the far class.
+    #[test]
+    fn ldm_row_covers_beyond_chain_reach() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let block: Vec<u8> = (0..(64 * 1024)).map(|_| (rand() >> 32) as u8).collect();
+        let mut data = Vec::with_capacity(5 * 1024 * 1024 + block.len() * 2);
+        data.extend_from_slice(&block);
+        data.extend((0..(5 << 20)).map(|_| (rand() >> 32) as u8));
+        data.extend_from_slice(&block);
+        let mut offsets = Vec::new();
+        let reconstructed = match_and_reconstruct_collecting_offsets(&data, &mut offsets);
+        assert_eq!(reconstructed, data);
+        assert!(
+            offsets.iter().any(|&o| o > (1 << 22)),
+            "no sequence beyond the chain reach: LDM far class missing"
+        );
+    }
+
+    /// dll corpus roundtrips through the balanced row's LDM path, when the
+    /// generated large-binary corpus is present (gitignored; built by
+    /// bench/gen_big.sh): dll100 exercises the full W26 reach, dll32 the
+    /// source-clamped window.
+    #[test]
+    #[cfg(feature = "std")]
+    fn ldm_dll_roundtrip() {
+        for name in ["bench/big/dll100.raw", "bench/big/dll32.raw"] {
+            let Ok(raw) = std::fs::read(name) else {
+                continue;
+            };
+            let c = crate::encoding::compress_slice_opts(&raw, crate::Level::Balanced, false);
+            let d = crate::bulk::decompress(&c, raw.len()).expect("decode");
+            assert_eq!(d, raw, "{name}");
+        }
     }
 
     #[test]

@@ -89,13 +89,16 @@ pub fn compress_slice_mt(
         len: Some(src.len() as u64),
         window_log,
     };
-    let window = MatchGeneratorDriver::window_for_level(level, shape);
-    // The full window as strip: the strip is fully indexed (see
+    // The dense matchers' domain as strip: the strip is fully indexed (see
     // `prefill_window`), so matches reach across job borders as far as the
-    // frame window allows. A shorter strip caps the ratio at repeats that
+    // dense search does. A shorter strip caps the ratio at repeats that
     // fit inside it — the text corpus's ~800K period against a 1 MiB window
-    // collapsed the multithreaded ratio by an order of magnitude.
-    let overlap = window as usize;
+    // collapsed the multithreaded ratio by an order of magnitude. LDM rows
+    // decouple the two (a wide frame window for far reach, a narrow strip):
+    // a full-window strip would scale the job floor with the LDM reach and
+    // starve parallelism.
+    let window = MatchGeneratorDriver::window_for_level(level, shape);
+    let overlap = MatchGeneratorDriver::strip_for_level(level, shape) as usize;
     let job_size = job_size_for(src.len() as u64, workers, overlap);
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
