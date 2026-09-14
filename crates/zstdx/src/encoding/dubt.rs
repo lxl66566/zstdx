@@ -12,6 +12,12 @@
 //! never reaches stay unsorted forever — match interiors and stepped-over
 //! positions pay nothing beyond the fill, which is the whole speed point.
 //!
+//! Like libzstd (and unlike the opt tree), entries are **u32**: the tree
+//! ring and hash heads are random-access working sets sized by the window
+//! (48 MiB at W22), where entry width is the dominant lever — the u64 form
+//! measured x2.87 vs libzstd on skewed.best, memory-latency-bound (200M L1
+//! + 100M dTLB misses per 32 MiB, one serialized load per tree step).
+//!
 //! Slot layout per ring position: `[0]` is the chain link while unsorted
 //! and the smaller child once sorted; `[1]` is the unsorted mark (or the
 //! backtrack link during a search's chain walk) and the larger child once
@@ -24,21 +30,45 @@
 
 use super::opt::{Match, OPT_NUM, count_from, hash3_at, hash4_at, hash5_at, read4};
 
-/// Marks a node as inserted but not yet sorted. Positions stay far below
-/// bit 63 (the opt tree's `POS_MASK` premise), so the sentinel cannot
-/// collide with a real entry.
-const UNSORTED: u64 = 1 << 63;
+/// Marks a node as inserted but not yet sorted. The value 1 is also
+/// position 1's stored form: a child pointer to it misreads as unsorted,
+/// which at worst re-sorts an already-sorted node — bounded by the descent
+/// budget and byte verification, the same ambiguity libzstd documents in
+/// `ZSTD_insertDUBT1`.
+const UNSORTED: u32 = 1;
 
-/// The DUBT finder: hash heads (`table`, raw positions) plus the two-slot
-/// ring (`bt`).
+/// Storage bias (kept at zero so outputs stay byte-identical to the u64
+/// form: position 0's entry reads as the null link and position 1's as the
+/// unsorted mark, exactly the sentinel collisions the u64 port carried).
+const POS_BIAS: u64 = 0;
+
+/// Truncate a position to its stored u32 form.
+#[inline(always)]
+fn pack_pos(pos: u64) -> u32 {
+    (pos + POS_BIAS) as u32
+}
+
+/// Rebuild the absolute position of stored entry `v` read while scanning
+/// `pos`. Candidates are window-bounded (far below 4 GiB away), so the
+/// entry's high bits are implied by `pos`; a stale entry from an earlier
+/// 4 GiB period rebuilds as a phantom inside that band, which the range
+/// checks reject or the byte compare verifies — it can only waste work.
+#[inline(always)]
+fn unpack_pos(v: u32, pos: u64) -> u64 {
+    pos.wrapping_sub((pos as u32).wrapping_sub(v) as u64)
+        .wrapping_sub(POS_BIAS)
+}
+
+/// The DUBT finder: hash heads (`table`) plus the two-slot ring (`bt`),
+/// both u32 like libzstd's btlazy2 tables.
 pub(crate) struct DubtFinder<'a, 'b> {
     pub(crate) win: &'a [u8],
     pub(crate) win_base: u64,
     pub(crate) block_end_idx: usize,
     pub(crate) max_window: u64,
-    pub(crate) table: &'b mut [u64],
+    pub(crate) table: &'b mut [u32],
     pub(crate) table_log: u32,
-    pub(crate) bt: &'b mut [u64],
+    pub(crate) bt: &'b mut [u32],
     pub(crate) bt_mask: usize,
     pub(crate) mls: usize,
     pub(crate) nb_compares: usize,
@@ -79,11 +109,11 @@ impl DubtFinder<'_, '_> {
             let bt = self.bt.as_mut_ptr();
             while idx < target_idx {
                 let h = self.hash_main(idx);
-                let pos = self.win_base + idx as u64;
-                let slot = bt.add(2 * (pos as usize & self.bt_mask));
+                let v = pack_pos(self.win_base + idx as u64);
+                let slot = bt.add(2 * (v as usize & self.bt_mask));
                 *slot = *table.add(h);
                 *slot.add(1) = UNSORTED;
-                *table.add(h) = pos;
+                *table.add(h) = v;
                 idx += 1;
             }
         }
@@ -97,19 +127,25 @@ impl DubtFinder<'_, '_> {
     fn insert_dubt1(&mut self, curr: u64, mut nb: usize, unsort_limit: u64) {
         let floor = self.cand_floor(curr);
         let curr_idx = (curr - self.win_base) as usize;
+        // The null link rebuilds as a huge position, so the range checks
+        // below reject it without a separate test.
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
-        let mut dummy = 0u64;
+        let mut dummy = 0u32;
         // SAFETY: ring slots are masked by construction; window reads stay
         // inside the block (count_from caps at block_end and the equal-tail
         // break precedes the ordering byte compare).
         unsafe {
             let bt = self.bt.as_mut_ptr();
-            let own = bt.add(2 * (curr as usize & self.bt_mask));
-            let mut smaller: *mut u64 = own;
-            let mut larger: *mut u64 = own.add(1);
-            let mut cand = *smaller; // the fill-time chain link
-            while nb > 0 && cand != 0 && cand > floor && cand < curr {
+            let own = bt.add(2 * (pack_pos(curr) as usize & self.bt_mask));
+            let mut smaller: *mut u32 = own;
+            let mut larger: *mut u32 = own.add(1);
+            let mut v = *smaller; // the fill-time chain link
+            while nb > 0 {
+                let cand = unpack_pos(v, curr);
+                if !(cand > floor && cand < curr) {
+                    break;
+                }
                 nb -= 1;
                 let cidx = (cand - self.win_base) as usize;
                 let mut ml = common_smaller.min(common_larger);
@@ -119,25 +155,25 @@ impl DubtFinder<'_, '_> {
                 if curr_idx + ml >= self.block_end_idx {
                     break;
                 }
-                let node = bt.add(2 * (cand as usize & self.bt_mask));
+                let node = bt.add(2 * (v as usize & self.bt_mask));
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(curr_idx + ml) {
-                    *smaller = cand;
+                    *smaller = v;
                     common_smaller = ml;
                     if cand <= unsort_limit {
                         smaller = &raw mut dummy;
                         break;
                     }
                     smaller = node.add(1);
-                    cand = *node.add(1);
+                    v = *node.add(1);
                 } else {
-                    *larger = cand;
+                    *larger = v;
                     common_larger = ml;
                     if cand <= unsort_limit {
                         larger = &raw mut dummy;
                         break;
                     }
                     larger = node;
-                    cand = *node;
+                    v = *node;
                 }
             }
             *smaller = 0;
@@ -217,8 +253,12 @@ impl DubtFinder<'_, '_> {
             // Walk the unsorted chain from the head, reversing slot[1] into
             // a backtrack link toward newer nodes.
             let mut cand = *self.table.as_ptr().add(h);
-            let mut prev = 0u64;
-            while cand != 0 && cand > unsort_limit && cand < pos {
+            let mut prev = 0u32;
+            loop {
+                let cand_abs = unpack_pos(cand, pos);
+                if !(cand_abs > unsort_limit && cand_abs < pos) {
+                    break;
+                }
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
                 if *node.add(1) != UNSORTED || nb_candidates <= 1 {
                     break;
@@ -231,11 +271,16 @@ impl DubtFinder<'_, '_> {
             // Nullify the chain's far end: the boundary node becomes a
             // leaf and everything older in this bucket is orphaned —
             // libzstd's deliberate ratio-for-speed trade.
-            if cand != 0 && cand > unsort_limit && cand < pos {
-                let node = bt.add(2 * (cand as usize & self.bt_mask));
-                if *node.add(1) == UNSORTED {
-                    *node = 0;
-                    *node.add(1) = 0;
+            {
+                // The null link (cand == 0) rebuilds huge and fails this
+                // range check, so it skips the nullify block too.
+                let cand_abs = unpack_pos(cand, pos);
+                if cand_abs > unsort_limit && cand_abs < pos {
+                    let node = bt.add(2 * (cand as usize & self.bt_mask));
+                    if *node.add(1) == UNSORTED {
+                        *node = 0;
+                        *node.add(1) = 0;
+                    }
                 }
             }
             // Batch-sort the walked nodes oldest-to-newest; the backtrack
@@ -244,7 +289,7 @@ impl DubtFinder<'_, '_> {
             while m != 0 {
                 let node = bt.add(2 * (m as usize & self.bt_mask));
                 let newer = *node.add(1);
-                self.insert_dubt1(m, nb_candidates, unsort_limit);
+                self.insert_dubt1(unpack_pos(m, pos), nb_candidates, unsort_limit);
                 m = newer;
                 nb_candidates += 1;
             }
@@ -252,42 +297,47 @@ impl DubtFinder<'_, '_> {
             // Sorted descent from the head, threading `pos` into the tree
             // while collecting strictly improving candidates.
             let head = *self.table.as_ptr().add(h);
-            *self.table.as_mut_ptr().add(h) = pos;
+            *self.table.as_mut_ptr().add(h) = pack_pos(pos);
             let mut cand = head;
             let mut common_smaller = 0usize;
             let mut common_larger = 0usize;
             let mut nb = self.nb_compares;
-            let mut dummy = 0u64;
-            let own = bt.add(2 * (pos as usize & self.bt_mask));
-            let mut smaller: *mut u64 = own;
-            let mut larger: *mut u64 = own.add(1);
-            while nb > 0 && cand != 0 && cand > floor && cand < pos {
+            let mut dummy = 0u32;
+            let own = bt.add(2 * (pack_pos(pos) as usize & self.bt_mask));
+            let mut smaller: *mut u32 = own;
+            let mut larger: *mut u32 = own.add(1);
+            while nb > 0 {
+                let cand_abs = unpack_pos(cand, pos);
+                if !(cand_abs > floor && cand_abs < pos) {
+                    break;
+                }
                 nb -= 1;
-                let cidx = (cand - self.win_base) as usize;
+                let cidx = (cand_abs - self.win_base) as usize;
                 let mut ml = common_smaller.min(common_larger);
                 ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+                let at_end = idx + ml >= self.block_end_idx;
                 if ml > best_len {
-                    if cand + ml as u64 > match_end {
-                        match_end = cand + ml as u64;
+                    if cand_abs + ml as u64 > match_end {
+                        match_end = cand_abs + ml as u64;
                     }
                     best_len = ml;
                     matches[mnum] = Match {
-                        off: (pos - cand + 3) as u32,
+                        off: (pos - cand_abs + 3) as u32,
                         len: ml as u32,
                     };
                     mnum += 1;
-                    if ml > OPT_NUM || idx + ml >= self.block_end_idx {
+                    if ml > OPT_NUM || at_end {
                         break;
                     }
                 }
-                if idx + ml >= self.block_end_idx {
+                if at_end {
                     break;
                 }
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
                     *smaller = cand;
                     common_smaller = ml;
-                    if cand <= bt_low {
+                    if cand_abs <= bt_low {
                         smaller = &raw mut dummy;
                         break;
                     }
@@ -296,7 +346,7 @@ impl DubtFinder<'_, '_> {
                 } else {
                     *larger = cand;
                     common_larger = ml;
-                    if cand <= bt_low {
+                    if cand_abs <= bt_low {
                         larger = &raw mut dummy;
                         break;
                     }
