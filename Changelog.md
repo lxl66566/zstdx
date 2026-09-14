@@ -4,6 +4,27 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Level 9 (Balanced) frames now parse their cold-start head (first
+  1.125 MiB) through the DUBT/btlazy2 machinery before the chain scan
+  takes over. The chain's newest-first candidate order accepts
+  nearer-shorter matches while its tables are still filling, which was
+  the entire text.Balanced deficit (localized to the first cold-start
+  tile); the tree's oldest-first order closes exactly that span. The
+  handoff dense-indexes the head region into the chain tables via the
+  existing catch-up fill, so later blocks match into it at full
+  resolution. Three gates keep the head where it wins: genuine frame
+  starts only (mt job zero's empty strip; dictionary/strip-warm starts
+  disarm), declared-or-unknown lengths >= 4 MiB, and >= 48 distinct
+  bytes in the first parsed block (small-symbol alphabets collapse the
+  tree's batch sort, and the corpus json at 39 distinct bytes keeps the
+  chain selection that carries its +19.5% density — both stay
+  byte-identical). Corpus A/B: text.balanced -2.49 -> +2.24% vs zstd-9
+  (stream-st +2.26; mt cells -2.73 -> +8.8), json/skewed byte-identical
+  in all modes; text solo speed 1305 -> ~505 MiB/s (bounded per-frame
+  head cost), json/skewed/dll100 speeds unchanged (dll100 -0.07% size).
+  Whole-tier DUBT rows were measured and rejected first: the json
+  density is the chain selection's, not the strategy class (see
+  docs/src/dev/negative.md).
 - MT decode checksum verification moved off the serial post-pass into
   stage B: the executor absorbs each executed segment's output range into
   the frame's xxh64 stream the moment it is final (bytes hot in its

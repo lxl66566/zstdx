@@ -192,6 +192,9 @@ struct LevelParams {
     /// Shortest hash-chain match worth emitting; libzstd's searchLength.
     /// Repcode matches stay legal from MIN_MATCH up.
     min_match: u32,
+    /// Parse the frame's cold-start head through the btlazy2 driver before
+    /// this row's chain takes over (see [`HEAD_LIMIT`]).
+    dubt_head: bool,
 }
 
 const fn fast(hash_log: u32, window: usize) -> LevelParams {
@@ -202,6 +205,7 @@ const fn fast(hash_log: u32, window: usize) -> LevelParams {
         search_depth: 1,
         lazy_depth: 0,
         min_match: MIN_MATCH as u32,
+        dubt_head: false,
     }
 }
 
@@ -213,6 +217,7 @@ const fn dfast(hash_log: u32, small_log: u32, window: usize) -> LevelParams {
         search_depth: 0,
         lazy_depth: 0,
         min_match: MIN_MATCH as u32,
+        dubt_head: false,
     }
 }
 
@@ -230,7 +235,14 @@ const fn chain(
         search_depth,
         lazy_depth,
         min_match: 5,
+        dubt_head: false,
     }
+}
+
+/// `chain` with the cold-start DUBT head enabled (row 9).
+const fn with_head(mut p: LevelParams) -> LevelParams {
+    p.dubt_head = true;
+    p
 }
 
 const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
@@ -241,6 +253,7 @@ const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         search_depth: 0,
         lazy_depth: 0,
         min_match: knobs.min_match,
+        dubt_head: false,
     }
 }
 
@@ -252,6 +265,7 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         search_depth: 0,
         lazy_depth: 2,
         min_match: knobs.mls,
+        dubt_head: false,
     }
 }
 
@@ -272,6 +286,48 @@ const fn bt_knobs(search_log: u32, bt_log: u32) -> OptKnobs {
         hash3_log: 0,
         ultra: false,
     }
+}
+
+/// Cold-start DUBT head (row 9): the span of frame-start blocks parsed
+/// through the btlazy2 driver before the chain takes over. The chain's
+/// newest-first selection is the balanced tier's json edge but accepts
+/// nearer-shorter candidates while the tables are still filling (text's
+/// cold-start tile deficit); the tree's oldest-first order closes exactly
+/// that window, and after it the chain parses at parity. The span covers
+/// the measured deficit (the corpus's first tile, 768 KiB) plus the tile
+/// behind it: matches into the freshly covered region are tree-selected
+/// too, worth more than the head's own span again on the tiled corpus.
+const HEAD_LIMIT: u64 = 9 * crate::common::MAX_BLOCK_SIZE as u64;
+/// Frames shorter than this keep the pure chain parse: a head would cover
+/// the whole input (small payloads are all cold start, and json-class
+/// smalls favor the chain's selection).
+const HEAD_MIN_TOTAL: u64 = 4 << 20;
+/// Distinct bytes required in the first parsed block for the head to run:
+/// on small-symbol alphabets the tree's batch sort collapses at any search
+/// depth (skewed), while the chain's selection there has no deficit.
+const HEAD_SYMS_MIN: u32 = 48;
+/// Head-table log (the heads table the btlazy bridge sizes from
+/// `opt_table`); the ring and search knobs ride [`HEAD_KNOBS`].
+const HEAD_HASH_LOG: u32 = 20;
+/// Head knobs: S4 search (libzstd's L13 depth — shallower trees accept
+/// nearer-shorter candidates again, S1-S3 measured at -1.3 to -4.4% vs
+/// zstd-9) over a 1 MiB ring — head candidates never sit further back
+/// than the head span itself.
+const HEAD_KNOBS: OptKnobs = bt_knobs(4, 20);
+
+/// Lifecycle of the cold-start DUBT head (row 9, see [`HEAD_LIMIT`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HeadPhase {
+    /// Not running this frame: the row opts out, the input is too small,
+    /// the alphabet gate failed, or a strip/dictionary prefilled the start.
+    Off,
+    /// Armed at the frame start; the first parsed block evaluates the
+    /// alphabet gate and arms the head tables.
+    Armed,
+    /// Gate passed; head blocks parse through the btlazy2 driver.
+    Running,
+    /// The head parsed its span and handed off to the chain.
+    Done,
 }
 
 const fn knobs(
@@ -324,7 +380,11 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     chain(20, 19, 1 << 21, 8, 2),
     // 9: the Balanced tier's row. libzstd's L9 is W22; the chain stays
     // C20, aliasing beyond 1 MiB like libzstd's cLog-below-wLog chains.
-    chain(21, 20, 1 << 22, 8, 2),
+    // The cold-start head parses the first HEAD_LIMIT bytes through the
+    // DUBT tree: the chain's newest-first selection accepts nearer-shorter
+    // candidates while no cross-tile history exists yet (the text
+    // cold-start deficit), which the tree's oldest-first order closes.
+    with_head(chain(21, 20, 1 << 22, 8, 2)),
     chain(22, 21, 1 << 22, 16, 2),
     chain(22, 21, 1 << 22, 32, 2),
     chain(23, 22, 1 << 22, 32, 2),
@@ -1160,6 +1220,8 @@ pub struct MatchGeneratorDriver {
     /// Caller-declared input shape (see [`Matcher::set_input_shape`]);
     /// applied at the next `reset` via [`params_for`].
     shape: InputShape,
+    /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
+    dubt_head: HeadPhase,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -1231,6 +1293,7 @@ impl MatchGeneratorDriver {
             miss_count: 0,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            dubt_head: HeadPhase::Off,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1269,6 +1332,7 @@ impl MatchGeneratorDriver {
             miss_count: 0,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            dubt_head: HeadPhase::Off,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1432,6 +1496,15 @@ impl MatchGeneratorDriver {
     /// The opt tables need no clear (their entries carry the epoch, bumped
     /// per job).
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
+        // The head applies only to a genuinely cold start: a non-empty
+        // strip (mt jobs with history, dictionary content) is warm, while
+        // the empty strip is mt job zero — a frame start, so the head
+        // arms exactly as at reset (pooled states arrive here directly).
+        self.dubt_head = if data.is_empty() && self.head_eligible() {
+            HeadPhase::Armed
+        } else {
+            HeadPhase::Off
+        };
         clear_table(&mut self.table);
         // The DUBT finder's entries carry no epoch tag, so a job restarts
         // its tree from scratch regardless of strip length: cleared heads
@@ -1738,6 +1811,11 @@ impl Matcher for MatchGeneratorDriver {
         self.next_update = 0;
         self.gap_start = u64::MAX;
         self.gate_hold = false;
+        self.dubt_head = if self.head_eligible() {
+            HeadPhase::Armed
+        } else {
+            HeadPhase::Off
+        };
         self.opt_state.reset();
     }
 
@@ -1833,6 +1911,11 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        if self.head_block() {
+            self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
+            self.finish_head();
+            return;
+        }
         if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
             self.catch_up_insertions();
         }
@@ -3290,6 +3373,68 @@ impl MatchGeneratorDriver {
         self.anchor = block_end;
     }
 
+    /// Whether the cold-start DUBT head applies to this frame: the row
+    /// opts in and the input is large enough that the head stays a
+    /// minority share of the parse (a declared length below
+    /// [`HEAD_MIN_TOTAL`] would be parsed entirely by the head).
+    fn head_eligible(&self) -> bool {
+        self.params.dubt_head
+            && matches!(self.params.strategy, Strategy::Chain(_))
+            && self.shape.len.map_or(true, |l| l >= HEAD_MIN_TOTAL)
+    }
+
+    /// Dispatch guard for the cold-start DUBT head ([`HEAD_LIMIT`]): on
+    /// the first head block, evaluate the alphabet gate and arm the head
+    /// tables; true while this block parses through the btlazy2 driver.
+    fn head_block(&mut self) -> bool {
+        if self.dubt_head != HeadPhase::Armed || self.block_start >= HEAD_LIMIT {
+            if self.dubt_head == HeadPhase::Running && self.block_start >= HEAD_LIMIT {
+                // First dispatch past the span: a gated or RLE-skipped final
+                // head block never reaches the parser, so the handoff rides
+                // the first block that does (before its chain scan probes).
+                self.finish_head();
+            }
+            return self.dubt_head == HeadPhase::Running;
+        }
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let idx = self.idx_of(self.block_start);
+        let mut seen = [0u64; 4];
+        for &b in &win[idx..(idx + 8192).min(win.len())] {
+            seen[(b >> 6) as usize] |= 1 << (b & 63);
+        }
+        let syms: u32 = seen.iter().map(|w| w.count_ones()).sum();
+        if syms < HEAD_SYMS_MIN {
+            self.dubt_head = HeadPhase::Off;
+            return false;
+        }
+        if self.opt_table.len() == 1 << HEAD_HASH_LOG && self.bt.len() == 2 << HEAD_KNOBS.bt_log {
+            self.opt_table.fill(EMPTY);
+            self.bt.fill(EMPTY);
+        } else {
+            self.opt_table = alloc::vec![EMPTY; 1 << HEAD_HASH_LOG];
+            self.bt = alloc::vec![EMPTY; 2 << HEAD_KNOBS.bt_log];
+        }
+        if self.lazy_scratch.is_none() {
+            self.lazy_scratch = Some(LazyScratch::new());
+        }
+        self.dubt_head = HeadPhase::Running;
+        true
+    }
+
+    /// Head handoff after the block that crosses [`HEAD_LIMIT`]: the chain
+    /// takes over from the next block with the whole head region
+    /// dense-indexed into its tables (`gap_start` at the frame start
+    /// drives [`Self::catch_up_insertions`] before the next scan probes).
+    /// The head tables stay allocated for the pooled state's next frame.
+    fn finish_head(&mut self) {
+        if self.block_end >= HEAD_LIMIT {
+            self.dubt_head = HeadPhase::Done;
+            self.gap_start = 0;
+            self.miss_count = 0;
+            self.rep_pending = 0;
+        }
+    }
+
     /// Bridge into the btlazy2 parser (rows 13-15): the same tables and
     /// cursors as the opt bridge, no price state.
     fn start_matching_btlazy(
@@ -3906,5 +4051,159 @@ mod tests {
         };
         assert_eq!(run(), data);
         assert_eq!(run(), data, "job parse must be deterministic");
+    }
+
+    /// The cold-start DUBT head (row 9) must roundtrip a frame that spans
+    /// the head, the handoff's dense re-index, and the chain tail — on a
+    /// wide alphabet (head runs) and on a small one (the alphabet gate
+    /// keeps the chain pure) — and stay deterministic.
+    #[test]
+    fn dubt_head_roundtrips() {
+        let block = 128 * 1024;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Wide alphabet: text-like words over > HEAD_SYMS_MIN symbols, with
+        // a repeated sentence to give the head real matches.
+        let mut wide = Vec::with_capacity(5 << 20);
+        let sentence = b"the cold-start head parses this sentence over and over; ";
+        while wide.len() < 5 << 20 {
+            wide.extend_from_slice(sentence);
+            for _ in 0..8 {
+                wide.push(b' ' + (rand() % 64) as u8);
+            }
+        }
+        // Narrow alphabet: 16 symbols, above HEAD_MIN_TOTAL so only the
+        // alphabet gate can keep the chain pure.
+        let narrow: Vec<u8> = (0..5 << 20).map(|_| (rand() & 15) as u8).collect();
+        for (data, expect_head) in [(&wide[..], true), (&narrow[..], false)] {
+            let run = || {
+                let mut driver = MatchGeneratorDriver::new(block);
+                driver.reset(crate::Level::from_zstd(9));
+                let mut rep = [1u32, 4, 8];
+                let mut reconstructed = Vec::new();
+                for chunk in data.chunks(block) {
+                    driver.block_tail()[..chunk.len()].copy_from_slice(chunk);
+                    driver.commit_block(chunk.len());
+                    driver.start_matching(|seq| match seq {
+                        Sequence::Literals { literals } => {
+                            reconstructed.extend_from_slice(literals)
+                        },
+                        Sequence::Triple {
+                            literals,
+                            offset,
+                            match_len,
+                        } => {
+                            reconstructed.extend_from_slice(literals);
+                            let actual = crate::decoding::sequence_execution::do_offset_history(
+                                offset as u32,
+                                literals.len() as u32,
+                                &mut rep,
+                            );
+                            let from = reconstructed.len() - actual as usize;
+                            for i in 0..match_len {
+                                let b = reconstructed[from + i];
+                                reconstructed.push(b);
+                            }
+                        },
+                    });
+                }
+                (reconstructed, driver.dubt_head)
+            };
+            let (first, phase) = run();
+            assert_eq!(
+                first, *data,
+                "roundtrip failed (head expected {expect_head})"
+            );
+            assert_eq!(
+                phase,
+                if expect_head {
+                    super::HeadPhase::Done
+                } else {
+                    super::HeadPhase::Off
+                },
+                "head lifecycle (head expected {expect_head})"
+            );
+            assert_eq!(run().0, *data, "parse must be deterministic");
+        }
+    }
+
+    /// A gated (incompressible) block crossing `HEAD_LIMIT` must still
+    /// hand the head off to the chain: the handoff rides the first
+    /// dispatched block past the span, and the head region is
+    /// dense-indexed before the chain probes.
+    #[test]
+    fn dubt_head_hands_off_across_gated_block() {
+        let block = 128 * 1024;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut text = Vec::new();
+        let sentence = b"the gated block must not swallow the handoff; ";
+        while text.len() < block * 8 {
+            text.extend_from_slice(sentence);
+            // Wide-alphabet filler so the head's alphabet gate accepts.
+            for _ in 0..sentence.len() {
+                text.push(b' ' + (rand() % 64) as u8);
+            }
+        }
+        text.truncate(block * 8);
+        let mut random_block = Vec::with_capacity(block);
+        for _ in 0..block {
+            random_block.push((rand() >> 32) as u8);
+        }
+        let mut data = text.clone();
+        data.extend_from_slice(&random_block);
+        // The tail repeats the head region: post-handoff chain blocks must
+        // find matches reaching back into it.
+        data.extend_from_slice(&text);
+        data.extend_from_slice(&text);
+
+        let mut driver = MatchGeneratorDriver::new(block);
+        driver.reset(crate::Level::from_zstd(9));
+        let mut rep = [1u32, 4, 8];
+        let mut reconstructed = Vec::new();
+        for chunk in data.chunks(block) {
+            driver.block_tail()[..chunk.len()].copy_from_slice(chunk);
+            driver.commit_block(chunk.len());
+            if driver.skip_if_incompressible() {
+                assert!(
+                    reconstructed.len() >= block * 8 && reconstructed.len() < block * 9 + block,
+                    "only the random block may gate"
+                );
+                reconstructed.extend_from_slice(chunk);
+                continue;
+            }
+            driver.start_matching(|seq| match seq {
+                Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => {
+                    reconstructed.extend_from_slice(literals);
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    );
+                    let from = reconstructed.len() - actual as usize;
+                    for i in 0..match_len {
+                        let b = reconstructed[from + i];
+                        reconstructed.push(b);
+                    }
+                },
+            });
+        }
+        assert_eq!(reconstructed, data);
+        assert_eq!(driver.dubt_head, super::HeadPhase::Done);
     }
 }
