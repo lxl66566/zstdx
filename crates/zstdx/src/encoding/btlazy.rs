@@ -1,12 +1,8 @@
 //! btlazy2 strategy: libzstd's `ZSTD_compressBlock_btlazy2` — the
-//! lazy-generic selection loop at depth 2 over a binary match tree.
-//!
-//! The tree is the optimal parser's (`opt.rs`), with one knob split: the
-//! lazy scan visits nearly every position, so the fill inserts each
-//! position with a reduced compare budget (`insert_log`) while the search
-//! walks the full `search_log`. A shallow insert prunes the tree below its
-//! early exit (EMPTY leaves) — it never falsifies a link, so candidate
-//! claims stay sound by the same invariant the optimal parser relies on.
+//! lazy-generic selection loop at depth 2 over the DUBT match tree
+//! (`dubt.rs`): positions fill at three stores each, and sorting is
+//! amortized into the searches' batch sort, so the lazy scan's
+//! stepped-over positions and match interiors pay nothing beyond the fill.
 //!
 //! The selection prices displaced literals at the code lengths fed back by
 //! the block encoder (the chain tier's measured win); before the first
@@ -16,6 +12,7 @@ use alloc::vec::Vec;
 
 use super::{
     SeqWord,
+    dubt::DubtFinder,
     match_generator::{HASH_READ, MIN_MATCH, push_seq_packed},
     opt::{Match, OptKnobs, count_from, read4},
 };
@@ -98,10 +95,8 @@ pub(crate) fn run_block_lazy(
     block_start: u64,
     block_end: u64,
     max_window: u64,
-    epoch: u64,
     table: &mut [u64],
     bt: &mut [u64],
-    hash3: &mut [u64],
     next_update: &mut u64,
     scratch: &mut LazyScratch,
     lit_lens: &[u8; 256],
@@ -113,32 +108,21 @@ pub(crate) fn run_block_lazy(
     let block_end_idx = (block_end - win_base) as usize;
     let table_log = table.len().trailing_zeros();
     let bt_mask = bt.len() / 2 - 1;
-    let mut finder = super::opt::Finder {
+    let mut finder = DubtFinder {
         win,
         win_base,
         block_end_idx,
-        epoch,
-        tag: epoch << 48,
         max_window,
         table,
         table_log,
         bt,
         bt_mask,
-        hash3,
-        hash3_log: knobs.hash3_log,
-        min_match: knobs.min_match as usize,
         mls: knobs.mls as usize,
         nb_compares: 1usize << knobs.search_log,
-        insert_compares: 1usize << knobs.insert_log,
-        keep_links: matches!(knobs.fill_term, super::opt::FillTerm::Keep { .. }),
-        cross_cap: match knobs.fill_term {
-            super::opt::FillTerm::Cut => 0,
-            super::opt::FillTerm::Keep { cross_cap } => cross_cap as usize,
-        },
+        min_match: knobs.min_match as usize,
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
     };
-    let mut next_update3 = *finder.next_update;
     let matches = &mut scratch.matches[..];
 
     // The very first frame position has nothing behind it.
@@ -156,16 +140,8 @@ pub(crate) fn run_block_lazy(
         // keeping the rep0 offset rideable at ll>=1).
         let mut best = Match { off: 0, len: 0 };
         if pos >= *finder.next_update {
-            finder.update_tree(idx);
-            let nb = finder.get_all_matches(
-                matches,
-                idx,
-                rep,
-                ll0,
-                MIN_MATCH,
-                &mut next_update3,
-                *rep_pending != 0,
-            );
+            finder.fill_to(idx);
+            let nb = finder.find_all_matches(matches, idx, rep, ll0, MIN_MATCH, *rep_pending != 0);
             if nb > 0 {
                 // All candidates share the position, so the value scales
                 // with length alone; the price separates the offsets.
@@ -237,16 +213,8 @@ pub(crate) fn run_block_lazy(
                     let nb2 = if p2 < *finder.next_update {
                         0
                     } else {
-                        finder.update_tree(idx2);
-                        finder.get_all_matches(
-                            matches,
-                            idx2,
-                            rep,
-                            0,
-                            MIN_MATCH,
-                            &mut next_update3,
-                            *rep_pending != 0,
-                        )
+                        finder.fill_to(idx2);
+                        finder.find_all_matches(matches, idx2, rep, 0, MIN_MATCH, *rep_pending != 0)
                     };
                     if nb2 > 0 {
                         // Best repcode (longest; its off-base carries which

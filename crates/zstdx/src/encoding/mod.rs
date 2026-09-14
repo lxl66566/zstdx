@@ -6,6 +6,7 @@ pub(crate) mod block_header;
 pub(crate) mod blocks;
 pub(crate) mod btlazy;
 pub(crate) mod dictionary;
+pub(crate) mod dubt;
 pub(crate) mod frame_header;
 pub(crate) mod match_generator;
 #[cfg(feature = "std")]

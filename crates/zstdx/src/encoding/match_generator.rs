@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use super::{
     Matcher, SeqWord, Sequence,
     btlazy::LazyScratch,
-    opt::{FillTerm, OptKnobs, OptScratch, OptState},
+    opt::{OptKnobs, OptScratch, OptState},
     seq_codes::{decode_packed, pack_seq},
 };
 // Shared with the decoder so both sides agree on offset-history semantics.
@@ -258,12 +258,13 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
 /// btlazy2 row knobs: `min_match` stays 4 (the lazy family's accept bar and
 /// repcode compare width — libzstd's loop), while `mls` carries the row's
 /// searchLength (5: hash5 keys the tree). `sufficient_len` is the rows'
-/// targetLength, capping candidate collection on long matches.
-const fn bt_knobs(search_log: u32, insert_log: u32, bt_log: u32, fill_term: FillTerm) -> OptKnobs {
+/// targetLength. The DUBT finder keys off `search_log`/`bt_log` alone —
+/// its fill is O(1) by construction, so the opt tree's fill-budget knobs
+/// carry defaults that the strategy never reads.
+const fn bt_knobs(search_log: u32, bt_log: u32) -> OptKnobs {
     OptKnobs {
         search_log,
-        insert_log,
-        fill_term,
+        insert_log: search_log,
         sufficient_len: 32,
         min_match: 4,
         mls: 5,
@@ -283,7 +284,6 @@ const fn knobs(
     OptKnobs {
         search_log,
         insert_log: search_log,
-        fill_term: FillTerm::Cut,
         sufficient_len,
         min_match,
         mls: min_match,
@@ -328,23 +328,12 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     chain(22, 21, 1 << 22, 16, 2),
     chain(22, 21, 1 << 22, 32, 2),
     chain(23, 22, 1 << 22, 32, 2),
-    // 13: the Best tier: btlazy2 — the bt tree under lazy2 selection
-    // (libzstd's L13-15 rows: W22, S4/5/6, searchLength 5, TL 32). The
-    // fill budget is split from the search (see `insert_log`): shallow
-    // inserts — the lazy scan does not need every position threaded —
-    // moved json from the old opt-parser row's x4.2 to x1.7 while the
-    // literal-aware margins kept the ratio at 6.26 (zstd-13: 6.10).
-    btlazy(
-        22,
-        1 << 22,
-        bt_knobs(4, 1, 22, FillTerm::Keep { cross_cap: 4 }),
-    ),
-    btlazy(
-        23,
-        1 << 22,
-        bt_knobs(4, 1, 22, FillTerm::Keep { cross_cap: 4 }),
-    ),
-    btlazy(23, 1 << 22, bt_knobs(6, 3, 23, FillTerm::Cut)),
+    // 13: the Best tier: btlazy2 — the DUBT tree (O(1) fill, search-time
+    // batch sort) under lazy2 selection, libzstd's L13-15 rows (W22,
+    // S4/5/6, searchLength 5, TL 32).
+    btlazy(22, 1 << 22, bt_knobs(4, 22)),
+    btlazy(23, 1 << 22, bt_knobs(5, 22)),
+    btlazy(23, 1 << 22, bt_knobs(6, 23)),
     // 16: libzstd's btopt rows begin.
     opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
     // 17: the Opt tier; libzstd's L17 row with the ring capped one below
@@ -1436,6 +1425,15 @@ impl MatchGeneratorDriver {
     /// per job).
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
         clear_table(&mut self.table);
+        // The DUBT finder's entries carry no epoch tag, so a job restarts
+        // its tree from scratch regardless of strip length: cleared heads
+        // make every descent start at a strip chain node, and the strip
+        // fill rewrites each position's ring slots. bt slots below the
+        // strip are never read — their owners can no longer resolve as
+        // candidates.
+        if matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            self.opt_table.fill(EMPTY);
+        }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
             self.chain.fill(0);
         }
@@ -1449,8 +1447,11 @@ impl MatchGeneratorDriver {
         }
         let last = data.len() - HASH_READ;
         match self.params.strategy {
-            Strategy::Opt(_) | Strategy::BtLazy(_) => {
+            Strategy::Opt(_) => {
                 self.next_update = self.next_update.min(base);
+            },
+            Strategy::BtLazy(_) => {
+                self.next_update = base;
             },
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
@@ -1707,9 +1708,11 @@ impl Matcher for MatchGeneratorDriver {
         self.block_start = 0;
         // Stale opt-table entries from previous frames fail the epoch check;
         // the u32 tables need no reset (entries decode against the scanning
-        // position and die on the window-range check).
+        // position and die on the window-range check). The DUBT finder has
+        // no tag: its rows clear both tables, since frame positions restart
+        // at zero and old absolute positions would alias the new window.
         self.epoch += 1;
-        if self.epoch > 0xffff {
+        if self.epoch > 0xffff || matches!(self.params.strategy, Strategy::BtLazy(_)) {
             self.opt_table.fill(EMPTY);
             self.bt.fill(EMPTY);
             self.hash3.fill(EMPTY);
@@ -3302,10 +3305,8 @@ impl MatchGeneratorDriver {
             self.block_start,
             self.block_end,
             self.params.window as u64,
-            self.epoch,
             &mut self.opt_table,
             &mut self.bt,
-            &mut self.hash3,
             &mut self.next_update,
             scratch,
             &lit_lens,
