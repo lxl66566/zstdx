@@ -2189,6 +2189,11 @@ impl MatchGeneratorDriver {
                     // positions' compares collapse into one unpredictable
                     // branch (adjacent-position rep hits are correlated, so
                     // the fold predicts no worse than either compare alone).
+                    // `(a == 0) | (b == 0)`, not `||`: the short-circuit
+                    // form compiles to three unpredictable branches (the
+                    // two compares plus the combine — ~19% of json.fastest's
+                    // mispredicts); the bitwise OR keeps the one intended
+                    // branch, with the `a`-disambiguation on the taken path.
                     // A taken fold whose first position misses arms the
                     // second position's full probe — its compare is then
                     // known good. Probe and emission order are unchanged,
@@ -2205,7 +2210,7 @@ impl MatchGeneratorDriver {
                         } else {
                             1
                         };
-                        if a == 0 || b == 0 {
+                        if (a == 0) | (b == 0) {
                             if a == 0 {
                                 let mut cand = pidx - r;
                                 let mut ml = extend_match(win, pidx, cand);
