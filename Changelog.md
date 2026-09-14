@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Docs: SIMD copy scheduling of the fused sequence loop (todo 2, the last
+  unassessed structural idea) is falsified — porting libzstd's wildcopy
+  issue structure (head-first copy16 + unrolled landing tail + dead-branch
+  removal; three builds) shrinks the exec half by the predicted 0.5-0.6M
+  Ir (json) but regresses net Ir and wall on every shape: the loop is one
+  register-allocation domain and the saturated budget returns the saving
+  as decode-half spills. No code change; the loop stands.
 - Docs: the two open fastest-tier angles (todo 3) are falsified and
   withdrawn — miss-run stepping (and its dense-insert / parse-statistic
   gate variants) wins json on both axes (−3.2% size, +8.8% speed) but
