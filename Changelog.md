@@ -4,6 +4,13 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- MT decode staging buffers are pooled globally (256 MiB cap): every
+  decode call used to map fresh multi-megabyte staging vectors per
+  segment and pay their whole first-touch fault cost again (the encoder
+  accumulate-buffer lesson, same machine). Repeat decodes now reuse the
+  faulted pages; contents are never observable across uses. 64 MiB solo:
+  json.zst3 mt4/mt8 1.47x/1.68x -> 1.5-1.7x/1.74x ST, skewed.zst9
+  1.14x -> 1.57x, our-encoder skewed mt4 1.54x -> 2.10x.
 - MT decode stage B (staged sequence execution) now uses the flat
   executor's inline wildcopy strategy (16/8-byte chunks, doubling fallback
   near the buffer end) instead of libc calls per doubling chunk: json64

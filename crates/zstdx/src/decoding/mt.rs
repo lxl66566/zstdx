@@ -104,6 +104,72 @@ struct DecodedSegment {
     out_size: usize,
 }
 
+/// Pooled staging buffers: every decode call used to map fresh
+/// multi-megabyte staging vectors per segment, paying the whole first-touch
+/// fault cost again on repeat calls (the encoder's accumulate-buffer
+/// lesson, same machine). Global, not thread-local: stage A stages on
+/// workers while the calling thread consumes, so buffers return across
+/// threads. Contents are never observable across uses (staging overwrites
+/// exactly what execution reads).
+struct StagingPool {
+    bufs: Mutex<Vec<StagingBuf>>,
+    /// Retained-buffer budget; over it, buffers free normally.
+    retained: AtomicUsize,
+}
+
+struct StagingBuf {
+    literals: Vec<u8>,
+    sequences: Vec<Sequence>,
+}
+
+const STAGING_POOL_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+static STAGING_POOL: std::sync::OnceLock<StagingPool> = std::sync::OnceLock::new();
+
+fn staging_take() -> StagingBuf {
+    let pool = STAGING_POOL.get_or_init(|| StagingPool {
+        bufs: Mutex::new(Vec::new()),
+        retained: AtomicUsize::new(0),
+    });
+    match pool.bufs.lock().unwrap().pop() {
+        Some(mut b) => {
+            b.literals.clear();
+            b.sequences.clear();
+            pool.retained.fetch_sub(
+                b.literals.capacity() + b.sequences.capacity() * core::mem::size_of::<Sequence>(),
+                Ordering::Relaxed,
+            );
+            b
+        },
+        None => StagingBuf {
+            literals: Vec::new(),
+            sequences: Vec::new(),
+        },
+    }
+}
+
+fn staging_put(bufs: StagingBuf) {
+    let bytes =
+        bufs.literals.capacity() + bufs.sequences.capacity() * core::mem::size_of::<Sequence>();
+    let pool = STAGING_POOL.get_or_init(|| StagingPool {
+        bufs: Mutex::new(Vec::new()),
+        retained: AtomicUsize::new(0),
+    });
+    if pool.retained.load(Ordering::Relaxed) + bytes <= STAGING_POOL_MAX_BYTES {
+        pool.retained.fetch_add(bytes, Ordering::Relaxed);
+        pool.bufs.lock().unwrap().push(bufs);
+    }
+}
+
+impl Drop for DecodedSegment {
+    fn drop(&mut self) {
+        staging_put(StagingBuf {
+            literals: core::mem::take(&mut self.literals),
+            sequences: core::mem::take(&mut self.sequences),
+        });
+    }
+}
+
 /// Reusable per-worker entropy state; reset between segments (every
 /// segment starts at a restart point, so fresh tables are correct).
 struct SegmentScratch {
@@ -294,8 +360,8 @@ fn decode_segment(
     scratch: &mut SegmentScratch,
 ) -> Result<DecodedSegment, FrameDecoderError> {
     scratch.reset_tables();
-    let mut literals = Vec::new();
-    let mut sequences = Vec::new();
+    let mut staging = staging_take();
+    let (mut literals, mut sequences) = (staging.literals, staging.sequences);
     let mut out_size = 0usize;
     let mut blocks = Vec::with_capacity(plan.blocks.len());
     for blk in &plan.blocks {
@@ -457,7 +523,7 @@ unsafe fn execute_segment(
                     }
                     if lit as usize + ll > lit_end as usize {
                         return Err(exec_err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                            wanted: (lit as usize - seg.literals.as_ptr() as usize) + ll,
+                            wanted: (lit as usize - lit_base as usize) + ll,
                             have: lits.end - lits.start,
                         }));
                     }
