@@ -716,9 +716,17 @@ fn insert_covered(
     if match_len <= 16 {
         let end = (win_base + (start + match_len) as u64).min(insert_max);
         let mut p = win_base + start as u64;
-        while p < end {
+        // Peel the odd tail before the loop: `while p < end` alone unrolls
+        // mod 2 behind a per-entry parity guard that mispredicts on every
+        // other insert (measured on json.fastest).
+        if (end - p) & 1 == 1 {
             insert_at(win, table, (p - win_base) as usize, p, log);
             p += 1;
+        }
+        while p < end {
+            insert_at(win, table, (p - win_base) as usize, p, log);
+            insert_at(win, table, (p + 1 - win_base) as usize, p + 1, log);
+            p += 2;
         }
     } else {
         let base = win_base + start as u64;
