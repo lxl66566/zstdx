@@ -601,6 +601,17 @@ pub fn run(args: &Args) {
 
     // Differential mode: decode the reference frame through our decoder's
     // seq_dump log and compare the two parses of the same raw data.
+    #[cfg(not(feature = "seq_dump"))]
+    if let Some(ref_frame) = &args.ref_frame {
+        let _ = ref_frame;
+        eprintln!(
+            "error: --ref-frame needs the decoder dump hook; rebuild with `--features seq_dump` \
+             (never enabled by default: the hook sits in the decode hot loop and invalidates \
+             timing builds)"
+        );
+        std::process::exit(2);
+    }
+    #[cfg(feature = "seq_dump")]
     if let Some(ref_frame) = &args.ref_frame {
         let frame = fs::read(ref_frame).unwrap();
         let decoded = zstdx::bulk::decompress(&frame, raw.len()).unwrap();

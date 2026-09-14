@@ -145,13 +145,19 @@ cargo run --release -p zstdx-bench -- mtcheck bench/corpus
 Sequence statistics and entropy lower bound of our matcher on one corpus
 file; `--level` selects. `--ref-frame <file.zst>` adds the differential mode:
 the reference frame (e.g. `bench/corpus/text.zst9`) is decoded through the
-`seq_dump` decoder hook (enabled in this crate's zstdx dependency) and its
-(ll, ml, of-wire) triples diffed against our encoder's parse of the same raw
-data — same-position divergences, matches only the reference found (bucketed
-by ml and offset-log, with our covering sequence as context), per-side
-literal/match/repcode aggregates and entropy bounds, and the cold-start
-literal split (first 768 KiB). `--divergences N` caps the printed events
-(they also count toward the missed-match context lines).
+`seq_dump` decoder hook and its (ll, ml, of-wire) triples diffed against our
+encoder's parse of the same raw data — same-position divergences, matches
+only the reference found (bucketed by ml and offset-log, with our covering
+sequence as context), per-side literal/match/repcode aggregates and entropy
+bounds, and the cold-start literal split (first 768 KiB). `--divergences N`
+caps the printed events (they also count toward the missed-match context
+lines). The hook sits in the decode hot loop, so `seq_dump` is a
+bench-crate feature and is **never enabled by default** (it would slow every
+measured decode by ~30-40%); build explicitly:
+
+```bash
+cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...
+```
 
 ### `prefill` — `prefill_window` micro
 
