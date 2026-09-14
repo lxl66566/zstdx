@@ -18,6 +18,13 @@
 //! measured x2.87 vs libzstd on skewed.best, memory-latency-bound (200M L1
 //! + 100M dTLB misses per 32 MiB, one serialized load per tree step).
 //!
+//! Where C's search returns the single longest match, ours prices every
+//! strictly improving candidate against the position's literal scale and
+//! keeps the two argmaxes the lazy selection consumes ([`Found`]) — fused
+//! into the descent, so no candidate list is ever written. The wider
+//! selection is the +2.5% density over zstd-13; pricing it per candidate
+//! in the driver's array loop was the tier's speed deficit.
+//!
 //! Slot layout per ring position: `[0]` is the chain link while unsorted
 //! and the smaller child once sorted; `[1]` is the unsorted mark (or the
 //! backtrack link during a search's chain walk) and the larger child once
@@ -29,6 +36,43 @@
 //! compares, never falsify a match.
 
 use super::opt::{Match, OPT_NUM, count_from, hash3_at, hash4_at, hash5_at, read4};
+
+/// Offset price class (`highbit32(offBase)`); ~free for repcodes and for
+/// "no candidate".
+#[inline(always)]
+pub(crate) fn lazy_price(off: u32) -> i32 {
+    if off > 3 {
+        off.ilog2() as i32
+    } else {
+        0
+    }
+}
+
+/// Displaced-literal value of a match of `len` bytes at a position whose
+/// four-byte literal scale is `s` (the driver's `lit_scale`).
+#[inline(always)]
+pub(crate) fn scale_value(s: i32, len: usize) -> i32 {
+    debug_assert!(len >= super::match_generator::MIN_MATCH || len == 0);
+    s * len as i32 / 4
+}
+
+/// One search's selection, priced against the position's literal scale:
+/// the longest repcode candidate (price 0 by construction) and the best
+/// literal-offset candidate by value-minus-offset-price, either side
+/// absent at `len == 0`. This is the improving candidate set of the plain
+/// port reduced to its two argmaxes — the only facts the lazy selection
+/// consumes — computed inside the descent so the per-candidate array
+/// round trip (store per improving candidate, reload and re-price in the
+/// driver) never happens.
+pub(crate) struct Found {
+    /// Longest repcode candidate; `off` is the wire off-base (1-3).
+    pub(crate) rep: Match,
+    /// Best literal-offset candidate by `score`.
+    pub(crate) cand: Match,
+    /// `scale_value(scale, cand.len) - lazy_price(cand.off)`; `i32::MIN`
+    /// while `cand.len == 0`.
+    pub(crate) score: i32,
+}
 
 /// Marks a node as inserted but not yet sorted. The value 1 is also
 /// position 1's stored form: a child pointer to it misreads as unsorted,
@@ -181,25 +225,29 @@ impl DubtFinder<'_, '_> {
         }
     }
 
-    /// `ZSTD_DUBT_findBestMatch` generalized to candidate collection (the
-    /// btlazy2 selection prices every improving candidate, not just the
-    /// longest): consume the bucket's unsorted backlog, then descend from
-    /// the head collecting strictly longer candidates, repcodes first.
-    /// Returns the match count; `length_to_beat` starts at `min_match`.
-    pub(crate) fn find_all_matches(
+    /// `ZSTD_DUBT_findBestMatch` fused with the btlazy2 selection's
+    /// pricing (see [`Found`]): consume the bucket's unsorted backlog,
+    /// then descend from the head pricing strictly improving candidates —
+    /// repcodes first, kept by longest length (their scores are strictly
+    /// increasing in it). `length_to_beat` starts at `min_match`.
+    pub(crate) fn find_best(
         &mut self,
-        matches: &mut [Match],
         idx: usize,
         rep: &[u32; 3],
         ll0: u32,
         length_to_beat: usize,
         rep_gated: bool,
-    ) -> usize {
+        scale: i32,
+    ) -> Found {
         debug_assert!(idx + super::match_generator::HASH_READ <= self.block_end_idx);
         let pos = self.win_base + idx as u64;
         let floor = self.cand_floor(pos);
         let mut best_len = length_to_beat - 1;
-        let mut mnum = 0usize;
+        let mut found = Found {
+            rep: Match { off: 1, len: 0 },
+            cand: Match { off: 0, len: 0 },
+            score: i32::MIN,
+        };
 
         // Repeated-offset candidates (the cheapest offsets to encode) —
         // same contract as the optimal parser's collection walk.
@@ -226,14 +274,13 @@ impl DubtFinder<'_, '_> {
                     let rep_len =
                         count_from(self.win, idx, cand, self.min_match, self.block_end_idx);
                     if rep_len > best_len {
-                        matches[mnum] = Match {
+                        found.rep = Match {
                             off: rep_code - ll0 + 1,
                             len: rep_len as u32,
                         };
-                        mnum += 1;
                         best_len = rep_len;
                         if rep_len > self.sufficient_len || idx + rep_len >= self.block_end_idx {
-                            return mnum;
+                            return found;
                         }
                     }
                 }
@@ -295,7 +342,9 @@ impl DubtFinder<'_, '_> {
             }
 
             // Sorted descent from the head, threading `pos` into the tree
-            // while collecting strictly improving candidates.
+            // while pricing strictly improving candidates. The strict `>`
+            // keeps the first score maximum — the argmax (and its
+            // tie-breaks) of the array loop the fusion replaced.
             let head = *self.table.as_ptr().add(h);
             *self.table.as_mut_ptr().add(h) = pack_pos(pos);
             let mut cand = head;
@@ -321,11 +370,15 @@ impl DubtFinder<'_, '_> {
                         match_end = cand_abs + ml as u64;
                     }
                     best_len = ml;
-                    matches[mnum] = Match {
-                        off: (pos - cand_abs + 3) as u32,
-                        len: ml as u32,
-                    };
-                    mnum += 1;
+                    let off = (pos - cand_abs + 3) as u32;
+                    let score = scale_value(scale, ml) - lazy_price(off);
+                    if score > found.score {
+                        found.score = score;
+                        found.cand = Match {
+                            off,
+                            len: ml as u32,
+                        };
+                    }
                     if ml > OPT_NUM || at_end {
                         break;
                     }
@@ -359,6 +412,6 @@ impl DubtFinder<'_, '_> {
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
-        mnum
+        found
     }
 }
