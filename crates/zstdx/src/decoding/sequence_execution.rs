@@ -401,7 +401,7 @@ unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
 /// always overwritten in address order by the next sequence's literals or
 /// match before anything can read it.
 #[inline(always)]
-unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
+pub(crate) unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
     unsafe {
         let end = d.add(ml);
         if (d as usize).wrapping_sub(s as usize) >= 16 {

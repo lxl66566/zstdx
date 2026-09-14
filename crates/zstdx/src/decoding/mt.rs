@@ -42,7 +42,7 @@ use super::{
     frame,
     literals_section_decoder::decode_literals,
     scratch::{FSEScratch, HuffmanScratch},
-    sequence_execution::do_offset_history,
+    sequence_execution::{do_offset_history, wildcopy_match},
     sequence_section_decoder::decode_sequences_into,
 };
 use crate::{
@@ -402,16 +402,23 @@ fn decode_segment(
 /// out_size)`, reading match sources at absolute positions below
 /// `seg_start` (final output of earlier segments; stage B runs in order).
 ///
+/// `buf_limit` is the absolute end of the region the writes may overshoot
+/// by up to 16 bytes (wildcopy slack): the caller's slice end, or the
+/// vector's capacity. The slack bytes are overwritten in address order
+/// before anything can read them (same contract as the flat executor).
+///
 /// # Safety
 /// `base` must be valid for writes in `[seg_start, seg_start + out_size)`
-/// and for reads in `[0, seg_start)`. The caller guarantees both by
-/// sizing the output before each segment and executing in order.
+/// plus 16 bytes of slack below `buf_limit`, and for reads in
+/// `[0, seg_start)`. The caller guarantees both by sizing the output
+/// before each segment and executing in order.
 unsafe fn execute_segment(
     base: *mut u8,
     seg_start: usize,
     seg: &DecodedSegment,
     input: &[u8],
     offset_hist: &mut [u32; 3],
+    buf_limit: usize,
 ) -> Result<(), FrameDecoderError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let exec_err =
@@ -438,76 +445,84 @@ unsafe fn execute_segment(
                 w += len;
             },
             BlockPlan::Compressed { lits, seqs } => {
-                let mut lit_pos = lits.start;
+                // SAFETY: lits is a range of seg.literals
+                let lit_base = unsafe { seg.literals.as_ptr().add(lits.start) };
+                let lit_end = unsafe { seg.literals.as_ptr().add(lits.end) };
+                let mut lit = lit_base;
                 for seq in &seg.sequences[seqs.clone()] {
                     let ll = seq.ll as usize;
                     let ml = seq.ml as usize;
                     if w + ll + ml > seg.out_size {
                         return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                     }
-                    if lit_pos + ll > lits.end {
+                    if lit as usize + ll > lit_end as usize {
                         return Err(exec_err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                            wanted: lit_pos + ll,
-                            have: lits.end,
+                            wanted: (lit as usize - seg.literals.as_ptr() as usize) + ll,
+                            have: lits.end - lits.start,
                         }));
                     }
-                    // SAFETY: the budget check bounds the write; the literal
+                    // Wildcopy when the 16-byte overshoot of both the
+                    // literal and the match copy stays below `buf_limit`;
+                    // the literal side additionally needs its own 16-byte
+                    // overread to stay inside the staged literals.
+                    // SAFETY: budget checks bound the writes; the literal
                     // range was checked above
+                    let end = seg_start + w + ll + ml;
+                    let wild = end + 16 <= buf_limit;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            seg.literals.as_ptr().add(lit_pos),
-                            base.add(seg_start + w),
-                            ll,
-                        );
-                    }
-                    lit_pos += ll;
-                    w += ll;
-                    let offset = do_offset_history(seq.of, seq.ll, offset_hist);
-                    if offset == 0 {
-                        return Err(exec_err(ExecuteSequencesError::ZeroOffset));
-                    }
-                    let offset = offset as usize;
-                    let cur = seg_start + w;
-                    if offset > cur {
-                        return Err(exec_err(ExecuteSequencesError::DecodebufferError(
-                            crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                                offset,
-                                buf_len: cur,
-                            },
-                        )));
-                    }
-                    if ml > 0 {
-                        // Doubling chunks anchored at the match source (the
-                        // same scheme as the flat executor): after `copied`
-                        // bytes the readable span behind the anchor is
-                        // `offset + copied`, so reads never run ahead of the
-                        // write cursor.
-                        // SAFETY: cur - offset >= 0 was checked; every chunk
-                        // reads only already-written bytes and the budget
-                        // check bounds the write end.
-                        unsafe {
-                            let src = base.add(cur - offset);
-                            let mut copied = 0;
-                            while copied < ml {
-                                let chunk = (offset + copied).min(ml - copied);
-                                core::ptr::copy(src, base.add(cur + copied), chunk);
-                                copied += chunk;
+                        let dst = base.add(seg_start + w);
+                        if ll > 0 {
+                            if wild && lit.add(ll + 16) <= lit_end {
+                                copy16_chunks(dst, lit, ll);
+                            } else {
+                                core::ptr::copy_nonoverlapping(lit, dst, ll);
+                            }
+                            lit = lit.add(ll);
+                        }
+                        w += ll;
+                        let offset = do_offset_history(seq.of, seq.ll, offset_hist);
+                        if offset == 0 {
+                            return Err(exec_err(ExecuteSequencesError::ZeroOffset));
+                        }
+                        let offset = offset as usize;
+                        let cur = seg_start + w;
+                        if offset > cur {
+                            return Err(exec_err(ExecuteSequencesError::DecodebufferError(
+                                crate::decoding::errors::DecodeBufferError::OffsetTooBig {
+                                    offset,
+                                    buf_len: cur,
+                                },
+                            )));
+                        }
+                        if ml > 0 {
+                            let dst = base.add(cur);
+                            let src = dst.sub(offset);
+                            if wild {
+                                wildcopy_match(dst, src, ml);
+                            } else {
+                                // Doubling chunks anchored at the match
+                                // source: after `copied` bytes the readable
+                                // span behind the anchor is `offset +
+                                // copied`, so reads never run ahead of the
+                                // write cursor.
+                                let mut copied = 0;
+                                while copied < ml {
+                                    let chunk = (offset + copied).min(ml - copied);
+                                    core::ptr::copy(src, dst.add(copied), chunk);
+                                    copied += chunk;
+                                }
                             }
                         }
                         w += ml;
                     }
                 }
-                let rest = lits.end - lit_pos;
+                let rest = lit_end as usize - lit as usize;
                 if w + rest > seg.out_size {
                     return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                 }
                 // SAFETY: budget checked above
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        seg.literals.as_ptr().add(lit_pos),
-                        base.add(seg_start + w),
-                        rest,
-                    );
+                    core::ptr::copy_nonoverlapping(lit, base.add(seg_start + w), rest);
                 }
                 w += rest;
             },
@@ -520,6 +535,28 @@ unsafe fn execute_segment(
     Ok(())
 }
 
+/// Copy `len` bytes in 16-byte chunks, overshooting by up to 15 bytes (the
+/// caller guarantees the overshoot stays inside the write bound and the
+/// read bound).
+#[inline(always)]
+unsafe fn copy16_chunks(mut d: *mut u8, mut s: *const u8, len: usize) {
+    unsafe {
+        d.cast::<u128>()
+            .write_unaligned(s.cast::<u128>().read_unaligned());
+        if len > 16 {
+            let end = d.add(len);
+            d = d.add(16);
+            s = s.add(16);
+            while d < end {
+                d.cast::<u128>()
+                    .write_unaligned(s.cast::<u128>().read_unaligned());
+                d = d.add(16);
+                s = s.add(16);
+            }
+        }
+    }
+}
+
 /// Two-stage pipeline driver. `place(start, end)` makes the output region
 /// valid for absolute positions `[0, end)` and returns its base pointer
 /// (called per segment, so a growing Vec may move between calls). Returns
@@ -528,7 +565,7 @@ fn decode_parallel(
     input: &[u8],
     workers: u32,
     segments: &[SegmentPlan],
-    place: &mut dyn FnMut(usize, usize) -> Result<*mut u8, FrameDecoderError>,
+    place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
 ) -> Result<usize, FrameDecoderError> {
     let n_segments = segments.len();
     let threads = (workers as usize).min(n_segments);
@@ -602,11 +639,11 @@ fn decode_parallel(
                 if seg_plan.frame_start {
                     offset_hist = [1, 4, 8];
                 }
-                let base = place(written, written + seg.out_size)?;
+                let (base, buf_limit) = place(written, written + seg.out_size)?;
                 // SAFETY: `place` made [0, written + out_size) valid; every
                 // match source below `written` is final (in-order execution).
                 unsafe {
-                    execute_segment(base, written, &seg, input, &mut offset_hist)?;
+                    execute_segment(base, written, &seg, input, &mut offset_hist, buf_limit)?;
                 }
                 written += seg.out_size;
                 consumed.store(id + 1, Ordering::Release);
@@ -648,12 +685,13 @@ pub fn decode_all_mt(
 ) -> Result<usize, FrameDecoderError> {
     if let Some(segments) = engage(input, workers, max_window_size) {
         let out_len = output.len();
-        let mut place = |_start: usize, end: usize| -> Result<*mut u8, FrameDecoderError> {
-            if end > out_len {
-                return Err(FrameDecoderError::TargetTooSmall);
-            }
-            Ok(output.as_mut_ptr())
-        };
+        let mut place =
+            |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                if end > out_len {
+                    return Err(FrameDecoderError::TargetTooSmall);
+                }
+                Ok((output.as_mut_ptr(), out_len))
+            };
         decode_parallel(input, workers, &segments, &mut place)
     } else {
         let mut decoder = FrameDecoder::new();
@@ -673,15 +711,18 @@ pub fn decode_to_vec_mt(
 ) -> Result<(), FrameDecoderError> {
     if let Some(segments) = engage(input, workers, max_window_size) {
         let start_len = output.len();
-        let mut place = |_start: usize, end: usize| -> Result<*mut u8, FrameDecoderError> {
-            output.reserve(end - start_len);
-            // SAFETY: start_len bytes are initialized and capacity now
-            // covers `end`; the region base is the vector's data start. The
-            // pointer is re-acquired per segment, so growth between segments
-            // is fine, and set_len below publishes the writes segment by
-            // segment so an error leaves the tail unobserved.
-            Ok(output.as_mut_ptr())
-        };
+        let mut place =
+            |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                output.reserve(end - start_len);
+                // SAFETY: start_len bytes are initialized and capacity now
+                // covers `end`; the region base is the vector's data start.
+                // The pointer is re-acquired per segment, so growth between
+                // segments is fine, and set_len below publishes the writes
+                // segment by segment so an error leaves the tail unobserved.
+                // The wildcopy slack may write up to 16 bytes past `end`
+                // inside the capacity (raw writes; never read past `end`).
+                Ok((output.as_mut_ptr(), output.capacity() + start_len))
+            };
         let written = decode_parallel(input, workers, &segments, &mut place)?;
         // SAFETY: every byte in [start_len, start_len + written) was written
         // by execute_segment.

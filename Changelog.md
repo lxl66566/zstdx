@@ -4,6 +4,10 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- MT decode stage B (staged sequence execution) now uses the flat
+  executor's inline wildcopy strategy (16/8-byte chunks, doubling fallback
+  near the buffer end) instead of libc calls per doubling chunk: json64
+  mt4/mt8 1.10x/1.14x -> 1.65x/1.80x ST, skewed.zst9 0.79x -> 1.13x.
 - MT decode: a zero-sequence compressed block mid-segment (our own MT
   encoder emits them on small-alphabet data at balanced levels) aborted
   stage A with `MissingCompressionMode`. Stage A now skips sequence
