@@ -80,6 +80,7 @@
 | DUBT walk/batch cap ×4 (sort deeper backlogs per search) | json 5473898 (slightly *worse*), speed 25→20 MiB/s | the far-candidate loss vs the old Keep tree is not chain-cap starvation — more sorting just re-threads/prunes more; the old tree's json edge was link *retention*, a different mechanism |
 | DUBT row13 at S5 (search descent 32, C's L14 knob) | json 5472469 (flat vs S4), speed −24% | on this corpus the json candidates sit within the first ~16 tree steps; deepening buys text +0.3% only — keep C's S4/S5/S6 ladder split across rows instead of paying S5 on row 13 |
 | DUBT frontier retention on budget-exhaustion breaks (null the trailing links only when the ordering claim broke — equal tail — and keep them on a pure budget stop) | json 5469237 (−0.05%), speed 22 vs 25 MiB/s | keeping unvisited continuation links preserves little reach at this shape — the pruned candidates are the worst-ordered ones; not worth −12% speed (the full Keep/STALE class stays retired) |
+| folding the DUBT walk/descent range pairs (`floor < cand < pos`) into one unsigned compare via precomputed `cand−lo < span` (plus the redundant null test dropped from the loop heads) | find_all_matches Ir +2.5% (11.06G→11.34G), wall flat | the two plain compares codegen cheaper than the wrapping-sub chain; loop-head branch *count* is not the cost on this walk (the null test itself was free to drop — the u32 rebuild of the null link always fails the range checks, kept in the landed port) |
 
 ## Encode side · entropy / checksum / misc
 
