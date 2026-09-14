@@ -4,6 +4,14 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- MT decode fixed on zero-sequence blocks: `decode_segment` called the
+  sequence decoder unconditionally, so a compressed block with nbSeq=0
+  (all-literals — 16-symbol skewed data at Fastest emits them as full
+  128KiB literal blocks) failed with `MissingCompressionMode` where the
+  sequential decoder skipped the sequence section. The guard now mirrors
+  the ST path, including its `ExtraBits` report for leftover bytes after
+  the bare nbSeq=0 byte. Found while benching checksum overhead on the
+  skewed corpus (libzstd and our ST decoder both decoded the same frame).
 - btlazy: the depth-0 rep probe priced the empty incumbent through
   `lazy_value`'s MIN_MATCH contract (`{off: 0, len: 0}` sentinel from a
   candidate-less tree search) — `full_ladder_roundtrip` failed its debug

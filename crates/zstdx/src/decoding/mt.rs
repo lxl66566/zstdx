@@ -38,7 +38,9 @@ use std::sync::{Condvar, Mutex};
 
 use super::{
     FrameDecoder,
-    errors::{DecodeBlockContentError, DecompressBlockError, FrameDecoderError},
+    errors::{
+        DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, FrameDecoderError,
+    },
     frame,
     literals_section_decoder::decode_literals,
     scratch::{FSEScratch, HuffmanScratch},
@@ -356,14 +358,23 @@ fn decode_segment(
                     .map_err(DecompressBlockError::from)
                     .map_err(block_body_err)? as usize;
                 let seqs_start = sequences.len();
-                decode_sequences_into(
-                    &seq_header,
-                    &seq_raw_all[seq_header_len..],
-                    &mut scratch.fse,
-                    &mut sequences,
-                )
-                .map_err(DecompressBlockError::from)
-                .map_err(block_body_err)?;
+                let seq_raw = &seq_raw_all[seq_header_len..];
+                if seq_header.num_sequences == 0 {
+                    // All-literals block: the sequence section is the bare
+                    // nbSeq=0 byte; the ST decoder reports leftovers as
+                    // ExtraBits, mirror that here instead of table-updating.
+                    if !seq_raw.is_empty() {
+                        return Err(block_body_err(DecompressBlockError::DecodeSequenceError(
+                            DecodeSequenceError::ExtraBits {
+                                bits_remaining: seq_raw.len() as isize * 8,
+                            },
+                        )));
+                    }
+                } else {
+                    decode_sequences_into(&seq_header, seq_raw, &mut scratch.fse, &mut sequences)
+                        .map_err(DecompressBlockError::from)
+                        .map_err(block_body_err)?;
+                }
                 let match_bytes: usize =
                     sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
                 out_size += literals.len() - lits_start + match_bytes;
@@ -856,6 +867,31 @@ mod tests {
         let n = decode_all_mt(&tiny_c, &mut a, 4, MAX_WINDOW).unwrap();
         assert_eq!(n, decoder.decode_all(&tiny_c, &mut b).unwrap());
         assert_eq!(a, b);
+    }
+
+    /// Blocks with zero sequences (all-literals, e.g. 16-symbol skewed data
+    /// at Fastest) must decode like the sequential path: the sequence
+    /// section is the bare nbSeq=0 byte, not a table update.
+    #[test]
+    fn zero_sequence_blocks_decode() {
+        let mut state = 7u64;
+        let alphabet = [
+            0x51u8, 0x9a, 0x03, 0xc7, 0xe8, 0x2d, 0x6b, 0xf4, 0x17, 0x88, 0xa2, 0x4c, 0xd9, 0x70,
+            0x0e, 0xb3,
+        ];
+        let mut data = Vec::with_capacity(6 * 1024 * 1024);
+        while data.len() < 6 * 1024 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push(alphabet[(state >> 33) as usize % alphabet.len()]);
+        }
+        for workers in [2u32, 4] {
+            let compressed =
+                bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(workers))
+                    .unwrap();
+            let mut out = Vec::new();
+            decode_to_vec_mt(&compressed, &mut out, workers, MAX_WINDOW).unwrap();
+            assert_eq!(out, data);
+        }
     }
 
     /// Corrupt input must surface an error, not silent garbage.
