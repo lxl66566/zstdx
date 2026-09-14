@@ -114,11 +114,11 @@ Identical cell-for-cell to the 09-12 sweep (byte-identical-output commits): geo-
 
 ## Top open deficits (from this run, x = ours/zstd wall time)
 
-1. **Best-tier encoder core (L13)**: json x4.22, skewed x6.22, text x1.77 — the largest single wall-clock gap, and it caps the streaming columns too (json.best stream ST x4.05 / stream-mt8 x3.31, text.best x2.60/x1.9-2.3). Per-block DP cost over the candidate space (todo 7).
+1. **Best-tier encoder core (L13)**: json x4.22, skewed x6.22, text x1.77 — the largest single wall-clock gap, and it caps the streaming columns too (json.best stream ST x4.05 / stream-mt8 x3.31, text.best x2.60/x1.9-2.3). Per-block DP cost over the candidate space (todo 6).
 2. **json ST encode speed**: fastest x1.57 (largest low-tier gap), fast x1.11, balanced x1.34 (carries +19.5% density), opt/ultra x1.30-1.32 at ratio parity or denser (todos 4-7).
-3. **Streaming decode on compressible shapes**: json x1.27-1.35, skewed x1.10-1.32, text x1.04-1.21 — core-vs-core (our stream ≈ our bulk; the fused loop vs libzstd's pipeline) (todo 3).
-4. ~~Streaming MT burst-model serialization~~ resolved 09-14: persistent pool + overlapped accumulation + pooled buffers put all fastest/fast stream-mt8 cells ahead of zstd (text.fastest x0.75, json.fastest x0.72); residues move to strip-prefill amortization and job sizing (todo 13).
+3. **Streaming decode on compressible shapes**: json x1.27-1.35, skewed x1.10-1.32, text x1.04-1.21 — core-vs-core (our stream ≈ our bulk; the fused loop vs libzstd's pipeline) (todo 2).
+4. ~~Streaming MT burst-model serialization~~ resolved 09-14: persistent pool + overlapped accumulation + pooled buffers put all fastest/fast stream-mt8 cells ahead of zstd (text.fastest x0.75, json.fastest x0.72); residues move to strip-prefill amortization and job sizing (todo 12).
 5. **MT decode**: no scaling, skewed anti-scales 0.71x ST (todo 1, stage-B parallelization — leapfrog dimension).
 6. **json.fastest.mt8**: x1.27 (the one clean zstd mt win; we win mt16 at x0.39).
 7. **random fastest/fast ST**: x0.90/0.81 minor residue (raw-block per-block overhead).
-8. **Ratio residues** (only cells we lose): text.Balanced −2.78%, text opt/ultra −0.3%, json.opt −0.3% (todo 10).
+8. **Ratio residues** (only cells we lose): text.Balanced −2.78%, text opt/ultra −0.3%, json.opt −0.3% (todo 9).

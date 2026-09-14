@@ -4,6 +4,25 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Frame checksums are now verified on every decode path (libzstd parity;
+  previously *no* path compared — the ST decoder computed the hash and
+  stored the trailer word but left the comparison to the caller via
+  `get_checksum_from_data`/`get_calculated_checksum`, and the MT path did
+  not hash at all). Mismatch errors with the new
+  `FrameDecoderError::ChecksumMismatch { expected, calculated }`: the ST
+  paths fold the compare into the trailer read (folding any not-yet-
+  drained ring-buffer bytes first, then disabling further hashing so
+  later drains don't double-count), the MT paths post-pass one
+  sequential xxh64 per checksummed frame over the assembled output on
+  the calling thread (`decoding/frame_checksum.rs`; frame ranges derive
+  from the `place` callback's per-segment ends — `decode_parallel`
+  itself is untouched). `decode_to_vec_mt` verifies before publishing so
+  its length stays unchanged on error, matching `decode_all_to_vec`.
+  Multi-frame inputs report the offending frame. Cost on checksummed
+  frames (4T, 32MiB): ~1.7 ms — text 25.2->11.5, skewed 4.1->3.5, json
+  1.88->1.63 GiB/s; the ST paths already paid the hash per block, so
+  their cost is just the compare; frames without the checksum flag are
+  untouched.
 - MT decode fixed on zero-sequence blocks: `decode_segment` called the
   sequence decoder unconditionally, so a compressed block with nbSeq=0
   (all-literals — 16-symbol skewed data at Fastest emits them as full

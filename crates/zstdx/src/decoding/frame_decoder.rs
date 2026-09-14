@@ -171,6 +171,29 @@ impl FrameDecoderState {
         }
         Ok(())
     }
+
+    /// Verify the frame checksum once the trailer word has been read. The
+    /// ring path hashes on drain, so any bytes it has not delivered yet are
+    /// folded in here (the flat paths hash per block and the ring stays
+    /// empty); hashing is then disabled so later drains don't fold them a
+    /// second time.
+    #[cfg(feature = "hash")]
+    fn verify_frame_checksum(&mut self) -> Result<(), FrameDecoderError> {
+        let Some(expected) = self.check_sum else {
+            return Ok(());
+        };
+        let buffer = &mut self.decoder_scratch.buffer;
+        buffer.hash_pending();
+        buffer.set_checksum_enabled(false);
+        let calculated = buffer.hash.finish() as u32;
+        if calculated != expected {
+            return Err(FrameDecoderError::ChecksumMismatch {
+                expected,
+                calculated,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for FrameDecoder {
@@ -392,6 +415,8 @@ impl FrameDecoder {
                     let chksum = u32::from_le_bytes(chksum);
                     state.check_sum = Some(chksum);
                 }
+                #[cfg(feature = "hash")]
+                state.verify_frame_checksum()?;
                 break;
             }
 
@@ -512,6 +537,8 @@ impl FrameDecoder {
                     state.bytes_read_counter += 4;
                     state.check_sum = Some(u32::from_le_bytes(chksum));
                 }
+                #[cfg(feature = "hash")]
+                state.verify_frame_checksum()?;
                 break;
             }
 
@@ -695,6 +722,8 @@ impl FrameDecoder {
                     state.bytes_read_counter += 4;
                     state.check_sum = Some(u32::from_le_bytes(chksum));
                 }
+                #[cfg(feature = "hash")]
+                state.verify_frame_checksum()?;
                 break;
             }
         }
@@ -754,6 +783,8 @@ impl FrameDecoder {
                         state.bytes_read_counter += 4;
                         mt_source = &mt_source[4..];
                         state.check_sum = Some(u32::from_le_bytes(chksum));
+                        #[cfg(feature = "hash")]
+                        state.verify_frame_checksum()?;
                     } else {
                         return Ok((0, 0));
                     }
@@ -859,6 +890,8 @@ impl FrameDecoder {
                                 state.bytes_read_counter += 4;
                                 mt_source = &mt_source[4..];
                                 state.check_sum = Some(u32::from_le_bytes(chksum));
+                                #[cfg(feature = "hash")]
+                                state.verify_frame_checksum()?;
                             }
                             break;
                         }
@@ -902,6 +935,8 @@ impl FrameDecoder {
                                 state.bytes_read_counter += 4;
                                 let chksum = u32::from_le_bytes(chksum);
                                 state.check_sum = Some(chksum);
+                                #[cfg(feature = "hash")]
+                                state.verify_frame_checksum()?;
                             }
                         }
                         break;
