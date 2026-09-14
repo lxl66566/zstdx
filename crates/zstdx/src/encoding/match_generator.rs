@@ -348,6 +348,21 @@ const HEAD_HASH_LOG: u32 = 20;
 /// than the head span itself.
 const HEAD_KNOBS: OptKnobs = bt_knobs(4, 20);
 
+/// Quiet blocks before the LDM generation latch shuts off: a winless
+/// megabyte is a shape whose far class either does not exist or never
+/// wins — the split pass (gear + xxh over every 64-byte window, ~9 cyc/B
+/// measured) is pure tax from there on. Any win resets the latch; the
+/// false-kill risk (a far duplicate isolated by winless content on both
+/// sides) is bounded by the canary revival below.
+const LDM_QUIET: u8 = 16;
+
+/// Blocks between canary generations while latched off: one block per
+/// megabyte re-runs the split pass, and a canary whose beyond-reach
+/// candidates exist revives the matcher — far-match density can ramp up
+/// anywhere in the file, and the quiet stretch that latched cannot prove
+/// the class absent beyond what it scanned.
+const LDM_CANARY: u8 = 8;
+
 /// Lifecycle of the cold-start DUBT head (row 9, see [`HEAD_LIMIT`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum HeadPhase {
@@ -1275,6 +1290,17 @@ pub struct MatchGeneratorDriver {
     /// Long-distance candidates of the block being scanned (regenerated
     /// per block by [`Self::ldm_generate`]).
     ldm_seqs: Vec<LdmSeq>,
+    /// Consecutive winless scanned blocks past the reach horizon (see
+    /// [`LDM_QUIET`]); counts toward the shutoff latch.
+    ldm_quiet: u8,
+    /// Shutoff: generation stops after [`LDM_QUIET`] quiet blocks and
+    /// drops to one canary block per [`LDM_CANARY`] — shapes whose repeats
+    /// all sit inside the chain's domain never pay the full split pass
+    /// again, and a canary that finds the far class revives it. Reset per
+    /// frame and job.
+    ldm_dead: bool,
+    /// Blocks since the last canary while shut off.
+    ldm_canary: u8,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -1362,6 +1388,9 @@ impl MatchGeneratorDriver {
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
+            ldm_quiet: 0,
+            ldm_dead: false,
+            ldm_canary: 0,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1405,6 +1434,9 @@ impl MatchGeneratorDriver {
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
+            ldm_quiet: 0,
+            ldm_dead: false,
+            ldm_canary: 0,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1472,7 +1504,15 @@ impl MatchGeneratorDriver {
             if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
                 self.lazy_scratch = Some(LazyScratch::new());
             }
-            let ldm_wanted = params.ldm && matches!(params.strategy, Strategy::Chain(_));
+            // The size gate: the split pass costs ~9 cyc/B (measured), so
+            // LDM arms only where its full 64 MiB reach survived the
+            // source-length clamp — smaller inputs keep the pure chain
+            // parse at zero tax, trading the 4-32 MiB far classes of
+            // mid-size binaries (dll32-class, measured worth -19.7%
+            // there) for the corpus cells' speed.
+            let ldm_wanted = params.ldm
+                && matches!(params.strategy, Strategy::Chain(_))
+                && params.window >= (1 << 26);
             let ldm_sized = self
                 .ldm
                 .as_ref()
@@ -1619,6 +1659,9 @@ impl MatchGeneratorDriver {
         // candidate history — same content the grid fill indexes below.
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
+            self.ldm_quiet = 0;
+            self.ldm_dead = false;
+            self.ldm_canary = 0;
             if data.len() >= super::ldm::MIN_MATCH_LENGTH {
                 ldm.fill(data, base, base, base + data.len() as u64);
             }
@@ -1923,6 +1966,9 @@ impl Matcher for MatchGeneratorDriver {
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(0);
         }
+        self.ldm_quiet = 0;
+        self.ldm_dead = false;
+        self.ldm_canary = 0;
         self.opt_state.reset();
     }
 
@@ -2034,7 +2080,7 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
             Strategy::Chain(_) => {
                 self.ldm_generate();
-                if self.params.ldm {
+                if self.ldm.is_some() {
                     self.start_matching_chain::<true>(literals, seqs);
                 } else {
                     self.start_matching_chain::<false>(literals, seqs);
@@ -2246,8 +2292,16 @@ impl MatchGeneratorDriver {
     #[inline(never)]
     fn ldm_generate(&mut self) {
         self.ldm_seqs.clear();
+        if self.ldm_dead {
+            self.ldm_canary += 1;
+            if self.ldm_canary < LDM_CANARY {
+                return;
+            }
+            self.ldm_canary = 0;
+        }
         if let Some(ldm) = &mut self.ldm {
             let win = window_slice(&self.win, self.ext.as_ref());
+            let reach = self.params.chain_reach.unwrap_or(self.params.window) as u64;
             ldm.generate(
                 &mut self.ldm_seqs,
                 win,
@@ -2255,6 +2309,16 @@ impl MatchGeneratorDriver {
                 self.pos,
                 self.block_end,
             );
+            // Only offsets beyond the chain's search domain survive:
+            // nearer candidates are the chain's own class (the newest-wins
+            // heads already serve the modal repeat distance), and probing
+            // them measured as pure interference — a far read per split
+            // plus a miss-step clamp on tiled data.
+            self.ldm_seqs.retain(|s| s.offset as u64 > reach);
+            if self.ldm_dead && !self.ldm_seqs.is_empty() {
+                self.ldm_dead = false;
+                self.ldm_quiet = 0;
+            }
         }
     }
 
@@ -3091,6 +3155,7 @@ impl MatchGeneratorDriver {
         // split lies behind the anchor) are dropped as emissions advance.
         let ldm_seqs = &self.ldm_seqs[..];
         let mut ldm_i = 0usize;
+        let mut ldm_won = LDM && false;
 
         // Chain-walk search from the hash head `entry` at window index `idx`,
         // returning the longest match's (length, candidate window index):
@@ -3176,6 +3241,7 @@ impl MatchGeneratorDriver {
                             if ml > best_len {
                                 best_len = ml;
                                 best_cand = ci;
+                                ldm_won = true;
                             }
                         }
                     }
@@ -3483,6 +3549,19 @@ impl MatchGeneratorDriver {
         if !emit.seqs.is_empty() && anchor < block_end {
             let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
             emit.literals.extend_from_slice(&win[tail]);
+        }
+        if LDM {
+            if ldm_won {
+                self.ldm_quiet = 0;
+            } else if block_end - win_base > max_window {
+                // Count quiet only where a beyond-reach twin could exist
+                // at all: the frame's first `reach` bytes have no content
+                // far enough back.
+                self.ldm_quiet += 1;
+                if self.ldm_quiet >= LDM_QUIET {
+                    self.ldm_dead = true;
+                }
+            }
         }
         self.pos = block_end;
         self.anchor = block_end;
@@ -3832,11 +3911,20 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let block: Vec<u8> = (0..(64 * 1024)).map(|_| (rand() >> 32) as u8).collect();
-        let mut data = Vec::with_capacity(5 * 1024 * 1024 + block.len() * 2);
-        data.extend_from_slice(&block);
-        data.extend((0..(5 << 20)).map(|_| (rand() >> 32) as u8));
-        data.extend_from_slice(&block);
+        // dll-shaped: 80 distinct 64 KiB blocks, then a run of far copies
+        // (5 MiB back, beyond the row's 4 MiB chain reach) spaced 64 KiB
+        // apart — the far class recurs throughout, like shared code in
+        // concatenated binaries, instead of one isolated duplicate (which
+        // the quiet latch could legitimately miss; see LDM_QUIET).
+        const UNIT: usize = 64 * 1024;
+        let mut data = Vec::with_capacity(6 * 1024 * 1024);
+        for _ in 0..80 {
+            data.extend((0..UNIT).map(|_| (rand() >> 32) as u8));
+        }
+        for i in 0..16 {
+            let unit: Vec<u8> = data[i * UNIT..(i + 1) * UNIT].to_vec();
+            data.extend_from_slice(&unit);
+        }
         let mut offsets = Vec::new();
         let reconstructed = match_and_reconstruct_collecting_offsets(&data, &mut offsets);
         assert_eq!(reconstructed, data);
