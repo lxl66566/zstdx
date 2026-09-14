@@ -233,6 +233,12 @@ pub(crate) struct MtEncoderCore {
     /// spawn+join of the whole set per burst, ~0.5-2 ms each). Joined on
     /// drop via shutdown.
     pool_threads: Vec<JoinHandle<()>>,
+    /// The burst posted to the pool and not yet assembled: the calling
+    /// thread keeps accumulating (appends confined to the reserved window,
+    /// which never reallocs while workers read the buffer) and the burst is
+    /// assembled at the next fire, a flush/finish, or when the window
+    /// fills.
+    inflight: Option<Arc<BurstCtx>>,
 }
 
 impl MtEncoderCore {
@@ -310,18 +316,40 @@ impl MtEncoderCore {
                 states: Mutex::new(Vec::new()),
             }),
             pool_threads: Vec::new(),
+            inflight: None,
         }
     }
 
     pub(crate) fn write(&mut self, data: &[u8]) {
         debug_assert!(!self.finished);
-        if data.is_empty() {
-            return;
+        self.try_compact();
+        let mut data = data;
+        while !data.is_empty() {
+            // A burst in flight freezes the buffer (its workers read it),
+            // so appends stay inside the reserved window; a full window
+            // drains the burst, which trims and re-reserves.
+            let space = match &self.inflight {
+                Some(_) => self.buf.capacity() - self.buf.len(),
+                None => data.len(),
+            };
+            let n = space.min(data.len());
+            if n == 0 {
+                self.drain_inflight();
+                continue;
+            }
+            self.buf.extend_from_slice(&data[..n]);
+            data = &data[n..];
+            self.pos += n as u64;
+            if let Some(hi) = self.burst_hi() {
+                self.fire_burst(hi);
+            }
         }
-        self.buf.extend_from_slice(data);
-        self.pos += data.len() as u64;
-        if let Some(hi) = self.burst_hi() {
-            self.encode_jobs(hi, false);
+        // Surface a worker panic at the write that fired the burst — the
+        // timing the blocking model used to give.
+        if let Some(ctx) = &self.inflight {
+            if ctx.poison.lock().unwrap().is_some() {
+                self.drain_inflight();
+            }
         }
     }
 
@@ -331,6 +359,7 @@ impl MtEncoderCore {
         if self.finished {
             return;
         }
+        self.drain_inflight();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, true);
         } else {
@@ -359,6 +388,9 @@ impl MtEncoderCore {
     /// data visible early is what a flush is for).
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
+        // A flush promises visibility: the in-flight burst's blocks belong
+        // to the output even when no new bytes are pending.
+        self.drain_inflight();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, false);
         }
@@ -476,16 +508,14 @@ impl MtEncoderCore {
     /// `last_frame_block` is set (only finish passes true). `hi` must not
     /// exceed `pos`; when it lands mid-job (flush, or the finish tail) the
     /// last job is short.
-    fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
-        debug_assert!(self.job_start < hi && hi <= self.pos);
-        self.emit_header();
-        // Job boundaries between job_start and hi, on the absolute schedule.
-        // The growing grid re-slices everything past the last epoch boundary
-        // into at most `burst_jobs` equal jobs: that range only appears when
-        // hi is the stream end or a flush point — a pure function of the
-        // input, so chunking-independence holds — and the re-slice lets the
-        // tail burst fill the workers instead of idling them behind one
-        // schedule-sized job.
+    /// Job boundaries between job_start and hi, on the absolute schedule.
+    // The growing grid re-slices everything past the last epoch boundary
+    // into at most `burst_jobs` equal jobs: that range only appears when
+    // hi is the stream end or a flush point — a pure function of the
+    // input, so chunking-independence holds — and the re-slice lets the
+    // tail burst fill the workers instead of idling them behind one
+    // schedule-sized job.
+    fn build_bounds(&self, hi: u64) -> Vec<u64> {
         let mut bounds = Vec::with_capacity(self.burst_jobs * 3 + 2);
         bounds.push(self.job_start);
         match self.grid {
@@ -526,95 +556,188 @@ impl MtEncoderCore {
                 }
             },
         }
-        let n_jobs = bounds.len() - 1;
+        bounds
+    }
+
+    /// Encode the jobs covering [job_start, hi) synchronously: the
+    /// flush/finish path, where the caller wants the bytes on return.
+    fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
+        debug_assert!(self.job_start < hi && hi <= self.pos);
+        self.drain_inflight();
+        self.emit_header();
+        let bounds = self.build_bounds(hi);
+        if bounds.len() == 2 {
+            self.run_inline_job(&bounds, hi, last_frame_block);
+        } else {
+            self.fire_jobs(bounds, hi, last_frame_block);
+            self.drain_inflight();
+        }
+    }
+
+    /// The steady write path's sibling of [`Self::encode_jobs`]: drains the
+    /// previous burst (by now the workers are usually long done), then
+    /// posts the new one and returns while they encode — the calling thread
+    /// goes straight back to accumulating, overlapping the pump with the
+    /// burst instead of serializing behind its barrier. A single short job
+    /// still runs inline (no pool spun up for it).
+    fn fire_burst(&mut self, hi: u64) {
+        debug_assert!(self.job_start < hi && hi <= self.pos);
+        self.drain_inflight();
+        self.emit_header();
+        let bounds = self.build_bounds(hi);
+        if bounds.len() == 2 {
+            self.run_inline_job(&bounds, hi, false);
+        } else {
+            self.fire_jobs(bounds, hi, false);
+        }
+    }
+
+    /// One short tail job (small inputs, a flush, or a finish without a
+    /// burst behind it): inline on the calling thread, no pool involved.
+    fn run_inline_job(&mut self, bounds: &[u64], hi: u64, last_frame_block: bool) {
         // The shared job view starts at the next job's strip (the previous
         // job's tail), which is exactly what the buffer retained.
         let strip_lo = self.job_start.saturating_sub(self.overlap as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (self.job_start - strip_lo) as usize;
-
-        if n_jobs == 1 {
-            // One short tail job (small inputs, a flush, or a finish without
-            // a burst behind it): inline on the calling thread, no pool
-            // spun up.
-            self.hash_to(hi);
-            let last_len = (bounds[1] - bounds[0]) as usize;
-            let mut state = take_pooled_state(&self.shared.states);
-            let bytes = run_job_with(
-                &mut state,
-                &self.buf[..(hi - self.buf_base) as usize],
-                first..first + last_len,
-                self.overlap,
-                last_frame_block,
-                self.level,
-                self.job_start > 0,
-                self.shape,
-            );
-            self.shared.states.lock().unwrap().push(state);
-            self.output.extend_from_slice(&bytes);
-        } else {
-            let pool_size = self.ensure_workers(n_jobs);
-            // SAFETY: posted for the burst and frozen until the pool
-            // quiesces below (see FrozenSrc).
-            let src =
-                unsafe { slice::from_raw_parts(self.buf.as_ptr(), (hi - self.buf_base) as usize) };
-            let ctx = Arc::new(BurstCtx {
-                src: FrozenSrc {
-                    ptr: src.as_ptr(),
-                    len: src.len(),
-                },
-                first,
-                bounds,
-                n_jobs,
-                job_start: self.job_start,
-                overlap: self.overlap,
-                level: self.level,
-                last_frame_block,
-                shape: self.shape,
-                slots: (0..n_jobs).map(|_| Mutex::new(None)).collect(),
-                ready: Condvar::new(),
-                next_job: AtomicUsize::new(0),
-                poison: Mutex::new(None),
-                exited: AtomicUsize::new(pool_size),
-                quiesce: Mutex::new(()),
-                quiesce_cv: Condvar::new(),
-            });
-            {
-                let mut inner = self.shared.inner.lock().unwrap();
-                // The previous burst quiesced before this call returned, so
-                // no worker still holds an older ctx.
-                debug_assert!(inner.ctx.is_none());
-                inner.generation += 1;
-                inner.ctx = Some(ctx.clone());
-            }
-            self.shared.wake.notify_all();
-
-            // Checksum absorb on the calling thread while the workers
-            // encode; then ordered assembly: each job's blocks append as
-            // soon as they land.
-            self.hash_to(hi);
-            for slot in &ctx.slots {
-                let mut guard = slot.lock().unwrap();
-                while guard.is_none() {
-                    guard = ctx.ready.wait(guard).unwrap();
-                }
-                self.output.extend_from_slice(&guard.take().unwrap());
-            }
-            // Quiesce: every worker has left the burst's job loop, so the
-            // source buffer may be mutated, moved or dropped again.
-            {
-                let mut guard = ctx.quiesce.lock().unwrap();
-                while ctx.exited.load(Ordering::Acquire) != 0 {
-                    guard = ctx.quiesce_cv.wait(guard).unwrap();
-                }
-            }
-            self.shared.inner.lock().unwrap().ctx = None;
-            if let Some(payload) = ctx.poison.lock().unwrap().take() {
-                std::panic::resume_unwind(payload);
-            }
-        }
+        self.hash_to(hi);
+        let last_len = (bounds[1] - bounds[0]) as usize;
+        let mut state = take_pooled_state(&self.shared.states);
+        let bytes = run_job_with(
+            &mut state,
+            &self.buf[..(hi - self.buf_base) as usize],
+            first..first + last_len,
+            self.overlap,
+            last_frame_block,
+            self.level,
+            self.job_start > 0,
+            self.shape,
+        );
+        self.shared.states.lock().unwrap().push(state);
+        self.output.extend_from_slice(&bytes);
         self.job_start = hi;
         self.trim_buf();
+    }
+
+    /// Post a multi-job burst to the pool and return without waiting: the
+    /// burst lands in `inflight` and is assembled by
+    /// [`Self::drain_inflight`]. The next append window is reserved before
+    /// posting — the frozen buffer cannot realloc while the workers read
+    /// it, so `write` can keep appending inside the window.
+    fn fire_jobs(&mut self, bounds: Vec<u64>, hi: u64, last_frame_block: bool) {
+        debug_assert!(self.inflight.is_none());
+        let n_jobs = bounds.len() - 1;
+        let burst_start = bounds[0];
+        let strip_lo = burst_start.saturating_sub(self.overlap as u64);
+        debug_assert!(self.buf_base <= strip_lo);
+        let first = (burst_start - strip_lo) as usize;
+        let pool_size = self.ensure_workers(n_jobs);
+        let burst_job_start = self.job_start;
+        self.job_start = hi;
+        self.reserve_next_window();
+        // SAFETY: posted for the burst and frozen until the pool quiesces
+        // (see FrozenSrc); the reservation above already happened with the
+        // pool idle, so the pointer is stable for the whole burst.
+        let src =
+            unsafe { slice::from_raw_parts(self.buf.as_ptr(), (hi - self.buf_base) as usize) };
+        let ctx = Arc::new(BurstCtx {
+            src: FrozenSrc {
+                ptr: src.as_ptr(),
+                len: src.len(),
+            },
+            first,
+            bounds,
+            n_jobs,
+            job_start: burst_job_start,
+            overlap: self.overlap,
+            level: self.level,
+            last_frame_block,
+            shape: self.shape,
+            slots: (0..n_jobs).map(|_| Mutex::new(None)).collect(),
+            ready: Condvar::new(),
+            next_job: AtomicUsize::new(0),
+            poison: Mutex::new(None),
+            exited: AtomicUsize::new(pool_size),
+            quiesce: Mutex::new(()),
+            quiesce_cv: Condvar::new(),
+        });
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            // The previous burst drained before this one posts, so no
+            // worker still holds an older ctx.
+            debug_assert!(inner.ctx.is_none());
+            inner.generation += 1;
+            inner.ctx = Some(ctx.clone());
+        }
+        self.shared.wake.notify_all();
+        // Checksum absorb on the calling thread while the workers encode.
+        self.hash_to(hi);
+        self.inflight = Some(ctx);
+    }
+
+    /// Drop the consumed buffer prefix once the in-flight burst has
+    /// quiesced (an acquire load of the exit countdown — the same freeze
+    /// guarantee `drain_inflight` waits for). Compacting early keeps the
+    /// prefix drain at strip scale; deferring it to the next fire would
+    /// move a whole epoch of pending bytes.
+    fn try_compact(&mut self) {
+        let Some(ctx) = &self.inflight else {
+            return;
+        };
+        if ctx.exited.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let keep = self.job_start.saturating_sub(self.overlap as u64);
+        debug_assert!(self.buf_base <= keep);
+        let drop = (keep - self.buf_base) as usize;
+        if drop > 0 {
+            self.buf.drain(..drop);
+            self.buf_base = keep;
+        }
+    }
+
+    /// Assemble the in-flight burst's blocks in order, wait for the pool to
+    /// quiesce (the source buffer unfreezes), trim, and surface a worker
+    /// panic if any.
+    fn drain_inflight(&mut self) {
+        let Some(ctx) = self.inflight.take() else {
+            return;
+        };
+        for slot in &ctx.slots {
+            let mut guard = slot.lock().unwrap();
+            while guard.is_none() {
+                guard = ctx.ready.wait(guard).unwrap();
+            }
+            self.output.extend_from_slice(&guard.take().unwrap());
+        }
+        {
+            let mut guard = ctx.quiesce.lock().unwrap();
+            while ctx.exited.load(Ordering::Acquire) != 0 {
+                guard = ctx.quiesce_cv.wait(guard).unwrap();
+            }
+        }
+        self.shared.inner.lock().unwrap().ctx = None;
+        self.trim_buf();
+        if let Some(payload) = ctx.poison.lock().unwrap().take() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Reserve buffer space for everything the next burst will accumulate
+    /// (plus its strip), so appends never realloc while a burst is in
+    /// flight. Called with the pool idle (before posting); a fixed grid
+    /// bounds the next burst at `burst_jobs` complete jobs plus the held
+    /// back one, the growing grid at its epoch end.
+    fn reserve_next_window(&mut self) {
+        let next_hi = match self.grid {
+            JobGrid::Fixed(size) => self.job_start + (self.burst_jobs as u64 + 1) * size as u64,
+            JobGrid::Growing => self.growing_epoch_end(self.job_start),
+        };
+        let want = (next_hi - self.buf_base) as usize + self.overlap + 64 * 1024;
+        if self.buf.capacity() < want {
+            self.buf.reserve_exact(want - self.buf.len());
+            advise_hugepages(&self.buf);
+        }
     }
 
     /// Retain exactly the strip the next job will prefill from, dropping
