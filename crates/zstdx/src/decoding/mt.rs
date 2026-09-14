@@ -845,15 +845,23 @@ pub fn decode_to_vec_mt(
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
                 seg_ends.push(end);
-                output.reserve(end - start_len);
-                // SAFETY: start_len bytes are initialized and capacity now
-                // covers `end`; the region base is the vector's data start.
-                // The pointer is re-acquired per segment, so growth between
-                // segments is fine, and set_len below publishes the writes
-                // segment by segment so an error leaves the tail unobserved.
-                // The wildcopy slack may write up to 16 bytes past `end`
-                // inside the capacity (raw writes; never read past `end`).
-                Ok((output.as_mut_ptr(), output.capacity() + start_len))
+                output.reserve(end);
+                // `end` is executor-relative, i.e. exactly the additional
+                // bytes needed behind the existing contents; the base hands
+                // out that region and the limit is the remaining capacity.
+                // SAFETY: start_len bytes are initialized and the reserve
+                // above covers `end` more. The pointer is re-acquired per
+                // segment, so growth between segments is fine, and set_len
+                // below publishes the writes segment by segment so an error
+                // leaves the tail unobserved. The wildcopy slack may write up
+                // to 16 bytes past `end` inside the capacity (raw writes;
+                // never read past `end`).
+                Ok((
+                    // SAFETY: in-bounds pointer one past the existing
+                    // contents, inside the vector's allocation.
+                    unsafe { output.as_mut_ptr().add(start_len) },
+                    output.capacity() - start_len,
+                ))
             };
         let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
         // Verify before publishing so the length stays unchanged on error
@@ -1081,6 +1089,21 @@ mod tests {
         let mut vec_out = Vec::new();
         decode_to_vec_mt(&compressed, &mut vec_out, 4, MAX_WINDOW).unwrap();
         assert_eq!(vec_out, data);
+    }
+
+    /// Appending to a non-empty vector must leave the existing contents
+    /// untouched (execution coordinates are append-relative; the place
+    /// callback used to hand out the vector's base and overwrite them).
+    #[test]
+    fn append_to_nonempty_vec() {
+        let data = textish(8 * 1024 * 1024);
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let mut out = alloc::vec![0x41u8; 1024 * 1024];
+        let prefix = out.clone();
+        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        assert_eq!(&out[..prefix.len()], &prefix[..]);
+        assert_eq!(&out[prefix.len()..], &data[..]);
     }
 
     /// Corrupt input must surface an error, not silent garbage.

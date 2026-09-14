@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- `decode_to_vec_mt` corrupted memory when appending to a non-empty
+  vector: the place callback handed out the vector's base (execution
+  coordinates are append-relative), reserved only `end - start_len` extra
+  bytes (short by `start_len`), and reported the write limit as
+  `capacity + start_len`. All callers passed fresh vectors, so the path was
+  only reachable through the public API. Now the base is offset past the
+  existing contents, the reserve covers the executor-relative `end`, and the
+  limit is the remaining capacity; regression test appends behind a 1 MiB
+  prefix (caught as heap corruption under MALLOC_CHECK_/valgrind).
 - MT decode staging buffers are pooled globally (256 MiB cap): every
   decode call used to map fresh multi-megabyte staging vectors per
   segment and pay their whole first-touch fault cost again (the encoder
