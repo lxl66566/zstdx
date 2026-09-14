@@ -515,6 +515,12 @@ pub(crate) fn decode_step(
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
         }
     }
+    // Dev-feature differential dump: records every decoded sequence for
+    // parse comparison against a reference frame (see decoding::seq_dump).
+    // Compiled out unless `seq_dump` is enabled, so release builds are
+    // untouched.
+    #[cfg(feature = "seq_dump")]
+    super::seq_dump::record(seq.ll, seq.ml, seq.of);
     Ok(seq)
 }
 

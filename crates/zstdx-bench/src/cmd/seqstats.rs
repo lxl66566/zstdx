@@ -195,6 +195,319 @@ pub struct Args {
     /// zstd numeric level selecting the matcher strategy.
     #[arg(long, default_value = "1")]
     pub level: i32,
+    /// Reference frame (e.g. libzstd output at the paired level): decode it
+    /// through our decoder's seq_dump log and diff its parse against our
+    /// encoder's parse of the same raw data.
+    #[arg(long)]
+    pub ref_frame: Option<PathBuf>,
+    /// Number of leading parse divergences to print in diff mode.
+    #[arg(long, default_value = "10")]
+    pub divergences: usize,
+}
+
+/// Decoder-side repcode history resolution (mirrors
+/// `sequence_execution::do_offset_history`, wire values in, actual offset out).
+fn resolve_actual(triples: &[(u32, u32, u32)]) -> Vec<(u32, u32, u64)> {
+    let mut hist = [1u32, 4, 8];
+    triples
+        .iter()
+        .map(|&(ll, ml, of)| {
+            let idx = of.wrapping_sub(1).wrapping_add((ll == 0) as u32);
+            let slot = (idx & 3) as usize;
+            let slot = if slot == 3 {
+                0
+            } else {
+                slot
+            };
+            let actual = if of <= 3 {
+                hist[slot].saturating_sub((idx == 3) as u32)
+            } else {
+                of.wrapping_sub(3)
+            };
+            let keep = idx == 0;
+            let rotate_all = idx >= 2;
+            hist[2] = if rotate_all {
+                hist[1]
+            } else {
+                hist[2]
+            };
+            hist[1] = if keep {
+                hist[1]
+            } else {
+                hist[0]
+            };
+            hist[0] = if keep {
+                hist[0]
+            } else {
+                actual
+            };
+            (ll, ml, actual as u64)
+        })
+        .collect()
+}
+
+struct ParseStats {
+    nseq: usize,
+    lit_bytes: u64,
+    match_bytes: u64,
+    rep_frac: f64,
+    avg_ll: f64,
+    avg_ml: f64,
+    med_of: u64,
+    seq_bits: f64, // entropy bound over code histograms + add bits
+    lit_bits: f64, // order-0 entropy of the literal bytes
+}
+
+fn parse_stats(raw: &[u8], triples: &[(u32, u32, u32)]) -> ParseStats {
+    let resolved = resolve_actual(triples);
+    let n = triples.len() as u64;
+    let mut llh = [0u64; 36];
+    let mut mlh = [0u64; 53];
+    let mut ofh = [0u64; 32];
+    let (mut ll_add, mut ml_add, mut of_add) = (0u64, 0u64, 0u64);
+    let mut reps = 0u64;
+    let mut lits_hist = [0u64; 256];
+    let (mut lit_bytes, mut match_bytes) = (0u64, 0u64);
+    // Replay over the raw output to pick up the literal bytes the parse chose.
+    let mut pos = 0usize;
+    let mut offs: Vec<u64> = Vec::with_capacity(triples.len());
+    for (i, &(ll, ml, of)) in triples.iter().enumerate() {
+        let (_, _, of_a) = resolved[i];
+        let (lc, lnb) = ll_code(ll);
+        let (mc, mnb) = ml_code(ml);
+        llh[lc as usize] += 1;
+        mlh[mc as usize] += 1;
+        ofh[of_a.ilog2() as usize] += 1;
+        ll_add += lnb as u64;
+        ml_add += mnb as u64;
+        of_add += of_a.ilog2() as u64;
+        if of <= 3 {
+            reps += 1;
+        }
+        lit_bytes += ll as u64;
+        match_bytes += ml as u64;
+        for &b in &raw[pos..pos + ll as usize] {
+            lits_hist[b as usize] += 1;
+        }
+        pos += ll as usize + ml as usize;
+        offs.push(of_a);
+    }
+    for &b in &raw[pos..] {
+        lits_hist[b as usize] += 1;
+        lit_bytes += 1;
+    }
+    offs.sort_unstable();
+    let code_bits = entropy(&llh, n) + entropy(&mlh, n) + entropy(&ofh, n);
+    let lit_bits = entropy(&lits_hist, lit_bytes.max(1));
+    ParseStats {
+        nseq: triples.len(),
+        lit_bytes,
+        match_bytes,
+        rep_frac: reps as f64 / n as f64,
+        avg_ll: lit_bytes as f64 / n as f64,
+        avg_ml: match_bytes as f64 / n as f64,
+        med_of: offs[offs.len() / 2],
+        seq_bits: code_bits + (ll_add + ml_add + of_add) as f64,
+        lit_bits,
+    }
+}
+
+/// Walk both parses aligned on absolute output position and classify where
+/// they disagree.
+fn diff_parses(ours: &[(u32, u32, u32)], ref_: &[(u32, u32, u32)], raw: &[u8], show: usize) {
+    let total_len = raw.len();
+    let o = resolve_actual(ours);
+    let r = resolve_actual(ref_);
+    // Sequence start positions (literal-run tail excluded from both).
+    let starts = |t: &[(u32, u32, u32)]| -> Vec<u64> {
+        let mut p = 0u64;
+        t.iter()
+            .map(|&(ll, ml, _)| {
+                let s = p;
+                p += ll as u64 + ml as u64;
+                s
+            })
+            .collect()
+    };
+    let so = starts(ours);
+    let sr = starts(ref_);
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut same = 0u64;
+    let mut only_ours = 0u64;
+    let mut only_ref = 0u64;
+    // ref matches that start where our parse has literals (we missed them)
+    let mut missed_mlh = [0u64; 53];
+    let mut missed_olog = [0u64; 32];
+    let mut shown = 0usize;
+    while i < ours.len() && j < ref_.len() {
+        match so[i].cmp(&sr[j]) {
+            std::cmp::Ordering::Equal => {
+                let (oll, oml, oof) = o[i];
+                let (rll, rml, rof) = r[j];
+                if oll == rll && oml == rml && oof == rof {
+                    same += 1;
+                } else if shown < show {
+                    shown += 1;
+                    println!(
+                        "  @{} ours (ll={oll} ml={oml} of={oof}) vs ref (ll={rll} ml={rml} \
+                         of={rof})",
+                        so[i]
+                    );
+                }
+                i += 1;
+                j += 1;
+            },
+            std::cmp::Ordering::Less => {
+                only_ours += 1;
+                i += 1;
+            },
+            std::cmp::Ordering::Greater => {
+                // ref emits at a position we do not: either covered by our
+                // longer match or a match we missed entirely — the missed-
+                // match accounting below uses literal coverage, this is the
+                // raw stream view
+                only_ref += 1;
+                j += 1;
+            },
+        }
+    }
+    // Coverage view: which byte ranges each side matched. A ref match whose
+    // start lies inside one of our literal runs is a match we missed.
+    let mut covered = vec![false; total_len];
+    let mut p = 0usize;
+    for &(ll, ml, _) in ours {
+        p += ll as usize;
+        for c in covered.iter_mut().skip(p).take(ml as usize) {
+            *c = true;
+        }
+        p += ml as usize;
+    }
+    // Map each byte to the our-side sequence covering it (index + whether it
+    // sits in the sequence's literal or match part), for divergence context.
+    let mut owner = vec![(0usize, false); total_len]; // (seq idx, in-match)
+    let mut p = 0usize;
+    for (i, &(ll, ml, _)) in ours.iter().enumerate() {
+        for o in owner.iter_mut().skip(p).take(ll as usize + ml as usize) {
+            *o = (i, false);
+        }
+        for o in owner.iter_mut().skip(p + ll as usize).take(ml as usize) {
+            *o = (i, true);
+        }
+        p += ll as usize + ml as usize;
+    }
+    let mut missed = 0u64;
+    let mut missed_bytes = 0u64;
+    let mut missed_in_zero = 0u64;
+    let mut p = 0usize;
+    let mut ctx_shown = 0u64;
+    for (j, &(ll, ml, _)) in ref_.iter().enumerate() {
+        p += ll as usize;
+        if p < covered.len() && !covered[p] {
+            missed += 1;
+            missed_bytes += ml as u64;
+            missed_mlh[ml_code(ml).0 as usize] += 1;
+            missed_olog[r[j].2.ilog2() as usize] += 1;
+            if raw[p] == 0 {
+                missed_in_zero += 1;
+            }
+            if ctx_shown < show as u64 {
+                ctx_shown += 1;
+                let (oi, in_match) = owner[p];
+                let (oll, oml, oof) = o[oi];
+                let ostart = so[oi];
+                println!(
+                    "  miss @{p}: ref (ll={ll} ml={ml} of={}) | our seq #{oi} @{} (ll={oll} \
+                     ml={oml} of={oof}) pos-in-seq {} (match-part={in_match})",
+                    r[j].2,
+                    ostart,
+                    p - ostart as usize
+                );
+            }
+        }
+        p += ml as usize;
+    }
+    println!("missed in zero-fill region: {missed_in_zero} / {missed}");
+    println!(
+        "diff: same={same} only_ours={only_ours} only_ref={only_ref} missed_ref_matches={missed} \
+         ({missed_bytes} B)"
+    );
+    let top: Vec<String> = missed_mlh
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c > 0)
+        .map(|(c, &n)| format!("{}x{}", n, ml_code_val(c)))
+        .collect();
+    if !top.is_empty() {
+        println!("missed ref ml distribution: {}", top.join(" "));
+    }
+    let top: Vec<String> = missed_olog
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c > 0)
+        .map(|(b, &n)| format!("{}x2^{}", n, b))
+        .collect();
+    if !top.is_empty() {
+        println!("missed ref offset-log distribution: {}", top.join(" "));
+    }
+}
+
+fn ml_code_val(code: usize) -> u32 {
+    const ML_META: [(u32, u8); 53] = [
+        (3, 0),
+        (4, 0),
+        (5, 0),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+        (9, 0),
+        (10, 0),
+        (11, 0),
+        (12, 0),
+        (13, 0),
+        (14, 0),
+        (15, 0),
+        (16, 0),
+        (17, 0),
+        (18, 0),
+        (19, 0),
+        (20, 0),
+        (21, 0),
+        (22, 0),
+        (23, 0),
+        (24, 0),
+        (25, 0),
+        (26, 0),
+        (27, 0),
+        (28, 0),
+        (29, 0),
+        (30, 0),
+        (31, 0),
+        (32, 0),
+        (33, 0),
+        (34, 0),
+        (35, 1),
+        (37, 1),
+        (39, 1),
+        (41, 1),
+        (43, 2),
+        (47, 2),
+        (51, 3),
+        (59, 3),
+        (67, 4),
+        (83, 4),
+        (99, 5),
+        (131, 7),
+        (259, 8),
+        (515, 9),
+        (1027, 10),
+        (2051, 11),
+        (4099, 12),
+        (8195, 13),
+        (16387, 14),
+        (32771, 15),
+        (65539, 16),
+    ];
+    ML_META[code].0
 }
 
 pub fn run(args: &Args) {
@@ -285,4 +598,71 @@ pub fn run(args: &Args) {
         ml: 0,
         of: 0,
     };
+
+    // Differential mode: decode the reference frame through our decoder's
+    // seq_dump log and compare the two parses of the same raw data.
+    if let Some(ref_frame) = &args.ref_frame {
+        let frame = fs::read(ref_frame).unwrap();
+        let decoded = zstdx::bulk::decompress(&frame, raw.len()).unwrap();
+        assert_eq!(decoded, raw, "reference frame must decode to the input");
+        let dumped = zstdx::decoding::seq_dump::take();
+        let ref_triples: Vec<(u32, u32, u32)> = dumped.iter().map(|s| (s.ll, s.ml, s.of)).collect();
+        let ours = parse_stats(&raw, &rec.triples);
+        let theirs = parse_stats(&raw, &ref_triples);
+        let show = |name: &str, s: &ParseStats| {
+            println!(
+                "{name}: nseq={} lit={}B match={}B rep={:.1}% avg_ll={:.2} avg_ml={:.2} med_of={} \
+                 seq_bound={:.0}B lit_bound={:.0}B",
+                s.nseq,
+                s.lit_bytes,
+                s.match_bytes,
+                s.rep_frac * 100.0,
+                s.avg_ll,
+                s.avg_ml,
+                s.med_of,
+                s.seq_bits / 8.0,
+                s.lit_bits / 8.0
+            );
+        };
+        show("ours", &ours);
+        show("ref ", &theirs);
+        // Cold-start view: literal bytes of sequences starting inside the
+        // first tile-period of a tiled corpus (fixed 768 KiB cut: the corpus
+        // tiles repo content at ~839 KiB; anything below is cold-start only).
+        let cold_lit = |t: &[(u32, u32, u32)]| -> (u64, u64) {
+            let mut p = 0usize;
+            let (mut l, mut m) = (0u64, 0u64);
+            for &(ll, ml, _) in t {
+                if p < 786432 {
+                    l += ll as u64;
+                    m += ml as u64;
+                }
+                p += ll as usize + ml as usize;
+            }
+            (l, m)
+        };
+        let (ol, om) = cold_lit(&rec.triples);
+        let (rl, rm) = cold_lit(&ref_triples);
+        println!("first-768K: ours lit={ol} match={om} | ref lit={rl} match={rm}");
+        // Dump both literal streams (the parse's literal-band choice) for
+        // offline inspection.
+        let dump_lits = |name: &str, t: &[(u32, u32, u32)]| {
+            let mut v = Vec::with_capacity(raw.len());
+            let mut p = 0usize;
+            for &(ll, ml, _) in t {
+                v.extend_from_slice(&raw[p..p + ll as usize]);
+                p += ll as usize + ml as usize;
+            }
+            v.extend_from_slice(&raw[p..]);
+            fs::write(format!("target/lit_{name}.bin"), &v).unwrap();
+        };
+        dump_lits("ours", &rec.triples);
+        dump_lits("ref", &ref_triples);
+        println!(
+            "bounds delta (ours-ref): seq {:+.1}% lit {:+.1}%",
+            (ours.seq_bits / theirs.seq_bits - 1.0) * 100.0,
+            (ours.lit_bits / theirs.lit_bits - 1.0) * 100.0
+        );
+        diff_parses(&rec.triples, &ref_triples, &raw, args.divergences);
+    }
 }

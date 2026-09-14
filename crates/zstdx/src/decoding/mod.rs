@@ -2,6 +2,8 @@
 
 pub mod errors;
 mod frame_decoder;
+#[cfg(feature = "seq_dump")]
+pub mod seq_dump;
 mod streaming_decoder;
 
 pub use dictionary::Dictionary;
