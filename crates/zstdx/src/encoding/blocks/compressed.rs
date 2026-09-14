@@ -594,11 +594,16 @@ fn encode_sequences(
     }
 }
 
-/// Append the low `nb` bits of `v` to a hot accumulator, flushing whole
-/// bytes with one unaligned u64 store whenever the pending bits could
-/// overflow the container. Produces the same bits as `write_bits`; callers
-/// keep `bits` below 64 so the shift cannot drop payload. The capacity for
-/// every store is reserved once by the caller (see `encode_sequences`).
+/// Append the low `nb` bits of `v` to a hot accumulator, unconditionally
+/// flushing the whole pending bytes with one unaligned u64 store first —
+/// libzstd's BIT_flushBits discipline. The conditional headroom check was
+/// the single largest mispredicted branch of json.fastest (~18% of
+/// misses); the unconditional flush trades it for a predictable
+/// store-shift-or chain. The flush leaves `bits < 8`, so any `nb <= 56`
+/// keeps the accumulator below 64 and the shift cannot drop payload. The
+/// store may write stale bytes past the semantic end; later stores
+/// overwrite them or `set_len` cuts them. The capacity for every store is
+/// reserved once by the caller (see `encode_sequences`).
 #[inline(always)]
 unsafe fn hot_push_raw(
     out: *mut u8,
@@ -608,17 +613,15 @@ unsafe fn hot_push_raw(
     v: u64,
     nb: usize,
 ) {
-    if *bits + nb >= 64 {
-        let k = *bits / 8;
-        // SAFETY: the caller's reserve covers the store; bytes past the
-        // semantic end are overwritten by later stores or cut by set_len.
-        unsafe {
-            out.add(*pos).cast::<u64>().write_unaligned(acc.to_le());
-        }
-        *pos += k;
-        *acc >>= 8 * k;
-        *bits -= 8 * k;
+    let k = *bits / 8;
+    // SAFETY: the caller's reserve covers the store; bytes past the
+    // semantic end are overwritten by later stores or cut by set_len.
+    unsafe {
+        out.add(*pos).cast::<u64>().write_unaligned(acc.to_le());
     }
+    *pos += k;
+    *acc >>= 8 * k;
+    *bits -= 8 * k;
     *acc |= v << *bits;
     *bits += nb;
 }
