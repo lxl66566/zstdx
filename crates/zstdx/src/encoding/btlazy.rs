@@ -165,8 +165,14 @@ pub(crate) fn run_block_lazy(
             };
             if let Some(ml) = rep_probe(win, win_base, block_end_idx, probe, rep[0]) {
                 let v = lazy_value(win, (probe - win_base) as usize, ml, lit_lens);
-                let incumbent =
-                    lazy_value(win, idx, best.len as usize, lit_lens) - lazy_price(best.off);
+                // An empty incumbent (no tree candidate) prices 0 — the
+                // baseline the rep probe must beat (lazy_value would read
+                // past its MIN_MATCH contract on the len-0 sentinel).
+                let incumbent = if best.len > 0 {
+                    lazy_value(win, idx, best.len as usize, lit_lens) - lazy_price(best.off)
+                } else {
+                    0
+                };
                 if v > incumbent {
                     best = Match {
                         off: 1,

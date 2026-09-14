@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- btlazy: the depth-0 rep probe priced the empty incumbent through
+  `lazy_value`'s MIN_MATCH contract (`{off: 0, len: 0}` sentinel from a
+  candidate-less tree search) — `full_ladder_roundtrip` failed its debug
+  assert since the DUBT landing while release output was correct (the
+  len-0 arithmetic degenerates to exactly the no-candidate baseline 0).
+  The sentinel is now priced explicitly; release bytes unchanged.
 - Fast-tier heap overread fixed (fuzz-found, 8-byte reproducer): the
   matcher's insert bound `insert_max` is inclusive, but the short-match
   fill in `insert_covered` used it as an exclusive loop end — a match

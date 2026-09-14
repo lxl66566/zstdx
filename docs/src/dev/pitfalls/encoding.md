@@ -46,6 +46,7 @@
 
 ## Misc
 
+- **A sentinel passed through a contracted helper is a debug-build time bomb**: btlazy's depth-0 rep probe priced the incumbent `best` even when the tree search returned nothing — `lazy_value`'s `debug_assert!(len >= MIN_MATCH)` fired on the `{off: 0, len: 0}` sentinel and `full_ladder_roundtrip` failed in every debug run (release passed: `s*0/4 - lazy_price(0) == 0`, *accidentally* the correct no-candidate baseline of 0). Make the sentinel's semantics explicit at the call site (`incumbent = 0` when `best.len == 0`) instead of relying on len-0 arithmetic to degenerate to the right value — the release behavior was never wrong, but nothing tied the two together.
 - **btlazy2 selection: a repcode winner must keep its own off-base.** Collapsing the longest-rep candidate to `off_base 1` ("it's a rep") emits the wrong offset whenever the winner is the rep1/rep2 form — roundtrip fails only on rep-dense data and far into the stream (found at ~4 MiB on json). Same class as the ll0-form rule: off-base 1/2/3 each name a *different* decoder action at ll==0 (swap, rep2, rep3) and a *different* plain repcode at ll>0.
 
 - Streaming 128KB trailing-empty-block quirk: when Stream fills the tail it cannot know EOF in advance, must do a second read that triggers 0, and emits one extra 3-byte raw last block; the slice path must explicitly mirror trailing_empty for bit-identical output.
