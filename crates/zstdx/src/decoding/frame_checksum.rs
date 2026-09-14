@@ -1,50 +1,132 @@
-//! Frame checksum verification over assembled decode output.
+//! Frame checksum verification folded into MT decode stage B.
 //!
-//! The parallel decoder stages and executes segments before any frame-level
-//! accounting exists, so checksums are verified in a post-pass on the calling
-//! thread: one sequential xxh64 pass per checksummed frame over its output
-//! range, compared against the trailer word the pre-scan collected. The
-//! sequential decoder folds the same comparison into its trailer read (see
-//! `FrameDecoderState::verify_frame_checksum`); both paths report
+//! Stage B executes segments in order on the calling thread, and the bytes
+//! of `[seg_start, seg_end)` are final the moment [`execute_segment`](super::
+//! mt) returns (the wildcopy overshoot only writes at or beyond the
+//! executor's own cursor, so later segments never rewrite a published
+//! range). [`StreamingChecksum`] therefore absorbs each executed range
+//! right there on the executing thread: the bytes are still hot in the
+//! executor's private caches, so the xxh64 costs its ALU work (~1.6 ms per
+//! 32 MiB) without a second memory pass, and stage A workers keep staging
+//! ahead meanwhile (the A/B overlap the serial stage-B design already has).
+//!
+//! This replaced two falsified placements (see `negative.md` for data): a
+//! sequential post-pass over the assembled output (reads the output cold —
+//! up to +7.6 ms on skewed where later decode traffic evicted it), and a
+//! dedicated concurrent hasher thread (on L3-capacity-bound decodes like
+//! json its reads run at DRAM speed *and* slow the decoder's own misses —
+//! net regression). The sequential decoder keeps its own per-block hash
+//! folded into the trailer read; both paths report
 //! [`FrameDecoderError::ChecksumMismatch`].
 
-use super::errors::FrameDecoderError;
+use alloc::vec::Vec;
+use core::ops::Range;
+
+use super::{errors::FrameDecoderError, mt::ScanPlan};
 use crate::xxh64::Xxh64;
 
-/// One checksummed frame: its output range in the assembled output and the
-/// trailer word promised after its last block.
-pub(super) struct ChecksumSpan {
-    pub(super) out: core::ops::Range<usize>,
-    pub(super) expected: u32,
+/// What one executed segment means for the per-frame hash stream.
+#[derive(Clone, Copy)]
+enum FrameBoundary {
+    /// The segment continues the current frame's stream.
+    Interior,
+    /// The segment closes its frame: finish the stream, compare when the
+    /// frame was checksummed, then start a fresh one.
+    FrameEnd { expected: Option<u32> },
 }
 
-/// Hash every span and compare with the expected trailer word.
-pub(super) fn verify(spans: &[ChecksumSpan], out: &[u8]) -> Result<(), FrameDecoderError> {
-    for span in spans {
-        // Spans are built from the executed segment sizes, so they are inside
-        // the output by construction; a violation is an internal bug.
-        let Some(bytes) = out.get(span.out.clone()) else {
-            debug_assert!(false, "checksum span outside decoded output");
-            return Ok(());
-        };
-        let mut hash = Xxh64::new(0);
-        hash.write(bytes);
-        let calculated = hash.finish() as u32;
-        if calculated != span.expected {
-            return Err(FrameDecoderError::ChecksumMismatch {
-                expected: span.expected,
-                calculated,
-            });
+/// Per-segment frame boundaries, derived from the scan plan (a segment
+/// closes its frame when the next one starts a frame; the last segment
+/// always closes the last frame).
+pub(super) struct FrameBoundaries(Vec<FrameBoundary>);
+
+impl FrameBoundaries {
+    /// Compute the boundaries; `None` when no frame carries a checksum
+    /// (those decodes must not pay any verification cost).
+    pub(super) fn new(plan: &ScanPlan) -> Option<Self> {
+        if !plan.checksums.iter().any(Option::is_some) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(plan.segments.len());
+        let mut frame_idx = 0usize;
+        for i in 0..plan.segments.len() {
+            let closes_frame = plan.segments.get(i + 1).is_none_or(|n| n.frame_start);
+            if closes_frame {
+                out.push(FrameBoundary::FrameEnd {
+                    expected: plan.checksums.get(frame_idx).copied().flatten(),
+                });
+                frame_idx += 1;
+            } else {
+                out.push(FrameBoundary::Interior);
+            }
+        }
+        debug_assert_eq!(frame_idx, plan.checksums.len());
+        Some(Self(out))
+    }
+}
+
+/// The executor-side xxh64 stream: absorb each executed segment range as
+/// stage B publishes it, finish and compare at frame closes. The first
+/// mismatch is recorded (later frames still close the stream correctly, but
+/// hashing stops — only draining the recorded verdict matters then).
+pub(super) struct StreamingChecksum {
+    stream: Xxh64,
+    boundaries: FrameBoundaries,
+    segment: usize,
+    err: Option<FrameDecoderError>,
+}
+
+impl StreamingChecksum {
+    pub(super) fn new(boundaries: FrameBoundaries) -> Self {
+        Self {
+            stream: Xxh64::new(0),
+            boundaries,
+            segment: 0,
+            err: None,
         }
     }
-    Ok(())
+
+    /// Absorb one executed output range. Call on the executing thread, in
+    /// segment order, before any later `place` call may move the output.
+    ///
+    /// # Safety
+    /// `base.add(range)` must address exactly the bytes the executor just
+    /// wrote for this segment (the caller passes the same base it executed
+    /// with; the range is final — later writes never land below the
+    /// executor cursor).
+    pub(super) unsafe fn absorb_executed(&mut self, base: *const u8, range: Range<usize>) {
+        let boundary = self.boundaries.0[self.segment];
+        self.segment += 1;
+        if self.err.is_none() && !range.is_empty() {
+            // SAFETY: caller contract above; same-thread read of bytes this
+            // thread just wrote.
+            let bytes = unsafe { core::slice::from_raw_parts(base.add(range.start), range.len()) };
+            self.stream.write(bytes);
+        }
+        if let FrameBoundary::FrameEnd { expected } = boundary {
+            if let Some(expected) = expected {
+                let calculated = self.stream.finish() as u32;
+                if calculated != expected && self.err.is_none() {
+                    self.err = Some(FrameDecoderError::ChecksumMismatch {
+                        expected,
+                        calculated,
+                    });
+                }
+            }
+            self.stream = Xxh64::new(0);
+        }
+    }
+
+    /// Take the verdict: the decode error (if any) keeps its precedence.
+    pub(super) fn take_result(&mut self) -> Option<FrameDecoderError> {
+        self.err.take()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use super::{ChecksumSpan, verify};
     use crate::{
         EncoderOptions, Level, bulk,
         decoding::{
@@ -167,25 +249,17 @@ mod tests {
         assert!(mismatch(&err), "{err:?}");
     }
 
-    /// Direct unit check of the span compare.
+    /// Corruption inside the compressed body must surface an error (decode
+    /// or checksum), never a panic or hang.
     #[test]
-    fn span_verify_unit() {
-        let data = b"hello world, hello zstd";
-        let mut hash = crate::xxh64::Xxh64::new(0);
-        hash.write(data);
-        let good = hash.finish() as u32;
-        let spans = alloc::vec![ChecksumSpan {
-            out: 0..data.len(),
-            expected: good,
-        }];
-        assert!(verify(&spans, data).is_ok());
-        let bad = alloc::vec![ChecksumSpan {
-            out: 0..data.len(),
-            expected: good ^ 1,
-        }];
-        assert!(matches!(
-            verify(&bad, data),
-            Err(FrameDecoderError::ChecksumMismatch { .. })
-        ));
+    fn body_corruption_surfaces_decode_error_or_mismatch() {
+        let data = textish(4 * 1024 * 1024);
+        let mut compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xff;
+        compressed[mid + 1] ^= 0xff;
+        let mut out = Vec::new();
+        let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW);
     }
 }

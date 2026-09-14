@@ -26,9 +26,9 @@
 //! Dictionary frames, small inputs, inputs without a second restart point
 //! and single-core processes fall back to the sequential decoder.
 //!
-//! Checksummed frames are verified after assembly: the pre-scan collects
-//! each trailer word and the calling thread hashes every checksummed
-//! frame's output range once stage B has placed it (see `frame_checksum`).
+//! Checksummed frames are verified inline in stage B: the pre-scan collects
+//! each trailer word, and the executor absorbs every segment's range into
+//! the frame's xxh64 stream the moment it is final (see `frame_checksum`).
 
 use alloc::vec::Vec;
 use core::{
@@ -38,7 +38,7 @@ use core::{
 use std::sync::{Condvar, Mutex};
 
 #[cfg(feature = "hash")]
-use super::frame_checksum::{ChecksumSpan, verify as verify_checksums};
+use super::frame_checksum::{FrameBoundaries, StreamingChecksum};
 use super::{
     FrameDecoder,
     errors::{
@@ -79,19 +79,19 @@ struct ScannedBlock {
 }
 
 /// A run of blocks between two restart points (or frame boundaries).
-struct SegmentPlan {
+pub(super) struct SegmentPlan {
     blocks: Vec<ScannedBlock>,
     /// This segment starts a frame: execution resets the repcode history
     /// and stage A gets fresh tables (frame starts are restart points).
-    frame_start: bool,
+    pub(super) frame_start: bool,
 }
 
 /// Scan output: the segment plans plus the expected content checksum per
 /// frame (`None` for frames without one), in frame order.
-struct ScanPlan {
-    segments: Vec<SegmentPlan>,
+pub(super) struct ScanPlan {
+    pub(super) segments: Vec<SegmentPlan>,
     #[cfg(feature = "hash")]
-    checksums: Vec<Option<u32>>,
+    pub(super) checksums: Vec<Option<u32>>,
 }
 
 /// How stage B walks a block whose stage A staging is done.
@@ -652,36 +652,6 @@ unsafe fn copy16_chunks(mut d: *mut u8, mut s: *const u8, len: usize) {
     }
 }
 
-/// Output range and expected trailer word per checksummed frame, from the
-/// scan's trailer words and the executed segment ends (`place` recorded one
-/// end per segment, in order; a segment whose successor starts a frame
-/// closes the current one).
-#[cfg(feature = "hash")]
-fn frame_spans(plan: &ScanPlan, seg_ends: &[usize]) -> Vec<ChecksumSpan> {
-    debug_assert_eq!(plan.segments.len(), seg_ends.len());
-    let mut spans = Vec::new();
-    let mut frame_idx = 0usize;
-    let mut frame_start = 0usize;
-    for (i, end) in seg_ends.iter().enumerate() {
-        let closes_frame = plan.segments.get(i + 1).is_none_or(|next| next.frame_start);
-        if closes_frame {
-            if let Some(&Some(expected)) = plan.checksums.get(frame_idx) {
-                spans.push(ChecksumSpan {
-                    out: frame_start..*end,
-                    expected,
-                });
-            }
-            frame_idx += 1;
-            frame_start = *end;
-        }
-    }
-    debug_assert_eq!(
-        frame_idx,
-        plan.segments.iter().filter(|s| s.frame_start).count()
-    );
-    spans
-}
-
 /// Two-stage pipeline driver. `place(start, end)` makes the output region
 /// valid for absolute positions `[0, end)` and returns its base pointer
 /// (called per segment, so a growing Vec may move between calls). Returns
@@ -691,6 +661,7 @@ fn decode_parallel(
     workers: u32,
     segments: &[SegmentPlan],
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
+    #[cfg(feature = "hash")] after_segment: &mut dyn FnMut(*const u8, Range<usize>),
 ) -> Result<usize, FrameDecoderError> {
     let n_segments = segments.len();
     let threads = (workers as usize).min(n_segments);
@@ -764,6 +735,8 @@ fn decode_parallel(
                 if seg_plan.frame_start {
                     offset_hist = [1, 4, 8];
                 }
+                #[cfg(feature = "hash")]
+                let seg_out_start = written;
                 let (base, buf_limit) = place(written, written + seg.out_size)?;
                 // SAFETY: `place` made [0, written + out_size) valid; every
                 // match source below `written` is final (in-order execution).
@@ -771,6 +744,10 @@ fn decode_parallel(
                     execute_segment(base, written, &seg, input, &mut offset_hist, buf_limit)?;
                 }
                 written += seg.out_size;
+                // The executed range is final from here on: later writes never
+                // land below the executor cursor.
+                #[cfg(feature = "hash")]
+                after_segment(base.cast_const(), seg_out_start..written);
                 consumed.store(id + 1, Ordering::Release);
                 ready.notify_all();
             }
@@ -810,18 +787,40 @@ pub fn decode_all_mt(
 ) -> Result<usize, FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
         let out_len = output.len();
-        let mut seg_ends: Vec<usize> = Vec::with_capacity(plan.segments.len());
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
-                seg_ends.push(end);
                 if end > out_len {
                     return Err(FrameDecoderError::TargetTooSmall);
                 }
                 Ok((output.as_mut_ptr(), out_len))
             };
-        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
         #[cfg(feature = "hash")]
-        verify_checksums(&frame_spans(&plan, &seg_ends), &output[..written])?;
+        let mut checksum = FrameBoundaries::new(&plan).map(StreamingChecksum::new);
+        #[cfg(feature = "hash")]
+        let mut after_segment = |base: *const u8, range: Range<usize>| {
+            // SAFETY: the range was just executed at this base by the same
+            // thread; decode_parallel calls this before the next `place`
+            // can move the output.
+            unsafe {
+                if let Some(c) = checksum.as_mut() {
+                    c.absorb_executed(base, range);
+                }
+            }
+        };
+        #[cfg(feature = "hash")]
+        let written = decode_parallel(
+            input,
+            workers,
+            &plan.segments,
+            &mut place,
+            &mut after_segment,
+        )?;
+        #[cfg(feature = "hash")]
+        if let Some(err) = checksum.and_then(|mut c| c.take_result()) {
+            return Err(err);
+        }
+        #[cfg(not(feature = "hash"))]
+        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
         Ok(written)
     } else {
         let mut decoder = FrameDecoder::new();
@@ -841,10 +840,8 @@ pub fn decode_to_vec_mt(
 ) -> Result<(), FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
         let start_len = output.len();
-        let mut seg_ends: Vec<usize> = Vec::with_capacity(plan.segments.len());
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
-                seg_ends.push(end);
                 output.reserve(end);
                 // `end` is executor-relative, i.e. exactly the additional
                 // bytes needed behind the existing contents; the base hands
@@ -863,18 +860,33 @@ pub fn decode_to_vec_mt(
                     output.capacity() - start_len,
                 ))
             };
-        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
-        // Verify before publishing so the length stays unchanged on error
-        // (the sequential decode_all_to_vec contract).
         #[cfg(feature = "hash")]
-        {
-            // SAFETY: every byte in [start_len, start_len + written) was
-            // written by execute_segment; the reserve calls covered the
-            // capacity.
-            let decoded =
-                unsafe { core::slice::from_raw_parts(output.as_ptr().add(start_len), written) };
-            verify_checksums(&frame_spans(&plan, &seg_ends), decoded)?;
+        let mut checksum = FrameBoundaries::new(&plan).map(StreamingChecksum::new);
+        #[cfg(feature = "hash")]
+        // SAFETY: same-thread absorb of just-executed bytes, before the next
+        // `place` call may grow (and move) the vector.
+        let mut after_segment = |base: *const u8, range: Range<usize>| unsafe {
+            if let Some(c) = checksum.as_mut() {
+                c.absorb_executed(base, range);
+            }
+        };
+        #[cfg(feature = "hash")]
+        let written = decode_parallel(
+            input,
+            workers,
+            &plan.segments,
+            &mut place,
+            &mut after_segment,
+        )?;
+        // Verification finished before this point, so the length stays
+        // unchanged on a checksum error (the sequential decode_all_to_vec
+        // contract).
+        #[cfg(feature = "hash")]
+        if let Some(err) = checksum.and_then(|mut c| c.take_result()) {
+            return Err(err);
         }
+        #[cfg(not(feature = "hash"))]
+        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
         // SAFETY: every byte in [start_len, start_len + written) was written
         // by execute_segment.
         unsafe { output.set_len(start_len + written) };

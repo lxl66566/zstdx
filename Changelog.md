@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- MT decode checksum verification moved off the serial post-pass into
+  stage B: the executor absorbs each executed segment's output range into
+  the frame's xxh64 stream the moment it is final (bytes hot in its
+  caches; stage A keeps staging ahead during the absorb), finishing and
+  comparing at frame closes. Locked 32 MiB matrix dec-mt: json mt4
+  1871->2029 and mt16 1996->2200 MiB/s (1.33x/1.41x -> 1.44x/1.56x ours
+  ST), skewed mt4 695->756 (1.07x -> 1.16x), text unchanged; frames
+  without the checksum flag skip verification entirely, error contract
+  unchanged (decode errors win, `decode_to_vec_mt` keeps its length on
+  checksum error). Two alternative placements measured and rejected: a
+  dedicated concurrent hasher thread (on L3-capacity-bound json the
+  concurrent output read stream runs at DRAM speed and slows the decoder:
+  wall +33% for identical instructions) and the previous sequential
+  post-pass (reads the assembled output cold, up to +7.6 ms on skewed).
 - `decode_to_vec_mt` corrupted memory when appending to a non-empty
   vector: the place callback handed out the vector's base (execution
   coordinates are append-relative), reserved only `end - start_len` extra

@@ -8,6 +8,7 @@
 
 1. **MT decode stage B** — parallelization falsified, residue landed (2026-09-15)
    - Piece watermarks with exact per-sequence source gating were built and byte-correct, but shallow near-boundary reads (~100-400 B offsets) chain pieces serially — see [negative.md](negative.md); the serial-B + A/B-overlap structure stays. Landed instead: wildcopy staged execution, pooled staging buffers, zero-seq block fix (json.zst3 mt4 1.03→1.56×, skewed.zst9 0.71→1.24× on the 32 MiB matrix).
+   - Checksum tax recovered (2026-09-15): verification is absorbed inline in stage B over the hot just-executed ranges (`frame_checksum.rs`; the concurrent-hasher-thread and post-pass placements are falsified in [negative.md](negative.md)) — json mt4 back to 1.44x, mt16 1.56x ours-ST on the 32 MiB matrix.
    - Open: an encoder-side "deep-offset ramp" at job boundaries would make our own frames' stage B parallel-decodable (offsets at cut points guaranteed ≥ ramp depth); ratio cost of suppressing near matches at job starts is unmeasured.
 ## P1 · Decoding speed
 
