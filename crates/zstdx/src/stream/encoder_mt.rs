@@ -72,6 +72,55 @@ struct FrozenSrc {
 unsafe impl Send for FrozenSrc {}
 unsafe impl Sync for FrozenSrc {}
 
+/// Reusable accumulate buffers: a fresh encoder mapping its multi-megabyte
+/// buffer pays the whole first-touch fault+zero cost again, which on a
+/// THP=madvise machine with fragmented physical memory falls back to 4 KiB
+/// pages (~1.5-2 us each — thousands of faults per stream, measured as the
+/// interleaved-bench bimodality's mechanism). Retaining one buffer per
+/// thread caps that cost at the first stream. Size-capped so a one-off huge
+/// stream does not pin memory forever.
+std::thread_local! {
+    static BUF_POOL: core::cell::RefCell<Vec<Vec<u8>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+/// Largest buffer retained per thread (a 32 MiB stream peaks at ~35 MiB).
+const BUF_POOL_KEEP_MAX: usize = 64 * 1024 * 1024;
+/// Buffers retained per thread (a second one covers size-mismatched pairs).
+const BUF_POOL_DEPTH: usize = 2;
+
+/// Take the pooled accumulate buffer, or a fresh one, with room for `want`
+/// bytes (a larger pooled buffer is kept as-is — its spare capacity only
+/// helps the growth reserve).
+fn take_pooled_buf(want: usize) -> Vec<u8> {
+    BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let best = pool
+            .iter()
+            .rposition(|b| b.capacity() >= want)
+            .or_else(|| pool.iter().rposition(|_| true));
+        match best {
+            Some(i) => {
+                let mut buf = pool.swap_remove(i);
+                buf.clear();
+                buf
+            },
+            None => Vec::new(),
+        }
+    })
+}
+
+fn return_pooled_buf(buf: Vec<u8>) {
+    if buf.capacity() == 0 || buf.capacity() > BUF_POOL_KEEP_MAX {
+        return;
+    }
+    BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < BUF_POOL_DEPTH {
+            pool.push(buf);
+        }
+    });
+}
+
 /// One burst of jobs posted to the pool: everything a worker needs to run
 /// its share. Slots and the poison slot mirror the former scope-based
 /// burst; `exited` counts workers still inside this burst's job loop, and
@@ -272,7 +321,9 @@ impl MtEncoderCore {
         };
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
-        let mut buf = Vec::new();
+        let mut buf = take_pooled_buf(
+            (options.workers as usize).max(2) * (MIN_JOB_SIZE.max(overlap)) + 64 * 1024,
+        );
         if let JobGrid::Growing = grid {
             // The first epoch's whole span up front, advised huge: the
             // buffer is touched densely and grows to burst scale, and the
@@ -819,6 +870,10 @@ impl Drop for MtEncoderCore {
                 let _ = handle.join();
             }
         }
+        // The accumulate buffer outlives the encoder in the thread-local
+        // pool (see take_pooled_buf).
+        let mut buf = core::mem::take(&mut self.buf);
+        return_pooled_buf(core::mem::take(&mut buf));
     }
 }
 
