@@ -53,6 +53,20 @@ const HASH_PRIME: u64 = 0xc2b2_ae3d_27d4_eb4f;
 /// chain slots simply read as dead or stale entries, which the walk's
 /// domain check already discards.
 const PREFILL_STRIDE: usize = 3;
+/// Tail fraction of a [`Strategy::Fast`] strip that the grid fill covers, in
+/// units of `slots * PREFILL_STRIDE` bytes. The strategy's table holds one
+/// candidate per slot, newest-wins, and a full-window strip contributes
+/// `strip / (slots * stride)` grid inserts per slot — every insert before the
+/// last few per slot is overwritten before the job's scan ever probes, so
+/// filling beyond the retention horizon is churn on random-class data. The
+/// dropped head entries are NOT all dead, though: on a period≈window corpus
+/// each period-old twin hashes its slot once per period and survives the
+/// whole fill (measured: text tiles at period 441226 ride exactly these
+/// entries), so the cap is only safe because the confirmed seed
+/// ([`SEED_CONFIRMS`]) carries that class — never cap one without the other.
+/// Fast only: dfast's long table is 2^17 (a 2 MiB strip barely reaches one
+/// horizon), and chain links make the whole strip walkable.
+const PREFILL_RETAIN_HORIZONS: usize = 2;
 /// Backward bytes that must agree (beyond the 8-byte anchor) before a strip
 /// position becomes the job-start seed offset: long enough that word-level
 /// repeats (~10-15 agreeing bytes on natural text) cannot qualify, short
@@ -1441,10 +1455,14 @@ impl MatchGeneratorDriver {
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
-                // twin is unreachable (see PREFILL_STRIDE).
+                // twin is unreachable (see PREFILL_STRIDE). Only the strip's
+                // retention tail is inserted (PREFILL_RETAIN_HORIZONS); the
+                // seed scan below still sees the whole strip, so period-long
+                // repeats keep their reach.
                 let table = &mut self.table[..];
                 let log = self.params.hash_log;
-                let mut idx = 0;
+                let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
+                let mut idx = last.saturating_sub(retain);
                 while idx < last {
                     insert_at(data, table, idx, base + idx as u64, log);
                     idx += PREFILL_STRIDE;
