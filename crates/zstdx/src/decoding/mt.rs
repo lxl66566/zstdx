@@ -26,8 +26,9 @@
 //! Dictionary frames, small inputs, inputs without a second restart point
 //! and single-core processes fall back to the sequential decoder.
 //!
-//! The frame checksum is not verified here, matching the sequential
-//! `decode_all` paths (which leave it to the caller).
+//! Checksummed frames are verified after assembly: the pre-scan collects
+//! each trailer word and the calling thread hashes every checksummed
+//! frame's output range once stage B has placed it (see `frame_checksum`).
 
 use alloc::vec::Vec;
 use core::{
@@ -36,9 +37,13 @@ use core::{
 };
 use std::sync::{Condvar, Mutex};
 
+#[cfg(feature = "hash")]
+use super::frame_checksum::{ChecksumSpan, verify as verify_checksums};
 use super::{
     FrameDecoder,
-    errors::{DecodeBlockContentError, DecompressBlockError, FrameDecoderError},
+    errors::{
+        DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, FrameDecoderError,
+    },
     frame,
     literals_section_decoder::decode_literals,
     scratch::{FSEScratch, HuffmanScratch},
@@ -79,6 +84,14 @@ struct SegmentPlan {
     /// This segment starts a frame: execution resets the repcode history
     /// and stage A gets fresh tables (frame starts are restart points).
     frame_start: bool,
+}
+
+/// Scan output: the segment plans plus the expected content checksum per
+/// frame (`None` for frames without one), in frame order.
+struct ScanPlan {
+    segments: Vec<SegmentPlan>,
+    #[cfg(feature = "hash")]
+    checksums: Vec<Option<u32>>,
 }
 
 /// How stage B walks a block whose stage A staging is done.
@@ -136,7 +149,7 @@ fn staging_take() -> StagingBuf {
             b.literals.clear();
             b.sequences.clear();
             pool.retained.fetch_sub(
-                b.literals.capacity() + b.sequences.capacity() * core::mem::size_of::<Sequence>(),
+                b.literals.capacity() + b.sequences.capacity() * size_of::<Sequence>(),
                 Ordering::Relaxed,
             );
             b
@@ -149,8 +162,7 @@ fn staging_take() -> StagingBuf {
 }
 
 fn staging_put(bufs: StagingBuf) {
-    let bytes =
-        bufs.literals.capacity() + bufs.sequences.capacity() * core::mem::size_of::<Sequence>();
+    let bytes = bufs.literals.capacity() + bufs.sequences.capacity() * size_of::<Sequence>();
     let pool = STAGING_POOL.get_or_init(|| StagingPool {
         bufs: Mutex::new(Vec::new()),
         retained: AtomicUsize::new(0),
@@ -251,9 +263,11 @@ fn restart_point(body: &[u8]) -> bool {
 /// into segments at restart points. `None` means "do not parallelize":
 /// dictionary frames, malformed or truncated input (the sequential path
 /// reports those properly), or too few segments to be worth it.
-fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentPlan>> {
+fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     let target_segment = (input.len() / (workers as usize * 2)).max(MIN_SEGMENT_INPUT);
     let mut segments: Vec<SegmentPlan> = Vec::new();
+    #[cfg(feature = "hash")]
+    let mut checksums: Vec<Option<u32>> = Vec::new();
     let mut cursor = 0usize;
     while cursor < input.len() {
         let mut reader = &input[cursor..];
@@ -319,10 +333,21 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentP
             }
         }
         if checksummed {
-            scan_cur += 4;
-            if scan_cur > input.len() {
+            let trailer_end = scan_cur.checked_add(4)?;
+            if trailer_end > input.len() {
                 return None;
             }
+            #[cfg(feature = "hash")]
+            checksums.push(Some(u32::from_le_bytes([
+                input[scan_cur],
+                input[scan_cur + 1],
+                input[scan_cur + 2],
+                input[scan_cur + 3],
+            ])));
+            scan_cur = trailer_end;
+        } else {
+            #[cfg(feature = "hash")]
+            checksums.push(None);
         }
 
         // Close a segment at the first restart point past each target
@@ -350,7 +375,11 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentP
         });
         cursor = scan_cur;
     }
-    (segments.len() >= 2).then_some(segments)
+    (segments.len() >= 2).then_some(ScanPlan {
+        segments,
+        #[cfg(feature = "hash")]
+        checksums,
+    })
 }
 
 /// Stage A: decode one segment's literals and sequences into staging.
@@ -360,7 +389,7 @@ fn decode_segment(
     scratch: &mut SegmentScratch,
 ) -> Result<DecodedSegment, FrameDecoderError> {
     scratch.reset_tables();
-    let mut staging = staging_take();
+    let staging = staging_take();
     let (mut literals, mut sequences) = (staging.literals, staging.sequences);
     let mut out_size = 0usize;
     let mut blocks = Vec::with_capacity(plan.blocks.len());
@@ -441,7 +470,7 @@ fn decode_segment(
                     let rest = &seq_raw_all[seq_header_len..];
                     if !rest.is_empty() {
                         return Err(block_body_err(DecompressBlockError::DecodeSequenceError(
-                            crate::decoding::errors::DecodeSequenceError::ExtraBits {
+                            DecodeSequenceError::ExtraBits {
                                 bits_remaining: rest.len() as isize * 8,
                             },
                         )));
@@ -623,6 +652,36 @@ unsafe fn copy16_chunks(mut d: *mut u8, mut s: *const u8, len: usize) {
     }
 }
 
+/// Output range and expected trailer word per checksummed frame, from the
+/// scan's trailer words and the executed segment ends (`place` recorded one
+/// end per segment, in order; a segment whose successor starts a frame
+/// closes the current one).
+#[cfg(feature = "hash")]
+fn frame_spans(plan: &ScanPlan, seg_ends: &[usize]) -> Vec<ChecksumSpan> {
+    debug_assert_eq!(plan.segments.len(), seg_ends.len());
+    let mut spans = Vec::new();
+    let mut frame_idx = 0usize;
+    let mut frame_start = 0usize;
+    for (i, end) in seg_ends.iter().enumerate() {
+        let closes_frame = plan.segments.get(i + 1).is_none_or(|next| next.frame_start);
+        if closes_frame {
+            if let Some(&Some(expected)) = plan.checksums.get(frame_idx) {
+                spans.push(ChecksumSpan {
+                    out: frame_start..*end,
+                    expected,
+                });
+            }
+            frame_idx += 1;
+            frame_start = *end;
+        }
+    }
+    debug_assert_eq!(
+        frame_idx,
+        plan.segments.iter().filter(|s| s.frame_start).count()
+    );
+    spans
+}
+
 /// Two-stage pipeline driver. `place(start, end)` makes the output region
 /// valid for absolute positions `[0, end)` and returns its base pointer
 /// (called per segment, so a growing Vec may move between calls). Returns
@@ -729,7 +788,7 @@ fn decode_parallel(
     result
 }
 
-fn engage(input: &[u8], workers: u32, max_window_size: u64) -> Option<Vec<SegmentPlan>> {
+fn engage(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     if workers < 2
         || input.len() < MIN_MT_INPUT
         || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
@@ -749,16 +808,21 @@ pub fn decode_all_mt(
     workers: u32,
     max_window_size: u64,
 ) -> Result<usize, FrameDecoderError> {
-    if let Some(segments) = engage(input, workers, max_window_size) {
+    if let Some(plan) = engage(input, workers, max_window_size) {
         let out_len = output.len();
+        let mut seg_ends: Vec<usize> = Vec::with_capacity(plan.segments.len());
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                seg_ends.push(end);
                 if end > out_len {
                     return Err(FrameDecoderError::TargetTooSmall);
                 }
                 Ok((output.as_mut_ptr(), out_len))
             };
-        decode_parallel(input, workers, &segments, &mut place)
+        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
+        #[cfg(feature = "hash")]
+        verify_checksums(&frame_spans(&plan, &seg_ends), &output[..written])?;
+        Ok(written)
     } else {
         let mut decoder = FrameDecoder::new();
         decoder.set_max_window_size(max_window_size);
@@ -775,10 +839,12 @@ pub fn decode_to_vec_mt(
     workers: u32,
     max_window_size: u64,
 ) -> Result<(), FrameDecoderError> {
-    if let Some(segments) = engage(input, workers, max_window_size) {
+    if let Some(plan) = engage(input, workers, max_window_size) {
         let start_len = output.len();
+        let mut seg_ends: Vec<usize> = Vec::with_capacity(plan.segments.len());
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                seg_ends.push(end);
                 output.reserve(end - start_len);
                 // SAFETY: start_len bytes are initialized and capacity now
                 // covers `end`; the region base is the vector's data start.
@@ -789,7 +855,18 @@ pub fn decode_to_vec_mt(
                 // inside the capacity (raw writes; never read past `end`).
                 Ok((output.as_mut_ptr(), output.capacity() + start_len))
             };
-        let written = decode_parallel(input, workers, &segments, &mut place)?;
+        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
+        // Verify before publishing so the length stays unchanged on error
+        // (the sequential decode_all_to_vec contract).
+        #[cfg(feature = "hash")]
+        {
+            // SAFETY: every byte in [start_len, start_len + written) was
+            // written by execute_segment; the reserve calls covered the
+            // capacity.
+            let decoded =
+                unsafe { core::slice::from_raw_parts(output.as_ptr().add(start_len), written) };
+            verify_checksums(&frame_spans(&plan, &seg_ends), decoded)?;
+        }
         // SAFETY: every byte in [start_len, start_len + written) was written
         // by execute_segment.
         unsafe { output.set_len(start_len + written) };
@@ -1017,7 +1094,7 @@ mod tests {
         compressed[mid] ^= 0xff;
         compressed[mid + 1] ^= 0xff;
         let mut out = Vec::new();
-        // Errors (or a checksum-visible mismatch caught upstream) are both
+        // Errors (or the frame checksum flagging the mismatch) are both
         // acceptable; a panic or hang is not.
         let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW);
     }

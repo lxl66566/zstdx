@@ -119,7 +119,7 @@ MT ratio preservation vs own ST unchanged (every cell within ±0.5%). zstd warm-
 | text.balanced | — | — | — | 485-1485 | 971 | 0.66-0.81 |
 | text.best | 266 | 691 | 2.60 | 161-191 | 368 | 1.90-2.28 |
 
-json.fast stream ST is now at parity (was x1.11). The text fast/balanced/best stream-mt8 cells are bimodal across passes (per-round burst-schedule variance; text.balanced measured 485, 1171, then 1485 on a focused re-run — the focused 1485/x0.66 matches the 09-12 value, so no regression, just variance to keep in mind when reading single passes). Bulk-mt8 ceilings (this run's T4): json fastest/fast/balanced/best = 3403/2551/294/19, text = 19712/15034/1937/228. Stream-MT8 reaches 43/45/64/79% (json) and 12/12-15/25-77/71-84% (text) of its own bulk ceiling; text.fastest (12%) and json.fastest (43%) stay bounded by the burst model's serialized accumulate/spawn/barrier (persistent-pool redesign, todo 13).
+json.fast stream ST is now at parity (was x1.11). The text fast/balanced/best stream-mt8 cells are bimodal across passes (per-round burst-schedule variance; text.balanced measured 485, 1171, then 1485 on a focused re-run — the focused 1485/x0.66 matches the 09-12 value, so no regression, just variance to keep in mind when reading single passes). Bulk-mt8 ceilings (this run's T4): json fastest/fast/balanced/best = 3403/2551/294/19, text = 19712/15034/1937/228. Stream-MT8 reaches 43/45/64/79% (json) and 12/12-15/25-77/71-84% (text) of its own bulk ceiling; text.fastest (12%) and json.fastest (43%) stay bounded by the burst model's serialized accumulate/spawn/barrier (persistent-pool redesign, todo 12).
 
 ## T6 compression-ratio sweep (`zstdx-bench ratio`, 2026-09-14)
 

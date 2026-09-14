@@ -79,6 +79,17 @@ impl DecodeBuffer {
         }
     }
 
+    /// Fold all buffered (not yet drained) bytes into the checksum; used at
+    /// frame end so the digest covers output the drain paths haven't seen.
+    #[cfg(feature = "hash")]
+    pub(crate) fn hash_pending(&mut self) {
+        if self.hash_enabled {
+            let (pending_a, pending_b) = self.buffer.as_slices();
+            self.hash.write(pending_a);
+            self.hash.write(pending_b);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.buffer.len()
     }

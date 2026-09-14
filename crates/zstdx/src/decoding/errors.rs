@@ -184,6 +184,8 @@ pub enum FrameDecoderError {
     FailedToReadBlockBody(#[from] DecodeBlockContentError),
     #[error("Failed to read checksum: {0}")]
     FailedToReadChecksum(Error),
+    #[error("Frame checksum mismatch; expected 0x{expected:08X}, calculated 0x{calculated:08X}")]
+    ChecksumMismatch { expected: u32, calculated: u32 },
     #[error("Decoder must initialized or reset before using it")]
     NotYetInitialized,
     #[error("Decoder encountered error while initializing: {0}")]

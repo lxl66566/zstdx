@@ -1,6 +1,8 @@
 //! Structures and utilities used for decoding zstd formatted data
 
 pub mod errors;
+#[cfg(all(feature = "std", feature = "hash"))]
+mod frame_checksum;
 mod frame_decoder;
 #[cfg(feature = "seq_dump")]
 pub mod seq_dump;
