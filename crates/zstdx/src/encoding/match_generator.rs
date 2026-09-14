@@ -307,7 +307,7 @@ const HEAD_MIN_TOTAL: u64 = 4 << 20;
 /// depth (skewed), while the chain's selection there has no deficit.
 const HEAD_SYMS_MIN: u32 = 48;
 /// Head-table log (the heads table the btlazy bridge sizes from
-/// `opt_table`); the ring and search knobs ride [`HEAD_KNOBS`].
+/// `dubt_table`); the ring and search knobs ride [`HEAD_KNOBS`].
 const HEAD_HASH_LOG: u32 = 20;
 /// Head knobs: S4 search (libzstd's L13 depth — shallower trees accept
 /// nearer-shorter candidates again, S1-S3 measured at -1.3 to -4.4% vs
@@ -3429,12 +3429,14 @@ impl MatchGeneratorDriver {
             self.dubt_head = HeadPhase::Off;
             return false;
         }
-        if self.opt_table.len() == 1 << HEAD_HASH_LOG && self.bt.len() == 2 << HEAD_KNOBS.bt_log {
-            self.opt_table.fill(EMPTY);
-            self.bt.fill(EMPTY);
+        if self.dubt_table.len() == 1 << HEAD_HASH_LOG
+            && self.dubt_bt.len() == 2 << HEAD_KNOBS.bt_log
+        {
+            self.dubt_table.fill(0);
+            self.dubt_bt.fill(0);
         } else {
-            self.opt_table = alloc::vec![EMPTY; 1 << HEAD_HASH_LOG];
-            self.bt = alloc::vec![EMPTY; 2 << HEAD_KNOBS.bt_log];
+            self.dubt_table = alloc::vec![0u32; 1 << HEAD_HASH_LOG];
+            self.dubt_bt = alloc::vec![0u32; 2 << HEAD_KNOBS.bt_log];
         }
         if self.lazy_scratch.is_none() {
             self.lazy_scratch = Some(LazyScratch::new());
