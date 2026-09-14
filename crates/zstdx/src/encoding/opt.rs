@@ -38,10 +38,19 @@ const PREDEF_THRESHOLD: usize = 8;
 /// adaptation depth.
 const SEED_SPAN: u64 = 2 * crate::common::MAX_BLOCK_SIZE as u64;
 
-/// Positions in table entries live in the low 48 bits; the high 16 carry the
-/// epoch (shared convention with the other matcher strategies).
-pub(crate) const POS_MASK: u64 = (1u64 << 48) - 1;
+/// Positions occupy the low 47 bits; bit 47 marks a retired-but-kept link
+/// (`FillTerm::Keep` rows). Positions beyond 2^47 cannot be represented —
+/// the encoder's absolute stream position stays far below it in practice.
+pub(crate) const POS_MASK: u64 = (1u64 << 47) - 1;
+pub(crate) const STALE: u64 = 1 << 47;
 pub(crate) const EMPTY: u64 = 0;
+
+/// Compares a `FillTerm::Keep` search walk may still spend after its first
+/// stale link. On rich data about half the candidates sit behind a retired
+/// link and each pays a from-byte-0 recount (a full match-length scan);
+/// capping the tainted tail keeps the walk's cost near the `Cut` rows'
+/// while preserving the deep-walk rescue the retention exists for.
+const TAINT_COMPARES: usize = 6;
 
 /// Whole-bit weight: `highbit32(stat+1)` scaled (libzstd's `ZSTD_bitWeight`).
 #[inline(always)]
@@ -102,6 +111,13 @@ impl Default for Optimal {
     }
 }
 
+/// Fill termination policy (see [`OptKnobs::fill_term`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum FillTerm {
+    Cut,
+    Keep { cross_cap: u32 },
+}
+
 /// Per-strategy knobs (libzstd clevels 16-19 as the reference points).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct OptKnobs {
@@ -126,6 +142,15 @@ pub(crate) struct OptKnobs {
     pub insert_log: u32,
     /// Single-probe 3-byte table; 0 disables (only Ultra uses one).
     pub hash3_log: u32,
+    /// Shallow-fill termination policy. `Cut` is the C-faithful form: stop
+    /// at `insert_log` compares and prune the continuation links. `Keep`
+    /// preserves them (sound by interval monotonicity: every live link's
+    /// ordering claim was written by an older position) and extends the
+    /// walk while the new node links only one side, up to `cross_cap`
+    /// visits — an uncrossed node's far-side EMPTY slot is what later
+    /// walks die on when the vocabulary is small enough that the tree
+    /// degenerates into a one-sided recency spine.
+    pub fill_term: FillTerm,
     /// btultra family: fractional prices, match+1-literal recheck, 2-pass
     /// first-block statistics seeding.
     pub ultra: bool,
@@ -418,6 +443,11 @@ pub(crate) struct Finder<'a, 'b> {
     /// Fill-side budget (see [`OptKnobs::insert_log`]); the search keeps
     /// the full `nb_compares`.
     pub(crate) insert_compares: usize,
+    /// Fill keeps continuation links and extends uncrossed walks
+    /// (see [`OptKnobs::fill_term`]).
+    pub(crate) keep_links: bool,
+    /// Total visit cap for an extended fill walk.
+    pub(crate) cross_cap: usize,
     pub(crate) sufficient_len: usize,
     pub(crate) next_update: &'b mut u64,
 }
@@ -432,10 +462,14 @@ impl Finder<'_, '_> {
     /// Resolve a table entry to an absolute candidate position in
     /// `[floor, pos)`; anything else ends the walk.
     #[inline]
-    fn resolve(&self, entry: u64, floor: u64, pos: u64) -> Option<u64> {
+    /// Resolve a table entry to `(absolute candidate, stale)` in
+    /// `[floor, pos)`; anything else ends the walk. A stale flag marks a
+    /// link retired by a later insertion: its interval claim may no longer
+    /// hold for this reader, so the caller must count from byte 0.
+    fn resolve(&self, entry: u64, floor: u64, pos: u64) -> Option<(u64, bool)> {
         let cand = entry & POS_MASK;
         if (entry >> 48 == self.epoch) && cand >= floor && cand < pos {
-            Some(cand)
+            Some((cand, entry & STALE != 0))
         } else {
             None
         }
@@ -457,14 +491,18 @@ impl Finder<'_, '_> {
         let pos = self.win_base + idx as u64;
         let floor = self.cand_floor(pos);
         let h = self.hash_main(idx);
-        let mut cand_abs = self.resolve(self.table[h], floor, pos);
+        let mut cand = self.resolve(self.table[h], floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut best_len = 8usize;
         let mut match_end = pos + 9;
         let mut nb = self.insert_compares;
+        // Cross-bonus budget: extra visits granted past `nb` while the new
+        // node links only one side (`cross_cap` bounds the total).
+        let mut bonus = self.cross_cap.saturating_sub(self.insert_compares);
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
         let mut dummy = EMPTY;
+        let (mut s_side, mut l_side) = (false, false);
         // Insert-side counts cap at the DP window: the parser can only
         // exploit matches up to OPT_NUM positions, so a longer common prefix
         // cannot improve the tree's usefulness here. Without the cap,
@@ -481,14 +519,37 @@ impl Finder<'_, '_> {
             *self.table.get_unchecked_mut(h) = self.tag | pos;
             let mut smaller: *mut u64 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
             let mut larger: *mut u64 = smaller.add(1);
-            while let Some(ca) = cand_abs {
+            // A stale link's interval claim may not hold for this walk;
+            // from there on every count verifies from byte 0 (the u64
+            // chunking keeps that cheap) and the walk's own re-threading
+            // revalidates the path it crosses.
+            let mut tainted = false;
+            while let Some((ca, stale)) = cand {
                 if nb == 0 {
+                    // A one-sided node's far slot stays unreachable and
+                    // later walks die there; extend the walk while the
+                    // node has not linked both sides.
+                    if !self.keep_links || (s_side && l_side) || bonus == 0 {
+                        break;
+                    }
+                    bonus -= 1;
+                } else {
+                    nb -= 1;
+                }
+                if stale {
+                    // The fill threads the fresh crest only; stale
+                    // structure is the search's reach.
                     break;
                 }
-                nb -= 1;
-                let cand = (ca - self.win_base) as usize;
-                let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, idx, cand, ml, count_limit);
+                tainted |= stale;
+                let cidx = (ca - self.win_base) as usize;
+                let seed = if tainted {
+                    0
+                } else {
+                    common_smaller.min(common_larger)
+                };
+                let mut ml = seed;
+                ml = count_from(self.win, idx, cidx, ml, count_limit);
                 if ml > best_len {
                     best_len = ml;
                     if ca + ml as u64 > match_end {
@@ -500,30 +561,54 @@ impl Finder<'_, '_> {
                 if idx + ml >= count_limit {
                     break;
                 }
-                if *self.win.get_unchecked(cand + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.tag | ca;
+                let node = 2 * (ca as usize & self.bt_mask);
+                if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
+                    // The refresh re-asserts the consumed link's
+                    // interval claim; keep it retired when the walk's
+                    // interval state is not trustworthy (taint).
+                    *smaller = self.tag | ca | (tainted as u64) * STALE;
                     common_smaller = ml;
+                    s_side = true;
                     if ca <= bt_low {
                         smaller = &raw mut dummy;
                         break;
                     }
-                    let node = 2 * (ca as usize & self.bt_mask);
                     smaller = self.bt.as_mut_ptr().add(node + 1);
-                    cand_abs = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
+                    cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
                 } else {
-                    *larger = self.tag | ca;
+                    *larger = self.tag | ca | (tainted as u64) * STALE;
                     common_larger = ml;
+                    l_side = true;
                     if ca <= bt_low {
                         larger = &raw mut dummy;
                         break;
                     }
-                    let node = 2 * (ca as usize & self.bt_mask);
                     larger = self.bt.as_mut_ptr().add(node);
-                    cand_abs = self.resolve(*self.bt.get_unchecked(node), floor, pos);
+                    cand = self.resolve(*self.bt.get_unchecked(node), floor, pos);
                 }
             }
-            *smaller = EMPTY;
-            *larger = EMPTY;
+            if self.keep_links {
+                // Retire instead of prune: this walk's threading narrowed
+                // the interval of its trailing links, so their claims are
+                // stale for later readers — mark them (walks following a
+                // stale link verify from byte 0). Slots still pointing at
+                // this position's own pair hold ring residue and are cut.
+                let base = self.bt.as_ptr().cast_mut();
+                let own = 2 * (pos as usize & self.bt_mask);
+                if smaller == base.add(own) {
+                    *smaller = EMPTY;
+                } else if *smaller != EMPTY {
+                    *smaller |= STALE;
+                }
+                if larger == base.add(own + 1) {
+                    *larger = EMPTY;
+                } else if *larger != EMPTY {
+                    *larger |= STALE;
+                }
+            } else {
+                *smaller = EMPTY;
+                *larger = EMPTY;
+            }
         }
         let positions = if best_len > 384 {
             (best_len - 384).min(192)
@@ -660,11 +745,13 @@ impl Finder<'_, '_> {
 
         // Tree search.
         let h = self.hash_main(idx);
-        let mut cand_abs = self.resolve(self.table[h], floor, pos);
+        let mut cand = self.resolve(self.table[h], floor, pos);
+        let mut tainted = false;
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut match_end = pos + 9;
         let mut nb = self.nb_compares;
+        let mut taint_budget = TAINT_COMPARES;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
         let mut dummy = EMPTY;
         // SAFETY: same invariants as insert_bt1.
@@ -672,14 +759,29 @@ impl Finder<'_, '_> {
             *self.table.get_unchecked_mut(h) = self.tag | pos;
             let mut smaller: *mut u64 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
             let mut larger: *mut u64 = smaller.add(1);
-            while let Some(ca) = cand_abs {
+            while let Some((ca, stale)) = cand {
                 if nb == 0 {
                     break;
                 }
                 nb -= 1;
-                let cand = (ca - self.win_base) as usize;
-                let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, idx, cand, ml, self.block_end_idx);
+                tainted |= stale;
+                if tainted && self.keep_links {
+                    // A from-zero recount costs a full match-length scan
+                    // (json: ~16 u64 chunks per candidate); bound the tail
+                    // a tainted walk may still visit.
+                    taint_budget -= 1;
+                    if taint_budget == 0 {
+                        break;
+                    }
+                }
+                let cidx = (ca - self.win_base) as usize;
+                let seed = if tainted {
+                    0
+                } else {
+                    common_smaller.min(common_larger)
+                };
+                let mut ml = seed;
+                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
                 if ml > best_len {
                     if ca + ml as u64 > match_end {
                         match_end = ca + ml as u64;
@@ -697,30 +799,45 @@ impl Finder<'_, '_> {
                 if idx + ml >= self.block_end_idx {
                     break;
                 }
-                if *self.win.get_unchecked(cand + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.tag | ca;
+                let node = 2 * (ca as usize & self.bt_mask);
+                if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
+                    *smaller = self.tag | ca | (tainted as u64) * STALE;
                     common_smaller = ml;
                     if ca <= bt_low {
                         smaller = &raw mut dummy;
                         break;
                     }
-                    let node = 2 * (ca as usize & self.bt_mask);
                     smaller = self.bt.as_mut_ptr().add(node + 1);
-                    cand_abs = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
+                    cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
                 } else {
-                    *larger = self.tag | ca;
+                    *larger = self.tag | ca | (tainted as u64) * STALE;
                     common_larger = ml;
                     if ca <= bt_low {
                         larger = &raw mut dummy;
                         break;
                     }
-                    let node = 2 * (ca as usize & self.bt_mask);
                     larger = self.bt.as_mut_ptr().add(node);
-                    cand_abs = self.resolve(*self.bt.get_unchecked(node), floor, pos);
+                    cand = self.resolve(*self.bt.get_unchecked(node), floor, pos);
                 }
             }
-            *smaller = EMPTY;
-            *larger = EMPTY;
+            if self.keep_links {
+                // Retire instead of prune (see insert_bt1).
+                let base = self.bt.as_ptr().cast_mut();
+                let own = 2 * (pos as usize & self.bt_mask);
+                if smaller == base.add(own) {
+                    *smaller = EMPTY;
+                } else if *smaller != EMPTY {
+                    *smaller |= STALE;
+                }
+                if larger == base.add(own + 1) {
+                    *larger = EMPTY;
+                } else if *larger != EMPTY {
+                    *larger |= STALE;
+                }
+            } else {
+                *smaller = EMPTY;
+                *larger = EMPTY;
+            }
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
@@ -897,6 +1014,11 @@ fn run_once<const ULTRA: bool>(
         mls: knobs.mls as usize,
         nb_compares: 1usize << knobs.search_log,
         insert_compares: 1usize << knobs.insert_log,
+        keep_links: matches!(knobs.fill_term, FillTerm::Keep { .. }),
+        cross_cap: match knobs.fill_term {
+            FillTerm::Cut => 0,
+            FillTerm::Keep { cross_cap } => cross_cap as usize,
+        },
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
     };

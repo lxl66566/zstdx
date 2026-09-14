@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use super::{
     Matcher, SeqWord, Sequence,
     btlazy::LazyScratch,
-    opt::{OptKnobs, OptScratch, OptState},
+    opt::{FillTerm, OptKnobs, OptScratch, OptState},
     seq_codes::{decode_packed, pack_seq},
 };
 // Shared with the decoder so both sides agree on offset-history semantics.
@@ -234,10 +234,11 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
 /// repcode compare width — libzstd's loop), while `mls` carries the row's
 /// searchLength (5: hash5 keys the tree). `sufficient_len` is the rows'
 /// targetLength, capping candidate collection on long matches.
-const fn bt_knobs(search_log: u32, insert_log: u32, bt_log: u32) -> OptKnobs {
+const fn bt_knobs(search_log: u32, insert_log: u32, bt_log: u32, fill_term: FillTerm) -> OptKnobs {
     OptKnobs {
         search_log,
         insert_log,
+        fill_term,
         sufficient_len: 32,
         min_match: 4,
         mls: 5,
@@ -257,6 +258,7 @@ const fn knobs(
     OptKnobs {
         search_log,
         insert_log: search_log,
+        fill_term: FillTerm::Cut,
         sufficient_len,
         min_match,
         mls: min_match,
@@ -307,9 +309,17 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     // inserts — the lazy scan does not need every position threaded —
     // moved json from the old opt-parser row's x4.2 to x1.7 while the
     // literal-aware margins kept the ratio at 6.26 (zstd-13: 6.10).
-    btlazy(22, 1 << 22, bt_knobs(4, 2, 22)),
-    btlazy(23, 1 << 22, bt_knobs(5, 2, 22)),
-    btlazy(23, 1 << 22, bt_knobs(6, 3, 23)),
+    btlazy(
+        22,
+        1 << 22,
+        bt_knobs(4, 1, 22, FillTerm::Keep { cross_cap: 4 }),
+    ),
+    btlazy(
+        23,
+        1 << 22,
+        bt_knobs(4, 1, 22, FillTerm::Keep { cross_cap: 4 }),
+    ),
+    btlazy(23, 1 << 22, bt_knobs(6, 3, 23, FillTerm::Cut)),
     // 16: libzstd's btopt rows begin.
     opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
     // 17: the Opt tier; libzstd's L17 row with the ring capped one below

@@ -130,6 +130,11 @@ pub(crate) fn run_block_lazy(
         mls: knobs.mls as usize,
         nb_compares: 1usize << knobs.search_log,
         insert_compares: 1usize << knobs.insert_log,
+        keep_links: matches!(knobs.fill_term, super::opt::FillTerm::Keep { .. }),
+        cross_cap: match knobs.fill_term {
+            super::opt::FillTerm::Cut => 0,
+            super::opt::FillTerm::Keep { cross_cap } => cross_cap as usize,
+        },
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
     };
