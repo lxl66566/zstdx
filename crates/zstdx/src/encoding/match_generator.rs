@@ -730,6 +730,14 @@ fn insert_covered(
     if match_len <= 16 {
         let end = (win_base + (start + match_len) as u64).min(insert_max);
         let mut p = win_base + start as u64;
+        // The clamped end can fall below p — tiny windows saturate
+        // insert_max to win_base, and rep-chain tails emit to MIN_MATCH of
+        // the block end, not HASH_READ. Bail on the empty range: the
+        // wrapped `end - p` below would peel-insert one position whose
+        // hash reads past the window (fuzz-found heap overread).
+        if p >= end {
+            return;
+        }
         // Peel the odd tail before the loop: `while p < end` alone unrolls
         // mod 2 behind a per-entry parity guard that mispredicts on every
         // other insert (measured on json.fastest).
@@ -3383,6 +3391,21 @@ mod tests {
         data.extend([0u8; 8]);
         assert_eq!(match_and_reconstruct(&data, 8), data);
         assert_eq!(match_and_reconstruct(&data, 4), data);
+    }
+
+    #[test]
+    fn reconstructs_tiny_rep_inputs() {
+        // Fuzz-found (2026-09-14): an 8-byte input whose rep probe hits at
+        // position 1 gives insert_covered a match start past insert_max
+        // (win_base + 0 here); the wrapped `end - p` parity peel then
+        // hashed 8 bytes past the input. Guarded empty-range now.
+        for data in [
+            &[0x0fu8; 6][..],
+            &[0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x2a, 0xff][..],
+            &[0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x2a, 0x90][..],
+        ] {
+            assert_eq!(&match_and_reconstruct(data, 8)[..], data);
+        }
     }
 
     #[test]

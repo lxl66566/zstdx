@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Fast-tier heap overread fixed (fuzz-found, 8-byte reproducer): the
+  matcher's insert bound `insert_max` is inclusive, but the short-match
+  fill in `insert_covered` used it as an exclusive loop end — a match
+  starting past it (first blocks < 9 B where the bound saturates to the
+  window base, or `rep1_chain` tails within MIN_MATCH of the block end,
+  which also reach ordinary inputs) left an "empty" range whose wrapped
+  `(end - p)` parity peel hashed 8 bytes past the window. Streaming inputs
+  overread silently inside the ring buffer; bulk inputs whose window ends
+  at the allocation end are the ASAN-visible case. Output byte-identical
+  on every corpus cell (30-cell dump gate), fastest-tier Ir +0.23% for
+  the empty-range guard (wall flat), 4-min ASAN fuzz clean.
 - Best tier (levels 13-15) re-strategied from a low-config optimal parser
   to a btlazy2 port (`encoding/btlazy.rs`): lazy2 selection (two-deep lazy
   walk with libzstd's alternating margins, literal-aware displaced-literal

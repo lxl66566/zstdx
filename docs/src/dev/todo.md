@@ -30,7 +30,6 @@
    - text Opt 313 vs libzstd ~440 MiB/s, streaming MT per-job fixed cost, W22/W23 json cost (solo Opt 6.05s), Ultra dll residue (7.7% sparser than zstd-19 at same knobs).
 8. **Small/mid payloads (4K-1M)**: small end closed (json-4KiB ratio ±1-5% since the small-literal huffman fix; the dict residue is item 11). Open: mid-size json/text ~2× speed — per-byte scan+emit cost, not fixed overhead (table build is done).
 9. **Large-binary ST encode (100MB-class)**: windows closed; the remaining gap is pure per-byte cost — fast x1.35 (359 vs ~480-560 MB/s), balanced x2.24 (x2.14 after the 2026-09-14 pipelined head reads). dll's 25% literal fraction puts huff0+compress_literals at ~20% of fastest cycles (huff0 stream itself at libzstd parity); scan/emit miss loops are at libzstd parity. Left: the emit body's residual + the 2×-denser seq-count differential vs libzstd's parse. Corpus: `bench/gen_big.sh` (ELF concat; avg_ll 3.58/avg_ml 10.9 — see [matchers](perf/matchers.md)).
-9b. **Fast-tier tiny-input overread (pre-existing, fuzz-found 2026-09-14)**: `insert_covered` → `insert_at` → `hash_at_log` reads 8 bytes past an 8-byte heap region on tiny inputs (ASAN heap-buffer-overflow; 8-byte reproducer `0f0f0f0f0f0f2a90` at Fastest; reproduces on master, unrelated to the DUBT round — the crash artifact sits in `zstdx-fuzz/artifacts/encode/`). Read-only overread, no output corruption observed; fix is presumably a HASH_READ guard at the small-block tail. Next round.
 
 ## P2 · Ratio and features
 
