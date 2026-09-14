@@ -58,6 +58,17 @@ const PREFILL_STRIDE: usize = 3;
 /// repeats (~10-15 agreeing bytes on natural text) cannot qualify, short
 /// enough that one cache line of checking settles it.
 const SEED_AGREE: usize = 48;
+/// Spread anchors behind the 56-byte agreement window where a seed candidate
+/// must still agree (one u64 compare each). The window alone cannot tell a
+/// strip-long period from a long local repeat: a duplicated block of ≥56
+/// bytes near the strip tail agrees with itself at every offset inside the
+/// block, and the nearest-first scan prefers it (measured: a 194-byte
+/// duplicated source statement at offset 2244 beat a 441226-byte tile period
+/// and burned the seed budget, collapsing that job's ratio). A genuine
+/// period or duplicated block agrees at every distance it spans, so spread
+/// confirms separate the classes; anchors that underflow the candidate's own
+/// history are skipped (short strips).
+const SEED_CONFIRMS: [usize; 3] = [64, 640, 6144];
 /// Seed matches to emit before retiring the seed: three literal offsets
 /// both clear the repcode gate and rotate `rep` until `rep[0]` holds the
 /// seed offset, so the regular repcode probes take over from there.
@@ -1490,14 +1501,15 @@ impl MatchGeneratorDriver {
     }
 
     /// Scan back from the strip's tail for the nearest position whose 8
-    /// bytes equal the tail's and whose preceding [`SEED_AGREE`] bytes agree,
-    /// and install its distance as the job-start seed offset (see
-    /// `seed_offset`). Word-level repeats die at ~15 agreeing bytes, so only
-    /// a genuine long repeat — a period riding the strip, or a duplicated
-    /// block — qualifies. The offset is by construction inside the strip,
-    /// hence inside the window, so seed matches are always encodable.
-    /// `last` is the strip's final insertable index; the anchor bytes
-    /// `[last, last + 8)` abut the job start.
+    /// bytes equal the tail's, whose preceding [`SEED_AGREE`] bytes agree,
+    /// and whose [`SEED_CONFIRMS`] anchors agree, and install its distance
+    /// as the job-start seed offset (see `seed_offset`). Word-level repeats
+    /// die at ~15 agreeing bytes and local block repeats at the confirms, so
+    /// only a genuine long repeat — a period riding the strip, or a
+    /// duplicated block — qualifies. The offset is by construction inside
+    /// the strip, hence inside the window, so seed matches are always
+    /// encodable. `last` is the strip's final insertable index; the anchor
+    /// bytes `[last, last + 8)` abut the job start.
     fn acquire_seed(&mut self, data: &[u8], last: usize) {
         let a8 = read8(data, last);
         if let Some(u) = seed_scan(data, last, a8) {
@@ -1571,7 +1583,7 @@ fn seed_scan(data: &[u8], last: usize, a8: u64) -> Option<usize> {
     let mut u = last;
     while u > 0 {
         u -= 1;
-        if read8(data, u) == a8 && seed_agrees(data, u, last) {
+        if read8(data, u) == a8 && seed_agrees(data, u, last) && seed_confirms(data, u, last) {
             return Some(u);
         }
     }
@@ -1586,6 +1598,19 @@ fn seed_agrees(data: &[u8], u: usize, last: usize) -> bool {
         k += 1;
     }
     k > SEED_AGREE
+}
+
+/// Whether the [`SEED_CONFIRMS`] anchors behind `u` still agree with those
+/// behind `last` (see the const's doc): the local-repeat filter that keeps
+/// the nearest-first seed honest. `u < last`, so `u >= t` bounds both reads.
+#[inline(always)]
+fn seed_confirms(data: &[u8], u: usize, last: usize) -> bool {
+    for t in SEED_CONFIRMS {
+        if u >= t && read8(data, u - t) != read8(data, last - t) {
+            return false;
+        }
+    }
+    true
 }
 
 /// AVX-512 seed scan: 64-candidate blocks from the anchor down, eight
@@ -1627,7 +1652,7 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
                 let bit = occ.ilog2();
                 occ ^= 1 << bit;
                 let u = b + bit as usize;
-                if u < last && seed_agrees(data, u, last) {
+                if u < last && seed_agrees(data, u, last) && seed_confirms(data, u, last) {
                     return Some(u);
                 }
             }
@@ -1636,9 +1661,9 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
             }
             b -= 64;
         }
-        (0..bottom)
-            .rev()
-            .find(|&u| read8(data, u) == a8 && seed_agrees(data, u, last))
+        (0..bottom).rev().find(|&u| {
+            read8(data, u) == a8 && seed_agrees(data, u, last) && seed_confirms(data, u, last)
+        })
     }
 }
 
@@ -3451,14 +3476,13 @@ mod tests {
     /// short for the block scheme.
     #[test]
     fn seed_scan_matches_naive_walk() {
-        let qualify = |data: &[u8], u: usize, last: usize| -> bool {
-            u >= 48 && data[u - 48..u] == data[last - 48..last]
-        };
         let naive = |data: &[u8], last: usize| -> Option<usize> {
             let a8 = super::read8(data, last);
-            (0..last)
-                .rev()
-                .find(|&u| super::read8(data, u) == a8 && qualify(data, u, last))
+            (0..last).rev().find(|&u| {
+                super::read8(data, u) == a8
+                    && super::seed_agrees(data, u, last)
+                    && super::seed_confirms(data, u, last)
+            })
         };
         let check = |data: &[u8]| {
             let last = data.len() - 8;
@@ -3491,7 +3515,9 @@ mod tests {
         };
         // A 56-byte pattern planted as the anchor window `[last-48,
         // last+8)` and, disjoint from it, as the candidate window
-        // `[hit-48, hit+8)`; everything else random. `hit` sweeps the
+        // `[hit-48, hit+8)`; everything else random. The candidate is a
+        // confirmed repeat: the u64s behind it at each confirm offset
+        // (where it has history) mirror the anchor's. `hit` sweeps the
         // interesting offsets: residue classes mod 8, the block-grid
         // boundaries and the bottom tail (< 64).
         let len = 700;
@@ -3518,6 +3544,12 @@ mod tests {
             let pat: Vec<u8> = (0..56).map(|_| rng() as u8).collect();
             data[hit - 48..hit + 8].copy_from_slice(&pat);
             data[last - 48..].copy_from_slice(&pat);
+            for t in super::SEED_CONFIRMS {
+                if hit >= t {
+                    let a = super::read8(&data, last - t);
+                    data[hit - t..hit - t + 8].copy_from_slice(&a.to_le_bytes());
+                }
+            }
             check(&data);
             assert_eq!(
                 super::seed_scan(&data, last, super::read8(&data, last)),
@@ -3537,6 +3569,32 @@ mod tests {
             super::seed_scan(&data, last, super::read8(&data, last)),
             None
         );
+        // A local block repeat passes the 56-byte window but not the spread
+        // confirms; only a confirmed candidate may become the seed, so the
+        // nearer unconfirmed plant is skipped for the farther confirmed one
+        // — and with no confirmed plant at all there is no seed.
+        for far in [Some(last - 300), None] {
+            for b in &mut data {
+                *b = rng() as u8;
+            }
+            data[last - 48..].copy_from_slice(&pat);
+            data[last - 148..last - 92].copy_from_slice(&pat); // near, unconfirmed
+            if let Some(hit) = far {
+                data[hit - 48..hit + 8].copy_from_slice(&pat);
+                for t in super::SEED_CONFIRMS {
+                    if hit >= t {
+                        let a = super::read8(&data, last - t);
+                        data[hit - t..hit - t + 8].copy_from_slice(&a.to_le_bytes());
+                    }
+                }
+            }
+            check(&data);
+            assert_eq!(
+                super::seed_scan(&data, last, super::read8(&data, last)),
+                far,
+                "confirmed candidate {far:?}"
+            );
+        }
         // All-same bytes: every position trivially matches, nearest wins and
         // the anchor itself is excluded.
         let flat = alloc::vec![0x5Au8; len];
