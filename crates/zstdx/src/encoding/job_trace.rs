@@ -19,6 +19,11 @@ use std::{
 /// untimed residue by the threshold.
 pub const FILL_MIN_BYTES: u64 = 8 * 1024;
 
+/// Fills at least this large count as strip ingestions rather than
+/// block-boundary refills: the opt rows' job fills start mid-window (the
+/// tail-half bound), so position cannot classify them.
+pub const STRIP_MIN_BYTES: u64 = 1024 * 1024;
+
 /// Component totals since the last [`reset`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Snapshot {
@@ -116,13 +121,13 @@ pub fn add_seed(started: Instant) {
     add_ns(&C.seed_ns, started.elapsed());
 }
 
-/// Record one large `update_tree` fill: `at_base` distinguishes the job
-/// strip ingestion (fill starting at the window base) from an in-job
-/// block-boundary refill.
+/// Record one large `update_tree` fill: `strip` distinguishes the job's
+/// strip ingestion (see [`STRIP_MIN_BYTES`]) from an in-job block-boundary
+/// refill.
 #[inline]
-pub fn add_fill(started: Instant, at_base: bool, bytes: u64) {
+pub fn add_fill(started: Instant, strip: bool, bytes: u64) {
     let elapsed = started.elapsed();
-    if at_base {
+    if strip {
         add_ns(&C.strip_fill_ns, elapsed);
         C.strip_fill_bytes.fetch_add(bytes, Ordering::Relaxed);
         C.strip_fill_calls.fetch_add(1, Ordering::Relaxed);

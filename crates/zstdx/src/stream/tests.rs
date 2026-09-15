@@ -467,6 +467,17 @@ mod mt {
                 assert_eq!(streamed, bulk_mt, "workers {workers} checksum {checksum}");
             }
         }
+        // The opt rows exercise the strip/job-floor coupling and ultra's
+        // job-boundary seed parse — the deep tiers' job paths. One combo:
+        // the deep parse is slow under debug builds (the data still splits
+        // into two jobs at the opt strip's 4 MiB floor).
+        let deep = textish(4 * 1024 * 1024 + 512 * 1024);
+        for level in [Level::Opt, Level::Ultra] {
+            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None);
+            let streamed =
+                encode_write(&deep, 1024 * 1024, level, 4, false, Some(deep.len() as u64));
+            assert_eq!(streamed, bulk_mt, "{level:?}");
+        }
     }
 
     /// A flush makes the pending bytes visible early at the cost of a

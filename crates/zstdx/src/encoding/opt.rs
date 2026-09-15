@@ -33,11 +33,14 @@ pub(crate) const OPT_SIZE: usize = OPT_NUM + 3;
 const LITFREQ_ADD: u32 = 2;
 /// Blocks at or below this size price symbols from the predefined tables.
 const PREDEF_THRESHOLD: usize = 8;
-/// Job-boundary seeding span (two blocks): the strip tail parsed as a
+/// Job-boundary seeding span (one block): the strip tail parsed as a
 /// self-contained frame to seed the statistics. Longer spans measured
-/// neutral-to-worse (basin noise); two blocks match the frame-start pass's
-/// adaptation depth.
-const SEED_SPAN: u64 = 2 * crate::common::MAX_BLOCK_SIZE as u64;
+/// neutral-to-worse (basin noise), and one block is the frame-start
+/// pass's own depth (it seeds the first block itself); the block-tiled
+/// shapes make the seed expensive (a 256 KiB isolated span sits below
+/// text's tile period, so its parse runs literal-dense — half the span,
+/// half the seed cost).
+const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
 
 /// Positions occupy the low 47 bits (epoch tags the high 16). Positions
 /// beyond 2^47 cannot be represented — the encoder's absolute stream
@@ -613,8 +616,12 @@ impl Finder<'_, '_> {
         #[cfg(feature = "job_trace")]
         let trace = {
             let from = idx;
-            super::job_trace::fill_start((target_idx - from) as u64)
-                .map(|start| (start, from == 0, (target_idx - from) as u64))
+            super::job_trace::fill_start((target_idx - from) as u64).map(|start| {
+                // The opt rows' job fills start mid-window (the tail-half
+                // bound), so the strip/lag split is size-based.
+                let bytes = (target_idx - from) as u64;
+                (start, bytes >= super::job_trace::STRIP_MIN_BYTES, bytes)
+            })
         };
         while idx < target_idx {
             let forward = self.insert_bt1(idx).max(1);

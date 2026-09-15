@@ -628,7 +628,7 @@ pub(crate) fn compress_job_blocks(
     let trace_prefill = std::time::Instant::now();
     state
         .matcher
-        .prefill_window(&src[strip..job.start], strip as u64);
+        .prefill_job_strip(&src[strip..job.start], strip as u64);
     #[cfg(feature = "job_trace")]
     super::job_trace::add_prefill(trace_prefill);
     let mut cursor = job.start;

@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the opt tier's MT jobs fill only the tail half of their
+  history strip through the tree (libzstd zstdmt's btopt overlap parity,
+  `ZSTDMT_overlapLog_default` 8; ultra keeps the full strip like
+  btultra2), while the LDM table still ingests the whole strip — measured
+  by the new per-job decomposition (`jobdecomp` bench, `job_trace` dev
+  feature), the strip tree-fill was 40-73% of summed job time on every
+  shape. Ultra's job-boundary seed parse span halved to one block (the
+  frame-start depth). Ratio gates: corpus worst json.opt +0.011%,
+  text.opt -0.017% (denser), dll100 -0.002%, dll32 -0.04%, dll16 -0.11%,
+  st paths byte-identical; the whole-strip-halved form (LDM included) is
+  falsified (dll100 +4.13%). Interleaved mt8: json.opt stream 9->13
+  MiB/s (+44%), json.opt bulk +36%, dll100.opt bulk +20%, text.ultra
+  stream +10%, text.opt stream +3%, json.ultra flat.
 - Encoder: the dfast scan instantiates const-generic table logs — the
   dispatch keys on the tables' actual lengths and the two full rows
   (17/16, 18/18) compile their hash shifts to immediates, freeing the two
