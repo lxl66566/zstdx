@@ -79,7 +79,8 @@ pub fn run(args: &Args) {
             len: Some(raw.len() as u64),
             window_log: None,
         };
-        let job = zstdx::encoding::mt_job_size_for(raw.len() as u64, args.workers, level, shape);
+        let job =
+            zstdx::encoding::mt_job_size_for(raw.len() as u64, args.workers, level, shape, &raw);
         println!("job_size {job}");
     }
 }

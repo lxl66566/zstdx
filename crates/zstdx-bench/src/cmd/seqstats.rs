@@ -52,6 +52,14 @@ impl Matcher for RecordingMatcher {
         self.triples.extend(seqs.iter().map(|s| (s.ll, s.ml, s.of)));
     }
 
+    fn consider_reach_probe(&mut self, head: &[u8], level: Level) {
+        self.inner.consider_reach_probe(head, level);
+    }
+
+    fn set_input_shape(&mut self, shape: zstdx::InputShape) {
+        self.inner.set_input_shape(shape);
+    }
+
     fn reset(&mut self, level: Level) {
         self.inner.reset(level);
     }
@@ -531,6 +539,10 @@ pub fn run(args: &Args) {
     };
     let mut compressor =
         zstdx::encoding::FrameCompressor::new_with_matcher(matcher, Level::from_zstd(args.level));
+    // Declare the source length like the bulk paths do (they always know
+    // it), so window downsizing and the row-9 reach probe measure the same
+    // bytes the bulk encoder produces.
+    compressor.set_input_shape(zstdx::InputShape::default().with_len(raw.len() as u64));
     compressor.set_source(raw.as_slice());
     let sink = Sink(Vec::new());
     compressor.set_drain(sink);

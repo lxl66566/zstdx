@@ -17,6 +17,8 @@
 - **Raw-block fallback is a breeding ground for state divergence**: any cross-block encoder state (rep / reused entropy tables) must be reconciled against "what the decoder actually received" — a raw fallback must roll back rep + the reused table, otherwise the next block's Treeless/Repeat references a table the decoder never received.
 - `ip1_idx - anchor_idx` underflow (the new anchor returned by emit can move past ip1): silent in release; the debug panic interrupts an MT worker → join waits forever. Fix: switch to an exact predicate with no subtraction.
 - Matcher-scratch driver reproducing MT job scenarios: blocks must be ≤128K (ml>131074 hits unreachable), adopt_window only up to block_end (otherwise extend_match crosses the block and yields a huge ml).
+- **A span gate without a slice is O(input), not O(span)**: the reach probe checked `head.len() < PROBE_SPAN` as its engagement gate but then parsed the whole `head` — the "fixed ~36 ms" probe cost 580 ms on a 33 MiB frame (json solo 76→41 MiB/s). The symptom (output byte-correct, speed halved) reads as a feature cost, not a bug; any prefix-probe pattern must slice `&head[..SPAN]` at the gate, and its cost claim must be re-measured on a large input before it is believed.
+- **A replay cursor declared inside the read loop replays the same block forever**: staging probe bytes inside `FrameCompressor::compress`'s block loop reset `staged_read` each iteration — the same first block replayed until the frame hangs (32 MiB json stuck 10+ min, RSS 375 MB). Replay cursors live *outside* the loop they gate.
 
 ## Entropy coding / bitstream
 

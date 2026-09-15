@@ -35,6 +35,7 @@ use crate::{
         frame_header::FrameHeader,
         match_generator::MatchGeneratorDriver,
         mt::{MAX_JOB_SIZE, MIN_JOB_SIZE, job_size_for, run_job_with},
+        reach_probe::ReachChoice,
     },
 };
 
@@ -211,6 +212,10 @@ fn pool_worker(shared: Arc<PoolShared>) {
                     ctx.level,
                     gate,
                     ctx.shape,
+                    // The stream core keeps the stock reach: its jobs flow
+                    // before any head is assembled to probe (see
+                    // reach_probe's engagement notes).
+                    ReachChoice::Keep,
                 )
             }));
             match attempt {
@@ -663,6 +668,9 @@ impl MtEncoderCore {
             self.level,
             self.job_start > 0,
             self.shape,
+            // See the pool worker's note: the stream core keeps the stock
+            // reach.
+            ReachChoice::Keep,
         );
         self.shared.states.lock().unwrap().push(state);
         self.output.extend_from_slice(&bytes);

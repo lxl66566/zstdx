@@ -31,6 +31,7 @@ use super::{
     },
     frame_header::FrameHeader,
     match_generator::MatchGeneratorDriver,
+    reach_probe,
 };
 use crate::{Level, common::MAX_BLOCK_SIZE};
 
@@ -62,8 +63,17 @@ pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
 /// pieces at these boundaries, so it must not re-derive the formula.
 /// Hidden: not API-stable.
 #[doc(hidden)]
-pub fn mt_job_size_for(len: u64, workers: u32, level: Level, shape: crate::InputShape) -> usize {
-    let overlap = MatchGeneratorDriver::strip_for_level(level, shape) as usize;
+pub fn mt_job_size_for(
+    len: u64,
+    workers: u32,
+    level: Level,
+    shape: crate::InputShape,
+    head: &[u8],
+) -> usize {
+    // The frame's reach probe result (see reach_probe) decides the strip
+    // with it.
+    let choice = reach_probe::probe_reach_choice(head, level, shape);
+    let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     job_size_for(len, workers.max(2), overlap)
 }
 
@@ -108,7 +118,10 @@ pub fn compress_slice_mt(
     // a full-window strip would scale the job floor with the LDM reach and
     // starve parallelism.
     let window = MatchGeneratorDriver::window_for_level(level, shape);
-    let overlap = MatchGeneratorDriver::strip_for_level(level, shape) as usize;
+    // The frame's head decides its chain reach (see reach_probe), and with
+    // it the strip: a shrunk search domain shrinks the strip to match.
+    let choice = reach_probe::probe_reach_choice(src, level, shape);
+    let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     let job_size = job_size_for(src.len() as u64, workers, overlap);
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
@@ -159,6 +172,7 @@ pub fn compress_slice_mt(
                             level,
                             gate,
                             shape,
+                            choice,
                         )
                     }));
                     match attempt {
@@ -231,8 +245,9 @@ pub(crate) fn run_job_with(
     level: Level,
     gate: bool,
     shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
-    reset_slice_state(state, level, shape);
+    reset_slice_state(state, level, shape, choice);
     if gate {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -254,8 +269,9 @@ pub(crate) fn run_job(
     level: Level,
     gate: bool,
     shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level, shape);
+    let mut state = take_slice_state(level, shape, choice);
     let output = run_job_with(
         &mut state,
         src,
@@ -265,6 +281,7 @@ pub(crate) fn run_job(
         level,
         gate,
         shape,
+        choice,
     );
     return_slice_state(state);
     output

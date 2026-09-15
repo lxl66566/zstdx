@@ -13,6 +13,7 @@ pub(crate) mod match_generator;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
 pub(crate) mod opt;
+pub(crate) mod reach_probe;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
 
@@ -281,6 +282,12 @@ pub trait Matcher {
     /// and/or a forced window log overriding the level's row. Per frame —
     /// implementations must not carry it across resets.
     fn set_input_shape(&mut self, _shape: crate::InputShape) {}
+    /// Decide the frame's chain reach from its first bytes (the built-in
+    /// matcher's shape-adaptive row-9 probe, see
+    /// `match_generator::reach_probe`): called once per frame, before the
+    /// first block is matched, with at least the probe's span of head bytes
+    /// staged. The default keeps the level's stock reach.
+    fn consider_reach_probe(&mut self, _head: &[u8], _level: Level) {}
     /// Load dictionary content as the frame's match history after
     /// [`Matcher::reset`], before the first block (owned-window
     /// implementations only; the default drops it, and the encoder still

@@ -22,7 +22,7 @@ use crate::{
         frame_compressor::{BlockChecksum, CompressState, FrameHasher, FseTables},
         frame_header::FrameHeader,
         match_generator::MatchGeneratorDriver,
-        util,
+        reach_probe, util,
     },
 };
 
@@ -80,6 +80,10 @@ pub(crate) struct FrameEncoderCoreSt {
     /// Input bytes of the block currently being assembled; always shorter
     /// than the block size outside [`FrameEncoderCoreSt::write`].
     staged: Vec<u8>,
+    /// Whether the frame's reach probe (see [`reach_probe`]) is still
+    /// pending: the first [`reach_probe::PROBE_SPAN`] bytes stage as one
+    /// contiguous unit before the first block is matched.
+    probe_pending: bool,
     /// Encoded bytes not yet consumed by the enclosing encoder, starting
     /// with the frame header before the first block. `out_read` is the
     /// consumed prefix: serving reads advances the cursor instead of
@@ -137,6 +141,13 @@ impl FrameEncoderCoreSt {
             },
         };
         let checksum = options.checksum && cfg!(feature = "hash");
+        // Dictionary frames keep the stock reach (see reach_probe), so only
+        // a plain frame stages the probe's head.
+        let probe_pending = dict_id.is_none()
+            && reach_probe::eligible(options.level, crate::InputShape {
+                len: options.pledged_size,
+                window_log: options.input_shape.window_log,
+            });
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
             single_segment: false,
@@ -159,6 +170,7 @@ impl FrameEncoderCoreSt {
             block_size,
             header: serialized,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
+            probe_pending,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
             out_read: 0,
             blocks: 0,
@@ -170,13 +182,36 @@ impl FrameEncoderCoreSt {
         debug_assert!(!self.finished);
         let mut data = data;
         while !data.is_empty() {
-            let space = self.block_size - self.staged.len();
+            // While the reach probe is pending (see reach_probe), the
+            // frame's first PROBE_SPAN bytes stage as one contiguous unit —
+            // the probe parses them as a whole before any block is matched.
+            let limit = if self.probe_pending {
+                reach_probe::PROBE_SPAN
+            } else {
+                self.block_size
+            };
+            let space = limit - self.staged.len();
             let n = space.min(data.len());
             self.staged.extend_from_slice(&data[..n]);
             data = &data[n..];
-            if self.staged.len() == self.block_size {
-                self.encode_block(false);
+            if self.staged.len() == limit {
+                if self.probe_pending {
+                    self.state
+                        .matcher
+                        .consider_reach_probe(&self.staged, self.level);
+                    self.probe_pending = false;
+                }
+                self.drain_full_blocks();
             }
+        }
+    }
+
+    /// Encode every full staged block. Outside the probe's staging window
+    /// this is the plain per-block encode; after it, the staged head drains
+    /// in block-sized pieces.
+    fn drain_full_blocks(&mut self) {
+        while self.staged.len() >= self.block_size {
+            self.encode_block(false);
         }
     }
 
@@ -189,6 +224,11 @@ impl FrameEncoderCoreSt {
         // A frame needs at least one block: empty input, and an input that
         // is an exact multiple of the block size, encode one empty raw last
         // block (mirroring the legacy streaming path).
+        //
+        // A still-pending probe means the frame never staged its head (a
+        // short input or an early finish): the stock reach stays.
+        self.probe_pending = false;
+        self.drain_full_blocks();
         self.encode_block(true);
         if self.checksum {
             let checksum = self.hasher.finish32();
@@ -201,7 +241,10 @@ impl FrameEncoderCoreSt {
     /// is staged.
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
-        if !self.staged.is_empty() {
+        // A flush inside the probe's staging window cancels the probe (the
+        // stock reach stays) and emits the staged head block by block.
+        self.probe_pending = false;
+        while !self.staged.is_empty() {
             self.encode_block(false);
         }
     }
@@ -239,12 +282,14 @@ impl FrameEncoderCoreSt {
     }
 
     fn encode_block(&mut self, last: bool) {
-        let n = self.staged.len();
+        // At most one block's worth: outside the probe's staging window the
+        // staged bytes are always shorter than the block size.
+        let n = self.staged.len().min(self.block_size);
         debug_assert!(n <= MAX_BLOCK_SIZE as usize);
         let tail = self.state.matcher.block_tail();
-        tail[..n].copy_from_slice(&self.staged);
+        tail[..n].copy_from_slice(&self.staged[..n]);
         self.state.matcher.commit_block(n);
-        self.staged.clear();
+        self.staged.drain(..n);
         if self.blocks == 0 {
             self.output.extend_from_slice(&self.header);
         }

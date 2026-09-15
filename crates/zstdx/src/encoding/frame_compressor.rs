@@ -5,7 +5,7 @@ use core::convert::TryInto;
 
 use super::{
     Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver,
+    match_generator::MatchGeneratorDriver, reach_probe,
 };
 use crate::{
     Level,
@@ -366,8 +366,10 @@ pub(crate) fn reset_slice_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     level: Level,
     shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
 ) {
     state.matcher.set_input_shape(shape);
+    state.matcher.set_reach_choice(choice);
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
@@ -380,14 +382,15 @@ pub(crate) fn reset_slice_state(
 pub(crate) fn take_slice_state(
     level: Level,
     shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
-        reset_slice_state(&mut s, level, shape);
+        reset_slice_state(&mut s, level, shape, choice);
         return s;
     }
     let mut fresh = alloc::boxed::Box::new(new_slice_state());
-    reset_slice_state(&mut fresh, level, shape);
+    reset_slice_state(&mut fresh, level, shape, choice);
     fresh
 }
 
@@ -429,7 +432,9 @@ pub fn compress_slice_shaped(
 ) -> Vec<u8> {
     let mut shape = shape;
     shape.len = Some(src.len() as u64);
-    let mut state = take_slice_state(level, shape);
+    // The frame's head decides its chain reach (see reach_probe).
+    let choice = reach_probe::probe_reach_choice(src, level, shape);
+    let mut state = take_slice_state(level, shape, choice);
     let output = compress_with_state(&mut state, src, level, checksum);
     return_slice_state(state);
     output
@@ -705,6 +710,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .map(super::dictionary::EncDictionary::parse)
             .map(|d| d.expect("valid dictionary"));
         let dict_id = dict.as_ref().map_or(None, |d| d.header_id());
+        // No frame inherits the previous one's reach choice (see
+        // reach_probe): an empty head resets it to the stock reach.
+        self.state
+            .matcher
+            .consider_reach_probe(&[], self.compression_level);
         match dict {
             Some(ref dict) => {
                 let mut shape = self.input_shape;
@@ -723,6 +733,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
         }
         self.hasher = FrameHasher::new();
+        // The probe's staged head (see reach_probe): the block loop below
+        // only ever sees one block's worth, so the head is staged whole
+        // here and replays through the loop first. Dictionary frames keep
+        // the stock reach (their history needs it).
+        let mut probe_staged: Vec<u8> = Vec::new();
+        if dict.is_none() && reach_probe::eligible(self.compression_level, self.input_shape) {
+            let source = self.uncompressed_data.as_mut().unwrap();
+            probe_staged.reserve(reach_probe::PROBE_SPAN);
+            while probe_staged.len() < reach_probe::PROBE_SPAN {
+                let mut chunk = [0u8; 8 * 1024];
+                let n = source.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                probe_staged.extend_from_slice(&chunk[..n]);
+            }
+            self.state
+                .matcher
+                .consider_reach_probe(&probe_staged, self.compression_level);
+        }
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
         // As the frame is compressed, it's stored here
@@ -736,7 +766,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);
-        // Now compress block by block
+        // Now compress block by block. `staged_read` tracks the probe's
+        // staged head replay across blocks (it spans sixteen of them).
+        let mut staged_read = 0usize;
         loop {
             // Read a single block's worth of uncompressed data straight into
             // the tail of the matcher's window (no intermediate buffer copy).
@@ -746,12 +778,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             let mut read_bytes = 0;
             let last_block;
             'read_loop: loop {
-                let new_bytes = source.read(&mut tail[read_bytes..]).unwrap();
-                if new_bytes == 0 {
-                    last_block = true;
-                    break 'read_loop;
+                if staged_read < probe_staged.len() {
+                    // The probe's staged head replays before the source.
+                    let take = (tail.len() - read_bytes).min(probe_staged.len() - staged_read);
+                    tail[read_bytes..read_bytes + take]
+                        .copy_from_slice(&probe_staged[staged_read..staged_read + take]);
+                    staged_read += take;
+                    read_bytes += take;
+                } else {
+                    let new_bytes = source.read(&mut tail[read_bytes..]).unwrap();
+                    if new_bytes == 0 {
+                        last_block = true;
+                        break 'read_loop;
+                    }
+                    read_bytes += new_bytes;
                 }
-                read_bytes += new_bytes;
                 if read_bytes == tail.len() {
                     last_block = false;
                     break 'read_loop;

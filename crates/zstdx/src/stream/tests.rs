@@ -544,3 +544,78 @@ fn decoders_decode_libzstd_frames() {
     }
     assert_eq!(sink, data);
 }
+
+/// Near-local vocabulary text (the shape the reach probe's shrunk domain
+/// serves), sized above the probe's engagement floor.
+#[cfg(test)]
+fn near_local(len: usize) -> Vec<u8> {
+    let words: [&[u8]; 13] = [
+        b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ", b"lorem ",
+        b"ipsum ", b"dolor ", b"sit ", b"amet ",
+    ];
+    let mut state = 7u64;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let w = words[((state >> 33) as usize) % words.len()];
+        let take = w.len().min(len - out.len());
+        out.extend_from_slice(&w[..take]);
+    }
+    out
+}
+
+/// The reach probe (see `encoding::reach_probe`): a pledged Balanced stream
+/// above the engagement floor runs the whole staging path — probe parse,
+/// reach decision, head replay — and must stay a valid, deterministic
+/// frame whichever way the decision lands.
+#[test]
+fn reach_probe_stream_roundtrips() {
+    let len = crate::encoding::reach_probe::PROBE_MIN_FRAME as usize + 123 * 1024;
+    let data = near_local(len);
+    for (workers, label) in [(1, "st"), (4, "mt")] {
+        let options = || {
+            EncoderOptions::new(Level::Balanced)
+                .pledged_size(Some(len as u64))
+                .workers(workers)
+        };
+        let encode = || {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, options()).unwrap();
+            // Odd chunk sizes cross the probe's staging window and the
+            // block boundaries in every alignment.
+            write_in_chunks(&data, 333 * 1024 + 7, &mut enc);
+            enc.finish().unwrap();
+            sink
+        };
+        let a = encode();
+        let b = encode();
+        assert_eq!(a, b, "{label}: stream must be deterministic");
+        assert_eq!(bulk::decompress(&a, len).unwrap(), data, "{label}");
+        #[cfg(feature = "std")]
+        {
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(a.as_slice(), &mut decoded).unwrap();
+            assert_eq!(decoded, data, "{label}: libzstd must decode");
+        }
+    }
+    // Unpledged and unflushed: the probe never engages (no staged head),
+    // the stream still must roundtrip; an explicit flush mid-head cancels
+    // the pending probe the same way.
+    let mut sink = Vec::new();
+    let mut enc =
+        write::Encoder::with_options(&mut sink, EncoderOptions::new(Level::Balanced)).unwrap();
+    write_in_chunks(&data, 128 * 1024, &mut enc);
+    enc.finish().unwrap();
+    assert_eq!(bulk::decompress(&sink, len).unwrap(), data);
+    let mut sink = Vec::new();
+    let mut enc = write::Encoder::with_options(
+        &mut sink,
+        EncoderOptions::new(Level::Balanced).pledged_size(Some(len as u64)),
+    )
+    .unwrap();
+    enc.write_all(&data[..1024 * 1024]).unwrap();
+    enc.flush().unwrap();
+    write_in_chunks(&data[1024 * 1024..], 512 * 1024, &mut enc);
+    enc.finish().unwrap();
+    assert_eq!(bulk::decompress(&sink, len).unwrap(), data);
+}

@@ -24,6 +24,7 @@ use super::{
     btlazy::LazyScratch,
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
+    reach_probe::{KEEP_REACH, ReachChoice, SHRINK_REACH},
     seq_codes::{decode_packed, pack_seq},
 };
 // Shared with the decoder so both sides agree on offset-history semantics.
@@ -1352,6 +1353,10 @@ pub struct MatchGeneratorDriver {
     /// Caller-declared input shape (see [`Matcher::set_input_shape`]);
     /// applied at the next `reset` via [`params_for`].
     shape: InputShape,
+    /// The frame's reach probe result (see [`super::reach_probe`]); applied
+    /// inside `apply_level`, so entry points set it before `reset` or
+    /// re-apply through [`Matcher::consider_reach_probe`].
+    reach_choice: ReachChoice,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
     /// Gear-hash long-distance matcher state for chain rows with
@@ -1418,6 +1423,34 @@ impl MatchGeneratorDriver {
         p.chain_reach.unwrap_or(p.window) as u64
     }
 
+    /// Whether the shape-adaptive reach probe (see [`super::reach_probe`])
+    /// may decide this frame's reach: only the Balanced row with its stock
+    /// reach still in place — a shape-clamped reach means the window itself
+    /// is small, with nothing left to trade away.
+    pub fn reach_probe_eligible(level: Level, shape: InputShape) -> bool {
+        params_for(level, shape).chain_reach == Some(KEEP_REACH)
+    }
+
+    /// [`Self::strip_for_level`] under the frame's reach probe result: a
+    /// shrunk chain domain shrinks the strip with it — the strip needs to
+    /// cover the dense search, and the LDM far class rides within-job
+    /// history (the probe's own measurement priced the near-local shape
+    /// without cross-strip far matches mattering).
+    pub(crate) fn strip_for_choice(level: Level, shape: InputShape, choice: ReachChoice) -> u64 {
+        let p = params_for(level, shape);
+        if choice == ReachChoice::Shrink && p.chain_reach == Some(KEEP_REACH) {
+            SHRINK_REACH as u64
+        } else {
+            p.chain_reach.unwrap_or(p.window) as u64
+        }
+    }
+
+    /// Declare the frame's reach probe result (see [`super::reach_probe`])
+    /// before `reset`; the choice survives resets until changed.
+    pub(crate) fn set_reach_choice(&mut self, choice: ReachChoice) {
+        self.reach_choice = choice;
+    }
+
     /// Largest block the frame may carry: the format caps blocks at the
     /// declared window (RFC 8878: Block_Maximum_Size = min(window, 128K)),
     /// so a forced or downsized window below 128 KiB shrinks the blocks.
@@ -1458,6 +1491,7 @@ impl MatchGeneratorDriver {
             miss_count: 0,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            reach_choice: ReachChoice::Keep,
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
@@ -1505,6 +1539,7 @@ impl MatchGeneratorDriver {
             miss_count: 0,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            reach_choice: ReachChoice::Keep,
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
@@ -1525,7 +1560,12 @@ impl MatchGeneratorDriver {
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let params = params_for(level, self.shape);
+        let mut params = params_for(level, self.shape);
+        // The frame's reach probe result: only the row's stock reach is
+        // replaceable, never a shape-clamped one.
+        if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
+            params.chain_reach = Some(SHRINK_REACH);
+        }
         if params != self.params {
             // Exactly one table family is live per strategy; switching
             // families drops the other's buffers.
@@ -2004,6 +2044,20 @@ unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
 impl Matcher for MatchGeneratorDriver {
     fn set_input_shape(&mut self, shape: InputShape) {
         self.shape = shape;
+    }
+
+    /// Decide the frame's reach from its first bytes (see
+    /// [`super::reach_probe`]). Called before any block of the frame is
+    /// matched; no-op for heads below the probe span.
+    fn consider_reach_probe(&mut self, head: &[u8], level: Level) {
+        let choice = super::reach_probe::probe_reach_choice(head, level, self.shape);
+        if choice != self.reach_choice {
+            self.reach_choice = choice;
+            // No block has been matched yet, so re-deriving the params is
+            // the whole state change; the tables' sizes are
+            // reach-independent.
+            self.apply_level(level);
+        }
     }
 
     /// See the inherent [`MatchGeneratorDriver::load_dictionary`] — the
