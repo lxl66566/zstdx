@@ -76,6 +76,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         // is known, saving the per-block staging copy of the whole content.
         let start = output.len();
         output.extend_from_slice(&[0u8; 3]);
+        let dict_entropy = state.dict_entropy;
         let outcome = compress_block(
             &mut state.matcher,
             old_huff.as_ref(),
@@ -85,6 +86,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 &state.fse_tables.of_default,
             ),
             (&old_tables[0], &old_tables[1], &old_tables[2]),
+            dict_entropy,
             output,
             &mut state.scratch,
         );
@@ -103,9 +105,12 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             };
             // Adopt the tables this block was encoded with; anything the
             // block did not replace falls back to the previous table. A
-            // retired table's transition buffer goes back to the pool.
+            // retired table's transition buffer goes back to the pool. A
+            // stream that wrote its own table (or lost it to a predefined
+            // one) is no longer dictionary-seeded.
             state.last_huff_table = match tables.huff {
                 Some(new) => {
+                    state.dict_entropy.huff = false;
                     if let Some(old) = old_huff {
                         old.recycle_codes(&mut state.scratch.huff);
                     }
@@ -116,6 +121,11 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             // `Clear` drops the remembered table: the block overwrote the
             // decoder's table with a predefined or RLE one, so repeating the
             // old custom table in a later block would desync the streams.
+            // Only a carried-over table keeps its dictionary seeding: a
+            // fresh table replaces the statistics, a clear drops them.
+            state.dict_entropy.ll = dict_entropy.ll && matches!(tables.ll, PrevTable::Keep);
+            state.dict_entropy.ml = dict_entropy.ml && matches!(tables.ml, PrevTable::Keep);
+            state.dict_entropy.of = dict_entropy.of && matches!(tables.of, PrevTable::Keep);
             state.fse_tables.ll_previous =
                 replace_previous(old_tables[0].take(), tables.ll, &mut state.scratch.fse);
             state.fse_tables.ml_previous =

@@ -154,7 +154,16 @@ impl HuffmanTable {
     /// the serialized form of the code lengths.
     pub(crate) fn wire_weights(&self) -> Vec<u8> {
         let max = self.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        self.codes.iter().map(|&(_, nb)| if nb == 0 { 0 } else { max - nb + 1 }).collect()
+        self.codes
+            .iter()
+            .map(|&(_, nb)| {
+                if nb == 0 {
+                    0
+                } else {
+                    max - nb + 1
+                }
+            })
+            .collect()
     }
 
     /// Serialize the table description exactly as a compressed literals
@@ -202,7 +211,6 @@ impl HuffmanTable {
         }
     }
 }
-
 
 #[derive(Clone)]
 pub struct HuffmanTable {
@@ -311,6 +319,16 @@ impl HuffmanTable {
         }
         let mut codes = alloc::vec![(0, 0); weights.len()];
         build_from_weights_slice(&narrow[..weights.len()], &mut codes)
+    }
+
+    /// Stream size in bits this table yields for a histogram (libzstd's
+    /// `HUF_estimateCompressedSize`): the sum of count × code length.
+    pub(crate) fn estimate_bits(&self, counts: &[usize]) -> u64 {
+        self.codes
+            .iter()
+            .zip(counts.iter())
+            .map(|(&(_, nb), &c)| c as u64 * nb as u64)
+            .sum()
     }
 
     /// Per-symbol code lengths (0 = symbol not covered by the table).

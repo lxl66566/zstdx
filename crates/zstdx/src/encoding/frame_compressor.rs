@@ -325,6 +325,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// Which reusable tables still carry dictionary statistics (see
+    /// `DictEntropy`).
+    pub(crate) dict_entropy: super::blocks::compressed::DictEntropy,
     /// Pooled per-block scratch (literals, sequences, code streams): reused
     /// across blocks so steady-state blocks run allocation-free.
     pub(crate) scratch: super::blocks::compressed::BlockScratch,
@@ -346,6 +349,7 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         matcher: MatchGeneratorDriver::new_direct(),
         last_huff_table: None,
         fse_tables: FseTables::new(),
+        dict_entropy: Default::default(),
         scratch: super::blocks::compressed::BlockScratch::default(),
     }
 }
@@ -358,6 +362,7 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
         matcher: MatchGeneratorDriver::new(crate::common::MAX_BLOCK_SIZE as usize),
         last_huff_table: None,
         fse_tables: FseTables::new(),
+        dict_entropy: Default::default(),
         scratch: super::blocks::compressed::BlockScratch::default(),
     }
 }
@@ -379,6 +384,7 @@ pub(crate) fn reset_slice_state(
     state.matcher.set_reach_choice(choice);
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
+    state.dict_entropy = Default::default();
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_codes(&mut state.scratch.huff);
     }
@@ -662,6 +668,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             input_shape: crate::InputShape::default(),
             dictionary: None,
             state: CompressState {
+                dict_entropy: Default::default(),
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
@@ -679,6 +686,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data: None,
             compressed_data: None,
             state: CompressState {
+                dict_entropy: Default::default(),
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
@@ -759,6 +767,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 self.state.matcher.set_input_shape(self.input_shape);
                 self.state.matcher.reset(self.compression_level);
                 self.state.last_huff_table = None;
+                self.state.dict_entropy = Default::default();
             },
         }
         self.hasher = FrameHasher::new();

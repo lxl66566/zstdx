@@ -66,11 +66,38 @@ pub(crate) struct BlockScratch {
 }
 
 /// A block of [`crate::common::BlockType::Compressed`]
+/// Which reusable entropy tables still carry dictionary statistics. A
+/// dictionary-seeded table competes for the block through libzstd's
+/// cost-based selection (repeat/treeless judged against real bit costs)
+/// instead of the tuned heuristics the between-block reuse path uses; the
+/// flag clears per stream once the frame installs its own table.
+// Four per-stream flags, not a state machine: each clears independently
+// as the frame replaces that one stream's table.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DictEntropy {
+    pub huff: bool,
+    pub ll: bool,
+    pub ml: bool,
+    pub of: bool,
+}
+
+impl DictEntropy {
+    /// Every stream seeded (a formatted dictionary with an id).
+    pub const ALL: Self = Self {
+        huff: true,
+        ll: true,
+        ml: true,
+        of: true,
+    };
+}
+
 pub(crate) fn compress_block<M: Matcher>(
     matcher: &mut M,
     last_huff_table: Option<&huff0_encoder::HuffmanTable>,
     default_tables: (&FSETable, &FSETable, &FSETable),
     previous_tables: (&Option<FSETable>, &Option<FSETable>, &Option<FSETable>),
+    dict_entropy: DictEntropy,
     output: &mut Vec<u8>,
     scratch: &mut BlockScratch,
 ) -> BlockOutcome {
@@ -124,6 +151,7 @@ pub(crate) fn compress_block<M: Matcher>(
         match compress_literals(
             literals,
             last_huff_table,
+            dict_entropy.huff,
             &mut writer,
             literals_gate_hold,
             fse,
@@ -165,7 +193,7 @@ pub(crate) fn compress_block<M: Matcher>(
         // computed exactly once per sequence and every consumer (table
         // selection, table description, bitstream encoder) reads the streams.
         let (ll_mode, ml_mode, of_mode) =
-            choose_tables_fast(seqs, default_tables, previous_tables, fse);
+            choose_tables_fast(seqs, default_tables, previous_tables, dict_entropy, fse);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -243,6 +271,7 @@ fn choose_tables_fast<'a>(
         &'a Option<FSETable>,
         &'a Option<FSETable>,
     ),
+    dict_entropy: DictEntropy,
     fse_scratch: &mut FseBuildScratch,
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
     let nb_seq = seqs.len();
@@ -295,6 +324,7 @@ fn choose_tables_fast<'a>(
             last as u8,
             default_tables.0,
             previous_tables.0.as_ref(),
+            dict_entropy.ll,
             6,
             9,
             fse_scratch,
@@ -306,6 +336,7 @@ fn choose_tables_fast<'a>(
             (last >> 8) as u8,
             default_tables.1,
             previous_tables.1.as_ref(),
+            dict_entropy.ml,
             6,
             9,
             fse_scratch,
@@ -317,6 +348,7 @@ fn choose_tables_fast<'a>(
             (last >> 16) as u8,
             default_tables.2,
             previous_tables.2.as_ref(),
+            dict_entropy.of,
             5,
             8,
             fse_scratch,
@@ -332,6 +364,7 @@ fn choose_tables_fast<'a>(
 /// of libzstd's ZSTD_selectEncodingType: the repeat comparison follows the
 /// cost-based path the lazy+ strategies use (the fast-strategy shortcut only
 /// engages with dictionary-provided tables, which this encoder never has).
+#[allow(clippy::too_many_arguments)]
 fn select_from_counts<'a>(
     counts: &mut [u32; SEQ_CODE_SPACE],
     nb_seq: usize,
@@ -339,6 +372,7 @@ fn select_from_counts<'a>(
     last_code: u8,
     default_table: &'a FSETable,
     previous: Option<&'a FSETable>,
+    dict_seeded: bool,
     default_norm_log: u32,
     max_log: u8,
     fse_scratch: &mut FseBuildScratch,
@@ -366,24 +400,56 @@ fn select_from_counts<'a>(
     }
     // The predefined table must cover every code that occurs.
     let default_covers = max_symbol < 31 || default_norm_log == 6;
-    if default_covers {
-        let dynamic_min = ((1u32 << default_norm_log) * 9) >> 3;
-        if (nb_seq as u32) < dynamic_min
-            || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
+    if dict_seeded {
+        // libzstd's lazy+ selection for dictionary-provided tables: a pure
+        // cost comparison, predefined included — the small-block heuristic
+        // gates below would preempt the repeat mode that carries the
+        // dictionary's statistics.
+        let basic_bits = if default_covers {
+            repeat_bit_cost(default_table, counts, max_symbol)
+        } else {
+            None
+        };
+        if let Some(prev) = previous
+            && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
+        {
+            let fresh_bits =
+                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+            if let Some(basic) = basic_bits
+                && basic <= repeat_bits
+                && basic <= fresh_bits
+            {
+                return FseTableMode::Predefined(default_table);
+            }
+            if repeat_bits <= fresh_bits {
+                return FseTableMode::Repeat(prev);
+            }
+        } else if let Some(basic) = basic_bits
+            && basic
+                <= entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol)
         {
             return FseTableMode::Predefined(default_table);
         }
-    }
-    if let Some(prev) = previous
-        && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
-    {
-        // The bound understates a fresh table's bitstream and the
-        // description term is under two percent of the comparison, so
-        // the estimate leans toward rebuilding: ratio-safe.
-        let fresh_bits =
-            entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
-        if repeat_bits <= fresh_bits {
-            return FseTableMode::Repeat(prev);
+    } else {
+        if default_covers {
+            let dynamic_min = ((1u32 << default_norm_log) * 9) >> 3;
+            if (nb_seq as u32) < dynamic_min
+                || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
+            {
+                return FseTableMode::Predefined(default_table);
+            }
+        }
+        if let Some(prev) = previous
+            && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
+        {
+            // The bound understates a fresh table's bitstream and the
+            // description term is under two percent of the comparison, so
+            // the estimate leans toward rebuilding: ratio-safe.
+            let fresh_bits =
+                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+            if repeat_bits <= fresh_bits {
+                return FseTableMode::Repeat(prev);
+            }
         }
     }
     match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code, fse_scratch) {
@@ -967,6 +1033,7 @@ enum LitOutcome {
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
+    dict_seeded: bool,
     writer: &mut BitWriter<&mut Vec<u8>>,
     gate_hold: &mut bool,
     fse: &mut FseBuildScratch,
@@ -1006,7 +1073,22 @@ fn compress_literals(
     let new_encoder_table =
         huff0_encoder::HuffmanTable::build_from_counts_into(&counts[..=max_symbol], huff);
 
-    let (encoder_table, new_table) = if let Some(table) = last_table {
+    // A dictionary-seeded table is reused on real bit costs (libzstd's
+    // HUF comparison: old stream size vs new stream size plus the new
+    // table's description); between-block reuse keeps the tuned bit-length
+    // heuristic.
+    let dict_treeless = dict_carried_table(
+        dict_seeded,
+        last_table,
+        &new_encoder_table,
+        &counts[..=max_symbol],
+        literals.len(),
+        fse,
+        huff,
+    );
+    let (encoder_table, new_table) = if let Some(table) = dict_treeless {
+        (table, false)
+    } else if let Some(table) = last_table {
         if let Some(diff) = table.can_encode(&new_encoder_table) {
             // TODO this is a very simple heuristic, maybe we should try to do better
             if diff > 5 {
@@ -1029,6 +1111,9 @@ fn compress_literals(
 
     let (size_format, size_bits) = match literals.len() {
         0..6 => (0b00u8, 10),
+        // A dictionary table carried over treeless also carries
+        // libzstd's single-stream form (repeat tables cost no jump table).
+        _ if dict_treeless.is_some() && literals.len() < 1024 => (0b00u8, 10),
         6..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
@@ -1061,6 +1146,51 @@ fn compress_literals(
     } else {
         LitOutcome::Treeless
     }
+}
+
+/// The dictionary-seeded treeless decision: `Some(table)` when the carried
+/// table codes this histogram no dearer than a fresh table plus its
+/// description (libzstd's `HUF_estimateCompressedSize` comparison, with
+/// its "a description this large never pays" escape).
+#[allow(clippy::too_many_arguments)]
+fn dict_carried_table<'t>(
+    dict_seeded: bool,
+    last_table: Option<&'t huff0_encoder::HuffmanTable>,
+    fresh: &huff0_encoder::HuffmanTable,
+    counts: &[usize],
+    literals_len: usize,
+    fse: &mut FseBuildScratch,
+    huff: &mut huff0_encoder::HuffScratch,
+) -> Option<&'t huff0_encoder::HuffmanTable> {
+    let table = last_table?;
+    if !dict_seeded || table.can_encode(fresh).is_none() {
+        return None;
+    }
+    let desc_bytes = description_bits_of(fresh, fse, huff);
+    let old_bits = table.estimate_bits(counts);
+    let fresh_bits = fresh.estimate_bits(counts);
+    (old_bits <= desc_bytes as u64 * 8 + fresh_bits || desc_bytes + 12 >= literals_len)
+        .then_some(table)
+}
+
+/// Exact wire size of a huffman table description (serialized to scratch,
+/// not the output — the decision needs it before committing either form).
+fn description_bits_of(
+    table: &huff0_encoder::HuffmanTable,
+    fse: &mut FseBuildScratch,
+    huff: &mut huff0_encoder::HuffScratch,
+) -> usize {
+    let mut desc = Vec::new();
+    {
+        let mut writer = BitWriter::from(&mut desc);
+        table.write_description(&mut writer, fse, huff);
+        let pad = writer.misaligned();
+        if pad != 0 {
+            writer.write_bits(0u8, pad);
+        }
+        writer.flush();
+    }
+    desc.len()
 }
 
 #[cfg(test)]
@@ -1109,6 +1239,7 @@ mod tests {
             last,
             &default,
             Some(&prev),
+            false,
             6,
             9,
             &mut FseBuildScratch::default(),
@@ -1130,6 +1261,7 @@ mod tests {
             last,
             &default,
             Some(&prev),
+            false,
             6,
             9,
             &mut FseBuildScratch::default(),
@@ -1152,6 +1284,7 @@ mod tests {
             30,
             &default,
             Some(&prev),
+            false,
             6,
             9,
             &mut FseBuildScratch::default(),

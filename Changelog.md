@@ -4,6 +4,21 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: dictionary-seeded entropy tables now compete for the block on
+  measured bit costs (libzstd's dict paths) instead of losing to the
+  between-block reuse heuristics. A per-stream `DictEntropy` flag tracks
+  which reusable tables still carry dictionary statistics (cleared as the
+  frame installs its own): the huffman side reuses the dict table when
+  its stream cost beats a fresh table plus its exact serialized
+  description and takes the single-stream literals form below 1 KiB
+  (repeat tables cost no jump table); the FSE side runs the lazy+
+  three-way cost comparison (predefined vs repeat vs fresh) instead of
+  letting the small-block predefined thresholds preempt the repeat mode.
+  Every no-dict path keeps the stock selection: full-ladder dump
+  byte-identical. End-to-end on the 54-file systemd holdout at -9 with
+  our own formatted dict: 5,917 -> 5,413 B vs libzstd's 5,256 (+3.0%,
+  was +11.6%; formatted now -5.7% vs our raw-content dict, mirroring
+  libzstd's -1.2%).
 - Dict trainer: formatted-dictionary emission, the `ZDICT_finalizeDictionary`
   port (`dict/finalize.rs`, bench `train --formatted`): every training
   sample's first block is parsed against the trained content as raw match

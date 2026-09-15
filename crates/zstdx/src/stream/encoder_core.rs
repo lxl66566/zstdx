@@ -109,6 +109,7 @@ impl FrameEncoderCoreSt {
         // feeds blocks through block_tail/commit_block, so unlike the slice
         // path (new_direct, borrowed window) the matcher must own its window.
         let mut state = CompressState {
+            dict_entropy: Default::default(),
             matcher: MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize),
             last_huff_table: None,
             fse_tables: FseTables::new(),

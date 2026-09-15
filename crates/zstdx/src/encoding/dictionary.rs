@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::{
     Error, InputShape, Level,
     decoding::{Dictionary, dictionary::MAGIC_NUM},
-    encoding::frame_compressor::CompressState,
+    encoding::{blocks::compressed::DictEntropy, frame_compressor::CompressState},
     fse::fse_encoder::{FSETable, build_table_from_probabilities},
     huff0::huff0_encoder::HuffmanTable,
 };
@@ -114,10 +114,12 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     state.fse_tables.ll_previous = None;
     state.fse_tables.ml_previous = None;
     state.fse_tables.of_previous = None;
+    state.dict_entropy = DictEntropy::default();
     if dict.id != 0 {
         state.last_huff_table = dict.huff.clone();
         state.fse_tables.ll_previous = dict.ll.clone();
         state.fse_tables.ml_previous = dict.ml.clone();
         state.fse_tables.of_previous = dict.of.clone();
+        state.dict_entropy = DictEntropy::ALL;
     }
 }
