@@ -405,14 +405,19 @@ impl FrameEncoderCore {
         }
     }
 
-    /// Pull once from `source` and feed the encoder: returns after every
-    /// source read, so the caller's loop decides how eagerly to drain.
-    pub(crate) fn pump_from(&mut self, source: &mut impl crate::io::Read) -> Result<()> {
+    /// Pull once from `source` into `chunk` and feed the encoder: returns
+    /// after every source read, so the caller's loop decides how eagerly to
+    /// drain. The staging chunk is caller-owned so it is zeroed once per
+    /// encoder, not once per pull.
+    pub(crate) fn pump_from(
+        &mut self,
+        source: &mut impl crate::io::Read,
+        chunk: &mut [u8],
+    ) -> Result<()> {
         if self.is_finished() {
             return Ok(());
         }
-        let mut chunk = [0u8; 16 * 1024];
-        match source.read(&mut chunk).map_err(Error::from) {
+        match source.read(chunk).map_err(Error::from) {
             Ok(0) => self.finish(),
             Ok(n) => self.write(&chunk[..n]),
             Err(e) => return Err(e),

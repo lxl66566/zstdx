@@ -1,26 +1,33 @@
-//! Multithreaded streaming frame core: the burst-shaped sibling of the
+//! Multithreaded streaming frame core: the job-queue sibling of the
 //! single-threaded [`super::encoder_core`] core.
 //!
 //! Input accumulates in one contiguous buffer — a strip of already-encoded
-//! history followed by the bytes not yet encoded — and once enough
-//! job-sized slices are pending, a burst encodes them in parallel through
-//! the same pooled-job machinery as the bulk mt path (see
-//! [`crate::encoding::mt`]), appending the assembled blocks to the output in
-//! order. Jobs are cut on absolute job-size boundaries, so the frame bytes
-//! depend only on the input and not on how it was written; a flush is the
-//! one exception, re-gridding early because making data visible early is
-//! its purpose. With a pledged size the job size follows the bulk formula,
-//! so a stream written exactly to its pledge is byte-identical to the bulk
-//! mt output; without a pledge the job size grows along the stream in
-//! equal-size epochs (see [`JobGrid::Growing`]).
+//! history followed by the bytes not yet encoded — and every job posts to a
+//! persistent worker pool the moment its bytes are complete (a pledged
+//! stream holds its final bulk-grid job for `finish` to mark last). Jobs are
+//! cut on absolute job-size boundaries, so the frame bytes depend only on
+//! the input and not on how it was written; a flush is the one exception,
+//! re-gridding early because making data visible early is its purpose. With
+//! a pledged size the job size follows the bulk formula, so a stream written
+//! exactly to its pledge is byte-identical to the bulk mt output; without a
+//! pledge the job size grows along the stream in equal-size epochs (see
+//! [`JobGrid::Growing`]).
+//!
+//! Buffer recycling is the pipelining hinge: the dead prefix wraps in place
+//! (an in-buffer move of the still-live tail) and the buffer grows at the
+//! same points — both only once every posted job has completed, because
+//! incomplete jobs hold resolved pointers into the buffer. The pump
+//! therefore stalls on the workers only when it has lapped the buffer's
+//! live data, which the epoch-scale sizing bounds to once per epoch.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     slice,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use std::{
     any::Any,
+    collections::VecDeque,
     sync::{Condvar, Mutex},
     thread::JoinHandle,
 };
@@ -54,24 +61,46 @@ enum JobGrid {
     /// and smallest job a growth-factor^burst_jobs apart, so the barrier
     /// idled half the workers), the epoch grid still converges toward the
     /// bulk job density on long streams, and the schedule stays a pure
-    /// function of absolute offset — bursts fire exactly on epoch
-    /// completion, so a burst is one epoch and never a straddle.
+    /// function of absolute offset — jobs post exactly on grid boundaries,
+    /// so the queue never straddles an epoch.
     Growing,
 }
 
-/// Frozen job source handed to the worker pool: the backing buffer is not
-/// mutated, moved or dropped for the burst's lifetime — the posting thread
-/// only resumes buffer work after the pool quiesces (every worker has left
-/// the burst's job loop), the same freeze thread::scope used to provide.
-struct FrozenSrc {
-    ptr: *const u8,
+/// One posted job: the frozen source view (see the recycling rules in
+/// [`MtEncoderCore`]'s docs — the backing bytes cannot move before this job
+/// completes) plus the slot its encoded blocks land in.
+struct Job {
+    /// Base and length of the frozen source view shared with the pool.
+    src: FrozenSrc,
+    /// Index of the job's strip start inside `src`, and the job's own range
+    /// relative to it.
+    first: usize,
     len: usize,
+    /// Every job except the frame's first starts where the decoder's
+    /// repcode history is unknown (see the bulk mt path); a flush-rebased
+    /// grid starts mid-frame too.
+    gate: bool,
+    last_frame_block: bool,
+    overlap: usize,
+    level: Level,
+    shape: crate::InputShape,
+    out: Mutex<Option<Vec<u8>>>,
+    /// Set (Release) once `out` holds the job's bytes: the assembling side
+    /// polls this instead of taking the mutex per tick.
+    done: core::sync::atomic::AtomicBool,
 }
 
-// SAFETY: the pointer is dereferenced only while the burst is posted, and
-// the posting thread guarantees the freeze above for that whole window.
+// SAFETY: the pointer is dereferenced only while the posting thread
+// guarantees the backing allocation and bytes stable: buffer moves (wrap)
+// and reallocations happen only at quiescence, after every job reading the
+// buffer has completed.
 unsafe impl Send for FrozenSrc {}
 unsafe impl Sync for FrozenSrc {}
+
+/// Frozen job source handed to the worker pool.
+struct FrozenSrc {
+    ptr: *const u8,
+}
 
 // Reusable accumulate buffers: a fresh encoder mapping its multi-megabyte
 // buffer pays the whole first-touch fault+zero cost again, which on a
@@ -88,6 +117,12 @@ std::thread_local! {
 const BUF_POOL_KEEP_MAX: usize = 64 * 1024 * 1024;
 // Buffers retained per thread (a second one covers size-mismatched pairs).
 const BUF_POOL_DEPTH: usize = 2;
+
+// Upper bound on the accumulate buffer's growth; past it the dead-prefix
+// wrap alone recycles space (a wait per ~BUF_CAP_MAX bytes of stream is
+// negligible). The old burst model reserved epoch-scale windows of the
+// same magnitude.
+const BUF_CAP_MAX: usize = 256 * 1024 * 1024;
 
 // Take the pooled accumulate buffer, or a fresh one, with room for `want`
 // bytes (a larger pooled buffer is kept as-is — its spare capacity only
@@ -122,124 +157,99 @@ fn return_pooled_buf(buf: Vec<u8>) {
     });
 }
 
-/// One burst of jobs posted to the pool: everything a worker needs to run
-/// its share. Slots and the poison slot mirror the former scope-based
-/// burst; `exited` counts workers still inside this burst's job loop, and
-/// reaching zero is the pool's quiesce point.
-struct BurstCtx {
-    src: FrozenSrc,
-    /// Window index of `job_start` inside `src`.
-    first: usize,
-    /// Absolute job boundaries, `bounds.len() == n_jobs + 1`.
-    bounds: Vec<u64>,
-    n_jobs: usize,
-    job_start: u64,
-    overlap: usize,
-    level: Level,
-    last_frame_block: bool,
-    shape: crate::InputShape,
-    slots: Vec<Mutex<Option<Vec<u8>>>>,
-    ready: Condvar,
-    next_job: AtomicUsize,
-    poison: Mutex<Option<alloc::boxed::Box<dyn Any + Send>>>,
-    exited: AtomicUsize,
-    quiesce: Mutex<()>,
-    quiesce_cv: Condvar,
-}
-
-struct PoolInner {
+struct QueueInner {
     shutdown: bool,
-    /// Burst generation: a worker picks the posted ctx up when `generation` moves
-    /// past the generation it last served, and parks otherwise.
-    generation: u64,
-    ctx: Option<Arc<BurstCtx>>,
+    /// Unclaimed posted jobs, in post order (workers claim from the front,
+    /// so the oldest job always starts first).
+    queue: VecDeque<Arc<Job>>,
+    poison: Option<alloc::boxed::Box<dyn Any + Send>>,
 }
 
-/// State shared between the encoder and its pool threads: burst
-/// coordination plus the reusable encoder states (also serving the
-/// single-job inline path, exactly like the former plain Vec pool).
-struct PoolShared {
-    inner: Mutex<PoolInner>,
+/// State shared between the encoder and its pool threads.
+struct QueueShared {
+    inner: Mutex<QueueInner>,
+    /// Workers wait for posted jobs; the encoder waits for completions.
     wake: Condvar,
+    progressed: Condvar,
+    /// Fast-path mirror of `inner.poison` (the hot write path polls it
+    /// without taking the queue lock).
+    poisoned: core::sync::atomic::AtomicBool,
+    /// Posted jobs not yet completed — the wrap/grow guard and the drain
+    /// waits key on it reaching zero.
+    n_incomplete: AtomicU64,
+    /// Monotonic count of completed jobs — the drain waits' progress tick.
+    completed: AtomicU64,
+    /// Reusable encoder states for the calling thread's inline jobs.
     states: Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
 }
 
-/// Pool worker body: serve every posted burst until shutdown. The job loop
-/// is the former thread::scope body verbatim (pooled state per burst,
-/// atomic job pickup, poison check before each job); the only addition is
-/// the `exited` countdown that marks the burst quiesced.
-fn pool_worker(shared: Arc<PoolShared>) {
-    let mut seen = 0u64;
+/// Pool worker body: claim the oldest posted job, encode it through a
+/// worker-local state (reused across jobs — the pooled matcher tables are
+/// the expensive part), publish the bytes, and count the completion.
+fn pool_worker(shared: Arc<QueueShared>) {
+    let mut state: Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>> = None;
     loop {
-        let ctx;
-        {
+        let job = {
             let mut inner = shared.inner.lock().unwrap();
-            while !inner.shutdown && inner.generation == seen {
+            loop {
+                if inner.poison.is_some() {
+                    // The encoder is unwinding; in-flight jobs run out, but
+                    // no new claims (the caller clears the queue itself).
+                    return;
+                }
+                if let Some(job) = inner.queue.pop_front() {
+                    break job;
+                }
+                if inner.shutdown {
+                    return;
+                }
                 inner = shared.wake.wait(inner).unwrap();
             }
-            if inner.shutdown {
-                return;
-            }
-            seen = inner.generation;
-            ctx = inner.ctx.clone().unwrap();
-        }
-        let mut state = take_pooled_state(&shared.states);
+        };
         let mut poisoned = false;
-        loop {
-            if ctx.poison.lock().unwrap().is_some() {
-                break;
-            }
-            let id = ctx.next_job.fetch_add(1, Ordering::Relaxed);
-            if id >= ctx.n_jobs {
-                break;
-            }
-            let start = ctx.first + (ctx.bounds[id] - ctx.job_start) as usize;
-            let end = ctx.first + (ctx.bounds[id + 1] - ctx.job_start) as usize;
-            // Every job except the frame's first starts where the decoder's
-            // repcode history is unknown (see the bulk mt path); a
-            // flush-rebased grid starts mid-frame too.
-            let gate = ctx.bounds[id] > 0;
-            // SAFETY: the posting thread freezes the source for the whole
-            // burst (see FrozenSrc).
-            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let src = unsafe { slice::from_raw_parts(ctx.src.ptr, ctx.src.len) };
-                run_job_with(
-                    &mut state,
-                    src,
-                    start..end,
-                    ctx.overlap,
-                    ctx.last_frame_block && id + 1 == ctx.n_jobs,
-                    ctx.level,
-                    gate,
-                    ctx.shape,
-                    // The stream core keeps the stock reach: its jobs flow
-                    // before any head is assembled to probe (see
-                    // reach_probe's engagement notes).
-                    ReachChoice::Keep,
-                )
-            }));
-            match attempt {
-                Ok(bytes) => *ctx.slots[id].lock().unwrap() = Some(bytes),
-                Err(payload) => {
-                    *ctx.poison.lock().unwrap() = Some(payload);
-                    // Release the slot so the ordered assembly below can run
-                    // to completion before the panic is resumed. The state
-                    // may be mid-compress garbage, so it is dropped rather
-                    // than pooled.
-                    poisoned = true;
-                    *ctx.slots[id].lock().unwrap() = Some(Vec::new());
-                    ctx.ready.notify_all();
-                    break;
-                },
-            }
-            ctx.ready.notify_all();
+        // SAFETY: the posting thread keeps the backing bytes stable for
+        // this job's whole lifetime (see FrozenSrc).
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let state = state.get_or_insert_with(|| alloc::boxed::Box::new(new_slice_state()));
+            let src = unsafe { slice::from_raw_parts(job.src.ptr, job.len) };
+            run_job_with(
+                state,
+                src,
+                job.first..job.len,
+                job.overlap,
+                job.last_frame_block,
+                job.level,
+                job.gate,
+                job.shape,
+                // The stream core keeps the stock reach: its jobs flow
+                // before any head is assembled to probe (see
+                // reach_probe's engagement notes).
+                ReachChoice::Keep,
+            )
+        }));
+        match attempt {
+            Ok(bytes) => {
+                *job.out.lock().unwrap() = Some(bytes);
+                job.done.store(true, Ordering::Release);
+            },
+            Err(payload) => {
+                // The state may be mid-compress garbage: drop it rather
+                // than reuse. The slot is filled with an empty block so the
+                // ordered assembly can run to completion before the panic
+                // is resumed.
+                state = None;
+                poisoned = true;
+                *job.out.lock().unwrap() = Some(Vec::new());
+                job.done.store(true, Ordering::Release);
+                shared.poisoned.store(true, Ordering::Release);
+                shared.inner.lock().unwrap().poison = Some(payload);
+            },
         }
-        if !poisoned {
-            shared.states.lock().unwrap().push(state);
-        }
-        if ctx.exited.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _g = ctx.quiesce.lock().unwrap();
-            ctx.quiesce_cv.notify_all();
+        shared.n_incomplete.fetch_sub(1, Ordering::Release);
+        shared.completed.fetch_add(1, Ordering::AcqRel);
+        shared.progressed.notify_all();
+        if poisoned {
+            return;
         }
     }
 }
@@ -250,7 +260,7 @@ pub(crate) struct MtEncoderCore {
     workers: u32,
     /// Absolute job schedule: job boundaries derive from absolute stream
     /// offsets alone (see [`JobGrid`]), so the frame bytes never depend on
-    /// how the input was written. A flush re-grids by advancing job_start
+    /// how the input is written. A flush re-grids by advancing job_start
     /// to the current end.
     job_start: u64,
     grid: JobGrid,
@@ -279,20 +289,14 @@ pub(crate) struct MtEncoderCore {
     out_read: usize,
     header_emitted: bool,
     finished: bool,
-    /// Pool coordination state (reusable encoder states included), shared
-    /// with the worker threads. Workers spawn lazily at the first
-    /// multi-job burst; until then this is only the state pool.
-    shared: Arc<PoolShared>,
-    /// Persistent burst workers, spawned once (thread::scope used to pay a
-    /// spawn+join of the whole set per burst, ~0.5-2 ms each). Joined on
-    /// drop via shutdown.
+    /// Pool coordination state, shared with the worker threads. Workers
+    /// spawn lazily at the first post; until then this is only the state
+    /// pool.
+    shared: Arc<QueueShared>,
+    /// Persistent pool workers, spawned once. Joined on drop via shutdown.
     pool_threads: Vec<JoinHandle<()>>,
-    /// The burst posted to the pool and not yet assembled: the calling
-    /// thread keeps accumulating (appends confined to the reserved window,
-    /// which never reallocs while workers read the buffer) and the burst is
-    /// assembled at the next fire, a flush/finish, or when the window
-    /// fills.
-    inflight: Option<Arc<BurstCtx>>,
+    /// Posted jobs not yet assembled, in post order.
+    pending: VecDeque<Arc<Job>>,
 }
 
 impl MtEncoderCore {
@@ -330,16 +334,14 @@ impl MtEncoderCore {
         };
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
-        let mut buf = take_pooled_buf(
-            (options.workers as usize).max(2) * (MIN_JOB_SIZE.max(overlap)) + 64 * 1024,
-        );
-        if let JobGrid::Growing = grid {
-            // The first epoch's whole span up front, advised huge: the
-            // buffer is touched densely and grows to burst scale, and the
-            // kernel only backs THP=madvise mappings when asked.
-            buf.reserve_exact(
-                (options.workers as usize).max(2) * (MIN_JOB_SIZE.max(overlap)) + 64 * 1024,
-            );
+        // One epoch-scale window, like the burst model's reserve: enough for
+        // a full round of in-flight jobs plus the strip and write-chunk
+        // slack. The size also stays inside the buffer pool's keep cap, so
+        // consecutive streams reuse the already-faulted allocation.
+        let want = (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024;
+        let mut buf = take_pooled_buf(want);
+        if buf.capacity() < want {
+            buf.reserve_exact(want - buf.len());
             advise_hugepages(&buf);
         }
         Self {
@@ -366,50 +368,38 @@ impl MtEncoderCore {
             out_read: 0,
             header_emitted: false,
             finished: false,
-            shared: Arc::new(PoolShared {
-                inner: Mutex::new(PoolInner {
+            shared: Arc::new(QueueShared {
+                inner: Mutex::new(QueueInner {
                     shutdown: false,
-                    generation: 0,
-                    ctx: None,
+                    queue: VecDeque::new(),
+                    poison: None,
                 }),
                 wake: Condvar::new(),
+                progressed: Condvar::new(),
+                poisoned: core::sync::atomic::AtomicBool::new(false),
+                n_incomplete: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
                 states: Mutex::new(Vec::new()),
             }),
             pool_threads: Vec::new(),
-            inflight: None,
+            pending: VecDeque::new(),
         }
     }
 
     pub(crate) fn write(&mut self, data: &[u8]) {
         debug_assert!(!self.finished);
-        self.try_compact();
         let mut data = data;
         while !data.is_empty() {
-            // A burst in flight freezes the buffer (its workers read it),
-            // so appends stay inside the reserved window; a full window
-            // drains the burst, which trims and re-reserves.
-            let space = match &self.inflight {
-                Some(_) => self.buf.capacity() - self.buf.len(),
-                None => data.len(),
-            };
-            let n = space.min(data.len());
-            if n == 0 {
-                self.drain_inflight();
+            let space = self.buf.capacity() - self.buf.len();
+            if space == 0 {
+                self.make_space(data.len());
                 continue;
             }
+            let n = space.min(data.len());
             self.buf.extend_from_slice(&data[..n]);
             data = &data[n..];
             self.pos += n as u64;
-            if let Some(hi) = self.burst_hi() {
-                self.fire_burst(hi);
-            }
-        }
-        // Surface a worker panic at the write that fired the burst — the
-        // timing the blocking model used to give.
-        if let Some(ctx) = &self.inflight {
-            if ctx.poison.lock().unwrap().is_some() {
-                self.drain_inflight();
-            }
+            self.post_ready();
         }
     }
 
@@ -419,7 +409,8 @@ impl MtEncoderCore {
         if self.finished {
             return;
         }
-        self.drain_inflight();
+        self.surface_poison();
+        self.drain_all();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, true);
         } else {
@@ -448,9 +439,10 @@ impl MtEncoderCore {
     /// data visible early is what a flush is for).
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
-        // A flush promises visibility: the in-flight burst's blocks belong
-        // to the output even when no new bytes are pending.
-        self.drain_inflight();
+        // A flush promises visibility: every posted job's blocks belong to
+        // the output before it returns.
+        self.surface_poison();
+        self.drain_all();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, false);
         }
@@ -528,46 +520,55 @@ impl MtEncoderCore {
         }
     }
 
-    /// Growing grid: end of the epoch containing `o`. Bursts fire here, so
-    /// in the steady state one burst encodes exactly one epoch.
+    /// Growing grid: end of the epoch containing `o`.
     fn growing_epoch_end(&self, o: u64) -> u64 {
         let (lo, size) = self.growing_epoch(o);
         lo + self.burst_jobs as u64 * size
     }
 
-    /// End offset of the next burst, once enough is fed: the fixed grid
-    /// fires on `burst_jobs` complete jobs (keeping the pledged final job
-    /// held back for finish), the growing grid fires on epoch completion.
-    fn burst_hi(&self) -> Option<u64> {
-        debug_assert!(self.pos >= self.job_start);
-        match self.grid {
-            JobGrid::Fixed(size) => {
-                let size = size as u64;
-                let complete = (self.pos - self.job_start) / size;
-                if complete < self.burst_jobs as u64 {
-                    return None;
-                }
-                let jobs = match self.shape.len {
-                    Some(n) if self.pos <= n => {
-                        let pledged_jobs = (n - self.job_start).div_ceil(size);
-                        complete.min(pledged_jobs.saturating_sub(1))
-                    },
-                    _ => complete,
-                };
-                Some(self.job_start + jobs * size)
-            },
-            JobGrid::Growing => {
-                let hi = self.growing_epoch_end(self.job_start);
-                (self.pos >= hi).then_some(hi)
-            },
+    /// Post every job whose bytes are complete, gated so the schedule stays
+    /// a pure function of the input: the growing grid posts an epoch only
+    /// once fully buffered (a stream end then re-slices the whole pending
+    /// span into worker-filling tail jobs — posting the final epoch's big
+    /// jobs early would both strand their encode on one worker at EOF and
+    /// change the re-slice), while the fixed grid's boundaries never depend
+    /// on the posting cadence, so each job posts the moment it completes. A
+    /// pledged grid holds its final job back for `finish` to mark last
+    /// (unlocked on overshoot, where the bulk path also stops holding).
+    fn post_ready(&mut self) {
+        loop {
+            let end = self.job_end(self.job_start);
+            match self.grid {
+                JobGrid::Fixed(_) => {
+                    // The fixed grid's boundaries never depend on the
+                    // posting cadence (its build_bounds never re-slices),
+                    // so each job posts the moment it completes.
+                    if self.pos < end {
+                        return;
+                    }
+                    if let Some(n) = self.shape.len {
+                        if end >= n && self.pos <= n {
+                            return;
+                        }
+                    }
+                },
+                JobGrid::Growing => {
+                    // An epoch's jobs post only once the whole epoch is
+                    // buffered — rechecked per job, because a large write
+                    // (or an oversized pooled buffer) can carry `pos` past
+                    // several epoch ends in one append: greedily posting an
+                    // incomplete epoch's jobs would change both the
+                    // stream-end tail re-slice and the bytes.
+                    if self.pos < self.growing_epoch_end(self.job_start) {
+                        return;
+                    }
+                },
+            }
+            self.post_job(self.job_start, end, false);
+            self.job_start = end;
         }
     }
 
-    /// Encode the jobs covering [job_start, hi) and advance the grid: the job
-    /// ending at `hi` carries the frame's last-block flag when
-    /// `last_frame_block` is set (only finish passes true). `hi` must not
-    /// exceed `pos`; when it lands mid-job (flush, or the finish tail) the
-    /// last job is short.
     /// Job boundaries between job_start and hi, on the absolute schedule.
     // The growing grid re-slices everything past the last epoch boundary
     // into at most `burst_jobs` equal jobs: that range only appears when
@@ -619,36 +620,23 @@ impl MtEncoderCore {
         bounds
     }
 
-    /// Encode the jobs covering [job_start, hi) synchronously: the
-    /// flush/finish path, where the caller wants the bytes on return.
+    /// Encode the jobs covering [job_start, hi) and wait them out: the
+    /// flush/finish path, where the caller wants the bytes on return. A
+    /// single short job on a pool-less core still runs inline (small inputs
+    /// never spin up the pool).
     fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
         debug_assert!(self.job_start < hi && hi <= self.pos);
-        self.drain_inflight();
         self.emit_header();
         let bounds = self.build_bounds(hi);
-        if bounds.len() == 2 {
+        if bounds.len() == 2 && self.pool_threads.is_empty() {
             self.run_inline_job(&bounds, hi, last_frame_block);
         } else {
-            self.fire_jobs(bounds, hi, last_frame_block);
-            self.drain_inflight();
-        }
-    }
-
-    /// The steady write path's sibling of [`Self::encode_jobs`]: drains the
-    /// previous burst (by now the workers are usually long done), then
-    /// posts the new one and returns while they encode — the calling thread
-    /// goes straight back to accumulating, overlapping the pump with the
-    /// burst instead of serializing behind its barrier. A single short job
-    /// still runs inline (no pool spun up for it).
-    fn fire_burst(&mut self, hi: u64) {
-        debug_assert!(self.job_start < hi && hi <= self.pos);
-        self.drain_inflight();
-        self.emit_header();
-        let bounds = self.build_bounds(hi);
-        if bounds.len() == 2 {
-            self.run_inline_job(&bounds, hi, false);
-        } else {
-            self.fire_jobs(bounds, hi, false);
+            let last = bounds.len() - 2;
+            for (i, w) in bounds.windows(2).enumerate() {
+                self.post_job(w[0], w[1], last_frame_block && i == last);
+            }
+            self.job_start = hi;
+            self.drain_all();
         }
     }
 
@@ -679,154 +667,163 @@ impl MtEncoderCore {
         self.shared.states.lock().unwrap().push(state);
         self.output.extend_from_slice(&bytes);
         self.job_start = hi;
-        self.trim_buf();
     }
 
-    /// Post a multi-job burst to the pool and return without waiting: the
-    /// burst lands in `inflight` and is assembled by
-    /// [`Self::drain_inflight`]. The next append window is reserved before
-    /// posting — the frozen buffer cannot realloc while the workers read
-    /// it, so `write` can keep appending inside the window.
-    fn fire_jobs(&mut self, bounds: Vec<u64>, hi: u64, last_frame_block: bool) {
-        debug_assert!(self.inflight.is_none());
-        let n_jobs = bounds.len() - 1;
-        let burst_start = bounds[0];
-        let strip_lo = burst_start.saturating_sub(self.overlap as u64);
+    /// Post one job [start, end) to the pool. The source view is the
+    /// buffer's [strip_lo, end) — the posting thread guarantees those bytes
+    /// stable until the job completes (wrap and growth both require
+    /// quiescence).
+    fn post_job(&mut self, start: u64, end: u64, last_frame_block: bool) {
+        debug_assert!(self.pos >= end);
+        // The post cadence is also the assembly and panic-surfacing cadence:
+        // per-write calls would burn millions of polls on the pump path.
+        self.surface_poison();
+        self.assemble_ready();
+        self.emit_header();
+        let strip_lo = start.saturating_sub(self.overlap as u64);
         debug_assert!(self.buf_base <= strip_lo);
-        let first = (burst_start - strip_lo) as usize;
-        let pool_size = self.ensure_workers(n_jobs);
-        let burst_job_start = self.job_start;
-        self.job_start = hi;
-        self.reserve_next_window();
-        // SAFETY: posted for the burst and frozen until the pool quiesces
-        // (see FrozenSrc); the reservation above already happened with the
-        // pool idle, so the pointer is stable for the whole burst.
-        let src =
-            unsafe { slice::from_raw_parts(self.buf.as_ptr(), (hi - self.buf_base) as usize) };
-        let ctx = Arc::new(BurstCtx {
-            src: FrozenSrc {
-                ptr: src.as_ptr(),
-                len: src.len(),
-            },
+        let first = (start - strip_lo) as usize;
+        let len = (end - strip_lo) as usize;
+        self.ensure_workers();
+        // SAFETY: strip_lo >= buf_base (asserted above); the view is the
+        // buffer's [strip_lo, end), so `first` indexes from its head.
+        let ptr = unsafe { self.buf.as_ptr().add((strip_lo - self.buf_base) as usize) };
+        let job = Arc::new(Job {
+            src: FrozenSrc { ptr },
             first,
-            bounds,
-            n_jobs,
-            job_start: burst_job_start,
+            len,
             overlap: self.overlap,
             level: self.level,
             last_frame_block,
+            gate: start > 0,
             shape: self.shape,
-            slots: (0..n_jobs).map(|_| Mutex::new(None)).collect(),
-            ready: Condvar::new(),
-            next_job: AtomicUsize::new(0),
-            poison: Mutex::new(None),
-            exited: AtomicUsize::new(pool_size),
-            quiesce: Mutex::new(()),
-            quiesce_cv: Condvar::new(),
+            out: Mutex::new(None),
+            done: core::sync::atomic::AtomicBool::new(false),
         });
+        // Register before publishing: a worker's completion decrement must
+        // never race ahead of the registration (the queue push below is the
+        // earliest a worker can see the job).
+        self.shared.n_incomplete.fetch_add(1, Ordering::Release);
         {
             let mut inner = self.shared.inner.lock().unwrap();
-            // The previous burst drained before this one posts, so no
-            // worker still holds an older ctx.
-            debug_assert!(inner.ctx.is_none());
-            inner.generation += 1;
-            inner.ctx = Some(ctx.clone());
+            inner.queue.push_back(job.clone());
         }
+        self.pending.push_back(job);
         self.shared.wake.notify_all();
         // Checksum absorb on the calling thread while the workers encode.
-        self.hash_to(hi);
-        self.inflight = Some(ctx);
+        self.hash_to(end);
     }
 
-    /// Drop the consumed buffer prefix once the in-flight burst has
-    /// quiesced (an acquire load of the exit countdown — the same freeze
-    /// guarantee `drain_inflight` waits for). Compacting early keeps the
-    /// prefix drain at strip scale; deferring it to the next fire would
-    /// move a whole epoch of pending bytes.
-    fn try_compact(&mut self) {
-        let Some(ctx) = &self.inflight else {
-            return;
-        };
-        if ctx.exited.load(Ordering::Acquire) != 0 {
-            return;
-        }
-        let keep = self.job_start.saturating_sub(self.overlap as u64);
-        debug_assert!(self.buf_base <= keep);
-        let drop = (keep - self.buf_base) as usize;
-        if drop > 0 {
-            self.buf.drain(..drop);
-            self.buf_base = keep;
-        }
-    }
-
-    /// Assemble the in-flight burst's blocks in order, wait for the pool to
-    /// quiesce (the source buffer unfreezes), trim, and surface a worker
-    /// panic if any.
-    fn drain_inflight(&mut self) {
-        let Some(ctx) = self.inflight.take() else {
-            return;
-        };
-        for slot in &ctx.slots {
-            let mut guard = slot.lock().unwrap();
-            while guard.is_none() {
-                guard = ctx.ready.wait(guard).unwrap();
-            }
-            self.output.extend_from_slice(&guard.take().unwrap());
-        }
+    /// Assemble every completed prefix job's blocks into the output, in post
+    /// order. Never blocks; the read path calls it between pulls so output
+    /// appears as soon as its jobs complete.
+    fn assemble_ready(&mut self) {
+        while self
+            .pending
+            .front()
+            .is_some_and(|j| j.done.load(Ordering::Acquire))
         {
-            let mut guard = ctx.quiesce.lock().unwrap();
-            while ctx.exited.load(Ordering::Acquire) != 0 {
-                guard = ctx.quiesce_cv.wait(guard).unwrap();
+            let job = self.pending.pop_front().unwrap();
+            let bytes = job.out.lock().unwrap().take().unwrap();
+            self.output.extend_from_slice(&bytes);
+        }
+    }
+
+    /// Wait for every posted job to complete and assemble it: the
+    /// flush/finish visibility barrier.
+    fn drain_all(&mut self) {
+        loop {
+            self.assemble_ready();
+            if self.pending.is_empty() {
+                return;
+            }
+            if self.quiescent() {
+                // Everything completed yet the pending prefix has an
+                // un-ready slot: only reachable through the poison abort
+                // path.
+                self.surface_poison();
+                continue;
+            }
+            self.wait_progress();
+        }
+    }
+
+    /// Wait until a job completes (or the pool dies). Exit conditions are
+    /// re-checked on every wake: a completion burst that lands between the
+    /// caller's own predicate check and the `completed` snapshot below
+    /// would otherwise fire its notify before this wait parks, leaving the
+    /// snapshot already final and the loop sleeping on a condition that
+    /// will never change again.
+    fn wait_progress(&self) {
+        let mut inner = self.shared.inner.lock().unwrap();
+        loop {
+            if inner.poison.is_some() || inner.shutdown {
+                return;
+            }
+            // Everything completed: the caller's predicate (drain or
+            // recycle) is due a re-evaluation regardless of the snapshot.
+            if self.shared.n_incomplete.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let before = self.shared.completed.load(Ordering::Acquire);
+            let (guard, _) = self
+                .shared
+                .progressed
+                .wait_timeout(inner, core::time::Duration::from_millis(100))
+                .unwrap();
+            inner = guard;
+            if self.shared.completed.load(Ordering::Acquire) != before {
+                return;
             }
         }
-        self.shared.inner.lock().unwrap().ctx = None;
-        self.trim_buf();
-        if let Some(payload) = ctx.poison.lock().unwrap().take() {
-            std::panic::resume_unwind(payload);
-        }
     }
 
-    /// Reserve buffer space for everything the next burst will accumulate
-    /// (plus its strip), so appends never realloc while a burst is in
-    /// flight. Called with the pool idle (before posting); a fixed grid
-    /// bounds the next burst at `burst_jobs` complete jobs plus the held
-    /// back one, the growing grid at its epoch end.
-    fn reserve_next_window(&mut self) {
-        let next_hi = match self.grid {
-            JobGrid::Fixed(size) => self.job_start + (self.burst_jobs as u64 + 1) * size as u64,
-            JobGrid::Growing => self.growing_epoch_end(self.job_start),
-        };
-        let want = (next_hi - self.buf_base) as usize + self.overlap + 64 * 1024;
-        if self.buf.capacity() < want {
-            self.buf.reserve_exact(want - self.buf.len());
-            advise_hugepages(&self.buf);
-        }
+    /// Lowest absolute offset the buffer must still serve: the next job to
+    /// post borrows [job_start - overlap, job_start) as its strip, and the
+    /// bytes after it feed that job.
+    fn movable_lo(&self) -> u64 {
+        self.job_start.saturating_sub(self.overlap as u64)
     }
 
-    /// Retain exactly the strip the next job will prefill from, dropping
-    /// everything older: the pending bytes slide to the buffer head, no
-    /// separate window copy. The buffer is then sized for the whole next
-    /// burst in one reservation: epoch-sized growth otherwise arrives as a
-    /// long run of Vec-doubling reallocs, whose recopy tail costs more than
-    /// the encoding it precedes.
-    fn trim_buf(&mut self) {
-        let keep = self.job_start.saturating_sub(self.overlap as u64);
+    /// Whether every posted job has completed (no resolved pointers into
+    /// the buffer remain — the wrap/grow precondition). Completions only
+    /// ever lower `n_incomplete`, and only this thread posts, so a zero
+    /// read is stable for the caller's next move.
+    fn quiescent(&self) -> bool {
+        self.shared.n_incomplete.load(Ordering::Acquire) == 0
+    }
+
+    /// Make room for `want` more bytes of appends. Recycling the dead
+    /// prefix (an in-buffer move of the live tail) and growth (which may
+    /// relocate the allocation) both invalidate the resolved pointers
+    /// incomplete jobs hold into the buffer, so they wait for the pool to
+    /// run out first. With the buffer sized per epoch this stalls the pump
+    /// at most once per epoch, behind the jobs it just fed.
+    fn make_space(&mut self, want: usize) {
+        while !self.quiescent() {
+            if self.shared.poisoned.load(Ordering::Acquire) {
+                // In-flight jobs still complete under poison; the unwind
+                // resumes from there and never returns here.
+                self.surface_poison();
+            }
+            self.wait_progress();
+        }
+        let keep = self.movable_lo();
         debug_assert!(self.buf_base <= keep);
-        let drop = (keep - self.buf_base) as usize;
-        if drop > 0 {
-            self.buf.drain(..drop);
+        let drop_n = (keep - self.buf_base) as usize;
+        if drop_n > 0 {
+            self.buf.copy_within(drop_n.., 0);
+            let live = self.buf.len() - drop_n;
+            self.buf.truncate(live);
             self.buf_base = keep;
         }
-        if let JobGrid::Growing = self.grid {
-            // Space for the strip plus every job of the epoch about to
-            // accumulate, plus one write chunk of slack.
-            let want = (self.growing_epoch_end(self.job_start) - self.buf_base) as usize
-                + self.overlap
-                + 64 * 1024;
-            if self.buf.capacity() < want {
-                self.buf.reserve_exact(want - self.buf.len());
-                advise_hugepages(&self.buf);
-            }
+        if self.buf.len() + want > self.buf.capacity() {
+            // Doubling below the cap amortizes the growth; past it the wrap
+            // alone recycles space, so growth tracks the live need.
+            let target =
+                (self.buf.len() + want + 64 * 1024).max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            self.buf.reserve_exact(target - self.buf.len());
+            advise_hugepages(&self.buf);
         }
     }
 
@@ -838,12 +835,10 @@ impl MtEncoderCore {
         self.hashed_end = end;
     }
 
-    /// Spawn the persistent pool workers on the first multi-job burst and
-    /// return the live thread count (the `exited` countdown's size).
-    fn ensure_workers(&mut self, n_jobs: usize) -> usize {
+    /// Spawn the persistent pool workers at the first posted job.
+    fn ensure_workers(&mut self) {
         if self.pool_threads.is_empty() {
-            let n = (self.workers as usize).min(n_jobs).max(1);
-            for _ in 0..n {
+            for _ in 0..self.workers {
                 let shared = self.shared.clone();
                 self.pool_threads.push(
                     std::thread::Builder::new()
@@ -852,7 +847,35 @@ impl MtEncoderCore {
                 );
             }
         }
-        self.pool_threads.len()
+    }
+
+    /// Resume a worker panic at the write/finish that observes it. The
+    /// unclaimed queue jobs are aborted (completed empty, so the counts and
+    /// the in-order assembly run to completion), the in-flight ones run
+    /// out, and the panic surfaces with the frame state settled.
+    fn surface_poison(&mut self) {
+        if !self.shared.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let payload = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            match inner.poison.take() {
+                None => return,
+                Some(payload) => {
+                    while let Some(job) = inner.queue.pop_front() {
+                        *job.out.lock().unwrap() = Some(Vec::new());
+                        job.done.store(true, Ordering::Release);
+                        self.shared.n_incomplete.fetch_sub(1, Ordering::Release);
+                    }
+                    payload
+                },
+            }
+        };
+        while !self.quiescent() {
+            self.wait_progress();
+        }
+        self.assemble_ready();
+        std::panic::resume_unwind(payload);
     }
 
     fn emit_header(&mut self) {
@@ -883,16 +906,16 @@ impl Drop for MtEncoderCore {
             }
         }
         // The accumulate buffer outlives the encoder in the thread-local
-        // pool (see take_pooled_buf).
-        let mut buf = core::mem::take(&mut self.buf);
-        return_pooled_buf(core::mem::take(&mut buf));
+        // pool (see take_pooled_buf); every worker has exited by now, so
+        // nothing reads it anymore.
+        return_pooled_buf(core::mem::take(&mut self.buf));
     }
 }
 
 /// Advise MADV_HUGEPAGE over the buffer's whole capacity: the accumulate
 /// buffer is written densely at burst scale, and on THP=madvise machines its
-/// first touch otherwise pays one 4 KiB fault per page — milliseconds at the
-/// spans the growing grid reaches. Pure advice: THP=always machines map it
+/// first touch otherwise pays one 4 KiB fault per page — milliseconds at
+/// the spans the growing grid reaches. Pure advice: THP=always machines map it
 /// huge anyway, THP=never ignores it, and a failing syscall is too.
 #[cfg(target_os = "linux")]
 fn advise_hugepages(buf: &Vec<u8>) {

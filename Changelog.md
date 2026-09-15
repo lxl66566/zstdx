@@ -4,6 +4,24 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Streaming MT encode: the burst-barrier model is now a posted-job queue
+  (encoder_mt.rs). Jobs post to the persistent pool the moment their epoch
+  is fully buffered (per-job re-checked gate — posting an incomplete epoch
+  changes the stream-end tail re-slice), workers keep a per-thread
+  CompressState across jobs, assembly drains incrementally at post
+  cadence, and pledged streams post each bulk-grid job at its own
+  completion. Buffer recycling is quiesce-gated wrap+grow (the WIP's
+  spare/regen ping-pong carried unmeasured benefit and three lifecycle
+  bugs; see negative/mt-stream.md). The read-side pump keeps a persistent
+  16 KiB staging chunk. The historical sporadic hang is root-caused (a
+  completion-burst race against the drain wait's snapshot — notify fires
+  before the waiter parks, the snapshot-delta exit never fires; idle
+  machines reproduce it, loaded ones dodge it) and fixed by re-checking
+  the quiesce predicate on every wait wake. Interleaved A/B, stream-mt8
+  32 MiB: text.fastest +11.5%, text.fast +11%, json.fast +4.7%,
+  json.fastest flat (encode-span-bound). Output byte-identical (30/30
+  stream-mt ratio cells, pledged ≡ bulk-mt). zstdx-bench gains
+  `prof enc-stream-read` (the matrix enc-stream cell shape).
 - Encoder: per-block entropy-table builds recycle their buffers through a
   pool in the block scratch (FSE transition tables, huffman codes,
   package-merge lists, wire weights); a buffer zeroes only its growth tail,
