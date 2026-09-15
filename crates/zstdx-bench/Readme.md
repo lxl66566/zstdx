@@ -80,11 +80,16 @@ iteration — run it once before a release. Combine with `--shape`/`--level`/
 ### `small` — small-payload encode
 
 Per-call encode throughput for 1 KiB–1 MiB payloads (allocator effects
-included), zstdx level `fastest` vs libzstd level 1. `--size` and
+included), zstdx vs libzstd at the same numeric level (`--level`, default
+`fastest`; tier names or numeric levels 1-22). The timed zstdx side runs
+checksum-off, matching `zstd::bulk::compress`'s default — the crate's
+`hash`-feature default (checksummed frames plus the >=256 KiB sidecar
+thread) is a real user cost but not a fair A/B. `--size` and
 `--impl zstdx|zstd` pin one size/implementation for profiler attribution.
 
 ```bash
 cargo run --release -p zstdx-bench -- small --size 4096
+cargo run --release -p zstdx-bench -- small --shape json --level 1,3,9 --size 65536,262144
 ```
 
 ### `files` — decode timing on explicit files
