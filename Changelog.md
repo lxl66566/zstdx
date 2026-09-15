@@ -4,6 +4,10 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: `encode_sequences` carries one output cursor pointer instead of a
+  stack-reloaded base plus byte offset (and terminates on the SeqWord
+  pointer, dropping a spilled counter). Byte-identical output; fastest/fast
+  json -0.35%/-0.42% instructions (gungraun), wall neutral.
 - Docs: SIMD copy scheduling of the fused sequence loop (todo 2, the last
   unassessed structural idea) is falsified — porting libzstd's wildcopy
   issue structure (head-first copy16 + unrolled landing tail + dead-branch

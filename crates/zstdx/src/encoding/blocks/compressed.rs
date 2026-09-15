@@ -493,7 +493,7 @@ fn encode_sequences(
     // per-sequence writes through the writer used to reload and store its
     // fields each time. Flushes leave fewer than eight bits pending, so
     // neither push (≤45 transition bits, ≤51 add bits) can overflow.
-    let (mut acc, mut bits, mut pos) = writer.hot_state();
+    let (mut acc, mut bits, pos) = writer.hot_state();
     {
         let out = writer.out();
         // One reserve covers the whole loop: the last sequence adds ≤51
@@ -503,15 +503,21 @@ fn encode_sequences(
         // away. The seqs/row accesses move to raw pointers for the same
         // reason (the slice fields rode the stack through every iteration).
         out.reserve(nb_seq * 11 + 32);
-        let out = out.as_mut_ptr();
+        let base = out.as_mut_ptr();
         let sp = seqs.as_ptr();
+        // The output cursor carries `base + pos` in ONE register: keeping
+        // `pos` as an index forced the loop to reload `base` from its stack
+        // slot every sequence (register pressure) and pay the add in the
+        // store's addressing anyway. The loop below also terminates on the
+        // SeqWord cursor instead of a counter, so no index stays live.
+        let mut cur = unsafe { base.add(pos) };
         // SAFETY: the reserve above covers every flush store (≤ nb_seq*11+8
         // bytes past the entry position, with ≤16 bytes of store overshoot).
         // The seqs reads stay below nb_seq, the row reads inside their flat
         // tables (see the row-index argument above).
         unsafe {
             let w = &*sp.add(li);
-            hot_push_raw(out, &mut pos, &mut acc, &mut bits, w.add, w.add_nb as usize);
+            hot_push_raw(&mut cur, &mut acc, &mut bits, w.add, w.add_nb as usize);
         }
 
         // encode backwards so the decoder reads the first sequence first
@@ -519,11 +525,14 @@ fn encode_sequences(
             let ll_pp = ll_ptrs.as_ptr();
             let ml_pp = ml_ptrs.as_ptr();
             let of_pp = of_ptrs.as_ptr();
-            for i in (0..=nb_seq - 2).rev() {
-                // SAFETY: as above. The pointer-table reads index a
-                // 256-entry array with a u8.
+            let mut p = unsafe { sp.add(li) };
+            loop {
+                // SAFETY: the loop runs from the last sequence down to the
+                // first; p stays inside seqs. The pointer-table reads index
+                // a 256-entry array with a u8.
                 let (add, add_nb, e_of, e_ml, e_ll) = unsafe {
-                    let w = &*sp.add(i);
+                    p = p.sub(1);
+                    let w = p.read();
                     let packed = w.codes;
                     (
                         w.add,
@@ -565,22 +574,27 @@ fn encode_sequences(
                 unsafe {
                     if trans_nb + add_nb <= 56 {
                         hot_push_raw(
-                            out,
-                            &mut pos,
+                            &mut cur,
                             &mut acc,
                             &mut bits,
                             trans | (add << trans_nb),
                             trans_nb + add_nb,
                         );
                     } else {
-                        hot_push_raw(out, &mut pos, &mut acc, &mut bits, trans, trans_nb);
-                        hot_push_raw(out, &mut pos, &mut acc, &mut bits, add, add_nb);
+                        hot_push_raw(&mut cur, &mut acc, &mut bits, trans, trans_nb);
+                        hot_push_raw(&mut cur, &mut acc, &mut bits, add, add_nb);
                     }
+                }
+                if p == sp {
+                    break;
                 }
             }
         }
+        // SAFETY: cur advanced only over reserved bytes; the offset stays
+        // in the buffer.
+        let pos = unsafe { cur.offset_from(base) } as usize;
+        writer.set_hot_state(acc, bits, pos);
     }
-    writer.set_hot_state(acc, bits, pos);
 
     writer.write_bits(ml_state as u64, ml_log);
     writer.write_bits(of_state as u64, of_log);
@@ -605,21 +619,14 @@ fn encode_sequences(
 /// overwrite them or `set_len` cuts them. The capacity for every store is
 /// reserved once by the caller (see `encode_sequences`).
 #[inline(always)]
-unsafe fn hot_push_raw(
-    out: *mut u8,
-    pos: &mut usize,
-    acc: &mut u64,
-    bits: &mut usize,
-    v: u64,
-    nb: usize,
-) {
+unsafe fn hot_push_raw(cur: &mut *mut u8, acc: &mut u64, bits: &mut usize, v: u64, nb: usize) {
     let k = *bits / 8;
     // SAFETY: the caller's reserve covers the store; bytes past the
     // semantic end are overwritten by later stores or cut by set_len.
     unsafe {
-        out.add(*pos).cast::<u64>().write_unaligned(acc.to_le());
+        (*cur).cast::<u64>().write_unaligned(acc.to_le());
+        *cur = (*cur).add(k);
     }
-    *pos += k;
     *acc >>= 8 * k;
     *bits -= 8 * k;
     *acc |= v << *bits;
