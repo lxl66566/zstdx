@@ -1715,8 +1715,9 @@ impl MatchGeneratorDriver {
             }
             self.params = params;
         }
-        // The size gate: the split pass costs ~9 cyc/B (measured), so LDM
-        // arms only where the window the source clamp left is worth it —
+        // The size gate: the split pass costs real cycles per byte even
+        // cheapened (see ldm.rs), so LDM arms only where the window the
+        // source clamp left is worth it —
         // the bar depends on the driver's arming context ([`LdmArming`]),
         // so this check runs on every apply, not only on params changes
         // (a pooled driver can re-arm between identical-param frames). A

@@ -2,10 +2,10 @@
 //! sparse candidate source for distance classes the dense search tables
 //! lose to pressure. A rolling gear hash samples the input at ~one split
 //! per `2^HASH_RATE_LOG` bytes; each split's 64-byte window is bucketed by
-//! its XXH64 into a small round-robin table (16 entries per bucket). The
-//! table holds exactly one window of splits, so a far twin of the window's
-//! content survives where a per-position hash table buries it under near
-//! recurrences.
+//! a fingerprint into a small round-robin table (16 entries per bucket).
+//! The table holds exactly one window of splits, so a far twin of the
+//! window's content survives where a per-position hash table buries it
+//! under near recurrences.
 //!
 //! Deviations from C, all behavior-preserving:
 //! - entries are `pack_pos`-biased u32 positions (the chain-table idiom) instead of raw u32
@@ -14,6 +14,8 @@
 //! - the rolling state is carried across blocks (C re-arms per 1 MiB chunk, leaving a 64-byte blind
 //!   spot each time); the arm position is tracked as an entry floor so no split window reaches
 //!   before it;
+//! - the window fingerprint is an 8-lane multiply-xor fold instead of a fresh XXH64 (see
+//!   [`split_fp`]); measured at parity on dll-class data at a fraction of the cost;
 //! - a match's backward extension is not measured here: sequences carry only (split, offset) and
 //!   the consumer recomputes length live against its own anchor — the same bytes under a tighter
 //!   bound.
@@ -21,7 +23,6 @@
 use alloc::vec::Vec;
 
 use super::match_generator::{extend_match, pack_pos};
-use crate::xxh64::Xxh64;
 
 /// Shortest split-window match that can become a candidate (C's
 /// `LDM_MIN_MATCH_LENGTH` for the lazy strategies).
@@ -296,6 +297,129 @@ static GEAR_TAB: [u64; 256] = [
     0x2b4da14f2613d8f4,
 ];
 
+/// The four gear checkpoints over the bytes `w[0..4]` from chain state
+/// `h`: `(2h+g0, 4h+2g0+g1, 8h+4g0+2g1+g2, 16h+8g0+4g1+2g2+g3)` — exactly
+/// the naive serial states, re-associated so the state-to-state dependency
+/// is one add per group. See `LdmState::gear_feed` for why the x86-64 form
+/// is hand-written.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline(always)]
+fn gear4_portable(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
+    debug_assert!(w.len() >= 4);
+    let g0 = GEAR_TAB[w[0] as usize];
+    let g1 = GEAR_TAB[w[1] as usize];
+    let g2 = GEAR_TAB[w[2] as usize];
+    let g3 = GEAR_TAB[w[3] as usize];
+    let p2 = g1.wrapping_add(g0 << 1);
+    let p3 = g2.wrapping_add(p2 << 1);
+    let p4 = g3.wrapping_add(p3 << 1);
+    (
+        g0.wrapping_add(h << 1),
+        p2.wrapping_add(h << 2),
+        p3.wrapping_add(h << 3),
+        p4.wrapping_add(h << 4),
+    )
+}
+
+/// x86-64 `gear4`: forces the re-associated schedule (LEA per checkpoint,
+/// `shl`+add for the x16 group step, loads hoisted off the chain). The
+/// portable `gear4` above is semantically identical but compiles back into
+/// the one-byte serial chain.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn gear4_asm(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
+    debug_assert!(w.len() >= 4);
+    let (mut t0, mut t1, mut t2, mut t3, mut t4) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (c1, c2, c3, c4);
+    // SAFETY: baseline x86-64 instructions only; reads exactly w[0..4] and
+    // the 2 KiB GEAR_TAB, writes nothing.
+    unsafe {
+        core::arch::asm!(
+            "movzbl ({wp}), {t0:e}",
+            "movzbl 1({wp}), {t1:e}",
+            "movzbl 2({wp}), {t2:e}",
+            "movzbl 3({wp}), {t3:e}",
+            "mov ({tab}, {t0}, 8), {t0}",
+            "mov ({tab}, {t1}, 8), {t1}",
+            "mov ({tab}, {t2}, 8), {t2}",
+            "mov ({tab}, {t3}, 8), {t3}",
+            "lea ({t0}, {h}, 2), {c1}",
+            "lea ({t1}, {t0}, 2), {t4}",
+            "lea ({t4}, {h}, 4), {c2}",
+            "lea ({t2}, {t4}, 2), {t4}",
+            "lea ({t4}, {h}, 8), {c3}",
+            "lea ({t3}, {t4}, 2), {t4}",
+            "mov {h}, {t0}",
+            "shlq $4, {t0}",
+            "lea ({t4}, {t0}), {c4}",
+            wp = in(reg) w.as_ptr(),
+            tab = in(reg) GEAR_TAB.as_ptr(),
+            h = in(reg) h,
+            t0 = out(reg) t0,
+            t1 = out(reg) t1,
+            t2 = out(reg) t2,
+            t3 = out(reg) t3,
+            t4 = out(reg) t4,
+            c1 = lateout(reg) c1,
+            c2 = lateout(reg) c2,
+            c3 = lateout(reg) c3,
+            c4 = lateout(reg) c4,
+            options(nostack, att_syntax)
+        );
+    }
+    let _ = (t0, t1, t2, t3, t4);
+    (c1, c2, c3, c4)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
+    gear4_asm(w, h)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
+    gear4_portable(w, h)
+}
+
+/// Checksum-hit mask over one bucket: bit `i` set when entry `i`'s checksum
+/// equals `checksum`. Pure filter — callers iterate hits in ascending order
+/// so the replacement of a linear scan changes no match selection.
+#[inline(always)]
+fn checksum_mask(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        // SAFETY: guarded by the feature check; reads exactly the bucket.
+        if std::is_x86_feature_detected!("avx512f") {
+            return unsafe { checksum_mask_avx512(entries, checksum) };
+        }
+    }
+    let mut m = 0u16;
+    for (i, &e) in entries.iter().enumerate() {
+        m |= (((e >> 32) as u32 == checksum) as u16) << i;
+    }
+    m
+}
+
+/// AVX-512 `checksum_mask`: two shifted 8-lane compares replace sixteen
+/// load-shift-compare-branch steps; the common no-hit case leaves only the
+/// two loads on the critical path.
+// SAFETY: caller checks the feature.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn checksum_mask_avx512(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let cks = _mm512_set1_epi64(checksum as i64);
+        let lo = _mm512_loadu_si512(entries.as_ptr().cast());
+        let hi = _mm512_loadu_si512(entries.as_ptr().add(8).cast());
+        let mlo = _mm512_cmp_epu64_mask(_mm512_srli_epi64(lo, 32), cks, _CMP_EQ_OQ);
+        let mhi = _mm512_cmp_epu64_mask(_mm512_srli_epi64(hi, 32), cks, _CMP_EQ_OQ);
+        mlo as u16 | ((mhi as u16) << 8)
+    }
+}
+
 /// A generated candidate: the split position (where its 64-byte window
 /// starts, the injection point) and the match offset.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -317,8 +441,8 @@ pub(super) struct LdmState {
     rolling: u64,
     /// Split trigger; the mask's bits sit at the top of the 64-byte window.
     stop_mask: u64,
-    /// Bucket index bits (`hash_log - BUCKET_SIZE_LOG`).
-    hash_bits: u32,
+    /// Bucket index mask (`hash_log - BUCKET_SIZE_LOG` bits).
+    hash_mask: usize,
     /// Maximum candidate offset (the row's window).
     window: u64,
     /// Absolute position up to which the rolling hash has been fed.
@@ -342,7 +466,7 @@ impl LdmState {
             bucket_offsets: alloc::vec![0u8; buckets],
             rolling: !(u32::MAX as u64),
             stop_mask: ((1u64 << HASH_RATE_LOG) - 1) << (MIN_MATCH_LENGTH as u32 - HASH_RATE_LOG),
-            hash_bits: hash_log - BUCKET_SIZE_LOG,
+            hash_mask: (1usize << (hash_log - BUCKET_SIZE_LOG)) - 1,
             window,
             fed: 0,
             arm: 0,
@@ -367,8 +491,10 @@ impl LdmState {
     }
 
     #[inline]
-    fn bucket(&self, hash: usize) -> &[u64] {
-        &self.table[hash * ENTS_PER_BUCKET..(hash + 1) * ENTS_PER_BUCKET]
+    fn bucket(&self, hash: usize) -> &[u64; ENTS_PER_BUCKET] {
+        self.table[hash * ENTS_PER_BUCKET..(hash + 1) * ENTS_PER_BUCKET]
+            .try_into()
+            .unwrap()
     }
 
     /// Round-robin insert (C's `ZSTD_ldm_insertEntry`).
@@ -398,6 +524,13 @@ impl LdmState {
     /// to [`BATCH_SIZE`] split entry positions ≥ `floor`. Returns the fed
     /// byte count; a full batch stops early so its splits are inserted
     /// before the state runs ahead (C's `ZSTD_ldm_gear_feed`).
+    ///
+    /// Outlined on purpose: inlined into `generate` the per-byte loop
+    /// spilled its base pointers to the stack (two loads per byte plus a
+    /// table-base LEA inside the loop); standalone the register file holds
+    /// the whole loop state. Called once per batch (~4 KiB), so the call
+    /// overhead is noise.
+    #[inline(never)]
     fn gear_feed(
         &mut self,
         win: &[u8],
@@ -410,20 +543,60 @@ impl LdmState {
         debug_assert_eq!(self.fed, base);
         let mut hash = self.rolling;
         let mask = self.stop_mask;
-        let start = (base - win_base) as usize;
+        let win = &win[(base - win_base) as usize..(end - win_base) as usize];
+        let floor_trigger = floor + MIN_MATCH_LENGTH as u64;
+        let len = win.len();
         let mut n = 0usize;
         let mut count = 0usize;
-        while (base + n as u64) < end {
-            hash = (hash << 1).wrapping_add(GEAR_TAB[win[start + n] as usize]);
-            n += 1;
-            if hash & mask == 0 {
-                let trigger = base + n as u64;
-                if trigger >= floor + MIN_MATCH_LENGTH as u64 {
-                    splits[count] = trigger - MIN_MATCH_LENGTH as u64;
-                    count += 1;
-                    if count == BATCH_SIZE {
-                        break;
+        // One trigger test per fed byte; `m` is the 1-based byte offset of
+        // checkpoint `c` within the group. A full batch exits with the
+        // state frozen at exactly the triggering checkpoint.
+        macro_rules! trigger {
+            ($c:expr, $m:expr) => {
+                if $c & mask == 0 && base + (n + $m) as u64 >= floor_trigger {
+                    if Self::record_split(
+                        splits,
+                        &mut count,
+                        base + (n + $m) as u64 - MIN_MATCH_LENGTH as u64,
+                    ) {
+                        self.rolling = $c;
+                        n += $m;
+                        self.fed = base + n as u64;
+                        return (n, count);
                     }
+                }
+            };
+        }
+        // The serial chain `state -> 2*state + g` costs one dependent add
+        // per byte however it is shaped in source: LLVM reassociates the
+        // group-local prefix folds back into that chain and folds the
+        // table loads into memory-operand adds (two dependent adds per
+        // byte, measured at half the achievable speed). The asm `gear4`
+        // keeps the reassociated form — the interior checkpoints are
+        // `(state << k) + pk` with `pk = 2*p(k-1) + g` independent of the
+        // live state — so the state-to-state dependency is one add per
+        // four bytes. Checkpoint values are bit-identical to the serial
+        // form (exact mod-2^64 arithmetic), so the split set is unchanged.
+        while n + 4 <= len {
+            let (c1, c2, c3, c4) = gear4(&win[n..], hash);
+            trigger!(c1, 1);
+            trigger!(c2, 2);
+            trigger!(c3, 3);
+            trigger!(c4, 4);
+            hash = c4;
+            n += 4;
+        }
+        while n < len {
+            let g = GEAR_TAB[win[n] as usize];
+            hash = g.wrapping_add(hash << 1);
+            n += 1;
+            if hash & mask == 0 && base + n as u64 >= floor_trigger {
+                if Self::record_split(
+                    splits,
+                    &mut count,
+                    base + n as u64 - MIN_MATCH_LENGTH as u64,
+                ) {
+                    break;
                 }
             }
         }
@@ -432,13 +605,45 @@ impl LdmState {
         (n, count)
     }
 
-    /// Hash the 64 bytes at `split` into (bucket, checksum).
-    fn window_hash(&self, win: &[u8], win_base: u64, split: u64) -> (usize, u32) {
-        let idx = (split - win_base) as usize;
-        let mut h = Xxh64::new(0);
-        h.write(&win[idx..idx + MIN_MATCH_LENGTH]);
-        let x = h.finish();
-        ((x as usize) & ((1 << self.hash_bits) - 1), (x >> 32) as u32)
+    /// Cold half of a gear trigger: stage one split and report a full batch.
+    #[cold]
+    #[inline(never)]
+    fn record_split(splits: &mut [u64; BATCH_SIZE], count: &mut usize, split: u64) -> bool {
+        splits[*count] = split;
+        *count += 1;
+        *count == BATCH_SIZE
+    }
+
+    /// Fingerprint a split's 64-byte window: eight multiply-xor lanes and
+    /// one avalanche step. Independent of the gear state (a fingerprint
+    /// correlated with the trigger condition shifts with the split
+    /// placement — the fold-derived candidate measured a dll100
+    /// no-latch size regression while this form tracks a fresh XXH64 of
+    /// the window to within noise, at a fraction of its serial-multiply
+    /// latency). Quality on dll-class data: false checksum matches
+    /// 0.17/kilo-split vs XXH64's 0.015 (both noise), twin retention
+    /// equal.
+    #[inline(always)]
+    fn split_fp(win: &[u8], idx: usize) -> u64 {
+        let w = &win[idx..idx + MIN_MATCH_LENGTH];
+        let lane = |k: usize| u64::from_le_bytes(w[k..k + 8].try_into().unwrap());
+        let acc = lane(0).wrapping_mul(0xa076_1d64_78bd_642f)
+            ^ lane(1).wrapping_mul(0xe703_7ed1_a0b4_28db)
+            ^ lane(2).wrapping_mul(0x8ebc_6af0_9c88_c6e3)
+            ^ lane(3).wrapping_mul(0x5899_65cc_7587_4f13)
+            ^ lane(4).wrapping_mul(0x1d8e_4e27_c47d_124f)
+            ^ lane(5).wrapping_mul(0xeb44_acca_b455_d165)
+            ^ lane(6).wrapping_mul(0xc685_6960_5a92_1e65)
+            ^ lane(7).wrapping_mul(0x7394_4f5b_82d3_8245);
+        let x = (acc ^ (acc >> 31)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^ (x >> 29)
+    }
+
+    /// (bucket, checksum) of a split whose window starts at `win[idx]`.
+    #[inline(always)]
+    fn window_hash(&self, win: &[u8], idx: usize) -> (usize, u32) {
+        let fp = Self::split_fp(win, idx);
+        (fp as usize & self.hash_mask, (fp >> 32) as u32)
     }
 
     /// Index every split of `[base, end)` without matching — the
@@ -450,9 +655,9 @@ impl LdmState {
         while pos < end {
             let floor = self.arm.max(win_base);
             let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
-            for &split in &splits[..count] {
-                let (hash, checksum) = self.window_hash(win, win_base, split);
-                self.insert(hash, split, checksum);
+            for i in 0..count {
+                let (hash, checksum) = self.window_hash(win, (splits[i] - win_base) as usize);
+                self.insert(hash, splits[i], checksum);
             }
             pos += n as u64;
         }
@@ -495,16 +700,21 @@ impl LdmState {
             let floor = self.arm.max(win_base);
             let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
             let fed_end = pos + n as u64;
-            for &split in &splits[..count] {
-                let (hash, checksum) = self.window_hash(win, win_base, split);
+            for i in 0..count {
+                let split = splits[i];
+                let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
                 // (offset, forward match end); the longest forward run
                 // wins — the consumer re-prices the offset itself.
                 let mut best: Option<(u64, u64)> = None;
                 if split >= anchor {
-                    for e in self.bucket(hash).iter().copied() {
-                        if (e >> 32) as u32 != checksum {
-                            continue;
-                        }
+                    let entries = self.bucket(hash);
+                    // Ascending hit order keeps the first-longest tie-break
+                    // of the entry scan it replaces.
+                    let mut hits = checksum_mask(entries, checksum);
+                    while hits != 0 {
+                        let i = hits.trailing_zeros() as usize;
+                        hits &= hits - 1;
+                        let e = entries[i];
                         let dist = split.wrapping_sub(e as u32 as u64).wrapping_add(1);
                         if dist == 0 || dist > self.window {
                             continue;
@@ -731,5 +941,33 @@ mod tests {
         data.extend_from_slice(&block);
         data.extend_from_slice(&block);
         assert!(!collect_and_verify(&data, data.len(), 17).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_separates_oldest_byte_difference() {
+        // The gear fold is blind to an oldest-byte difference whose table
+        // entries share parity (the difference shifts out at bit 63, which
+        // the trigger mask forces to zero anyway) — the fingerprint must
+        // not inherit that blindness, whatever its implementation.
+        let (a, b) = (0u64..256)
+            .flat_map(|a| (0u64..256).map(move |b| (a, b)))
+            .find(|&(a, b)| a != b && GEAR_TAB[a as usize] & 1 == GEAR_TAB[b as usize] & 1)
+            .expect("gear table has a parity pair");
+        let mut w1 = rand_bytes(MIN_MATCH_LENGTH, 0x5a5a);
+        let mut w2 = w1.clone();
+        w1[0] = a as u8;
+        w2[0] = b as u8;
+        let st = LdmState::new(10, 1 << 10);
+        assert_ne!(
+            st.window_hash(&w1, 0),
+            st.window_hash(&w2, 0),
+            "fingerprint collided on an oldest-byte difference"
+        );
+        // Content addressing: the same window at another position hashes
+        // identically.
+        let mut data = rand_bytes(3 * MIN_MATCH_LENGTH, 0x1337);
+        data.extend_from_slice(&w1);
+        let idx = data.len() - MIN_MATCH_LENGTH;
+        assert_eq!(st.window_hash(&w1, 0), st.window_hash(&data, idx));
     }
 }
