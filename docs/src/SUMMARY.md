@@ -39,6 +39,10 @@
 
 - [Todo List](dev/todo.md)
 - [Disproven Directions (Do Not Retry)](dev/negative.md)
+  - [Decoding](dev/negative/decoding.md)
+  - [Encoding · Matchers](dev/negative/matchers.md)
+  - [Encoding · Entropy / Checksum / Misc](dev/negative/entropy.md)
+  - [MT / Streaming](dev/negative/mt-stream.md)
 
 ## Pitfalls
 
