@@ -387,7 +387,7 @@ impl LdmState {
         let mut hash = self.rolling;
         let idx = (pos - MIN_MATCH_LENGTH as u64 - win_base) as usize;
         for k in 0..MIN_MATCH_LENGTH {
-            hash = (hash << 1) + GEAR_TAB[win[idx + k] as usize];
+            hash = (hash << 1).wrapping_add(GEAR_TAB[win[idx + k] as usize]);
         }
         self.rolling = hash;
         self.fed = pos;
@@ -414,7 +414,7 @@ impl LdmState {
         let mut n = 0usize;
         let mut count = 0usize;
         while (base + n as u64) < end {
-            hash = (hash << 1) + GEAR_TAB[win[start + n] as usize];
+            hash = (hash << 1).wrapping_add(GEAR_TAB[win[start + n] as usize]);
             n += 1;
             if hash & mask == 0 {
                 let trigger = base + n as u64;
@@ -475,6 +475,19 @@ impl LdmState {
         end: u64,
     ) {
         debug_assert_eq!(end, win_base + win.len() as u64);
+        // A shutoff gap (the driver's canary blocks feed nothing while the
+        // latch is dead, see `ldm_generate`): the rolling hash is stale, so
+        // splits found from it land misaligned. Re-arm at the block start —
+        // the same reset a frame or job boundary does — so the canary
+        // samples the far class faithfully.
+        if self.fed < base {
+            if base >= win_base + MIN_MATCH_LENGTH as u64 {
+                self.gear_rearm(win, win_base, base);
+            } else {
+                self.fed = base;
+                self.arm = base;
+            }
+        }
         let mut splits = [0u64; BATCH_SIZE];
         let mut pos = base;
         let mut anchor = base;
@@ -560,7 +573,7 @@ mod tests {
         let mut off = 0usize;
         while off < data.len() {
             let end = (off + block).min(data.len());
-            st.generate(&mut seqs, &data, 0, off as u64, end as u64);
+            st.generate(&mut seqs, &data[..end], 0, off as u64, end as u64);
             off = end;
         }
         for s in &seqs {

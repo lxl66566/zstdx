@@ -169,7 +169,13 @@ pub fn create_raw_dict_from_samples<W: Write>(samples: &[&[u8]], output: &mut W,
         if dict.is_empty() {
             continue;
         }
-        let score = evaluate(&dict, &test_samples);
+        // Without a holdout the sweep is a single default-K candidate;
+        // there is nothing to score it against.
+        let score = if test_samples.is_empty() {
+            0
+        } else {
+            evaluate(&dict, &test_samples)
+        };
         vprintln!("create_dict: k={k} -> {} bytes, eval {score}", dict.len());
         if best.as_ref().is_none_or(|(s, _)| score < *s) {
             best = Some((score, dict));

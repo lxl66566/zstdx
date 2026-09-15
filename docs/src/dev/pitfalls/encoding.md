@@ -20,6 +20,9 @@
 - **A span gate without a slice is O(input), not O(span)**: the reach probe checked `head.len() < PROBE_SPAN` as its engagement gate but then parsed the whole `head` — the "fixed ~36 ms" probe cost 580 ms on a 33 MiB frame (json solo 76→41 MiB/s). The symptom (output byte-correct, speed halved) reads as a feature cost, not a bug; any prefix-probe pattern must slice `&head[..SPAN]` at the gate, and its cost claim must be re-measured on a large input before it is believed.
 - **A replay cursor declared inside the read loop replays the same block forever**: staging probe bytes inside `FrameCompressor::compress`'s block loop reset `staged_read` each iteration — the same first block replayed until the frame hangs (32 MiB json stuck 10+ min, RSS 375 MB). Replay cursors live *outside* the loop they gate.
 
+- **LDM gear arithmetic wraps by design**: the rolling gear hash is `(hash << 1) + GEAR_TAB[b]` over full 64-bit values — in C this wraps silently; Rust's debug overflow panic fires the moment LDM runs on large debug inputs (release was unaffected). Same class as the `fed` cursor: a shutoff gap must leave `fed` at the arm floor (`gear_rearm` semantics), or the next revival block's `debug_assert_eq!(fed, base)` fires and the canary split lands mid-match (a release-mode correctness bug, not just an assertion).
+- **An empty holdout must skip scoring, not score zero**: the dict sweep calls `evaluate` even when the train/test split produced no test samples (a single small source) — the debug assert `!test_samples.is_empty()` fired under `--all-features`. When a sweep can collapse to one candidate, the evaluation step is optional, not unconditional.
+
 ## Entropy coding / bitstream
 
 - **Rust operator precedence**: `1u64 << 62 / total` parses as `1 << (62/total)` (`/` binds tighter than `<<`), every normalization step wrong → ratio -28%. **When porting C's `f(a,b)`-style function calls, add parentheses manually.**
