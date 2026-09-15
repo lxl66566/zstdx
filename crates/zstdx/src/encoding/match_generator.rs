@@ -951,6 +951,30 @@ fn chain_search(
     (best_len, best_cand)
 }
 
+/// Short-match interior fill policy of the fast strategy, selected per
+/// block from the previous block's parse density (the field
+/// `MatchGeneratorDriver::covered_fill`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoveredFill {
+    /// Every covered position. Structured shapes need it: their
+    /// phase-shifted repeats have no second earlier copy for a shifted
+    /// probe to hit instead (dual anchors alone: json +1.6%, text +3.0%).
+    Dense,
+    /// Every second covered position. On dll-class sparse parses the
+    /// duplicated mass has many copies, and the pair-probed scan covers
+    /// both strides' phases (any two adjacent probes span the parities),
+    /// so the halved insert volume keeps the coverage at ~0.04% size.
+    Strided,
+}
+
+/// Sequence floor of the covered-fill density gate: below it a block's
+/// parse carries no usable density signal (literal-run tails).
+const COVERED_GATE_MIN_SEQS: usize = 64;
+/// Literal bytes per sequence above which a block counts as dll-class
+/// sparse for the covered-fill density gate (structured shapes sit at
+/// 2.6-3.0).
+const COVERED_GATE_AVG_LL: usize = 4;
+
 /// Store `abs` as the newest position for its hash into a table of `log`
 /// bits. Caller guarantees `idx` has at least 5 bytes of window behind it.
 #[inline(always)]
@@ -1029,6 +1053,7 @@ fn insert_covered(
     match_len: usize,
     insert_max: u64,
     log: u32,
+    fill: CoveredFill,
 ) {
     if match_len <= 16 {
         let end = (win_base + (start + match_len) as u64).min(insert_max);
@@ -1039,6 +1064,19 @@ fn insert_covered(
         // wrapped `end - p` below would peel-insert one position whose
         // hash reads past the window (fuzz-found heap overread).
         if p >= end {
+            return;
+        }
+        // Density-gated stride-2 form first, so the dense path below stays
+        // instruction-identical on the shapes that never gate (the branch
+        // lives in this outlined body, never in the scan loop).
+        if fill == CoveredFill::Strided {
+            // Kept rolled: the modal gated match holds 3-4 stride-2
+            // inserts, where an unrolled pair form's peel and tail checks
+            // cost more than they save (measured on dll100).
+            while p < end {
+                insert_at(win, table, (p - win_base) as usize, p, log);
+                p += 2;
+            }
             return;
         }
         // Peel the odd tail before the loop: `while p < end` alone unrolls
@@ -1080,6 +1118,9 @@ struct TableEmit<'a> {
     insert_max: u64,
     /// Log of `table` (the fast strategy's hash log).
     hash_log: u32,
+    /// Short-match interior fill policy of this block (density-coupled;
+    /// see [`CoveredFill`]). Only `emit` reads it.
+    covered_fill: CoveredFill,
 }
 
 impl TableEmit<'_> {
@@ -1122,6 +1163,7 @@ impl TableEmit<'_> {
             match_len,
             self.insert_max,
             self.hash_log,
+            self.covered_fill,
         );
         self.win_base + match_end as u64
     }
@@ -1451,6 +1493,15 @@ pub struct MatchGeneratorDriver {
     gap_start: u64,
     epoch: u64,
     miss_count: usize,
+    /// Short-match interior fill policy for the current block's fast scan,
+    /// decided from the previous block's parse density: at least
+    /// `COVERED_GATE_MIN_SEQS` sequences and `COVERED_GATE_AVG_LL` literal
+    /// bytes per sequence marks dll-class sparse content, whose redundant
+    /// copies keep stride-2 fill's phase coverage at ~0.04% size for half
+    /// the inserts; denser parses keep every position (their shifted
+    /// repeats have no duplicate copy to hit instead). Set at fast-strategy
+    /// block boundaries only; reset per frame.
+    covered_fill: CoveredFill,
     params: LevelParams,
     /// Repeated-offset history, kept in lockstep with the decoder's
     /// `offset_hist` so repcode probes see the same candidates it will.
@@ -1661,6 +1712,7 @@ impl MatchGeneratorDriver {
             // Epoch 0 is the never-valid state of a zeroed table.
             epoch: 1,
             miss_count: 0,
+            covered_fill: CoveredFill::Dense,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
@@ -1712,6 +1764,7 @@ impl MatchGeneratorDriver {
             gap_start: u64::MAX,
             epoch: 1,
             miss_count: 0,
+            covered_fill: CoveredFill::Dense,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
@@ -2287,6 +2340,7 @@ impl Matcher for MatchGeneratorDriver {
             self.dubt_bt.fill(0);
         }
         self.miss_count = 0;
+        self.covered_fill = CoveredFill::Dense;
         self.ramp = RampGate::OFF;
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
@@ -2430,6 +2484,18 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     self.start_matching_fast::<false>(literals, seqs);
                 }
+                // This block's parse density picks the next block's
+                // covered-fill policy. Structured shapes never fire
+                // (json sits at 2.6-3.0 literal bytes per sequence; text
+                // and skewed only ever fire literal-run tails below the
+                // sequence floor), so their bytes stay identical.
+                self.covered_fill = if seqs.len() >= COVERED_GATE_MIN_SEQS
+                    && literals.len() >= COVERED_GATE_AVG_LL * seqs.len()
+                {
+                    CoveredFill::Strided
+                } else {
+                    CoveredFill::Dense
+                };
             },
             Strategy::Dfast(_) => {
                 if self.ramp.is_armed() {
@@ -2857,6 +2923,7 @@ impl MatchGeneratorDriver {
             win_base,
             insert_max,
             hash_log,
+            covered_fill: self.covered_fill,
         };
         let max_window = self.params.window as u64;
         let mut pos = self.pos;
@@ -3643,6 +3710,9 @@ impl MatchGeneratorDriver {
             win_base,
             insert_max,
             hash_log,
+            // The chain's emits go through `emit_chain`; the fast-only
+            // covered-fill policy is dead state here.
+            covered_fill: CoveredFill::Dense,
         };
         let hash_read = HASH_READ as u64;
         let mut pos = self.pos;
