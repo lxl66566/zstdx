@@ -22,6 +22,10 @@ pub struct Args {
     /// Do not train; write the content section of this formatted dict
     #[arg(long)]
     pub content_of: Option<PathBuf>,
+    /// Emit a formatted dictionary (entropy tables + content, the
+    /// `zstd --train` shape) instead of raw content
+    #[arg(long)]
+    pub formatted: bool,
 }
 
 pub fn run(args: &Args) {
@@ -56,7 +60,11 @@ pub fn run(args: &Args) {
     let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
     let out = fs::File::create(&args.out).unwrap();
     let mut out = BufWriter::new(out);
-    zstdx::dict::create_raw_dict_from_samples(&refs, &mut out, args.size);
+    if args.formatted {
+        zstdx::dict::create_formatted_dict_from_samples(&refs, &mut out, args.size);
+    } else {
+        zstdx::dict::create_raw_dict_from_samples(&refs, &mut out, args.size);
+    }
     out.flush().unwrap();
     println!(
         "trained dict: {} bytes",

@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Dict trainer: formatted-dictionary emission, the `ZDICT_finalizeDictionary`
+  port (`dict/finalize.rs`, bench `train --formatted`): every training
+  sample's first block is parsed against the trained content as raw match
+  history, the literals and ll/ml/of code streams feed four all-ones-seeded
+  histograms, and huffman description + three FSE NCcounts + repcodes
+  {1,4,8} serialize in front of the content in libzstd's exact layout
+  (content-hash dictID, tail-clipped content budget, flat-lit rescue).
+  C's dead code is not ported (the most-common-first-offsets analysis
+  never reaches the wire). Interop gated both directions through the
+  zstd CLI (54/54 holdout files compress/decode cross); libzstd using our
+  finalized dictionary matches its own trained one (5,256 vs 5,258 B at
+  -9 on the systemd holdout).
 - Encoder: raw literals sections use libzstd's size-format ladder
   (`flSize = 1 + (size>31) + (size>4095)`, mirroring `rle_literals`)
   instead of always writing the 20-bit form — every raw-literals block

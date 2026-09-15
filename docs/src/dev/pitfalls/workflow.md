@@ -17,6 +17,7 @@
 ## cargo / git
 
 - **A/B always runs back-to-back on the same machine via `git stash`**; after a stash round-trip `target/` is not rebuilt automatically — once spent half a day objdumping the stale BASE binary analyzing "bmi2 not generated".
+- **`git stash` operates on the SHARED stash stack, not the worktree's**: all worktrees of this repo (zstd-rs, -dev, -dev2, -dev3...) push onto one `refs/stash`, so a `git stash pop` after any delay can restore (and drop) ANOTHER session's WIP — observed live: a pop restored a foreign match_generator/opt.rs diff and dropped its entry. Before popping, verify the top entry's content (`git stash show --stat`); on a wrong pop, the dropped commit usually still exists and `git stash store <sha>` re-registers it exactly. For worktree-local parking prefer scratch commits on the branch (`git add -A && git commit -m wip`) and reset later.
 - **cargo A/B binaries are per-package**: `cargo build -p zstdx` does NOT refresh `target/release/zstdx-bench`; rebuild the bench binary after every edit (a ratio run once showed byte-identical output — it was a stale binary).
 - On this repo's git version, `git stash push --staged` only copies without restoring the scene; for splitting atomic commits use `git restore --staged` + `git commit <path>`.
 - **cargo fmt touches historically unformatted files**: before committing, `git checkout --` the unrelated files (nearly dragged 6 unrelated files into an atomic commit).

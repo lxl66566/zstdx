@@ -11,6 +11,7 @@
 //! frequency estimates, stable iteration order.
 
 mod cover;
+mod finalize;
 
 use std::{
     fs,
@@ -21,6 +22,7 @@ use std::{
 };
 
 use cover::KMerTable;
+pub use finalize::finalize_dictionary;
 
 use crate::{EncoderOptions, Level};
 
@@ -105,85 +107,160 @@ pub fn create_raw_dict_from_source<R: Read, W: Write>(
     create_raw_dict_from_samples(&[&body], output, dict_size);
 }
 
+/// The shuffled training body: sample order is fixed-seed shuffled, then
+/// concatenated with lengths. `train_end` splits train from holdout.
+struct TrainingSet {
+    body: Vec<u8>,
+    lens: Vec<usize>,
+    train_end: usize,
+}
+
+impl TrainingSet {
+    /// Build from `samples` (raw content is passed through when too small
+    /// to train — `body` then holds it whole and `trainable` is false).
+    fn build(samples: &[&[u8]]) -> Self {
+        let mut order: Vec<usize> = (0..samples.len()).collect();
+        shuffle(&mut order);
+        let mut body = Vec::new();
+        let mut lens: Vec<usize> = Vec::with_capacity(samples.len());
+        for &i in &order {
+            let sample = samples[i];
+            let take = sample.len().min(SOURCE_CAP - body.len());
+            if take == 0 {
+                continue;
+            }
+            body.extend_from_slice(&sample[..take]);
+            lens.push(take);
+            if body.len() == SOURCE_CAP {
+                break;
+            }
+        }
+        let train_end = if lens.len() >= MIN_SAMPLES_FOR_SPLIT {
+            lens.len() * TRAIN_SPLIT_NUM / TRAIN_SPLIT_DEN
+        } else {
+            lens.len()
+        };
+        Self {
+            body,
+            lens,
+            train_end,
+        }
+    }
+
+    fn trainable(&self) -> bool {
+        self.body.len() >= 16
+    }
+
+    /// The training split's samples in shuffled order (C's finalize step
+    /// uses the whole train split at the default acceleration).
+    fn train_samples(&self) -> Vec<&[u8]> {
+        let mut offset = 0;
+        self.lens[..self.train_end]
+            .iter()
+            .map(|&len| {
+                let sample = &self.body[offset..offset + len];
+                offset += len;
+                sample
+            })
+            .collect()
+    }
+
+    /// Select the dictionary content (the fastCover pass with its
+    /// segment-size sweep, scored on the holdout).
+    fn select_content(&self, dict_size: usize) -> Vec<u8> {
+        let train_len: usize = self.lens[..self.train_end].iter().sum();
+        let train_body = &self.body[..train_len];
+        let test_samples: Vec<&[u8]> = self.lens[self.train_end..]
+            .iter()
+            .scan(train_len, |offset, &len| {
+                let sample = &self.body[*offset..*offset + len];
+                *offset += len;
+                Some(sample)
+            })
+            .collect();
+
+        let counts = KMerTable::build(train_body);
+        let candidates: Vec<usize> = if test_samples.is_empty() {
+            vec![K_DEFAULT]
+        } else {
+            K_SWEEP
+                .iter()
+                .copied()
+                .filter(|&k| k <= dict_size && k <= train_body.len())
+                .collect()
+        };
+        let mut best: Option<(usize, Vec<u8>)> = None;
+        for &k in &candidates {
+            let dict = build_dict(&mut counts.clone(), train_body, k, dict_size);
+            if dict.is_empty() {
+                continue;
+            }
+            // Without a holdout the sweep is a single default-K candidate;
+            // there is nothing to score it against.
+            let score = if test_samples.is_empty() {
+                0
+            } else {
+                evaluate(&dict, &test_samples)
+            };
+            vprintln!("create_dict: k={k} -> {} bytes, eval {score}", dict.len());
+            if best.as_ref().is_none_or(|(s, _)| score < *s) {
+                best = Some((score, dict));
+            }
+        }
+        best.map_or_else(Vec::new, |(_, dict)| dict)
+    }
+}
+
 /// Train a "raw content" dictionary of at most `dict_size` bytes from
 /// `samples`, written to `output`.
 pub fn create_raw_dict_from_samples<W: Write>(samples: &[&[u8]], output: &mut W, dict_size: usize) {
     if samples.is_empty() {
         return;
     }
-    let mut order: Vec<usize> = (0..samples.len()).collect();
-    shuffle(&mut order);
-    let mut body = Vec::new();
-    let mut lens: Vec<usize> = Vec::with_capacity(samples.len());
-    for &i in &order {
-        let sample = samples[i];
-        let take = sample.len().min(SOURCE_CAP - body.len());
-        if take == 0 {
-            continue;
-        }
-        body.extend_from_slice(&sample[..take]);
-        lens.push(take);
-        if body.len() == SOURCE_CAP {
-            break;
-        }
+    let set = TrainingSet::build(samples);
+    let dict = if set.trainable() {
+        vprintln!(
+            "create_dict: training {dict_size} byte dict from {} samples, {} bytes",
+            set.lens.len(),
+            set.body.len()
+        );
+        set.select_content(dict_size)
+    } else {
+        set.body
+    };
+    output.write_all(&dict).expect("could not write to output");
+}
+
+/// Train a formatted dictionary of at most `dict_size` bytes from
+/// `samples`: the selected content plus entropy tables collected over the
+/// training split (the `ZDICT_finalizeDictionary` step). Falls back to the
+/// raw-content form when the capacity cannot carry a header.
+pub fn create_formatted_dict_from_samples<W: Write>(
+    samples: &[&[u8]],
+    output: &mut W,
+    dict_size: usize,
+) {
+    if samples.is_empty() {
+        return;
     }
-    if body.len() < 16 {
-        output.write_all(&body).expect("could not write to output");
+    let set = TrainingSet::build(samples);
+    if !set.trainable() {
+        output
+            .write_all(&set.body)
+            .expect("could not write to output");
         return;
     }
     vprintln!(
         "create_dict: training {dict_size} byte dict from {} samples, {} bytes",
-        lens.len(),
-        body.len()
+        set.lens.len(),
+        set.body.len()
     );
-
-    let train_end = if lens.len() >= MIN_SAMPLES_FOR_SPLIT {
-        lens.len() * TRAIN_SPLIT_NUM / TRAIN_SPLIT_DEN
-    } else {
-        lens.len()
+    let content = set.select_content(dict_size);
+    let dict = match finalize_dictionary(&content, &set.train_samples(), dict_size) {
+        Some(dict) => dict,
+        None => content,
     };
-    let train_len: usize = lens[..train_end].iter().sum();
-    let train_body = &body[..train_len];
-    let test_samples: Vec<&[u8]> = lens[train_end..]
-        .iter()
-        .scan(train_len, |offset, &len| {
-            let sample = &body[*offset..*offset + len];
-            *offset += len;
-            Some(sample)
-        })
-        .collect();
-
-    let counts = KMerTable::build(train_body);
-    let candidates: Vec<usize> = if test_samples.is_empty() {
-        vec![K_DEFAULT]
-    } else {
-        K_SWEEP
-            .iter()
-            .copied()
-            .filter(|&k| k <= dict_size && k <= train_body.len())
-            .collect()
-    };
-    let mut best: Option<(usize, Vec<u8>)> = None;
-    for &k in &candidates {
-        let dict = build_dict(&mut counts.clone(), train_body, k, dict_size);
-        if dict.is_empty() {
-            continue;
-        }
-        // Without a holdout the sweep is a single default-K candidate;
-        // there is nothing to score it against.
-        let score = if test_samples.is_empty() {
-            0
-        } else {
-            evaluate(&dict, &test_samples)
-        };
-        vprintln!("create_dict: k={k} -> {} bytes, eval {score}", dict.len());
-        if best.as_ref().is_none_or(|(s, _)| score < *s) {
-            best = Some((score, dict));
-        }
-    }
-    if let Some((_, dict)) = best {
-        output.write_all(&dict).expect("could not write to output");
-    }
+    output.write_all(&dict).expect("could not write to output");
 }
 
 /// Deterministic Fisher-Yates over sample order (libzstd's `DiB_shuffle`):
@@ -195,7 +272,7 @@ pub fn create_raw_dict_from_samples<W: Write>(samples: &[&[u8]], output: &mut W,
 fn shuffle<T>(items: &mut [T]) {
     let mut seed: u32 = 0xfd2fb528;
     for i in (1..items.len()).rev() {
-        seed = seed.wrapping_mul(2654435761) ^ 2246822519;
+        seed = seed.wrapping_mul(2654435761) ^ 0x85eb_ca77;
         seed = seed.rotate_left(13);
         let j = (seed >> 5) as usize % (i + 1);
         items.swap(j, i);
@@ -252,7 +329,7 @@ fn build_dict(table: &mut KMerTable, train_body: &[u8], k: usize, dict_size: usi
 /// dictionary — the sweep's selection metric, evaluated at the zstd default
 /// level like libzstd's trainer. Callers without a holdout skip the sweep.
 fn evaluate(dict: &[u8], test_samples: &[&[u8]]) -> usize {
-    debug_assert!(!test_samples.is_empty());
+    debug_assert_ne!(test_samples.len(), 0);
     let mut options = EncoderOptions::new(Level::from_zstd(3));
     options.checksum = false;
     options.dictionary = Some(dict.to_vec());
@@ -350,6 +427,50 @@ fn trained_dict_roundtrips_through_both_decoders() {
     assert_eq!(ours, payload);
 
     // libzstd treats magic-less dictionaries as content history too.
+    let mut reference = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+    let libzstd = reference.decompress(&frame, payload.len()).unwrap();
+    assert_eq!(libzstd, payload);
+}
+
+#[cfg(feature = "hash")]
+#[test]
+fn formatted_dict_interops_both_ways() {
+    use std::vec::Vec;
+
+    // Train + finalize on shared-boilerplate samples; compress an unseen
+    // sample of the same family with our encoder and the formatted dict,
+    // and require libzstd to decode it (and vice versa for decoding a
+    // libzstd-made frame we cannot produce here, the reverse direction is
+    // covered by the raw-dict test above plus the CLI gates in bench).
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for i in 0..24u8 {
+        let mut sample = Vec::new();
+        sample.extend_from_slice(b"[Unit]\nDescription=formatted dict boilerplate\n");
+        for j in 0..48 {
+            sample.push(b'a' + (i % 16) + (j % 5));
+        }
+        sample.extend_from_slice(b"[Install]\nWantedBy=multi-user.target\n");
+        samples.push(sample);
+    }
+    let payload = samples.pop().unwrap();
+    let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+    let mut dict = Vec::new();
+    create_formatted_dict_from_samples(&refs, &mut dict, 2048);
+    assert!(!dict.is_empty());
+
+    let options = EncoderOptions::new(Level::from_zstd(9)).dictionary(&dict);
+    let frame = crate::bulk::compress_with(&payload, &options).unwrap();
+
+    // Our decoder applies the formatted dictionary's tables and content.
+    let ours = crate::bulk::decompress_with(
+        &frame,
+        payload.len(),
+        &crate::DecoderOptions::new().dictionary(&dict),
+    )
+    .unwrap();
+    assert_eq!(ours, payload);
+
+    // libzstd decodes a frame made with our finalized dictionary.
     let mut reference = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
     let libzstd = reference.decompress(&frame, payload.len()).unwrap();
     assert_eq!(libzstd, payload);

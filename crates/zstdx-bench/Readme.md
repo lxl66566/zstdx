@@ -219,11 +219,14 @@ strips (`--shape random,text,json` defaults; `--level` selects strategies).
 
 ### `train` — dictionary trainer tooling
 
-Trains a raw-content dictionary with the in-tree trainer from files or
-directories (`--size` caps the output), or dumps the content section of a
-formatted dict (`--content-of <dict>`) so content selection and
-entropy-table seeding can be A/B'd in isolation against `zstd --train`.
+Trains a dictionary with the in-tree trainer from files or directories
+(`--size` caps the output): raw content by default, or a formatted
+dictionary with entropy tables (`--formatted`, the `zstd --train` shape —
+accepted by libzstd verbatim). `--content-of <dict>` dumps the content
+section of a formatted dict so content selection and entropy-table
+seeding can be A/B'd in isolation against `zstd --train`.
 
 ```bash
 cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384
+cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384 --formatted
 ```

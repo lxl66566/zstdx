@@ -139,60 +139,70 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     #[cfg(any(test, feature = "fuzz_exports"))]
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub(super) fn weights(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.table.codes.len());
-        self.write_weights_into(&mut out);
-        out
-    }
-
-    /// [`Self::weights`] into a recycled buffer.
-    fn write_weights_into(&self, out: &mut Vec<u8>) {
-        out.clear();
-        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        out.extend(self.table.codes.iter().copied().map(|(_, nb)| {
-            if nb == 0 {
-                0
-            } else {
-                max - nb + 1
-            }
-        }));
+        self.table.wire_weights()
     }
 
     fn write_table_with(&mut self, fse: &mut fse_encoder::FseBuildScratch, huff: &mut HuffScratch) {
+        self.table.write_description(self.writer, fse, huff);
+    }
+}
+
+impl HuffmanTable {
+    /// This table's wire weights (0 = absent symbol, 1 = longest code):
+    /// the serialized form of the code lengths.
+    pub(crate) fn wire_weights(&self) -> Vec<u8> {
+        let max = self.codes.iter().map(|(_, nb)| nb).max().unwrap();
+        self.codes.iter().map(|&(_, nb)| if nb == 0 { 0 } else { max - nb + 1 }).collect()
+    }
+
+    /// Serialize the table description exactly as a compressed literals
+    /// section (or a formatted dictionary header) carries it: FSE-coded
+    /// weights for large alphabets, direct 4-bit weights otherwise. Ends
+    /// byte-aligned.
+    pub(crate) fn write_description<V: AsMut<Vec<u8>>>(
+        &self,
+        writer: &mut BitWriter<V>,
+        fse: &mut fse_encoder::FseBuildScratch,
+        huff: &mut HuffScratch,
+    ) {
         // TODO strategy for determining this?
-        self.write_weights_into(&mut huff.wire_weights);
+        huff.wire_weights.clear();
+        huff.wire_weights.extend(self.wire_weights());
         let weights = &huff.wire_weights[..huff.wire_weights.len() - 1]; // dont encode last weight
         if weights.len() > 16 {
-            let size_idx = self.writer.index();
-            self.writer.write_bits(0u8, 8);
-            let idx_before = self.writer.index();
+            let size_idx = writer.index();
+            writer.write_bits(0u8, 8);
+            let idx_before = writer.index();
             let table =
                 fse_encoder::build_table_from_data_into(weights.iter().copied(), 6, true, fse);
-            let mut encoder = FSEEncoder::new(table, self.writer);
+            let mut encoder = FSEEncoder::new(table, writer);
             encoder.encode_interleaved(weights);
             encoder.finish(fse);
-            let encoded_len = (self.writer.index() - idx_before) / 8;
+            let encoded_len = (writer.index() - idx_before) / 8;
             assert!(encoded_len < 128);
-            self.writer.change_bits(size_idx, encoded_len as u8, 8);
+            writer.change_bits(size_idx, encoded_len as u8, 8);
         } else {
-            self.writer.write_bits(weights.len() as u8 + 127, 8);
+            writer.write_bits(weights.len() as u8 + 127, 8);
             let (pairs, remainder) = weights.as_chunks::<2>();
             for pair in pairs {
                 let weight1 = pair[0];
                 let weight2 = pair[1];
                 assert!(weight1 < 16);
                 assert!(weight2 < 16);
-                self.writer.write_bits(weight2, 4);
-                self.writer.write_bits(weight1, 4);
+                writer.write_bits(weight2, 4);
+                writer.write_bits(weight1, 4);
             }
             if !remainder.is_empty() {
                 let weight = remainder[0];
                 assert!(weight < 16);
-                self.writer.write_bits(weight << 4, 8);
+                writer.write_bits(weight << 4, 8);
             }
         }
     }
 }
+
 
 #[derive(Clone)]
 pub struct HuffmanTable {

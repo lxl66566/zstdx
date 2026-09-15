@@ -30,20 +30,26 @@ pub(crate) struct EncDictionary {
 }
 
 impl EncDictionary {
+    /// A raw-content dictionary: pure match history, no id, no entropy
+    /// tables (libzstd's `ZSTD_dct_rawContent` load).
+    pub(crate) fn raw_content(content: &[u8]) -> Self {
+        Self {
+            id: 0,
+            content: content.to_vec(),
+            rep: [1, 4, 8],
+            huff: None,
+            ll: None,
+            ml: None,
+            of: None,
+        }
+    }
+
     /// Parse a dictionary: formatted (as produced by `zstd --train`) or raw
     /// content (as produced by the in-tree trainer), which loads as pure
     /// match history with the format-default repcodes.
     pub(crate) fn parse(raw: &[u8]) -> Result<Self, Error> {
         if raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
-            return Ok(Self {
-                id: 0,
-                content: raw.to_vec(),
-                rep: [1, 4, 8],
-                huff: None,
-                ll: None,
-                ml: None,
-                of: None,
-            });
+            return Ok(Self::raw_content(raw));
         }
         let dict = Dictionary::decode_dict(raw)?;
         // libzstd's load check: a repcode must be 0 (unused) or point into
