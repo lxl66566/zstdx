@@ -521,6 +521,8 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
             },
         ));
     }
+    #[cfg(feature = "seq_dump")]
+    super::seq_dump::record_exec(pos as u64, seq.ml, offset as u64);
     if ml > 0 {
         // Source inside the active segment: virtual distances are physical
         // distances there, so the source sits exactly `offset` bytes behind

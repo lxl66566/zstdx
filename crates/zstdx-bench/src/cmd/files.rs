@@ -24,6 +24,10 @@ pub struct Args {
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
+    /// Also time our MT decoder at these worker counts (zstd has no MT
+    /// decode counterpart)
+    #[arg(long, value_delimiter = ',')]
+    pub threads: Vec<u32>,
 }
 
 /// decode_all_to_vec never grows the vector; retry with geometric growth.
@@ -93,5 +97,22 @@ pub fn run(args: &Args) {
             stats.mibs(reference.len() as u64),
             reference.len() as f64 / (1024.0 * 1024.0) / stats.max,
         );
+        for threads in &args.threads {
+            let stats = measure_solo(|| {
+                zstdx::bulk::decompress_to_buffer_with(
+                    &compressed,
+                    &mut out,
+                    &zstdx::DecoderOptions::new().threads(*threads),
+                )
+                .unwrap();
+                black_box(&out);
+            });
+            assert_eq!(&out[..], &reference[..], "mt decode mismatch");
+            println!(
+                "  mt{threads}: {:.0} MiB/s (med; min {:.0})",
+                stats.mibs(reference.len() as u64),
+                reference.len() as f64 / (1024.0 * 1024.0) / stats.max,
+            );
+        }
     }
 }

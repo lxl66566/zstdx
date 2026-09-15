@@ -20,6 +20,15 @@ This document records the changes made between versions, starting with version 0
   parity through the current serial-B decoder. Full ratio sweep with the
   gate compiled in (env unset): no regression (+8.43% geo-mean vs
   libzstd, worst cell text.best -0.45% as before).
+- Bench tooling for the decode-parallelism work: `emitframe` (one corpus
+  file to a zstdx frame, bulk/stream, st/mt, roundtrip-gated, prints the
+  exact MT job size), `piecepipe` (piece-pipeline critical-path
+  simulation on one frame through a new `seq_dump` executor-truth hook
+  recording every match's absolute position and resolved offset; uniform
+  or bounded-lane schedules at rate 1, depth-guarantee audit), and
+  `files --threads` (MT decode timing on explicit files). The piece
+  cutting uses the encoder's real job grid via the hidden
+  `zstdx::encoding::mt_job_size_for`.
 - Docs: the two open fastest-tier angles (todo 3) are falsified and
   withdrawn — miss-run stepping (and its dense-insert / parse-statistic
   gate variants) wins json on both axes (−3.2% size, +8.8% speed) but

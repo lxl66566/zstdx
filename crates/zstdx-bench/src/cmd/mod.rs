@@ -1,8 +1,10 @@
 pub mod corrupt;
 pub mod dump;
+pub mod emitframe;
 pub mod files;
 pub mod matrix;
 pub mod mtcheck;
+pub mod piecepipe;
 pub mod prefill;
 pub mod prof;
 pub mod ratio;

@@ -44,6 +44,9 @@ enum Command {
     /// byte (`cmp -r`); the regression gate for optimizations that must not
     /// change the encoder's output.
     Dump(cmd::dump::Args),
+    /// Emit one corpus file as a zstdx frame (bulk/stream, st/mt) for the
+    /// downstream analysis tools.
+    Emitframe(cmd::emitframe::Args),
     /// Random-corruption smoke test: flipped bytes must error, never panic.
     Corrupt(cmd::corrupt::Args),
     /// Multithreaded decode validation: every file in a directory decoded
@@ -52,6 +55,9 @@ enum Command {
     /// Sequence statistics and entropy lower bound of our matcher on one
     /// corpus file.
     Seqstats(cmd::seqstats::Args),
+    /// Piece-pipeline critical-path analysis for parallel stage-B
+    /// execution on one frame (seq_dump decode hook).
+    Piecepipe(cmd::piecepipe::Args),
     /// Micro-benchmark of the matcher's `prefill_window` per strategy.
     Prefill(cmd::prefill::Args),
     /// Train a raw-content dictionary with the in-tree trainer, or extract
@@ -67,9 +73,11 @@ fn main() {
         Command::Files(args) => cmd::files::run(&args),
         Command::Prof(args) => cmd::prof::run(&args),
         Command::Dump(args) => cmd::dump::run(&args),
+        Command::Emitframe(args) => cmd::emitframe::run(&args),
         Command::Corrupt(args) => cmd::corrupt::run(&args),
         Command::Mtcheck(args) => cmd::mtcheck::run(&args),
         Command::Seqstats(args) => cmd::seqstats::run(&args),
+        Command::Piecepipe(args) => cmd::piecepipe::run(&args),
         Command::Prefill(args) => cmd::prefill::run(&args),
         Command::Train(args) => cmd::train::run(&args),
     }

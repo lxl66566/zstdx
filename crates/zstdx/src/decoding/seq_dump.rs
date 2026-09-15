@@ -15,6 +15,13 @@ pub struct DumpedSeq {
     pub of: u32,
 }
 
+// Ground-truth match execution on the flat path: (match_pos, ml, offset)
+// per executed sequence. Cross-checks the wire-dump resolution in the
+// analysis tools.
+std::thread_local! {
+    static EXEC: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
 std::thread_local! {
     static LOG: RefCell<Vec<DumpedSeq>> = const { RefCell::new(Vec::new()) };
 }
@@ -24,7 +31,18 @@ pub(crate) fn record(ll: u32, ml: u32, of: u32) {
     LOG.with_borrow_mut(|log| log.push(DumpedSeq { ll, ml, of }));
 }
 
+/// Record hook called once per executed match on the flat decode path.
+#[cfg(feature = "seq_dump")]
+pub(crate) fn record_exec(match_pos: u64, ml: u32, offset: u64) {
+    EXEC.with_borrow_mut(|e| e.push((match_pos, ml, offset)));
+}
+
 /// Take the recorded sequences, clearing the log.
 pub fn take() -> Vec<DumpedSeq> {
     LOG.with_borrow_mut(std::mem::take)
+}
+
+/// Take the recorded executed matches, clearing the log.
+pub fn take_exec() -> Vec<(u64, u32, u64)> {
+    EXEC.with_borrow_mut(std::mem::take)
 }

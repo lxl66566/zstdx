@@ -91,10 +91,40 @@ cargo run --release -p zstdx-bench -- small --size 4096
 
 Decodes given `.zst` files with a time budget; verifies against the raw
 counterpart found next to the file (both `z000033.zst` and `json.zst3`
-naming conventions).
+naming conventions). `--threads 4,8,16` additionally times our MT decoder
+at those worker counts (zstd has no MT decode counterpart).
 
 ```bash
 cargo run --release -p zstdx-bench -- files bench/corpus/*.zst3
+cargo run --release -p zstdx-bench -- files --threads 4,8,16 frames/*.zst3
+```
+
+### `emitframe` — emit one corpus file as a zstdx frame
+
+Encodes one raw file to a frame (bulk/stream, st/mt, any level) for the
+downstream analysis tools, with an in-process roundtrip gate. Prints the
+encoder's exact MT job size (`job_size N`) — `piecepipe` must be given the
+same value. `ZSTDX_MT_RAMP_BYTES=<D>` arms the deep-offset ramp at job
+starts (see `match_generator::RampGate`).
+
+```bash
+ZSTDX_MT_RAMP_BYTES=2097152 cargo run --release -p zstdx-bench -- emitframe bench/corpus/json.raw /tmp/json.zst3 --level 3 --workers 4
+```
+
+### `piecepipe` — piece-pipeline critical-path analysis
+
+Simulates parallel stage-B execution on one frame: decodes it through the
+`seq_dump` executor hook (every match's absolute position and resolved
+offset, exactly as executed), cuts the output into pieces at `--job-size`
+boundaries, and schedules the pieces under exact per-byte source
+dependencies at rate 1 — the unlimited-worker wall is the critical path,
+so serial/piece wall upper-bounds what piece-parallel stage B could win.
+`--depth D` audits an encoder-side depth guarantee (crossing reads
+shallower than D below a piece start). Needs `--features seq_dump`; cut
+pieces at the real encode job boundaries (`emitframe`'s `job_size` line).
+
+```bash
+cargo run --release -p zstdx-bench --features seq_dump -- piecepipe /tmp/json.zst3 --job-size 4194316 --depth 2097152
 ```
 
 ### `prof` — solo profiling loops
