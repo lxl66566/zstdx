@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 use super::{
     SeqWord,
+    ldm::LdmSeq,
     match_generator::{HASH_READ, push_seq_packed},
     seq_codes::{encode_literal_length, encode_match_len},
 };
@@ -77,6 +78,74 @@ fn new_rep(rep: &[u32; 3], off_base: u32, ll0: bool) -> [u32; 3] {
 pub(crate) struct Match {
     pub(crate) off: u32,
     pub(crate) len: u32,
+}
+
+/// Cursor over this block's long-distance candidates ([`super::ldm`]), the
+/// port of libzstd's `ZSTD_optLdm_t`: one active candidate span at a time.
+/// A collection position inside the span is offered the remaining length —
+/// generation verified the span against the offset-shifted source, and
+/// contiguity carries that agreement to any interior position. Collection
+/// positions ascend monotonically across the block (series start at the end
+/// of the previous series' path), so one cursor serves both call sites of
+/// [`Finder::get_all_matches`].
+struct LdmCursor<'a> {
+    seqs: &'a [LdmSeq],
+    next: usize,
+    /// (offset, span end) of the candidate the parse may currently be
+    /// inside; `None` between spans.
+    active: Option<(u32, u64)>,
+}
+
+impl<'a> LdmCursor<'a> {
+    fn new(seqs: &'a [LdmSeq]) -> Self {
+        LdmCursor {
+            seqs,
+            next: 0,
+            active: None,
+        }
+    }
+
+    /// Advance to `pos` and, when an active span covers it, append the
+    /// remaining length as a candidate (`ZSTD_optLdm_maybeAddMatch`: kept
+    /// only when strictly longer than the longest collected match, keeping
+    /// the matches array strictly increasing). Returns whether an appended
+    /// candidate out-lengthed the tree's own best — the quiet latch's "won"
+    /// signal, the chain-side `ldm_won` semantics (an injection-time flag,
+    /// not an emission flag).
+    #[inline]
+    fn add(&mut self, matches: &mut [Match], nb: &mut usize, pos: u64, min_match: u32) -> bool {
+        let seqs = self.seqs;
+        if seqs.is_empty() {
+            return false;
+        }
+        if self.active.is_some_and(|(_, end)| pos >= end) {
+            self.active = None;
+        }
+        while self.active.is_none() && self.next < seqs.len() {
+            let s = seqs[self.next];
+            if s.split > pos {
+                break;
+            }
+            self.next += 1;
+            let end = s.split + s.len as u64;
+            if pos < end {
+                self.active = Some((s.offset, end));
+            }
+        }
+        let Some(&(off, end)) = self.active.as_ref() else {
+            return false;
+        };
+        let len = (end - pos) as u32;
+        if len < min_match || *nb >= OPT_NUM {
+            return false;
+        }
+        if *nb != 0 && len <= matches[*nb - 1].len {
+            return false;
+        }
+        matches[*nb] = Match { off: off + 3, len };
+        *nb += 1;
+        true
+    }
 }
 
 /// One DP entry: the stretch ending at this relative position — `mlen` bytes
@@ -724,6 +793,11 @@ impl Finder<'_, '_> {
 
 /// One full block parse. Sequences append to `literals`/`seqs` exactly like
 /// the other strategies; `rep` and `rep_pending` follow the emitted stream.
+/// `ldm_seqs` are this block's long-distance candidates (empty when LDM is
+/// not armed); the ultra seeding parse consumes the same set — its spans are
+/// absolute, so a job-boundary seed (whose span precedes the block) simply
+/// never reaches them. Returns whether any LDM candidate out-lengthed the
+/// tree's best (the quiet latch's "won" signal).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_block<const ULTRA: bool>(
     knobs: &OptKnobs,
@@ -732,6 +806,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     block_start: u64,
     block_end: u64,
     max_window: u64,
+    ldm_seqs: &[LdmSeq],
     epoch: &mut u64,
     table: &mut [u64],
     bt: &mut [u64],
@@ -743,7 +818,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     rep_pending: &mut u8,
     literals: &mut Vec<u8>,
     seqs: &mut Vec<SeqWord>,
-) {
+) -> bool {
     let block_len = (block_end - block_start) as usize;
     // btultra2: seed statistics with a throwaway parse before the first real
     // parse of a fresh state (`ZSTD_initStats_ultra`). At the frame start the
@@ -785,6 +860,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
                 seed_start,
                 seed_end,
                 max_window,
+                ldm_seqs,
                 *epoch,
                 table,
                 bt,
@@ -829,6 +905,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         block_start,
         block_end,
         max_window,
+        ldm_seqs,
         *epoch,
         table,
         bt,
@@ -840,7 +917,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         rep_pending,
         literals,
         seqs,
-    );
+    )
 }
 
 /// The caller guarantees the tables match the knobs' logs, the window covers
@@ -856,6 +933,7 @@ fn run_once<const ULTRA: bool>(
     block_start: u64,
     block_end: u64,
     max_window: u64,
+    ldm_seqs: &[LdmSeq],
     epoch: u64,
     table: &mut [u64],
     bt: &mut [u64],
@@ -867,7 +945,7 @@ fn run_once<const ULTRA: bool>(
     rep_pending: &mut u8,
     literals: &mut Vec<u8>,
     seqs: &mut Vec<SeqWord>,
-) {
+) -> bool {
     let block_end_idx = (block_end - win_base) as usize;
     let ilimit_idx = block_end_idx.saturating_sub(8);
     state.rescale_freqs::<ULTRA>(&win[(block_start - win_base) as usize..block_end_idx]);
@@ -903,6 +981,8 @@ fn run_once<const ULTRA: bool>(
     let matches = &mut scratch.matches[..];
     let sufficient_len = knobs.sufficient_len as usize;
     let min_match = knobs.min_match as usize;
+    let mut ldm = LdmCursor::new(ldm_seqs);
+    let mut ldm_won = false;
 
     // The outer loop runs one DP series per match group; `pos` jumps to the
     // end of every emitted sequence.
@@ -911,7 +991,7 @@ fn run_once<const ULTRA: bool>(
         let litlen = (pos - anchor) as u32;
         let ll0 = (litlen == 0) as u32;
         // idx + HASH_READ stays inside the block by the loop guard.
-        let nb = if pos < *finder.next_update {
+        let mut nb = if pos < *finder.next_update {
             0 // Skipped area (interior of a long match).
         } else {
             finder.update_tree(idx);
@@ -925,6 +1005,7 @@ fn run_once<const ULTRA: bool>(
                 *rep_pending != 0,
             )
         };
+        ldm_won |= ldm.add(matches, &mut nb, pos, knobs.min_match);
         if nb == 0 {
             pos += 1;
             continue;
@@ -1046,7 +1127,7 @@ fn run_once<const ULTRA: bool>(
                 let base_price = opt[cur].price + state.lit_length_price::<ULTRA>(0);
                 // idx_cur <= ilimit_idx keeps the search 8 bytes inside the
                 // block end.
-                let nb2 = if pos + (cur as u64) < *finder.next_update {
+                let mut nb2 = if pos + (cur as u64) < *finder.next_update {
                     0
                 } else {
                     finder.update_tree(idx_cur);
@@ -1060,6 +1141,7 @@ fn run_once<const ULTRA: bool>(
                         *rep_pending != 0,
                     )
                 };
+                ldm_won |= ldm.add(matches, &mut nb2, pos + cur as u64, knobs.min_match);
                 if nb2 == 0 {
                     cur += 1;
                     continue;
@@ -1188,6 +1270,7 @@ fn run_once<const ULTRA: bool>(
         let tail = (anchor - win_base) as usize..block_end_idx;
         literals.extend_from_slice(&win[tail]);
     }
+    ldm_won
 }
 
 #[cfg(test)]

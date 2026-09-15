@@ -305,7 +305,11 @@ impl MtEncoderCore {
             window_log: options.input_shape.window_log,
         };
         let window = MatchGeneratorDriver::window_for_level(options.level, shape);
-        let overlap = window as usize;
+        // The job history rides the level's stream overlap rule (see
+        // `stream_overlap_for`): the whole window where cross-job history
+        // carries a far class, the search domain where the LDM restarts
+        // per job like the bulk path.
+        let overlap = MatchGeneratorDriver::stream_overlap_for(options.level, shape) as usize;
         // A pledge sizes the grid like the bulk path (byte-identical output
         // when the input matches the pledge); an open-ended stream grows
         // its jobs along the stream (see JobGrid).

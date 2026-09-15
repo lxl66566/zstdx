@@ -451,6 +451,21 @@ enum LdmFill {
     Skipped,
 }
 
+/// Strided distinct-byte count over `win[start..end]`, the incompressibility
+/// gate's sampling idiom: ~2048 samples read a 128-symbol alphabet to ~100,
+/// a 256-symbol one to ~247 — both margins around [`LDM_SYMS_MIN`] are wide.
+fn sampled_distinct(win: &[u8], start: usize, end: usize) -> u32 {
+    let stride = ((end - start) >> 11) | 1;
+    let mut bitmap = [0u64; 4];
+    let mut i = start;
+    while i < end {
+        let b = win[i] as usize;
+        bitmap[b >> 6] |= 1 << (b & 63);
+        i += stride;
+    }
+    bitmap.iter().map(|w| w.count_ones()).sum()
+}
+
 /// Where a driver's LDM history domain ends, deciding the size gate's bar
 /// (see [`ldm_min_window`]). Set before `reset`; pooled drivers re-derive
 /// their arming on every reset.
@@ -570,16 +585,31 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     btlazy(22, 1 << 22, bt_knobs(4, 22)),
     btlazy(23, 1 << 22, bt_knobs(5, 22)),
     btlazy(23, 1 << 22, bt_knobs(6, 23)),
-    // 16: libzstd's btopt rows begin.
-    opt(22, 1 << 22, knobs(5, 48, 4, 22, false)),
+    // 16: libzstd's btopt rows begin. The opt family keeps a wide frame
+    // window (W26, the LDM far reach — C's --long shape) with the tree's
+    // search domain at the stock row window via `chain_reach`; LDM carries
+    // the distance classes beyond the domain.
+    with_ldm(with_chain_reach(
+        opt(22, 1 << 26, knobs(5, 48, 4, 22, false)),
+        1 << 22,
+    )),
     // 17: the Opt tier; libzstd's L17 row with the ring capped one below
     // its C23 (shorter candidate walks: json −18% time for +0.16% dll).
-    opt(22, 1 << 23, knobs(5, 64, 4, 22, false)),
+    with_ldm(with_chain_reach(
+        opt(22, 1 << 26, knobs(5, 64, 4, 22, false)),
+        1 << 23,
+    )),
     // 18: btultra: fractional-bit prices, mls 3 (hash3 at H17).
-    opt(22, 1 << 23, knobs(6, 64, 3, 23, true)),
+    with_ldm(with_chain_reach(
+        opt(22, 1 << 26, knobs(6, 64, 3, 23, true)),
+        1 << 23,
+    )),
     // 19: the Ultra tier. libzstd's C24 ring is byte-identical to C23
     // here (proven), so the ring stays 23.
-    opt(22, 1 << 23, knobs(7, 256, 3, 23, true)),
+    with_ldm(with_chain_reach(
+        opt(22, 1 << 26, knobs(7, 256, 3, 23, true)),
+        1 << 23,
+    )),
     // 20-22: libzstd widens to W25-27 with C25-27/H23-25. Our u64-tagged
     // opt tables would cost 2-8x libzstd's u32 memory there, so the ring
     // caps at 24 and the hash stays at 22 (H23 measured 0.06-0.13% sparser
@@ -1497,12 +1527,29 @@ impl MatchGeneratorDriver {
         p.chain_reach.unwrap_or(p.window) as u64
     }
 
+    /// The streaming-MT job's history strip: the level's whole window for
+    /// the chain rows (their LDM far class rides cross-job through the
+    /// adopted window), the search domain for the opt rows (their LDM
+    /// restarts per job exactly like the bulk path, so a full-window job
+    /// floor would only serialize sub-window streams without buying
+    /// reach).
+    pub fn stream_overlap_for(level: Level, shape: InputShape) -> u64 {
+        let p = params_for(level, shape);
+        match p.strategy {
+            Strategy::Opt(_) => p.chain_reach.unwrap_or(p.window) as u64,
+            _ => p.window as u64,
+        }
+    }
+
     /// Whether the shape-adaptive reach probe (see [`super::reach_probe`])
-    /// may decide this frame's reach: only the Balanced row with its stock
-    /// reach still in place — a shape-clamped reach means the window itself
-    /// is small, with nothing left to trade away.
+    /// may decide this frame's reach: only the Balanced chain row with its
+    /// stock reach still in place — the opt rows share the `chain_reach`
+    /// field (their tree search domain) without being probe subjects, and a
+    /// shape-clamped reach means the window itself is small, with nothing
+    /// left to trade away.
     pub fn reach_probe_eligible(level: Level, shape: InputShape) -> bool {
-        params_for(level, shape).chain_reach == Some(KEEP_REACH)
+        let p = params_for(level, shape);
+        matches!(p.strategy, Strategy::Chain(_)) && p.chain_reach == Some(KEEP_REACH)
     }
 
     /// [`Self::strip_for_level`] under the frame's reach probe result: a
@@ -1727,7 +1774,7 @@ impl MatchGeneratorDriver {
         // shrunk parse matches that measurement exactly.
         let ldm_wanted = params.ldm
             && params.chain_reach != Some(SHRINK_REACH)
-            && matches!(params.strategy, Strategy::Chain(_))
+            && matches!(params.strategy, Strategy::Chain(_) | Strategy::Opt(_))
             && ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar);
         let ldm_sized = self
             .ldm
@@ -1877,12 +1924,19 @@ impl MatchGeneratorDriver {
         // LDM job boundary: entries from earlier jobs must not shape this
         // one's output (pooled matchers), and the strip is the job's
         // candidate history — same content the grid fill indexes below.
+        // The opt rows sample the strip's alphabet first: the fill is an
+        // unconditional split pass, and a low-alphabet strip (json-class
+        // source above the full-window bar) never yields a paying far
+        // class (the frame-start alphabet gate's rule, applied to the
+        // job's own history). The chain row keeps its frozen ungated flow.
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
             self.ldm_quiet = 0;
             self.ldm_dead = false;
             self.ldm_canary = 0;
-            if data.len() >= super::ldm::MIN_MATCH_LENGTH {
+            let gated = matches!(self.params.strategy, Strategy::Opt(_))
+                && sampled_distinct(data, 0, data.len()) < LDM_SYMS_MIN;
+            if data.len() >= super::ldm::MIN_MATCH_LENGTH && !gated {
                 ldm.fill(data, base, base, base + data.len() as u64);
             }
         }
@@ -2323,7 +2377,11 @@ impl Matcher for MatchGeneratorDriver {
                     self.start_matching_chain::<false>(literals, seqs);
                 }
             },
-            Strategy::Opt(knobs) => self.start_matching_opt(knobs, literals, seqs),
+            Strategy::Opt(knobs) => {
+                self.ldm_alphabet_gate();
+                self.ldm_generate();
+                self.start_matching_opt(knobs, literals, seqs)
+            },
             Strategy::BtLazy(knobs) => self.start_matching_btlazy(knobs, literals, seqs),
         }
     }
@@ -2524,7 +2582,15 @@ impl MatchGeneratorDriver {
     /// fill unconditionally (its bytes are frozen).
     fn ldm_fill_block(&mut self, why: LdmFill) {
         self.ldm_alphabet_gate();
-        if why == LdmFill::Skipped && self.params.window < LDM_FULL_WINDOW {
+        // Skipped blocks stop filling except for the chain row's full-window
+        // population, whose bytes are frozen. The opt rows have no frozen
+        // population, so they exempt Skipped blocks at every window: the
+        // latch cannot fire through them either way (no scan runs), and
+        // max-entropy or uniform windows carry no far class.
+        if why == LdmFill::Skipped
+            && !(matches!(self.params.strategy, Strategy::Chain(_))
+                && self.params.window >= LDM_FULL_WINDOW)
+        {
             return;
         }
         if let Some(ldm) = &mut self.ldm {
@@ -2536,35 +2602,49 @@ impl MatchGeneratorDriver {
     /// The mid-size population's alphabet gate ([`LDM_SYMS_MIN`]): run
     /// once per frame at the first block that reaches LDM, before any of
     /// its own indexing — a poor alphabet disarms outright, bounding the
-    /// split-pass tax at the head span already filled.
+    /// split-pass tax at the head span already filled. The chain row's
+    /// full-window population is the one exception (its bytes are frozen,
+    /// so the gate stays skipped there); the opt rows gate at every window.
     fn ldm_alphabet_gate(&mut self) {
-        if self.ldm_checked || self.ldm.is_none() || self.params.window >= LDM_FULL_WINDOW {
+        let chain_frozen = matches!(self.params.strategy, Strategy::Chain(_))
+            && self.params.window >= LDM_FULL_WINDOW;
+        if self.ldm_checked || self.ldm.is_none() || chain_frozen {
             return;
         }
         self.ldm_checked = true;
         let win = window_slice(&self.win, self.ext.as_ref());
         let start = (self.block_start - self.win_base) as usize;
         let end = (self.block_end - self.win_base) as usize;
-        // Strided sampling, the incompressibility gate's idiom: ~2048
-        // samples read a 128-symbol alphabet to ~100, a 256-symbol one to
-        // ~247 — both margins around the bar are wide.
-        let stride = ((end - start) >> 11) | 1;
-        let mut bitmap = [0u64; 4];
-        let mut i = start;
-        while i < end {
-            let b = win[i] as usize;
-            bitmap[b >> 6] |= 1 << (b & 63);
-            i += stride;
-        }
-        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
-        if distinct < LDM_SYMS_MIN {
+        if sampled_distinct(win, start, end) < LDM_SYMS_MIN {
             self.ldm = None;
             self.ldm_seqs.clear();
         }
     }
 
+    /// Post-block latch bookkeeping, shared by the consumers (the chain
+    /// scan's `ldm_won`, the optimal parser's out-length signal): a block
+    /// whose LDM candidate won resets the quiet counter; a winless block
+    /// past the far-history horizon counts quiet, and [`LDM_QUIET`]
+    /// consecutive quiet blocks latch the generator off. Quiet counts only
+    /// where a beyond-reach twin could exist at all — the frame's first
+    /// `window` bytes have no content far enough back.
+    fn ldm_note_block(&mut self, won: bool) {
+        if self.ldm.is_none() {
+            return;
+        }
+        if won {
+            self.ldm_quiet = 0;
+        } else if self.block_end - self.win_base > self.params.window as u64 {
+            self.ldm_quiet += 1;
+            if self.ldm_quiet >= LDM_QUIET {
+                self.ldm_dead = true;
+            }
+        }
+    }
+
     /// Generate this block's long-distance candidates into
-    /// [`Self::ldm_seqs`] ahead of the chain scan.
+    /// [`Self::ldm_seqs`] ahead of the consuming scan (chain or optimal
+    /// parser).
     #[inline(never)]
     fn ldm_generate(&mut self) {
         self.ldm_seqs.clear();
@@ -2585,11 +2665,11 @@ impl MatchGeneratorDriver {
                 self.pos,
                 self.block_end,
             );
-            // Only offsets beyond the chain's search domain survive:
-            // nearer candidates are the chain's own class (the newest-wins
-            // heads already serve the modal repeat distance), and probing
-            // them measured as pure interference — a far read per split
-            // plus a miss-step clamp on tiled data.
+            // Only offsets beyond the consumer's search domain survive:
+            // nearer candidates are the dense tables' own class (the
+            // newest-wins heads already serve the modal repeat distance),
+            // and probing them measured as pure interference — a far read
+            // per split plus a miss-step clamp on tiled data.
             self.ldm_seqs.retain(|s| s.offset as u64 > reach);
             if self.ldm_dead && !self.ldm_seqs.is_empty() {
                 self.ldm_dead = false;
@@ -3867,17 +3947,7 @@ impl MatchGeneratorDriver {
             emit.literals.extend_from_slice(&win[tail]);
         }
         if LDM {
-            if ldm_won {
-                self.ldm_quiet = 0;
-            } else if block_end - win_base > max_window {
-                // Count quiet only where a beyond-reach twin could exist
-                // at all: the frame's first `reach` bytes have no content
-                // far enough back.
-                self.ldm_quiet += 1;
-                if self.ldm_quiet >= LDM_QUIET {
-                    self.ldm_dead = true;
-                }
-            }
+            self.ldm_note_block(ldm_won);
         }
         self.pos = block_end;
         self.anchor = block_end;
@@ -3891,7 +3961,9 @@ impl MatchGeneratorDriver {
 
     /// Bridge into the optimal parser (levels Opt/Ultra): hands over
     /// the window, the epoch-tagged tables and the persistent price state,
-    /// then stores back the cursors the parser advanced.
+    /// then stores back the cursors the parser advanced. The tree's search
+    /// domain is the `chain_reach` override (the stock row window; the
+    /// frame window may sit wider for LDM's far classes).
     fn start_matching_opt(
         &mut self,
         knobs: OptKnobs,
@@ -3902,7 +3974,8 @@ impl MatchGeneratorDriver {
         let win_base = self.win_base;
         let block_start = self.block_start;
         let block_end = self.block_end;
-        let max_window = self.params.window as u64;
+        let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        let ldm_seqs: &[LdmSeq] = &self.ldm_seqs[..];
         let mut epoch = self.epoch;
         let mut next_update = self.next_update;
         let mut rep = self.rep;
@@ -3911,7 +3984,7 @@ impl MatchGeneratorDriver {
             unreachable!("opt scratch allocated by apply_level")
         };
         // Disjoint field borrows: the window (win/ext) against the tables.
-        if knobs.ultra {
+        let ldm_won = if knobs.ultra {
             super::opt::run_block::<true>(
                 &knobs,
                 win,
@@ -3919,6 +3992,7 @@ impl MatchGeneratorDriver {
                 block_start,
                 block_end,
                 max_window,
+                ldm_seqs,
                 &mut epoch,
                 &mut self.opt_table,
                 &mut self.bt,
@@ -3930,7 +4004,7 @@ impl MatchGeneratorDriver {
                 &mut rep_pending,
                 literals,
                 seqs,
-            );
+            )
         } else {
             super::opt::run_block::<false>(
                 &knobs,
@@ -3939,6 +4013,7 @@ impl MatchGeneratorDriver {
                 block_start,
                 block_end,
                 max_window,
+                ldm_seqs,
                 &mut epoch,
                 &mut self.opt_table,
                 &mut self.bt,
@@ -3950,14 +4025,15 @@ impl MatchGeneratorDriver {
                 &mut rep_pending,
                 literals,
                 seqs,
-            );
-        }
+            )
+        };
         self.epoch = epoch;
         self.next_update = next_update;
         self.rep = rep;
         self.rep_pending = rep_pending;
         self.pos = block_end;
         self.anchor = block_end;
+        self.ldm_note_block(ldm_won);
     }
 
     /// Whether the cold-start DUBT head applies to this frame: the row
@@ -4274,6 +4350,66 @@ mod tests {
             let c = crate::encoding::compress_slice_opts(&raw, crate::Level::Balanced, false);
             let d = crate::bulk::decompress(&c, raw.len()).expect("decode");
             assert_eq!(d, raw, "{name}");
+        }
+    }
+
+    /// Far repeats beyond the tree domain must ride LDM candidates on the
+    /// opt rows too (wide W26 frame window, tree domain at the stock row
+    /// window): the same shape as the balanced test above, at Opt and Ultra,
+    /// with the copies 12 MiB apart — beyond the rows' 8 MiB domain.
+    #[test]
+    fn ldm_opt_rows_cover_beyond_tree_domain() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const UNIT: usize = 64 * 1024;
+        let mut data = Vec::with_capacity(14 * 1024 * 1024);
+        for _ in 0..200 {
+            data.extend((0..UNIT).map(|_| (rand() >> 32) as u8));
+        }
+        for i in 0..16 {
+            let unit: Vec<u8> = data[i * UNIT..(i + 1) * UNIT].to_vec();
+            data.extend_from_slice(&unit);
+        }
+        for level in [crate::Level::Opt, crate::Level::Ultra] {
+            let mut driver = MatchGeneratorDriver::new(128 * 1024);
+            driver.reset(level);
+            let mut rep = [1u32, 4, 8];
+            let mut reconstructed = Vec::new();
+            let mut far = false;
+            for block in data.chunks(128 * 1024) {
+                driver.block_tail()[..block.len()].copy_from_slice(block);
+                driver.commit_block(block.len());
+                driver.start_matching(|seq| match seq {
+                    Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                    Sequence::Triple {
+                        literals,
+                        offset,
+                        match_len,
+                    } => {
+                        reconstructed.extend_from_slice(literals);
+                        if offset > (1 << 23) {
+                            far = true;
+                        }
+                        let actual = crate::decoding::sequence_execution::do_offset_history(
+                            offset as u32,
+                            literals.len() as u32,
+                            &mut rep,
+                        );
+                        let start = reconstructed.len() - actual as usize;
+                        for i in 0..match_len {
+                            let b = reconstructed[start + i];
+                            reconstructed.push(b);
+                        }
+                    },
+                });
+            }
+            assert_eq!(reconstructed, data, "reconstruct {level:?}");
+            assert!(far, "{level:?}: no sequence beyond the tree domain");
         }
     }
 

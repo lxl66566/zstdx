@@ -421,11 +421,15 @@ unsafe fn checksum_mask_avx512(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) 
 }
 
 /// A generated candidate: the split position (where its 64-byte window
-/// starts, the injection point) and the match offset.
+/// starts, the injection point), the match offset, and the forward match
+/// length measured at generation (block-bounded). Consumers that price
+/// candidates mid-span (the optimal parser) use the length as the span's
+/// extent; the lazy strategies re-derive it live against their own anchor.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct LdmSeq {
+pub(crate) struct LdmSeq {
     pub split: u64,
     pub offset: u32,
+    pub len: u32,
 }
 
 /// Bucketed split table plus the rolling hash state. The state is carried
@@ -740,6 +744,7 @@ impl LdmState {
                     out.push(LdmSeq {
                         split,
                         offset: dist as u32,
+                        len: (match_end - split) as u32,
                     });
                     anchor = match_end;
                     if anchor > fed_end {
@@ -800,6 +805,16 @@ mod tests {
                 "candidate at {} offset {} verifies only {}",
                 s.split,
                 s.offset,
+                fwd
+            );
+            // The stored span is the block-bounded forward count; a
+            // re-derivation over the whole buffer can only meet or exceed it.
+            assert!(
+                fwd as u32 >= s.len,
+                "candidate at {} offset {} stores len {} but verifies {}",
+                s.split,
+                s.offset,
+                s.len,
                 fwd
             );
         }
