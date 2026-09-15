@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: raw literals sections use libzstd's size-format ladder
+  (`flSize = 1 + (size>31) + (size>4095)`, mirroring `rle_literals`)
+  instead of always writing the 20-bit form — every raw-literals block
+  with <=4095 literal bytes shrinks by 1-2 B. This was the whole
+  text.Opt/Ultra ratio residue (todo 9): the parse was at parity with
+  libzstd (12 differing sequences of 27k, entropy bound 12 B better)
+  while the tiled/zero tail's ~130 one-match blocks each carried a +2 B
+  header. text opt/ultra bulk-st 82,092->81,832 / 81,333->81,073
+  (zstd -17/-19: 81,844/81,079; tier now -0.011/-0.019% vs the crate
+  ref), text.best -178 B, dll100 opt/ultra -327/-368 B; 120-cell ratio
+  sweep: no cell worse, geo-mean +8.48%; speeds in band (text.opt
+  x0.632, text.ultra x0.716); full-ladder dump roundtrip-gated.
 - Encoder: the opt tier's MT jobs fill only the tail half of their
   history strip through the tree (libzstd zstdmt's btopt overlap parity,
   `ZSTDMT_overlapLog_default` 8; ultra keeps the full strip like

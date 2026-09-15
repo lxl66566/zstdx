@@ -674,10 +674,26 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     }
 }
 
+/// Raw literals (`Literals_Block_Type 0`); the size-format ladder mirrors
+/// libzstd's `ZSTD_noCompressLiterals` (`flSize = 1 + (size>31) + (size>4095)`)
+/// — the smallest form spends a single size-format bit so the 5-bit size
+/// fills out the first header byte.
 fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.write_bits(0u8, 2);
-    writer.write_bits(0b11u8, 2);
-    writer.write_bits(literals.len() as u32, 20);
+    match literals.len() {
+        0..=31 => {
+            writer.write_bits(0u8, 1);
+            writer.write_bits(literals.len() as u32, 5);
+        },
+        32..=4095 => {
+            writer.write_bits(0b01u8, 2);
+            writer.write_bits(literals.len() as u32, 12);
+        },
+        _ => {
+            writer.write_bits(0b11u8, 2);
+            writer.write_bits(literals.len() as u32, 20);
+        },
+    }
     writer.append_bytes(literals);
 }
 
