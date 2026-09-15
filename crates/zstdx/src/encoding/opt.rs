@@ -33,11 +33,14 @@ pub(crate) const OPT_SIZE: usize = OPT_NUM + 3;
 const LITFREQ_ADD: u32 = 2;
 /// Blocks at or below this size price symbols from the predefined tables.
 const PREDEF_THRESHOLD: usize = 8;
-/// Job-boundary seeding span (two blocks): the strip tail parsed as a
+/// Job-boundary seeding span (one block): the strip tail parsed as a
 /// self-contained frame to seed the statistics. Longer spans measured
-/// neutral-to-worse (basin noise); two blocks match the frame-start pass's
-/// adaptation depth.
-const SEED_SPAN: u64 = 2 * crate::common::MAX_BLOCK_SIZE as u64;
+/// neutral-to-worse (basin noise), and one block is the frame-start
+/// pass's own depth (it seeds the first block itself); the block-tiled
+/// shapes make the seed expensive (a 256 KiB isolated span sits below
+/// text's tile period, so its parse runs literal-dense — half the span,
+/// half the seed cost).
+const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
 
 /// Positions occupy the low 47 bits (epoch tags the high 16). Positions
 /// beyond 2^47 cannot be represented — the encoder's absolute stream
@@ -610,9 +613,23 @@ impl Finder<'_, '_> {
         let fill_floor = target_abs.saturating_sub(self.max_window);
         let mut idx =
             ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
+        #[cfg(feature = "job_trace")]
+        let trace = {
+            let from = idx;
+            super::job_trace::fill_start((target_idx - from) as u64).map(|start| {
+                // The opt rows' job fills start mid-window (the tail-half
+                // bound), so the strip/lag split is size-based.
+                let bytes = (target_idx - from) as u64;
+                (start, bytes >= super::job_trace::STRIP_MIN_BYTES, bytes)
+            })
+        };
         while idx < target_idx {
             let forward = self.insert_bt1(idx).max(1);
             idx += forward;
+        }
+        #[cfg(feature = "job_trace")]
+        if let Some((start, at_base, bytes)) = trace {
+            super::job_trace::add_fill(start, at_base, bytes);
         }
         *self.next_update = self.win_base + target_idx as u64;
     }
@@ -624,6 +641,8 @@ impl Finder<'_, '_> {
         let target = self.win_base + idx as u64;
         let mut p = (*cursor).max(self.win_base);
         let mask = self.hash3.len() - 1;
+        #[cfg(feature = "job_trace")]
+        let trace = super::job_trace::fill_start(target - p).map(|start| (start, target - p));
         // SAFETY: p is a live window position; the hash masks to the table.
         unsafe {
             while p < target {
@@ -631,6 +650,10 @@ impl Finder<'_, '_> {
                 *self.hash3.get_unchecked_mut(h) = self.tag | p;
                 p += 1;
             }
+        }
+        #[cfg(feature = "job_trace")]
+        if let Some((start, bytes)) = trace {
+            super::job_trace::add_hash3(start, bytes);
         }
         *cursor = target;
         let h = hash3_at(self.win, idx, self.hash3_log) & mask;
@@ -856,6 +879,8 @@ pub(crate) fn run_block<const ULTRA: bool>(
             } else {
                 seed_start
             };
+            #[cfg(feature = "job_trace")]
+            let trace_seed = std::time::Instant::now();
             run_once::<ULTRA>(
                 knobs,
                 seed_win,
@@ -876,6 +901,8 @@ pub(crate) fn run_block<const ULTRA: bool>(
                 literals,
                 seqs,
             );
+            #[cfg(feature = "job_trace")]
+            super::job_trace::add_seed(trace_seed);
             *rep = saved_rep;
             *rep_pending = saved_pending;
             literals.clear();

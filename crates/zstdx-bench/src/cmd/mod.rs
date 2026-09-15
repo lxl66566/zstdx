@@ -2,6 +2,7 @@ pub mod corrupt;
 pub mod dump;
 pub mod emitframe;
 pub mod files;
+pub mod jobdecomp;
 pub mod matrix;
 pub mod mtcheck;
 pub mod piecepipe;

@@ -132,6 +132,24 @@ pieces at the real encode job boundaries (`emitframe`'s `job_size` line).
 cargo run --release -p zstdx-bench --features seq_dump -- piecepipe /tmp/json.zst3 --job-size 4194316 --depth 2097152
 ```
 
+### `jobdecomp` — per-job cost decomposition (opt/ultra)
+
+Runs one raw file through the bulk-mt / stream-mt / single-threaded
+encoders and reports the `job_trace` spans per component — the strip
+tree-fill (the job history the opt tier re-indexes through its binary
+tree), in-job block-boundary refills, the hash3 strip ingestion, ultra's
+job-boundary seed parse, the per-job state reset and the LDM prefill —
+each against the summed job time (which exceeds the wall clock on the mt
+paths: jobs run in parallel). Component shares, not walls, are the
+verdict; interleaved A/B stays the wall tool. Needs the encoder trace
+hooks (`--features job_trace`; compiled out of timing builds like
+`seq_dump`):
+
+```bash
+cargo run --release -p zstdx-bench --features job_trace -- jobdecomp \
+    bench/corpus/text.raw --level opt,ultra --workers 8 --iters 3
+```
+
 ### `prof` — solo profiling loops
 
 Tight single-side loops for `perf`: no reference side, so samples land in

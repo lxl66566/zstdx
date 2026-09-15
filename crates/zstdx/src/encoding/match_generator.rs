@@ -1668,6 +1668,24 @@ impl MatchGeneratorDriver {
         params_for(level, shape).window as u64
     }
 
+    /// The opt family's tree-filled share of a job strip: libzstd zstdmt's
+    /// default overlap for btopt/btultra is half the window
+    /// (`ZSTDMT_overlapLog_default` 8); btultra2 keeps the whole window
+    /// (9). The strip tree-fill is the tier's largest per-job cost
+    /// (40-73% of summed job time across shapes; see dev/perf), so the
+    /// non-ultra rows' lazy tree fill covers only the tail half of the
+    /// strip while the LDM table (the far class's server on armed frames)
+    /// still ingests the whole strip — the full-strip tree form is
+    /// dll100-gated (see dev/negative). Ultra keeps the full domain —
+    /// the density flagship's row, C's btultra2 parity.
+    fn opt_tree_strip(p: &LevelParams) -> u64 {
+        let reach = p.chain_reach.unwrap_or(p.window) as u64;
+        match p.strategy {
+            Strategy::Opt(knobs) if !knobs.ultra => reach / 2,
+            _ => reach,
+        }
+    }
+
     /// The multithreaded job strip: the dense matchers' search domain.
     /// LDM rows keep a wide frame window (their far reach) but only the
     /// chain's domain needs cross-job strip coverage — within a job the
@@ -2054,6 +2072,24 @@ impl MatchGeneratorDriver {
     /// dfast `chain` buffer is a second probed head table and is cleared.
     /// The opt tables need no clear (their entries carry the epoch, bumped
     /// per job).
+    /// An MT job adopting `data` as its history strip at absolute offset
+    /// `base`: [`Self::prefill_window`]'s full semantics, with the opt
+    /// rows' tree fill bounded to the strip's tail half
+    /// ([`Self::opt_tree_strip`]) — an assignment, not a further min: a
+    /// fresh state's cursor sits at 0 and a pooled one at the previous
+    /// job's end, and both must land on the bound, not under it. The LDM
+    /// block inside `prefill_window` still ingests the whole strip (the
+    /// far class's server on armed frames; the whole-strip-halved form is
+    /// dll100-gated, see dev/negative).
+    pub(crate) fn prefill_job_strip(&mut self, data: &[u8], base: u64) {
+        self.prefill_window(data, base);
+        if matches!(self.params.strategy, Strategy::Opt(_)) {
+            let tree_back = Self::opt_tree_strip(&self.params);
+            let bound = base + (data.len() as u64).saturating_sub(tree_back);
+            self.next_update = self.next_update.max(bound);
+        }
+    }
+
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
         // The head applies only to a genuinely cold start: a non-empty
         // strip (mt jobs with history, dictionary content) is warm, while
@@ -2092,6 +2128,7 @@ impl MatchGeneratorDriver {
         // to the job's own history). The chain row keeps its frozen
         // ungated flow.
         self.strip_parse = true;
+        // (the opt rows' tree-fill bound lives in `prefill_job_strip`)
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
             self.ldm_quiet = 0;

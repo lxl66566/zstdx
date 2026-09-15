@@ -18,6 +18,8 @@ pub(crate) mod seq_codes;
 pub(crate) mod util;
 
 pub(crate) mod frame_compressor;
+#[cfg(feature = "job_trace")]
+pub mod job_trace;
 mod levels;
 use alloc::vec::Vec;
 
