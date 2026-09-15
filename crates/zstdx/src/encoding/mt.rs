@@ -30,7 +30,7 @@ use super::{
         CompressState, compress_job_blocks, reset_slice_state, return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
-    match_generator::MatchGeneratorDriver,
+    match_generator::{LdmArming, MatchGeneratorDriver},
     reach_probe,
 };
 use crate::{Level, common::MAX_BLOCK_SIZE};
@@ -247,7 +247,7 @@ pub(crate) fn run_job_with(
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
-    reset_slice_state(state, level, shape, choice);
+    reset_slice_state(state, level, shape, choice, LdmArming::Job);
     if gate {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -271,7 +271,7 @@ pub(crate) fn run_job(
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level, shape, choice);
+    let mut state = take_slice_state(level, shape, choice, LdmArming::Job);
     let output = run_job_with(
         &mut state,
         src,

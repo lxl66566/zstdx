@@ -419,6 +419,73 @@ const LDM_QUIET: u8 = 16;
 /// the class absent beyond what it scanned.
 const LDM_CANARY: u8 = 8;
 
+/// Smallest source-downsized window that arms LDM under
+/// [`LdmArming::Frame`]: one step under the row's W26, so a 32 MiB source
+/// (clamped to W25) still arms — the dll32-class far classes measured
+/// −19.7% size there — while the quiet latch bounds the discovery cost the
+/// same-size far-less shapes pay.
+const LDM_MIDSIZE_WINDOW: usize = 1 << 25;
+
+/// The [`LdmArming::Job`] bar: the row's full window, meaning the source
+/// clamp left it intact.
+const LDM_FULL_WINDOW: usize = 1 << 26;
+
+/// Sampled distinct-byte count the mid-size population's first parsed
+/// block must show to stay armed: low alphabets (skewed's 16 symbols,
+/// text's ~100 ASCII) produce structural 64-byte repeats whose far twins
+/// never survive the price of their offset — candidates exist and keep
+/// the latch alive, but no sequence ever emits, so the split pass runs at
+/// near-always-on duty (skewed measured −35% solo). Binary content (dll,
+/// 256) clears it by a wide margin. The full-window population skips the
+/// check (its bytes are frozen).
+const LDM_SYMS_MIN: u32 = 128;
+
+/// Why a block the scan will not parse reaches the LDM indexer.
+#[derive(Clone, Copy, PartialEq)]
+enum LdmFill {
+    /// Parsed by the cold-start DUBT head: real content, and the far class
+    /// sources the frame start through it.
+    Head,
+    /// Incompressibility-gated or RLE-skipped: max-entropy or uniform
+    /// bytes whose 64-byte windows hold no twin worth a far offset.
+    Skipped,
+}
+
+/// Where a driver's LDM history domain ends, deciding the size gate's bar
+/// (see [`ldm_min_window`]). Set before `reset`; pooled drivers re-derive
+/// their arming on every reset.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum LdmArming {
+    /// Frame-continuous history (bulk and single-threaded streaming): the
+    /// mid-size bar arms, and the quiet latch bounds the split-pass tax on
+    /// shapes whose far class never shows.
+    #[default]
+    Frame,
+    /// A multithreaded job: the table restarts per job, so only strip- and
+    /// own-span-sourced candidates exist — the strip fill is an
+    /// unconditional per-job split pass that far-less shapes pay in full,
+    /// so the bar stays at the unclamped row window and mid-size frames
+    /// keep the pure chain parse in MT (deterministic: the bar depends on
+    /// the frame's shape alone, never the worker assignment).
+    Job,
+    /// The reach probe's parses: the keep parse's span sits below the
+    /// row's chain reach, so no candidate can survive the beyond-reach
+    /// filter there (the shrink parse never arms at all — a shrunk parse
+    /// abandons LDM, see the size gate). Skipping the split pass is
+    /// byte-exact either way: it changes no sequence the probe could cost.
+    ProbeKeep,
+}
+
+/// The size gate's arming bar: the smallest (post source-clamp) window
+/// that arms LDM under `arming`, or `None` to never arm.
+const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
+    match arming {
+        LdmArming::Frame => Some(LDM_MIDSIZE_WINDOW),
+        LdmArming::Job => Some(LDM_FULL_WINDOW),
+        LdmArming::ProbeKeep => None,
+    }
+}
+
 /// Lifecycle of the cold-start DUBT head (row 9, see [`HEAD_LIMIT`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum HeadPhase {
@@ -1357,6 +1424,10 @@ pub struct MatchGeneratorDriver {
     /// inside `apply_level`, so entry points set it before `reset` or
     /// re-apply through [`Matcher::consider_reach_probe`].
     reach_choice: ReachChoice,
+    /// LDM arming context (see [`LdmArming`]); applied inside
+    /// [`Self::apply_level`]'s size gate, so entry points set it before
+    /// `reset`.
+    ldm_arming: LdmArming,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
     /// Gear-hash long-distance matcher state for chain rows with
@@ -1376,6 +1447,9 @@ pub struct MatchGeneratorDriver {
     ldm_dead: bool,
     /// Blocks since the last canary while shut off.
     ldm_canary: u8,
+    /// Whether the mid-size population's alphabet gate already ran (once
+    /// per frame, at the first parsed or filled block).
+    ldm_checked: bool,
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
@@ -1451,6 +1525,12 @@ impl MatchGeneratorDriver {
         self.reach_choice = choice;
     }
 
+    /// Declare the driver's LDM arming context (see [`LdmArming`]) before
+    /// `reset`; like the reach choice it survives resets until changed.
+    pub(crate) fn set_ldm_arming(&mut self, arming: LdmArming) {
+        self.ldm_arming = arming;
+    }
+
     /// Largest block the frame may carry: the format caps blocks at the
     /// declared window (RFC 8878: Block_Maximum_Size = min(window, 128K)),
     /// so a forced or downsized window below 128 KiB shrinks the blocks.
@@ -1492,12 +1572,14 @@ impl MatchGeneratorDriver {
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
+            ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
             ldm_dead: false,
             ldm_canary: 0,
+            ldm_checked: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1540,12 +1622,14 @@ impl MatchGeneratorDriver {
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
+            ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
             ldm: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
             ldm_dead: false,
             ldm_canary: 0,
+            ldm_checked: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1619,27 +1703,6 @@ impl MatchGeneratorDriver {
             if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
                 self.lazy_scratch = Some(LazyScratch::new());
             }
-            // The size gate: the split pass costs ~9 cyc/B (measured), so
-            // LDM arms only where its full 64 MiB reach survived the
-            // source-length clamp — smaller inputs keep the pure chain
-            // parse at zero tax, trading the 4-32 MiB far classes of
-            // mid-size binaries (dll32-class, measured worth -19.7%
-            // there) for the corpus cells' speed.
-            let ldm_wanted = params.ldm
-                && matches!(params.strategy, Strategy::Chain(_))
-                && params.window >= (1 << 26);
-            let ldm_sized = self
-                .ldm
-                .as_ref()
-                .is_some_and(|l| l.window() == params.window as u64);
-            self.ldm = match (ldm_wanted, ldm_sized) {
-                (true, true) => self.ldm.take(),
-                (true, false) => Some(LdmState::new(
-                    (params.window as u64).ilog2(),
-                    params.window as u64,
-                )),
-                (false, _) => None,
-            };
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
             // the capacity. Direct-window matchers (slice size zero) never
@@ -1652,6 +1715,31 @@ impl MatchGeneratorDriver {
             }
             self.params = params;
         }
+        // The size gate: the split pass costs ~9 cyc/B (measured), so LDM
+        // arms only where the window the source clamp left is worth it —
+        // the bar depends on the driver's arming context ([`LdmArming`]),
+        // so this check runs on every apply, not only on params changes
+        // (a pooled driver can re-arm between identical-param frames). A
+        // shrunk frame abandons the far domain entirely: the probe decided
+        // near-locality from a parse without LDM (its candidates cannot
+        // surface in the probe span at the stock reach), and the executed
+        // shrunk parse matches that measurement exactly.
+        let ldm_wanted = params.ldm
+            && params.chain_reach != Some(SHRINK_REACH)
+            && matches!(params.strategy, Strategy::Chain(_))
+            && ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar);
+        let ldm_sized = self
+            .ldm
+            .as_ref()
+            .is_some_and(|l| l.window() == params.window as u64);
+        self.ldm = match (ldm_wanted, ldm_sized) {
+            (true, true) => self.ldm.take(),
+            (true, false) => Some(LdmState::new(
+                (params.window as u64).ilog2(),
+                params.window as u64,
+            )),
+            (false, _) => None,
+        };
     }
 
     /// Point the window at caller-owned memory: `data` holds the bytes at
@@ -2115,6 +2203,7 @@ impl Matcher for MatchGeneratorDriver {
         self.ldm_quiet = 0;
         self.ldm_dead = false;
         self.ldm_canary = 0;
+        self.ldm_checked = false;
         self.opt_state.reset();
     }
 
@@ -2213,7 +2302,7 @@ impl Matcher for MatchGeneratorDriver {
         if self.head_block() {
             // The head parses through the btlazy2 driver; its bytes stay
             // LDM-indexed so later chain blocks can match far into them.
-            self.ldm_fill_block();
+            self.ldm_fill_block(LdmFill::Head);
             self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
             self.finish_head();
             return;
@@ -2225,6 +2314,7 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Fast => self.start_matching_fast(literals, seqs),
             Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
             Strategy::Chain(_) => {
+                self.ldm_alphabet_gate();
                 self.ldm_generate();
                 if self.ldm.is_some() {
                     self.start_matching_chain::<true>(literals, seqs);
@@ -2358,7 +2448,7 @@ impl Matcher for MatchGeneratorDriver {
         if self.gap_start == u64::MAX {
             self.gap_start = self.block_start;
         }
-        self.ldm_fill_block();
+        self.ldm_fill_block(LdmFill::Skipped);
         self.pos = self.block_end;
         self.anchor = self.block_end;
         true
@@ -2415,7 +2505,7 @@ impl Matcher for MatchGeneratorDriver {
                 },
             }
         }
-        self.ldm_fill_block();
+        self.ldm_fill_block(LdmFill::Skipped);
         self.pos = self.block_end;
         self.anchor = self.block_end;
     }
@@ -2425,11 +2515,50 @@ impl MatchGeneratorDriver {
     /// LDM-index a block the scan will not parse (incompressibility-gated,
     /// RLE-skipped, or parsed by the DUBT head): the bytes stay matchable
     /// far-distance history for later blocks, and the rolling hash stays
-    /// fed to the block end.
-    fn ldm_fill_block(&mut self) {
+    /// fed to the block end. The mid-size population skips `Skipped`
+    /// blocks entirely: such a frame cannot latch through them (no scan
+    /// runs, so quiet never counts — random paid half its speed in fills
+    /// for entries nothing can match), and max-entropy or uniform windows
+    /// carry no far class anyway. The full-window population keeps the
+    /// fill unconditionally (its bytes are frozen).
+    fn ldm_fill_block(&mut self, why: LdmFill) {
+        self.ldm_alphabet_gate();
+        if why == LdmFill::Skipped && self.params.window < LDM_FULL_WINDOW {
+            return;
+        }
         if let Some(ldm) = &mut self.ldm {
             let win = window_slice(&self.win, self.ext.as_ref());
             ldm.fill(win, self.win_base, self.block_start, self.block_end);
+        }
+    }
+
+    /// The mid-size population's alphabet gate ([`LDM_SYMS_MIN`]): run
+    /// once per frame at the first block that reaches LDM, before any of
+    /// its own indexing — a poor alphabet disarms outright, bounding the
+    /// split-pass tax at the head span already filled.
+    fn ldm_alphabet_gate(&mut self) {
+        if self.ldm_checked || self.ldm.is_none() || self.params.window >= LDM_FULL_WINDOW {
+            return;
+        }
+        self.ldm_checked = true;
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let start = (self.block_start - self.win_base) as usize;
+        let end = (self.block_end - self.win_base) as usize;
+        // Strided sampling, the incompressibility gate's idiom: ~2048
+        // samples read a 128-symbol alphabet to ~100, a 256-symbol one to
+        // ~247 — both margins around the bar are wide.
+        let stride = ((end - start) >> 11) | 1;
+        let mut bitmap = [0u64; 4];
+        let mut i = start;
+        while i < end {
+            let b = win[i] as usize;
+            bitmap[b >> 6] |= 1 << (b & 63);
+            i += stride;
+        }
+        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if distinct < LDM_SYMS_MIN {
+            self.ldm = None;
+            self.ldm_seqs.clear();
         }
     }
 
@@ -3938,8 +4067,18 @@ impl MatchGeneratorDriver {
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{MatchGeneratorDriver, pack_pos, unpack_pos};
+    use super::{LdmArming, MatchGeneratorDriver, ldm_min_window, pack_pos, unpack_pos};
     use crate::encoding::{Matcher, Sequence};
+
+    #[test]
+    fn ldm_arming_bars() {
+        // The mid-size bar arms one step under the row window; the job bar
+        // requires the clamp to have left the row window intact; the probe's
+        // keep parse never arms.
+        assert_eq!(ldm_min_window(LdmArming::Frame), Some(1 << 25));
+        assert_eq!(ldm_min_window(LdmArming::Job), Some(1 << 26));
+        assert_eq!(ldm_min_window(LdmArming::ProbeKeep), None);
+    }
 
     fn block_label(i: usize) -> Vec<u8> {
         // "block N filler text; " without needing format! in no_std tests

@@ -4,8 +4,12 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use super::{
-    Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, reach_probe,
+    Matcher,
+    block_header::BlockHeader,
+    frame_header::FrameHeader,
+    levels::*,
+    match_generator::{LdmArming, MatchGeneratorDriver},
+    reach_probe,
 };
 use crate::{
     Level,
@@ -361,15 +365,19 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
 /// Reset a pooled state for a new frame: the matcher's epoch bump retires
 /// stale hash entries and the entropy tables return to their defaults.
 /// `shape` carries what the caller declared about the input (length,
-/// forced window; see [`Matcher::set_input_shape`]).
+/// forced window; see [`Matcher::set_input_shape`]); `ldm` is the driver's
+/// LDM arming context (frame-continuous callers pass [`LdmArming::Frame`],
+/// multithreaded jobs [`LdmArming::Job`]).
 pub(crate) fn reset_slice_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
 ) {
     state.matcher.set_input_shape(shape);
     state.matcher.set_reach_choice(choice);
+    state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
@@ -383,14 +391,15 @@ pub(crate) fn take_slice_state(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
-        reset_slice_state(&mut s, level, shape, choice);
+        reset_slice_state(&mut s, level, shape, choice, ldm);
         return s;
     }
     let mut fresh = alloc::boxed::Box::new(new_slice_state());
-    reset_slice_state(&mut fresh, level, shape, choice);
+    reset_slice_state(&mut fresh, level, shape, choice, ldm);
     fresh
 }
 
@@ -434,7 +443,7 @@ pub fn compress_slice_shaped(
     shape.len = Some(src.len() as u64);
     // The frame's head decides its chain reach (see reach_probe).
     let choice = reach_probe::probe_reach_choice(src, level, shape);
-    let mut state = take_slice_state(level, shape, choice);
+    let mut state = take_slice_state(level, shape, choice, LdmArming::Frame);
     let output = compress_with_state(&mut state, src, level, checksum);
     return_slice_state(state);
     output

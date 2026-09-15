@@ -32,7 +32,11 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
 
-use super::{Matcher, match_generator::MatchGeneratorDriver, util};
+use super::{
+    Matcher,
+    match_generator::{LdmArming, MatchGeneratorDriver},
+    util,
+};
 use crate::{InputShape, Level};
 
 /// The row's stock chain reach (W22): the probe's keep side.
@@ -112,6 +116,11 @@ fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice)
 
     driver.set_input_shape(shape);
     driver.set_reach_choice(choice);
+    // Neither probe parse runs LDM (see `LdmArming::ProbeKeep`): the keep
+    // parse's span cannot surface a candidate past its reach, and the
+    // shrink parse's configuration never arms — the executed shrunk parse
+    // abandons LDM too, so the measurement stays exact.
+    driver.set_ldm_arming(LdmArming::ProbeKeep);
     driver.reset(level);
     let block = driver.block_size();
     let max_window = driver.window_size();
