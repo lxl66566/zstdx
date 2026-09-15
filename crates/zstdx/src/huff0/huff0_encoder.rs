@@ -23,9 +23,28 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// * Table description
     /// * Encoded data
     /// * Padding bits to fill up last byte
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn encode(&mut self, data: &[u8], with_table: bool) {
+        self.encode_with(
+            data,
+            with_table,
+            &mut fse_encoder::FseBuildScratch::default(),
+            &mut HuffScratch::default(),
+        );
+    }
+
+    /// [`Self::encode`] with pooled build scratch: repeated small-block
+    /// encodes recycle the package-merge and FSE weight-table buffers
+    /// instead of allocating per call.
+    pub fn encode_with(
+        &mut self,
+        data: &[u8],
+        with_table: bool,
+        fse: &mut fse_encoder::FseBuildScratch,
+        huff: &mut HuffScratch,
+    ) {
         if with_table {
-            self.write_table();
+            self.write_table_with(fse, huff);
         }
         Self::encode_stream(self.table, self.writer, data);
     }
@@ -35,7 +54,25 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// * Table description
     /// * Jumptable
     /// * Encoded data in 4 streams, each padded to fill the last byte
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
+        self.encode4x_with(
+            data,
+            with_table,
+            &mut fse_encoder::FseBuildScratch::default(),
+            &mut HuffScratch::default(),
+        );
+    }
+
+    /// [`Self::encode4x`] with pooled build scratch (see
+    /// [`Self::encode_with`]).
+    pub fn encode4x_with(
+        &mut self,
+        data: &[u8],
+        with_table: bool,
+        fse: &mut fse_encoder::FseBuildScratch,
+        huff: &mut HuffScratch,
+    ) {
         assert!(data.len() >= 4);
 
         // Split data in 4 equally sized parts (the last one might be a bit smaller than the rest)
@@ -47,7 +84,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
         // Write table description
         if with_table {
-            self.write_table();
+            self.write_table_with(fse, huff);
         }
 
         // Reserve space for the jump table, will be changed later
@@ -101,36 +138,39 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
     }
 
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub(super) fn weights(&self) -> Vec<u8> {
-        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-
-        self.table
-            .codes
-            .iter()
-            .copied()
-            .map(|(_, nb)| {
-                if nb == 0 {
-                    0
-                } else {
-                    max - nb + 1
-                }
-            })
-            .collect::<Vec<u8>>()
+        let mut out = Vec::with_capacity(self.table.codes.len());
+        self.write_weights_into(&mut out);
+        out
     }
 
-    fn write_table(&mut self) {
+    /// [`Self::weights`] into a recycled buffer.
+    fn write_weights_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
+        out.extend(self.table.codes.iter().copied().map(|(_, nb)| {
+            if nb == 0 {
+                0
+            } else {
+                max - nb + 1
+            }
+        }));
+    }
+
+    fn write_table_with(&mut self, fse: &mut fse_encoder::FseBuildScratch, huff: &mut HuffScratch) {
         // TODO strategy for determining this?
-        let weights = self.weights();
-        let weights = &weights[..weights.len() - 1]; // dont encode last weight
+        self.write_weights_into(&mut huff.wire_weights);
+        let weights = &huff.wire_weights[..huff.wire_weights.len() - 1]; // dont encode last weight
         if weights.len() > 16 {
             let size_idx = self.writer.index();
             self.writer.write_bits(0u8, 8);
             let idx_before = self.writer.index();
-            let mut encoder = FSEEncoder::new(
-                fse_encoder::build_table_from_data(weights.iter().copied(), 6, true),
-                self.writer,
-            );
+            let table =
+                fse_encoder::build_table_from_data_into(weights.iter().copied(), 6, true, fse);
+            let mut encoder = FSEEncoder::new(table, self.writer);
             encoder.encode_interleaved(weights);
+            encoder.finish(fse);
             let encoded_len = (self.writer.index() - idx_before) / 8;
             assert!(encoded_len < 128);
             self.writer.change_bits(size_idx, encoded_len as u8, 8);
@@ -207,6 +247,7 @@ impl HuffmanTable {
         Self::build_from_weights(&weights)
     }
 
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
         // Optimal length-limited code lengths from the actual magnitudes;
@@ -227,85 +268,39 @@ impl HuffmanTable {
         Self::build_from_weights(&weights)
     }
 
+    /// The pooled [`Self::build_from_counts`]: the package-merge lists and
+    /// the codes buffer are recycled through `scratch`.
+    pub(crate) fn build_from_counts_into(counts: &[usize], scratch: &mut HuffScratch) -> Self {
+        assert!(counts.len() <= 256);
+        package_merge_lengths_into(counts, MAX_CODE_LENGTH, scratch);
+        let n = counts.len();
+        let max_len = scratch.lengths[..n].iter().copied().max().unwrap_or(1) as usize;
+        let weights = &mut scratch.weights;
+        for (w, &len) in weights[..n].iter_mut().zip(scratch.lengths[..n].iter()) {
+            *w = if len == 0 {
+                0
+            } else {
+                (max_len - len as usize + 1) as u8
+            };
+        }
+        let mut codes = scratch.take_codes(n);
+        build_from_weights_slice(&scratch.weights[..n], &mut codes)
+    }
+
+    /// Return the codes buffer to a build pool (see [`HuffScratch`]);
+    /// the table must not be used afterwards.
+    pub(crate) fn recycle_codes(self, scratch: &mut HuffScratch) {
+        scratch.recycle_codes(self.codes);
+    }
+
     pub fn build_from_weights(weights: &[usize]) -> Self {
-        // Counting sort by weight. Package-merge caps weights at
-        // MAX_CODE_LENGTH, so MAX_CODE_LENGTH + 1 buckets cover every nonzero
-        // weight; scattering symbols in ascending order keeps each bucket
-        // symbol-ascending, the exact order the comparison sort produced and
-        // the code-assignment loop below requires (non-decreasing weight).
         debug_assert!(weights.iter().all(|&w| w <= MAX_CODE_LENGTH));
-        let mut bucket_counts = [0u16; MAX_CODE_LENGTH + 1];
-        for &weight in weights {
-            bucket_counts[weight] += 1;
+        let mut narrow = [0u8; 256];
+        for (dst, &w) in narrow.iter_mut().zip(weights.iter()) {
+            *dst = w as u8;
         }
-        let mut bucket_start = [0u16; MAX_CODE_LENGTH + 1];
-        let mut total = 0u16;
-        for weight in 1..=MAX_CODE_LENGTH {
-            bucket_start[weight] = total;
-            total += bucket_counts[weight];
-        }
-
-        let mut sorted = [0u8; 256];
-        let mut cursor = bucket_start;
-        for (symbol, &weight) in weights.iter().enumerate() {
-            if weight != 0 {
-                sorted[cursor[weight] as usize] = symbol as u8;
-                cursor[weight] += 1;
-            }
-        }
-
-        // Prepare huffman table with placeholders
-        let mut table = HuffmanTable {
-            codes: alloc::vec![(0, 0); weights.len()],
-            packed: [0; 256],
-            aligned: [0; 256],
-            uniform_nb: 0,
-        };
-
-        // Determine the number of bits needed for codes with the lowest weight
-        let weight_sum = (1..=MAX_CODE_LENGTH)
-            .map(|weight| (bucket_counts[weight] as usize) << (weight - 1))
-            .sum::<usize>();
-        assert!(weight_sum.is_power_of_two(), "This is an internal error");
-        let max_num_bits = highest_bit_set(weight_sum) - 1; // this is a log_2 of a clean power of two
-
-        // Starting at the symbols with the lowest weight we update the placeholders in the table
-        let mut current_code = 0;
-        let mut current_weight = 0;
-        let mut uniform_nb = 0u8;
-        let mut seen_first = false;
-        let mut all_same = true;
-        for weight in 1..=MAX_CODE_LENGTH {
-            let start = bucket_start[weight] as usize;
-            let end = start + bucket_counts[weight] as usize;
-            if start == end {
-                continue;
-            }
-            // The code shifts by the difference of the weights to allow for enough unique values
-            current_code >>= weight - current_weight;
-            // Encoding a symbol of this weight will take less bits than the previous weight
-            let current_num_bits = max_num_bits - weight + 1;
-            // Run the next update when the weight changes again
-            current_weight = weight;
-            for &symbol in &sorted[start..end] {
-                if seen_first && current_num_bits != uniform_nb as usize {
-                    all_same = false;
-                }
-                uniform_nb = current_num_bits as u8;
-                seen_first = true;
-                table.codes[symbol as usize] = (current_code as u32, current_num_bits as u8);
-                debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
-                table.packed[symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
-                table.aligned[symbol as usize] =
-                    ((current_code as u64) << (64 - current_num_bits)) | current_num_bits as u64;
-                current_code += 1;
-            }
-        }
-        if all_same && total as usize >= 2 {
-            table.uniform_nb = uniform_nb;
-        }
-
-        table
+        let mut codes = alloc::vec![(0, 0); weights.len()];
+        build_from_weights_slice(&narrow[..weights.len()], &mut codes)
     }
 
     /// Per-symbol code lengths (0 = symbol not covered by the table).
@@ -334,6 +329,86 @@ impl HuffmanTable {
     }
 }
 
+/// Core of [`HuffmanTable::build_from_weights`] over u8 weights and a
+/// caller-owned codes buffer (recycled by the pooled variant).
+fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> HuffmanTable {
+    debug_assert!(weights.iter().all(|&w| w <= MAX_CODE_LENGTH as u8));
+    codes.resize(weights.len(), (0, 0));
+    codes.fill((0, 0));
+    let mut bucket_counts = [0u16; MAX_CODE_LENGTH + 1];
+    for &weight in weights {
+        bucket_counts[weight as usize] += 1;
+    }
+    let mut bucket_start = [0u16; MAX_CODE_LENGTH + 1];
+    let mut total = 0u16;
+    for weight in 1..=MAX_CODE_LENGTH {
+        bucket_start[weight] = total;
+        total += bucket_counts[weight];
+    }
+
+    let mut sorted = [0u8; 256];
+    let mut cursor = bucket_start;
+    for (symbol, &weight) in weights.iter().enumerate() {
+        if weight != 0 {
+            sorted[cursor[weight as usize] as usize] = symbol as u8;
+            cursor[weight as usize] += 1;
+        }
+    }
+
+    // Prepare huffman table with placeholders
+    let mut table = HuffmanTable {
+        packed: [0; 256],
+        aligned: [0; 256],
+        uniform_nb: 0,
+        codes: core::mem::take(codes),
+    };
+
+    // Determine the number of bits needed for codes with the lowest weight
+    let weight_sum = (1..=MAX_CODE_LENGTH)
+        .map(|weight| (bucket_counts[weight] as usize) << (weight - 1))
+        .sum::<usize>();
+    assert!(weight_sum.is_power_of_two(), "This is an internal error");
+    let max_num_bits = highest_bit_set(weight_sum) - 1; // this is a log_2 of a clean power of two
+
+    // Starting at the symbols with the lowest weight we update the placeholders in the table
+    let mut current_code = 0;
+    let mut current_weight = 0;
+    let mut uniform_nb = 0u8;
+    let mut seen_first = false;
+    let mut all_same = true;
+    for weight in 1..=MAX_CODE_LENGTH {
+        let start = bucket_start[weight] as usize;
+        let end = start + bucket_counts[weight] as usize;
+        if start == end {
+            continue;
+        }
+        // The code shifts by the difference of the weights to allow for enough unique values
+        current_code >>= weight - current_weight;
+        // Encoding a symbol of this weight will take less bits than the previous weight
+        let current_num_bits = max_num_bits - weight + 1;
+        // Run the next update when the weight changes again
+        current_weight = weight;
+        for &symbol in &sorted[start..end] {
+            if seen_first && current_num_bits != uniform_nb as usize {
+                all_same = false;
+            }
+            uniform_nb = current_num_bits as u8;
+            seen_first = true;
+            table.codes[symbol as usize] = (current_code as u32, current_num_bits as u8);
+            debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
+            table.packed[symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
+            table.aligned[symbol as usize] =
+                ((current_code as u64) << (64 - current_num_bits)) | current_num_bits as u64;
+            current_code += 1;
+        }
+    }
+    if all_same && total as usize >= 2 {
+        table.uniform_nb = uniform_nb;
+    }
+
+    table
+}
+
 /// Assert that the provided value is greater than zero, and returns index of the first set bit
 fn highest_bit_set(x: usize) -> usize {
     assert!(x > 0);
@@ -358,31 +433,123 @@ fn huffman() {
     assert_eq!(table.codes[5], (1, 4));
 }
 
+/// Pooled scratch for the per-block Huffman build (held in the compressor
+/// state): the package-merge level lists, the per-symbol length/weight
+/// scratch, the wire weight stream, and retired `codes` buffers.
+pub(crate) struct HuffScratch {
+    leaves: Vec<Ent>,
+    arena: Vec<Node>,
+    prev: Vec<Ent>,
+    packages: Vec<Ent>,
+    cur: Vec<Ent>,
+    active: Vec<u32>,
+    next: Vec<u32>,
+    /// Code lengths per symbol (0 = symbol absent), valid for the build's
+    /// alphabet prefix.
+    lengths: [u8; 256],
+    /// Weights per symbol, same layout.
+    weights: [u8; 256],
+    /// The literals-section weight stream (one weight per symbol, last
+    /// dropped on the wire).
+    wire_weights: Vec<u8>,
+    /// Retired `codes` buffers.
+    codes: Vec<Vec<(u32, u8)>>,
+}
+
+/// Two live code buffers cover the adopt/replace flow per block.
+const HUFF_CODES_CAP: usize = 2;
+
+impl Default for HuffScratch {
+    fn default() -> Self {
+        Self {
+            leaves: Vec::new(),
+            arena: Vec::new(),
+            prev: Vec::new(),
+            packages: Vec::new(),
+            cur: Vec::new(),
+            active: Vec::new(),
+            next: Vec::new(),
+            lengths: [0; 256],
+            weights: [0; 256],
+            wire_weights: Vec::new(),
+            codes: Vec::new(),
+        }
+    }
+}
+
+impl HuffScratch {
+    /// Take a codes buffer of `len` initialized entries (the build fills
+    /// every slot, so recycling only needs the capacity).
+    fn take_codes(&mut self, len: usize) -> Vec<(u32, u8)> {
+        let mut v = match self.codes.iter().position(|v| v.len() >= len) {
+            Some(i) => self.codes.swap_remove(i),
+            None => Vec::with_capacity(len),
+        };
+        if v.len() < len {
+            v.resize(len, (0, 0));
+        } else {
+            v.truncate(len);
+        }
+        v
+    }
+
+    /// Return a retired table's codes buffer to the pool.
+    fn recycle_codes(&mut self, v: Vec<(u32, u8)>) {
+        if self.codes.len() < HUFF_CODES_CAP {
+            self.codes.push(v);
+        } else if self.codes.iter().all(|s| s.len() >= v.len()) {
+            // Every pooled buffer is at least as large: drop the retiree.
+        } else {
+            let smallest = self
+                .codes
+                .iter_mut()
+                .min_by_key(|s| s.len())
+                .expect("pool is non-empty at capacity");
+            *smallest = v;
+        }
+    }
+}
+
 /// Maximum Huffman code length the literals section can carry.
 const MAX_CODE_LENGTH: usize = 11;
+
+#[derive(Clone, Copy)]
+enum Node {
+    Leaf(u16),
+    Pkg(u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct Ent {
+    // Block literals are capped far below 2^32, so package weights (sums
+    // of leaf counts) cannot overflow either; the narrow field halves
+    // sort/merge memory traffic.
+    weight: u32,
+    node: u32,
+}
 
 /// Boundary package-merge (Larmore-Hirschberg): optimal length-limited code
 /// lengths. Zero-count symbols get length 0; the returned lengths for used
 /// symbols are Kraft-exact (sum of 2^-len == 1) and never exceed `max_len`.
 /// Requires `max_len >= log2(symbol count)` and at least two used symbols.
+#[cfg(any(test, feature = "fuzz_exports"))]
 fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
-    #[derive(Clone, Copy)]
-    enum Node {
-        Leaf(u16),
-        Pkg(u32, u32),
-    }
-    #[derive(Clone, Copy)]
-    struct Ent {
-        // Block literals are capped far below 2^32, so package weights (sums
-        // of leaf counts) cannot overflow either; the narrow field halves
-        // sort/merge memory traffic.
-        weight: u32,
-        node: u32,
-    }
+    let mut scratch = HuffScratch::default();
+    package_merge_lengths_into(counts, max_len, &mut scratch);
+    scratch.lengths[..counts.len()]
+        .iter()
+        .map(|&l| l as usize)
+        .collect()
+}
 
-    let mut lengths = alloc::vec![0usize; counts.len()];
-    let mut leaves: Vec<Ent> = Vec::new();
-    let mut arena: Vec<Node> = Vec::new();
+/// The pooled [`package_merge_lengths`]: fills `scratch.lengths[..n]`.
+fn package_merge_lengths_into(counts: &[usize], max_len: usize, scratch: &mut HuffScratch) {
+    let lengths = &mut scratch.lengths;
+    lengths[..counts.len()].fill(0);
+    let leaves = &mut scratch.leaves;
+    let arena = &mut scratch.arena;
+    leaves.clear();
+    arena.clear();
     for (sym, &count) in counts.iter().enumerate() {
         if count > 0 {
             arena.push(Node::Leaf(sym as u16));
@@ -402,11 +569,13 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
     // the leaves with packages formed from consecutive pairs of the previous
     // level, keeping the cheapest `take` items. Only the previous level is
     // ever read again, so two swapped buffers replace the list-of-lists
-    // (which allocated two Vecs per level).
-    let mut prev: Vec<Ent> = leaves.clone();
-    prev.truncate(take);
-    let mut packages: Vec<Ent> = Vec::with_capacity(n - 1);
-    let mut cur: Vec<Ent> = Vec::with_capacity(take);
+    // (which allocated two Vecs per level) — and both now live in the
+    // scratch, so no level allocates at all.
+    let prev = &mut scratch.prev;
+    prev.clear();
+    prev.extend_from_slice(&leaves[..take.min(leaves.len())]);
+    let packages = &mut scratch.packages;
+    let cur = &mut scratch.cur;
     for _ in 1..max_len {
         packages.clear();
         let mut i = 0;
@@ -443,15 +612,19 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
                 pi += 1;
             }
         }
-        core::mem::swap(&mut prev, &mut cur);
+        core::mem::swap(prev, cur);
     }
 
     // Walk the solution back down: every leaf encountered at level k adds one
-    // length unit; packages expand into their children one level below.
-    let mut active: Vec<u32> = prev.iter().map(|e| e.node).collect();
+    // length unit; packages expand into their children one level below. The
+    // active/next lists alternate inside the scratch.
+    let active = &mut scratch.active;
+    active.clear();
+    active.extend(prev.iter().map(|e| e.node));
+    let next = &mut scratch.next;
     for _ in (0..max_len).rev() {
-        let mut next = Vec::with_capacity(active.len());
-        for id in active {
+        next.clear();
+        for &id in active.iter() {
             match arena[id as usize] {
                 Node::Leaf(sym) => lengths[sym as usize] += 1,
                 Node::Pkg(a, b) => {
@@ -460,21 +633,20 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
                 },
             }
         }
-        active = next;
+        core::mem::swap(active, next);
     }
     debug_assert_eq!(
-        lengths
+        lengths[..counts.len()]
             .iter()
             .map(|&l| if l == 0 {
                 0
             } else {
-                1usize << (max_len - l)
+                1usize << (max_len - l as usize)
             })
             .sum::<usize>(),
         1 << max_len,
         "package-merge lengths must be Kraft-exact"
     );
-    lengths
 }
 
 #[test]

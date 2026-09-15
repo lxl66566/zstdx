@@ -37,5 +37,10 @@ name    = "stream"
 harness = false
 test    = false
 
+[[bench]]
+name    = "small"
+harness = false
+test    = false
+
 [lints]
 workspace = true

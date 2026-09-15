@@ -11,6 +11,7 @@ use crate::{
         },
         frame_compressor::{BlockChecksum, CompressState},
     },
+    fse::fse_encoder::FSETable,
 };
 
 /// Compresses a single block at [`crate::Level::Fastest`].
@@ -101,29 +102,26 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 BlockOutcome::Raw => unreachable!(),
             };
             // Adopt the tables this block was encoded with; anything the
-            // block did not replace falls back to the previous table.
+            // block did not replace falls back to the previous table. A
+            // retired table's transition buffer goes back to the pool.
             state.last_huff_table = match tables.huff {
-                Some(new) => Some(new),
+                Some(new) => {
+                    if let Some(old) = old_huff {
+                        old.recycle_codes(&mut state.scratch.huff);
+                    }
+                    Some(new)
+                },
                 None => old_huff,
             };
             // `Clear` drops the remembered table: the block overwrote the
             // decoder's table with a predefined or RLE one, so repeating the
             // old custom table in a later block would desync the streams.
-            state.fse_tables.ll_previous = match tables.ll {
-                PrevTable::New(new) => Some(new),
-                PrevTable::Keep => old_tables[0].take(),
-                PrevTable::Clear => None,
-            };
-            state.fse_tables.ml_previous = match tables.ml {
-                PrevTable::New(new) => Some(new),
-                PrevTable::Keep => old_tables[1].take(),
-                PrevTable::Clear => None,
-            };
-            state.fse_tables.of_previous = match tables.of {
-                PrevTable::New(new) => Some(new),
-                PrevTable::Keep => old_tables[2].take(),
-                PrevTable::Clear => None,
-            };
+            state.fse_tables.ll_previous =
+                replace_previous(old_tables[0].take(), tables.ll, &mut state.scratch.fse);
+            state.fse_tables.ml_previous =
+                replace_previous(old_tables[1].take(), tables.ml, &mut state.scratch.fse);
+            state.fse_tables.of_previous =
+                replace_previous(old_tables[2].take(), tables.of, &mut state.scratch.fse);
             let mut prefix = [0u8; 3];
             BlockHeader {
                 last_block,
@@ -140,6 +138,17 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             state.fse_tables.ll_previous = old_tables[0].take();
             state.fse_tables.ml_previous = old_tables[1].take();
             state.fse_tables.of_previous = old_tables[2].take();
+            // The block's freshly built tables are discarded unused.
+            // (Recycled one by one: PrevTable is ~1.5 KB inline, so an
+            // array of them would memcpy the empty slots too.)
+            if let BlockOutcome::Encoded(tables) = outcome {
+                discard_prev(tables.ll, &mut state.scratch.fse);
+                discard_prev(tables.ml, &mut state.scratch.fse);
+                discard_prev(tables.of, &mut state.scratch.fse);
+                if let Some(table) = tables.huff {
+                    table.recycle_codes(&mut state.scratch.huff);
+                }
+            }
             // (raw fallback: the decoder never saw a sequence section, so
             // the remembered tables stay exactly as they were)
             let header = BlockHeader {
@@ -151,5 +160,39 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             header.serialize(output);
             hasher.raw_out(output, state.matcher.get_last_space(), hashed);
         }
+    }
+}
+
+/// Recycle a discarded outcome table's transition buffer (raw-fallback
+/// blocks build tables they then throw away unused).
+fn discard_prev(table: PrevTable, fse: &mut crate::fse::fse_encoder::FseBuildScratch) {
+    if let PrevTable::New(table) = table {
+        table.recycle(fse);
+    }
+}
+
+/// Swap in the block's outcome for one remembered sequence table: the new
+/// table when the block wrote one, the previous one on `Keep`; `Clear`
+/// (predefined/RLE took over the decoder) and any replaced table return
+/// their transition buffer to the pool.
+fn replace_previous(
+    old: Option<FSETable>,
+    new: PrevTable,
+    fse: &mut crate::fse::fse_encoder::FseBuildScratch,
+) -> Option<FSETable> {
+    match new {
+        PrevTable::New(new) => {
+            if let Some(old) = old {
+                old.recycle(fse);
+            }
+            Some(new)
+        },
+        PrevTable::Keep => old,
+        PrevTable::Clear => {
+            if let Some(old) = old {
+                old.recycle(fse);
+            }
+            None
+        },
     }
 }

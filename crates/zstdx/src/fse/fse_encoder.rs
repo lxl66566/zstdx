@@ -17,6 +17,12 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         self.table
     }
 
+    /// Consume the encoder, returning its table's transition buffer to a
+    /// build pool (see [`FseBuildScratch`]).
+    pub(crate) fn finish(self, scratch: &mut FseBuildScratch) {
+        self.table.recycle(scratch);
+    }
+
     /// Encodes the data using the provided table
     /// Writes
     /// * Table description
@@ -142,6 +148,55 @@ pub(crate) fn approx_log2(x: f64) -> f64 {
     }
 }
 
+/// Recycled scratch for entropy-table builds, pooled in the compressor
+/// state: transition buffers only need capacity, because every live
+/// symbol's row is fully overwritten by the build walk and dead rows are
+/// never read (wire codes stay below the histogram's `max_symbol`). A
+/// buffer zeroes its tail at most once per size, not once per table.
+#[derive(Default)]
+pub(crate) struct FseBuildScratch {
+    /// State-owner map, refilled per build.
+    owner: Vec<u8>,
+    /// Retired transition buffers (their `len` is the initialized prefix).
+    spare: Vec<Vec<u32>>,
+}
+
+/// Pool depth: the three sequence tables plus the Huffman weight table can
+/// be in flight per block.
+const FSE_SPARE_CAP: usize = 4;
+
+impl FseBuildScratch {
+    /// Take a buffer whose first `len` entries are initialized.
+    fn take_transitions(&mut self, len: usize) -> Vec<u32> {
+        let mut v = match self.spare.iter().position(|v| v.capacity() >= len) {
+            Some(i) => self.spare.swap_remove(i),
+            None => Vec::with_capacity(len),
+        };
+        if v.len() < len {
+            v.resize(len, 0);
+        } else {
+            v.truncate(len);
+        }
+        v
+    }
+
+    /// Keep a retired buffer: at capacity, the pool swaps out its smallest.
+    fn recycle(&mut self, v: Vec<u32>) {
+        if self.spare.len() < FSE_SPARE_CAP {
+            self.spare.push(v);
+        } else if self.spare.iter().all(|s| s.capacity() >= v.capacity()) {
+            // Every pooled buffer is at least as large: drop the retiree.
+        } else {
+            let smallest = self
+                .spare
+                .iter_mut()
+                .min_by_key(|s| s.capacity())
+                .expect("pool is non-empty at capacity");
+            *smallest = v;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FSETable {
     /// Normalized probability per symbol: positive weight, -1 for the
@@ -201,6 +256,12 @@ impl FSETable {
         Some(approx_log2(
             self.table_size as f64 / p.unsigned_abs() as f64,
         ))
+    }
+
+    /// Return the transition buffer to a build pool (see
+    /// [`FseBuildScratch`]); the table must not be used afterwards.
+    pub(crate) fn recycle(self, scratch: &mut FseBuildScratch) {
+        scratch.recycle(self.transitions);
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
@@ -275,10 +336,11 @@ impl FSETable {
     }
 }
 
-pub fn build_table_from_data(
+pub(crate) fn build_table_from_data_into(
     data: impl Iterator<Item = u8>,
     max_log: u8,
     avoid_0_numbit: bool,
+    scratch: &mut FseBuildScratch,
 ) -> FSETable {
     let mut counts = [0; 256];
     let mut max_symbol = 0;
@@ -290,7 +352,20 @@ pub fn build_table_from_data(
             max_symbol = idx;
         }
     }
-    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
+    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit, scratch)
+}
+
+pub fn build_table_from_data(
+    data: impl Iterator<Item = u8>,
+    max_log: u8,
+    avoid_0_numbit: bool,
+) -> FSETable {
+    build_table_from_data_into(
+        data,
+        max_log,
+        avoid_0_numbit,
+        &mut FseBuildScratch::default(),
+    )
 }
 
 /// libzstd's FSE_minTableLog: the smallest table size that can safely
@@ -322,13 +397,16 @@ pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize)
 /// A degenerate one-state table for the sequence-table RLE wire mode: the
 /// table description is a single code byte and every transition costs zero
 /// bits, so encoding routes through the normal path unchanged.
-pub(crate) fn rle_table(code: u8) -> FSETable {
+pub(crate) fn rle_table(code: u8, scratch: &mut FseBuildScratch) -> FSETable {
+    let mut transitions = scratch.take_transitions(256);
+    // table_size is 1, so `symbol * table_size + state` indexes at `symbol`;
+    // only the RLE code's degenerate zero transition is ever read.
+    transitions[code as usize] = 0;
     let mut table = FSETable {
         probs: [0; 256],
         start: [0; 256],
         table_size: 1,
-        // table_size is 1, so `symbol * table_size + state` indexes at `symbol`.
-        transitions: alloc::vec![0u32; 256],
+        transitions,
     };
     table.probs[code as usize] = 1;
     table.start[code as usize] = 0;
@@ -348,6 +426,7 @@ pub(crate) fn build_normalized_table(
     max_symbol: usize,
     max_log: u8,
     last_code: u8,
+    scratch: &mut FseBuildScratch,
 ) -> Option<FSETable> {
     debug_assert!(nb_seq > 2);
     let table_log = optimal_table_log(max_log, nb_seq, max_symbol);
@@ -368,9 +447,10 @@ pub(crate) fn build_normalized_table(
     ) {
         return None;
     }
-    Some(build_table_from_probabilities(
+    Some(build_table_from_probabilities_into(
         &norm[..=max_symbol],
         table_log,
+        scratch,
     ))
 }
 
@@ -540,7 +620,12 @@ fn normalize_m2(
     true
 }
 
-fn build_table_from_counts(counts: &[usize], max_log: u8, legacy_avoid_0_numbit: bool) -> FSETable {
+fn build_table_from_counts(
+    counts: &[usize],
+    max_log: u8,
+    legacy_avoid_0_numbit: bool,
+    scratch: &mut FseBuildScratch,
+) -> FSETable {
     let mut probs = [0; 256];
     let probs = &mut probs[..counts.len()];
     let mut min_count = 0;
@@ -615,10 +700,39 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, legacy_avoid_0_numbit:
         assert!(*second_max <= max);
     }
 
-    build_table_from_probabilities(probs, acc_log)
+    build_table_from_probabilities_into(probs, acc_log, scratch)
 }
 
 pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
+    let table_size = 1usize << acc_log;
+    build_table_body(
+        probs,
+        acc_log,
+        &mut alloc::vec![255u8; table_size],
+        &mut alloc::vec![0u32; probs.len() * table_size],
+    )
+}
+
+/// The pooled [`build_table_from_probabilities`]: recycles the transition
+/// buffer through `scratch` instead of allocating (and zeroing) per table.
+pub(crate) fn build_table_from_probabilities_into(
+    probs: &[i32],
+    acc_log: u8,
+    scratch: &mut FseBuildScratch,
+) -> FSETable {
+    let table_size = 1usize << acc_log;
+    let mut transitions = scratch.take_transitions(probs.len() * table_size);
+    scratch.owner.clear();
+    scratch.owner.resize(table_size, 255);
+    build_table_body(probs, acc_log, &mut scratch.owner, &mut transitions)
+}
+
+fn build_table_body(
+    probs: &[i32],
+    acc_log: u8,
+    owner: &mut Vec<u8>,
+    transitions: &mut Vec<u32>,
+) -> FSETable {
     // Entry packing gives 12 bits each to baseline and target index.
     debug_assert!(
         (1..=12).contains(&acc_log),
@@ -627,10 +741,6 @@ pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     let table_size = 1usize << acc_log;
     let mut probs_full = [0i32; 256];
     probs_full[..probs.len()].copy_from_slice(probs);
-
-    // Which positive-probability symbol owns each state index; -1 symbols
-    // never participate in the bottom-up walk.
-    let mut owner = alloc::vec![255u8; table_size];
 
     let mut start = [0u16; 256];
 
@@ -665,7 +775,6 @@ pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     let mut baseline = [0usize; 256];
     let mut prev_baseline = [usize::MAX; 256];
 
-    let mut transitions = alloc::vec![0u32; probs.len() * table_size];
     // A -1 symbol has a single state spanning the whole index range: its
     // entry is the top-region slot recorded above with acc_log output bits.
     for (symbol, prob) in probs.iter().copied().enumerate() {
@@ -738,7 +847,7 @@ pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         probs: probs_full,
         start,
         table_size,
-        transitions,
+        transitions: core::mem::take(transitions),
     }
 }
 
