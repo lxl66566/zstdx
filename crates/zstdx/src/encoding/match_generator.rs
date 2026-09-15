@@ -1490,6 +1490,12 @@ pub struct MatchGeneratorDriver {
     /// Whether the mid-size population's alphabet gate already ran (once
     /// per frame, at the first parsed or filled block).
     ldm_checked: bool,
+    /// Set by [`Self::prefill_window`]: this driver parses job strips (or a
+    /// dictionary prefill), not a frame-continuous stream. Gates the opt
+    /// fill-lag clamp, whose output-neutrality is proven for
+    /// frame-continuous parses only (a job-restart parse measurably used
+    /// the lagged region's candidates).
+    strip_parse: bool,
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
@@ -1637,6 +1643,7 @@ impl MatchGeneratorDriver {
             ldm_dead: false,
             ldm_canary: 0,
             ldm_checked: false,
+            strip_parse: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1687,6 +1694,7 @@ impl MatchGeneratorDriver {
             ldm_dead: false,
             ldm_canary: 0,
             ldm_checked: false,
+            strip_parse: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1943,6 +1951,7 @@ impl MatchGeneratorDriver {
         // paying far class (the frame-start alphabet gate's rule, applied
         // to the job's own history). The chain row keeps its frozen
         // ungated flow.
+        self.strip_parse = true;
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
             self.ldm_quiet = 0;
@@ -2274,6 +2283,7 @@ impl Matcher for MatchGeneratorDriver {
         self.ldm_dead = false;
         self.ldm_canary = 0;
         self.ldm_checked = false;
+        self.strip_parse = false;
         self.opt_state.reset();
     }
 
@@ -4005,6 +4015,14 @@ impl MatchGeneratorDriver {
         let mut next_update = self.next_update;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
+        // The fill-lag clamp in `opt::run_block` runs only on the
+        // alphabet-gated population: `ldm_checked` set with `ldm` disabled
+        // means LDM was armed and the first block's alphabet check turned
+        // it off (a size-gated frame never reaches the check, and an
+        // armed frame keeps its far candidates). Job/dictionary strips
+        // (`prefill_window`) stay unclamped: their restart parses measurably
+        // used the lagged region's candidates.
+        let clamp_lag = self.ldm_checked && self.ldm.is_none() && !self.strip_parse;
         let Some(scratch) = self.opt_scratch.as_mut() else {
             unreachable!("opt scratch allocated by apply_level")
         };
@@ -4029,6 +4047,7 @@ impl MatchGeneratorDriver {
                 &mut rep_pending,
                 literals,
                 seqs,
+                clamp_lag,
             )
         } else {
             super::opt::run_block::<false>(
@@ -4050,6 +4069,7 @@ impl MatchGeneratorDriver {
                 &mut rep_pending,
                 literals,
                 seqs,
+                clamp_lag,
             )
         };
         self.epoch = epoch;

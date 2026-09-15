@@ -796,8 +796,10 @@ impl Finder<'_, '_> {
 /// `ldm_seqs` are this block's long-distance candidates (empty when LDM is
 /// not armed); the ultra seeding parse consumes the same set — its spans are
 /// absolute, so a job-boundary seed (whose span precedes the block) simply
-/// never reaches them. Returns whether any LDM candidate out-lengthed the
-/// tree's best (the quiet latch's "won" signal).
+/// never reaches them. `clamp_lag` gates the fill-lag clamp below (true on
+/// the alphabet-gated population: LDM armed, then disabled by the first
+/// block's alphabet check). Returns whether any LDM candidate out-lengthed
+/// the tree's best (the quiet latch's "won" signal).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_block<const ULTRA: bool>(
     knobs: &OptKnobs,
@@ -818,6 +820,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     rep_pending: &mut u8,
     literals: &mut Vec<u8>,
     seqs: &mut Vec<SeqWord>,
+    clamp_lag: bool,
 ) -> bool {
     let block_len = (block_end - block_start) as usize;
     // btultra2: seed statistics with a throwaway parse before the first real
@@ -898,7 +901,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
             }
         }
     }
-    run_once::<ULTRA>(
+    let won = run_once::<ULTRA>(
         knobs,
         win,
         win_base,
@@ -917,7 +920,25 @@ pub(crate) fn run_block<const ULTRA: bool>(
         rep_pending,
         literals,
         seqs,
-    )
+    );
+    // libzstd `ZSTD_buildSeqStore`'s "limited update after a very long
+    // match": the last improving candidate's end can leave `next_update`
+    // lagging far behind the parse (on block-tiled data, one full block
+    // per block), and the next block would re-index that whole stretch
+    // through the tree at full compare depth. Cap the carry-over at 192
+    // positions and skip the fill for the rest. C applies this
+    // unconditionally; here it runs only on the alphabet-gated population
+    // — where a far class is in play (LDM armed, or a window too small to
+    // arm) the lagged region's in-domain candidates measurably pay
+    // (dll100 −0.65%, dll16 −0.28% under the unconditional form), while
+    // on the gated shapes the clamp proved output-neutral everywhere.
+    // Not applied to the seeding parse above either: its cursor is reset
+    // right after (C's `initStats_ultra` likewise bypasses
+    // `buildSeqStore`).
+    if clamp_lag && block_end > *next_update + 384 {
+        *next_update = block_end - (block_end - *next_update - 384).min(192);
+    }
+    won
 }
 
 /// The caller guarantees the tables match the knobs' logs, the window covers
