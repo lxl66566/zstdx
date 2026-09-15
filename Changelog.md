@@ -11,6 +11,31 @@ This document records the changes made between versions, starting with version 0
   Ir (json) but regresses net Ir and wall on every shape: the loop is one
   register-allocation domain and the saturated budget returns the saving
   as decode-half spills. No code change; the loop stands.
+- Encoder-side deep-offset ramp for multithreaded jobs (env-gated
+  `ZSTDX_MT_RAMP_BYTES`, off by default): a gated job rejects every match
+  whose source lies within D bytes below the job start (DEPTH semantics —
+  a piece-parallel decoder's binding constraint is how far below the cut
+  a crossing read reaches, not its offset), across all 9 probe/acceptance
+  paths plus a piecewise backward-extension floor (in-job sources stop at
+  the boundary; already-deep sources extend freely). Suppressed crossing
+  matches are weak, so the ratio cost is ~zero where D clears the shape's
+  match period: json D=2 MiB -0.72% size, skewed -0.02%, text D=512 KiB
+  +1.27% (text at D=2 MiB is +403% — its ~800 KiB period falls inside the
+  band). Executor-truth simulation shows zero guarantee violations and
+  piece-parallel ceilings of 8.0x (json, piece-count bound), 1.99x
+  (skewed), 1.94x (text); ramp frames decode byte-identically at speed
+  parity through the current serial-B decoder. Full ratio sweep with the
+  gate compiled in (env unset): no regression (+8.43% geo-mean vs
+  libzstd, worst cell text.best -0.45% as before).
+- Bench tooling for the decode-parallelism work: `emitframe` (one corpus
+  file to a zstdx frame, bulk/stream, st/mt, roundtrip-gated, prints the
+  exact MT job size), `piecepipe` (piece-pipeline critical-path
+  simulation on one frame through a new `seq_dump` executor-truth hook
+  recording every match's absolute position and resolved offset; uniform
+  or bounded-lane schedules at rate 1, depth-guarantee audit), and
+  `files --threads` (MT decode timing on explicit files). The piece
+  cutting uses the encoder's real job grid via the hidden
+  `zstdx::encoding::mt_job_size_for`.
 - Docs: the two open fastest-tier angles (todo 3) are falsified and
   withdrawn — miss-run stepping (and its dense-insert / parse-statistic
   gate variants) wins json on both axes (−3.2% size, +8.8% speed) but

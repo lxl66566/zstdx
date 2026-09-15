@@ -26,6 +26,8 @@ pub use frame_compressor::{
 };
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
+#[doc(hidden)]
+pub use mt::mt_job_size_for;
 use seq_codes::pack_seq;
 
 use crate::{
