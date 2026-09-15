@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use crate::{
     bit_io::BitWriter,
     encoding::{Matcher, seq_codes::SEQ_CODE_SPACE},
-    fse::fse_encoder::{FSETable, approx_log2, build_normalized_table, rle_table},
+    fse::fse_encoder::{FSETable, FseBuildScratch, approx_log2, build_normalized_table, rle_table},
     huff0::huff0_encoder,
 };
 
@@ -59,6 +59,10 @@ pub(crate) struct BlockScratch {
     /// entropy bound, so the strided gate below is skipped until a block
     /// proves otherwise. Pure cost hint; every outcome stays reachable.
     literals_gate_hold: bool,
+    /// Recycled FSE transition buffers (per-block table builds).
+    pub(crate) fse: FseBuildScratch,
+    /// Recycled Huffman build buffers (per-block table builds).
+    pub(crate) huff: huff0_encoder::HuffScratch,
 }
 
 /// A block of [`crate::common::BlockType::Compressed`]
@@ -77,6 +81,8 @@ pub(crate) fn compress_block<M: Matcher>(
         literals: literals_vec,
         seqs,
         literals_gate_hold,
+        fse,
+        huff,
     } = scratch;
     literals_vec.clear();
     seqs.clear();
@@ -115,7 +121,14 @@ pub(crate) fn compress_block<M: Matcher>(
         // residual literals paid a flat ~35% block tax at the old >1024
         // raw cutoff), and compress_literals' entropy gate plus the
         // encoded-vs-raw comparison bound the cost of trying.
-        match compress_literals(literals, last_huff_table, &mut writer, literals_gate_hold) {
+        match compress_literals(
+            literals,
+            last_huff_table,
+            &mut writer,
+            literals_gate_hold,
+            fse,
+            huff,
+        ) {
             LitOutcome::Raw => {},
             // Feed the encoding table's code lengths back to the matcher: the
             // chain strategy's store gate prices a match against the marginal
@@ -151,7 +164,8 @@ pub(crate) fn compress_block<M: Matcher>(
         // codes and pre-merged add-bit payloads, so the per-code metadata is
         // computed exactly once per sequence and every consumer (table
         // selection, table description, bitstream encoder) reads the streams.
-        let (ll_mode, ml_mode, of_mode) = choose_tables_fast(seqs, default_tables, previous_tables);
+        let (ll_mode, ml_mode, of_mode) =
+            choose_tables_fast(seqs, default_tables, previous_tables, fse);
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
@@ -229,6 +243,7 @@ fn choose_tables_fast<'a>(
         &'a Option<FSETable>,
         &'a Option<FSETable>,
     ),
+    fse_scratch: &mut FseBuildScratch,
 ) -> (FseTableMode<'a>, FseTableMode<'a>, FseTableMode<'a>) {
     let nb_seq = seqs.len();
     let mut ll_counts = [0u32; SEQ_CODE_SPACE];
@@ -282,6 +297,7 @@ fn choose_tables_fast<'a>(
             previous_tables.0.as_ref(),
             6,
             9,
+            fse_scratch,
         ),
         select_from_counts(
             &mut ml_counts,
@@ -292,6 +308,7 @@ fn choose_tables_fast<'a>(
             previous_tables.1.as_ref(),
             6,
             9,
+            fse_scratch,
         ),
         select_from_counts(
             &mut of_counts,
@@ -302,6 +319,7 @@ fn choose_tables_fast<'a>(
             previous_tables.2.as_ref(),
             5,
             8,
+            fse_scratch,
         ),
     )
 }
@@ -323,6 +341,7 @@ fn select_from_counts<'a>(
     previous: Option<&'a FSETable>,
     default_norm_log: u32,
     max_log: u8,
+    fse_scratch: &mut FseBuildScratch,
 ) -> FseTableMode<'a> {
     let mut max_symbol = 0usize;
     let mut most_frequent = 0u32;
@@ -342,7 +361,7 @@ fn select_from_counts<'a>(
         }
         return FseTableMode::Rle {
             code: first_code,
-            table: rle_table(first_code),
+            table: rle_table(first_code, fse_scratch),
         };
     }
     // The predefined table must cover every code that occurs.
@@ -367,7 +386,7 @@ fn select_from_counts<'a>(
             return FseTableMode::Repeat(prev);
         }
     }
-    match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code) {
+    match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code, fse_scratch) {
         Some(table) => FseTableMode::Encoded(table),
         // Normalization corner case: fall back to the predefined table.
         None => FseTableMode::Predefined(default_table),
@@ -934,6 +953,8 @@ fn compress_literals(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
     gate_hold: &mut bool,
+    fse: &mut FseBuildScratch,
+    huff: &mut huff0_encoder::HuffScratch,
 ) -> LitOutcome {
     let reset_idx = writer.index();
 
@@ -966,7 +987,8 @@ fn compress_literals(
         }
     }
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_symbol]);
+    let new_encoder_table =
+        huff0_encoder::HuffmanTable::build_from_counts_into(&counts[..=max_symbol], huff);
 
     let (encoder_table, new_table) = if let Some(table) = last_table {
         if let Some(diff) = table.can_encode(&new_encoder_table) {
@@ -1004,9 +1026,9 @@ fn compress_literals(
     let index_before = writer.index();
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
     if size_format == 0 {
-        encoder.encode(literals, new_table);
+        encoder.encode_with(literals, new_table, fse, huff);
     } else {
-        encoder.encode4x(literals, new_table);
+        encoder.encode4x_with(literals, new_table, fse, huff);
     }
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);
@@ -1053,7 +1075,15 @@ mod tests {
         let first = symbols[0];
         let last = symbols[nb_seq - 1];
         let prev_counts = counts_from(&symbols);
-        let prev = build_normalized_table(&mut prev_counts.clone(), nb_seq, 8, 9, last).unwrap();
+        let prev = build_normalized_table(
+            &mut prev_counts.clone(),
+            nb_seq,
+            8,
+            9,
+            last,
+            &mut FseBuildScratch::default(),
+        )
+        .unwrap();
 
         let mut counts = counts_from(&symbols);
         let mode = select_from_counts(
@@ -1065,6 +1095,7 @@ mod tests {
             Some(&prev),
             6,
             9,
+            &mut FseBuildScratch::default(),
         );
         assert!(
             matches!(mode, FseTableMode::Repeat(_)),
@@ -1085,6 +1116,7 @@ mod tests {
             Some(&prev),
             6,
             9,
+            &mut FseBuildScratch::default(),
         );
         assert!(
             matches!(mode, FseTableMode::Encoded(_)),
@@ -1097,7 +1129,17 @@ mod tests {
             other.push(30 + (i % 5) as u8);
         }
         let mut counts = counts_from(&other);
-        let mode = select_from_counts(&mut counts, nb_seq, first, 30, &default, Some(&prev), 6, 9);
+        let mode = select_from_counts(
+            &mut counts,
+            nb_seq,
+            first,
+            30,
+            &default,
+            Some(&prev),
+            6,
+            9,
+            &mut FseBuildScratch::default(),
+        );
         assert!(
             matches!(mode, FseTableMode::Encoded(_)),
             "drifted distribution must rebuild"

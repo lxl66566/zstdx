@@ -214,6 +214,45 @@ mod tests {
         }
     }
 
+    /// Repeated calls through the pooled slice state must be byte-identical:
+    /// the recycled entropy-build buffers carry stale contents that only
+    /// live rows overwrite, so a dead-row read would flip the output from
+    /// the second call on (multi-block inputs also exercise the
+    /// previous-table adoption between blocks and calls).
+    #[test]
+    fn pooled_calls_byte_identical() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut mixed: Vec<u8> = Vec::new();
+        for i in 0..300 * 1024u32 {
+            // Compressible stretches interleaved with random bytes keep
+            // both the entropy builds and the raw fallbacks live.
+            mixed.push(if i % 97 < 64 {
+                b'a' + (i % 23) as u8
+            } else {
+                (rand() & 0xff) as u8
+            });
+        }
+        mixed.extend((0..130 * 1024).map(|i| (i % 61) as u8));
+        mixed.extend((0..64 * 1024).map(|_| (rand() & 0xff) as u8));
+        for level in [Level::Fastest, Level::Fast, Level::Balanced, Level::Best] {
+            let opts = crate::EncoderOptions::new(level).checksum(false);
+            let first = compress_with(&mixed, &opts).unwrap();
+            for _ in 0..3 {
+                assert_eq!(
+                    compress_with(&mixed, &opts).unwrap(),
+                    first,
+                    "pooled call diverged at {level:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn to_buffer_reports_written() {
         let input = b"small payload for the exact-size path";

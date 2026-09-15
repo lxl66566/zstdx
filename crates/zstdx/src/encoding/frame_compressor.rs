@@ -379,10 +379,22 @@ pub(crate) fn reset_slice_state(
     state.matcher.set_reach_choice(choice);
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
-    state.last_huff_table = None;
-    state.fse_tables.ll_previous = None;
-    state.fse_tables.ml_previous = None;
-    state.fse_tables.of_previous = None;
+    if let Some(table) = state.last_huff_table.take() {
+        table.recycle_codes(&mut state.scratch.huff);
+    }
+    // Retired tables return their transition buffers to the block scratch.
+    // (Three statements, not an array: FSETable is ~1.5 KB inline, so
+    // materializing an array would memcpy even the empty slots.)
+    let fse = &mut state.scratch.fse;
+    if let Some(table) = state.fse_tables.ll_previous.take() {
+        table.recycle(fse);
+    }
+    if let Some(table) = state.fse_tables.ml_previous.take() {
+        table.recycle(fse);
+    }
+    if let Some(table) = state.fse_tables.of_previous.take() {
+        table.recycle(fse);
+    }
 }
 
 /// Take the per-thread pooled slice state, reset for a fresh frame at

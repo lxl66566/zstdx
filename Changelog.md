@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: per-block entropy-table builds recycle their buffers through a
+  pool in the block scratch (FSE transition tables, huffman codes,
+  package-merge lists, wire weights); a buffer zeroes only its growth tail,
+  once per size. Byte-identical output (25-cell emit diff + pooled-call
+  regression test); small-payload band: json-4K -13.6% instructions
+  (gungraun), wall x1.96->1.83 vs libzstd; text-4K -11.1% / x1.91->1.87;
+  8K/16K -4..6% wall; skewed-4K x0.90->0.80; 64K-1M and the 32MiB matrix
+  flat to ahead. zstdx-gungraun gains a deterministic small-payload bench
+  (4K-64K cells, both implementations).
 - Docs/falsification: the fast-tier acceptance bar (todo item 3's last
   open lever). Fed-back literal pricing (the chain store gate's mechanism)
   is shape-safe and wins json.fastest -1.25% size in all four modes with
