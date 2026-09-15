@@ -11,3 +11,4 @@ crates/zstdx/fuzz/corpus
 .idea
 /docs/book
 /bench/big
+/bench/scratch

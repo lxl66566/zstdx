@@ -7,6 +7,9 @@
 //!   switches to the checksummed bulk path.
 //! - `prof enc-stream <zstd-level> <iters> <file> [workers=1]`: streaming encode with 64 KiB
 //!   writes; a worker count above one selects the mt streaming core.
+//! - `prof enc-stream-read <zstd-level> <iters> <file> [workers=1]`: the read-shaped streaming
+//!   encoder over an in-memory source with 64 KiB output pulls — the exact shape the matrix
+//!   `enc-stream` cells time (checksums off).
 
 use std::{
     fs,
@@ -24,6 +27,8 @@ pub enum ProfMode {
     Enc,
     /// Streaming (write) encode of one file.
     EncStream,
+    /// Streaming (read) encode of one file, the matrix enc-stream shape.
+    EncStreamRead,
 }
 
 #[derive(clap::Args)]
@@ -146,10 +151,49 @@ fn run_enc_stream(rest: &[String]) {
     );
 }
 
+fn run_enc_stream_read(rest: &[String]) {
+    let level = zstdx::Level::from_zstd(num::<i32>(rest, 0, "zstd level"));
+    let iters: usize = num(rest, 1, "iters");
+    let path = arg(rest, 2, "file");
+    let workers: u32 = rest
+        .get(3)
+        .map_or(1, |w| w.parse().expect("workers must be a number"));
+    let raw = fs::read(path).unwrap();
+    let mut sink = vec![0u8; 64 * 1024];
+    let t0 = Instant::now();
+    let mut total_out = 0usize;
+    for _ in 0..iters {
+        let mut enc = zstdx::stream::read::Encoder::with_options(
+            &raw[..],
+            zstdx::EncoderOptions::new(level)
+                .checksum(false)
+                .workers(workers),
+        )
+        .unwrap();
+        let mut acc = 0u64;
+        loop {
+            let n = enc.read(&mut sink).unwrap();
+            if n == 0 {
+                break;
+            }
+            acc += n as u64;
+        }
+        enc.finish();
+        total_out = acc as usize;
+        std::hint::black_box(acc);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    println!(
+        "{path} L{level:?} w{workers}: {iters} iters, out={total_out} bytes, {:.0} MiB/s",
+        iters as f64 * raw.len() as f64 / dt / (1 << 20) as f64
+    );
+}
+
 pub fn run(args: &Args) {
     match args.mode {
         ProfMode::Dec => run_dec(&args.rest),
         ProfMode::Enc => run_enc(&args.rest),
         ProfMode::EncStream => run_enc_stream(&args.rest),
+        ProfMode::EncStreamRead => run_enc_stream_read(&args.rest),
     }
 }

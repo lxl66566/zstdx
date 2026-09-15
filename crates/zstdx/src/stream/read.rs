@@ -24,6 +24,12 @@ use crate::{
 pub struct Encoder<R: Read> {
     source: Option<R>,
     core: FrameEncoderCore,
+    /// Pump staging buffer: reused across pulls so it is zeroed once per
+    /// encoder instead of once per 16 KiB pull. The 16 KiB granularity is
+    /// measured (interleaved A/B): 64/128 KiB pulls overshoot the job
+    /// grid's posting boundaries and pay for it at the buffer's recycle
+    /// points.
+    chunk: alloc::vec::Vec<u8>,
 }
 
 impl<R: Read> Encoder<R> {
@@ -39,6 +45,7 @@ impl<R: Read> Encoder<R> {
         Ok(Self {
             source: Some(source),
             core: FrameEncoderCore::new(&options)?,
+            chunk: alloc::vec![0u8; 16 * 1024],
         })
     }
 
@@ -70,7 +77,8 @@ impl<R: Read> Encoder<R> {
 impl<R: Read> Read for Encoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         while !self.core.has_output() && !self.core.is_finished() {
-            self.core.pump_from(self.source.as_mut().unwrap())?;
+            self.core
+                .pump_from(self.source.as_mut().unwrap(), &mut self.chunk)?;
         }
         Ok(self.core.split_output(buf))
     }
