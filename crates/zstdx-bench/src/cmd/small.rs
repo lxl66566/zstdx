@@ -7,11 +7,12 @@
 //! code path. `--level` selects ladder tiers or numeric levels (default
 //! `fastest`), bench-paired with libzstd at the same numeric level.
 
+use zstdx::EncoderOptions;
+
 use crate::{
     common::{Ab, apply_budget, black_box, measure_solo, want},
     corpus::{LevelSel, Shape, load_raw},
 };
-use zstdx::EncoderOptions;
 
 /// Zeros is skipped: RLE payloads say nothing about the small-call paths.
 const SMALL_SHAPES: [Shape; 4] = [Shape::Json, Shape::Text, Shape::Skewed, Shape::Random];
@@ -64,7 +65,12 @@ pub fn run(args: &Args) {
             LevelSel::Num(l) => (l, l.as_i32()),
         };
         println!("level {} (zstdx vs libzstd at the same number)", zstd_level);
-        println!("{:<16}{:>9}{:>9}  xslow  (MiB/s)", "shape", "ruz", format!("zstd{zstd_level}"));
+        println!(
+            "{:<16}{:>9}{:>9}  xslow  (MiB/s)",
+            "shape",
+            "ruz",
+            format!("zstd{zstd_level}")
+        );
         for shape in SMALL_SHAPES
             .iter()
             .copied()

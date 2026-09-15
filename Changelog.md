@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Fast scan: the pair's two hash-match compares share one branch (the rep
+  OR-fold's class). Both positions' candidates are resolved and
+  pre-compared up front — `m = (cand == ip) | (read4(cand) ^ cur)`, fold
+  on `(m0 == 0) | (m1 == 0)` — with the armed-rep entry kept off the fold
+  condition (a folded spilled bool put its reload on the hot input path).
+  Byte-identical output (full-ladder dump ×30, L1/L2 × ST/MT emitframe);
+  mid-size fastest A/Bs: json-256K +9% (x1.53→1.40 vs libzstd-1),
+  json-1M +7%, text-256K +4.5%, text-1M +3.3%, 32MiB json.fastest
+  x1.502 (was 1.52-1.57), 4K flat; json-64K −5% (the merged branch
+  mispredicts in the L1-resident single-block regime — reproduced, the
+  one cell traded). Post-fold the scan's branch inventory is flat.
+- Bench: `small` gains a `--level` axis (tier names or numeric levels,
+  libzstd-paired) and checksum parity with `zstd::bulk::compress` — the
+  old timed path paid our checksum + ≥256 KiB sidecar thread against a
+  reference that never did (~8-12% of the recorded mid-size "2×").
+
 - Docs: SIMD copy scheduling of the fused sequence loop (todo 2, the last
   unassessed structural idea) is falsified — porting libzstd's wildcopy
   issue structure (head-first copy16 + unrolled landing tail + dead-branch
