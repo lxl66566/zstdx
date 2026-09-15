@@ -1619,12 +1619,13 @@ impl MatchGeneratorDriver {
             if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
                 self.lazy_scratch = Some(LazyScratch::new());
             }
-            // The size gate: the split pass costs ~9 cyc/B (measured), so
-            // LDM arms only where its full 64 MiB reach survived the
-            // source-length clamp — smaller inputs keep the pure chain
-            // parse at zero tax, trading the 4-32 MiB far classes of
-            // mid-size binaries (dll32-class, measured worth -19.7%
-            // there) for the corpus cells' speed.
+            // The size gate: the split pass costs real cycles per byte
+            // even cheapened (see ldm.rs), so LDM arms only where its
+            // full 64 MiB reach survived the source-length clamp —
+            // smaller inputs keep the pure chain parse at zero tax,
+            // trading the 4-32 MiB far classes of mid-size binaries
+            // (dll32-class, measured worth -19.7% there) for the corpus
+            // cells' speed.
             let ldm_wanted = params.ldm
                 && matches!(params.strategy, Strategy::Chain(_))
                 && params.window >= (1 << 26);
