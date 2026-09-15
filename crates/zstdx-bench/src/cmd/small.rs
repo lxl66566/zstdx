@@ -4,11 +4,14 @@
 //! Rounds batch ~4 MiB of calls so tiny payloads don't measure timer
 //! overhead (see `common`). `--impl` restricts to one implementation and
 //! `--size` to one payload size so profilers attribute samples to a single
-//! code path.
+//! code path. `--level` selects ladder tiers or numeric levels (default
+//! `fastest`), bench-paired with libzstd at the same numeric level.
+
+use zstdx::EncoderOptions;
 
 use crate::{
     common::{Ab, apply_budget, black_box, measure_solo, want},
-    corpus::{Shape, load_raw},
+    corpus::{LevelSel, Shape, load_raw},
 };
 
 /// Zeros is skipped: RLE payloads say nothing about the small-call paths.
@@ -28,6 +31,9 @@ pub struct Args {
     /// Payload sizes in bytes (comma-separated)
     #[arg(long, value_delimiter = ',')]
     pub size: Vec<usize>,
+    /// Levels to include: tier names or numeric levels 1-22 (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    pub level: Vec<LevelSel>,
     /// Restrict to one implementation
     #[arg(long, value_enum)]
     pub r#impl: Option<Impl>,
@@ -43,63 +49,84 @@ pub fn run(args: &Args) {
     } else {
         args.size.clone()
     };
+    let levels: Vec<LevelSel> = if args.level.is_empty() {
+        vec![LevelSel::Tier(crate::corpus::LevelName::Fastest)]
+    } else {
+        args.level.clone()
+    };
     let ab = Ab::default();
     println!(
         "small-payload encode (interleaved A/B, budget {:.0} ms/side)",
         ab.min_secs * 1000.0
     );
-    println!("{:<16}{:>9}{:>9}  xslow  (MiB/s)", "shape", "ruz", "zstd1");
-    for shape in SMALL_SHAPES
-        .iter()
-        .copied()
-        .filter(|s| want(&args.shape, s))
-    {
-        let raw = load_raw(shape);
-        for size in &sizes {
-            let data = &raw[..(*size).min(raw.len())];
-            // correctness gate
-            let comp = zstdx::bulk::compress(data, zstdx::Level::Fastest);
-            let mut back = Vec::with_capacity(data.len() + 16);
-            zstdx::decoding::FrameDecoder::new()
-                .decode_all_to_vec(&comp, &mut back)
-                .unwrap();
-            assert_eq!(&back[..], data);
+    for level in &levels {
+        let (zlevel, zstd_level) = match *level {
+            LevelSel::Tier(t) => t.pair(),
+            LevelSel::Num(l) => (l, l.as_i32()),
+        };
+        println!("level {} (zstdx vs libzstd at the same number)", zstd_level);
+        println!(
+            "{:<16}{:>9}{:>9}  xslow  (MiB/s)",
+            "shape",
+            "ruz",
+            format!("zstd{zstd_level}")
+        );
+        for shape in SMALL_SHAPES
+            .iter()
+            .copied()
+            .filter(|s| want(&args.shape, s))
+        {
+            let raw = load_raw(shape);
+            for size in &sizes {
+                let data = &raw[..(*size).min(raw.len())];
+                // Timed path matches libzstd's `zstd::bulk::compress`
+                // default: no frame checksum (and no checksum sidecar
+                // thread on the >=256 KiB inputs).
+                let opts = EncoderOptions::new(zlevel).checksum(false);
+                // correctness gate
+                let comp = zstdx::bulk::compress_with(data, &opts).unwrap();
+                let mut back = Vec::with_capacity(data.len() + 16);
+                zstdx::decoding::FrameDecoder::new()
+                    .decode_all_to_vec(&comp, &mut back)
+                    .unwrap();
+                assert_eq!(&back[..], data);
 
-            let batch = (4 * 1024 * 1024 / data.len()).clamp(1, 100_000);
-            let name = format!("{}-{}K", shape.raw_name(), data.len() / 1024);
-            let bytes = (data.len() * batch) as u64;
-            match args.r#impl {
-                Some(Impl::Zstd) => {
-                    let stats = measure_solo(|| {
-                        for _ in 0..batch {
-                            black_box(zstd::bulk::compress(data, 1).unwrap());
-                        }
-                    });
-                    println!("{name:<16}{:>9}{:>9.0}", "", stats.mibs(bytes));
-                },
-                Some(Impl::Zstdx) => {
-                    let stats = measure_solo(|| {
-                        for _ in 0..batch {
-                            black_box(zstdx::bulk::compress(data, zstdx::Level::Fastest));
-                        }
-                    });
-                    println!("{name:<16}{:>9.0}{:>9}", stats.mibs(bytes), "");
-                },
-                None => {
-                    let report = ab.measure(
-                        || {
+                let batch = (4 * 1024 * 1024 / data.len()).clamp(1, 100_000);
+                let name = format!("{}-{}K", shape.raw_name(), data.len() / 1024);
+                let bytes = (data.len() * batch) as u64;
+                match args.r#impl {
+                    Some(Impl::Zstd) => {
+                        let stats = measure_solo(|| {
                             for _ in 0..batch {
-                                black_box(zstdx::bulk::compress(data, zstdx::Level::Fastest));
+                                black_box(zstd::bulk::compress(data, zstd_level).unwrap());
                             }
-                        },
-                        || {
+                        });
+                        println!("{name:<16}{:>9}{:>9.0}", "", stats.mibs(bytes));
+                    },
+                    Some(Impl::Zstdx) => {
+                        let stats = measure_solo(|| {
                             for _ in 0..batch {
-                                black_box(zstd::bulk::compress(data, 1).unwrap());
+                                black_box(zstdx::bulk::compress_with(data, &opts).unwrap());
                             }
-                        },
-                    );
-                    report.print(&name, bytes);
-                },
+                        });
+                        println!("{name:<16}{:>9.0}{:>9}", stats.mibs(bytes), "");
+                    },
+                    None => {
+                        let report = ab.measure(
+                            || {
+                                for _ in 0..batch {
+                                    black_box(zstdx::bulk::compress_with(data, &opts).unwrap());
+                                }
+                            },
+                            || {
+                                for _ in 0..batch {
+                                    black_box(zstd::bulk::compress(data, zstd_level).unwrap());
+                                }
+                            },
+                        );
+                        report.print(&name, bytes);
+                    },
+                }
             }
         }
     }

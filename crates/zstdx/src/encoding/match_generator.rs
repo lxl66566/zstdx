@@ -3044,55 +3044,84 @@ impl MatchGeneratorDriver {
                     }
                 }
 
+                // Both positions' hash candidates are resolved and compared
+                // up front so the two data-dependent compare outcomes share
+                // ONE unpredictable branch (the rep OR-fold's rationale:
+                // adjacent-position outcomes are correlated). The pre-reads
+                // are loads only — the table writes happen inside emit, after
+                // every probe here — and probe/emission order is untouched,
+                // so the output is byte-identical to the two-compare form.
+                // An `m` is 0 iff the candidate is not the scanning position
+                // itself and its first 4 bytes agree; the tail pair
+                // (pair_len 1) aliases the first position's values, so its
+                // `m1` can only re-fire the already-tried `m0` probe. The
+                // fold consumes only the two register-resident `m`s —
+                // folding `rep1_armed` into the same condition kept its
+                // spilled byte load on the hot branch input (a measured
+                // json-64K regression), so the armed-but-no-hash-hit case
+                // enters through its own rarely-taken branch instead.
                 let reach = (pos - win_base).min(max_window);
                 let mut cand0 = resolve(prev0, pos, reach, idx0);
-                if cand0 != idx0 && read4(win, cand0) == cur0 {
-                    let mut ml = extend_match(win, idx0, cand0);
-                    // A hash match already spans 5 bytes; below 6 the
-                    // sequence overhead roughly equals the literals
-                    // it covers, and rejecting it lets the scan try
-                    // the next position where a longer match may
-                    // start.
-                    if ml >= 6 && !ramp.blocks(pos, win_base + cand0 as u64) {
-                        let anchor_idx = (anchor - win_base) as usize;
-                        let mut start = idx0;
-                        let cfl = ramp.ext_floor(cand0, win_base);
-                        // Extend backwards into the pending literals;
-                        // the offset (idx0 - cand) stays constant.
-                        while start > anchor_idx && cand0 > cfl && win[cand0 - 1] == win[start - 1] {
-                            cand0 -= 1;
-                            start -= 1;
-                            ml += 1;
-                        }
-                        let of_value = (start - cand0 + 3) as u32;
-                        anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
-                        // A literal offset shifts the decoder's history
-                        // one slot down; after the third one a job-start
-                        // gate has fully converged and repcode use is
-                        // safe again.
-                        if $gated {
-                            rep_pending = rep_pending.saturating_sub(1);
-                            pos = if rep_pending == 0 {
-                                emit.rep1_chain(win, anchor, block_end, &mut rep, ramp)
+                let m0 = (cand0 == idx0) as u32 | (read4(win, cand0) ^ cur0);
+                let pos1 = win_base + idx1 as u64;
+                let reach1 = (pos1 - win_base).min(max_window);
+                let mut cand1 = resolve(prev1, pos1, reach1, idx1);
+                let m1 = (cand1 == idx1) as u32 | (read4(win, cand1) ^ cur1);
+                'probes: {
+                if (m0 == 0) | (m1 == 0) {
+                    if m0 == 0 {
+                        let mut ml = extend_match(win, idx0, cand0);
+                        // A hash match already spans 5 bytes; below 6 the
+                        // sequence overhead roughly equals the literals
+                        // it covers, and rejecting it lets the scan try
+                        // the next position where a longer match may
+                        // start.
+                        if ml >= 6 && !ramp.blocks(pos, win_base + cand0 as u64) {
+                            let anchor_idx = (anchor - win_base) as usize;
+                            let mut start = idx0;
+                            let cfl = ramp.ext_floor(cand0, win_base);
+                            // Extend backwards into the pending literals;
+                            // the offset (idx0 - cand) stays constant.
+                            while start > anchor_idx
+                                && cand0 > cfl
+                                && win[cand0 - 1] == win[start - 1]
+                            {
+                                cand0 -= 1;
+                                start -= 1;
+                                ml += 1;
+                            }
+                            let of_value = (start - cand0 + 3) as u32;
+                            anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
+                            // A literal offset shifts the decoder's history
+                            // one slot down; after the third one a job-start
+                            // gate has fully converged and repcode use is
+                            // safe again.
+                            if $gated {
+                                rep_pending = rep_pending.saturating_sub(1);
+                                pos = if rep_pending == 0 {
+                                    emit.rep1_chain(win, anchor, block_end, &mut rep, ramp)
+                                } else {
+                                    anchor
+                                };
                             } else {
-                                anchor
-                            };
-                        } else {
-                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                                pos =
+                                    emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                            }
+                            anchor = pos;
+                            miss_count = 0;
+                            continue $restart;
                         }
-                        anchor = pos;
-                        miss_count = 0;
-                        continue $restart;
                     }
+                } else if !rep1_armed {
+                    break 'probes;
                 }
-            }
 
-            // Probe the second position through the entry prepared above.
-            // `pos1 == anchor` is impossible (anchor <= pos < pos + 1), so
-            // the pending-literal select folds away here. The repcode probe
-            // is armed by the folded prefilter above (which also applies the
-            // window bound and the job-start gate), so it runs compare-free.
-            if pair_len == 2 {
+                // Probe the second position through the entry prepared
+                // above. `pos1 == anchor` is impossible (anchor <= pos <
+                // pos + 1), so the pending-literal select folds away
+                // here. The repcode probe is armed by the folded
+                // prefilter above (which also applies the window bound
+                // and the job-start gate), so it runs compare-free.
                 if rep1_armed {
                     let mut cand = idx1 - rep[0] as usize;
                     let mut ml = extend_match(win, idx1, cand);
@@ -3118,16 +3147,16 @@ impl MatchGeneratorDriver {
                     }
                 }
 
-                let pos1 = win_base + idx1 as u64;
-                let reach1 = (pos1 - win_base).min(max_window);
-                let mut cand1 = resolve(prev1, pos1, reach1, idx1);
-                if cand1 != idx1 && read4(win, cand1) == cur1 {
+                if m1 == 0 {
                     let mut ml = extend_match(win, idx1, cand1);
                     if ml >= 6 && !ramp.blocks(pos1, win_base + cand1 as u64) {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
                         let cfl = ramp.ext_floor(cand1, win_base);
-                        while start > anchor_idx && cand1 > cfl && win[cand1 - 1] == win[start - 1] {
+                        while start > anchor_idx
+                            && cand1 > cfl
+                            && win[cand1 - 1] == win[start - 1]
+                        {
                             cand1 -= 1;
                             start -= 1;
                             ml += 1;
@@ -3153,7 +3182,8 @@ impl MatchGeneratorDriver {
                         continue $restart;
                     }
                 }
-            }
+                }
+                }
 
             // Both positions missed: grow the probe step on long literal
             // runs so incompressible data does not pay a full hash per
