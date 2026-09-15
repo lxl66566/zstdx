@@ -247,7 +247,11 @@ pub(crate) fn run_job_with(
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
+    #[cfg(feature = "job_trace")]
+    let trace_reset = std::time::Instant::now();
     reset_slice_state(state, level, shape, choice, LdmArming::Job);
+    #[cfg(feature = "job_trace")]
+    super::job_trace::add_reset(trace_reset);
     if gate {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();

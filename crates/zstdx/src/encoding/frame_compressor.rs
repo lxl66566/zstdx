@@ -621,10 +621,16 @@ pub(crate) fn compress_job_blocks(
     // pooled state may carry an earlier frame's entries), and without the
     // index pass the strip is only a legal boundary extension no sequence
     // can ever resolve into.
+    #[cfg(feature = "job_trace")]
+    let trace_job = std::time::Instant::now();
     let strip = job.start.saturating_sub(overlap);
+    #[cfg(feature = "job_trace")]
+    let trace_prefill = std::time::Instant::now();
     state
         .matcher
         .prefill_window(&src[strip..job.start], strip as u64);
+    #[cfg(feature = "job_trace")]
+    super::job_trace::add_prefill(trace_prefill);
     let mut cursor = job.start;
     while cursor < job.end {
         let block_end = (cursor + block_size).min(job.end);
@@ -641,6 +647,8 @@ pub(crate) fn compress_job_blocks(
         compress_fastest(state, last_block, &mut output, &mut hasher);
         cursor = block_end;
     }
+    #[cfg(feature = "job_trace")]
+    super::job_trace::add_job(trace_job);
     output
 }
 

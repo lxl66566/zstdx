@@ -567,6 +567,11 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             LevelName::Fast,
             LevelName::Balanced,
             LevelName::Best,
+            // The deep tiers: per-job fixed costs (strip tree-fill, ultra's
+            // seed parse) are exactly what these cells expose — very slow on
+            // json (seconds per iteration), so narrow with --level/--shape.
+            LevelName::Opt,
+            LevelName::Ultra,
         ]) {
             // gate: both sides' multithreaded streaming outputs must roundtrip
             let mut comp = Vec::new();
@@ -631,6 +636,8 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             LevelName::Fast,
             LevelName::Balanced,
             LevelName::Best,
+            LevelName::Opt,
+            LevelName::Ultra,
         ]) {
             let comp = compress_with_ok(
                 &raw,

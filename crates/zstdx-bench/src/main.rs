@@ -37,6 +37,10 @@ enum Command {
     /// Decode explicit .zst files with a time budget, verifying against the
     /// raw counterpart when one is found next to the file.
     Files(cmd::files::Args),
+    /// Per-job fixed-cost decomposition for the opt/ultra tiers (needs
+    /// `--features job_trace`): strip fill / seed parse / reset / refills
+    /// against the summed job time.
+    Jobdecomp(cmd::jobdecomp::JobDecompArgs),
     /// Solo profiling loops for `perf` attribution: decode, bulk encode, or
     /// streaming encode of one file, no reference side.
     Prof(cmd::prof::Args),
@@ -71,6 +75,7 @@ fn main() {
         Command::Ratio(args) => cmd::ratio::run(&args),
         Command::Small(args) => cmd::small::run(&args),
         Command::Files(args) => cmd::files::run(&args),
+        Command::Jobdecomp(args) => cmd::jobdecomp::run(&args),
         Command::Prof(args) => cmd::prof::run(&args),
         Command::Dump(args) => cmd::dump::run(&args),
         Command::Emitframe(args) => cmd::emitframe::run(&args),
