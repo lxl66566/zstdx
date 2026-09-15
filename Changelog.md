@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the fastest tier's fast scan instantiates a dense-mode body per
+  block (`const DENSE` pair alongside the ramp instantiation), selected
+  from the previous block's parse (>=512 sequences, <4 literal B/seq, and
+  the fed-back literal table covering <32 symbols — the alphabet arm is
+  what keeps text/skewed/dll byte-identical: their match-dense blocks
+  overlap json's parse-statistic bands). The dense body hosts the
+  fed-back-literal-price acceptance bar (dist >= 1024, priced at the
+  previous block's Huffman code lengths, declines fall through to the
+  next probe) and miss-run stepping (pair advance doubles after one full
+  missed pair). json.fastest -3.3..-3.9% size in all four modes at
+  559->590 MiB/s interleaved (x1.53->x1.44 vs libzstd-1); json-1M -2.72%
+  at 608->630 MiB/s; every other output byte-identical (120-cell sweep,
+  full-ladder dump, dll100 emitframes); text.fastest -1.8% wall at
+  identical output (plain-body placement in the doubled-code binary).
+  Falsified variants in docs/src/dev/negative/matchers.md (stats-only
+  gates, step thresholds, the 48-symbol bar).
 - Encoder: the dfast scan instantiates const-generic table logs — the
   dispatch keys on the tables' actual lengths and the two full rows
   (17/16, 18/18) compile their hash shifts to immediates, freeing the two

@@ -980,6 +980,54 @@ const COVERED_GATE_MIN_SEQS: usize = 64;
 /// 2.6-3.0).
 const COVERED_GATE_AVG_LL: usize = 4;
 
+/// Scan instantiation of the fast strategy for the upcoming block,
+/// decided from the previous block's parse (the [`CoveredFill`]
+/// precedent). The dense body hosts levers whose unconditional hosting is
+/// falsified: even a never-taken acceptance-bar branch costs text.fastest
+/// 12% wall (see the negative notes), while match-dense narrow-alphabet
+/// parses (json: 97% of blocks) win on them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanDensity {
+    /// The stock scan body, byte-for-byte.
+    Plain,
+    /// Hosts the fed-back-literal-price acceptance bar and miss-run
+    /// stepping (see [`DENSE_BAR_MIN_DIST`]/[`DENSE_STEP_AFTER`]).
+    Dense,
+}
+
+/// Sequence floor of the dense-scan gate: below it a block's parse carries
+/// no usable density signal (skewed's literal-run tails sit at ≤ 10
+/// sequences per block).
+const DENSE_GATE_MIN_SEQS: usize = 512;
+/// Literal bytes per sequence ceiling of the dense-scan gate: dll-class
+/// sparse parses (median 8.6) stay plain — their far matches are payload
+/// the bar would decline.
+const DENSE_GATE_MAX_AVG_LL: usize = 4;
+/// Covered-symbol ceiling of the dense-scan gate: the width of the literal
+/// alphabet under the previous block's fed-back Huffman lengths. This is
+/// the signal that separates the classes — text's four match-dense blocks
+/// carry 99.5% of its sequences and are locally json-shaped in every parse
+/// statistic (nseq, avg_ll), but price their literals on a ~80-symbol
+/// alphabet at 5.4+ bits/B where json's residual stream covers 11-25
+/// symbols at 3.5, dll's sparsest passing block covers 43. The bar sits
+/// mid-gap (json max 25, dll min 43, text 78+).
+const DENSE_GATE_SYMS_MAX: usize = 32;
+/// Offset floor of the dense scan's acceptance bar: nearer matches clear
+/// the flat-4 price already, so only far candidates pay the price gather.
+const DENSE_BAR_MIN_DIST: usize = 1024;
+/// Consecutive missed bytes after which the dense scan doubles the pair
+/// advance: json's mid-run weak matches are net-negative on both axes
+/// (skipping them shrinks size AND raises speed), text's are payload —
+/// hence dense-mode only.
+const DENSE_STEP_AFTER: usize = 3;
+
+/// Count the symbols the fed-back literal table covers (code lengths below
+/// the 11-bit cap [`MatchGeneratorDriver::note_literal_costs`] maps
+/// uncovered symbols to). 256 ops per block, never per byte.
+fn covered_lit_symbols(lit_lens: &[u8; 256]) -> usize {
+    lit_lens.iter().filter(|&&l| l < 11).count()
+}
+
 /// Store `abs` as the newest position for its hash into a table of `log`
 /// bits. Caller guarantees `idx` has at least 5 bytes of window behind it.
 #[inline(always)]
@@ -1507,6 +1555,9 @@ pub struct MatchGeneratorDriver {
     /// repeats have no duplicate copy to hit instead). Set at fast-strategy
     /// block boundaries only; reset per frame.
     covered_fill: CoveredFill,
+    /// Scan instantiation of the next fast block (see [`ScanDensity`]);
+    /// decided at fast-strategy block boundaries, reset per frame.
+    scan_density: ScanDensity,
     params: LevelParams,
     /// Repeated-offset history, kept in lockstep with the decoder's
     /// `offset_hist` so repcode probes see the same candidates it will.
@@ -1718,6 +1769,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
+            scan_density: ScanDensity::Plain,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
@@ -1770,6 +1822,7 @@ impl MatchGeneratorDriver {
             epoch: 1,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
+            scan_density: ScanDensity::Plain,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
             reach_choice: ReachChoice::Keep,
@@ -2346,6 +2399,7 @@ impl Matcher for MatchGeneratorDriver {
         }
         self.miss_count = 0;
         self.covered_fill = CoveredFill::Dense;
+        self.scan_density = ScanDensity::Plain;
         self.ramp = RampGate::OFF;
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
@@ -2484,10 +2538,21 @@ impl Matcher for MatchGeneratorDriver {
         }
         match self.params.strategy {
             Strategy::Fast => {
-                if self.ramp.is_armed() {
-                    self.start_matching_fast::<true>(literals, seqs);
-                } else {
-                    self.start_matching_fast::<false>(literals, seqs);
+                // The instantiation pair is compile-time: plain blocks run
+                // a body with every dense-mode lever folded out.
+                match (self.ramp.is_armed(), self.scan_density) {
+                    (false, ScanDensity::Plain) => {
+                        self.start_matching_fast::<false, false>(literals, seqs)
+                    },
+                    (false, ScanDensity::Dense) => {
+                        self.start_matching_fast::<false, true>(literals, seqs)
+                    },
+                    (true, ScanDensity::Plain) => {
+                        self.start_matching_fast::<true, false>(literals, seqs)
+                    },
+                    (true, ScanDensity::Dense) => {
+                        self.start_matching_fast::<true, true>(literals, seqs)
+                    },
                 }
                 // This block's parse density picks the next block's
                 // covered-fill policy. Structured shapes never fire
@@ -2500,6 +2565,19 @@ impl Matcher for MatchGeneratorDriver {
                     CoveredFill::Strided
                 } else {
                     CoveredFill::Dense
+                };
+                // Same-block dispatch of the next scan's instantiation:
+                // match-dense, literal-light parses over a narrow literal
+                // alphabet (the fed-back table's coverage) run dense.
+                // Frame starts stay plain (no parse yet; DEFAULT_LIT_LENS
+                // reads as a 256-wide alphabet).
+                self.scan_density = if seqs.len() >= DENSE_GATE_MIN_SEQS
+                    && literals.len() < DENSE_GATE_MAX_AVG_LL * seqs.len()
+                    && covered_lit_symbols(&self.lit_lens) < DENSE_GATE_SYMS_MAX
+                {
+                    ScanDensity::Dense
+                } else {
+                    ScanDensity::Plain
                 };
             },
             Strategy::Dfast(_) => {
@@ -2917,7 +2995,7 @@ impl MatchGeneratorDriver {
     }
 
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
-    fn start_matching_fast<const RAMPED: bool>(
+    fn start_matching_fast<const RAMPED: bool, const DENSE: bool>(
         &mut self,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
@@ -2959,6 +3037,10 @@ impl MatchGeneratorDriver {
         let mut seed_hits = self.seed_hits;
         let mut seed_budget = self.seed_budget;
         let hash_read = HASH_READ as u64;
+        // Fed-back literal prices for the dense body's acceptance bar. A
+        // plain block's copy is dead code (DENSE folds to false), so the
+        // plain instantiation stays byte-for-byte the stock body.
+        let lit_lens = self.lit_lens;
 
         // Resolve a table entry to a window index. The truncated absolute
         // position is rebuilt as a *distance* from the scanning position:
@@ -3226,26 +3308,41 @@ impl MatchGeneratorDriver {
                                 start -= 1;
                                 ml += 1;
                             }
-                            let of_value = (start - cand0 + 3) as u32;
-                            anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
-                            // A literal offset shifts the decoder's history
-                            // one slot down; after the third one a job-start
-                            // gate has fully converged and repcode use is
-                            // safe again.
-                            if $gated {
-                                rep_pending = rep_pending.saturating_sub(1);
-                                pos = if rep_pending == 0 {
-                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                            // Dense-mode acceptance bar: decline a far
+                            // match whose displaced literals, priced at the
+                            // fed-back code lengths, do not cover its offset
+                            // (the chain store gate's pricing). The decline
+                            // falls through to the second-position probe
+                            // and feeds the miss ramp below; with DENSE
+                            // false the condition folds to the constant
+                            // true, keeping this body stock.
+                            let bar_ok = !DENSE
+                                || start - cand0 < DENSE_BAR_MIN_DIST
+                                || pays_for_offset_lit(
+                                    win, start, ml, cand0, false, &lit_lens,
+                                );
+                            if bar_ok {
+                                let of_value = (start - cand0 + 3) as u32;
+                                anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
+                                // A literal offset shifts the decoder's history
+                                // one slot down; after the third one a job-start
+                                // gate has fully converged and repcode use is
+                                // safe again.
+                                if $gated {
+                                    rep_pending = rep_pending.saturating_sub(1);
+                                    pos = if rep_pending == 0 {
+                                        emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                                    } else {
+                                        anchor
+                                    };
                                 } else {
-                                    anchor
-                                };
-                            } else {
-                                pos =
-                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                    pos =
+                                        emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                }
+                                anchor = pos;
+                                miss_count = 0;
+                                continue $restart;
                             }
-                            anchor = pos;
-                            miss_count = 0;
-                            continue $restart;
                         }
                     }
                 } else if !rep1_armed {
@@ -3297,25 +3394,32 @@ impl MatchGeneratorDriver {
                             start -= 1;
                             ml += 1;
                         }
-                        let of_value = (start - cand1 + 3) as u32;
-                        anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
-                        // A literal offset shifts the decoder's history
-                        // one slot down; after the third one a job-start
-                        // gate has fully converged and repcode use is
-                        // safe again.
-                        if $gated {
-                            rep_pending = rep_pending.saturating_sub(1);
-                            pos = if rep_pending == 0 {
-                                emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                        // Dense-mode acceptance bar, second position;
+                        // a decline falls to the miss ramp.
+                        let bar_ok = !DENSE
+                            || start - cand1 < DENSE_BAR_MIN_DIST
+                            || pays_for_offset_lit(win, start, ml, cand1, false, &lit_lens);
+                        if bar_ok {
+                            let of_value = (start - cand1 + 3) as u32;
+                            anchor = emit.emit(win, anchor, start, ml, of_value, &mut rep);
+                            // A literal offset shifts the decoder's history
+                            // one slot down; after the third one a job-start
+                            // gate has fully converged and repcode use is
+                            // safe again.
+                            if $gated {
+                                rep_pending = rep_pending.saturating_sub(1);
+                                pos = if rep_pending == 0 {
+                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                                } else {
+                                    anchor
+                                };
                             } else {
-                                anchor
-                            };
-                        } else {
-                            pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                            }
+                            anchor = pos;
+                            miss_count = 0;
+                            continue $restart;
                         }
-                        anchor = pos;
-                        miss_count = 0;
-                        continue $restart;
                     }
                 }
                 }
@@ -3332,6 +3436,15 @@ impl MatchGeneratorDriver {
             // corpora fast.
             miss_count += pair_len as usize;
             let step = 1 + (miss_count >> 2).min(255) as u64;
+            // Dense-mode miss-run stepping: once a miss run outgrows
+            // DENSE_STEP_AFTER bytes, double the pair advance — weak
+            // mid-run matches on match-dense parses are net-negative.
+            // Folds to the stock step on plain blocks.
+            let step = if DENSE && miss_count > DENSE_STEP_AFTER {
+                step * 2
+            } else {
+                step
+            };
             pos += pair_len * step;
             };
         }
