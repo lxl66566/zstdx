@@ -1130,7 +1130,11 @@ impl TableEmit<'_> {
     /// indexed with complete hash head plus chain links (a coarse grid for
     /// long matches, so huge runs cannot dominate the hash work), keeping
     /// later chain walks connected to same-hash predecessors.
-    #[inline]
+    /// `inline(always)`: at a plain `#[inline]` LLVM leaves the chain
+    /// scan's one emit call outlined, and every sequence pays the fat
+    /// calling convention (ten-plus args, Vec fields through `self`) —
+    /// the same disease the outlined search closure had.
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit_chain(
         &mut self,
