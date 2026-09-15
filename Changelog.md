@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the fastest tier's short-match interior fill is density-gated per
+  block (previous block parsed >=64 sequences at >=4 literal bytes per
+  sequence -> stride-2 fill instead of dense; the branch lives inside the
+  outlined insert_covered). dll100 fastest -0.043% size at +1.1-1.7% wall;
+  corpus output byte-identical (full-ladder dump); small-band instructions
+  +0.2-0.5% (dormant gate cost).
 - Encoder: per-block entropy-table builds recycle their buffers through a
   pool in the block scratch (FSE transition tables, huffman codes,
   package-merge lists, wire weights); a buffer zeroes only its growth tail,
