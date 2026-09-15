@@ -605,6 +605,26 @@ pub fn run(args: &Args) {
     println!("ll hist: {llh:?}");
     println!("ml hist: {mlh:?}");
     println!("of hist: {ofh:?}");
+    // Joint weak-match anatomy: sequence count for each (ml bucket, wire-of
+    // bucket). Wire of 1/2/3 are repcode emissions; larger buckets are
+    // offset magnitudes (of-wire = offset+3, so bucket k ≈ offsets
+    // 2^(k-1)..2^k). The acceptance-bar design wants to know where the
+    // short-match mass sits: cheap near offsets are text's payload, far
+    // offsets are the json weak-match pollution candidates.
+    let mut joint = [[0u64; 32]; 24]; // [ml min(23), of-wire ilog2]
+    for (ll, ml, of) in &rec.triples {
+        let m = (*ml as usize).min(23);
+        joint[m][of.ilog2() as usize] += 1;
+        let _ = ll;
+    }
+    println!("joint ml x of-wire-log (rows ml 4..16, cols log 0..21):");
+    for (m, row) in joint.iter().enumerate().take(17).skip(4) {
+        let counts: Vec<u64> = row.iter().take(22).copied().collect();
+        let total: u64 = counts.iter().sum();
+        if total > 0 {
+            println!("  ml={m:2} n={total:6} {counts:?}");
+        }
+    }
     let _ = EncodedSequence {
         ll: 0,
         ml: 0,

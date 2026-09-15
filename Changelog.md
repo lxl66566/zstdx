@@ -4,6 +4,18 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Docs/falsification: the fast-tier acceptance bar (todo item 3's last
+  open lever). Fed-back literal pricing (the chain store gate's mechanism)
+  is shape-safe and wins json.fastest -1.25% size in all four modes with
+  text/skewed unharmed; static flat pricing is not shape-safe (text +1.5%
+  at 3 bits/B). Hosting the bar in the scan loop is falsified: a dormant
+  bar (code present, never taken, byte-identical output) costs text.fastest
+  -12% and json.fastest -4% wall; the outlined-cold form does not recover.
+  Bar reverted; negative/matchers.md carries the data and the reopening
+  condition (a hosting that leaves the loop body byte-for-byte). seqstats
+  gains a joint ml x offset-log weak-match anatomy table (the bar's design
+  data: json's pollution is ml=6 at 4 KiB-768 KiB distances, 2.5% of
+  sequences).
 - Encoder: `encode_sequences` carries one output cursor pointer instead of a
   stack-reloaded base plus byte offset (and terminates on the SeqWord
   pointer, dropping a spilled counter). Byte-identical output; fastest/fast
