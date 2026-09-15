@@ -57,6 +57,16 @@ pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
         .min(MAX_JOB_SIZE as u64) as usize
 }
 
+/// The encoder's exact MT job size for an input, with the overlap the
+/// level implies — dev tooling (`emitframe`/`piecepipe`) cuts its analysis
+/// pieces at these boundaries, so it must not re-derive the formula.
+/// Hidden: not API-stable.
+#[doc(hidden)]
+pub fn mt_job_size_for(len: u64, workers: u32, level: Level, shape: crate::InputShape) -> usize {
+    let overlap = MatchGeneratorDriver::strip_for_level(level, shape) as usize;
+    job_size_for(len, workers.max(2), overlap)
+}
+
 /// Compress `src` into one frame using up to `workers` threads.
 ///
 /// Falls back to the single-threaded slice path (byte-identical to
@@ -193,6 +203,19 @@ pub fn compress_slice_mt(
     output
 }
 
+/// Deep-offset ramp depth for gated jobs (decode-parallelism experiment):
+/// `ZSTDX_MT_RAMP_BYTES` env var, parsed once. Zero (unset) keeps the job
+/// parse unconstrained; see `match_generator::RampGate` for the semantics.
+fn ramp_depth_from_env() -> u64 {
+    static DEPTH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("ZSTDX_MT_RAMP_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Compress one job through `state`, resetting it for the job: fresh
 /// entropy tables, and the repcode gate unless the job starts the frame
 /// (the decoder's repeated-offset history is the format default only there).
@@ -212,6 +235,10 @@ pub(crate) fn run_job_with(
     reset_slice_state(state, level, shape);
     if gate {
         state.matcher.gate_repcodes();
+        let depth = ramp_depth_from_env();
+        if depth > 0 {
+            state.matcher.arm_ramp(job.start as u64, depth);
+        }
     }
     compress_job_blocks(state, src, job, overlap, is_last_job)
 }
