@@ -580,11 +580,21 @@ const LEVEL_PARAMS: [LevelParams; 23] = [
     chain(22, 21, 1 << 22, 32, 2),
     chain(23, 22, 1 << 22, 32, 2),
     // 13: the Best tier: btlazy2 — the DUBT tree (O(1) fill, search-time
-    // batch sort) under lazy2 selection, libzstd's L13-15 rows (W22,
-    // S4/5/6, searchLength 5, TL 32).
-    btlazy(22, 1 << 22, bt_knobs(4, 22)),
-    btlazy(23, 1 << 22, bt_knobs(5, 22)),
-    btlazy(23, 1 << 22, bt_knobs(6, 23)),
+    // batch sort) under lazy2 selection, libzstd's L13-15 rows (S4/5/6,
+    // searchLength 5, TL 32). The frame window rides LDM's W26 far reach
+    // with the tree's search domain at the stock W22.
+    with_ldm(with_chain_reach(
+        btlazy(22, 1 << 26, bt_knobs(4, 22)),
+        1 << 22,
+    )),
+    with_ldm(with_chain_reach(
+        btlazy(23, 1 << 26, bt_knobs(5, 22)),
+        1 << 22,
+    )),
+    with_ldm(with_chain_reach(
+        btlazy(23, 1 << 26, bt_knobs(6, 23)),
+        1 << 22,
+    )),
     // 16: libzstd's btopt rows begin. The opt family keeps a wide frame
     // window (W26, the LDM far reach — C's --long shape) with the tree's
     // search domain at the stock row window via `chain_reach`; LDM carries
@@ -1529,14 +1539,14 @@ impl MatchGeneratorDriver {
 
     /// The streaming-MT job's history strip: the level's whole window for
     /// the chain rows (their LDM far class rides cross-job through the
-    /// adopted window), the search domain for the opt rows (their LDM
-    /// restarts per job exactly like the bulk path, so a full-window job
-    /// floor would only serialize sub-window streams without buying
-    /// reach).
+    /// adopted window), the search domain for the opt and btlazy2 rows
+    /// (their LDM restarts per job exactly like the bulk path, so a
+    /// full-window job floor would only serialize sub-window streams
+    /// without buying reach).
     pub fn stream_overlap_for(level: Level, shape: InputShape) -> u64 {
         let p = params_for(level, shape);
         match p.strategy {
-            Strategy::Opt(_) => p.chain_reach.unwrap_or(p.window) as u64,
+            Strategy::Opt(_) | Strategy::BtLazy(_) => p.chain_reach.unwrap_or(p.window) as u64,
             _ => p.window as u64,
         }
     }
@@ -1774,7 +1784,10 @@ impl MatchGeneratorDriver {
         // shrunk parse matches that measurement exactly.
         let ldm_wanted = params.ldm
             && params.chain_reach != Some(SHRINK_REACH)
-            && matches!(params.strategy, Strategy::Chain(_) | Strategy::Opt(_))
+            && matches!(
+                params.strategy,
+                Strategy::Chain(_) | Strategy::Opt(_) | Strategy::BtLazy(_)
+            )
             && ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar);
         let ldm_sized = self
             .ldm
@@ -1924,17 +1937,18 @@ impl MatchGeneratorDriver {
         // LDM job boundary: entries from earlier jobs must not shape this
         // one's output (pooled matchers), and the strip is the job's
         // candidate history — same content the grid fill indexes below.
-        // The opt rows sample the strip's alphabet first: the fill is an
-        // unconditional split pass, and a low-alphabet strip (json-class
-        // source above the full-window bar) never yields a paying far
-        // class (the frame-start alphabet gate's rule, applied to the
-        // job's own history). The chain row keeps its frozen ungated flow.
+        // The opt and btlazy2 rows sample the strip's alphabet first: the
+        // fill is an unconditional split pass, and a low-alphabet strip
+        // (json-class source above the full-window bar) never yields a
+        // paying far class (the frame-start alphabet gate's rule, applied
+        // to the job's own history). The chain row keeps its frozen
+        // ungated flow.
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
             self.ldm_quiet = 0;
             self.ldm_dead = false;
             self.ldm_canary = 0;
-            let gated = matches!(self.params.strategy, Strategy::Opt(_))
+            let gated = matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_))
                 && sampled_distinct(data, 0, data.len()) < LDM_SYMS_MIN;
             if data.len() >= super::ldm::MIN_MATCH_LENGTH && !gated {
                 ldm.fill(data, base, base, base + data.len() as u64);
@@ -2255,6 +2269,7 @@ impl Matcher for MatchGeneratorDriver {
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(0);
         }
+        self.ldm_seqs.clear();
         self.ldm_quiet = 0;
         self.ldm_dead = false;
         self.ldm_canary = 0;
@@ -2357,7 +2372,11 @@ impl Matcher for MatchGeneratorDriver {
         if self.head_block() {
             // The head parses through the btlazy2 driver; its bytes stay
             // LDM-indexed so later chain blocks can match far into them.
+            // The head itself consumes no candidates (row 9's parse is
+            // frozen; `reset` already emptied the block's set, this covers
+            // a pooled state mid-frame) and its blocks never count quiet.
             self.ldm_fill_block(LdmFill::Head);
+            self.ldm_seqs.clear();
             self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
             self.finish_head();
             return;
@@ -2380,9 +2399,15 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Opt(knobs) => {
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
-                self.start_matching_opt(knobs, literals, seqs)
+                let won = self.start_matching_opt(knobs, literals, seqs);
+                self.ldm_note_block(won);
             },
-            Strategy::BtLazy(knobs) => self.start_matching_btlazy(knobs, literals, seqs),
+            Strategy::BtLazy(knobs) => {
+                self.ldm_alphabet_gate();
+                self.ldm_generate();
+                let won = self.start_matching_btlazy(knobs, literals, seqs);
+                self.ldm_note_block(won);
+            },
         }
     }
 
@@ -3969,7 +3994,7 @@ impl MatchGeneratorDriver {
         knobs: OptKnobs,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
-    ) {
+    ) -> bool {
         let win = window_slice(&self.win, self.ext.as_ref());
         let win_base = self.win_base;
         let block_start = self.block_start;
@@ -4033,7 +4058,7 @@ impl MatchGeneratorDriver {
         self.rep_pending = rep_pending;
         self.pos = block_end;
         self.anchor = block_end;
-        self.ldm_note_block(ldm_won);
+        ldm_won
     }
 
     /// Whether the cold-start DUBT head applies to this frame: the row
@@ -4101,28 +4126,33 @@ impl MatchGeneratorDriver {
     }
 
     /// Bridge into the btlazy2 parser (rows 13-15): the same tables and
-    /// cursors as the opt bridge, no price state.
+    /// cursors as the opt bridge, no price state. The search domain is the
+    /// `chain_reach` override (the stock row window; the frame window may
+    /// sit wider for LDM's far classes).
     fn start_matching_btlazy(
         &mut self,
         knobs: OptKnobs,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
-    ) {
+    ) -> bool {
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
+        let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        let ldm_seqs: &[LdmSeq] = &self.ldm_seqs[..];
         let Some(scratch) = self.lazy_scratch.as_mut() else {
             unreachable!("btlazy scratch allocated by apply_level")
         };
         let lit_lens = self.lit_lens;
         // Disjoint field borrows: the window (win/ext) against the tables.
-        super::btlazy::run_block_lazy(
+        let ldm_won = super::btlazy::run_block_lazy(
             &knobs,
             win,
             self.win_base,
             self.block_start,
             self.block_end,
-            self.params.window as u64,
+            max_window,
+            ldm_seqs,
             &mut self.dubt_table,
             &mut self.dubt_bt,
             &mut self.next_update,
@@ -4133,10 +4163,11 @@ impl MatchGeneratorDriver {
             literals,
             seqs,
         );
-        self.rep = rep;
-        self.rep_pending = rep_pending;
         self.pos = self.block_end;
         self.anchor = self.block_end;
+        self.rep = rep;
+        self.rep_pending = rep_pending;
+        ldm_won
     }
 }
 
@@ -4354,11 +4385,12 @@ mod tests {
     }
 
     /// Far repeats beyond the tree domain must ride LDM candidates on the
-    /// opt rows too (wide W26 frame window, tree domain at the stock row
-    /// window): the same shape as the balanced test above, at Opt and Ultra,
-    /// with the copies 12 MiB apart — beyond the rows' 8 MiB domain.
+    /// opt and btlazy2 rows too (wide W26 frame window, tree domain at the
+    /// stock row window): the same shape as the balanced test above, at
+    /// Best, Opt and Ultra, with the copies 12 MiB apart — beyond the
+    /// rows' 4-8 MiB domains.
     #[test]
-    fn ldm_opt_rows_cover_beyond_tree_domain() {
+    fn ldm_high_rows_cover_beyond_tree_domain() {
         let mut state = 0x0123_4567_89ab_cdefu64;
         let mut rand = move || {
             state ^= state << 13;
@@ -4375,7 +4407,7 @@ mod tests {
             let unit: Vec<u8> = data[i * UNIT..(i + 1) * UNIT].to_vec();
             data.extend_from_slice(&unit);
         }
-        for level in [crate::Level::Opt, crate::Level::Ultra] {
+        for level in [crate::Level::Best, crate::Level::Opt, crate::Level::Ultra] {
             let mut driver = MatchGeneratorDriver::new(128 * 1024);
             driver.reset(level);
             let mut rep = [1u32, 4, 8];
