@@ -128,6 +128,13 @@ impl RampGate {
         depth: 0,
     };
 
+    /// Whether the gate is armed; scan-loop instantiation choice keys off
+    /// this (disarmed loops compile the checks out entirely).
+    #[inline(always)]
+    fn is_armed(&self) -> bool {
+        self.end != 0
+    }
+
     /// Whether the match `(pos_abs, cand_abs)` violates the ramp: a source
     /// inside the `depth` bytes just below the job start. `pos_abs` is
     /// unused — the constraint is position-independent (the depth of a
@@ -153,6 +160,24 @@ impl RampGate {
         } else {
             0
         }
+    }
+}
+
+/// Const-generic [`RampGate`] checks: the fast scan loops instantiate with
+/// `RAMPED = false` on disarmed frames (all bulk-ST paths; MT jobs without
+/// the env ramp), so the gate's three live u64s and its per-site branches
+/// fold away entirely instead of riding the loop as never-taken state.
+#[inline(always)]
+fn ramp_blocks<const RAMPED: bool>(ramp: RampGate, pos_abs: u64, cand_abs: u64) -> bool {
+    RAMPED && ramp.blocks(pos_abs, cand_abs)
+}
+
+#[inline(always)]
+fn ramp_ext_floor<const RAMPED: bool>(ramp: RampGate, cand_idx: usize, win_base: u64) -> usize {
+    if RAMPED {
+        ramp.ext_floor(cand_idx, win_base)
+    } else {
+        0
     }
 }
 
@@ -1164,7 +1189,7 @@ impl TableEmit<'_> {
     /// on its own. Returns the cursor after the last chained match.
     /// `inline(always)` for the same budget reason as [`DfastEmit::rep_chain`].
     #[inline(always)]
-    fn rep1_chain(
+    fn rep1_chain<const RAMPED: bool>(
         &mut self,
         win: &[u8],
         pos: u64,
@@ -1180,7 +1205,7 @@ impl TableEmit<'_> {
             if cand_abs < self.win_base {
                 break;
             }
-            if ramp.blocks(pos, cand_abs) {
+            if RAMPED && ramp.blocks(pos, cand_abs) {
                 break;
             }
             let pidx = (pos - self.win_base) as usize;
@@ -1299,7 +1324,7 @@ impl DfastEmit<'_> {
     /// `#[inline]` judgment the helper flips to an outlined call in the
     /// steady phase and every dense-match emit pays the argument setup.
     #[inline(always)]
-    fn rep_chain(
+    fn rep_chain<const RAMPED: bool>(
         &mut self,
         win: &[u8],
         pos_idx: usize,
@@ -1315,7 +1340,7 @@ impl DfastEmit<'_> {
             if cand_abs < self.win_base {
                 break;
             }
-            if ramp.blocks(self.win_base + pos as u64, cand_abs) {
+            if RAMPED && ramp.blocks(self.win_base + pos as u64, cand_abs) {
                 break;
             }
             let cand = (cand_abs - self.win_base) as usize;
@@ -2395,8 +2420,20 @@ impl Matcher for MatchGeneratorDriver {
             self.catch_up_insertions();
         }
         match self.params.strategy {
-            Strategy::Fast => self.start_matching_fast(literals, seqs),
-            Strategy::Dfast(_) => self.start_matching_dfast(literals, seqs),
+            Strategy::Fast => {
+                if self.ramp.is_armed() {
+                    self.start_matching_fast::<true>(literals, seqs);
+                } else {
+                    self.start_matching_fast::<false>(literals, seqs);
+                }
+            },
+            Strategy::Dfast(_) => {
+                if self.ramp.is_armed() {
+                    self.start_matching_dfast::<true>(literals, seqs);
+                } else {
+                    self.start_matching_dfast::<false>(literals, seqs);
+                }
+            },
             Strategy::Chain(_) => {
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
@@ -2786,7 +2823,11 @@ impl MatchGeneratorDriver {
     }
 
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
-    fn start_matching_fast(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+    fn start_matching_fast<const RAMPED: bool>(
+        &mut self,
+        literals: &mut Vec<u8>,
+        seqs: &mut Vec<SeqWord>,
+    ) {
         // Hot state lives in locals for the whole loop: the emit helpers
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
@@ -2963,10 +3004,10 @@ impl MatchGeneratorDriver {
                                 let mut cand = pidx - r;
                                 let mut ml = extend_match(win, pidx, cand);
                                 if ml >= MIN_MATCH
-                                    && !ramp.blocks(win_base + pidx as u64, win_base + cand as u64)
+                                    && !ramp_blocks::<RAMPED>(ramp, win_base + pidx as u64, win_base + cand as u64)
                                 {
                                     let mut start = pidx;
-                                    let cfl = ramp.ext_floor(cand, win_base);
+                                    let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
                                     // Extend backwards into the pending literals;
                                     // the offset (pidx - cand) stays constant.
                                     while start > anchor_idx + 1
@@ -2978,7 +3019,7 @@ impl MatchGeneratorDriver {
                                         ml += 1;
                                     }
                                     anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                                    pos = emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                                    pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
                                     // The chain's matches advance the cursor too.
                                     anchor = pos;
                                     miss_count = 0;
@@ -3006,12 +3047,12 @@ impl MatchGeneratorDriver {
                         // keeps a far seed honest about its worth.
                         if ml >= 6
                             && pays_for_offset(ml, idx0, ci, false)
-                            && !ramp.blocks(pos, win_base + ci as u64)
+                            && !ramp_blocks::<RAMPED>(ramp, pos, win_base + ci as u64)
                         {
                             let anchor_idx = (anchor - win_base) as usize;
                             let mut start = idx0;
                             let mut ci = ci;
-                            let cfl = ramp.ext_floor(ci, win_base);
+                            let cfl = ramp_ext_floor::<RAMPED>(ramp, ci, win_base);
                             // Extend backwards into the pending literals;
                             // the offset stays constant.
                             while start > anchor_idx && ci > cfl && win[ci - 1] == win[start - 1] {
@@ -3027,7 +3068,7 @@ impl MatchGeneratorDriver {
                                 seed_offset = 0;
                             }
                             pos = if rep_pending == 0 {
-                                emit.rep1_chain(win, anchor, block_end, &mut rep, ramp)
+                                emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
                             } else {
                                 anchor
                             };
@@ -3076,10 +3117,10 @@ impl MatchGeneratorDriver {
                         // it covers, and rejecting it lets the scan try
                         // the next position where a longer match may
                         // start.
-                        if ml >= 6 && !ramp.blocks(pos, win_base + cand0 as u64) {
+                        if ml >= 6 && !ramp_blocks::<RAMPED>(ramp, pos, win_base + cand0 as u64) {
                             let anchor_idx = (anchor - win_base) as usize;
                             let mut start = idx0;
-                            let cfl = ramp.ext_floor(cand0, win_base);
+                            let cfl = ramp_ext_floor::<RAMPED>(ramp, cand0, win_base);
                             // Extend backwards into the pending literals;
                             // the offset (idx0 - cand) stays constant.
                             while start > anchor_idx
@@ -3099,13 +3140,13 @@ impl MatchGeneratorDriver {
                             if $gated {
                                 rep_pending = rep_pending.saturating_sub(1);
                                 pos = if rep_pending == 0 {
-                                    emit.rep1_chain(win, anchor, block_end, &mut rep, ramp)
+                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
                                 } else {
                                     anchor
                                 };
                             } else {
                                 pos =
-                                    emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
                             }
                             anchor = pos;
                             miss_count = 0;
@@ -3126,11 +3167,11 @@ impl MatchGeneratorDriver {
                     let mut cand = idx1 - rep[0] as usize;
                     let mut ml = extend_match(win, idx1, cand);
                     if ml >= MIN_MATCH
-                        && !ramp.blocks(win_base + idx1 as u64, win_base + cand as u64)
+                        && !ramp_blocks::<RAMPED>(ramp, win_base + idx1 as u64, win_base + cand as u64)
                     {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
-                        let cfl = ramp.ext_floor(cand, win_base);
+                        let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
                         while start > anchor_idx + 1
                             && cand > cfl
                             && win[cand - 1] == win[start - 1]
@@ -3140,7 +3181,7 @@ impl MatchGeneratorDriver {
                             ml += 1;
                         }
                         anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                        pos = emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                        pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
                         anchor = pos;
                         miss_count = 0;
                         continue $restart;
@@ -3149,10 +3190,10 @@ impl MatchGeneratorDriver {
 
                 if m1 == 0 {
                     let mut ml = extend_match(win, idx1, cand1);
-                    if ml >= 6 && !ramp.blocks(pos1, win_base + cand1 as u64) {
+                    if ml >= 6 && !ramp_blocks::<RAMPED>(ramp, pos1, win_base + cand1 as u64) {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
-                        let cfl = ramp.ext_floor(cand1, win_base);
+                        let cfl = ramp_ext_floor::<RAMPED>(ramp, cand1, win_base);
                         while start > anchor_idx
                             && cand1 > cfl
                             && win[cand1 - 1] == win[start - 1]
@@ -3170,12 +3211,12 @@ impl MatchGeneratorDriver {
                         if $gated {
                             rep_pending = rep_pending.saturating_sub(1);
                             pos = if rep_pending == 0 {
-                                emit.rep1_chain(win, anchor, block_end, &mut rep, ramp)
+                                emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
                             } else {
                                 anchor
                             };
                         } else {
-                            pos = emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                            pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
                         }
                         anchor = pos;
                         miss_count = 0;
@@ -3236,7 +3277,11 @@ impl MatchGeneratorDriver {
     /// [`DfastEmit::emit`]). The miss step grows with the literal run
     /// (one per 256 B, libzstd's `kSearchStrength` grid).
     #[allow(clippy::too_many_lines)]
-    fn start_matching_dfast(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+    fn start_matching_dfast<const RAMPED: bool>(
+        &mut self,
+        literals: &mut Vec<u8>,
+        seqs: &mut Vec<SeqWord>,
+    ) {
         let win = window_slice(&self.win, self.ext.as_ref());
         let long_log = self.table.len().trailing_zeros();
         let small_log = self.chain.len().trailing_zeros();
@@ -3346,7 +3391,7 @@ impl MatchGeneratorDriver {
                     if probe >= rep[0] as usize {
                         let cand = probe - rep[0] as usize;
                         if read4(win, cand) == read4(win, probe)
-                            && !ramp.blocks(
+                            && !ramp_blocks::<RAMPED>(ramp,
                                 win_base + probe as u64,
                                 win_base + cand as u64,
                             )
@@ -3355,7 +3400,7 @@ impl MatchGeneratorDriver {
                             debug_assert!(ml >= MIN_MATCH);
                             anchor_idx =
                                 emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
-                            ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp);
+                            ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
                             continue $outer;
@@ -3373,11 +3418,11 @@ impl MatchGeneratorDriver {
                         let mut ml = extend_match(win, ip_idx, ci);
                         if ml >= 6
                             && pays_for_offset(ml, ip_idx, ci, false)
-                            && !ramp.blocks(pos_abs, win_base + ci as u64)
+                            && !ramp_blocks::<RAMPED>(ramp, pos_abs, win_base + ci as u64)
                         {
                             let mut start = ip_idx;
                             let mut c = ci;
-                            let cfl = ramp.ext_floor(ci, win_base);
+                            let cfl = ramp_ext_floor::<RAMPED>(ramp, ci, win_base);
                             while start > anchor_idx && c > cfl && win[c - 1] == win[start - 1] {
                                 c -= 1;
                                 start -= 1;
@@ -3392,7 +3437,7 @@ impl MatchGeneratorDriver {
                                 seed_offset = 0;
                             }
                             ip_idx = if rep_pending == 0 {
-                                emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
                             } else {
                                 anchor_idx
                             };
@@ -3413,12 +3458,12 @@ impl MatchGeneratorDriver {
                     let cand = resolve(entry_l0, pos_abs, reach, ip_idx);
                     if cand != ip_idx
                         && read8(win, cand) == read8(win, ip_idx)
-                        && !ramp.blocks(pos_abs, win_base + cand as u64)
+                        && !ramp_blocks::<RAMPED>(ramp, pos_abs, win_base + cand as u64)
                     {
                         let mut start = ip_idx;
                         let mut c = cand;
                         let mut ml = extend_match(win, ip_idx, cand);
-                        let cfl = ramp.ext_floor(cand, win_base);
+                        let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
                         // Backward catch-up into the pending literals; the
                         // offset (start - c) stays constant.
                         while start > anchor_idx && c > cfl && win[c - 1] == win[start - 1] {
@@ -3445,12 +3490,12 @@ impl MatchGeneratorDriver {
                         if $gated {
                             rep_pending = rep_pending.saturating_sub(1);
                             ip_idx = if rep_pending == 0 {
-                                emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
                             } else {
                                 anchor_idx
                             };
                         } else {
-                            ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp);
+                            ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
                         }
                         // The chain's matches advance the anchor too.
                         anchor_idx = ip_idx;
@@ -3483,8 +3528,8 @@ impl MatchGeneratorDriver {
                         // A ramp-blocked pair falls through to the miss
                         // advance below (never `break`: the inner loop's
                         // advance is what moves past this position).
-                        if !ramp.blocks(win_base + start as u64, win_base + c as u64) {
-                            let cfl = ramp.ext_floor(c, win_base);
+                        if !ramp_blocks::<RAMPED>(ramp, win_base + start as u64, win_base + c as u64) {
+                            let cfl = ramp_ext_floor::<RAMPED>(ramp, c, win_base);
                             while start > anchor_idx && c > cfl && win[c - 1] == win[start - 1] {
                                 c -= 1;
                                 start -= 1;
@@ -3506,12 +3551,12 @@ impl MatchGeneratorDriver {
                             if $gated {
                                 rep_pending = rep_pending.saturating_sub(1);
                                 ip_idx = if rep_pending == 0 {
-                                    emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                    emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
                                 } else {
                                     anchor_idx
                                 };
                             } else {
-                                ip_idx = emit.rep_chain(win, anchor_idx, limit_idx, &mut rep, ramp);
+                                ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
                             }
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
@@ -3991,7 +4036,7 @@ impl MatchGeneratorDriver {
             if $gated && rep_pending != 0 {
                 pos = anchor;
             } else {
-                pos = emit.rep1_chain(win, anchor, block_end, &mut rep, ramp);
+                pos = emit.rep1_chain::<true>(win, anchor, block_end, &mut rep, ramp);
             }
             anchor = pos;
             };
