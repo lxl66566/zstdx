@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the dfast scan instantiates const-generic table logs — the
+  dispatch keys on the tables' actual lengths and the two full rows
+  (17/16, 18/18) compile their hash shifts to immediates, freeing the two
+  shift registers; clamped-window inputs keep a runtime-log instantiation.
+  Byte-identical output (full-ladder dump); dfast scan instructions -4.9%
+  (dll 4MiB slice callgrind, 1.42x -> 1.36x libzstd's
+  ZSTD_compressBlock_doubleFast), -4.4% on json; wall interleaved dll100
+  fast +3.4%, json fast +3.6%. Two C-parity restructures of the same loop
+  (nextStep counter advance, rep-probe delta hoisting) are falsified in
+  docs/src/dev/negative/matchers.md: the loop's saturated register budget
+  re-rolls allocation on every added live value.
 - Encoder: per-block entropy-table builds recycle their buffers through a
   pool in the block scratch (FSE transition tables, huffman codes,
   package-merge lists, wire weights); a buffer zeroes only its growth tail,

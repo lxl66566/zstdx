@@ -89,6 +89,11 @@ const SEED_CONFIRMS: [usize; 3] = [64, 640, 6144];
 /// both clear the repcode gate and rotate `rep` until `rep[0]` holds the
 /// seed offset, so the regular repcode probes take over from there.
 const SEED_MATCHES: u8 = 3;
+/// Marker for the const-generic dfast logs meaning "read the runtime
+/// value" (real logs are never zero); only clamped-window shapes
+/// (inputs small enough to shrink the row's tables) take that path.
+const RUNTIME_LOG: u32 = 0;
+
 /// Probe attempts an unused seed survives: a seed whose offset stops
 /// matching (broken period, or a repeated block that ended) must not pay a
 /// dead compare for the rest of the job.
@@ -2432,10 +2437,29 @@ impl Matcher for MatchGeneratorDriver {
                 }
             },
             Strategy::Dfast(_) => {
-                if self.ramp.is_armed() {
-                    self.start_matching_dfast::<true>(literals, seqs);
-                } else {
-                    self.start_matching_dfast::<false>(literals, seqs);
+                // Key on the tables' actual lengths (what the scan body
+                // derives): the two full rows cover every input the level
+                // clamp leaves at full tables; smaller inputs (clamped
+                // windows, shrunken logs) take the runtime-log
+                // instantiation.
+                let long_log = self.table.len().trailing_zeros();
+                let small_log = self.chain.len().trailing_zeros();
+                match (self.ramp.is_armed(), long_log, small_log) {
+                    (false, 17, 16) => self.start_matching_dfast::<false, 17, 16>(literals, seqs),
+                    (true, 17, 16) => self.start_matching_dfast::<true, 17, 16>(literals, seqs),
+                    (false, 18, 18) => self.start_matching_dfast::<false, 18, 18>(literals, seqs),
+                    (true, 18, 18) => self.start_matching_dfast::<true, 18, 18>(literals, seqs),
+                    (armed, ..) => {
+                        if armed {
+                            self.start_matching_dfast::<true, RUNTIME_LOG, RUNTIME_LOG>(
+                                literals, seqs,
+                            )
+                        } else {
+                            self.start_matching_dfast::<false, RUNTIME_LOG, RUNTIME_LOG>(
+                                literals, seqs,
+                            )
+                        }
+                    },
                 }
             },
             Strategy::Chain(_) => {
@@ -3281,14 +3305,25 @@ impl MatchGeneratorDriver {
     /// [`DfastEmit::emit`]). The miss step grows with the literal run
     /// (one per 256 B, libzstd's `kSearchStrength` grid).
     #[allow(clippy::too_many_lines)]
-    fn start_matching_dfast<const RAMPED: bool>(
+    fn start_matching_dfast<const RAMPED: bool, const LONG_LOG: u32, const SMALL_LOG: u32>(
         &mut self,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
     ) {
         let win = window_slice(&self.win, self.ext.as_ref());
-        let long_log = self.table.len().trailing_zeros();
-        let small_log = self.chain.len().trailing_zeros();
+        // Known rows instantiate with their logs as constants (the hash
+        // shifts fold to immediates and the two shift registers free up);
+        // clamped-window shapes pass [`RUNTIME_LOG`] for both.
+        let long_log = if LONG_LOG == RUNTIME_LOG {
+            self.table.len().trailing_zeros()
+        } else {
+            LONG_LOG
+        };
+        let small_log = if SMALL_LOG == RUNTIME_LOG {
+            self.chain.len().trailing_zeros()
+        } else {
+            SMALL_LOG
+        };
         let win_base = self.win_base;
         let ramp = self.ramp;
         let block_len = (self.block_end - win_base) as usize;
