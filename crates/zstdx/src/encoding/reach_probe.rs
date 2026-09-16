@@ -24,14 +24,16 @@
 //! least [`PROBE_MIN_FRAME`] bytes (the probe's two parses are a fixed
 //! ~30 ms tax; below that size they outrun their savings), and only entry
 //! points that see the frame's head before the first block is matched:
-//! bulk single- and multithreaded, pledged streaming, and the
-//! multithreaded stream core (which stages the head itself — a pledge
-//! gates at construction, an open-ended stream at [`PROBE_MIN_FRAME`]
-//! streamed bytes; a stream that ends or flushes before the gate keeps
-//! the stock reach). The unpledged single-threaded stream core keeps the
-//! stock reach (its blocks flow at block size — staging a head there
-//! withholds output from small-pull consumers); dictionary frames probe
-//! nothing (their history needs the reach it has).
+//! bulk single- and multithreaded and the multithreaded stream core — all
+//! donating (the keep side runs as the frame's/job zero's own blocks; see
+//! `mt::donate_keep_span`), with the stream core staging the head on a pool
+//! worker at its gate (a pledge gates at construction, an open-ended
+//! stream at [`PROBE_MIN_FRAME`] streamed bytes; a stream that ends or
+//! flushes before the gate keeps the stock reach). The single-threaded
+//! stream cores keep the stock throwaway probe or none (unpledged blocks
+//! flow at block size — staging a head there withholds output from
+//! small-pull consumers); dictionary frames probe nothing (their history
+//! needs the reach it has).
 
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
@@ -208,6 +210,22 @@ pub(crate) fn decide_donated(
     level: Level,
     shape: InputShape,
 ) -> ReachChoice {
+    let mut driver = probe_driver();
+    let choice = decide_donated_with(&mut driver, keep, shrink, head, level, shape);
+    return_probe_driver(driver);
+    choice
+}
+
+/// [`decide_donated`] on a caller-supplied pooled driver (see
+/// [`parse_cost_with`]).
+pub(crate) fn decide_donated_with(
+    probe: &mut MatchGeneratorDriver,
+    keep: f64,
+    shrink: f64,
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+) -> ReachChoice {
     if shrink == keep {
         // Identical costs mean identical parses under the model — the
         // shape is reach- and feedback-degenerate (skewed, random, zeros
@@ -225,7 +243,7 @@ pub(crate) fn decide_donated(
     if shrink >= keep * KEEP_LANDSLIDE {
         return ReachChoice::Keep;
     }
-    let gain = feedback_gain(head, level, shape).clamp(0.0, 0.5);
+    let gain = feedback_gain_with(probe, head, level, shape).clamp(0.0, 0.5);
     let keep_flat = keep / (1.0 - gain);
     decide(keep_flat, shrink)
 }
@@ -235,10 +253,30 @@ pub(crate) fn decide_donated(
 /// with approximate per-block literal pricing (the same structure the
 /// encoder's table feedback gives the real parse).
 fn feedback_gain(head: &[u8], level: Level, shape: InputShape) -> f64 {
+    let mut driver = probe_driver();
+    let gain = feedback_gain_with(&mut driver, head, level, shape);
+    return_probe_driver(driver);
+    gain
+}
+
+fn feedback_gain_with(
+    probe: &mut MatchGeneratorDriver,
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+) -> f64 {
     let end = FEEDBACK_PROBE.min(head.len());
     let prefix = &head[..end];
-    let flat = parse_cost(prefix, level, shape, ReachChoice::Keep, ProbeFeedback::Flat);
-    let approx = parse_cost(
+    let flat = parse_cost_with(
+        probe,
+        prefix,
+        level,
+        shape,
+        ReachChoice::Keep,
+        ProbeFeedback::Flat,
+    );
+    let approx = parse_cost_with(
+        probe,
         prefix,
         level,
         shape,
@@ -308,13 +346,59 @@ pub(crate) fn parse_cost(
     choice: ReachChoice,
     feedback: ProbeFeedback,
 ) -> f64 {
-    #[cfg(feature = "std")]
-    let mut driver = PROBE_DRIVER
-        .with(|p| p.borrow_mut().take())
-        .unwrap_or_else(|| Box::new(MatchGeneratorDriver::new_direct()));
-    #[cfg(not(feature = "std"))]
-    let mut driver = MatchGeneratorDriver::new_direct();
+    let mut driver = probe_driver();
+    let cost = parse_cost_with(&mut driver, head, level, shape, choice, feedback);
+    return_probe_driver(driver);
+    cost
+}
 
+/// Take the calling thread's pooled probe driver (building one on a cold
+/// thread); [`return_probe_driver`] puts it back. The take/return pair is
+/// the thread-local wrapper's front half.
+#[cfg(feature = "std")]
+fn probe_driver() -> Box<MatchGeneratorDriver> {
+    PROBE_DRIVER
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or_else(|| Box::new(MatchGeneratorDriver::new_direct()))
+}
+
+#[cfg(feature = "std")]
+fn return_probe_driver(driver: Box<MatchGeneratorDriver>) {
+    PROBE_DRIVER.with(|p| *p.borrow_mut() = Some(driver));
+}
+
+#[cfg(not(feature = "std"))]
+fn probe_driver() -> Box<MatchGeneratorDriver> {
+    Box::new(MatchGeneratorDriver::new_direct())
+}
+
+#[cfg(not(feature = "std"))]
+fn return_probe_driver(_driver: Box<MatchGeneratorDriver>) {}
+
+/// The thread-local pooled probe driver, exposed for the bulk donation's
+/// calling threads (steady threads — the pool stays warm across frames).
+#[cfg(feature = "std")]
+pub(crate) fn take_thread_probe_driver() -> Box<MatchGeneratorDriver> {
+    probe_driver()
+}
+
+/// [`take_thread_probe_driver`]'s return path.
+#[cfg(feature = "std")]
+pub(crate) fn return_thread_probe_driver(driver: Box<MatchGeneratorDriver>) {
+    return_probe_driver(driver);
+}
+
+/// [`parse_cost`] on a caller-supplied pooled driver: a donation running
+/// on an ephemeral pool worker cannot warm the thread-local driver, so it
+/// carries its own across encoders (see `mt::donate_span`).
+pub(crate) fn parse_cost_with(
+    driver: &mut MatchGeneratorDriver,
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+    choice: ReachChoice,
+    feedback: ProbeFeedback,
+) -> f64 {
     driver.set_input_shape(shape);
     driver.set_reach_choice(choice);
     // Neither probe parse runs LDM (see `LdmArming::ProbeKeep`): the keep
@@ -379,8 +463,6 @@ pub(crate) fn parse_cost(
         pos = end;
     }
 
-    #[cfg(feature = "std")]
-    PROBE_DRIVER.with(|p| *p.borrow_mut() = Some(driver));
     let lit_total: u64 = lit_hist.iter().sum();
     order0_bits(&lit_hist, lit_total) + seq_bits as f64
 }

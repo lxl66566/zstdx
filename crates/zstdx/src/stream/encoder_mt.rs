@@ -21,18 +21,23 @@
 //! live data, which the epoch-scale sizing bounds to once per epoch.
 //!
 //! A reach-probe-eligible frame (see [`reach_probe`]: the Balanced row with
-//! its stock reach) defers its schedule until the probe's head is staged —
-//! the probe decides the chain reach, and with it the history strip and the
-//! job floor. A pledge clears the probe's size gate at construction, so the
-//! head stages at [`reach_probe::PROBE_SPAN`]; an open-ended stream cannot
-//! know its length, so the decision waits for
-//! [`reach_probe::PROBE_MIN_FRAME`] streamed bytes (the chain rows' Growing
-//! floor — the whole window — keeps any job from posting before then
-//! anyway). A shrunk frame re-grids from offset zero with the shrunk strip
-//! the bulk path uses, so it stays byte-identical to bulk mt; a kept frame
-//! keeps the stream strip (see [`MatchGeneratorDriver::stream_overlap_for`]
-//! — the chain rows' cross-job LDM carrier, deliberately wider than the
-//! bulk strip). A stream that ends or flushes before the gate keeps the
+//! its stock reach) donates the probe's keep side to a pool worker at the
+//! staging gate (see `post_donation`): the worker runs job zero's first
+//! [`reach_probe::PROBE_SPAN`] bytes through the job machinery itself —
+//! entropy feedback, LDM and the incompressibility gate included — while
+//! the pump keeps filling the buffer, and only the shrink side parses
+//! separately. The verdict is consumed lazily, wherever the schedule first
+//! needs it (a post coming due, or a flush/finish); a shrunk frame re-grids
+//! from offset zero with the shrunk strip the bulk path uses, and a kept
+//! frame's job zero continues the donated state past the span (the
+//! continuation skips the strip prefill — it would clear the tables the
+//! donation built) while keeping the stream strip (see
+//! [`MatchGeneratorDriver::stream_overlap_for`] — the chain rows'
+//! cross-job LDM carrier, deliberately wider than the bulk strip). A
+//! pledge clears the probe's size gate at construction, so the head stages
+//! at [`reach_probe::PROBE_SPAN`]; an open-ended stream cannot know its
+//! length, so the decision waits for [`reach_probe::PROBE_MIN_FRAME`]
+//! streamed bytes. A stream that ends or flushes before the gate keeps the
 //! stock reach.
 
 use alloc::{sync::Arc, vec::Vec};
@@ -53,11 +58,14 @@ use crate::{
     blocks::block::BlockType,
     encoding::{
         block_header::BlockHeader,
-        frame_compressor::{BlockChecksum as _, CompressState, FrameHasher, new_slice_state},
+        frame_compressor::{
+            BlockChecksum as _, CompressState, FrameHasher, compress_job_blocks_inner,
+            new_slice_state,
+        },
         frame_header::FrameHeader,
         match_generator::MatchGeneratorDriver,
-        mt::{MAX_JOB_SIZE, MIN_JOB_SIZE, job_size_for, run_job_with},
-        reach_probe::{self, ReachChoice},
+        mt::{MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, run_job_with},
+        reach_probe::{self, ProbeFeedback, ReachChoice},
     },
 };
 
@@ -81,31 +89,111 @@ enum JobGrid {
     Growing,
 }
 
+/// The reach probe's donated keep side (see `post_donation`): job zero's
+/// parsed span as a continuation-ready state plus its encoded blocks. The
+/// verdict is taken at `resolve_probe`; a Shrink discards both — job zero
+/// parses undonated, from a pooled state like any other job.
+struct Donation {
+    state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+    prefix: Vec<u8>,
+}
+
+/// The keep-side task's parked result (the verdict needs the shrink side's
+/// cost too — see `JobKind::DonateShrink`).
+struct KeepOutcome {
+    keep_bits: f64,
+    donation: Donation,
+}
+
 /// One posted job: the frozen source view (see the recycling rules in
 /// [`MtEncoderCore`]'s docs — the backing bytes cannot move before this job
-/// completes) plus the slot its encoded blocks land in.
+/// completes) plus its payload.
 struct Job {
-    /// Base and length of the frozen source view shared with the pool.
-    src: FrozenSrc,
-    /// Index of the job's strip start inside `src`, and the job's own range
-    /// relative to it.
-    first: usize,
-    len: usize,
-    /// Every job except the frame's first starts where the decoder's
-    /// repcode history is unknown (see the bulk mt path); a flush-rebased
-    /// grid starts mid-frame too.
-    gate: bool,
-    last_frame_block: bool,
-    overlap: usize,
     level: Level,
     /// The frame's reach probe decision (see [`reach_probe`]), shared by
     /// every job so the frame's jobs and its header agree.
     choice: ReachChoice,
     shape: crate::InputShape,
-    out: Mutex<Option<Vec<u8>>>,
-    /// Set (Release) once `out` holds the job's bytes: the assembling side
-    /// polls this instead of taking the mutex per tick.
-    done: core::sync::atomic::AtomicBool,
+    /// The donation tasks' owned copy of the frame's first
+    /// [`reach_probe::PROBE_SPAN`] bytes, shared between the two: owned,
+    /// not borrowed, so neither holds a buffer view — donations do not
+    /// count in `n_incomplete` and never gate buffer recycling.
+    head: Option<Arc<[u8]>>,
+    kind: JobKind,
+}
+
+enum JobKind {
+    /// Encode `[first, len)` of the frozen source view as the job's own
+    /// blocks.
+    Encode {
+        /// The frozen source view (see the recycling rules in
+        /// [`MtEncoderCore`]'s docs — the backing bytes cannot move before
+        /// this job completes).
+        src: FrozenSrc,
+        /// Index of the job's strip start inside `src`, and the job's own
+        /// range relative to it.
+        first: usize,
+        len: usize,
+        /// Every job except the frame's first starts where the decoder's
+        /// repcode history is unknown (see the bulk mt path); a
+        /// flush-rebased grid starts mid-frame too.
+        gate: bool,
+        last_frame_block: bool,
+        overlap: usize,
+        /// The probe's donated keep side when this job is the frame's
+        /// first: the continuation resumes the donated state at the span
+        /// (skipping the strip prefill — it would clear the very tables
+        /// the donation built) and emits the encoded prefix verbatim.
+        donation: Mutex<Option<Donation>>,
+        out: Mutex<Option<Vec<u8>>>,
+        /// Set (Release) once `out` holds the job's bytes: the assembling
+        /// side polls this instead of taking the mutex per tick.
+        done: core::sync::atomic::AtomicBool,
+    },
+    /// The probe's keep side over the frame's first
+    /// [`reach_probe::PROBE_SPAN`] bytes (see `donate_keep_span`) — job
+    /// zero's own blocks, parsed and encoded on a pool worker while the
+    /// pump keeps filling the buffer.
+    DonateKeep {
+        outcome: Mutex<Option<KeepOutcome>>,
+        done: core::sync::atomic::AtomicBool,
+    },
+    /// The probe's shrink side: the throwaway W12 measurement parse on a
+    /// second worker (see `parse_cost_with`) — the verdict's other input,
+    /// run concurrently with the keep side so neither serializes behind
+    /// the other (together they are a full keep-side parse plus a
+    /// shrink-side parse, more serial time than the frame's tail can hide
+    /// on one worker).
+    DonateShrink {
+        outcome: Mutex<Option<f64>>,
+        done: core::sync::atomic::AtomicBool,
+    },
+}
+
+impl Job {
+    /// Mark this job completed without running it (the poison abort path):
+    /// encode slots fill empty so the ordered assembly runs to completion
+    /// before the panic resumes; a donation simply never lands an outcome.
+    fn abort(&self) {
+        match &self.kind {
+            JobKind::Encode { out, done, .. } => {
+                *out.lock().unwrap() = Some(Vec::new());
+                done.store(true, Ordering::Release);
+            },
+            JobKind::DonateKeep { done, .. } | JobKind::DonateShrink { done, .. } => {
+                done.store(true, Ordering::Release);
+            },
+        }
+    }
+
+    /// Whether the job has published its result (bytes or measurement).
+    fn is_done(&self) -> bool {
+        match &self.kind {
+            JobKind::Encode { done, .. }
+            | JobKind::DonateKeep { done, .. }
+            | JobKind::DonateShrink { done, .. } => done.load(Ordering::Acquire),
+        }
+    }
 }
 
 // SAFETY: the pointer is dereferenced only while the posting thread
@@ -228,24 +316,11 @@ fn pool_worker(shared: Arc<QueueShared>) {
         // SAFETY: the posting thread keeps the backing bytes stable for
         // this job's whole lifetime (see FrozenSrc).
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let state = state.get_or_insert_with(|| alloc::boxed::Box::new(new_slice_state()));
-            let src = unsafe { slice::from_raw_parts(job.src.ptr, job.len) };
-            run_job_with(
-                state,
-                src,
-                job.first..job.len,
-                job.overlap,
-                job.last_frame_block,
-                job.level,
-                job.gate,
-                job.shape,
-                job.choice,
-            )
+            run_claimed_job(&job, &mut state)
         }));
         match attempt {
-            Ok(bytes) => {
-                *job.out.lock().unwrap() = Some(bytes);
-                job.done.store(true, Ordering::Release);
+            Ok(()) => {
+                mark_done(&job);
             },
             Err(payload) => {
                 // The state may be mid-compress garbage: drop it rather
@@ -254,18 +329,117 @@ fn pool_worker(shared: Arc<QueueShared>) {
                 // is resumed.
                 state = None;
                 poisoned = true;
-                *job.out.lock().unwrap() = Some(Vec::new());
-                job.done.store(true, Ordering::Release);
+                job.abort();
                 shared.poisoned.store(true, Ordering::Release);
                 shared.inner.lock().unwrap().poison = Some(payload);
             },
         }
-        shared.n_incomplete.fetch_sub(1, Ordering::Release);
+        if matches!(job.kind, JobKind::Encode { .. }) {
+            // Only encode jobs hold buffer views; a donation's completion
+            // is a progress tick alone (see `wait_donation`).
+            shared.n_incomplete.fetch_sub(1, Ordering::Release);
+        }
         shared.completed.fetch_add(1, Ordering::AcqRel);
         shared.progressed.notify_all();
         if poisoned {
             return;
         }
+    }
+}
+
+/// Encode or donate one claimed job through a worker-local (or donated)
+/// state, publishing the bytes (encode) or the parked verdict (donation).
+fn run_claimed_job(
+    job: &Job,
+    state: &mut Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
+) {
+    match &job.kind {
+        JobKind::Encode {
+            src: frozen,
+            first,
+            len,
+            gate,
+            last_frame_block,
+            overlap,
+            donation,
+            out,
+            ..
+        } => {
+            // SAFETY: the posting thread keeps the backing bytes stable for
+            // this job's whole lifetime (see FrozenSrc).
+            let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
+            let bytes = if let Some(don) = donation.lock().unwrap().take() {
+                // The donated continuation: job zero's state already carries
+                // its reset, strip prefill and parsed span — the
+                // continuation emits from where the donation stopped. The
+                // state returns to the kit pool afterwards (the worker
+                // builds its own like any undonated job's would).
+                let mut dstate = don.state;
+                let out = compress_job_blocks_inner(
+                    &mut dstate,
+                    src,
+                    *first..*len,
+                    *overlap,
+                    *last_frame_block,
+                    reach_probe::PROBE_SPAN,
+                    don.prefix,
+                );
+                crate::encoding::mt::return_donation_state(dstate);
+                out
+            } else {
+                let state = state.get_or_insert_with(|| alloc::boxed::Box::new(new_slice_state()));
+                run_job_with(
+                    state,
+                    src,
+                    *first..*len,
+                    *overlap,
+                    *last_frame_block,
+                    job.level,
+                    *gate,
+                    job.shape,
+                    job.choice,
+                )
+            };
+            *out.lock().unwrap() = Some(bytes);
+        },
+        JobKind::DonateKeep { outcome, .. } => {
+            let head = job.head.as_deref().expect("a donation carries the head");
+            // The kit pool (see `mt`'s DONATION_KIT docs): ephemeral pool
+            // workers carry no warm tables, so the donation's state
+            // round-trips a process-global pool instead.
+            let mut st = crate::encoding::mt::take_donation_state();
+            let (keep_bits, prefix) = donate_keep_span(&mut st, head, job.level, job.shape);
+            *outcome.lock().unwrap() = Some(KeepOutcome {
+                keep_bits,
+                donation: Donation { state: st, prefix },
+            });
+        },
+        JobKind::DonateShrink { outcome, .. } => {
+            let head = job.head.as_deref().expect("a donation carries the head");
+            let mut probe = crate::encoding::mt::take_donation_probe();
+            let shrink = reach_probe::parse_cost_with(
+                &mut probe,
+                head,
+                job.level,
+                job.shape,
+                ReachChoice::Shrink,
+                ProbeFeedback::Approx,
+            );
+            crate::encoding::mt::return_donation_probe(probe);
+            *outcome.lock().unwrap() = Some(shrink);
+        },
+    }
+}
+
+/// Publish a successfully run job's result (Release-paired with
+/// [`Job::is_done`]).
+fn mark_done(job: &Job) {
+    match &job.kind {
+        JobKind::Encode { done, .. }
+        | JobKind::DonateKeep { done, .. }
+        | JobKind::DonateShrink { done, .. } => {
+            done.store(true, Ordering::Release);
+        },
     }
 }
 
@@ -288,6 +462,12 @@ pub(crate) struct MtEncoderCore {
     /// Whether the reach probe's decision (see [`reach_probe`]) is still
     /// pending: no job posts until the head is staged and decided.
     probe_pending: bool,
+    /// The posted donation tasks whose verdict has not been consumed yet
+    /// (see `post_donation`/`resolve_probe`): the keep and shrink sides.
+    probe_wait: Option<(Arc<Job>, Arc<Job>)>,
+    /// The consumed Keep verdict's continuation for job zero (donated
+    /// state plus encoded span), parked until job zero posts.
+    donation: Option<Donation>,
     /// The frame's reach decision, handed to every job (see
     /// [`reach_probe`]).
     choice: ReachChoice,
@@ -389,6 +569,8 @@ impl MtEncoderCore {
             overlap,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
+            probe_wait: None,
+            donation: None,
             choice: ReachChoice::Keep,
 
             shape,
@@ -531,46 +713,143 @@ impl MtEncoderCore {
         }
     }
 
-    /// Run the pending reach probe (see [`reach_probe`]) and apply its
-    /// choice: a shrunk frame re-grids from offset zero with the shrunk
-    /// history strip and the job floor it implies — nothing posts while
-    /// the probe is pending, so the schedule stays a pure function of the
-    /// input — and every outcome re-reserves the decided schedule's
-    /// working scale (the pending reserve covers only the head). A frame
-    /// that never cleared the gate (a short stream, or a flush ahead of
-    /// it) keeps the stock reach.
-    fn decide_probe(&mut self) {
-        if !self.probe_pending {
-            return;
-        }
+    /// Post the probe's keep-side donation (see [`reach_probe`],
+    /// `donate_span`): a pool worker runs job zero's first span blocks
+    /// through the job machinery and parks the verdict, while the pump
+    /// keeps filling the buffer — only a keep-side parse's worth of work
+    /// runs at all, and it overlaps the pump instead of stalling it. The
+    /// verdict is consumed lazily wherever the schedule needs it (see
+    /// `resolve_probe`). Nothing else may post while the probe is pending,
+    /// so the donated head still sits at the buffer's start; the donation
+    /// counts in `n_incomplete`, so buffer recycling waits it out.
+    fn post_donation(&mut self) {
         self.probe_pending = false;
-        if self.pos >= self.probe_gate() {
-            // No job ever posted while pending, so the head still sits at
-            // the buffer's start.
-            debug_assert_eq!(self.job_start, 0);
-            debug_assert_eq!(self.buf_base, 0);
-            let choice = reach_probe::probe_staged(
-                &self.buf[..reach_probe::PROBE_SPAN],
-                self.level,
-                self.shape,
-            );
-            self.choice = choice;
-            if choice == ReachChoice::Shrink {
-                self.overlap = reach_probe::SHRINK_REACH;
-                if let JobGrid::Fixed(_) = self.grid {
-                    let n = self.shape.len.expect("the gate saw a pledge");
-                    self.grid = JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
-                }
-            }
+        debug_assert_eq!(self.job_start, 0);
+        debug_assert_eq!(self.buf_base, 0);
+        debug_assert!(self.pos >= reach_probe::PROBE_SPAN as u64);
+        self.ensure_workers();
+        // The donation owns its head: no buffer view is held, so the pump's
+        // wrap/growth never waits on it (a shrink-class verdict trails the
+        // pump by a whole keep-side parse — gating buffer growth on it
+        // would stall the pump behind the very work the donation was meant
+        // to hide).
+        let head: Arc<[u8]> = Arc::from(
+            self.buf[..reach_probe::PROBE_SPAN]
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let done = || core::sync::atomic::AtomicBool::new(false);
+        let keep = Arc::new(Job {
+            level: self.level,
+            choice: ReachChoice::Keep,
+            shape: self.shape,
+            head: Some(head.clone()),
+            kind: JobKind::DonateKeep {
+                outcome: Mutex::new(None),
+                done: done(),
+            },
+        });
+        let shrink = Arc::new(Job {
+            level: self.level,
+            choice: ReachChoice::Keep,
+            shape: self.shape,
+            head: Some(head),
+            kind: JobKind::DonateShrink {
+                outcome: Mutex::new(None),
+                done: done(),
+            },
+        });
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            inner.queue.push_back(keep.clone());
+            inner.queue.push_back(shrink.clone());
         }
+        self.probe_wait = Some((keep, shrink));
+        self.shared.wake.notify_all();
+    }
+
+    /// Settle the reach decision at a flush/finish boundary: a frame that
+    /// never cleared the staging gate keeps the stock reach (the schedule's
+    /// pure-function property — the verdict was never taken), and a posted
+    /// donation is waited out and applied.
+    fn settle_probe(&mut self) {
+        if self.probe_pending {
+            self.probe_pending = false;
+            self.reserve_decided();
+        }
+        if self.probe_wait.is_some() {
+            self.resolve_probe();
+        }
+    }
+
+    /// Consume the donation's verdict: a shrunk frame re-grids from offset
+    /// zero with the shrunk history strip and the job floor it implies
+    /// (job zero parses undonated, from a pooled state), a kept frame parks
+    /// the donated state and prefix for job zero's continuation. Every
+    /// outcome re-reserves the decided schedule's working scale (the
+    /// pending reserve covers only the head).
+    fn resolve_probe(&mut self) {
+        let Some((keep_job, shrink_job)) = self.probe_wait.take() else {
+            return;
+        };
+        // Wait both sides out (they hold no buffer views and do not count
+        // in n_incomplete, so the quiesce-based waits cannot see them). An
+        // aborted task lands done without an outcome, and the unwind
+        // resumes below.
+        while !keep_job.is_done() {
+            self.wait_donation(&keep_job);
+        }
+        while !shrink_job.is_done() {
+            self.wait_donation(&shrink_job);
+        }
+        let keep = match &keep_job.kind {
+            JobKind::DonateKeep { outcome, .. } => outcome.lock().unwrap().take(),
+            _ => unreachable!("probe_wait holds the donation tasks"),
+        };
+        let shrink = match &shrink_job.kind {
+            JobKind::DonateShrink { outcome, .. } => outcome.lock().unwrap().take(),
+            _ => unreachable!("probe_wait holds the donation tasks"),
+        };
+        let (Some(keep), Some(shrink)) = (keep, shrink) else {
+            self.surface_poison();
+            return;
+        };
+        // The verdict runs here on the pump: its feedback escalation (the
+        // contested band only) reuses this thread's pooled probe driver,
+        // warm across encoders.
+        let choice = reach_probe::decide_donated(
+            keep.keep_bits,
+            shrink,
+            &self.buf[..reach_probe::PROBE_SPAN],
+            self.level,
+            self.shape,
+        );
+        self.choice = choice;
+        if choice == ReachChoice::Shrink {
+            crate::encoding::mt::return_donation_state(keep.donation.state);
+            self.overlap = reach_probe::SHRINK_REACH;
+            if let JobGrid::Fixed(_) = self.grid {
+                let n = self.shape.len.expect("the gate saw a pledge");
+                self.grid = JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
+            }
+        } else {
+            self.donation = Some(keep.donation);
+        }
+        // Nothing else is in flight at this point (nothing posts while the
+        // verdict is unconsumed and the donation tasks just completed), so
+        // the growth below needs no quiesce wait.
+        self.reserve_decided();
+    }
+
+    /// Re-reserve the accumulate buffer for the decided schedule's working
+    /// scale (see `MtEncoderCore::new`).
+    fn reserve_decided(&mut self) {
         let initial_job = match self.grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
         };
         let want = (self.workers as usize).max(2) * initial_job + self.overlap + 64 * 1024;
         if self.buf.capacity() < want {
-            // Nothing is in flight (no job posted while pending), so
-            // growth needs no quiesce wait.
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
@@ -636,42 +915,64 @@ impl MtEncoderCore {
         if self.probe_pending {
             // Nothing posts until the probe's head is staged and decided
             // (see the module docs) — the schedule below must never see a
-            // pending frame.
+            // pending frame. The donation itself posts here and its
+            // verdict is consumed lazily, only where the schedule needs it.
             if self.pos < self.probe_gate() {
                 return;
             }
-            self.decide_probe();
+            self.post_donation();
         }
         loop {
+            // A verdict that already landed is consumed for free here (the
+            // finish path then never waits on it); a pending one is only
+            // waited out where the schedule needs it — the post below.
+            if self
+                .probe_wait
+                .as_ref()
+                .is_some_and(|(k, s)| k.is_done() && s.is_done())
+            {
+                self.resolve_probe();
+            }
             let end = self.job_end(self.job_start);
-            match self.grid {
-                JobGrid::Fixed(_) => {
-                    // The fixed grid's boundaries never depend on the
-                    // posting cadence (its build_bounds never re-slices),
-                    // so each job posts the moment it completes.
-                    if self.pos < end {
-                        return;
-                    }
-                    if let Some(n) = self.shape.len {
-                        if end >= n && self.pos <= n {
-                            return;
-                        }
-                    }
-                },
-                JobGrid::Growing => {
-                    // An epoch's jobs post only once the whole epoch is
-                    // buffered — rechecked per job, because a large write
-                    // (or an oversized pooled buffer) can carry `pos` past
-                    // several epoch ends in one append: greedily posting an
-                    // incomplete epoch's jobs would change both the
-                    // stream-end tail re-slice and the bytes.
-                    if self.pos < self.growing_epoch_end(self.job_start) {
-                        return;
-                    }
-                },
+            if !self.post_due(end) {
+                return;
+            }
+            if self.probe_wait.is_some() {
+                // The verdict re-derives the grid (a Shrink re-grids from
+                // offset zero) — recompute the schedule before posting.
+                self.resolve_probe();
+                continue;
             }
             self.post_job(self.job_start, end, false);
             self.job_start = end;
+        }
+    }
+
+    /// Whether the job starting at `job_start` (ending at `end`) may post
+    /// now. The fixed grid's boundaries never depend on the posting cadence
+    /// (its build_bounds never re-slices), so each job posts the moment it
+    /// completes — except a pledged grid's final job, held back for
+    /// `finish` to mark last (unlocked on overshoot, where the bulk path
+    /// also stops holding). The growing grid posts an epoch's jobs only
+    /// once the whole epoch is buffered — rechecked per job, because a
+    /// large write (or an oversized pooled buffer) can carry `pos` past
+    /// several epoch ends in one append: greedily posting an incomplete
+    /// epoch's jobs would change both the stream-end tail re-slice and the
+    /// bytes.
+    fn post_due(&self, end: u64) -> bool {
+        match self.grid {
+            JobGrid::Fixed(_) => {
+                if self.pos < end {
+                    return false;
+                }
+                if let Some(n) = self.shape.len {
+                    if end >= n && self.pos <= n {
+                        return false;
+                    }
+                }
+                true
+            },
+            JobGrid::Growing => self.pos >= self.growing_epoch_end(self.job_start),
         }
     }
 
@@ -734,7 +1035,7 @@ impl MtEncoderCore {
         debug_assert!(self.job_start < hi && hi <= self.pos);
         // A flush or finish ahead of the staging gate decides the probe
         // with the stock reach (see the module docs).
-        self.decide_probe();
+        self.settle_probe();
         self.emit_header();
         let bounds = self.build_bounds(hi);
         if bounds.len() == 2 && self.pool_threads.is_empty() {
@@ -754,6 +1055,10 @@ impl MtEncoderCore {
     fn run_inline_job(&mut self, bounds: &[u64], hi: u64, last_frame_block: bool) {
         // The shared job view starts at the next job's strip (the previous
         // job's tail), which is exactly what the buffer retained.
+        // A donation implies the pool was spawned at its post, so this
+        // pool-less path never carries one (job zero would parse undonated
+        // — byte-identical, but the donation's work would be wasted).
+        debug_assert!(self.donation.is_none() || !self.pool_threads.is_empty());
         let strip_lo = self.job_start.saturating_sub(self.overlap as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (self.job_start - strip_lo) as usize;
@@ -792,21 +1097,43 @@ impl MtEncoderCore {
         let first = (start - strip_lo) as usize;
         let len = (end - strip_lo) as usize;
         self.ensure_workers();
+        // Job zero carries the probe's donated keep side when one was
+        // parked (see `resolve_probe`); a donation whose continuation
+        // cannot take the last-block flag (the job ends at the span, so
+        // the donated blocks' non-last emission would stand) is discarded —
+        // job zero parses undonated, byte-identical to the stock schedule.
+        let mut donation = if start == 0 {
+            self.donation.take()
+        } else {
+            debug_assert!(self.donation.is_none());
+            None
+        };
+        if donation
+            .as_ref()
+            .is_some_and(|_| last_frame_block && end <= reach_probe::PROBE_SPAN as u64)
+        {
+            let discarded = donation.take().unwrap();
+            crate::encoding::mt::return_donation_state(discarded.state);
+        }
         // SAFETY: strip_lo >= buf_base (asserted above); the view is the
         // buffer's [strip_lo, end), so `first` indexes from its head.
         let ptr = unsafe { self.buf.as_ptr().add((strip_lo - self.buf_base) as usize) };
         let job = Arc::new(Job {
-            src: FrozenSrc { ptr },
-            first,
-            len,
-            overlap: self.overlap,
             level: self.level,
-            last_frame_block,
-            gate: start > 0,
             choice: self.choice,
             shape: self.shape,
-            out: Mutex::new(None),
-            done: core::sync::atomic::AtomicBool::new(false),
+            head: None,
+            kind: JobKind::Encode {
+                src: FrozenSrc { ptr },
+                first,
+                len,
+                overlap: self.overlap,
+                last_frame_block,
+                gate: start > 0,
+                donation: Mutex::new(donation),
+                out: Mutex::new(None),
+                done: core::sync::atomic::AtomicBool::new(false),
+            },
         });
         // Register before publishing: a worker's completion decrement must
         // never race ahead of the registration (the queue push below is the
@@ -826,13 +1153,14 @@ impl MtEncoderCore {
     /// order. Never blocks; the read path calls it between pulls so output
     /// appears as soon as its jobs complete.
     fn assemble_ready(&mut self) {
-        while self
-            .pending
-            .front()
-            .is_some_and(|j| j.done.load(Ordering::Acquire))
-        {
+        while self.pending.front().is_some_and(|j| j.is_done()) {
             let job = self.pending.pop_front().unwrap();
-            let bytes = job.out.lock().unwrap().take().unwrap();
+            let bytes = match &job.kind {
+                JobKind::Encode { out, .. } => out.lock().unwrap().take().unwrap(),
+                JobKind::DonateKeep { .. } | JobKind::DonateShrink { .. } => {
+                    unreachable!("donations never pend assembly")
+                },
+            };
             self.output.extend_from_slice(&bytes);
         }
     }
@@ -881,6 +1209,33 @@ impl MtEncoderCore {
                 .unwrap();
             inner = guard;
             if self.shared.completed.load(Ordering::Acquire) != before {
+                return;
+            }
+        }
+    }
+
+    /// Wait for the donation's completion tick: the donating worker ticks
+    /// `progressed` (and `completed`) when it lands the verdict. Exit
+    /// conditions are re-checked on every wake — a completion that lands
+    /// between the caller's `is_done` check and the `completed` snapshot
+    /// below fires its notify before this wait parks, so the snapshot is
+    /// already final and the delta test would sleep on a condition that
+    /// never changes again; the done re-check and the bounded timeout keep
+    /// the wait correct either way.
+    fn wait_donation(&self, job: &Job) {
+        let mut inner = self.shared.inner.lock().unwrap();
+        loop {
+            if inner.poison.is_some() || inner.shutdown || job.is_done() {
+                return;
+            }
+            let before = self.shared.completed.load(Ordering::Acquire);
+            let (guard, _) = self
+                .shared
+                .progressed
+                .wait_timeout(inner, core::time::Duration::from_millis(100))
+                .unwrap();
+            inner = guard;
+            if job.is_done() || self.shared.completed.load(Ordering::Acquire) != before {
                 return;
             }
         }
@@ -971,9 +1326,10 @@ impl MtEncoderCore {
                 None => return,
                 Some(payload) => {
                     while let Some(job) = inner.queue.pop_front() {
-                        *job.out.lock().unwrap() = Some(Vec::new());
-                        job.done.store(true, Ordering::Release);
-                        self.shared.n_incomplete.fetch_sub(1, Ordering::Release);
+                        job.abort();
+                        if matches!(job.kind, JobKind::Encode { .. }) {
+                            self.shared.n_incomplete.fetch_sub(1, Ordering::Release);
+                        }
                     }
                     payload
                 },
