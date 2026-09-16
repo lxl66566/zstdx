@@ -22,6 +22,42 @@ This document records the changes made between versions, starting with version 0
   discarded keep parse hidden under the pump; the cell's remaining distance
   to the bulk-mt ceiling is the finish-tail strip prefills (the whole-window
   stream strips), not the probe. See docs/src/dev/perf/mt-stream.md.
+- Encoder: the stream-mt read path's pump is single-copy and the buffer
+  recycling it feeds is wait-free in the steady state. Output
+  byte-identical (full-ladder dump, 120-cell ratio sweep, matrix
+  enc-stream sizes all equal); interleaved solo A/B vs the previous
+  build, 32 MiB mt8 medians: text.fastest 6736->9580, text.fast
+  5515->7618, json.fastest 2742->3551, json.fast 2026->2263 MiB/s.
+  Matrix enc-stream mt8: json.fastest 2667->3405 (91% of its own bulk
+  ceiling), json.fast 1968->2260, text.fastest 6217->7084-7318,
+  text.fast 4910->6464. Four scheduling/data-path changes:
+  - `read::Encoder` under std reads straight into the mt accumulate
+    buffer's spare capacity (`pump_direct`): the region handed to
+    `Read::read` is always previously-initialized bytes (an `init_len`
+    extent tracks it; the buffer pool carries it across encoders as the
+    returned Vec's length, growth clamps it - a realloc copies only the
+    live bytes). This halves the pump's serial memcpy; the old
+    source->16 KiB chunk->buffer double copy stays as the ST core /
+    no-std path (the ST pump hides behind its encode span). Each direct
+    read is capped at 1 MiB so job posting stays close behind the
+    buffered bytes.
+  - The accumulate buffer now doubles at every recycle point up to the
+    256 MiB cap: the old grow-only-when-full policy kept the buffer at
+    epoch scale, paying a dead-prefix wrap (a live-tail move plus a
+    quiesce wait on the in-flight epoch) once or twice per epoch
+    forever; a grown buffer fits a whole stream without recycling, so
+    the steady state wraps, waits and zero-fills zero times (the pool
+    carries the initialized extent, so the fill is a first-use cost).
+  - Worker states pool globally: the pool threads are fresh per encoder
+    (spawned at its first post, joined at drop), so the per-encoder
+    state pool always missed and every stream rebuilt eight matcher
+    table sets; workers now loan their state from a depth-capped global
+    pool and return it at the shutdown exit.
+  - `finish` posts the tail re-slice before draining: the pre-drain
+    idled workers behind the last straggler of the previous epoch while
+    the tail jobs were already postable (a stream ending exactly on an
+    epoch boundary still drains its pending jobs first - regression
+    test).
 - Encoder: the Balanced row's per-frame fixed costs (reach probe + DUBT
   head) no longer parse anything twice. Three changes, output
   byte-identical across the full ladder dump and the whole 120-cell
