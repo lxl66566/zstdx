@@ -4,6 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: RLE-class frames (uniform/low-alphabet inputs whose parse is
+  one uniform scan per block) no longer pay per-frame table fixed costs
+  that real shapes amortize. The btlazy2 rows' DUBT tables clear at the
+  frame's first searching block instead of at reset (all-RLE/all-raw
+  frames never touch them, 48 MiB/frame at level 13);
+  `apply_level` re-keys its table reallocation on table lengths rather
+  than the whole params struct (the reach probe's Keep/Shrink
+  alternation re-zeroed same-sized chain tables on every head parse);
+  and the LDM alphabet gate parks the pooled `LdmState` instead of
+  dropping it (low-alphabet shapes re-allocated and re-cleared its
+  table every frame), with the state's frame-boundary table clear
+  likewise deferred to its first fill/generate. Output is
+  byte-identical everywhere (full-ladder dump and the 120-cell ratio
+  sweep, zeros included). 32 MiB matrix, MiB/s of raw: zeros.balanced
+  16,080 -> 41,768, zeros.best 8,515 -> 42,918, zeros.opt 30,874 ->
+  41,208, zeros.ultra 29,958 -> 39,633.
 - Encoder: dictionary-seeded entropy tables now compete for the block on
   measured bit costs (libzstd's dict paths) instead of losing to the
   between-block reuse heuristics. A per-stream `DictEntropy` flag tracks
