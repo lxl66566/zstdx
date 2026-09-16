@@ -1,6 +1,6 @@
 # Status Overview
 
-> As of `ad57445` (2026-09-14). Branch goal (AGENTS.md): feature parity with upstream zstd and performance beyond it; no upstreaming; arbitrary unsafe / SIMD / new instruction sets allowed.
+> As of `dedd267d` (2026-09-16). Branch goal (AGENTS.md): feature parity with upstream zstd and performance beyond it; no upstreaming; arbitrary unsafe / SIMD / new instruction sets allowed.
 
 ## Capability matrix
 
@@ -29,22 +29,23 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 | slice/bulk codec | ✅ zero-copy encoding + thread_local state pool; decoding writes directly into the flat output |
 | streaming codec (read/write Encoder, Decoder) | ✅ streaming output byte-identical to bulk when no flush |
 | MT encoding | ✅ bulk (overlap jobs) + streaming (bursts); workers>1; no_std reports Unsupported |
-| MT decoding | ✅ restart-point segmentation; serial stage B is the bottleneck, no scalability yet |
-| frame checksum | ✅ optional on encode (+sidecar thread offload); decode verifies on every path (ST folds the compare into the trailer read, MT post-passes over the assembled output; `ChecksumMismatch` on mismatch — libzstd parity) |
+| MT decoding | ✅ restart-point segmentation; json scales to 1.54× ST at mt16 (= 1.16× the zstd stream reference), text flat, skewed 1.06-1.22× ST — serial stage B is the wall, decoder-side piece-parallel is todo 1's open half |
+| frame checksum | ✅ optional on encode (+sidecar thread offload); decode verifies on every path (ST folds the compare into the trailer read, MT absorbs it inline in stage B over the hot just-executed ranges; `ChecksumMismatch` on mismatch — libzstd parity) |
 | zstd-crate compat layer `zstdx::compat` | ✅ (dictionary decode works end-to-end) |
-| dictionaries | decode ✅ (formatted + raw content: `Dictionary::load`, an id-0 dict applies to frames without dictID); encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; formatted dicts load content as match history + seed entropy tables + dictID, headerless raw content as pure match history with default repcodes — libzstd parity, frames decodable by libzstd; MT falls back ST); `dict/` training ✅ raw content (deterministic fastCover port: shuffled samples, sliding distinct-dmer scoring, k-sweep scored on a held-out split; `zstdx-bench train`; holdout parity with libzstd's dict content on the systemd fixture). Remaining: entropy-table emission for trained dicts (todo 10) |
+| dictionaries | decode ✅ (formatted + raw content: `Dictionary::load`, an id-0 dict applies to frames without dictID); encode ✅ (ST all paths, `EncoderOptions::dictionary`/`FrameCompressor::set_dictionary`/CLI `-D`; formatted dicts load content as match history + seed entropy tables + dictID, headerless raw content as pure match history with default repcodes — libzstd parity, frames decodable by libzstd; MT falls back ST); `dict/` training ✅ raw content (deterministic fastCover port: shuffled samples, sliding distinct-dmer scoring, k-sweep scored on a held-out split; `zstdx-bench train`; holdout parity with libzstd's dict content on the systemd fixture). Formatted-dict emission ✅ (`dict/finalize.rs`, the `ZDICT_finalizeDictionary` port; `zstdx-bench train --formatted`). Remaining: the small-payload parse gap over dictionary history (todo 10, +3% on the systemd fixture) |
 | forced window log (`InputShape::with_window_log`) | ✅ all paths; blocks cap at the window (RFC 8878 Block_Maximum_Size) |
-| LDM / superblock / C FFI | ❌ |
+| LDM | ✅ row 9 (W26/reach W22, dll100 −9.75%), ≥32 MiB clamped windows on frame-continuous paths, opt-family optLdm + lazy-family gap-parse (todo 11; `encoding/ldm.rs`) |
+| superblock / preSplit / C FFI | ❌ (todo 13) |
 
 ## Completeness vs libzstd (subjective estimates, for targeting)
 
 | Dimension | Estimate | Basis |
 |---|---|---|
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz |
-| decode performance | bulk ahead across the board; streaming ~74-80% | streaming residue is on json/skewed (core-vs-core x1.04-1.35), see [current snapshot](dev/bench/snapshot.md) |
-| encode features | ~85% | full 1-22 ladder + dictionary encode (ST) + raw-content dictionary training + adjustable window + MT + streaming in place; missing trained-dict entropy-table emission, LDM, superblock |
-| encode speed | wins and losses split by tier | 2026-09-12 ladder speed curve (json 32MiB ST, CLI): chain rows 137/67/25 MiB/s at L6/9/12 vs libzstd 423/165/82 (0.25-0.33×, the known chain/json speed story); opt rows 7/4/2 at L13/17/19 vs 54/6/3 (0.13× at the btlazy2 slot, ~0.7× at btopt+); fastest/fast 447/340 vs 1118/812; small-call side wins (4KiB L19 5.96 vs 16.20 ms incl. spawn); tier-level x in the fresh [snapshot](dev/bench/snapshot.md) (2026-09-14: low tiers json x1.57/1.11/1.34, best-tier x1.63-2.87 after the DUBT port (was x1.77-6.2, the former largest gap); the six byte-identical perf lands of 09-13/09-14 moved json/text/skewed low tiers 5-13%) |
-| encode ratio | matched at every tier | 2026-09-12 full-ladder `ratio` sweep vs libzstd at same numeric levels (1MiB slice, all modes): json geo-mean +4.8% denser (balanced +19.6%, best +10.2%), skewed +2.8%, zeros +2.0%, random 0.00%, text +97.6% geo (window; balanced row -2.7% is the one losing cell — chain-row text residue, todo 9); 4KiB json ±1-5% after the small-literal huffman fix; dll Best/Opt denser than zstd-12/16, Ultra 7.7% behind zstd-19 |
+| decode performance | bulk ahead across the board; streaming ~74-80% | streaming residue is on json/skewed (core-vs-core x1.04-1.36), see [current snapshot](dev/bench/snapshot.md) |
+| encode features | ~90% | full 1-22 ladder + dictionary encode (ST) + formatted-dictionary training/emission + adjustable window + LDM + MT + streaming in place; missing superblock, preSplit, C FFI |
+| encode speed | wins and losses split by tier | 2026-09-12 ladder speed curve (json 32MiB ST, CLI): chain rows 137/67/25 MiB/s at L6/9/12 vs libzstd 423/165/82 (0.25-0.33×, the known chain/json speed story); opt rows 7/4/2 at L13/17/19 vs 54/6/3 (0.13× at the btlazy2 slot, ~0.7× at btopt+); fastest/fast 447/340 vs 1118/812; small-call side wins (4KiB L19 5.96 vs 16.20 ms incl. spawn); tier-level x in the fresh [snapshot](dev/bench/snapshot.md) (2026-09-16: json tiers x1.44/1.04/**0.76**/1.43/1.10/1.12 — balanced ahead at +21% density; text best/opt/ultra ahead x0.95/0.61/0.69, text.balanced x3.47 is the DUBT-head ratio trade; skewed best x2.15; json/text/skewed fastest-fast mostly ahead; stream-mt8 ahead on every json tier) |
+| encode ratio | matched at every tier | 2026-09-16 full-corpus `ratio` sweep vs libzstd at same numeric levels (32 MiB, all modes): geo-mean +8.66% denser; losing cells reduced to text.best −0.15..−0.23% and skewed.opt −0.07% (todo 9); text.balanced flipped to +1.65% (cold-start DUBT head); 4KiB json ±1-5%; dll Best/Opt/Ultra all denser than zstd-12/16/19 (ultra +9.8% via optLdm, `--long=26` still ~6% ahead of us) |
 | API/ecosystem | ~60% | bulk + streaming + compat (incl. dictionary constructors) + CLI (levels 1-22, -D dictionaries); missing C FFI, language bindings, standard CLI argument surface |
 
 Note: `COMPARE.md`'s completeness assessment is frozen at the `4ff2b7b` point in time; its conclusions — "encode features ~40%", "json.Best ratio gap (btopt shortfall)", "MT ratio collapse" — have been superseded by the optimal parser (`c726dfd`), package-merge Huffman (`aa07308`), the Best core swap (`b39a192`), and MT ratio retention (`a37ebaa`).
