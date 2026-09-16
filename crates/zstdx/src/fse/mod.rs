@@ -32,21 +32,23 @@ fn tables_equal() {
 fn check_tables(dec_table: &FSETable, enc_table: &fse_encoder::FSETable) {
     let ts = enc_table.table_size;
     for (idx, dec_state) in dec_table.decode.iter().enumerate() {
-        let base = dec_state.symbol as usize * ts;
-        // The transition row holds one entry per state range; find the entry
-        // targeting this state index and compare its wire parameters. The
-        // low field is the precomputed `position - baseline` diff.
-        let (pos, entry) = enc_table.transitions[base..base + ts]
-            .iter()
-            .enumerate()
-            .find(|(_, e)| ((**e >> 16) as usize) == idx)
-            .unwrap();
-        assert_eq!(
-            (*entry & 0xfff) as usize,
-            pos - dec_state.base_line as usize,
-            "wire diff at row position {pos}"
-        );
-        assert_eq!(((*entry >> 12) & 0xf) as u8, dec_state.num_bits);
+        // Every decoder state is the target of exactly one encode step from
+        // its own symbol; scan the source states and compare the wire
+        // parameters (the emitted diff is `state - baseline`).
+        let mut found = false;
+        for i in 0..ts {
+            let (nb, emit, next) = enc_table.step(dec_state.symbol, (ts + i) as u32);
+            if next as usize == ts + idx {
+                assert_eq!(nb as u8, dec_state.num_bits, "num_bits at state {i}");
+                assert_eq!(
+                    emit as usize,
+                    i - dec_state.base_line as usize,
+                    "wire diff at state {i}"
+                );
+                found = true;
+            }
+        }
+        assert!(found, "no encode step targets decoder state {idx}");
     }
 }
 

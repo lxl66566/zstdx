@@ -33,15 +33,15 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     pub fn encode(&mut self, data: &[u8]) {
         self.write_table();
 
+        let acc_log = self.acc_log() as u32;
         let mut state = self.table.start_index(data[data.len() - 1]);
         for x in data[0..data.len() - 1].iter().rev().copied() {
-            let next = self.table.next_state(x, state);
-            self.writer
-                .write_bits(next.diff as u64, next.num_bits as usize);
-            state = next.index;
+            let (nb, emit, next) = self.table.step(x, state);
+            self.writer.write_bits(emit as u64, nb as usize);
+            state = next;
         }
         self.writer
-            .write_bits(state as u64, self.acc_log() as usize);
+            .write_bits((state & ((1 << acc_log) - 1)) as u64, acc_log as usize);
 
         let bits_to_fill = self.writer.misaligned();
         if bits_to_fill == 0 {
@@ -60,6 +60,8 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     pub fn encode_interleaved(&mut self, data: &[u8]) {
         self.write_table();
 
+        let acc_log = self.acc_log() as u32;
+        let mask = (1u32 << acc_log) - 1;
         let mut state_1 = self.table.start_index(data[data.len() - 1]);
         let mut state_2 = self.table.start_index(data[data.len() - 2]);
 
@@ -68,20 +70,14 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         let mut idx = data.len() - 4;
         loop {
             {
-                let state = state_1;
-                let x = data[idx + 1];
-                let next = self.table.next_state(x, state);
-                self.writer
-                    .write_bits(next.diff as u64, next.num_bits as usize);
-                state_1 = next.index;
+                let (nb, emit, next) = self.table.step(data[idx + 1], state_1);
+                self.writer.write_bits(emit as u64, nb as usize);
+                state_1 = next;
             }
             {
-                let state = state_2;
-                let x = data[idx];
-                let next = self.table.next_state(x, state);
-                self.writer
-                    .write_bits(next.diff as u64, next.num_bits as usize);
-                state_2 = next.index;
+                let (nb, emit, next) = self.table.step(data[idx], state_2);
+                self.writer.write_bits(emit as u64, nb as usize);
+                state_2 = next;
             }
 
             if idx < 2 {
@@ -94,22 +90,19 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         // If odd we need to encode the last states transition and encode the final states in the
         // flipped order
         if idx == 1 {
-            let state = state_1;
-            let x = data[0];
-            let next = self.table.next_state(x, state);
-            self.writer
-                .write_bits(next.diff as u64, next.num_bits as usize);
-            state_1 = next.index;
+            let (nb, emit, next) = self.table.step(data[0], state_1);
+            self.writer.write_bits(emit as u64, nb as usize);
+            state_1 = next;
 
             self.writer
-                .write_bits(state_2 as u64, self.acc_log() as usize);
+                .write_bits((state_2 & mask) as u64, acc_log as usize);
             self.writer
-                .write_bits(state_1 as u64, self.acc_log() as usize);
+                .write_bits((state_1 & mask) as u64, acc_log as usize);
         } else {
             self.writer
-                .write_bits(state_1 as u64, self.acc_log() as usize);
+                .write_bits((state_1 & mask) as u64, acc_log as usize);
             self.writer
-                .write_bits(state_2 as u64, self.acc_log() as usize);
+                .write_bits((state_2 & mask) as u64, acc_log as usize);
         }
 
         let bits_to_fill = self.writer.misaligned();
@@ -149,16 +142,16 @@ pub(crate) fn approx_log2(x: f64) -> f64 {
 }
 
 /// Recycled scratch for entropy-table builds, pooled in the compressor
-/// state: transition buffers only need capacity, because every live
-/// symbol's row is fully overwritten by the build walk and dead rows are
-/// never read (wire codes stay below the histogram's `max_symbol`). A
-/// buffer zeroes its tail at most once per size, not once per table.
+/// state: table buffers only need capacity, because the tt entries and the
+/// state table are fully overwritten by the build walk (dead symbols get
+/// the dead fill, every state slot is written). A buffer zeroes its tail at
+/// most once per size, not once per table.
 #[derive(Default)]
 pub(crate) struct FseBuildScratch {
     /// State-owner map, refilled per build.
     owner: Vec<u8>,
-    /// Retired transition buffers (their `len` is the initialized prefix).
-    spare: Vec<Vec<u32>>,
+    /// Retired table buffers (their `len` is the initialized prefix).
+    spare: Vec<Vec<u64>>,
 }
 
 /// Pool depth: the three sequence tables plus the Huffman weight table can
@@ -167,7 +160,7 @@ const FSE_SPARE_CAP: usize = 4;
 
 impl FseBuildScratch {
     /// Take a buffer whose first `len` entries are initialized.
-    fn take_transitions(&mut self, len: usize) -> Vec<u32> {
+    fn take_tab(&mut self, len: usize) -> Vec<u64> {
         let mut v = match self.spare.iter().position(|v| v.capacity() >= len) {
             Some(i) => self.spare.swap_remove(i),
             None => Vec::with_capacity(len),
@@ -181,7 +174,7 @@ impl FseBuildScratch {
     }
 
     /// Keep a retired buffer: at capacity, the pool swaps out its smallest.
-    fn recycle(&mut self, v: Vec<u32>) {
+    fn recycle(&mut self, v: Vec<u64>) {
         if self.spare.len() < FSE_SPARE_CAP {
             self.spare.push(v);
         } else if self.spare.iter().all(|s| s.capacity() >= v.capacity()) {
@@ -203,41 +196,73 @@ pub struct FSETable {
     /// low-probability wire form, 0 for absent symbols. `write_table`
     /// serializes this array in symbol order.
     probs: [i32; 256],
-    /// Encoding start state per symbol: the index of its lowest-baseline
-    /// state (mirrors the state order the old per-symbol lists kept).
+    /// Biased encoding start state per symbol (`table_size + state index`,
+    /// the scale `tab`'s state table carries): the symbol's lowest spread
+    /// position, mirroring libzstd's `FSE_initCState2` ("the smallest state
+    /// value possible" — its decode entry always consumes >= 1 bit).
     start: [u16; 256],
     /// Sum of all probabilities (2^acc_log).
     pub(crate) table_size: usize,
-    /// Flat encoder transition table indexed by `symbol * table_size + state`,
-    /// packing the transition as
-    /// `(next_index << 16) | (num_bits << 12) | emitted_diff`, where
-    /// `emitted_diff` is the value this state emits (`state - run_baseline`,
-    /// precomputed per position at build time).
-    /// Replaces a linear scan per encoded symbol.
-    pub(super) transitions: Vec<u32>,
+    /// Arithmetic tANS transition tables (libzstd's `FSE_CTable` form) in
+    /// one buffer: `[tt: u64 x 256][state_table: u16 x table_size]`.
+    /// `tt[code]` packs `delta_nb_bits` (low u32) and `delta_find_state`
+    /// (high u32, two's complement); one step is
+    /// `nb = (state + delta_nb_bits) >> 16`,
+    /// `next = state_table[(state >> nb) + delta_find_state]`, and the
+    /// emitted value is the biased state's low `nb` bits. Replaces the
+    /// materialized `(max_symbol+1) x table_size` transition matrix: the
+    /// build writes O(table_size) entries instead of
+    /// O(max_symbol x table_size), and both tables stay L1-resident.
+    tab: Vec<u64>,
 }
 
+/// u64 length of the tt region of [`FSETable::tab`].
+const TT_LEN: usize = 256;
+/// u16 index of the state table inside [`FSETable::tab`] (byte 2048).
+const ST_U16_OFF: usize = TT_LEN * 4;
+
 impl FSETable {
-    /// O(1) encoder transition: packed `(next_index << 16) | (num_bits << 12)
-    /// | emitted_diff` for encoding `symbol` while in state `idx`.
+    /// One tANS encode step: `(nb_bits, emitted value, next state)` for
+    /// encoding `code` while in the biased running state `state`. The
+    /// emitted value is already masked to `nb_bits`.
     #[inline(always)]
-    pub(crate) fn transition(&self, symbol: u8, idx: usize) -> u32 {
-        self.transitions[symbol as usize * self.table_size + idx]
+    pub(crate) fn step(&self, code: u8, state: u32) -> (u32, u32, u32) {
+        let t = self.tab[code as usize];
+        let nb = state.wrapping_add(t as u32) >> 16;
+        let emit = state & ((1 << nb) - 1);
+        let idx = (state >> nb).wrapping_add((t >> 32) as u32);
+        let next = self.state_table()[idx as usize] as u32;
+        (nb, emit, next)
     }
 
-    /// Flat transition rows for hot encoder loops, as `(rows, row_shift)`:
-    /// entry `code << row_shift | state` holds the same packed transition as
-    /// [`transition`]. `table_size` is always a power of two, so the row
-    /// stride is a shift instead of a multiply.
-    pub(crate) fn transitions_flat(&self) -> (&[u32], u32) {
-        debug_assert!(self.table_size.is_power_of_two());
-        (&self.transitions[..], self.table_size.trailing_zeros())
+    /// Raw table pointers for hot encode loops: the tt base (`u64` entries)
+    /// and the state-table base (`u16` entries at the fixed byte offset
+    /// 2048), so one base register serves both.
+    pub(crate) fn tab_parts(&self) -> (*const u64, *const u16) {
+        let tt = self.tab.as_ptr();
+        // SAFETY: the state table lives at ST_U16_OFF inside the same
+        // allocation, with `table_size` u16 entries.
+        let st = unsafe { tt.cast::<u16>().add(ST_U16_OFF) };
+        (tt, st)
     }
 
-    /// Index of the state encoding a block's last `symbol` starts from.
+    fn state_table(&self) -> &[u16] {
+        // SAFETY: the state table is `table_size` u16 entries at a fixed
+        // offset inside the tab allocation (the buffer's u64 length covers
+        // TT_LEN + ceil(table_size / 4)).
+        unsafe {
+            core::slice::from_raw_parts(
+                self.tab.as_ptr().cast::<u16>().add(ST_U16_OFF),
+                self.table_size,
+            )
+        }
+    }
+
+    /// Index of the state encoding a block's last `symbol` starts from
+    /// (biased: `table_size + index`).
     #[inline(always)]
-    pub(crate) fn start_index(&self, symbol: u8) -> usize {
-        self.start[symbol as usize] as usize
+    pub(crate) fn start_index(&self, symbol: u8) -> u32 {
+        self.start[symbol as usize] as u32
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -258,10 +283,10 @@ impl FSETable {
         ))
     }
 
-    /// Return the transition buffer to a build pool (see
+    /// Return the table buffer to a build pool (see
     /// [`FseBuildScratch`]); the table must not be used afterwards.
     pub(crate) fn recycle(self, scratch: &mut FseBuildScratch) {
-        scratch.recycle(self.transitions);
+        scratch.recycle(self.tab);
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
@@ -307,32 +332,6 @@ impl FSETable {
             }
         }
         writer.write_bits(0u8, writer.misaligned());
-    }
-}
-
-/// Reconstruct the transition an entry encodes. The 12-bit field packing
-/// (see [`FSETable::transitions`]) limits tables to acc_log <= 12, which
-/// `build_table_from_probabilities` asserts and every builder enforces.
-#[derive(Debug, Clone)]
-pub(crate) struct State {
-    /// How many bits the range of this state needs to be encoded as
-    pub(crate) num_bits: u8,
-    /// The value this transition emits: the precomputed `state - baseline`
-    pub(crate) diff: usize,
-    /// Index of this state in the decoding table
-    pub(crate) index: usize,
-}
-
-impl FSETable {
-    pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> State {
-        let e = self.transition(symbol, idx);
-        let num_bits = ((e >> 12) & 0xf) as u8;
-        let diff = (e & 0xfff) as usize;
-        State {
-            num_bits,
-            diff,
-            index: (e >> 16) as usize,
-        }
     }
 }
 
@@ -406,19 +405,9 @@ pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize)
 /// table description is a single code byte and every transition costs zero
 /// bits, so encoding routes through the normal path unchanged.
 pub(crate) fn rle_table(code: u8, scratch: &mut FseBuildScratch) -> FSETable {
-    let mut transitions = scratch.take_transitions(256);
-    // table_size is 1, so `symbol * table_size + state` indexes at `symbol`;
-    // only the RLE code's degenerate zero transition is ever read.
-    transitions[code as usize] = 0;
-    let mut table = FSETable {
-        probs: [0; 256],
-        start: [0; 256],
-        table_size: 1,
-        transitions,
-    };
-    table.probs[code as usize] = 1;
-    table.start[code as usize] = 0;
-    table
+    let mut probs = [0i32; 256];
+    probs[code as usize] = 1;
+    build_table_from_probabilities_into(&probs, 0, scratch)
 }
 
 /// libzstd's set_compressed table build for sequence code histograms: the
@@ -714,51 +703,44 @@ fn build_table_from_counts(
 
 pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
     let table_size = 1usize << acc_log;
-    build_table_body(
-        probs,
-        acc_log,
-        &mut alloc::vec![255u8; table_size],
-        &mut alloc::vec![0u32; probs.len() * table_size],
-    )
+    let mut owner = alloc::vec![255u8; table_size];
+    let mut tab = alloc::vec![0u64; TT_LEN + table_size.div_ceil(4)];
+    build_table_body(probs, acc_log, &mut owner, &mut tab)
 }
 
-/// The pooled [`build_table_from_probabilities`]: recycles the transition
-/// buffer through `scratch` instead of allocating (and zeroing) per table.
+/// The pooled [`build_table_from_probabilities`]: recycles the table buffer
+/// through `scratch` instead of allocating (and zeroing) per table.
 pub(crate) fn build_table_from_probabilities_into(
     probs: &[i32],
     acc_log: u8,
     scratch: &mut FseBuildScratch,
 ) -> FSETable {
     let table_size = 1usize << acc_log;
-    let mut transitions = scratch.take_transitions(probs.len() * table_size);
+    let mut tab = scratch.take_tab(TT_LEN + table_size.div_ceil(4));
     scratch.owner.clear();
     scratch.owner.resize(table_size, 255);
-    build_table_body(probs, acc_log, &mut scratch.owner, &mut transitions)
+    build_table_body(probs, acc_log, &mut scratch.owner, &mut tab)
 }
 
 fn build_table_body(
     probs: &[i32],
     acc_log: u8,
     owner: &mut Vec<u8>,
-    transitions: &mut Vec<u32>,
+    tab: &mut Vec<u64>,
 ) -> FSETable {
-    // Entry packing gives 12 bits each to baseline and target index.
     debug_assert!(
-        (1..=12).contains(&acc_log),
-        "acc_log {acc_log} exceeds the transition packing"
+        (0..=12).contains(&acc_log),
+        "acc_log {acc_log} exceeds the supported range"
     );
     let table_size = 1usize << acc_log;
     let mut probs_full = [0i32; 256];
     probs_full[..probs.len()].copy_from_slice(probs);
-
-    let mut start = [0u16; 256];
 
     // -1 symbols take state indices from the top downward.
     let mut negative_idx = (table_size - 1) as i32;
     for (symbol, prob) in probs.iter().copied().enumerate() {
         if prob == -1 {
             owner[negative_idx as usize] = symbol as u8;
-            start[symbol] = negative_idx as u16;
             negative_idx -= 1;
         }
     }
@@ -779,85 +761,83 @@ fn build_table_body(
         }
     }
 
-    // Per-symbol counters for the baseline walk below.
-    let mut seen = [0u32; 256];
-    let mut baseline = [0usize; 256];
+    // cumul[s]: prefix sum of state counts (a -1 weight owns one state) —
+    // deltaFindState's base and each symbol's state-table row start,
+    // exactly libzstd's cumul.
+    let mut cumul = [0u32; 256];
+    let mut total = 0u32;
+    for (s, &prob) in probs.iter().enumerate() {
+        cumul[s] = total;
+        total += if prob == -1 {
+            1
+        } else {
+            prob as u32
+        };
+    }
 
-    // A -1 symbol has a single state spanning the whole index range: its
-    // entry is the top-region slot recorded above with acc_log output bits.
-    for (symbol, prob) in probs.iter().copied().enumerate() {
-        if prob != -1 {
-            continue;
-        }
-        let index = start[symbol] as usize;
-        let entry = (index as u32) << 16 | (acc_log as u32) << 12;
-        let base = symbol * table_size;
-        // Baseline 0: the emitted value at row position p is p itself.
-        for (p, slot) in transitions[base..base + table_size].iter_mut().enumerate() {
-            *slot = entry | p as u32;
+    // State table: positions ascending, symbol-major rows — `next` for the
+    // k-th state of a symbol is its k-th smallest spread position. The walk
+    // runs before the tt fill so start states can read it.
+    // SAFETY: the state table is `table_size` u16 entries at ST_U16_OFF in
+    // the tab buffer (whose u64 length covers TT_LEN + ceil(table_size/4)).
+    let st = unsafe {
+        core::slice::from_raw_parts_mut(tab.as_mut_ptr().cast::<u16>().add(ST_U16_OFF), table_size)
+    };
+    {
+        let mut cursor = cumul;
+        for (u, &symbol) in owner[..table_size].iter().enumerate() {
+            let s = symbol as usize;
+            st[cursor[s] as usize] = (table_size + u) as u16;
+            cursor[s] += 1;
         }
     }
 
-    // Assign baselines in ascending state-index order (identical to the old
-    // index sort + sequential walk): the first `double` states of a symbol
-    // emit one extra bit and their baselines wrap mod table_size. The symbol's
-    // lowest-index state is the encode start (libzstd's FSE_initCState2, "the
-    // smallest state value possible"), and its decode entry always consumes
-    // >= 1 bit — above half the table the smallest-baseline state flips to a
-    // zero-bit entry, which no stream can terminate on.
-    for (i, &owner_symbol) in owner.iter().enumerate() {
-        let symbol = owner_symbol as usize;
-        let prob = probs_full[symbol];
-        if prob <= 0 {
-            continue;
-        }
-        let prob = prob as u32;
-        let prob_log = if prob.is_power_of_two() {
-            prob.ilog2()
-        } else {
-            prob.ilog2() + 1
+    // Transform entries and start states (port of libzstd's "Build Symbol
+    // Transformation Table"): deltaNbBits makes
+    // `(state + deltaNbBits) >> 16` the emitted bit count, deltaFindState
+    // lands the state-table index inside the symbol's row. The equivalence
+    // with the previous materialized run walk (double states first in index
+    // order, baselines multiples of their run width) is pinned by
+    // `soa_matches_reference`.
+    let mut start = [0u16; 256];
+    for (s, &prob) in probs.iter().enumerate() {
+        let (dnb, dfs) = match prob {
+            // Dead-symbol fill (libzstd's), never encoded.
+            0 => (
+                ((u32::from(acc_log) + 1) << 16).wrapping_sub(table_size as u32),
+                0,
+            ),
+            // Single-state symbols (-1 or weight 1): always acc_log bits.
+            1 | -1 => (
+                (u32::from(acc_log) << 16).wrapping_sub(table_size as u32),
+                cumul[s].wrapping_sub(1),
+            ),
+            p => {
+                let prob_log = if (p as u32).is_power_of_two() {
+                    (p as u32).ilog2()
+                } else {
+                    (p as u32).ilog2() + 1
+                };
+                let nb = u32::from(acc_log) - prob_log;
+                (
+                    ((nb + 1) << 16).wrapping_sub((p as u32) << (nb + 1)),
+                    cumul[s].wrapping_sub(p as u32),
+                )
+            },
         };
-        let rounded_up = 1u32 << prob_log;
-        let double_states = rounded_up - prob;
-        let num_bits = acc_log - prob_log as u8;
-        let k = seen[symbol];
-        if k == 0 {
-            let single_states = prob - double_states;
-            baseline[symbol] = (single_states as usize * (1 << num_bits)) % table_size;
+        tab[s] = u64::from(dnb) | u64::from(dfs) << 32;
+        if prob != 0 {
+            // The symbol's lowest spread position — the first entry of its
+            // state-table row — as the biased encode start state.
+            start[s] = st[cumul[s] as usize];
         }
-        let (nb, width) = if k < double_states {
-            (num_bits + 1, 1usize << (num_bits + 1))
-        } else {
-            (num_bits, 1usize << num_bits)
-        };
-        let b = baseline[symbol];
-        if k == 0 {
-            start[symbol] = i as u16;
-        }
-        let entry = ((i as u32) << 16) | ((nb as u32) << 12);
-        // The run [b, b+width) emits its own offset: a row is indexed by the
-        // state itself, so the transition value `state - b` is a build-time
-        // constant per position — the hot encoders read it straight from the
-        // entry instead of subtracting the run base at runtime.
-        for (j, slot) in transitions[symbol * table_size + b..symbol * table_size + b + width]
-            .iter_mut()
-            .enumerate()
-        {
-            *slot = entry | j as u32;
-        }
-        baseline[symbol] = if k < double_states {
-            (b + width) % table_size
-        } else {
-            b + width
-        };
-        seen[symbol] = k + 1;
     }
 
     FSETable {
         probs: probs_full,
         start,
         table_size,
-        transitions: core::mem::take(transitions),
+        tab: core::mem::take(tab),
     }
 }
 
@@ -1053,26 +1033,39 @@ mod soa_tests {
             let (ref_flat, ref_starts, ref_ts) = build_reference(&probs, acc_log);
             assert_eq!(table.table_size, ref_ts, "case {case} ts");
             for (s, &start) in ref_starts.iter().enumerate().take(nsym) {
+                let expect = if probs[s] != 0 {
+                    (ref_ts + start) as u16
+                } else {
+                    0
+                };
                 assert_eq!(
-                    table.start[s], start as u16,
+                    table.start[s], expect,
                     "case {case} start {s} probs {probs:?} acc {acc_log}"
                 );
             }
-            // rebuild flat from new table transitions
-            for (symbol, nb, baseline, _index) in &ref_flat {
-                let e = table.transitions[*symbol as usize * ref_ts + *baseline];
-                assert_eq!(
-                    ((e >> 12) & 0xf) as u8,
-                    *nb,
-                    "case {case} sym {symbol} base {baseline} nb"
-                );
-                // The run's first position emits a zero diff: the low field
-                // holds `position - run_baseline`.
-                assert_eq!(
-                    e & 0xfff,
-                    0,
-                    "case {case} sym {symbol} base {baseline} diff"
-                );
+            // The arithmetic step must reproduce the reference run walk
+            // bit-for-bit: every state of every live symbol steps to the
+            // reference's next index, emits the run offset, and spends the
+            // run's bit count. The reference runs tile [0, table_size), so
+            // the loop covers each (symbol, state) pair exactly once.
+            for (symbol, nb, baseline, index) in &ref_flat {
+                for i in *baseline..*baseline + (1usize << *nb) {
+                    let (step_nb, emit, next) = table.step(*symbol, (ref_ts + i) as u32);
+                    assert_eq!(
+                        step_nb as usize, *nb as usize,
+                        "case {case} sym {symbol} state {i} nb probs {probs:?}"
+                    );
+                    assert_eq!(
+                        emit as usize,
+                        i - *baseline,
+                        "case {case} sym {symbol} state {i} emit"
+                    );
+                    assert_eq!(
+                        next as usize,
+                        ref_ts + *index,
+                        "case {case} sym {symbol} state {i} next"
+                    );
+                }
             }
         }
     }

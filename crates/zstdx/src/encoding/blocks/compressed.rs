@@ -587,36 +587,16 @@ fn encode_sequences(
     ml_table: &FSETable,
     of_table: &FSETable,
 ) {
-    // The codes and pre-merged add-bit payloads arrive precomputed; the
-    // transitions still need each table's entry for the running states.
-    // Rows are flat `code << shift | state` (table_size is a power of two),
-    // replacing the runtime-stride multiply and bounds check of the indexed
-    // accessor. The per-code share of the row address is loop-invariant, so
-    // it is resolved once per block into a 256-entry table of ROW POINTERS
-    // (`rows + (code << shift)`): the hot loop reaches an entry with one
-    // stack load (the pointer slot, addressed off rsp for free) plus one
-    // indexed load through it. The earlier u32 offset tables kept a third
-    // live register per channel for the row base — exactly the registers
-    // this loop does not have, so all three bases were reloaded from the
-    // stack every sequence and an `or` spliced each offset back in; the
-    // pointer tables drop both. Codes are u8 and states cycle below
-    // table_size by table construction, so both loads stay inside the flat
-    // array.
-    let (ll_rows, ll_shift) = ll_table.transitions_flat();
-    let (ml_rows, ml_shift) = ml_table.transitions_flat();
-    let (of_rows, of_shift) = of_table.transitions_flat();
-    let mut ll_ptrs = [ll_rows.as_ptr(); 256];
-    let mut ml_ptrs = [ml_rows.as_ptr(); 256];
-    let mut of_ptrs = [of_rows.as_ptr(); 256];
-    for c in 0..256usize {
-        // SAFETY: c << shift stays inside the flat transitions array
-        // (256 codes × table_size entries cover every row).
-        unsafe {
-            ll_ptrs[c] = ll_rows.as_ptr().add(c << ll_shift);
-            ml_ptrs[c] = ml_rows.as_ptr().add(c << ml_shift);
-            of_ptrs[c] = of_rows.as_ptr().add(c << of_shift);
-        }
-    }
+    // The codes and pre-merged add-bit payloads arrive precomputed. The
+    // tANS transitions run in libzstd's arithmetic form (see `FSETable`'s
+    // `tab`): per channel one u64 tt entry yields the emitted bit count and
+    // the state-table index, the u16 state table holds the biased next
+    // states (`table_size + index`), and the emitted value is the biased
+    // state's low `nb` bits — no materialized transition matrix, no
+    // per-block row-pointer setup, and both tables are L1-resident.
+    let (ll_tt, ll_st) = ll_table.tab_parts();
+    let (ml_tt, ml_st) = ml_table.tab_parts();
+    let (of_tt, of_st) = of_table.tab_parts();
 
     let li = nb_seq - 1;
     let packed = seqs[li].codes;
@@ -642,7 +622,7 @@ fn encode_sequences(
         // bits, every earlier one ≤87 (36 transition + 51 add), and each
         // flush stores eight bytes at the running position — the per-push
         // capacity probe (a Vec field load plus branch per sequence) goes
-        // away. The seqs/row accesses move to raw pointers for the same
+        // away. The seqs/table accesses move to raw pointers for the same
         // reason (the slice fields rode the stack through every iteration).
         out.reserve(nb_seq * 11 + 32);
         let base = out.as_mut_ptr();
@@ -655,8 +635,10 @@ fn encode_sequences(
         let mut cur = unsafe { base.add(pos) };
         // SAFETY: the reserve above covers every flush store (≤ nb_seq*11+8
         // bytes past the entry position, with ≤16 bytes of store overshoot).
-        // The seqs reads stay below nb_seq, the row reads inside their flat
-        // tables (see the row-index argument above).
+        // The seqs reads stay below nb_seq; the tt reads index a 256-entry
+        // array with a u8, and the state-table reads stay inside each
+        // table's row by construction (states cycle below 2*table_size and
+        // deltaFindState lands the index in the code's own row).
         unsafe {
             let w = &*sp.add(li);
             hot_push_raw(&mut cur, &mut acc, &mut bits, w.add, w.add_nb as usize);
@@ -664,46 +646,56 @@ fn encode_sequences(
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
-            let ll_pp = ll_ptrs.as_ptr();
-            let ml_pp = ml_ptrs.as_ptr();
-            let of_pp = of_ptrs.as_ptr();
             let mut p = unsafe { sp.add(li) };
             loop {
                 // SAFETY: the loop runs from the last sequence down to the
-                // first; p stays inside seqs. The pointer-table reads index
-                // a 256-entry array with a u8.
-                let (add, add_nb, e_of, e_ml, e_ll) = unsafe {
+                // first; p stays inside seqs.
+                let (add, add_nb, t_of, t_ml, t_ll) = unsafe {
                     p = p.sub(1);
                     let w = p.read();
                     let packed = w.codes;
                     (
                         w.add,
                         w.add_nb as usize,
-                        *(*of_pp.add((packed >> 16) as u8 as usize)).add(of_state),
-                        *(*ml_pp.add((packed >> 8) as u8 as usize)).add(ml_state),
-                        *(*ll_pp.add(packed as u8 as usize)).add(ll_state),
+                        *of_tt.add((packed >> 16) as u8 as usize),
+                        *ml_tt.add((packed >> 8) as u8 as usize),
+                        *ll_tt.add(packed as u8 as usize),
                     )
                 };
-                debug_assert!(of_state < of_table.table_size);
-                debug_assert!(ml_state < ml_table.table_size);
-                debug_assert!(ll_state < ll_table.table_size);
+                debug_assert!(of_state < 2 * of_table.table_size as u32);
+                debug_assert!(ml_state < 2 * ml_table.table_size as u32);
+                debug_assert!(ll_state < 2 * ll_table.table_size as u32);
+
+                // One arithmetic step per channel: the biased state's low
+                // `nb` bits are the emitted value (the run baseline is a
+                // multiple of the run width), and `(state >> nb) +
+                // deltaFindState` indexes the symbol's state-table row.
+                let of_nb = of_state.wrapping_add(t_of as u32) >> 16;
+                let ml_nb = ml_state.wrapping_add(t_ml as u32) >> 16;
+                let ll_nb = ll_state.wrapping_add(t_ll as u32) >> 16;
+                let of_diff = of_state & ((1 << of_nb) - 1);
+                let ml_diff = ml_state & ((1 << ml_nb) - 1);
+                let ll_diff = ll_state & ((1 << ll_nb) - 1);
+                // SAFETY: the tt entries hold deltaFindState in their high
+                // half; the index lands in the code's own state-table row.
+                unsafe {
+                    of_state = *of_st
+                        .add((of_state >> of_nb).wrapping_add((t_of >> 32) as u32) as usize)
+                        as u32;
+                    ml_state = *ml_st
+                        .add((ml_state >> ml_nb).wrapping_add((t_ml >> 32) as u32) as usize)
+                        as u32;
+                    ll_state = *ll_st
+                        .add((ll_state >> ll_nb).wrapping_add((t_ll >> 32) as u32) as usize)
+                        as u32;
+                }
 
                 // The three state-transition bit groups (max 12 bits each:
                 // nb <= acc_log <= 12) fit a single u64 write; concatenating
-                // them keeps the writer's hot path. The entry's low 12 bits
-                // carry the emitted value directly (the diff is precomputed
-                // per row position at table build), so the loop never
-                // subtracts the run baseline.
-                let of_diff = (e_of & 0xfff) as u64;
-                let ml_diff = (e_ml & 0xfff) as u64;
-                let ll_diff = (e_ll & 0xfff) as u64;
-                let of_nb = ((e_of >> 12) & 0xf) as usize;
-                let ml_nb = ((e_ml >> 12) & 0xf) as usize;
-                let ll_nb = ((e_ll >> 12) & 0xf) as usize;
-                let trans = of_diff | (ml_diff << of_nb) | (ll_diff << (of_nb + ml_nb));
-                of_state = (e_of >> 16) as usize;
-                ml_state = (e_ml >> 16) as usize;
-                ll_state = (e_ll >> 16) as usize;
+                // them keeps the writer's hot path.
+                let trans = of_diff as u64
+                    | (ml_diff as u64) << of_nb
+                    | (ll_diff as u64) << (of_nb + ml_nb);
 
                 // Transition bits then add bits are adjacent in the stream;
                 // one combined push keeps the writer's flush path once per
@@ -711,7 +703,7 @@ fn encode_sequences(
                 // cap keeps a post-flush (bits < 8) accumulator from dropping
                 // payload; wider pairs fall back to two pushes of the same
                 // bits.
-                let trans_nb = of_nb + ml_nb + ll_nb;
+                let trans_nb = (of_nb + ml_nb + ll_nb) as usize;
                 // SAFETY: the upfront reserve covers the stores (see above).
                 unsafe {
                     if trans_nb + add_nb <= 56 {
@@ -738,9 +730,11 @@ fn encode_sequences(
         writer.set_hot_state(acc, bits, pos);
     }
 
-    writer.write_bits(ml_state as u64, ml_log);
-    writer.write_bits(of_state as u64, of_log);
-    writer.write_bits(ll_state as u64, ll_log);
+    // The final states are written unbiased (the low acc_log bits of the
+    // biased values are exactly the indices).
+    writer.write_bits((ml_state & ((1 << ml_log) - 1)) as u64, ml_log);
+    writer.write_bits((of_state & ((1 << of_log) - 1)) as u64, of_log);
+    writer.write_bits((ll_state & ((1 << ll_log) - 1)) as u64, ll_log);
 
     let bits_to_fill = writer.misaligned();
     if bits_to_fill == 0 {
