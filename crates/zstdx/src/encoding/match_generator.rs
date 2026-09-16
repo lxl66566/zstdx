@@ -1038,6 +1038,31 @@ fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64, log: u32) {
     }
 }
 
+/// [`insert_at`] with the chain link written too: the head insert parks a
+/// candidate position whose chain slot the walk side reads, so every head
+/// entry needs its link (see `prefill_window`'s stale-slot notes — a
+/// link-less head entry parks the walk on a slot whose content depends on
+/// whatever earlier job last wrote it).
+#[inline(always)]
+fn insert_linked_at(
+    win: &[u8],
+    table: &mut [u32],
+    chain: &mut [u32],
+    idx: usize,
+    abs: u64,
+    log: u32,
+) {
+    // SAFETY: hash_at_log masks to log bits and the tables hold 1 << log
+    // and chain.len() slots; the absolute position masks to the chain size
+    // (absolute key; see emit_chain's note on the walk side's indexing).
+    unsafe {
+        let h = hash_at_log(win, idx, log);
+        let head = *table.get_unchecked(h);
+        *chain.get_unchecked_mut(abs as usize & (chain.len() - 1)) = head;
+        *table.get_unchecked_mut(h) = pack_pos(abs);
+    }
+}
+
 /// Push one sequence's literals and packed code/add-bits streams, and
 /// update the repeated-offset history. Shared by the fast, chain and opt
 /// emit paths; returns the literal length and the window-relative match end.
@@ -1100,6 +1125,7 @@ pub(super) fn push_seq_packed(
 fn insert_covered(
     win: &[u8],
     table: &mut [u32],
+    mut chain: Option<&mut [u32]>,
     win_base: u64,
     start: usize,
     match_len: usize,
@@ -1107,6 +1133,17 @@ fn insert_covered(
     log: u32,
     fill: CoveredFill,
 ) {
+    // One insert form per fill site: the chain strategies link every
+    // covered position they head-insert (see `insert_linked_at`), the fast
+    // strategy has no chain to link.
+    macro_rules! put {
+        ($idx:expr, $abs:expr) => {
+            match chain.as_deref_mut() {
+                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log),
+                None => insert_at(win, table, $idx, $abs, log),
+            }
+        };
+    }
     if match_len <= 16 {
         let end = (win_base + (start + match_len) as u64).min(insert_max);
         let mut p = win_base + start as u64;
@@ -1126,7 +1163,7 @@ fn insert_covered(
             // inserts, where an unrolled pair form's peel and tail checks
             // cost more than they save (measured on dll100).
             while p < end {
-                insert_at(win, table, (p - win_base) as usize, p, log);
+                put!((p - win_base) as usize, p);
                 p += 2;
             }
             return;
@@ -1135,12 +1172,12 @@ fn insert_covered(
         // mod 2 behind a per-entry parity guard that mispredicts on every
         // other insert (measured on json.fastest).
         if (end - p) & 1 == 1 {
-            insert_at(win, table, (p - win_base) as usize, p, log);
+            put!((p - win_base) as usize, p);
             p += 1;
         }
         while p < end {
-            insert_at(win, table, (p - win_base) as usize, p, log);
-            insert_at(win, table, (p + 1 - win_base) as usize, p + 1, log);
+            put!((p - win_base) as usize, p);
+            put!((p + 1 - win_base) as usize, p + 1);
             p += 2;
         }
     } else {
@@ -1148,9 +1185,9 @@ fn insert_covered(
         let hi = base + match_len as u64 - 2;
         if hi <= insert_max {
             let lo = base + 2;
-            insert_at(win, table, (lo - win_base) as usize, lo, log);
+            put!((lo - win_base) as usize, lo);
             if hi > lo {
-                insert_at(win, table, (hi - win_base) as usize, hi, log);
+                put!((hi - win_base) as usize, hi);
             }
         }
     }
@@ -1210,6 +1247,47 @@ impl TableEmit<'_> {
         insert_covered(
             win,
             self.table,
+            None,
+            self.win_base,
+            start,
+            match_len,
+            self.insert_max,
+            self.hash_log,
+            self.covered_fill,
+        );
+        self.win_base + match_end as u64
+    }
+
+    /// [`TableEmit::emit`] with the covered fill chain-linked: the chain
+    /// strategies' repcode continuation emits through here, and a covered
+    /// fill without its link parks a head entry the walk side cannot trust
+    /// (see `insert_linked_at`).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_linked(
+        &mut self,
+        win: &[u8],
+        chain: &mut [u32],
+        anchor: u64,
+        start: usize,
+        match_len: usize,
+        rep: &mut [u32; 3],
+    ) -> u64 {
+        let (_ll, match_end) = push_seq_packed(
+            win,
+            self.win_base,
+            anchor,
+            start,
+            match_len,
+            1,
+            rep,
+            self.literals,
+            self.seqs,
+        );
+        insert_covered(
+            win,
+            self.table,
+            Some(chain),
             self.win_base,
             start,
             match_len,
@@ -1290,6 +1368,7 @@ impl TableEmit<'_> {
     fn rep1_chain<const RAMPED: bool>(
         &mut self,
         win: &[u8],
+        mut chain: Option<&mut [u32]>,
         pos: u64,
         block_end: u64,
         rep: &mut [u32; 3],
@@ -1313,7 +1392,10 @@ impl TableEmit<'_> {
             }
             let ml = extend_match(win, pidx, cand);
             debug_assert!(ml >= MIN_MATCH);
-            pos = self.emit(win, pos, pidx, ml, 1, rep);
+            pos = match chain.as_deref_mut() {
+                Some(chain) => self.emit_linked(win, chain, pos, pidx, ml, rep),
+                None => self.emit(win, pos, pidx, ml, 1, rep),
+            };
         }
         pos
     }
@@ -2070,8 +2152,11 @@ impl MatchGeneratorDriver {
     /// frame bytes stay reproducible; libzstd's job path clears its tables
     /// per job for the same reason. The chain strategy's link table needs
     /// no clear: a chain slot is only ever read at a candidate position,
-    /// and candidates arise only from the cleared head table or from link
-    /// values written this job — stale link slots are unreachable. The
+    /// and candidates arise only from the cleared head table or from head
+    /// inserts this job links on the spot (`insert_linked_at` — the
+    /// link-less form once let a pooled previous job's slot resolve a
+    /// head-hopped candidate, making the output claim-order-dependent);
+    /// slots below this job's inserts stay stale and unreachable. The
     /// dfast `chain` buffer is a second probed head table and is cleared.
     /// The opt tables need no clear (their entries carry the coordinate
     /// origin, advanced by the per-job reset).
@@ -3238,7 +3323,7 @@ impl MatchGeneratorDriver {
                                         ml += 1;
                                     }
                                     anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                                    pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                    pos = emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp);
                                     // The chain's matches advance the cursor too.
                                     anchor = pos;
                                     miss_count = 0;
@@ -3287,7 +3372,7 @@ impl MatchGeneratorDriver {
                                 seed_offset = 0;
                             }
                             pos = if rep_pending == 0 {
-                                emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                                emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp)
                             } else {
                                 anchor
                             };
@@ -3373,13 +3458,13 @@ impl MatchGeneratorDriver {
                                 if $gated {
                                     rep_pending = rep_pending.saturating_sub(1);
                                     pos = if rep_pending == 0 {
-                                        emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                                        emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp)
                                     } else {
                                         anchor
                                     };
                                 } else {
                                     pos =
-                                        emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                        emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp);
                                 }
                                 anchor = pos;
                                 miss_count = 0;
@@ -3415,7 +3500,7 @@ impl MatchGeneratorDriver {
                             ml += 1;
                         }
                         anchor = emit.emit(win, anchor, start, ml, 1, &mut rep);
-                        pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                        pos = emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp);
                         anchor = pos;
                         miss_count = 0;
                         continue $restart;
@@ -3451,12 +3536,12 @@ impl MatchGeneratorDriver {
                             if $gated {
                                 rep_pending = rep_pending.saturating_sub(1);
                                 pos = if rep_pending == 0 {
-                                    emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp)
+                                    emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp)
                                 } else {
                                     anchor
                                 };
                             } else {
-                                pos = emit.rep1_chain::<RAMPED>(win, anchor, block_end, &mut rep, ramp);
+                                pos = emit.rep1_chain::<RAMPED>(win, None, anchor, block_end, &mut rep, ramp);
                             }
                             anchor = pos;
                             miss_count = 0;
@@ -4300,7 +4385,14 @@ impl MatchGeneratorDriver {
             if $gated && rep_pending != 0 {
                 pos = anchor;
             } else {
-                pos = emit.rep1_chain::<true>(win, anchor, block_end, &mut rep, ramp);
+                pos = emit.rep1_chain::<true>(
+                    win,
+                    Some(&mut *chain),
+                    anchor,
+                    block_end,
+                    &mut rep,
+                    ramp,
+                );
             }
             anchor = pos;
             };

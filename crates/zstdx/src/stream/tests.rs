@@ -480,6 +480,46 @@ mod mt {
         }
     }
 
+    /// The stream pool's workers reuse their `CompressState` across jobs; the
+    /// job boundary (the state reset plus the strip prefill) must retire
+    /// every output-shaping carryover, so a pooled job's bytes stay a
+    /// function of the frame content alone.
+    #[test]
+    fn pooled_state_reuse_is_output_neutral() {
+        use crate::encoding::frame_compressor::{
+            compress_job_blocks, new_slice_state, reset_slice_state,
+        };
+        use crate::encoding::match_generator::LdmArming;
+        use crate::encoding::reach_probe::ReachChoice;
+        let data = jsonish(11 * 1024 * 1024 + 100 * 1024);
+        let shape = crate::InputShape::default();
+        let reset = |st: &mut crate::encoding::frame_compressor::CompressState<
+            crate::encoding::MatchGeneratorDriver,
+        >| {
+            reset_slice_state(st, Level::Balanced, shape, ReachChoice::Shrink, LdmArming::Job);
+        };
+        let mk = || {
+            let mut st = new_slice_state();
+            reset(&mut st);
+            st
+        };
+        // Job B on a fresh state vs on a pooled state that already parsed a
+        // prior job (up to a full-window one).
+        let b = 5 * 1024 * 1024..10 * 1024 * 1024;
+        let fresh = compress_job_blocks(&mut mk(), &data, b.clone(), 4096, false);
+        for a in [
+            0..5 * 1024 * 1024usize,
+            0..4096usize,
+            1024 * 1024..3 * 1024 * 1024usize,
+        ] {
+            let mut st = mk();
+            compress_job_blocks(&mut st, &data, a.clone(), 4096, false);
+            reset(&mut st);
+            let reused = compress_job_blocks(&mut st, &data, b.clone(), 4096, false);
+            assert_eq!(reused, fresh, "job A {a:?}");
+        }
+    }
+
     /// A flush makes the pending bytes visible early at the cost of a
     /// re-gridded job boundary; the reassembled stream must still decode.
     #[test]
@@ -571,6 +611,41 @@ fn near_local(len: usize) -> Vec<u8> {
         let w = words[((state >> 33) as usize) % words.len()];
         let take = w.len().min(len - out.len());
         out.extend_from_slice(&w[..take]);
+    }
+    out
+}
+
+/// Json-shaped records (a small user pool over near-local structure): the
+/// shrink class of the reach probe (see `encoding::reach_probe`) — its far
+/// chain candidates displace nearer repcode reuse, so the shrunk reach
+/// parses the head cheaper.
+#[cfg(test)]
+fn jsonish(len: usize) -> Vec<u8> {
+    use std::format;
+    let mut state = 42u64;
+    let mut rnd = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) as u32
+    };
+    let events = ["click", "view", "purchase", "error", "login"];
+    let mut out = Vec::with_capacity(len);
+    let mut id = 0u64;
+    while out.len() < len {
+        let user = rnd() % 5000;
+        let payload = rnd() % 25;
+        let score = rnd() % 1_000_000;
+        let rec = format!(
+            "{{\"id\":{},\"user\":\"user_{}\",\"event\":\"{}\",\"ts\":{},\"payload\":\"{}\",\"score\":{}.{:06}}}\n",
+            id,
+            user,
+            events[(rnd() % 5) as usize],
+            1700000000 + id,
+            "x".repeat(payload as usize),
+            score / 1_000_000,
+            score % 1_000_000
+        );
+        out.extend_from_slice(rec.as_bytes());
+        id += 1;
     }
     out
 }
