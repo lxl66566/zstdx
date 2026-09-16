@@ -455,7 +455,10 @@ mod mt {
     #[test]
     fn reach_probe_unpledged_mt_write_independent() {
         let gate = crate::encoding::reach_probe::PROBE_MIN_FRAME as usize;
-        for (name, data) in [("jsonish", jsonish(gate + 1024 * 1024)), ("near_local", near_local(gate + 1024 * 1024))] {
+        for (name, data) in [
+            ("jsonish", jsonish(gate + 1024 * 1024)),
+            ("near_local", near_local(gate + 1024 * 1024)),
+        ] {
             let reference = encode_write(&data, usize::MAX, Level::Balanced, 4, false, None);
             for chunk in [64 * 1024, 333 * 1024, 3 * 1024 * 1024] {
                 assert_eq!(
@@ -464,7 +467,11 @@ mod mt {
                     "{name}: chunk {chunk}"
                 );
             }
-            assert_eq!(bulk::decompress(&reference, data.len()).unwrap(), data, "{name}");
+            assert_eq!(
+                bulk::decompress(&reference, data.len()).unwrap(),
+                data,
+                "{name}"
+            );
         }
         // A flush ahead of the gate decides the stock reach; the stream
         // still must roundtrip.
@@ -518,24 +525,36 @@ mod mt {
         // stream stays byte-identical to bulk mt there too.
         let near = jsonish(9 * 1024 * 1024 + 123 * 1024);
         let bulk_mt = encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None);
-        let streamed =
-            encode_write(&near, 1024 * 1024, Level::Balanced, 4, false, Some(near.len() as u64));
+        let streamed = encode_write(
+            &near,
+            1024 * 1024,
+            Level::Balanced,
+            4,
+            false,
+            Some(near.len() as u64),
+        );
         assert_eq!(streamed, bulk_mt);
     }
 
     #[test]
     fn pooled_state_reuse_is_output_neutral() {
-        use crate::encoding::frame_compressor::{
-            compress_job_blocks, new_slice_state, reset_slice_state,
+        use crate::encoding::{
+            frame_compressor::{compress_job_blocks, new_slice_state, reset_slice_state},
+            match_generator::LdmArming,
+            reach_probe::ReachChoice,
         };
-        use crate::encoding::match_generator::LdmArming;
-        use crate::encoding::reach_probe::ReachChoice;
         let data = jsonish(11 * 1024 * 1024 + 100 * 1024);
         let shape = crate::InputShape::default();
         let reset = |st: &mut crate::encoding::frame_compressor::CompressState<
             crate::encoding::MatchGeneratorDriver,
         >| {
-            reset_slice_state(st, Level::Balanced, shape, ReachChoice::Shrink, LdmArming::Job);
+            reset_slice_state(
+                st,
+                Level::Balanced,
+                shape,
+                ReachChoice::Shrink,
+                LdmArming::Job,
+            );
         };
         let mk = || {
             let mut st = new_slice_state();
@@ -676,7 +695,8 @@ fn jsonish(len: usize) -> Vec<u8> {
         let payload = rnd() % 25;
         let score = rnd() % 1_000_000;
         let rec = format!(
-            "{{\"id\":{},\"user\":\"user_{}\",\"event\":\"{}\",\"ts\":{},\"payload\":\"{}\",\"score\":{}.{:06}}}\n",
+            "{{\"id\":{},\"user\":\"user_{}\",\"event\":\"{}\",\"ts\":{},\"payload\":\"{}\",\"\
+             score\":{}.{:06}}}\n",
             id,
             user,
             events[(rnd() % 5) as usize],

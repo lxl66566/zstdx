@@ -371,9 +371,7 @@ impl MtEncoderCore {
         // plus a first shrunk epoch); the decision re-reserves the decided
         // schedule's scale.
         let want = if probe_pending {
-            (options.workers as usize).max(2) * MIN_JOB_SIZE
-                + reach_probe::PROBE_SPAN
-                + 64 * 1024
+            (options.workers as usize).max(2) * MIN_JOB_SIZE + reach_probe::PROBE_SPAN + 64 * 1024
         } else {
             (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024
         };
@@ -561,8 +559,7 @@ impl MtEncoderCore {
                 self.overlap = reach_probe::SHRINK_REACH;
                 if let JobGrid::Fixed(_) = self.grid {
                     let n = self.shape.len.expect("the gate saw a pledge");
-                    self.grid =
-                        JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
+                    self.grid = JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
                 }
             }
         }
