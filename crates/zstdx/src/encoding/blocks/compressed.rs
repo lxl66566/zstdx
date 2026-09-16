@@ -1006,6 +1006,11 @@ fn compress_literals(
     let new_encoder_table =
         huff0_encoder::HuffmanTable::build_from_counts_into(&counts[..=max_symbol], huff);
 
+    // The fresh table's description, serialized libzstd-exact (see
+    // `write_table_desc`); appended byte-aligned ahead of the streams below
+    // when the fresh table wins.
+    huff0_encoder::write_table_desc(&new_encoder_table, fse, huff);
+
     let (encoder_table, new_table) = if let Some(table) = last_table {
         if let Some(diff) = table.can_encode(&new_encoder_table) {
             // TODO this is a very simple heuristic, maybe we should try to do better
@@ -1040,11 +1045,14 @@ fn compress_literals(
     let size_index = writer.index();
     writer.write_bits(0u32, size_bits);
     let index_before = writer.index();
+    if new_table {
+        writer.append_bytes(&huff.desc);
+    }
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
     if size_format == 0 {
-        encoder.encode_with(literals, new_table, fse, huff);
+        encoder.encode_stream_only(literals);
     } else {
-        encoder.encode4x_with(literals, new_table, fse, huff);
+        encoder.encode4x_only(literals);
     }
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);

@@ -1,9 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{
-    bit_io::BitWriter,
-    fse::fse_encoder::{self, FSEEncoder},
-};
+use crate::{bit_io::BitWriter, fse::fse_encoder};
 
 pub(crate) struct HuffmanEncoder<'output, 'table, V: AsMut<Vec<u8>>> {
     table: &'table HuffmanTable,
@@ -36,6 +33,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// [`Self::encode`] with pooled build scratch: repeated small-block
     /// encodes recycle the package-merge and FSE weight-table buffers
     /// instead of allocating per call.
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn encode_with(
         &mut self,
         data: &[u8],
@@ -66,6 +64,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     /// [`Self::encode4x`] with pooled build scratch (see
     /// [`Self::encode_with`]).
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn encode4x_with(
         &mut self,
         data: &[u8],
@@ -73,6 +72,15 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         fse: &mut fse_encoder::FseBuildScratch,
         huff: &mut HuffScratch,
     ) {
+        if with_table {
+            self.write_table_with(fse, huff);
+        }
+        self.encode4x_only(data);
+    }
+
+    /// The four-stream form without a table description: the caller appended
+    /// the description (byte-aligned) beforehand or chose the treeless form.
+    pub(crate) fn encode4x_only(&mut self, data: &[u8]) {
         assert!(data.len() >= 4);
 
         // Split data in 4 equally sized parts (the last one might be a bit smaller than the rest)
@@ -81,11 +89,6 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         let src2 = &data[split_size..split_size * 2];
         let src3 = &data[split_size * 2..split_size * 3];
         let src4 = &data[split_size * 3..];
-
-        // Write table description
-        if with_table {
-            self.write_table_with(fse, huff);
-        }
 
         // Reserve space for the jump table, will be changed later
         let size_idx = self.writer.index();
@@ -119,6 +122,12 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         self.writer.change_bits(size_idx + 32, size3 as u16, 16);
     }
 
+    /// The one-stream form without a table description: the caller appended
+    /// the description (byte-aligned) beforehand or chose the treeless form.
+    pub(crate) fn encode_stream_only(&mut self, data: &[u8]) {
+        Self::encode_stream(self.table, self.writer, data);
+    }
+
     /// Encode one stream and pad it to fill the last byte
     fn encode_stream<VV: AsMut<Vec<u8>>>(
         table: &HuffmanTable,
@@ -141,57 +150,128 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     #[cfg(any(test, feature = "fuzz_exports"))]
     pub(super) fn weights(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.table.codes.len());
-        self.write_weights_into(&mut out);
+        self.table.write_weights_into(&mut out);
         out
     }
 
-    /// [`Self::weights`] into a recycled buffer.
-    fn write_weights_into(&self, out: &mut Vec<u8>) {
-        out.clear();
-        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        out.extend(self.table.codes.iter().copied().map(|(_, nb)| {
-            if nb == 0 {
-                0
-            } else {
-                max - nb + 1
-            }
-        }));
-    }
-
+    #[cfg(any(test, feature = "fuzz_exports"))]
     fn write_table_with(&mut self, fse: &mut fse_encoder::FseBuildScratch, huff: &mut HuffScratch) {
-        // TODO strategy for determining this?
-        self.write_weights_into(&mut huff.wire_weights);
-        let weights = &huff.wire_weights[..huff.wire_weights.len() - 1]; // dont encode last weight
-        if weights.len() > 16 {
-            let size_idx = self.writer.index();
-            self.writer.write_bits(0u8, 8);
-            let idx_before = self.writer.index();
-            let table =
-                fse_encoder::build_table_from_data_into(weights.iter().copied(), 6, true, fse);
-            let mut encoder = FSEEncoder::new(table, self.writer);
-            encoder.encode_interleaved(weights);
-            encoder.finish(fse);
-            let encoded_len = (self.writer.index() - idx_before) / 8;
-            assert!(encoded_len < 128);
-            self.writer.change_bits(size_idx, encoded_len as u8, 8);
-        } else {
-            self.writer.write_bits(weights.len() as u8 + 127, 8);
-            let (pairs, remainder) = weights.as_chunks::<2>();
-            for pair in pairs {
-                let weight1 = pair[0];
-                let weight2 = pair[1];
-                assert!(weight1 < 16);
-                assert!(weight2 < 16);
-                self.writer.write_bits(weight2, 4);
-                self.writer.write_bits(weight1, 4);
+        write_table_desc(self.table, fse, huff);
+        self.writer.append_bytes(&huff.desc);
+    }
+}
+
+/// Serialize the table's weight description into `scratch.desc` (cleared
+/// first), libzstd-exact (`HUF_writeCTable_wksp` + `HUF_compressWeights`):
+/// FSE-compressed weights when they beat the raw 4-bit form under libzstd's
+/// gate, raw 4-bit weights otherwise. The last symbol's weight is never
+/// written (the decoder derives it from the Kraft sum).
+pub(crate) fn write_table_desc(
+    table: &HuffmanTable,
+    fse: &mut fse_encoder::FseBuildScratch,
+    scratch: &mut HuffScratch,
+) {
+    table.write_weights_into(&mut scratch.wire_weights);
+    let weights = &scratch.wire_weights[..scratch.wire_weights.len() - 1]; // dont encode last weight
+    let desc = &mut scratch.desc;
+    desc.clear();
+    let n = weights.len();
+    if n >= 4 {
+        // libzstd's HUF_compressWeights pre-checks: single-symbol and
+        // all-distinct weight streams compress worse than the raw form.
+        let mut counts = [0u32; MAX_CODE_LENGTH + 1];
+        let mut max_w = 0usize;
+        let mut max_count = 0u32;
+        for &w in weights {
+            let w = w as usize;
+            counts[w] += 1;
+            max_w = max_w.max(w);
+            max_count = max_count.max(counts[w]);
+        }
+        let mut norm = [0i32; MAX_CODE_LENGTH + 1];
+        let normalized = max_count != n as u32 && max_count > 1 && {
+            let table_log = fse_encoder::optimal_table_log(6, n, max_w);
+            fse_encoder::normalize_count(&mut norm, table_log, &counts, n, max_w, false)
+        };
+        if normalized {
+            let table_log = fse_encoder::optimal_table_log(6, n, max_w);
+            let fse_table =
+                fse_encoder::build_table_from_probabilities_into(&norm[..=max_w], table_log, fse);
+            if write_fse_weights(fse_table, weights, &mut scratch.desc_fse, fse) {
+                let fse_len = scratch.desc_fse.len();
+                // libzstd's FSE-vs-raw gate in HUF_writeCTable_wksp. The raw
+                // form's header cannot count past 128 weights, so wider
+                // alphabets keep the FSE form unconditionally.
+                if fse_len > 1 && (fse_len < n / 2 || n > 128) {
+                    desc.push(fse_len as u8);
+                    desc.extend_from_slice(&scratch.desc_fse);
+                    return;
+                }
             }
-            if !remainder.is_empty() {
-                let weight = remainder[0];
-                assert!(weight < 16);
-                self.writer.write_bits(weight << 4, 8);
+        } else if n > 128 {
+            // Only reachable with a single distinct weight over more than
+            // 128 symbols (a uniform code over a full 256-symbol alphabet;
+            // the literals entropy gate keeps compressible blocks away from
+            // it, direct table dumps do not): the raw form cannot address
+            // the header and a one-symbol FSE table has only zero-bit
+            // entries, which no stream can terminate. Park one state on an
+            // unused weight value so the dominant symbol keeps >= 1-bit
+            // entries.
+            let phantom = if max_w == MAX_CODE_LENGTH {
+                MAX_CODE_LENGTH - 1
+            } else {
+                max_w + 1
+            };
+            let mut norm = [0i32; MAX_CODE_LENGTH + 1];
+            norm[max_w] = 31;
+            norm[phantom] = 1;
+            let fse_table = fse_encoder::build_table_from_probabilities_into(
+                &norm[..=phantom.max(max_w)],
+                5,
+                fse,
+            );
+            if write_fse_weights(fse_table, weights, &mut scratch.desc_fse, fse) {
+                let fse_len = scratch.desc_fse.len();
+                if fse_len < 128 {
+                    desc.push(fse_len as u8);
+                    desc.extend_from_slice(&scratch.desc_fse);
+                    return;
+                }
             }
         }
     }
+    debug_assert!(n <= 128);
+    // Raw 4-bit weights; the header counts the stored (non-last) weights.
+    desc.push(n as u8 + 127);
+    let (pairs, remainder) = weights.as_chunks::<2>();
+    for pair in pairs {
+        desc.push((pair[0] << 4) | pair[1]);
+    }
+    if !remainder.is_empty() {
+        desc.push(remainder[0] << 4);
+    }
+}
+
+/// FSE-encode `weights` with `table` into `out` (cleared first). Returns
+/// false when the stream cannot be built (normalization corner cases).
+fn write_fse_weights(
+    table: fse_encoder::FSETable,
+    weights: &[u8],
+    out: &mut Vec<u8>,
+    fse: &mut fse_encoder::FseBuildScratch,
+) -> bool {
+    out.clear();
+    {
+        let mut bits = BitWriter::from(&mut *out);
+        let mut encoder = fse_encoder::FSEEncoder::new(table, &mut bits);
+        encoder.encode_interleaved(weights);
+        encoder.finish(fse);
+        // Materialize the stream's trailing byte: the writer keeps
+        // unflushed bits in its accumulator, and this buffer would be
+        // dropped right here.
+        bits.flush();
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -312,6 +392,20 @@ impl HuffmanTable {
             lens[i] = (p & 0xf) as u8;
         }
         lens
+    }
+
+    /// Per-symbol wire weights into a recycled buffer (the format's
+    /// weight form; see [`write_table_desc`]).
+    pub(crate) fn write_weights_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        let max = self.codes.iter().map(|(_, nb)| *nb).max().unwrap();
+        out.extend(self.codes.iter().copied().map(|(_, nb)| {
+            if nb == 0 {
+                0
+            } else {
+                max - nb + 1
+            }
+        }));
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
@@ -452,6 +546,11 @@ pub(crate) struct HuffScratch {
     /// The literals-section weight stream (one weight per symbol, last
     /// dropped on the wire).
     wire_weights: Vec<u8>,
+    /// Serialized weight description (the bytes that follow the literals
+    /// header for a fresh table; see [`write_table_desc`]).
+    pub(crate) desc: Vec<u8>,
+    /// FSE-compressed weight region while probing the description form.
+    desc_fse: Vec<u8>,
     /// Retired `codes` buffers.
     codes: Vec<Vec<(u32, u8)>>,
 }
@@ -472,6 +571,8 @@ impl Default for HuffScratch {
             lengths: [0; 256],
             weights: [0; 256],
             wire_weights: Vec::new(),
+            desc: Vec::new(),
+            desc_fse: Vec::new(),
             codes: Vec::new(),
         }
     }
