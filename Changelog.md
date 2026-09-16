@@ -4,6 +4,24 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the reach probe's donation now reaches the multithreaded stream
+  core (the last stock-probe holdout), output byte-identical (emitframe
+  stream gates at workers 8, 60-cell stream sweep, full test suite). At the
+  staging gate (pledged: span; open-ended: 8 MiB) the pump posts the
+  probe's keep side to a pool worker as job zero's own first span blocks
+  and the shrink side to a second worker concurrently — the verdict lands
+  on whichever finishes first plus the other, then is consumed lazily
+  where the schedule first needs it (a post coming due, or flush/finish),
+  so the donation overlaps the pump instead of stalling it. A Keep hands
+  job zero the donated state and prefix (the continuation skips the strip
+  prefill); a Shrink re-grids undonated as before. The donation's state
+  and probe driver round-trip a process-global kit pool: the stream core's
+  worker threads are ephemeral per encoder, and cold tables measured 4-5x
+  the warm parse cost. text.balanced stream-mt8 366->445 MiB/s
+  (x3.28->x2.16 vs zstd-9); json.balanced at ratio parity (x0.33) with the
+  discarded keep parse hidden under the pump; the cell's remaining distance
+  to the bulk-mt ceiling is the finish-tail strip prefills (the whole-window
+  stream strips), not the probe. See docs/src/dev/perf/mt-stream.md.
 - Encoder: the Balanced row's per-frame fixed costs (reach probe + DUBT
   head) no longer parse anything twice. Three changes, output
   byte-identical across the full ladder dump and the whole 120-cell

@@ -29,7 +29,7 @@ use super::{
     Matcher, compress_fastest,
     frame_compressor::{
         CompressState, SliceChecksum, compress_job_blocks, compress_job_blocks_inner,
-        reset_slice_state, return_slice_state, take_slice_state,
+        new_slice_state, reset_slice_state, return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{LdmArming, MatchGeneratorDriver},
@@ -290,25 +290,32 @@ fn ramp_depth_from_env() -> u64 {
     })
 }
 
-/// Run the reach probe's keep side as job zero's own first span blocks on
-/// the calling thread: the state is job-zero-shaped exactly (reset at the
-/// job arming, empty-strip prefill with its table clear and head arming),
-/// the emit mirrors `compress_job_blocks`, and the matcher accumulates the
-/// probe cost while the blocks become the frame's own output. Returns the
-/// verdict plus the state and encoded prefix for job zero's continuation
-/// (a Shrink verdict discards both — the caller returns the state to the
-/// pool and job zero parses from its own pooled state).
-fn donate_job_zero_prefix(
-    src: &[u8],
+/// Run the reach probe's keep side as job zero's own first span blocks
+/// through `state`: the state is job-zero-shaped exactly (reset at the job
+/// arming, empty-strip prefill with its table clear and head arming), the
+/// emit mirrors `compress_job_blocks`, and the matcher accumulates the
+/// probe cost while the blocks become the frame's own output. `head` is the
+/// frame's first [`reach_probe::PROBE_SPAN`] bytes. Returns the measured
+/// keep cost and the encoded span; the caller takes the verdict (the
+/// shrink side measures separately — bulk serially on the calling thread,
+/// the stream core on a second pool worker) and disposes of the state (a
+/// Shrink verdict's returns to its pool, a Keep's becomes job zero's
+/// continuation state).
+pub(crate) fn donate_keep_span(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    head: &[u8],
     level: Level,
     shape: crate::InputShape,
-) -> (
-    reach_probe::ReachChoice,
-    alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
-    Vec<u8>,
-) {
-    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, LdmArming::Job);
-    state.matcher.prefill_job_strip(&src[..0], 0);
+) -> (f64, Vec<u8>) {
+    debug_assert_eq!(head.len(), reach_probe::PROBE_SPAN);
+    reset_slice_state(
+        state,
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        LdmArming::Job,
+    );
+    state.matcher.prefill_job_strip(&head[..0], 0);
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
     let span = reach_probe::PROBE_SPAN;
@@ -321,17 +328,36 @@ fn donate_job_zero_prefix(
         let hist = cursor.saturating_sub(max_window);
         state
             .matcher
-            .adopt_window(&src[hist..block_end], hist as u64);
+            .adopt_window(&head[hist..block_end], hist as u64);
         state.matcher.set_block(cursor as u64, block_end as u64);
-        compress_fastest(&mut state, false, &mut output, &mut hasher);
+        compress_fastest(state, false, &mut output, &mut hasher);
         cursor = block_end;
     }
     let keep = state
         .matcher
         .take_probe_cost()
         .expect("donation began the stats");
+    (keep, output)
+}
+
+/// [`donate_keep_span`] wrapped for the bulk path: returns the verdict plus the
+/// state and encoded prefix for job zero's continuation (a Shrink verdict
+/// discards both — the caller returns the state to the pool and job zero
+/// parses from its own pooled state).
+fn donate_job_zero_prefix(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+) -> (
+    reach_probe::ReachChoice,
+    alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+    Vec<u8>,
+) {
+    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, LdmArming::Job);
+    let (keep, output) =
+        donate_keep_span(&mut state, &src[..reach_probe::PROBE_SPAN], level, shape);
     let shrink = reach_probe::parse_cost(
-        &src[..span],
+        &src[..reach_probe::PROBE_SPAN],
         level,
         shape,
         reach_probe::ReachChoice::Shrink,
@@ -339,6 +365,64 @@ fn donate_job_zero_prefix(
     );
     let choice = reach_probe::decide_donated(keep, shrink, src, level, shape);
     (choice, state, output)
+}
+
+/// Pooled donation kit for the streaming core: its pool workers are
+/// ephemeral (spawned per encoder, joined at drop), so a donation running
+/// there inherits no warm tables — a fresh state and probe driver measured
+/// 4-5x the warm parse cost (first-touch faults on ~50 MiB of tables, per
+/// stream). The kit outlives encoders and hands the donation the same
+/// steady-thread warmth the bulk paths get from their thread-local pools;
+/// depth one (a frame has one donation, and the retained tables are the
+/// price).
+#[cfg(feature = "std")]
+static DONATION_KIT: std::sync::OnceLock<
+    Mutex<(
+        Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
+        Option<alloc::boxed::Box<MatchGeneratorDriver>>,
+    )>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "std")]
+fn donation_kit() -> &'static Mutex<(
+    Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
+    Option<alloc::boxed::Box<MatchGeneratorDriver>>,
+)> {
+    DONATION_KIT.get_or_init(|| Mutex::new((None, None)))
+}
+
+/// Take the kit's state (a fresh one when the pool is cold).
+#[cfg(feature = "std")]
+pub(crate) fn take_donation_state() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    donation_kit()
+        .lock()
+        .unwrap()
+        .0
+        .take()
+        .unwrap_or_else(|| alloc::boxed::Box::new(new_slice_state()))
+}
+
+/// Return a donation state to the kit.
+#[cfg(feature = "std")]
+pub(crate) fn return_donation_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
+    donation_kit().lock().unwrap().0 = Some(state);
+}
+
+/// Take the kit's probe driver (a fresh one when the pool is cold).
+#[cfg(feature = "std")]
+pub(crate) fn take_donation_probe() -> alloc::boxed::Box<MatchGeneratorDriver> {
+    donation_kit()
+        .lock()
+        .unwrap()
+        .1
+        .take()
+        .unwrap_or_else(|| alloc::boxed::Box::new(MatchGeneratorDriver::new_direct()))
+}
+
+/// Return a donation probe driver to the kit.
+#[cfg(feature = "std")]
+pub(crate) fn return_donation_probe(probe: alloc::boxed::Box<MatchGeneratorDriver>) {
+    donation_kit().lock().unwrap().1 = Some(probe);
 }
 
 /// Compress one job through `state`, resetting it for the job: fresh
