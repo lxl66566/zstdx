@@ -454,6 +454,10 @@ pub(super) struct LdmState {
     /// Entry floor: the last gear (re)arm's window start, below which no
     /// split may index.
     arm: u64,
+    /// The tables carry a previous frame's/job's entries and must be
+    /// zeroed before this span's first table touch (`restart` defers the
+    /// clear here: RLE-class spans never touch the tables and never pay).
+    stale: bool,
 }
 
 impl LdmState {
@@ -474,19 +478,29 @@ impl LdmState {
             window,
             fed: 0,
             arm: 0,
+            stale: false,
         }
     }
 
     /// Frame or job boundary: drop every table entry (a pooled matcher's
-    /// output must not depend on earlier jobs) and re-arm the hash fresh
-    /// at `pos`, the base the next `fill`/`generate` starts from (a
-    /// 64-byte blind spot per boundary, C's per-chunk reset).
+    /// output must not depend on earlier jobs — the clear itself is
+    /// deferred to the first table touch, see `stale`) and re-arm the
+    /// hash fresh at `pos`, the base the next `fill`/`generate` starts
+    /// from (a 64-byte blind spot per boundary, C's per-chunk reset).
     pub fn restart(&mut self, pos: u64) {
-        self.table.fill(0);
-        self.bucket_offsets.fill(0);
         self.rolling = !(u32::MAX as u64);
         self.fed = pos;
         self.arm = pos;
+        self.stale = true;
+    }
+
+    /// The deferred restart clear, ahead of this span's first table touch.
+    fn ensure_fresh(&mut self) {
+        if self.stale {
+            self.table.fill(0);
+            self.bucket_offsets.fill(0);
+            self.stale = false;
+        }
     }
 
     /// The configured reach (the row window; table sizing key).
@@ -654,6 +668,7 @@ impl LdmState {
     /// prefill/dictionary path (C's `ZSTD_ldm_fillHashTable`). `end` must
     /// sit at the window buffer's end (the block model), like generate.
     pub fn fill(&mut self, win: &[u8], win_base: u64, base: u64, end: u64) {
+        self.ensure_fresh();
         let mut splits = [0u64; BATCH_SIZE];
         let mut pos = base;
         while pos < end {
@@ -683,6 +698,7 @@ impl LdmState {
         base: u64,
         end: u64,
     ) {
+        self.ensure_fresh();
         debug_assert_eq!(end, win_base + win.len() as u64);
         // A shutoff gap (the driver's canary blocks feed nothing while the
         // latch is dead, see `ldm_generate`): the rolling hash is stale, so

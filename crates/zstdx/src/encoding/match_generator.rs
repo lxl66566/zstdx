@@ -1696,9 +1696,19 @@ pub struct MatchGeneratorDriver {
     /// [`super::reach_probe`]); `None` on every other path, so the
     /// accumulation itself costs one branch per block.
     probe_stats: Option<alloc::boxed::Box<ProbeStats>>,
+    /// The DUBT tables carry a previous frame's positions and must be
+    /// zeroed before this frame's first search (their u32 entries carry no
+    /// coordinate origin). Set at `reset`, consumed at the first btlazy
+    /// block that searches: a frame of RLE/raw blocks never touches the
+    /// tables, so it never pays the clear.
+    dubt_stale: bool,
     /// Gear-hash long-distance matcher state for chain rows with
     /// [`LevelParams::ldm`] (see [`super::ldm`]); `None` elsewhere.
     ldm: Option<LdmState>,
+    /// The alphabet gate's parking spot for [`Self::ldm`]: the state is
+    /// disabled for the frame, not dropped — a pooled state on a
+    /// low-alphabet shape once re-allocated the table on every frame.
+    ldm_parked: Option<LdmState>,
     /// Long-distance candidates of the block being scanned (regenerated
     /// per block by [`Self::ldm_generate`]).
     ldm_seqs: Vec<LdmSeq>,
@@ -1922,7 +1932,9 @@ impl MatchGeneratorDriver {
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
             probe_stats: None,
+            dubt_stale: false,
             ldm: None,
+            ldm_parked: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
             ldm_dead: false,
@@ -1976,7 +1988,9 @@ impl MatchGeneratorDriver {
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
             probe_stats: None,
+            dubt_stale: false,
             ldm: None,
+            ldm_parked: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
             ldm_dead: false,
@@ -2016,35 +2030,67 @@ impl MatchGeneratorDriver {
             || params.window != self.params.window;
         if tables_change {
             // Exactly one table family is live per strategy; switching
-            // families drops the other's buffers.
+            // families drops the other's buffers. Within a family the
+            // reallocation keys on the tables' lengths, not on the whole
+            // params struct: a params-only change (the reach probe's
+            // chain_reach switch, a window clamp that leaves the logs)
+            // must not drop and re-zero same-sized tables — the probe's
+            // Keep/Shrink alternation once re-zeroed the chain family on
+            // every parse, a fixed cost that dwarfed RLE-class frames
+            // (zeros.balanced's 2.9x regression). Kept tables carry the
+            // previous parse's entries; candidates are window-guarded and
+            // byte-verified, the same accepted residue as the
+            // equal-params path (which never cleared either).
+            let heads_kept = self.table.len() == 1usize << params.hash_log;
             match params.strategy {
                 Strategy::Fast => {
-                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    if !heads_kept {
+                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    }
                     self.chain = Vec::new();
                 },
                 Strategy::Dfast(small_log) => {
-                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
-                    self.chain = alloc::vec![0u32; 1usize << small_log];
+                    if !heads_kept {
+                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    }
+                    if self.chain.len() != 1usize << small_log {
+                        self.chain = alloc::vec![0u32; 1usize << small_log];
+                    }
                 },
                 Strategy::Chain(chain_log) => {
-                    self.table = alloc::vec![0u32; 1usize << params.hash_log];
-                    self.chain = alloc::vec![0u32; 1usize << chain_log];
+                    if !heads_kept {
+                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                    }
+                    if self.chain.len() != 1usize << chain_log {
+                        self.chain = alloc::vec![0u32; 1usize << chain_log];
+                    }
                 },
                 Strategy::Opt(knobs) => {
-                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                    if self.opt_table.len() != 1usize << params.hash_log {
+                        self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                    }
                     // The tree ring: two link slots per ring position.
-                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
-                    self.hash3 = if knobs.hash3_log > 0 {
-                        alloc::vec![EMPTY; 1usize << knobs.hash3_log]
-                    } else {
-                        Vec::new()
-                    };
+                    if self.bt.len() != 2usize << knobs.bt_log {
+                        self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                    }
+                    let want_h3 = usize::from(knobs.hash3_log > 0) << knobs.hash3_log;
+                    if self.hash3.len() != want_h3 {
+                        self.hash3 = if knobs.hash3_log > 0 {
+                            alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+                        } else {
+                            Vec::new()
+                        };
+                    }
                     self.table = Vec::new();
                     self.chain = Vec::new();
                 },
                 Strategy::BtLazy(knobs) => {
-                    self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
-                    self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
+                    if self.dubt_table.len() != 1usize << params.hash_log {
+                        self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
+                    }
+                    if self.dubt_bt.len() != 2usize << knobs.bt_log {
+                        self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
+                    }
                     self.opt_table = Vec::new();
                     self.bt = Vec::new();
                     self.hash3 = Vec::new();
@@ -2102,10 +2148,13 @@ impl MatchGeneratorDriver {
             .is_some_and(|l| l.window() == params.window as u64);
         self.ldm = match (ldm_wanted, ldm_sized) {
             (true, true) => self.ldm.take(),
-            (true, false) => Some(LdmState::new(
-                (params.window as u64).ilog2(),
-                params.window as u64,
-            )),
+            (true, false) => match self.ldm_parked.take() {
+                Some(parked) if parked.window() == params.window as u64 => Some(parked),
+                _ => Some(LdmState::new(
+                    (params.window as u64).ilog2(),
+                    params.window as u64,
+                )),
+            },
             (false, _) => None,
         };
     }
@@ -2596,9 +2645,10 @@ impl Matcher for MatchGeneratorDriver {
         // Stale opt-table entries from previous frames decode below the
         // window floor once the origin advances past them (read before the
         // cursor zeroes below); the u32 tables need no reset. The DUBT
-        // finder carries no origin: its rows clear both tables, since
-        // frame positions restart at zero and old absolute positions would
-        // alias the new window.
+        // finder carries no origin either, but its clear is deferred to
+        // the first searching block (`dubt_stale`): frame positions
+        // restart at zero and old absolute positions would alias the new
+        // window, while RLE/raw-only frames never read the tables at all.
         self.opt_origin += self.pos + 1;
         self.ext = None;
         self.win.clear();
@@ -2607,10 +2657,7 @@ impl Matcher for MatchGeneratorDriver {
         self.block_end = 0;
         self.anchor = 0;
         self.block_start = 0;
-        if matches!(self.params.strategy, Strategy::BtLazy(_)) {
-            self.dubt_table.fill(0);
-            self.dubt_bt.fill(0);
-        }
+        self.dubt_stale = matches!(self.params.strategy, Strategy::BtLazy(_));
         self.miss_count = 0;
         self.covered_fill = CoveredFill::Dense;
         self.scan_density = ScanDensity::Plain;
@@ -2844,6 +2891,13 @@ impl Matcher for MatchGeneratorDriver {
                 self.ldm_note_block(won);
             },
             Strategy::BtLazy(knobs) => {
+                // The reset's deferred clear lands at the first searching
+                // block (see `dubt_stale`).
+                if self.dubt_stale {
+                    self.dubt_table.fill(0);
+                    self.dubt_bt.fill(0);
+                    self.dubt_stale = false;
+                }
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
                 let won = self.start_matching_btlazy(knobs, literals, seqs);
@@ -3089,7 +3143,10 @@ impl MatchGeneratorDriver {
         let start = (self.block_start - self.win_base) as usize;
         let end = (self.block_end - self.win_base) as usize;
         if sampled_distinct(win, start, end) < LDM_SYMS_MIN {
-            self.ldm = None;
+            // Park, don't drop: the pooled state re-arms the same window
+            // next frame, and the re-allocation churned megabytes on
+            // low-alphabet shapes (the zeros regression's residue).
+            self.ldm_parked = self.ldm.take();
             self.ldm_seqs.clear();
         }
     }
