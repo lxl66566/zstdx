@@ -511,6 +511,8 @@ pub(crate) enum LdmArming {
     /// so the bar stays at the unclamped row window and mid-size frames
     /// keep the pure chain parse in MT (deterministic: the bar depends on
     /// the frame's shape alone, never the worker assignment).
+    /// Constructed by the std-gated mt paths only.
+    #[cfg(feature = "std")]
     Job,
     /// The reach probe's parses: the keep parse's span sits below the
     /// row's chain reach, so no candidate can survive the beyond-reach
@@ -525,6 +527,7 @@ pub(crate) enum LdmArming {
 const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
     match arming {
         LdmArming::Frame => Some(LDM_MIDSIZE_WINDOW),
+        #[cfg(feature = "std")]
         LdmArming::Job => Some(LDM_FULL_WINDOW),
         LdmArming::ProbeKeep => None,
     }
@@ -1778,6 +1781,7 @@ impl MatchGeneratorDriver {
     /// still ingests the whole strip — the full-strip tree form is
     /// dll100-gated (see dev/negative). Ultra keeps the full domain —
     /// the density flagship's row, C's btultra2 parity.
+    #[cfg(feature = "std")]
     fn opt_tree_strip(p: &LevelParams) -> u64 {
         let reach = p.chain_reach.unwrap_or(p.window) as u64;
         match p.strategy {
@@ -1827,6 +1831,7 @@ impl MatchGeneratorDriver {
     /// cover the dense search, and the LDM far class rides within-job
     /// history (the probe's own measurement priced the near-local shape
     /// without cross-strip far matches mattering).
+    #[cfg(feature = "std")]
     pub(crate) fn strip_for_choice(level: Level, shape: InputShape, choice: ReachChoice) -> u64 {
         let p = params_for(level, shape);
         if choice == ReachChoice::Shrink && p.chain_reach == Some(KEEP_REACH) {
@@ -2274,6 +2279,7 @@ impl MatchGeneratorDriver {
     /// block inside `prefill_window` still ingests the whole strip (the
     /// far class's server on armed frames; the whole-strip-halved form is
     /// dll100-gated, see dev/negative).
+    #[cfg(feature = "std")]
     pub(crate) fn prefill_job_strip(&mut self, data: &[u8], base: u64) {
         self.prefill_window(data, base);
         if matches!(self.params.strategy, Strategy::Opt(_)) {

@@ -793,6 +793,7 @@ pub(crate) fn compress_job_blocks(
 /// probe's keep-side donation for job zero — same state, same emit
 /// machinery, so the job's bytes are exactly an undonated run's), and
 /// `prefix` carries their encoded output verbatim.
+#[cfg(feature = "std")]
 pub(crate) fn compress_job_blocks_inner(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],

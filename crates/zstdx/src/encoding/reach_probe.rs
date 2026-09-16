@@ -36,6 +36,7 @@
 //! needs the reach it has).
 
 use alloc::{boxed::Box, vec::Vec};
+#[cfg(feature = "std")]
 use core::cell::RefCell;
 
 use super::{
@@ -153,6 +154,54 @@ fn byte_hist(lits: &[u8]) -> [u32; 256] {
     hist
 }
 
+/// `f64::log2` is std-only; no_std builds use an atanh-series form
+/// (relative error < 1e-7 — the verdict margins are percent-scale, so the
+/// two forms decide identically). std keeps the libm call bit-for-bit.
+#[cfg(feature = "std")]
+#[inline(always)]
+fn f64_log2(x: f64) -> f64 {
+    x.log2()
+}
+
+#[cfg(not(feature = "std"))]
+fn f64_log2(x: f64) -> f64 {
+    if x <= 0.0 {
+        return f64::NAN;
+    }
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let m = if biased == 0 {
+        // Subnormal: m in [0,1) against the -1022 exponent.
+        -1022.0
+    } else {
+        (biased - 1023) as f64
+    };
+    let mant = 1.0 + (bits & ((1u64 << 52) - 1)) as f64 / (1u64 << 52) as f64;
+    let z = (mant - 1.0) / (mant + 1.0);
+    let z2 = z * z;
+    let mut ln = z;
+    let mut zk = z;
+    for k in (3..=15).step_by(2) {
+        zk *= z2;
+        ln += zk / k as f64;
+    }
+    m + 2.0 * ln / core::f64::consts::LN_2
+}
+
+/// `f64::round` is std-only; the caller's domain is positive (the clamp
+/// band [1, 11]), where `+0.5` then truncate equals round exactly.
+#[cfg(feature = "std")]
+#[inline(always)]
+fn f64_round(x: f64) -> f64 {
+    x.round()
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+fn f64_round(x: f64) -> f64 {
+    (x + 0.5) as i64 as f64
+}
+
 /// Code lengths for a parsed block's literals: `-log2(count/total)`
 /// clamped into the format's [1, 11] band, absent symbols capped the way
 /// [`Matcher::note_literal_costs`] maps them.
@@ -164,7 +213,7 @@ fn approx_lit_lens(lits: &[u8], out: &mut [u8; 256]) {
         out[i] = if c == 0 {
             11
         } else {
-            (-(c as f64 / total).log2()).clamp(1.0, 11.0).round() as u8
+            f64_round((-f64_log2(c as f64 / total)).clamp(1.0, 11.0)) as u8
         };
     }
 }
@@ -252,13 +301,6 @@ pub(crate) fn decide_donated_with(
 /// the relative model-cost drop between a feedback-free parse and one
 /// with approximate per-block literal pricing (the same structure the
 /// encoder's table feedback gives the real parse).
-fn feedback_gain(head: &[u8], level: Level, shape: InputShape) -> f64 {
-    let mut driver = probe_driver();
-    let gain = feedback_gain_with(&mut driver, head, level, shape);
-    return_probe_driver(driver);
-    gain
-}
-
 fn feedback_gain_with(
     probe: &mut MatchGeneratorDriver,
     head: &[u8],
@@ -375,19 +417,6 @@ fn probe_driver() -> Box<MatchGeneratorDriver> {
 #[cfg(not(feature = "std"))]
 fn return_probe_driver(_driver: Box<MatchGeneratorDriver>) {}
 
-/// The thread-local pooled probe driver, exposed for the bulk donation's
-/// calling threads (steady threads — the pool stays warm across frames).
-#[cfg(feature = "std")]
-pub(crate) fn take_thread_probe_driver() -> Box<MatchGeneratorDriver> {
-    probe_driver()
-}
-
-/// [`take_thread_probe_driver`]'s return path.
-#[cfg(feature = "std")]
-pub(crate) fn return_thread_probe_driver(driver: Box<MatchGeneratorDriver>) {
-    return_probe_driver(driver);
-}
-
 /// [`parse_cost`] on a caller-supplied pooled driver: a donation running
 /// on an ephemeral pool worker cannot warm the thread-local driver, so it
 /// carries its own across encoders (see `mt::donate_span`).
@@ -476,7 +505,7 @@ fn order0_bits(hist: &[u64; 256], total: u64) -> f64 {
     for &c in hist {
         if c > 0 {
             let p = c as f64 / total as f64;
-            bits -= p * p.log2();
+            bits -= p * f64_log2(p);
         }
     }
     bits * total as f64

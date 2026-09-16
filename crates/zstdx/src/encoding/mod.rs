@@ -29,6 +29,7 @@ pub use frame_compressor::{
 };
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub use mt::mt_job_size_for;
 #[cfg(feature = "std")]

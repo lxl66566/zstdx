@@ -4,6 +4,15 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Build: the no-default-features (no_std) configuration compiles again
+  — it had drifted broken through the r6/r7 encoder rounds without any
+  gate noticing (`mt_job_size_for` re-exported without its std gate;
+  `f64::log2`/`f64::round` are std-only, now behind core-only shims whose
+  std forms delegate unchanged, so verdicts are bit-identical; the
+  mt-only items `LdmArming::Job`, the strip helpers and
+  `compress_job_blocks_inner` are std-gated like their callers). Also
+  drops three probe helpers left dead by the r7 donation iteration.
+  Std builds are unchanged (warning count back to the pre-r6 two).
 - Encoder: the reach probe's donation now reaches the multithreaded stream
   core (the last stock-probe holdout), output byte-identical (emitframe
   stream gates at workers 8, 60-cell stream sweep, full test suite). At the
