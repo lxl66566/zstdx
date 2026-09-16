@@ -394,6 +394,18 @@ impl HuffmanTable {
         lens
     }
 
+    /// libzstd's HUF_estimateCompressedSize: the exact cost of coding
+    /// `counts` under this table, rounded up to bytes. `counts` may be
+    /// shorter than the table's alphabet (the missing tail is all zeros).
+    pub(crate) fn estimate_compressed_size(&self, counts: &[usize]) -> usize {
+        self.codes
+            .iter()
+            .zip(counts.iter())
+            .map(|(&(_, nb), &c)| c * nb as usize)
+            .sum::<usize>()
+            .div_ceil(8)
+    }
+
     /// Per-symbol wire weights into a recycled buffer (the format's
     /// weight form; see [`write_table_desc`]).
     pub(crate) fn write_weights_into(&self, out: &mut Vec<u8>) {

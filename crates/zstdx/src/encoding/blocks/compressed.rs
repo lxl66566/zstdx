@@ -1006,19 +1006,23 @@ fn compress_literals(
     let new_encoder_table =
         huff0_encoder::HuffmanTable::build_from_counts_into(&counts[..=max_symbol], huff);
 
-    // The fresh table's description, serialized libzstd-exact (see
-    // `write_table_desc`); appended byte-aligned ahead of the streams below
-    // when the fresh table wins.
+    // The fresh table's description, needed on the wire when it wins and for
+    // the reuse decision itself (libzstd compares exact coding costs).
     huff0_encoder::write_table_desc(&new_encoder_table, fse, huff);
+    let desc_len = huff.desc.len();
 
-    let (encoder_table, new_table) = if let Some(table) = last_table {
-        if let Some(diff) = table.can_encode(&new_encoder_table) {
-            // TODO this is a very simple heuristic, maybe we should try to do better
-            if diff > 5 {
-                (&new_encoder_table, true)
-            } else {
-                (table, false)
-            }
+    let (encoder_table, new_table) = if let Some(table) = last_table
+        && table.can_encode(&new_encoder_table).is_some()
+    {
+        // libzstd's decision in HUF_compress_internal: keep the previous
+        // table when its exact cost beats the fresh table's cost plus the
+        // description, or the description cannot pay for itself at this
+        // literals size.
+        let costs = &counts[..=max_symbol];
+        let old_cost = table.estimate_compressed_size(costs);
+        let new_cost = new_encoder_table.estimate_compressed_size(costs);
+        if desc_len + 12 >= literals.len() || old_cost <= desc_len + new_cost {
+            (table, false)
         } else {
             (&new_encoder_table, true)
         }
@@ -1032,9 +1036,13 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
+    // libzstd's ZSTD_compressLiterals: one stream below 256 literals (the
+    // four-stream jumptable never pays for itself there). The literals
+    // header keeps the stream count and size format in one field.
+    let single_stream = literals.len() < 256;
     let (size_format, size_bits) = match literals.len() {
-        0..6 => (0b00u8, 10),
-        6..1024 => (0b01, 10),
+        0..256 => (0b00u8, 10),
+        256..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
         _ => unimplemented!("too many literals"),
@@ -1049,7 +1057,7 @@ fn compress_literals(
         writer.append_bytes(&huff.desc);
     }
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
-    if size_format == 0 {
+    if single_stream {
         encoder.encode_stream_only(literals);
     } else {
         encoder.encode4x_only(literals);
