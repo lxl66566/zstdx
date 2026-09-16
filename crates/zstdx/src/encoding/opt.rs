@@ -42,11 +42,26 @@ const PREDEF_THRESHOLD: usize = 8;
 /// half the seed cost).
 const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
 
-/// Positions occupy the low 47 bits (epoch tags the high 16). Positions
-/// beyond 2^47 cannot be represented — the encoder's absolute stream
-/// position stays far below it in practice.
-pub(crate) const POS_MASK: u64 = (1u64 << 47) - 1;
-pub(crate) const EMPTY: u64 = 0;
+/// The never-valid table entry (also written to terminate tree links).
+const EMPTY: u32 = 0;
+/// Storage bias: keeps position 0's entry nonzero — the tagged form
+/// resolved position 0 as a candidate, so the bias preserves that — and
+/// cancels in the distance math at read time.
+const POS_BIAS: u32 = 1;
+/// The tables are a random-access window-sized working set (48 MiB at
+/// Opt, 80 at Ultra), where entry width dominates cache/TLB latency; the
+/// entries are u32 like the rest of the matcher: `(position + origin +
+/// POS_BIAS) mod 2^32`, with the origin advancing past every position the
+/// state has ever written at each invalidation point (`Matcher::reset`
+/// per frame/job, ultra's pass-1 at frame starts) — the u64 form's
+/// 16-bit epoch replaced by monotone coordinates, so invalidation stays
+/// O(1) with no clears. A stale entry from an earlier origin rebuilds as
+/// `cand = q - advance < 0` (the advance exceeds every written position)
+/// and dies on the range check; only after 4 GiB of cumulative positions
+/// on one pooled state can the wrapped advance resurface an old entry as
+/// an in-window phantom that the byte verify then arbitrates — the same
+/// accepted class the u32 chain tables carry. Live entries rebuild
+/// exactly: the true distance is far below 2^32.
 
 /// Whole-bit weight: `highbit32(stat+1)` scaled (libzstd's `ZSTD_bitWeight`).
 #[inline(always)]
@@ -474,15 +489,14 @@ pub(crate) struct Finder<'a, 'b> {
     pub(crate) win: &'a [u8],
     pub(crate) win_base: u64,
     pub(crate) block_end_idx: usize,
-    pub(crate) epoch: u64,
-    pub(crate) tag: u64,
+    pub(crate) origin: u64,
     pub(crate) max_window: u64,
-    pub(crate) table: &'b mut [u64],
+    pub(crate) table: &'b mut [u32],
     pub(crate) table_log: u32,
-    pub(crate) bt: &'b mut [u64],
+    pub(crate) bt: &'b mut [u32],
     /// Position mask for the ring (which holds 2 slots per position).
     pub(crate) bt_mask: usize,
-    pub(crate) hash3: &'b mut [u64],
+    pub(crate) hash3: &'b mut [u32],
     pub(crate) hash3_log: u32,
     pub(crate) min_match: usize,
     pub(crate) mls: usize,
@@ -504,9 +518,24 @@ impl Finder<'_, '_> {
     /// Resolve a table entry to an absolute candidate position in
     /// `[floor, pos)`; anything else ends the walk.
     #[inline]
-    fn resolve(&self, entry: u64, floor: u64, pos: u64) -> Option<u64> {
-        let cand = entry & POS_MASK;
-        (entry >> 48 == self.epoch && cand >= floor && cand < pos).then_some(cand)
+    fn resolve(&self, entry: u32, floor: u64, pos: u64) -> Option<u64> {
+        if entry == EMPTY {
+            return None;
+        }
+        let dist = (pos as u32)
+            .wrapping_add(self.origin as u32)
+            .wrapping_add(POS_BIAS)
+            .wrapping_sub(entry);
+        let cand = pos.wrapping_sub(dist as u64);
+        (cand >= floor && cand < pos).then_some(cand)
+    }
+
+    /// Pack an absolute position into its stored u32 form.
+    #[inline(always)]
+    fn pack(&self, pos: u64) -> u32 {
+        (pos as u32)
+            .wrapping_add(self.origin as u32)
+            .wrapping_add(POS_BIAS)
     }
 
     #[inline(always)]
@@ -546,9 +575,9 @@ impl Finder<'_, '_> {
         // at count_limit and the equal-tail case breaks before the byte
         // compare). Verified by debug_asserts at the call sites.
         unsafe {
-            *self.table.get_unchecked_mut(h) = self.tag | pos;
-            let mut smaller: *mut u64 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
-            let mut larger: *mut u64 = smaller.add(1);
+            *self.table.get_unchecked_mut(h) = self.pack(pos);
+            let mut smaller: *mut u32 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
+            let mut larger: *mut u32 = smaller.add(1);
             while let Some(ca) = cand {
                 if nb == 0 {
                     break;
@@ -570,7 +599,7 @@ impl Finder<'_, '_> {
                 }
                 let node = 2 * (ca as usize & self.bt_mask);
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.tag | ca;
+                    *smaller = self.pack(ca);
                     common_smaller = ml;
                     if ca <= bt_low {
                         smaller = &raw mut dummy;
@@ -579,7 +608,7 @@ impl Finder<'_, '_> {
                     smaller = self.bt.as_mut_ptr().add(node + 1);
                     cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
                 } else {
-                    *larger = self.tag | ca;
+                    *larger = self.pack(ca);
                     common_larger = ml;
                     if ca <= bt_low {
                         larger = &raw mut dummy;
@@ -647,7 +676,7 @@ impl Finder<'_, '_> {
         unsafe {
             while p < target {
                 let h = hash3_at(self.win, (p - self.win_base) as usize, self.hash3_log) & mask;
-                *self.hash3.get_unchecked_mut(h) = self.tag | p;
+                *self.hash3.get_unchecked_mut(h) = self.pack(p);
                 p += 1;
             }
         }
@@ -657,8 +686,7 @@ impl Finder<'_, '_> {
         }
         *cursor = target;
         let h = hash3_at(self.win, idx, self.hash3_log) & mask;
-        let entry = self.hash3[h];
-        (entry >> 48 == self.epoch).then_some(entry & POS_MASK)
+        self.resolve(self.hash3[h], 0, target)
     }
 
     /// Collect every candidate at `idx` whose length strictly improves on the
@@ -756,9 +784,9 @@ impl Finder<'_, '_> {
         let mut dummy = EMPTY;
         // SAFETY: same invariants as insert_bt1.
         unsafe {
-            *self.table.get_unchecked_mut(h) = self.tag | pos;
-            let mut smaller: *mut u64 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
-            let mut larger: *mut u64 = smaller.add(1);
+            *self.table.get_unchecked_mut(h) = self.pack(pos);
+            let mut smaller: *mut u32 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
+            let mut larger: *mut u32 = smaller.add(1);
             while let Some(ca) = cand {
                 if nb == 0 {
                     break;
@@ -786,7 +814,7 @@ impl Finder<'_, '_> {
                 }
                 let node = 2 * (ca as usize & self.bt_mask);
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.tag | ca;
+                    *smaller = self.pack(ca);
                     common_smaller = ml;
                     if ca <= bt_low {
                         smaller = &raw mut dummy;
@@ -795,7 +823,7 @@ impl Finder<'_, '_> {
                     smaller = self.bt.as_mut_ptr().add(node + 1);
                     cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
                 } else {
-                    *larger = self.tag | ca;
+                    *larger = self.pack(ca);
                     common_larger = ml;
                     if ca <= bt_low {
                         larger = &raw mut dummy;
@@ -832,10 +860,10 @@ pub(crate) fn run_block<const ULTRA: bool>(
     block_end: u64,
     max_window: u64,
     ldm_seqs: &[LdmSeq],
-    epoch: &mut u64,
-    table: &mut [u64],
-    bt: &mut [u64],
-    hash3: &mut [u64],
+    origin: &mut u64,
+    table: &mut [u32],
+    bt: &mut [u32],
+    hash3: &mut [u32],
     next_update: &mut u64,
     state: &mut OptState,
     scratch: &mut OptScratch,
@@ -889,7 +917,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
                 seed_end,
                 max_window,
                 ldm_seqs,
-                *epoch,
+                *origin,
                 table,
                 bt,
                 hash3,
@@ -909,15 +937,10 @@ pub(crate) fn run_block<const ULTRA: bool>(
             seqs.clear();
             if frame_start {
                 // Drop the pass-1 tree (libzstd rewinds its window limits
-                // instead; the epoch tag achieves the same invalidation for
-                // free).
-                *epoch += 1;
-                if *epoch > 0xffff {
-                    table.fill(EMPTY);
-                    bt.fill(EMPTY);
-                    hash3.fill(EMPTY);
-                    *epoch = 1;
-                }
+                // instead; advancing the origin achieves the same
+                // invalidation for free — every pass-1 entry now rebuilds
+                // below the window floor).
+                *origin += block_end + 1;
                 *next_update = block_start;
             } else {
                 // The isolated seed left the strip unindexed and its own
@@ -936,7 +959,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         block_end,
         max_window,
         ldm_seqs,
-        *epoch,
+        *origin,
         table,
         bt,
         hash3,
@@ -982,10 +1005,10 @@ fn run_once<const ULTRA: bool>(
     block_end: u64,
     max_window: u64,
     ldm_seqs: &[LdmSeq],
-    epoch: u64,
-    table: &mut [u64],
-    bt: &mut [u64],
-    hash3: &mut [u64],
+    origin: u64,
+    table: &mut [u32],
+    bt: &mut [u32],
+    hash3: &mut [u32],
     next_update: &mut u64,
     state: &mut OptState,
     scratch: &mut OptScratch,
@@ -1004,8 +1027,7 @@ fn run_once<const ULTRA: bool>(
         win,
         win_base,
         block_end_idx,
-        epoch,
-        tag: epoch << 48,
+        origin,
         max_window,
         table,
         table_log,

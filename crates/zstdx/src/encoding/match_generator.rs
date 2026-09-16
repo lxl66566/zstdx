@@ -13,9 +13,9 @@
 //! position biased by one and truncated (zero stays the never-written
 //! sentinel), with the high bits reconstructed from the scanning position
 //! and a window-range check at read time — half the working set of the
-//! former u64 slots. The opt strategies keep their own u64 tables with an
-//! `(epoch << 48) | position` tag; a reset bumps that epoch instead of
-//! clearing them, while the u32 tables need no clearing at all.
+//! former u64 slots. The opt strategies' tree tables are u32 too: a
+//! biased position on per-state monotone coordinates whose origin a reset
+//! advances instead of clearing the tables (see [`super::opt`]).
 
 use alloc::vec::Vec;
 
@@ -194,10 +194,9 @@ const GATE_PROBE_LOG: u32 = 15;
 /// sample pass is not worth its own cost.
 const GATE_MIN_BLOCK: usize = 16384;
 
-// The opt strategies' never-valid table entry; their positions live in
-// the low 48 bits with the epoch in the high 16 (see
-// [`MatchGeneratorDriver::reset`]).
-const EMPTY: u64 = 0;
+// The opt strategies' never-valid table entry (see [`super::opt`] for the
+// biased monotone-position form).
+const EMPTY: u32 = 0;
 
 /// Encode an absolute position as a fast/dfast/chain table entry. The +1
 /// bias keeps a zeroed slot dead (no position maps to zero), so fresh and
@@ -1490,14 +1489,15 @@ pub struct MatchGeneratorDriver {
     /// hash or the chain links; see [`Strategy`]), u32 entries like
     /// `table`; empty for the fast strategy.
     chain: Vec<u32>,
-    /// Head hash table for the opt strategies, epoch-tagged u64 entries.
-    opt_table: Vec<u64>,
-    /// The opt strategies' binary-tree ring: two u64 link slots per ring
+    /// Head hash table for the opt strategies, u32 origin-biased entries
+    /// (see [`super::opt`]).
+    opt_table: Vec<u32>,
+    /// The opt strategies' binary-tree ring: two u32 link slots per ring
     /// position; empty outside opt.
-    bt: Vec<u64>,
+    bt: Vec<u32>,
     /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
     /// (libzstd's hashTable3); empty otherwise.
-    hash3: Vec<u64>,
+    hash3: Vec<u32>,
     /// The DUBT finder's hash heads for the btlazy2 strategy: u32
     /// position entries (see [`super::dubt`]), like libzstd's btlazy2
     /// tables. The random-access working set is window-sized, so entry
@@ -1544,7 +1544,10 @@ pub struct MatchGeneratorDriver {
     /// write it (their bodies must stay byte-identical to the ungated
     /// build; the fast tiers pay pure layout noise for any growth).
     gap_start: u64,
-    epoch: u64,
+    /// Coordinate origin of the opt tables' entries (see [`super::opt`]):
+    /// every reset advances it past every position the state has written,
+    /// retiring all stale entries at read time instead of clearing.
+    opt_origin: u64,
     miss_count: usize,
     /// Short-match interior fill policy for the current block's fast scan,
     /// decided from the previous block's parse density: at least
@@ -1784,7 +1787,7 @@ impl MatchGeneratorDriver {
             next_update: 0,
             gap_start: u64::MAX,
             // Epoch 0 is the never-valid state of a zeroed table.
-            epoch: 1,
+            opt_origin: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
             scan_density: ScanDensity::Plain,
@@ -1837,7 +1840,7 @@ impl MatchGeneratorDriver {
             lazy_scratch: None,
             next_update: 0,
             gap_start: u64::MAX,
-            epoch: 1,
+            opt_origin: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
             scan_density: ScanDensity::Plain,
@@ -2070,8 +2073,8 @@ impl MatchGeneratorDriver {
     /// and candidates arise only from the cleared head table or from link
     /// values written this job — stale link slots are unreachable. The
     /// dfast `chain` buffer is a second probed head table and is cleared.
-    /// The opt tables need no clear (their entries carry the epoch, bumped
-    /// per job).
+    /// The opt tables need no clear (their entries carry the coordinate
+    /// origin, advanced by the per-job reset).
     /// An MT job adopting `data` as its history strip at absolute offset
     /// `base`: [`Self::prefill_window`]'s full semantics, with the opt
     /// rows' tree fill bounded to the strip's tail half
@@ -2411,6 +2414,13 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: Level) {
         self.apply_level(level);
+        // Stale opt-table entries from previous frames decode below the
+        // window floor once the origin advances past them (read before the
+        // cursor zeroes below); the u32 tables need no reset. The DUBT
+        // finder carries no origin: its rows clear both tables, since
+        // frame positions restart at zero and old absolute positions would
+        // alias the new window.
+        self.opt_origin += self.pos + 1;
         self.ext = None;
         self.win.clear();
         self.win_base = 0;
@@ -2418,18 +2428,6 @@ impl Matcher for MatchGeneratorDriver {
         self.block_end = 0;
         self.anchor = 0;
         self.block_start = 0;
-        // Stale opt-table entries from previous frames fail the epoch check;
-        // the u32 tables need no reset (entries decode against the scanning
-        // position and die on the window-range check). The DUBT finder has
-        // no tag: its rows clear both tables, since frame positions restart
-        // at zero and old absolute positions would alias the new window.
-        self.epoch += 1;
-        if self.epoch > 0xffff {
-            self.opt_table.fill(EMPTY);
-            self.bt.fill(EMPTY);
-            self.hash3.fill(EMPTY);
-            self.epoch = 1;
-        }
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
             self.dubt_table.fill(0);
             self.dubt_bt.fill(0);
@@ -4329,7 +4327,7 @@ impl MatchGeneratorDriver {
     }
 
     /// Bridge into the optimal parser (levels Opt/Ultra): hands over
-    /// the window, the epoch-tagged tables and the persistent price state,
+    /// the window, the origin-biased tables and the persistent price state,
     /// then stores back the cursors the parser advanced. The tree's search
     /// domain is the `chain_reach` override (the stock row window; the
     /// frame window may sit wider for LDM's far classes).
@@ -4345,7 +4343,7 @@ impl MatchGeneratorDriver {
         let block_end = self.block_end;
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         let ldm_seqs: &[LdmSeq] = &self.ldm_seqs[..];
-        let mut epoch = self.epoch;
+        let mut origin = self.opt_origin;
         let mut next_update = self.next_update;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
@@ -4370,7 +4368,7 @@ impl MatchGeneratorDriver {
                 block_end,
                 max_window,
                 ldm_seqs,
-                &mut epoch,
+                &mut origin,
                 &mut self.opt_table,
                 &mut self.bt,
                 &mut self.hash3,
@@ -4392,7 +4390,7 @@ impl MatchGeneratorDriver {
                 block_end,
                 max_window,
                 ldm_seqs,
-                &mut epoch,
+                &mut origin,
                 &mut self.opt_table,
                 &mut self.bt,
                 &mut self.hash3,
@@ -4406,7 +4404,7 @@ impl MatchGeneratorDriver {
                 clamp_lag,
             )
         };
-        self.epoch = epoch;
+        self.opt_origin = origin;
         self.next_update = next_update;
         self.rep = rep;
         self.rep_pending = rep_pending;
