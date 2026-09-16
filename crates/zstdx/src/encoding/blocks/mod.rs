@@ -4,5 +4,6 @@
 //! There are a few different kinds of blocks, and implementations for those kinds are
 //! in this module.
 pub(crate) mod compressed;
+pub(crate) mod split;
 
 pub(super) use compressed::*;

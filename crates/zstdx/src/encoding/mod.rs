@@ -336,6 +336,13 @@ pub trait Matcher {
     /// go raw/RLE (and fresh frames or jobs) leave the matcher's current
     /// lengths untouched.
     fn note_literal_costs(&mut self, _lengths: &[u8; 256]) {}
+    /// Whether the current frame's row splits 128 KiB blocks at entropy
+    /// shifts (libzstd's post-parse block splitter; see
+    /// `blocks::split`). The default keeps the stock
+    /// one-block-per-128-KiB shape.
+    fn block_splitting_enabled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]

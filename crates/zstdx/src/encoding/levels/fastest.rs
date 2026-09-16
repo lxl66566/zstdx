@@ -8,6 +8,7 @@ use crate::{
         blocks::{
             compress_block,
             compressed::{BlockOutcome, PrevTable},
+            split,
         },
         frame_compressor::{BlockChecksum, CompressState},
     },
@@ -77,27 +78,57 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         let start = output.len();
         output.extend_from_slice(&[0u8; 3]);
         let dict_entropy = state.dict_entropy;
-        let outcome = compress_block(
-            &mut state.matcher,
-            old_huff.as_ref(),
+        // The opt rows with a >=2^17 window split blocks at entropy shifts
+        // (libzstd's post-parse block splitter); every other row takes the
+        // stock single-block path. `headers_final` marks that the splitter
+        // already wrote every partition's header and ran the per-partition
+        // size guards, so the single-block patch and checks below are
+        // skipped.
+        let (outcome, headers_final) = if state.matcher.block_splitting_enabled() {
+            match super::super::blocks::split::compress_split_block(
+                &mut state.matcher,
+                last_block,
+                output,
+                old_huff.as_ref(),
+                (
+                    &state.fse_tables.ll_default,
+                    &state.fse_tables.ml_default,
+                    &state.fse_tables.of_default,
+                ),
+                (&old_tables[0], &old_tables[1], &old_tables[2]),
+                dict_entropy,
+                &mut state.scratch,
+            ) {
+                split::SplitOutcome::Emitted(tables) => (BlockOutcome::Encoded(tables), true),
+                split::SplitOutcome::Single(outcome) => (outcome, false),
+            }
+        } else {
             (
-                &state.fse_tables.ll_default,
-                &state.fse_tables.ml_default,
-                &state.fse_tables.of_default,
-            ),
-            (&old_tables[0], &old_tables[1], &old_tables[2]),
-            dict_entropy,
-            output,
-            &mut state.scratch,
-        );
+                compress_block(
+                    &mut state.matcher,
+                    old_huff.as_ref(),
+                    (
+                        &state.fse_tables.ll_default,
+                        &state.fse_tables.ml_default,
+                        &state.fse_tables.of_default,
+                    ),
+                    (&old_tables[0], &old_tables[1], &old_tables[2]),
+                    dict_entropy,
+                    output,
+                    &mut state.scratch,
+                ),
+                false,
+            )
+        };
         let compressed_size = output.len() - start - 3;
         // If compression does not shrink the block, store it raw instead.
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size. The raw copy absorbs the frame
         // checksum on the way out.
         if matches!(outcome, BlockOutcome::Encoded(_))
-            && compressed_size < block_size as usize
-            && compressed_size <= MAX_BLOCK_SIZE as usize
+            && (headers_final
+                || (compressed_size < block_size as usize
+                    && compressed_size <= MAX_BLOCK_SIZE as usize))
         {
             let tables = match outcome {
                 BlockOutcome::Encoded(t) => t,
@@ -139,7 +170,9 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 block_size: compressed_size as u32,
             }
             .serialize_into(&mut prefix);
-            output[start..start + 3].copy_from_slice(&prefix);
+            if !headers_final {
+                output[start..start + 3].copy_from_slice(&prefix);
+            }
             hasher.hash_tail(&state.matcher.get_last_space()[hashed..]);
         } else {
             output.truncate(start);

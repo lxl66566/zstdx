@@ -53,16 +53,32 @@ pub(crate) enum BlockOutcome {
 /// allocate-and-double chain per block.
 #[derive(Default)]
 pub(crate) struct BlockScratch {
-    literals: Vec<u8>,
-    seqs: Vec<crate::encoding::SeqWord>,
+    pub(super) literals: Vec<u8>,
+    pub(super) seqs: Vec<crate::encoding::SeqWord>,
     /// Sticky heuristic: the previous block's literals cleared the exact
     /// entropy bound, so the strided gate below is skipped until a block
     /// proves otherwise. Pure cost hint; every outcome stays reachable.
-    literals_gate_hold: bool,
+    pub(super) literals_gate_hold: bool,
     /// Recycled FSE transition buffers (per-block table builds).
     pub(crate) fse: FseBuildScratch,
     /// Recycled Huffman build buffers (per-block table builds).
     pub(crate) huff: huff0_encoder::HuffScratch,
+    /// Block-splitter driver scratch (partitions, table measuring).
+    pub(crate) split: super::split::SplitScratch,
+}
+
+/// One block's staged contents: the literal buffer and packed sequence
+/// words from [`Matcher::start_matching_codes`]. A zero-sequence block
+/// stages no literals — its literals are the block itself, read from the
+/// matcher's committed space (see [`StagedBlock::ZeroSeq`]).
+pub(crate) enum StagedBlock<'a> {
+    Seqs {
+        literals: &'a [u8],
+        seqs: &'a [crate::encoding::SeqWord],
+    },
+    /// Zero-sequence block; `encode_staged_block` reads the literals from
+    /// the matcher's last committed space.
+    ZeroSeq,
 }
 
 /// A block of [`crate::common::BlockType::Compressed`]
@@ -101,7 +117,6 @@ pub(crate) fn compress_block<M: Matcher>(
     output: &mut Vec<u8>,
     scratch: &mut BlockScratch,
 ) -> BlockOutcome {
-    let mut tables = BlockTables::default();
     // Typical block shape: a few KB of literals and a few thousand sequences;
     // the pooled buffers keep that capacity after the first blocks.
     let BlockScratch {
@@ -110,20 +125,62 @@ pub(crate) fn compress_block<M: Matcher>(
         literals_gate_hold,
         fse,
         huff,
+        ..
     } = scratch;
     literals_vec.clear();
     seqs.clear();
     matcher.start_matching_codes(literals_vec, seqs);
+    let staged = if seqs.is_empty() {
+        StagedBlock::ZeroSeq
+    } else {
+        StagedBlock::Seqs {
+            literals: literals_vec,
+            seqs,
+        }
+    };
+    encode_staged_block(
+        matcher,
+        staged,
+        last_huff_table,
+        default_tables,
+        (
+            previous_tables.0.as_ref(),
+            previous_tables.1.as_ref(),
+            previous_tables.2.as_ref(),
+        ),
+        dict_entropy,
+        output,
+        literals_gate_hold,
+        fse,
+        huff,
+    )
+}
 
+/// Encode one block from staged contents: the body of [`compress_block`]
+/// for callers that stage the matcher's output themselves (the block
+/// splitter — it re-slices one staging pass into several blocks). `output`
+/// must end with the block's three reserved header bytes.
+pub(crate) fn encode_staged_block<M: Matcher>(
+    matcher: &mut M,
+    staged: StagedBlock<'_>,
+    last_huff_table: Option<&huff0_encoder::HuffmanTable>,
+    default_tables: (&FSETable, &FSETable, &FSETable),
+    previous_tables: (Option<&FSETable>, Option<&FSETable>, Option<&FSETable>),
+    dict_entropy: DictEntropy,
+    output: &mut Vec<u8>,
+    literals_gate_hold: &mut bool,
+    fse: &mut FseBuildScratch,
+    huff: &mut huff0_encoder::HuffScratch,
+) -> BlockOutcome {
+    let mut tables = BlockTables::default();
+    let zero_seq = matches!(staged, StagedBlock::ZeroSeq);
     // A zero-sequence block stages no literals (the matcher skips the
     // whole-block copy); its literals are the block itself, read straight
     // from the window. Same bytes, so every entropy decision below — and
     // thus the output — matches the staged path.
-    let zero_seq = seqs.is_empty();
-    let literals: &[u8] = if zero_seq {
-        matcher.get_last_space()
-    } else {
-        &literals_vec[..]
+    let (literals, seqs): (&[u8], &[crate::encoding::SeqWord]) = match staged {
+        StagedBlock::Seqs { literals, seqs } => (literals, seqs),
+        StagedBlock::ZeroSeq => (matcher.get_last_space(), &[]),
     };
 
     // Early raw exit: a zero-sequence block whose literals fail the strided
@@ -230,7 +287,7 @@ pub(crate) fn compress_block<M: Matcher>(
 
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
-enum FseTableMode<'a> {
+pub(super) enum FseTableMode<'a> {
     Predefined(&'a FSETable),
     Encoded(FSETable),
     /// Single-code RLE mode: `code` is the wire byte, `table` the degenerate
@@ -267,9 +324,9 @@ fn choose_tables_fast<'a>(
     seqs: &[crate::encoding::SeqWord],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
     previous_tables: (
-        &'a Option<FSETable>,
-        &'a Option<FSETable>,
-        &'a Option<FSETable>,
+        Option<&'a FSETable>,
+        Option<&'a FSETable>,
+        Option<&'a FSETable>,
     ),
     dict_entropy: DictEntropy,
     fse_scratch: &mut FseBuildScratch,
@@ -323,7 +380,7 @@ fn choose_tables_fast<'a>(
             first as u8,
             last as u8,
             default_tables.0,
-            previous_tables.0.as_ref(),
+            previous_tables.0,
             dict_entropy.ll,
             6,
             9,
@@ -335,7 +392,7 @@ fn choose_tables_fast<'a>(
             (first >> 8) as u8,
             (last >> 8) as u8,
             default_tables.1,
-            previous_tables.1.as_ref(),
+            previous_tables.1,
             dict_entropy.ml,
             6,
             9,
@@ -347,7 +404,7 @@ fn choose_tables_fast<'a>(
             (first >> 16) as u8,
             (last >> 16) as u8,
             default_tables.2,
-            previous_tables.2.as_ref(),
+            previous_tables.2,
             dict_entropy.of,
             5,
             8,
@@ -365,7 +422,7 @@ fn choose_tables_fast<'a>(
 /// cost-based path the lazy+ strategies use (the fast-strategy shortcut only
 /// engages with dictionary-provided tables, which this encoder never has).
 #[allow(clippy::too_many_arguments)]
-fn select_from_counts<'a>(
+pub(super) fn select_from_counts<'a>(
     counts: &mut [u32; SEQ_CODE_SPACE],
     nb_seq: usize,
     first_code: u8,
@@ -462,7 +519,7 @@ fn select_from_counts<'a>(
 /// Bits the previous table needs for this histogram: one occurrence costs
 /// log2(table_size / prob). `None` when a live symbol has no state in the
 /// table, which rules the table out entirely.
-fn repeat_bit_cost(
+pub(super) fn repeat_bit_cost(
     prev: &FSETable,
     counts: &[u32; SEQ_CODE_SPACE],
     max_symbol: usize,
@@ -789,7 +846,7 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
 /// log2 for the entropy bound and repeat-table costs; shared approximation
 /// (see [`approx_log2`]).
 #[inline(always)]
-fn entropy_log2(x: f64) -> f64 {
+pub(super) fn entropy_log2(x: f64) -> f64 {
     approx_log2(x)
 }
 
@@ -799,7 +856,7 @@ fn entropy_log2(x: f64) -> f64 {
 /// LUT); anything wider falls back to the four-lane scalar pass keyed by
 /// position mod 4, whose sub-histograms keep concurrent increments in
 /// different cache lines. Returns the highest symbol with a nonzero count.
-fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
+pub(super) fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if literals.len() >= 64

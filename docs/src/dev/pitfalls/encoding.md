@@ -2,6 +2,7 @@
 
 ## Frame format
 
+- **The per-block emission contract is "one reserved 3-byte header per block, patched by the caller" — any path that emits MORE than one block must take over header ownership explicitly.** The block splitter hit this twice in bring-up: (a) later partitions computed their header offset as `len - 3` *before* appending their own reserved bytes, patching into the previous partition's tail; (b) worse, the caller then re-patched the first reserved header with the summed size, producing a *super-block* header that swallows the partitions' own headers into its bitstream — our own decoder roundtripped it (permissively) while libzstd flagged corruption. Interop through the zstd crate is the mandatory gate for any multi-block-per-parse path; a `SplitOutcome::{Emitted, Single}` return now marks "headers already final and size-guarded" so the caller skips patch and checks.
 - **Block size is capped by the declared window** (RFC 8878: Block_Maximum_Size = min(window, 128K)). The srcSize adjustment can never trigger this (window ≥ ceil_log2(src) ≥ src), so only a forced window log below 128K exposed it — libzstd rejected even all-raw frames ("Data corruption detected", error 36) while our own permissive decoder accepted them. Every emission path now reads `Matcher::block_size`; when adding any window-shaping knob, grep `MAX_BLOCK_SIZE` in emission paths first.
 
 ## Matcher

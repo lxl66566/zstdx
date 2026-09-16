@@ -2488,6 +2488,13 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    fn block_splitting_enabled(&self) -> bool {
+        // libzstd's ZSTD_resolveBlockSplitterMode auto rule: the opt
+        // strategies with a window of at least 2^17 (the row as adjusted
+        // to the declared input shape).
+        matches!(self.params.strategy, Strategy::Opt(_)) && self.params.window >= (1 << 17)
+    }
+
     fn block_tail(&mut self) -> &mut [u8] {
         debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
         if self.win.len() + self.slice_size > self.win.capacity() {
