@@ -1105,13 +1105,15 @@ fn compress_literals(
     }
 
     // libzstd's ZSTD_compressLiterals: one stream below 256 literals (the
-    // four-stream jumptable never pays for itself there); a dictionary
-    // table carried over treeless also carries libzstd's single-stream
-    // form below 1 KiB (repeat tables cost no jump table). The literals
-    // header keeps the stream count and size format in one field.
+    // four-stream jumptable never pays for itself there); a
+    // dictionary-seeded stream additionally takes the single-stream form
+    // below 1 KiB whatever the table outcome (libzstd's `repeat_valid &&
+    // lhSize == 3` — the flag exists only while the frame still carries
+    // dictionary statistics). The literals header keeps the stream count
+    // and size format in one field.
     let (size_format, size_bits) = match literals.len() {
         0..256 => (0b00u8, 10),
-        _ if dict_seeded && !new_table && literals.len() < 1024 => (0b00u8, 10),
+        _ if dict_seeded && literals.len() < 1024 => (0b00u8, 10),
         256..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
