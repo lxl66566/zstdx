@@ -336,6 +336,10 @@ impl FSETable {
     }
 }
 
+/// Legacy histogram normalization, only used by the FSE round-trip test
+/// helper (the literals weight table and sequence tables use the ported
+/// libzstd builders).
+#[cfg(any(test, feature = "fuzz_exports"))]
 pub(crate) fn build_table_from_data_into(
     data: impl Iterator<Item = u8>,
     max_log: u8,
@@ -355,6 +359,7 @@ pub(crate) fn build_table_from_data_into(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit, scratch)
 }
 
+#[cfg(any(test, feature = "fuzz_exports"))]
 pub fn build_table_from_data(
     data: impl Iterator<Item = u8>,
     max_log: u8,
@@ -381,14 +386,17 @@ fn min_table_log(src_size: usize, max_symbol: usize) -> u8 {
 /// respecting the minimum needed to represent every symbol value.
 pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize) -> u8 {
     debug_assert!(src_size > 1);
-    let max_bits_src = (usize::BITS - (src_size - 1).leading_zeros() - 1) - 2; // highbit - 2
-    let min_bits = min_table_log(src_size, max_symbol);
+    let highbit = usize::BITS - (src_size - 1).leading_zeros() - 1;
+    // libzstd computes this in U32 and lets it wrap: an underflowed cap (few
+    // source symbols) simply never applies.
+    let max_bits_src = highbit.wrapping_sub(2);
+    let min_bits = min_table_log(src_size, max_symbol) as u32;
     let mut table_log = max_log as u32;
     if max_bits_src < table_log {
         table_log = max_bits_src;
     }
-    if (min_bits as u32) > table_log {
-        table_log = min_bits as u32;
+    if min_bits > table_log {
+        table_log = min_bits;
     }
     table_log = table_log.clamp(5, 12);
     table_log as u8
@@ -620,6 +628,7 @@ fn normalize_m2(
     true
 }
 
+#[cfg(any(test, feature = "fuzz_exports"))]
 fn build_table_from_counts(
     counts: &[usize],
     max_log: u8,
@@ -773,7 +782,6 @@ fn build_table_body(
     // Per-symbol counters for the baseline walk below.
     let mut seen = [0u32; 256];
     let mut baseline = [0usize; 256];
-    let mut prev_baseline = [usize::MAX; 256];
 
     // A -1 symbol has a single state spanning the whole index range: its
     // entry is the top-region slot recorded above with acc_log output bits.
@@ -792,8 +800,11 @@ fn build_table_body(
 
     // Assign baselines in ascending state-index order (identical to the old
     // index sort + sequential walk): the first `double` states of a symbol
-    // emit one extra bit and their baselines wrap mod table_size; the state
-    // right after the wrap is the encoding start state.
+    // emit one extra bit and their baselines wrap mod table_size. The symbol's
+    // lowest-index state is the encode start (libzstd's FSE_initCState2, "the
+    // smallest state value possible"), and its decode entry always consumes
+    // >= 1 bit — above half the table the smallest-baseline state flips to a
+    // zero-bit entry, which no stream can terminate on.
     for (i, &owner_symbol) in owner.iter().enumerate() {
         let symbol = owner_symbol as usize;
         let prob = probs_full[symbol];
@@ -820,6 +831,9 @@ fn build_table_body(
             (num_bits, 1usize << num_bits)
         };
         let b = baseline[symbol];
+        if k == 0 {
+            start[symbol] = i as u16;
+        }
         let entry = ((i as u32) << 16) | ((nb as u32) << 12);
         // The run [b, b+width) emits its own offset: a row is indexed by the
         // state itself, so the transition value `state - b` is a build-time
@@ -831,10 +845,6 @@ fn build_table_body(
         {
             *slot = entry | j as u32;
         }
-        if b < prev_baseline[symbol] {
-            start[symbol] = i as u16;
-        }
-        prev_baseline[symbol] = b;
         baseline[symbol] = if k < double_states {
             (b + width) % table_size
         } else {
@@ -977,7 +987,9 @@ mod soa_tests {
             if st.is_empty() {
                 continue;
             }
-            starts[symbol] = st[0].index;
+            // Lowest-index state of the symbol: the encode start (libzstd's
+            // FSE_initCState2), whose decode entry always consumes >= 1 bit.
+            starts[symbol] = st.iter().map(|s| s.index).min().unwrap();
             for s in st {
                 flat.push((symbol as u8, s.num_bits, s.baseline, s.index));
             }

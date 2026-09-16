@@ -25,7 +25,7 @@ use crate::{
         frame_compressor::new_owned_state,
     },
     fse::fse_encoder::{FseBuildScratch, build_table_from_probabilities, normalize_count},
-    huff0::huff0_encoder::{HuffScratch, HuffmanTable},
+    huff0::huff0_encoder::{HuffScratch, HuffmanTable, write_table_desc},
 };
 
 /// The only rep triple a finalized dictionary writes: C's `repStartValue`.
@@ -92,10 +92,9 @@ fn serialize_header(
     out.extend_from_slice(&MAGIC_NUM);
     out.extend_from_slice(&id.to_le_bytes());
 
-    let mut writer = BitWriter::from(&mut out);
     let table = build_huffman(&stats, huff);
-    table.write_description(&mut writer, fse, huff);
-    writer.flush();
+    write_table_desc(&table, fse, huff);
+    out.extend_from_slice(&huff.desc);
 
     let of_max = offcode_max(content.len());
     write_ncode(&mut out, &stats.of[..=of_max], OF_LOG);

@@ -1073,29 +1073,24 @@ fn compress_literals(
     let new_encoder_table =
         huff0_encoder::HuffmanTable::build_from_counts_into(&counts[..=max_symbol], huff);
 
-    // A dictionary-seeded table is reused on real bit costs (libzstd's
-    // HUF comparison: old stream size vs new stream size plus the new
-    // table's description); between-block reuse keeps the tuned bit-length
-    // heuristic.
-    let dict_treeless = dict_carried_table(
-        dict_seeded,
-        last_table,
-        &new_encoder_table,
-        &counts[..=max_symbol],
-        literals.len(),
-        fse,
-        huff,
-    );
-    let (encoder_table, new_table) = if let Some(table) = dict_treeless {
-        (table, false)
-    } else if let Some(table) = last_table {
-        if let Some(diff) = table.can_encode(&new_encoder_table) {
-            // TODO this is a very simple heuristic, maybe we should try to do better
-            if diff > 5 {
-                (&new_encoder_table, true)
-            } else {
-                (table, false)
-            }
+    // The fresh table's description, needed on the wire when it wins and for
+    // the reuse decision itself (libzstd compares exact coding costs — the
+    // dictionary-seeded table enters through the same `last_table` slot).
+    huff0_encoder::write_table_desc(&new_encoder_table, fse, huff);
+    let desc_len = huff.desc.len();
+
+    let (encoder_table, new_table) = if let Some(table) = last_table
+        && table.can_encode(&new_encoder_table).is_some()
+    {
+        // libzstd's decision in HUF_compress_internal: keep the previous
+        // table when its exact cost beats the fresh table's cost plus the
+        // description, or the description cannot pay for itself at this
+        // literals size.
+        let costs = &counts[..=max_symbol];
+        let old_cost = table.estimate_compressed_size(costs);
+        let new_cost = new_encoder_table.estimate_compressed_size(costs);
+        if desc_len + 12 >= literals.len() || old_cost <= desc_len + new_cost {
+            (table, false)
         } else {
             (&new_encoder_table, true)
         }
@@ -1109,27 +1104,34 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
+    // libzstd's ZSTD_compressLiterals: one stream below 256 literals (the
+    // four-stream jumptable never pays for itself there); a dictionary
+    // table carried over treeless also carries libzstd's single-stream
+    // form below 1 KiB (repeat tables cost no jump table). The literals
+    // header keeps the stream count and size format in one field.
     let (size_format, size_bits) = match literals.len() {
-        0..6 => (0b00u8, 10),
-        // A dictionary table carried over treeless also carries
-        // libzstd's single-stream form (repeat tables cost no jump table).
-        _ if dict_treeless.is_some() && literals.len() < 1024 => (0b00u8, 10),
-        6..1024 => (0b01, 10),
+        0..256 => (0b00u8, 10),
+        _ if dict_seeded && !new_table && literals.len() < 1024 => (0b00u8, 10),
+        256..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
         _ => unimplemented!("too many literals"),
     };
+    let single_stream = size_format == 0;
 
     writer.write_bits(size_format, 2);
     writer.write_bits(literals.len() as u32, size_bits);
     let size_index = writer.index();
     writer.write_bits(0u32, size_bits);
     let index_before = writer.index();
+    if new_table {
+        writer.append_bytes(&huff.desc);
+    }
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
-    if size_format == 0 {
-        encoder.encode_with(literals, new_table, fse, huff);
+    if single_stream {
+        encoder.encode_stream_only(literals);
     } else {
-        encoder.encode4x_with(literals, new_table, fse, huff);
+        encoder.encode4x_only(literals);
     }
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);
@@ -1146,51 +1148,6 @@ fn compress_literals(
     } else {
         LitOutcome::Treeless
     }
-}
-
-/// The dictionary-seeded treeless decision: `Some(table)` when the carried
-/// table codes this histogram no dearer than a fresh table plus its
-/// description (libzstd's `HUF_estimateCompressedSize` comparison, with
-/// its "a description this large never pays" escape).
-#[allow(clippy::too_many_arguments)]
-fn dict_carried_table<'t>(
-    dict_seeded: bool,
-    last_table: Option<&'t huff0_encoder::HuffmanTable>,
-    fresh: &huff0_encoder::HuffmanTable,
-    counts: &[usize],
-    literals_len: usize,
-    fse: &mut FseBuildScratch,
-    huff: &mut huff0_encoder::HuffScratch,
-) -> Option<&'t huff0_encoder::HuffmanTable> {
-    let table = last_table?;
-    if !dict_seeded || table.can_encode(fresh).is_none() {
-        return None;
-    }
-    let desc_bytes = description_bits_of(fresh, fse, huff);
-    let old_bits = table.estimate_bits(counts);
-    let fresh_bits = fresh.estimate_bits(counts);
-    (old_bits <= desc_bytes as u64 * 8 + fresh_bits || desc_bytes + 12 >= literals_len)
-        .then_some(table)
-}
-
-/// Exact wire size of a huffman table description (serialized to scratch,
-/// not the output — the decision needs it before committing either form).
-fn description_bits_of(
-    table: &huff0_encoder::HuffmanTable,
-    fse: &mut FseBuildScratch,
-    huff: &mut huff0_encoder::HuffScratch,
-) -> usize {
-    let mut desc = Vec::new();
-    {
-        let mut writer = BitWriter::from(&mut desc);
-        table.write_description(&mut writer, fse, huff);
-        let pad = writer.misaligned();
-        if pad != 0 {
-            writer.write_bits(0u8, pad);
-        }
-        writer.flush();
-    }
-    desc.len()
 }
 
 #[cfg(test)]
