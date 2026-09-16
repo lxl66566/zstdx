@@ -31,6 +31,9 @@ pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
 #[doc(hidden)]
 pub use mt::mt_job_size_for;
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use mt::set_mt_ramp_depth_for_tests;
 use seq_codes::pack_seq;
 
 use crate::{

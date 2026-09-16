@@ -29,6 +29,10 @@
 //! Checksummed frames are verified inline in stage B: the pre-scan collects
 //! each trailer word, and the executor absorbs every segment's range into
 //! the frame's xxh64 stream the moment it is final (see `frame_checksum`).
+//!
+//! Frames whose encoder jobs carry the deep-offset ramp guarantee can
+//! instead execute stage B in parallel as job-grid "pieces" (see
+//! `mt_pieces`, env-paired with the encoder-side ramp experiment).
 
 use alloc::vec::Vec;
 use core::{
@@ -69,18 +73,18 @@ const MIN_SEGMENT_INPUT: usize = 256 * 1024;
 
 /// One scanned block: enough to route stage A and locate the body bytes.
 #[derive(Clone)]
-struct ScannedBlock {
+pub(super) struct ScannedBlock {
     btype: BlockType,
     /// Decompressed length of Raw blocks; the run length for RLE blocks.
     raw_size: u32,
     /// Body bytes within the whole input: the payload for Raw and
     /// Compressed, the single repeated byte for RLE.
-    body: Range<usize>,
+    pub(super) body: Range<usize>,
 }
 
 /// A run of blocks between two restart points (or frame boundaries).
 pub(super) struct SegmentPlan {
-    blocks: Vec<ScannedBlock>,
+    pub(super) blocks: Vec<ScannedBlock>,
     /// This segment starts a frame: execution resets the repcode history
     /// and stage A gets fresh tables (frame starts are restart points).
     pub(super) frame_start: bool,
@@ -92,12 +96,19 @@ pub(super) struct ScanPlan {
     pub(super) segments: Vec<SegmentPlan>,
     #[cfg(feature = "hash")]
     pub(super) checksums: Vec<Option<u32>>,
+    /// The pledged content size when the input is exactly one frame
+    /// carrying it (`None` for multi-frame/skippable inputs or frames
+    /// without a size pledge). The piece-parallel executor needs it.
+    pub(super) pledged_single: Option<u64>,
 }
 
-/// How stage B walks a block whose stage A staging is done.
-enum BlockPlan {
+/// How stage B walks a block whose stage A staging is done. Every variant
+/// carries the block's exact output size (stage A accounting), which the
+/// piece planner uses to map restart points to output positions.
+pub(super) enum BlockPlan {
     Raw {
         body: Range<usize>,
+        out: usize,
     },
     Rle {
         byte: u8,
@@ -106,15 +117,25 @@ enum BlockPlan {
     Compressed {
         lits: Range<usize>,
         seqs: Range<usize>,
+        out: usize,
     },
 }
 
+impl BlockPlan {
+    pub(super) fn out(&self) -> usize {
+        match *self {
+            BlockPlan::Rle { len, .. } => len,
+            BlockPlan::Raw { out, .. } | BlockPlan::Compressed { out, .. } => out,
+        }
+    }
+}
+
 /// Stage A output for one segment.
-struct DecodedSegment {
-    literals: Vec<u8>,
-    sequences: Vec<Sequence>,
-    plan: Vec<BlockPlan>,
-    out_size: usize,
+pub(super) struct DecodedSegment {
+    pub(super) literals: Vec<u8>,
+    pub(super) sequences: Vec<Sequence>,
+    pub(super) plan: Vec<BlockPlan>,
+    pub(super) out_size: usize,
 }
 
 /// Pooled staging buffers: every decode call used to map fresh
@@ -184,13 +205,13 @@ impl Drop for DecodedSegment {
 
 /// Reusable per-worker entropy state; reset between segments (every
 /// segment starts at a restart point, so fresh tables are correct).
-struct SegmentScratch {
+pub(super) struct SegmentScratch {
     huf: HuffmanScratch,
     fse: FSEScratch,
 }
 
 impl SegmentScratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             huf: HuffmanScratch::new(),
             fse: FSEScratch::new(),
@@ -268,6 +289,9 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     let mut segments: Vec<SegmentPlan> = Vec::new();
     #[cfg(feature = "hash")]
     let mut checksums: Vec<Option<u32>> = Vec::new();
+    let mut n_frames = 0usize;
+    let mut saw_skip = false;
+    let mut pledged_single: Option<u64> = None;
     let mut cursor = 0usize;
     while cursor < input.len() {
         let mut reader = &input[cursor..];
@@ -279,10 +303,19 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
                 if end > input.len() {
                     return None;
                 }
+                saw_skip = true;
                 cursor = end;
                 continue;
             },
             Err(_) => return None,
+        };
+        n_frames += 1;
+        let fcs_present = frame_header.descriptor.frame_content_size_flag() != 0
+            || frame_header.descriptor.single_segment_flag();
+        pledged_single = if n_frames == 1 && fcs_present && !saw_skip {
+            Some(frame_header.frame_content_size())
+        } else {
+            None
         };
         if frame_header.dictionary_id().is_some() {
             return None; // dictionary state cannot be split across segments
@@ -379,11 +412,12 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         segments,
         #[cfg(feature = "hash")]
         checksums,
+        pledged_single,
     })
 }
 
 /// Stage A: decode one segment's literals and sequences into staging.
-fn decode_segment(
+pub(super) fn decode_segment(
     input: &[u8],
     plan: &SegmentPlan,
     scratch: &mut SegmentScratch,
@@ -399,6 +433,7 @@ fn decode_segment(
                 out_size += blk.body.len();
                 blocks.push(BlockPlan::Raw {
                     body: blk.body.clone(),
+                    out: blk.body.len(),
                 });
             },
             BlockType::RLE => {
@@ -451,7 +486,7 @@ fn decode_segment(
                     .map_err(DecompressBlockError::from)
                     .map_err(block_body_err)? as usize;
                 let seqs_start = sequences.len();
-                if seq_header.num_sequences != 0 {
+                let block_out = if seq_header.num_sequences != 0 {
                     decode_sequences_into(
                         &seq_header,
                         &seq_raw_all[seq_header_len..],
@@ -462,7 +497,7 @@ fn decode_segment(
                     .map_err(block_body_err)?;
                     let match_bytes: usize =
                         sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
-                    out_size += literals.len() - lits_start + match_bytes;
+                    literals.len() - lits_start + match_bytes
                 } else {
                     // Zero-sequence block: the FSE tables stay untouched (the
                     // scratch carries them across blocks). The sequential
@@ -475,11 +510,13 @@ fn decode_segment(
                             },
                         )));
                     }
-                    out_size += literals.len() - lits_start;
-                }
+                    literals.len() - lits_start
+                };
+                out_size += block_out;
                 blocks.push(BlockPlan::Compressed {
                     lits: lits_start..literals.len(),
                     seqs: seqs_start..sequences.len(),
+                    out: block_out,
                 });
             },
             BlockType::Reserved => unreachable!("scan rejects reserved blocks"),
@@ -507,7 +544,7 @@ fn decode_segment(
 /// plus 16 bytes of slack below `buf_limit`, and for reads in
 /// `[0, seg_start)`. The caller guarantees both by sizing the output
 /// before each segment and executing in order.
-unsafe fn execute_segment(
+pub(super) unsafe fn execute_segment(
     base: *mut u8,
     seg_start: usize,
     seg: &DecodedSegment,
@@ -515,31 +552,68 @@ unsafe fn execute_segment(
     offset_hist: &mut [u32; 3],
     buf_limit: usize,
 ) -> Result<(), FrameDecoderError> {
+    unsafe {
+        execute_blocks(
+            base,
+            seg_start,
+            seg,
+            0..seg.plan.len(),
+            input,
+            offset_hist,
+            buf_limit,
+            usize::MAX,
+        )
+    }
+}
+
+/// Execute a contiguous block range of a staged segment starting at
+/// absolute output position `start` (the first block's own position).
+/// `wild_cap` bounds where wildcopy may overshoot beyond the copy end
+/// (the piece executor passes the piece end so parallel pieces never
+/// write into a neighbor's range; the serial path passes `usize::MAX`).
+///
+/// # Safety
+/// `base` must be valid for writes over the blocks' combined output plus
+/// 16 bytes of slack below `min(buf_limit, wild_cap)`, and for reads in
+/// `[0, start)`. `offset_hist` must hold the true repcode history at
+/// `start`.
+pub(super) unsafe fn execute_blocks(
+    base: *mut u8,
+    start: usize,
+    seg: &DecodedSegment,
+    blocks: Range<usize>,
+    input: &[u8],
+    offset_hist: &mut [u32; 3],
+    buf_limit: usize,
+    wild_cap: usize,
+) -> Result<(), FrameDecoderError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let exec_err =
         |e: ExecuteSequencesError| block_body_err(DecompressBlockError::ExecuteSequencesError(e));
+    let cap: usize = seg.plan[blocks.clone()].iter().map(BlockPlan::out).sum();
+    let write_limit = buf_limit.min(wild_cap);
     let mut w = 0usize;
-    for block in &seg.plan {
+    for block in &seg.plan[blocks] {
         match block {
-            BlockPlan::Raw { body } => {
-                // SAFETY: stage A accounted this block's body length in out_size
+            BlockPlan::Raw { body, .. } => {
+                // SAFETY: stage A accounted this block's body length in cap
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         input.as_ptr().add(body.start),
-                        base.add(seg_start + w),
+                        base.add(start + w),
                         body.len(),
                     );
                 }
                 w += body.len();
             },
             BlockPlan::Rle { byte, len } => {
-                // SAFETY: stage A accounted the run length in out_size
+                // SAFETY: stage A accounted the run length in cap
                 unsafe {
-                    core::ptr::write_bytes(base.add(seg_start + w), *byte, *len);
+                    core::ptr::write_bytes(base.add(start + w), *byte, *len);
                 }
                 w += len;
             },
-            BlockPlan::Compressed { lits, seqs } => {
+            BlockPlan::Compressed { lits, seqs, .. } => {
                 // SAFETY: lits is a range of seg.literals
                 let lit_base = unsafe { seg.literals.as_ptr().add(lits.start) };
                 let lit_end = unsafe { seg.literals.as_ptr().add(lits.end) };
@@ -547,7 +621,7 @@ unsafe fn execute_segment(
                 for seq in &seg.sequences[seqs.clone()] {
                     let ll = seq.ll as usize;
                     let ml = seq.ml as usize;
-                    if w + ll + ml > seg.out_size {
+                    if w + ll + ml > cap {
                         return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                     }
                     if lit as usize + ll > lit_end as usize {
@@ -557,15 +631,15 @@ unsafe fn execute_segment(
                         }));
                     }
                     // Wildcopy when the 16-byte overshoot of both the
-                    // literal and the match copy stays below `buf_limit`;
-                    // the literal side additionally needs its own 16-byte
-                    // overread to stay inside the staged literals.
+                    // literal and the match copy stays below the write
+                    // limit; the literal side additionally needs its own
+                    // 16-byte overread to stay inside the staged literals.
                     // SAFETY: budget checks bound the writes; the literal
                     // range was checked above
-                    let end = seg_start + w + ll + ml;
-                    let wild = end + 16 <= buf_limit;
+                    let end = start + w + ll + ml;
+                    let wild = end + 16 <= write_limit;
                     unsafe {
-                        let dst = base.add(seg_start + w);
+                        let dst = base.add(start + w);
                         if ll > 0 {
                             if wild && lit.add(ll + 16) <= lit_end {
                                 copy16_chunks(dst, lit, ll);
@@ -580,7 +654,7 @@ unsafe fn execute_segment(
                             return Err(exec_err(ExecuteSequencesError::ZeroOffset));
                         }
                         let offset = offset as usize;
-                        let cur = seg_start + w;
+                        let cur = start + w;
                         if offset > cur {
                             return Err(exec_err(ExecuteSequencesError::DecodebufferError(
                                 crate::decoding::errors::DecodeBufferError::OffsetTooBig {
@@ -612,21 +686,18 @@ unsafe fn execute_segment(
                     }
                 }
                 let rest = lit_end as usize - lit as usize;
-                if w + rest > seg.out_size {
+                if w + rest > cap {
                     return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                 }
                 // SAFETY: budget checked above
                 unsafe {
-                    core::ptr::copy_nonoverlapping(lit, base.add(seg_start + w), rest);
+                    core::ptr::copy_nonoverlapping(lit, base.add(start + w), rest);
                 }
                 w += rest;
             },
         }
     }
-    debug_assert_eq!(
-        w, seg.out_size,
-        "stage A size accounting must match execution"
-    );
+    debug_assert_eq!(w, cap, "stage A size accounting must match execution");
     Ok(())
 }
 
@@ -775,6 +846,29 @@ fn engage(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> 
     scan(input, workers, max_window_size)
 }
 
+/// Hidden: not API-stable (integration tests reach the router-forced MT
+/// entry points with custom output buffers).
+#[doc(hidden)]
+pub fn mt_decode_all_for_tests(
+    input: &[u8],
+    output: &mut [u8],
+    workers: u32,
+    max_window_size: u64,
+) -> Result<usize, FrameDecoderError> {
+    decode_all_mt(input, output, workers, max_window_size)
+}
+
+/// Hidden: not API-stable.
+#[doc(hidden)]
+pub fn mt_decode_to_vec_for_tests(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    workers: u32,
+    max_window_size: u64,
+) -> Result<(), FrameDecoderError> {
+    decode_to_vec_mt(input, output, workers, max_window_size)
+}
+
 /// Parallel [`FrameDecoder::decode_all`]: decode a complete multi-frame
 /// input into the caller's buffer with a worker pool. Falls back to the
 /// sequential decoder for small inputs, dictionary frames, single-core
@@ -786,6 +880,17 @@ pub fn decode_all_mt(
     max_window_size: u64,
 ) -> Result<usize, FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
+        if let Some(fcs) = super::mt_pieces::gate(&plan) {
+            let out_len = output.len();
+            let mut place =
+                |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                    if end > out_len {
+                        return Err(FrameDecoderError::TargetTooSmall);
+                    }
+                    Ok((output.as_mut_ptr(), out_len))
+                };
+            return super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place);
+        }
         let out_len = output.len();
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
@@ -839,6 +944,25 @@ pub fn decode_to_vec_mt(
     max_window_size: u64,
 ) -> Result<(), FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
+        if let Some(fcs) = super::mt_pieces::gate(&plan) {
+            let start_len = output.len();
+            let mut place =
+                |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                    output.reserve(end);
+                    // SAFETY: in-bounds pointer one past the existing
+                    // contents, inside the vector's allocation (see the
+                    // serial path below for the full contract).
+                    Ok((
+                        unsafe { output.as_mut_ptr().add(start_len) },
+                        output.capacity() - start_len,
+                    ))
+                };
+            let written = super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place)?;
+            // SAFETY: every byte in [start_len, start_len + written) was
+            // written by the piece executor.
+            unsafe { output.set_len(start_len + written) };
+            return Ok(());
+        }
         let start_len = output.len();
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {

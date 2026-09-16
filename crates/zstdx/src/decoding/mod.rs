@@ -10,6 +10,9 @@ mod streaming_decoder;
 
 pub use dictionary::Dictionary;
 pub use frame_decoder::{BlockDecodingStrategy, DEFAULT_MAX_WINDOW_SIZE, FrameDecoder};
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use mt::{mt_decode_all_for_tests, mt_decode_to_vec_for_tests};
 pub use streaming_decoder::StreamingDecoder;
 
 pub(crate) mod block_decoder;
@@ -21,6 +24,8 @@ pub(crate) mod frame_source;
 pub(crate) mod literals_section_decoder;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
+#[cfg(feature = "std")]
+pub(crate) mod mt_pieces;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;

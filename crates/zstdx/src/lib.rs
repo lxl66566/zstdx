@@ -58,6 +58,14 @@ pub mod options;
 pub mod stream;
 
 pub use bulk::{compress, decompress};
+/// Test-only knobs for the ramp/piece-parallel experiment pair (isolated
+/// integration-test process). Hidden: not API-stable.
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use decoding::mt_pieces::{piece_engagements, set_piece_decode_for_tests};
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use encoding::set_mt_ramp_depth_for_tests;
 pub use error::{Error, Feature, ParameterError, Result};
 pub use level::Level;
 pub use options::{DecoderOptions, EncoderOptions, InputShape};

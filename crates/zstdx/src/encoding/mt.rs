@@ -21,7 +21,7 @@
 use alloc::vec::Vec;
 use core::{
     ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::sync::{Condvar, Mutex};
 
@@ -220,8 +220,21 @@ pub fn compress_slice_mt(
 /// Deep-offset ramp depth for gated jobs (decode-parallelism experiment):
 /// `ZSTDX_MT_RAMP_BYTES` env var, parsed once. Zero (unset) keeps the job
 /// parse unconstrained; see `match_generator::RampGate` for the semantics.
+static RAMP_TEST_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Test-only ramp override (env parsing is process-global; tests must not
+/// race other tests' encodes through `set_var`). Hidden: not API-stable.
+#[doc(hidden)]
+pub fn set_mt_ramp_depth_for_tests(depth: u64) {
+    RAMP_TEST_OVERRIDE.store(depth, Ordering::Relaxed);
+}
+
 fn ramp_depth_from_env() -> u64 {
     static DEPTH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let over = RAMP_TEST_OVERRIDE.load(Ordering::Relaxed);
+    if over != u64::MAX {
+        return over;
+    }
     *DEPTH.get_or_init(|| {
         std::env::var("ZSTDX_MT_RAMP_BYTES")
             .ok()
