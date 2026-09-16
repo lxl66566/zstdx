@@ -23,11 +23,15 @@
 //! reach unclamped by the frame's shape, only frames a caller declared at
 //! least [`PROBE_MIN_FRAME`] bytes (the probe's two parses are a fixed
 //! ~30 ms tax; below that size they outrun their savings), and only entry
-//! points that see the frame's head before the first block: bulk
-//! single- and multithreaded, and pledged streaming. Unpledged streaming
-//! and the multithreaded stream core keep the stock reach (their blocks
-//! flow before any head is assembled); dictionary frames probe nothing
-//! (their history needs the reach it has).
+//! points that see the frame's head before the first block is matched:
+//! bulk single- and multithreaded, pledged streaming, and the
+//! multithreaded stream core (which stages the head itself — a pledge
+//! gates at construction, an open-ended stream at [`PROBE_MIN_FRAME`]
+//! streamed bytes; a stream that ends or flushes before the gate keeps
+//! the stock reach). The unpledged single-threaded stream core keeps the
+//! stock reach (its blocks flow at block size — staging a head there
+//! withholds output from small-pull consumers); dictionary frames probe
+//! nothing (their history needs the reach it has).
 
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
@@ -81,7 +85,19 @@ pub(crate) fn eligible(level: Level, shape: InputShape) -> bool {
 /// and keep the cheaper parse. `head` shorter than the span, or an
 /// ineligible frame, keeps the stock reach.
 pub(crate) fn probe_reach_choice(head: &[u8], level: Level, shape: InputShape) -> ReachChoice {
-    if head.len() < PROBE_SPAN || !eligible(level, shape) {
+    if !eligible(level, shape) {
+        return ReachChoice::Keep;
+    }
+    probe_staged(head, level, shape)
+}
+
+/// [`probe_reach_choice`] on a frame the caller already size-gated: the
+/// stream-mt core stages its own head (a pledge clears the size gate at
+/// construction, an open-ended stream at [`PROBE_MIN_FRAME`] streamed
+/// bytes — see its notes), so only the span check remains. A head below
+/// the span keeps the stock reach.
+pub(crate) fn probe_staged(head: &[u8], level: Level, shape: InputShape) -> ReachChoice {
+    if head.len() < PROBE_SPAN {
         return ReachChoice::Keep;
     }
     let head = &head[..PROBE_SPAN];
@@ -228,3 +244,4 @@ mod tests {
         );
     }
 }
+

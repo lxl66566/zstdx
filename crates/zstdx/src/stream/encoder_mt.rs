@@ -19,6 +19,21 @@
 //! incomplete jobs hold resolved pointers into the buffer. The pump
 //! therefore stalls on the workers only when it has lapped the buffer's
 //! live data, which the epoch-scale sizing bounds to once per epoch.
+//!
+//! A reach-probe-eligible frame (see [`reach_probe`]: the Balanced row with
+//! its stock reach) defers its schedule until the probe's head is staged —
+//! the probe decides the chain reach, and with it the history strip and the
+//! job floor. A pledge clears the probe's size gate at construction, so the
+//! head stages at [`reach_probe::PROBE_SPAN`]; an open-ended stream cannot
+//! know its length, so the decision waits for
+//! [`reach_probe::PROBE_MIN_FRAME`] streamed bytes (the chain rows' Growing
+//! floor — the whole window — keeps any job from posting before then
+//! anyway). A shrunk frame re-grids from offset zero with the shrunk strip
+//! the bulk path uses, so it stays byte-identical to bulk mt; a kept frame
+//! keeps the stream strip (see [`MatchGeneratorDriver::stream_overlap_for`]
+//! — the chain rows' cross-job LDM carrier, deliberately wider than the
+//! bulk strip). A stream that ends or flushes before the gate keeps the
+//! stock reach.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -42,7 +57,7 @@ use crate::{
         frame_header::FrameHeader,
         match_generator::MatchGeneratorDriver,
         mt::{MAX_JOB_SIZE, MIN_JOB_SIZE, job_size_for, run_job_with},
-        reach_probe::ReachChoice,
+        reach_probe::{self, ReachChoice},
     },
 };
 
@@ -83,6 +98,9 @@ struct Job {
     last_frame_block: bool,
     overlap: usize,
     level: Level,
+    /// The frame's reach probe decision (see [`reach_probe`]), shared by
+    /// every job so the frame's jobs and its header agree.
+    choice: ReachChoice,
     shape: crate::InputShape,
     out: Mutex<Option<Vec<u8>>>,
     /// Set (Release) once `out` holds the job's bytes: the assembling side
@@ -221,10 +239,7 @@ fn pool_worker(shared: Arc<QueueShared>) {
                 job.level,
                 job.gate,
                 job.shape,
-                // The stream core keeps the stock reach: its jobs flow
-                // before any head is assembled to probe (see
-                // reach_probe's engagement notes).
-                ReachChoice::Keep,
+                job.choice,
             )
         }));
         match attempt {
@@ -270,6 +285,12 @@ pub(crate) struct MtEncoderCore {
     /// Jobs buffered before a burst fires: at least one full round of
     /// workers, amortizing the thread spawn.
     burst_jobs: usize,
+    /// Whether the reach probe's decision (see [`reach_probe`]) is still
+    /// pending: no job posts until the head is staged and decided.
+    probe_pending: bool,
+    /// The frame's reach decision, handed to every job (see
+    /// [`reach_probe`]).
+    choice: ReachChoice,
     /// The frame's declared shape (length = the pledge, plus the forced
     /// window log); shared by every job so tables and the header agree.
     shape: crate::InputShape,
@@ -321,6 +342,14 @@ impl MtEncoderCore {
             Some(n) => JobGrid::Fixed(job_size_for(n, options.workers, overlap)),
             None => JobGrid::Growing,
         };
+        // The reach probe (see reach_probe): a probe-eligible frame defers
+        // its schedule until the probe's head is staged. A pledge clears
+        // the probe's size gate here; an open-ended stream gates at
+        // PROBE_MIN_FRAME streamed bytes (see the module docs).
+        let probe_pending = match options.pledged_size {
+            Some(_) => reach_probe::eligible(options.level, shape),
+            None => MatchGeneratorDriver::reach_probe_eligible(options.level, shape),
+        };
         let initial_job = match grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(overlap),
@@ -337,8 +366,17 @@ impl MtEncoderCore {
         // One epoch-scale window, like the burst model's reserve: enough for
         // a full round of in-flight jobs plus the strip and write-chunk
         // slack. The size also stays inside the buffer pool's keep cap, so
-        // consecutive streams reuse the already-faulted allocation.
-        let want = (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024;
+        // consecutive streams reuse the already-faulted allocation. A
+        // pending probe reserves only its staging scale (the probe head
+        // plus a first shrunk epoch); the decision re-reserves the decided
+        // schedule's scale.
+        let want = if probe_pending {
+            (options.workers as usize).max(2) * MIN_JOB_SIZE
+                + reach_probe::PROBE_SPAN
+                + 64 * 1024
+        } else {
+            (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024
+        };
         let mut buf = take_pooled_buf(want);
         if buf.capacity() < want {
             buf.reserve_exact(want - buf.len());
@@ -352,6 +390,8 @@ impl MtEncoderCore {
             grid,
             overlap,
             burst_jobs: (options.workers as usize).max(2),
+            probe_pending,
+            choice: ReachChoice::Keep,
 
             shape,
             hasher: if checksum {
@@ -480,6 +520,66 @@ impl MtEncoderCore {
         n
     }
 
+    /// The probe decision's staging gate (see [`reach_probe`]): a pledged
+    /// frame stages its head at [`reach_probe::PROBE_SPAN`] (the pledge
+    /// already cleared the probe's size gate), an open-ended stream must
+    /// stream [`reach_probe::PROBE_MIN_FRAME`] bytes before the probe's
+    /// fixed cost amortizes.
+    fn probe_gate(&self) -> u64 {
+        if self.shape.len.is_some() {
+            reach_probe::PROBE_SPAN as u64
+        } else {
+            reach_probe::PROBE_MIN_FRAME
+        }
+    }
+
+    /// Run the pending reach probe (see [`reach_probe`]) and apply its
+    /// choice: a shrunk frame re-grids from offset zero with the shrunk
+    /// history strip and the job floor it implies — nothing posts while
+    /// the probe is pending, so the schedule stays a pure function of the
+    /// input — and every outcome re-reserves the decided schedule's
+    /// working scale (the pending reserve covers only the head). A frame
+    /// that never cleared the gate (a short stream, or a flush ahead of
+    /// it) keeps the stock reach.
+    fn decide_probe(&mut self) {
+        if !self.probe_pending {
+            return;
+        }
+        self.probe_pending = false;
+        if self.pos >= self.probe_gate() {
+            // No job ever posted while pending, so the head still sits at
+            // the buffer's start.
+            debug_assert_eq!(self.job_start, 0);
+            debug_assert_eq!(self.buf_base, 0);
+            let choice = reach_probe::probe_staged(
+                &self.buf[..reach_probe::PROBE_SPAN],
+                self.level,
+                self.shape,
+            );
+            self.choice = choice;
+            if choice == ReachChoice::Shrink {
+                self.overlap = reach_probe::SHRINK_REACH;
+                if let JobGrid::Fixed(_) = self.grid {
+                    let n = self.shape.len.expect("the gate saw a pledge");
+                    self.grid =
+                        JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
+                }
+            }
+        }
+        let initial_job = match self.grid {
+            JobGrid::Fixed(size) => size,
+            JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
+        };
+        let want = (self.workers as usize).max(2) * initial_job + self.overlap + 64 * 1024;
+        if self.buf.capacity() < want {
+            // Nothing is in flight (no job posted while pending), so
+            // growth needs no quiesce wait.
+            let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            self.buf.reserve_exact(target - self.buf.len());
+            advise_hugepages(&self.buf);
+        }
+    }
+
     /// End offset of the job starting at absolute offset `start`.
     fn job_end(&self, start: u64) -> u64 {
         let size = match self.grid {
@@ -536,6 +636,15 @@ impl MtEncoderCore {
     /// pledged grid holds its final job back for `finish` to mark last
     /// (unlocked on overshoot, where the bulk path also stops holding).
     fn post_ready(&mut self) {
+        if self.probe_pending {
+            // Nothing posts until the probe's head is staged and decided
+            // (see the module docs) — the schedule below must never see a
+            // pending frame.
+            if self.pos < self.probe_gate() {
+                return;
+            }
+            self.decide_probe();
+        }
         loop {
             let end = self.job_end(self.job_start);
             match self.grid {
@@ -626,6 +735,9 @@ impl MtEncoderCore {
     /// never spin up the pool).
     fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
         debug_assert!(self.job_start < hi && hi <= self.pos);
+        // A flush or finish ahead of the staging gate decides the probe
+        // with the stock reach (see the module docs).
+        self.decide_probe();
         self.emit_header();
         let bounds = self.build_bounds(hi);
         if bounds.len() == 2 && self.pool_threads.is_empty() {
@@ -660,9 +772,7 @@ impl MtEncoderCore {
             self.level,
             self.job_start > 0,
             self.shape,
-            // See the pool worker's note: the stream core keeps the stock
-            // reach.
-            ReachChoice::Keep,
+            self.choice,
         );
         self.shared.states.lock().unwrap().push(state);
         self.output.extend_from_slice(&bytes);
@@ -696,6 +806,7 @@ impl MtEncoderCore {
             level: self.level,
             last_frame_block,
             gate: start > 0,
+            choice: self.choice,
             shape: self.shape,
             out: Mutex::new(None),
             done: core::sync::atomic::AtomicBool::new(false),

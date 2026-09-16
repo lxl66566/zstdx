@@ -447,6 +447,41 @@ mod mt {
         }
     }
 
+    /// The reach probe on the multithreaded stream core (see
+    /// `encoding::reach_probe`): an open-ended Balanced stream crossing the
+    /// probe's staging gate runs the deferred decision, and the frame bytes
+    /// must stay a pure function of the input — whichever way the decision
+    /// lands and however the writes are chunked.
+    #[test]
+    fn reach_probe_unpledged_mt_write_independent() {
+        let gate = crate::encoding::reach_probe::PROBE_MIN_FRAME as usize;
+        for (name, data) in [("jsonish", jsonish(gate + 1024 * 1024)), ("near_local", near_local(gate + 1024 * 1024))] {
+            let reference = encode_write(&data, usize::MAX, Level::Balanced, 4, false, None);
+            for chunk in [64 * 1024, 333 * 1024, 3 * 1024 * 1024] {
+                assert_eq!(
+                    encode_write(&data, chunk, Level::Balanced, 4, false, None),
+                    reference,
+                    "{name}: chunk {chunk}"
+                );
+            }
+            assert_eq!(bulk::decompress(&reference, data.len()).unwrap(), data, "{name}");
+        }
+        // A flush ahead of the gate decides the stock reach; the stream
+        // still must roundtrip.
+        let data = jsonish(gate + 512 * 1024);
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Balanced).workers(4),
+        )
+        .unwrap();
+        write_in_chunks(&data[..1024 * 1024], 128 * 1024, &mut enc);
+        enc.flush().unwrap();
+        write_in_chunks(&data[1024 * 1024..], 128 * 1024, &mut enc);
+        enc.finish().unwrap();
+        assert_eq!(bulk::decompress(&sink, data.len()).unwrap(), data);
+    }
+
     /// A stream written exactly to its pledge shares the bulk job grid (and
     /// job flags), so the outputs must be byte-identical.
     #[test]
@@ -478,12 +513,16 @@ mod mt {
                 encode_write(&deep, 1024 * 1024, level, 4, false, Some(deep.len() as u64));
             assert_eq!(streamed, bulk_mt, "{level:?}");
         }
+        // The Balanced row on a shrink-class head: the deferred stream
+        // probe shares the bulk strip, job floor and reach, so a pledged
+        // stream stays byte-identical to bulk mt there too.
+        let near = jsonish(9 * 1024 * 1024 + 123 * 1024);
+        let bulk_mt = encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None);
+        let streamed =
+            encode_write(&near, 1024 * 1024, Level::Balanced, 4, false, Some(near.len() as u64));
+        assert_eq!(streamed, bulk_mt);
     }
 
-    /// The stream pool's workers reuse their `CompressState` across jobs; the
-    /// job boundary (the state reset plus the strip prefill) must retire
-    /// every output-shaping carryover, so a pooled job's bytes stay a
-    /// function of the frame content alone.
     #[test]
     fn pooled_state_reuse_is_output_neutral() {
         use crate::encoding::frame_compressor::{
@@ -504,7 +543,9 @@ mod mt {
             st
         };
         // Job B on a fresh state vs on a pooled state that already parsed a
-        // prior job (up to a full-window one).
+        // prior job (up to a full-window one): the reset + strip prefill
+        // must retire every output-shaping carryover, so the pool's reuse
+        // keeps a job's bytes a function of the frame content alone.
         let b = 5 * 1024 * 1024..10 * 1024 * 1024;
         let fresh = compress_job_blocks(&mut mk(), &data, b.clone(), 4096, false);
         for a in [
