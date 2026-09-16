@@ -4,6 +4,40 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the Balanced row's per-frame fixed costs (reach probe + DUBT
+  head) no longer parse anything twice. Three changes, output
+  byte-identical across the full ladder dump and the whole 120-cell
+  ratio sweep (mt/stream included; every emitframe cross-checked at
+  workers 4/8):
+  - The probe's shrink side never runs the DUBT head: a shrunk frame is
+    chain-selection class by definition, so the measurement and the
+    executed parse are the same object on both reach sides (the
+    head-in-shrink-parse was the single most expensive item on text:
+    18.6 of the 26.7 ms shrink parse).
+  - The probe's block loop calls the incompressibility gate the executed
+    path uses; it was missing, so the "measurement" re-parsed blocks the
+    frame emits verbatim — random paid two full ungated parses per frame
+    (the 09-16 random.balanced 2317->1220 MiB/s regression).
+  - The probe's keep side is donated: bulk-ST parses the first span
+    blocks through the real pipeline while the matcher accumulates the
+    cost, bulk-MT hands the same to job zero (a donated continuation
+    skips the strip prefill - it would clear the tables the donation
+    built), and only a Shrink verdict re-parses. The verdict compares
+    the true (feedback-carrying) keep cost against the feedback-free
+    shrink cost, calibrated by the feedback gain measured on a cheap
+    twice-parsed 512 KiB prefix: json's keep side gains 4.75% from the
+    entropy feedback, more than double the shrink margin, and the flat
+    comparison the margin is calibrated on must be reconstructed
+    (degenerate ties - skewed/random/zeros measure bit-identical costs -
+    keep outright). Reach changes also stop reallocating the parse
+    tables (sizes are reach-independent; the probe flips the reach three
+    times a frame): the flip sites clear their residue explicitly.
+  32 MiB matrix: text.balanced bulk-st 499->867 MiB/s (x3.47->x2.0),
+  mt8 444->701 (x2.81->x1.81); skewed solo ~1390->1850, random
+  951->2076 (regression repaid with interest), zeros ~9.3k->17k,
+  dll100 +3% (probe amortizes over 100 MB), json -5% (a shrink-class
+  frame pays the donated keep parse it then discards - it is ahead at
+  x0.62 mt / x0.9 st either way).
 - Encoder: dictionary-seeded entropy tables now compete for the block on
   measured bit costs (libzstd's dict paths) instead of losing to the
   between-block reuse heuristics. A per-stream `DictEntropy` flag tracks
