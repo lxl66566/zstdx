@@ -459,6 +459,20 @@ pub fn compress_slice_shaped(
 ) -> Vec<u8> {
     let mut shape = shape;
     shape.len = Some(src.len() as u64);
+    if reach_probe::eligible(level, shape) {
+        // The probe's keep side donates: the first span blocks run as the
+        // frame's own blocks through the full pipeline, and only a Shrink
+        // verdict restarts the frame (see `compress_with_state_donated`).
+        let mut state = take_slice_state(
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            LdmArming::Frame,
+        );
+        let output = compress_with_state_donated(&mut state, src, level, checksum, shape);
+        return_slice_state(state);
+        return output;
+    }
     // The frame's head decides its chain reach (see reach_probe).
     let choice = reach_probe::probe_reach_choice(src, level, shape);
     let mut state = take_slice_state(level, shape, choice, LdmArming::Frame);
@@ -495,7 +509,55 @@ fn compress_with_state(
     // block size ends with one empty raw block; emit the same shape to keep
     // the outputs byte-identical.
     let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
-    for (i, block) in src.chunks(block_size).enumerate() {
+    emit_slice_blocks(
+        state,
+        src,
+        level,
+        &mut output,
+        &mut hasher,
+        max_window,
+        0,
+        usize::MAX,
+    );
+    // A frame needs at least one block: empty input, and the exact-multiple
+    // tail above, encode one empty raw last block (mirroring the streaming
+    // path).
+    if src.is_empty() || trailing_empty {
+        let header = BlockHeader {
+            last_block: true,
+            block_type: crate::blocks::block::BlockType::Raw,
+            block_size: 0,
+        };
+        header.serialize(&mut output);
+    }
+    #[cfg(feature = "hash")]
+    if checksum {
+        output.extend_from_slice(&hasher.finish32().to_le_bytes());
+    }
+    output
+}
+
+/// Drive block indices `[first, next)` of the bulk slice loop: window
+/// adoption, block declaration, per-block encode. `next` clamps to the
+/// block count, so `usize::MAX` means "to the end". Shared by the plain
+/// slice path and the donating probe's prefix/continuation.
+fn emit_slice_blocks(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    level: Level,
+    output: &mut Vec<u8>,
+    hasher: &mut SliceChecksum,
+    max_window: u64,
+    first: usize,
+    next: usize,
+) {
+    let block_size = state.matcher.block_size();
+    // The streaming reader cannot mark a just-filled block as last until the
+    // next read returns EOF, so an input that is an exact multiple of the
+    // block size ends with one empty raw block; emit the same shape to keep
+    // the outputs byte-identical.
+    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
+    for (i, block) in src.chunks(block_size).enumerate().take(next).skip(first) {
         let block_start = (i * block_size) as u64;
         let block_end = block_start + block.len() as u64;
         let last_block = block_end == src.len() as u64 && !trailing_empty;
@@ -510,15 +572,121 @@ fn compress_with_state(
                 block_type: crate::blocks::block::BlockType::Raw,
                 block_size: block.len() as u32,
             };
-            header.serialize(&mut output);
-            BlockChecksum::raw_out(&mut hasher, &mut output, state.matcher.get_last_space(), 0);
+            header.serialize(output);
+            BlockChecksum::raw_out(hasher, output, state.matcher.get_last_space(), 0);
         } else {
-            compress_fastest(state, last_block, &mut output, &mut hasher);
+            compress_fastest(state, last_block, output, hasher);
         }
     }
-    // A frame needs at least one block: empty input, and the exact-multiple
-    // tail above, encode one empty raw last block (mirroring the streaming
-    // path).
+}
+
+/// [`compress_with_state`] for reach-probe-eligible frames, with the probe's
+/// keep side donated: the first [`reach_probe::PROBE_SPAN`] bytes run through
+/// the real pipeline (entropy feedback, LDM, the incompressibility gate —
+/// the probe's own driver re-parses none of them) while the matcher
+/// accumulates the keep cost, and only the shrink side parses separately.
+/// A Keep verdict continues the frame from the span; a Shrink verdict
+/// rebuilds the state fresh at the shrunk reach (the keep parse's table
+/// residue covers the same bytes and would alias a clean re-parse) and
+/// re-encodes the whole frame — the price shrink-class frames pay for the
+/// donation, one throwaway span they were owed anyway.
+fn compress_with_state_donated(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+) -> Vec<u8> {
+    let mut hasher = SliceChecksum::new(src.len(), checksum);
+    let block_size = state.matcher.block_size();
+    let block_overhead = 3 * (src.len() / block_size + 1);
+    let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    let header = FrameHeader {
+        frame_content_size: None,
+        single_segment: false,
+        content_checksum: checksum && cfg!(feature = "hash"),
+        dictionary_id: None,
+        window_size: Some(state.matcher.window_size()),
+    };
+    header.serialize(&mut output);
+    let max_window = state.matcher.window_size();
+    // The span is whole blocks (2 MiB against the 128 KiB block size); the
+    // eligibility gate keeps the frame far above it.
+    let span_blocks = reach_probe::PROBE_SPAN / block_size;
+    debug_assert_eq!(span_blocks * block_size, reach_probe::PROBE_SPAN);
+
+    state.matcher.begin_probe_stats();
+    emit_slice_blocks(
+        state,
+        src,
+        level,
+        &mut output,
+        &mut hasher,
+        max_window,
+        0,
+        span_blocks,
+    );
+    let keep = state
+        .matcher
+        .take_probe_cost()
+        .expect("donation began the stats");
+    let shrink = reach_probe::parse_cost(
+        &src[..reach_probe::PROBE_SPAN],
+        level,
+        shape,
+        reach_probe::ReachChoice::Shrink,
+        reach_probe::ProbeFeedback::Approx,
+    );
+    if reach_probe::decide_donated(keep, shrink, src, level, shape)
+        == reach_probe::ReachChoice::Shrink
+    {
+        // Fresh shrunk state, fresh checksum, fresh output: the keep-side
+        // blocks are discarded wholesale. `reset_slice_state` returns the
+        // entropy tables to the frame-start state (the donated blocks
+        // adopted tables a fresh shrink frame must not see), and
+        // `restart_shrunk` clears the parse tables the same-bytes keep
+        // residue sits in.
+        reset_slice_state(
+            state,
+            level,
+            shape,
+            reach_probe::ReachChoice::Shrink,
+            LdmArming::Frame,
+        );
+        state.matcher.restart_shrunk(level);
+        hasher = SliceChecksum::new(src.len(), checksum);
+        output.clear();
+        let header = FrameHeader {
+            frame_content_size: None,
+            single_segment: false,
+            content_checksum: checksum && cfg!(feature = "hash"),
+            dictionary_id: None,
+            window_size: Some(state.matcher.window_size()),
+        };
+        header.serialize(&mut output);
+        emit_slice_blocks(
+            state,
+            src,
+            level,
+            &mut output,
+            &mut hasher,
+            max_window,
+            0,
+            usize::MAX,
+        );
+    } else {
+        emit_slice_blocks(
+            state,
+            src,
+            level,
+            &mut output,
+            &mut hasher,
+            max_window,
+            span_blocks,
+            usize::MAX,
+        );
+    }
+    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
     if src.is_empty() || trailing_empty {
         let header = BlockHeader {
             last_block: true,
@@ -616,9 +784,28 @@ pub(crate) fn compress_job_blocks(
     overlap: usize,
     is_last_job: bool,
 ) -> Vec<u8> {
+    let start = job.start;
+    compress_job_blocks_inner(state, src, job, overlap, is_last_job, start, Vec::new())
+}
+
+/// [`compress_job_blocks`] with a donated prefix: `start_cursor` blocks of
+/// the job were already parsed and encoded on the calling side (the reach
+/// probe's keep-side donation for job zero — same state, same emit
+/// machinery, so the job's bytes are exactly an undonated run's), and
+/// `prefix` carries their encoded output verbatim.
+pub(crate) fn compress_job_blocks_inner(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    job: core::ops::Range<usize>,
+    overlap: usize,
+    is_last_job: bool,
+    start_cursor: usize,
+    prefix: Vec<u8>,
+) -> Vec<u8> {
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
-    let mut output = Vec::with_capacity(job.len() + 3 * (job.len() / block_size + 1) + 8);
+    let mut output = prefix;
+    output.reserve(job.len() + 3 * (job.len() / block_size + 1) + 8);
     // Uniform detection still runs (the RLE path), but the frame checksum is
     // the mt driver's job over the whole input.
     let mut hasher = SliceChecksum::new(0, false);
@@ -632,12 +819,17 @@ pub(crate) fn compress_job_blocks(
     let strip = job.start.saturating_sub(overlap);
     #[cfg(feature = "job_trace")]
     let trace_prefill = std::time::Instant::now();
-    state
-        .matcher
-        .prefill_job_strip(&src[strip..job.start], strip as u64);
+    // A donated continuation already prefilled (and parsed): the prefill
+    // would clear the very tables the donation built.
+    if start_cursor <= job.start {
+        state
+            .matcher
+            .prefill_job_strip(&src[strip..job.start], strip as u64);
+    }
     #[cfg(feature = "job_trace")]
     super::job_trace::add_prefill(trace_prefill);
-    let mut cursor = job.start;
+    debug_assert!(start_cursor >= job.start);
+    let mut cursor = start_cursor.max(job.start);
     while cursor < job.end {
         let block_end = (cursor + block_size).min(job.end);
         let last_block = is_last_job && block_end == job.end;
@@ -804,9 +996,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);
+        // `staged_read` tracks the probe's staged head replay across
+        // blocks (it spans sixteen of them).
+        let mut staged_read = 0usize;
         // Now compress block by block. `staged_read` tracks the probe's
         // staged head replay across blocks (it spans sixteen of them).
-        let mut staged_read = 0usize;
         loop {
             // Read a single block's worth of uncompressed data straight into
             // the tail of the matcher's window (no intermediate buffer copy).

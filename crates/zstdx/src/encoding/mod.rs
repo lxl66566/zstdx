@@ -293,6 +293,19 @@ pub trait Matcher {
     /// first block is matched, with at least the probe's span of head bytes
     /// staged. The default keeps the level's stock reach.
     fn consider_reach_probe(&mut self, _head: &[u8], _level: Level) {}
+    /// Donation-mode hooks for [`Matcher::consider_reach_probe`]'s frame
+    /// (see `reach_probe`): `begin_probe_stats` arms a cost accumulation
+    /// fed by the matcher's own parses, `take_probe_cost` returns the
+    /// accumulated bits (a `None` return opts the matcher out of donation
+    /// entirely — its staged blocks stand and the reach stays stock), and
+    /// `restart_shrunk` rebuilds the matcher as a fresh shrunk-reach frame
+    /// after a donated keep parse measured Shrink. The defaults are the
+    /// undonated stock path.
+    fn begin_probe_stats(&mut self) {}
+    fn take_probe_cost(&mut self) -> Option<f64> {
+        None
+    }
+    fn restart_shrunk(&mut self, _level: Level) {}
     /// Load dictionary content as the frame's match history after
     /// [`Matcher::reset`], before the first block (owned-window
     /// implementations only; the default drops it, and the encoder still

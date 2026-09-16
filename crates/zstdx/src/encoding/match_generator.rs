@@ -24,7 +24,7 @@ use super::{
     btlazy::LazyScratch,
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
-    reach_probe::{KEEP_REACH, ReachChoice, SHRINK_REACH},
+    reach_probe::{KEEP_REACH, ProbeStats, ReachChoice, SHRINK_REACH},
     seq_codes::{decode_packed, pack_seq},
 };
 // Shared with the decoder so both sides agree on offset-history semantics.
@@ -1691,6 +1691,11 @@ pub struct MatchGeneratorDriver {
     ldm_arming: LdmArming,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
+    /// Live reach-probe accumulator while a donating entry point runs the
+    /// frame's own keep-side blocks as the probe's keep measurement (see
+    /// [`super::reach_probe`]); `None` on every other path, so the
+    /// accumulation itself costs one branch per block.
+    probe_stats: Option<alloc::boxed::Box<ProbeStats>>,
     /// Gear-hash long-distance matcher state for chain rows with
     /// [`LevelParams::ldm`] (see [`super::ldm`]); `None` elsewhere.
     ldm: Option<LdmState>,
@@ -1827,6 +1832,44 @@ impl MatchGeneratorDriver {
         self.reach_choice = choice;
     }
 
+    /// Clear the parse tables for a fresh deterministic parse on a driver
+    /// whose allocations persist across reach flips: the probe's pooled
+    /// driver parses keep and shrink sides (and the feedback prefix)
+    /// back-to-back over the same bytes, and a reach flip no longer
+    /// reallocates the tables (see [`Self::apply_level`]) — same-bytes
+    /// residue would otherwise alias as candidates.
+    pub(crate) fn clear_parse_tables(&mut self) {
+        if !self.table.is_empty() {
+            clear_table(&mut self.table);
+        }
+        if !self.chain.is_empty() {
+            self.chain.fill(0);
+        }
+        if matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            self.dubt_table.fill(0);
+        }
+    }
+
+    /// Donation mode (see [`Self::probe_stats`]): the real parse feeds the
+    /// reach measurement while it runs, so the keep side's cost is the
+    /// frame's own parse — entropy feedback, LDM and the gate included —
+    /// not a re-parse without them. One branch per block otherwise.
+    pub(crate) fn absorb_probe_stats(&mut self, literals: &[u8], seqs: &[SeqWord]) {
+        let Some(stats) = &mut self.probe_stats else {
+            return;
+        };
+        if seqs.is_empty() {
+            // A zero-sequence block's literals are the block itself.
+            // Direct field reads: the stats borrow keeps this disjoint.
+            let start = (self.block_start - self.win_base) as usize;
+            let win = window_slice(&self.win, self.ext.as_ref());
+            stats.absorb_literals(&win[start..]);
+        } else {
+            stats.absorb_literals(literals);
+            stats.absorb_seqs(seqs);
+        }
+    }
+
     /// Declare the driver's LDM arming context (see [`LdmArming`]) before
     /// `reset`; like the reach choice it survives resets until changed.
     pub(crate) fn set_ldm_arming(&mut self, arming: LdmArming) {
@@ -1878,6 +1921,7 @@ impl MatchGeneratorDriver {
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
+            probe_stats: None,
             ldm: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
@@ -1931,6 +1975,7 @@ impl MatchGeneratorDriver {
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
+            probe_stats: None,
             ldm: None,
             ldm_seqs: Vec::new(),
             ldm_quiet: 0,
@@ -1958,7 +2003,18 @@ impl MatchGeneratorDriver {
         if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
             params.chain_reach = Some(SHRINK_REACH);
         }
-        if params != self.params {
+        // The reach change alone must not re-derive anything: the tables'
+        // sizes are reach-independent, and the reach flips twice per probe
+        // (keep, shrink, then the executed choice) plus once per shrunk
+        // restart — a full-table realloc on each flip is pure page-fault
+        // churn. Only table-shaping fields (strategy with its logs, hash
+        // log, window) re-derive; every reach consumer reads `self.params`
+        // live, and the reach-flipping sites clear their residue
+        // explicitly (`restart_shrunk`, the probe parse below).
+        let tables_change = params.strategy != self.params.strategy
+            || params.hash_log != self.params.hash_log
+            || params.window != self.params.window;
+        if tables_change {
             // Exactly one table family is live per strategy; switching
             // families drops the other's buffers.
             match params.strategy {
@@ -2021,8 +2077,8 @@ impl MatchGeneratorDriver {
                     self.win.reserve(need - self.win.len());
                 }
             }
-            self.params = params;
         }
+        self.params = params;
         // The size gate: the split pass costs real cycles per byte even
         // cheapened (see ldm.rs), so LDM arms only where the window the
         // source clamp left is worth it —
@@ -2480,14 +2536,52 @@ impl Matcher for MatchGeneratorDriver {
     /// Decide the frame's reach from its first bytes (see
     /// [`super::reach_probe`]). Called before any block of the frame is
     /// matched; no-op for heads below the probe span.
+    /// Start accumulating a reach-probe cost off this driver's real parses
+    /// (donation mode; see [`self.probe_stats`]). No effect on the parse.
+    fn begin_probe_stats(&mut self) {
+        self.probe_stats = Some(alloc::boxed::Box::default());
+    }
+
+    /// Take the accumulated probe cost in bits (order-0 literals plus the
+    /// sequence-code estimate); `None` when no accumulation was begun.
+    fn take_probe_cost(&mut self) -> Option<f64> {
+        self.probe_stats.take().map(|stats| stats.cost_bits())
+    }
+
+    /// Rebuild this state as a fresh shrunk-reach frame after a donated
+    /// keep parse measured Shrink. The keep parse's table residue covers
+    /// the same bytes at the same positions, so unlike cross-frame pool
+    /// residue the byte-verify cannot arbitrate it — the parse tables and
+    /// the gate's sampled-hash history return to the fresh-state content.
+    /// (`apply_level` already reallocates both tables zeroed on the reach
+    /// change; the explicit clears keep this correct even where the params
+    /// compare equal.)
+    fn restart_shrunk(&mut self, level: Level) {
+        self.set_reach_choice(ReachChoice::Shrink);
+        self.reset(level);
+        if !self.table.is_empty() {
+            clear_table(&mut self.table);
+        }
+        if !self.chain.is_empty() && matches!(self.params.strategy, Strategy::Chain(_)) {
+            // The dfast small table doubles as `chain`; its strategies never
+            // reach here, but the clear stays strategy-exact regardless.
+            self.chain.fill(0);
+        }
+        self.probe.clear();
+    }
+
     fn consider_reach_probe(&mut self, head: &[u8], level: Level) {
         let choice = super::reach_probe::probe_reach_choice(head, level, self.shape);
         if choice != self.reach_choice {
             self.reach_choice = choice;
             // No block has been matched yet, so re-deriving the params is
             // the whole state change; the tables' sizes are
-            // reach-independent.
+            // reach-independent. A shrunk frame disarms the head here too
+            // (the reset path checks the same condition at arm time).
             self.apply_level(level);
+            if choice == ReachChoice::Shrink && self.dubt_head == HeadPhase::Armed {
+                self.dubt_head = HeadPhase::Off;
+            }
         }
     }
 
@@ -2658,6 +2752,7 @@ impl Matcher for MatchGeneratorDriver {
             self.ldm_seqs.clear();
             self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
             self.finish_head();
+            self.absorb_probe_stats(literals, seqs);
             return;
         }
         if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
@@ -2755,6 +2850,7 @@ impl Matcher for MatchGeneratorDriver {
                 self.ldm_note_block(won);
             },
         }
+        self.absorb_probe_stats(literals, seqs);
     }
 
     // Outlined on purpose: with the body inlined into `compress_fastest`
@@ -2877,6 +2973,12 @@ impl Matcher for MatchGeneratorDriver {
         // block still matches.
         if self.gap_start == u64::MAX {
             self.gap_start = self.block_start;
+        }
+        // Donation mode: a gated block's cost model is its own bytes as
+        // literals (the frame emits it raw). Runs before the cursor
+        // advance: the block borrow must not straddle the LDM fill call.
+        if let Some(stats) = &mut self.probe_stats {
+            stats.absorb_literals(block);
         }
         self.ldm_fill_block(LdmFill::Skipped);
         self.pos = self.block_end;
@@ -4519,6 +4621,10 @@ impl MatchGeneratorDriver {
     fn head_eligible(&self) -> bool {
         self.params.dubt_head
             && matches!(self.params.strategy, Strategy::Chain(_))
+            // A shrunk frame never runs the head: the shrink side is the
+            // chain-selection class, so the probe's measurement and the
+            // executed parse stay the same object on both reach sides.
+            && self.reach_choice != ReachChoice::Shrink
             && self.shape.len.map_or(true, |l| l >= HEAD_MIN_TOTAL)
     }
 

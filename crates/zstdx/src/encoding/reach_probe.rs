@@ -37,7 +37,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
 
 use super::{
-    Matcher,
+    Matcher, SeqWord,
     match_generator::{LdmArming, MatchGeneratorDriver},
     util,
 };
@@ -71,6 +71,187 @@ pub(crate) enum ReachChoice {
     Shrink,
 }
 
+/// Running reach-probe cost accumulated off a real parse (donation mode):
+/// the frame's own keep-side blocks absorb their literals and sequences as
+/// they run, so the keep measurement is the executed parse itself —
+/// feedback, LDM and the incompressibility gate included — instead of a
+/// separate re-parse without them.
+pub(crate) struct ProbeStats {
+    lit_hist: [u64; 256],
+    seq_bits: u64,
+}
+
+impl Default for ProbeStats {
+    fn default() -> Self {
+        ProbeStats {
+            lit_hist: [0; 256],
+            seq_bits: 0,
+        }
+    }
+}
+
+impl ProbeStats {
+    pub(crate) fn absorb_literals(&mut self, lits: &[u8]) {
+        let hist = byte_hist(lits);
+        for (slot, c) in self.lit_hist.iter_mut().zip(hist) {
+            *slot += c as u64;
+        }
+    }
+
+    pub(crate) fn absorb_seqs(&mut self, seqs: &[SeqWord]) {
+        for w in seqs {
+            self.seq_bits += SEQ_CODE_BITS + w.add_nb as u64;
+        }
+    }
+
+    /// Pre-entropy cost in bits (order-0 literals plus sequence codes).
+    pub(crate) fn cost_bits(&self) -> f64 {
+        let total: u64 = self.lit_hist.iter().sum();
+        order0_bits(&self.lit_hist, total) + self.seq_bits as f64
+    }
+}
+
+/// How a probe parse prices literals in its store gate: the throwaway
+/// parses run feedback-free (flat lengths, like a frame's first block),
+/// while a parse measured against a donated keep side needs the entropy
+/// feedback the real pipeline enjoys — otherwise the comparison is biased
+/// toward the donated side by the whole feedback gain (json's keep side
+/// measured 4.75% from it, enough to flip its verdict).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ProbeFeedback {
+    /// Flat 4-bit lengths: the stock probe's model on both sides.
+    Flat,
+    /// Approximate feedback: after each parsed block, the next block's
+    /// gate prices literals at Shannon lengths derived from the block's
+    /// own literal histogram (absent symbols at the 11-bit cap) — the
+    /// same per-block structure as the encoder's table feedback.
+    Approx,
+}
+
+/// Four-lane byte histogram (breaking the store-forward chain, the
+/// incompressibility gate's exact-pass pattern): the model side reads
+/// every literal byte once per parse, which on literal-heavy shapes is
+/// comparable to the parse itself.
+fn byte_hist(lits: &[u8]) -> [u32; 256] {
+    let mut lanes = [[0u32; 256]; 4];
+    let (chunks, remainder) = lits.as_chunks::<4>();
+    for chunk in chunks {
+        lanes[0][chunk[0] as usize] += 1;
+        lanes[1][chunk[1] as usize] += 1;
+        lanes[2][chunk[2] as usize] += 1;
+        lanes[3][chunk[3] as usize] += 1;
+    }
+    for &b in remainder {
+        lanes[0][b as usize] += 1;
+    }
+    let mut hist = [0u32; 256];
+    for i in 0..256 {
+        hist[i] = lanes[0][i] + lanes[1][i] + lanes[2][i] + lanes[3][i];
+    }
+    hist
+}
+
+/// Code lengths for a parsed block's literals: `-log2(count/total)`
+/// clamped into the format's [1, 11] band, absent symbols capped the way
+/// [`Matcher::note_literal_costs`] maps them.
+fn approx_lit_lens(lits: &[u8], out: &mut [u8; 256]) {
+    let hist = byte_hist(lits);
+    let total = lits.len() as f64;
+    for i in 0..256 {
+        let c = hist[i];
+        out[i] = if c == 0 {
+            11
+        } else {
+            (-(c as f64 / total).log2()).clamp(1.0, 11.0).round() as u8
+        };
+    }
+}
+
+/// The probe's verdict from two measured costs: shrink needs the margin
+/// (the noise floor measures 0% and json ~8%).
+pub(crate) fn decide(keep: f64, shrink: f64) -> ReachChoice {
+    if shrink * 100.0 <= keep * (100.0 - SHRINK_MARGIN_PCT) {
+        ReachChoice::Shrink
+    } else {
+        ReachChoice::Keep
+    }
+}
+
+/// Prefix the donated path measures its feedback gain on (whole blocks;
+/// the first two blocks of any parse are near-identical, the gain needs a
+/// few feedback rounds to show).
+const FEEDBACK_PROBE: usize = 512 * 1024;
+
+/// Landslide keep shortcut: a feedback-free shrink cost this far above the
+/// donated (true) keep cost keeps without measuring the feedback gain —
+/// only a keep side gaining >~20% from feedback (json, the most
+/// feedback-sensitive shape on record, gains 5%) could still bring the
+/// flat comparison inside the margin from there.
+const KEEP_LANDSLIDE: f64 = 1.25;
+
+/// The donated path's verdict. Its keep cost is the TRUE one (the frame's
+/// own parse, entropy feedback included) while the shrink side parses
+/// feedback-free — an asymmetry worth 4.75% on json's keep side, more
+/// than double the margin: the flat comparison the margin is calibrated
+/// on must be reconstructed. A shrink that already wins against the
+/// true keep cost is contained in the flat verdict (feedback only ever
+/// lowered measured keep costs); a landslide keeps outright; the
+/// contested band converts the true keep cost back to the feedback-free
+/// scale through the gain measured on a cheap twice-parsed prefix.
+/// Float equality is the point in the tie shortcut: it fires on
+/// bit-identical model costs (identical parses), not near-equal ones.
+#[allow(clippy::float_cmp)]
+pub(crate) fn decide_donated(
+    keep: f64,
+    shrink: f64,
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+) -> ReachChoice {
+    if shrink == keep {
+        // Identical costs mean identical parses under the model — the
+        // shape is reach- and feedback-degenerate (skewed, random, zeros
+        // all land here bit-for-bit, including the all-uniform 0 == 0), so
+        // the flat verdict keeps and the escalation below could not
+        // measure anything.
+        return ReachChoice::Keep;
+    }
+    if decide(keep, shrink) == ReachChoice::Shrink {
+        // A shrink this far ahead of even the true (feedback) keep cost is
+        // contained in the flat verdict: feedback only ever lowered
+        // measured keep costs.
+        return ReachChoice::Shrink;
+    }
+    if shrink >= keep * KEEP_LANDSLIDE {
+        return ReachChoice::Keep;
+    }
+    let gain = feedback_gain(head, level, shape).clamp(0.0, 0.5);
+    let keep_flat = keep / (1.0 - gain);
+    decide(keep_flat, shrink)
+}
+
+/// The keep-side parse's entropy-feedback gain, estimated on a prefix:
+/// the relative model-cost drop between a feedback-free parse and one
+/// with approximate per-block literal pricing (the same structure the
+/// encoder's table feedback gives the real parse).
+fn feedback_gain(head: &[u8], level: Level, shape: InputShape) -> f64 {
+    let end = FEEDBACK_PROBE.min(head.len());
+    let prefix = &head[..end];
+    let flat = parse_cost(prefix, level, shape, ReachChoice::Keep, ProbeFeedback::Flat);
+    let approx = parse_cost(
+        prefix,
+        level,
+        shape,
+        ReachChoice::Keep,
+        ProbeFeedback::Approx,
+    );
+    if flat <= 0.0 {
+        0.0
+    } else {
+        (flat - approx) / flat
+    }
+}
+
 /// Whether a frame at `level`/`shape` is probe-eligible: only the Balanced
 /// row with its stock reach still in place (a shape-clamped reach means the
 /// window itself is small — nothing to trade away) and a declared length
@@ -101,13 +282,9 @@ pub(crate) fn probe_staged(head: &[u8], level: Level, shape: InputShape) -> Reac
         return ReachChoice::Keep;
     }
     let head = &head[..PROBE_SPAN];
-    let keep = parse_cost(head, level, shape, ReachChoice::Keep);
-    let shrink = parse_cost(head, level, shape, ReachChoice::Shrink);
-    if shrink * 100.0 <= keep * (100.0 - SHRINK_MARGIN_PCT) {
-        ReachChoice::Shrink
-    } else {
-        ReachChoice::Keep
-    }
+    let keep = parse_cost(head, level, shape, ReachChoice::Keep, ProbeFeedback::Flat);
+    let shrink = parse_cost(head, level, shape, ReachChoice::Shrink, ProbeFeedback::Flat);
+    decide(keep, shrink)
 }
 
 #[cfg(feature = "std")]
@@ -120,9 +297,17 @@ std::thread_local! {
 
 /// Parse `head` at `choice` and return its pre-entropy cost in bits. The
 /// block loop mirrors the bulk slice path exactly (per-block adopted
-/// window, uniform/RLE skip, head and LDM riding the row's own machinery),
-/// so the two parses differ in nothing but the reach.
-fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice) -> f64 {
+/// window, uniform/RLE skip and the incompressibility gate, head and LDM
+/// riding the row's own machinery), so the two parses differ in nothing but
+/// the reach. The donating entry points call this for the shrink side only
+/// — their keep cost comes off the frame's own blocks (see `ProbeStats`).
+pub(crate) fn parse_cost(
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+    choice: ReachChoice,
+    feedback: ProbeFeedback,
+) -> f64 {
     #[cfg(feature = "std")]
     let mut driver = PROBE_DRIVER
         .with(|p| p.borrow_mut().take())
@@ -138,6 +323,7 @@ fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice)
     // abandons LDM too, so the measurement stays exact.
     driver.set_ldm_arming(LdmArming::ProbeKeep);
     driver.reset(level);
+    driver.clear_parse_tables();
     let block = driver.block_size();
     let max_window = driver.window_size();
 
@@ -145,6 +331,7 @@ fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice)
     let mut seqs = Vec::new();
     let mut lit_hist = [0u64; 256];
     let mut seq_bits = 0u64;
+    let mut fb_lens = [0u8; 256];
     let mut pos = 0usize;
     while pos < head.len() {
         let end = (pos + block).min(head.len());
@@ -154,6 +341,15 @@ fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice)
         if util::is_uniform(&head[pos..end]) {
             // The RLE path: the block contributes no literals or sequences.
             driver.skip_matching();
+        } else if driver.skip_if_incompressible() {
+            // The executed path's gate, missing here before: a gated block
+            // is emitted raw, so the probe re-parsed max-entropy blocks the
+            // frame never matches (random paid a full chain walk per gated
+            // block, twice, to measure a cost the gate had already decided).
+            // Its cost model is the block's own bytes as literals.
+            for (i, c) in byte_hist(&head[pos..end]).into_iter().enumerate() {
+                lit_hist[i] += c as u64;
+            }
         } else {
             driver.start_matching_codes(&mut literals, &mut seqs);
             if seqs.is_empty() {
@@ -161,12 +357,20 @@ fn parse_cost(head: &[u8], level: Level, shape: InputShape, choice: ReachChoice)
                 for &b in &head[pos..end] {
                     lit_hist[b as usize] += 1;
                 }
+                if feedback == ProbeFeedback::Approx {
+                    approx_lit_lens(&head[pos..end], &mut fb_lens);
+                    driver.note_literal_costs(&fb_lens);
+                }
             } else {
-                for &b in &literals {
-                    lit_hist[b as usize] += 1;
+                for (i, c) in byte_hist(&literals).into_iter().enumerate() {
+                    lit_hist[i] += c as u64;
                 }
                 for w in &seqs {
                     seq_bits += SEQ_CODE_BITS + w.add_nb as u64;
+                }
+                if feedback == ProbeFeedback::Approx {
+                    approx_lit_lens(&literals, &mut fb_lens);
+                    driver.note_literal_costs(&fb_lens);
                 }
                 literals.clear();
                 seqs.clear();

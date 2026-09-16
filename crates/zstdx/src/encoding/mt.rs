@@ -26,8 +26,10 @@ use core::{
 use std::sync::{Condvar, Mutex};
 
 use super::{
+    Matcher, compress_fastest,
     frame_compressor::{
-        CompressState, compress_job_blocks, reset_slice_state, return_slice_state, take_slice_state,
+        CompressState, SliceChecksum, compress_job_blocks, compress_job_blocks_inner,
+        reset_slice_state, return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{LdmArming, MatchGeneratorDriver},
@@ -120,7 +122,34 @@ pub fn compress_slice_mt(
     let window = MatchGeneratorDriver::window_for_level(level, shape);
     // The frame's head decides its chain reach (see reach_probe), and with
     // it the strip: a shrunk search domain shrinks the strip to match.
-    let choice = reach_probe::probe_reach_choice(src, level, shape);
+    // Eligible frames donate the probe's keep side into job zero (see
+    // `donate_job_zero_prefix`): the first span blocks run as job zero's
+    // own blocks on the calling thread through the job machinery, so only
+    // a Shrink verdict pays a re-parse. The keep grid must leave job zero
+    // work beyond the span for the continuation to take over.
+    let mut donation = None;
+    let choice;
+    if reach_probe::eligible(level, shape)
+        && job_size_for(
+            src.len() as u64,
+            workers.max(2),
+            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
+                as usize,
+        ) >= reach_probe::PROBE_SPAN
+    {
+        let (donated_choice, state, prefix) = donate_job_zero_prefix(src, level, shape);
+        choice = donated_choice;
+        if choice == reach_probe::ReachChoice::Keep {
+            donation = Some((state, prefix));
+        } else {
+            // The shrink verdict discards the donation; job zero parses
+            // from its own pooled state like an undonated frame.
+            return_slice_state(state);
+        }
+    } else {
+        choice = reach_probe::probe_reach_choice(src, level, shape);
+    }
+    let donation = Mutex::new(donation);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     let job_size = job_size_for(src.len() as u64, workers, overlap);
     let n_jobs = src.len().div_ceil(job_size);
@@ -164,6 +193,24 @@ pub fn compress_slice_mt(
                     // history is still the format default [1, 4, 8].
                     let gate = id > 0;
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if id == 0
+                            && let Some((mut dstate, prefix)) = donation.lock().unwrap().take()
+                        {
+                            // The donated state already carries job zero's
+                            // reset, strip prefill and parsed span — the
+                            // continuation emits from where it stopped.
+                            let out = compress_job_blocks_inner(
+                                &mut dstate,
+                                src,
+                                start..end,
+                                overlap,
+                                end == src.len(),
+                                reach_probe::PROBE_SPAN,
+                                prefix,
+                            );
+                            return_slice_state(dstate);
+                            return out;
+                        }
                         run_job(
                             src,
                             start..end,
@@ -241,6 +288,57 @@ fn ramp_depth_from_env() -> u64 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
     })
+}
+
+/// Run the reach probe's keep side as job zero's own first span blocks on
+/// the calling thread: the state is job-zero-shaped exactly (reset at the
+/// job arming, empty-strip prefill with its table clear and head arming),
+/// the emit mirrors `compress_job_blocks`, and the matcher accumulates the
+/// probe cost while the blocks become the frame's own output. Returns the
+/// verdict plus the state and encoded prefix for job zero's continuation
+/// (a Shrink verdict discards both — the caller returns the state to the
+/// pool and job zero parses from its own pooled state).
+fn donate_job_zero_prefix(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+) -> (
+    reach_probe::ReachChoice,
+    alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+    Vec<u8>,
+) {
+    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, LdmArming::Job);
+    state.matcher.prefill_job_strip(&src[..0], 0);
+    let block_size = state.matcher.block_size();
+    let max_window = state.matcher.window_size() as usize;
+    let span = reach_probe::PROBE_SPAN;
+    let mut output = Vec::with_capacity(span + 3 * (span / block_size + 1) + 8);
+    let mut hasher = SliceChecksum::new(0, false);
+    state.matcher.begin_probe_stats();
+    let mut cursor = 0usize;
+    while cursor < span {
+        let block_end = (cursor + block_size).min(span);
+        let hist = cursor.saturating_sub(max_window);
+        state
+            .matcher
+            .adopt_window(&src[hist..block_end], hist as u64);
+        state.matcher.set_block(cursor as u64, block_end as u64);
+        compress_fastest(&mut state, false, &mut output, &mut hasher);
+        cursor = block_end;
+    }
+    let keep = state
+        .matcher
+        .take_probe_cost()
+        .expect("donation began the stats");
+    let shrink = reach_probe::parse_cost(
+        &src[..span],
+        level,
+        shape,
+        reach_probe::ReachChoice::Shrink,
+        reach_probe::ProbeFeedback::Approx,
+    );
+    let choice = reach_probe::decide_donated(keep, shrink, src, level, shape);
+    (choice, state, output)
 }
 
 /// Compress one job through `state`, resetting it for the job: fresh
