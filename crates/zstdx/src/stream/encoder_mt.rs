@@ -136,6 +136,13 @@ const BUF_POOL_KEEP_MAX: usize = 64 * 1024 * 1024;
 // Buffers retained per thread (a second one covers size-mismatched pairs).
 const BUF_POOL_DEPTH: usize = 2;
 
+// Upper bound on one direct read into the buffer's spare capacity
+// (`pump_direct`): bounds how long a single pump step can defer job
+// posting past a completed epoch (a grown buffer's whole spare in one read
+// would defer it by the read's own memcpy span).
+#[cfg(feature = "std")]
+const PUMP_READ_MAX: usize = 1024 * 1024;
+
 // Upper bound on the accumulate buffer's growth; past it the dead-prefix
 // wrap alone recycles space (a wait per ~BUF_CAP_MAX bytes of stream is
 // negligible). The old burst model reserved epoch-scale windows of the
@@ -144,8 +151,10 @@ const BUF_CAP_MAX: usize = 256 * 1024 * 1024;
 
 // Take the pooled accumulate buffer, or a fresh one, with room for `want`
 // bytes (a larger pooled buffer is kept as-is — its spare capacity only
-// helps the growth reserve).
-fn take_pooled_buf(want: usize) -> Vec<u8> {
+// helps the growth reserve). The returned length is the buffer's
+// ever-initialized extent: a returned buffer carries it as its Vec length,
+// so the direct pump can hand out spare bytes without re-zeroing them.
+fn take_pooled_buf(want: usize) -> (Vec<u8>, usize) {
     BUF_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let best = pool
@@ -155,10 +164,11 @@ fn take_pooled_buf(want: usize) -> Vec<u8> {
         match best {
             Some(i) => {
                 let mut buf = pool.swap_remove(i);
+                let init_len = buf.len().min(buf.capacity());
                 buf.clear();
-                buf
+                (buf, init_len)
             },
-            None => Vec::new(),
+            None => (Vec::new(), 0),
         }
     })
 }
@@ -197,8 +207,36 @@ struct QueueShared {
     n_incomplete: AtomicU64,
     /// Monotonic count of completed jobs — the drain waits' progress tick.
     completed: AtomicU64,
-    /// Reusable encoder states for the calling thread's inline jobs.
-    states: Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+}
+
+// Reusable worker states, global across encoders: the pool threads are
+// fresh per encoder (spawned at its first post, joined at drop), so a
+// per-encoder pool always misses and every stream pays the whole matcher
+// table build (allocations plus first-touch faults) eight times over.
+// Depth-capped so one-off worker counts do not pin memory forever.
+static STATE_POOL: std::sync::OnceLock<
+    Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+> = std::sync::OnceLock::new();
+const STATE_POOL_DEPTH: usize = 32;
+
+fn take_pooled_state() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    pool.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop()
+        .unwrap_or_else(new_slice_state_boxed)
+}
+
+fn return_pooled_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
+    let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut pool = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pool.len() < STATE_POOL_DEPTH {
+        pool.push(state);
+    }
+}
+
+fn new_slice_state_boxed() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    alloc::boxed::Box::new(new_slice_state())
 }
 
 /// Pool worker body: claim the oldest posted job, encode it through a
@@ -219,6 +257,12 @@ fn pool_worker(shared: Arc<QueueShared>) {
                     break job;
                 }
                 if inner.shutdown {
+                    // The loan ends here: this worker's jobs all completed
+                    // (the encoder drops only after joining), so the state
+                    // is quiescent and safe to pool for a later encoder.
+                    if let Some(state) = state.take() {
+                        return_pooled_state(state);
+                    }
                     return;
                 }
                 inner = shared.wake.wait(inner).unwrap();
@@ -228,7 +272,7 @@ fn pool_worker(shared: Arc<QueueShared>) {
         // SAFETY: the posting thread keeps the backing bytes stable for
         // this job's whole lifetime (see FrozenSrc).
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let state = state.get_or_insert_with(|| alloc::boxed::Box::new(new_slice_state()));
+            let state = state.get_or_insert_with(take_pooled_state);
             let src = unsafe { slice::from_raw_parts(job.src.ptr, job.len) };
             run_job_with(
                 state,
@@ -301,6 +345,13 @@ pub(crate) struct MtEncoderCore {
     /// offset.
     buf: Vec<u8>,
     buf_base: u64,
+    /// Ever-initialized extent of `buf` ([0, init_len) all initialized):
+    /// the direct pump hands out only previously-written bytes (the Read
+    /// contract forbids uninitialized buffers). Monotone under wraps;
+    /// clamped to the live length by growth (a realloc copies only the
+    /// live bytes); carried across encoders by the buffer pool (the
+    /// returned Vec's length).
+    init_len: usize,
     /// Total bytes fed.
     pos: u64,
     /// Checksum absorbed up to this absolute offset.
@@ -375,10 +426,13 @@ impl MtEncoderCore {
         } else {
             (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024
         };
-        let mut buf = take_pooled_buf(want);
+        let (mut buf, mut init_len) = take_pooled_buf(want);
         if buf.capacity() < want {
             buf.reserve_exact(want - buf.len());
             advise_hugepages(&buf);
+            // A realloc copies only the live bytes: the new tail starts
+            // uninitialized.
+            init_len = buf.len();
         }
         Self {
             level: options.level,
@@ -400,6 +454,7 @@ impl MtEncoderCore {
             header: serialized,
             buf,
             buf_base: 0,
+            init_len,
             pos: 0,
             hashed_end: 0,
             output: Vec::with_capacity(initial_job + 64),
@@ -417,7 +472,6 @@ impl MtEncoderCore {
                 poisoned: core::sync::atomic::AtomicBool::new(false),
                 n_incomplete: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
-                states: Mutex::new(Vec::new()),
             }),
             pool_threads: Vec::new(),
             pending: VecDeque::new(),
@@ -441,6 +495,61 @@ impl MtEncoderCore {
         }
     }
 
+    /// Pull once from `source` straight into the buffer's spare capacity:
+    /// the Read-side pump's single-copy form. The region handed to `read`
+    /// is always previously-initialized bytes (`init_len` tracks the
+    /// ever-initialized extent — handing out uninitialized memory violates
+    /// the Read contract), extended one bounded zero-fill at a time, so a
+    /// source's bytes land in the job buffer without the staging-chunk
+    /// round-trip of `write` — the read path's serial memcpy halves.
+    /// Recycling, posting and EOF semantics mirror `write` plus
+    /// `pump_from`. One bounded read per call, so job posting stays close
+    /// behind the buffered bytes (a whole grown spare in one read would
+    /// defer an epoch's post by the read's own span).
+    #[cfg(feature = "std")]
+    pub(crate) fn pump_direct(&mut self, source: &mut impl crate::io::Read) -> crate::Result<()> {
+        debug_assert!(!self.finished);
+        if self.buf.len() == self.buf.capacity() {
+            // A positive want keeps the growth arm engaged for the nothing-
+            // to-wrap case (an all-live buffer at the cap).
+            self.make_space(1);
+        }
+        let len = self.buf.len();
+        let want = PUMP_READ_MAX.min(self.buf.capacity() - len);
+        debug_assert!(want > 0);
+        if self.init_len < len + want {
+            // Zero-fill the next region once per buffer region: the pool
+            // carries the extent across encoders, so steady-state streams
+            // pay this only for freshly grown capacity.
+            // SAFETY: [len, target) lies inside the allocation, past the
+            // live data; writing it initializes the bytes for future reads.
+            let target = (len + want).min(self.buf.capacity());
+            unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), target - len) }
+                .fill(0);
+            self.init_len = target;
+        }
+        // SAFETY: [len, init_len) is initialized (zero-fill above or the
+        // pool's carried extent) and this pump is the sole accessor past
+        // the live prefix (workers read only frozen views below `len`).
+        let spare = unsafe {
+            slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), self.init_len - len)
+        };
+        // Bound before the match: the spare borrow of the buffer must not
+        // outlive the scrutinee into the arms below.
+        let read = source.read(&mut spare[..want]).map_err(crate::Error::from);
+        match read {
+            Ok(0) => self.finish(),
+            Ok(n) => {
+                // SAFETY: `read` wrote n initialized bytes into spare[..n].
+                unsafe { self.buf.set_len(len + n) };
+                self.pos += n as u64;
+                self.post_ready();
+            },
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
     /// Close the frame: the pending jobs (or an empty block) become the last
     /// block and the checksum, if enabled, is appended.
     pub(crate) fn finish(&mut self) {
@@ -448,13 +557,16 @@ impl MtEncoderCore {
             return;
         }
         self.surface_poison();
-        self.drain_all();
         if self.pos > self.job_start {
+            // Post the tail before waiting: posting first lets workers
+            // claim tail jobs the moment earlier ones free them, instead
+            // of idling behind the last straggler of a pre-drain.
             self.encode_jobs(self.pos, true);
         } else {
-            // Everything fed is already encoded (or nothing was fed): the
-            // frame still needs a last block, and an empty raw one is the
-            // shape the single-threaded streaming path emits.
+            // Everything fed is already encoded (or nothing was fed):
+            // assemble whatever is still pending, then close with an empty
+            // raw last block (the shape the single-threaded path emits).
+            self.drain_all();
             self.emit_header();
             BlockHeader {
                 last_block: true,
@@ -478,11 +590,13 @@ impl MtEncoderCore {
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
         // A flush promises visibility: every posted job's blocks belong to
-        // the output before it returns.
+        // the output before it returns (encode_jobs drains everything it
+        // posts; with nothing new pending, the drain below covers them).
         self.surface_poison();
-        self.drain_all();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, false);
+        } else {
+            self.drain_all();
         }
     }
 
@@ -574,6 +688,9 @@ impl MtEncoderCore {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            // A realloc copies only the live bytes: the new tail starts
+            // uninitialized.
+            self.init_len = self.buf.len();
         }
     }
 
@@ -759,7 +876,7 @@ impl MtEncoderCore {
         let first = (self.job_start - strip_lo) as usize;
         self.hash_to(hi);
         let last_len = (bounds[1] - bounds[0]) as usize;
-        let mut state = take_pooled_state(&self.shared.states);
+        let mut state = take_pooled_state();
         let bytes = run_job_with(
             &mut state,
             &self.buf[..(hi - self.buf_base) as usize],
@@ -771,7 +888,7 @@ impl MtEncoderCore {
             self.shape,
             self.choice,
         );
-        self.shared.states.lock().unwrap().push(state);
+        return_pooled_state(state);
         self.output.extend_from_slice(&bytes);
         self.job_start = hi;
     }
@@ -925,13 +1042,20 @@ impl MtEncoderCore {
             self.buf.truncate(live);
             self.buf_base = keep;
         }
-        if self.buf.len() + want > self.buf.capacity() {
-            // Doubling below the cap amortizes the growth; past it the wrap
-            // alone recycles space, so growth tracks the live need.
+        if self.buf.len() + want > self.buf.capacity() || self.buf.capacity() < BUF_CAP_MAX {
+            // Doubling below the cap at every recycle point: an epoch-sized
+            // buffer wraps (and waits) once per epoch because the growing
+            // grid's posting gate holds a whole epoch live — growing past
+            // that lets a stream fit without recycling at all. Past the cap
+            // the wrap alone recycles space, so growth tracks the live
+            // need.
             let target =
                 (self.buf.len() + want + 64 * 1024).max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            // A realloc copies only the live bytes: the new tail starts
+            // uninitialized.
+            self.init_len = self.buf.len();
         }
     }
 
@@ -994,16 +1118,6 @@ impl MtEncoderCore {
     }
 }
 
-/// Take a worker state from the pool, or build a fresh one.
-fn take_pooled_state(
-    pool: &Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
-) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
-    pool.lock()
-        .unwrap()
-        .pop()
-        .unwrap_or_else(|| alloc::boxed::Box::new(new_slice_state()))
-}
-
 impl Drop for MtEncoderCore {
     fn drop(&mut self) {
         if !self.pool_threads.is_empty() {
@@ -1015,8 +1129,13 @@ impl Drop for MtEncoderCore {
         }
         // The accumulate buffer outlives the encoder in the thread-local
         // pool (see take_pooled_buf); every worker has exited by now, so
-        // nothing reads it anymore.
-        return_pooled_buf(core::mem::take(&mut self.buf));
+        // nothing reads it anymore. Its length carries the ever-initialized
+        // extent to the buffer's next encoder.
+        let mut buf = core::mem::take(&mut self.buf);
+        // SAFETY: [0, init_len) is initialized (the pump's zero-fill and
+        // reads); the extent never exceeds the capacity.
+        unsafe { buf.set_len(self.init_len.min(buf.capacity())) };
+        return_pooled_buf(buf);
     }
 }
 
@@ -1089,6 +1208,34 @@ mod tests {
             pledged.job_end(0),
             pledged.job_end(32 * 1024 * 1024) - 32 * 1024 * 1024
         );
+    }
+
+    /// A stream ending exactly on an epoch boundary has its last jobs
+    /// already posted (and possibly still in flight) at finish: the tail
+    /// path must not skip their assembly, and a flush at the same point
+    /// must still surface them (visibility promise).
+    #[test]
+    fn epoch_end_finish_assembles_pending() {
+        let mib = 1024 * 1024usize;
+        // Fastest with 4 workers: the first epoch is exactly 4 MiB.
+        let data = textish(4 * mib);
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        core.write(&data);
+        core.finish();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        core.write(&data);
+        core.flush_block();
+        assert!(core.has_output());
+        core.finish();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
     /// A long unpledged stream crosses many growth points and burst/tail

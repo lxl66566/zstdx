@@ -25,10 +25,11 @@ pub struct Encoder<R: Read> {
     source: Option<R>,
     core: FrameEncoderCore,
     /// Pump staging buffer: reused across pulls so it is zeroed once per
-    /// encoder instead of once per 16 KiB pull. The 16 KiB granularity is
-    /// measured (interleaved A/B): 64/128 KiB pulls overshoot the job
-    /// grid's posting boundaries and pay for it at the buffer's recycle
-    /// points.
+    /// encoder instead of once per 16 KiB pull. The single-threaded core's
+    /// path; the mt core reads straight into its accumulate buffer. The
+    /// 16 KiB granularity is measured (interleaved A/B): 64/128 KiB pulls
+    /// overshoot the job grid's posting boundaries and pay for it at the
+    /// buffer's recycle points.
     chunk: alloc::vec::Vec<u8>,
 }
 
@@ -78,7 +79,7 @@ impl<R: Read> Read for Encoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         while !self.core.has_output() && !self.core.is_finished() {
             self.core
-                .pump_from(self.source.as_mut().unwrap(), &mut self.chunk)?;
+                .pump(self.source.as_mut().unwrap(), &mut self.chunk)?;
         }
         Ok(self.core.split_output(buf))
     }

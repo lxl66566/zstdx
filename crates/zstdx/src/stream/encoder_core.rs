@@ -406,6 +406,27 @@ impl FrameEncoderCore {
         }
     }
 
+    /// Pull once from `source` and feed the encoder: the Read-side pump.
+    /// Under std the mt core reads straight into its accumulate buffer's
+    /// initialized spare capacity — one serial copy per byte instead of the
+    /// staging chunk's two (the read path's dominant cost on the fastest
+    /// tiers, where the encode span no longer hides it); the
+    /// single-threaded core keeps the staging chunk (its pump hides behind
+    /// the encode span, and its block-staged buffer is small).
+    pub(crate) fn pump(
+        &mut self,
+        source: &mut impl crate::io::Read,
+        chunk: &mut [u8],
+    ) -> Result<()> {
+        #[cfg(feature = "std")]
+        {
+            if let Self::Mt(core) = self {
+                return core.pump_direct(source);
+            }
+        }
+        self.pump_from(source, chunk)
+    }
+
     /// Pull once from `source` into `chunk` and feed the encoder: returns
     /// after every source read, so the caller's loop decides how eagerly to
     /// drain. The staging chunk is caller-owned so it is zeroed once per
