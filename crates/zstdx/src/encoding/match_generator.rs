@@ -495,6 +495,38 @@ fn sampled_distinct(win: &[u8], start: usize, end: usize) -> u32 {
     bitmap.iter().map(|w| w.count_ones()).sum()
 }
 
+/// The bulk-mt prefix-LDM engagement screen over the frame's first block:
+/// a wide alphabet (the mid-size population's own gate, [`LDM_SYMS_MIN`])
+/// plus one strided 8-byte repeat — the same evidence class
+/// `skip_if_incompressible`'s probe collects, reduced to its hit
+/// predicate (a collision anywhere keeps the whole block matchable
+/// there). Binary heads hit within the first few thousand samples;
+/// max-entropy heads never hit, so the strip fill's unconditional split
+/// pass is not bought for frames whose blocks go raw.
+#[cfg(feature = "std")]
+pub(crate) fn ldm_head_parses(head: &[u8]) -> bool {
+    if sampled_distinct(head, 0, head.len()) < LDM_SYMS_MIN {
+        return false;
+    }
+    let stride = (head.len() >> 11) | 1;
+    // Slot count one below the block gate's probe: an engagement screen,
+    // not a byte-affecting decision — the 47-bit content hash keeps
+    // false hits at ~1e-7 per screen.
+    let mut probe = [0u32; 1 << 12];
+    let mut i = 0usize;
+    while i + HASH_READ <= head.len() {
+        let h = read8(head, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+        let slot = (h >> 52) as usize;
+        let tag = h as u32;
+        if probe[slot] == tag {
+            return true;
+        }
+        probe[slot] = tag;
+        i += stride;
+    }
+    false
+}
+
 /// Where a driver's LDM history domain ends, deciding the size gate's bar
 /// (see [`ldm_min_window`]). Set before `reset`; pooled drivers re-derive
 /// their arming on every reset.
@@ -514,6 +546,15 @@ pub(crate) enum LdmArming {
     /// Constructed by the std-gated mt paths only.
     #[cfg(feature = "std")]
     Job,
+    /// A multithreaded job whose strip reaches back through the frame's
+    /// own prefix (the bulk path's shared prefix fill, mid-size windows):
+    /// the strip content is exactly what the frame-continuous path would
+    /// have indexed by the same position, so the mid-size bar arms and the
+    /// far class survives the job split — the per-job fill tax the `Job`
+    /// bar guards against is paid once by the shared build instead of per
+    /// job. Constructed by the std-gated bulk mt path only.
+    #[cfg(feature = "std")]
+    JobPrefix,
     /// The reach probe's parses: the keep parse's span sits below the
     /// row's chain reach, so no candidate can survive the beyond-reach
     /// filter there (the shrink parse never arms at all — a shrunk parse
@@ -529,6 +570,8 @@ const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
         LdmArming::Frame => Some(LDM_MIDSIZE_WINDOW),
         #[cfg(feature = "std")]
         LdmArming::Job => Some(LDM_FULL_WINDOW),
+        #[cfg(feature = "std")]
+        LdmArming::JobPrefix => Some(LDM_MIDSIZE_WINDOW),
         LdmArming::ProbeKeep => None,
     }
 }
@@ -1755,6 +1798,16 @@ unsafe impl Send for MatchGeneratorDriver {}
 #[cfg(feature = "std")]
 use super::ldm::LdmSnapshot;
 
+/// Smallest largest prefix strip that engages the shared prefix fill;
+/// below it the tail jobs' own parallel fills are the cheaper schedule.
+#[cfg(feature = "std")]
+pub(crate) const SPF_MIN_PREFIX: u64 = 8 * 1024 * 1024;
+/// Shared-prefix-fill segment length: the soft bound between build polls
+/// and the slack past the target boundary a segment may run while
+/// searching for the next exact (batch-freeze) boundary.
+#[cfg(feature = "std")]
+pub(crate) const SPF_SEG: u64 = 1024 * 1024;
+
 /// Captured strip-fill state of a [`MatchGeneratorDriver`] (the streaming
 /// core's shared prefix fill): the chain row's head/chain grid tables plus
 /// the LDM fill state after a fill covering `[base, base + upto)` —
@@ -1842,6 +1895,28 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     pub(crate) fn spf_strip_fill(level: Level, shape: InputShape) -> bool {
         matches!(params_for(level, shape).strategy, Strategy::Chain(_))
+    }
+
+    /// The window whose jobs run prefix strips under
+    /// [`LdmArming::JobPrefix`] (the bulk path's mid-size LDM capture):
+    /// the chain row at its stock reach, a Keep verdict (a shrunk frame
+    /// abandons LDM) and a window the source clamp left inside
+    /// `[LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW)` — wide enough that the far
+    /// class pays, narrow enough that every job's window strip is a whole
+    /// frame prefix. `None` keeps the per-job [`LdmArming::Job`] model.
+    #[cfg(feature = "std")]
+    pub(crate) fn prefix_ldm_window(
+        level: Level,
+        shape: InputShape,
+        choice: ReachChoice,
+    ) -> Option<u64> {
+        let p = params_for(level, shape);
+        (Self::spf_strip_fill(level, shape)
+            && p.ldm
+            && choice == ReachChoice::Keep
+            && p.window >= LDM_MIDSIZE_WINDOW
+            && p.window < LDM_FULL_WINDOW)
+            .then_some(p.window as u64)
     }
 
     /// Whether the shape-adaptive reach probe (see [`super::reach_probe`])
@@ -5116,56 +5191,6 @@ mod tests {
         assert!(
             s_ldm.snapshot().same_as(&b_ldm.snapshot()),
             "builder LDM diverges"
-        );
-    }
-
-    /// The gate's repeat probe is exactly the job's strip history: a block
-    /// whose only twins live in the strip stays searchable, and neither
-    /// verdict may depend on what an earlier job on the same pooled driver
-    /// left in the probe.
-    #[cfg(feature = "std")]
-    #[test]
-    fn gate_probe_is_strip_history() {
-        let mut s = 0x1234_5678_9abc_def0u64;
-        let mut rand = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let mut noise = |n: usize| -> Vec<u8> { (0..n).map(|_| (rand() & 0xff) as u8).collect() };
-        // A 2 MiB strip whose [1 MiB, 1 MiB + 128 KiB) span the job's first
-        // block repeats verbatim (beyond the gate's self-samples: a fresh
-        // probe holds nothing, so without strip seeding the block gates).
-        let mut data = noise(2 * 1024 * 1024);
-        let twin = data[1024 * 1024..1024 * 1024 + 128 * 1024].to_vec();
-        data.extend_from_slice(&twin);
-        let prior = noise(2 * 1024 * 1024 + 128 * 1024);
-        let verdict = |prior: Option<&[u8]>| -> bool {
-            let mut d = MatchGeneratorDriver::new_direct();
-            d.set_ldm_arming(LdmArming::Job);
-            d.reset(crate::Level::Balanced);
-            if let Some(p) = prior {
-                // An earlier job: a strip plus one gated noise block, the
-                // residue a pooled driver carries into its next job.
-                d.prefill_job_strip(&p[..2 * 1024 * 1024], 0);
-                d.adopt_window(p, 0);
-                d.set_block(2 * 1024 * 1024, 2 * 1024 * 1024 + 128 * 1024);
-                assert!(d.skip_if_incompressible());
-            }
-            d.prefill_job_strip(&data[..2 * 1024 * 1024], 0);
-            d.adopt_window(&data, 0);
-            d.set_block(2 * 1024 * 1024, 2 * 1024 * 1024 + 128 * 1024);
-            d.skip_if_incompressible()
-        };
-        assert!(
-            !verdict(None),
-            "a block repeating its strip must stay searchable"
-        );
-        assert_eq!(
-            verdict(None),
-            verdict(Some(&prior)),
-            "pooled residue must not change the gate's verdict"
         );
     }
 

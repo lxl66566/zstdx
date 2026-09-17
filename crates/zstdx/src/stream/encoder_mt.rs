@@ -63,7 +63,9 @@ use crate::{
             new_slice_state, reset_slice_state,
         },
         frame_header::FrameHeader,
-        match_generator::{LdmArming, MatchGeneratorDriver, StripSnapshot},
+        match_generator::{
+            LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
+        },
         mt::{
             MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state,
             run_job_with,
@@ -127,15 +129,6 @@ impl SpfPlan {
         start > self.upto && start <= self.prefix_end
     }
 }
-
-/// Smallest largest prefix strip that engages the shared prefix fill;
-/// below it the tail jobs' own parallel fills are the cheaper schedule.
-const SPF_MIN_PREFIX: u64 = 8 * 1024 * 1024;
-/// Shared-prefix-fill segment length: the soft bound between the
-/// probe-donation polls (a shrink verdict retires the build) and the
-/// slack past the median boundary a segment may run while searching for
-/// the next exact (batch-freeze) boundary.
-const SPF_SEG: u64 = 1024 * 1024;
 
 /// One posted job: the frozen source view (see the recycling rules in
 /// [`MtEncoderCore`]'s docs — the backing bytes cannot move before this job
@@ -658,7 +651,14 @@ fn run_claimed_job(
                     // any job's, then continue the fill to this job's own
                     // strip end instead of re-running its whole prefix.
                     Some(snap) => {
-                        prepare_job_state(state, job.level, job.shape, job.choice, *first as u64);
+                        prepare_job_state(
+                            state,
+                            job.level,
+                            job.shape,
+                            job.choice,
+                            LdmArming::Job,
+                            *first as u64,
+                        );
                         compress_job_blocks_inner(
                             state,
                             src,
@@ -679,6 +679,8 @@ fn run_claimed_job(
                         job.level,
                         job.shape,
                         job.choice,
+                        LdmArming::Job,
+                        None,
                     ),
                 }
             };
@@ -1562,6 +1564,8 @@ impl MtEncoderCore {
             self.level,
             self.shape,
             self.choice,
+            LdmArming::Job,
+            None,
         );
         return_pooled_state(state);
         self.output.extend_from_slice(&bytes);

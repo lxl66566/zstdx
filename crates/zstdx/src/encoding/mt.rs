@@ -23,7 +23,7 @@ use core::{
     ops::Range,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
     Matcher, compress_fastest,
@@ -32,7 +32,9 @@ use super::{
         new_slice_state, reset_slice_state, return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
-    match_generator::{LdmArming, MatchGeneratorDriver},
+    match_generator::{
+        LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, ldm_head_parses,
+    },
     reach_probe,
 };
 use crate::{Level, common::MAX_BLOCK_SIZE};
@@ -155,6 +157,25 @@ pub fn compress_slice_mt(
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
+    // The mid-size prefix-LDM class (dll32-shaped frames): jobs borrow the
+    // whole clamped window as their strip, so every job's history is a
+    // frame prefix and the far class survives the job split exactly as on
+    // the frame-continuous path. The grid keeps the reach-based job size —
+    // the window would floor jobs at 32 MiB and starve parallelism — and
+    // the shared prefix fill bounds the per-job prefix fill's redundancy:
+    // one build to the median boundary, tail jobs above it adopt.
+    let spf = plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs);
+    let job_overlap = if spf.is_some() {
+        window as usize
+    } else {
+        overlap
+    };
+    let job_ldm = if spf.is_some() {
+        LdmArming::JobPrefix
+    } else {
+        LdmArming::Job
+    };
+
     #[cfg(feature = "hash")]
     let mut frame_hash = checksum.then(|| crate::xxh64::Xxh64::new(0));
 
@@ -189,6 +210,26 @@ pub fn compress_slice_mt(
                     }
                     let start = id * job_size;
                     let end = (start + job_size).min(src.len());
+                    // Adopters of the shared prefix fill wait for the
+                    // calling thread's build (it runs while the workers
+                    // encode the below-boundary jobs); a start the build's
+                    // freeze overshot keeps the stock whole-prefix fill.
+                    let snapshot = match spf.as_ref() {
+                        Some(plan) if start as u64 > plan.med => {
+                            match wait_prefix_build(plan, &ready, &poison) {
+                                Some((upto, snap)) => (start as u64 > upto).then_some(snap),
+                                None => {
+                                    // Poisoned while waiting: release the
+                                    // slot so the ordered assembly drains
+                                    // before the panic resumes.
+                                    *slots[id].lock().unwrap() = Some(Vec::new());
+                                    ready.notify_all();
+                                    break;
+                                },
+                            }
+                        },
+                        _ => None,
+                    };
                     // The first job starts where the decoder's repeated-offset
                     // history is still the format default [1, 4, 8]; the gate
                     // is job.start > 0 (applied inside the state preparation).
@@ -203,7 +244,7 @@ pub fn compress_slice_mt(
                                 &mut dstate,
                                 src,
                                 start..end,
-                                overlap,
+                                job_overlap,
                                 end == src.len(),
                                 reach_probe::PROBE_SPAN,
                                 prefix,
@@ -215,15 +256,19 @@ pub fn compress_slice_mt(
                         run_job(
                             src,
                             start..end,
-                            overlap,
+                            job_overlap,
                             end == src.len(),
                             level,
                             shape,
                             choice,
+                            job_ldm,
+                            snapshot.as_deref(),
                         )
                     }));
                     match attempt {
-                        Ok(bytes) => *slots[id].lock().unwrap() = Some(bytes),
+                        Ok(bytes) => {
+                            *slots[id].lock().unwrap() = Some(bytes);
+                        },
                         Err(payload) => {
                             *poison.lock().unwrap() = Some(payload);
                             // Release the slot so the ordered assembly below can
@@ -234,6 +279,20 @@ pub fn compress_slice_mt(
                     ready.notify_all();
                 }
             });
+        }
+
+        // Build the shared prefix fill on the calling thread while the
+        // workers encode: one sequential fill to the median boundary in
+        // place of the tail jobs' redundant whole-prefix fills.
+        if let Some(plan) = &spf {
+            #[cfg(feature = "job_trace")]
+            let trace_spf = std::time::Instant::now();
+            let build = build_prefix_snapshot(src, level, shape, plan.med)
+                .map(|(upto, snapshot)| PrefixBuild { upto, snapshot });
+            *plan.share.lock().unwrap() = build;
+            ready.notify_all();
+            #[cfg(feature = "job_trace")]
+            super::job_trace::add_prefill(trace_spf);
         }
 
         // The frame checksum is independent of the job split; hash it while
@@ -434,6 +493,122 @@ pub(crate) fn return_donation_probe(probe: alloc::boxed::Box<MatchGeneratorDrive
     donation_kit().lock().unwrap().1 = Some(probe);
 }
 
+/// The shared prefix fill's published build: the boundary the snapshot
+/// covers (an LDM batch-freeze point at or past the plan's median) and
+/// the snapshot itself, shared by every adopting tail job.
+struct PrefixBuild {
+    upto: u64,
+    snapshot: Arc<StripSnapshot>,
+}
+
+/// The bulk path's shared prefix fill plan (the mid-size prefix-LDM
+/// class): jobs starting above `med` wait for the calling thread's build
+/// and adopt its snapshot when their strip extends it, instead of filling
+/// their whole frame prefix from scratch.
+struct PrefixPlan {
+    med: u64,
+    share: Arc<Mutex<Option<PrefixBuild>>>,
+}
+
+/// Whether the bulk path runs a frame on prefix-strip LDM jobs (the
+/// dll32-class capture, see `compress_slice_mt`): the row/window/verdict
+/// class plus a head that both parses and carries a wide alphabet, and a
+/// job grid whose prefix strips are large enough to pay for the shared
+/// fill. Deterministic in the input, level and worker count alone.
+fn plan_prefix_ldm(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    job_size: usize,
+    n_jobs: usize,
+) -> Option<PrefixPlan> {
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice)?;
+    let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
+    if !ldm_head_parses(head) {
+        return None;
+    }
+    // Tail jobs whose window strip is a whole frame prefix: the source
+    // sits inside the clamped window in this class, but the bound stays
+    // explicit — a mid-stream strip keeps the stock fill either way.
+    let prefix_jobs: Vec<usize> = (1..n_jobs)
+        .filter(|&i| (i * job_size) as u64 <= window)
+        .collect();
+    let s_max = (*prefix_jobs.last()? * job_size) as u64;
+    if s_max < SPF_MIN_PREFIX {
+        return None;
+    }
+    // The median prefix boundary balances the sequential build against the
+    // adopters' parallel remainder fills (the same balance point the
+    // streaming core's finish tail picks).
+    let med = (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64;
+    Some(PrefixPlan {
+        med,
+        share: Arc::new(Mutex::new(None)),
+    })
+}
+
+/// Fill `[0, med)` once on the calling thread through a pooled state,
+/// segmented at LDM batch-freeze points (the only exactly-resumable
+/// boundaries — see `LdmState::fill_to_freeze`) and snapshotted at the
+/// first freeze at or past `med`. `None` when no freeze lands before the
+/// boundary: the tail jobs keep their stock whole-prefix fills.
+fn build_prefix_snapshot(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+    med: u64,
+) -> Option<(u64, Arc<StripSnapshot>)> {
+    let mut state = take_slice_state(
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        LdmArming::JobPrefix,
+    );
+    // The stock prefill's clears and LDM restart, then the fill itself in
+    // segments whose slack past `med` stays bounded — the loop cannot run
+    // the whole prefix hunting a freeze.
+    state.matcher.prefill_window(&[], 0);
+    let cap = ((med + SPF_SEG) as usize).min(src.len());
+    let mut upto = 0u64;
+    loop {
+        let soft = (upto + SPF_SEG).min(med);
+        let Some(freeze) = state.matcher.strip_fill_segment(&src[..cap], 0, upto, soft) else {
+            return_slice_state(state);
+            return None;
+        };
+        upto = freeze;
+        if upto >= med {
+            break;
+        }
+    }
+    let snapshot = Arc::new(state.matcher.snapshot_strip_fill(upto));
+    return_slice_state(state);
+    Some((upto, snapshot))
+}
+
+/// Block until the calling thread publishes the shared prefix fill's
+/// build (or a poisoned pool aborts the wait). Re-checks on every wake:
+/// the build publishes through the shared `ready` condvar the job
+/// completions already use. Lock order share→poison is one-sided, like
+/// the assembly's slot→poison.
+fn wait_prefix_build(
+    plan: &PrefixPlan,
+    ready: &Condvar,
+    poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+) -> Option<(u64, Arc<StripSnapshot>)> {
+    let mut guard = plan.share.lock().unwrap();
+    loop {
+        if let Some(build) = guard.as_ref() {
+            return Some((build.upto, Arc::clone(&build.snapshot)));
+        }
+        if poison.lock().unwrap().is_some() {
+            return None;
+        }
+        guard = ready.wait(guard).unwrap();
+    }
+}
+
 /// Reset a state for a job and apply the job-start gates: fresh entropy
 /// tables, the repcode gate and ramp arm unless the job starts the frame
 /// (the decoder's repeated-offset history is the format default only
@@ -445,9 +620,10 @@ pub(crate) fn prepare_job_state(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
     job_start: u64,
 ) {
-    reset_slice_state(state, level, shape, choice, LdmArming::Job);
+    reset_slice_state(state, level, shape, choice, ldm);
     if job_start > 0 {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -462,7 +638,9 @@ pub(crate) fn prepare_job_state(
 /// (the decoder's repeated-offset history is the format default only there).
 /// `shape` is the whole frame's declared shape (length known for bulk,
 /// pledge or none for streaming; jobs share it so tables and the header
-/// window agree).
+/// window agree). `ldm` is the job's LDM arming context; `spf` the shared
+/// prefix fill's snapshot when the job adopts one instead of filling its
+/// strip from scratch (see `StripSnapshot`).
 pub(crate) fn run_job_with(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -472,13 +650,30 @@ pub(crate) fn run_job_with(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
+    spf: Option<&StripSnapshot>,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
-    prepare_job_state(state, level, shape, choice, job.start as u64);
+    prepare_job_state(state, level, shape, choice, ldm, job.start as u64);
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
-    compress_job_blocks(state, src, job, overlap, is_last_job)
+    match spf {
+        Some(snap) => {
+            let start = job.start;
+            compress_job_blocks_inner(
+                state,
+                src,
+                job,
+                overlap,
+                is_last_job,
+                start,
+                Vec::new(),
+                Some(snap),
+            )
+        },
+        None => compress_job_blocks(state, src, job, overlap, is_last_job),
+    }
 }
 
 /// Compress one job on the calling (worker) thread through the per-thread
@@ -492,8 +687,10 @@ pub(crate) fn run_job(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
+    spf: Option<&StripSnapshot>,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level, shape, choice, LdmArming::Job);
+    let mut state = take_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
         &mut state,
         src,
@@ -503,6 +700,8 @@ pub(crate) fn run_job(
         level,
         shape,
         choice,
+        ldm,
+        spf,
     );
     return_slice_state(state);
     output
@@ -642,6 +841,85 @@ mod tests {
                 st.len()
             );
         }
+    }
+
+    /// The mid-size prefix-LDM class (dll32-shaped frames): jobs borrow the
+    /// whole clamped window as their strip, so repeats beyond the chain
+    /// reach survive the job split — the multithreaded ratio stays near the
+    /// frame-continuous one instead of dropping the far class. The corpus
+    /// tiles four mutated copies of one 5 MiB unit, so its redundancy sits
+    /// at 5 MiB periods: beyond the row's W22 reach, exactly LDM's class.
+    #[test]
+    fn mt_midsize_prefix_ldm_keeps_far_repeats() {
+        let unit_len = 5 * 1024 * 1024;
+        let mut unit = lcg(unit_len);
+        // A code-like 256 KiB head — instructions drawn from a 96-pattern
+        // pool: wide alphabet (the engagement screen's bar) and repeated
+        // 8-byte windows (its parse evidence), aperiodic so the probe's
+        // keep parse pays no periodic-bucket walks. The head re-copies 1
+        // MiB into the unit (a repeat only the stock reach finds), and
+        // the unit-to-unit copies below sit at 5 MiB periods — beyond the
+        // chain reach, exactly LDM's class.
+        let head_len = 256 * 1024;
+        let mut patterns = alloc::vec::Vec::with_capacity(96);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = alloc::vec::Vec::with_capacity(head_len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        unit[..head_len].copy_from_slice(&head);
+        unit[1024 * 1024..1024 * 1024 + head_len].copy_from_slice(&head);
+        let mut data = Vec::with_capacity(4 * unit_len);
+        for copy in 0..4u32 {
+            for (i, &b) in unit.iter().enumerate() {
+                // One flipped byte per 4 KiB keeps the copies' 64-byte
+                // windows intact while no copy is exact.
+                data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None);
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&mt4, &mut out)
+            .unwrap_or_else(|e| panic!("midsize decode: {e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(mt4.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+        // Same job grid at this size, so the worker count cannot show in
+        // the bytes; and repeated runs are identical by construction.
+        if mt4 != mt8 {
+            let at = mt4.iter().zip(mt8.iter()).position(|(a, b)| a != b);
+            panic!(
+                "mt4 {} mt8 {} st {} first-diff {at:?}",
+                mt4.len(),
+                mt8.len(),
+                st.len()
+            );
+        }
+        assert_eq!(
+            mt4,
+            compress_slice_mt(&data, Level::Balanced, true, 4, None)
+        );
+        assert!(
+            mt4.len() <= st.len() + st.len() / 50,
+            "the far class must survive the job split: mt {} vs st {}",
+            mt4.len(),
+            st.len()
+        );
     }
 
     /// Inputs below the engagement threshold must fall back to the
