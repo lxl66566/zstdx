@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: pledged stream-mt frames in the mid-size LDM class (chain row,
+  Keep verdict, clamped window in [32, 64) MiB, wide-alphabet head) now
+  re-grid at the reach verdict onto the bulk capture's schedule:
+  reach-based job size (the whole-window stream strip had floored such
+  frames at a single job), whole-prefix strips and JobPrefix arming.
+  The clamped window sits below the Job bar, so the far class previously
+  disarmed and the pledged stream paid a chain-only parse where bulk-mt
+  captures it - dll32 pledged stream-mt 5,460,884 -> 4,390,255,
+  byte-identical to bulk-mt (mt4 == mt8), restoring the pledged-equals-
+  bulk contract on the class. The unpledged path keeps its unclamped
+  full-window semantics, which dominate bulk-mt at every dll scale
+  (dll16 2,929,187 vs 2,937,032; dll100 20,869,254 vs 23,459,589) -
+  the todo-11 "engage the mid-size clamp there" question is closed as
+  no. Gates: 120-cell ratio sweep and full-ladder dump byte-identical
+  to the prior build; new regression test
+  `pledged_midsize_capture_matches_bulk`.
+
 
 - Encoder: dictionary content now prefill-indexes under its own grid
   instead of the MT strip's geometry (`FillGrid` in
@@ -22,7 +39,6 @@ This document records the changes made between versions, starting with version 0
   +0.3-0.5% (was +3.2-4.1%), -3 unchanged at parity. No-dict output
   untouched: full-ladder dump and 120-cell ratio sweep
   byte-identical; dict cells roundtrip through both decoders.
-||||||| 42828b9c
 - Encoder: the package-merge huffman build runs on fixed-capacity array
   stacks pooled in HuffScratch (structural bounds, unchecked hot-loop
   indexing, register-carried lengths) instead of seven working Vecs - the
