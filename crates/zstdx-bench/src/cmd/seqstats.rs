@@ -691,13 +691,24 @@ pub fn run(args: &Args) {
         // offline inspection.
         let dump_lits = |name: &str, t: &[(u32, u32, u32)]| {
             let mut v = Vec::with_capacity(raw.len());
+            let mut quads = Vec::with_capacity(t.len() * 4);
             let mut p = 0usize;
-            for &(ll, ml, _) in t {
+            for &(ll, ml, of) in t {
                 v.extend_from_slice(&raw[p..p + ll as usize]);
+                quads.extend_from_slice(&[p as u32, ll, ml, of]);
                 p += ll as usize + ml as usize;
             }
             v.extend_from_slice(&raw[p..]);
             fs::write(format!("target/lit_{name}.bin"), &v).unwrap();
+            // Positioned parse (start, ll, ml, of-wire) for offline banding.
+            fs::write(
+                format!("target/triples_{name}.bin"),
+                quads
+                    .iter()
+                    .flat_map(|q| q.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         };
         dump_lits("ours", &rec.triples);
         dump_lits("ref", &ref_triples);
