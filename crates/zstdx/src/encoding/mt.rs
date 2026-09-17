@@ -248,6 +248,15 @@ pub fn compress_slice_mt(
         for slot in &slots {
             let mut guard = slot.lock().unwrap();
             while guard.is_none() {
+                // A poisoned pool retires its workers with jobs unclaimed —
+                // those slots would never fill. Empty them so the assembly
+                // completes and the panic resumes below instead of
+                // deadlocking this wait. (Lock order slot→poison is
+                // one-sided: workers take them sequentially, never nested.)
+                if poison.lock().unwrap().is_some() {
+                    *guard = Some(Vec::new());
+                    break;
+                }
                 guard = ready.wait(guard).unwrap();
             }
             let bytes = guard.take().unwrap();

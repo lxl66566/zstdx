@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: fixed a P0 where unpledged row-9 (balanced) stream-mt frames past
+  the 32 MiB corpus scale were deterministically corrupt, and the same
+  trigger deadlocked bulk-mt. The job-start seed and LDM probes compared
+  candidates against a stale scan index after the repcode probe advanced the
+  position — an offset of exactly one probed the position against itself and
+  the store gate priced the zero offset with ilog2(0), panicking the worker.
+  The stream encoder's drain assembled the aborted jobs empty and shipped the
+  frame (decoded short by whole jobs); the bulk pool's workers all exited on
+  poison and the ordered assembly waited forever on unclaimed slots. The
+  probes now take strictly-older candidates only (byte-neutral: full-ladder
+  dump and 5 shapes x 6 tiers stream-mt8 emitframe plus mt2/mt4/bulk-mt8
+  byte-identical against the prior build), the drain surfaces the poison, and
+  the bulk assembly resumes the panic instead of hanging. Regression test
+  `strip_tail_period_run_roundtrips`.
 - Encoder: the unpledged row-9 stream's finish tail now shares one prefix
   fill — output byte-identical everywhere (full-ladder dump, 120-cell sweep,
   emitframe stream gates incl. a 96 MiB probe), text.balanced stream-mt8
