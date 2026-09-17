@@ -69,6 +69,23 @@ const PREFILL_STRIDE: usize = 3;
 /// Fast only: dfast's long table is 2^17 (a 2 MiB strip barely reaches one
 /// horizon), and chain links make the whole strip walkable.
 const PREFILL_RETAIN_HORIZONS: usize = 2;
+/// Which fill geometry a history window is indexed under.
+#[derive(Clone, Copy, PartialEq)]
+enum FillGrid {
+    /// The multithreaded job strip's tuned sparse grid ([`PREFILL_STRIDE`],
+    /// Fast's retention-tail cap): a strip is as long as the window, so a
+    /// dense fill would rival the job's own scan cost while mid-distance
+    /// coverage survives the grid.
+    Strip,
+    /// The dictionary load, mirroring libzstd's `ZSTD_loadDictionaryContent`
+    /// as the CLI's CDict-attach route fills it (`ZSTD_dtlm_full`): the
+    /// payload is parsed mostly against the dictionary, where candidate
+    /// coverage dominates, and the content is at most one window long —
+    /// fast/dfast take the stride grid plus every skipped position whose
+    /// slot is still empty, chain takes every position densely, and the
+    /// tree rows keep the lazy whole-content fill.
+    Dictionary,
+}
 /// Backward bytes that must agree (beyond the 8-byte anchor) before a strip
 /// position becomes the job-start seed offset: long enough that word-level
 /// repeats (~10-15 agreeing bytes on natural text) cannot qualify, short
@@ -1081,6 +1098,44 @@ fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64, log: u32) {
     // 1 << log slots, so the index cannot leave it.
     unsafe {
         *table.get_unchecked_mut(hash_at_log(win, idx, log)) = pack_pos(abs);
+    }
+}
+
+/// Dictionary-load backfill of one stride group's skipped positions (the
+/// `[1, PREFILL_STRIDE)` offsets after `idx`): a position claims its slot
+/// only while the slot is still empty, so the stride grid's newest-wins
+/// inserts are untouched and the oldest twin of an otherwise-idle slot
+/// survives (libzstd's `ZSTD_dtlm_full` fill). 5-byte hash variant.
+fn backfill_empty(table: &mut [u32], win: &[u8], base: u64, idx: usize, log: u32, last: usize) {
+    // SAFETY: same indexing contract as insert_at; the slot check reads
+    // before the write, both inside the table.
+    unsafe {
+        for p in 1..PREFILL_STRIDE {
+            let q = idx + p;
+            if q < last {
+                let h = hash_at_log(win, q, log);
+                if *table.get_unchecked(h) == 0 {
+                    *table.get_unchecked_mut(h) = pack_pos(base + q as u64);
+                }
+            }
+        }
+    }
+}
+
+/// [`backfill_empty`]'s 8-byte hash variant (the dfast long table).
+fn backfill8_empty(table: &mut [u32], win: &[u8], base: u64, idx: usize, log: u32, last: usize) {
+    // SAFETY: same indexing contract as insert_at; the slot check reads
+    // before the write, both inside the table.
+    unsafe {
+        for p in 1..PREFILL_STRIDE {
+            let q = idx + p;
+            if q < last {
+                let h = hash8_at_log(win, q, log);
+                if *table.get_unchecked(h) == 0 {
+                    *table.get_unchecked_mut(h) = pack_pos(base + q as u64);
+                }
+            }
+        }
     }
 }
 
@@ -2288,9 +2343,10 @@ impl MatchGeneratorDriver {
     /// data starts at `n`. `rep` is the dictionary's repeated-offset
     /// history (already validated against the content length by the
     /// caller). Content beyond the level's window is unreachable and
-    /// dropped. The prefill indexes the surviving content exactly like a
-    /// multithreaded job strip (grid fill, seed detection included), so
-    /// matches into the dictionary cost nothing extra at scan time.
+    /// dropped. The prefill indexes the surviving content under the
+    /// dictionary grid (see [`FillGrid::Dictionary`]; seed detection
+    /// included), so matches into the dictionary cost nothing extra at
+    /// scan time.
     pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
         debug_assert!(self.ext.is_none() && self.win.is_empty() && self.pos == 0);
         let keep = content.len().min(self.params.window);
@@ -2304,9 +2360,21 @@ impl MatchGeneratorDriver {
         self.block_end = keep as u64;
         self.rep = rep;
         self.rep_pending = 0;
+        // The chain walk's candidate budget mirrors libzstd's dict-side
+        // search: its per-position attempt count is `1 << searchLog`, which
+        // the no-dict tuning table halves for speed (big payloads never
+        // notice — measured at parity there), while a dictionary parse
+        // walks a long, densely filled dict chain and the extra candidates
+        // convert. Dict frames are not a hot path; no-dict params stay put.
+        if matches!(self.params.strategy, Strategy::Chain(_)) {
+            self.params.search_depth *= 2;
+        }
         // The owned window is filled above; prefill over the caller's slice
-        // avoids the self-borrow (identical bytes).
-        self.prefill_window(content, 0);
+        // avoids the self-borrow (identical bytes). The dictionary grid:
+        // libzstd fills dictionary content more densely than an mt strip
+        // (see FillGrid::Dictionary) — small payloads parse against this
+        // window, so candidate coverage dominates.
+        self.fill_window_grid(content, 0, FillGrid::Dictionary);
     }
 
     /// Declare `[start, end)` (absolute offsets inside the adopted window)
@@ -2575,6 +2643,13 @@ impl MatchGeneratorDriver {
     }
 
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
+        self.fill_window_grid(data, base, FillGrid::Strip);
+    }
+
+    /// Index a history window into the search tables under one of the two
+    /// fill geometries (see [`FillGrid`]): the shared prologue and strategy
+    /// dispatch of [`Self::prefill_window`] and the dictionary load.
+    fn fill_window_grid(&mut self, data: &[u8], base: u64, grid: FillGrid) {
         // The head applies only to a genuinely cold start: a non-empty
         // strip (mt jobs with history, dictionary content) is warm, while
         // the empty strip is mt job zero — a frame start, so the head
@@ -2639,17 +2714,35 @@ impl MatchGeneratorDriver {
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
-                // twin is unreachable (see PREFILL_STRIDE). Only the strip's
-                // retention tail is inserted (PREFILL_RETAIN_HORIZONS); the
-                // seed scan below still sees the whole strip, so period-long
-                // repeats keep their reach.
+                // twin is unreachable (see PREFILL_STRIDE).
                 let table = &mut self.table[..];
                 let log = self.params.hash_log;
-                let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
-                let mut idx = last.saturating_sub(retain);
-                while idx < last {
-                    insert_at(data, table, idx, base + idx as u64, log);
-                    idx += PREFILL_STRIDE;
+                match grid {
+                    FillGrid::Strip => {
+                        // Only the strip's retention tail is inserted
+                        // (PREFILL_RETAIN_HORIZONS); the seed scan below
+                        // still sees the whole strip, so period-long repeats
+                        // keep their reach.
+                        let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
+                        let mut idx = last.saturating_sub(retain);
+                        while idx < last {
+                            insert_at(data, table, idx, base + idx as u64, log);
+                            idx += PREFILL_STRIDE;
+                        }
+                    },
+                    FillGrid::Dictionary => {
+                        // Whole content on the stride grid, then every
+                        // skipped position whose slot is still empty claims
+                        // it (libzstd's dtlm_full backfill): the oldest
+                        // twin of a collision survives, where the strip's
+                        // retention cap would drop dictionary-head entries.
+                        let mut idx = 0;
+                        while idx < last {
+                            insert_at(data, table, idx, base + idx as u64, log);
+                            backfill_empty(table, data, base, idx, log, last);
+                            idx += PREFILL_STRIDE;
+                        }
+                    },
                 }
                 self.acquire_seed(data, last);
             },
@@ -2665,6 +2758,12 @@ impl MatchGeneratorDriver {
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_log(data, idx, small_log)) = entry;
                     }
+                    if grid == FillGrid::Dictionary {
+                        // The long table takes the empty-slot backfill
+                        // (libzstd's fillDoubleHashTableForCDict); the
+                        // small one stays on the stride grid.
+                        backfill8_empty(long, data, base, idx, long_log, last);
+                    }
                     idx += PREFILL_STRIDE;
                 }
                 // The double table is as burial-prone as the fast one for
@@ -2676,6 +2775,18 @@ impl MatchGeneratorDriver {
                 let chain_mask = self.chain.len() - 1;
                 let table = &mut self.table[..];
                 let chain = &mut self.chain[..];
+                // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
+                // strip cannot afford a dense fill). Dictionary: every
+                // position, oldest-to-newest, linked — libzstd's dict load
+                // (`ZSTD_insertAndFindFirstIndex`) indexes the whole content
+                // this way, and a small payload's parse rides the chain
+                // walk, where a stride grid leaves two thirds of the
+                // dictionary unreachable as candidates.
+                let stride = if grid == FillGrid::Strip {
+                    PREFILL_STRIDE
+                } else {
+                    1
+                };
                 let mut idx = 0;
                 while idx < last {
                     let abs = base + idx as u64;
@@ -2688,11 +2799,15 @@ impl MatchGeneratorDriver {
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
                         *table.get_unchecked_mut(h) = pack_pos(abs);
                     }
-                    idx += PREFILL_STRIDE;
+                    idx += stride;
                 }
                 // The head table's first hop is as burial-prone as the fast
                 // strategy's single probe; seed the walk-independent path.
-                self.acquire_seed(data, last);
+                // (The dictionary grid's dense links make every position a
+                // walkable candidate, so the seed is strip-only there.)
+                if grid == FillGrid::Strip {
+                    self.acquire_seed(data, last);
+                }
             },
         }
     }
