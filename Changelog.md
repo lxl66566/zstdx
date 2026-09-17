@@ -4,6 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: dictionary-seeded literal blocks no longer pay a fresh-table
+  description in the incompressibility gates — both literal gates drop
+  their flat description term while the frame's huffman table still
+  carries dictionary statistics (`DictEntropy`), so small-literals blocks
+  treeless-compress against the dict table instead of raw-ing out
+  (libzstd's repeat path carries no description term either). 54-file
+  systemd fixture, summed bytes vs the zstd CLI with formatted dicts:
+  -3 +0.1 -> -1.2% (ahead of the CLI), -1 +2.0 -> +0.6%, -2 +2.6 ->
+  +1.2%, -5 +2.7 -> +0.3%, -9 -0.0 -> -2.4%; raw-content and no-dict
+  output unchanged (byte-identical full-ladder dump + 120-cell sweep;
+  dict cells roundtrip through both decoders at levels 1-12).
 - Encoder: dictionary frames on the chain rows (levels 5-12) now switch to
   libzstd's lazy-family dict semantics: a 4-byte chain-hash width
   (`ChainHashWidth`), accept bar `min_match` 4, the offset-pays gate

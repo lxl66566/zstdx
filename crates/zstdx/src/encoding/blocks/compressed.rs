@@ -189,7 +189,10 @@ pub(crate) fn encode_staged_block<M: Matcher>(
     // the certain outcome. Signalling it here skips the encode-and-discard
     // writes (the block bytes are then copied and hashed exactly once, in
     // the raw writer).
-    if zero_seq && literals.len() > 1024 && sampled_gate_rejects(literals, literals_gate_hold) {
+    if zero_seq
+        && literals.len() > 1024
+        && sampled_gate_rejects(literals, literals_gate_hold, dict_entropy.huff)
+    {
         return BlockOutcome::Raw;
     }
 
@@ -1027,7 +1030,7 @@ unsafe fn histogram_small_alpha_avx512(
 /// can encode larger than before. Passing sets `gate_hold` so the next
 /// block skips the sample; rejecting leaves it, exactly like the inline
 /// path did.
-fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
+fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool, dict_seeded: bool) -> bool {
     if !*gate_hold {
         let total = literals.len();
         if total >= 8192 {
@@ -1060,7 +1063,17 @@ fn sampled_gate_rejects(literals: &[u8], gate_hold: &mut bool) -> bool {
                 // +256B/+8% wrongly raw-ed compressible small-literal
                 // blocks; sub-4KiB json paid a constant ~35% size tax
                 // against libzstd).
-                if bits_per_byte + 160.0 / total as f64 + 0.02 + 0.12 >= 8.0 {
+                // A dictionary-seeded stream's candidate is treeless: no
+                // table description rides in front of it, so the flat
+                // description weight drops out of the reject floor
+                // (libzstd has no such pre-gate there — it compresses with
+                // the old table and compares exact sizes).
+                let description = if dict_seeded {
+                    0.0
+                } else {
+                    160.0
+                };
+                if bits_per_byte + description / total as f64 + 0.02 + 0.12 >= 8.0 {
                     return true;
                 }
             }
@@ -1096,7 +1109,7 @@ fn compress_literals(
 ) -> LitOutcome {
     let reset_idx = writer.index();
 
-    if sampled_gate_rejects(literals, gate_hold) {
+    if sampled_gate_rejects(literals, gate_hold, dict_seeded) {
         raw_literals(literals, writer);
         return LitOutcome::Raw;
     }
@@ -1119,7 +1132,18 @@ fn compress_literals(
                 entropy_bits -= c as f64 * entropy_log2(c as f64 / total);
             }
         }
-        if entropy_bits + 160.0 + total * 0.02 >= total * 8.0 {
+        // The flat description weight only prices a fresh table; with a
+        // dictionary-seeded table the leading candidate is treeless (no
+        // description on the wire), and the treeless-vs-fresh comparison
+        // below plus the encoded-vs-raw size check bound the cost of
+        // trying. Charging the description anyway rejected every small
+        // literals block on dict frames (libzstd treeless-compressed them).
+        let description = if dict_seeded {
+            0.0
+        } else {
+            160.0
+        };
+        if entropy_bits + description + total * 0.02 >= total * 8.0 {
             raw_literals(literals, writer);
             return LitOutcome::Raw;
         }
