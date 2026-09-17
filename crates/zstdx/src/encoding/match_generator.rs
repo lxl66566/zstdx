@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use super::{
     Matcher, SeqWord, Sequence,
-    btlazy::LazyScratch,
+    btlazy::{LazyScratch, LazyStep},
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
     reach_probe::{KEEP_REACH, ProbeStats, ReachChoice, SHRINK_REACH},
@@ -606,6 +606,31 @@ enum HeadPhase {
     Running,
     /// The head parsed its span and handed off to the chain.
     Done,
+}
+
+/// Span of the frame head the btlazy2 rows parse at libzstd's exact
+/// probe step ([`LazyStep::Dense`]): text.best's measured deficit sat
+/// entirely inside the first 448 KiB (4 blocks covers it with margin),
+/// and beyond it the steady ramp's skipping is the measured win on
+/// json/skewed-class shapes.
+const BT_DENSE_LIMIT: u64 = 4 * crate::common::MAX_BLOCK_SIZE as u64;
+
+/// Lifecycle of the btlazy2 rows' cold-head probe step (the Best tier's
+/// counterpart of [`HeadPhase`], which stays row-9-specific): the frame's
+/// first searching block inside [`BT_DENSE_LIMIT`] evaluates the
+/// [`HEAD_SYMS_MIN`] alphabet gate — json-class heads (39 symbols) and
+/// low alphabets keep the steady ramp, so their bytes stay identical —
+/// then the head blocks parse dense until the limit. Strip- or
+/// dictionary-warm starts never arm (a prefilled job is not a cold
+/// head), matching the row-9 head's arming rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BtStepPhase {
+    /// Waiting for the frame's first searching block.
+    Armed,
+    /// Gate passed; head blocks parse at libzstd's probe step.
+    Dense,
+    /// Gate failed, scope exhausted, or a warm start: steady ramp.
+    Off,
 }
 
 const fn knobs(
@@ -1792,6 +1817,9 @@ pub struct MatchGeneratorDriver {
     ldm_arming: LdmArming,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
+    /// Cold-head probe-step phase for the btlazy2 rows (see
+    /// [`BtStepPhase`]).
+    bt_step: BtStepPhase,
     /// Live reach-probe accumulator while a donating entry point runs the
     /// frame's own keep-side blocks as the probe's keep measurement (see
     /// [`super::reach_probe`]); `None` on every other path, so the
@@ -2095,6 +2123,7 @@ impl MatchGeneratorDriver {
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
+            bt_step: BtStepPhase::Off,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -2151,6 +2180,7 @@ impl MatchGeneratorDriver {
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
+            bt_step: BtStepPhase::Off,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -2548,6 +2578,7 @@ impl MatchGeneratorDriver {
         debug_assert_eq!(self.chain.len(), snap.chain.len());
         debug_assert!(snap.upto <= base + data.len() as u64);
         self.dubt_head = HeadPhase::Off;
+        self.bt_step = BtStepPhase::Off;
         self.table.clone_from(&snap.table);
         self.chain.clone_from(&snap.chain);
         self.gap_start = u64::MAX;
@@ -2658,6 +2689,14 @@ impl MatchGeneratorDriver {
             HeadPhase::Armed
         } else {
             HeadPhase::Off
+        };
+        // The same cold-start rule for the btlazy2 rows' probe step: the
+        // empty strip is a genuine frame start (mt job zero, or reset),
+        // anything prefilled is warm.
+        self.bt_step = if data.is_empty() && matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            BtStepPhase::Armed
+        } else {
+            BtStepPhase::Off
         };
         clear_table(&mut self.table);
         // The DUBT finder's entries carry no epoch tag, so a job restarts
@@ -3065,6 +3104,11 @@ impl Matcher for MatchGeneratorDriver {
         self.anchor = 0;
         self.block_start = 0;
         self.dubt_stale = matches!(self.params.strategy, Strategy::BtLazy(_));
+        self.bt_step = if matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            BtStepPhase::Armed
+        } else {
+            BtStepPhase::Off
+        };
         self.miss_count = 0;
         self.covered_fill = CoveredFill::Dense;
         self.scan_density = ScanDensity::Plain;
@@ -3209,7 +3253,7 @@ impl Matcher for MatchGeneratorDriver {
             // a pooled state mid-frame) and its blocks never count quiet.
             self.ldm_fill_block(LdmFill::Head);
             self.ldm_seqs.clear();
-            self.start_matching_btlazy(HEAD_KNOBS, literals, seqs);
+            self.start_matching_btlazy(HEAD_KNOBS, literals, seqs, LazyStep::Ramp);
             self.finish_head();
             self.absorb_probe_stats(literals, seqs);
             return;
@@ -3310,9 +3354,10 @@ impl Matcher for MatchGeneratorDriver {
                     self.dubt_bt.fill(0);
                     self.dubt_stale = false;
                 }
+                let step = self.bt_lazy_step();
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
-                let won = self.start_matching_btlazy(knobs, literals, seqs);
+                let won = self.start_matching_btlazy(knobs, literals, seqs, step);
                 self.ldm_note_block(won);
             },
         }
@@ -5171,6 +5216,37 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Cold-head probe-step dispatch for the btlazy2 rows ([`BtStepPhase`]):
+    /// evaluate the alphabet gate at the frame's first searching block
+    /// inside the dense span, keep head blocks dense, resume the steady
+    /// ramp past it. Gated and RLE-skipped blocks never reach this, so
+    /// `Armed` survives to the first block that actually parses.
+    fn bt_lazy_step(&mut self) -> LazyStep {
+        if self.block_start >= BT_DENSE_LIMIT {
+            self.bt_step = BtStepPhase::Off;
+            return LazyStep::Ramp;
+        }
+        if self.bt_step == BtStepPhase::Armed {
+            let win = window_slice(&self.win, self.ext.as_ref());
+            let idx = self.idx_of(self.block_start);
+            let mut seen = [0u64; 4];
+            for &b in &win[idx..(idx + 8192).min(win.len())] {
+                seen[(b >> 6) as usize] |= 1 << (b & 63);
+            }
+            let syms: u32 = seen.iter().map(|w| w.count_ones()).sum();
+            self.bt_step = if syms >= HEAD_SYMS_MIN {
+                BtStepPhase::Dense
+            } else {
+                BtStepPhase::Off
+            };
+        }
+        if self.bt_step == BtStepPhase::Dense {
+            LazyStep::Dense
+        } else {
+            LazyStep::Ramp
+        }
+    }
+
     /// Bridge into the btlazy2 parser (rows 13-15): the same tables and
     /// cursors as the opt bridge, no price state. The search domain is the
     /// `chain_reach` override (the stock row window; the frame window may
@@ -5180,6 +5256,7 @@ impl MatchGeneratorDriver {
         knobs: OptKnobs,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
+        step: LazyStep,
     ) -> bool {
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut rep = self.rep;
@@ -5193,6 +5270,7 @@ impl MatchGeneratorDriver {
         // Disjoint field borrows: the window (win/ext) against the tables.
         let ldm_won = super::btlazy::run_block_lazy(
             &knobs,
+            step,
             win,
             self.win_base,
             self.block_start,
