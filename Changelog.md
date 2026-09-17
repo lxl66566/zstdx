@@ -22,7 +22,6 @@ This document records the changes made between versions, starting with version 0
   +0.3-0.5% (was +3.2-4.1%), -3 unchanged at parity. No-dict output
   untouched: full-ladder dump and 120-cell ratio sweep
   byte-identical; dict cells roundtrip through both decoders.
-||||||| 42828b9c
 - Encoder: the package-merge huffman build runs on fixed-capacity array
   stacks pooled in HuffScratch (structural bounds, unchecked hot-loop
   indexing, register-carried lengths) instead of seven working Vecs - the
