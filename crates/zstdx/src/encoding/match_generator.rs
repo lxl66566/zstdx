@@ -3678,7 +3678,11 @@ impl MatchGeneratorDriver {
                     // without further seed help.
                     if $gated && seed_offset != 0 {
                     let ci = (pos - seed_offset as u64 - win_base) as usize;
-                    if read4(win, ci) == cur0 {
+                    // Strictly older than the probed position: the rep
+                    // probe's pos-advance can otherwise cancel a seed
+                    // offset of one into a zero-offset self-compare (the
+                    // pays gate's ilog2(0)).
+                    if ci < idx0 && read4(win, ci) == cur0 {
                         let mut ml = extend_match(win, idx0, ci);
                         // Same bar as the hash path: below 6 the sequence
                         // overhead eats the match, and the offset-gain gate
@@ -4094,7 +4098,11 @@ impl MatchGeneratorDriver {
                 // Mirrors the fast loop's twin block.
                 if $gated && seed_offset != 0 {
                     let ci = (pos_abs - seed_offset as u64 - win_base) as usize;
-                    if read4(win, ci) == read4(win, ip_idx) {
+                    // Strictly older than the probed position: the rep
+                    // probe's pos-advance can otherwise cancel a seed
+                    // offset of one into a zero-offset self-compare (the
+                    // pays gate's ilog2(0)).
+                    if ci < ip_idx && read4(win, ci) == read4(win, ip_idx) {
                         let mut ml = extend_match(win, ip_idx, ci);
                         if ml >= 6
                             && pays_for_offset(ml, ip_idx, ci, false)
@@ -4418,9 +4426,15 @@ impl MatchGeneratorDriver {
                     let seq = ldm_seqs[ldm_i];
                     ldm_i += 1;
                     let cand_abs = pos - seq.offset as u64;
+                    // The rep probe above may have advanced `pos` past this
+                    // iteration's `idx`; an offset equal to that advance
+                    // (offset 1) then resolves the candidate to `idx`
+                    // itself — a self-compare whose zero offset the store
+                    // gate below prices (ilog2(0)). Candidates must be
+                    // strictly older than the probed position.
                     if cand_abs >= win_base {
                         let ci = (cand_abs - win_base) as usize;
-                        if read4(win, ci) == read4(win, idx) {
+                        if ci < idx && read4(win, ci) == read4(win, idx) {
                             let ml = extend_match(win, idx, ci);
                             if ml > best_len {
                                 best_len = ml;
@@ -4473,7 +4487,13 @@ impl MatchGeneratorDriver {
             let mut seed_hit = false;
             if $gated && seed_offset != 0 {
                 let ci = (pos - seed_offset as u64 - win_base) as usize;
-                if read4(win, ci) == read4(win, idx) {
+                // The rep probe may have advanced `pos` one byte past this
+                // iteration's `idx`; a seed offset of exactly one then
+                // resolves the candidate to `idx` itself — a self-compare
+                // whose zero offset the store gate below prices
+                // (ilog2(0)). The seed's twin must be strictly older than
+                // the probed position.
+                if ci < idx && read4(win, ci) == read4(win, idx) {
                     let ml = extend_match(win, idx, ci);
                     if ml >= 6 && ml + 3 > best_len && !ramp.blocks(pos, win_base + ci as u64) {
                         best_len = ml;

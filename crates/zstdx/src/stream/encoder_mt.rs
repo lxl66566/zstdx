@@ -1665,6 +1665,11 @@ impl MtEncoderCore {
         loop {
             self.assemble_ready();
             if self.pending.is_empty() {
+                // Aborted jobs (a poisoned worker) assemble as empty and
+                // drain like any completion — surfacing only on the
+                // quiescent-with-pending branch below would swallow the
+                // panic and ship a frame missing the poisoned jobs' bytes.
+                self.surface_poison();
                 return;
             }
             if self.quiescent() {
