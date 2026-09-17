@@ -4,6 +4,23 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: dictionary content now prefill-indexes under its own grid
+  instead of the MT strip's geometry (`FillGrid` in
+  `match_generator`): fast/dfast take the stride grid plus
+  libzstd's `dtlm_full` empty-slot backfill over the whole content,
+  chain inserts every position with links (libzstd's
+  `ZSTD_insertAndFindFirstIndex` dict load), the tree rows keep the
+  lazy whole-content fill, and dict frames walk the chain at
+  libzstd's full `1 << searchLog` attempt count (the base table
+  halves it as a no-dict speed tuning). Small payloads parse mostly
+  against dictionary history, where candidate coverage dominates:
+  on the 54-file systemd holdout (0.5-4 KiB, per-file frames,
+  summed bytes vs the zstd CLI), -9 with our formatted dict is now
+  -0.0% (was +3.7%), with libzstd's formatted dict -2.0% (was
+  +1.2%), raw-content controls +1.9-2.1% (was +5.5-5.9%), -1 raw
+  +0.3-0.5% (was +3.2-4.1%), -3 unchanged at parity. No-dict output
+  untouched: full-ladder dump and 120-cell ratio sweep
+  byte-identical; dict cells roundtrip through both decoders.
 - Encoder: fixed a P0 where unpledged row-9 (balanced) stream-mt frames past
   the 32 MiB corpus scale were deterministically corrupt, and the same
   trigger deadlocked bulk-mt. The job-start seed and LDM probes compared
