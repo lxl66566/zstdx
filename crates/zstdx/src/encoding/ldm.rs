@@ -361,10 +361,13 @@ fn gear4_asm(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
             t2 = out(reg) t2,
             t3 = out(reg) t3,
             t4 = out(reg) t4,
-            c1 = lateout(reg) c1,
-            c2 = lateout(reg) c2,
-            c3 = lateout(reg) c3,
-            c4 = lateout(reg) c4,
+            // early (not late) outs: the template reads `h` after writing
+            // `c1`/`c2`, so a lateout sharing `h`'s register would corrupt
+            // `c3`/`c4` (lateouts may alias inputs by contract).
+            c1 = out(reg) c1,
+            c2 = out(reg) c2,
+            c3 = out(reg) c3,
+            c4 = out(reg) c4,
             options(nostack, att_syntax)
         );
     }
@@ -1114,6 +1117,31 @@ mod tests {
         data.extend_from_slice(&block);
         data.extend_from_slice(&block);
         assert!(!collect_and_verify(&data, data.len(), 17).is_empty());
+    }
+
+    #[test]
+    fn gear_feed_records_serial_splits() {
+        // The asm `gear4` is only bit-identical to the serial recurrence
+        // when no output register aliases `h` (a lateout may share an
+        // input's register); this locks the actual inlined instance to the
+        // serial split set.
+        let data = rand_bytes(2048, 0x5151);
+        let mut st = LdmState::new(17, 1 << 17);
+        let mut splits = [0u64; BATCH_SIZE];
+        let (_, count) = st.gear_feed(&data, 0, 0, data.len() as u64, 0, &mut splits);
+        let mut serial = Vec::new();
+        let mut h = !(u32::MAX as u64);
+        for (t, &b) in data.iter().enumerate() {
+            h = GEAR_TAB[b as usize].wrapping_add(h << 1);
+            if h & st.stop_mask == 0 && t as u64 + 1 >= MIN_MATCH_LENGTH as u64 {
+                serial.push(t as u64 + 1 - MIN_MATCH_LENGTH as u64);
+            }
+        }
+        assert_eq!(
+            splits[..count],
+            serial[..],
+            "asm checkpoints diverged from the serial gear"
+        );
     }
 
     #[test]
