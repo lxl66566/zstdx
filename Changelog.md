@@ -5,6 +5,25 @@ This document records the changes made between versions, starting with version 0
 # After 0.9.0 (Current)
 
 
+- Encoder: the fast/dfast/chain strategies' two match tables now live in
+  ONE allocation (`tables: Vec<u32>` + a `second: usize` split marker on
+  the driver; the heads table is `tables[..second]`, the dfast short
+  hash / chain links `tables[second..]`). The dfast scan loop keeps a
+  single table base register with the small table addressed as a fixed
+  displacement (`0x80000(%rsi,%rax,4)` on the H17 row) instead of two
+  hot pointers plus their spill round-trips — the todo-8 emit-live-set
+  lever. callgrind dll4: fast scan 145.22M → 136.55M Ir (−6.0%, 1.350x
+  C's ZSTD_compressBlock_doubleFast; whole encode 205.9M → 197.2M =
+  1.099x C), fastest 80.82M → 80.42M (−0.5%). Wall: dll100 fast
+  383.5→387.2 and fastest 370→373.5 MiB/s (n=4 interleaved), text.fast
+  +2.2%, skewed.fast +3.8%, json/skewed fastest in the noise band —
+  the spill loads were L1 hits, so the wall gain is bounded by the
+  shape's 1.72 L1-misses/B floor. Table keep/refresh semantics across
+  level switches preserved exactly (kept heads with a resized second
+  table truncate+re-extend; any heads-size change reallocates).
+  Output byte-identical: full-ladder dump, dll100 l1/l3 st + l1/l9
+  bulk-mt emitframes, and the 120-cell ratio sweep diffed against a
+  baseline-build sweep; 199+7+16 tests.
 - Encoder: const-generic hash-log instantiation for the fastest tier's
   dense scan body (`start_matching_fast` takes `const HASH_LOG`; the
   dispatch instantiates the row's H15 for dense blocks of full-row inputs,
