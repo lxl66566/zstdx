@@ -69,6 +69,23 @@ impl LazyScratch {
     }
 }
 
+/// The lazy scan's probe-step policy on the miss path. `Dense` is
+/// libzstd's exact lazy-family step (`1 + run >> kSearchStrength(8)`: a
+/// literal run under 256 bytes searches every position). `Ramp` is the
+/// tier's steady miss ramp (`1 + miss >> 2`, the fast/chain policy),
+/// which steps over positions a cold head can never recover — there is
+/// no indexed history behind a frame start, so a skipped matchable
+/// position stays a permanent literal (text.best's whole ratio deficit
+/// vs zstd-13 sat inside such runs). json/skewed-class frames parse
+/// better under the ramp (+590/+2,011 B measured at the dense step), so
+/// the dense step is head-scoped and alphabet-gated by the driver (see
+/// `MatchGeneratorDriver::bt_lazy_step`).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LazyStep {
+    Ramp,
+    Dense,
+}
+
 /// One full block parsed with the btlazy2 strategy. Selection is libzstd's
 /// lazy-generic loop at depth 2: each position's repcode and tree
 /// candidates compete on value-minus-offset-price, a two-deep lazy walk
@@ -90,6 +107,7 @@ impl LazyScratch {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_block_lazy(
     knobs: &OptKnobs,
+    step: LazyStep,
     win: &[u8],
     win_base: u64,
     block_start: u64,
@@ -213,11 +231,14 @@ pub(crate) fn run_block_lazy(
                 }
             }
             if best.len < MIN_MATCH as u32 {
-                // Grow the probe step on long literal runs (the fast/chain
-                // policy); the fill still indexes every stepped position.
-                miss += 1;
-                let step = 1 + (miss >> 2).min(255) as u64;
-                pos += step;
+                // The fill still indexes every stepped position either way.
+                pos += match step {
+                    LazyStep::Ramp => {
+                        miss += 1;
+                        1 + (miss >> 2).min(255) as u64
+                    },
+                    LazyStep::Dense => 1 + ((pos - anchor) >> 8),
+                };
                 continue;
             }
             miss = 0;

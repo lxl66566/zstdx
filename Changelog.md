@@ -4,6 +4,24 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: text.best's last ratio residue (todo 9b) closed — the btlazy2
+  lazy loop parses a frame's cold head at libzstd's exact probe step
+  (`LazyStep` in `encoding/btlazy.rs`: `1 + run>>8`, libzstd's
+  `kSearchStrength`-8 lazy-family step) instead of the fast/chain miss
+  ramp (`1 + miss>>2`), which skipped matchable positions in runs of
+  4..255 bytes that a cold head has no indexed history to recover —
+  the whole −0.15..−0.23% cell was +1,262 raw literals in the first
+  448 KiB. Scoped to the first 4 blocks (512 KiB) of genuine frame
+  starts (reset or mt job zero's empty strip), gated by the row-9
+  head's ≥48-symbol alphabet bar (json at 39 and skewed at 16 keep the
+  ramp — the dense step measured +590/+2,011 B on them); row 9's own
+  DUBT-head bridge keeps the ramp. text.best 87,145→86,838 B bulk-st
+  (−0.35%, ahead of libzstd-13); the four sweep cells move
+  −0.15..−0.23% → +0.12..+0.20%; dll100/dll32/dll16 l13 emitframes
+  −4,108 B each; every other cell byte-identical (full-ladder dump +
+  120-cell sweep diffed against a baseline build). text.best wall
+  x0.94→x0.81-0.83 vs libzstd-13 (bounded head cost, json/skewed in
+  band).
 
 - Encoder: dictionary content now prefill-indexes under its own grid
   instead of the MT strip's geometry (`FillGrid` in
