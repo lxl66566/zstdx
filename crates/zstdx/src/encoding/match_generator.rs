@@ -1690,13 +1690,16 @@ pub struct MatchGeneratorDriver {
     anchor: u64,
     /// Absolute start of the last committed block (for `get_last_space`).
     block_start: u64,
-    /// Head hash table for the fast/dfast/chain strategies; u32 entries
-    /// (see [`pack_pos`]).
-    table: Vec<u32>,
-    /// Second search table for the two-table strategies (the dfast short
-    /// hash or the chain links; see [`Strategy`]), u32 entries like
-    /// `table`; empty for the fast strategy.
-    chain: Vec<u32>,
+    /// The fast/dfast/chain strategies' two tables in one allocation —
+    /// `tables[..second]` the head hash table, `tables[second..]` the
+    /// second table (the dfast short hash or the chain links; see
+    /// [`Strategy`]), u32 entries (see [`pack_pos`]). One buffer keeps a
+    /// single base pointer live in the scan loops: the second table's
+    /// accesses are displacements off it instead of a second hot pointer.
+    tables: Vec<u32>,
+    /// Length of the head table inside `tables` (== `tables.len()` when
+    /// the strategy has no second table).
+    second: usize,
     /// Head hash table for the opt strategies, u32 origin-biased entries
     /// (see [`super::opt`]).
     opt_table: Vec<u32>,
@@ -1901,8 +1904,10 @@ pub(crate) const SPF_SEG: u64 = 1024 * 1024;
 /// the whole strip fill.
 #[cfg(feature = "std")]
 pub(crate) struct StripSnapshot {
-    table: Vec<u32>,
-    chain: Vec<u32>,
+    /// The fused head+chain buffer; the split matches the capturing
+    /// driver's `second`.
+    tables: Vec<u32>,
+    second: usize,
     ldm: Option<LdmSnapshot>,
     /// Absolute stream offset the fill covered.
     upto: u64,
@@ -2041,11 +2046,8 @@ impl MatchGeneratorDriver {
     /// reallocates the tables (see [`Self::apply_level`]) — same-bytes
     /// residue would otherwise alias as candidates.
     pub(crate) fn clear_parse_tables(&mut self) {
-        if !self.table.is_empty() {
-            clear_table(&mut self.table);
-        }
-        if !self.chain.is_empty() {
-            self.chain.fill(0);
+        if !self.tables.is_empty() {
+            clear_table(&mut self.tables);
         }
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
             self.dubt_table.fill(0);
@@ -2099,8 +2101,8 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            table: alloc::vec![0u32; 1usize << HASH_LOG],
-            chain: Vec::new(),
+            tables: alloc::vec![0u32; 1usize << HASH_LOG],
+            second: 1usize << HASH_LOG,
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
@@ -2157,8 +2159,8 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            table: alloc::vec![0u32; 1usize << HASH_LOG],
-            chain: Vec::new(),
+            tables: alloc::vec![0u32; 1usize << HASH_LOG],
+            second: 1usize << HASH_LOG,
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
@@ -2235,28 +2237,44 @@ impl MatchGeneratorDriver {
             // previous parse's entries; candidates are window-guarded and
             // byte-verified, the same accepted residue as the
             // equal-params path (which never cleared either).
-            let heads_kept = self.table.len() == 1usize << params.hash_log;
+            let heads_len = 1usize << params.hash_log;
+            let heads_kept = self.second == heads_len;
+            // The fused buffer preserves the two-table keep/refresh
+            // semantics exactly: a kept head with a resized second table
+            // truncates and re-extends (resize zeroes only the new tail),
+            // which is today's fresh-second-table behavior; any head-size
+            // change drops the whole buffer like the old two allocations.
             match params.strategy {
                 Strategy::Fast => {
                     if !heads_kept {
-                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
+                        self.tables = alloc::vec![0u32; heads_len];
+                        self.second = heads_len;
+                    } else if self.tables.len() != heads_len {
+                        self.tables.truncate(heads_len);
                     }
-                    self.chain = Vec::new();
                 },
                 Strategy::Dfast(small_log) => {
-                    if !heads_kept {
-                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
-                    }
-                    if self.chain.len() != 1usize << small_log {
-                        self.chain = alloc::vec![0u32; 1usize << small_log];
+                    let total = heads_len + (1usize << small_log);
+                    if heads_kept && self.tables.len() == total {
+                        // both kept
+                    } else if heads_kept {
+                        self.tables.truncate(heads_len);
+                        self.tables.resize(total, 0);
+                    } else {
+                        self.tables = alloc::vec![0u32; total];
+                        self.second = heads_len;
                     }
                 },
                 Strategy::Chain(chain_log) => {
-                    if !heads_kept {
-                        self.table = alloc::vec![0u32; 1usize << params.hash_log];
-                    }
-                    if self.chain.len() != 1usize << chain_log {
-                        self.chain = alloc::vec![0u32; 1usize << chain_log];
+                    let total = heads_len + (1usize << chain_log);
+                    if heads_kept && self.tables.len() == total {
+                        // both kept
+                    } else if heads_kept {
+                        self.tables.truncate(heads_len);
+                        self.tables.resize(total, 0);
+                    } else {
+                        self.tables = alloc::vec![0u32; total];
+                        self.second = heads_len;
                     }
                 },
                 Strategy::Opt(knobs) => {
@@ -2275,8 +2293,8 @@ impl MatchGeneratorDriver {
                             Vec::new()
                         };
                     }
-                    self.table = Vec::new();
-                    self.chain = Vec::new();
+                    self.tables = Vec::new();
+                    self.second = 0;
                 },
                 Strategy::BtLazy(knobs) => {
                     if self.dubt_table.len() != 1usize << params.hash_log {
@@ -2288,8 +2306,8 @@ impl MatchGeneratorDriver {
                     self.opt_table = Vec::new();
                     self.bt = Vec::new();
                     self.hash3 = Vec::new();
-                    self.table = Vec::new();
-                    self.chain = Vec::new();
+                    self.tables = Vec::new();
+                    self.second = 0;
                 },
             }
             if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
@@ -2499,8 +2517,8 @@ impl MatchGeneratorDriver {
     pub(crate) fn snapshot_strip_fill(&self, upto: u64) -> StripSnapshot {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
         StripSnapshot {
-            table: self.table.clone(),
-            chain: self.chain.clone(),
+            tables: self.tables.clone(),
+            second: self.second,
             ldm: self.ldm.as_ref().map(|ldm| ldm.snapshot()),
             upto,
         }
@@ -2574,13 +2592,12 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     pub(crate) fn adopt_strip_snapshot(&mut self, snap: &StripSnapshot, data: &[u8], base: u64) {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
-        debug_assert_eq!(self.table.len(), snap.table.len());
-        debug_assert_eq!(self.chain.len(), snap.chain.len());
+        debug_assert_eq!(self.tables.len(), snap.tables.len());
+        debug_assert_eq!(self.second, snap.second);
         debug_assert!(snap.upto <= base + data.len() as u64);
         self.dubt_head = HeadPhase::Off;
         self.bt_step = BtStepPhase::Off;
-        self.table.clone_from(&snap.table);
-        self.chain.clone_from(&snap.chain);
+        self.tables.clone_from(&snap.tables);
         self.gap_start = u64::MAX;
         self.gate_hold = false;
         self.strip_parse = true;
@@ -2648,9 +2665,8 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
         let hash_log = self.params.hash_log;
-        let chain_mask = self.chain.len() - 1;
-        let table = &mut self.table[..];
-        let chain = &mut self.chain[..];
+        let (table, chain) = self.tables.split_at_mut(self.second);
+        let chain_mask = chain.len() - 1;
         // The from-scratch loop runs idx = 0, 3, 6, ... while idx < last;
         // a prefix fill to `from` exited at the first aligned idx >=
         // from - HASH_READ, which is exactly where this resumes.
@@ -2698,7 +2714,7 @@ impl MatchGeneratorDriver {
         } else {
             BtStepPhase::Off
         };
-        clear_table(&mut self.table);
+        clear_table(&mut self.tables[..self.second]);
         // The DUBT finder's entries carry no epoch tag, so a job restarts
         // its tree from scratch regardless of strip length: cleared heads
         // make every descent start at a strip chain node, and the strip
@@ -2709,7 +2725,7 @@ impl MatchGeneratorDriver {
             self.dubt_table.fill(0);
         }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
-            self.chain.fill(0);
+            self.tables[self.second..].fill(0);
         }
         // The strip (grid fill below, or nothing for opt) is the tables'
         // entire content: any gap a previous job left open ends here, and
@@ -2754,7 +2770,7 @@ impl MatchGeneratorDriver {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
                 // twin is unreachable (see PREFILL_STRIDE).
-                let table = &mut self.table[..];
+                let table = &mut self.tables[..self.second];
                 let log = self.params.hash_log;
                 match grid {
                     FillGrid::Strip => {
@@ -2787,8 +2803,7 @@ impl MatchGeneratorDriver {
             },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
-                let long = &mut self.table[..];
-                let small = &mut self.chain[..];
+                let (long, small) = self.tables.split_at_mut(self.second);
                 let mut idx = 0;
                 while idx < last {
                     // SAFETY: both hashes are masked to their tables' sizes.
@@ -2811,9 +2826,8 @@ impl MatchGeneratorDriver {
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
-                let chain_mask = self.chain.len() - 1;
-                let table = &mut self.table[..];
-                let chain = &mut self.chain[..];
+                let (table, chain) = self.tables.split_at_mut(self.second);
+                let chain_mask = chain.len() - 1;
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
                 // strip cannot afford a dense fill). Dictionary: every
                 // position, oldest-to-newest, linked — libzstd's dict load
@@ -3054,13 +3068,15 @@ impl Matcher for MatchGeneratorDriver {
     fn restart_shrunk(&mut self, level: Level) {
         self.set_reach_choice(ReachChoice::Shrink);
         self.reset(level);
-        if !self.table.is_empty() {
-            clear_table(&mut self.table);
+        if !self.tables.is_empty() {
+            clear_table(&mut self.tables[..self.second]);
         }
-        if !self.chain.is_empty() && matches!(self.params.strategy, Strategy::Chain(_)) {
+        if !self.tables[self.second..].is_empty()
+            && matches!(self.params.strategy, Strategy::Chain(_))
+        {
             // The dfast small table doubles as `chain`; its strategies never
             // reach here, but the clear stays strategy-exact regardless.
-            self.chain.fill(0);
+            self.tables[self.second..].fill(0);
         }
         self.probe.clear();
     }
@@ -3265,18 +3281,33 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Fast => {
                 // The instantiation pair is compile-time: plain blocks run
                 // a body with every dense-mode lever folded out.
+                // The log axis instantiates the row's full value (HASH_LOG,
+                // everything at or above ~32 KiB of input) for the dense
+                // body only: its re-roll measured json −3.4% Ir while the
+                // plain body's re-roll measured dll +1.4% (the register
+                // freed by the constant shift is a lottery per body — the
+                // negative notes' lesson), so the plain body keeps the
+                // runtime-log codegen byte for byte. Clamped-window shapes
+                // (hash log below the row) take the [`RUNTIME_LOG`]
+                // instantiation either way.
                 match (self.ramp.is_armed(), self.scan_density) {
                     (false, ScanDensity::Plain) => {
-                        self.start_matching_fast::<false, false>(literals, seqs)
-                    },
-                    (false, ScanDensity::Dense) => {
-                        self.start_matching_fast::<false, true>(literals, seqs)
+                        self.start_matching_fast::<false, false, RUNTIME_LOG>(literals, seqs)
                     },
                     (true, ScanDensity::Plain) => {
-                        self.start_matching_fast::<true, false>(literals, seqs)
+                        self.start_matching_fast::<true, false, RUNTIME_LOG>(literals, seqs)
                     },
-                    (true, ScanDensity::Dense) => {
-                        self.start_matching_fast::<true, true>(literals, seqs)
+                    (false, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
+                        true => self.start_matching_fast::<false, true, HASH_LOG>(literals, seqs),
+                        false => {
+                            self.start_matching_fast::<false, true, RUNTIME_LOG>(literals, seqs)
+                        },
+                    },
+                    (true, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
+                        true => self.start_matching_fast::<true, true, HASH_LOG>(literals, seqs),
+                        false => {
+                            self.start_matching_fast::<true, true, RUNTIME_LOG>(literals, seqs)
+                        },
                     },
                 }
                 // This block's parse density picks the next block's
@@ -3311,8 +3342,8 @@ impl Matcher for MatchGeneratorDriver {
                 // clamp leaves at full tables; smaller inputs (clamped
                 // windows, shrunken logs) take the runtime-log
                 // instantiation.
-                let long_log = self.table.len().trailing_zeros();
-                let small_log = self.chain.len().trailing_zeros();
+                let long_log = self.second.trailing_zeros();
+                let small_log = (self.tables.len() - self.second).trailing_zeros();
                 match (self.ramp.is_armed(), long_log, small_log) {
                     (false, 17, 16) => self.start_matching_dfast::<false, 17, 16>(literals, seqs),
                     (true, 17, 16) => self.start_matching_dfast::<true, 17, 16>(literals, seqs),
@@ -3519,12 +3550,12 @@ impl Matcher for MatchGeneratorDriver {
                     // start to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
                     unsafe {
-                        let head = *self.table.get_unchecked(h);
-                        let chain_mask = self.chain.len() - 1;
-                        *self
-                            .chain
-                            .get_unchecked_mut(self.block_start as usize & chain_mask) = head;
-                        *self.table.get_unchecked_mut(h) = pack_pos(self.block_start);
+                        let head = *self.tables.get_unchecked(h);
+                        let chain_mask = self.tables.len() - self.second - 1;
+                        *self.tables.get_unchecked_mut(
+                            self.second + (self.block_start as usize & chain_mask),
+                        ) = head;
+                        *self.tables.get_unchecked_mut(h) = pack_pos(self.block_start);
                     }
                 },
                 Strategy::Dfast(small_log) => {
@@ -3533,14 +3564,14 @@ impl Matcher for MatchGeneratorDriver {
                     // SAFETY: both hashes masked to their tables' sizes.
                     unsafe {
                         let entry = pack_pos(self.block_start);
-                        *self.table.get_unchecked_mut(hl) = entry;
-                        *self.chain.get_unchecked_mut(hs) = entry;
+                        *self.tables.get_unchecked_mut(hl) = entry;
+                        *self.tables.get_unchecked_mut(self.second + hs) = entry;
                     }
                 },
                 Strategy::Fast => {
                     insert_at(
                         win,
-                        &mut self.table,
+                        &mut self.tables[..self.second],
                         idx,
                         self.block_start,
                         self.params.hash_log,
@@ -3693,14 +3724,19 @@ impl MatchGeneratorDriver {
             Strategy::Fast => {
                 let log = self.params.hash_log;
                 while idx < to {
-                    insert_at(win, &mut self.table, idx, win_base + idx as u64, log);
+                    insert_at(
+                        win,
+                        &mut self.tables[..self.second],
+                        idx,
+                        win_base + idx as u64,
+                        log,
+                    );
                     idx += 1;
                 }
             },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
-                let long = &mut self.table[..];
-                let small = &mut self.chain[..];
+                let (long, small) = self.tables.split_at_mut(self.second);
                 while idx < to {
                     // SAFETY: both hashes are masked to their tables' sizes
                     // (same pair as the dfast prefill).
@@ -3714,9 +3750,8 @@ impl MatchGeneratorDriver {
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
-                let chain_mask = self.chain.len() - 1;
-                let table = &mut self.table[..];
-                let chain = &mut self.chain[..];
+                let (table, chain) = self.tables.split_at_mut(self.second);
+                let chain_mask = chain.len() - 1;
                 while idx < to {
                     let abs = win_base + idx as u64;
                     // SAFETY: the hash masks to hash_log bits, the absolute
@@ -3738,7 +3773,7 @@ impl MatchGeneratorDriver {
     }
 
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
-    fn start_matching_fast<const RAMPED: bool, const DENSE: bool>(
+    fn start_matching_fast<const RAMPED: bool, const DENSE: bool, const HASH_LOG: u32>(
         &mut self,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
@@ -3759,10 +3794,19 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u32 = self.table.as_mut_ptr();
-        let hash_log = self.params.hash_log;
+        let table_ptr: *mut u32 = self.tables[..self.second].as_mut_ptr();
+        // Known rows instantiate with the fastest row's log as a constant
+        // (the hash shift folds to an immediate and the shift-count register
+        // frees — the same disease the dfast const-log landing treated);
+        // clamped-window inputs (hash log below the row) take the
+        // [`RUNTIME_LOG`] instantiation.
+        let hash_log = if HASH_LOG == RUNTIME_LOG {
+            self.params.hash_log
+        } else {
+            HASH_LOG
+        };
         let mut emit = TableEmit {
-            table: &mut self.table[..],
+            table: &mut self.tables[..self.second],
             literals,
             seqs,
             win_base,
@@ -4242,12 +4286,12 @@ impl MatchGeneratorDriver {
         // shifts fold to immediates and the two shift registers free up);
         // clamped-window shapes pass [`RUNTIME_LOG`] for both.
         let long_log = if LONG_LOG == RUNTIME_LOG {
-            self.table.len().trailing_zeros()
+            self.second.trailing_zeros()
         } else {
             LONG_LOG
         };
         let small_log = if SMALL_LOG == RUNTIME_LOG {
-            self.chain.len().trailing_zeros()
+            (self.tables.len() - self.second).trailing_zeros()
         } else {
             SMALL_LOG
         };
@@ -4273,14 +4317,25 @@ impl MatchGeneratorDriver {
         // through the emit context's slice fields kept the pointers,
         // log shifts and tag stack-resident (a re-load per access, the
         // classic SROA failure at this loop's live-value count).
+        // The two tables live in ONE allocation: the small table is a
+        // fixed displacement off the long table's base (the row's const
+        // log), so the loop keeps a single table base live instead of
+        // two pointers — one register and its spill round-trips off the
+        // hottest loop's live set.
         // SAFETY: derived here, before the context below takes its
         // borrows; both address the same memory, and the loop and the
         // emit helpers never access a slot concurrently.
-        let long_ptr: *mut u32 = self.table.as_mut_ptr();
-        let small_ptr: *mut u32 = self.chain.as_mut_ptr();
+        let split = if LONG_LOG == RUNTIME_LOG {
+            self.second
+        } else {
+            1usize << LONG_LOG
+        };
+        let (long, small) = self.tables.split_at_mut(split);
+        let long_ptr: *mut u32 = long.as_mut_ptr();
+        let small_ptr: *mut u32 = small.as_mut_ptr();
         let mut emit = DfastEmit {
-            long: &mut self.table[..],
-            small: &mut self.chain[..],
+            long,
+            small,
             literals,
             seqs,
             win_base,
@@ -4582,7 +4637,7 @@ impl MatchGeneratorDriver {
         seqs: &mut Vec<SeqWord>,
     ) {
         let win = window_slice(&self.win, self.ext.as_ref());
-        let chain = &mut self.chain[..];
+        let (table_view, chain) = self.tables.split_at_mut(self.second);
         let chain_mask = chain.len() - 1;
         let win_base = self.win_base;
         let ramp = self.ramp;
@@ -4600,10 +4655,10 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u32 = self.table.as_mut_ptr();
+        let table_ptr: *mut u32 = table_view.as_mut_ptr();
         let chain_ptr: *const u32 = chain.as_ptr();
         let mut emit = TableEmit {
-            table: &mut self.table[..],
+            table: table_view,
             literals,
             seqs,
             win_base,
@@ -5364,10 +5419,10 @@ mod tests {
         let mut adopted = fresh();
         adopted.adopt_strip_snapshot(&snap, &data, 0);
 
-        assert_eq!(stock.table, adopted.table, "head grid tables diverge");
-        assert_eq!(stock.chain, adopted.chain, "chain tables diverge");
-        assert_eq!(stock.table, builder.table, "builder head grid diverges");
-        assert_eq!(stock.chain, builder.chain, "builder chain diverges");
+        assert_eq!(stock.tables, adopted.tables, "head grid tables diverge");
+        assert_eq!(stock.second, adopted.second, "chain split diverges");
+        assert_eq!(stock.tables, builder.tables, "builder head grid diverges");
+        assert_eq!(stock.second, builder.second, "chain split diverges");
         assert_eq!(
             stock.seed_offset, adopted.seed_offset,
             "seed offset diverges"
