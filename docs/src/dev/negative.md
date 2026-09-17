@@ -5,7 +5,7 @@
 - [Decoding](negative/decoding.md) — fused-loop restructures (batch splits, ring pipeline, SIMD copy scheduling), repcode/register work, X1/huffman/FSE/xxhash loop attempts.
 - [Encoding · Matchers](negative/matchers.md) — hash4/rep probing revivals, window/lazy/insertion variants, DUBT/LDM ports and knobs, scan-loop and emit-path restructures.
 - [Encoding · Entropy / Checksum / Misc](negative/entropy.md) — raw pre-gates, bit-writer/histogram forms, package-merge, PGO, AVX-512 insertion loops.
-- [MT / Streaming](negative/mt-stream.md) — frame-per-job, overlap/prefill/seeding, stage-B parallelization, checksum absorb placements.
+- [MT / Streaming](negative/mt-stream.md) — frame-per-job, overlap/prefill/seeding, stage-B parallelization, piece-decode hybrid overlap, checksum absorb placements.
 
 ## Methodology
 
