@@ -4,6 +4,7 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+
 - Encoder: dictionary content now prefill-indexes under its own grid
   instead of the MT strip's geometry (`FillGrid` in
   `match_generator`): fast/dfast take the stride grid plus
@@ -21,6 +22,21 @@ This document records the changes made between versions, starting with version 0
   +0.3-0.5% (was +3.2-4.1%), -3 unchanged at parity. No-dict output
   untouched: full-ladder dump and 120-cell ratio sweep
   byte-identical; dict cells roundtrip through both decoders.
+||||||| 42828b9c
+- Encoder: the package-merge huffman build runs on fixed-capacity array
+  stacks pooled in HuffScratch (structural bounds, unchecked hot-loop
+  indexing, register-carried lengths) instead of seven working Vecs - the
+  Vec push/bookkeeping machinery was ~24K Ir of a json-4K fastest call.
+  Output byte-identical (full-ladder dump); small-payload encode a further
+  -4.7%/-7.0% Ir on json/text-4K (cumulative -9.4%/-10.2% with the lane
+  cut; wall json-4K x1.639->1.553, text-4K x1.837->1.674 vs libzstd).
+- Encoder: the sequence-code lane histograms in `choose_tables_fast` are
+  pooled with a prefix-only clear — only the 64-entry prefix of each
+  256-wide lane is zeroed per block (wire codes never reach 64; `pack_seq`
+  debug-asserts the invariant), cutting the 12 KB per-block memset to 3 KB.
+  Output byte-identical (full-ladder dump); small-payload encode
+  json-4K -5.0% Ir / text-4K -3.5% (wall json-4K x1.671->1.647 vs libzstd).
+
 - Encoder: fixed a P0 where unpledged row-9 (balanced) stream-mt frames past
   the 32 MiB corpus scale were deterministically corrupt, and the same
   trigger deadlocked bulk-mt. The job-start seed and LDM probes compared

@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{bit_io::BitWriter, fse::fse_encoder};
 
@@ -543,13 +543,21 @@ fn huffman() {
 /// state): the package-merge level lists, the per-symbol length/weight
 /// scratch, the wire weight stream, and retired `codes` buffers.
 pub(crate) struct HuffScratch {
-    leaves: Vec<Ent>,
-    arena: Vec<Node>,
-    prev: Vec<Ent>,
-    packages: Vec<Ent>,
-    cur: Vec<Ent>,
-    active: Vec<u32>,
-    next: Vec<u32>,
+    /// Package-merge working stacks (see `package_merge_lengths_into`).
+    /// Fixed-capacity array stacks, not Vecs: the per-push capacity checks
+    /// and length bookkeeping of the Vec form cost ~24K Ir per json-4K
+    /// fastest call (a fifth of the call). Capacities are structural —
+    /// leaves ≤ `MAX_SYMBOLS` (distinct literal symbols), packages ≤ n-1
+    /// per level, level lists ≤ `MAX_TAKE`, arena ≤ symbols + levels ×
+    /// (n-1) — and the hot loops index them unchecked under those
+    /// invariants. Ping-pong buffer pairs replace the swapped Vecs.
+    leaves: Box<[Ent; MAX_SYMBOLS]>,
+    arena: Box<[Node]>,
+    list_a: Box<[Ent; MAX_TAKE]>,
+    list_b: Box<[Ent; MAX_TAKE]>,
+    packages: Box<[Ent; MAX_SYMBOLS]>,
+    ids_a: Box<[u32; MAX_TAKE]>,
+    ids_b: Box<[u32; MAX_TAKE]>,
     /// Code lengths per symbol (0 = symbol absent), valid for the build's
     /// alphabet prefix.
     lengths: [u8; 256],
@@ -573,13 +581,13 @@ const HUFF_CODES_CAP: usize = 2;
 impl Default for HuffScratch {
     fn default() -> Self {
         Self {
-            leaves: Vec::new(),
-            arena: Vec::new(),
-            prev: Vec::new(),
-            packages: Vec::new(),
-            cur: Vec::new(),
-            active: Vec::new(),
-            next: Vec::new(),
+            leaves: Box::new([Ent { weight: 0, node: 0 }; MAX_SYMBOLS]),
+            arena: alloc::vec![Node::Pkg(0, 0); ARENA_CAP].into_boxed_slice(),
+            list_a: Box::new([Ent { weight: 0, node: 0 }; MAX_TAKE]),
+            list_b: Box::new([Ent { weight: 0, node: 0 }; MAX_TAKE]),
+            packages: Box::new([Ent { weight: 0, node: 0 }; MAX_SYMBOLS]),
+            ids_a: Box::new([0; MAX_TAKE]),
+            ids_b: Box::new([0; MAX_TAKE]),
             lengths: [0; 256],
             weights: [0; 256],
             wire_weights: Vec::new(),
@@ -626,6 +634,14 @@ impl HuffScratch {
 /// Maximum Huffman code length the literals section can carry.
 const MAX_CODE_LENGTH: usize = 11;
 
+/// Structural capacities of the package-merge stacks in [`HuffScratch`]:
+/// `n` (used symbols) never exceeds the alphabet, a level keeps at most
+/// `take = 2(n-1` entries, and the arena holds the leaves plus at most
+/// `max_len` levels of `n-1` packages each.
+const MAX_SYMBOLS: usize = 256;
+const MAX_TAKE: usize = 2 * (MAX_SYMBOLS - 1);
+const ARENA_CAP: usize = MAX_SYMBOLS + MAX_CODE_LENGTH * (MAX_SYMBOLS - 1);
+
 #[derive(Clone, Copy)]
 enum Node {
     Leaf(u16),
@@ -656,49 +672,67 @@ fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
 }
 
 /// The pooled [`package_merge_lengths`]: fills `scratch.lengths[..n]`.
+///
+/// The walk runs over fixed-capacity array stacks (see [`HuffScratch`])
+/// with the loop-local lengths carried in registers; every hot-loop access
+/// is unchecked under the structural bounds stated at each `SAFETY`.
 fn package_merge_lengths_into(counts: &[usize], max_len: usize, scratch: &mut HuffScratch) {
+    assert!(counts.len() <= MAX_SYMBOLS);
+    assert!(
+        max_len <= MAX_CODE_LENGTH,
+        "arena capacity covers MAX_CODE_LENGTH levels"
+    );
     let lengths = &mut scratch.lengths;
     lengths[..counts.len()].fill(0);
-    let leaves = &mut scratch.leaves;
-    let arena = &mut scratch.arena;
-    leaves.clear();
-    arena.clear();
+    let mut n = 0usize;
+    let mut arena_len = 0usize;
     for (sym, &count) in counts.iter().enumerate() {
         if count > 0 {
-            arena.push(Node::Leaf(sym as u16));
-            leaves.push(Ent {
+            scratch.arena[arena_len] = Node::Leaf(sym as u16);
+            scratch.leaves[n] = Ent {
                 weight: u32::try_from(count).expect("literal count exceeds u32"),
-                node: (arena.len() - 1) as u32,
-            });
+                node: arena_len as u32,
+            };
+            n += 1;
+            arena_len += 1;
         }
     }
-    let n = leaves.len();
     assert!(n >= 2, "single-symbol alphabets go through the RLE path");
     assert!(max_len >= n.next_power_of_two().ilog2() as usize);
-    leaves.sort_by_key(|e| (e.weight, e.node));
+    scratch.leaves[..n].sort_by_key(|e| (e.weight, e.node));
+    let leaves = &scratch.leaves;
     let take = 2 * (n - 1);
 
-    // Level lists: level 0 is the leaves alone; every further level merges
-    // the leaves with packages formed from consecutive pairs of the previous
-    // level, keeping the cheapest `take` items. Only the previous level is
-    // ever read again, so two swapped buffers replace the list-of-lists
-    // (which allocated two Vecs per level) — and both now live in the
-    // scratch, so no level allocates at all.
-    let prev = &mut scratch.prev;
-    prev.clear();
-    prev.extend_from_slice(&leaves[..take.min(leaves.len())]);
-    let packages = &mut scratch.packages;
-    let cur = &mut scratch.cur;
-    for _ in 1..max_len {
-        packages.clear();
-        let mut i = 0;
-        while i + 1 < prev.len() && packages.len() < n - 1 {
-            let id = arena.len() as u32;
-            arena.push(Node::Pkg(prev[i].node, prev[i + 1].node));
-            packages.push(Ent {
-                weight: prev[i].weight + prev[i + 1].weight,
-                node: id,
-            });
+    // Level lists: level 0 is the leaves alone (take = 2(n-1) >= n for
+    // n >= 2); every further level merges the leaves with packages formed
+    // from consecutive pairs of the previous level, keeping the cheapest
+    // `take` items. Only the previous level is ever read again, so the two
+    // ping-pong buffers `list_a`/`list_b` cover all levels.
+    scratch.list_a[..n].copy_from_slice(&leaves[..n]);
+    let mut prev_len = n;
+    for level in 1..max_len {
+        let (prev, cur) = if level & 1 == 1 {
+            (&scratch.list_a[..], &mut scratch.list_b[..])
+        } else {
+            (&scratch.list_b[..], &mut scratch.list_a[..])
+        };
+        let packages = &mut scratch.packages;
+        let mut plen = 0usize;
+        let mut i = 0usize;
+        while i + 1 < prev_len && plen < n - 1 {
+            // SAFETY: i+1 < prev_len <= take <= MAX_TAKE covers `prev`;
+            // plen < n-1 <= MAX_SYMBOLS-1 covers `packages`; arena_len
+            // stays under leaves + levels*(n-1) <= ARENA_CAP.
+            let (a, b) = unsafe { (*prev.get_unchecked(i), *prev.get_unchecked(i + 1)) };
+            unsafe {
+                *scratch.arena.get_unchecked_mut(arena_len) = Node::Pkg(a.node, b.node);
+                *packages.get_unchecked_mut(plen) = Ent {
+                    weight: a.weight + b.weight,
+                    node: arena_len as u32,
+                };
+            }
+            arena_len += 1;
+            plen += 1;
             i += 2;
         }
         // No sort needed: `prev` is (weight, node)-sorted, so disjoint adjacent
@@ -706,47 +740,84 @@ fn package_merge_lengths_into(counts: &[usize], max_len: usize, scratch: &mut Hu
         // imply pkg[k+1] >= pkg[k]); ties break by node id, which strictly
         // increases in push order. The packages are therefore already in the
         // exact order the removed sort produced.
-        debug_assert!(packages.is_sorted_by(|a, b| { (a.weight, a.node) <= (b.weight, b.node) }));
+        debug_assert!(
+            packages[..plen].is_sorted_by(|a, b| { (a.weight, a.node) <= (b.weight, b.node) })
+        );
         // Intermediate levels can hold fewer than `take` items; only the
         // top level is guaranteed full (L >= log2 n).
-        cur.clear();
-        let mut li = 0;
-        let mut pi = 0;
-        while cur.len() < take && (li < leaves.len() || pi < packages.len()) {
-            let pick_leaf = pi >= packages.len()
-                || (li < leaves.len()
-                    && (leaves[li].weight, leaves[li].node)
-                        <= (packages[pi].weight, packages[pi].node));
-            if pick_leaf {
-                cur.push(leaves[li]);
-                li += 1;
-            } else {
-                cur.push(packages[pi]);
-                pi += 1;
+        let mut clen = 0usize;
+        let mut li = 0usize;
+        let mut pi = 0usize;
+        while clen < take && (li < n || pi < plen) {
+            let pick_leaf = pi >= plen
+                || (li < n && {
+                    // SAFETY: guarded by `li < n` / reached only while
+                    // `pi < plen` (otherwise the first arm fired); plen
+                    // <= n-1 < MAX_SYMBOLS.
+                    let (l, p) =
+                        unsafe { (*leaves.get_unchecked(li), *packages.get_unchecked(pi)) };
+                    (l.weight, l.node) <= (p.weight, p.node)
+                });
+            // SAFETY: clen < take <= MAX_TAKE by the loop head; the source
+            // index matches the guard that picked it.
+            unsafe {
+                *cur.get_unchecked_mut(clen) = if pick_leaf {
+                    li += 1;
+                    *leaves.get_unchecked(li - 1)
+                } else {
+                    pi += 1;
+                    *packages.get_unchecked(pi - 1)
+                };
             }
+            clen += 1;
         }
-        core::mem::swap(prev, cur);
+        prev_len = clen;
     }
 
     // Walk the solution back down: every leaf encountered at level k adds one
     // length unit; packages expand into their children one level below. The
-    // active/next lists alternate inside the scratch.
-    let active = &mut scratch.active;
-    active.clear();
-    active.extend(prev.iter().map(|e| e.node));
-    let next = &mut scratch.next;
+    // id lists alternate between `ids_a`/`ids_b`; the top-level list lives in
+    // list_b for an even `max_len` (last level wrote list_b), list_a else.
+    let top = if max_len & 1 == 0 {
+        &scratch.list_b[..prev_len]
+    } else {
+        &scratch.list_a[..prev_len]
+    };
+    for (k, e) in top.iter().enumerate() {
+        scratch.ids_a[k] = e.node;
+    }
+    let mut alen = prev_len;
+    let mut active_in_a = true;
     for _ in (0..max_len).rev() {
-        next.clear();
-        for &id in active.iter() {
-            match arena[id as usize] {
-                Node::Leaf(sym) => lengths[sym as usize] += 1,
-                Node::Pkg(a, b) => {
-                    next.push(a);
-                    next.push(b);
+        let mut nlen = 0usize;
+        for k in 0..alen {
+            // SAFETY: ids never exceed arena_len (every stored node field
+            // was an arena index of this walk), and the expansion of one
+            // level's active set is a subset of that level's list, so
+            // nlen stays under take <= MAX_TAKE.
+            let id = if active_in_a {
+                scratch.ids_a[k]
+            } else {
+                scratch.ids_b[k]
+            };
+            match scratch.arena[id as usize] {
+                Node::Leaf(sym) => unsafe {
+                    *lengths.get_unchecked_mut(sym as usize) += 1;
+                },
+                Node::Pkg(a, b) => unsafe {
+                    let next = if active_in_a {
+                        &mut scratch.ids_b
+                    } else {
+                        &mut scratch.ids_a
+                    };
+                    *next.get_unchecked_mut(nlen) = a;
+                    *next.get_unchecked_mut(nlen + 1) = b;
+                    nlen += 2;
                 },
             }
         }
-        core::mem::swap(active, next);
+        alen = nlen;
+        active_in_a = !active_in_a;
     }
     debug_assert_eq!(
         lengths[..counts.len()]

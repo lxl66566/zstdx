@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{bit_io::BitWriter, encoding::seq_codes::SEQ_CODE_SPACE};
 
@@ -146,19 +146,47 @@ pub(crate) fn approx_log2(x: f64) -> f64 {
 /// state table are fully overwritten by the build walk (dead symbols get
 /// the dead fill, every state slot is written). A buffer zeroes its tail at
 /// most once per size, not once per table.
-#[derive(Default)]
 pub(crate) struct FseBuildScratch {
     /// State-owner map, refilled per build.
     owner: Vec<u8>,
     /// Retired table buffers (their `len` is the initialized prefix).
     spare: Vec<Vec<u64>>,
+    /// Lane-split sequence-code histograms for `choose_tables_fast` (four
+    /// sub-histograms per LL/ML/OF channel). Pooled, and only the
+    /// [`SEQ_CODE_SPACE`]-entry prefix of each lane is cleared per use:
+    /// wire codes never reach 64, so no increment can touch and no merge
+    /// can read the stale tail — the per-block clear covers 3 KB, not the
+    /// 12 KB a fresh 256-wide array costs. The lanes stay 256-wide so the
+    /// per-sequence increments with unmasked u8 wire codes remain
+    /// bounds-check-free.
+    seq_lanes: Box<[[u32; 256]; 12]>,
 }
 
 /// Pool depth: the three sequence tables plus the Huffman weight table can
 /// be in flight per block.
 const FSE_SPARE_CAP: usize = 4;
 
+impl Default for FseBuildScratch {
+    fn default() -> Self {
+        Self {
+            owner: Vec::new(),
+            spare: Vec::new(),
+            seq_lanes: Box::new([[0; 256]; 12]),
+        }
+    }
+}
+
 impl FseBuildScratch {
+    /// Borrow the lane histograms with every lane's touched prefix
+    /// (the code space, < 64 entries) cleared; see [`Self::seq_lanes`].
+    pub(crate) fn take_seq_lanes(&mut self) -> &mut [[u32; 256]; 12] {
+        let lanes = self.seq_lanes.as_mut();
+        for lane in lanes.iter_mut() {
+            lane[..SEQ_CODE_SPACE].fill(0);
+        }
+        lanes
+    }
+
     /// Take a buffer whose first `len` entries are initialized.
     fn take_tab(&mut self, len: usize) -> Vec<u64> {
         let mut v = match self.spare.iter().position(|v| v.capacity() >= len) {
