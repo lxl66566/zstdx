@@ -60,11 +60,14 @@ use crate::{
         block_header::BlockHeader,
         frame_compressor::{
             BlockChecksum as _, CompressState, FrameHasher, compress_job_blocks_inner,
-            new_slice_state,
+            new_slice_state, reset_slice_state,
         },
         frame_header::FrameHeader,
-        match_generator::MatchGeneratorDriver,
-        mt::{MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, run_job_with},
+        match_generator::{LdmArming, MatchGeneratorDriver, StripSnapshot},
+        mt::{
+            MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state,
+            run_job_with,
+        },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
 };
@@ -105,6 +108,35 @@ struct KeepOutcome {
     donation: Donation,
 }
 
+/// The finish tail's shared prefix fill (see `MtEncoderCore::build_spf`):
+/// a snapshot of one state's strip fill covering `[0, upto)`.
+struct SpfPlan {
+    upto: u64,
+    /// Largest job start whose strip is the whole prefix `[0, start)`: the
+    /// overlap at plan build. A job starting beyond it carries a
+    /// mid-stream strip `[start - overlap, start)` the snapshot's fill
+    /// does not cover — it keeps the stock path.
+    prefix_end: u64,
+    snapshot: Arc<StripSnapshot>,
+}
+
+impl SpfPlan {
+    /// Whether the tail job starting at `start` (strip `[0, start)` when a
+    /// prefix) adopts the snapshot instead of filling its whole strip.
+    fn covers(&self, start: u64) -> bool {
+        start > self.upto && start <= self.prefix_end
+    }
+}
+
+/// Smallest largest prefix strip that engages the shared prefix fill;
+/// below it the tail jobs' own parallel fills are the cheaper schedule.
+const SPF_MIN_PREFIX: u64 = 8 * 1024 * 1024;
+/// Shared-prefix-fill segment length: the soft bound between the
+/// probe-donation polls (a shrink verdict retires the build) and the
+/// slack past the median boundary a segment may run while searching for
+/// the next exact (batch-freeze) boundary.
+const SPF_SEG: u64 = 1024 * 1024;
+
 /// One posted job: the frozen source view (see the recycling rules in
 /// [`MtEncoderCore`]'s docs — the backing bytes cannot move before this job
 /// completes) plus its payload.
@@ -134,12 +166,12 @@ enum JobKind {
         /// range relative to it.
         first: usize,
         len: usize,
-        /// Every job except the frame's first starts where the decoder's
-        /// repcode history is unknown (see the bulk mt path); a
-        /// flush-rebased grid starts mid-frame too.
-        gate: bool,
         last_frame_block: bool,
         overlap: usize,
+        /// The shared prefix fill's snapshot for this job, when the
+        /// finish tail engaged one and this job's strip extends it (see
+        /// `MtEncoderCore::build_spf`).
+        spf: Mutex<Option<Arc<StripSnapshot>>>,
         /// The probe's donated keep side when this job is the frame's
         /// first: the continuation resumes the donated state at the span
         /// (skipping the strip prefill — it would clear the very tables
@@ -402,16 +434,17 @@ fn run_claimed_job(
             src: frozen,
             first,
             len,
-            gate,
             last_frame_block,
             overlap,
             donation,
+            spf,
             out,
             ..
         } => {
             // SAFETY: the posting thread keeps the backing bytes stable for
             // this job's whole lifetime (see FrozenSrc).
             let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
+            let spf = spf.lock().unwrap().take();
             let bytes = if let Some(don) = donation.lock().unwrap().take() {
                 // The donated continuation: job zero's state already carries
                 // its reset, strip prefill and parsed span — the
@@ -427,22 +460,40 @@ fn run_claimed_job(
                     *last_frame_block,
                     reach_probe::PROBE_SPAN,
                     don.prefix,
+                    None,
                 );
                 crate::encoding::mt::return_donation_state(dstate);
                 out
             } else {
                 let state = state.get_or_insert_with(take_pooled_state);
-                run_job_with(
-                    state,
-                    src,
-                    *first..*len,
-                    *overlap,
-                    *last_frame_block,
-                    job.level,
-                    *gate,
-                    job.shape,
-                    job.choice,
-                )
+                match spf.as_ref() {
+                    // Adopt the shared prefix snapshot: reset and gates as
+                    // any job's, then continue the fill to this job's own
+                    // strip end instead of re-running its whole prefix.
+                    Some(snap) => {
+                        prepare_job_state(state, job.level, job.shape, job.choice, *first as u64);
+                        compress_job_blocks_inner(
+                            state,
+                            src,
+                            *first..*len,
+                            *overlap,
+                            *last_frame_block,
+                            *first,
+                            Vec::new(),
+                            Some(snap),
+                        )
+                    },
+                    _ => run_job_with(
+                        state,
+                        src,
+                        *first..*len,
+                        *overlap,
+                        *last_frame_block,
+                        job.level,
+                        job.shape,
+                        job.choice,
+                    ),
+                }
             };
             *out.lock().unwrap() = Some(bytes);
         },
@@ -1060,7 +1111,7 @@ impl MtEncoderCore {
                 self.resolve_probe();
                 continue;
             }
-            self.post_job(self.job_start, end, false);
+            self.post_job(self.job_start, end, false, None);
             self.job_start = end;
         }
     }
@@ -1150,21 +1201,152 @@ impl MtEncoderCore {
     /// never spin up the pool).
     fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
         debug_assert!(self.job_start < hi && hi <= self.pos);
+        // The finish tail's shared prefix fill builds before the probe
+        // settles: the build (a full strip fill) runs on this thread while
+        // the donation tasks finish on the workers — time the settle would
+        // spend waiting anyway. A flush never engages it (see build_spf).
+        let mut spf = if last_frame_block {
+            self.build_spf(hi)
+        } else {
+            None
+        };
         // A flush or finish ahead of the staging gate decides the probe
         // with the stock reach (see the module docs).
         self.settle_probe();
+        if spf.is_some() && self.choice == ReachChoice::Shrink {
+            // The shrunk re-grid's strips are not the prefixes the build
+            // filled; drop the plan unused.
+            spf = None;
+        }
         self.emit_header();
         let bounds = self.build_bounds(hi);
-        if bounds.len() == 2 && self.pool_threads.is_empty() {
+        if bounds.len() == 2 && self.pool_threads.is_empty() && spf.is_none() {
             self.run_inline_job(&bounds, hi, last_frame_block);
         } else {
             let last = bounds.len() - 2;
             for (i, w) in bounds.windows(2).enumerate() {
-                self.post_job(w[0], w[1], last_frame_block && i == last);
+                let spf = spf
+                    .as_ref()
+                    .filter(|p| p.covers(w[0]))
+                    .map(|p| p.snapshot.clone());
+                self.post_job(w[0], w[1], last_frame_block && i == last, spf);
             }
             self.job_start = hi;
             self.drain_all();
         }
+    }
+
+    /// Build the finish tail's shared prefix fill (see the module docs):
+    /// an unpledged whole-window stream (the row-9 keep class) posts
+    /// nothing during write — the growing grid's first epoch spans
+    /// `burst_jobs` whole windows — so at finish every tail job would
+    /// prefill its own whole-prefix strip [0, start): nested prefixes,
+    /// redundant fills jobdecomp put at ~84% of the tail's summed job
+    /// time. Instead one state fills the median tail boundary's prefix
+    /// once, and the tail jobs share it (the median job continues on the
+    /// pre-built state; the jobs above adopt a snapshot and fill only
+    /// their remainder; the jobs below keep the stock path — their
+    /// strips are the small half). Every fill loop is position-ordered
+    /// over position-indexed or newest-wins state, so the incremental
+    /// fill is bit-identical to the stock per-job fills and the frame
+    /// bytes cannot change.
+    ///
+    /// The build fills in bounded segments, polling the probe donation
+    /// between them: a shrink verdict retires the build immediately (its
+    /// strips are not these prefixes), and the wasted segments ran inside
+    /// the donation wait the caller would spend either way.
+    fn build_spf(&mut self, hi: u64) -> Option<SpfPlan> {
+        // Eligibility: the growing grid with nothing posted yet (every
+        // tail strip is then the prefix [0, start)), buffers still at
+        // stream offset zero, a chain-row strip fill (the snapshot's
+        // build/adopt machinery is the chain grid + LDM split pass; the
+        // opt/btlazy rows fill different tables), and a prefix strip
+        // large enough to pay for the machinery. The strategy gate plus
+        // the threshold admit exactly the whole-window chain rows: every
+        // other row's stream strip is its search domain (<= 8 MiB).
+        if !matches!(self.grid, JobGrid::Growing)
+            || self.job_start != 0
+            || self.buf_base != 0
+            || self.choice == ReachChoice::Shrink
+            || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
+        {
+            return None;
+        }
+        let bounds = self.build_bounds(hi);
+        let n_jobs = bounds.len() - 1;
+        if n_jobs < 2 {
+            return None;
+        }
+        // Tail jobs (index >= 1) whose strip is the whole prefix; job zero
+        // has no strip of its own (the donation's continuation, or empty).
+        let prefix_jobs: Vec<usize> = (1..n_jobs)
+            .filter(|&i| bounds[i] <= self.overlap as u64)
+            .collect();
+        let s_max = bounds[*prefix_jobs.last()?];
+        if s_max < SPF_MIN_PREFIX {
+            return None;
+        }
+        // Fill to the median prefix boundary (the balance point: the jobs
+        // above adopt and fill their remainders in parallel, the jobs
+        // below keep stock fills of the smaller half).
+        let med = bounds[prefix_jobs[prefix_jobs.len() / 2]];
+        let mut state = take_pooled_state();
+        reset_slice_state(
+            &mut state,
+            self.level,
+            self.shape,
+            ReachChoice::Keep,
+            LdmArming::Job,
+        );
+        // The clears of a stock prefill, then the fill itself segmented at
+        // LDM batch-freeze points (the exact boundaries — see
+        // `LdmState::fill_to_freeze`), each segment past `upto` bounded by
+        // `med` plus slack so the loop cannot run the whole strip.
+        state.matcher.prefill_window(&[], 0);
+        let cap = med + SPF_SEG;
+        let mut upto = 0u64;
+        loop {
+            if self
+                .probe_wait
+                .as_ref()
+                .is_some_and(|(k, s)| k.is_done() && s.is_done())
+            {
+                self.resolve_probe();
+            }
+            if self.choice == ReachChoice::Shrink {
+                return_pooled_state(state);
+                return None;
+            }
+            let soft = (upto + SPF_SEG).min(med);
+            let Some(freeze) =
+                state
+                    .matcher
+                    .strip_fill_segment(&self.buf[..cap as usize], 0, upto, soft)
+            else {
+                // No freeze before the cap: not a shape the snapshot can
+                // be cut at; the tail jobs keep their stock fills.
+                return_pooled_state(state);
+                return None;
+            };
+            upto = freeze;
+            if upto >= med {
+                break;
+            }
+        }
+        #[cfg(feature = "job_trace")]
+        let trace_spf = std::time::Instant::now();
+        let snapshot = Arc::new(state.matcher.snapshot_strip_fill(upto));
+        #[cfg(feature = "job_trace")]
+        {
+            let t = trace_spf;
+            crate::encoding::job_trace::add_prefill(t);
+        }
+        return_pooled_state(state);
+        Some(SpfPlan {
+            upto,
+            prefix_end: self.overlap as u64,
+            snapshot,
+        })
     }
 
     /// One short tail job (small inputs, a flush, or a finish without a
@@ -1189,7 +1371,6 @@ impl MtEncoderCore {
             self.overlap,
             last_frame_block,
             self.level,
-            self.job_start > 0,
             self.shape,
             self.choice,
         );
@@ -1201,8 +1382,15 @@ impl MtEncoderCore {
     /// Post one job [start, end) to the pool. The source view is the
     /// buffer's [strip_lo, end) — the posting thread guarantees those bytes
     /// stable until the job completes (wrap and growth both require
-    /// quiescence).
-    fn post_job(&mut self, start: u64, end: u64, last_frame_block: bool) {
+    /// quiescence). `spf` is the job's share of the shared prefix fill,
+    /// when the finish tail engaged one.
+    fn post_job(
+        &mut self,
+        start: u64,
+        end: u64,
+        last_frame_block: bool,
+        spf: Option<Arc<StripSnapshot>>,
+    ) {
         debug_assert!(self.pos >= end);
         // The post cadence is also the assembly and panic-surfacing cadence:
         // per-write calls would burn millions of polls on the pump path.
@@ -1246,7 +1434,7 @@ impl MtEncoderCore {
                 len,
                 overlap: self.overlap,
                 last_frame_block,
-                gate: start > 0,
+                spf: Mutex::new(spf),
                 donation: Mutex::new(donation),
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),

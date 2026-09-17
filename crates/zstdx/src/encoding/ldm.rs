@@ -432,6 +432,32 @@ pub(crate) struct LdmSeq {
     pub len: u32,
 }
 
+/// Captured fill state of an [`LdmState`] (see its `snapshot`/`restore`):
+/// the tables plus the rolling-hash scalars a prefix-fill continuation
+/// needs. Shared with the streaming core's shared prefix fill.
+#[cfg(feature = "std")]
+pub(super) struct LdmSnapshot {
+    table: Vec<u64>,
+    bucket_offsets: Vec<u8>,
+    rolling: u64,
+    fed: u64,
+    arm: u64,
+}
+
+#[cfg(feature = "std")]
+impl LdmSnapshot {
+    /// Whether two snapshots carry identical content (the shared prefix
+    /// fill's exactness gate).
+    #[cfg(test)]
+    pub(super) fn same_as(&self, other: &LdmSnapshot) -> bool {
+        self.table == other.table
+            && self.bucket_offsets == other.bucket_offsets
+            && self.rolling == other.rolling
+            && self.fed == other.fed
+            && self.arm == other.arm
+    }
+}
+
 /// Bucketed split table plus the rolling hash state. The state is carried
 /// across `fill`/`generate` calls of one frame or job; [`Self::restart`]
 /// is the frame/job boundary.
@@ -506,6 +532,45 @@ impl LdmState {
     /// The configured reach (the row window; table sizing key).
     pub fn window(&self) -> u64 {
         self.window
+    }
+
+    #[cfg(feature = "std")]
+    /// Capture the fill state for [`Self::restore`]: exactly the parts a
+    /// prefix-fill continuation needs (`window`/`stop_mask`/`hash_mask`
+    /// derive from the row params both sides share). The state must not
+    /// be `stale` (an unfilled restart carries no content to share).
+    pub(super) fn snapshot(&self) -> LdmSnapshot {
+        debug_assert!(!self.stale);
+        LdmSnapshot {
+            table: self.table.clone(),
+            bucket_offsets: self.bucket_offsets.clone(),
+            rolling: self.rolling,
+            fed: self.fed,
+            arm: self.arm,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    /// Adopt a snapshot: the tables and rolling state of a fill that ran
+    /// `[0, fed)`, replacing this state's content wholesale. The next
+    /// `fill` continues seamlessly from `fed`: the fill is a pure
+    /// function of the bytes and the insert order, so an incremental
+    /// fill equals a from-scratch one over the union span.
+    pub(super) fn restore(&mut self, snap: &LdmSnapshot) {
+        debug_assert_eq!(self.table.len(), snap.table.len());
+        self.table.clone_from(&snap.table);
+        self.bucket_offsets.clone_from(&snap.bucket_offsets);
+        self.rolling = snap.rolling;
+        self.fed = snap.fed;
+        self.arm = snap.arm;
+        self.stale = false;
+    }
+
+    #[cfg(feature = "std")]
+    /// Absolute position up to which the rolling hash has been fed (the
+    /// resume point of a continuation fill).
+    pub(super) fn fed(&self) -> u64 {
+        self.fed
     }
 
     #[inline]
@@ -680,6 +745,43 @@ impl LdmState {
             }
             pos += n as u64;
         }
+    }
+
+    /// The shared prefix fill's segmented fill (see `encoder_mt`): like
+    /// [`Self::fill`], but it stops early at the first full-batch freeze
+    /// at or beyond `soft` and reports where. A freeze point is the one
+    /// call-boundary kind that is exactly invisible to a stock one-call
+    /// fill: the batch count is zero there by construction, and the gear
+    /// group grid restarts at the freeze position inside the stock fill
+    /// too (a batch-full early return re-enters `gear_feed` at the
+    /// triggering checkpoint), so a fill resumed from the freeze point
+    /// produces the same splits and table state as the unsegmented fill
+    /// of the union span. `None` when `end` is reached without a
+    /// qualifying freeze — the caller falls back to the stock path.
+    pub fn fill_to_freeze(
+        &mut self,
+        win: &[u8],
+        win_base: u64,
+        base: u64,
+        end: u64,
+        soft: u64,
+    ) -> Option<u64> {
+        self.ensure_fresh();
+        let mut splits = [0u64; BATCH_SIZE];
+        let mut pos = base;
+        while pos < end {
+            let floor = self.arm.max(win_base);
+            let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
+            for i in 0..count {
+                let (hash, checksum) = self.window_hash(win, (splits[i] - win_base) as usize);
+                self.insert(hash, splits[i], checksum);
+            }
+            pos += n as u64;
+            if count == BATCH_SIZE && pos >= soft {
+                return Some(pos);
+            }
+        }
+        None
     }
 
     /// Generate candidates over `[base, end)`: every split is inserted,

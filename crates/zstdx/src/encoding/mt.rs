@@ -190,8 +190,8 @@ pub fn compress_slice_mt(
                     let start = id * job_size;
                     let end = (start + job_size).min(src.len());
                     // The first job starts where the decoder's repeated-offset
-                    // history is still the format default [1, 4, 8].
-                    let gate = id > 0;
+                    // history is still the format default [1, 4, 8]; the gate
+                    // is job.start > 0 (applied inside the state preparation).
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if id == 0
                             && let Some((mut dstate, prefix)) = donation.lock().unwrap().take()
@@ -207,6 +207,7 @@ pub fn compress_slice_mt(
                                 end == src.len(),
                                 reach_probe::PROBE_SPAN,
                                 prefix,
+                                None,
                             );
                             return_slice_state(dstate);
                             return out;
@@ -217,7 +218,6 @@ pub fn compress_slice_mt(
                             overlap,
                             end == src.len(),
                             level,
-                            gate,
                             shape,
                             choice,
                         )
@@ -425,6 +425,29 @@ pub(crate) fn return_donation_probe(probe: alloc::boxed::Box<MatchGeneratorDrive
     donation_kit().lock().unwrap().1 = Some(probe);
 }
 
+/// Reset a state for a job and apply the job-start gates: fresh entropy
+/// tables, the repcode gate and ramp arm unless the job starts the frame
+/// (the decoder's repeated-offset history is the format default only
+/// there). The prefix of [`run_job_with`] shared with the streaming
+/// core's pre-built prefix-fill state (see `encoder_mt::build_spf`),
+/// whose state is prepared before it is handed to a worker.
+pub(crate) fn prepare_job_state(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    job_start: u64,
+) {
+    reset_slice_state(state, level, shape, choice, LdmArming::Job);
+    if job_start > 0 {
+        state.matcher.gate_repcodes();
+        let depth = ramp_depth_from_env();
+        if depth > 0 {
+            state.matcher.arm_ramp(job_start, depth);
+        }
+    }
+}
+
 /// Compress one job through `state`, resetting it for the job: fresh
 /// entropy tables, and the repcode gate unless the job starts the frame
 /// (the decoder's repeated-offset history is the format default only there).
@@ -438,22 +461,14 @@ pub(crate) fn run_job_with(
     overlap: usize,
     is_last_job: bool,
     level: Level,
-    gate: bool,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
-    reset_slice_state(state, level, shape, choice, LdmArming::Job);
+    prepare_job_state(state, level, shape, choice, job.start as u64);
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
-    if gate {
-        state.matcher.gate_repcodes();
-        let depth = ramp_depth_from_env();
-        if depth > 0 {
-            state.matcher.arm_ramp(job.start as u64, depth);
-        }
-    }
     compress_job_blocks(state, src, job, overlap, is_last_job)
 }
 
@@ -466,7 +481,6 @@ pub(crate) fn run_job(
     overlap: usize,
     is_last_job: bool,
     level: Level,
-    gate: bool,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
 ) -> Vec<u8> {
@@ -478,7 +492,6 @@ pub(crate) fn run_job(
         overlap,
         is_last_job,
         level,
-        gate,
         shape,
         choice,
     );
