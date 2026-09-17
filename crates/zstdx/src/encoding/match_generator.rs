@@ -1752,6 +1752,26 @@ struct ExtWindow {
 // keep the borrowed buffer on the same thread's stack for the whole call.
 unsafe impl Send for MatchGeneratorDriver {}
 
+#[cfg(feature = "std")]
+use super::ldm::LdmSnapshot;
+
+/// Captured strip-fill state of a [`MatchGeneratorDriver`] (the streaming
+/// core's shared prefix fill): the chain row's head/chain grid tables plus
+/// the LDM fill state after a fill covering `[base, base + upto)` —
+/// `upto` an LDM batch-freeze point, the one boundary kind where a fill
+/// may be split and resumed exactly (see `LdmState::fill_to_freeze`).
+/// Tail jobs whose strip extends the same prefix adopt it via
+/// [`MatchGeneratorDriver::adopt_strip_snapshot`] instead of re-running
+/// the whole strip fill.
+#[cfg(feature = "std")]
+pub(crate) struct StripSnapshot {
+    table: Vec<u32>,
+    chain: Vec<u32>,
+    ldm: Option<LdmSnapshot>,
+    /// Absolute stream offset the fill covered.
+    upto: u64,
+}
+
 /// Resolve the active window (owned or borrowed). A free function so callers
 /// can split-borrow `win`/`ext` against `&mut table`.
 fn window_slice<'a>(win: &'a [u8], ext: Option<&'a ExtWindow>) -> &'a [u8] {
@@ -1813,6 +1833,15 @@ impl MatchGeneratorDriver {
             Strategy::Opt(_) | Strategy::BtLazy(_) => p.chain_reach.unwrap_or(p.window) as u64,
             _ => p.window as u64,
         }
+    }
+
+    /// Whether the row's strip fill is the chain grid plus the LDM split
+    /// pass — the shape [`StripSnapshot`]'s build/adopt machinery
+    /// implements. The opt/btlazy rows fill different tables (their
+    /// `chain` stays empty) and must not engage the shared prefix fill.
+    #[cfg(feature = "std")]
+    pub(crate) fn spf_strip_fill(level: Level, shape: InputShape) -> bool {
+        matches!(params_for(level, shape).strategy, Strategy::Chain(_))
     }
 
     /// Whether the shape-adaptive reach probe (see [`super::reach_probe`])
@@ -2286,6 +2315,146 @@ impl MatchGeneratorDriver {
             let tree_back = Self::opt_tree_strip(&self.params);
             let bound = base + (data.len() as u64).saturating_sub(tree_back);
             self.next_update = self.next_update.max(bound);
+        }
+    }
+
+    /// Capture the current strip-fill state (see [`StripSnapshot`]):
+    /// valid right after `prefill_window`/`strip_fill_continue` on a
+    /// chain-row driver, where the strip fill is the head/chain grid plus
+    /// the LDM split pass.
+    #[cfg(feature = "std")]
+    pub(crate) fn snapshot_strip_fill(&self, upto: u64) -> StripSnapshot {
+        debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        StripSnapshot {
+            table: self.table.clone(),
+            chain: self.chain.clone(),
+            ldm: self.ldm.as_ref().map(|ldm| ldm.snapshot()),
+            upto,
+        }
+    }
+
+    /// Continue this driver's own strip fill from `[base, base + from)`
+    /// to `[base, data.len())` — the adopter's half of the shared prefix
+    /// fill (see [`StripSnapshot`]). No clears, no seed: exactly the work
+    /// a from-scratch `prefill_window` over the longer span would still
+    /// do after having filled the shorter one, resumed at a freeze point
+    /// (see `strip_fill_segment`).
+    #[cfg(feature = "std")]
+    pub(crate) fn strip_fill_continue(&mut self, data: &[u8], base: u64, from: u64) {
+        debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        if let Some(ldm) = self.ldm.as_mut() {
+            debug_assert_eq!(ldm.fed(), base + from);
+            if data.len() as u64 > from {
+                ldm.fill(data, base, base + from, base + data.len() as u64);
+            }
+        }
+        if data.len() < HASH_READ {
+            return;
+        }
+        let last = data.len() - HASH_READ;
+        self.chain_grid_fill(data, base, from, last);
+    }
+
+    /// The builder's half of the shared prefix fill: advance the strip
+    /// fill from `[base, base + from)` to the first LDM batch-freeze at
+    /// or beyond `soft` (bounded by `data.len()`), returning the absolute
+    /// freeze point — the boundary a snapshot may be taken at (see
+    /// `LdmState::fill_to_freeze` for why freeze points are the exact
+    /// boundaries). `None` when no freeze lands before `data.len()`.
+    #[cfg(feature = "std")]
+    pub(crate) fn strip_fill_segment(
+        &mut self,
+        data: &[u8],
+        base: u64,
+        from: u64,
+        soft: u64,
+    ) -> Option<u64> {
+        debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        let upto = self
+            .ldm
+            .as_mut()
+            .map(|ldm| {
+                debug_assert_eq!(ldm.fed(), base + from);
+                if data.len() as u64 > from {
+                    ldm.fill_to_freeze(data, base, base + from, base + data.len() as u64, soft)
+                } else {
+                    None
+                }
+            })
+            .flatten()?;
+        // The grid fill covers the same prefix [0, upto): its stride
+        // alignment resumes from `from` and its extent is the freeze
+        // point's HASH_READ margin, exactly as a from-scratch fill of
+        // that prefix would cover.
+        if upto > base + HASH_READ as u64 {
+            self.chain_grid_fill(data, base, from, (upto - base - HASH_READ as u64) as usize);
+        }
+        Some(upto)
+    }
+
+    /// Adopt a prefix snapshot as this job's strip prefill and continue
+    /// the fill to this job's own strip end: `data` is the job's whole
+    /// strip at absolute offset `base`, `snap.upto` the prefix the
+    /// snapshot covers. Table contents afterwards are bit-identical to
+    /// `prefill_window(data, base)`; the non-table fields mirror it too,
+    /// and the job-start seed scan runs per job (it reads the strip tail).
+    #[cfg(feature = "std")]
+    pub(crate) fn adopt_strip_snapshot(&mut self, snap: &StripSnapshot, data: &[u8], base: u64) {
+        debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        debug_assert_eq!(self.table.len(), snap.table.len());
+        debug_assert_eq!(self.chain.len(), snap.chain.len());
+        debug_assert!(snap.upto <= base + data.len() as u64);
+        self.dubt_head = HeadPhase::Off;
+        self.table.clone_from(&snap.table);
+        self.chain.clone_from(&snap.chain);
+        self.gap_start = u64::MAX;
+        self.gate_hold = false;
+        self.strip_parse = true;
+        self.ldm_quiet = 0;
+        self.ldm_dead = false;
+        self.ldm_canary = 0;
+        match (&mut self.ldm, &snap.ldm) {
+            (Some(ldm), Some(snap_ldm)) => ldm.restore(snap_ldm),
+            (None, None) => {},
+            _ => unreachable!("same row params arm LDM identically"),
+        }
+        self.strip_fill_continue(data, base, snap.upto - base);
+        if data.len() < HASH_READ {
+            return;
+        }
+        let last = data.len() - HASH_READ;
+        self.acquire_seed(data, last);
+    }
+
+    /// The chain row's stride-3 grid fill over `[resume, last)` (see
+    /// `prefill_window`'s Chain arm — the same loop, entry point split so
+    /// a continuation resumes at the aligned stride position the
+    /// from-scratch pass would next take).
+    #[cfg(feature = "std")]
+    fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
+        let hash_log = self.params.hash_log;
+        let chain_mask = self.chain.len() - 1;
+        let table = &mut self.table[..];
+        let chain = &mut self.chain[..];
+        // The from-scratch loop runs idx = 0, 3, 6, ... while idx < last;
+        // a prefix fill to `from` exited at the first aligned idx >=
+        // from - HASH_READ, which is exactly where this resumes.
+        let mut idx = (from as usize)
+            .saturating_sub(HASH_READ)
+            .div_ceil(PREFILL_STRIDE)
+            * PREFILL_STRIDE;
+        while idx < last {
+            let abs = base + idx as u64;
+            // SAFETY: the hash masks to hash_log bits, the absolute
+            // position to the chain size (absolute key; see emit_chain's
+            // note on the walk side's indexing).
+            unsafe {
+                let h = hash_at_log(data, idx, hash_log);
+                let head = *table.get_unchecked(h);
+                *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
+                *table.get_unchecked_mut(h) = pack_pos(abs);
+            }
+            idx += PREFILL_STRIDE;
         }
     }
 
@@ -4797,6 +4966,91 @@ mod tests {
 
     use super::{LdmArming, MatchGeneratorDriver, ldm_min_window, pack_pos, unpack_pos};
     use crate::encoding::{Matcher, Sequence};
+
+    /// The shared prefix fill (the streaming finish tail's strip-fill
+    /// share) must reproduce the stock per-job strip fill bit for bit: a
+    /// driver that adopts a snapshot of a shorter prefix fill and
+    /// continues it, and a builder that continues its own fill, both end
+    /// with exactly the tables a from-scratch `prefill_job_strip` of the
+    /// same strip produced.
+    #[cfg(feature = "std")]
+    #[test]
+    fn strip_snapshot_adopt_is_exact() {
+        // Far repeats (a block duplicated megabytes apart) so the LDM
+        // split pass and the stride-3 grid both have entries to evolve.
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut rand = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let head: Vec<u8> = (0..512 * 1024).map(|_| (rand() & 0xff) as u8).collect();
+        let mut data = head.clone();
+        for _ in 0..(1024 * 1024 / 8) {
+            data.extend_from_slice(&rand().to_le_bytes());
+        }
+        data.extend_from_slice(&head);
+        while data.len() < 4 * 1024 * 1024 {
+            data.extend_from_slice(&head[..data.len().min(1024)]);
+        }
+        // An unaligned final strip end exercises the tail loop both paths
+        // share; the segment boundaries stay grid-aligned (multiples of
+        // four) as `build_spf` keeps them.
+        data.truncate(data.len() - 5);
+        let (seg, med) = (1024 * 1024, 2 * 1024 * 1024);
+
+        let fresh = || {
+            let mut d = MatchGeneratorDriver::new_direct();
+            d.set_ldm_arming(LdmArming::Job);
+            d.reset(crate::Level::Balanced);
+            d
+        };
+        let mut stock = fresh();
+        stock.prefill_job_strip(&data, 0);
+
+        let mut builder = fresh();
+        builder.prefill_window(&data[..0], 0);
+        let mut from = 0u64;
+        let mut upto = 0u64;
+        loop {
+            let soft = (from + seg as u64).min(med as u64);
+            upto = builder
+                .strip_fill_segment(&data, 0, from, soft)
+                .expect("a freeze lands within each segment's slack");
+            from = upto;
+            if upto >= med as u64 {
+                break;
+            }
+        }
+        let snap = builder.snapshot_strip_fill(upto);
+        builder.strip_fill_continue(&data, 0, upto);
+
+        let mut adopted = fresh();
+        adopted.adopt_strip_snapshot(&snap, &data, 0);
+
+        assert_eq!(stock.table, adopted.table, "head grid tables diverge");
+        assert_eq!(stock.chain, adopted.chain, "chain tables diverge");
+        assert_eq!(stock.table, builder.table, "builder head grid diverges");
+        assert_eq!(stock.chain, builder.chain, "builder chain diverges");
+        assert_eq!(
+            stock.seed_offset, adopted.seed_offset,
+            "seed offset diverges"
+        );
+        let (s_ldm, a_ldm, b_ldm) = (
+            stock.ldm.as_ref().unwrap(),
+            adopted.ldm.as_ref().unwrap(),
+            builder.ldm.as_ref().unwrap(),
+        );
+        assert!(
+            s_ldm.snapshot().same_as(&a_ldm.snapshot()),
+            "adopted LDM diverges"
+        );
+        assert!(
+            s_ldm.snapshot().same_as(&b_ldm.snapshot()),
+            "builder LDM diverges"
+        );
+    }
 
     #[test]
     fn ldm_arming_bars() {

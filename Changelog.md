@@ -4,6 +4,19 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the unpledged row-9 stream's finish tail now shares one prefix
+  fill — output byte-identical everywhere (full-ladder dump, 120-cell sweep,
+  emitframe stream gates incl. a 96 MiB probe), text.balanced stream-mt8
+  +5.6% (537->568 MiB/s, interleaved medians). The tail jobs' whole-prefix
+  strip prefills (nested prefixes, ~84% of the tail's summed job time)
+  collapse into one pump-thread build to the median tail boundary,
+  segmented at LDM batch-freeze points (the only exactly-resumable cut
+  points; the asm gear4 c4 divergence that forces them is recorded in
+  docs/dev/negative), with jobs above the median adopting the snapshot
+  (`StripSnapshot`) and filling only their remainder. Chain rows only, and
+  adopters bounded to prefix strips — the ungated form segfaulted the
+  opt/btlazy rows in release and byte-diverged past-overlap tails. Also
+  restores the no-default-features build behind the new items' std gates.
 - Encoder: the stream-mt worker threads pool across encoders. A worker
   whose encoder drops parks back into a process-global slot pool instead
   of exiting, and the next encoder's first post re-leases it — a slot

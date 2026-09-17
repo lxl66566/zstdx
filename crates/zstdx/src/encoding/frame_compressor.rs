@@ -3,6 +3,8 @@
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
+#[cfg(feature = "std")]
+use super::match_generator::StripSnapshot;
 use super::{
     Matcher,
     block_header::BlockHeader,
@@ -785,14 +787,25 @@ pub(crate) fn compress_job_blocks(
     is_last_job: bool,
 ) -> Vec<u8> {
     let start = job.start;
-    compress_job_blocks_inner(state, src, job, overlap, is_last_job, start, Vec::new())
+    compress_job_blocks_inner(
+        state,
+        src,
+        job,
+        overlap,
+        is_last_job,
+        start,
+        Vec::new(),
+        None,
+    )
 }
 
 /// [`compress_job_blocks`] with a donated prefix: `start_cursor` blocks of
 /// the job were already parsed and encoded on the calling side (the reach
 /// probe's keep-side donation for job zero — same state, same emit
 /// machinery, so the job's bytes are exactly an undonated run's), and
-/// `prefix` carries their encoded output verbatim.
+/// `prefix` carries their encoded output verbatim. `snapshot` is the
+/// shared prefix fill's snapshot when the job adopts one instead of
+/// filling its strip from scratch (see `StripSnapshot`).
 #[cfg(feature = "std")]
 pub(crate) fn compress_job_blocks_inner(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -802,6 +815,7 @@ pub(crate) fn compress_job_blocks_inner(
     is_last_job: bool,
     start_cursor: usize,
     prefix: Vec<u8>,
+    snapshot: Option<&StripSnapshot>,
 ) -> Vec<u8> {
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
@@ -822,7 +836,11 @@ pub(crate) fn compress_job_blocks_inner(
     let trace_prefill = std::time::Instant::now();
     // A donated continuation already prefilled (and parsed): the prefill
     // would clear the very tables the donation built.
-    if start_cursor <= job.start {
+    if let Some(snap) = snapshot {
+        state
+            .matcher
+            .adopt_strip_snapshot(snap, &src[strip..job.start], strip as u64);
+    } else if start_cursor <= job.start {
         state
             .matcher
             .prefill_job_strip(&src[strip..job.start], strip as u64);
