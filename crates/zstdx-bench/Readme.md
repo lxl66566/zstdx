@@ -204,7 +204,11 @@ only the reference found (bucketed by ml and offset-log, with our covering
 sequence as context), per-side literal/match/repcode aggregates and entropy
 bounds, and the cold-start literal split (first 768 KiB). `--divergences N`
 caps the printed events (they also count toward the missed-match context
-lines). The hook sits in the decode hot loop, so `seq_dump` is a
+lines). `--dict <file>` compresses against a raw-content or formatted
+dictionary and decodes the reference frame with it, so the differential
+mode works on dictionary frames (the dict frame must come from the same
+dict the reference was compressed with). The hook sits in the decode hot
+loop, so `seq_dump` is a
 bench-crate feature and is **never enabled by default** (it would slow every
 measured decode by ~30-40%); build explicitly:
 
