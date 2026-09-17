@@ -3265,18 +3265,33 @@ impl Matcher for MatchGeneratorDriver {
             Strategy::Fast => {
                 // The instantiation pair is compile-time: plain blocks run
                 // a body with every dense-mode lever folded out.
+                // The log axis instantiates the row's full value (HASH_LOG,
+                // everything at or above ~32 KiB of input) for the dense
+                // body only: its re-roll measured json −3.4% Ir while the
+                // plain body's re-roll measured dll +1.4% (the register
+                // freed by the constant shift is a lottery per body — the
+                // negative notes' lesson), so the plain body keeps the
+                // runtime-log codegen byte for byte. Clamped-window shapes
+                // (hash log below the row) take the [`RUNTIME_LOG`]
+                // instantiation either way.
                 match (self.ramp.is_armed(), self.scan_density) {
                     (false, ScanDensity::Plain) => {
-                        self.start_matching_fast::<false, false>(literals, seqs)
-                    },
-                    (false, ScanDensity::Dense) => {
-                        self.start_matching_fast::<false, true>(literals, seqs)
+                        self.start_matching_fast::<false, false, RUNTIME_LOG>(literals, seqs)
                     },
                     (true, ScanDensity::Plain) => {
-                        self.start_matching_fast::<true, false>(literals, seqs)
+                        self.start_matching_fast::<true, false, RUNTIME_LOG>(literals, seqs)
                     },
-                    (true, ScanDensity::Dense) => {
-                        self.start_matching_fast::<true, true>(literals, seqs)
+                    (false, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
+                        true => self.start_matching_fast::<false, true, HASH_LOG>(literals, seqs),
+                        false => {
+                            self.start_matching_fast::<false, true, RUNTIME_LOG>(literals, seqs)
+                        },
+                    },
+                    (true, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
+                        true => self.start_matching_fast::<true, true, HASH_LOG>(literals, seqs),
+                        false => {
+                            self.start_matching_fast::<true, true, RUNTIME_LOG>(literals, seqs)
+                        },
                     },
                 }
                 // This block's parse density picks the next block's
@@ -3738,7 +3753,7 @@ impl MatchGeneratorDriver {
     }
 
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
-    fn start_matching_fast<const RAMPED: bool, const DENSE: bool>(
+    fn start_matching_fast<const RAMPED: bool, const DENSE: bool, const HASH_LOG: u32>(
         &mut self,
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
@@ -3760,7 +3775,16 @@ impl MatchGeneratorDriver {
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
         let table_ptr: *mut u32 = self.table.as_mut_ptr();
-        let hash_log = self.params.hash_log;
+        // Known rows instantiate with the fastest row's log as a constant
+        // (the hash shift folds to an immediate and the shift-count register
+        // frees — the same disease the dfast const-log landing treated);
+        // clamped-window inputs (hash log below the row) take the
+        // [`RUNTIME_LOG`] instantiation.
+        let hash_log = if HASH_LOG == RUNTIME_LOG {
+            self.params.hash_log
+        } else {
+            HASH_LOG
+        };
         let mut emit = TableEmit {
             table: &mut self.table[..],
             literals,

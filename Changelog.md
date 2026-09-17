@@ -5,6 +5,16 @@ This document records the changes made between versions, starting with version 0
 # After 0.9.0 (Current)
 
 
+- Encoder: const-generic hash-log instantiation for the fastest tier's
+  dense scan body (`start_matching_fast` takes `const HASH_LOG`; the
+  dispatch instantiates the row's H15 for dense blocks of full-row inputs,
+  everything else keeps the runtime-log body). The dense body's
+  register-allocation re-roll lands well: json4 fastest scan Ir
+  64.23M→62.04M (−3.4%, whole call −1.8%) at wall parity; the plain
+  body's re-roll measured dll4 +1.4% Ir at wall parity, so the plain
+  body keeps the runtime-log codegen and dll4's scan Ir stays
+  bit-identical. Output byte-identical everywhere (full-ladder dump,
+  dll100 l1/l3 emitframes); 199+7+16 tests pass.
 - Encoder: text.best's last ratio residue (todo 9b) closed — the btlazy2
   lazy loop parses a frame's cold head at libzstd's exact probe step
   (`LazyStep` in `encoding/btlazy.rs`: `1 + run>>8`, libzstd's
