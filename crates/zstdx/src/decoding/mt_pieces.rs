@@ -21,6 +21,17 @@
 //! fail discovery or validation fall back to the serial stage B
 //! unchanged.
 //!
+//! Validation is fused into staging instead of running as a barrier round
+//! after it: each staged segment extends the contiguous staged prefix,
+//! grid multiples are checked and pieces cut against that prefix, and
+//! idle workers walk pieces as soon as their range is fully staged — the
+//! last piece's walk is the only validation left on the critical path.
+//! The verdict (first ascending grid that fully validates with a deep
+//! enough lag) is deterministic in the staged content, so the fused form
+//! picks the same grid the round form would. Worker wakes and caller
+//! wakes use separate condvars: phase transitions touch the pool once,
+//! and verdict changes wake only the calling thread.
+//!
 //! Gated on the same env var as the encoder-side ramp (an experiment
 //! pair): this path runs stage A to completion before executing (staging
 //! must cover the whole frame before the grid is known), losing the serial
@@ -132,8 +143,8 @@ struct BlockEntry {
 /// shared job formula `ceil(fcs / (2 * workers))` over plausible worker
 /// counts (floored at 1 MiB like the formula), plus the overlap-raised
 /// sizes deep levels' strips can set (row-9 reach: a 4 MiB strip). Wrong
-/// candidates die on the first validated piece (violations abort the
-/// round), so the lattice's reject cost stays near one piece walk.
+/// candidates die on their first violating piece, so the reject cost
+/// stays near one piece walk per grid.
 fn candidate_jobs(fcs: usize) -> Vec<usize> {
     let mut cands: Vec<usize> = (2..=32u32)
         .map(|w| fcs.div_ceil(w as usize * 2).max(1024 * 1024))
@@ -145,77 +156,38 @@ fn candidate_jobs(fcs: usize) -> Vec<usize> {
     cands
 }
 
-/// Candidate grids for the staged frame: `(job_size, pieces)` pairs,
-/// ascending job size. A grid is kept when every `k * job_size` lands on a
-/// block start (the encoder's jobs end at block edges, so true job
-/// boundaries always are; pieces may start at any block — entropy
-/// independence is the segment's job, not the piece's).
-fn plan_grids(segs: &[Arc<DecodedSegment>], fcs: usize) -> Vec<(usize, Vec<Piece>)> {
-    let total: usize = segs.iter().map(|s| s.plan.len()).sum();
-    let mut blocks: Vec<BlockEntry> = Vec::with_capacity(total);
-    let mut pos = 0usize;
-    for (si, seg) in segs.iter().enumerate() {
-        for (bi, b) in seg.plan.iter().enumerate() {
-            blocks.push(BlockEntry {
-                seg: si,
-                idx: bi,
-                start: pos,
-            });
-            pos += b.out();
-        }
-    }
-    if pos != fcs {
-        // Corrupt pledge: the serial path reports it with its own errors.
-        return Vec::new();
-    }
-    let mut grids = Vec::new();
-    'seed: for j in candidate_jobs(fcs) {
-        let n_pieces = fcs.div_ceil(j);
-        for k in 1..n_pieces {
-            let target = k * j;
-            if blocks.binary_search_by_key(&target, |b| b.start).is_err() {
-                continue 'seed;
-            }
-        }
-        grids.push((j, cut_pieces(&blocks, j, fcs, n_pieces)));
-    }
-    grids
+/// One candidate grid's incremental state, advanced against the
+/// contiguous staged prefix: block-start multiples checked, pieces cut
+/// once their whole range is staged, and per-piece validation progress.
+struct GridState {
+    j: usize,
+    alive: bool,
+    pieces: Vec<Piece>,
+    /// Measured max_top per cut piece, in piece order.
+    tops: Vec<usize>,
+    /// Next piece index to hand to a validator (pieces below are cut).
+    next_validate: usize,
+    validated: usize,
+    /// Block-table cursor: index of the first block not yet consumed by a
+    /// cut piece.
+    cut_bi: usize,
+    /// Next multiple k whose block-start check is still pending.
+    next_mult: usize,
 }
 
-fn cut_pieces(blocks: &[BlockEntry], j: usize, fcs: usize, n_pieces: usize) -> Vec<Piece> {
-    let mut pieces = Vec::with_capacity(n_pieces);
-    let mut bi = 0usize;
-    for k in 0..n_pieces {
-        let start = k * j;
-        let end = ((k + 1) * j).min(fcs);
-        while blocks[bi].start < start {
-            bi += 1;
+impl GridState {
+    fn new(j: usize) -> Self {
+        GridState {
+            j,
+            alive: true,
+            pieces: Vec::new(),
+            tops: Vec::new(),
+            next_validate: 0,
+            validated: 0,
+            cut_bi: 0,
+            next_mult: 1,
         }
-        debug_assert_eq!(blocks[bi].start, start, "grid multiples are block starts");
-        let mut parts = Vec::new();
-        while bi < blocks.len() && blocks[bi].start < end {
-            let seg = blocks[bi].seg;
-            let part_start = blocks[bi].start;
-            let first = blocks[bi].idx;
-            let mut last = first;
-            while bi < blocks.len() && blocks[bi].start < end && blocks[bi].seg == seg {
-                last = blocks[bi].idx;
-                bi += 1;
-            }
-            parts.push(PiecePart {
-                seg,
-                blocks: first..last + 1,
-                start: part_start,
-            });
-        }
-        pieces.push(Piece {
-            start,
-            end,
-            parts,
-            max_top: 0,
-        });
     }
-    pieces
 }
 
 /// Resolve one piece's sequences standalone and measure its deepest
@@ -305,10 +277,9 @@ unsafe fn execute_piece(
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Phase {
-    /// Workers stage segments; no execution decision yet.
+    /// Workers stage segments and validate every candidate grid's pieces
+    /// as their range stages; the verdict is decided on the pool.
     Staging,
-    /// A candidate grid is being validated; `round` holds its pieces.
-    Validating,
     /// The chosen grid executes as pieces; `pieces` holds them.
     Execute,
     /// Validation failed everywhere: the caller runs the serial stage B.
@@ -317,23 +288,38 @@ enum Phase {
 
 enum Job {
     Stage(usize),
-    Validate(usize),
+    Validate { grid: usize, piece: usize },
     Exec(usize),
     Quit,
+}
+
+/// One segment's staging slot. `Ok` segments move into `Driver::segs` when
+/// the contiguous prefix reaches them.
+enum Slot {
+    Pending,
+    Ok(Arc<DecodedSegment>),
+    Failed,
 }
 
 struct Driver {
     phase: Phase,
     aborting: bool,
-    staged: Vec<Option<Result<Arc<DecodedSegment>, FrameDecoderError>>>,
+    n_segments: usize,
+    fcs: usize,
+    staged: Vec<Slot>,
     staged_count: usize,
     next_stage: usize,
+    stage_errors: Vec<(usize, FrameDecoderError)>,
+    /// Segments [0, contig_next) are staged and in `segs`, with their
+    /// blocks in `blocks` covering [0, staged_pos).
+    contig_next: usize,
+    staged_pos: usize,
     segs: Vec<Arc<DecodedSegment>>,
-    round: Option<Arc<Vec<Piece>>>,
-    round_tops: Vec<Arc<AtomicUsize>>,
-    next_validate: usize,
-    validated: usize,
-    violations: usize,
+    blocks: Vec<BlockEntry>,
+    grids: Vec<GridState>,
+    winner: Option<usize>,
+    all_dead: bool,
+    stage_failed: bool,
     pieces: Option<Arc<Vec<Piece>>>,
     next_piece: usize,
     done: Vec<bool>,
@@ -351,6 +337,160 @@ struct Driver {
 }
 
 impl Driver {
+    /// Extend the contiguous staged prefix over consecutively completed
+    /// segments, then advance the grids against it. Returns whether new
+    /// validation work appeared.
+    fn advance_prefix(&mut self) -> bool {
+        while self.contig_next < self.n_segments {
+            let seg = match &self.staged[self.contig_next] {
+                Slot::Ok(s) => s.clone(),
+                _ => break,
+            };
+            let mut pos = self.staged_pos;
+            for (bi, b) in seg.plan.iter().enumerate() {
+                self.blocks.push(BlockEntry {
+                    seg: self.contig_next,
+                    idx: bi,
+                    start: pos,
+                });
+                pos += b.out();
+            }
+            self.staged_pos = pos;
+            self.contig_next += 1;
+            self.segs.push(seg);
+        }
+        self.refresh_grids(self.staged_count == self.n_segments)
+    }
+
+    /// Check grid multiples and cut pieces against the current staged
+    /// prefix; `complete` marks frame-end staging (every multiple is
+    /// decidable and every piece cuttable). Returns whether any new
+    /// validation work appeared.
+    fn refresh_grids(&mut self, complete: bool) -> bool {
+        let mut new_work = false;
+        if complete && self.staged_pos != self.fcs {
+            // Corrupt pledge: the serial path reports it with its own
+            // errors.
+            self.grids.iter_mut().for_each(|g| g.alive = false);
+            return false;
+        }
+        for gi in 0..self.grids.len() {
+            let j = self.grids[gi].j;
+            let n_pieces = self.fcs.div_ceil(j);
+            while self.grids[gi].alive && self.grids[gi].next_mult < n_pieces {
+                let target = self.grids[gi].next_mult * j;
+                if !complete && self.staged_pos <= target {
+                    break; // undecided until a block past the target stages
+                }
+                if self
+                    .blocks
+                    .binary_search_by_key(&target, |b| b.start)
+                    .is_err()
+                {
+                    self.grids[gi].alive = false;
+                    break;
+                }
+                self.grids[gi].next_mult += 1;
+            }
+            while self.grids[gi].alive && self.grids[gi].pieces.len() < n_pieces {
+                let k = self.grids[gi].pieces.len();
+                let start = k * j;
+                let end = ((k + 1) * j).min(self.fcs);
+                if self.staged_pos < end {
+                    break;
+                }
+                debug_assert_eq!(
+                    self.blocks[self.grids[gi].cut_bi].start, start,
+                    "grid multiples are block starts"
+                );
+                let mut bi = self.grids[gi].cut_bi;
+                let mut parts = Vec::new();
+                while bi < self.blocks.len() && self.blocks[bi].start < end {
+                    let seg = self.blocks[bi].seg;
+                    let part_start = self.blocks[bi].start;
+                    let first = self.blocks[bi].idx;
+                    let mut last = first;
+                    while bi < self.blocks.len()
+                        && self.blocks[bi].start < end
+                        && self.blocks[bi].seg == seg
+                    {
+                        last = self.blocks[bi].idx;
+                        bi += 1;
+                    }
+                    parts.push(PiecePart {
+                        seg,
+                        blocks: first..last + 1,
+                        start: part_start,
+                    });
+                }
+                self.grids[gi].cut_bi = bi;
+                self.grids[gi].pieces.push(Piece {
+                    start,
+                    end,
+                    parts,
+                    max_top: 0,
+                });
+                self.grids[gi].tops.push(0);
+                new_work = true;
+            }
+        }
+        new_work
+    }
+
+    /// Settle the verdict on the first alive grid once it is fully cut and
+    /// every piece is validated: lag pass → winner; lag fail → dead and
+    /// the next grid is considered. Grids after an alive-but-incomplete
+    /// one wait (their pieces are claimed only in staging idle anyway —
+    /// ascending priority).
+    fn try_settle(&mut self) {
+        if self.winner.is_some() {
+            return;
+        }
+        for gi in 0..self.grids.len() {
+            let g = &self.grids[gi];
+            if !g.alive {
+                continue;
+            }
+            // A grid still being cut is incomplete even when its cut
+            // pieces all validated: settling it would leave the uncut
+            // tail's max_top at zero and the watermark gate open.
+            let n_pieces = self.fcs.div_ceil(g.j);
+            if g.pieces.len() < n_pieces || g.validated < g.pieces.len() {
+                break;
+            }
+            let j = g.j;
+            let lag_ok = g
+                .pieces
+                .iter()
+                .skip(1)
+                .zip(g.tops.iter().skip(1))
+                .all(|(p, &top)| p.start.saturating_sub(top) >= j * MIN_LAG_NUM / MIN_LAG_DEN);
+            if lag_ok {
+                self.winner = Some(gi);
+                return;
+            }
+            self.grids[gi].alive = false;
+        }
+        self.all_dead = self.grids.iter().all(|g| !g.alive);
+    }
+
+    /// Next validation job: the first alive grid (ascending job size)
+    /// with an unclaimed cut piece.
+    fn claim_validation(&mut self) -> Option<Job> {
+        if self.winner.is_some() || self.all_dead || self.stage_failed {
+            return None;
+        }
+        self.grids
+            .iter_mut()
+            .enumerate()
+            .find(|(_, g)| g.alive && g.next_validate < g.pieces.len())
+            .map(|(grid, g)| {
+                let piece = g.next_validate;
+                g.next_validate += 1;
+                Job::Validate { grid, piece }
+            })
+    }
+
     /// Absorb every completed-but-unabsorbed piece below `upto` (piece
     /// index bound) into the frame checksum, in order. Own-range absorbs
     /// stay on the executing thread's caches; a foreign range is absorbed
@@ -380,11 +520,13 @@ impl Driver {
     }
 }
 
-/// Shared pool context: the phase machine under one mutex, a broadcast
-/// condvar, panic poison, and the immutable inputs.
+/// Shared pool context: the phase machine under one mutex, worker and
+/// caller condvars (verdict changes wake the calling thread alone), panic
+/// poison, and the immutable inputs.
 struct Pool<'a> {
     mtx: &'a Mutex<Driver>,
     cv: &'a Condvar,
+    cv_caller: &'a Condvar,
     poison: &'a Mutex<Option<Box<dyn std::any::Any + Send>>>,
     input: &'a [u8],
     plans: &'a [SegmentPlan],
@@ -405,25 +547,9 @@ impl Pool<'_> {
                         d.next_stage += 1;
                         return Job::Stage(id);
                     }
-                    if d.staged_count < self.n_segments {
-                        d = self.cv.wait(d).unwrap();
-                        continue;
+                    if let Some(job) = d.claim_validation() {
+                        return job;
                     }
-                    // Staging complete; the caller decides the next phase.
-                    d = self.cv.wait(d).unwrap();
-                },
-                Phase::Validating => {
-                    let len = d.round.as_ref().map_or(0, |r| r.len());
-                    if d.violations == 0 && d.next_validate < len {
-                        let i = d.next_validate;
-                        d.next_validate += 1;
-                        return Job::Validate(i);
-                    }
-                    if d.validated < d.next_validate {
-                        d = self.cv.wait(d).unwrap();
-                        continue;
-                    }
-                    // Round settled; the caller posts the next one.
                     d = self.cv.wait(d).unwrap();
                 },
                 Phase::Execute => {
@@ -450,39 +576,68 @@ impl Pool<'_> {
         }));
         let mut d = self.mtx.lock().unwrap();
         match attempt {
-            Ok(Ok(seg)) => d.staged[id] = Some(Ok(Arc::new(seg))),
-            Ok(Err(e)) => d.staged[id] = Some(Err(e)),
+            Ok(Ok(seg)) => d.staged[id] = Slot::Ok(Arc::new(seg)),
+            Ok(Err(e)) => {
+                d.staged[id] = Slot::Failed;
+                d.stage_errors.push((id, e));
+                d.stage_failed = true;
+                d.grids.iter_mut().for_each(|g| g.alive = false);
+            },
             Err(payload) => {
                 *self.poison.lock().unwrap() = Some(payload);
                 d.aborting = true;
             },
         }
         d.staged_count += 1;
+        let mut new_work = false;
+        if !d.aborting && !d.stage_failed && id == d.contig_next {
+            new_work = d.advance_prefix();
+            d.try_settle();
+        }
+        let settled = d.winner.is_some() || d.all_dead;
+        let staged_done = d.staged_count == self.n_segments;
+        let aborting = d.aborting;
         drop(d);
-        self.cv.notify_all();
+        if new_work || aborting {
+            self.cv.notify_all();
+        }
+        // The calling thread parks only once staging is exhausted, so the
+        // verdict conditions alone can release it.
+        if settled || staged_done || aborting {
+            self.cv_caller.notify_one();
+        }
     }
 
-    fn run_validate(&self, i: usize) {
-        let (segs, round, tops) = {
+    fn run_validate(&self, grid: usize, piece: usize) {
+        let (segs, target) = {
             let d = self.mtx.lock().unwrap();
-            let round = d.round.clone().expect("validation job implies a round");
-            (d.segs.clone(), round, d.round_tops[i].clone())
+            (d.segs.clone(), d.grids[grid].pieces[piece].clone())
         };
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            validate_piece(&segs, &round[i])
+            validate_piece(&segs, &target)
         }));
         let mut d = self.mtx.lock().unwrap();
-        d.validated += 1;
+        d.grids[grid].validated += 1;
         match attempt {
-            Ok(Some(top)) => tops.store(top, Ordering::Relaxed),
-            Ok(None) => d.violations += 1,
+            Ok(Some(top)) => d.grids[grid].tops[piece] = top,
+            Ok(None) => d.grids[grid].alive = false,
             Err(payload) => {
                 *self.poison.lock().unwrap() = Some(payload);
                 d.aborting = true;
             },
         }
+        d.try_settle();
+        let settled = d.winner.is_some() || d.all_dead;
+        let aborting = d.aborting;
         drop(d);
-        self.cv.notify_all();
+        // No worker wake otherwise: a validation completion never makes new
+        // work claimable (pieces appear only through the staging prefix).
+        if aborting {
+            self.cv.notify_all();
+        }
+        if settled || aborting {
+            self.cv_caller.notify_one();
+        }
     }
 
     fn run_exec(&self, i: usize) {
@@ -532,8 +687,13 @@ impl Pool<'_> {
                 d.aborting = true;
             },
         }
+        let finished = d.executed == d.pieces.as_ref().map_or(0, |p| p.len());
+        let errored = d.exec_err.is_some() || d.aborting;
         drop(d);
         self.cv.notify_all();
+        if finished || errored {
+            self.cv_caller.notify_one();
+        }
     }
 
     fn worker_loop(&self) {
@@ -542,7 +702,7 @@ impl Pool<'_> {
             match self.claim() {
                 Job::Quit => return,
                 Job::Stage(id) => self.run_stage(id, &mut scratch),
-                Job::Validate(i) => self.run_validate(i),
+                Job::Validate { grid, piece } => self.run_validate(grid, piece),
                 Job::Exec(i) => self.run_exec(i),
             }
         }
@@ -550,15 +710,30 @@ impl Pool<'_> {
 }
 
 /// Abort in-flight phases (a caller error path) and wake the pool.
-fn abort_pool(mtx: &Mutex<Driver>, cv: &Condvar) {
+fn abort_pool(mtx: &Mutex<Driver>, cv: &Condvar, cv_caller: &Condvar) {
     mtx.lock().unwrap().aborting = true;
     cv.notify_all();
+    cv_caller.notify_one();
 }
 
-/// Piece-parallel driver: stage everything, discover and validate job
-/// grids, then execute pieces on the pool + caller. Validation failure
-/// runs the serial stage B over the same staged segments. `place` is
-/// called with the whole pledged range on this thread only.
+/// The first staging error in segment order, taken out of the driver.
+fn take_stage_error(driver: &Mutex<Driver>) -> Option<FrameDecoderError> {
+    let mut d = driver.lock().unwrap();
+    let pos = d
+        .stage_errors
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (id, _))| *id)
+        .map(|(pos, _)| pos)?;
+    Some(d.stage_errors.swap_remove(pos).1)
+}
+
+/// Piece-parallel driver: stage and validate fused on the pool (grid
+/// pieces are walked as their range stages; the verdict is the first
+/// ascending grid that fully validates with a deep-enough watermark lag),
+/// then execute pieces on the pool + caller. Validation failure runs the
+/// serial stage B over the same staged segments. `place` is called with
+/// the whole pledged range on this thread only.
 pub(super) fn decode_pieces(
     input: &[u8],
     workers: u32,
@@ -573,15 +748,23 @@ pub(super) fn decode_pieces(
     let driver = Mutex::new(Driver {
         phase: Phase::Staging,
         aborting: false,
-        staged: (0..n_segments).map(|_| None).collect(),
+        n_segments,
+        fcs,
+        staged: (0..n_segments).map(|_| Slot::Pending).collect(),
         staged_count: 0,
         next_stage: 0,
+        stage_errors: Vec::new(),
+        contig_next: 0,
+        staged_pos: 0,
         segs: Vec::new(),
-        round: None,
-        round_tops: Vec::new(),
-        next_validate: 0,
-        validated: 0,
-        violations: 0,
+        blocks: Vec::new(),
+        grids: candidate_jobs(fcs)
+            .into_iter()
+            .map(GridState::new)
+            .collect(),
+        winner: None,
+        all_dead: false,
+        stage_failed: false,
         pieces: None,
         next_piece: 0,
         done: Vec::new(),
@@ -596,10 +779,12 @@ pub(super) fn decode_pieces(
         hash: None,
     });
     let cv = Condvar::new();
+    let cv_caller = Condvar::new();
     let poison: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
     let pool = Pool {
         mtx: &driver,
         cv: &cv,
+        cv_caller: &cv_caller,
         poison: &poison,
         input,
         plans: &plan.segments,
@@ -615,101 +800,61 @@ pub(super) fn decode_pieces(
             scope.spawn(|| pool.worker_loop());
         }
 
-        // Phase A: wait for the whole frame to stage, then take it out of
-        // the slots (the first error in segment order wins).
+        // Fused staging + validation runs on the pool, and the calling
+        // thread stages segments along (it executes pieces later the same
+        // way): between segments it parks on its own condvar until either
+        // staging work appears or the verdict is ready (a winning grid, a
+        // staging error, or every grid dead). It never claims validation:
+        // a caller walking pieces reads the staged set while workers still
+        // write it, and measured slower on every shape than staying out
+        // (the staging streams are the same either way).
         {
+            let mut scratch = SegmentScratch::new();
             let mut d = driver.lock().unwrap();
-            while d.staged_count < n_segments && !d.aborting {
-                d = cv.wait(d).unwrap();
-            }
-        }
-        let mut segs: Vec<Arc<DecodedSegment>> = Vec::with_capacity(n_segments);
-        let stage_err = {
-            let mut d = driver.lock().unwrap();
-            let mut err = None;
-            for slot in &mut d.staged {
-                match slot.take().expect("staged_count covers every slot") {
-                    Ok(seg) => {
-                        if err.is_none() {
-                            segs.push(seg);
-                        }
+            loop {
+                let ready = d.winner.is_some()
+                    || d.aborting
+                    || (d.staged_count == n_segments && (d.all_dead || d.stage_failed));
+                if ready {
+                    break;
+                }
+                let job: Option<Job> = if d.phase != Phase::Staging || d.next_stage >= n_segments {
+                    None
+                } else {
+                    let id = d.next_stage;
+                    d.next_stage += 1;
+                    Some(Job::Stage(id))
+                };
+                match job {
+                    Some(Job::Stage(id)) => {
+                        drop(d);
+                        pool.run_stage(id, &mut scratch);
+                        d = driver.lock().unwrap();
                     },
-                    Err(e) => {
-                        if err.is_none() {
-                            err = Some(e);
-                        }
+                    Some(Job::Validate { .. } | Job::Exec(_) | Job::Quit) => {
+                        unreachable!("the caller claims staging only")
                     },
+                    None => d = cv_caller.wait(d).unwrap(),
                 }
             }
-            err
-        };
-        if let Some(e) = stage_err {
-            abort_pool(&driver, &cv);
+            if d.aborting {
+                // The poison (if any) resumes after the scope joins.
+                return Err(FrameDecoderError::NotYetInitialized);
+            }
+        }
+        if let Some(e) = take_stage_error(&driver) {
+            abort_pool(&driver, &cv, &cv_caller);
             return Err(e);
         }
 
-        // Grid discovery + validation rounds; the first grid whose pieces
-        // all validate with a deep-enough watermark lag wins.
-        let grids = plan_grids(&segs, fcs);
-        let mut chosen: Option<Vec<Piece>> = None;
-        'candidates: for (j, pieces) in grids {
-            let n = pieces.len();
-            {
-                let mut d = driver.lock().unwrap();
-                if d.aborting {
-                    break 'candidates;
-                }
-                d.segs.clone_from(&segs);
-                d.round = Some(Arc::new(pieces.clone()));
-                d.round_tops = (0..n).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-                d.next_validate = 0;
-                d.validated = 0;
-                d.violations = 0;
-                d.phase = Phase::Validating;
-            }
-            cv.notify_all();
-            let (violations, tops) = {
-                let mut d = driver.lock().unwrap();
-                loop {
-                    let settled = d.validated == d.next_validate
-                        && (d.violations > 0 || d.next_validate == n);
-                    if settled || d.aborting {
-                        break;
-                    }
-                    d = cv.wait(d).unwrap();
-                }
-                if d.aborting {
-                    break 'candidates;
-                }
-                let tops = d
-                    .round_tops
-                    .iter()
-                    .map(|t| t.load(Ordering::Relaxed))
-                    .collect::<Vec<_>>();
-                (d.violations, tops)
-            };
-            if violations > 0 {
-                continue;
-            }
-            let lag_ok = pieces
-                .iter()
-                .skip(1)
-                .zip(&tops[1..])
-                .all(|(p, &top)| p.start.saturating_sub(top) >= j * MIN_LAG_NUM / MIN_LAG_DEN);
-            if lag_ok {
-                let mut merged = pieces;
-                for (p, &top) in merged.iter_mut().zip(&tops) {
-                    p.max_top = top;
-                }
-                chosen = Some(merged);
-                break;
-            }
-        }
-
-        let Some(pieces) = chosen else {
+        // A plain binding first: a lock guard in the let-else scrutinee
+        // would live through the else branch and deadlock the re-lock.
+        let winner = driver.lock().unwrap().winner;
+        let Some(winner) = winner else {
             // Serial stage B over the staged segments; workers quit.
             driver.lock().unwrap().phase = Phase::Serial;
             cv.notify_all();
+            let segs = driver.lock().unwrap().segs.clone();
             #[cfg(feature = "hash")]
             let mut hash = expected.map(|e| (Xxh64::new(0), e));
             #[cfg(feature = "hash")]
@@ -722,15 +867,19 @@ pub(super) fn decode_pieces(
         let (base, buf_limit) = match place(0, fcs) {
             Ok(ok) => ok,
             Err(e) => {
-                abort_pool(&driver, &cv);
+                abort_pool(&driver, &cv, &cv_caller);
                 return Err(e);
             },
         };
-        let n = pieces.len();
-        {
+        let n = {
             let mut d = driver.lock().unwrap();
-            d.segs = segs;
-            d.pieces = Some(Arc::new(pieces));
+            let g = &mut d.grids[winner];
+            for (p, &top) in g.pieces.iter_mut().zip(&g.tops) {
+                p.max_top = top;
+            }
+            let pieces = Arc::new(core::mem::take(&mut g.pieces));
+            let n = pieces.len();
+            d.pieces = Some(pieces);
             d.done = alloc::vec![false; n];
             d.next_piece = 0;
             d.watermark_piece = 0;
@@ -744,7 +893,8 @@ pub(super) fn decode_pieces(
                 d.hash = expected.map(|_| Xxh64::new(0));
             }
             d.phase = Phase::Execute;
-        }
+            n
+        };
         cv.notify_all();
         ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
 
@@ -754,7 +904,7 @@ pub(super) fn decode_pieces(
             match pool.claim() {
                 Job::Quit => break,
                 Job::Exec(i) => pool.run_exec(i),
-                Job::Stage(_) | Job::Validate(_) => {
+                Job::Stage(_) | Job::Validate { .. } => {
                     unreachable!("phase counters are exhausted in Execute")
                 },
             }
@@ -762,7 +912,7 @@ pub(super) fn decode_pieces(
         let verdict = {
             let mut d = driver.lock().unwrap();
             while d.executed < n && d.exec_err.is_none() && !d.aborting {
-                d = cv.wait(d).unwrap();
+                d = cv_caller.wait(d).unwrap();
             }
             if let Some(e) = d.exec_err.take() {
                 Err(e)
@@ -788,7 +938,7 @@ pub(super) fn decode_pieces(
             }
         };
         if verdict.is_err() {
-            abort_pool(&driver, &cv);
+            abort_pool(&driver, &cv, &cv_caller);
         }
         verdict
     });
