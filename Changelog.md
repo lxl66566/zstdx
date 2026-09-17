@@ -4,7 +4,22 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
-
+- Encoder: the opt/ultra block splitter's estimation tax re-measured and
+  cut byte-identically (`blocks/split.rs`): the whole-range estimate now
+  threads down the bisection recursion (a child re-derived the exact range
+  its parent had just estimated) and the right half is costed from
+  `whole - left` histograms — adjacent ranges' counts add up entry-wise,
+  so the subtraction is exact, uniformity collapses to `exactly one live
+  symbol`, and the left halves remain the only O(range) scans. The
+  splitter's measured share is 0.53%/1.37%/0.20%/0.47% of json/text
+  opt/ultra (gungraun vs a splitter-disabled build; `derive_splits` is
+  essentially all of it, the partition-emission delta ~0) — the json
+  opt/ultra wall gap is parse-side, not splitter-side. Full-ladder dump
+  byte-identical; Ir json opt -0.108%, text opt -0.178%, json/text ultra
+  -0.040%/-0.060%; walls in band. Also fixes `histogram_literals` on
+  empty literal ranges (a splitter half of pure matches): its tail scan
+  assumed a live symbol — debug panicked on the underflow, release would
+  index out of bounds.
 - Encoder: text.best's last ratio residue (todo 9b) closed — the btlazy2
   lazy loop parses a frame's cold head at libzstd's exact probe step
   (`LazyStep` in `encoding/btlazy.rs`: `1 + run>>8`, libzstd's

@@ -128,7 +128,8 @@ pub(crate) fn compress_split_block<M: Matcher>(
             huff,
             fse_desc: &mut split.fse_desc,
         };
-        derive_splits(&mut est, &mut split.partitions, 0, nb_seq);
+        let whole = est.estimate_scanned(0, nb_seq);
+        derive_splits(&mut est, &mut split.partitions, 0, nb_seq, &whole);
     }
     if split.partitions.is_empty() {
         return SplitOutcome::Single(single_block(
@@ -226,21 +227,68 @@ fn build_prefixes(seqs: &[SeqWord], lit_prefix: &mut Vec<u32>, match_prefix: &mu
     }
 }
 
+/// Everything one estimate would scan over a range: the literal histogram
+/// and the per-stream sequence-code histograms plus the add-bits total.
+/// Adjacent ranges add up entry-wise, so a suffix range's histograms are
+/// the difference of its parent's and its prefix's — exact, no rescan.
+struct RangeCounts {
+    lit: [usize; 256],
+    ll: [u32; SEQ_CODE_SPACE],
+    ml: [u32; SEQ_CODE_SPACE],
+    of: [u32; SEQ_CODE_SPACE],
+    add_bits: u32,
+}
+
+impl RangeCounts {
+    /// Histograms of `[b, c)` from `[a, c)`'s minus `[a, b)`'s.
+    fn suffix_after(&self, prefix: &Self) -> Self {
+        Self {
+            lit: core::array::from_fn(|i| self.lit[i] - prefix.lit[i]),
+            ll: core::array::from_fn(|i| self.ll[i] - prefix.ll[i]),
+            ml: core::array::from_fn(|i| self.ml[i] - prefix.ml[i]),
+            of: core::array::from_fn(|i| self.of[i] - prefix.of[i]),
+            add_bits: self.add_bits - prefix.add_bits,
+        }
+    }
+}
+
+/// One derived range: its estimated size plus the histograms the estimate
+/// was costed from (the recursion's material for the subtraction above).
+struct RangeEstimate {
+    size: usize,
+    counts: RangeCounts,
+}
+
 /// libzstd's `ZSTD_deriveBlockSplitsHelper`: bisect `[start, end)` and
 /// commit the midpoint when the halves' estimates beat the whole's,
 /// recursing into both halves. Pushes split points in ascending order.
-fn derive_splits(est: &mut Estimator<'_>, out: &mut Vec<u32>, start: usize, end: usize) {
+///
+/// The whole range's estimate is threaded down from the parent — the
+/// recursion would otherwise re-derive the exact range the parent just
+/// estimated — and only the left half is scanned: the right half's cost
+/// runs on `whole - left` histograms, so every decision sees the numbers a
+/// fresh scan would produce.
+fn derive_splits(
+    est: &mut Estimator<'_>,
+    out: &mut Vec<u32>,
+    start: usize,
+    end: usize,
+    whole: &RangeEstimate,
+) {
     if end - start < MIN_SEQUENCES_BLOCK_SPLITTING || out.len() >= MAX_NB_BLOCK_SPLITS {
         return;
     }
     let mid = (start + end) / 2;
-    let whole = est.estimate(start, end);
-    let left = est.estimate(start, mid);
-    let right = est.estimate(mid, end);
-    if left + right < whole {
-        derive_splits(est, out, start, mid);
+    let left = est.estimate_scanned(start, mid);
+    let right_counts = whole.counts.suffix_after(&left.counts);
+    let right = RangeEstimate {
+        size: est.cost_range(mid, end, &right_counts),
+        counts: right_counts,
+    };
+    if left.size + right.size < whole.size {
+        derive_splits(est, out, start, mid, &left);
         out.push(mid as u32);
-        derive_splits(est, out, mid, end);
+        derive_splits(est, out, mid, end, &right);
     }
 }
 
@@ -496,30 +544,74 @@ struct Estimator<'a> {
 }
 
 impl Estimator<'_> {
-    /// Estimated bytes of one range's block (block header included).
-    fn estimate(&mut self, start: usize, end: usize) -> usize {
+    /// Scan a range no parent estimated and cost it.
+    fn estimate_scanned(&mut self, start: usize, end: usize) -> RangeEstimate {
+        let counts = self.scan_counts(start, end);
+        let size = self.cost_range(start, end, &counts);
+        RangeEstimate { size, counts }
+    }
+
+    /// One pass over the range's literals and packed sequences filling the
+    /// histograms every cost below consumes.
+    fn scan_counts(&self, start: usize, end: usize) -> RangeCounts {
         let lit_a = self.lit_prefix[start] as usize;
         let lit_b = self.lit_prefix[end] as usize;
-        self.estimate_literals(&self.literals[lit_a..lit_b])
-            + self.estimate_sequences(&self.seqs[start..end])
+        let mut counts = RangeCounts {
+            lit: [0; 256],
+            ll: [0; SEQ_CODE_SPACE],
+            ml: [0; SEQ_CODE_SPACE],
+            of: [0; SEQ_CODE_SPACE],
+            add_bits: 0,
+        };
+        // An empty literal range keeps the all-zero histogram (the cost's
+        // `n == 0` early return); `histogram_literals` requires at least one
+        // byte (its tail scan assumes a live symbol).
+        if lit_b > lit_a {
+            histogram_literals(&self.literals[lit_a..lit_b], &mut counts.lit);
+        }
+        for &w in &self.seqs[start..end] {
+            let packed = w.codes;
+            // Wire codes never reach 64; the mask keeps the increments
+            // bounds-check-free like the emission's histograms.
+            counts.ll[(packed & 0x3f) as usize] += 1;
+            counts.ml[((packed >> 8) & 0x3f) as usize] += 1;
+            counts.of[((packed >> 16) & 0x3f) as usize] += 1;
+            counts.add_bits += w.add_nb as u32;
+        }
+        counts
+    }
+
+    /// Estimated bytes of one range's block (block header included); pure
+    /// in the histograms, no O(range) work.
+    fn cost_range(&mut self, start: usize, end: usize, counts: &RangeCounts) -> usize {
+        let n_lit = self.lit_prefix[end] as usize - self.lit_prefix[start] as usize;
+        self.cost_literals(n_lit, &counts.lit)
+            + self.cost_sequences(&self.seqs[start..end], counts)
             + 3
     }
 
     /// Estimated bytes of the literals section: the same raw/RLE/repeat/
     /// fresh-table decision [`compress_literals`](super::compressed) makes,
-    /// costed through the exact code lengths instead of encoding.
-    fn estimate_literals(&mut self, lits: &[u8]) -> usize {
-        let n = lits.len();
+    /// costed through the exact code lengths instead of encoding. Pure in
+    /// the histogram — uniformity is `exactly one live symbol`, which is
+    /// what a byte-wise `is_uniform` scan would report.
+    fn cost_literals(&mut self, n: usize, counts: &[usize; 256]) -> usize {
         // The raw and RLE forms share the size-format ladder.
         let raw_header = 1 + (n > 31) as usize + (n > 4095) as usize;
         if n == 0 {
             return 1;
         }
-        if crate::encoding::util::is_uniform(lits) {
+        let mut max_symbol = 0usize;
+        let mut live = 0usize;
+        for (s, &c) in counts.iter().enumerate() {
+            if c > 0 {
+                max_symbol = s;
+                live += 1;
+            }
+        }
+        if live == 1 {
             return raw_header + 1;
         }
-        let mut counts = [0usize; 256];
-        let max_symbol = histogram_literals(lits, &mut counts);
         let total = n as f64;
         let mut entropy_bits = 0.0f64;
         for &c in &counts[..=max_symbol] {
@@ -574,26 +666,15 @@ impl Estimator<'_> {
 
     /// Estimated bytes of the sequences section: per-stream table sizes
     /// and stream costs under the same selection the emission runs, plus
-    /// the shared add-bits payload and the section header.
-    fn estimate_sequences(&mut self, seqs: &[SeqWord]) -> usize {
+    /// the shared add-bits payload and the section header. The histograms
+    /// arrive prescanned ([`RangeCounts`]); `seqs` is read for nothing but
+    /// the first and last codes.
+    fn cost_sequences(&mut self, seqs: &[SeqWord], counts: &RangeCounts) -> usize {
         let n = seqs.len();
-        let mut ll_counts = [0u32; SEQ_CODE_SPACE];
-        let mut ml_counts = [0u32; SEQ_CODE_SPACE];
-        let mut of_counts = [0u32; SEQ_CODE_SPACE];
-        let mut add_bits = 0u32;
-        for &w in seqs {
-            let packed = w.codes;
-            // Wire codes never reach 64; the mask keeps the increments
-            // bounds-check-free like the emission's histograms.
-            ll_counts[(packed & 0x3f) as usize] += 1;
-            ml_counts[((packed >> 8) & 0x3f) as usize] += 1;
-            of_counts[((packed >> 16) & 0x3f) as usize] += 1;
-            add_bits += w.add_nb as u32;
-        }
         let first = seqs[0].codes;
         let last = seqs[n - 1].codes;
         let ll = self.stream_size(
-            ll_counts,
+            counts.ll,
             n,
             first as u8,
             last as u8,
@@ -604,7 +685,7 @@ impl Estimator<'_> {
             9,
         );
         let ml = self.stream_size(
-            ml_counts,
+            counts.ml,
             n,
             (first >> 8) as u8,
             (last >> 8) as u8,
@@ -615,7 +696,7 @@ impl Estimator<'_> {
             9,
         );
         let of = self.stream_size(
-            of_counts,
+            counts.of,
             n,
             (first >> 16) as u8,
             (last >> 16) as u8,
@@ -625,7 +706,12 @@ impl Estimator<'_> {
             5,
             8,
         );
-        ll + ml + of + (add_bits >> 3) as usize + 2 + (n >= 128) as usize + (n >= 0x7f00) as usize
+        ll + ml
+            + of
+            + (counts.add_bits >> 3) as usize
+            + 2
+            + (n >= 128) as usize
+            + (n >= 0x7f00) as usize
     }
 
     /// One stream's description bytes plus its symbol cost under the
