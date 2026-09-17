@@ -75,6 +75,10 @@ impl Matcher for RecordingMatcher {
     fn restore_repcode(&mut self, rep: [u32; 3]) {
         self.inner.restore_repcode(rep);
     }
+
+    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
+        self.inner.load_dictionary(content, rep);
+    }
 }
 
 fn ll_code(len: u32) -> (u8, u32) {
@@ -211,6 +215,10 @@ pub struct Args {
     /// Number of leading parse divergences to print in diff mode.
     #[arg(long, default_value = "10")]
     pub divergences: usize,
+    /// Dictionary (raw content or formatted) to compress against; also used
+    /// to decode the reference frame when given.
+    #[arg(long)]
+    pub dict: Option<PathBuf>,
 }
 
 /// Decoder-side repcode history resolution (mirrors
@@ -543,6 +551,10 @@ pub fn run(args: &Args) {
     // it), so window downsizing and the row-9 reach probe measure the same
     // bytes the bulk encoder produces.
     compressor.set_input_shape(zstdx::InputShape::default().with_len(raw.len() as u64));
+    if let Some(dict) = &args.dict {
+        let bytes = fs::read(dict).unwrap();
+        compressor.set_dictionary(&bytes);
+    }
     compressor.set_source(raw.as_slice());
     let sink = Sink(Vec::new());
     compressor.set_drain(sink);
@@ -646,7 +658,18 @@ pub fn run(args: &Args) {
     #[cfg(feature = "seq_dump")]
     if let Some(ref_frame) = &args.ref_frame {
         let frame = fs::read(ref_frame).unwrap();
-        let decoded = zstdx::bulk::decompress(&frame, raw.len()).unwrap();
+        let decoded = match &args.dict {
+            None => zstdx::bulk::decompress(&frame, raw.len()).unwrap(),
+            Some(dict) => {
+                let bytes = fs::read(dict).unwrap();
+                let parsed = zstdx::decoding::Dictionary::load(&bytes).unwrap();
+                let mut decoder = zstdx::decoding::FrameDecoder::new();
+                decoder.add_dict(parsed).unwrap();
+                let mut out = vec![0u8; raw.len()];
+                decoder.decode_all(&frame, &mut out).unwrap();
+                out
+            },
+        };
         assert_eq!(decoded, raw, "reference frame must decode to the input");
         let dumped = zstdx::decoding::seq_dump::take();
         let ref_triples: Vec<(u32, u32, u32)> = dumped.iter().map(|s| (s.ll, s.ml, s.of)).collect();
