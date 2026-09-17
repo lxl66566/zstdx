@@ -9,8 +9,9 @@
 //!
 //! Deviations from C, all behavior-preserving:
 //! - entries are `pack_pos`-biased u32 positions (the chain-table idiom) instead of raw u32
-//!   offsets, so an unwritten slot resolves as an out-of-range distance instead of aliasing
-//!   position 0;
+//!   offsets, so an unwritten slot resolves as a distance one past the current split instead of
+//!   aliasing position 0; `generate` drops it on the split-side bound (`checked_sub`), since the
+//!   reach check alone passes for splits below the window size;
 //! - the rolling state is carried across blocks (C re-arms per 1 MiB chunk, leaving a 64-byte blind
 //!   spot each time); the arm position is tracked as an entry floor so no split window reaches
 //!   before it;
@@ -852,7 +853,14 @@ impl LdmState {
                         if dist == 0 || dist > self.window {
                             continue;
                         }
-                        let cand_abs = split - dist;
+                        // A distance past the split itself is the dead entry
+                        // encoding: an unwritten slot, or the one position
+                        // whose pack_pos bias wraps to zero. There is no
+                        // source to extend against, and a wrapped `cand_abs`
+                        // would reach far outside the window buffer.
+                        let Some(cand_abs) = split.checked_sub(dist) else {
+                            continue;
+                        };
                         if cand_abs < win_base {
                             continue;
                         }
@@ -954,6 +962,27 @@ mod tests {
     fn random_data_yields_no_candidates() {
         let data = rand_bytes(1 << 20, 7);
         assert!(collect_and_verify(&data, 128 * 1024, 21).is_empty());
+    }
+
+    #[test]
+    fn zero_checksum_window_skips_empty_slots() {
+        // A 64-byte window from the encode_stream fuzzer (artifact
+        // crash-899d2f24) whose fingerprint's checksum half is zero: the
+        // bucket scan then selects unwritten slots — the empty encoding
+        // also carries checksum zero — whose biased distance is split + 1,
+        // dead yet inside the reach while split < window. The gear
+        // checkpoint after these bytes is G(W) (prior state shifts out),
+        // so the window heads a split in any buffer it starts.
+        let magic: [u8; 64] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x3f, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3,
+            0xd3, 0xd3, 0xd2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xd3, 0xd3, 0xd3,
+            0xd3, 0xd3, 0xd3, 0xd4, 0xd4, 0xd4, 0xd4, 0xd4, 0xd4, 0xd3, 0xd3, 0xd3, 0xd3, 0xd3,
+            0xd3, 0xd3, 0xd3, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+        ];
+        let mut data = magic.to_vec();
+        data.extend(rand_bytes(256, 0xc0ff_ee00));
+        collect_and_verify(&data, 320, 17);
     }
 
     #[test]
