@@ -428,6 +428,54 @@ mod mt {
         }
     }
 
+    /// A job whose strip tail sits in a period-1 run acquires the seed
+    /// offset 1; once the job-start repcode gate opens, the rep probe's
+    /// one-byte pos-advance makes the seed probe's candidate land on the
+    /// iteration's own index — a zero-offset self-compare the store gate
+    /// priced with ilog2(0). The panicked worker's jobs assembled empty,
+    /// shipping frames missing whole jobs (the 2026-09-17 P0: unpledged
+    /// row-9 stream-mt frames corrupt past 32 MiB). The second text head
+    /// supplies the far-match anchors the failing alignment needs; the
+    /// word generator is fixed so the alignment is reproduced exactly.
+    #[test]
+    fn strip_tail_period_run_roundtrips() {
+        let mut rand = {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            }
+        };
+        let words: Vec<Vec<u8>> = (0..64)
+            .map(|_| {
+                let len = 3 + (rand() % 7) as usize;
+                (0..len).map(|_| 97 + (rand() % 26) as u8).collect()
+            })
+            .collect();
+        let textish_words = |len: usize| {
+            let mut state = 7u64;
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let w = &words[((state >> 33) as usize) % words.len()];
+                let take = w.len().min(len - out.len());
+                out.extend_from_slice(&w[..take]);
+            }
+            out
+        };
+        let head = textish_words(384 * 1024);
+        let mut data = Vec::with_capacity(head.len() * 2 + 384 * 1024);
+        data.extend_from_slice(&head);
+        data.resize(head.len() + 384 * 1024, 0);
+        data.extend_from_slice(&head);
+        for workers in [2u32, 8] {
+            let comp = encode_write(&data, usize::MAX, Level::Balanced, workers, true, None);
+            assert_both_decoders(&comp, &data, &format!("seed1/mt{workers}"));
+        }
+    }
+
     /// Without flushes the job grid is absolute, so the frame bytes must not
     /// depend on how the input was written — regardless of where the bursts
     /// land (whole-input writes burst once at the end, small writes several
