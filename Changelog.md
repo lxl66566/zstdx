@@ -4,6 +4,31 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the stream-mt worker threads pool across encoders. A worker
+  whose encoder drops parks back into a process-global slot pool instead
+  of exiting, and the next encoder's first post re-leases it — a slot
+  handoff measures ~10 us against the ~130 us the eight-thread
+  spawn+join paid per stream (clone plus stack guard-page setup
+  dominates), and that cost sat serially on the pump thread. Lease
+  semantics: drop still waits every lease out of its queue (the join
+  equivalent — the buffer may not move while a lease can touch it), a
+  worker whose own job panicked retires exactly as before (never reuse a
+  thread that has seen an unwind), a panicked lease machine retires its
+  slot so no dropper can wait on a dead thread, and a parked thread
+  retires after 5 s idle (nothing pinned in long-running processes); the
+  pool and slot mutexes are never held together. The worker state now
+  rides the thread across leases (provenance cannot reach the bytes —
+  every job clears what it reads). Output byte-identical (emitframe
+  stream: 5 shapes x 6 tiers at workers 8 plus json/text
+  fastest/fast/balanced at workers 4; full-ladder dump; debug+release
+  test suite). Interleaved solo A/B, paired-ratio medians, read path
+  mt8: 4 MiB json.fastest +9.8% / text.fastest +13% / json.fast +6.3%,
+  8 MiB json.fastest +17% / text.fastest +7.6%, 32 MiB text.fastest
+  +3.1% / json.fast +4.3% / json.fastest +1%; slow tiers flat (json.opt
+  +0.0%); 1 MiB cells flat by construction (single inline tail job, the
+  pool never engages). Matrix enc-stream mt8 text.fastest
+  7084-7318 -> 8088 MiB/s, the other fast-tier cells unchanged within
+  noise. See docs/src/dev/perf/mt-stream.md.
 - Build: the no-default-features (no_std) configuration compiles again
   — it had drifted broken through the r6/r7 encoder rounds without any
   gate noticing (`mt_job_size_for` re-exported without its std gate;

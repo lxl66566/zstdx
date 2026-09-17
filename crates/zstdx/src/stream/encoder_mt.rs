@@ -49,7 +49,7 @@ use std::{
     any::Any,
     collections::VecDeque,
     sync::{Condvar, Mutex},
-    thread::JoinHandle,
+    time::Duration,
 };
 
 use super::encoder_core::StreamChecksum;
@@ -297,11 +297,12 @@ struct QueueShared {
     completed: AtomicU64,
 }
 
-// Reusable worker states, global across encoders: the pool threads are
-// fresh per encoder (spawned at its first post, joined at drop), so a
-// per-encoder pool always misses and every stream pays the whole matcher
-// table build (allocations plus first-touch faults) eight times over.
-// Depth-capped so one-off worker counts do not pin memory forever.
+// Reusable worker states, global across encoders. The thread leases (see
+// `THREAD_POOL`) carry their state across encoders now, but a lease's
+// thread still starts cold whenever the pool misses or a worker retires,
+// and the inline-job path borrows from here — so states pool globally.
+// Every job clears what it reads, so state provenance cannot reach the
+// bytes. Depth-capped so one-off worker counts do not pin memory forever.
 static STATE_POOL: std::sync::OnceLock<
     Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
 > = std::sync::OnceLock::new();
@@ -327,11 +328,199 @@ fn new_slice_state_boxed() -> alloc::boxed::Box<CompressState<MatchGeneratorDriv
     alloc::boxed::Box::new(new_slice_state())
 }
 
-/// Pool worker body: claim the oldest posted job, encode it through a
-/// worker-local state (reused across jobs — the pooled matcher tables are
-/// the expensive part), publish the bytes, and count the completion.
-fn pool_worker(shared: Arc<QueueShared>) {
+/// One parked pool thread's handoff slot: the thread parks here between
+/// encoder leases, and the next encoder's `ensure_workers` wakes it with a
+/// lease on its queue.
+struct WorkerSlot {
+    state: Mutex<WorkerSlotState>,
+    wake: Condvar,
+}
+
+enum WorkerSlotState {
+    /// Parked in the pool, waiting for the next lease.
+    Parked,
+    /// Serving the leased queue.
+    Serving(Arc<QueueShared>),
+    /// The thread is exiting: its lease panicked, the pool was full at
+    /// repark, or the idle timeout fired.
+    Retiring,
+}
+
+// Parked worker threads, global across encoders: a fresh encoder otherwise
+// pays the whole worker spawn+join per stream — ~130 us for eight
+// default-stack threads on this class of machine (clone plus stack
+// guard-page setup dominates; the queue itself is a condvar either way),
+// against ~10 us for a slot handoff. Depth-capped like the state pool; a
+// parked thread retires after `THREAD_POOL_IDLE`, so a one-off encoder
+// does not pin threads into a long-running process. Lock order: the pool
+// mutex and a slot's state mutex are never held together, so none of the
+// park/assign/retire races can deadlock.
+static THREAD_POOL: std::sync::OnceLock<Mutex<Vec<Arc<WorkerSlot>>>> = std::sync::OnceLock::new();
+const THREAD_POOL_DEPTH: usize = 32;
+const THREAD_POOL_IDLE: Duration = Duration::from_secs(5);
+
+fn take_parked_slot() -> Option<Arc<WorkerSlot>> {
+    let pool = THREAD_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+}
+
+/// Re-register a served-out slot as parked. False: the pool is at depth.
+fn repark_slot(slot: &Arc<WorkerSlot>) -> bool {
+    let pool = THREAD_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pool.len() < THREAD_POOL_DEPTH && {
+        pool.push(slot.clone());
+        true
+    }
+}
+
+/// Withdraw a timed-out slot from the pool. False: an assigner popped it
+/// first, so a lease is imminent — the caller re-checks the slot state.
+fn unpark_self(slot: &Arc<WorkerSlot>) -> bool {
+    let pool = THREAD_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match pool.iter().position(|s| Arc::ptr_eq(s, slot)) {
+        Some(i) => {
+            pool.swap_remove(i);
+            true
+        },
+        None => false,
+    }
+}
+
+/// Hand a lease to a parked slot. Only slots popped from the pool are
+/// assignable, so the slot is necessarily `Parked` here.
+fn assign_lease(slot: &Arc<WorkerSlot>, shared: Arc<QueueShared>) {
+    {
+        let mut state = slot.state.lock().unwrap();
+        debug_assert!(matches!(&*state, WorkerSlotState::Parked));
+        *state = WorkerSlotState::Serving(shared);
+    }
+    slot.wake.notify_one();
+}
+
+/// The serving thread leaves its lease (Parked to await another, Retiring
+/// to exit), waking any dropper parked on the slot (`wait_leave`).
+fn leave_lease(slot: &Arc<WorkerSlot>, retire: bool) {
+    {
+        let mut state = slot.state.lock().unwrap();
+        *state = if retire {
+            WorkerSlotState::Retiring
+        } else {
+            WorkerSlotState::Parked
+        };
+    }
+    slot.wake.notify_all();
+}
+
+/// Wait until the slot's thread has left `shared`'s service: the lease
+/// model's join equivalent — once it returns, no thread can still touch
+/// this encoder's queue or buffer. A recycled slot may already serve a
+/// later encoder by then, hence the pointer check. The bounded wait
+/// re-checks its predicate, like `wait_progress`.
+fn wait_leave(slot: &Arc<WorkerSlot>, shared: &Arc<QueueShared>) {
+    let mut state = slot.state.lock().unwrap();
+    while matches!(&*state, WorkerSlotState::Serving(s) if Arc::ptr_eq(s, shared)) {
+        let (guard, _) = slot
+            .wake
+            .wait_timeout(state, Duration::from_millis(100))
+            .unwrap();
+        state = guard;
+    }
+}
+
+/// Pool thread body: one leased queue at a time, parking between leases.
+// The spawn body must own its slot ('static); it stays alive after the
+// guarded inner loop so the panic path can retire the slot.
+#[allow(clippy::needless_pass_by_value)]
+fn pool_thread(slot: Arc<WorkerSlot>) {
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool_thread_inner(&slot)));
+    if let Err(payload) = outcome {
+        // The lease machinery itself panicked (job panics are caught in
+        // `serve_queue`): withdraw the slot so no dropper waits on a dead
+        // thread and no future lease lands on it.
+        unpark_self(&slot);
+        {
+            let mut state = slot.state.lock().unwrap();
+            *state = WorkerSlotState::Retiring;
+        }
+        slot.wake.notify_all();
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn pool_thread_inner(slot: &Arc<WorkerSlot>) {
     let mut state: Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>> = None;
+    while let Some(shared) = wait_lease(slot) {
+        let retire = serve_queue(&shared, &mut state);
+        leave_lease(slot, retire);
+        if retire {
+            // A job panicked on this thread: never reuse a thread that has
+            // seen an unwind. The state (possibly mid-compress garbage) is
+            // already dropped.
+            return;
+        }
+        if !repark_slot(slot) {
+            leave_lease(slot, true);
+            if let Some(state) = state.take() {
+                return_pooled_state(state);
+            }
+            return;
+        }
+    }
+    // Retired (idle timeout): the state is quiescent, pool it.
+    if let Some(state) = state.take() {
+        return_pooled_state(state);
+    }
+}
+
+/// Wait for the next lease. None retires the thread.
+fn wait_lease(slot: &Arc<WorkerSlot>) -> Option<Arc<QueueShared>> {
+    let mut state = slot.state.lock().unwrap();
+    loop {
+        if let WorkerSlotState::Serving(shared) = &*state {
+            return Some(shared.clone());
+        }
+        if matches!(&*state, WorkerSlotState::Retiring) {
+            return None;
+        }
+        let (guard, timed_out) = slot.wake.wait_timeout(state, THREAD_POOL_IDLE).unwrap();
+        state = guard;
+        if !timed_out.timed_out() || !matches!(&*state, WorkerSlotState::Parked) {
+            continue;
+        }
+        // Idle: withdraw from the pool before retiring. The pool lock is
+        // never taken under the slot lock, so an assigner may have popped
+        // the slot in between — the state re-check below catches its lease.
+        drop(state);
+        if unpark_self(slot) {
+            let mut state = slot.state.lock().unwrap();
+            if matches!(&*state, WorkerSlotState::Parked) {
+                *state = WorkerSlotState::Retiring;
+                return None;
+            }
+        }
+        state = slot.state.lock().unwrap();
+    }
+}
+
+/// Serve one leased queue: claim the oldest posted job, encode it through
+/// a worker-local state (reused across jobs — the pooled matcher tables
+/// are the expensive part), publish the bytes, and count the completion.
+/// Returns whether this thread must retire (its own job panicked); the
+/// worker-local state stays with the thread for its next lease (every job
+/// clears what it reads, so provenance cannot reach the bytes).
+fn serve_queue(
+    shared: &QueueShared,
+    state: &mut Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
+) -> bool {
     loop {
         let job = {
             let mut inner = shared.inner.lock().unwrap();
@@ -339,19 +528,17 @@ fn pool_worker(shared: Arc<QueueShared>) {
                 if inner.poison.is_some() {
                     // The encoder is unwinding; in-flight jobs run out, but
                     // no new claims (the caller clears the queue itself).
-                    return;
+                    // This thread is healthy — it may lease again.
+                    return false;
                 }
                 if let Some(job) = inner.queue.pop_front() {
                     break job;
                 }
                 if inner.shutdown {
-                    // The loan ends here: this worker's jobs all completed
-                    // (the encoder drops only after joining), so the state
-                    // is quiescent and safe to pool for a later encoder.
-                    if let Some(state) = state.take() {
-                        return_pooled_state(state);
-                    }
-                    return;
+                    // The lease ends here: this worker's jobs all completed
+                    // (the encoder drops only after every lease left), so
+                    // the state is quiescent and stays for the next lease.
+                    return false;
                 }
                 inner = shared.wake.wait(inner).unwrap();
             }
@@ -360,7 +547,7 @@ fn pool_worker(shared: Arc<QueueShared>) {
         // SAFETY: the posting thread keeps the backing bytes stable for
         // this job's whole lifetime (see FrozenSrc).
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_claimed_job(&job, &mut state)
+            run_claimed_job(&job, state);
         }));
         match attempt {
             Ok(()) => {
@@ -371,7 +558,7 @@ fn pool_worker(shared: Arc<QueueShared>) {
                 // than reuse. The slot is filled with an empty block so the
                 // ordered assembly can run to completion before the panic
                 // is resumed.
-                state = None;
+                *state = None;
                 poisoned = true;
                 job.abort();
                 shared.poisoned.store(true, Ordering::Release);
@@ -386,7 +573,7 @@ fn pool_worker(shared: Arc<QueueShared>) {
         shared.completed.fetch_add(1, Ordering::AcqRel);
         shared.progressed.notify_all();
         if poisoned {
-            return;
+            return true;
         }
     }
 }
@@ -541,12 +728,14 @@ pub(crate) struct MtEncoderCore {
     out_read: usize,
     header_emitted: bool,
     finished: bool,
-    /// Pool coordination state, shared with the worker threads. Workers
-    /// spawn lazily at the first post; until then this is only the state
-    /// pool.
+    /// Pool coordination state, shared with the leased worker threads.
+    /// Workers are leased lazily at the first post; until then this is
+    /// only the state pool.
     shared: Arc<QueueShared>,
-    /// Persistent pool workers, spawned once. Joined on drop via shutdown.
-    pool_threads: Vec<JoinHandle<()>>,
+    /// Leased worker slots, taken at the first post (parked threads from
+    /// the cross-encoder pool first, fresh spawns making up the rest) and
+    /// waited out at drop (`wait_leave` — the join equivalent).
+    pool_threads: Vec<Arc<WorkerSlot>>,
     /// Posted jobs not yet assembled, in post order.
     pending: VecDeque<Arc<Job>>,
 }
@@ -1172,7 +1361,7 @@ impl MtEncoderCore {
     fn run_inline_job(&mut self, bounds: &[u64], hi: u64, last_frame_block: bool) {
         // The shared job view starts at the next job's strip (the previous
         // job's tail), which is exactly what the buffer retained.
-        // A donation implies the pool was spawned at its post, so this
+        // A donation implies the pool was leased at its post, so this
         // pool-less path never carries one (job zero would parse undonated
         // — byte-identical, but the donation's work would be wasted).
         debug_assert!(self.donation.is_none() || !self.pool_threads.is_empty());
@@ -1322,7 +1511,7 @@ impl MtEncoderCore {
             let (guard, _) = self
                 .shared
                 .progressed
-                .wait_timeout(inner, core::time::Duration::from_millis(100))
+                .wait_timeout(inner, Duration::from_millis(100))
                 .unwrap();
             inner = guard;
             if self.shared.completed.load(Ordering::Acquire) != before {
@@ -1349,7 +1538,7 @@ impl MtEncoderCore {
             let (guard, _) = self
                 .shared
                 .progressed
-                .wait_timeout(inner, core::time::Duration::from_millis(100))
+                .wait_timeout(inner, Duration::from_millis(100))
                 .unwrap();
             inner = guard;
             if job.is_done() || self.shared.completed.load(Ordering::Acquire) != before {
@@ -1422,16 +1611,37 @@ impl MtEncoderCore {
         self.hashed_end = end;
     }
 
-    /// Spawn the persistent pool workers at the first posted job.
+    /// Lease the pool workers at the first posted job: parked threads from
+    /// the cross-encoder pool first (a handoff costs ~10 us against the
+    /// ~130 us a fresh eight-thread spawn+join pays), fresh spawns making
+    /// up the rest.
     fn ensure_workers(&mut self) {
         if self.pool_threads.is_empty() {
             for _ in 0..self.workers {
-                let shared = self.shared.clone();
-                self.pool_threads.push(
-                    std::thread::Builder::new()
-                        .spawn(move || pool_worker(shared))
-                        .unwrap(),
-                );
+                let slot = match take_parked_slot() {
+                    Some(slot) => {
+                        assign_lease(&slot, self.shared.clone());
+                        slot
+                    },
+                    None => {
+                        let slot = Arc::new(WorkerSlot {
+                            state: Mutex::new(WorkerSlotState::Serving(self.shared.clone())),
+                            wake: Condvar::new(),
+                        });
+                        if let Err(e) = std::thread::Builder::new().spawn({
+                            let slot = slot.clone();
+                            move || pool_thread(slot)
+                        }) {
+                            // No thread ever serves this lease: retire the
+                            // slot so Drop's leave-wait passes, then surface
+                            // the failure like the raw spawn's unwrap did.
+                            leave_lease(&slot, true);
+                            panic!("worker spawn failed: {e}");
+                        }
+                        slot
+                    },
+                };
+                self.pool_threads.push(slot);
             }
         }
     }
@@ -1477,10 +1687,14 @@ impl MtEncoderCore {
 impl Drop for MtEncoderCore {
     fn drop(&mut self) {
         if !self.pool_threads.is_empty() {
+            // The leases run their queues out (workers claim until the
+            // queue drains) and leave at the shutdown flag; the per-slot
+            // wait is the join equivalent — the encoder's buffer must not
+            // move while any lease can still touch it.
             self.shared.inner.lock().unwrap().shutdown = true;
             self.shared.wake.notify_all();
-            for handle in self.pool_threads.drain(..) {
-                let _ = handle.join();
+            for slot in self.pool_threads.drain(..) {
+                wait_leave(&slot, &self.shared);
             }
         }
         // The accumulate buffer outlives the encoder in the thread-local
@@ -1587,6 +1801,63 @@ mod tests {
         core.write(&data);
         core.flush_block();
         assert!(core.has_output());
+        core.finish();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// Cross-encoder lease reuse through the global thread pool:
+    /// sequential encoders (whose workers park between encoders and are
+    /// re-leased) stay byte-identical, and many encoders leasing
+    /// concurrently all produce the reference bytes.
+    #[test]
+    fn pool_lease_reuse_deterministic() {
+        let data = textish(512 * 1024);
+        let mut reference = None;
+        for _ in 0..4 {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
+            core.write(&data);
+            core.finish();
+            match &reference {
+                Some(bytes) => assert_eq!(&core.output, bytes, "sequential reuse"),
+                None => reference = Some(core.output.clone()),
+            }
+        }
+        let reference = reference.unwrap();
+        let mut handles = Vec::new();
+        for t in 0..16usize {
+            let data = data.clone();
+            let reference = reference.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
+                    core.write(&data);
+                    core.finish();
+                    assert_eq!(core.output, reference, "concurrent lease {t}");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// Dropping mid-stream retires the leases with jobs possibly still
+    /// queued or in flight: no hang, and the pool still serves a full
+    /// encode identically afterwards.
+    #[test]
+    fn pool_drop_midstream() {
+        let data = textish(9 * 1024 * 1024);
+        for _ in 0..4 {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+            core.write(&data);
+            // Drop here: the first epoch's jobs are posted, later bytes
+            // are not.
+        }
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        core.write(&data);
         core.finish();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
