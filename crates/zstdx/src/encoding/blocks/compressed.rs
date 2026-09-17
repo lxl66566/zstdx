@@ -314,12 +314,15 @@ impl FseTableMode<'_> {
 /// mode is then decided from its own counts (three selection passes used to
 /// scan the code stream separately).
 ///
-/// Wire codes never reach 64 (LL ≤ 35, ML ≤ 52, OF ≤ 31), so the merged
-/// histograms and every downstream scan cover [`SEQ_CODE_SPACE`] entries.
-/// The lane arrays keep 256 entries though: a u8 index is provably in range
-/// there, which keeps the per-sequence increments bounds-check-free (a
-/// 64-wide lane array reintroduces three compare-and-panic pairs per
-/// sequence — measured +0.3% instructions).
+/// Wire codes never reach 64 (LL ≤ 35, ML ≤ 52, OF ≤ 31; `pack_seq`
+/// debug-asserts every packed code), so the merged histograms and every
+/// downstream scan cover [`SEQ_CODE_SPACE`] entries. The lane arrays keep
+/// 256 entries though: a u8 index is provably in range there, which keeps
+/// the per-sequence increments bounds-check-free (a 64-wide lane array
+/// reintroduces three compare-and-panic pairs per sequence — measured
+/// +0.3% instructions). They live pooled in [`FseBuildScratch`] with only
+/// the 64-entry prefix cleared per block: no increment touches and no
+/// merge reads a lane entry >= 64, so the clear covers 3 KB, not 12 KB.
 fn choose_tables_fast<'a>(
     seqs: &[crate::encoding::SeqWord],
     default_tables: (&'a FSETable, &'a FSETable, &'a FSETable),
@@ -339,8 +342,9 @@ fn choose_tables_fast<'a>(
         // Four lane-split sub-histograms per channel: runs of one repeated
         // code (common in ll/ml) otherwise serialize on store-forward
         // latency. Small blocks keep the direct pass below — the lane
-        // zero/merge overhead does not pay off there.
-        let mut lanes = [[0u32; 256]; 12];
+        // clear/merge overhead does not pay off there. The pooled buffer
+        // arrives with only the touchable 64-entry prefix cleared.
+        let lanes = fse_scratch.take_seq_lanes();
         let (chunks, remainder) = seqs.as_chunks::<4>();
         for chunk in chunks {
             for (l, w) in lanes.as_chunks_mut::<3>().0.iter_mut().zip(chunk) {

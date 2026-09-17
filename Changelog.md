@@ -4,6 +4,12 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Encoder: the sequence-code lane histograms in `choose_tables_fast` are
+  pooled with a prefix-only clear — only the 64-entry prefix of each
+  256-wide lane is zeroed per block (wire codes never reach 64; `pack_seq`
+  debug-asserts the invariant), cutting the 12 KB per-block memset to 3 KB.
+  Output byte-identical (full-ladder dump); small-payload encode
+  json-4K -5.0% Ir / text-4K -3.5% (wall json-4K x1.671->1.647 vs libzstd).
 - Encoder: fixed a P0 where unpledged row-9 (balanced) stream-mt frames past
   the 32 MiB corpus scale were deterministically corrupt, and the same
   trigger deadlocked bulk-mt. The job-start seed and LDM probes compared
