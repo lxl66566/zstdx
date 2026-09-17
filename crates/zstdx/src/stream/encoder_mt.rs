@@ -56,6 +56,7 @@ use super::encoder_core::StreamChecksum;
 use crate::{
     EncoderOptions, Level,
     blocks::block::BlockType,
+    common::MAX_BLOCK_SIZE,
     encoding::{
         block_header::BlockHeader,
         frame_compressor::{
@@ -65,6 +66,7 @@ use crate::{
         frame_header::FrameHeader,
         match_generator::{
             LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
+            ldm_head_parses,
         },
         mt::{
             MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state,
@@ -161,6 +163,10 @@ enum JobKind {
         len: usize,
         last_frame_block: bool,
         overlap: usize,
+        /// The job's LDM arming context: `JobPrefix` on the pledged
+        /// mid-size capture (see `MtEncoderCore::resolve_probe`), `Job`
+        /// everywhere else.
+        ldm: LdmArming,
         /// The shared prefix fill's snapshot for this job, when the
         /// finish tail engaged one and this job's strip extends it (see
         /// `MtEncoderCore::build_spf`).
@@ -616,6 +622,7 @@ fn run_claimed_job(
             len,
             last_frame_block,
             overlap,
+            ldm,
             donation,
             spf,
             out,
@@ -656,7 +663,7 @@ fn run_claimed_job(
                             job.level,
                             job.shape,
                             job.choice,
-                            LdmArming::Job,
+                            *ldm,
                             *first as u64,
                         );
                         compress_job_blocks_inner(
@@ -679,7 +686,7 @@ fn run_claimed_job(
                         job.level,
                         job.shape,
                         job.choice,
-                        LdmArming::Job,
+                        *ldm,
                         None,
                     ),
                 }
@@ -740,6 +747,10 @@ pub(crate) struct MtEncoderCore {
     /// History strip each job borrows (and fully indexes) as match window:
     /// the level's whole window, like the bulk mt path.
     overlap: usize,
+    /// The jobs' LDM arming context: flipped to [`LdmArming::JobPrefix`]
+    /// when a pledged keep-class frame's verdict re-grids it onto the bulk
+    /// mid-size capture (see [`Self::resolve_probe`]).
+    job_ldm: LdmArming,
     /// Jobs buffered before a burst fires: at least one full round of
     /// workers, amortizing the thread spawn.
     burst_jobs: usize,
@@ -863,6 +874,7 @@ impl MtEncoderCore {
             job_start: 0,
             grid,
             overlap,
+            job_ldm: LdmArming::Job,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             probe_wait: None,
@@ -1190,11 +1202,48 @@ impl MtEncoderCore {
             }
         } else {
             self.donation = Some(keep.donation);
+            self.engage_midsize_capture();
         }
         // Nothing else is in flight at this point (nothing posts while the
         // verdict is unconsumed and the donation tasks just completed), so
         // the growth below needs no quiesce wait.
         self.reserve_decided();
+    }
+
+    /// A pledged keep-class frame whose source-clamped window lands in the
+    /// bulk mid-size capture's class (`prefix_ldm_window`) re-grids onto
+    /// that capture: reach-based job size (the whole-window strip would
+    /// floor the frame at one job and idle the workers), whole-prefix
+    /// strips (the overlap already is the clamped window) and
+    /// [`LdmArming::JobPrefix`] — the clamped window sits below the `Job`
+    /// bar, so without the flip the far class disarms and the pledged
+    /// stream pays a chain-only parse where bulk-mt captures it (dll32:
+    /// 5,460,884 vs 4,390,255, a 24% gap against the pledged-equals-bulk
+    /// contract). The head screen mirrors the bulk planner's
+    /// (`ldm_head_parses`): low-alphabet heads keep the stock single-job
+    /// schedule — their LDM cannot survive the alphabet gate, so only the
+    /// job split would move (a pure boundary loss).
+    fn engage_midsize_capture(&mut self) {
+        if !matches!(self.grid, JobGrid::Fixed(_)) || self.shape.len.is_none() {
+            return;
+        }
+        let Some(window) =
+            MatchGeneratorDriver::prefix_ldm_window(self.level, self.shape, ReachChoice::Keep)
+        else {
+            return;
+        };
+        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        if !ldm_head_parses(head) {
+            return;
+        }
+        let n = self.shape.len.expect("the pledge gate checked len");
+        debug_assert_eq!(
+            self.overlap as u64, window,
+            "the strip is the clamped window"
+        );
+        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
+        self.grid = JobGrid::Fixed(job_size_for(n, self.workers, reach as usize));
+        self.job_ldm = LdmArming::JobPrefix;
     }
 
     /// Re-reserve the accumulate buffer for the decided schedule's working
@@ -1564,7 +1613,7 @@ impl MtEncoderCore {
             self.level,
             self.shape,
             self.choice,
-            LdmArming::Job,
+            self.job_ldm,
             None,
         );
         return_pooled_state(state);
@@ -1626,6 +1675,7 @@ impl MtEncoderCore {
                 first,
                 len,
                 overlap: self.overlap,
+                ldm: self.job_ldm,
                 last_frame_block,
                 spf: Mutex::new(spf),
                 donation: Mutex::new(donation),

@@ -584,6 +584,67 @@ mod mt {
         assert_eq!(streamed, bulk_mt);
     }
 
+    /// The pledged mid-size capture (see `MtEncoderCore::engage_midsize_capture`):
+    /// a keep-class frame whose clamped window lands in the bulk capture's
+    /// class must share the bulk grid, strips and JobPrefix arming, so the
+    /// pledged stream is byte-identical to bulk mt — without it the clamped
+    /// window sits below the `Job` bar and the stream pays a chain-only
+    /// single-job parse (dll32: 5,460,884 vs bulk's 4,390,255). The corpus
+    /// mirrors `mt_midsize_prefix_ldm_keeps_far_repeats`: a code-like
+    /// wide-alphabet head, a 1 MiB in-unit repeat, and four mutated copies
+    /// of one 5 MiB unit (redundancy beyond the chain reach, exactly LDM's
+    /// class).
+    #[test]
+    fn pledged_midsize_capture_matches_bulk() {
+        let unit_len = 5 * 1024 * 1024;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        let mut patterns = Vec::with_capacity(96);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::with_capacity(head_len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        unit[..head_len].copy_from_slice(&head);
+        unit[1024 * 1024..1024 * 1024 + head_len].copy_from_slice(&head);
+        let mut data = Vec::with_capacity(4 * unit_len);
+        for copy in 0..4u32 {
+            for (i, &b) in unit.iter().enumerate() {
+                data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let st = encoding::compress_slice_to_vec(&data, Level::Balanced);
+        for (workers, checksum) in [(4u32, true), (4, false), (8, true)] {
+            let bulk_mt =
+                encoding::mt::compress_slice_mt(&data, Level::Balanced, checksum, workers, None);
+            let streamed = encode_write(
+                &data,
+                1024 * 1024,
+                Level::Balanced,
+                workers,
+                checksum,
+                Some(data.len() as u64),
+            );
+            assert_eq!(streamed, bulk_mt, "workers {workers} checksum {checksum}");
+            assert!(
+                bulk_mt.len() <= st.len() + st.len() / 50,
+                "the far class must ride the capture: mt {} vs st {}",
+                bulk_mt.len(),
+                st.len()
+            );
+        }
+    }
+
     #[test]
     fn pooled_state_reuse_is_output_neutral() {
         use crate::encoding::{
