@@ -818,16 +818,53 @@ fn hash5_log(v: u64, log: u32) -> usize {
     (v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)
 }
 
+/// Input width of the chain-table hash: 5 bytes on no-dict frames (the
+/// calibration that beat libzstd's width there), 4 on dictionary frames —
+/// libzstd's lazy-family rows hash `minMatch` bytes and every chain row
+/// its small-input tables select at levels 5-12 carries searchLength 4.
+/// A small payload parses mostly against dictionary content, where the
+/// 4-byte candidate classes (near-duplicate lines diverging at byte 5)
+/// convert; the no-dict width stays put (byte-identical no-dict output).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainHashWidth {
+    Five,
+    Four,
+}
+
+impl ChainHashWidth {
+    #[inline(always)]
+    fn of(dict_chain: bool) -> Self {
+        if dict_chain {
+            ChainHashWidth::Four
+        } else {
+            ChainHashWidth::Five
+        }
+    }
+
+    #[inline(always)]
+    fn mask(self) -> u64 {
+        match self {
+            ChainHashWidth::Five => 0x00ff_ffff_ffff,
+            ChainHashWidth::Four => 0xffff_ffff,
+        }
+    }
+}
+
+#[inline(always)]
+fn hash_at_width(win: &[u8], idx: usize, log: u32, width: ChainHashWidth) -> usize {
+    // SAFETY: see the contract above.
+    unsafe {
+        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & width.mask();
+        v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)
+    }
+}
+
 /// Hash the 5 bytes at `idx` into a table of `log` bits. Caller guarantees
 /// `idx + 5 <= win.len()` (the scanning and emit loops bound-check once per
 /// loop, not per position).
 #[inline(always)]
 fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
-    // SAFETY: see the contract above; the hash itself is [`hash5_log`].
-    unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & 0x00ff_ffff_ffff;
-        v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)
-    }
+    hash_at_width(win, idx, log, ChainHashWidth::Five)
 }
 
 /// Hash the 8 bytes at `idx` into the dfast long table (libzstd's
@@ -1177,12 +1214,13 @@ fn insert_linked_at(
     idx: usize,
     abs: u64,
     log: u32,
+    width: ChainHashWidth,
 ) {
-    // SAFETY: hash_at_log masks to log bits and the tables hold 1 << log
+    // SAFETY: hash_at_width masks to log bits and the tables hold 1 << log
     // and chain.len() slots; the absolute position masks to the chain size
     // (absolute key; see emit_chain's note on the walk side's indexing).
     unsafe {
-        let h = hash_at_log(win, idx, log);
+        let h = hash_at_width(win, idx, log, width);
         let head = *table.get_unchecked(h);
         *chain.get_unchecked_mut(abs as usize & (chain.len() - 1)) = head;
         *table.get_unchecked_mut(h) = pack_pos(abs);
@@ -1258,6 +1296,7 @@ fn insert_covered(
     insert_max: u64,
     log: u32,
     fill: CoveredFill,
+    width: ChainHashWidth,
 ) {
     // One insert form per fill site: the chain strategies link every
     // covered position they head-insert (see `insert_linked_at`), the fast
@@ -1265,7 +1304,7 @@ fn insert_covered(
     macro_rules! put {
         ($idx:expr, $abs:expr) => {
             match chain.as_deref_mut() {
-                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log),
+                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log, width),
                 None => insert_at(win, table, $idx, $abs, log),
             }
         };
@@ -1336,6 +1375,9 @@ struct TableEmit<'a> {
     /// Short-match interior fill policy of this block (density-coupled;
     /// see [`CoveredFill`]). Only `emit` reads it.
     covered_fill: CoveredFill,
+    /// The chain-table hash width (fast rows always pass `Six`; only the
+    /// linked arm of `insert_covered` reads it).
+    width: ChainHashWidth,
 }
 
 impl TableEmit<'_> {
@@ -1380,6 +1422,7 @@ impl TableEmit<'_> {
             self.insert_max,
             self.hash_log,
             self.covered_fill,
+            ChainHashWidth::Five,
         );
         self.win_base + match_end as u64
     }
@@ -1420,6 +1463,7 @@ impl TableEmit<'_> {
             self.insert_max,
             self.hash_log,
             self.covered_fill,
+            self.width,
         );
         self.win_base + match_end as u64
     }
@@ -1466,7 +1510,7 @@ impl TableEmit<'_> {
         let mut p = self.win_base + start as u64;
         while p < end_abs {
             let i = (p - self.win_base) as usize;
-            let h = hash_at_log(win, i, hash_log);
+            let h = hash_at_width(win, i, hash_log, self.width);
             // SAFETY: h is masked to hash_log bits, p to the chain table
             // size. The chain slot key is the ABSOLUTE position — the walk
             // side resolves candidates absolutely: a window-relative index
@@ -1864,6 +1908,11 @@ pub struct MatchGeneratorDriver {
     /// frame-continuous parses only (a job-restart parse measurably used
     /// the lagged region's candidates).
     strip_parse: bool,
+    /// Dictionary frame on a chain row ([`Self::load_dictionary`]): the
+    /// parse switches to libzstd's lazy-family dict semantics — 4-byte
+    /// hash width, accept bar 4, no offset-pays gate, deeper walk. Cleared
+    /// by [`Self::reset`]; a no-dict frame never touches it.
+    dict_chain: bool,
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
@@ -2136,6 +2185,7 @@ impl MatchGeneratorDriver {
             ldm_canary: 0,
             ldm_checked: false,
             strip_parse: false,
+            dict_chain: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -2193,6 +2243,7 @@ impl MatchGeneratorDriver {
             ldm_canary: 0,
             ldm_checked: false,
             strip_parse: false,
+            dict_chain: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -2408,14 +2459,31 @@ impl MatchGeneratorDriver {
         self.block_end = keep as u64;
         self.rep = rep;
         self.rep_pending = 0;
-        // The chain walk's candidate budget mirrors libzstd's dict-side
-        // search: its per-position attempt count is `1 << searchLog`, which
-        // the no-dict tuning table halves for speed (big payloads never
-        // notice — measured at parity there), while a dictionary parse
-        // walks a long, densely filled dict chain and the extra candidates
-        // convert. Dict frames are not a hot path; no-dict params stay put.
+        // A chain row parsing over dictionary content switches to
+        // libzstd's lazy-family dict semantics wholesale; each knob alone
+        // measurably does nothing (or loses), the combination converts
+        // (fixture grid, 54-file systemd holdout, summed bytes, zstdx-raw
+        // dict at -5/-9):
+        // - hash width 4: the lazy family hashes minMatch bytes (4 on every chain row its
+        //   small-input tables select at levels 5-12); near-duplicate dict lines diverging at byte
+        //   5 are candidates for its chain, invisible to our 5-byte width. Alone the dilution loses
+        //   (8708 -> 8736 / 8442 -> 8451 B).
+        // - accept bar 4: greedy/lazy/lazy2 store any candidate >= 4 (the row's searchLength only
+        //   shapes the hash); ours is min_match 5. Worth 103/166 B on top of the rest; without the
+        //   width change it does nothing (the 4-byte twins are never candidates).
+        // - no offset-pays gate: the far-dict matches the gate rejects (5 bits/byte literal bar)
+        //   are exactly the dict's payload — bypassing it is worth 49/95 B on top of the two above.
+        // - walk depth x8 of the no-dict budget: the 4-byte table is dilute; the newest-first walk
+        //   needs the extra attempts to reach older dict twins (x2: 8640/8278; x4: 8551/8269; x8:
+        //   8518/8259, already past the zstd CLI's 8272; x16: 8499/8259).
+        // Combined at x8: -5 raw 8708 -> 8518 (CLI 8230), -9 raw
+        // 8442 -> 8259. Dict frames are not a hot path (1.4 ms/file on
+        // the fixture at -5/-9 either way); no-dict params and widths
+        // stay put (byte-identical no-dict output).
         if matches!(self.params.strategy, Strategy::Chain(_)) {
-            self.params.search_depth *= 2;
+            self.params.search_depth *= 8;
+            self.params.min_match = MIN_MATCH as u32;
+            self.dict_chain = true;
         }
         // The owned window is filled above; prefill over the caller's slice
         // avoids the self-borrow (identical bytes). The dictionary grid:
@@ -2826,6 +2894,7 @@ impl MatchGeneratorDriver {
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
+                let width = ChainHashWidth::of(self.dict_chain);
                 let (table, chain) = self.tables.split_at_mut(self.second);
                 let chain_mask = chain.len() - 1;
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
@@ -2847,7 +2916,7 @@ impl MatchGeneratorDriver {
                     // position to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
                     unsafe {
-                        let h = hash_at_log(data, idx, hash_log);
+                        let h = hash_at_width(data, idx, hash_log, width);
                         let head = *table.get_unchecked(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
                         *table.get_unchecked_mut(h) = pack_pos(abs);
@@ -3159,6 +3228,7 @@ impl Matcher for MatchGeneratorDriver {
         self.ldm_canary = 0;
         self.ldm_checked = false;
         self.strip_parse = false;
+        self.dict_chain = false;
         self.opt_state.reset();
     }
 
@@ -3545,7 +3615,12 @@ impl Matcher for MatchGeneratorDriver {
                     // The head hash uses params.hash_log; the pattern's
                     // payload is the chain-table log (they differ on rows
                     // whose head table outsizes the chain table).
-                    let h = hash_at_log(win, idx, self.params.hash_log);
+                    let h = hash_at_width(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        ChainHashWidth::of(self.dict_chain),
+                    );
                     // SAFETY: h is masked to hash_log bits, the absolute block
                     // start to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
@@ -3750,6 +3825,7 @@ impl MatchGeneratorDriver {
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
+                let width = ChainHashWidth::of(self.dict_chain);
                 let (table, chain) = self.tables.split_at_mut(self.second);
                 let chain_mask = chain.len() - 1;
                 while idx < to {
@@ -3758,7 +3834,7 @@ impl MatchGeneratorDriver {
                     // position to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
                     unsafe {
-                        let h = hash_at_log(win, idx, hash_log);
+                        let h = hash_at_width(win, idx, hash_log, width);
                         let head = *table.get_unchecked(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
                         *table.get_unchecked_mut(h) = pack_pos(abs);
@@ -3813,6 +3889,7 @@ impl MatchGeneratorDriver {
             insert_max,
             hash_log,
             covered_fill: self.covered_fill,
+            width: ChainHashWidth::Five,
         };
         let max_window = self.params.window as u64;
         let mut pos = self.pos;
@@ -4646,6 +4723,8 @@ impl MatchGeneratorDriver {
         let search_depth = self.params.search_depth as usize;
         let lazy_depth = self.params.lazy_depth;
         let min_match = self.params.min_match as usize;
+        let dict_chain = self.dict_chain;
+        let width = ChainHashWidth::of(dict_chain);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
@@ -4667,6 +4746,7 @@ impl MatchGeneratorDriver {
             // The chain's emits go through `emit_chain`; the fast-only
             // covered-fill policy is dead state here.
             covered_fill: CoveredFill::Dense,
+            width,
         };
         let hash_read = HASH_READ as u64;
         let mut pos = self.pos;
@@ -4724,7 +4804,7 @@ impl MatchGeneratorDriver {
             // share them — nothing writes the table in between.
             // SAFETY: hash_at_log masks to hash_log bits and the table holds
             // 1 << hash_log slots.
-            let h = hash_at_log(win, idx, hash_log);
+            let h = hash_at_width(win, idx, hash_log, width);
             let entry = unsafe { *table_ptr.add(h) };
             // Cross-position pipelining of the hash+head read (the dfast
             // ip0/ip1 pattern): the lazy walk below usually searches pos+1
@@ -4741,7 +4821,7 @@ impl MatchGeneratorDriver {
             let mut pre1 = (0usize, 0u32);
             let piped = block_end - pos > hash_read;
             if piped {
-                pre1.0 = hash_at_log(win, idx + 1, hash_log);
+                pre1.0 = hash_at_width(win, idx + 1, hash_log, width);
                 // SAFETY: the hash masks to hash_log bits and the table
                 // holds 1 << hash_log slots.
                 pre1.1 = unsafe { *table_ptr.add(pre1.0) };
@@ -4874,8 +4954,13 @@ impl MatchGeneratorDriver {
 
             // Repcode matches stay legal from MIN_MATCH up regardless of the
             // row's min_match (libzstd's rep probe also checks 4 bytes).
+            // The offset-pays gate is a no-dict speed calibration; a
+            // dictionary frame bypasses it (libzstd has no such gate, and
+            // the far-dict matches it rejects are the dict parse's
+            // payload).
             if (best_len < min_match && !(rep_hit && best_len >= MIN_MATCH))
-                || !pays_for_offset_lit(win, idx, best_len, best_cand, rep_hit, lit_lens)
+                || (!dict_chain
+                    && !pays_for_offset_lit(win, idx, best_len, best_cand, rep_hit, lit_lens))
             {
                 // Grow the probe step on long literal runs (same policy as
                 // the fast loop) so incompressible data does not pay a full
@@ -4946,7 +5031,7 @@ impl MatchGeneratorDriver {
                         let entry2 = match pipe.take() {
                             Some(pre) => pre,
                             None => {
-                                let hf = hash_at_log(win, idx2, hash_log);
+                                let hf = hash_at_width(win, idx2, hash_log, width);
                                 // SAFETY: hash_at_log masks to hash_log
                                 // bits and the table holds 1 << hash_log
                                 // slots.
@@ -4958,7 +5043,7 @@ impl MatchGeneratorDriver {
                         // own break condition, so a skipped refresh is
                         // never consumed.
                         if block_end.saturating_sub(p2 + 1) >= hash_read {
-                            let hn = hash_at_log(win, idx2 + 1, hash_log);
+                            let hn = hash_at_width(win, idx2 + 1, hash_log, width);
                             // SAFETY: as above.
                             pipe = Some(unsafe { *table_ptr.add(hn) });
                         }

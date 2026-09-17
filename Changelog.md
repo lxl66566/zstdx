@@ -4,7 +4,17 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
-
+- Encoder: dictionary frames on the chain rows (levels 5-12) now switch to
+  libzstd's lazy-family dict semantics: a 4-byte chain-hash width
+  (`ChainHashWidth`), accept bar `min_match` 4, the offset-pays gate
+  bypassed, and the chain-walk budget x8 of the no-dict row. Each knob
+  alone loses or does nothing; jointly (54-file systemd fixture, per-file
+  frames, summed bytes vs the zstd CLI): -9 raw-dict 8,442 -> 8,259 B
+  (-0.2%, ahead of the CLI; was +2.1%), -9 formatted -0.3..-1.6% (was
+  -0.0..-2.0 -> ahead everywhere), -12 raw +1.9%, -5 raw 8,708 -> 8,518
+  (+5.8 -> +3.5%). Fast/dfast rows and all no-dict output unchanged
+  (byte-identical full-ladder dump + 120-cell sweep; dict cells roundtrip
+  through both decoders at levels 1-12).
 - Encoder: the opt/ultra block splitter's estimation tax re-measured and
   cut byte-identically (`blocks/split.rs`): the whole-range estimate now
   threads down the bisection recursion (a child re-derived the exact range
