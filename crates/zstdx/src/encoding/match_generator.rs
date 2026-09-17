@@ -2418,12 +2418,53 @@ impl MatchGeneratorDriver {
             (None, None) => {},
             _ => unreachable!("same row params arm LDM identically"),
         }
+        self.seed_gate_probe(data);
         self.strip_fill_continue(data, base, snap.upto - base);
         if data.len() < HASH_READ {
             return;
         }
         let last = data.len() - HASH_READ;
         self.acquire_seed(data, last);
+    }
+
+    /// Reset the incompressibility gate's repeat probe to exactly the
+    /// prefilled history: the per-block sample pass `skip_if_incompressible`
+    /// accumulates, replayed over the strip up front — same block-sized
+    /// segments, same per-segment stride — so the filter ends where a
+    /// from-scratch scan of the strip would have left it (block-phase
+    /// included: a repeat at a block-multiple displacement finds its twin
+    /// on the segment grid a scan would have planted, which a single
+    /// whole-strip stride misses for most phases). A block whose only
+    /// twins sit inside the job's matchable history — near twins in a
+    /// reach strip, far twins in a window strip the armed LDM serves —
+    /// then probes a hit instead of gating. The clear matters as much as
+    /// the replay: a pooled matcher's probe otherwise carries whatever
+    /// earlier jobs sampled, so the gate's verdicts (and the frame bytes)
+    /// depended on which worker ran which job.
+    fn seed_gate_probe(&mut self, data: &[u8]) {
+        if self.probe.is_empty() {
+            if data.len() < GATE_MIN_BLOCK {
+                return;
+            }
+            self.probe.resize(1 << GATE_PROBE_LOG, 0);
+        } else {
+            self.probe.fill(0);
+        }
+        let block = self.block_size();
+        let mut off = 0;
+        while off < data.len() {
+            let seg = (data.len() - off).min(block);
+            if seg >= GATE_MIN_BLOCK {
+                let stride = (seg >> 11) | 1;
+                let mut i = off;
+                while i + HASH_READ <= off + seg {
+                    let h = read8(data, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+                    self.probe[(h >> (64 - GATE_PROBE_LOG)) as usize] = h as u32;
+                    i += stride;
+                }
+            }
+            off += seg;
+        }
     }
 
     /// The chain row's stride-3 grid fill over `[resume, last)` (see
@@ -2508,6 +2549,7 @@ impl MatchGeneratorDriver {
                 ldm.fill(data, base, base, base + data.len() as u64);
             }
         }
+        self.seed_gate_probe(data);
         if data.len() < HASH_READ {
             return;
         }
@@ -2855,6 +2897,11 @@ impl Matcher for MatchGeneratorDriver {
         };
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(0);
+        }
+        // The gate's repeat probe is history, not capacity: a pooled state
+        // starts each frame as a fresh one (see `seed_gate_probe`).
+        if !self.probe.is_empty() {
+            self.probe.fill(0);
         }
         self.ldm_seqs.clear();
         self.ldm_quiet = 0;
@@ -5069,6 +5116,56 @@ mod tests {
         assert!(
             s_ldm.snapshot().same_as(&b_ldm.snapshot()),
             "builder LDM diverges"
+        );
+    }
+
+    /// The gate's repeat probe is exactly the job's strip history: a block
+    /// whose only twins live in the strip stays searchable, and neither
+    /// verdict may depend on what an earlier job on the same pooled driver
+    /// left in the probe.
+    #[cfg(feature = "std")]
+    #[test]
+    fn gate_probe_is_strip_history() {
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut rand = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut noise = |n: usize| -> Vec<u8> { (0..n).map(|_| (rand() & 0xff) as u8).collect() };
+        // A 2 MiB strip whose [1 MiB, 1 MiB + 128 KiB) span the job's first
+        // block repeats verbatim (beyond the gate's self-samples: a fresh
+        // probe holds nothing, so without strip seeding the block gates).
+        let mut data = noise(2 * 1024 * 1024);
+        let twin = data[1024 * 1024..1024 * 1024 + 128 * 1024].to_vec();
+        data.extend_from_slice(&twin);
+        let prior = noise(2 * 1024 * 1024 + 128 * 1024);
+        let verdict = |prior: Option<&[u8]>| -> bool {
+            let mut d = MatchGeneratorDriver::new_direct();
+            d.set_ldm_arming(LdmArming::Job);
+            d.reset(crate::Level::Balanced);
+            if let Some(p) = prior {
+                // An earlier job: a strip plus one gated noise block, the
+                // residue a pooled driver carries into its next job.
+                d.prefill_job_strip(&p[..2 * 1024 * 1024], 0);
+                d.adopt_window(p, 0);
+                d.set_block(2 * 1024 * 1024, 2 * 1024 * 1024 + 128 * 1024);
+                assert!(d.skip_if_incompressible());
+            }
+            d.prefill_job_strip(&data[..2 * 1024 * 1024], 0);
+            d.adopt_window(&data, 0);
+            d.set_block(2 * 1024 * 1024, 2 * 1024 * 1024 + 128 * 1024);
+            d.skip_if_incompressible()
+        };
+        assert!(
+            !verdict(None),
+            "a block repeating its strip must stay searchable"
+        );
+        assert_eq!(
+            verdict(None),
+            verdict(Some(&prior)),
+            "pooled residue must not change the gate's verdict"
         );
     }
 

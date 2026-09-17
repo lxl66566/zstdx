@@ -732,8 +732,19 @@ impl LdmState {
     /// Index every split of `[base, end)` without matching — the
     /// prefill/dictionary path (C's `ZSTD_ldm_fillHashTable`). `end` must
     /// sit at the window buffer's end (the block model), like generate.
+    /// A fed gap below `base` (gated blocks the driver skipped filling)
+    /// re-arms at `base` — the same reset `generate` applies — so the
+    /// rolling hash never runs stale; the gap's bytes stay unindexed.
     pub fn fill(&mut self, win: &[u8], win_base: u64, base: u64, end: u64) {
         self.ensure_fresh();
+        if self.fed < base {
+            if base >= win_base + MIN_MATCH_LENGTH as u64 {
+                self.gear_rearm(win, win_base, base);
+            } else {
+                self.fed = base;
+                self.arm = base;
+            }
+        }
         let mut splits = [0u64; BATCH_SIZE];
         let mut pos = base;
         while pos < end {
