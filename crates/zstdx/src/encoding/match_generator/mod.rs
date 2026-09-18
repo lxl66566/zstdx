@@ -1261,6 +1261,27 @@ impl MatchGeneratorDriver {
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_width(data, idx, small_log, width)) =
                             entry;
+                        if grid == FillGrid::Dictionary && idx + 2 < last {
+                            // Beyond libzstd's dict fill, whose small table
+                            // stays on the stride grid (off-grid twins stay
+                            // reachable only through the long probe's
+                            // empty-slot backfill, mml 8): dense small
+                            // writes make off-grid 4-class dict twins
+                            // candidates — 13/15 of the remaining missed
+                            // sources in the fixture decomposition.
+                            *small.get_unchecked_mut(hash_at_width(
+                                data,
+                                idx + 1,
+                                small_log,
+                                width,
+                            )) = pack_pos(base + idx as u64 + 1);
+                            *small.get_unchecked_mut(hash_at_width(
+                                data,
+                                idx + 2,
+                                small_log,
+                                width,
+                            )) = pack_pos(base + idx as u64 + 2);
+                        }
                     }
                     if grid == FillGrid::Dictionary {
                         // The long table takes the empty-slot backfill

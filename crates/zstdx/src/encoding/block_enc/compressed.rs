@@ -470,7 +470,13 @@ pub(super) fn select_from_counts<'a>(
         // libzstd's lazy+ selection for dictionary-provided tables: a pure
         // cost comparison, predefined included — the small-block heuristic
         // gates below would preempt the repeat mode that carries the
-        // dictionary's statistics.
+        // dictionary's statistics. Measured against two alternatives on the
+        // dict fixture (54-file holdout, fast rows): blind repeat (C's
+        // fast-row shortcut, valid below 1000 sequences) loses +8/+9 B per
+        // file — this encoder's parse distributions fit the seeded tables
+        // worse than libzstd's own parses do — and pricing the fresh table
+        // exactly (build, then cost through it) flipped no decision the
+        // entropy-bound compare got wrong.
         let basic_bits = if default_covers {
             repeat_bit_cost(default_table, counts, max_symbol)
         } else {
