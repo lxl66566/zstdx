@@ -702,7 +702,7 @@ fn maybe_update_fse_tables(
             }
             bytes_read += 1;
             if source[0] > MAX_LITERAL_LENGTH_CODE {
-                return Err(DecodeSequenceError::MissingByteForRleMlTable);
+                return Err(DecodeSequenceError::MissingByteForRleLlTable);
             }
             scratch.ll_rle = Some(source[0]);
             scratch.ll_predefined = false;
@@ -753,7 +753,7 @@ fn maybe_update_fse_tables(
             }
             bytes_read += 1;
             if of_source[0] > MAX_OFFSET_CODE {
-                return Err(DecodeSequenceError::MissingByteForRleMlTable);
+                return Err(DecodeSequenceError::MissingByteForRleOfTable);
             }
             scratch.of_rle = Some(of_source[0]);
             scratch.of_predefined = false;
