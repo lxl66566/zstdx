@@ -280,6 +280,40 @@ mod tests {
         assert_eq!(&exact[..], input);
     }
 
+    /// A gated (incompressible) block followed by a tail block shorter than
+    /// HASH_READ: the next scan's catch-up insertions must stop HASH_READ
+    /// bytes short of the window end, because the bulk window borrows the
+    /// caller's slice and the old `block_start` bound read past the
+    /// allocation (heap overread, ASAN-visible as "READ of size 8" just
+    /// past the input region). A plain run cannot observe the overread —
+    /// this locks the no-panic + valid-output behavior; run under
+    /// `-Zsanitizer=address` to catch the actual read.
+    #[test]
+    fn gated_block_followed_by_sub_hash_read_tail() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        // 128 KiB uniform random: the whole first block, over the gate's
+        // 16 KiB floor and past the entropy bar, so the gate opens the gap
+        // deterministically and the tail block triggers the catch-up fill.
+        let body: Vec<u8> = (0..128 * 1024).map(|_| (rand() & 0xff) as u8).collect();
+        // Tail lengths around the fill's HASH_READ margin.
+        for tail in [1usize, 4, 7, 8, 9] {
+            let mut input = body.clone();
+            input.extend_from_slice(&body[..tail]);
+            // One level per catch-up arm: Fast / Dfast / Chain.
+            for level in [Level::Fastest, Level::Fast, Level::Balanced] {
+                let compressed = compress(&input, level);
+                let out = decompress(&compressed, input.len()).unwrap();
+                assert_eq!(out, input, "tail {tail} level {level:?}");
+            }
+        }
+    }
+
     /// A forced window log must shrink the declared window (and with it the
     /// reachable history), roundtrip through libzstd, and leave the forced
     /// frames decodable by our own decoder.

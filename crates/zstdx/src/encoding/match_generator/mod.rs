@@ -2072,7 +2072,14 @@ impl MatchGeneratorDriver {
             .gap_start
             .max(win_base)
             .max(block_start.saturating_sub(self.params.window as u64));
-        let to = (block_start - win_base) as usize;
+        // Each insert hashes HASH_READ bytes at `idx`, but the window only
+        // guarantees coverage up to the gated block's end: a block of fewer
+        // than HASH_READ bytes right after a gated one (bulk/MT windows
+        // borrow the caller's slice) would overread. The scan itself never
+        // inserts at or past `block_end - HASH_READ` either, so this bound
+        // also leaves the tables exactly in the state a full scan would
+        // have produced.
+        let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut idx = (from - win_base) as usize;
         match self.params.strategy {
