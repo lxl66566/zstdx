@@ -882,7 +882,7 @@ mod mt {
             .unwrap();
             let mut comp = Vec::new();
             enc.read_to_end(&mut comp).unwrap();
-            enc.finish();
+            enc.finish().unwrap();
             assert_both_decoders(&comp, &data, &format!("read-side mt{workers}"));
         }
     }

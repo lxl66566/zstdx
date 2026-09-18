@@ -1991,7 +1991,7 @@ mod tests {
         let data = textish(4 * mib);
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -2001,7 +2001,7 @@ mod tests {
         core.write(&data);
         core.flush_block();
         assert!(core.has_output());
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -2059,7 +2059,7 @@ mod tests {
         assert!(core.has_output());
         // The retry resumes into the same writer; finish closes the frame.
         core.write_output_to(&mut flaky).unwrap();
-        core.finish();
+        core.finish().unwrap();
         core.write_output_to(&mut flaky).unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -2078,7 +2078,7 @@ mod tests {
         for _ in 0..4 {
             let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
             core.write(&data);
-            core.finish();
+            core.finish().unwrap();
             match &reference {
                 Some(bytes) => assert_eq!(&core.output, bytes, "sequential reuse"),
                 None => reference = Some(core.output.clone()),
@@ -2093,7 +2093,7 @@ mod tests {
                 for _ in 0..4 {
                     let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
                     core.write(&data);
-                    core.finish();
+                    core.finish().unwrap();
                     assert_eq!(core.output, reference, "concurrent lease {t}");
                 }
             }));
@@ -2117,7 +2117,7 @@ mod tests {
         }
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -2136,7 +2136,7 @@ mod tests {
             for piece in data.chunks(chunk) {
                 core.write(piece);
             }
-            core.finish();
+            core.finish().unwrap();
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&core.output, &mut out).unwrap();

@@ -183,12 +183,7 @@ pub(super) fn locate_fcs(frame: &[u8]) -> (u64, usize) {
         3 => 4,
         _ => unreachable!("two-bit flag"),
     };
-    let pos =
-        5 + if single_segment {
-            0
-        } else {
-            1
-        } + dict_len;
+    let pos = 5 + usize::from(!single_segment) + dict_len;
     let declared = match fhd >> 6 {
         0 => {
             assert!(single_segment, "no FCS field to locate");
