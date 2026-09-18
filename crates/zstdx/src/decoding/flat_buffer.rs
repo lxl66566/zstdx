@@ -7,13 +7,16 @@
 //! segment's tail keeps serving as the match window.
 //!
 //! Wrap safety: the buffer holds `window + 2 * MAX_BLOCK_SIZE + slack` bytes. A
-//! wrap only happens once at least `window + MAX_BLOCK_SIZE` bytes were produced,
-//! so the wrapped-away history segment `[origin - window, origin)` always ends at
-//! least `MAX_BLOCK_SIZE` bytes above any position the new segment can write in
-//! its first block. By induction (the k-th block after a wrap writes absolute
-//! `[k*bs, (k+1)*bs)` while match references stay above `(k+1)*bs + slack`),
-//! match sources and match destinations never collide within a buffer
-//! generation.
+//! wrap only happens once at least `window + MAX_BLOCK_SIZE + WILDCOPY_SLACK`
+//! bytes were produced, so a new generation's writes (block output plus the
+//! 16-byte wildcopy overshoot) stay below the wrapped-away history's in-window
+//! floor `[origin - window, origin)`: its lowest legally readable byte sits at
+//! physical `end - window >= MAX_BLOCK_SIZE + WILDCOPY_SLACK`, above anything
+//! the first block can touch. Later blocks may write over dead history, but by
+//! induction (the k-th block after a wrap writes absolute `[k*bs, (k+1)*bs)`
+//! while match references from output position `q >= k*bs` stay above
+//! `end - window + k*bs >= (k+1)*bs + WILDCOPY_SLACK`), match sources and
+//! match destinations never collide within a buffer generation.
 
 use alloc::vec::Vec;
 
@@ -117,11 +120,14 @@ impl FlatOut {
         if self.end + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK <= self.buf.len() {
             return true;
         }
-        if self.start == self.end && self.end >= self.window + MAX_BLOCK_SIZE_USIZE {
+        if self.start == self.end && self.end >= self.window + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK
+        {
             // Wrap: everything decoded so far was flushed and the previous
-            // segment keeps a full window with the safety margin proven
-            // above. Virtual origins chain so addresses stay monotonic
-            // across generations (offsets are global distances).
+            // segment keeps a full window plus the wildcopy overshoot margin
+            // proven above (its lowest in-window byte is
+            // `WILDCOPY_SLACK` above anything the new generation's first
+            // block can write). Virtual origins chain so addresses stay
+            // monotonic across generations (offsets are global distances).
             self.prev_origin = self.origin;
             self.seg_a_end = self.end;
             self.origin += self.end;
@@ -212,11 +218,17 @@ impl FlatOut {
     pub fn origin_for_test(&self) -> usize {
         self.origin
     }
+
+    /// `(prev_origin, seg_a_end)` for wrap-margin assertions.
+    #[cfg(test)]
+    pub fn prev_segment_for_test(&self) -> (usize, usize) {
+        (self.prev_origin, self.seg_a_end)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::FlatOut;
+    use super::{FlatOut, WILDCOPY_SLACK};
     use crate::common::MAX_BLOCK_SIZE;
 
     #[test]
@@ -273,5 +285,64 @@ mod tests {
         // A wrap must have happened for this much production.
         let origin = f.origin_for_test();
         assert!(origin == 0 || origin >= window + MAX_BLOCK_SIZE as usize);
+    }
+
+    #[test]
+    fn wrap_never_too_early_for_wildcopy_overshoot() {
+        // The wrap point must leave the previous generation's in-window floor
+        // (physical `end - window`) above everything the new generation can
+        // write before its cursor reaches that floor: block output is capped
+        // at MAX_BLOCK_SIZE and the wildcopy overshoot adds 16 more bytes.
+        let window = 4096;
+        let mut f = FlatOut::new();
+        f.reset(window);
+        // Grow to the steady-state size first, as the streaming layer would.
+        assert!(f.ensure_block_space(false));
+
+        // At the historic wrap threshold (window + MAX_BLOCK_SIZE) with a
+        // full-size buffer the block simply continues in the same generation:
+        // no wrap, no stall.
+        let old_threshold = window + MAX_BLOCK_SIZE as usize;
+        f.advance(old_threshold);
+        let _ = f.take_pending(); // start == end, everything flushed
+        assert!(
+            f.ensure_block_space(false),
+            "must not stall at the old wrap threshold"
+        );
+        assert_eq!(
+            f.origin_for_test(),
+            0,
+            "must not wrap below the safe margin"
+        );
+
+        // Keep producing full blocks: once the cursor gate (end + block max +
+        // overshoot > buffer) can no longer serve the block in this
+        // generation, the wrap fires, and the wrapped-away segment is well
+        // above the wildcopy margin.
+        let mut sink = alloc::vec![0u8; window];
+        for i in 0..64u8 {
+            loop {
+                if f.flush_to(&mut sink) == 0 {
+                    break;
+                }
+            }
+            assert!(f.ensure_block_space(false), "stalled at block {i}");
+            if f.origin_for_test() != 0 {
+                let (prev_origin, seg_a_end) = f.prev_segment_for_test();
+                assert!(
+                    seg_a_end >= window + MAX_BLOCK_SIZE as usize + WILDCOPY_SLACK,
+                    "wrapped with only {seg_a_end} bytes of history"
+                );
+                // The in-window floor of the wrapped-away history stays above
+                // a full block plus overshoot, so the new generation's first
+                // block cannot touch readable history. Origins chain.
+                assert!(seg_a_end - window >= MAX_BLOCK_SIZE as usize + WILDCOPY_SLACK);
+                assert_eq!(f.origin_for_test(), prev_origin + seg_a_end);
+                return;
+            }
+            f.block_target()[..window].fill(i);
+            f.advance(window);
+        }
+        panic!("a wrap should have happened");
     }
 }
