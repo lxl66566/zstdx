@@ -12,3 +12,4 @@ crates/zstdx/fuzz/corpus
 /docs/book
 /bench/big
 /bench/scratch
+/test*
