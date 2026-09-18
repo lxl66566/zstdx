@@ -37,16 +37,17 @@ impl FrameHeader {
     pub fn serialize(self, output: &mut Vec<u8>) {
         vprintln!("Serializing frame with header: {self:?}");
         // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header
+        let header = self.normalized();
         // Magic Number:
         output.extend_from_slice(&MAGIC_NUM.to_le_bytes());
 
         // `Frame_Header_Descriptor`:
-        output.push(self.descriptor());
+        output.push(header.descriptor());
 
         // `Window_Descriptor
         // TODO: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#window_descriptor
-        if !self.single_segment
-            && let Some(window_size) = self.window_size
+        if !header.single_segment
+            && let Some(window_size) = header.window_size
         {
             let log = window_size.next_power_of_two().ilog2();
             let exponent = if log > 10 {
@@ -57,13 +58,32 @@ impl FrameHeader {
             output.push(exponent << 3);
         }
 
-        if let Some(id) = self.dictionary_id {
+        if let Some(id) = header.dictionary_id {
             output.extend(minify_val(id));
         }
 
-        if let Some(frame_content_size) = self.frame_content_size {
+        if let Some(frame_content_size) = header.frame_content_size {
             output.extend(minify_val_fcs(frame_content_size));
         }
+    }
+
+    /// Restrict the header to what the format can actually express: without
+    /// the single-segment flag the 1-byte Frame_Content_Size class does not
+    /// exist (flag 0 means the field is absent), so a size below 256 bytes
+    /// cannot be declared in a windowed frame. Drop the declaration instead
+    /// of emitting a stray byte that shifts every following field — both
+    /// this crate's and the reference decoder reject the shifted frame.
+    /// The pledged size keeps shaping the encode; only the header promise is
+    /// lost.
+    fn normalized(mut self) -> Self {
+        if !self.single_segment
+            && self
+                .frame_content_size
+                .is_some_and(|v| find_min_size(v) == 1)
+        {
+            self.frame_content_size = None;
+        }
+        self
     }
 
     /// Generate a serialized frame header descriptor for the frame header.
@@ -282,5 +302,50 @@ mod tests {
 
         let mut serialized_header = Vec::new();
         header.serialize(&mut serialized_header);
+    }
+
+    /// A windowed frame cannot declare the 1-byte FCS class: flag 0 means
+    /// the field is absent without the single-segment flag, so sizes below
+    /// 256 used to serialize a stray byte that shifted every following
+    /// field (both decoders rejected the frame). The declaration is dropped
+    /// instead; the 2-byte class (256 and above) keeps declaring.
+    #[test]
+    fn windowed_small_fcs_is_dropped() {
+        for fcs in [0u64, 1, 200, 255] {
+            let header = FrameHeader {
+                frame_content_size: Some(fcs),
+                single_segment: false,
+                content_checksum: false,
+                dictionary_id: None,
+                window_size: Some(1024),
+            };
+            let mut serialized = Vec::new();
+            header.serialize(&mut serialized);
+            let parsed = read_frame_header(serialized.as_slice()).unwrap().0;
+            assert_eq!(parsed.frame_content_size(), 0, "fcs {fcs}");
+            let desc = parsed.descriptor;
+            assert_eq!(desc.frame_content_size_flag(), 0, "fcs {fcs}");
+            assert!(!desc.single_segment_flag(), "fcs {fcs}");
+            // magic + descriptor + window descriptor, nothing else
+            assert_eq!(serialized.len(), 6, "fcs {fcs}");
+        }
+        for fcs in [256u64, 300, u16::MAX as u64] {
+            let header = FrameHeader {
+                frame_content_size: Some(fcs),
+                single_segment: false,
+                content_checksum: false,
+                dictionary_id: None,
+                window_size: Some(1024),
+            };
+            let mut serialized = Vec::new();
+            header.serialize(&mut serialized);
+            let parsed = read_frame_header(serialized.as_slice()).unwrap().0;
+            assert_eq!(parsed.frame_content_size(), fcs, "fcs {fcs}");
+            let desc = parsed.descriptor;
+            assert!(
+                desc.frame_content_size_flag() != 0 || desc.single_segment_flag(),
+                "fcs {fcs} must declare"
+            );
+        }
     }
 }

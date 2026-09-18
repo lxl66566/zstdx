@@ -90,6 +90,33 @@ fn pledged_size_lands_in_header() {
     }
 }
 
+/// A pledged stream below 256 bytes used to serialize a 1-byte
+/// Frame_Content_Size field the windowed descriptor cannot express (flag 0
+/// means the field is absent), shifting every following byte — both this
+/// crate's and the reference decoder rejected the frame. The declaration is
+/// dropped now and the frame must roundtrip.
+#[test]
+fn small_pledged_streams_roundtrip() {
+    for n in [0usize, 1, 200, 255, 256, 300] {
+        let data = vec![b'x'; n];
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest).pledged_size(Some(n as u64)),
+        )
+        .unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(crate::stream::decode_all(&sink[..]).unwrap(), data, "n={n}");
+        #[cfg(feature = "std")]
+        assert_eq!(
+            zstd::stream::decode_all(&sink[..]).unwrap(),
+            data,
+            "reference n={n}"
+        );
+    }
+}
+
 /// A stream pledged a content size it did not write fails at finish instead
 /// of emitting a frame every decoder rejects (libzstd treats the pledge as a
 /// hard contract). Both directions (over- and undershoot) on the
