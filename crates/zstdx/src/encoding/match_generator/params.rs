@@ -358,12 +358,15 @@ pub(crate) enum LdmArming {
     #[cfg(feature = "std")]
     Job,
     /// A multithreaded job whose strip reaches back through the frame's
-    /// own prefix (the bulk path's shared prefix fill, mid-size windows):
-    /// the strip content is exactly what the frame-continuous path would
-    /// have indexed by the same position, so the mid-size bar arms and the
-    /// far class survives the job split — the per-job fill tax the `Job`
-    /// bar guards against is paid once by the shared build instead of per
-    /// job. Constructed by the std-gated bulk mt path only.
+    /// own prefix (the mt paths' mid-size LDM capture): the strip content
+    /// is exactly what the frame-continuous path would have indexed by the
+    /// same position, so the mid-size bar arms and the far class survives
+    /// the job split — the per-job fill tax the `Job` bar guards against is
+    /// paid once by the shared build instead of per job. Also the donated
+    /// reach-probe span's arming when the frame's Keep verdict would
+    /// engage the capture (the donated span must parse as the kept frame's
+    /// job zero would — see `mt::donation_arming` and the stream core's
+    /// `post_donation`). Constructed by the std-gated mt paths only.
     #[cfg(feature = "std")]
     JobPrefix,
     /// A streaming job on a far-dead frame (both far-class screens

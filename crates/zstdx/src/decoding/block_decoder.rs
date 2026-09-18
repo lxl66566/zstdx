@@ -211,10 +211,20 @@ impl BlockDecoder {
         let out = &mut out[..block_limit];
 
         if seq_section.num_sequences != 0 {
-            // The flat executor's inline 16-byte literal copies may read up
-            // to 15 bytes past the final literal; keep that inside the
-            // allocation (the bytes themselves are never used).
+            // The flat executor's inline 16-byte literal chunks read up to
+            // 15 bytes past the final literal (see `wildcopy_literals`).
+            // `reserve` keeps the overshoot inside the allocation; zeroing
+            // the overshoot window keeps the read initialized — under the
+            // strict Rust model, scanning the uninitialized capacity tail
+            // is UB even when the values are never used (libzstd's
+            // ZSTD_wildcopy over-reads the same shape in C and gets away
+            // with it there). The cost is a 16-byte memset per block; the
+            // buffer is pooled and `reserve` ran above, so this never
+            // reallocates.
             literals_buffer.reserve(16);
+            let len = literals_buffer.len();
+            literals_buffer.resize(len + 16, 0);
+            literals_buffer.truncate(len);
             let mut dec = SeqDecoder::new(&seq_section, raw, fse)?;
             execute_decoded_flat(
                 &mut dec,

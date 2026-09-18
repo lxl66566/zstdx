@@ -132,6 +132,14 @@ pub fn compress_slice_mt(
     // a Shrink verdict pays a re-parse. The keep grid must leave job zero
     // work beyond the span for the continuation to take over.
     let mut donation = None;
+    // Whether the donated state arms with the mid-size capture's arming
+    // (see `donation_arming`): the pairing invariant below checks the
+    // capture the frame finally runs against it.
+    let mut donation_prefix = false;
+    // The capture plan a Keep verdict would run, computed before the
+    // donation so the donated span can arm for it; reused as the frame's
+    // plan when the verdict keeps.
+    let mut keep_plan = None;
     let choice;
     if reach_probe::eligible(level, shape)
         && job_size_for(
@@ -141,14 +149,30 @@ pub fn compress_slice_mt(
                 as usize,
         ) >= reach_probe::PROBE_SPAN
     {
-        let (donated_choice, state, prefix) = donate_job_zero_prefix(src, level, shape);
+        let keep_strip =
+            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
+                as usize;
+        let keep_job_size = job_size_for(src.len() as u64, workers.max(2), keep_strip);
+        keep_plan = plan_prefix_ldm(
+            src,
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            keep_job_size,
+            src.len().div_ceil(keep_job_size),
+        );
+        donation_prefix = keep_plan.is_some();
+        let (donated_choice, state, prefix) =
+            donate_job_zero_prefix(src, level, shape, donation_arming(donation_prefix));
         choice = donated_choice;
         if choice == reach_probe::ReachChoice::Keep {
             donation = Some((state, prefix));
         } else {
-            // The shrink verdict discards the donation; job zero parses
-            // from its own pooled state like an undonated frame.
+            // The shrink verdict discards the donation (and the plan: the
+            // shrunk strips are not the prefixes it filled); job zero
+            // parses from its own pooled state like an undonated frame.
             return_slice_state(state);
+            keep_plan = None;
         }
     } else {
         choice = reach_probe::probe_reach_choice(src, level, shape);
@@ -166,7 +190,22 @@ pub fn compress_slice_mt(
     // the window would floor jobs at 32 MiB and starve parallelism — and
     // the shared prefix fill bounds the per-job prefix fill's redundancy:
     // one build to the median boundary, tail jobs above it adopt.
-    let spf = plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs);
+    let spf: Option<PrefixPlan> = if choice == reach_probe::ReachChoice::Keep {
+        // A kept frame's capture is exactly the plan the donation gate
+        // computed (the same pure inputs at Keep); a non-donated frame
+        // plans from its final schedule.
+        keep_plan
+            .take()
+            .or_else(|| plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs))
+    } else {
+        None
+    };
+    // Pairing invariant: a capture the frame runs is one the donated job
+    // zero armed for. The reverse direction is trivially the gate's own
+    // computation; a capture without any donation cannot happen (the
+    // capture's window band keeps the frame probe-eligible, so the gate
+    // passed and the plan was computed there).
+    debug_assert!(spf.is_none() || donation_prefix);
     let job_overlap = if spf.is_some() {
         window as usize
     } else {
@@ -359,31 +398,41 @@ fn ramp_depth_from_env() -> u64 {
     })
 }
 
+/// The donated span's LDM arming for a capture engagement verdict (see
+/// `compress_slice_mt`'s donation gate): the capture's own arming when it
+/// engages — a kept frame's job zero is a `JobPrefix` job, so the donated
+/// span must parse with the same bar — the stock job arming otherwise.
+fn donation_arming(capture_engages: bool) -> LdmArming {
+    if capture_engages {
+        LdmArming::JobPrefix
+    } else {
+        LdmArming::Job
+    }
+}
+
 /// Run the reach probe's keep side as job zero's own first span blocks
 /// through `state`: the state is job-zero-shaped exactly (reset at the job
 /// arming, empty-strip prefill with its table clear and head arming), the
 /// emit mirrors `compress_job_blocks`, and the matcher accumulates the
-/// probe cost while the blocks become the frame's own output. `head` is the
-/// frame's first [`reach_probe::PROBE_SPAN`] bytes. Returns the measured
-/// keep cost and the encoded span; the caller takes the verdict (the
-/// shrink side measures separately — bulk serially on the calling thread,
-/// the stream core on a second pool worker) and disposes of the state (a
-/// Shrink verdict's returns to its pool, a Keep's becomes job zero's
-/// continuation state).
+/// probe cost while the blocks become the frame's own output. `ldm` is the
+/// arming the kept frame's job zero would run with (see `donation_arming`
+/// and the stream core's `post_donation`) — the probe measures the kept
+/// parse's true cost only when the span parses as that job would. `head`
+/// is the frame's first [`reach_probe::PROBE_SPAN`] bytes. Returns the
+/// measured keep cost and the encoded span; the caller takes the verdict
+/// (the shrink side measures separately — bulk serially on the calling
+/// thread, the stream core on a second pool worker) and disposes of the
+/// state (a Shrink verdict's returns to its pool, a Keep's becomes job
+/// zero's continuation state).
 pub(crate) fn donate_keep_span(
     state: &mut CompressState<MatchGeneratorDriver>,
     head: &[u8],
     level: Level,
     shape: crate::InputShape,
+    ldm: LdmArming,
 ) -> (f64, Vec<u8>) {
     debug_assert_eq!(head.len(), reach_probe::PROBE_SPAN);
-    reset_slice_state(
-        state,
-        level,
-        shape,
-        reach_probe::ReachChoice::Keep,
-        LdmArming::Job,
-    );
+    reset_slice_state(state, level, shape, reach_probe::ReachChoice::Keep, ldm);
     state.matcher.prefill_job_strip(&head[..0], 0);
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
@@ -417,14 +466,20 @@ fn donate_job_zero_prefix(
     src: &[u8],
     level: Level,
     shape: crate::InputShape,
+    ldm: LdmArming,
 ) -> (
     reach_probe::ReachChoice,
     alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
     Vec<u8>,
 ) {
-    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, LdmArming::Job);
-    let (keep, output) =
-        donate_keep_span(&mut state, &src[..reach_probe::PROBE_SPAN], level, shape);
+    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
+    let (keep, output) = donate_keep_span(
+        &mut state,
+        &src[..reach_probe::PROBE_SPAN],
+        level,
+        shape,
+        ldm,
+    );
     let shrink = reach_probe::parse_cost(
         &src[..reach_probe::PROBE_SPAN],
         level,
@@ -714,8 +769,201 @@ pub(crate) fn run_job(
 mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
-    use super::{LdmArming, compress_slice_mt, reach_probe, take_slice_state};
-    use crate::{Level, decoding::FrameDecoder};
+    use super::{
+        compress_slice_mt, donation_arming, job_size_for, plan_prefix_ldm, reach_probe,
+        take_slice_state,
+    };
+    use crate::{
+        Level,
+        common::MAX_BLOCK_SIZE,
+        decoding::FrameDecoder,
+        encoding::{
+            match_generator::{LdmArming, MatchGeneratorDriver},
+            reach_probe::ReachChoice,
+        },
+    };
+
+    /// Wide-alphabet head built from a 96-pattern pool: 8-byte windows
+    /// repeat (the capture head screen's parse evidence) and the alphabet
+    /// is wide enough to clear it, unlike random or uniform bytes.
+    fn pattern_head(len: usize) -> Vec<u8> {
+        let mut patterns = Vec::new();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::with_capacity(len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        head
+    }
+
+    /// The capture plan (and with it the donation's arming) at the band
+    /// edges: only the source-clamped window in [W25, W26) engages — a
+    /// `Job`-armed donation would parse the span without LDM there, so the
+    /// pairing with `donation_arming` is load-bearing exactly in this band.
+    #[test]
+    fn donation_arming_pairs_with_the_capture_plan() {
+        let src = pattern_head(MAX_BLOCK_SIZE as usize);
+        let mib: u64 = 1024 * 1024;
+        let cases: &[(u64, u32, Option<u32>, bool)] = &[
+            // The band: row 9's source-clamped window is W25.
+            (24 * mib, 2, None, true),
+            (17 * mib, 4, None, true),
+            // A forced window inside the band engages on a large source.
+            (128 * mib, 4, Some(25), true),
+            // Above the band (window W26) the `Job` bar holds.
+            (64 * mib, 4, None, false),
+            // Below it there are no prefix strips worth sharing.
+            (8 * mib, 4, None, false),
+        ];
+        for &(len, workers, window_log, engages) in cases {
+            let shape = crate::InputShape {
+                len: Some(len),
+                window_log,
+            };
+            let strip =
+                MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
+                    as usize;
+            let job_size = job_size_for(len, workers.max(2), strip);
+            let n_jobs = len.div_ceil(job_size as u64) as usize;
+            let plan = plan_prefix_ldm(
+                &src,
+                Level::Balanced,
+                shape,
+                ReachChoice::Keep,
+                job_size,
+                n_jobs,
+            );
+            assert_eq!(
+                plan.is_some(),
+                engages,
+                "len {len} workers {workers} window_log {window_log:?}"
+            );
+            assert_eq!(
+                donation_arming(plan.is_some()),
+                if engages {
+                    LdmArming::JobPrefix
+                } else {
+                    LdmArming::Job
+                }
+            );
+        }
+        // The head screen: same band, uniform bytes — no capture, and the
+        // donation keeps the stock arming.
+        let shape = crate::InputShape {
+            len: Some(24 * mib),
+            window_log: None,
+        };
+        let strip =
+            MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
+                as usize;
+        let job_size = job_size_for(shape.len.unwrap(), 2, strip);
+        let plan = plan_prefix_ldm(
+            &vec![0u8; MAX_BLOCK_SIZE as usize],
+            Level::Balanced,
+            shape,
+            ReachChoice::Keep,
+            job_size,
+            shape.len.unwrap().div_ceil(job_size as u64) as usize,
+        );
+        assert_eq!(plan.is_some(), false);
+        assert_eq!(donation_arming(plan.is_some()), LdmArming::Job);
+    }
+
+    /// Far periodicity whose twins resolve only through LDM inside job
+    /// zero's own span: a 4.5 MiB unit (past the row's W22 chain reach)
+    /// tiled exactly, so every copy after the first matches 4.5 MiB back.
+    /// The unit carries an 8-byte motif every 2 KiB so the incompressibility
+    /// gate's repeat probe keeps every block matchable — copy one is then
+    /// scanned and LDM-indexed, and copy two's far twins resolve through
+    /// the table. The donated job zero must parse with the capture's
+    /// arming: a `Job`-armed donation (the arming mismatch this pins)
+    /// parses the span without LDM — the capture's clamped window sits
+    /// below the `Job` bar — and loses the far twins it holds, diverging
+    /// from the single-threaded path by their whole cost.
+    #[test]
+    fn donated_job_zero_resolves_intra_job_far_twin() {
+        const MIB: usize = 1024 * 1024;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let unit_len = 9 * MIB / 2; // 4.5 MiB
+        let mut unit: Vec<u8> = (0..unit_len).map(|_| (rand() & 0xff) as u8).collect();
+        let word: [u8; 8] = core::array::from_fn(|_| (rand() & 0xff) as u8);
+        let mut i = 0;
+        while i + 64 <= unit_len {
+            for k in 0..8 {
+                unit[i + k * 8..i + k * 8 + 8].copy_from_slice(&word);
+            }
+            i += 2048;
+        }
+        let mut data = pattern_head(256 * 1024);
+        while data.len() < 32 * MIB {
+            let take = unit.len().min(32 * MIB - data.len());
+            data.extend_from_slice(&unit[..take]);
+        }
+        // 32 MiB at two workers grids 8 MiB jobs, so job zero holds the
+        // head copy plus ~3.25 MiB of copy two; the capture engages (the
+        // head above).
+        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None);
+        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None);
+        for (name, frame) in [("st", &st), ("mt", &mt)] {
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder
+                .decode_all(frame, &mut out)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]), "{name}");
+            let mut libzstd = Vec::new();
+            zstd::stream::copy_decode(frame.as_slice(), &mut libzstd).unwrap();
+            assert_eq!(libzstd, data, "{name} libzstd");
+        }
+        assert!(
+            mt.len() <= st.len() + st.len() / 50,
+            "the intra-job far twin must survive the donated job zero: mt {} vs st {}",
+            mt.len(),
+            st.len()
+        );
+    }
+
+    #[test]
+    fn zzz_probe_ldm_tiling() {
+        const MIB: usize = 1024 * 1024;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let unit: Vec<u8> = (0..(9 * MIB / 2)).map(|_| (rand() & 0xff) as u8).collect();
+        let mut tiled = unit.clone();
+        while tiled.len() < 28 * MIB {
+            let take = unit.len().min(28 * MIB - tiled.len());
+            tiled.extend_from_slice(&unit[..take]);
+        }
+        let head = pattern_head(256 * 1024);
+        let mut tiled_head = head.clone();
+        tiled_head.extend_from_slice(&tiled[..28 * MIB - head.len()]);
+        let st_unit = compress_slice_mt(&unit, Level::from_zstd(9), true, 1, None);
+        let st_tiled = compress_slice_mt(&tiled, Level::from_zstd(9), true, 1, None);
+        let st_tiled_head = compress_slice_mt(&tiled_head, Level::from_zstd(9), true, 1, None);
+        std::println!(
+            "unit={} tiled={} tiled_head={}",
+            st_unit.len(),
+            st_tiled.len(),
+            st_tiled_head.len()
+        );
+    }
 
     fn lcg(len: usize) -> Vec<u8> {
         let mut state = 0x1234_5678_9abc_def0u64;

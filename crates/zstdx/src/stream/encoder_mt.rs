@@ -143,6 +143,9 @@ struct Donation {
 /// cost too — see `JobKind::DonateShrink`).
 struct KeepOutcome {
     keep_bits: f64,
+    /// The arming the donated state carries (see `post_donation`): the
+    /// pairing assert in `resolve_probe` checks the capture flip against it.
+    arming: LdmArming,
     donation: Donation,
 }
 
@@ -164,6 +167,23 @@ impl SpfPlan {
     fn covers(&self, start: u64) -> bool {
         start > self.upto && start <= self.prefix_end
     }
+}
+
+/// The pledged mid-size capture's engagement (see
+/// [`MtEncoderCore::engage_midsize_capture`]): the pledge itself, the
+/// source-clamped window class and the head screen over the frame's first
+/// block. Shared verbatim by the capture flip and the donation's arming
+/// (see `post_donation`) — the capture's jobs and a donated job zero must
+/// arm alike, and both sites read the same decision off the same head
+/// bytes (nothing posts or wraps before the verdict resolves, so the
+/// buffer's head is still the frame's).
+fn midsize_capture_window(level: Level, shape: crate::InputShape, head: &[u8]) -> Option<u64> {
+    if shape.len.is_none() {
+        return None;
+    }
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, ReachChoice::Keep)?;
+    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
+    ldm_head_parses(head).then_some(window)
 }
 
 /// One posted job: the frozen source view (see the recycling rules in
@@ -219,8 +239,11 @@ enum JobKind {
     /// The probe's keep side over the frame's first
     /// [`reach_probe::PROBE_SPAN`] bytes (see `donate_keep_span`) — job
     /// zero's own blocks, parsed and encoded on a pool worker while the
-    /// pump keeps filling the buffer.
+    /// pump keeps filling the buffer. `arming` is the arming the kept
+    /// frame's job zero would run with (the mid-size capture's when the
+    /// capture engages, see `post_donation`).
     DonateKeep {
+        arming: LdmArming,
         outcome: Mutex<Option<KeepOutcome>>,
         done: core::sync::atomic::AtomicBool,
     },
@@ -304,6 +327,18 @@ const PUMP_STEP_MAX: usize = 1024 * 1024;
 // negligible). The old burst model reserved epoch-scale windows of the
 // same magnitude.
 const BUF_CAP_MAX: usize = 256 * 1024 * 1024;
+
+/// The accumulate buffer's initial reserve for a schedule: a full round of
+/// in-flight jobs plus the `extra` strip/slack, capped at [`BUF_CAP_MAX`].
+/// The reserve is a scheduling scale, not a need — a huge pledge's grid
+/// (job size at the `MAX_JOB_SIZE` ceiling, a full round scaling with the
+/// worker count) would otherwise reserve workers x job_size up front and
+/// hold the first that-much input resident for the whole stream. The pump
+/// grows into the live need through `make_space` instead, whose wrap
+/// recycles at the same grid lines the unpledged path already runs at.
+fn initial_reserve(workers: u32, initial_job: usize, extra: usize) -> usize {
+    ((workers as usize).max(2) * initial_job + extra + 64 * 1024).min(BUF_CAP_MAX)
+}
 
 // Take the pooled accumulate buffer, or a fresh one, with room for `want`
 // bytes (a larger pooled buffer is kept as-is — its spare capacity only
@@ -538,15 +573,19 @@ fn run_claimed_job(
             };
             *out.lock().unwrap() = Some(bytes);
         },
-        JobKind::DonateKeep { outcome, .. } => {
+        JobKind::DonateKeep {
+            arming, outcome, ..
+        } => {
             let head = job.head.as_deref().expect("a donation carries the head");
             // The kit pool (see `mt`'s DONATION_KIT docs): ephemeral pool
             // workers carry no warm tables, so the donation's state
             // round-trips a process-global pool instead.
             let mut st = crate::encoding::mt::take_donation_state();
-            let (keep_bits, prefix) = donate_keep_span(&mut st, head, job.level, job.shape);
+            let (keep_bits, prefix) =
+                donate_keep_span(&mut st, head, job.level, job.shape, *arming);
             *outcome.lock().unwrap() = Some(KeepOutcome {
                 keep_bits,
+                arming: *arming,
                 donation: Donation { state: st, prefix },
             });
         },
@@ -707,15 +746,16 @@ impl MtEncoderCore {
         header.serialize(&mut serialized);
         // One epoch-scale window, like the burst model's reserve: enough for
         // a full round of in-flight jobs plus the strip and write-chunk
-        // slack. The size also stays inside the buffer pool's keep cap, so
-        // consecutive streams reuse the already-faulted allocation. A
-        // pending probe reserves only its staging scale (the probe head
-        // plus a first shrunk epoch); the decision re-reserves the decided
-        // schedule's scale.
+        // slack, capped at BUF_CAP_MAX (see `initial_reserve`). The size
+        // also stays inside the buffer pool's keep cap, so consecutive
+        // streams reuse the already-faulted allocation. A pending probe
+        // reserves only its staging scale (the probe head plus a first
+        // shrunk epoch); the decision re-reserves the decided schedule's
+        // scale.
         let want = if probe_pending {
-            (options.workers as usize).max(2) * MIN_JOB_SIZE + reach_probe::PROBE_SPAN + 64 * 1024
+            initial_reserve(options.workers, MIN_JOB_SIZE, reach_probe::PROBE_SPAN)
         } else {
-            (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024
+            initial_reserve(options.workers, initial_job, overlap)
         };
         let (mut buf, mut init_len) = take_pooled_buf(want);
         if buf.capacity() < want {
@@ -990,12 +1030,25 @@ impl MtEncoderCore {
                 .into_boxed_slice(),
         );
         let done = || core::sync::atomic::AtomicBool::new(false);
+        // The donated span must parse exactly as the kept frame's job zero
+        // would: the mid-size capture's arming when the capture engages
+        // (the same predicate `engage_midsize_capture` flips the jobs with,
+        // evaluated on the same head bytes), the stock job arming
+        // otherwise. A Job-armed span in the capture's window band would
+        // parse without LDM (the clamped window sits below the `Job` bar)
+        // and job zero's bytes would diverge from the undonated schedule.
+        let arming = if midsize_capture_window(self.level, self.shape, &head).is_some() {
+            LdmArming::JobPrefix
+        } else {
+            LdmArming::Job
+        };
         let keep = Arc::new(Job {
             level: self.level,
             choice: ReachChoice::Keep,
             shape: self.shape,
             head: Some(head.clone()),
             kind: JobKind::DonateKeep {
+                arming,
                 outcome: Mutex::new(None),
                 done: done(),
             },
@@ -1084,8 +1137,17 @@ impl MtEncoderCore {
                 self.grid = JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
             }
         } else {
+            let arming = keep.arming;
             self.donation = Some(keep.donation);
             self.engage_midsize_capture();
+            // Pairing invariant: the capture's jobs and the donated job
+            // zero arm alike (see `post_donation`, the same predicate on
+            // the same head bytes).
+            debug_assert_eq!(
+                self.job_ldm == LdmArming::JobPrefix,
+                arming == LdmArming::JobPrefix,
+                "the capture's jobs and the donated job zero must arm alike"
+            );
         }
         // Nothing else is in flight at this point (nothing posts while the
         // verdict is unconsumed and the donation tasks just completed), so
@@ -1102,24 +1164,18 @@ impl MtEncoderCore {
     /// bar, so without the flip the far class disarms and the pledged
     /// stream pays a chain-only parse where bulk-mt captures it (dll32:
     /// 5,460,884 vs 4,390,255, a 24% gap against the pledged-equals-bulk
-    /// contract). The head screen mirrors the bulk planner's
-    /// (`ldm_head_parses`): low-alphabet heads keep the stock single-job
-    /// schedule — their LDM cannot survive the alphabet gate, so only the
-    /// job split would move (a pure boundary loss).
+    /// contract). The donated job zero arms with the same predicate (see
+    /// `post_donation`), so the continuation parses as the capture's own
+    /// job zero would.
     fn engage_midsize_capture(&mut self) {
-        if !matches!(self.grid, JobGrid::Fixed(_)) || self.shape.len.is_none() {
+        if !matches!(self.grid, JobGrid::Fixed(_)) {
             return;
         }
-        let Some(window) =
-            MatchGeneratorDriver::prefix_ldm_window(self.level, self.shape, ReachChoice::Keep)
-        else {
+        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let Some(window) = midsize_capture_window(self.level, self.shape, head) else {
             return;
         };
-        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
-        if !ldm_head_parses(head) {
-            return;
-        }
-        let n = self.shape.len.expect("the pledge gate checked len");
+        let n = self.shape.len.expect("the capture gate checked the pledge");
         debug_assert_eq!(
             self.overlap as u64, window,
             "the strip is the clamped window"
@@ -1189,13 +1245,15 @@ impl MtEncoderCore {
     }
 
     /// Re-reserve the accumulate buffer for the decided schedule's working
-    /// scale (see `MtEncoderCore::new`).
+    /// scale, under the same cap as the initial reserve (see
+    /// `initial_reserve`) — a huge pledge's grid must not reserve
+    /// workers x job_size here either.
     fn reserve_decided(&mut self) {
         let initial_job = match self.grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
         };
-        let want = (self.workers as usize).max(2) * initial_job + self.overlap + 64 * 1024;
+        let want = initial_reserve(self.workers, initial_job, self.overlap);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
@@ -1952,7 +2010,67 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
-    use crate::decoding::FrameDecoder;
+    use crate::{InputShape, decoding::FrameDecoder};
+
+    /// The mid-size capture's engagement predicate at its boundaries. The
+    /// same decision arms the donation (see `post_donation`) and flips the
+    /// jobs (see `engage_midsize_capture`), so the edges are load-bearing:
+    /// inside the band the source-clamped window arms LDM only under the
+    /// `JobPrefix` bar, and a `Job`-armed donation would parse its span
+    /// without LDM there.
+    #[test]
+    fn midsize_capture_window_boundaries() {
+        // Wide-alphabet head with 8-byte repeats: passes the head screen.
+        let mut patterns = Vec::new();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::new();
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < MAX_BLOCK_SIZE as usize {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        let mib = 1024 * 1024;
+        let band = InputShape {
+            len: Some(24 * mib),
+            window_log: None,
+        };
+        // Row 9's source-clamped window is W25: the capture's window.
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, band, &head),
+            Some(1 << 25)
+        );
+        // Above the band (window W26) the `Job` bar holds: no capture.
+        let above = InputShape {
+            len: Some(64 * mib),
+            window_log: None,
+        };
+        assert_eq!(midsize_capture_window(Level::Balanced, above, &head), None);
+        // Below it there are no prefix strips worth sharing.
+        let below = InputShape {
+            len: Some(8 * mib),
+            window_log: None,
+        };
+        assert_eq!(midsize_capture_window(Level::Balanced, below, &head), None);
+        // An open-ended stream never flips (a Growing grid has no capture).
+        let open = InputShape::default();
+        assert_eq!(midsize_capture_window(Level::Balanced, open, &head), None);
+        // A uniform head fails the capture's head screen.
+        let zeros = vec![0u8; MAX_BLOCK_SIZE as usize];
+        assert_eq!(midsize_capture_window(Level::Balanced, band, &zeros), None);
+        // Not the LDM chain row: no capture at any size.
+        assert_eq!(
+            midsize_capture_window(Level::from_zstd(10), band, &head),
+            None
+        );
+        assert_eq!(
+            midsize_capture_window(Level::from_zstd(13), band, &head),
+            None
+        );
+    }
 
     fn textish(len: usize) -> Vec<u8> {
         let words: [&[u8]; 13] = [
@@ -2297,5 +2415,39 @@ mod tests {
         // The caller (serve_queue) owns the counts: publish must not touch
         // them.
         assert_eq!(core.shared.n_incomplete.load(Ordering::Acquire), 0);
+||||||| 7cf9f828
+    }
+
+
+    /// A huge pledge must not size the initial reserve to the job grid
+    /// (workers x job_size at the MAX_JOB_SIZE ceiling — the CLI always
+    /// pledges the file size, so a 16 GiB file at -T8 would reserve
+    /// ~8 GiB up front and hold the first that-much input resident for
+    /// the whole stream). The reserve is a scheduling scale capped at
+    /// BUF_CAP_MAX; the pump grows into the live need through make_space,
+    /// whose wrap recycles at the grid lines the unpledged path already
+    /// runs at. Covers both reserve sites: the constructor and the probe
+    /// settle's re-reserve (the Balanced pledge stages a probe, so its
+    /// decided schedule re-reserves at finish).
+    #[test]
+    fn huge_pledge_caps_initial_reserve() {
+        for level in [Level::Fastest, Level::Balanced] {
+            let options = EncoderOptions::new(level)
+                .workers(8)
+                .pledged_size(Some(16 * 1024 * 1024 * 1024));
+            let mut core = MtEncoderCore::new(&options);
+            assert!(
+                core.buf.capacity() <= BUF_CAP_MAX,
+                "huge pledge reserved {} at construction ({level:?})",
+                core.buf.capacity()
+            );
+            core.finish();
+            assert!(
+                core.buf.capacity() <= BUF_CAP_MAX,
+                "huge pledge reserved {} at the probe settle ({level:?})",
+                core.buf.capacity()
+            );
+            drop(core);
+        }
     }
 }
