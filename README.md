@@ -7,7 +7,7 @@ A pure Rust implementation of the Zstandard compression format, focus on perform
 - Multithreaded _decompression_ (restart-point parallel decode), which libzstd does not have.
 - `no_std` + `alloc` capable; a `zstdx::compat` layer mirrors the [`zstd` crate](https://docs.rs/zstd)'s API shape (numeric levels, `io::Result`) for easy porting.
 
-Performance is tracked against libzstd in `docs/src/dev/` ([snapshot](docs/src/dev/bench/snapshot.md)).
+Performance is tracked against libzstd in `docs/src/dev/` ([snapshot](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md)).
 
 ## Usage
 
@@ -38,7 +38,7 @@ zstdx::stream::read::Decoder::new(&compressed[..])
 assert_eq!(restored, b"some payload");
 ```
 
-Options (checksum, pledged size, worker threads, dictionaries, forced window) are builder-style: `zstdx::EncoderOptions` / `zstdx::DecoderOptions`. See the [user guide](docs/src/user.md) for the full tour, and `docs.rs/zstdx` for the API reference.
+Options (checksum, pledged size, worker threads, dictionaries, forced window) are builder-style: `zstdx::EncoderOptions` / `zstdx::DecoderOptions`. See the [user guide](https://github.com/lxl66566/zstdx/blob/master/docs/src/user.md) for the full tour, and `docs.rs/zstdx` for the API reference.
 
 ## Feature flags
 
@@ -67,13 +67,13 @@ Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = z
 | 9 | json | 0.85 | 0.64 | 0.73 |
 | 9 | text | 1.51 | 1.54 | 0.28 |
 | 9 | skewed | 0.04 | 0.17 | 1.02 |
-| 19 | json | 1.10 | — | 0.73 |
-| 19 | text | 0.69 | — | 0.28 |
-| 19 | skewed | 1.07 | — | 1.02 |
+| 19 | json | 1.10 | — | — |
+| 19 | text | 0.69 | — | — |
+| 19 | skewed | 1.07 | — | — |
 
 Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers.
 
-Full per-level tables (1-22), methodology and noise caveats: [docs/src/dev/bench/snapshot.md](docs/src/dev/bench/snapshot.md) and [matrix.md](docs/src/dev/bench/matrix.md).
+Full per-level tables (1-22), methodology and noise caveats: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/matrix.md).
 
 ## CLI
 

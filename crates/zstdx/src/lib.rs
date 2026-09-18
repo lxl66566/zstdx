@@ -19,7 +19,9 @@
 //! The [encoding] module contains the code for compression.
 //! Compression can be achieved by using the [`encoding::compress`]/[`encoding::compress_to_vec`]
 //! functions or [`encoding::FrameCompressor`]
-#![doc = include_str!("../../../README.md")]
+// Resolves through the crate-root README.md symlink in the repo; the
+// published crate ships the same path as a regular file.
+#![doc = include_str!("../README.md")]
 #![no_std]
 #![deny(trivial_casts, trivial_numeric_casts, rust_2018_idioms)]
 
