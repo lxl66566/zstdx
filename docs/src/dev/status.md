@@ -6,7 +6,7 @@
 
 ### Compression levels
 
-Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `clevels.h` large-source table — see `LEVEL_PARAMS` in `encoding/match_generator.rs`); `Level::from_zstd(n)` maps exactly, negative levels clamp to 1. The named tiers alias representative rows:
+Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `clevels.h` large-source table — see `LEVEL_PARAMS` in `encoding/match_generator/params.rs`); `Level::from_zstd(n)` maps exactly, negative levels clamp to 1. The named tiers alias representative rows:
 
 | Tier (=level) | ≈zstd | Matcher strategy | Window | Notes |
 |---|---|---|---|---|
@@ -57,10 +57,10 @@ Note: `COMPARE.md`'s completeness assessment is frozen at the `4ff2b7b` point in
 | `bit_io/` | bit readers/writers (reverse bit reader BitReader, BitWriter) |
 | `blocks/` | block-level parsing |
 | `decoding/` | decoder: frame/block/literals/sequence decoding, `sequence_execution.rs` (fused execution), `flat_buffer.rs` (streaming flat window), `ringbuffer.rs` (dictionary path), `mt.rs` (segment-parallel) |
-| `encoding/` | encoder: `frame_compressor.rs`, `match_generator.rs` (fast/dfast/chain matchers), `opt.rs` (optimal parsing), `levels/fastest.rs`, `mt.rs` (bulk MT), `async_checksum.rs` (sidecar checksum), `blocks/compressed.rs` (entropy-coded blocks), `seq_codes.rs` |
+| `encoding/` | encoder: `frame_compressor.rs`, `match_generator/` (driver in `mod.rs`, strategy loops in `parse_*.rs`, level ladder in `params.rs`), `opt.rs` (optimal parsing), `levels/fastest.rs`, `mt.rs` (bulk MT), `async_checksum.rs` (sidecar checksum), `block_enc/compressed.rs` (entropy-coded blocks), `seq_codes.rs` |
 | `fse/` `huff0/` | entropy codecs |
 | `xxh64.rs` | in-tree checksum (shared by encode/decode; zero external deps at runtime) |
-| `bulk.rs` `stream/` | one-shot and streaming APIs (`encoder_core.rs` / `encoder_mt.rs`) |
+| `bulk.rs` `stream/` | one-shot and streaming APIs (`encoder_core.rs` / `encoder_mt.rs` (+ `mt_pool.rs` worker leases)) |
 | `compat/` | zstd-crate compat layer |
 | `dict/` | raw-content dictionary training, fastCover port (feature = "dict_builder") |
 | `level.rs` `options.rs` | level enums and encode/decode options |
