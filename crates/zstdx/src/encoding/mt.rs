@@ -712,9 +712,9 @@ pub(crate) fn run_job(
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{string::String, vec, vec::Vec};
 
-    use super::compress_slice_mt;
+    use super::{LdmArming, compress_slice_mt, reach_probe, take_slice_state};
     use crate::{Level, decoding::FrameDecoder};
 
     fn lcg(len: usize) -> Vec<u8> {
@@ -933,5 +933,51 @@ mod tests {
         let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None);
         let st = crate::encoding::compress_slice_to_vec(&data, Level::Fastest);
         assert_eq!(mt, st);
+    }
+
+    /// The tree rows (`BtLazy`, `Opt`) never read the ramp gate: arming one
+    /// of their jobs would silently run the experiment unconstrained, so
+    /// `arm_ramp` refuses. Arming the gate directly needs no env override —
+    /// the strategy check is unconditional and the test stays race-free
+    /// against the process-global ramp override other lib tests use.
+    #[test]
+    fn ramp_arm_refuses_tree_rows() {
+        for level in [Level::Best, Level::Opt] {
+            let mut state = take_slice_state(
+                level,
+                crate::InputShape::default(),
+                reach_probe::ReachChoice::Keep,
+                LdmArming::Frame,
+            );
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.matcher.arm_ramp(1 << 20, 1 << 20);
+            }));
+            let payload = match attempt {
+                Ok(()) => panic!("{level:?}: arming must refuse, not arm"),
+                Err(payload) => payload,
+            };
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(
+                message.contains("deep-offset ramp"),
+                "{level:?}: unexpected panic message: {message}"
+            );
+        }
+    }
+
+    /// The scan rows (here: the Balanced chain row) still arm, so the guard
+    /// cannot widen past the tree rows.
+    #[test]
+    fn ramp_arm_still_arms_chain_rows() {
+        let mut state = take_slice_state(
+            Level::Balanced,
+            crate::InputShape::default(),
+            reach_probe::ReachChoice::Keep,
+            LdmArming::Frame,
+        );
+        state.matcher.arm_ramp(1 << 20, 1 << 20);
     }
 }
