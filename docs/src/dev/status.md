@@ -1,6 +1,6 @@
 # Status Overview
 
-> As of `dedd267d` (2026-09-16). Branch goal (AGENTS.md): feature parity with upstream zstd and performance beyond it; no upstreaming; arbitrary unsafe / SIMD / new instruction sets allowed.
+> As of `2279020` (2026-09-19). Branch goal (AGENTS.md): feature parity with upstream zstd and performance beyond it; no upstreaming; arbitrary unsafe / SIMD / new instruction sets allowed.
 
 ## Capability matrix
 
@@ -15,7 +15,7 @@ Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `cle
 | Fastest (1) | 1 | fast (hash5 single-probe table) | 768 KiB | row 2: fast H16/W20 |
 | Fast (3) | 3 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | row 4: dfast H18/C18; rows 5-12: chain family (greedy→lazy→lazy2 via lazy_depth, min_match 5, depths half libzstd's 1<<S — our per-probe walk is dearer; W21→W22, H19→H23) |
 | Balanced (9) | 9 | hash chain + lazy2 | 4 MiB | H21 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
-| Best (13) | 13 | btlazy2 over the DUBT tree | 21 MiB/s | rows 13-15 (libzstd btlazy2 territory, C's exact S4/5/6 ladder); W22 / H22-23; O(1) fill + search-time batch sort (`dubt.rs`, 2026-09-14) |
+| Best (13) | 13 | btlazy2 over the DUBT tree | 64 MiB | rows 13-15 (libzstd btlazy2 territory, C's exact S4/5/6 ladder); W22 / H22-23; O(1) fill + search-time batch sort (`dubt.rs`, 2026-09-14) |
 | Opt (17) | 17 | btopt (full port) | 8 MiB | rows 16-17; W23 / H22 / C22 (L17 row, ring capped below libzstd's C23: json −19.6% time for +0.16% dll) |
 | Ultra (19) | 19 | btultra(+2) (full port) | 8 MiB | rows 18-22; 2-pass first-block statistics; rows 20-22 widen to W24-26 with the ring capped at 24 and hash at 22 (u64-slot memory guard; libzstd runs C25-27/H23-25 u32 there) |
 

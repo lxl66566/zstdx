@@ -13,6 +13,7 @@
 | streaming decoder (read/write Decoder, multi-frame + skippable transparency) + `encode_all/decode_all/copy_encode/copy_decode` | `b21d937` |
 | zstd-crate compat layer `zstdx::compat` (full bulk/stream suite; dictionary decode verified end-to-end) | `4b60239` |
 | CLI: clap rework; all numeric levels accepted | during `c726dfd` |
+| CLI rewritten as a flag-based zstd-compatible command line (stdin/stdout streaming, dir recursion, progress bar, `-D` dicts) | `897e5026` |
 | errors via thiserror derive (first external dependency, compile-time only, no_std compatible) | `72f3c04` |
 | decoder checksum moved in-tree (xxh64 shared by encode/decode; twox demoted to dev-dep; zero external deps at runtime) | `81d2119` |
 | dict_builder module renamed `zstdx::dict` (aligned with zstd crate naming) | `7ad9e7a` |

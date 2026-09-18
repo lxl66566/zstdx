@@ -10,12 +10,13 @@ Development-log handbook for the `ext` branch (the deep-optimization fork of zst
 | Document | Role | Update model |
 |---|---|---|
 | `docs/` (this handbook) | Topical experience: technical designs, completed work, todos, negative results, pitfalls, performance comparisons | Archived after each batch of work |
-| Root `*.md` (not in git) | Process logs: plans, progress, raw A/B data | Already archived; kept for the record, deletable at any time |
+| Root `README.md` | Published readme (crates.io/docs.rs front page): API quick tour + headline bench table mirroring [bench/snapshot](dev/bench/snapshot.md) | Updated at release or bench refresh |
+| `AGENTS.md` / `prompt.md` (local, not in git) | Agent working files (branch rules, batch prompts) | — |
 
 ## Reading Conventions
 
 - **Round numbering is ignored**. The original documents' "Round N / rN / Batch N / M1 / D6 / E9" labels overlap across documents and are non-contiguous; this handbook is organized by topic and preserves sequence only where causality makes it meaningful.
-- **Every performance figure carries its measurement timestamp**. The test machine (AMD Zen4 32C) has ±10% noise plus a slow drift phase, so absolute values are not comparable across time windows; only interleaved A/B comparisons are trusted. Numbers generally trace to the corresponding Changelog entry or the wide matrix (the latter is older in time; see the bench page notes).
+- **Every performance figure carries its measurement timestamp**. The test machine (AMD Zen4 32C) has ±10% noise plus a slow drift phase, so absolute values are not comparable across time windows; only interleaved A/B comparisons are trusted. Numbers generally trace to the wide matrix ([bench/matrix](dev/bench/matrix.md)) or the dated prose on each page.
 - Commit short hashes can be inspected with `git show <hash>`.
 
 ## Glossary

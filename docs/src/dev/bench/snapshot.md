@@ -115,13 +115,13 @@ Geo-mean Δ over 120 cells **+8.67%**; per mode bulk-st +1.42% / bulk-mt +11.08%
 
 ## Top open deficits (from this run, x = ours/zstd wall time)
 
-1. **text.balanced speed x1.51 ST / x1.51-1.54 mt / x1.48 stream-mt8** — halved from x3.47/2.85/3.02 by the entropy-build rewrite; the residual is the cold-start DUBT head's remaining per-frame cost; ratio +1.65% denser than zstd-9 (todo 9).
+1. **text.balanced speed x1.51 ST / x1.51-1.54 mt / x1.48 stream-mt8** — halved from x3.47/2.85/3.02 by the entropy-build rewrite; the residual is the cold-start DUBT head's remaining per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](todo.md)).
 2. **Streaming decode on compressible shapes**: json x1.27-1.37, skewed x1.10-1.32, text x1.09-1.24 — core-vs-core, the fused loop vs libzstd's pipeline (todo 2). Structural levers falsified; only uop attrition remains.
 3. **json.fastest x1.43 ST / x1.16 mt8** — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.03 is near closed.
-4. **Best-tier core**: json x1.45, skewed x2.15 (memory-latency tree walk) (todo 6). Caps the two stream ST cells (json/text.best x1.46/1.40).
-5. **json opt/ultra x1.10-1.12, skewed.ultra x1.07** — per-node codegen + event-volume residue at ratio parity or denser (todo 6); skewed.opt crossed to x1.00.
+4. **Best-tier core**: json x1.45, skewed x2.15 (memory-latency tree walk; floor in [todo](todo.md)). Caps the two stream ST cells (json/text.best x1.46/1.40).
+5. **json opt/ultra x1.10-1.12, skewed.ultra x1.07** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](todo.md)); skewed.opt crossed to x1.00.
 6. **json chain rows 5-12** (full-ladder T7): x1.17-2.84, the weakest speed band — the deep-chain rows lose to libzstd's chain on both axes while our own level-9 row beats them; a ladder-tuning question, not a matcher-core one.
 7. **MT decode**: text flat ~0.98×, skewed below the zstd stream ref — decoder-side piece-parallel stage B to spend the ramp guarantee (todo 1's open half).
-8. **dll100 large-binary ST** (09-16 doc baselines, todo 8): fastest x~1.44-1.55, fast x1.16, balanced x~1.55 — matcher-side instruction counts; emit live-set shrink the one untried lever.
-9. **Small band 64K-1M** fastest x~1.36-1.49 (this run: json-64K/1M x1.42/1.36, text x1.39/1.49; level 3 at parity 0.99-1.14; level 9 ahead 0.58-0.91 except the 1M cells x1.04-1.07) (todo 7).
-10. **Ratio residues**: json.fast mt −0.12..−0.14% (new this run), skewed.opt −0.07% (near-tie), dictionary small-payload +3% parse-side (todo 10).
+8. **dll100 large-binary ST** (09-16 doc baselines; floor in [todo](todo.md)): fastest x~1.44-1.55, fast x1.16, balanced x~1.55 — matcher-side instruction counts; emit live-set shrink the one untried lever.
+9. **Small band 64K-1M** fastest x~1.36-1.49 (this run: json-64K/1M x1.42/1.36, text x1.39/1.49; level 3 at parity 0.99-1.14; level 9 ahead 0.58-0.91 except the 1M cells x1.04-1.07) (todo 4).
+10. **Ratio residues**: json.fast mt −0.12..−0.14% (new this run), skewed.opt −0.07% (near-tie), dictionary small-payload +3% parse-side (todo 6).
