@@ -594,7 +594,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             )
             .unwrap();
             enc.read_to_end(&mut comp).unwrap();
-            enc.finish();
+            enc.finish().unwrap();
             assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
             let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
@@ -621,7 +621,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                             break;
                         }
                     }
-                    enc.finish();
+                    enc.finish().unwrap();
                 },
                 || {
                     let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
@@ -666,7 +666,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             )
             .unwrap();
             enc.read_to_end(&mut comp).unwrap();
-            enc.finish();
+            enc.finish().unwrap();
             assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
             let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
@@ -694,7 +694,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                             break;
                         }
                     }
-                    enc.finish();
+                    enc.finish().unwrap();
                 },
                 || {
                     let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();

@@ -809,7 +809,7 @@ impl MtEncoderCore {
         // outlive the scrutinee into the arms below.
         let read = source.read(&mut spare[..want]).map_err(crate::Error::from);
         match read {
-            Ok(0) => self.finish(),
+            Ok(0) => return self.finish(),
             Ok(n) => {
                 // SAFETY: `read` wrote n initialized bytes into spare[..n].
                 unsafe { self.buf.set_len(len + n) };
@@ -822,10 +822,23 @@ impl MtEncoderCore {
     }
 
     /// Close the frame: the pending jobs (or an empty block) become the last
-    /// block and the checksum, if enabled, is appended.
-    pub(crate) fn finish(&mut self) {
+    /// block and the checksum, if enabled, is appended. A stream pledged a
+    /// content size it did not meet fails here, before any job is posted or
+    /// frame byte produced: the header declares the pledge and decoders
+    /// reject a frame whose content disagrees with it.
+    pub(crate) fn finish(&mut self) -> crate::Result<()> {
         if self.finished {
-            return;
+            return Ok(());
+        }
+        // `pos` is live from the writes themselves, so the check fires
+        // before the drain below could discover it.
+        if let Some(pledged) = self.shape.len
+            && pledged != self.pos
+        {
+            return Err(crate::Error::PledgedSizeMismatch {
+                pledged,
+                actual: self.pos,
+            });
         }
         self.surface_poison();
         if self.pos > self.job_start {
@@ -852,6 +865,7 @@ impl MtEncoderCore {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        Ok(())
     }
 
     /// Emit the pending bytes early as non-last jobs. A no-op when nothing
@@ -1940,6 +1954,30 @@ mod tests {
             pledged.job_end(0),
             pledged.job_end(32 * 1024 * 1024) - 32 * 1024 * 1024
         );
+    }
+
+    /// The pledged-size contract on the mt core itself: over- and
+    /// undershooting the pledge fails finish before anything is posted,
+    /// assembled or emitted.
+    #[test]
+    fn pledged_mismatch_fails_finish() {
+        for (pledged, fed) in [(10u64, 20usize), (100, 20)] {
+            let mut core = MtEncoderCore::new(
+                &EncoderOptions::new(Level::Fastest)
+                    .workers(4)
+                    .pledged_size(Some(pledged)),
+            );
+            core.write(&vec![b'x'; fed]);
+            match core.finish() {
+                Err(crate::Error::PledgedSizeMismatch {
+                    pledged: p,
+                    actual: a,
+                }) => assert_eq!((p, a), (pledged, fed as u64)),
+                other => panic!("pledge {pledged}: got {other:?}"),
+            }
+            assert!(!core.is_finished());
+            assert!(!core.has_output());
+        }
     }
 
     /// A stream ending exactly on an epoch boundary has its last jobs

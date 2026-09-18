@@ -96,8 +96,9 @@ pub mod write {
             Ok(Self { state })
         }
 
-        /// Sets the pledged source size (written into the frame header);
-        /// fails once streaming started.
+        /// Sets the pledged source size (written into the frame header; a
+        /// stream writing a different size fails at finish); fails once
+        /// streaming started.
         pub fn set_pledged_src_size(&mut self, size: Option<u64>) -> io::Result<()> {
             self.state.set_started()?;
             self.state.options.pledged_size = size;
@@ -379,9 +380,10 @@ pub mod read {
             self.inner.get_mut()
         }
 
-        /// Destructures this object into the underlying reader.
-        pub fn finish(self) -> R {
-            self.inner.finish()
+        /// Destructures this object into the underlying reader. Fails when a
+        /// pledged content size was not met by the bytes consumed so far.
+        pub fn finish(self) -> io::Result<R> {
+            self.inner.finish().map_err(io::Error::from)
         }
 
         /// Tries to fill `out` with encoded bytes.

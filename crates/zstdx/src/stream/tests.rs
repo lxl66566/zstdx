@@ -90,6 +90,71 @@ fn pledged_size_lands_in_header() {
     }
 }
 
+/// A stream pledged a content size it did not write fails at finish instead
+/// of emitting a frame every decoder rejects (libzstd treats the pledge as a
+/// hard contract). Both directions (over- and undershoot) on the
+/// single-threaded core and, on multi-core builds, the mt core: workers(4)
+/// keeps the output empty because neither core encodes a 20-byte tail ahead
+/// of finish.
+#[test]
+fn pledged_size_mismatch_fails_finish() {
+    let data = vec![b'q'; 20];
+    #[cfg(feature = "std")]
+    let workers = [1u32, 4];
+    #[cfg(not(feature = "std"))]
+    let workers = [1u32];
+    for w in workers {
+        for pledged in [10u64, 100] {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Fastest)
+                    .workers(w)
+                    .pledged_size(Some(pledged)),
+            )
+            .unwrap();
+            enc.write_all(&data).unwrap();
+            match enc.finish() {
+                Err(crate::Error::PledgedSizeMismatch {
+                    pledged: p,
+                    actual: a,
+                }) => assert_eq!((p, a), (pledged, data.len() as u64)),
+                other => panic!("workers {w} pledge {pledged}: got {other:?}"),
+            }
+            assert!(sink.is_empty(), "no frame may be emitted");
+        }
+    }
+}
+
+/// The read-side encoder surfaces the same contract: a source that ends
+/// short of the pledge errors on the read hitting EOF (the core finishes
+/// there), and finish() keeps reporting the failure afterwards.
+#[test]
+fn pledged_size_mismatch_fails_read_encoder() {
+    let data = vec![b'r'; 40];
+    let mut enc = read::Encoder::with_options(
+        data.as_slice(),
+        EncoderOptions::new(Level::Fastest).pledged_size(Some(100)),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    // The read path crosses the io::Error boundary, so the check matches the
+    // Display text the umbrella error carries through both io backends.
+    let err = crate::io::Read::read_to_end(&mut enc, &mut out).unwrap_err();
+    let msg = alloc::format!("{err}");
+    assert!(
+        msg.contains("pledged content size 100 does not match the 40 bytes written"),
+        "{err}"
+    );
+    match enc.finish() {
+        Err(crate::Error::PledgedSizeMismatch {
+            pledged: 100,
+            actual: 40,
+        }) => {},
+        other => panic!("expected PledgedSizeMismatch, got {other:?}"),
+    }
+}
+
 #[test]
 fn checksum_option_toggles_trailer() {
     let data = vec![b'c'; 64 * 1024];

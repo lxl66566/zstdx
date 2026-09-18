@@ -34,6 +34,14 @@ pub enum Error {
     /// A parameter was applied to a stream that already started.
     #[error("{0}")]
     Parameter(#[from] ParameterError),
+    /// The stream was pledged a content size that does not match the bytes
+    /// actually written. The frame header declares the pledge, so the frame
+    /// would be rejected by every decoder; it is not emitted.
+    #[error(
+        "pledged content size {pledged} does not match the {actual} bytes written; the frame \
+         would be rejected by decoders"
+    )]
+    PledgedSizeMismatch { pledged: u64, actual: u64 },
 }
 
 /// Capabilities whose API surface exists ahead of the implementation.

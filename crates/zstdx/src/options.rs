@@ -103,7 +103,10 @@ impl EncoderOptions {
     }
 
     /// Pledge the total input size so it can be written into the frame
-    /// header, letting decoders preallocate exactly.
+    /// header, letting decoders preallocate exactly. The pledge is a hard
+    /// contract: finishing a stream that wrote a different byte count fails
+    /// with [`Error::PledgedSizeMismatch`][crate::Error::PledgedSizeMismatch]
+    /// instead of emitting a frame decoders would reject.
     pub const fn pledged_size(mut self, size: Option<u64>) -> Self {
         self.pledged_size = size;
         self

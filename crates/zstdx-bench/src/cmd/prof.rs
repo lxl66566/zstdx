@@ -178,7 +178,7 @@ fn run_enc_stream_read(rest: &[String]) {
             }
             acc += n as u64;
         }
-        enc.finish();
+        enc.finish().unwrap();
         total_out = acc as usize;
         std::hint::black_box(acc);
     }
