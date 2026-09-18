@@ -560,6 +560,16 @@ mod mt {
         }
     }
 
+    /// One write_all carrying the whole 32 MiB stream: far above the epoch
+    /// scale, so the write loop refills through many bounded recycling
+    /// steps; it must neither stall nor corrupt the frame.
+    #[test]
+    fn single_write_all_roundtrip() {
+        let data = textish(32 * 1024 * 1024);
+        let comp = encode_write(&data, usize::MAX, Level::Fastest, 4, true, None);
+        assert_both_decoders(&comp, &data, "32MiB single write");
+    }
+
     /// The reach probe on the multithreaded stream core (see
     /// `encoding::reach_probe`): an open-ended Balanced stream crossing the
     /// probe's staging gate runs the deferred decision, and the frame bytes

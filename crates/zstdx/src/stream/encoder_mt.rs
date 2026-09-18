@@ -290,12 +290,14 @@ const BUF_POOL_KEEP_MAX: usize = 64 * 1024 * 1024;
 // Buffers retained per thread (a second one covers size-mismatched pairs).
 const BUF_POOL_DEPTH: usize = 2;
 
-// Upper bound on one direct read into the buffer's spare capacity
-// (`pump_direct`): bounds how long a single pump step can defer job
-// posting past a completed epoch (a grown buffer's whole spare in one read
-// would defer it by the read's own memcpy span).
+// Upper bound on one pump step's fresh bytes: a direct read's pull
+// (`pump_direct`), or the growth a full-buffer `write` step asks
+// `make_space` for. Bounds how long a single step can defer job posting
+// past a completed epoch (a grown buffer's whole spare — or a huge write
+// slice reserved in one go — would defer it by the step's own memcpy span,
+// the write one with no memory cap at all).
 #[cfg(feature = "std")]
-const PUMP_READ_MAX: usize = 1024 * 1024;
+const PUMP_STEP_MAX: usize = 1024 * 1024;
 
 // Upper bound on the accumulate buffer's growth; past it the dead-prefix
 // wrap alone recycles space (a wait per ~BUF_CAP_MAX bytes of stream is
@@ -755,7 +757,13 @@ impl MtEncoderCore {
         while !data.is_empty() {
             let space = self.buf.capacity() - self.buf.len();
             if space == 0 {
-                self.make_space(data.len());
+                // One bounded growth/recycle step per full buffer: the whole
+                // remaining slice as the growth target would reserve it in
+                // full (a single write_all of a multi-GiB slice had no
+                // memory cap at all). The loop refills and re-recycles; the
+                // posts each step leaves behind keep completed jobs widening
+                // the wrappable dead prefix, so the capped steps progress.
+                self.make_space(data.len().min(PUMP_STEP_MAX));
                 continue;
             }
             let n = space.min(data.len());
@@ -786,7 +794,7 @@ impl MtEncoderCore {
             self.make_space(1);
         }
         let len = self.buf.len();
-        let want = PUMP_READ_MAX.min(self.buf.capacity() - len);
+        let want = PUMP_STEP_MAX.min(self.buf.capacity() - len);
         debug_assert!(want > 0);
         if self.init_len < len + want {
             // Zero-fill the next region once per buffer region: the pool
@@ -2108,5 +2116,30 @@ mod tests {
                 None => reference = Some(core.output.clone()),
             }
         }
+    }
+
+    /// One write_all far above the buffer cap must not size the reserve to
+    /// the slice: growth stays the BUF_CAP_MAX ladder plus one bounded
+    /// step, and the stream still round-trips — the write loop refills
+    /// through bounded recycling steps while its posts open dead prefix to
+    /// wrap.
+    #[test]
+    fn huge_single_write_bounds_reserve() {
+        let len = BUF_CAP_MAX + BUF_CAP_MAX / 4;
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        core.write(&vec![0u8; len]);
+        let cap = core.buf.capacity();
+        assert!(
+            cap <= BUF_CAP_MAX + PUMP_STEP_MAX + 64 * 1024,
+            "single huge write grew the reserve to {cap}"
+        );
+        core.finish();
+        let output = core.output.clone();
+        drop(core);
+        let mut out = vec![1u8; len];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&output, &mut out).unwrap();
+        assert_eq!(n, len);
+        assert!(out.iter().all(|&b| b == 0), "decoded content diverged");
     }
 }

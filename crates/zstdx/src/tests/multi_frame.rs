@@ -281,11 +281,8 @@ fn transient_error_mid_skippable_frame_resumes() {
 
     // the injection lands mid-content: 8 KiB (the trash pull size) were
     // already discarded, the retry must continue from there.
-    let input = concat(&[
-        &frame(b"aaaa"),
-        &skippable(&[b'x'; 20_000]),
-        &frame(b"bbbbb"),
-    ]);
+    let content = vec![b'x'; 20_000];
+    let input = concat(&[&frame(b"aaaa"), &skippable(&content), &frame(b"bbbbb")]);
     let content_start = input.len() - frame(b"bbbbb").len() - 20_000;
     assert_eq!(
         decode_with_transient_error(&input, content_start + 8192 + 5),
