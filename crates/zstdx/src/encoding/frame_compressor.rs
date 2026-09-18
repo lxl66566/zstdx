@@ -957,29 +957,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .as_deref()
             .map(super::dictionary::EncDictionary::parse)
             .map(|d| d.expect("valid dictionary"));
-        let dict_id = dict.as_ref().map_or(None, |d| d.header_id());
+        let dict_id = dict
+            .as_ref()
+            .and_then(super::dictionary::EncDictionary::header_id);
         // No frame inherits the previous one's reach choice (see
         // reach_probe): an empty head resets it to the stock reach.
         self.state
             .matcher
             .consider_reach_probe(&[], self.compression_level);
-        match dict {
-            Some(ref dict) => {
-                let mut shape = self.input_shape;
-                shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
-                super::dictionary::reset_with_dictionary(
-                    &mut self.state,
-                    dict,
-                    self.compression_level,
-                    shape,
-                );
-            },
-            None => {
-                self.state.matcher.set_input_shape(self.input_shape);
-                self.state.matcher.reset(self.compression_level);
-                self.state.last_huff_table = None;
-                self.state.dict_entropy = Default::default();
-            },
+        if let Some(ref dict) = dict {
+            let mut shape = self.input_shape;
+            shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+            super::dictionary::reset_with_dictionary(
+                &mut self.state,
+                dict,
+                self.compression_level,
+                shape,
+            );
+        } else {
+            self.state.matcher.set_input_shape(self.input_shape);
+            self.state.matcher.reset(self.compression_level);
+            self.state.last_huff_table = None;
+            self.state.dict_entropy = Default::default();
         }
         self.hasher = FrameHasher::new();
         // The probe's staged head (see reach_probe): the block loop below

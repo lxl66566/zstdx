@@ -90,7 +90,7 @@ impl EncDictionary {
     /// (the format's null dictID) — entropy seeding is skipped there too,
     /// so the frame stays decodable without the dictionary.
     pub fn header_id(&self) -> Option<u64> {
-        (self.id != 0).then(|| self.id as u64)
+        (self.id != 0).then_some(self.id as u64)
     }
 }
 

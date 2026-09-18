@@ -2587,7 +2587,7 @@ impl MatchGeneratorDriver {
         StripSnapshot {
             tables: self.tables.clone(),
             second: self.second,
-            ldm: self.ldm.as_ref().map(|ldm| ldm.snapshot()),
+            ldm: self.ldm.as_ref().map(LdmState::snapshot),
             upto,
         }
     }
@@ -2629,18 +2629,14 @@ impl MatchGeneratorDriver {
         soft: u64,
     ) -> Option<u64> {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
-        let upto = self
-            .ldm
-            .as_mut()
-            .map(|ldm| {
-                debug_assert_eq!(ldm.fed(), base + from);
-                if data.len() as u64 > from {
-                    ldm.fill_to_freeze(data, base, base + from, base + data.len() as u64, soft)
-                } else {
-                    None
-                }
-            })
-            .flatten()?;
+        let upto = self.ldm.as_mut().and_then(|ldm| {
+            debug_assert_eq!(ldm.fed(), base + from);
+            if data.len() as u64 > from {
+                ldm.fill_to_freeze(data, base, base + from, base + data.len() as u64, soft)
+            } else {
+                None
+            }
+        })?;
         // The grid fill covers the same prefix [0, upto): its stride
         // alignment resumes from `from` and its extent is the freeze
         // point's HASH_READ margin, exactly as a from-scratch fill of
@@ -3168,7 +3164,7 @@ impl Matcher for MatchGeneratorDriver {
     /// See the inherent [`MatchGeneratorDriver::load_dictionary`] — the
     /// trait view.
     fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
-        self.load_dictionary(content, rep)
+        self.load_dictionary(content, rep);
     }
 
     fn reset(&mut self, level: Level) {
@@ -3362,22 +3358,24 @@ impl Matcher for MatchGeneratorDriver {
                 // instantiation either way.
                 match (self.ramp.is_armed(), self.scan_density) {
                     (false, ScanDensity::Plain) => {
-                        self.start_matching_fast::<false, false, RUNTIME_LOG>(literals, seqs)
+                        self.start_matching_fast::<false, false, RUNTIME_LOG>(literals, seqs);
                     },
                     (true, ScanDensity::Plain) => {
-                        self.start_matching_fast::<true, false, RUNTIME_LOG>(literals, seqs)
+                        self.start_matching_fast::<true, false, RUNTIME_LOG>(literals, seqs);
                     },
-                    (false, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
-                        true => self.start_matching_fast::<false, true, HASH_LOG>(literals, seqs),
-                        false => {
-                            self.start_matching_fast::<false, true, RUNTIME_LOG>(literals, seqs)
-                        },
+                    (false, ScanDensity::Dense) => {
+                        if self.params.hash_log == HASH_LOG {
+                            self.start_matching_fast::<false, true, HASH_LOG>(literals, seqs);
+                        } else {
+                            self.start_matching_fast::<false, true, RUNTIME_LOG>(literals, seqs);
+                        }
                     },
-                    (true, ScanDensity::Dense) => match self.params.hash_log == HASH_LOG {
-                        true => self.start_matching_fast::<true, true, HASH_LOG>(literals, seqs),
-                        false => {
-                            self.start_matching_fast::<true, true, RUNTIME_LOG>(literals, seqs)
-                        },
+                    (true, ScanDensity::Dense) => {
+                        if self.params.hash_log == HASH_LOG {
+                            self.start_matching_fast::<true, true, HASH_LOG>(literals, seqs);
+                        } else {
+                            self.start_matching_fast::<true, true, RUNTIME_LOG>(literals, seqs);
+                        }
                     },
                 }
                 // This block's parse density picks the next block's
@@ -3423,11 +3421,11 @@ impl Matcher for MatchGeneratorDriver {
                         if armed {
                             self.start_matching_dfast::<true, RUNTIME_LOG, RUNTIME_LOG>(
                                 literals, seqs,
-                            )
+                            );
                         } else {
                             self.start_matching_dfast::<false, RUNTIME_LOG, RUNTIME_LOG>(
                                 literals, seqs,
-                            )
+                            );
                         }
                     },
                 }
@@ -5299,7 +5297,7 @@ impl MatchGeneratorDriver {
             // chain-selection class, so the probe's measurement and the
             // executed parse stay the same object on both reach sides.
             && self.reach_choice != ReachChoice::Shrink
-            && self.shape.len.map_or(true, |l| l >= HEAD_MIN_TOTAL)
+            && self.shape.len.is_none_or(|l| l >= HEAD_MIN_TOTAL)
     }
 
     /// Dispatch guard for the cold-start DUBT head ([`HEAD_LIMIT`]): on

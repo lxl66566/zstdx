@@ -278,7 +278,7 @@ fn derive_splits(
     if end - start < MIN_SEQUENCES_BLOCK_SPLITTING || out.len() >= MAX_NB_BLOCK_SPLITS {
         return;
     }
-    let mid = (start + end) / 2;
+    let mid = usize::midpoint(start, end);
     let left = est.estimate_scanned(start, mid);
     let right_counts = whole.counts.suffix_after(&left.counts);
     let right = RangeEstimate {
@@ -309,10 +309,10 @@ impl<T> Rolling<'_, T> {
 
     /// Drop the owned table (if any) back to nothing, pooled by `recycle`.
     fn take_owned(&mut self, recycle: impl FnOnce(T)) {
-        if let Self::Owned(o) = self {
-            if let Some(t) = o.take() {
-                recycle(t);
-            }
+        if let Self::Owned(o) = self
+            && let Some(t) = o.take()
+        {
+            recycle(t);
         }
     }
 }
@@ -459,14 +459,11 @@ fn emit_partitions<M: Matcher>(
         // Roll the remembered tables: a stream that wrote a table hands it
         // to the next partition, `Clear` forgets the remembered one, and
         // the dictionary seeding only survives streams that keep theirs.
-        match tables.huff {
-            Some(t) => {
-                cur_huff.take_owned(|old| old.recycle_aligned(huff));
-                cur_huff = Rolling::Owned(Some(t));
-                huff_written = true;
-                dict.huff = false;
-            },
-            None => {},
+        if let Some(t) = tables.huff {
+            cur_huff.take_owned(|old| old.recycle_aligned(huff));
+            cur_huff = Rolling::Owned(Some(t));
+            huff_written = true;
+            dict.huff = false;
         }
         for (rolling, mode, dict_flag) in [
             (&mut roll_ll, tables.ll, &mut dict.ll),

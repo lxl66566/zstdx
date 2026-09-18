@@ -342,14 +342,16 @@ const STATE_POOL_DEPTH: usize = 32;
 fn take_pooled_state() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
     pool.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .pop()
         .unwrap_or_else(new_slice_state_boxed)
 }
 
 fn return_pooled_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
     let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
-    let mut pool = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if pool.len() < STATE_POOL_DEPTH {
         pool.push(state);
     }
@@ -1373,10 +1375,11 @@ impl MtEncoderCore {
                 if self.pos < end {
                     return false;
                 }
-                if let Some(n) = self.shape.len {
-                    if end >= n && self.pos <= n {
-                        return false;
-                    }
+                if let Some(n) = self.shape.len
+                    && end >= n
+                    && self.pos <= n
+                {
+                    return false;
                 }
                 true
             },
@@ -1865,28 +1868,25 @@ impl MtEncoderCore {
     fn ensure_workers(&mut self) {
         if self.pool_threads.is_empty() {
             for _ in 0..self.workers {
-                let slot = match take_parked_slot() {
-                    Some(slot) => {
-                        assign_lease(&slot, self.shared.clone());
-                        slot
-                    },
-                    None => {
-                        let slot = Arc::new(WorkerSlot {
-                            state: Mutex::new(WorkerSlotState::Serving(self.shared.clone())),
-                            wake: Condvar::new(),
-                        });
-                        if let Err(e) = std::thread::Builder::new().spawn({
-                            let slot = slot.clone();
-                            move || pool_thread(slot)
-                        }) {
-                            // No thread ever serves this lease: retire the
-                            // slot so Drop's leave-wait passes, then surface
-                            // the failure like the raw spawn's unwrap did.
-                            leave_lease(&slot, true);
-                            panic!("worker spawn failed: {e}");
-                        }
-                        slot
-                    },
+                let slot = if let Some(slot) = take_parked_slot() {
+                    assign_lease(&slot, self.shared.clone());
+                    slot
+                } else {
+                    let slot = Arc::new(WorkerSlot {
+                        state: Mutex::new(WorkerSlotState::Serving(self.shared.clone())),
+                        wake: Condvar::new(),
+                    });
+                    if let Err(e) = std::thread::Builder::new().spawn({
+                        let slot = slot.clone();
+                        move || pool_thread(slot)
+                    }) {
+                        // No thread ever serves this lease: retire the
+                        // slot so Drop's leave-wait passes, then surface
+                        // the failure like the raw spawn's unwrap did.
+                        leave_lease(&slot, true);
+                        panic!("worker spawn failed: {e}");
+                    }
+                    slot
                 };
                 self.pool_threads.push(slot);
             }

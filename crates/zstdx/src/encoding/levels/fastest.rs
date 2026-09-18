@@ -85,7 +85,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         // size guards, so the single-block patch and checks below are
         // skipped.
         let (outcome, headers_final) = if state.matcher.block_splitting_enabled() {
-            match super::super::blocks::split::compress_split_block(
+            match split::compress_split_block(
                 &mut state.matcher,
                 last_block,
                 output,

@@ -677,14 +677,15 @@ impl LdmState {
             let g = GEAR_TAB[win[n] as usize];
             hash = g.wrapping_add(hash << 1);
             n += 1;
-            if hash & mask == 0 && base + n as u64 >= floor_trigger {
-                if Self::record_split(
+            if hash & mask == 0
+                && base + n as u64 >= floor_trigger
+                && Self::record_split(
                     splits,
                     &mut count,
                     base + n as u64 - MIN_MATCH_LENGTH as u64,
-                ) {
-                    break;
-                }
+                )
+            {
+                break;
             }
         }
         self.rolling = hash;

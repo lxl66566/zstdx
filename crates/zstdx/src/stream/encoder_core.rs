@@ -115,31 +115,28 @@ impl FrameEncoderCoreSt {
             fse_tables: FseTables::new(),
             scratch: BlockScratch::default(),
         };
-        let dict_id = match dict {
-            Some(dict) => {
-                let mut shape = crate::InputShape {
-                    len: options.pledged_size,
-                    window_log: options.input_shape.window_log,
-                };
-                // libzstd clamps the window by src + dict.
-                shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
-                crate::encoding::dictionary::reset_with_dictionary(
-                    &mut state,
-                    dict,
-                    options.level,
-                    shape,
-                );
-                dict.header_id()
-            },
-            None => {
-                let shape = crate::InputShape {
-                    len: options.pledged_size,
-                    window_log: options.input_shape.window_log,
-                };
-                state.matcher.set_input_shape(shape);
-                state.matcher.reset(options.level);
-                None
-            },
+        let dict_id = if let Some(dict) = dict {
+            let mut shape = crate::InputShape {
+                len: options.pledged_size,
+                window_log: options.input_shape.window_log,
+            };
+            // libzstd clamps the window by src + dict.
+            shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+            crate::encoding::dictionary::reset_with_dictionary(
+                &mut state,
+                dict,
+                options.level,
+                shape,
+            );
+            dict.header_id()
+        } else {
+            let shape = crate::InputShape {
+                len: options.pledged_size,
+                window_log: options.input_shape.window_log,
+            };
+            state.matcher.set_input_shape(shape);
+            state.matcher.reset(options.level);
+            None
         };
         let checksum = options.checksum && cfg!(feature = "hash");
         // Dictionary frames keep the stock reach (see reach_probe), so only

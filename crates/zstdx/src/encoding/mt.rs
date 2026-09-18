@@ -216,16 +216,15 @@ pub fn compress_slice_mt(
                     // freeze overshot keeps the stock whole-prefix fill.
                     let snapshot = match spf.as_ref() {
                         Some(plan) if start as u64 > plan.med => {
-                            match wait_prefix_build(plan, &ready, &poison) {
-                                Some((upto, snap)) => (start as u64 > upto).then_some(snap),
-                                None => {
-                                    // Poisoned while waiting: release the
-                                    // slot so the ordered assembly drains
-                                    // before the panic resumes.
-                                    *slots[id].lock().unwrap() = Some(Vec::new());
-                                    ready.notify_all();
-                                    break;
-                                },
+                            if let Some((upto, snap)) = wait_prefix_build(plan, &ready, &poison) {
+                                (start as u64 > upto).then_some(snap)
+                            } else {
+                                // Poisoned while waiting: release the
+                                // slot so the ordered assembly drains
+                                // before the panic resumes.
+                                *slots[id].lock().unwrap() = Some(Vec::new());
+                                ready.notify_all();
+                                break;
                             }
                         },
                         _ => None,
