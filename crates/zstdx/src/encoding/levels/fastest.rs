@@ -143,7 +143,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 Some(new) => {
                     state.dict_entropy.huff = false;
                     if let Some(old) = old_huff {
-                        old.recycle_codes(&mut state.scratch.huff);
+                        old.recycle_aligned(&mut state.scratch.huff);
                     }
                     Some(new)
                 },
@@ -189,7 +189,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 discard_prev(tables.ml, &mut state.scratch.fse);
                 discard_prev(tables.of, &mut state.scratch.fse);
                 if let Some(table) = tables.huff {
-                    table.recycle_codes(&mut state.scratch.huff);
+                    table.recycle_aligned(&mut state.scratch.huff);
                 }
             }
             // (raw fallback: the decoder never saw a sequence section, so

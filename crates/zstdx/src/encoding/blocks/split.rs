@@ -420,12 +420,12 @@ fn emit_partitions<M: Matcher>(
                 }
             }
             if let Some(t) = tables.huff {
-                t.recycle_codes(huff);
+                t.recycle_aligned(huff);
             }
             roll_ll.take_owned(|t| t.recycle(fse));
             roll_ml.take_owned(|t| t.recycle(fse));
             roll_of.take_owned(|t| t.recycle(fse));
-            cur_huff.take_owned(|t| t.recycle_codes(huff));
+            cur_huff.take_owned(|t| t.recycle_aligned(huff));
             output.truncate(header_base);
             output.extend_from_slice(&[0u8; 3]);
             return SplitOutcome::Single(encode_staged_block(
@@ -461,7 +461,7 @@ fn emit_partitions<M: Matcher>(
         // the dictionary seeding only survives streams that keep theirs.
         match tables.huff {
             Some(t) => {
-                cur_huff.take_owned(|old| old.recycle_codes(huff));
+                cur_huff.take_owned(|old| old.recycle_aligned(huff));
                 cur_huff = Rolling::Owned(Some(t));
                 huff_written = true;
                 dict.huff = false;
@@ -642,7 +642,7 @@ impl Estimator<'_> {
             },
             None => desc + new_cost,
         };
-        table.recycle_codes(self.huff);
+        table.recycle_aligned(self.huff);
         let single_stream = n < 256 || (self.dict.huff && n < 1024);
         let header = if n < 1024 {
             2

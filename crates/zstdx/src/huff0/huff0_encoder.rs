@@ -149,7 +149,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     #[cfg(any(test, feature = "fuzz_exports"))]
     pub(super) fn weights(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.table.codes.len());
+        let mut out = Vec::with_capacity(self.table.nsym as usize);
         self.table.write_weights_into(&mut out);
         out
     }
@@ -276,18 +276,20 @@ fn write_fse_weights(
 
 #[derive(Clone)]
 pub struct HuffmanTable {
-    /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount
-    /// of bits in the u8
-    codes: Vec<(u32, u8)>,
-    /// Same codes packed as `(code << 4) | num_bits` so the encoding loop
-    /// loads one u16 instead of an 8-byte tuple (the table stays fully
+    /// Alphabet prefix length: symbols at or beyond it are dead by
+    /// construction (`nb` reads as 0).
+    nsym: u16,
+    /// Per-symbol codes packed as `(code << 4) | num_bits` so the encoding
+    /// loop loads one u16 instead of an 8-byte tuple (the table stays fully
     /// L1-resident). Weight redistribution caps codes at 9 bits, so the
     /// packing cannot overflow.
     packed: [u16; 256],
     /// Left-aligned form for the dual-accumulator stream loop: the code in
     /// the top `nb` bits of a u64, `nb` in the low nibble. One load feeds
-    /// the container shift, the OR and the bit counter.
-    aligned: [u64; 256],
+    /// the container shift, the OR and the bit counter. Pooled behind the
+    /// build scratch: dead symbols are never read, so the box is recycled
+    /// without clearing.
+    aligned: Box<[u64; 256]>,
     /// The common code length when every symbol shares one length (flat
     /// alphabets such as 9..16 symbols), zero otherwise. Fixed-length codes
     /// let the stream encoder pack two symbols per byte without the
@@ -335,7 +337,7 @@ impl HuffmanTable {
     }
 
     /// The pooled [`Self::build_from_counts`]: the tree-walk scratch and
-    /// the codes buffer are recycled through `scratch`.
+    /// the aligned-form box are recycled through `scratch`.
     pub(crate) fn build_from_counts_into(counts: &[usize], scratch: &mut HuffScratch) -> Self {
         assert!(counts.len() <= 256);
         build_lengths_into(counts, MAX_CODE_LENGTH as u8, scratch);
@@ -349,14 +351,14 @@ impl HuffmanTable {
                 (max_len - len as usize + 1) as u8
             };
         }
-        let mut codes = scratch.take_codes(n);
-        build_from_weights_slice(&scratch.weights[..n], &mut codes)
+        let aligned = scratch.take_aligned();
+        build_from_weights_slice(&scratch.weights[..n], aligned)
     }
 
-    /// Return the codes buffer to a build pool (see [`HuffScratch`]);
-    /// the table must not be used afterwards.
-    pub(crate) fn recycle_codes(self, scratch: &mut HuffScratch) {
-        scratch.recycle_codes(self.codes);
+    /// Return the aligned-form buffer to a build pool (see
+    /// [`HuffScratch`]); the table must not be used afterwards.
+    pub(crate) fn recycle_aligned(self, scratch: &mut HuffScratch) {
+        scratch.recycle_aligned(self.aligned);
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
@@ -365,8 +367,7 @@ impl HuffmanTable {
         for (dst, &w) in narrow.iter_mut().zip(weights.iter()) {
             *dst = w as u8;
         }
-        let mut codes = alloc::vec![(0, 0); weights.len()];
-        build_from_weights_slice(&narrow[..weights.len()], &mut codes)
+        build_from_weights_slice(&narrow[..weights.len()], Box::new([0; 256]))
     }
 
     /// Per-symbol code lengths (0 = symbol not covered by the table).
@@ -382,12 +383,13 @@ impl HuffmanTable {
 
     /// libzstd's HUF_estimateCompressedSize: the exact cost of coding
     /// `counts` under this table, rounded up to bytes. `counts` may be
-    /// shorter than the table's alphabet (the missing tail is all zeros).
+    /// shorter or longer than the table's alphabet (entries past it count
+    /// zero bits either way).
     pub(crate) fn estimate_compressed_size(&self, counts: &[usize]) -> usize {
-        self.codes
+        counts
             .iter()
-            .zip(counts.iter())
-            .map(|(&(_, nb), &c)| c * nb as usize)
+            .enumerate()
+            .map(|(s, &c)| c * (self.packed[s] & 0xf) as usize)
             .sum::<usize>()
             .div_ceil(8)
     }
@@ -396,8 +398,12 @@ impl HuffmanTable {
     /// weight form; see [`write_table_desc`]).
     pub(crate) fn write_weights_into(&self, out: &mut Vec<u8>) {
         out.clear();
-        let max = self.codes.iter().map(|(_, nb)| *nb).max().unwrap();
-        out.extend(self.codes.iter().copied().map(|(_, nb)| {
+        let max = (0..self.nsym as usize)
+            .map(|s| (self.packed[s] & 0xf) as u8)
+            .max()
+            .unwrap();
+        out.extend((0..self.nsym as usize).map(|s| {
+            let nb = (self.packed[s] & 0xf) as u8;
             if nb == 0 {
                 0
             } else {
@@ -407,35 +413,46 @@ impl HuffmanTable {
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
-        if other.codes.len() > self.codes.len() {
+        if other.nsym > self.nsym {
             return None;
         }
         let mut sum = 0;
-        for ((_, other_num_bits), (_, self_num_bits)) in other.codes.iter().zip(self.codes.iter()) {
-            if *other_num_bits != 0 && *self_num_bits == 0 {
+        for s in 0..other.nsym as usize {
+            let (other_nb, self_nb) = ((other.packed[s] & 0xf) as u8, (self.packed[s] & 0xf) as u8);
+            if other_nb != 0 && self_nb == 0 {
                 return None;
             }
-            sum += other_num_bits.abs_diff(*self_num_bits) as usize;
+            sum += other_nb.abs_diff(self_nb) as usize;
         }
         Some(sum)
     }
 }
 
 /// Core of [`HuffmanTable::build_from_weights`] over u8 weights and a
-/// caller-owned codes buffer (recycled by the pooled variant).
-fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> HuffmanTable {
+/// caller-owned aligned-form buffer (pooled by the `scratch` variants).
+fn build_from_weights_slice(weights: &[u8], aligned: Box<[u64; 256]>) -> HuffmanTable {
     debug_assert!(weights.iter().all(|&w| w <= MAX_CODE_LENGTH as u8));
-    codes.resize(weights.len(), (0, 0));
-    codes.fill((0, 0));
     let mut bucket_counts = [0u16; MAX_CODE_LENGTH + 1];
     for &weight in weights {
         bucket_counts[weight as usize] += 1;
     }
     let mut bucket_start = [0u16; MAX_CODE_LENGTH + 1];
     let mut total = 0u16;
+    // Uniform-code detection rides along: every live symbol shares one
+    // code length exactly when only one weight bucket is non-empty.
+    let mut uniform_w = 0u8;
+    let mut uniform = true;
     for weight in 1..=MAX_CODE_LENGTH {
         bucket_start[weight] = total;
-        total += bucket_counts[weight];
+        let count = bucket_counts[weight];
+        if count != 0 {
+            if uniform_w == 0 {
+                uniform_w = weight as u8;
+            } else {
+                uniform = false;
+            }
+        }
+        total += count;
     }
 
     let mut sorted = [0u8; 256];
@@ -449,10 +466,10 @@ fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> Huffm
 
     // Prepare huffman table with placeholders
     let mut table = HuffmanTable {
+        nsym: weights.len() as u16,
         packed: [0; 256],
-        aligned: [0; 256],
+        aligned,
         uniform_nb: 0,
-        codes: core::mem::take(codes),
     };
 
     // Determine the number of bits needed for codes with the lowest weight
@@ -465,9 +482,6 @@ fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> Huffm
     // Starting at the symbols with the lowest weight we update the placeholders in the table
     let mut current_code = 0;
     let mut current_weight = 0;
-    let mut uniform_nb = 0u8;
-    let mut seen_first = false;
-    let mut all_same = true;
     for weight in 1..=MAX_CODE_LENGTH {
         let start = bucket_start[weight] as usize;
         let end = start + bucket_counts[weight] as usize;
@@ -481,12 +495,6 @@ fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> Huffm
         // Run the next update when the weight changes again
         current_weight = weight;
         for &symbol in &sorted[start..end] {
-            if seen_first && current_num_bits != uniform_nb as usize {
-                all_same = false;
-            }
-            uniform_nb = current_num_bits as u8;
-            seen_first = true;
-            table.codes[symbol as usize] = (current_code as u32, current_num_bits as u8);
             debug_assert!(current_num_bits <= 11 && current_code <= 0xfff);
             table.packed[symbol as usize] = ((current_code << 4) | current_num_bits) as u16;
             table.aligned[symbol as usize] =
@@ -494,8 +502,8 @@ fn build_from_weights_slice(weights: &[u8], codes: &mut Vec<(u32, u8)>) -> Huffm
             current_code += 1;
         }
     }
-    if all_same && total as usize >= 2 {
-        table.uniform_nb = uniform_nb;
+    if uniform && total as usize >= 2 {
+        table.uniform_nb = (max_num_bits - uniform_w as usize + 1) as u8;
     }
 
     table
@@ -507,28 +515,38 @@ fn highest_bit_set(x: usize) -> usize {
     usize::BITS as usize - x.leading_zeros() as usize
 }
 
+impl HuffmanTable {
+    /// `(code, num_bits)` of `symbol` (test-facing form of the packed
+    /// entry).
+    #[cfg(test)]
+    fn code_of(&self, symbol: usize) -> (u32, u8) {
+        let p = self.packed[symbol];
+        ((p >> 4) as u32, (p & 0xf) as u8)
+    }
+}
+
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
-    assert_eq!(table.codes[0], (1, 2));
-    assert_eq!(table.codes[1], (2, 2));
-    assert_eq!(table.codes[2], (3, 2));
-    assert_eq!(table.codes[3], (0, 3));
-    assert_eq!(table.codes[4], (1, 3));
+    assert_eq!(table.code_of(0), (1, 2));
+    assert_eq!(table.code_of(1), (2, 2));
+    assert_eq!(table.code_of(2), (3, 2));
+    assert_eq!(table.code_of(3), (0, 3));
+    assert_eq!(table.code_of(4), (1, 3));
 
     let table = HuffmanTable::build_from_weights(&[4, 3, 2, 0, 1, 1]);
-    assert_eq!(table.codes[0], (1, 1));
-    assert_eq!(table.codes[1], (1, 2));
-    assert_eq!(table.codes[2], (1, 3));
-    assert_eq!(table.codes[3], (0, 0));
-    assert_eq!(table.codes[4], (0, 4));
-    assert_eq!(table.codes[5], (1, 4));
+    assert_eq!(table.code_of(0), (1, 1));
+    assert_eq!(table.code_of(1), (1, 2));
+    assert_eq!(table.code_of(2), (1, 3));
+    assert_eq!(table.code_of(3), (0, 0));
+    assert_eq!(table.code_of(4), (0, 4));
+    assert_eq!(table.code_of(5), (1, 4));
 }
 
 /// Pooled scratch for the per-block Huffman build (held in the compressor
 /// state): the tree-walk node table, the rank-bucket sort positions, the
 /// per-symbol length/weight scratch, the wire weight stream, and retired
-/// `codes` buffers.
+/// aligned-form boxes.
 pub(crate) struct HuffScratch {
     /// The two-queue builder's node table (see [`build_lengths_into`]):
     /// index 0 is the count barrier, 1..=256 the sorted leaves, 257.. the
@@ -549,12 +567,13 @@ pub(crate) struct HuffScratch {
     pub(crate) desc: Vec<u8>,
     /// FSE-compressed weight region while probing the description form.
     desc_fse: Vec<u8>,
-    /// Retired `codes` buffers.
-    codes: Vec<Vec<(u32, u8)>>,
+    /// Retired aligned-form boxes (dead symbols are never read, so a box
+    /// recycles without clearing; every byte stays initialized).
+    aligned: Vec<Box<[u64; 256]>>,
 }
 
-/// Two live code buffers cover the adopt/replace flow per block.
-const HUFF_CODES_CAP: usize = 2;
+/// Two live tables cover the adopt/replace flow per block.
+const HUFF_ALIGNED_CAP: usize = 2;
 
 impl Default for HuffScratch {
     fn default() -> Self {
@@ -566,40 +585,22 @@ impl Default for HuffScratch {
             wire_weights: Vec::new(),
             desc: Vec::new(),
             desc_fse: Vec::new(),
-            codes: Vec::new(),
+            aligned: Vec::new(),
         }
     }
 }
 
 impl HuffScratch {
-    /// Take a codes buffer of `len` initialized entries (the build fills
-    /// every slot, so recycling only needs the capacity).
-    fn take_codes(&mut self, len: usize) -> Vec<(u32, u8)> {
-        let mut v = match self.codes.iter().position(|v| v.len() >= len) {
-            Some(i) => self.codes.swap_remove(i),
-            None => Vec::with_capacity(len),
-        };
-        if v.len() < len {
-            v.resize(len, (0, 0));
-        } else {
-            v.truncate(len);
-        }
-        v
+    /// Take an aligned-form box (zero-initialized on first use only; the
+    /// build overwrites every entry a later read can touch).
+    fn take_aligned(&mut self) -> Box<[u64; 256]> {
+        self.aligned.pop().unwrap_or_else(|| Box::new([0; 256]))
     }
 
-    /// Return a retired table's codes buffer to the pool.
-    fn recycle_codes(&mut self, v: Vec<(u32, u8)>) {
-        if self.codes.len() < HUFF_CODES_CAP {
-            self.codes.push(v);
-        } else if self.codes.iter().all(|s| s.len() >= v.len()) {
-            // Every pooled buffer is at least as large: drop the retiree.
-        } else {
-            let smallest = self
-                .codes
-                .iter_mut()
-                .min_by_key(|s| s.len())
-                .expect("pool is non-empty at capacity");
-            *smallest = v;
+    /// Keep a retired aligned-form box beyond the adopt/replace depth.
+    fn recycle_aligned(&mut self, v: Box<[u64; 256]>) {
+        if self.aligned.len() < HUFF_ALIGNED_CAP {
+            self.aligned.push(v);
         }
     }
 }
@@ -1084,31 +1085,31 @@ fn build_lengths_reference_optimality() {
 #[test]
 fn counts() {
     let counts = &[3, 0, 4, 1, 5];
-    let table = HuffmanTable::build_from_counts(counts).codes;
+    let table = HuffmanTable::build_from_counts(counts);
 
-    assert_eq!(table[1].1, 0);
+    assert_eq!(table.code_of(1).1, 0);
     // Optimal lengths: strictly larger counts never get longer codes.
     let mut sorted: Vec<(usize, u8)> = counts
         .iter()
-        .zip(table.iter())
+        .zip(table.packed.iter())
         .filter(|(c, _)| **c > 0)
-        .map(|(c, (_, nb))| (*c, *nb))
+        .map(|(c, p)| (*c, (p & 0xf) as u8))
         .collect();
     sorted.sort_by_key(|(c, _)| *c);
     for pair in sorted.windows(2) {
         assert!(pair[1].1 <= pair[0].1, "sorted = {sorted:?}");
     }
     let counts = &[3, 0, 4, 0, 7, 2, 2, 2, 0, 2, 2, 1, 5];
-    let table = HuffmanTable::build_from_counts(counts).codes;
+    let table = HuffmanTable::build_from_counts(counts);
 
-    assert_eq!(table[1].1, 0);
-    assert_eq!(table[3].1, 0);
-    assert_eq!(table[8].1, 0);
+    assert_eq!(table.code_of(1).1, 0);
+    assert_eq!(table.code_of(3).1, 0);
+    assert_eq!(table.code_of(8).1, 0);
     let mut sorted: Vec<(usize, u8)> = counts
         .iter()
-        .zip(table.iter())
+        .zip(table.packed.iter())
         .filter(|(c, _)| **c > 0)
-        .map(|(c, (_, nb))| (*c, *nb))
+        .map(|(c, p)| (*c, (p & 0xf) as u8))
         .collect();
     sorted.sort_by_key(|(c, _)| *c);
     for pair in sorted.windows(2) {
@@ -1123,8 +1124,9 @@ fn from_data() {
     for &b in data {
         counts[b as usize] += 1;
     }
-    let table = HuffmanTable::build_from_counts(&counts[..=4]).codes;
-    let table2 = HuffmanTable::build_from_data(data).codes;
+    let table = HuffmanTable::build_from_counts(&counts[..=4]);
+    let table2 = HuffmanTable::build_from_data(data);
 
-    assert_eq!(table, table2);
+    assert_eq!(table.packed, table2.packed);
+    assert_eq!(table.uniform_nb, table2.uniform_nb);
 }

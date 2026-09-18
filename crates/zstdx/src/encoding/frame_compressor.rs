@@ -388,7 +388,7 @@ pub(crate) fn reset_slice_state(
     state.matcher.reset(level);
     state.dict_entropy = Default::default();
     if let Some(table) = state.last_huff_table.take() {
-        table.recycle_codes(&mut state.scratch.huff);
+        table.recycle_aligned(&mut state.scratch.huff);
     }
     // Retired tables return their transition buffers to the block scratch.
     // (Three statements, not an array: FSETable is ~1.5 KB inline, so
