@@ -2417,7 +2417,6 @@ mod tests {
         assert_eq!(core.shared.n_incomplete.load(Ordering::Acquire), 0);
     }
 
-
     /// A huge pledge must not size the initial reserve to the job grid
     /// (workers x job_size at the MAX_JOB_SIZE ceiling — the CLI always
     /// pledges the file size, so a 16 GiB file at -T8 would reserve
