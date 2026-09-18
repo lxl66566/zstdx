@@ -12,7 +12,7 @@ use alloc::{
 use crate::{
     Level,
     decoding::{FrameDecoder, StreamingDecoder, errors::FrameDecoderError},
-    io::Read,
+    io::{Error, ErrorKind, Read},
 };
 
 /// Decode through the streaming path with deliberately awkward read sizes so
@@ -182,4 +182,113 @@ fn truncated_next_frame_is_an_error() {
         expect_reference_error(&concat(&[&frame(b"aaaa"), &frame(b"bbbbb")[..6]]));
         expect_reference_error(&concat(&[&frame(b"aaaa"), &skippable(b"0123456789")[..12]]));
     }
+}
+
+/// A source that fails once with `WouldBlock` as soon as its position
+/// reaches `fail_after`, then serves normally. Non-blocking sockets behave
+/// like this: a failed read leaves the already-served bytes consumed.
+struct OneShotWouldBlock<'a> {
+    data: &'a [u8],
+    pos: usize,
+    fail_after: usize,
+    failed: bool,
+}
+
+impl<'a> OneShotWouldBlock<'a> {
+    fn new(data: &'a [u8], fail_after: usize) -> Self {
+        Self {
+            data,
+            pos: 0,
+            fail_after,
+            failed: false,
+        }
+    }
+}
+
+impl Read for OneShotWouldBlock<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if !self.failed && self.pos >= self.fail_after {
+            self.failed = true;
+            return Err(Error::from(ErrorKind::WouldBlock));
+        }
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Decode with deliberately small reads; the single injected `WouldBlock`
+/// surfaces once and the retry must resume the stream.
+fn decode_with_transient_error(input: &[u8], fail_after: usize) -> Vec<u8> {
+    let mut dec = StreamingDecoder::new(OneShotWouldBlock::new(input, fail_after))
+        .expect("the first frame header lies before the injection");
+    let mut out = Vec::new();
+    let mut sink = [0u8; 7];
+    let mut failures = 0;
+    loop {
+        match dec.read(&mut sink) {
+            Ok(0) => return out,
+            Ok(n) => out.extend_from_slice(&sink[..n]),
+            Err(e) => {
+                failures += 1;
+                assert_eq!(failures, 1, "transient failure was not recovered: {e}");
+            },
+        }
+    }
+}
+
+#[test]
+fn transient_error_in_next_frame_hunt_resumes() {
+    let payload_a = b"aaaa";
+    let payload_b = b"bbbbb";
+    let expected = b"aaaabbbbb";
+
+    // control: no injection decodes the concatenated frames
+    let input = concat(&[&frame(payload_a), &frame(payload_b)]);
+    let mut plain = Vec::new();
+    let mut sink = [0u8; 7];
+    let mut dec = StreamingDecoder::new(&input[..]).unwrap();
+    while let Ok(n) = dec.read(&mut sink) {
+        if n == 0 {
+            break;
+        }
+        plain.extend_from_slice(&sink[..n]);
+    }
+    assert_eq!(plain, expected);
+
+    // the injection lands right after frame two's magic number, before its
+    // descriptor: the retry replays the peeked magic instead of re-reading
+    // descriptor bytes as a magic number.
+    let boundary = input.len() - frame(payload_b).len();
+    assert_eq!(decode_with_transient_error(&input, boundary + 4), expected);
+}
+
+#[test]
+fn transient_error_mid_skippable_frame_resumes() {
+    // the injection lands right after the skip length field: no content was
+    // served yet, the retry must resume the discard instead of re-reading
+    // content as a magic number.
+    let input = concat(&[&frame(b"aaaa"), &skippable(&[b'x'; 1000]), &frame(b"bbbbb")]);
+    let content_start = input.len() - frame(b"bbbbb").len() - 1000;
+    assert_eq!(
+        decode_with_transient_error(&input, content_start),
+        b"aaaabbbbb"
+    );
+
+    // the injection lands mid-content: 8 KiB (the trash pull size) were
+    // already discarded, the retry must continue from there.
+    let input = concat(&[
+        &frame(b"aaaa"),
+        &skippable(&[b'x'; 20_000]),
+        &frame(b"bbbbb"),
+    ]);
+    let content_start = input.len() - frame(b"bbbbb").len() - 20_000;
+    assert_eq!(
+        decode_with_transient_error(&input, content_start + 8192 + 5),
+        b"aaaabbbbb"
+    );
 }

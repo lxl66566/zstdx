@@ -12,7 +12,7 @@ use crate::{
     decoding,
     decoding::{
         dictionary::Dictionary, errors::FrameDecoderError, flat_buffer::FlatOut,
-        scratch::DecoderScratch,
+        frame_source::NextFrameStaging, scratch::DecoderScratch,
     },
     io::{Error, Read, Write},
 };
@@ -88,6 +88,10 @@ pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
     dicts: BTreeMap<u32, Dictionary>,
     max_window_size: u64,
+    /// Bytes consumed from the source while hunting the next frame start
+    /// ([frame_source]); kept across calls so a transient read error there
+    /// resumes instead of corrupting the stream.
+    pub(super) next_frame_staging: NextFrameStaging,
 }
 
 struct FrameDecoderState {
@@ -211,6 +215,7 @@ impl FrameDecoder {
             state: None,
             dicts: BTreeMap::new(),
             max_window_size: DEFAULT_MAX_WINDOW_SIZE,
+            next_frame_staging: NextFrameStaging::Idle,
         }
     }
 
