@@ -147,8 +147,14 @@ pub(crate) fn approx_log2(x: f64) -> f64 {
 /// the dead fill, every state slot is written). A buffer zeroes its tail at
 /// most once per size, not once per table.
 pub(crate) struct FseBuildScratch {
-    /// State-owner map, refilled per build.
+    /// State-owner map. High-water buffer: every slot up to `table_size` is
+    /// written by each build (the row-start pass debug-asserts the sum
+    /// invariant that guarantees coverage), so no per-build clearing.
     owner: Vec<u8>,
+    /// Contiguous symbol-run staging for the no-low-prob spread fast path
+    /// (`table_size + 8` bytes; the u64 run writes may overrun the last run
+    /// by up to 7 bytes). High-water buffer, same coverage argument.
+    spread: Vec<u8>,
     /// Retired table buffers (their `len` is the initialized prefix).
     spare: Vec<Vec<u64>>,
     /// Lane-split sequence-code histograms for `choose_tables_fast` (four
@@ -170,6 +176,7 @@ impl Default for FseBuildScratch {
     fn default() -> Self {
         Self {
             owner: Vec::new(),
+            spread: Vec::new(),
             spare: Vec::new(),
             seq_lanes: Box::new([[0; 256]; 12]),
         }
@@ -731,9 +738,10 @@ fn build_table_from_counts(
 
 pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
     let table_size = 1usize << acc_log;
-    let mut owner = alloc::vec![255u8; table_size];
+    let mut owner = alloc::vec![0u8; table_size];
+    let mut spread = alloc::vec![0u8; table_size + 8];
     let mut tab = alloc::vec![0u64; TT_LEN + table_size.div_ceil(4)];
-    build_table_body(probs, acc_log, &mut owner, &mut tab)
+    build_table_body(probs, acc_log, &mut owner, &mut spread, &mut tab)
 }
 
 /// The pooled [`build_table_from_probabilities`]: recycles the table buffer
@@ -745,89 +753,144 @@ pub(crate) fn build_table_from_probabilities_into(
 ) -> FSETable {
     let table_size = 1usize << acc_log;
     let mut tab = scratch.take_tab(TT_LEN + table_size.div_ceil(4));
-    scratch.owner.clear();
-    scratch.owner.resize(table_size, 255);
-    build_table_body(probs, acc_log, &mut scratch.owner, &mut tab)
+    // High-water growth only: the build overwrites every slot it reads.
+    if scratch.owner.len() < table_size {
+        scratch.owner.resize(table_size, 0);
+    }
+    if scratch.spread.len() < table_size + 8 {
+        scratch.spread.resize(table_size + 8, 0);
+    }
+    build_table_body(
+        probs,
+        acc_log,
+        &mut scratch.owner,
+        &mut scratch.spread,
+        &mut tab,
+    )
 }
 
 fn build_table_body(
     probs: &[i32],
     acc_log: u8,
-    owner: &mut Vec<u8>,
+    owner: &mut [u8],
+    spread: &mut [u8],
     tab: &mut Vec<u64>,
 ) -> FSETable {
     debug_assert!(
         (0..=12).contains(&acc_log),
         "acc_log {acc_log} exceeds the supported range"
     );
+    debug_assert!(owner.len() >= 1usize << acc_log);
+    debug_assert!(spread.len() >= (1usize << acc_log) + 8);
     let table_size = 1usize << acc_log;
+    let owner = &mut owner[..table_size];
+    let spread = &mut spread[..table_size + 8];
     let mut probs_full = [0i32; 256];
     probs_full[..probs.len()].copy_from_slice(probs);
 
-    // -1 symbols take state indices from the top downward.
-    let mut negative_idx = (table_size - 1) as i32;
-    for (symbol, prob) in probs.iter().copied().enumerate() {
+    // Row starts + low-prob placement in one pass (libzstd's symbol start
+    // positions): `start[s]` doubles as the state-table walk's cursor below,
+    // then transforms into the biased encode start state. -1 weights take
+    // state indices from the top downward.
+    let mut start = [0u16; 256];
+    let mut total = 0u32;
+    let mut high_threshold = table_size as i32 - 1;
+    for (s, &prob) in probs.iter().enumerate() {
+        if prob != 0 {
+            start[s] = total as u16;
+        }
         if prob == -1 {
-            owner[negative_idx as usize] = symbol as u8;
-            negative_idx -= 1;
+            owner[high_threshold as usize] = s as u8;
+            high_threshold -= 1;
+            total += 1;
+        } else {
+            total += prob as u32;
         }
     }
+    debug_assert_eq!(total, table_size as u32);
 
-    // Positive symbols spread their states through the remaining space with
-    // the classic next_position walk.
-    let mut idx = 0usize;
-    for (symbol, prob) in probs.iter().copied().enumerate() {
-        if prob <= 0 {
-            continue;
+    // Spread the symbols over the table. The fast path (no -1 weights — the
+    // small-payload norm for sequence and weight tables) lays the symbol runs
+    // down contiguously — eight bytes per store — then scatters with a
+    // fixed-step, two-way unrolled loop of constant trip count, exactly
+    // libzstd's `FSE_buildCTable_wksp` fast branch. `step` is odd for every
+    // table_log >= 4, so the walk covers each position exactly once.
+    if high_threshold == table_size as i32 - 1 && table_size > 1 {
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+        let base = spread.as_mut_ptr();
+        let mut sv = 0u64;
+        let mut pos = 0usize;
+        for &prob in probs.iter() {
+            if prob > 0 {
+                // SAFETY: the runs tile [0, table_size) and each run's u64
+                // writes cover ceil(n / 8) * 8 bytes, so the farthest write
+                // stays under table_size + 8 (the slice's length).
+                unsafe {
+                    base.add(pos).cast::<u64>().write_unaligned(sv);
+                    let mut i = 8;
+                    while i < prob as usize {
+                        base.add(pos + i).cast::<u64>().write_unaligned(sv);
+                        i += 8;
+                    }
+                }
+                pos += prob as usize;
+            }
+            sv = sv.wrapping_add(0x0101_0101_0101_0101);
         }
-        for _ in 0..prob {
-            owner[idx] = symbol as u8;
-            idx = next_position(idx, table_size);
-            while idx > negative_idx as usize {
+        let mask = table_size - 1;
+        let mut position = 0usize;
+        let mut k = 0usize;
+        while k < table_size {
+            owner[position] = spread[k];
+            owner[(position + step) & mask] = spread[k + 1];
+            position = (position + 2 * step) & mask;
+            k += 2;
+        }
+        debug_assert_eq!(position, 0, "the spread walk must return to 0");
+    } else {
+        // Classic per-occurrence walk: positive symbols spread through the
+        // remaining space, skipping the low-probability area at the top.
+        let mut idx = 0usize;
+        for (symbol, prob) in probs.iter().copied().enumerate() {
+            if prob <= 0 {
+                continue;
+            }
+            for _ in 0..prob {
+                owner[idx] = symbol as u8;
                 idx = next_position(idx, table_size);
+                while idx > high_threshold as usize {
+                    idx = next_position(idx, table_size);
+                }
             }
         }
     }
 
-    // cumul[s]: prefix sum of state counts (a -1 weight owns one state) —
-    // deltaFindState's base and each symbol's state-table row start,
-    // exactly libzstd's cumul.
-    let mut cumul = [0u32; 256];
-    let mut total = 0u32;
-    for (s, &prob) in probs.iter().enumerate() {
-        cumul[s] = total;
-        total += if prob == -1 {
-            1
-        } else {
-            prob as u32
-        };
-    }
-
     // State table: positions ascending, symbol-major rows — `next` for the
     // k-th state of a symbol is its k-th smallest spread position. The walk
-    // runs before the tt fill so start states can read it.
+    // consumes `start` as its per-symbol cursor (libzstd mutates `cumul`
+    // in place the same way).
     // SAFETY: the state table is `table_size` u16 entries at ST_U16_OFF in
     // the tab buffer (whose u64 length covers TT_LEN + ceil(table_size/4)).
     let st = unsafe {
         core::slice::from_raw_parts_mut(tab.as_mut_ptr().cast::<u16>().add(ST_U16_OFF), table_size)
     };
-    {
-        let mut cursor = cumul;
-        for (u, &symbol) in owner[..table_size].iter().enumerate() {
-            let s = symbol as usize;
-            st[cursor[s] as usize] = (table_size + u) as u16;
-            cursor[s] += 1;
-        }
+    for (u, &symbol) in owner.iter().enumerate() {
+        let s = symbol as usize;
+        st[start[s] as usize] = (table_size + u) as u16;
+        start[s] += 1;
     }
 
     // Transform entries and start states (port of libzstd's "Build Symbol
     // Transformation Table"): deltaNbBits makes
     // `(state + deltaNbBits) >> 16` the emitted bit count, deltaFindState
-    // lands the state-table index inside the symbol's row. The equivalence
-    // with the previous materialized run walk (double states first in index
-    // order, baselines multiples of their run width) is pinned by
-    // `soa_matches_reference`.
-    let mut start = [0u16; 256];
+    // lands the state-table index inside the symbol's row. The running
+    // total re-derives each row's start (the walk above advanced `start`
+    // past it) and transforms it into the biased encode start state — the
+    // symbol's lowest spread position, the first entry of its state-table
+    // row. The equivalence with the previous materialized run walk (double
+    // states first in index order, baselines multiples of their run width)
+    // is pinned by `soa_matches_reference`.
+    let mut total = 0u32;
     for (s, &prob) in probs.iter().enumerate() {
         let (dnb, dfs) = match prob {
             // Dead-symbol fill (libzstd's), never encoded.
@@ -838,7 +901,7 @@ fn build_table_body(
             // Single-state symbols (-1 or weight 1): always acc_log bits.
             1 | -1 => (
                 (u32::from(acc_log) << 16).wrapping_sub(table_size as u32),
-                cumul[s].wrapping_sub(1),
+                total.wrapping_sub(1),
             ),
             p => {
                 let prob_log = if (p as u32).is_power_of_two() {
@@ -849,16 +912,19 @@ fn build_table_body(
                 let nb = u32::from(acc_log) - prob_log;
                 (
                     ((nb + 1) << 16).wrapping_sub((p as u32) << (nb + 1)),
-                    cumul[s].wrapping_sub(p as u32),
+                    total.wrapping_sub(p as u32),
                 )
             },
         };
         tab[s] = u64::from(dnb) | u64::from(dfs) << 32;
         if prob != 0 {
-            // The symbol's lowest spread position — the first entry of its
-            // state-table row — as the biased encode start state.
-            start[s] = st[cumul[s] as usize];
+            start[s] = st[total as usize];
         }
+        total += if prob == -1 {
+            1
+        } else {
+            prob as u32
+        };
     }
 
     FSETable {
@@ -1014,11 +1080,15 @@ mod soa_tests {
             seed ^= seed << 17;
             seed
         };
-        for case in 0..400 {
+        for case in 0..600 {
             let acc_log = 5 + (rand() % 4) as u8;
             let table_size = 1usize << acc_log;
             let nsym = 1 + (rand() % 20) as usize;
             let mut probs = vec![0i32; nsym];
+            // Every third case bans -1 weights, exercising the contiguous
+            // run-buffer spread fast path against the reference's classic
+            // per-occurrence walk.
+            let allow_negative = case % 3 != 0;
             // -1 weights occupy one table slot each, so positives must sum to
             // table_size minus the number of -1 entries.
             let mut remaining = table_size as i32;
@@ -1031,7 +1101,7 @@ mod soa_tests {
                     continue;
                 }
                 let r = rand();
-                if r % 7 == 0 {
+                if allow_negative && r % 7 == 0 {
                     *p = -1;
                     remaining -= 1;
                 } else {
