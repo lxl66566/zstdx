@@ -1,11 +1,13 @@
 //! Parallel decoding of complete in-memory inputs.
 //!
 //! A cheap pre-scan walks the block headers (3 bytes per block) and finds
-//! *restart points*: blocks whose entropy state is fully self-describing —
-//! literals not in Treeless mode and all three FSE streams out of Repeat
-//! mode. Encoders with jobs (libzstd's `-T` mode, this crate's
-//! [`crate::encoding::mt`]) emit exactly such blocks at every job boundary,
-//! and every frame start is one by definition.
+//! *restart points*: blocks where stage A's fresh entropy tables provably
+//! suffice — every FSE stream out of Repeat mode, and literals that rebuild
+//! the Huffman table (Compressed mode) or ignore it entirely (Raw/RLE, only
+//! while no Treeless block precedes the next table rebuild). Encoders with
+//! jobs (libzstd's `-T` mode, this crate's [`crate::encoding::mt`]) emit
+//! such blocks at every job boundary, and every frame start is one by
+//! definition.
 //!
 //! Between two restart points the compressed bytes decode independently of
 //! everything before them except the *output* history: literals Huffman
@@ -246,18 +248,36 @@ fn block_body_err(e: DecompressBlockError) -> FrameDecoderError {
     FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::DecompressBlockError(e))
 }
 
-/// Whether a compressed block's body re-establishes all entropy state:
-/// the literals section carries its own Huffman table (not Treeless) and
-/// every FSE stream leaves Repeat mode. Such a block is a legal restart
-/// point for an independent segment.
-fn restart_point(body: &[u8]) -> bool {
+/// How a compressed block's literals section treats the Huffman table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HuffmanState {
+    /// Compressed literals: the block rebuilds the table.
+    Rebuild,
+    /// Treeless literals: the block decodes through the carried table.
+    Reuse,
+    /// Raw/RLE literals: the block ignores the table entirely.
+    Ignore,
+}
+
+/// Per-block entropy-state classification from the pre-scan. A segment may
+/// only start where stage A's fresh tables provably suffice.
+struct RestartProbe {
+    huffman: HuffmanState,
+    /// Every FSE stream leaves Repeat mode (explicit table or the block
+    /// carries none at all). Malformed blocks report `false`: the scan
+    /// defers to the sequential path's proper errors.
+    fse_rebuilt: bool,
+}
+
+/// Classify a compressed block's body for the restart-point scan.
+fn probe_restart(body: &[u8]) -> RestartProbe {
     let mut section = LiteralsSection::new();
     let Ok(header_len) = section.parse_from_header(body) else {
-        return false;
+        return RestartProbe {
+            huffman: HuffmanState::Reuse,
+            fse_rebuilt: false,
+        };
     };
-    if matches!(section.ls_type, LiteralsSectionType::Treeless) {
-        return false;
-    }
     let literals_len = match section.compressed_size {
         Some(c) => c as usize,
         None => match section.ls_type {
@@ -266,21 +286,65 @@ fn restart_point(body: &[u8]) -> bool {
         },
     };
     let Some(seq_raw) = body.get(header_len as usize + literals_len..) else {
-        return false;
+        return RestartProbe {
+            huffman: HuffmanState::Reuse,
+            fse_rebuilt: false,
+        };
     };
     let mut seq_header = SequencesHeader::new();
     if seq_header.parse_from_header(seq_raw).is_err() {
-        return false;
+        return RestartProbe {
+            huffman: HuffmanState::Reuse,
+            fse_rebuilt: false,
+        };
     }
-    // A zero-sequence block leaves the FSE tables untouched, so the next
-    // block could legally use Repeat; require sequences with explicit
-    // tables instead.
-    let Some(modes) = seq_header.modes else {
-        return false;
+    let huffman = match section.ls_type {
+        LiteralsSectionType::Compressed => HuffmanState::Rebuild,
+        LiteralsSectionType::Treeless => HuffmanState::Reuse,
+        LiteralsSectionType::Raw | LiteralsSectionType::RLE => HuffmanState::Ignore,
     };
-    !matches!(modes.ll_mode(), ModeType::Repeat)
-        && !matches!(modes.ml_mode(), ModeType::Repeat)
-        && !matches!(modes.of_mode(), ModeType::Repeat)
+    // A zero-sequence block leaves the FSE tables untouched, so the next
+    // block could legally use Repeat; only explicit tables re-establish it.
+    let fse_rebuilt = seq_header.modes.is_some_and(|modes| {
+        !matches!(modes.ll_mode(), ModeType::Repeat)
+            && !matches!(modes.ml_mode(), ModeType::Repeat)
+            && !matches!(modes.of_mode(), ModeType::Repeat)
+    });
+    RestartProbe {
+        huffman,
+        fse_rebuilt,
+    }
+}
+
+/// The block indices a segment may start at. Besides blocks that rebuild
+/// every table (Compressed literals + explicit FSE), a Raw/RLE-literals
+/// block with explicit FSE tables qualifies when no Treeless-literals block
+/// precedes the next table rebuild: until a rebuild (or the cut itself)
+/// such a block would decode through the table stage A just reset.
+fn restart_candidates(probes: &[RestartProbe]) -> Vec<usize> {
+    let mut cut_ok = alloc::vec![false; probes.len()];
+    let mut treeless_ahead = false;
+    for i in (0..probes.len()).rev() {
+        cut_ok[i] = !treeless_ahead;
+        match probes[i].huffman {
+            HuffmanState::Rebuild => treeless_ahead = false,
+            HuffmanState::Reuse => treeless_ahead = true,
+            HuffmanState::Ignore => {},
+        }
+    }
+    probes
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| {
+            p.fse_rebuilt
+                && match p.huffman {
+                    HuffmanState::Rebuild => true,
+                    HuffmanState::Ignore => cut_ok[i],
+                    HuffmanState::Reuse => false,
+                }
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Walk the input, validating the frame structure and splitting frames
@@ -330,7 +394,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         let blocks_start = input.len() - reader.len();
 
         let mut blocks: Vec<ScannedBlock> = Vec::new();
-        let mut restarts: Vec<usize> = Vec::new();
+        let mut probes: Vec<RestartProbe> = Vec::new();
         let mut scan_cur = blocks_start;
         loop {
             let head = input.get(scan_cur..scan_cur + 3)?;
@@ -355,9 +419,15 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
             if body_end > input.len() {
                 return None;
             }
-            if btype == BlockType::Compressed && restart_point(&input[scan_cur + 3..body_end]) {
-                restarts.push(blocks.len());
-            }
+            probes.push(if btype == BlockType::Compressed {
+                probe_restart(&input[scan_cur + 3..body_end])
+            } else {
+                // Raw/RLE blocks touch no entropy state.
+                RestartProbe {
+                    huffman: HuffmanState::Ignore,
+                    fse_rebuilt: false,
+                }
+            });
             blocks.push(ScannedBlock {
                 btype,
                 raw_size: size,
@@ -368,6 +438,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
                 break;
             }
         }
+        let restarts = restart_candidates(&probes);
         if checksummed {
             let trailer_end = scan_cur.checked_add(4)?;
             if trailer_end > input.len() {
@@ -1273,6 +1344,177 @@ mod tests {
         decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
         assert_eq!(&out[..prefix.len()], &prefix[..]);
         assert_eq!(&out[prefix.len()..], &data[..]);
+    }
+
+    use super::{HuffmanState, RestartProbe, probe_restart, restart_candidates};
+
+    /// One sequence with all three FSE streams in RLE mode (ll code 4 = 4
+    /// literals, of code 0 = offset 1, ml code 0 = match 3): explicit tables
+    /// without Repeat, empty bitstream carrying only the mandatory end
+    /// marker.
+    fn rle_seq_body() -> Vec<u8> {
+        vec![0x01, 0x54, 0x04, 0x00, 0x00, 0x01]
+    }
+
+    fn probe(huffman: HuffmanState, fse_rebuilt: bool) -> RestartProbe {
+        RestartProbe {
+            huffman,
+            fse_rebuilt,
+        }
+    }
+
+    /// The pre-scan must classify literals sections by how they treat the
+    /// Huffman table, and only call FSE state rebuilt when no stream is in
+    /// Repeat mode.
+    #[test]
+    fn probe_restart_classifies_entropy_state() {
+        // Compressed literals (direct weights [1, 1]) rebuild the table.
+        let mut compressed = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
+        compressed.extend_from_slice(&rle_seq_body());
+        let p = probe_restart(&compressed);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Rebuild, true));
+
+        // Raw literals ignore the table but leave it intact.
+        let mut raw = vec![0x20, 0x30, 0x31, 0x32, 0x33];
+        raw.extend_from_slice(&rle_seq_body());
+        let p = probe_restart(&raw);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, true));
+
+        // RLE literals: same.
+        let mut rle = vec![0x21, 0xaa];
+        rle.extend_from_slice(&rle_seq_body());
+        let p = probe_restart(&rle);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, true));
+
+        // Treeless literals decode through the carried table.
+        let mut treeless = vec![0x43, 0x40, 0x00, 0x1f];
+        treeless.extend_from_slice(&rle_seq_body());
+        let p = probe_restart(&treeless);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Reuse, true));
+
+        // Any Repeat FSE stream carries state across.
+        let repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x01, 0xff];
+        let p = probe_restart(&repeat);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Rebuild, false));
+
+        // A zero-sequence block leaves the FSE tables untouched.
+        let p = probe_restart(&[0x20, 0x30, 0x31, 0x32, 0x33, 0x00]);
+        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, false));
+    }
+
+    /// A Raw/RLE-literals cut is legal only while no Treeless block precedes
+    /// the next table rebuild: stage A resets the tables, and a Treeless
+    /// block behind the cut would decode through the reset table. Treeless
+    /// and Repeat-carrying blocks are never cuts.
+    #[test]
+    fn restart_candidates_respect_huffman_carry() {
+        use HuffmanState::{Ignore, Rebuild, Reuse};
+
+        // Everything rebuilt: cut anywhere explicit.
+        let probes = [
+            probe(Rebuild, true),
+            probe(Ignore, false),
+            probe(Ignore, true),
+        ];
+        assert_eq!(restart_candidates(&probes), vec![0, 2]);
+
+        // Review's failing shape: Raw-literals candidate followed by a
+        // Treeless block before any rebuild - no cut allowed at 1.
+        let probes = [
+            probe(Rebuild, true),
+            probe(Ignore, false),
+            probe(Ignore, true),
+            probe(Reuse, true),
+        ];
+        assert_eq!(restart_candidates(&probes), vec![0]);
+
+        // Treeless behind the cut only after a rebuild: cut stands. Cutting
+        // after the Treeless block is legal again (it sits in the previous
+        // segment).
+        let probes = [
+            probe(Ignore, true),
+            probe(Rebuild, true),
+            probe(Reuse, true),
+            probe(Ignore, true),
+        ];
+        assert_eq!(restart_candidates(&probes), vec![0, 1, 3]);
+
+        // Treeless first: candidates before any rebuild stay forbidden (a
+        // cut at 0 would leave the Treeless block on reset tables). The
+        // block after the Treeless one is cuttable again - and the frame
+        // start before it is no candidate, so that unsound span only ever
+        // decodes as a whole frame from frame-start state, where a legal
+        // frame's Treeless block is preceded by its rebuild anyway and an
+        // illegal one fails identically in both paths.
+        let probes = [probe(Ignore, true), probe(Reuse, true), probe(Ignore, true)];
+        assert_eq!(restart_candidates(&probes), vec![2]);
+    }
+
+    /// A legal frame whose second segment would start at a Raw-literals
+    /// block (explicit FSE tables, no Huffman rebuild) followed by a
+    /// Treeless-literals block: the segment cut used to report
+    /// UninitializedHuffmanTable on every worker count while sequential
+    /// decoding succeeded.
+    #[test]
+    fn mt_segment_start_needs_huffman_rebuild() {
+        let rle_seq = rle_seq_body();
+        // Block A: rebuilds every entropy table. Huffman literals with
+        // direct weights [1, 1] (symbols 0/1 at 2 bits, symbol 2 at 1 bit),
+        // 8x symbol 2, then one explicit-table sequence.
+        let block_a = {
+            let mut b = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
+            b.extend_from_slice(&rle_seq);
+            b
+        };
+        // Block B: Raw literals + explicit FSE tables - the false restart
+        // point (no Huffman rebuild, but passes "not Treeless, no Repeat").
+        let block_b = {
+            let mut b = vec![0x20, 0x30, 0x31, 0x32, 0x33];
+            b.extend_from_slice(&rle_seq);
+            b
+        };
+        // Block C: Treeless literals over block A's table.
+        let block_c = {
+            let mut b = vec![0x43, 0x40, 0x00, 0x1f];
+            b.extend_from_slice(&rle_seq);
+            b
+        };
+
+        let push_block = |frame: &mut Vec<u8>, last: bool, btype: u32, body: &[u8]| {
+            let raw = ((body.len() as u32) << 3) | (btype << 1) | u32::from(last);
+            frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+            frame.extend_from_slice(body);
+        };
+
+        // Output: A = 8 literals + offset-4 match; 4x max-size Raw blocks
+        // pad the input past the MT floor and every segment-size target;
+        // B = 4 raw literals + offset-1 match; C = 4 treeless literals +
+        // offset-4 match.
+        let mut expect = vec![0x02u8; 11];
+        expect.resize(11 + 4 * 128 * 1024, 0xaa);
+        expect.extend_from_slice(&[0x30, 0x31, 0x32, 0x33, 0x33, 0x33, 0x33]);
+        expect.extend(std::iter::repeat_n(0x02, 7));
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+        frame.push(0xa0); // 4-byte frame content size + single segment
+        frame.extend_from_slice(&(expect.len() as u32).to_le_bytes());
+        push_block(&mut frame, false, 2, &block_a);
+        for _ in 0..4 {
+            push_block(&mut frame, false, 0, &[0xaa; 128 * 1024]);
+        }
+        push_block(&mut frame, false, 2, &block_b);
+        push_block(&mut frame, true, 2, &block_c);
+
+        for workers in [2u32, 4, 8] {
+            let mut out = vec![0u8; expect.len()];
+            let n = decode_all_mt(&frame, &mut out, workers, MAX_WINDOW).unwrap();
+            assert_eq!((n, &out[..n]), (expect.len(), &expect[..]), "{workers}");
+
+            let mut vec_out = Vec::new();
+            decode_to_vec_mt(&frame, &mut vec_out, workers, MAX_WINDOW).unwrap();
+            assert_eq!(vec_out, expect, "{workers}");
+        }
     }
 
     /// Corrupt input must surface an error, not silent garbage.

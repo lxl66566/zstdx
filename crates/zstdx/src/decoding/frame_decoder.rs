@@ -898,48 +898,57 @@ impl FrameDecoder {
                     }
                 }
 
-                loop {
-                    // check if there are enough bytes for the next header
-                    if mt_source.len() < 3 {
-                        break;
-                    }
-                    let (block_header, block_header_size) = block_dec
-                        .read_block_header(&mut mt_source)
-                        .map_err(err::FailedToReadBlockHeader)?;
-
-                    // check the needed size for the block before updating counters.
-                    // If not enough bytes are in the source, the header will have to be read again,
-                    // so act like we never read it in the first place
-                    if mt_source.len() < block_header.content_size as usize {
-                        break;
-                    }
-                    state.bytes_read_counter += u64::from(block_header_size);
-
-                    let bytes_read_in_block_body = block_dec
-                        .decode_block_content(
-                            &block_header,
-                            &mut state.decoder_scratch,
-                            &mut mt_source,
-                        )
-                        .map_err(err::FailedToReadBlockBody)?;
-                    state.bytes_read_counter += bytes_read_in_block_body;
-                    state.block_counter += 1;
-
-                    if block_header.last_block {
-                        state.frame_finished = true;
-                        if state.frame_header.descriptor.content_checksum_flag() {
-                            // if there are enough bytes handle this here. Else the block at the
-                            // start of this function will handle it at the next call
-                            if mt_source.len() >= 4 {
-                                let chksum = mt_source[..4].try_into().expect("optimized away");
-                                state.bytes_read_counter += 4;
-                                let chksum = u32::from_le_bytes(chksum);
-                                state.check_sum = Some(chksum);
-                                #[cfg(feature = "hash")]
-                                state.verify_frame_checksum()?;
-                            }
+                // Ring-buffer loop: dictionary-mode frames only. With the
+                // flat buffer active this must not run — when the flat loop
+                // paused on a full buffer, the remaining blocks would decode
+                // into an empty ring (matches find no history), and once the
+                // frame is finished, trailing source bytes would be parsed
+                // as a block header. Both wait for the next call instead.
+                if !state.flat_active {
+                    loop {
+                        // check if there are enough bytes for the next header
+                        if mt_source.len() < 3 {
+                            break;
                         }
-                        break;
+                        let (block_header, block_header_size) = block_dec
+                            .read_block_header(&mut mt_source)
+                            .map_err(err::FailedToReadBlockHeader)?;
+
+                        // check the needed size for the block before updating counters.
+                        // If not enough bytes are in the source, the header will have to be read
+                        // again, so act like we never read it in the first
+                        // place
+                        if mt_source.len() < block_header.content_size as usize {
+                            break;
+                        }
+                        state.bytes_read_counter += u64::from(block_header_size);
+
+                        let bytes_read_in_block_body = block_dec
+                            .decode_block_content(
+                                &block_header,
+                                &mut state.decoder_scratch,
+                                &mut mt_source,
+                            )
+                            .map_err(err::FailedToReadBlockBody)?;
+                        state.bytes_read_counter += bytes_read_in_block_body;
+                        state.block_counter += 1;
+
+                        if block_header.last_block {
+                            state.frame_finished = true;
+                            if state.frame_header.descriptor.content_checksum_flag() {
+                                // if there are enough bytes handle this here. Else the block at the
+                                // start of this function will handle it at the next call
+                                if mt_source.len() >= 4 {
+                                    let chksum = mt_source[..4].try_into().expect("optimized away");
+                                    state.bytes_read_counter += 4;
+                                    let chksum = u32::from_le_bytes(chksum);
+                                    state.check_sum = Some(chksum);
+                                    #[cfg(feature = "hash")]
+                                    state.verify_frame_checksum()?;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }

@@ -210,6 +210,113 @@ fn test_decode_from_to() {
     assert_eq!(counter, 0, "Result differs from original");
 }
 
+/// A small window pins the flat decode buffer at its steady-state size
+/// (window + 2 max blocks), far below this frame's output: the flat loop
+/// must pause with source bytes left over and resume on the next call. It
+/// used to hand those bytes to the ring-buffer loop, which decoded them
+/// into an empty ring and rejected the legal frame with
+/// NotEnoughBytesInDictionary.
+#[test]
+fn decode_from_to_resumes_after_flat_pause() {
+    use crate::{EncoderOptions, InputShape, Level, bulk, decoding::FrameDecoder};
+
+    let unit = b"the quick brown fox jumps over the lazy dog; ";
+    let len = 4 * 1024 * 1024;
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        let take = unit.len().min(len - data.len());
+        data.extend_from_slice(&unit[..take]);
+    }
+    let compressed = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Fastest)
+            .with_input_shape(InputShape::default().with_window_log(10)),
+    )
+    .unwrap();
+
+    // The premise: the frame really declares a small window (the encoder
+    // may round the forced log up).
+    let (header, _) =
+        crate::decoding::frame::read_frame_header(&mut compressed.as_slice()).unwrap();
+    let window = header.window_size().unwrap();
+    assert!(window <= 4096, "window {window} is not small");
+
+    let mut dec = FrameDecoder::new();
+    let mut src: &[u8] = &compressed;
+    dec.reset(&mut src).unwrap();
+    let mut target = vec![0u8; data.len()];
+    let mut written = 0usize;
+    let mut first_call_wrote = None;
+    while !dec.is_finished() {
+        let (read, out) = dec.decode_from_to(src, &mut target[written..]).unwrap();
+        if first_call_wrote.is_none() {
+            first_call_wrote = Some(out);
+        }
+        assert!(read + out > 0, "decode_from_to made no progress");
+        src = &src[read..];
+        written += out;
+    }
+    // The first call must have hit the flat buffer's high-water mark
+    // instead of decoding the whole frame.
+    assert!(
+        first_call_wrote.unwrap() < data.len(),
+        "flat loop never paused"
+    );
+    assert!(src.is_empty());
+    assert_eq!(written, data.len());
+    assert_eq!(&target[..], &data[..]);
+}
+
+/// Trailing bytes after a frame's last block belong to the next frame (or
+/// the caller): the flat path must leave them in the source untouched. The
+/// unguarded ring loop used to parse them as a block header, so a
+/// multi-frame input died on a bogus header in the middle of frame two.
+#[test]
+fn decode_from_to_leaves_trailing_bytes() {
+    use crate::{EncoderOptions, InputShape, Level, bulk, decoding::FrameDecoder};
+
+    let opts = || {
+        EncoderOptions::new(Level::Fastest)
+            .with_input_shape(InputShape::default().with_window_log(10))
+    };
+    let a = b"first frame payload, repeated repeated repeated";
+    let b: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let frame_a = bulk::compress_with(a, &opts()).unwrap();
+    let frame_b = bulk::compress_with(&b, &opts()).unwrap();
+    let mut both = frame_a.clone();
+    both.extend_from_slice(&frame_b);
+
+    let mut dec = FrameDecoder::new();
+    let mut src: &[u8] = &both;
+    dec.reset(&mut src).unwrap();
+    let mut target = vec![0u8; a.len() + b.len()];
+    let mut written = 0usize;
+    while !dec.is_finished() {
+        let (read, out) = dec.decode_from_to(src, &mut target[written..]).unwrap();
+        assert!(read + out > 0, "decode_from_to made no progress");
+        src = &src[read..];
+        written += out;
+    }
+    assert_eq!(written, a.len());
+    assert_eq!(&target[..written], &a[..]);
+    // Exactly frame two is left for the caller.
+    assert_eq!(src, frame_b.as_slice());
+
+    let mut dec = FrameDecoder::new();
+    let mut target2 = vec![0u8; b.len()];
+    let mut src2: &[u8] = src;
+    dec.reset(&mut src2).unwrap();
+    let mut written2 = 0usize;
+    while !dec.is_finished() {
+        let (read, out) = dec.decode_from_to(src2, &mut target2[written2..]).unwrap();
+        assert!(read + out > 0, "decode_from_to made no progress");
+        src2 = &src2[read..];
+        written2 += out;
+    }
+    assert!(src2.is_empty());
+    assert_eq!(&target2[..], &b[..]);
+}
+
 #[test]
 fn test_specific_file() {
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
