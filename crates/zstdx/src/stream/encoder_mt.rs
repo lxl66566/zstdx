@@ -356,13 +356,36 @@ pub(super) struct QueueShared {
     wake: Condvar,
     progressed: Condvar,
     /// Fast-path mirror of `inner.poison` (the hot write path polls it
-    /// without taking the queue lock).
+    /// without taking the queue lock). Publish order (see
+    /// [`QueueShared::publish_poison`]): a set flag always has the payload
+    /// already stored behind it.
     poisoned: core::sync::atomic::AtomicBool,
     /// Posted jobs not yet completed — the wrap/grow guard and the drain
     /// waits key on it reaching zero.
     n_incomplete: AtomicU64,
     /// Monotonic count of completed jobs — the drain waits' progress tick.
     completed: AtomicU64,
+}
+
+impl QueueShared {
+    /// Publish a worker panic. The order is load-bearing:
+    ///
+    /// 1. the payload lands under the queue lock,
+    /// 2. then the `poisoned` flag flips,
+    /// 3. then the panicking worker's own job is aborted (filled empty, so the ordered assembly can
+    ///    run to completion before the panic is resumed).
+    ///
+    /// A reader of the flag must therefore always find the payload behind
+    /// it, and an aborted (assemblable) job is never observable ahead of
+    /// the flag: with the flag stored first (the original order), the
+    /// posting thread could read flag set with `inner.poison` still empty,
+    /// surface nothing, drain the aborted job like any completion and ship
+    /// a frame missing its bytes — the payload stranded in the worker.
+    fn publish_poison(&self, job: &Job, payload: alloc::boxed::Box<dyn Any + Send>) {
+        self.inner.lock().unwrap().poison = Some(payload);
+        self.poisoned.store(true, Ordering::Release);
+        job.abort();
+    }
 }
 
 /// Serve one leased queue: claim the oldest posted job, encode it through
@@ -409,14 +432,13 @@ pub(super) fn serve_queue(
             },
             Err(payload) => {
                 // The state may be mid-compress garbage: drop it rather
-                // than reuse. The slot is filled with an empty block so the
-                // ordered assembly can run to completion before the panic
-                // is resumed.
+                // than reuse. The panic publishes (payload, flag, abort —
+                // see `publish_poison`) and the slot is filled with an
+                // empty block so the ordered assembly can run to
+                // completion before the panic is resumed.
                 *state = None;
                 poisoned = true;
-                job.abort();
-                shared.poisoned.store(true, Ordering::Release);
-                shared.inner.lock().unwrap().poison = Some(payload);
+                shared.publish_poison(&job, payload);
             },
         }
         if matches!(job.kind, JobKind::Encode { .. }) {
@@ -1834,6 +1856,17 @@ impl MtEncoderCore {
     /// unclaimed queue jobs are aborted (completed empty, so the counts and
     /// the in-order assembly run to completion), the in-flight ones run
     /// out, and the panic surfaces with the frame state settled.
+    ///
+    /// Observable (`poisoned`, `inner.poison`) combinations, by the publish
+    /// order in [`QueueShared::publish_poison`]:
+    /// - `(false, None)`: healthy — no-op.
+    /// - `(false, Some)`: impossible (the payload is stored before the flag).
+    /// - `(true, Some)`: a live poison — take it, abort the unclaimed queue, wait out the in-flight
+    ///   jobs, resume the unwind.
+    /// - `(true, None)`: unreachable — the flag never precedes the payload, and once taken this
+    ///   thread resumes before any re-entry (the posting thread is the only caller). The early
+    ///   return stays as the fail-safe: there is no payload to resume, so surfacing nothing beats
+    ///   fabricating state.
     fn surface_poison(&mut self) {
         if !self.shared.poisoned.load(Ordering::Acquire) {
             return;
@@ -2179,5 +2212,90 @@ mod tests {
         let n = decoder.decode_all(&output, &mut out).unwrap();
         assert_eq!(n, len);
         assert!(out.iter().all(|&b| b == 0), "decoded content diverged");
+    }
+
+    /// A published poison observed by a drain must resume the unwind: the
+    /// aborted job assembles as an empty slot like any completion, so a
+    /// drain that returned instead would ship a frame missing the poisoned
+    /// job's bytes as Ok. The state is built by hand (a real race's window
+    /// is not schedulable): the worker's claimed job aborted and pending,
+    /// the payload published behind the flag — exactly what
+    /// `QueueShared::publish_poison` leaves behind.
+    #[test]
+    fn drain_all_resumes_published_poison() {
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(2));
+        let job = Arc::new(Job {
+            level: Level::Fastest,
+            choice: ReachChoice::Keep,
+            shape: crate::InputShape {
+                len: None,
+                window_log: None,
+            },
+            head: None,
+            kind: JobKind::Encode {
+                // The job never runs; the view only needs a stable address
+                // for the struct to exist.
+                src: FrozenSrc {
+                    ptr: core.buf.as_ptr(),
+                },
+                first: 0,
+                len: 0,
+                last_frame_block: false,
+                overlap: 0,
+                ldm: LdmArming::Job,
+                spf: Mutex::new(None),
+                donation: Mutex::new(None),
+                out: Mutex::new(None),
+                done: core::sync::atomic::AtomicBool::new(false),
+            },
+        });
+        job.abort();
+        core.pending.push_back(job);
+        core.shared.inner.lock().unwrap().poison = Some(alloc::boxed::Box::new(41u32));
+        core.shared.poisoned.store(true, Ordering::Release);
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.drain_all();
+        }));
+        let payload = attempt.expect_err("a published poison must resume, not drain as Ok");
+        assert_eq!(payload.downcast_ref::<u32>(), Some(&41));
+    }
+
+    /// The publish order behind the flag invariant: after
+    /// `publish_poison`, a reader that sees the flag set finds the payload
+    /// in the queue state, and the aborted job is done (assemblable).
+    #[test]
+    fn publish_poison_orders_payload_before_flag() {
+        let core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(2));
+        let job = Arc::new(Job {
+            level: Level::Fastest,
+            choice: ReachChoice::Keep,
+            shape: crate::InputShape {
+                len: None,
+                window_log: None,
+            },
+            head: None,
+            kind: JobKind::Encode {
+                src: FrozenSrc {
+                    ptr: core.buf.as_ptr(),
+                },
+                first: 0,
+                len: 0,
+                last_frame_block: false,
+                overlap: 0,
+                ldm: LdmArming::Job,
+                spf: Mutex::new(None),
+                donation: Mutex::new(None),
+                out: Mutex::new(None),
+                done: core::sync::atomic::AtomicBool::new(false),
+            },
+        });
+        core.shared
+            .publish_poison(&job, alloc::boxed::Box::new(7u16));
+        assert!(core.shared.poisoned.load(Ordering::Acquire));
+        assert!(core.shared.inner.lock().unwrap().poison.is_some());
+        assert!(job.is_done());
+        // The caller (serve_queue) owns the counts: publish must not touch
+        // them.
+        assert_eq!(core.shared.n_incomplete.load(Ordering::Acquire), 0);
     }
 }

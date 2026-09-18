@@ -900,7 +900,24 @@ impl MatchGeneratorDriver {
     /// (see `RampGate`); `depth == 0` disarms it. Job zero needs no ramp:
     /// no output exists below the frame start, so cross-boundary reads are
     /// impossible there.
+    ///
+    /// Panics on the tree rows (`BtLazy`, `Opt`): their parses never read
+    /// the gate, so an armed ramp would be silently ignored — the frame
+    /// stays legal, but a piece-decode experiment on it measures nothing
+    /// (crossing reads of unbounded shallowness fail the executor's
+    /// validation or, worse, slip past it). Fail fast instead. The wiring
+    /// points for a real integration: in `dubt::find_best` the rep loop
+    /// and the sorted descent (band rejection per candidate); in
+    /// `btlazy::run_block_lazy` the depth-0 and offset-2 `rep_probe`s, the
+    /// literal-offset backward extension (floor at the boundary, like
+    /// `RampGate::ext_floor`) and the LDM far-candidate validation; the
+    /// opt family needs the same over its DP collection walk.
     pub fn arm_ramp(&mut self, job_start: u64, depth: u64) {
+        assert!(
+            !matches!(self.params.strategy, Strategy::BtLazy(_) | Strategy::Opt(_)),
+            "the deep-offset ramp is not wired into the btlazy2/opt parses (it holds for the \
+             fast/dfast/chain rows only); refusing to arm",
+        );
         self.ramp = if depth == 0 {
             RampGate::OFF
         } else {
