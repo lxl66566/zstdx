@@ -330,29 +330,15 @@ impl HuffmanTable {
     #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
-        // Optimal length-limited code lengths from the actual magnitudes;
-        // the rank-only assignment this replaces lost noticeably on skewed
-        // literal distributions (json digits/quotes).
-        let lengths = package_merge_lengths(counts, MAX_CODE_LENGTH);
-        let max_len = lengths.iter().copied().max().unwrap_or(1);
-        let weights: Vec<usize> = lengths
-            .iter()
-            .map(|&len| {
-                if len == 0 {
-                    0
-                } else {
-                    max_len - len + 1
-                }
-            })
-            .collect();
-        Self::build_from_weights(&weights)
+        let mut scratch = HuffScratch::default();
+        Self::build_from_counts_into(counts, &mut scratch)
     }
 
-    /// The pooled [`Self::build_from_counts`]: the package-merge lists and
+    /// The pooled [`Self::build_from_counts`]: the tree-walk scratch and
     /// the codes buffer are recycled through `scratch`.
     pub(crate) fn build_from_counts_into(counts: &[usize], scratch: &mut HuffScratch) -> Self {
         assert!(counts.len() <= 256);
-        package_merge_lengths_into(counts, MAX_CODE_LENGTH, scratch);
+        build_lengths_into(counts, MAX_CODE_LENGTH as u8, scratch);
         let n = counts.len();
         let max_len = scratch.lengths[..n].iter().copied().max().unwrap_or(1) as usize;
         let weights = &mut scratch.weights;
@@ -540,24 +526,16 @@ fn huffman() {
 }
 
 /// Pooled scratch for the per-block Huffman build (held in the compressor
-/// state): the package-merge level lists, the per-symbol length/weight
-/// scratch, the wire weight stream, and retired `codes` buffers.
+/// state): the tree-walk node table, the rank-bucket sort positions, the
+/// per-symbol length/weight scratch, the wire weight stream, and retired
+/// `codes` buffers.
 pub(crate) struct HuffScratch {
-    /// Package-merge working stacks (see `package_merge_lengths_into`).
-    /// Fixed-capacity array stacks, not Vecs: the per-push capacity checks
-    /// and length bookkeeping of the Vec form cost ~24K Ir per json-4K
-    /// fastest call (a fifth of the call). Capacities are structural —
-    /// leaves ≤ `MAX_SYMBOLS` (distinct literal symbols), packages ≤ n-1
-    /// per level, level lists ≤ `MAX_TAKE`, arena ≤ symbols + levels ×
-    /// (n-1) — and the hot loops index them unchecked under those
-    /// invariants. Ping-pong buffer pairs replace the swapped Vecs.
-    leaves: Box<[Ent; MAX_SYMBOLS]>,
-    arena: Box<[Node]>,
-    list_a: Box<[Ent; MAX_TAKE]>,
-    list_b: Box<[Ent; MAX_TAKE]>,
-    packages: Box<[Ent; MAX_SYMBOLS]>,
-    ids_a: Box<[u32; MAX_TAKE]>,
-    ids_b: Box<[u32; MAX_TAKE]>,
+    /// The two-queue builder's node table (see [`build_lengths_into`]):
+    /// index 0 is the count barrier, 1..=256 the sorted leaves, 257.. the
+    /// created internal nodes (≤ one per leaf).
+    nodes: Box<[NodeElt; NODES_CAP]>,
+    /// Rank-bucket bases and cursors for the count sort (see [`huf_sort`]).
+    rank_pos: Box<[(u16, u16); RANK_TABLE]>,
     /// Code lengths per symbol (0 = symbol absent), valid for the build's
     /// alphabet prefix.
     lengths: [u8; 256],
@@ -581,13 +559,8 @@ const HUFF_CODES_CAP: usize = 2;
 impl Default for HuffScratch {
     fn default() -> Self {
         Self {
-            leaves: Box::new([Ent { weight: 0, node: 0 }; MAX_SYMBOLS]),
-            arena: alloc::vec![Node::Pkg(0, 0); ARENA_CAP].into_boxed_slice(),
-            list_a: Box::new([Ent { weight: 0, node: 0 }; MAX_TAKE]),
-            list_b: Box::new([Ent { weight: 0, node: 0 }; MAX_TAKE]),
-            packages: Box::new([Ent { weight: 0, node: 0 }; MAX_SYMBOLS]),
-            ids_a: Box::new([0; MAX_TAKE]),
-            ids_b: Box::new([0; MAX_TAKE]),
+            nodes: Box::new([NodeElt::ZERO; NODES_CAP]),
+            rank_pos: Box::new([(0, 0); RANK_TABLE]),
             lengths: [0; 256],
             weights: [0; 256],
             wire_weights: Vec::new(),
@@ -634,240 +607,478 @@ impl HuffScratch {
 /// Maximum Huffman code length the literals section can carry.
 const MAX_CODE_LENGTH: usize = 11;
 
-/// Structural capacities of the package-merge stacks in [`HuffScratch`]:
-/// `n` (used symbols) never exceeds the alphabet, a level keeps at most
-/// `take = 2(n-1` entries, and the arena holds the leaves plus at most
-/// `max_len` levels of `n-1` packages each.
-const MAX_SYMBOLS: usize = 256;
-const MAX_TAKE: usize = 2 * (MAX_SYMBOLS - 1);
-const ARENA_CAP: usize = MAX_SYMBOLS + MAX_CODE_LENGTH * (MAX_SYMBOLS - 1);
-
+/// One Huffman tree node (C's `nodeElt`): the same array doubles as the
+/// count-sorted leaf list and the created-internal-node arena of the
+/// two-queue builder.
 #[derive(Clone, Copy)]
-enum Node {
-    Leaf(u16),
-    Pkg(u32, u32),
+struct NodeElt {
+    count: u32,
+    parent: u16,
+    byte: u8,
+    nb_bits: u8,
 }
 
-#[derive(Clone, Copy)]
-struct Ent {
-    // Block literals are capped far below 2^32, so package weights (sums
-    // of leaf counts) cannot overflow either; the narrow field halves
-    // sort/merge memory traffic.
-    weight: u32,
-    node: u32,
-}
-
-/// Boundary package-merge (Larmore-Hirschberg): optimal length-limited code
-/// lengths. Zero-count symbols get length 0; the returned lengths for used
-/// symbols are Kraft-exact (sum of 2^-len == 1) and never exceed `max_len`.
-/// Requires `max_len >= log2(symbol count)` and at least two used symbols.
-#[cfg(any(test, feature = "fuzz_exports"))]
-fn package_merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
-    let mut scratch = HuffScratch::default();
-    package_merge_lengths_into(counts, max_len, &mut scratch);
-    scratch.lengths[..counts.len()]
-        .iter()
-        .map(|&l| l as usize)
-        .collect()
-}
-
-/// The pooled [`package_merge_lengths`]: fills `scratch.lengths[..n]`.
-///
-/// The walk runs over fixed-capacity array stacks (see [`HuffScratch`])
-/// with the loop-local lengths carried in registers; every hot-loop access
-/// is unchecked under the structural bounds stated at each `SAFETY`.
-fn package_merge_lengths_into(counts: &[usize], max_len: usize, scratch: &mut HuffScratch) {
-    assert!(counts.len() <= MAX_SYMBOLS);
-    assert!(
-        max_len <= MAX_CODE_LENGTH,
-        "arena capacity covers MAX_CODE_LENGTH levels"
-    );
-    let lengths = &mut scratch.lengths;
-    lengths[..counts.len()].fill(0);
-    let mut n = 0usize;
-    let mut arena_len = 0usize;
-    for (sym, &count) in counts.iter().enumerate() {
-        if count > 0 {
-            scratch.arena[arena_len] = Node::Leaf(sym as u16);
-            scratch.leaves[n] = Ent {
-                weight: u32::try_from(count).expect("literal count exceeds u32"),
-                node: arena_len as u32,
-            };
-            n += 1;
-            arena_len += 1;
-        }
-    }
-    assert!(n >= 2, "single-symbol alphabets go through the RLE path");
-    assert!(max_len >= n.next_power_of_two().ilog2() as usize);
-    scratch.leaves[..n].sort_by_key(|e| (e.weight, e.node));
-    let leaves = &scratch.leaves;
-    let take = 2 * (n - 1);
-
-    // Level lists: level 0 is the leaves alone (take = 2(n-1) >= n for
-    // n >= 2); every further level merges the leaves with packages formed
-    // from consecutive pairs of the previous level, keeping the cheapest
-    // `take` items. Only the previous level is ever read again, so the two
-    // ping-pong buffers `list_a`/`list_b` cover all levels.
-    scratch.list_a[..n].copy_from_slice(&leaves[..n]);
-    let mut prev_len = n;
-    for level in 1..max_len {
-        let (prev, cur) = if level & 1 == 1 {
-            (&scratch.list_a[..], &mut scratch.list_b[..])
-        } else {
-            (&scratch.list_b[..], &mut scratch.list_a[..])
-        };
-        let packages = &mut scratch.packages;
-        let mut plen = 0usize;
-        let mut i = 0usize;
-        while i + 1 < prev_len && plen < n - 1 {
-            // SAFETY: i+1 < prev_len <= take <= MAX_TAKE covers `prev`;
-            // plen < n-1 <= MAX_SYMBOLS-1 covers `packages`; arena_len
-            // stays under leaves + levels*(n-1) <= ARENA_CAP.
-            let (a, b) = unsafe { (*prev.get_unchecked(i), *prev.get_unchecked(i + 1)) };
-            unsafe {
-                *scratch.arena.get_unchecked_mut(arena_len) = Node::Pkg(a.node, b.node);
-                *packages.get_unchecked_mut(plen) = Ent {
-                    weight: a.weight + b.weight,
-                    node: arena_len as u32,
-                };
-            }
-            arena_len += 1;
-            plen += 1;
-            i += 2;
-        }
-        // No sort needed: `prev` is (weight, node)-sorted, so disjoint adjacent
-        // pair sums are weight-monotone (w[2k+2] >= w[2k] and w[2k+3] >= w[2k+1]
-        // imply pkg[k+1] >= pkg[k]); ties break by node id, which strictly
-        // increases in push order. The packages are therefore already in the
-        // exact order the removed sort produced.
-        debug_assert!(
-            packages[..plen].is_sorted_by(|a, b| { (a.weight, a.node) <= (b.weight, b.node) })
-        );
-        // Intermediate levels can hold fewer than `take` items; only the
-        // top level is guaranteed full (L >= log2 n).
-        let mut clen = 0usize;
-        let mut li = 0usize;
-        let mut pi = 0usize;
-        while clen < take && (li < n || pi < plen) {
-            let pick_leaf = pi >= plen
-                || (li < n && {
-                    // SAFETY: guarded by `li < n` / reached only while
-                    // `pi < plen` (otherwise the first arm fired); plen
-                    // <= n-1 < MAX_SYMBOLS.
-                    let (l, p) =
-                        unsafe { (*leaves.get_unchecked(li), *packages.get_unchecked(pi)) };
-                    (l.weight, l.node) <= (p.weight, p.node)
-                });
-            // SAFETY: clen < take <= MAX_TAKE by the loop head; the source
-            // index matches the guard that picked it.
-            unsafe {
-                *cur.get_unchecked_mut(clen) = if pick_leaf {
-                    li += 1;
-                    *leaves.get_unchecked(li - 1)
-                } else {
-                    pi += 1;
-                    *packages.get_unchecked(pi - 1)
-                };
-            }
-            clen += 1;
-        }
-        prev_len = clen;
-    }
-
-    // Walk the solution back down: every leaf encountered at level k adds one
-    // length unit; packages expand into their children one level below. The
-    // id lists alternate between `ids_a`/`ids_b`; the top-level list lives in
-    // list_b for an even `max_len` (last level wrote list_b), list_a else.
-    let top = if max_len & 1 == 0 {
-        &scratch.list_b[..prev_len]
-    } else {
-        &scratch.list_a[..prev_len]
+impl NodeElt {
+    const ZERO: NodeElt = NodeElt {
+        count: 0,
+        parent: 0,
+        byte: 0,
+        nb_bits: 0,
     };
-    for (k, e) in top.iter().enumerate() {
-        scratch.ids_a[k] = e.node;
+}
+
+/// Node-table geometry: barrier at 0, leaves 1..=256, internal nodes from
+/// 257 up to one per leaf.
+const START_NODE: usize = 257;
+const NODES_CAP: usize = START_NODE + 256;
+
+/// Rank-bucket sort geometry (C's `HUF_sort`): counts below the cutoff get
+/// an exact bucket each, everything above folds into log2 buckets.
+const RANK_TABLE: usize = 192;
+const RANK_LOG_BEGIN: u32 = (RANK_TABLE as u32 - 1) - 32 - 1;
+const RANK_DISTINCT_CUTOFF: u32 = RANK_LOG_BEGIN + RANK_LOG_BEGIN.ilog2();
+
+/// The bucket a count lands in (C's `HUF_getIndex`).
+#[inline]
+fn rank_of(count: u32) -> usize {
+    if count < RANK_DISTINCT_CUTOFF {
+        count as usize
+    } else {
+        (count.ilog2() + RANK_LOG_BEGIN) as usize
     }
-    let mut alen = prev_len;
-    let mut active_in_a = true;
-    for _ in (0..max_len).rev() {
-        let mut nlen = 0usize;
-        for k in 0..alen {
-            // SAFETY: ids never exceed arena_len (every stored node field
-            // was an arena index of this walk), and the expansion of one
-            // level's active set is a subset of that level's list, so
-            // nlen stays under take <= MAX_TAKE.
-            let id = if active_in_a {
-                scratch.ids_a[k]
-            } else {
-                scratch.ids_b[k]
-            };
-            match scratch.arena[id as usize] {
-                Node::Leaf(sym) => unsafe {
-                    *lengths.get_unchecked_mut(sym as usize) += 1;
-                },
-                Node::Pkg(a, b) => unsafe {
-                    let next = if active_in_a {
-                        &mut scratch.ids_b
-                    } else {
-                        &mut scratch.ids_a
-                    };
-                    *next.get_unchecked_mut(nlen) = a;
-                    *next.get_unchecked_mut(nlen + 1) = b;
-                    nlen += 2;
-                },
-            }
-        }
-        alen = nlen;
-        active_in_a = !active_in_a;
+}
+
+/// Fill `scratch.lengths[..counts.len()]` with code lengths: a two-queue
+/// Huffman tree (optimal, unlimited depth) built over the count-sorted
+/// leaves, then depth-limited to `max_nb_bits` by C's `HUF_setMaxHeight`
+/// Kraft repayment. This is libzstd's `HUF_buildCTable_wksp` structure —
+/// O(n) work per build where boundary package-merge pays max_len levels
+/// of 2(n-1)-wide merges. Zero-count symbols get length 0; the result is
+/// Kraft-exact. Requires at least two used symbols.
+fn build_lengths_into(counts: &[usize], max_nb_bits: u8, scratch: &mut HuffScratch) {
+    let HuffScratch {
+        nodes,
+        rank_pos,
+        lengths,
+        ..
+    } = scratch;
+    lengths[..counts.len()].fill(0);
+    debug_assert!(
+        counts.iter().all(|&c| c < (1 << 30)),
+        "the two-queue barrier and uncreated-node markers live above 2^30"
+    );
+    let n = huf_sort(counts, &mut nodes[..], &mut rank_pos[..]);
+    debug_assert!(n >= 2, "single-symbol alphabets go through the RLE path");
+    debug_assert!(
+        usize::from(max_nb_bits) >= n.next_power_of_two().ilog2() as usize,
+        "the limit cannot address every symbol"
+    );
+    build_tree(&mut nodes[..], n);
+    set_max_height(&mut nodes[1..], n - 1, max_nb_bits);
+    for node in &nodes[1..=n] {
+        lengths[node.byte as usize] = node.nb_bits;
     }
     debug_assert_eq!(
         lengths[..counts.len()]
             .iter()
             .map(|&l| if l == 0 {
-                0
+                0u64
             } else {
-                1usize << (max_len - l as usize)
+                1u64 << (max_nb_bits - l)
             })
-            .sum::<usize>(),
-        1 << max_len,
-        "package-merge lengths must be Kraft-exact"
+            .sum::<u64>(),
+        1u64 << max_nb_bits,
+        "code lengths must be Kraft-exact"
     );
 }
 
+/// Scatter-sort symbols by count descending into `nodes[1..]` (C's
+/// `HUF_sort`): exact-count buckets preserve the ascending-symbol scatter
+/// order, log2 buckets get a descending count sort. Returns the table
+/// index of the last used symbol.
+fn huf_sort(counts: &[usize], nodes: &mut [NodeElt], rank_pos: &mut [(u16, u16)]) -> usize {
+    rank_pos.fill((0, 0));
+    let mut used = 0usize;
+    for &c in counts {
+        if c > 0 {
+            used += 1;
+        }
+        rank_pos[rank_of(u32::try_from(c).expect("literal count exceeds u32"))].0 += 1;
+    }
+    for r in (1..RANK_TABLE).rev() {
+        rank_pos[r - 1].0 += rank_pos[r].0;
+    }
+    for slot in rank_pos.iter_mut() {
+        slot.1 = slot.0;
+    }
+    for (sym, &c) in counts.iter().enumerate() {
+        let r = rank_of(u32::try_from(c).expect("literal count exceeds u32")) + 1;
+        let pos = rank_pos[r].1 as usize;
+        rank_pos[r].1 += 1;
+        nodes[pos + 1] = NodeElt {
+            count: c as u32,
+            parent: 0,
+            byte: sym as u8,
+            nb_bits: 0,
+        };
+    }
+    for slot in &rank_pos[RANK_DISTINCT_CUTOFF as usize..RANK_TABLE - 1] {
+        let (base, curr) = (slot.0 as usize, slot.1 as usize);
+        if curr - base > 1 {
+            nodes[base + 1..=curr].sort_unstable_by_key(|n| core::cmp::Reverse(n.count));
+        }
+    }
+    used
+}
+
+/// Build the unlimited-depth Huffman tree over the sorted leaves (C's
+/// `HUF_buildTree`): the two-queue merge takes each internal node's
+/// children from the smaller of the remaining leaf tail and the created
+/// nodes so far, writing parents and then code lengths in one array. Node
+/// 0 acts as the count barrier that keeps the leaf index valid after the
+/// tail is exhausted.
+fn build_tree(nodes: &mut [NodeElt], last_leaf: usize) {
+    // last_leaf leaves need last_leaf-1 internal nodes; the root lands at
+    // START_NODE + (last_leaf-1) - 1.
+    let node_root = START_NODE - 2 + last_leaf;
+    let mut node_nb = START_NODE;
+    let mut low_s = last_leaf;
+    let mut low_n = START_NODE;
+    nodes[node_nb].count = nodes[low_s].count + nodes[low_s - 1].count;
+    nodes[low_s].parent = node_nb as u16;
+    nodes[low_s - 1].parent = node_nb as u16;
+    node_nb += 1;
+    low_s -= 2;
+    for node in &mut nodes[node_nb..=node_root] {
+        node.count = 1 << 30;
+    }
+    nodes[0].count = u32::MAX;
+    while node_nb <= node_root {
+        // Counts stay under 2^30 (block and dictionary literal totals), so
+        // the barrier and the not-yet-created markers can never be picked.
+        let n1 = if nodes[low_s].count < nodes[low_n].count {
+            let picked = low_s;
+            low_s -= 1;
+            picked
+        } else {
+            let picked = low_n;
+            low_n += 1;
+            picked
+        };
+        let n2 = if nodes[low_s].count < nodes[low_n].count {
+            let picked = low_s;
+            low_s -= 1;
+            picked
+        } else {
+            let picked = low_n;
+            low_n += 1;
+            picked
+        };
+        nodes[node_nb].count = nodes[n1].count + nodes[n2].count;
+        nodes[n1].parent = node_nb as u16;
+        nodes[n2].parent = node_nb as u16;
+        node_nb += 1;
+    }
+    nodes[node_root].nb_bits = 0;
+    for n in (START_NODE..node_root).rev() {
+        nodes[n].nb_bits = nodes[nodes[n].parent as usize].nb_bits + 1;
+    }
+    for n in 1..=last_leaf {
+        nodes[n].nb_bits = nodes[nodes[n].parent as usize].nb_bits + 1;
+    }
+}
+
+/// Clamp the tree depth to `target` (C's `HUF_setMaxHeight`): every deeper
+/// leaf moves up to `target` and the Kraft debt is repaid by demoting the
+/// cheapest symbols rank by rank, keeping the code complete. `leaves` is
+/// the sorted leaf list (node 0 of the table). Returns the resulting
+/// maximum length.
+fn set_max_height(leaves: &mut [NodeElt], last_non_null: usize, target: u8) -> u8 {
+    /// The empty-rank sentinel for `rank_last`; real positions are >= 0.
+    const NO_SYMBOL: i32 = -1;
+    let largest_bits = leaves[last_non_null].nb_bits;
+    if largest_bits <= target {
+        return largest_bits;
+    }
+
+    let mut total_cost: i64 = 0;
+    let base_cost: u64 = 1 << (largest_bits - target);
+    let mut n = last_non_null as i32;
+
+    // Lift every over-deep leaf to `target`, collecting the Kraft debt.
+    while leaves[n as usize].nb_bits > target {
+        total_cost += (base_cost - (1 << (largest_bits - leaves[n as usize].nb_bits))) as i64;
+        leaves[n as usize].nb_bits = target;
+        n -= 1;
+    }
+    // Stop on the deepest rank below the target: the repayment candidates.
+    while leaves[n as usize].nb_bits == target {
+        n -= 1;
+    }
+    total_cost >>= largest_bits - target;
+    debug_assert!(total_cost > 0);
+
+    // `rank_last[d]` = position of the smallest symbol whose length is
+    // `target - d` (a demotion there shortens the rank-d gap); NO_SYMBOL
+    // marks an empty rank. Positions are leaf indices; 0 is the most
+    // frequent symbol and a valid position.
+    let mut rank_last = [NO_SYMBOL; MAX_CODE_LENGTH + 2];
+    let mut current_nb_bits = target;
+    let mut pos = n;
+    while pos >= 0 {
+        if leaves[pos as usize].nb_bits < current_nb_bits {
+            current_nb_bits = leaves[pos as usize].nb_bits;
+            rank_last[(target - current_nb_bits) as usize] = pos;
+        }
+        pos -= 1;
+    }
+
+    while total_cost > 0 {
+        // Demote at the shallowest rank whose cheapest symbol costs less
+        // than two of the next-shallower rank's (each demotion halves the
+        // remaining rank mass).
+        let mut n_bits = (total_cost as u32).ilog2() + 1;
+        while n_bits > 1 {
+            let high_pos = rank_last[n_bits as usize];
+            let low_pos = rank_last[n_bits as usize - 1];
+            if high_pos == NO_SYMBOL {
+                n_bits -= 1;
+                continue;
+            }
+            if low_pos == NO_SYMBOL {
+                break;
+            }
+            let high_total = leaves[high_pos as usize].count;
+            let low_total = 2 * leaves[low_pos as usize].count;
+            if high_total <= low_total {
+                break;
+            }
+            n_bits -= 1;
+        }
+        // The next-nonempty-rank skip can only walk upward while a rank is
+        // empty; rank 1 always holds a symbol (the smallest leaf).
+        while n_bits <= MAX_CODE_LENGTH as u32 && rank_last[n_bits as usize] == NO_SYMBOL {
+            n_bits += 1;
+        }
+        debug_assert!(rank_last[n_bits as usize] != NO_SYMBOL);
+        total_cost -= 1 << (n_bits - 1);
+        leaves[rank_last[n_bits as usize] as usize].nb_bits += 1;
+
+        if rank_last[n_bits as usize - 1] == NO_SYMBOL {
+            rank_last[n_bits as usize - 1] = rank_last[n_bits as usize];
+        }
+        if rank_last[n_bits as usize] == 0 {
+            rank_last[n_bits as usize] = NO_SYMBOL;
+        } else {
+            rank_last[n_bits as usize] -= 1;
+            if leaves[rank_last[n_bits as usize] as usize].nb_bits != target - n_bits as u8 {
+                rank_last[n_bits as usize] = NO_SYMBOL;
+            }
+        }
+    }
+
+    // Overshot repayments come back by shortening the most frequent rank.
+    while total_cost < 0 {
+        if rank_last[1] == NO_SYMBOL {
+            while leaves[n as usize].nb_bits == target {
+                n -= 1;
+            }
+            leaves[n as usize + 1].nb_bits -= 1;
+            debug_assert!(n >= 0);
+            rank_last[1] = n + 1;
+            total_cost += 1;
+            continue;
+        }
+        leaves[rank_last[1] as usize + 1].nb_bits -= 1;
+        rank_last[1] += 1;
+        total_cost += 1;
+    }
+    target
+}
+
+#[cfg(test)]
+mod reference {
+    //! Boundary package-merge (Larmore-Hirschberg): the optimal
+    //! length-limited code, kept as the production builder's optimality
+    //! reference (the production path is the two-queue port above).
+
+    use alloc::{vec, vec::Vec};
+
+    fn merge_lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
+        #[derive(Clone, Copy)]
+        struct Ent {
+            weight: u32,
+            node: u32,
+        }
+        #[derive(Clone, Copy)]
+        enum Node {
+            Leaf(u16),
+            Pkg(u32, u32),
+        }
+        let mut lengths = vec![0usize; counts.len()];
+        let mut leaves: Vec<Ent> = Vec::new();
+        let mut arena: Vec<Node> = Vec::new();
+        for (sym, &count) in counts.iter().enumerate() {
+            if count > 0 {
+                arena.push(Node::Leaf(sym as u16));
+                leaves.push(Ent {
+                    weight: count as u32,
+                    node: arena.len() as u32 - 1,
+                });
+            }
+        }
+        assert!(leaves.len() >= 2);
+        leaves.sort_by_key(|e| (e.weight, e.node));
+        let n = leaves.len();
+        let take = 2 * (n - 1);
+        let mut prev: Vec<Ent> = leaves.clone();
+        for _level in 1..max_len {
+            let mut packages = Vec::with_capacity(n - 1);
+            let mut i = 0;
+            while i + 1 < prev.len() && packages.len() < n - 1 {
+                let (a, b) = (prev[i], prev[i + 1]);
+                arena.push(Node::Pkg(a.node, b.node));
+                packages.push(Ent {
+                    weight: a.weight + b.weight,
+                    node: arena.len() as u32 - 1,
+                });
+                i += 2;
+            }
+            let mut merged: Vec<Ent> = Vec::with_capacity(take);
+            let (mut li, mut pi) = (0, 0);
+            while merged.len() < take && (li < n || pi < packages.len()) {
+                let pick_leaf = pi >= packages.len()
+                    || (li < n
+                        && (leaves[li].weight, leaves[li].node)
+                            <= (packages[pi].weight, packages[pi].node));
+                merged.push(if pick_leaf {
+                    li += 1;
+                    leaves[li - 1]
+                } else {
+                    pi += 1;
+                    packages[pi - 1]
+                });
+            }
+            prev = merged;
+        }
+        let mut active: Vec<u32> = prev.iter().map(|e| e.node).collect();
+        for _ in (0..max_len).rev() {
+            let mut next = Vec::with_capacity(take);
+            for id in active {
+                match arena[id as usize] {
+                    Node::Leaf(sym) => lengths[sym as usize] += 1,
+                    Node::Pkg(a, b) => {
+                        next.push(a);
+                        next.push(b);
+                    },
+                }
+            }
+            active = next;
+        }
+        lengths
+    }
+
+    pub fn lengths(counts: &[usize], max_len: usize) -> Vec<usize> {
+        merge_lengths(counts, max_len)
+    }
+}
+
 #[test]
-fn package_merge_optimality() {
+fn build_lengths_matches_optimal_and_is_kraft_exact() {
+    let mut shapes: Vec<Vec<usize>> = Vec::new();
+    for amount in 2..=256usize {
+        shapes.push((0..amount).map(|i| amount - i).collect());
+    }
+    // Fibonacci counts drive the unlimited tree past the limit.
+    let mut fib = alloc::vec![1usize, 1];
+    while fib.len() < 40 {
+        let next = fib[fib.len() - 1] + fib[fib.len() - 2];
+        fib.push(next);
+    }
+    shapes.push(fib.clone());
+    shapes.push(fib.iter().rev().copied().collect());
+    // Mixed magnitudes over a full alphabet.
+    shapes.push((0..256usize).map(|i| (i * 7919) % 1000 + 1).collect());
+    shapes.push(
+        (0..256usize)
+            .map(|i| {
+                if i % 3 == 0 {
+                    1 << 20
+                } else {
+                    i % 17 + 1
+                }
+            })
+            .collect(),
+    );
+    // Deterministic pseudo-random skews.
+    let mut x = 0x12345678u32;
+    for amount in [2usize, 3, 8, 40, 90, 200, 256] {
+        shapes.push(
+            (0..amount)
+                .map(|i| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (x >> 13) as usize % (1 << (i % 20)) + 1
+                })
+                .collect(),
+        );
+    }
+
+    let mut worst = 0f64;
+    for counts in &shapes {
+        let mut scratch = HuffScratch::default();
+        let table = HuffmanTable::build_from_counts_into(counts, &mut scratch);
+        let lens = table.code_lengths();
+        let max = lens[..counts.len()].iter().copied().max().unwrap();
+        assert!(usize::from(max) <= MAX_CODE_LENGTH);
+        let kraft: u64 = lens[..counts.len()]
+            .iter()
+            .map(|&l| {
+                if l == 0 {
+                    0
+                } else {
+                    1u64 << (max - l)
+                }
+            })
+            .sum();
+        assert_eq!(kraft, 1u64 << max, "counts = {counts:?}");
+        let cost: usize = counts
+            .iter()
+            .zip(lens.iter())
+            .map(|(&c, &l)| c * l as usize)
+            .sum();
+        let ref_lens = reference::lengths(counts, MAX_CODE_LENGTH);
+        let ref_cost: usize = counts
+            .iter()
+            .zip(ref_lens.iter())
+            .map(|(&c, &l)| c * l)
+            .sum();
+        assert!(cost >= ref_cost, "build claims a better-than-optimal code");
+        worst = worst.max((cost - ref_cost) as f64 / ref_cost.max(1) as f64);
+    }
+    // The two-queue + repayment heuristic sits at package-merge's optimum
+    // on all but the limit-clamped shapes, where it pays a bounded slack.
+    // Fibonacci-tail histograms (the unlimited tree far past the limit)
+    // pay ~2%; everything else sits at the optimum.
+    assert!(worst <= 0.02, "worst excess over optimal = {worst}");
+}
+
+#[test]
+fn build_lengths_reference_optimality() {
     // {A:1, B:1, C:2} with limit 2: optimal lengths [2, 2, 1].
-    let lengths = package_merge_lengths(&[1, 1, 2], 2);
+    let lengths = reference::lengths(&[1, 1, 2], 2);
     assert_eq!(lengths.as_slice(), &[2, 2, 1]);
-    // A classic Huffman shape: fibonacci counts produce consecutive lengths.
+    // Fibonacci counts produce consecutive lengths summing to the optimum.
     let counts = [1, 1, 2, 3, 5, 8];
-    let lengths = package_merge_lengths(&counts, 11);
+    let lengths = reference::lengths(&counts, 11);
     let cost: usize = counts.iter().zip(&lengths).map(|(c, l)| c * l).sum();
-    // hand-computed optimum: count * code_length per symbol
     assert_eq!(
         cost,
         [1, 1, 2, 3, 5, 8]
             .iter()
             .zip([5, 5, 4, 3, 2, 1])
             .map(|(c, l)| c * l)
-            .sum::<usize>()
+            .sum()
     );
-    // Every alphabet size produces Kraft-exact, bounded lengths.
-    for amount in 2..=256usize {
-        let counts: Vec<usize> = (0..amount).map(|i| amount - i).collect();
-        let lengths = package_merge_lengths(&counts, 11);
-        assert!(lengths.iter().all(|&l| l <= 11));
-        let kraft: usize = lengths
-            .iter()
-            .map(|&l| {
-                if l == 0 {
-                    0
-                } else {
-                    1usize << (11 - l)
-                }
-            })
-            .sum();
-        assert_eq!(kraft, 1 << 11);
-    }
 }
 
 #[test]

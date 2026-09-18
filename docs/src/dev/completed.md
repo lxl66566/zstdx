@@ -26,7 +26,7 @@
 | Fast switched to the dfast matcher | `19077f3` |
 | Best switched to a low-spec optimal parser (16 compares / targetLength 32) | `b39a192` |
 | Opt/Ultra: full port of btopt/btultra optimal parsing | `c726dfd` |
-| boundary package-merge optimal length-limited Huffman | `aa07308` |
+| boundary package-merge optimal length-limited Huffman | `aa07308` (superseded 2026-09-18 by the two-queue `HUF_buildCTable` port; package-merge remains as the test-side optimality reference) |
 | sequence FSE table repeat mode (mode 3) | `7769bf8` |
 | frame checksum (hash feature on by default) + pledged_size + workers options | early |
 | MT encode ratio retention (overlap prefill + gain gate + periodic seeds) | `a37ebaa` |
