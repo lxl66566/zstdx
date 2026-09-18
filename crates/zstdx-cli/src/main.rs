@@ -509,15 +509,16 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Vec<OsString> {
             normalized.push(arg);
             continue;
         }
-        let digit_level = arg.to_str().filter(|s| {
-            let digits = &s[1..];
-            s.len() >= 2
-                && s.starts_with('-')
-                && !digits.is_empty()
-                && digits.bytes().all(|b| b.is_ascii_digit())
+        // strip_prefix keeps the slicing boundary-safe: an argument starting
+        // with a multibyte character (a non-ASCII path) must pass through
+        // instead of panicking on a mid-character slice.
+        let digit_level = arg.to_str().and_then(|s| {
+            let digits = s.strip_prefix('-')?;
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| OsString::from(format!("--level={digits}")))
         });
         match digit_level {
-            Some(s) => normalized.push(OsString::from(format!("--level={}", &s[1..]))),
+            Some(level) => normalized.push(level),
             None => normalized.push(arg),
         }
     }
@@ -583,5 +584,44 @@ mod tests {
             OsString::from("--"),
             OsString::from("-3"),
         ]);
+    }
+
+    /// Arguments whose first byte is not ASCII must pass through untouched:
+    /// slicing `s[1..]` on them panics inside a multibyte character
+    /// (regression: `zstdx -d 中文文件.txt.zst` aborted with exit 101).
+    #[test]
+    fn non_ascii_args_pass_through() {
+        let args = [
+            OsString::from("zstdx"),
+            OsString::from("-d"),
+            OsString::from("中文文件.txt.zst"),
+            OsString::from("-é3"),
+        ];
+        // nothing after argv[0] is a digit flag, so everything is unchanged
+        assert_eq!(normalize_args(args.to_vec()), args.to_vec());
+    }
+
+    /// Boundary shapes of the `-<digits>` recognition.
+    #[test]
+    fn digit_flag_boundaries() {
+        let normalize = |args: &[&str]| {
+            normalize_args(
+                std::iter::once("zstdx")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .skip(1)
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(normalize(&["-0"]), ["--level=0"]);
+        assert_eq!(normalize(&["-1"]), ["--level=1"]);
+        assert_eq!(normalize(&["-123"]), ["--level=123"]);
+        // bare dash, a non-digit tail and a plain number stay untouched
+        assert_eq!(normalize(&["-"]), ["-"]);
+        assert_eq!(normalize(&["-12a"]), ["-12a"]);
+        assert_eq!(normalize(&["12"]), ["12"]);
     }
 }
