@@ -328,6 +328,18 @@ const PUMP_STEP_MAX: usize = 1024 * 1024;
 // same magnitude.
 const BUF_CAP_MAX: usize = 256 * 1024 * 1024;
 
+/// The accumulate buffer's initial reserve for a schedule: a full round of
+/// in-flight jobs plus the `extra` strip/slack, capped at [`BUF_CAP_MAX`].
+/// The reserve is a scheduling scale, not a need — a huge pledge's grid
+/// (job size at the `MAX_JOB_SIZE` ceiling, a full round scaling with the
+/// worker count) would otherwise reserve workers x job_size up front and
+/// hold the first that-much input resident for the whole stream. The pump
+/// grows into the live need through `make_space` instead, whose wrap
+/// recycles at the same grid lines the unpledged path already runs at.
+fn initial_reserve(workers: u32, initial_job: usize, extra: usize) -> usize {
+    ((workers as usize).max(2) * initial_job + extra + 64 * 1024).min(BUF_CAP_MAX)
+}
+
 // Take the pooled accumulate buffer, or a fresh one, with room for `want`
 // bytes (a larger pooled buffer is kept as-is — its spare capacity only
 // helps the growth reserve). The returned length is the buffer's
@@ -712,15 +724,16 @@ impl MtEncoderCore {
         header.serialize(&mut serialized);
         // One epoch-scale window, like the burst model's reserve: enough for
         // a full round of in-flight jobs plus the strip and write-chunk
-        // slack. The size also stays inside the buffer pool's keep cap, so
-        // consecutive streams reuse the already-faulted allocation. A
-        // pending probe reserves only its staging scale (the probe head
-        // plus a first shrunk epoch); the decision re-reserves the decided
-        // schedule's scale.
+        // slack, capped at BUF_CAP_MAX (see `initial_reserve`). The size
+        // also stays inside the buffer pool's keep cap, so consecutive
+        // streams reuse the already-faulted allocation. A pending probe
+        // reserves only its staging scale (the probe head plus a first
+        // shrunk epoch); the decision re-reserves the decided schedule's
+        // scale.
         let want = if probe_pending {
-            (options.workers as usize).max(2) * MIN_JOB_SIZE + reach_probe::PROBE_SPAN + 64 * 1024
+            initial_reserve(options.workers, MIN_JOB_SIZE, reach_probe::PROBE_SPAN)
         } else {
-            (options.workers as usize).max(2) * initial_job + overlap + 64 * 1024
+            initial_reserve(options.workers, initial_job, overlap)
         };
         let (mut buf, mut init_len) = take_pooled_buf(want);
         if buf.capacity() < want {
@@ -1196,13 +1209,15 @@ impl MtEncoderCore {
     }
 
     /// Re-reserve the accumulate buffer for the decided schedule's working
-    /// scale (see `MtEncoderCore::new`).
+    /// scale, under the same cap as the initial reserve (see
+    /// `initial_reserve`) — a huge pledge's grid must not reserve
+    /// workers x job_size here either.
     fn reserve_decided(&mut self) {
         let initial_job = match self.grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
         };
-        let want = (self.workers as usize).max(2) * initial_job + self.overlap + 64 * 1024;
+        let want = initial_reserve(self.workers, initial_job, self.overlap);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
@@ -2244,5 +2259,37 @@ mod tests {
         let n = decoder.decode_all(&output, &mut out).unwrap();
         assert_eq!(n, len);
         assert!(out.iter().all(|&b| b == 0), "decoded content diverged");
+    }
+
+    /// A huge pledge must not size the initial reserve to the job grid
+    /// (workers x job_size at the MAX_JOB_SIZE ceiling — the CLI always
+    /// pledges the file size, so a 16 GiB file at -T8 would reserve
+    /// ~8 GiB up front and hold the first that-much input resident for
+    /// the whole stream). The reserve is a scheduling scale capped at
+    /// BUF_CAP_MAX; the pump grows into the live need through make_space,
+    /// whose wrap recycles at the grid lines the unpledged path already
+    /// runs at. Covers both reserve sites: the constructor and the probe
+    /// settle's re-reserve (the Balanced pledge stages a probe, so its
+    /// decided schedule re-reserves at finish).
+    #[test]
+    fn huge_pledge_caps_initial_reserve() {
+        for level in [Level::Fastest, Level::Balanced] {
+            let options = EncoderOptions::new(level)
+                .workers(8)
+                .pledged_size(Some(16 * 1024 * 1024 * 1024));
+            let mut core = MtEncoderCore::new(&options);
+            assert!(
+                core.buf.capacity() <= BUF_CAP_MAX,
+                "huge pledge reserved {} at construction ({level:?})",
+                core.buf.capacity()
+            );
+            core.finish();
+            assert!(
+                core.buf.capacity() <= BUF_CAP_MAX,
+                "huge pledge reserved {} at the probe settle ({level:?})",
+                core.buf.capacity()
+            );
+            drop(core);
+        }
     }
 }
