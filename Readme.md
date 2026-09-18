@@ -53,6 +53,29 @@ Options (checksum, pledged size, worker threads, dictionaries, forced window) ar
 
 Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming and the low-level APIs work, thread options report `Error::Unsupported`.
 
+## Performance
+
+Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = zstdx time / zstd time (<1 = zstdx is faster):
+
+| level | shape | enc ST x | enc MT8 (bulk) x | dec ST bulk x |
+|---|---|---:|---:|---:|
+| 1 | json | 1.43 | 1.16 | 0.74 |
+| 1 | text | 0.74 | 0.50 | 0.41 |
+| 1 | skewed | 0.43 | 0.78 | 0.67 |
+| 3 | json | 1.03 | 0.41 | 0.82 |
+| 3 | text | 0.52 | 0.19 | 0.30 |
+| 3 | skewed | 1.07 | 0.50 | 0.85 |
+| 9 | json | 0.85 | 0.64 | 0.73 |
+| 9 | text | 1.51 | 1.54 | 0.28 |
+| 9 | skewed | 0.04 | 0.17 | 1.02 |
+| 19 | json | 1.10 | — | 0.73 |
+| 19 | text | 0.69 | — | 0.28 |
+| 19 | skewed | 1.07 | — | 1.02 |
+
+Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers.
+
+Provenance: commit `c56418c2`, 2026-09-18, rustc 1.100.0-nightly, AMD Zen4-class 32C, checksums off both sides, interleaved medians. Full per-level tables (1-22), methodology and noise caveats: [docs/src/dev/bench/snapshot.md](docs/src/dev/bench/snapshot.md) and [matrix.md](docs/src/dev/bench/matrix.md).
+
 ## CLI
 
 The companion `zstdx-cli` crate is a flag-compatible `zstd` command line (`zstdx file` → `file.zst`, `-d` to decode, `-1`..`-19`/`--fast`, `-T0`, `-D DICT`).

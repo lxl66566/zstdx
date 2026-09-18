@@ -4,6 +4,8 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- Docs: pre-release benchmark refresh at `c56418c2` (2026-09-18, libzstd 1.5.7, Zen4 32C) — all matrix sections re-run plus the first full numeric 1-22 ladder gate; snapshot/matrix pages rewritten, a Performance section added to the Readme. Headline moves vs the 09-16 pass: text.balanced encode x3.47→1.51 ST and stream-mt8 text best/opt/ultra crossed ahead (x0.67/0.61/0.68), text.best ratio flipped denser, decode-mt json.zst3 mt16 up to 1.60× ST / 1.21× the zstd stream reference, ratio sweep geo-mean +8.67% denser over 120 cells.
+
 - CLI (zstdx-cli 0.8.2 → 0.9.0, breaking): the `compress`/`decompress` subcommands are replaced by a flag-based interface mirroring the `zstd` command line — compression is the default, `-d`/`-z`/`-t`/`-c`/`-k`/`--rm`/`-f`/`-o`/`-r`/`-q`/`-v`/`-T`/`-D`, levels via `-1`..`-19`/`--fast[=N]`/`--ultra` (default level 3, was 1), stdin→stdout streaming with no FILES, tty safeguards (no overwrite without `-f`, no binary to/from a terminal), per-file error handling with exit code 1 on any failure. Publish metadata for both crates completed (descriptions, keywords, categories, `zstdx` dependency version).
 
 - Docs: root Readme rewritten against the current API (the old copy predated
