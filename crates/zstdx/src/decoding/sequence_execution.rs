@@ -20,6 +20,14 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         .map(|seq| seq.ml as usize)
         .sum::<usize>()
         .saturating_add(scratch.literals_buffer.len());
+    // A block's output is capped by Block_Maximum_Size = min(window, 128 KiB).
+    // Enforce the cap before the reserve: a hostile sequence section claiming
+    // gigabytes of match output is rejected here instead of being sized for
+    // (libzstd rejects such blocks at blockSizeMax before execution).
+    let block_out_max = crate::common::max_block_output(scratch.buffer.window_size);
+    if total_out > block_out_max {
+        return Err(ExecuteSequencesError::BlockOutputTooLarge { max: block_out_max });
+    }
     scratch.buffer.reserve(total_out);
 
     let DecoderScratch {

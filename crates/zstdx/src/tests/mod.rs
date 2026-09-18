@@ -830,6 +830,7 @@ fn test_max_window_size_clamped_to_format_maximum() {
 }
 
 pub mod bit_reader;
+pub mod block_output_cap;
 pub mod decode_corpus;
 pub mod dict_test;
 #[cfg(feature = "std")]

@@ -62,6 +62,16 @@ impl BlockDecoder {
         }
 
         let block_type = header.block_type;
+        // Raw/RLE blocks declare their output in the header: bounded to
+        // MAX_BLOCK_SIZE there, but a frame with a small window must keep
+        // every block under min(window, MAX_BLOCK_SIZE) too (libzstd's
+        // blockSizeMax). Checked before the content is read or written.
+        let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
+        if matches!(block_type, BlockType::Raw | BlockType::RLE)
+            && header.decompressed_size as usize > block_out_max
+        {
+            return Err(DecodeBlockContentError::BlockOutputTooLarge { max: block_out_max });
+        }
         match block_type {
             BlockType::RLE => {
                 let mut buf = [0u8; 1];
@@ -115,6 +125,7 @@ impl BlockDecoder {
                                          * building new trees */
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
+        let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
         let DecoderScratch {
             huf,
             fse,
@@ -129,6 +140,7 @@ impl BlockDecoder {
             block_content_buffer,
             huf,
             literals_buffer,
+            block_out_max,
             &mut source,
         )?;
 
@@ -168,6 +180,14 @@ impl BlockDecoder {
         view: crate::decoding::flat_buffer::FlatView,
         headroom: bool,
     ) -> Result<usize, DecompressBlockError> {
+        // Enforce the per-block output cap by bounding the executor's
+        // target: a block may never produce more than
+        // min(window, MAX_BLOCK_SIZE) bytes, so a sequence section claiming
+        // beyond that is stopped by the existing budget checks against the
+        // bounded slice. When the bounded slice was the binding bound (the
+        // real target had more room), a TargetTooSmall from below is the
+        // block cap, not a small caller buffer, and is reclassified below.
+        let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
         let DecoderScratch {
             huf,
             fse,
@@ -177,8 +197,18 @@ impl BlockDecoder {
             block_content_buffer,
             ..
         } = workspace;
-        let (seq_section, raw) =
-            Self::parse_sections(header, block_content_buffer, huf, literals_buffer, source)?;
+        let (seq_section, raw) = Self::parse_sections(
+            header,
+            block_content_buffer,
+            huf,
+            literals_buffer,
+            block_out_max,
+            source,
+        )?;
+
+        let real_out_len = out.len();
+        let block_limit = (*written).saturating_add(block_out_max).min(real_out_len);
+        let out = &mut out[..block_limit];
 
         if seq_section.num_sequences != 0 {
             // The flat executor's inline 16-byte literal copies may read up
@@ -195,7 +225,15 @@ impl BlockDecoder {
                 view,
                 offset_hist,
                 headroom,
-            )?;
+            )
+            .map_err(|e| match e {
+                DecompressBlockError::ExecuteSequencesError(
+                    ExecuteSequencesError::TargetTooSmall,
+                ) if block_limit < real_out_len => {
+                    DecompressBlockError::BlockOutputTooLarge { max: block_out_max }
+                },
+                other => other,
+            })?;
         } else {
             if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
@@ -224,11 +262,14 @@ impl BlockDecoder {
     /// decoding them into actual sequences is the caller's job, so the flat
     /// path can fuse it with execution. Takes the scratch fields individually
     /// so the returned borrow coexists with further field borrows.
+    /// `block_out_max` is the per-block output cap the literals section is
+    /// validated against before its size is used for allocation.
     fn parse_sections<'a>(
         header: &BlockHeader,
         block_content_buffer: &'a mut Vec<u8>,
         huf: &mut super::scratch::HuffmanScratch,
         literals_buffer: &mut Vec<u8>,
+        block_out_max: usize,
         source: &mut impl Read,
     ) -> Result<(SequencesHeader, &'a [u8]), DecompressBlockError> {
         block_content_buffer.resize(header.content_size as usize, 0);
@@ -238,6 +279,13 @@ impl BlockDecoder {
 
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
+        // The regenerated size is itself bounded by the block maximum
+        // (libzstd rejects litSize > blockSizeMax); enforce before the
+        // literals buffer is sized from it — an RLE section can claim up to
+        // 1 MiB from a single payload byte.
+        if section.regenerated_size as usize > block_out_max {
+            return Err(DecompressBlockError::BlockOutputTooLarge { max: block_out_max });
+        }
         let raw = &raw[bytes_in_literals_header as usize..];
         vprintln!(
             "Found {} literalssection with regenerated size: {}, and compressed size: {:?}",

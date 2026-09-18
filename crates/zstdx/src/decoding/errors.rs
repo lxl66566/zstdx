@@ -124,6 +124,15 @@ pub enum DecompressBlockError {
     DecodeSequenceError(#[from] DecodeSequenceError),
     #[error("{0:?}")]
     ExecuteSequencesError(#[from] ExecuteSequencesError),
+    /// The block's output would exceed the per-block cap of
+    /// `min(window_size, MAX_BLOCK_SIZE)` (`crate::common::max_block_output`).
+    /// Covers an oversized literals section, an oversized Raw/RLE block, and
+    /// the flat executor hitting the block-bounded target.
+    #[error(
+        "decompressed block output exceeds the per-block maximum of {max} bytes (min(window, 128 \
+         KiB))"
+    )]
+    BlockOutputTooLarge { max: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +149,13 @@ pub enum DecodeBlockContentError {
     ReadError { step: BlockType, source: Error },
     #[error("{0:?}")]
     DecompressBlockError(#[from] DecompressBlockError),
+    /// A Raw/RLE block whose declared output exceeds the per-block cap of
+    /// `min(window_size, MAX_BLOCK_SIZE)` (`crate::common::max_block_output`).
+    #[error(
+        "decompressed block output exceeds the per-block maximum of {max} bytes (min(window, 128 \
+         KiB))"
+    )]
+    BlockOutputTooLarge { max: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -247,6 +263,15 @@ pub enum ExecuteSequencesError {
     NotEnoughBytesForSequence { wanted: usize, have: usize },
     #[error("Illegal offset: 0 found")]
     ZeroOffset,
+    /// The block's claimed decompressed output exceeds the per-block cap of
+    /// `min(window_size, MAX_BLOCK_SIZE)` (`crate::common::max_block_output`).
+    /// Checked before the block-level reserve, so a hostile sequence section
+    /// can no longer trigger a gigabyte-sized allocation.
+    #[error(
+        "decompressed block output exceeds the per-block maximum of {max} bytes (min(window, 128 \
+         KiB))"
+    )]
+    BlockOutputTooLarge { max: usize },
     /// Flat-output execution ran out of space in the caller's target buffer.
     #[error("Not enough space in the target buffer for this block")]
     TargetTooSmall,
