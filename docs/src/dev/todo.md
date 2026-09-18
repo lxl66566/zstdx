@@ -2,6 +2,8 @@
 
 > Only remaining workable items. Landed work lives in [perf/](perf/) and [completed](completed.md); falsified directions are in [negative.md](negative.md) — do not resurrect the falsified *mechanism*; changing its premise (algorithm class, window regime, corpus shape) reopens the goal.
 >
+> Item numbers are stable labels: deleted numbers (5, 9-13) were landed or folded. Older pages citing "todo 9-13" refer to the archived list (see this file's git history).
+>
 > Gaps with no workable direction left (identified floors or falsified levers; attribution in [perf/](perf/), falsifications in [negative](negative/)): json.fast x1.09 — the concat/writer tails are latency-bound, the SIMD histogram ceiling is ~0.02% wall, the dfast scan's excess is register-budget-bound; json.best x1.30-1.45 / opt/ultra x1.30-1.33 — per-node codegen floor and event volume 1.2-2.1× by construction (short of an event-side rethink), skewed.best ceiling ~2.16-2.22; 100MB binary ST encode fastest x1.44-1.55 (insert_covered store floor + the FSE arithmetic round) / balanced x1.55 (latency-bound walk) — no removable live value left in either scan loop; random fastest/fast x0.84-0.90 (minor); text.balanced bulk — the DUBT head parse's ~30% post-abort share has no safe lever (a shallower head parses worse and hands the chain worse reps; the stream-mt tail landed with the far-dead strip cap, 735 MiB/s = 87% of its bulk ceiling). Gap numbers: 2026-09-16 matrix snapshot ([bench/snapshot](bench/snapshot.md)).
 
 ## P0 · Structural

@@ -176,30 +176,32 @@ if let Some(rest) = dec.collect() {
 | `dict_builder` | — | dictionary training (`zstdx::dict`) |
 | `fuzz_exports` | — | internal: exposes `fse`/`huff0` for fuzzing |
 
+`seq_dump` and `job_trace` are internal instrumentation features for the bench tooling, not a stable interface.
+
 Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming, and the low-level APIs work, thread options error with [`Error::Unsupported`].
 
 ## CLI
 
-```
-zstdx-cli compress <FILE> [OUTPUT] [-l LEVEL] [-D DICT]
-zstdx-cli decompress <FILE.zst> [OUTPUT] [-D DICT]
-```
+The `zstdx-cli` binary mirrors the `zstd` command line: flag-based, no subcommands.
+Compression is the default, `-d` decompresses, and with no FILES (or `-`) data streams stdin → stdout.
 
-- Default output names: `FILE.zst` when compressing, the archive name without extension when decompressing.
-- `-l` is the numeric level 0–22, default 1 (0 stores uncompressed).
-- `-D` compresses against a dictionary; decompressing such a frame requires the same `-D`.
-- Shows a progress bar and the final size ratio.
+- Default output names: `FILE.zst` when compressing, the name without the `.zst` suffix when decompressing; inputs are kept unless `--rm`.
+- Levels: `-1`..`-19` (default 3), `--fast[=N]` for negative levels, `--ultra` unlocks 20–22.
+- `-T N` sets worker threads (`-T0` = all cores); `-D DICT` (de)compresses against a dictionary.
+- `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity.
+- A progress bar shows only on an interactive stderr; it never pollutes pipes.
 
 ```sh
-zstdx-cli compress trace.log                    # → trace.log.zst, level 1
-zstdx-cli compress -l 19 data.csv out.zst
-zstdx-cli compress -D api.dict -l 9 req.json    # dictionary-compressed
-zstdx-cli decompress out.zst                    # → out
+zstdx trace.log                          # → trace.log.zst, level 3
+zstdx -19 -o data.zst data.csv
+zstdx -D api.dict -9 req.json            # dictionary-compressed
+zstdx -d out.zst                         # → out
+zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
 ```
 
 ## Current limitations
 
-- Encoder speed trails libzstd on most levels (bulk decode is ahead; measured numbers in [Current Status](dev/status.md)).
+- Encoder speed is split by tier and corpus shape (ahead on several tiers, behind on the json fastest scan core and the best-tier tree core); bulk decode is ahead across the board. Measured numbers in [Current Status](dev/status.md).
 - No superblock, preSplit, or C FFI.
 - `compat` streaming encoders reject multithreading (the native streaming API supports it).
 

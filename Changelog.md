@@ -4,6 +4,20 @@ This document records the changes made between versions, starting with version 0
 
 # After 0.9.0 (Current)
 
+- CLI (zstdx-cli 0.8.2 → 0.9.0, breaking): the `compress`/`decompress` subcommands are replaced by a flag-based interface mirroring the `zstd` command line — compression is the default, `-d`/`-z`/`-t`/`-c`/`-k`/`--rm`/`-f`/`-o`/`-r`/`-q`/`-v`/`-T`/`-D`, levels via `-1`..`-19`/`--fast[=N]`/`--ultra` (default level 3, was 1), stdin→stdout streaming with no FILES, tty safeguards (no overwrite without `-f`, no binary to/from a terminal), per-file error handling with exit code 1 on any failure. Publish metadata for both crates completed (descriptions, keywords, categories, `zstdx` dependency version).
+
+- Docs: root Readme rewritten against the current API (the old copy predated
+  the encoder ladder, dictionaries and the MT codecs and quoted years-old
+  speed figures); the user guide's limitations section aligned with the
+  measured status; the dev handbook cleaned up (stale todo cross-references,
+  superseded package-merge rounds, the comparison page's snapshot-era
+  summary corrected). No API change: doc comments only — the legacy
+  `encoding::compress`/`FrameCompressor::compress` convenience functions now
+  document that drain write errors panic (the fallible-io entry points are
+  `bulk`/`stream`), and doc examples were added to `bulk::decompress`,
+  `bulk::decompress_to_buffer`, `stream::decode_all` and
+  `stream::copy_decode`.
+
 - Encoder: dictionary-seeded literal blocks no longer pay a fresh-table
   description in the incompressibility gates — both literal gates drop
   their flat description term while the frame's huffman table still

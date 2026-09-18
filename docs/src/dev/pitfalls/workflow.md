@@ -39,10 +39,7 @@
 
 ## Toolchain / environment
 
-- WSL: `stat /mnt/c/...` random I/O errors (statx acting up, cargo/git dead across /mnt/c) → read file contents via cat/pipes; **WSL reading large files on /mnt/c can hang the entire VM** (recovered with wsl --shutdown); keep the analysis environment on native ext4; WSL auto-shutdown on idle wipes /tmp (put artifacts in ~); `wsl -e` errors on empty args and nested quotes break — write complex commands as .sh and run `wsl bash <path>`.
-- The Windows side has no grep/sed/head -c (use rg/powershell); `find` is Windows find; `;` is not a command separator in cmd; powershell bulk -replace: watch the `` `n `` escaping and regex collateral damage (as_ref was once replaced along with the target).
 - Three pitfalls of parsing zstd frames with python: in `(b1<<8)|b2+0x7f00`, `+` binds tighter than `|`; the literals-header size-field bit width misremembered; `sort -rn` mixed in kernel symbols. **Before writing an analysis tool, check its field definitions against a known-correct decoder.**
-- tar extraction should use the default (it overwrites); `--skip-old-files` skips already-existing files — this once kept the WSL side running old code.
 - Background task output: avoid tail/head in pipes; persist the full output to disk, then grep.
 - gungraun comparisons need explicit `--save-baseline=X` / `--baseline=X`; the default "No change" compares the run against itself. Baseline names reject `-` (use `_`).
 
