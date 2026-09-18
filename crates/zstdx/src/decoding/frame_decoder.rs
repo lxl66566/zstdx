@@ -172,6 +172,20 @@ impl FrameDecoderState {
         Ok(())
     }
 
+    /// Verify the frame's decoded output length against the header's
+    /// declared Frame_Content_Size (libzstd reports the mismatch at the
+    /// frame tail as a size error). Absent field: the size is unknown,
+    /// nothing to check.
+    fn verify_content_size(&self, actual: u64) -> Result<(), FrameDecoderError> {
+        if self.frame_header.descriptor.declares_content_size() {
+            let declared = self.frame_header.frame_content_size();
+            if declared != actual {
+                return Err(FrameDecoderError::ContentSizeMismatch { declared, actual });
+            }
+        }
+        Ok(())
+    }
+
     /// Verify the frame checksum once the trailer word has been read. The
     /// ring path hashes on drain, so any bytes it has not delivered yet are
     /// folded in here (the flat paths hash per block and the ring stays
@@ -406,6 +420,7 @@ impl FrameDecoder {
 
             if block_header.last_block {
                 state.frame_finished = true;
+                state.verify_content_size(state.decoder_scratch.buffer.total_output())?;
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     source
@@ -529,6 +544,7 @@ impl FrameDecoder {
 
             if block_header.last_block {
                 state.frame_finished = true;
+                state.verify_content_size(state.flat.produced() as u64)?;
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     source
@@ -714,6 +730,7 @@ impl FrameDecoder {
 
             if block_header.last_block {
                 state.frame_finished = true;
+                state.verify_content_size(written as u64)?;
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     source
@@ -883,6 +900,7 @@ impl FrameDecoder {
 
                         if block_header.last_block {
                             state.frame_finished = true;
+                            state.verify_content_size(state.flat.produced() as u64)?;
                             if state.frame_header.descriptor.content_checksum_flag()
                                 && mt_source.len() >= 4
                             {
@@ -935,6 +953,8 @@ impl FrameDecoder {
 
                         if block_header.last_block {
                             state.frame_finished = true;
+                            state
+                                .verify_content_size(state.decoder_scratch.buffer.total_output())?;
                             if state.frame_header.descriptor.content_checksum_flag() {
                                 // if there are enough bytes handle this here. Else the block at the
                                 // start of this function will handle it at the next call

@@ -181,6 +181,14 @@ impl FrameDescriptor {
         self.0 >> 6
     }
 
+    /// Whether the header carries a `Frame_Content_Size` field: the flag
+    /// encodes a nonzero field width, and flag 0 with the single-segment bit
+    /// still implies the 1-byte field. Only a declaring header's content size
+    /// binds the decoder; without the field the size is unknown.
+    pub fn declares_content_size(&self) -> bool {
+        self.frame_content_size_flag() != 0 || self.single_segment_flag()
+    }
+
     /// This bit is reserved for some future feature, a compliant decoder **must ensure**
     /// that this value is set to zero.
     #[expect(dead_code)]

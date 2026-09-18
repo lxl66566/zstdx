@@ -186,6 +186,11 @@ pub enum FrameDecoderError {
     FailedToReadChecksum(Error),
     #[error("Frame checksum mismatch; expected 0x{expected:08X}, calculated 0x{calculated:08X}")]
     ChecksumMismatch { expected: u32, calculated: u32 },
+    #[error(
+        "Frame_Content_Size mismatch; the header declared {declared} bytes but the frame decoded \
+         to {actual}"
+    )]
+    ContentSizeMismatch { declared: u64, actual: u64 },
     #[error("Decoder must initialized or reset before using it")]
     NotYetInitialized,
     #[error("Decoder encountered error while initializing: {0}")]
