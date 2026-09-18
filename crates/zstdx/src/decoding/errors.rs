@@ -161,6 +161,15 @@ pub enum DictionaryDecodeError {
         crate::decoding::dictionary::MAGIC_NUM
     )]
     BadMagicNum { got: [u8; 4] },
+    #[error(
+        "Dictionary repeat offset {index} is {rep}, but it must be in 1..={dict_content_size} \
+         (the dictionary's content size)"
+    )]
+    InvalidRepeatOffset {
+        index: usize,
+        rep: u32,
+        dict_content_size: usize,
+    },
     #[error("{0:?}")]
     FSETableError(#[from] FSETableError),
     #[error("{0:?}")]

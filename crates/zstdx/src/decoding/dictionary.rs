@@ -144,6 +144,19 @@ impl Dictionary {
         let offset3 = raw_tables[8..12].try_into().expect("optimized away");
         let offset3 = u32::from_le_bytes(offset3);
 
+        // Each repeat offset must point into the dictionary content
+        // (libzstd's ZSTD_loadDEntropy check).
+        let dict_content_size = raw_tables.len() - 12;
+        for (index, rep) in [offset1, offset2, offset3].into_iter().enumerate() {
+            if rep == 0 || rep as usize > dict_content_size {
+                return Err(DictionaryDecodeError::InvalidRepeatOffset {
+                    index,
+                    rep,
+                    dict_content_size,
+                });
+            }
+        }
+
         new_dict.offset_hist[0] = offset1;
         new_dict.offset_hist[1] = offset2;
         new_dict.offset_hist[2] = offset3;
@@ -155,39 +168,80 @@ impl Dictionary {
     }
 }
 
-#[test]
-fn truncated_dictionary() {
-    use alloc::vec;
-
-    // First case: Valid dictionary magic number, but missing the 4-byte dictionary ID.
-    let raw = [0x37, 0xa4, 0x30, 0xec];
-    let _ = Dictionary::decode_dict(&raw);
-
-    // Second case: Valid dictionary magic number, non-zero dictionary ID, table bytes known to
-    // parse successfully. But fewer than 12 bytes remain for the 3 offset-history u32 values..
-    let mut raw = vec![0u8; 8];
-    raw[0] = 0x37;
-    raw[1] = 0xa4;
-    raw[2] = 0x30;
-    raw[3] = 0xec;
-    raw[4] = 0x01;
-    raw[5] = 0x21;
-    raw[6] = 0x23;
-    raw[7] = 0x47;
-
-    let raw_tables = [
+/// Entropy-table bytes of a dictionary known to parse; the rep offsets and
+/// content follow them in the fixtures below.
+#[cfg(test)]
+fn fixture_tables() -> &'static [u8] {
+    &[
         54, 16, 192, 155, 4, 0, 207, 59, 239, 121, 158, 116, 220, 93, 114, 229, 110, 41, 249, 95,
         165, 255, 83, 202, 254, 68, 74, 159, 63, 161, 100, 151, 137, 21, 184, 183, 189, 100, 235,
         209, 251, 174, 91, 75, 91, 185, 19, 39, 75, 146, 98, 177, 249, 14, 4, 35, 0, 0, 0, 40, 40,
         20, 10, 12, 204, 37, 196, 1, 173, 122, 0, 4, 0, 128, 1, 2, 2, 25, 32, 27, 27, 22, 24, 26,
         18, 12, 12, 15, 16, 11, 69, 37, 225, 48, 20, 12, 6, 2, 161, 80, 40, 20, 44, 137, 145, 204,
         46, 0, 0, 0, 0, 0, 116, 253, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    ]
+}
 
-    raw.extend_from_slice(&raw_tables);
+/// A dictionary fixture: magic + id + entropy tables + the three rep offsets
+/// + `content` bytes.
+#[cfg(test)]
+fn fixture_dict(reps: [u32; 3], content: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&[0x37, 0xa4, 0x30, 0xec, 0x01, 0x21, 0x23, 0x47]);
+    raw.extend_from_slice(fixture_tables());
+    for rep in reps {
+        raw.extend_from_slice(&rep.to_le_bytes());
+    }
+    raw.extend_from_slice(content);
+    raw
+}
+
+#[test]
+fn truncated_dictionary() {
+    // First case: Valid dictionary magic number, but missing the 4-byte dictionary ID.
+    let raw = [0x37, 0xa4, 0x30, 0xec];
+    let _ = Dictionary::decode_dict(&raw);
+
+    // Second case: Valid dictionary magic number, non-zero dictionary ID, table bytes known to
+    // parse successfully. But fewer than 12 bytes remain for the 3 offset-history u32 values..
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&[0x37, 0xa4, 0x30, 0xec, 0x01, 0x21, 0x23, 0x47]);
+
+    raw.extend_from_slice(fixture_tables());
 
     // Fewer than 12 bytes remain for the 3 offset-history u32 values.
     raw.extend_from_slice(&[3, 0, 0, 0, 10, 0, 0, 0, 0xef, 0xcd, 0xab]);
 
     let _ = Dictionary::decode_dict(&raw);
+}
+
+#[test]
+fn repeat_offsets_must_reference_dict_content() {
+    use crate::decoding::errors::DictionaryDecodeError;
+
+    // Offsets 1, 2, 4 all fall inside the 4 content bytes.
+    let raw = fixture_dict([1, 2, 4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let dict = Dictionary::decode_dict(&raw).unwrap();
+    assert_eq!(dict.offset_hist, [1, 2, 4]);
+    assert_eq!(dict.dict_content, [0xaa, 0xbb, 0xcc, 0xdd]);
+
+    // Zero offsets and offsets past the content are rejected at load time
+    // (libzstd's ZSTD_loadDEntropy check).
+    for (index, reps) in [
+        (0usize, [0, 2, 4]),
+        (1, [1, 0, 4]),
+        (2, [1, 2, 0]),
+        (0, [5, 2, 4]),
+        (2, [1, 2, 5]),
+    ] {
+        let raw = fixture_dict(reps, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        match Dictionary::decode_dict(&raw) {
+            Err(DictionaryDecodeError::InvalidRepeatOffset {
+                index: got_index,
+                dict_content_size: 4,
+                ..
+            }) => assert_eq!(got_index, index),
+            other => panic!("reps {reps:?}: expected InvalidRepeatOffset, got {other:?}"),
+        }
+    }
 }
