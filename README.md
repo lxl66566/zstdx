@@ -1,16 +1,13 @@
 # Zstdx (a pure rust zstd format implementation)
 
-[![Released API docs](https://docs.rs/zstdx/badge.svg)](https://docs.rs/zstdx)
-[![CI](https://github.com/killingspark/zstd-rs/workflows/CI/badge.svg)](https://github.com/killingspark/zstd-rs/actions?query=workflow%3ACI)
-
-A pure Rust implementation of the Zstandard compression format, as defined in [RFC8878](https://www.rfc-editor.org/rfc/rfc8878.pdf). Forked from KillingSpark/zstd-rs (ruzstd) with a from-scratch encoder; the decoder and encoder both cover the full format and interoperate with the reference C implementation in both directions.
+A pure Rust implementation of the Zstandard compression format, focus on performance. Forked from KillingSpark/zstd-rs (ruzstd) with a from-scratch encoder; the decoder and encoder both cover the full format and interoperate with the reference C implementation in both directions.
 
 - Decoder: complete, including dictionaries, multi-frame/skippable-frame streams, and checksum verification on every path.
 - Encoder: the full numeric level ladder 0–22 (fast/dfast/chain/btlazy2/btopt/btultra strategy families modeled on libzstd's `clevels.h`), checksums, dictionaries (raw-content and `zstd --train`-style formatted), long-distance matching, and multithreaded compression.
-- Multithreaded *decompression* (restart-point parallel decode), which libzstd does not have.
+- Multithreaded _decompression_ (restart-point parallel decode), which libzstd does not have.
 - `no_std` + `alloc` capable; a `zstdx::compat` layer mirrors the [`zstd` crate](https://docs.rs/zstd)'s API shape (numeric levels, `io::Result`) for easy porting.
 
-Performance is tracked against libzstd in `docs/src/dev/` ([snapshot](docs/src/dev/bench/snapshot.md)); per-change records live in `Changelog.md`.
+Performance is tracked against libzstd in `docs/src/dev/` ([snapshot](docs/src/dev/bench/snapshot.md)).
 
 ## Usage
 
@@ -45,6 +42,7 @@ Options (checksum, pledged size, worker threads, dictionaries, forced window) ar
 
 ## Feature flags
 
+<!-- prettier-ignore -->
 | Feature | Default | Effect |
 |---|---|---|
 | `std` | ✓ | `std::io` traits, threads, `compat` |
@@ -57,6 +55,7 @@ Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming and the lo
 
 Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = zstdx time / zstd time (<1 = zstdx is faster):
 
+<!-- prettier-ignore -->
 | level | shape | enc ST x | enc MT8 (bulk) x | dec ST bulk x |
 |---|---|---:|---:|---:|
 | 1 | json | 1.43 | 1.16 | 0.74 |
@@ -74,7 +73,7 @@ Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = z
 
 Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers.
 
-Provenance: commit `c56418c2`, 2026-09-18, rustc 1.100.0-nightly, AMD Zen4-class 32C, checksums off both sides, interleaved medians. Full per-level tables (1-22), methodology and noise caveats: [docs/src/dev/bench/snapshot.md](docs/src/dev/bench/snapshot.md) and [matrix.md](docs/src/dev/bench/matrix.md).
+Full per-level tables (1-22), methodology and noise caveats: [docs/src/dev/bench/snapshot.md](docs/src/dev/bench/snapshot.md) and [matrix.md](docs/src/dev/bench/matrix.md).
 
 ## CLI
 
@@ -92,10 +91,6 @@ Tests take two forms:
 The fuzz targets live in `crates/zstdx-fuzz` (`decode`, `decode_dict`, `encode`, `encode_stream`, `interop`, `fse`, `huff0`). From that directory, use `cargo +nightly fuzz run decode` (or another target) to run the fuzzer.
 
 If the fuzzer finds a crash it will be saved to the artifacts dir by the fuzzer. Run `cargo test -p zstdx artifacts` to run the artifacts tests. This will tell you where the decoder panics exactly. If you are able to fix the issue please feel free to do a pull request. If not please still submit the offending input and I will see how to fix it myself.
-
-# Contributing
-
-Contributions will be published under the same MIT license as this project. Please make an entry in the Changelog.md file when you make a PR.
 
 ## AI Contributions
 

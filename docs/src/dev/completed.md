@@ -1,9 +1,10 @@
 # Completed · Features and Infrastructure
 
-> The full performance-optimization list has been merged by topic into the [performance optimization](../perf/decoding.md) pages (each entry carries its commit and measured effect); per-change records are authoritative in `Changelog.md`. This page records features, API, correctness milestones, and infrastructure.
+> The full performance-optimization list has been merged by topic into the [performance optimization](../perf/decoding.md) pages (each entry carries its commit and measured effect). This page records features, API, correctness milestones, and infrastructure.
 
 ## API surface
 
+<!-- prettier-ignore -->
 | Item | commit |
 |---|---|
 | root-level `Level` enum replacing CompressionLevel (removed the dead Default/Better/Best variants that were never implemented) | `55daf71` |
@@ -20,6 +21,7 @@
 
 ## Level ladder and encoding features
 
+<!-- prettier-ignore -->
 | Item | commit |
 |---|---|
 | Fast/Balanced/Best tiers landed (hash-chain matcher + clevels-aligned parameters) | `f8cc66d` |
@@ -34,6 +36,7 @@
 
 ## Multithreading
 
+<!-- prettier-ignore -->
 | Item | commit |
 |---|---|
 | bulk MT encoding (overlap jobs, 2/4/8 workers at 2.05×/3.95×/7.55×) | `fd931a1` |
@@ -42,6 +45,7 @@
 
 ## Correctness milestones
 
+<!-- prettier-ignore -->
 | bug | commit |
 |---|---|
 | decoder-side frame checksum auto-verification (previously the caller compared via getters) | `81d2119` |
@@ -58,7 +62,7 @@
 ## Infrastructure
 
 - **Interleaved A/B harness**: round-by-round alternation, warmup, time budget (`--budget-ms`/BENCH_BUDGET_MS), median/mad statistics; migrated into the zstdx-bench crate together with the tool family (`src/common.rs`). `dc82c29`
-- **bench tool family** (now the collection in `crates/zstdx-bench`, subcommands in [methodology](../bench/methodology.md)): matrix (full dec/enc × bulk/stream/MT matrix + roundtrip gate + checksum overhead row + both-side worker scalability, filtered by `--shape/--level/--workers/--mt-workers`), small, files, prof (dec/enc/enc-stream), dump (deterministic snapshots), corrupt, mtcheck, seqstats, prefill. matrix originated in `c922b34` `b1dd010`; consolidation commits in the Changelog.
+- **bench tool family** (now the collection in `crates/zstdx-bench`, subcommands in [methodology](../bench/methodology.md)): matrix (full dec/enc × bulk/stream/MT matrix + roundtrip gate + checksum overhead row + both-side worker scalability, filtered by `--shape/--level/--workers/--mt-workers`), small, files, prof (dec/enc/enc-stream), dump (deterministic snapshots), corrupt, mtcheck, seqstats, prefill. matrix originated in `c922b34` `b1dd010`.
 - **Deterministic regression probe**: dump byte-level snapshot comparison (a free A/B signal for "changes that must not alter output") + corrupt (random corruption, 0 panic, covers the flat path). `318d8f7`
 - corpus generator tracked in the repo.
 - ad-hoc profiling tools (enc/dec/enc-stream, mtcheck, prefill, seqstats) promoted to zstdx-bench subcommands (previously untracked examples).

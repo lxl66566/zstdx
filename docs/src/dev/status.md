@@ -8,6 +8,7 @@
 
 Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `clevels.h` large-source table — see `LEVEL_PARAMS` in `encoding/match_generator/params.rs`); `Level::from_zstd(n)` maps exactly, negative levels clamp to 1. The named tiers alias representative rows:
 
+<!-- prettier-ignore -->
 | Tier (=level) | ≈zstd | Matcher strategy | Window | Notes |
 |---|---|---|---|---|
 | Uncompressed (0) | 0 | raw block | — | |
@@ -24,6 +25,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 
 ### Codec paths
 
+<!-- prettier-ignore -->
 | Capability | Status |
 |---|---|
 | slice/bulk codec | ✅ zero-copy encoding + thread_local state pool; decoding writes directly into the flat output |
@@ -39,6 +41,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 
 ## Completeness vs libzstd (subjective estimates, for targeting)
 
+<!-- prettier-ignore -->
 | Dimension | Estimate | Basis |
 |---|---|---|
 | decode features/correctness | ~90% | spec compliance, dictionary decode, corpus+fuzz |
@@ -52,6 +55,7 @@ Note: the [comparison page](comparison.md)'s completeness assessment is frozen a
 
 ## Code structure (crates/zstdx/src)
 
+<!-- prettier-ignore -->
 | Module | Contents |
 |---|---|
 | `bit_io/` | bit readers/writers (reverse bit reader BitReader, BitWriter) |
@@ -67,4 +71,4 @@ Note: the [comparison page](comparison.md)'s completeness assessment is frozen a
 
 ## Verification discipline (every commit)
 
-Atomic commits (single-line msg) + fmt + Changelog entry + all-green debug/release/no-default tests + full-corpus interop roundtrip against libzstd (CLI) + corruption smoke (random corruption, 0 panic) + dump differential checks (deterministic output as a free regression probe) + perf A/B as back-to-back same-machine reruns via git stash. Details and counterexamples in [engineering and benchmarking methodology](dev/pitfalls/workflow.md).
+Atomic commits (single-line msg) + fmt + all-green debug/release/no-default tests + full-corpus interop roundtrip against libzstd (CLI) + corruption smoke (random corruption, 0 panic) + dump differential checks (deterministic output as a free regression probe) + perf A/B as back-to-back same-machine reruns via git stash. Details and counterexamples in [engineering and benchmarking methodology](dev/pitfalls/workflow.md).

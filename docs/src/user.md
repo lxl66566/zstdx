@@ -10,7 +10,7 @@ Library:
 
 ```toml
 [dependencies]
-zstdx = "0.9"
+zstdx = "0.1"
 ```
 
 CLI:
@@ -81,16 +81,16 @@ let original = compat::bulk::decompress(&compressed, 0)?;
 
 `Level` is the numeric libzstd level (0–22); [`Level::from_zstd(i32)`] maps exactly (negatives clamp to 1, values above 22 to 22). Named constants alias representative levels:
 
-| Constant | Level | Strategy (libzstd term) |
-|---|---|---|
-| `Level::Uncompressed` | 0 | raw blocks, stored |
-| `Level::Fastest` (default) | 1 | single-probe hash |
-| `Level::Fast` | 3 | dual-table hash |
-| `Level::Balanced` | 9 | hash chain, two lazy steps |
-| `Level::Best` | 13 | binary tree, two lazy steps |
-| `Level::Opt` | 17 | optimal parser |
-| `Level::Ultra` | 19 | optimal parser, densest |
-| `Level::MAX` | 22 | |
+| Constant                   | Level | Strategy (libzstd term)     |
+| -------------------------- | ----- | --------------------------- |
+| `Level::Uncompressed`      | 0     | raw blocks, stored          |
+| `Level::Fastest` (default) | 1     | single-probe hash           |
+| `Level::Fast`              | 3     | dual-table hash             |
+| `Level::Balanced`          | 9     | hash chain, two lazy steps  |
+| `Level::Best`              | 13    | binary tree, two lazy steps |
+| `Level::Opt`               | 17    | optimal parser              |
+| `Level::Ultra`             | 19    | optimal parser, densest     |
+| `Level::MAX`               | 22    |                             |
 
 Every integer in between selects a real parameter row; the default is `Fastest`.
 
@@ -169,12 +169,12 @@ if let Some(rest) = dec.collect() {
 
 ## Feature flags
 
-| Feature | Default | Effect |
-|---|---|---|
-| `std` | ✓ | `std::io` traits, threads, `compat` |
-| `hash` | ✓ | XXH64 frame checksums (write + verify) |
-| `dict_builder` | — | dictionary training (`zstdx::dict`) |
-| `fuzz_exports` | — | internal: exposes `fse`/`huff0` for fuzzing |
+| Feature        | Default | Effect                                      |
+| -------------- | ------- | ------------------------------------------- |
+| `std`          | ✓       | `std::io` traits, threads, `compat`         |
+| `hash`         | ✓       | XXH64 frame checksums (write + verify)      |
+| `dict_builder` | —       | dictionary training (`zstdx::dict`)         |
+| `fuzz_exports` | —       | internal: exposes `fse`/`huff0` for fuzzing |
 
 `seq_dump` and `job_trace` are internal instrumentation features for the bench tooling, not a stable interface.
 

@@ -15,14 +15,14 @@ zstd  = { version = "0.13.2", features = ["zstdmt"] }
 zstdx = { path = "../zstdx", features = ["dict_builder"] }
 
 [features]
-# Enables `seqstats --ref-frame` (decoder-side sequence dump). Off by
-# default: the dump hook sits in the decode hot loop, so it must never be
-# compiled into timing builds (`cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...`).
-seq_dump = ["zstdx/seq_dump"]
 # Enables `jobdecomp` (encoder-side per-job cost spans). Off by default:
 # the span hooks ride the job paths (`cargo run --release -p zstdx-bench
 # --features job_trace -- jobdecomp ...`).
 job_trace = ["zstdx/job_trace"]
+# Enables `seqstats --ref-frame` (decoder-side sequence dump). Off by
+# default: the dump hook sits in the decode hot loop, so it must never be
+# compiled into timing builds (`cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...`).
+seq_dump  = ["zstdx/seq_dump"]
 
 [lints]
 workspace = true

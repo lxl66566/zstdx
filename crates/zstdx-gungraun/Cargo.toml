@@ -6,15 +6,6 @@ rust-version = "1.89"
 description  = "Deterministic valgrind-instruction-count benchmarks comparing zstdx against libzstd"
 publish      = false
 
-[dependencies]
-# Reference implementation every benchmark compares against; also used by
-# the setup helpers to build interop frames and gate roundtrips.
-zstd  = "0.13.2"
-zstdx = { path = "../zstdx" }
-
-[dev-dependencies]
-gungraun = "0.19.4"
-
 [lib]
 # Keep cargo bench from running the lib's (empty) unittest target, which
 # would choke on runner arguments like --save-baseline.
@@ -23,24 +14,33 @@ bench = false
 # `test = false` keeps `cargo test --workspace` from executing the benches on
 # hosts without valgrind (e.g. Windows); they only run under `cargo bench`.
 [[bench]]
+harness = false
 name    = "decode"
-harness = false
 test    = false
 
 [[bench]]
+harness = false
 name    = "encode"
-harness = false
 test    = false
 
 [[bench]]
+harness = false
 name    = "stream"
-harness = false
 test    = false
 
 [[bench]]
-name    = "small"
 harness = false
+name    = "small"
 test    = false
+
+[dependencies]
+# Reference implementation every benchmark compares against; also used by
+# the setup helpers to build interop frames and gate roundtrips.
+zstd  = "0.13.2"
+zstdx = { path = "../zstdx" }
+
+[dev-dependencies]
+gungraun = "0.19.4"
 
 [lints]
 workspace = true

@@ -17,6 +17,7 @@ Pitfalls:
 
 A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench/dev tools no longer live inside zstdx's examples (also eliminating the pitfall of the no-default-features check recompiling examples over the release build). The heavy matrix runs rarely; day-to-day iteration runs filtered subsets.
 
+<!-- prettier-ignore -->
 | Subcommand | Purpose |
 |---|---|
 | `ratio` | Compression-ratio sweep: one deterministic pass per cell over every level × bulk/stream × st/mt (120 cells full corpus), zstdx vs libzstd, roundtrip-gated; cells run concurrently on a rayon pool (`--parallel`, default 8 — sizes only, ST cells still use the ST encoder), geo-mean Δ% summary printed last (tail-friendly); sizes diff cleanly across runs/builds |
@@ -30,7 +31,7 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 | `seqstats` | Sequence statistics and entropy lower bound |
 | `prefill` | prefill_window micro (`--shape/--level` selects) |
 
-Common harness (`src/common.rs` in the crate): per-round interleaving, warmup, time budget (`--budget-ms`, default 500ms/side; equivalent to the old BENCH_BUDGET_MS env, which still works), median/mad statistics. The crate's Readme documents every subcommand's usage.
+Common harness (`src/common.rs` in the crate): per-round interleaving, warmup, time budget (`--budget-ms`, default 500ms/side; equivalent to the old BENCH_BUDGET_MS env, which still works), median/mad statistics. The crate's README documents every subcommand's usage.
 
 Ratio-bench workflow note: run `ratio` after every encoder-touching change; it is single-pass and parallel (~1 min full sweep), and its output is fully deterministic — `diff` two captures to attribute size changes. For changes that must not alter output at all, `dump` + `cmp -r` remains the byte-exact gate.
 

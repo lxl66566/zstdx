@@ -6,21 +6,21 @@ Development-log handbook for the `ext` branch (the deep-optimization fork of zst
 
 ## Division of Labor Among Documents
 
+<!-- prettier-ignore -->
 | Document | Role | Update model |
 |---|---|---|
-| `Changelog.md` (in git) | Upstream-facing per-change record | One entry per commit |
 | `docs/` (this handbook) | Topical experience: technical designs, completed work, todos, negative results, pitfalls, performance comparisons | Archived after each batch of work |
 | Root `*.md` (not in git) | Process logs: plans, progress, raw A/B data | Already archived; kept for the record, deletable at any time |
 
 ## Reading Conventions
 
 - **Round numbering is ignored**. The original documents' "Round N / rN / Batch N / M1 / D6 / E9" labels overlap across documents and are non-contiguous; this handbook is organized by topic and preserves sequence only where causality makes it meaningful.
-- **Every improvement item was cross-checked against the Changelog** (as of `27b91cf`, 2026-09-10): items listed in process docs that have already landed no longer appear in the [todo list](dev/todo.md), which keeps only remaining gaps vs libzstd and candidate directions; don't-retry advice lives in [negative.md](dev/negative.md) and the pitfall logs.
 - **Every performance figure carries its measurement timestamp**. The test machine (AMD Zen4 32C) has ±10% noise plus a slow drift phase, so absolute values are not comparable across time windows; only interleaved A/B comparisons are trusted. Numbers generally trace to the corresponding Changelog entry or the wide matrix (the latter is older in time; see the bench page notes).
 - Commit short hashes can be inspected with `git show <hash>`.
 
 ## Glossary
 
+<!-- prettier-ignore -->
 | Term | Meaning |
 |---|---|
 | Fastest / Fast / Balanced / Best / Opt / Ultra | Compression-level ladder (≈zstd 1 / 3-5 / 6-9 / 10-15 / 16-17 / 18-22) |
@@ -39,6 +39,7 @@ Development-log handbook for the `ext` branch (the deep-optimization fork of zst
 
 ## Source Document → Handbook Mapping
 
+<!-- prettier-ignore -->
 | Original document | Content | Archived into |
 |---|---|---|
 | Early-Optimization.md | Combined summary of rounds 1-3 (mostly decoding + encoder matcher rewrite) | perf/decoding, perf/matchers, pitfalls, negative |

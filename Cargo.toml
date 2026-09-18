@@ -35,11 +35,11 @@ wildcard_imports         = "allow"
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
-[profile.release]
-codegen-units = 1
-
 # Callgrind attributes counts to source symbols; the gungraun benches need
 # them, and stripping must stay off for the same reason.
 [profile.bench]
 debug = true
 strip = false
+
+[profile.release]
+codegen-units = 1

@@ -13,7 +13,7 @@ outside the library so dev-only dependencies never leak into it.
   primary verdict (robust to clock drift). Per-side time budget:
   `--budget-ms` (default 500 ms), or the `BENCH_BUDGET_MS` env var.
 - Deterministic, instruction-count based benchmarks (valgrind) live in the
-  sibling crate [`zstdx-gungraun`](../zstdx-gungraun/Readme.md).
+  sibling crate [`zstdx-gungraun`](../zstdx-gungraun/README.md).
 
 Level vocabulary everywhere: the six ladder levels `fastest/fast/balanced/
 best/opt/ultra`, bench-paired with libzstd at the same numeric levels

@@ -9,7 +9,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx-cli");
+const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
 
 /// A scratch directory that removes itself on drop.
 struct Scratch(PathBuf);
