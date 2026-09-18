@@ -29,10 +29,11 @@ fn test_dict_parsing() {
     ];
     raw.extend(&raw_tables[..]);
 
-    // offset history 3,10,0x00ABCDEF
+    // offset history 3,10,25 (every rep must fall inside the 25 content bytes,
+    // mirroring libzstd's ZSTD_loadDEntropy check)
     raw.extend(vec![3, 0, 0, 0]);
     raw.extend(vec![10, 0, 0, 0]);
-    raw.extend(vec![0xef, 0xcd, 0xab, 0]);
+    raw.extend(vec![25, 0, 0, 0]);
 
     // just some random bytes
     let raw_content = vec![
@@ -49,7 +50,7 @@ fn test_dict_parsing() {
     );
     assert_eq!(
         dict.offset_hist,
-        [3, 10, 0x00abcdef],
+        [3, 10, 25],
         "offset history did not get parsed correctly"
     );
 
@@ -62,6 +63,25 @@ fn test_dict_parsing() {
         Dictionary::decode_dict(&raw).is_err(),
         "The dict got decoded but the magic num was incorrect!"
     );
+
+    // a rep of 0 or one past the content size is rejected at load time
+    raw[0] = 0x37;
+    raw[1] = 0xa4;
+    raw[2] = 0x30;
+    raw[3] = 0xec;
+    let corrupt_reps: [&[u8]; 2] = [
+        &[0, 0, 0, 0, 10, 0, 0, 0, 25, 0, 0, 0], // rep1 == 0
+        &[3, 0, 0, 0, 10, 0, 0, 0, 26, 0, 0, 0], // rep3 > content size
+    ];
+    for reps in corrupt_reps {
+        let mut corrupt = raw[..raw.len() - 12 - raw_content.len()].to_vec();
+        corrupt.extend_from_slice(reps);
+        corrupt.extend_from_slice(&raw_content);
+        assert!(
+            Dictionary::decode_dict(&corrupt).is_err(),
+            "dict with reps {reps:?} must be rejected"
+        );
+    }
 }
 
 #[test]

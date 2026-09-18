@@ -81,6 +81,13 @@ fn decompress_literals(
     let source = &source[bytes_read as usize..];
 
     if num_streams == 4 {
+        // The quarter split needs a non-degenerate fourth segment
+        // (libzstd's MIN_LITERALS_FOR_4_STREAMS).
+        if section.regenerated_size < 6 {
+            return Err(err::LiteralsTooSmallFor4Streams {
+                got: section.regenerated_size as usize,
+            });
+        }
         // build jumptable
         if source.len() < 6 {
             return Err(err::MissingBytesForJumpHeader { got: source.len() });
@@ -98,9 +105,9 @@ fn decompress_literals(
             });
         }
 
-        // decode 4 streams. The format splits the literals into four equal parts
-        //(the fourth may be smaller), so stream k decodes exactly segment * (k+1)
-        // bytes (the last stream the remainder).
+        // decode 4 streams. The format splits the literals into four equal
+        // parts (the fourth may be smaller), so stream k decodes exactly
+        // `segment` bytes (the last stream the remainder).
         let total_out = section.regenerated_size as usize;
         let segment = total_out.div_ceil(4);
         let stream_bounds = [
@@ -109,6 +116,7 @@ fn decompress_literals(
             (jump2, jump3),
             (jump3, source.len()),
         ];
+        let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
         // Fast interleaved path: needs one 8 byte window per stream and enough output
         // for the 4-way interleave to make progress (stream 4 must start before the end)
@@ -134,7 +142,15 @@ fn decompress_literals(
                 )?;
             }
         } else {
-            for &(start, end) in &stream_bounds {
+            // Slow path: same per-stream segment contract as the fast path
+            // (and libzstd's op/olimit + endOfDStream checks). A stream that
+            // encodes past its quarter would shift every later segment's
+            // output position, so it is corruption even when the totals
+            // still add up.
+            let tl = scratch.table.max_num_bits as isize;
+            let mut seg_start = 0;
+            for (&(start, end), &seg_end) in stream_bounds.iter().zip(seg_end.iter()) {
+                let seg_len = seg_end - seg_start;
                 let stream = &source[start..end];
                 let mut decoder = HuffmanDecoder::new(&scratch.table);
                 let mut br = BitReaderReversed::new(stream);
@@ -155,16 +171,25 @@ fn decompress_literals(
                 }
                 decoder.init_state(&mut br);
 
-                while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
+                let mut produced = 0;
+                while produced < seg_len && br.bits_remaining() > -tl {
                     target.push(decoder.decode_symbol());
                     decoder.next_state(&mut br);
+                    produced += 1;
                 }
-                if br.bits_remaining() != -(scratch.table.max_num_bits as isize) {
-                    return Err(DecompressLiteralsError::BitstreamReadMismatch {
-                        read_til: br.bits_remaining(),
-                        expected: -(scratch.table.max_num_bits as isize),
+                if produced != seg_len {
+                    return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                        decoded: produced,
+                        expected: seg_len,
                     });
                 }
+                if br.bits_remaining() != -tl {
+                    return Err(DecompressLiteralsError::BitstreamReadMismatch {
+                        read_til: br.bits_remaining(),
+                        expected: -tl,
+                    });
+                }
+                seg_start = seg_end;
             }
         }
 
@@ -612,4 +637,112 @@ fn decompress_4streams_interleaved_x2(
     finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::decode_literals;
+    use crate::{
+        blocks::literals_section::{LiteralsSection, LiteralsSectionType},
+        decoding::{errors::DecompressLiteralsError, scratch::HuffmanScratch},
+    };
+
+    // Minimal huffman table description: direct weights [2, 1]. Sum 3 ->
+    // max_num_bits 2, the implicit last weight closes the table. Symbol 0
+    // owns a 1-bit code, so a stream of 1-bits decodes to symbol 0 at one
+    // bit per symbol.
+    const TABLE: [u8; 2] = [0x81, 0x21];
+
+    /// A 1-byte stream that decodes `symbols` copies of symbol 0 and then
+    /// exhausts exactly: `7 - symbols` padding zeros, the end marker, then
+    /// `symbols` one-bits, read MSB-first.
+    fn stream_byte(symbols: usize) -> u8 {
+        assert!((1..=6).contains(&symbols));
+        ((1usize << (symbols + 1)) - 1) as u8
+    }
+
+    /// A 4-stream literals section whose streams are 1 byte each (below the
+    /// interleaved fast path's 8-byte minimum, so the slow path runs).
+    fn four_stream_section(regenerated: u32, streams: [u8; 4]) -> (LiteralsSection, Vec<u8>) {
+        let mut source = Vec::new();
+        source.extend_from_slice(&TABLE);
+        source.extend_from_slice(&[1, 0, 1, 0, 1, 0]); // jumptable: 3 streams of 1 byte
+        source.extend_from_slice(&streams);
+        let section = LiteralsSection {
+            regenerated_size: regenerated,
+            compressed_size: Some(source.len() as u32),
+            num_streams: Some(4),
+            ls_type: LiteralsSectionType::Compressed,
+        };
+        (section, source)
+    }
+
+    fn decode(
+        scratch: &mut HuffmanScratch,
+        section: &LiteralsSection,
+        source: &[u8],
+    ) -> Result<Vec<u8>, DecompressLiteralsError> {
+        let mut target = Vec::new();
+        decode_literals(section, scratch, source, &mut target)?;
+        Ok(target)
+    }
+
+    #[test]
+    fn slow_path_accepts_well_formed_streams() {
+        let (section, source) = four_stream_section(8, [stream_byte(2); 4]);
+        let mut scratch = HuffmanScratch::new();
+        let out = decode(&mut scratch, &section, &source).unwrap();
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&b| b == 0), "every symbol is 0");
+    }
+
+    #[test]
+    fn slow_path_rejects_stream_decoding_past_its_quarter() {
+        // Stream 1 encodes 3 symbols, stream 3 only 1: totals still add up to
+        // the regenerated size, but the per-segment layout is broken (the old
+        // total-only check accepted this).
+        let (section, source) = four_stream_section(8, [
+            stream_byte(3),
+            stream_byte(2),
+            stream_byte(1),
+            stream_byte(2),
+        ]);
+        let mut scratch = HuffmanScratch::new();
+        match decode(&mut scratch, &section, &source) {
+            Err(DecompressLiteralsError::BitstreamReadMismatch { .. }) => {},
+            other => panic!("expected BitstreamReadMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slow_path_rejects_stream_decoding_short_of_its_quarter() {
+        let (section, source) = four_stream_section(8, [
+            stream_byte(1),
+            stream_byte(2),
+            stream_byte(3),
+            stream_byte(2),
+        ]);
+        let mut scratch = HuffmanScratch::new();
+        match decode(&mut scratch, &section, &source) {
+            Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                decoded: 1,
+                expected: 2,
+            }) => {},
+            other => panic!("expected DecodedLiteralCountMismatch(1, 2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn four_streams_reject_regenerated_size_below_six() {
+        // The quarter split is degenerate below 6 bytes (libzstd's
+        // MIN_LITERALS_FOR_4_STREAMS); reject before touching the streams.
+        let (section, source) = four_stream_section(4, [stream_byte(1); 4]);
+        let mut scratch = HuffmanScratch::new();
+        match decode(&mut scratch, &section, &source) {
+            Err(DecompressLiteralsError::LiteralsTooSmallFor4Streams { got: 4 }) => {},
+            other => panic!("expected LiteralsTooSmallFor4Streams, got {other:?}"),
+        }
+    }
 }
