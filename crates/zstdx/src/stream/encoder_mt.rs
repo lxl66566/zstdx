@@ -2415,7 +2415,6 @@ mod tests {
         // The caller (serve_queue) owns the counts: publish must not touch
         // them.
         assert_eq!(core.shared.n_incomplete.load(Ordering::Acquire), 0);
-||||||| 7cf9f828
     }
 
 
