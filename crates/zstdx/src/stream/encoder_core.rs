@@ -256,14 +256,18 @@ impl FrameEncoderCoreSt {
         self.out_read < self.output.len()
     }
 
-    /// Hand the encoded bytes to `w`, keeping the output buffer's allocation.
+    /// Hand the encoded bytes to `w`, keeping the output buffer's
+    /// allocation. A failed write keeps the undelivered tail for the
+    /// caller's retry (see [`write_pending_output`]).
     pub(crate) fn write_output_to(
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
-        let res = w.write_all(&self.output[self.out_read..]);
-        self.output.clear();
-        self.out_read = 0;
+        let res = write_pending_output(&self.output, &mut self.out_read, w);
+        if res.is_ok() {
+            self.output.clear();
+            self.out_read = 0;
+        }
         res
     }
 
@@ -309,6 +313,35 @@ impl FrameEncoderCoreSt {
                 .raw_out(&mut self.output, self.state.matcher.get_last_space(), 0);
         }
     }
+}
+
+/// Write the pending `output[*out_read..]` to `w` through incremental
+/// `write` calls, advancing `out_read` by the accepted amount. On failure
+/// the undelivered tail stays in place, so the caller's retry resumes where
+/// this stopped: `write_all` cannot report how much a partial write
+/// accepted, and clearing the buffer on its error would drop encoded bytes
+/// the writer never received. Shared by both frame-encoder cores.
+pub(crate) fn write_pending_output(
+    output: &[u8],
+    out_read: &mut usize,
+    w: &mut impl crate::io::Write,
+) -> Result<(), crate::io::Error> {
+    while *out_read < output.len() {
+        match w.write(&output[*out_read..]) {
+            Ok(0) => {
+                // No progress with bytes remaining: write_all's verdict.
+                #[cfg(feature = "std")]
+                return Err(crate::io::Error::from(crate::io::ErrorKind::WriteZero));
+                #[cfg(not(feature = "std"))]
+                return Err(crate::io::Error::from(crate::io::ErrorKind::WriteAllEof));
+            },
+            Ok(n) => *out_read += n,
+            // write_all retries Interrupted; so does this loop.
+            Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// The incremental frame-encoding core shared by the stream encoders: the
