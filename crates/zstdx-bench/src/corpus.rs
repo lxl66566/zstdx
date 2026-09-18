@@ -1,6 +1,9 @@
 //! Shared corpus access, shapes/levels vocabulary and correctness gates.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::ValueEnum as _;
 use zstdx::{DecoderOptions, EncoderOptions, Level, decoding::FrameDecoder};
@@ -158,6 +161,22 @@ pub fn load(name: &str) -> (Vec<u8>, Vec<u8>) {
     let compressed = fs::read(dir.join(name)).unwrap();
     let raw = fs::read(dir.join(format!("{}.raw", name.split('.').next().unwrap()))).unwrap();
     (compressed, raw)
+}
+
+/// Raw counterpart of a corpus-style path: strip a trailing `.zst*`
+/// extension, then try the bare stem and `<stem>.raw` (so both the
+/// `z000033.zst` and `json.zst3` naming conventions resolve).
+pub fn raw_counterpart(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .rsplit_once('.')
+        .filter(|(_, ext)| ext.starts_with("zst"))
+        .map(|(stem, _)| stem)?;
+    let bare = path.with_file_name(stem);
+    let with_raw = path.with_file_name(format!("{stem}.raw"));
+    [bare, with_raw]
+        .into_iter()
+        .find(|p| p.is_file() && p != path)
 }
 
 pub fn load_raw(shape: Shape) -> Vec<u8> {

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Generate benchmark corpus into bench/corpus: raw data shapes + zstd-compressed
-# variants at levels 1/3/9. Usage: bash bench/gen_corpus.sh
+# variants at levels 1/3/9 (all shapes) and 19 (json/text/skewed, for the matrix
+# dec-st section). Usage: bash bench/gen_corpus.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p corpus
@@ -65,5 +66,13 @@ for f in *.raw; do
 			zstd -q -$lvl -k -o "$name.zst$lvl" "$f"
 		fi
 	done
+done
+
+# deep variant for the matrix dec-st section (curated to json/text/skewed;
+# -T0 because -19 is single-thread-slow)
+for name in json text skewed; do
+	if [ ! -f "$name.zst19" ]; then
+		zstd -q -T0 -19 -k -o "$name.zst19" "$name.raw"
+	fi
 done
 ls -la

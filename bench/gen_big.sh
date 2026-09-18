@@ -20,4 +20,11 @@ while read -r f; do
 done < <(find -L /run/current-system/sw/bin -type f -size +100k 2>/dev/null \
   | while read -r f; do head -c4 "$f" 2>/dev/null | grep -q ELF && echo "$f"; done)
 head -c 33554432 bench/big/dll100.raw > bench/big/dll32.raw
+# compressed variants so the decode A/B can run on the same payloads
+# (matrix --mode dec-st --file bench/big/dll100.zstN)
+for lvl in 1 3 9 19; do
+  if [ ! -f bench/big/dll100.zst$lvl ]; then
+    zstd -q -T0 -$lvl -k -o bench/big/dll100.zst$lvl bench/big/dll100.raw
+  fi
+done
 echo "dll100.raw: $(stat -c%s bench/big/dll100.raw) bytes; dll32.raw: $(stat -c%s bench/big/dll32.raw) bytes"

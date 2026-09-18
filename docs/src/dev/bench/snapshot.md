@@ -1,10 +1,12 @@
 # Perf vs zstd crate · current snapshot (2026-09-18)
 
 > Pre-release full pass at `c56418c2` (one machine, one corpus, same flags; 78 commits after the 09-16 pass at `dedd267d` — the huff0 two-queue tree build + one-form table materialization, the FSE CTable rewrite (C-shaped build, pooled 32 B tables, NCount at C parity), the mt-stream worker pool + shared finish-tail prefix fill + mid-size far-class captures, the matcher work (fused tables, dict grids, cold-head probe step, landslide abort) and the block-splitter estimates all landed in between — so both speed and ratio columns moved by design). Raw tables + per-section commands: [matrix.md](matrix.md), including the new full 1-22 numeric ladder (T7). Comparison target: zstd crate / libzstd 1.5.7 (zstdmt), rustc 1.100.0-nightly, AMD Zen4-class 32C (Eng Sample 100-000000870-32_Y). Ladder pairs numeric levels (fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19). Caveats: ±10% noise between runs; per-side budget 1s (500ms on the full ladder); interleaved medians, spreads in the raw tables.
+>
+> 2026-09-19 additions at the `a1176a9c` tree, same machine/flags: the decode sweep gained the `.zst19` rows (T1) and the 100 MB system-binary payload `dll100` (T1b decode / T3b encode, via `matrix --file` + `bench/gen_big.sh`); the re-run corpus cells reproduced the 09-18 tables within noise.
 
 ## Headline
 
-- **Decode ST bulk**: we win 10/11 cells (x 0.23-0.85), parity on skewed.zst9 (1.02); absolute 652-11476 MiB/s ours. The honest decode gap remains the streaming column (zstd's bulk API is a slow wrapper). Unchanged from 09-16 — the ST decode core had no commits.
+- **Decode ST bulk**: we win 13/14 cells (x 0.23-0.85), parity on skewed.zst9 (1.02); the 09-19 `.zst19` rows extend the sweep — all three won (json 0.62, text 0.27, skewed 0.67, the last flipping the zst9 parity to a clear win). Absolute 652-11476 MiB/s ours. The honest decode gap remains the streaming column (zstd's bulk API is a slow wrapper). Unchanged from 09-16 — the ST decode core had no commits.
 - **Decode ST streaming** (core-vs-core): zstd wins every compressible shape — json x1.27-1.37, skewed x1.10-1.32, text x1.09-1.24; we win random (x0.81) and hold zeros (1.00). Unchanged (the fused sequence loop, serial-chain limit).
 - **Encode ST**: json fastest/fast x1.43/1.03, **balanced ahead at x0.85 carrying +21% density**, best/opt/ultra x1.45/1.12/1.10 at ratio parity or denser (json.opt 9 B ahead of zstd-17). text: fastest/fast x0.74/0.52 (we win); **best/opt/ultra ahead x0.92/0.60/0.69, and text.best now denser too (386.39 vs 385.90 — the 09-16 −0.23% residue closed by the cold-head probe step)**; balanced x1.51 — down from x3.47, the cold-start DUBT head's per-frame cost cut by the entropy-build rewrite, still +1.65% denser than zstd-9. skewed: low tiers ahead or parity (best x2.15, opt/ultra x1.00/1.07 — opt crossed from 1.05). random/zeros: we win at every tier (up to 300× on incompressible high tiers); the 09-16 zeros.balanced/best fixed-cost regression is fully recovered (x0.053/0.020, was 0.108/0.098) and random.balanced flipped back ahead (x0.70, was 1.31).
 - **Encode MT**: json.fastest.mt8 x1.16 the one remaining clean zstd mt win (noisy 0.84-1.67; mt16 ours x0.35); every other cell ahead except text.balanced x1.51-1.54 — halved from x2.81-2.85 and no longer width-independent (826 MiB/s at mt8 vs 444). Our cold-pool mt16 json.fast (3376) still beats zstd's warm-pool reference (1593).
@@ -21,14 +23,19 @@
 | json.zst1 | 1741 | 1289 | 0.74 | 1728 | 2193 | 1.27 |
 | json.zst3 | 1442 | 1173 | 0.82 | 1373 | 1875 | 1.37 |
 | json.zst9 | 1737 | 1269 | 0.73 | 1627 | 2149 | 1.32 |
+| json.zst19 | 2162 | 1334 | 0.62 | 2151 | 2597 | 1.20 |
 | text.zst1 | 5538 | 2275 | 0.41 | 6073 | 7543 | 1.24 |
 | text.zst3 | 8455 | 2536 | 0.30 | 10072 | 11115 | 1.10 |
 | text.zst9 | 9289 | 2572 | 0.28 | 11150 | 12110 | 1.09 |
+| text.zst19 | 9411 | 2514 | 0.27 | 11035 | 12163 | 1.10 |
 | skewed.zst1 | 2309 | 1547 | 0.67 | 2581 | 2838 | 1.10 |
 | skewed.zst3 | 1251 | 1059 | 0.85 | 1266 | 1534 | 1.21 |
 | skewed.zst9 | 652 | 663 | 1.02 | 603 | 794 | 1.32 |
+| skewed.zst19 | 2174 | 1456 | 0.67 | 2385 | 2706 | 1.14 |
 | random.zst3 | 8903 | 2335 | 0.27 | 11082 | 8943 | 0.81 |
 | zeros.zst3 | 11476 | 2643 | 0.23 | 12876 | 12921 | 1.00 |
+
+The `.zst19` rows are from the 2026-09-19 re-run (the rest of this table is the 09-18 pass, reproduced within noise that day; raw table in [matrix.md](matrix.md) T1). Level-19 frames decode faster than zst9 on json (fewer, longer sequences) and flip skewed from the zst9 parity to a clear win; text is flat from zst9 on (tiling already saturates match length).
 
 ## Encode ST bulk (checksums off; x = ours_time/zstd_time; pairs 1/3/9/13/17/19)
 
@@ -122,6 +129,6 @@ Geo-mean Δ over 120 cells **+8.67%**; per mode bulk-st +1.42% / bulk-mt +11.08%
 5. **json opt/ultra x1.10-1.12, skewed.ultra x1.07** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](todo.md)); skewed.opt crossed to x1.00.
 6. **json chain rows 5-12** (full-ladder T7): x1.17-2.84, the weakest speed band — the deep-chain rows lose to libzstd's chain on both axes while our own level-9 row beats them; a ladder-tuning question, not a matcher-core one.
 7. **MT decode**: text flat ~0.98×, skewed below the zstd stream ref — decoder-side piece-parallel stage B to spend the ramp guarantee (todo 1's open half).
-8. **dll100 large-binary ST** (09-16 doc baselines; floor in [todo](todo.md)): fastest x~1.44-1.55, fast x1.16, balanced x~1.55 — matcher-side instruction counts; emit live-set shrink the one untried lever.
+8. **dll100 large-binary ST** (re-measured 2026-09-19, raw tables in [matrix.md](matrix.md) T1b/T3b; floor in [todo](todo.md)): encode fastest x1.37, fast x1.04 (closed from x~1.44-1.55/1.16 by the emit-inline/ramp/const-log landings), balanced x1.53 at −8.4% size — matcher-side instruction counts; emit live-set shrink the one untried lever. Decode bulk wins every level 1-19 (x0.81-0.89, 1143-1530 MiB/s); stream x1.31-1.38 as everywhere.
 9. **Small band 64K-1M** fastest x~1.36-1.49 (this run: json-64K/1M x1.42/1.36, text x1.39/1.49; level 3 at parity 0.99-1.14; level 9 ahead 0.58-0.91 except the 1M cells x1.04-1.07) (todo 4).
 10. **Ratio residues**: json.fast mt −0.12..−0.14% (new this run), skewed.opt −0.07% (near-tie), dictionary small-payload +3% parse-side (todo 6).

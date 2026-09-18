@@ -19,6 +19,7 @@
   - `matrix --mode enc-stream --workers 8 --mt-workers 8 --budget-ms 1000` — wall 237 s
   - `matrix --mode enc-st --full-ladder --budget-ms 500` — wall 3905 s (the release gate; levels 19-22 on json/skewed run 3 rounds of multi-second compressions per side)
   - `small --level 1,3,9 --shape json,text` — wall 28 s
+- 2026-09-19 additions (commit `a1176a9c` tree + `--file`/`.zst19` bench support, same machine/flags, `--budget-ms 1000`): `matrix --mode dec-st --shape json,text,skewed --file bench/big/dll100.zst{1,3,9,19}` and `matrix --mode enc-st --file bench/big/dll100.raw --level fastest,fast,balanced`. The re-run corpus cells reproduced the 09-18 tables within noise (worst drift text.balanced x1.51→1.47); dll100.raw was regenerated the same day (`bench/gen_big.sh`, size unchanged at 104857600).
 
 ## T1 decode ST (bulk + streaming, 64KiB pulls; MiB/s of raw)
 
@@ -29,16 +30,30 @@
 | json.zst1 | 1741 | 1289 | 0.74 | 1728 | 2193 | 1.27 |
 | json.zst3 | 1442 | 1173 | 0.82 | 1373 | 1875 | 1.37 |
 | json.zst9 | 1737 | 1269 | 0.73 | 1627 | 2149 | 1.32 |
+| json.zst19 | 2162 | 1334 | 0.62 | 2151 | 2597 | 1.20 |
 | text.zst1 | 5538 | 2275 | 0.41 | 6073 | 7543 | 1.24 |
 | text.zst3 | 8455 | 2536 | 0.30 | 10072 | 11115 | 1.10 |
 | text.zst9 | 9289 | 2572 | 0.28 | 11150 | 12110 | 1.09 |
+| text.zst19 | 9411 | 2514 | 0.27 | 11035 | 12163 | 1.10 |
 | skewed.zst1 | 2309 | 1547 | 0.67 | 2581 | 2838 | 1.10 |
 | skewed.zst3 | 1251 | 1059 | 0.85 | 1266 | 1534 | 1.21 |
 | skewed.zst9 | 652 | 663 | 1.02 | 603 | 794 | 1.32 |
+| skewed.zst19 | 2174 | 1456 | 0.67 | 2385 | 2706 | 1.14 |
 | random.zst3 | 8903 | 2335 | 0.27 | 11082 | 8943 | 0.81 |
 | zeros.zst3 | 11476 | 2643 | 0.23 | 12876 | 12921 | 1.00 |
 
-Reproduces the 09-16 column within ±0.03 on every cell: the ST decode core had no perf commits in this window. The honest core-vs-core gap stays the stream column (zstd's bulk API is a slow wrapper; our own stream-vs-bulk spread ≤2%).
+Reproduces the 09-16 column within ±0.03 on every cell: the ST decode core had no perf commits in this window. The honest core-vs-core gap stays the stream column (zstd's bulk API is a slow wrapper; our own stream-vs-bulk spread ≤2%). The `.zst19` rows are from the 2026-09-19 re-run (corpus `.zst19` trio added to `gen_corpus.sh`): level-19 frames decode faster than zst9 on json (2162 vs 1737 MiB/s — fewer, longer sequences) and flip skewed from the zst9 parity to a clear win, while text is flat from zst9 on (tiling already saturates match length).
+
+## T1b large-binary decode (`--file bench/big/dll100.zstN`, 2026-09-19; MiB/s of raw)
+
+100 MB of concatenated system ELF binaries (`bench/gen_big.sh`, ~DLL-like code+data+strings mix); same interleaved harness, cells appended via `matrix --mode dec-st --file <path>`.
+
+| file | bulk ours | bulk zstd | bulk x | stream ours | stream zstd | stream x |
+|---|---:|---:|---:|---:|---:|---:|
+| dll100.zst1 | 1143 | 1013 | 0.89 | 1160 | 1515 | 1.31 |
+| dll100.zst3 | 1231 | 1090 | 0.89 | 1245 | 1714 | 1.38 |
+| dll100.zst9 | 1530 | 1238 | 0.81 | 1524 | 2084 | 1.37 |
+| dll100.zst19 | 1329 | 1131 | 0.85 | 1332 | 1826 | 1.37 |
 
 ## T2 decode MT scaling (solo; libzstd has no MT decode; MiB/s)
 
@@ -89,6 +104,18 @@ json.zst3 scaling improved again: mt16 = **1.60× our ST = 1.21× the zstd strea
 The movers vs 09-16, all attributed: **text.balanced x3.47→1.51** (ours 499→1093 MiB/s) — the best-tier cold-head probe step and the huff0/FSE build rewrite cut the per-frame fixed costs that dominated this cell; ratio still +1.65% denser (384.64 vs 378.41). **text.best ratio flipped denser** (386.39 vs 385.90; the 09-16 sweep's −0.15..−0.23% residue closed by the cold-head probe step). **random.balanced x1.31→0.70** — the reach probe's incompressibility gate now probes the job's own history (the 09-16 table's double-parse attribution, fixed). **zeros.balanced/best recovered** to 32802/42189 MiB/s (09-16: 16080/8515; the per-frame fixed-cost regression closed 09-17, now also past the post-fix re-measure's 41768/42918). skewed.opt crossed to parity/ahead (x1.00, was 1.05). json.balanced x0.76→0.85 (ours 159→142) is the one backward move — inside the huff0/FSE rewrite window, still well ahead with +21% density; watch item.
 
 Checksum overhead (ours, on/off time ratio): json.fast 1.03, text.fast 0.85.
+
+## T3b large-binary encode (`--file bench/big/dll100.raw`, 2026-09-19; checksums off; MiB/s of raw)
+
+Same 100 MB system-ELF payload as T1b, ladder tiers 1/3/9. The 09-16 baselines (snapshot's old item 8: fastest x~1.44-1.55, fast x1.16, balanced x~1.55) predate the emit-inline/ramp/const-log landings.
+
+| cell | ours MiB/s | ours ratio | zstd MiB/s | zstd ratio | x | 09-16 x |
+|---|---:|---:|---:|---:|---:|---:|
+| dll100.fastest | 392 | 2.15 | 536 | 2.19 | 1.37 | ~1.44-1.55 |
+| dll100.fast | 411 | 3.47 | 429 | 3.40 | 1.04 | 1.16 |
+| dll100.balanced | 99 | 5.05 | 151 | 4.62 | 1.53 | ~1.55 |
+
+fastest/fast closed most of their gap (x1.37/1.04); balanced stays the open cell (x1.53) but carries −8.4% size (r 5.05 vs 4.62); fastest is +1.8% larger, fast −2.2% denser.
 
 ## T4 encode MT bulk (1 pass; cold pool per call both sides; MiB/s)
 

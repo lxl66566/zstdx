@@ -7,7 +7,8 @@ outside the library so dev-only dependencies never leak into it.
 - Build/run: `cargo run --release -p zstdx-bench -- <subcommand> [flags]`
   (always `--release`; debug builds measure nothing).
 - Corpus prerequisite: `bash bench/gen_corpus.sh` once (32 MiB × 5 shapes:
-  `json` / `text` / `skewed` / `random` / `zeros`, plus `.zst1/3/9` variants).
+  `json` / `text` / `skewed` / `random` / `zeros`, plus `.zst1/3/9` variants
+  and `.zst19` for json/text/skewed).
 - Timing subcommands share an interleaved A/B harness (`src/common.rs`):
   both sides alternate round by round and the per-round **ratio** is the
   primary verdict (robust to clock drift). Per-side time budget:
@@ -76,6 +77,28 @@ then select their number; the mt/stream sections keep their tier subsets).
 The full 1-22 ladder is extremely heavy: never run it during daily
 iteration — run it once before a release. Combine with `--shape`/`--level`/
 `--budget-ms` to narrow smoke passes.
+
+`--file <path>` (repeatable) appends payload files outside the corpus: a
+`.zst*` file adds `dec-st` cells (verified against the raw counterpart
+found next to it — stem or `<stem>.raw`), any other file adds `enc-st`
+cells as raw input. Other sections reject `--file`. See "Large payloads"
+below for the 100 MB+ recipe.
+
+### Large payloads (100 MB+)
+
+`bash bench/gen_big.sh` concatenates real system ELF binaries (code+data+
+strings mix, ~DLL-like shape) gathered from `/run/current-system/sw/bin`
+into `bench/big/dll100.raw` (~100 MB) plus `.zst1/3/9/19` variants and a
+32 MiB `dll32.raw` subset (gitignored; edit the script's `find` root for
+non-NixOS systems). Any explicit file path works as a `--file` payload, so
+ad-hoc large binaries need no corpus changes:
+
+```bash
+cargo run --release -p zstdx-bench -- matrix --mode enc-st \
+    --file bench/big/dll100.raw --level fastest,fast,balanced
+cargo run --release -p zstdx-bench -- matrix --mode dec-st \
+    --file bench/big/dll100.zst3 --file bench/big/dll100.zst9
+```
 
 ### `small` — small-payload encode
 

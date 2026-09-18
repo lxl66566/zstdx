@@ -4,7 +4,7 @@
 
 ## Corpus
 
-`bench/corpus`, 32MiB × 5 shapes: json (semi-structured records) / text (flattened source tree) / skewed (16-letter alphabet) / random (incompressible) / zeros. Decoding uses zst1/3/9 pre-compressed by the zstd CLI.
+`bench/corpus`, 32MiB × 5 shapes: json (semi-structured records) / text (flattened source tree) / skewed (16-letter alphabet) / random (incompressible) / zeros. Decoding uses zst1/3/9 pre-compressed by the zstd CLI, plus zst19 for json/text/skewed. Payloads beyond the corpus are passed via `matrix --file` (a `.zst*` path → dec-st cells, a raw path → enc-st cells); `bench/gen_big.sh` builds the standard 100 MB system-ELF payload `bench/big/dll100.raw` (+ `.zst1/3/9/19`).
 
 Pitfalls:
 
@@ -21,7 +21,7 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 | Subcommand | Purpose |
 |---|---|
 | `ratio` | Compression-ratio sweep: one deterministic pass per cell over every level × bulk/stream × st/mt (120 cells full corpus), zstdx vs libzstd, roundtrip-gated; cells run concurrently on a rayon pool (`--parallel`, default 8 — sizes only, ST cells still use the ST encoder), geo-mean Δ% summary printed last (tail-friendly); sizes diff cleanly across runs/builds |
-| `matrix` | Wide-coverage matrix: `--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` covers the five segments, interleaved A/B + roundtrip gate; `--shape/--level/--workers/--mt-workers` filter cells, `--budget-ms` caps the per-side budget; `--full-ladder` switches `enc-st` to the numeric 1-22 axis vs libzstd at the same level — extremely heavy, day-to-day runs never use it, it is a once-before-each-release gate |
+| `matrix` | Wide-coverage matrix: `--mode dec-st/dec-mt/enc-st/enc-mt/enc-stream/all` covers the five segments, interleaved A/B + roundtrip gate; `--shape/--level/--workers/--mt-workers` filter cells, `--file` appends payloads outside the corpus to dec-st/enc-st, `--budget-ms` caps the per-side budget; `--full-ladder` switches `enc-st` to the numeric 1-22 axis vs libzstd at the same level — extremely heavy, day-to-day runs never use it, it is a once-before-each-release gate |
 | `small` | 1KiB-1MiB small loads; `--size`/`--impl` pin a single size and a single impl (for profiler targeting) |
 | `files` | Decoding timing for arbitrary .zst files (budget-based; automatically finds the `.raw`/bare-stem reference for verification via any `zst*` suffix) |
 | `prof` | Single-side profiling loops: `prof dec <f> [n]` / `prof enc <lvl> <n> <f...>` / `prof enc-stream <lvl> <n> <f>`; `RUZ_CKSUM` env toggles the checksum path |

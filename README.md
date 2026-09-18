@@ -67,11 +67,11 @@ Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = z
 | 9 | json | 0.85 | 0.64 | 0.73 |
 | 9 | text | 1.51 | 1.54 | 0.28 |
 | 9 | skewed | 0.04 | 0.17 | 1.02 |
-| 19 | json | 1.10 | — | — |
-| 19 | text | 0.69 | — | — |
-| 19 | skewed | 1.07 | — | — |
+| 19 | json | 1.10 | — | 0.62 |
+| 19 | text | 0.69 | — | 0.27 |
+| 19 | skewed | 1.07 | — | 0.67 |
 
-Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers.
+Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers. On a 100 MB real-binary payload (concatenated system ELF files, [gen_big.sh](bench/gen_big.sh)): decode bulk x 0.81–0.89 across levels 1–19, encode x 1.37/1.04/1.53 at levels 1/3/9.
 
 Full per-level tables (1-22), methodology and noise caveats: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/matrix.md).
 

@@ -3,14 +3,16 @@
 //!
 //! This is the heavyweight tool; narrow it with `--shape`, `--level`,
 //! `--workers` and `--mode` instead of running `all` while iterating.
+//! `--file` appends payload files outside the corpus to the dec-st
+//! (`.zst*` inputs) and enc-st (raw inputs) sections.
 //! `--budget-ms` sets the per-side budget (see `common`); every cell is
 //! correctness-gated (roundtrip against the raw file) before anything is
 //! timed.
 //!
 //! Sections and verdicts:
 //! - `dec-st` interleaves both sides' bulk and streaming (64 KiB) decoders over the zst1/zst3/zst9
-//!   corpus variants. The streaming rows carry the real comparison: the zstd crate's bulk API is a
-//!   slow per-chunk wrapper.
+//!   corpus variants plus the optional .zst19 trio. The streaming rows carry the real comparison:
+//!   the zstd crate's bulk API is a slow per-chunk wrapper.
 //! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo; libzstd exposes no
 //!   multithreaded decode, so the zstd column is its single-threaded streaming speed as a reference
 //!   line.
@@ -24,7 +26,11 @@
 //!   interleaved, then multithreaded (`--mt-workers`, default 8) zstdx vs zstd interleaved, each
 //!   followed by our bulk mt path over the same bytes as the ceiling reference.
 
-use std::io::Read as _;
+use std::{
+    fs,
+    io::Read as _,
+    path::{Path, PathBuf},
+};
 
 use zstdx::{
     DecoderOptions, EncoderOptions, Level,
@@ -34,25 +40,32 @@ use zstdx::{
 use crate::{
     common::{Ab, apply_budget, black_box, measure_solo, want},
     corpus::{
-        LADDER, LevelName, LevelSel, SHAPES, Shape, assert_roundtrip, gate_ruz_dec, gate_ruz_enc,
-        gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw, want_number, want_tier,
+        LADDER, LevelName, LevelSel, SHAPES, Shape, assert_roundtrip, corpus_dir, gate_ruz_dec,
+        gate_ruz_enc, gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw,
+        raw_counterpart, want_number, want_tier,
     },
 };
 
 /// Curated decode set: the informative level/shape combinations (the
-/// omitted variants are redundant with their neighbours).
-const DEC_FILES: [(&str, Shape); 11] = [
-    ("json.zst1", Shape::Json),
-    ("json.zst3", Shape::Json),
-    ("json.zst9", Shape::Json),
-    ("text.zst1", Shape::Text),
-    ("text.zst3", Shape::Text),
-    ("text.zst9", Shape::Text),
-    ("skewed.zst1", Shape::Skewed),
-    ("skewed.zst3", Shape::Skewed),
-    ("skewed.zst9", Shape::Skewed),
-    ("random.zst3", Shape::Random),
-    ("zeros.zst3", Shape::Zeros),
+/// omitted variants are redundant with their neighbours). The `bool` marks
+/// optional entries: absent files are skipped with a note instead of
+/// failing (the `.zst19` trio entered `gen_corpus.sh` later; older corpora
+/// lack it).
+const DEC_FILES: [(&str, Shape, bool); 14] = [
+    ("json.zst1", Shape::Json, false),
+    ("json.zst3", Shape::Json, false),
+    ("json.zst9", Shape::Json, false),
+    ("json.zst19", Shape::Json, true),
+    ("text.zst1", Shape::Text, false),
+    ("text.zst3", Shape::Text, false),
+    ("text.zst9", Shape::Text, false),
+    ("text.zst19", Shape::Text, true),
+    ("skewed.zst1", Shape::Skewed, false),
+    ("skewed.zst3", Shape::Skewed, false),
+    ("skewed.zst9", Shape::Skewed, false),
+    ("skewed.zst19", Shape::Skewed, true),
+    ("random.zst3", Shape::Random, false),
+    ("zeros.zst3", Shape::Zeros, false),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -87,6 +100,12 @@ pub struct Args {
     /// extremely heavy (release-gate only, never for daily iteration)
     #[arg(long)]
     pub full_ladder: bool,
+    /// Extra payload files outside the corpus (repeatable): a `.zst*` file
+    /// adds dec-st cells (verified against the raw counterpart found next
+    /// to it), any other file adds enc-st cells as raw input. See
+    /// `bench/gen_big.sh` for the 100 MB+ recipe.
+    #[arg(long)]
+    pub file: Vec<PathBuf>,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
@@ -160,63 +179,119 @@ fn validate_levels(args: &Args) {
     }
 }
 
+/// `--file` payloads only run in the dec-st (`.zst*`) and enc-st (raw)
+/// sections; catch mismatches before any measurement starts.
+fn validate_files(args: &Args) {
+    if args.file.is_empty() {
+        return;
+    }
+    for p in &args.file {
+        assert!(p.is_file(), "--file {}: not a file", p.display());
+        let dec_section = matches!(args.mode, MatrixMode::All | MatrixMode::DecSt);
+        let enc_section = matches!(args.mode, MatrixMode::All | MatrixMode::EncSt);
+        if is_zst_payload(p) {
+            assert!(
+                dec_section,
+                "--file {}: .zst payloads run in --mode dec-st",
+                p.display()
+            );
+        } else {
+            assert!(
+                enc_section,
+                "--file {}: raw payloads run in --mode enc-st",
+                p.display()
+            );
+        }
+    }
+}
+
 // ---------- decode, single-thread, bulk vs streaming ----------
+
+/// Bulk + streaming decode A/B cells for one frame, verified against `raw`.
+fn dec_st_cells(ab: &Ab, comp: &[u8], raw: &[u8], name: &str) {
+    let bytes = raw.len() as u64;
+    gate_ruz_dec(comp, raw, name);
+    gate_zstd_dec(comp, raw, name);
+
+    // bulk / slice path
+    let mut fr = FrameDecoder::new();
+    let mut out = vec![0u8; raw.len()];
+    ab.measure(
+        || {
+            fr.decode_all(comp, &mut out).unwrap();
+            black_box(&out);
+        },
+        || {
+            black_box(zstd::bulk::decompress(comp, raw.len()).unwrap());
+        },
+    )
+    .print(&pad(&format!("{name}.bulk")), bytes);
+
+    // streaming path, 64 KiB reads
+    ab.measure(
+        || {
+            let mut dec = StreamingDecoder::new(comp).unwrap();
+            let mut sink = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            loop {
+                let n = dec.read(&mut sink).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            assert_eq!(total, raw.len());
+        },
+        || {
+            let mut dec = zstd::stream::read::Decoder::new(comp).unwrap();
+            let mut sink = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            loop {
+                let n = dec.read(&mut sink).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            assert_eq!(total, raw.len());
+        },
+    )
+    .print(&pad(&format!("{name}.stream")), bytes);
+}
+
+/// A `--file` payload is a decode input when its extension starts with
+/// `zst`, raw encode input otherwise.
+fn is_zst_payload(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.starts_with("zst"))
+    })
+}
 
 fn t1_dec_st(ab: &Ab, args: &Args) {
     println!("== T1 decode ST (interleaved A/B; MiB/s of raw; xslow = ruz_time/zstd_time) ==");
-    for (f, shape) in DEC_FILES {
+    for &(f, shape, optional) in &DEC_FILES {
         if !want(&args.shape, &shape) {
             continue;
         }
+        if optional && !corpus_dir().join(f).exists() {
+            println!("-- {f}: absent (regenerate with bench/gen_corpus.sh), skipped");
+            continue;
+        }
         let (comp, raw) = load(f);
-        let bytes = raw.len() as u64;
-        gate_ruz_dec(&comp, &raw, f);
-        gate_zstd_dec(&comp, &raw, f);
-
-        // bulk / slice path
-        let mut fr = FrameDecoder::new();
-        let mut out = vec![0u8; raw.len()];
-        ab.measure(
-            || {
-                fr.decode_all(&comp, &mut out).unwrap();
-                black_box(&out);
-            },
-            || {
-                black_box(zstd::bulk::decompress(&comp, raw.len()).unwrap());
-            },
-        )
-        .print(&pad(&format!("{f}.bulk")), bytes);
-
-        // streaming path, 64 KiB reads
-        ab.measure(
-            || {
-                let mut dec = StreamingDecoder::new(&comp[..]).unwrap();
-                let mut sink = vec![0u8; 64 * 1024];
-                let mut total = 0usize;
-                loop {
-                    let n = dec.read(&mut sink).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    total += n;
-                }
-                assert_eq!(total, raw.len());
-            },
-            || {
-                let mut dec = zstd::stream::read::Decoder::new(&comp[..]).unwrap();
-                let mut sink = vec![0u8; 64 * 1024];
-                let mut total = 0usize;
-                loop {
-                    let n = dec.read(&mut sink).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    total += n;
-                }
-                assert_eq!(total, raw.len());
-            },
-        )
-        .print(&pad(&format!("{f}.stream")), bytes);
+        dec_st_cells(ab, &comp, &raw, f);
+    }
+    for path in args.file.iter().filter(|p| is_zst_payload(p)) {
+        let raw_path = raw_counterpart(path).unwrap_or_else(|| {
+            panic!(
+                "--file {}: no raw counterpart next to it (stem or <stem>.raw)",
+                path.display()
+            )
+        });
+        let comp = fs::read(path).unwrap();
+        let raw = fs::read(&raw_path).unwrap();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap();
+        dec_st_cells(ab, &comp, &raw, name);
     }
 }
 
@@ -295,35 +370,45 @@ fn t2_dec_mt(args: &Args) {
 
 // ---------- encode, single-thread bulk, ladder vs zstd levels ----------
 
+/// One encode cell: sizes + gates + interleaved A/B, tagged `<stem>.<tag>`.
+fn enc_st_cell(ab: &Ab, raw: &[u8], stem: &str, tag: &str, level: Level, z: i32) {
+    let bytes = raw.len() as u64;
+    let rc = gate_ruz_enc(raw, level, tag);
+    let zc = gate_zstd_enc(raw, z, tag);
+    println!(
+        "sizes {stem}.{tag}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
+        rc.len(),
+        raw.len() as f64 / rc.len() as f64,
+        zc.len(),
+        raw.len() as f64 / zc.len() as f64,
+    );
+    ab.measure(
+        || {
+            black_box(compress_with_ok(
+                raw,
+                &EncoderOptions::new(level).checksum(false),
+            ));
+        },
+        || {
+            black_box(zstd::bulk::compress(raw, z).unwrap());
+        },
+    )
+    .print(&pad(&format!("{stem}.{tag}")), bytes);
+}
+
 fn t3_enc_st(ab: &Ab, args: &Args) {
     println!("== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==");
     for shape in shapes_selected(args) {
         let raw = load_raw(shape);
-        let bytes = raw.len() as u64;
         for (tag, level, z) in enc_axis(args) {
-            let rc = gate_ruz_enc(&raw, level, &tag);
-            let zc = gate_zstd_enc(&raw, z, &tag);
-            println!(
-                "sizes {}.{}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
-                shape.raw_name(),
-                tag,
-                rc.len(),
-                raw.len() as f64 / rc.len() as f64,
-                zc.len(),
-                raw.len() as f64 / zc.len() as f64,
-            );
-            ab.measure(
-                || {
-                    black_box(compress_with_ok(
-                        &raw,
-                        &EncoderOptions::new(level).checksum(false),
-                    ));
-                },
-                || {
-                    black_box(zstd::bulk::compress(&raw, z).unwrap());
-                },
-            )
-            .print(&pad(&format!("{}.{}", shape.raw_name(), tag)), bytes);
+            enc_st_cell(ab, &raw, shape.raw_name(), &tag, level, z);
+        }
+    }
+    for path in args.file.iter().filter(|p| !is_zst_payload(p)) {
+        let raw = fs::read(path).unwrap();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        for (tag, level, z) in enc_axis(args) {
+            enc_st_cell(ab, &raw, stem, &tag, level, z);
         }
     }
 
@@ -663,6 +748,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
 pub fn run(args: &Args) {
     apply_budget(args.budget_ms);
     validate_levels(args);
+    validate_files(args);
     println!(
         "# bench matrix: zstdx vs zstd crate (libzstd {}, binding {}), {} cores",
         zstd::zstd_safe::version_string(),

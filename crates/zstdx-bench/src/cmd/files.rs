@@ -7,14 +7,14 @@
 //! verified against it. Timing then loops in-place decodes into an
 //! exact-size buffer until the budget is spent.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use zstdx::decoding::{FrameDecoder, errors::FrameDecoderError};
 
-use crate::common::{apply_budget, black_box, measure_solo};
+use crate::{
+    common::{apply_budget, black_box, measure_solo},
+    corpus::raw_counterpart,
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -44,22 +44,6 @@ fn decode_to_vec(fr: &mut FrameDecoder, compressed: &[u8]) -> Vec<u8> {
             Err(e) => panic!("decode failed: {e}"),
         }
     }
-}
-
-/// Raw counterpart of a corpus-style path: strip a trailing `.zst*`
-/// extension, then try the bare stem and `<stem>.raw` (so both the
-/// `z000033.zst` and `json.zst3` naming conventions verify).
-fn raw_counterpart(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name
-        .rsplit_once('.')
-        .filter(|(_, ext)| ext.starts_with("zst"))
-        .map(|(stem, _)| stem)?;
-    let bare = path.with_file_name(stem);
-    let with_raw = path.with_file_name(format!("{stem}.raw"));
-    [bare, with_raw]
-        .into_iter()
-        .find(|p| p.is_file() && p != path)
 }
 
 pub fn run(args: &Args) {
