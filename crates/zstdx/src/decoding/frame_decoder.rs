@@ -152,6 +152,9 @@ impl FrameDecoderState {
         self.block_counter = 0;
         self.decoder_scratch.reset(window_size as usize);
         self.flat.reset(window_size as usize);
+        // Dictionary-free frames decode into the flat buffer; `reset()`'s
+        // caller re-disables this when the next frame carries a dictionary.
+        self.flat_active = true;
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
@@ -1094,5 +1097,66 @@ impl Read for FrameDecoder {
         } else {
             state.decoder_scratch.buffer.read(target)
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::{BlockDecodingStrategy, FrameDecoder};
+    use crate::decoding::{
+        dictionary::Dictionary,
+        scratch::{FSEScratch, HuffmanScratch},
+    };
+
+    /// Magic, FHD 0 (no dictionary id), window descriptor 0, single empty
+    /// last raw block.
+    fn plain_frame() -> Vec<u8> {
+        Vec::from(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x01, 0x00, 0x00][..])
+    }
+
+    /// The same frame with a 1-byte Dictionary_ID field (0x42); FHD bits 0-1
+    /// carry the dictionary-id flag.
+    fn dict_frame() -> Vec<u8> {
+        Vec::from(&[0x28, 0xb5, 0x2f, 0xfd, 0x01, 0x00, 0x42, 0x01, 0x00, 0x00][..])
+    }
+
+    fn dict_with_id() -> Dictionary {
+        Dictionary {
+            id: 0x42,
+            fse: FSEScratch::new(),
+            huf: HuffmanScratch::new(),
+            dict_content: Vec::from(&[0xab; 16][..]),
+            offset_hist: [1, 4, 8],
+        }
+    }
+
+    /// A dictionary frame must not pin the decoder to the ring path forever:
+    /// `reset()` puts the next dictionary-free frame back on the flat path.
+    #[test]
+    fn reset_restores_flat_path_after_dictionary_frame() {
+        use std::io::Cursor;
+
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(dict_with_id()).unwrap();
+
+        let mut src = Cursor::new(dict_frame());
+        dec.reset(&mut src).unwrap();
+        assert!(!dec.state.as_ref().expect("initialized").flat_active);
+        dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+            .unwrap();
+        assert!(dec.is_finished());
+
+        let mut src = Cursor::new(plain_frame());
+        dec.reset(&mut src).unwrap();
+        assert!(
+            dec.state.as_ref().expect("initialized").flat_active,
+            "flat path must be restored for dictionary-free frames"
+        );
+        dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+            .unwrap();
+        assert!(dec.is_finished());
+        assert!(dec.collect().unwrap().is_empty());
     }
 }
