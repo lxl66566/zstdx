@@ -1,27 +1,25 @@
 [package]
 name         = "zstdx-cli"
-version      = "0.8.2"
+version      = "0.9.0"
 rust-version = "1.89"
 authors      = ["Moritz Borcherding <moritz.borcherding@web.de>"]
 edition      = "2024"
 license      = "MIT"
 homepage     = "https://github.com/KillingSpark/zstd-rs"
 repository   = "https://github.com/KillingSpark/zstd-rs"
-description  = "A command line interface for the `zstdx` zstd implementation"
+description  = "A zstd-compatible command line interface built on the pure-Rust zstdx engine"
 readme       = "../../Readme.md"
-keywords     = ["decompression", "zstandard", "zstd"]
-categories   = ["compression"]
+keywords     = ["zstd", "zstandard", "compression", "cli"]
+categories   = ["compression", "command-line-utilities"]
 
 [dependencies]
 # Used for the command line binary only
 clap               = { version = "4.5.46", features = ["derive"] }
-color-eyre         = { version = "0.6.5" }
-console            = { version = "0.16.1" }
 indicatif          = { version = "0.18.0" }
 tracing            = { version = "0.1.41" }
 tracing-indicatif  = { version = "0.3.13" }
 tracing-subscriber = { version = "0.3.20" }
-zstdx              = { path = "../zstdx", features = ["std"] }
+zstdx              = { version = "0.9.1", path = "../zstdx", features = ["std"] }
 
 [lints]
 workspace = true

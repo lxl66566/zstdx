@@ -1,5 +1,5 @@
-// ! Utilities for displaying a progress monitor to track compression/decompression/whatever else
-//! This implementation relies heavily on the `indicatif` crate, see <https://docs.rs/indicatif>cargo hack check --feature-powerset --exclude-features rustc-dep-of-std
+//! Utilities for displaying a progress monitor to track compression/decompression/whatever else
+//! This implementation relies heavily on the `indicatif` crate, see <https://docs.rs/indicatif>
 
 use std::{fmt::Write, io::Read, time::Duration};
 
@@ -21,16 +21,22 @@ pub struct ProgressMonitor<R: Read> {
 }
 
 impl<R: Read> ProgressMonitor<R> {
-    /// Create a new progress monitor, initialized with zero bytes read
-    pub fn new(reader: R, size: usize) -> Self {
+    /// Create a new progress monitor, initialized with zero bytes read.
+    /// `visible` hides the bar entirely (non-terminal stderr, quiet mode).
+    pub fn new(reader: R, size: usize, visible: bool) -> Self {
         // https://docs.rs/indicatif/latest/indicatif/index.html#templates
         let style = ProgressStyle::with_template(
             "{wide_bar} {binary_bytes}/{binary_total_bytes}  \n[est. {eta} remaining]",
         )
         .unwrap();
         let progress_bar = ProgressBar::new(size as u64).with_style(style);
-        // The default is 20hz, this reduces rendering overhead
-        progress_bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+        let draw_target = if visible {
+            // The default is 20hz, this reduces rendering overhead
+            ProgressDrawTarget::stderr_with_hz(8)
+        } else {
+            ProgressDrawTarget::hidden()
+        };
+        progress_bar.set_draw_target(draw_target);
         Self {
             reader,
             total: size,
