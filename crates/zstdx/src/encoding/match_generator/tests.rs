@@ -95,9 +95,10 @@ fn strip_snapshot_adopt_is_exact() {
 fn ldm_arming_bars() {
     // The mid-size bar arms one step under the row window; the job bar
     // requires the clamp to have left the row window intact; the probe's
-    // keep parse never arms.
+    // keep parse and the far-dead screen never arm.
     assert_eq!(ldm_min_window(LdmArming::Frame), Some(1 << 25));
     assert_eq!(ldm_min_window(LdmArming::Job), Some(1 << 26));
+    assert_eq!(ldm_min_window(LdmArming::FarDead), None);
     assert_eq!(ldm_min_window(LdmArming::ProbeKeep), None);
 }
 

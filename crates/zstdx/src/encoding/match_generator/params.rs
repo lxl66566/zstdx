@@ -301,6 +301,43 @@ pub(crate) fn ldm_head_parses(head: &[u8]) -> bool {
     false
 }
 
+/// Far-repeat veto for the streaming strip cap (see `encoder_mt`'s
+/// `FarClass`): whether far-lag hash collisions dominate the span's
+/// strided samples — content whose matches come from beyond the row's
+/// search domain (tiling or templating at periods past the reach). The
+/// slot always keeps its latest sample, so a uniform span self-collides
+/// at the stride only (near, never counted) and an incidental
+/// long-distance 8-gram whose slot a nearer sample reclaims stays
+/// unseen; leakage from near-periodic shapes (an 8-gram whose nearer twin
+/// the stride missed) measures a few percent of samples, so the dominance
+/// bar sits well above it while any paying far class covers a
+/// double-digit fraction.
+#[cfg(feature = "std")]
+pub(crate) fn far_repeat_dominant(win: &[u8], reach: usize) -> bool {
+    const SLOTS: usize = 1 << 17;
+    const STRIDE: usize = 4 * 1024;
+    // Far-dominant: hits reach one twelfth of the samples (~8%).
+    const DOMINANCE_DEN: u32 = 12;
+    let far = (reach / STRIDE).max(1);
+    let mut probe = alloc::vec![(0u32, 0u32); SLOTS];
+    let mut hits = 0u32;
+    let mut samples = 0u32;
+    let mut i = 0usize;
+    while i + HASH_READ <= win.len() {
+        let h = read8(win, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+        let slot = ((h >> 45) as usize) & (SLOTS - 1);
+        let tag = h as u32;
+        let (prev_tag, prev_idx) = probe[slot];
+        if prev_tag == tag && samples.saturating_sub(prev_idx) >= far as u32 {
+            hits += 1;
+        }
+        probe[slot] = (tag, samples);
+        i += STRIDE;
+        samples += 1;
+    }
+    hits * DOMINANCE_DEN >= samples
+}
+
 /// Where a driver's LDM history domain ends, deciding the size gate's bar
 /// (see [`ldm_min_window`]). Set before `reset`; pooled drivers re-derive
 /// their arming on every reset.
@@ -329,6 +366,13 @@ pub(crate) enum LdmArming {
     /// job. Constructed by the std-gated bulk mt path only.
     #[cfg(feature = "std")]
     JobPrefix,
+    /// A streaming job on a far-dead frame (both far-class screens
+    /// rejected it, see `encoder_mt`'s `FarClass`): every job's strip
+    /// caps at the row's chain reach, so no beyond-reach history exists
+    /// to source a far candidate — LDM never arms. Constructed by the
+    /// std-gated stream mt path only.
+    #[cfg(feature = "std")]
+    FarDead,
     /// The reach probe's parses: the keep parse's span sits below the
     /// row's chain reach, so no candidate can survive the beyond-reach
     /// filter there (the shrink parse never arms at all — a shrunk parse
@@ -346,6 +390,8 @@ pub(super) const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
         LdmArming::Job => Some(LDM_FULL_WINDOW),
         #[cfg(feature = "std")]
         LdmArming::JobPrefix => Some(LDM_MIDSIZE_WINDOW),
+        #[cfg(feature = "std")]
+        LdmArming::FarDead => None,
         LdmArming::ProbeKeep => None,
     }
 }

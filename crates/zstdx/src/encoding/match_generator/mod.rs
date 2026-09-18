@@ -2150,13 +2150,13 @@ use hash::*;
 #[cfg(feature = "std")]
 use params::LDM_MIDSIZE_WINDOW;
 pub(crate) use params::LdmArming;
-#[cfg(feature = "std")]
-pub(crate) use params::ldm_head_parses;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_FULL_WINDOW, LDM_QUIET, LDM_SYMS_MIN, LEVEL_PARAMS,
     LdmFill, LevelParams, Strategy, ldm_min_window, params_for, sampled_distinct,
 };
+#[cfg(feature = "std")]
+pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
 use price::*;
 use tables::*;
 pub(in crate::encoding) use tables::{pack_pos, push_seq_packed};

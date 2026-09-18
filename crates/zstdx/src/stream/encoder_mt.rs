@@ -39,6 +39,13 @@
 //! length, so the decision waits for [`reach_probe::PROBE_MIN_FRAME`]
 //! streamed bytes. A stream that ends or flushes before the gate keeps the
 //! stock reach.
+//!
+//! The chain rows' whole-window strip carries exactly one reader beyond
+//! the row's search domain: LDM's far class (the chain walk rejects
+//! beyond-reach candidates on its own). A frame both far-class screens
+//! reject (see [`FarClass`]) caps every job's strip at the row's chain
+//! reach and disarms job LDM — the capped bytes had no reader left, so
+//! the frame bytes cannot move.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -70,7 +77,7 @@ use crate::{
         frame_header::FrameHeader,
         match_generator::{
             LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
-            ldm_head_parses,
+            far_repeat_dominant, ldm_head_parses,
         },
         mt::{
             MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state,
@@ -98,6 +105,29 @@ enum JobGrid {
     /// function of absolute offset — jobs post exactly on grid boundaries,
     /// so the queue never straddles an epoch.
     Growing,
+}
+
+/// The frame's far-class screen verdict (see `MtEncoderCore::far_class`):
+/// whether the chain rows' whole-window cross-job strip carries a paying
+/// LDM far class at all. The chain walk rejects beyond-reach candidates,
+/// so the strip past the row's chain reach has exactly one reader — LDM;
+/// a frame both screens reject (the head engagement screen and the
+/// far-repeat veto, see `resolve_far_class`) never pays that reader, and
+/// it caps every job's strip at the reach with job LDM disarmed.
+/// Byte-exact on such frames: the chain candidates the cap drops were
+/// beyond-reach (never emittable), LDM candidates never won (a far twin
+/// always trailed a within-reach twin the chain found first), and the
+/// strip's seed scan resolves nearest-first (a far-dead span's repeats
+/// sit far closer than the reach).
+enum FarClass {
+    /// No strip-defining site has run yet.
+    Pending,
+    /// The frame shows a paying far class (or the row screens no cap at
+    /// all): strips keep the whole window.
+    Alive,
+    /// Both screens rejected the far class: strips cap at the row's
+    /// chain reach and job LDM disarms for the frame.
+    Dead,
 }
 
 /// The reach probe's donated keep side (see `post_donation`): job zero's
@@ -168,8 +198,9 @@ enum JobKind {
         last_frame_block: bool,
         overlap: usize,
         /// The job's LDM arming context: `JobPrefix` on the pledged
-        /// mid-size capture (see `MtEncoderCore::resolve_probe`), `Job`
-        /// everywhere else.
+        /// mid-size capture (see `MtEncoderCore::resolve_probe`),
+        /// `FarDead` when the frame's far-class screen rejected the far
+        /// class (see `FarClass`), `Job` everywhere else.
         ldm: LdmArming,
         /// The shared prefix fill's snapshot for this job, when the
         /// finish tail engaged one and this job's strip extends it (see
@@ -545,8 +576,15 @@ pub(crate) struct MtEncoderCore {
     overlap: usize,
     /// The jobs' LDM arming context: flipped to [`LdmArming::JobPrefix`]
     /// when a pledged keep-class frame's verdict re-grids it onto the bulk
-    /// mid-size capture (see [`Self::resolve_probe`]).
+    /// mid-size capture (see [`Self::resolve_probe`]), or to
+    /// [`LdmArming::FarDead`] when the far-class screen (see
+    /// [`Self::far_class`]) rejects the far class.
     job_ldm: LdmArming,
+    /// The frame's far-class screen (see [`FarClass`]): resolved once, at
+    /// the first strip-defining site after the probe machinery settles,
+    /// over fixed input spans (see [`Self::resolve_far_class`]) — a pure
+    /// function of the input, never of the write cadence.
+    far_class: FarClass,
     /// Jobs buffered before a burst fires: at least one full round of
     /// workers, amortizing the thread spawn.
     burst_jobs: usize,
@@ -671,6 +709,7 @@ impl MtEncoderCore {
             grid,
             overlap,
             job_ldm: LdmArming::Job,
+            far_class: FarClass::Pending,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             probe_wait: None,
@@ -1042,6 +1081,65 @@ impl MtEncoderCore {
         self.job_ldm = LdmArming::JobPrefix;
     }
 
+    /// Resolve the far-class screen once per frame (see [`FarClass`]).
+    /// Runs only after the probe machinery settles (`post_job` and
+    /// `run_inline_job` entry — never inside `build_spf`, which overlaps
+    /// the donation wait), so the mid-size capture's `JobPrefix` flip has
+    /// already happened and cannot be overwritten. Two gates must both
+    /// reject the far class: the head screen (`ldm_head_parses`, the
+    /// bulk planner's own — a wide alphabet with a repeat at the head
+    /// keeps the stock strip outright), then the far-repeat veto over
+    /// exactly the span the first post's strips index, clamped at the
+    /// first post's grid line so a write overshoot cannot widen it — a
+    /// head whose repeats live beyond the reach (shadowed near-periodic
+    /// classes like tiled text) passes the first gate but must not pay
+    /// for strips until the span shows the class dominating it. A wrapped
+    /// buffer (frame head gone) or a short-of-span resolve keeps the
+    /// stock strip.
+    fn resolve_far_class(&mut self) {
+        if !matches!(self.far_class, FarClass::Pending) {
+            return;
+        }
+        self.far_class = FarClass::Alive;
+        if self.job_ldm != LdmArming::Job
+            || self.choice == ReachChoice::Shrink
+            || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
+        {
+            return;
+        }
+        let reach =
+            MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice) as usize;
+        if self.overlap <= reach
+            || self.buf_base != 0
+            || self.buf.len() < reach_probe::PROBE_SPAN
+            || ldm_head_parses(&self.buf[..reach_probe::PROBE_SPAN])
+        {
+            return;
+        }
+        let span = self.buf.len().min(self.job_end(0) as usize);
+        if !far_repeat_dominant(&self.buf[..span], reach) {
+            self.far_class = FarClass::Dead;
+            self.job_ldm = LdmArming::FarDead;
+        }
+    }
+
+    /// The strip each job borrows and indexes: the level's overlap, capped
+    /// at the row's chain reach when the far-class screen rejected the
+    /// far class (see [`FarClass`]). The cap never feeds the schedule —
+    /// job sizes and epochs stay derived from `overlap` — only the jobs'
+    /// own history span and the buffer retention floor.
+    fn strip_span(&self) -> usize {
+        if matches!(self.far_class, FarClass::Dead) {
+            self.overlap.min(MatchGeneratorDriver::strip_for_choice(
+                self.level,
+                self.shape,
+                self.choice,
+            ) as usize)
+        } else {
+            self.overlap
+        }
+    }
+
     /// Re-reserve the accumulate buffer for the decided schedule's working
     /// scale (see `MtEncoderCore::new`).
     fn reserve_decided(&mut self) {
@@ -1255,6 +1353,14 @@ impl MtEncoderCore {
             // filled; drop the plan unused.
             spf = None;
         }
+        // The far-class screen runs after the probe settles (a verdict can
+        // re-grid and re-arm); a dead verdict re-bases every tail strip at
+        // the row's reach — not the whole prefixes the build filled — so
+        // the plan drops unused, exactly like the shrunk one above.
+        self.resolve_far_class();
+        if spf.is_some() && matches!(self.far_class, FarClass::Dead) {
+            spf = None;
+        }
         self.emit_header();
         let bounds = self.build_bounds(hi);
         if bounds.len() == 2 && self.pool_threads.is_empty() && spf.is_none() {
@@ -1300,11 +1406,16 @@ impl MtEncoderCore {
         // opt/btlazy rows fill different tables), and a prefix strip
         // large enough to pay for the machinery. The strategy gate plus
         // the threshold admit exactly the whole-window chain rows: every
-        // other row's stream strip is its search domain (<= 8 MiB).
+        // other row's stream strip is its search domain (<= 8 MiB). A
+        // far-dead frame skips the build (its strips cap at the row's
+        // reach — no nesting, nothing to share); the screen may still be
+        // pending here (the probe settles after this), and `encode_jobs`
+        // drops the plan if it lands dead.
         if !matches!(self.grid, JobGrid::Growing)
             || self.job_start != 0
             || self.buf_base != 0
             || self.choice == ReachChoice::Shrink
+            || matches!(self.far_class, FarClass::Dead)
             || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
         {
             return None;
@@ -1395,7 +1506,9 @@ impl MtEncoderCore {
         // pool-less path never carries one (job zero would parse undonated
         // — byte-identical, but the donation's work would be wasted).
         debug_assert!(self.donation.is_none() || !self.pool_threads.is_empty());
-        let strip_lo = self.job_start.saturating_sub(self.overlap as u64);
+        self.resolve_far_class();
+        let strip = self.strip_span();
+        let strip_lo = self.job_start.saturating_sub(strip as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (self.job_start - strip_lo) as usize;
         self.hash_to(hi);
@@ -1405,7 +1518,7 @@ impl MtEncoderCore {
             &mut state,
             &self.buf[..(hi - self.buf_base) as usize],
             first..first + last_len,
-            self.overlap,
+            strip,
             last_frame_block,
             self.level,
             self.shape,
@@ -1431,12 +1544,16 @@ impl MtEncoderCore {
         spf: Option<Arc<StripSnapshot>>,
     ) {
         debug_assert!(self.pos >= end);
+        // The far-class screen lands with the first post (the probe
+        // machinery has settled by then), so every job of the frame —
+        // including this one — sees the same strip and arming.
+        self.resolve_far_class();
         // The post cadence is also the assembly and panic-surfacing cadence:
         // per-write calls would burn millions of polls on the pump path.
         self.surface_poison();
         self.assemble_ready();
         self.emit_header();
-        let strip_lo = start.saturating_sub(self.overlap as u64);
+        let strip_lo = start.saturating_sub(self.strip_span() as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (start - strip_lo) as usize;
         let len = (end - strip_lo) as usize;
@@ -1471,7 +1588,7 @@ impl MtEncoderCore {
                 src: FrozenSrc { ptr },
                 first,
                 len,
-                overlap: self.overlap,
+                overlap: self.strip_span(),
                 ldm: self.job_ldm,
                 last_frame_block,
                 spf: Mutex::new(spf),
@@ -1592,10 +1709,10 @@ impl MtEncoderCore {
     }
 
     /// Lowest absolute offset the buffer must still serve: the next job to
-    /// post borrows [job_start - overlap, job_start) as its strip, and the
+    /// post borrows [job_start - strip, job_start) as its strip, and the
     /// bytes after it feed that job.
     fn movable_lo(&self) -> u64 {
-        self.job_start.saturating_sub(self.overlap as u64)
+        self.job_start.saturating_sub(self.strip_span() as u64)
     }
 
     /// Whether every posted job has completed (no resolved pointers into
