@@ -140,11 +140,13 @@ impl FrameHeader {
 
         if let Some(frame_content_size) = self.frame_content_size {
             let field_size = find_min_size(frame_content_size);
+            // FCS flag encodes the field size (RFC 8878): 0 -> 1 byte,
+            // 1 -> 2, 2 -> 4, 3 -> 8. `find_min_size` yields 1/2/4/8.
             let flag_value: u8 = match field_size {
                 1 => 0,
                 2 => 1,
                 4 => 2,
-                3 => 8,
+                8 => 3,
                 _ => panic!(),
             };
 
@@ -194,6 +196,45 @@ mod tests {
         assert_eq!(decoded_descriptor.frame_content_size_bytes().unwrap(), 1);
         assert!(!decoded_descriptor.content_checksum_flag());
         assert_eq!(decoded_descriptor.dictionary_id_bytes().unwrap(), 0);
+    }
+
+    /// The FCS flag/field-size mapping across all four RFC 8878 classes,
+    /// exercised at each class's boundary: the descriptor must carry the
+    /// matching flag, the FCS field the matching width (flag 1 stores
+    /// value - 256), and our decoder must read the size back. The 8-byte
+    /// class (FCS >= 2^32) previously fell into a dead `3 => 8` match arm
+    /// and panicked, taking down every > 4 GiB MT compression and any
+    /// stream pledged at 2^32 or more.
+    #[test]
+    fn frame_header_fcs_field_sizes() {
+        // (frame_content_size, FCS flag, serialized FCS field bytes)
+        let cases: &[(u64, u8, &[u8])] = &[
+            (255, 0, &[0xff]),
+            (256, 1, &[0x00, 0x00]),
+            (u16::MAX as u64, 1, &[0xff, 0xfe]),
+            (1 << 16, 2, &[0x00, 0x00, 0x01, 0x00]),
+            (u32::MAX as u64, 2, &[0xff, 0xff, 0xff, 0xff]),
+            (1u64 << 32, 3, &[
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            ]),
+        ];
+        for &(fcs, flag, field) in cases {
+            let header = FrameHeader {
+                frame_content_size: Some(fcs),
+                single_segment: true,
+                content_checksum: false,
+                dictionary_id: None,
+                window_size: None,
+            };
+            let mut serialized = Vec::new();
+            header.serialize(&mut serialized);
+            // Single-segment: magic + descriptor + FCS field, nothing else.
+            assert_eq!(&serialized[..4], &crate::common::MAGIC_NUM.to_le_bytes());
+            assert_eq!(serialized[4], (flag << 6) | 0x20, "fcs {fcs}");
+            assert_eq!(&serialized[5..], field, "fcs {fcs}");
+            let parsed = read_frame_header(serialized.as_slice()).unwrap().0;
+            assert_eq!(parsed.frame_content_size(), fcs, "fcs {fcs}");
+        }
     }
 
     #[test]
