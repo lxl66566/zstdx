@@ -26,8 +26,8 @@ impl MatchGeneratorDriver {
         let search_depth = self.params.search_depth as usize;
         let lazy_depth = self.params.lazy_depth;
         let min_match = self.params.min_match as usize;
-        let dict_chain = self.dict_chain;
-        let width = ChainHashWidth::of(dict_chain);
+        let dict_row = self.dict_row;
+        let width = ChainHashWidth::of(dict_row);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
@@ -262,7 +262,7 @@ impl MatchGeneratorDriver {
             // the far-dict matches it rejects are the dict parse's
             // payload).
             if (best_len < min_match && !(rep_hit && best_len >= MIN_MATCH))
-                || (!dict_chain
+                || (!dict_row
                     && !pays_for_offset_lit(win, idx, best_len, best_cand, rep_hit, lit_lens))
             {
                 // Grow the probe step on long literal runs (same policy as

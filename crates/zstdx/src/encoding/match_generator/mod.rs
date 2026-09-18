@@ -280,11 +280,13 @@ pub struct MatchGeneratorDriver {
     /// frame-continuous parses only (a job-restart parse measurably used
     /// the lagged region's candidates).
     strip_parse: bool,
-    /// Dictionary frame on a chain row ([`Self::load_dictionary`]): the
-    /// parse switches to libzstd's lazy-family dict semantics — 4-byte
-    /// hash width, accept bar 4, no offset-pays gate, deeper walk. Cleared
-    /// by [`Self::reset`]; a no-dict frame never touches it.
-    dict_chain: bool,
+    /// Dictionary frame on a chain or dfast row ([`Self::load_dictionary`]):
+    /// the parse switches to libzstd's small-table dict-row semantics — chain
+    /// rows take the 4-byte hash width, accept bar 4, no offset-pays gate,
+    /// deeper walk; dfast rows take the 4-byte short-hash width (the long
+    /// probe stays 8-byte). Cleared by [`Self::reset`]; a no-dict frame never
+    /// touches it.
+    dict_row: bool,
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
@@ -557,7 +559,7 @@ impl MatchGeneratorDriver {
             ldm_canary: 0,
             ldm_checked: false,
             strip_parse: false,
-            dict_chain: false,
+            dict_row: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -615,7 +617,7 @@ impl MatchGeneratorDriver {
             ldm_canary: 0,
             ldm_checked: false,
             strip_parse: false,
-            dict_chain: false,
+            dict_row: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -831,15 +833,15 @@ impl MatchGeneratorDriver {
         self.block_end = keep as u64;
         self.rep = rep;
         self.rep_pending = 0;
-        // A chain row parsing over dictionary content switches to
-        // libzstd's lazy-family dict semantics wholesale; each knob alone
-        // measurably does nothing (or loses), the combination converts
+        // Chain and dfast rows parsing over dictionary content switch to
+        // libzstd's small-table dict-row semantics; the knobs alone
+        // measurably do nothing (or lose), the combinations convert
         // (fixture grid, 54-file systemd holdout, summed bytes, zstdx-raw
         // dict at -5/-9):
-        // - hash width 4: the lazy family hashes minMatch bytes (4 on every chain row its
-        //   small-input tables select at levels 5-12); near-duplicate dict lines diverging at byte
-        //   5 are candidates for its chain, invisible to our 5-byte width. Alone the dilution loses
-        //   (8708 -> 8736 / 8442 -> 8451 B).
+        // - hash width 4: libzstd hashes minMatch bytes, and its small-input tables select width-4
+        //   rows for the lazy family at levels 5-12 and dfast at 4 (payload+dict <= 128 KiB);
+        //   near-duplicate dict lines diverging at byte 5 are candidates there, invisible to our
+        //   5-byte width. Alone the dilution loses (8708 -> 8736 / 8442 -> 8451 B).
         // - accept bar 4: greedy/lazy/lazy2 store any candidate >= 4 (the row's searchLength only
         //   shapes the hash); ours is min_match 5. Worth 103/166 B on top of the rest; without the
         //   width change it does nothing (the 4-byte twins are never candidates).
@@ -849,13 +851,21 @@ impl MatchGeneratorDriver {
         //   needs the extra attempts to reach older dict twins (x2: 8640/8278; x4: 8551/8269; x8:
         //   8518/8259, already past the zstd CLI's 8272; x16: 8499/8259).
         // Combined at x8: -5 raw 8708 -> 8518 (CLI 8230), -9 raw
-        // 8442 -> 8259. Dict frames are not a hot path (1.4 ms/file on
-        // the fixture at -5/-9 either way); no-dict params and widths
-        // stay put (byte-identical no-dict output).
+        // 8442 -> 8259. The dfast row's width-4 short hash carries no extra
+        // knobs (its accept bar is already 4 and its probes are
+        // single-candidate); the long probe stays 8-byte — libzstd's dfast
+        // hashes 8 there whatever the row. Dict frames are not a hot path
+        // (1.4 ms/file on the fixture at -5/-9 either way); no-dict params
+        // and widths stay put (byte-identical no-dict output).
+        if matches!(
+            self.params.strategy,
+            Strategy::Chain(_) | Strategy::Dfast(_)
+        ) {
+            self.dict_row = true;
+        }
         if matches!(self.params.strategy, Strategy::Chain(_)) {
             self.params.search_depth *= 8;
             self.params.min_match = MIN_MATCH as u32;
-            self.dict_chain = true;
         }
         // The owned window is filled above; prefill over the caller's slice
         // avoids the self-borrow (identical bytes). The dictionary grid:
@@ -1239,6 +1249,9 @@ impl MatchGeneratorDriver {
             },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
+                // The short table keys 4-byte windows on dictionary frames
+                // (the scan's `MM4` row; see `dict_row`).
+                let width = ChainHashWidth::of(self.dict_row);
                 let (long, small) = self.tables.split_at_mut(self.second);
                 let mut idx = 0;
                 while idx < last {
@@ -1246,12 +1259,12 @@ impl MatchGeneratorDriver {
                     unsafe {
                         let entry = pack_pos(base + idx as u64);
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
-                        *small.get_unchecked_mut(hash_at_log(data, idx, small_log)) = entry;
+                        *small.get_unchecked_mut(hash_at_width(data, idx, small_log, width)) =
+                            entry;
                     }
                     if grid == FillGrid::Dictionary {
                         // The long table takes the empty-slot backfill
-                        // (libzstd's fillDoubleHashTableForCDict); the
-                        // small one stays on the stride grid.
+                        // (libzstd's fillDoubleHashTableForCDict).
                         backfill8_empty(long, data, base, idx, long_log, last);
                     }
                     idx += PREFILL_STRIDE;
@@ -1262,7 +1275,7 @@ impl MatchGeneratorDriver {
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
-                let width = ChainHashWidth::of(self.dict_chain);
+                let width = ChainHashWidth::of(self.dict_row);
                 let (table, chain) = self.tables.split_at_mut(self.second);
                 let chain_mask = chain.len() - 1;
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
@@ -1449,7 +1462,7 @@ impl Matcher for MatchGeneratorDriver {
         self.ldm_canary = 0;
         self.ldm_checked = false;
         self.strip_parse = false;
-        self.dict_chain = false;
+        self.dict_row = false;
         self.opt_state.reset();
     }
 
@@ -1634,25 +1647,48 @@ impl Matcher for MatchGeneratorDriver {
                 // derives): the two full rows cover every input the level
                 // clamp leaves at full tables; smaller inputs (clamped
                 // windows, shrunken logs) take the runtime-log
-                // instantiation.
-                let long_log = self.second.trailing_zeros();
-                let small_log = (self.tables.len() - self.second).trailing_zeros();
-                match (self.ramp.is_armed(), long_log, small_log) {
-                    (false, 17, 16) => self.start_matching_dfast::<false, 17, 16>(literals, seqs),
-                    (true, 17, 16) => self.start_matching_dfast::<true, 17, 16>(literals, seqs),
-                    (false, 18, 18) => self.start_matching_dfast::<false, 18, 18>(literals, seqs),
-                    (true, 18, 18) => self.start_matching_dfast::<true, 18, 18>(literals, seqs),
-                    (armed, ..) => {
-                        if armed {
-                            self.start_matching_dfast::<true, RUNTIME_LOG, RUNTIME_LOG>(
+                // instantiation. Dictionary frames take the `MM4` runtime-log
+                // body whatever their table sizes — dict frames are not a
+                // hot path, and keeping them off the const-log arms leaves
+                // every no-dict instantiation untouched.
+                if self.dict_row {
+                    if self.ramp.is_armed() {
+                        self.start_matching_dfast::<true, true, RUNTIME_LOG, RUNTIME_LOG>(
+                            literals, seqs,
+                        );
+                    } else {
+                        self.start_matching_dfast::<false, true, RUNTIME_LOG, RUNTIME_LOG>(
+                            literals, seqs,
+                        );
+                    }
+                } else {
+                    let long_log = self.second.trailing_zeros();
+                    let small_log = (self.tables.len() - self.second).trailing_zeros();
+                    match (self.ramp.is_armed(), long_log, small_log) {
+                        (false, 17, 16) => {
+                            self.start_matching_dfast::<false, false, 17, 16>(literals, seqs)
+                        },
+                        (true, 17, 16) => {
+                            self.start_matching_dfast::<true, false, 17, 16>(literals, seqs)
+                        },
+                        (false, 18, 18) => {
+                            self.start_matching_dfast::<false, false, 18, 18>(literals, seqs)
+                        },
+                        (true, 18, 18) => {
+                            self.start_matching_dfast::<true, false, 18, 18>(literals, seqs)
+                        },
+                        (armed, ..) => {
+                            if armed {
+                                self.start_matching_dfast::<true, false, RUNTIME_LOG, RUNTIME_LOG>(
+                                    literals, seqs,
+                                );
+                            } else {
+                                self.start_matching_dfast::<false, false, RUNTIME_LOG, RUNTIME_LOG>(
                                 literals, seqs,
                             );
-                        } else {
-                            self.start_matching_dfast::<false, RUNTIME_LOG, RUNTIME_LOG>(
-                                literals, seqs,
-                            );
-                        }
-                    },
+                            }
+                        },
+                    }
                 }
             },
             Strategy::Chain(_) => {
@@ -1842,7 +1878,7 @@ impl Matcher for MatchGeneratorDriver {
                         win,
                         idx,
                         self.params.hash_log,
-                        ChainHashWidth::of(self.dict_chain),
+                        ChainHashWidth::of(self.dict_row),
                     );
                     // SAFETY: h is masked to hash_log bits, the absolute block
                     // start to the chain size (absolute key; see
@@ -1858,7 +1894,7 @@ impl Matcher for MatchGeneratorDriver {
                 },
                 Strategy::Dfast(small_log) => {
                     let hl = hash8_at_log(win, idx, self.params.hash_log);
-                    let hs = hash_at_log(win, idx, small_log);
+                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
                     // SAFETY: both hashes masked to their tables' sizes.
                     unsafe {
                         let entry = pack_pos(self.block_start);
@@ -2034,6 +2070,7 @@ impl MatchGeneratorDriver {
             },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
+                let width = ChainHashWidth::of(self.dict_row);
                 let (long, small) = self.tables.split_at_mut(self.second);
                 while idx < to {
                     // SAFETY: both hashes are masked to their tables' sizes
@@ -2041,14 +2078,14 @@ impl MatchGeneratorDriver {
                     unsafe {
                         let entry = pack_pos(win_base + idx as u64);
                         *long.get_unchecked_mut(hash8_at_log(win, idx, long_log)) = entry;
-                        *small.get_unchecked_mut(hash_at_log(win, idx, small_log)) = entry;
+                        *small.get_unchecked_mut(hash_at_width(win, idx, small_log, width)) = entry;
                     }
                     idx += 1;
                 }
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
-                let width = ChainHashWidth::of(self.dict_chain);
+                let width = ChainHashWidth::of(self.dict_row);
                 let (table, chain) = self.tables.split_at_mut(self.second);
                 let chain_mask = chain.len() - 1;
                 while idx < to {

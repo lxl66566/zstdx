@@ -16,6 +16,7 @@ impl MatchGeneratorDriver {
     #[allow(clippy::too_many_lines)]
     pub(super) fn start_matching_dfast<
         const RAMPED: bool,
+        const MM4: bool,
         const LONG_LOG: u32,
         const SMALL_LOG: u32,
     >(
@@ -75,6 +76,15 @@ impl MatchGeneratorDriver {
         let (long, small) = self.tables.split_at_mut(split);
         let long_ptr: *mut u32 = long.as_mut_ptr();
         let small_ptr: *mut u32 = small.as_mut_ptr();
+        // Dictionary frames hash the short table over 4 bytes (libzstd's
+        // small-table dfast rows, minMatch 4 — see `dict_row`); every other
+        // instantiation keeps the 5-byte width, so its body compiles
+        // byte-identically to the pre-`MM4` form.
+        let short_width = if MM4 {
+            ChainHashWidth::Four
+        } else {
+            ChainHashWidth::Five
+        };
         let mut emit = DfastEmit {
             long,
             small,
@@ -84,6 +94,7 @@ impl MatchGeneratorDriver {
             insert_max_idx,
             long_log,
             small_log,
+            width: short_width,
         };
 
         // Resolve a table entry to a window index. Same distance trick as
@@ -127,7 +138,7 @@ impl MatchGeneratorDriver {
                 let mut entry_l0 = unsafe { *long_ptr.add(hl0) };
 
                 loop {
-                let hs0 = hash_at_log(win, ip_idx, small_log);
+                let hs0 = hash_at_width(win, ip_idx, small_log, short_width);
                 // SAFETY: hs0 is masked to the small table size.
                 let entry_s0 = unsafe { *small_ptr.add(hs0) };
                 let pos_abs = win_base + ip_idx as u64;

@@ -23,13 +23,14 @@ pub(super) fn hash5_log(v: u64, log: u32) -> usize {
     (v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)
 }
 
-/// Input width of the chain-table hash: 5 bytes on no-dict frames (the
-/// calibration that beat libzstd's width there), 4 on dictionary frames —
-/// libzstd's lazy-family rows hash `minMatch` bytes and every chain row
-/// its small-input tables select at levels 5-12 carries searchLength 4.
-/// A small payload parses mostly against dictionary content, where the
-/// 4-byte candidate classes (near-duplicate lines diverging at byte 5)
-/// convert; the no-dict width stays put (byte-identical no-dict output).
+/// Input width of the chain-table hash and the dfast short-table hash:
+/// 5 bytes on no-dict frames (the calibration that beat libzstd's width
+/// there), 4 on dictionary frames — libzstd hashes `minMatch` bytes, and
+/// its small-input tables select width-4 rows for the lazy family at
+/// levels 5-12 and dfast at 4. A small payload parses mostly against
+/// dictionary content, where the 4-byte candidate classes (near-duplicate
+/// lines diverging at byte 5) convert; the no-dict width stays put
+/// (byte-identical no-dict output).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChainHashWidth {
     Five,
@@ -38,8 +39,8 @@ pub(super) enum ChainHashWidth {
 
 impl ChainHashWidth {
     #[inline(always)]
-    pub(super) fn of(dict_chain: bool) -> Self {
-        if dict_chain {
+    pub(super) fn of(dict_row: bool) -> Self {
+        if dict_row {
             ChainHashWidth::Four
         } else {
             ChainHashWidth::Five

@@ -579,6 +579,10 @@ pub(super) struct DfastEmit<'a> {
     pub(super) insert_max_idx: usize,
     pub(super) long_log: u32,
     pub(super) small_log: u32,
+    /// Short-table hash width: 4 on dictionary frames (libzstd's
+    /// small-table dfast rows), 5 otherwise. A field, not a const generic:
+    /// these insert sites run per sequence, not per position.
+    pub(super) width: ChainHashWidth,
 }
 
 impl DfastEmit<'_> {
@@ -594,7 +598,7 @@ impl DfastEmit<'_> {
                 .get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = entry;
             *self
                 .small
-                .get_unchecked_mut(hash_at_log(win, idx, self.small_log)) = entry;
+                .get_unchecked_mut(hash_at_width(win, idx, self.small_log, self.width)) = entry;
         }
     }
 
@@ -650,10 +654,12 @@ impl DfastEmit<'_> {
         if match_end >= 1 && match_end - 1 <= self.insert_max_idx {
             // SAFETY: masked to the small table size.
             unsafe {
-                *self
-                    .small
-                    .get_unchecked_mut(hash_at_log(win, match_end - 1, self.small_log)) =
-                    pack_pos(self.win_base + (match_end - 1) as u64);
+                *self.small.get_unchecked_mut(hash_at_width(
+                    win,
+                    match_end - 1,
+                    self.small_log,
+                    self.width,
+                )) = pack_pos(self.win_base + (match_end - 1) as u64);
             }
         }
         match_end
