@@ -1,7 +1,7 @@
 //! Tests for the streaming encoders: byte-equality with the one-shot paths,
 //! option plumbing, drop behavior and interop with the reference decoder.
 
-use alloc::{vec, vec::Vec};
+use alloc::{collections::VecDeque, vec, vec::Vec};
 
 use crate::{
     EncoderOptions, Level, bulk, encoding,
@@ -180,6 +180,71 @@ fn flush_forces_partial_block() {
     let mut expect = data.clone();
     expect.extend_from_slice(&data);
     assert_eq!(bulk::decompress(&sink, 0).unwrap(), expect);
+}
+
+/// A writer serving a scripted sequence of partial accepts (`Ok(n)`) and
+/// errors, then accepting everything; `received` holds the bytes a real
+/// writer would have taken.
+#[cfg(test)]
+struct ScriptedWriter {
+    script: VecDeque<Result<usize, crate::io::Error>>,
+    received: Vec<u8>,
+}
+
+#[cfg(test)]
+impl crate::io::Write for ScriptedWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, crate::io::Error> {
+        match self.script.pop_front() {
+            Some(Ok(n)) => {
+                let n = n.min(buf.len());
+                self.received.extend_from_slice(&buf[..n]);
+                Ok(n)
+            },
+            Some(Err(e)) => Err(e),
+            None => {
+                self.received.extend_from_slice(buf);
+                Ok(buf.len())
+            },
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), crate::io::Error> {
+        Ok(())
+    }
+}
+
+fn would_block() -> crate::io::Error {
+    crate::io::Error::from(crate::io::ErrorKind::WouldBlock)
+}
+
+/// Regression: a drain failure after a partial underlying write must keep
+/// the undelivered encoded bytes addressable — clearing the pending output
+/// on error dropped a frame stretch the writer never received, and the
+/// retried stream shipped corrupt (both decoder-refused and silent).
+#[test]
+fn partial_write_then_error_keeps_pending_output() {
+    // Two-plus full blocks: the first drain carries bytes the writer
+    // half-accepts before failing.
+    let data: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut writer = ScriptedWriter {
+        script: [Ok(1), Err(would_block())].into(),
+        received: Vec::new(),
+    };
+    let mut enc = write::Encoder::new(&mut writer, Level::Fastest).unwrap();
+    assert!(crate::io::Write::write(&mut enc, &data).is_err());
+    // observe the sink through the encoder to keep the borrow valid
+    assert_eq!(enc.get_ref().received.len(), 1);
+    // The retry (here the flush of the staged tail) resumes the same bytes;
+    // the finished frame must decode to exactly the input.
+    enc.flush().unwrap();
+    let writer = enc.finish().unwrap();
+    assert_eq!(bulk::decompress(&writer.received, 0).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(writer.received.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
 }
 
 #[test]

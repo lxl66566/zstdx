@@ -118,6 +118,14 @@ impl<W: Write> Encoder<W> {
 }
 
 impl<W: Write> Write for Encoder<W> {
+    // Contract note: unlike a plain writer, an Err here does not imply the
+    // input was rejected. `buf` is staged (and encoded) before the pending
+    // output is flushed to the underlying writer, and that flush is what
+    // can fail — the input is accepted even when Err is returned. Aligning
+    // with the io::Write "Err = nothing written" guarantee would need the
+    // input deferred (copied) until the drain succeeds; the pending OUTPUT
+    // meanwhile does survive a failed drain, so retrying the drain (via
+    // another write/flush/finish) delivers exactly the encoded bytes once.
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         assert!(!self.core.is_finished(), "write after finish");
         self.core.write(buf);

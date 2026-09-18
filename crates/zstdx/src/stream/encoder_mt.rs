@@ -60,7 +60,7 @@ use std::{
 };
 
 use super::{
-    encoder_core::StreamChecksum,
+    encoder_core::{StreamChecksum, write_pending_output},
     mt_pool::{
         WorkerSlot, WorkerSlotState, assign_lease, leave_lease, pool_thread, return_pooled_state,
         take_parked_slot, take_pooled_state, wait_leave,
@@ -879,14 +879,18 @@ impl MtEncoderCore {
         self.out_read < self.output.len()
     }
 
-    /// Hand the encoded bytes to `w`, keeping the output buffer's allocation.
+    /// Hand the encoded bytes to `w`, keeping the output buffer's
+    /// allocation. A failed write keeps the undelivered tail for the
+    /// caller's retry (see [`write_pending_output`]).
     pub(crate) fn write_output_to(
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
-        let res = w.write_all(&self.output[self.out_read..]);
-        self.output.clear();
-        self.out_read = 0;
+        let res = write_pending_output(&self.output, &mut self.out_read, w);
+        if res.is_ok() {
+            self.output.clear();
+            self.out_read = 0;
+        }
         res
     }
 
@@ -1963,6 +1967,65 @@ mod tests {
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// Scripted writer: each scripted call accepts n bytes (or errors); past
+    /// the script everything is accepted.
+    struct ScriptedWriter {
+        script: VecDeque<std::io::Result<usize>>,
+        received: Vec<u8>,
+    }
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.script.pop_front() {
+                Some(Ok(n)) => {
+                    let n = n.min(buf.len());
+                    self.received.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                },
+                Some(Err(e)) => Err(e),
+                None => {
+                    self.received.extend_from_slice(buf);
+                    Ok(buf.len())
+                },
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a partial underlying write followed by an error must keep
+    /// the undelivered tail in the output buffer so the retry resumes there —
+    /// clearing on error dropped a frame stretch the writer never received.
+    #[test]
+    fn write_output_to_preserves_tail_on_error() {
+        let data = textish(4 * 1024 * 1024);
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
+        core.write(&data);
+        core.flush_block();
+        assert!(core.has_output());
+        let mut flaky = ScriptedWriter {
+            script: [
+                Ok(1),
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            ]
+            .into(),
+            received: Vec::new(),
+        };
+        assert!(core.write_output_to(&mut flaky).is_err());
+        assert_eq!(flaky.received.len(), 1);
+        assert!(core.has_output());
+        // The retry resumes into the same writer; finish closes the frame.
+        core.write_output_to(&mut flaky).unwrap();
+        core.finish();
+        core.write_output_to(&mut flaky).unwrap();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&flaky.received, &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
