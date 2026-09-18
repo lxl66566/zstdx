@@ -94,6 +94,13 @@ impl DecodeBuffer {
         self.buffer.len()
     }
 
+    /// Total bytes of frame output pushed so far (matches the frame's
+    /// declared Frame_Content_Size on a well-formed frame): the frame-finish
+    /// content-size check reads this, so every append path must count.
+    pub fn total_output(&self) -> u64 {
+        self.total_output_counter
+    }
+
     /// Ensure space for `amount` more bytes; used to reserve a whole block
     /// up front so per-sequence appends can skip capacity checks.
     pub fn reserve(&mut self, amount: usize) {
@@ -102,6 +109,7 @@ impl DecodeBuffer {
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         self.buffer.extend_and_fill(fill_with, fill_length);
+        self.total_output_counter += fill_length as u64;
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -109,7 +117,9 @@ impl DecodeBuffer {
         read: R,
         fill_length: usize,
     ) -> Result<(), Error> {
-        self.buffer.extend_from_reader(read, fill_length)
+        self.buffer.extend_from_reader(read, fill_length)?;
+        self.total_output_counter += fill_length as u64;
+        Ok(())
     }
 
     pub fn push(&mut self, data: &[u8]) {
@@ -222,6 +232,7 @@ impl DecodeBuffer {
             let high = low + match_length;
             let dict_slice = &self.dict_content[low..high];
             self.buffer.extend(dict_slice);
+            self.total_output_counter += match_length as u64;
             Ok(())
         } else {
             Err(DecodeBufferError::OffsetTooBig {

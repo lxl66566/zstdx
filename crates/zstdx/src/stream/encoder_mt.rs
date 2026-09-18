@@ -817,7 +817,7 @@ impl MtEncoderCore {
         // outlive the scrutinee into the arms below.
         let read = source.read(&mut spare[..want]).map_err(crate::Error::from);
         match read {
-            Ok(0) => self.finish(),
+            Ok(0) => return self.finish(),
             Ok(n) => {
                 // SAFETY: `read` wrote n initialized bytes into spare[..n].
                 unsafe { self.buf.set_len(len + n) };
@@ -830,10 +830,23 @@ impl MtEncoderCore {
     }
 
     /// Close the frame: the pending jobs (or an empty block) become the last
-    /// block and the checksum, if enabled, is appended.
-    pub(crate) fn finish(&mut self) {
+    /// block and the checksum, if enabled, is appended. A stream pledged a
+    /// content size it did not meet fails here, before any job is posted or
+    /// frame byte produced: the header declares the pledge and decoders
+    /// reject a frame whose content disagrees with it.
+    pub(crate) fn finish(&mut self) -> crate::Result<()> {
         if self.finished {
-            return;
+            return Ok(());
+        }
+        // `pos` is live from the writes themselves, so the check fires
+        // before the drain below could discover it.
+        if let Some(pledged) = self.shape.len
+            && pledged != self.pos
+        {
+            return Err(crate::Error::PledgedSizeMismatch {
+                pledged,
+                actual: self.pos,
+            });
         }
         self.surface_poison();
         if self.pos > self.job_start {
@@ -860,6 +873,7 @@ impl MtEncoderCore {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        Ok(())
     }
 
     /// Emit the pending bytes early as non-last jobs. A no-op when nothing
@@ -1950,6 +1964,30 @@ mod tests {
         );
     }
 
+    /// The pledged-size contract on the mt core itself: over- and
+    /// undershooting the pledge fails finish before anything is posted,
+    /// assembled or emitted.
+    #[test]
+    fn pledged_mismatch_fails_finish() {
+        for (pledged, fed) in [(10u64, 20usize), (100, 20)] {
+            let mut core = MtEncoderCore::new(
+                &EncoderOptions::new(Level::Fastest)
+                    .workers(4)
+                    .pledged_size(Some(pledged)),
+            );
+            core.write(&vec![b'x'; fed]);
+            match core.finish() {
+                Err(crate::Error::PledgedSizeMismatch {
+                    pledged: p,
+                    actual: a,
+                }) => assert_eq!((p, a), (pledged, fed as u64)),
+                other => panic!("pledge {pledged}: got {other:?}"),
+            }
+            assert!(!core.is_finished());
+            assert!(!core.has_output());
+        }
+    }
+
     /// A stream ending exactly on an epoch boundary has its last jobs
     /// already posted (and possibly still in flight) at finish: the tail
     /// path must not skip their assembly, and a flush at the same point
@@ -1961,7 +1999,7 @@ mod tests {
         let data = textish(4 * mib);
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -1971,7 +2009,7 @@ mod tests {
         core.write(&data);
         core.flush_block();
         assert!(core.has_output());
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -2029,7 +2067,7 @@ mod tests {
         assert!(core.has_output());
         // The retry resumes into the same writer; finish closes the frame.
         core.write_output_to(&mut flaky).unwrap();
-        core.finish();
+        core.finish().unwrap();
         core.write_output_to(&mut flaky).unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -2048,7 +2086,7 @@ mod tests {
         for _ in 0..4 {
             let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
             core.write(&data);
-            core.finish();
+            core.finish().unwrap();
             match &reference {
                 Some(bytes) => assert_eq!(&core.output, bytes, "sequential reuse"),
                 None => reference = Some(core.output.clone()),
@@ -2063,7 +2101,7 @@ mod tests {
                 for _ in 0..4 {
                     let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
                     core.write(&data);
-                    core.finish();
+                    core.finish().unwrap();
                     assert_eq!(core.output, reference, "concurrent lease {t}");
                 }
             }));
@@ -2087,7 +2125,7 @@ mod tests {
         }
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
-        core.finish();
+        core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
@@ -2106,7 +2144,7 @@ mod tests {
             for piece in data.chunks(chunk) {
                 core.write(piece);
             }
-            core.finish();
+            core.finish().unwrap();
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&core.output, &mut out).unwrap();

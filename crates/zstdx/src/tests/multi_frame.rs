@@ -108,10 +108,12 @@ fn two_frames_decode_completely() {
 fn fuzzer_found_two_frame_input() {
     // crash-b5593b58b45a98a3e4d44fb3c94ab6b545a3b7c6: two tiny frames (RLE
     // blocks emitting 4x0x38 and 5x0x04); the streaming path used to stop
-    // after the first.
+    // after the first. The second frame's declared Frame_Content_Size is 5,
+    // matching its RLE block (the originally fuzzed 0x39 declared 57 and is
+    // now the content_size_mismatch case below).
     let input = [
         0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x23, 0x00, 0x00, 0x38, //
-        0x28, 0xb5, 0x2f, 0xfd, 0x38, 0x39, 0x2b, 0x00, 0x00, 0x04,
+        0x28, 0xb5, 0x2f, 0xfd, 0x38, 0x05, 0x2b, 0x00, 0x00, 0x04,
     ];
     expect_consistent(&input);
     let out = flat_decode(&input).unwrap();
@@ -119,6 +121,105 @@ fn fuzzer_found_two_frame_input() {
     // No reference cross-check: this frame sets reserved frame-descriptor
     // bits (FHD 0x38), which libzstd rejects ("unsupported frame parameter")
     // while zstdx currently tolerates; only the internal paths must agree.
+}
+
+/// A frame whose header declares a Frame_Content_Size its blocks do not
+/// produce must be rejected by every decode path (libzstd reports the same
+/// shape as a size error at the frame tail).
+#[test]
+fn content_size_mismatch_is_an_error() {
+    // The original b5593b58 second frame: single-segment, 1-byte FCS field
+    // declaring 57 bytes, one RLE block producing 5.
+    let input = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x23, 0x00, 0x00, 0x38, //
+        0x28, 0xb5, 0x2f, 0xfd, 0x38, 0x39, 0x2b, 0x00, 0x00, 0x04,
+    ];
+    expect_content_size_error(&input);
+    #[cfg(feature = "std")]
+    assert!(zstd::decode_all(&input[..]).is_err(), "reference rejects");
+
+    // A real frame with its declared FCS patched one byte beyond the actual
+    // content must fail the same way (the encoder itself cannot emit this;
+    // the header field is the only thing corrupted). The one-shot paths
+    // declare no FCS, so the well-formed frame comes from a pledged stream.
+    let mut corrupt = pledged_frame(&vec![b'x'; 300]);
+    let (declared, fcs_at) = locate_fcs(&corrupt);
+    assert_eq!(declared, 300);
+    corrupt[fcs_at] += 1;
+    expect_content_size_error(&corrupt);
+    #[cfg(feature = "std")]
+    assert!(zstd::decode_all(&corrupt[..]).is_err(), "reference rejects");
+
+    // The uncorrupted frame still decodes on every path.
+    expect_consistent(&pledged_frame(&vec![b'x'; 300]));
+
+    // An empty frame declaring FCS=0 stays valid (0 == 0), skippable frames
+    // around it included.
+    expect_consistent(&concat(&[&skippable(b"x"), &pledged_frame(&[])]));
+}
+
+/// A well-formed single frame declaring its content size.
+fn pledged_frame(data: &[u8]) -> Vec<u8> {
+    let mut sink = Vec::new();
+    let mut enc = crate::stream::write::Encoder::with_options(
+        &mut sink,
+        crate::EncoderOptions::new(Level::Fastest).pledged_size(Some(data.len() as u64)),
+    )
+    .unwrap();
+    crate::io::Write::write_all(&mut enc, data).unwrap();
+    enc.finish().unwrap();
+    sink
+}
+
+/// Walk a frame header to its Frame_Content_Size field, returning the
+/// declared value and the field's byte offset.
+pub(super) fn locate_fcs(frame: &[u8]) -> (u64, usize) {
+    let fhd = frame[4];
+    let single_segment = (fhd >> 5) & 1 == 1;
+    let dict_len = match fhd & 3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => unreachable!("two-bit flag"),
+    };
+    let pos = 5 + usize::from(!single_segment) + dict_len;
+    let declared = match fhd >> 6 {
+        0 => {
+            assert!(single_segment, "no FCS field to locate");
+            u64::from(frame[pos])
+        },
+        1 => u64::from(u16::from_le_bytes([frame[pos], frame[pos + 1]])) + 256,
+        2 => u64::from(u32::from_le_bytes([
+            frame[pos],
+            frame[pos + 1],
+            frame[pos + 2],
+            frame[pos + 3],
+        ])),
+        3 => u64::from_le_bytes([
+            frame[pos],
+            frame[pos + 1],
+            frame[pos + 2],
+            frame[pos + 3],
+            frame[pos + 4],
+            frame[pos + 5],
+            frame[pos + 6],
+            frame[pos + 7],
+        ]),
+        _ => unreachable!("two-bit flag"),
+    };
+    (declared, pos)
+}
+
+/// Both decode paths must fail, naming the content-size mismatch.
+fn expect_content_size_error(input: &[u8]) {
+    let streamed = stream_decode(input).unwrap_err();
+    assert!(
+        streamed.contains("Frame_Content_Size mismatch"),
+        "{streamed}"
+    );
+    let flat = flat_decode(input).unwrap_err();
+    assert!(flat.contains("Frame_Content_Size mismatch"), "{flat}");
 }
 
 #[test]

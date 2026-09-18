@@ -68,10 +68,11 @@ impl<R: Read> Encoder<R> {
     }
 
     /// Reclaim the underlying reader. The frame is closed with whatever has
-    /// been consumed so far; the rest of the source stays unread.
-    pub fn finish(mut self) -> R {
-        self.core.finish();
-        self.source.take().unwrap()
+    /// been consumed so far; the rest of the source stays unread. Fails when
+    /// a pledged content size was not met by those bytes.
+    pub fn finish(mut self) -> Result<R> {
+        self.core.finish()?;
+        Ok(self.source.take().unwrap())
     }
 }
 

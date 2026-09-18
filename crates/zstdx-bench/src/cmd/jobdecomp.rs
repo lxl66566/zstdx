@@ -100,7 +100,7 @@ mod trace {
                 break;
             }
         }
-        enc.finish();
+        enc.finish().unwrap();
         out
     }
 

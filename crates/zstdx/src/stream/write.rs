@@ -85,9 +85,11 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Finish the stream without consuming the encoder; every following
-    /// [`Write::write`] panics, mirroring the libzstd bindings.
+    /// [`Write::write`] panics, mirroring the libzstd bindings. Fails when a
+    /// pledged content size was not met (the frame would be rejected by
+    /// decoders and is not emitted).
     pub fn do_finish(&mut self) -> Result<()> {
-        self.core.finish();
+        self.core.finish()?;
         self.drain()
     }
 

@@ -328,3 +328,74 @@ fn test_dict_encoding() {
     );
     std::println!("dict sizes: ours <= libzstd in {ours_smaller}, behind in {theirs_smaller}");
 }
+
+/// The ring decode path (dictionary frames) enforces the declared
+/// Frame_Content_Size against its own output count: a pledged dict stream
+/// decodes clean, and corrupting only the header's FCS field rejects the
+/// frame at the finish point.
+#[test]
+fn dict_frame_content_size_is_enforced() {
+    extern crate std;
+    use alloc::{string::String, vec::Vec};
+    use std::{fs, println};
+
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder, errors::FrameDecoderError};
+
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    let Some(mut files) = super::fixture_entries("./dict_tests/files") else {
+        return;
+    };
+    files.sort_by_key(|f| match f {
+        Ok(entry) => entry.path().to_string_lossy().into_owned(),
+        Err(_) => String::new(),
+    });
+    let Some(path) = files
+        .into_iter()
+        .filter_map(|f| f.ok().map(|f| f.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "service"))
+    else {
+        return;
+    };
+    let mut data = fs::read(path).unwrap();
+    data.truncate(64 * 1024);
+
+    // A pledged dictionary stream: its header declares the content size.
+    let mut sink = Vec::new();
+    let mut enc = crate::stream::write::Encoder::with_options(
+        &mut sink,
+        crate::EncoderOptions::new(crate::Level::Fastest)
+            .dictionary(&dict)
+            .pledged_size(Some(data.len() as u64)),
+    )
+    .unwrap();
+    crate::io::Write::write_all(&mut enc, &data).unwrap();
+    enc.finish().unwrap();
+
+    let decode = |frame: &[u8]| -> Result<Vec<u8>, FrameDecoderError> {
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(crate::decoding::Dictionary::decode_dict(&dict).unwrap())?;
+        let mut source = frame;
+        dec.reset(&mut source)?;
+        dec.decode_blocks(&mut source, BlockDecodingStrategy::All)?;
+        dec.collect().ok_or(FrameDecoderError::NotYetInitialized)
+    };
+
+    assert_eq!(decode(&sink).unwrap(), data);
+
+    // Corrupt only the declared FCS field: the blocks still decode, the
+    // frame must still be rejected, naming the mismatch.
+    let (declared, fcs_at) = super::multi_frame::locate_fcs(&sink);
+    assert_eq!(declared, data.len() as u64);
+    let mut corrupt = sink;
+    corrupt[fcs_at] = corrupt[fcs_at].wrapping_add(1);
+    match decode(&corrupt) {
+        Err(FrameDecoderError::ContentSizeMismatch { declared, actual }) => {
+            assert_eq!(declared, data.len() as u64 + 1);
+            assert_eq!(actual, data.len() as u64);
+        },
+        other => panic!("expected ContentSizeMismatch, got {other:?}"),
+    }
+    println!("dict frame FCS check at {} bytes", data.len());
+}

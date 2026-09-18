@@ -78,6 +78,11 @@ pub(crate) struct FrameEncoderCoreSt {
     /// blocks; RFC 8878 Block_Maximum_Size).
     block_size: usize,
     header: Vec<u8>,
+    /// The pledged content size, verbatim from the options: enforced against
+    /// [`FrameEncoderCoreSt::pos`] at [`FrameEncoderCoreSt::finish`].
+    pledged: Option<u64>,
+    /// Total input bytes fed.
+    pos: u64,
     /// Input bytes of the block currently being assembled; always shorter
     /// than the block size outside [`FrameEncoderCoreSt::write`].
     staged: Vec<u8>,
@@ -168,6 +173,8 @@ impl FrameEncoderCoreSt {
             checksum,
             block_size,
             header: serialized,
+            pledged: options.pledged_size,
+            pos: 0,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             probe_pending,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
@@ -179,6 +186,7 @@ impl FrameEncoderCoreSt {
 
     pub(crate) fn write(&mut self, data: &[u8]) {
         debug_assert!(!self.finished);
+        self.pos += data.len() as u64;
         let mut data = data;
         while !data.is_empty() {
             // While the reach probe is pending (see reach_probe), the
@@ -215,10 +223,21 @@ impl FrameEncoderCoreSt {
     }
 
     /// Close the frame: the staged bytes (or an empty block) become the last
-    /// block and the checksum, if enabled, is appended.
-    pub(crate) fn finish(&mut self) {
+    /// block and the checksum, if enabled, is appended. A stream pledged a
+    /// content size it did not meet fails here, before any frame byte is
+    /// produced: the header declares the pledge and decoders reject a frame
+    /// whose content disagrees with it.
+    pub(crate) fn finish(&mut self) -> Result<()> {
         if self.finished {
-            return;
+            return Ok(());
+        }
+        if let Some(pledged) = self.pledged
+            && pledged != self.pos
+        {
+            return Err(Error::PledgedSizeMismatch {
+                pledged,
+                actual: self.pos,
+            });
         }
         // A frame needs at least one block: empty input, and an input that
         // is an exact multiple of the block size, encode one empty raw last
@@ -234,6 +253,7 @@ impl FrameEncoderCoreSt {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        Ok(())
     }
 
     /// Emit the staged bytes early as a non-last block. A no-op when nothing
@@ -402,8 +422,9 @@ impl FrameEncoderCore {
     }
 
     /// Close the frame: the staged bytes (or an empty block) become the last
-    /// block and the checksum, if enabled, is appended.
-    pub(crate) fn finish(&mut self) {
+    /// block and the checksum, if enabled, is appended. Fails when a pledged
+    /// content size was not met; no frame is produced then.
+    pub(crate) fn finish(&mut self) -> Result<()> {
         match self {
             Self::Single(core) => core.finish(),
             #[cfg(feature = "std")]
@@ -471,7 +492,7 @@ impl FrameEncoderCore {
             return Ok(());
         }
         match source.read(chunk).map_err(Error::from) {
-            Ok(0) => self.finish(),
+            Ok(0) => return self.finish(),
             Ok(n) => self.write(&chunk[..n]),
             Err(e) => return Err(e),
         }

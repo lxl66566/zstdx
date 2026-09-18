@@ -145,7 +145,7 @@ fn zstdx_encode(raw: &[u8], level: Level, mode: RatioMode, mt: u32) -> Vec<u8> {
             let mut enc = RuzStreamEncoder::with_options(raw, opts).unwrap();
             let mut out = Vec::new();
             enc.read_to_end(&mut out).unwrap();
-            enc.finish();
+            enc.finish().unwrap();
             out
         },
     }
