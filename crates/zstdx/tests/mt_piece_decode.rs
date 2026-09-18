@@ -299,3 +299,60 @@ fn sequential_decoder_agrees() {
     set_mt_ramp_depth_for_tests(u64::MAX);
     set_piece_decode_for_tests(false);
 }
+
+/// High-ratio frames compress below the MT decoder's 512 KiB input floor
+/// (text 32 MiB -> ~100 KB); the pledged content size, not the compressed
+/// size, must route them into the piece executor.
+#[test]
+fn high_ratio_small_input_engages() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    // Pure short-period cycle: extreme ratio, a few KB compressed.
+    let data: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 61) as u8).collect();
+    for level in [Level::Fastest, Level::Fast, Level::Balanced] {
+        for workers in [2u32, 4, 8] {
+            let compressed = bulk::compress_with(
+                &data,
+                &EncoderOptions::new(level).workers(workers).checksum(true),
+            )
+            .unwrap();
+            assert!(
+                compressed.len() < 512 * 1024,
+                "{level:?}/{workers}: {} must sit below the MT input floor",
+                compressed.len()
+            );
+            let before = piece_engagements();
+            assert_eq!(decode_mt(&compressed, data.len(), workers), data);
+            assert!(
+                piece_engagements() > before,
+                "{level:?}/{workers}: piece executor did not engage below the input floor"
+            );
+        }
+    }
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(false);
+}
+
+/// A below-floor frame whose pledge misses the piece regime must stay
+/// serial: no engagement, still byte-exact.
+#[test]
+fn small_pledge_does_not_engage() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 61) as u8).collect();
+    let compressed = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Fastest)
+            .workers(4)
+            .checksum(true),
+    )
+    .unwrap();
+    assert!(compressed.len() < 512 * 1024);
+    let before = piece_engagements();
+    assert_eq!(decode_mt(&compressed, data.len(), 4), data);
+    assert_eq!(piece_engagements(), before, "sub-regime pledge engaged");
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(false);
+}

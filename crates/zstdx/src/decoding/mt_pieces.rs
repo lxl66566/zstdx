@@ -59,10 +59,10 @@ use crate::xxh64::Xxh64;
 
 /// Below this pledged size the piece machinery cannot pay (the job floor
 /// alone is 512 KiB; the encoder's MT path needs 2 MiB anyway).
-const MIN_PIECE_FRAME: usize = 2 * 1024 * 1024;
+pub(super) const MIN_PIECE_FRAME: usize = 2 * 1024 * 1024;
 /// Above this pledged size staging the whole frame (all segments' literals
 /// plus sequences) outweighs the serial path's bounded staging.
-const MAX_PIECE_FRAME: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PIECE_FRAME: usize = 64 * 1024 * 1024;
 /// Smallest job size worth cutting a piece at (the encoder's own job floor
 /// is 1 MiB; 512 KiB admits foreign grids without going sub-piece).
 const MIN_PIECE_JOB: usize = 512 * 1024;

@@ -23,8 +23,9 @@
 //!
 //! Segment output sizes are only known after stage A, so the output buffer
 //! is checked (or grown) segment by segment as stage B reaches them.
-//! Dictionary frames, small inputs, inputs without a second restart point
-//! and single-core processes fall back to the sequential decoder.
+//! Dictionary frames, small inputs (unless the pledge routes them to the
+//! piece executor), inputs without a second restart point and single-core
+//! processes fall back to the sequential decoder.
 //!
 //! Checksummed frames are verified inline in stage B: the pre-scan collects
 //! each trailer word, and the executor absorbs every segment's range into
@@ -64,8 +65,10 @@ use crate::{
 };
 
 /// Below this (compressed) input size the scan, spawn and hand-off overhead
-/// dominates; the restart-point count is the real gate, this only avoids
-/// spawning for inputs that could parallelize but not benefit.
+/// dominates — unless the frame pledges an output in the piece executor's
+/// regime (high-ratio shapes: the decode work scales with the pledge, not
+/// the compressed bytes). The restart-point count is the real gate; this
+/// only avoids spawning for inputs that could parallelize but not benefit.
 const MIN_MT_INPUT: usize = 512 * 1024;
 /// Segment-size floor: below it the staging buffers and hand-offs cost
 /// more than the parallelism saves.
@@ -408,12 +411,25 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         });
         cursor = scan_cur;
     }
-    (segments.len() >= 2).then_some(ScanPlan {
+    let plan = ScanPlan {
         segments,
         #[cfg(feature = "hash")]
         checksums,
         pledged_single,
-    })
+    };
+    // A high-ratio frame (compressed input under the MT floor, pledge in
+    // the piece regime) legitimately yields a single segment: stage A on a
+    // sub-floor input is negligible either way and the piece cut is
+    // output-gridded, not segment-gridded. Larger inputs keep the
+    // two-segment bar so the piece router never stages a big single-segment
+    // plan just to fail validation.
+    if plan.segments.len() >= 2
+        || (input.len() < MIN_MT_INPUT && super::mt_pieces::gate(&plan).is_some())
+    {
+        Some(plan)
+    } else {
+        None
+    }
 }
 
 /// Stage A: decode one segment's literals and sequences into staging.
@@ -836,11 +852,28 @@ fn decode_parallel(
     result
 }
 
+/// Below [`MIN_MT_INPUT`] the compressed size says nothing about the decode
+/// work: a high-ratio frame (text 32 MiB -> ~100 KB compressed) would never
+/// parallelize. Peek the leading frame header and let the scan run when a
+/// single pledged frame reaches the piece executor's size regime; the scan
+/// cost stays proportional to the compressed bytes.
+fn pledges_piece_frame(input: &[u8]) -> bool {
+    let mut reader = input;
+    match frame::read_frame_header(&mut reader) {
+        Ok((header, _)) => {
+            (header.descriptor.frame_content_size_flag() != 0
+                || header.descriptor.single_segment_flag())
+                && header.frame_content_size() >= super::mt_pieces::MIN_PIECE_FRAME as u64
+        },
+        Err(_) => false,
+    }
+}
+
 fn engage(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
-    if workers < 2
-        || input.len() < MIN_MT_INPUT
-        || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
-    {
+    if workers < 2 || std::thread::available_parallelism().map_or(true, |n| n.get() < 2) {
+        return None;
+    }
+    if input.len() < MIN_MT_INPUT && !pledges_piece_frame(input) {
         return None;
     }
     scan(input, workers, max_window_size)
