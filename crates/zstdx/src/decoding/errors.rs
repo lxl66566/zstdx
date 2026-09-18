@@ -247,6 +247,15 @@ pub enum ExecuteSequencesError {
     NotEnoughBytesForSequence { wanted: usize, have: usize },
     #[error("Illegal offset: 0 found")]
     ZeroOffset,
+    /// The block's claimed decompressed output exceeds the per-block cap of
+    /// `min(window_size, MAX_BLOCK_SIZE)` (`crate::common::max_block_output`).
+    /// Checked before the block-level reserve, so a hostile sequence section
+    /// can no longer trigger a gigabyte-sized allocation.
+    #[error(
+        "decompressed block output exceeds the per-block maximum of {max} bytes (min(window, 128 \
+         KiB))"
+    )]
+    BlockOutputTooLarge { max: usize },
     /// Flat-output execution ran out of space in the caller's target buffer.
     #[error("Not enough space in the target buffer for this block")]
     TargetTooSmall,
