@@ -1,4 +1,8 @@
 //! Structures and utilities used for compressing/encoding data into the Zstd format.
+//!
+//! Most users want the [`bulk`][crate::bulk] one-shot functions or the
+//! [`stream`][crate::stream] encoders instead; the entry points here are the
+//! low-level plumbing they are built on.
 
 #[cfg(all(feature = "std", feature = "hash"))]
 pub(crate) mod async_checksum;
@@ -45,6 +49,9 @@ use crate::{
 
 /// Convenience function to compress some source into a target without reusing any resources of the
 /// compressor
+///
+/// Write errors from `target` panic; use [`stream::write::Encoder`][crate::stream::write::Encoder]
+/// when the sink can fail.
 /// ```rust
 /// use zstdx::{Level, encoding::compress};
 /// let data: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];

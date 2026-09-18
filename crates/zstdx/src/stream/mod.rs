@@ -1,8 +1,8 @@
-//! Streaming encoders and decoders shaped after [`io::Read`]/[`io::Write`].
+//! Streaming encoders and decoders shaped after `std::io::Read`/`std::io::Write`.
 //!
 //! - [`write::Encoder`] compresses what is written to it into an underlying writer
 //!   ([`write::Decoder`] decodes into one)
-//! - [`read::Encoder`] exposes compressed bytes through [`io::Read`] ([`read::Decoder`]
+//! - [`read::Encoder`] exposes compressed bytes through `std::io::Read` ([`read::Decoder`]
 //!   decompresses while reading, transparently over concatenated frames)
 //!
 //! One-shot conveniences over the same machinery: [`encode_all`],
@@ -38,6 +38,14 @@ pub fn encode_all<R: Read>(source: R, level: Level) -> Result<alloc::vec::Vec<u8
 }
 
 /// Decompress everything `source` provides into a Vec (all frames).
+///
+/// ```rust
+/// let compressed = zstdx::stream::encode_all(&b"abcabcabc"[..], zstdx::Level::Fastest).unwrap();
+/// assert_eq!(
+///     zstdx::stream::decode_all(&compressed[..]).unwrap(),
+///     b"abcabcabc"
+/// );
+/// ```
 pub fn decode_all<R: Read>(source: R) -> Result<alloc::vec::Vec<u8>> {
     let mut output = alloc::vec::Vec::new();
     copy_decode(source, &mut output)?;
@@ -56,6 +64,13 @@ pub fn copy_encode<R: Read, W: Write>(
 }
 
 /// Decompress everything `source` provides into `destination` (all frames).
+///
+/// ```rust
+/// let compressed = zstdx::stream::encode_all(&b"abc"[..], zstdx::Level::Fastest).unwrap();
+/// let mut out = Vec::new();
+/// zstdx::stream::copy_decode(&compressed[..], &mut out).unwrap();
+/// assert_eq!(out, b"abc");
+/// ```
 pub fn copy_decode<R: Read, W: Write>(source: R, mut destination: W) -> Result<()> {
     let mut decoder = read::Decoder::new(source)?;
     copy_between(&mut decoder, &mut destination)

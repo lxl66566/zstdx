@@ -7,11 +7,11 @@ edition      = "2024"
 license      = "MIT"
 homepage     = "https://github.com/KillingSpark/zstd-rs"
 repository   = "https://github.com/KillingSpark/zstd-rs"
-description  = "A decoder for the zstd compression format"
+description  = "A pure Rust implementation of the zstd compression format (encoder and decoder)"
 exclude      = ["decodecorpus_files/*", "dict_tests/*"]
 readme       = "Readme.md"
-keywords     = ["decompression", "zstandard", "zstd"]
-categories   = ["compression"]
+keywords     = ["compression", "decompression", "zstandard", "zstd"]
+categories   = ["compression", "no-std"]
 
 [dependencies]
 # Compile-time only; the no_std build derives Display/From without the

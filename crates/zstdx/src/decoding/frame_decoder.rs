@@ -218,7 +218,7 @@ impl FrameDecoder {
     /// declaring a larger window are rejected with
     /// [FrameDecoderError::WindowSizeTooBig].
     ///
-    /// The default ([DEFAULT_MAX_WINDOW_SIZE], 100mb) bounds allocation for
+    /// The default ([DEFAULT_MAX_WINDOW_SIZE], 128 MiB) bounds allocation for
     /// untrusted input. Raising it reintroduces that large-allocation risk, so
     /// only do so for sources you trust. Mirrors `ZSTD_d_windowLogMax` in libzstd.
     ///

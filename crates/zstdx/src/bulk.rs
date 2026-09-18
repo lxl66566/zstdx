@@ -84,6 +84,12 @@ pub fn compress_with(
 /// header still start from the hint, so prefer `0` over a wrong guess; the
 /// buffer doubles automatically whenever the decoded data does not fit. When
 /// you know the exact size, [`decompress_to_buffer`] avoids the retries.
+///
+/// ```rust
+/// let compressed = zstdx::bulk::compress(b"abcabcabc", zstdx::Level::Fastest);
+/// let out = zstdx::bulk::decompress(&compressed, 0).unwrap();
+/// assert_eq!(out, b"abcabcabc");
+/// ```
 pub fn decompress(source: &[u8], capacity: usize) -> Result<alloc::vec::Vec<u8>> {
     let mut decoder = FrameDecoder::new();
     let mut capacity = capacity.max(64 * 1024);
@@ -102,6 +108,14 @@ pub fn decompress(source: &[u8], capacity: usize) -> Result<alloc::vec::Vec<u8>>
 /// Returns the number of bytes written. `destination` must be large enough
 /// for all decoded data; the whole input is consumed (multiple frames and
 /// skippable frames included).
+///
+/// ```rust
+/// let data = b"abcabcabc";
+/// let compressed = zstdx::bulk::compress(data, zstdx::Level::Fastest);
+/// let mut buf = [0u8; 16];
+/// let written = zstdx::bulk::decompress_to_buffer(&compressed, &mut buf).unwrap();
+/// assert_eq!(&buf[..written], data);
+/// ```
 pub fn decompress_to_buffer(source: &[u8], destination: &mut [u8]) -> Result<usize> {
     FrameDecoder::new()
         .decode_all(source, destination)

@@ -705,6 +705,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ///
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you
     /// can use the [Read::take] function
+    ///
+    /// Drain write errors panic; use [crate::stream::write::Encoder] when the sink can fail.
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor; a dictionary
         // (validated here — see `set_dictionary`'s panic contract) rides

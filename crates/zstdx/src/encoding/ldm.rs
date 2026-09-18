@@ -774,6 +774,8 @@ impl LdmState {
     /// produces the same splits and table state as the unsegmented fill
     /// of the union span. `None` when `end` is reached without a
     /// qualifying freeze — the caller falls back to the stock path.
+    // the only caller (`strip_fill_segment`) is std-gated with the MT paths
+    #[cfg(feature = "std")]
     pub fn fill_to_freeze(
         &mut self,
         win: &[u8],

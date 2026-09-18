@@ -430,7 +430,7 @@ impl MatchGeneratorDriver {
             .then_some(p.window as u64)
     }
 
-    /// Whether the shape-adaptive reach probe (see [`super::reach_probe`])
+    /// Whether the shape-adaptive reach probe (see `super::reach_probe`)
     /// may decide this frame's reach: only the Balanced chain row with its
     /// stock reach still in place — the opt rows share the `chain_reach`
     /// field (their tree search domain) without being probe subjects, and a
@@ -817,7 +817,7 @@ impl MatchGeneratorDriver {
     /// history (already validated against the content length by the
     /// caller). Content beyond the level's window is unreachable and
     /// dropped. The prefill indexes the surviving content under the
-    /// dictionary grid (see [`FillGrid::Dictionary`]; seed detection
+    /// dictionary grid (see `FillGrid::Dictionary`; seed detection
     /// included), so matches into the dictionary cost nothing extra at
     /// scan time.
     pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
@@ -897,7 +897,7 @@ impl MatchGeneratorDriver {
     }
 
     /// Arm the deep-offset ramp for a job that starts at `job_start`
-    /// (see [`RampGate`]); `depth == 0` disarms it. Job zero needs no ramp:
+    /// (see `RampGate`); `depth == 0` disarms it. Job zero needs no ramp:
     /// no output exists below the frame start, so cross-boundary reads are
     /// impossible there.
     pub fn arm_ramp(&mut self, job_start: u64, depth: u64) {
@@ -1367,10 +1367,10 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     /// Decide the frame's reach from its first bytes (see
-    /// [`super::reach_probe`]). Called before any block of the frame is
+    /// `super::reach_probe`). Called before any block of the frame is
     /// matched; no-op for heads below the probe span.
     /// Start accumulating a reach-probe cost off this driver's real parses
-    /// (donation mode; see [`self.probe_stats`]). No effect on the parse.
+    /// (donation mode; see `probe_stats`). No effect on the parse.
     fn begin_probe_stats(&mut self) {
         self.probe_stats = Some(alloc::boxed::Box::default());
     }
@@ -1687,16 +1687,16 @@ impl Matcher for MatchGeneratorDriver {
                     let small_log = (self.tables.len() - self.second).trailing_zeros();
                     match (self.ramp.is_armed(), long_log, small_log) {
                         (false, 17, 16) => {
-                            self.start_matching_dfast::<false, false, 17, 16>(literals, seqs)
+                            self.start_matching_dfast::<false, false, 17, 16>(literals, seqs);
                         },
                         (true, 17, 16) => {
-                            self.start_matching_dfast::<true, false, 17, 16>(literals, seqs)
+                            self.start_matching_dfast::<true, false, 17, 16>(literals, seqs);
                         },
                         (false, 18, 18) => {
-                            self.start_matching_dfast::<false, false, 18, 18>(literals, seqs)
+                            self.start_matching_dfast::<false, false, 18, 18>(literals, seqs);
                         },
                         (true, 18, 18) => {
-                            self.start_matching_dfast::<true, false, 18, 18>(literals, seqs)
+                            self.start_matching_dfast::<true, false, 18, 18>(literals, seqs);
                         },
                         (armed, ..) => {
                             if armed {
