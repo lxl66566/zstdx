@@ -1126,12 +1126,6 @@ fn compress_literals(
     // right away instead of encoding and throwing the result away.
     {
         let total = literals.len() as f64;
-        let mut entropy_bits = 0.0f64;
-        for &c in &counts[..=max_symbol] {
-            if c > 0 {
-                entropy_bits -= c as f64 * entropy_log2(c as f64 / total);
-            }
-        }
         // The flat description weight only prices a fresh table; with a
         // dictionary-seeded table the leading candidate is treeless (no
         // description on the wire), and the treeless-vs-fresh comparison
@@ -1143,9 +1137,26 @@ fn compress_literals(
         } else {
             160.0
         };
-        if entropy_bits + description + total * 0.02 >= total * 8.0 {
-            raw_literals(literals, writer);
-            return LitOutcome::Raw;
+        // Entropy over k distinct symbols never exceeds total * log2(k), so
+        // when even that bound cannot reach the reject floor the exact
+        // Shannon sum's verdict is already decided and its libm log2 loop
+        // (a per-block fixed cost on every compressible-literals block) is
+        // wasted work. Decision-exact: the exact sum is <= the bound in
+        // real arithmetic, and the nearest integer-k bound clears or misses
+        // the floor by >= ~1e-3 * total while f64 rounding moves either
+        // side by <= ~1e-12 * total.
+        let distinct = counts[..=max_symbol].iter().filter(|&&c| c > 0).count();
+        if total * entropy_log2(distinct as f64) + description + total * 0.02 >= total * 8.0 {
+            let mut entropy_bits = 0.0f64;
+            for &c in &counts[..=max_symbol] {
+                if c > 0 {
+                    entropy_bits -= c as f64 * entropy_log2(c as f64 / total);
+                }
+            }
+            if entropy_bits + description + total * 0.02 >= total * 8.0 {
+                raw_literals(literals, writer);
+                return LitOutcome::Raw;
+            }
         }
     }
 
