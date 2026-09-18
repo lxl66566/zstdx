@@ -85,6 +85,10 @@ enum FillGrid {
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xc0000;
 
+// The flags below are independent sticky per-frame/per-block latches (gate
+// hold, DUBT staleness, LDM latch, strip parse, dictionary chain) with
+// different clear points; they do not collapse into one state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MatchGeneratorDriver {
     /// Contiguous history: `win[0]` is absolute position `win_base`.
     /// Capacity holds two windows plus one block, so compaction (which keeps

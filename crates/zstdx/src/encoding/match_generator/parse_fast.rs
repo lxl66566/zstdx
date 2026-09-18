@@ -6,6 +6,7 @@ use super::*;
 
 impl MatchGeneratorDriver {
     /// The single-probe `fast` strategy loop (level [`Level::Fastest`]).
+    #[allow(clippy::too_many_lines)]
     pub(super) fn start_matching_fast<
         const RAMPED: bool,
         const DENSE: bool,

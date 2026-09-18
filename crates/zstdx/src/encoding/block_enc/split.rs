@@ -714,6 +714,7 @@ impl Estimator<'_> {
     /// One stream's description bytes plus its symbol cost under the
     /// selected mode; built tables return their transition buffers to the
     /// pool after measuring.
+    #[allow(clippy::too_many_arguments)]
     fn stream_size(
         &mut self,
         counts: [u32; SEQ_CODE_SPACE],

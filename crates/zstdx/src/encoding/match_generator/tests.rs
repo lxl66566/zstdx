@@ -3,6 +3,9 @@ use alloc::vec::Vec;
 use super::{LdmArming, MatchGeneratorDriver, ldm_min_window, pack_pos, unpack_pos};
 use crate::encoding::{Matcher, Sequence};
 
+/// The 64 KiB unit both LDM far-class tests duplicate.
+const UNIT: usize = 64 * 1024;
+
 /// The shared prefix fill (the streaming finish tail's strip-fill
 /// share) must reproduce the stock per-job strip fill bit for bit: a
 /// driver that adopts a snapshot of a shorter prefix fill and
@@ -48,7 +51,7 @@ fn strip_snapshot_adopt_is_exact() {
     let mut builder = fresh();
     builder.prefill_window(&data[..0], 0);
     let mut from = 0u64;
-    let mut upto = 0u64;
+    let mut upto;
     loop {
         let soft = (from + seg as u64).min(med as u64);
         upto = builder
@@ -240,7 +243,6 @@ fn reconstructs_after_compaction() {
     assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
 }
 
-#[test]
 /// Far repeats beyond the chain reach must ride LDM candidates: two
 /// copies of a random block 5 MiB apart inside filler, compressed at
 /// the balanced row (window W26, chain reach W22). The parse is only
@@ -259,7 +261,6 @@ fn ldm_row_covers_beyond_chain_reach() {
     // apart — the far class recurs throughout, like shared code in
     // concatenated binaries, instead of one isolated duplicate (which
     // the quiet latch could legitimately miss; see LDM_QUIET).
-    const UNIT: usize = 64 * 1024;
     let mut data = Vec::with_capacity(6 * 1024 * 1024);
     for _ in 0..80 {
         data.extend((0..UNIT).map(|_| (rand() >> 32) as u8));
@@ -308,7 +309,6 @@ fn ldm_high_rows_cover_beyond_tree_domain() {
         state ^= state << 17;
         state
     };
-    const UNIT: usize = 64 * 1024;
     let mut data = Vec::with_capacity(14 * 1024 * 1024);
     for _ in 0..200 {
         data.extend((0..UNIT).map(|_| (rand() >> 32) as u8));

@@ -71,6 +71,7 @@ pub(crate) struct BlockScratch {
 /// words from [`Matcher::start_matching_codes`]. A zero-sequence block
 /// stages no literals — its literals are the block itself, read from the
 /// matcher's committed space (see [`StagedBlock::ZeroSeq`]).
+#[derive(Clone, Copy)]
 pub(crate) enum StagedBlock<'a> {
     Seqs {
         literals: &'a [u8],
@@ -160,6 +161,7 @@ pub(crate) fn compress_block<M: Matcher>(
 /// for callers that stage the matcher's output themselves (the block
 /// splitter — it re-slices one staging pass into several blocks). `output`
 /// must end with the block's three reserved header bytes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_staged_block<M: Matcher>(
     matcher: &mut M,
     staged: StagedBlock<'_>,

@@ -333,9 +333,8 @@ pub(crate) fn run_block_lazy(
             // Immediate offset-2 chain (libzstd's rep_offset2 loop): ll0
             // repcode sequences alternating rep0/rep1 by construction.
             while *rep_pending == 0 && end - pos >= MIN_MATCH as u64 {
-                let ml2 = match rep_probe(win, win_base, end_idx, pos, rep[1]) {
-                    Some(ml) => ml,
-                    None => break,
+                let Some(ml2) = rep_probe(win, win_base, end_idx, pos, rep[1]) else {
+                    break;
                 };
                 let pidx = (pos - win_base) as usize;
                 let (_, me) =

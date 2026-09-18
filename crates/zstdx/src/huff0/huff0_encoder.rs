@@ -47,37 +47,6 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         Self::encode_stream(self.table, self.writer, data);
     }
 
-    /// Encodes the data using the provided table in 4 concatenated streams
-    /// Writes
-    /// * Table description
-    /// * Jumptable
-    /// * Encoded data in 4 streams, each padded to fill the last byte
-    #[cfg(any(test, feature = "fuzz_exports"))]
-    pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
-        self.encode4x_with(
-            data,
-            with_table,
-            &mut fse_encoder::FseBuildScratch::default(),
-            &mut HuffScratch::default(),
-        );
-    }
-
-    /// [`Self::encode4x`] with pooled build scratch (see
-    /// [`Self::encode_with`]).
-    #[cfg(any(test, feature = "fuzz_exports"))]
-    pub fn encode4x_with(
-        &mut self,
-        data: &[u8],
-        with_table: bool,
-        fse: &mut fse_encoder::FseBuildScratch,
-        huff: &mut HuffScratch,
-    ) {
-        if with_table {
-            self.write_table_with(fse, huff);
-        }
-        self.encode4x_only(data);
-    }
-
     /// The four-stream form without a table description: the caller appended
     /// the description (byte-aligned) beforehand or chose the treeless form.
     pub(crate) fn encode4x_only(&mut self, data: &[u8]) {
@@ -145,13 +114,6 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         } else {
             writer.write_bits(1u32, bits_to_fill);
         }
-    }
-
-    #[cfg(any(test, feature = "fuzz_exports"))]
-    pub(super) fn weights(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.table.nsym as usize);
-        self.table.write_weights_into(&mut out);
-        out
     }
 
     #[cfg(any(test, feature = "fuzz_exports"))]
@@ -568,7 +530,10 @@ pub(crate) struct HuffScratch {
     /// FSE-compressed weight region while probing the description form.
     desc_fse: Vec<u8>,
     /// Retired aligned-form boxes (dead symbols are never read, so a box
-    /// recycles without clearing; every byte stays initialized).
+    /// recycles without clearing; every byte stays initialized). Boxed because
+    /// a table hands its box out by value (see `HuffmanTable::aligned`) and a
+    /// 2 KiB inline array would copy on every take/recycle.
+    #[allow(clippy::vec_box)]
     aligned: Vec<Box<[u64; 256]>>,
 }
 

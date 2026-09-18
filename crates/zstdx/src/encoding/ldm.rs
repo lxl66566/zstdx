@@ -755,9 +755,9 @@ impl LdmState {
         while pos < end {
             let floor = self.arm.max(win_base);
             let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
-            for i in 0..count {
-                let (hash, checksum) = self.window_hash(win, (splits[i] - win_base) as usize);
-                self.insert(hash, splits[i], checksum);
+            for &split in splits.iter().take(count) {
+                let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
+                self.insert(hash, split, checksum);
             }
             pos += n as u64;
         }
@@ -788,9 +788,9 @@ impl LdmState {
         while pos < end {
             let floor = self.arm.max(win_base);
             let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
-            for i in 0..count {
-                let (hash, checksum) = self.window_hash(win, (splits[i] - win_base) as usize);
-                self.insert(hash, splits[i], checksum);
+            for &split in splits.iter().take(count) {
+                let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
+                self.insert(hash, split, checksum);
             }
             pos += n as u64;
             if count == BATCH_SIZE && pos >= soft {
@@ -838,8 +838,7 @@ impl LdmState {
             let floor = self.arm.max(win_base);
             let (n, count) = self.gear_feed(win, win_base, pos, end, floor, &mut splits);
             let fed_end = pos + n as u64;
-            for i in 0..count {
-                let split = splits[i];
+            for &split in splits.iter().take(count) {
                 let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
                 // (offset, forward match end); the longest forward run
                 // wins — the consumer re-prices the offset itself.

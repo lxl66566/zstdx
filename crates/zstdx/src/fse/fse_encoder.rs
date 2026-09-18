@@ -891,8 +891,8 @@ fn build_table_body(
     // inside the tab allocation (whose u64 length covers all three, see
     // [`tab_len`]); the three regions are disjoint.
     let (tt, probs_full, start) = unsafe {
-        let base = tab.as_mut_ptr().cast::<u8>();
-        let tt = core::slice::from_raw_parts_mut(base.cast::<u64>(), TT_LEN);
+        let base = tab.as_mut_ptr();
+        let tt = core::slice::from_raw_parts_mut(base, TT_LEN);
         let probs = core::slice::from_raw_parts_mut(base.cast::<i32>().add(PROB_I32_OFF), 256);
         let start = core::slice::from_raw_parts_mut(base.cast::<u16>().add(START_U16_OFF), 256);
         (tt, probs, start)

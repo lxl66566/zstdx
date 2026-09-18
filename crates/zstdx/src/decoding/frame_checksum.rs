@@ -1,8 +1,9 @@
 //! Frame checksum verification folded into MT decode stage B.
 //!
 //! Stage B executes segments in order on the calling thread, and the bytes
-//! of `[seg_start, seg_end)` are final the moment [`execute_segment`](super::
-//! mt) returns (the wildcopy overshoot only writes at or beyond the
+//! of `[seg_start, seg_end)` are final the moment
+//! [`execute_segment`](super::mt::execute_segment) returns (the wildcopy overshoot only
+//! writes at or beyond the
 //! executor's own cursor, so later segments never rewrite a published
 //! range). [`StreamingChecksum`] therefore absorbs each executed range
 //! right there on the executing thread: the bytes are still hot in the

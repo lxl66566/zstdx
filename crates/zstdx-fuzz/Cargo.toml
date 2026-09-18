@@ -52,6 +52,9 @@ features = ["fuzz_exports"]
 # Not a workspace member, so the workspace lints are duplicated here.
 [lints.clippy]
 all                      = { level = "warn", priority = -1 }
+# `is_empty()`/`!is_empty()` state the predicate; clippy's `assert_ne!(x, [] as
+# [T; 0])` rewrite reads worse.
+assert_is_empty          = "allow"
 cargo                    = { level = "warn", priority = -1 }
 # The format fixes exact integer bit widths; `as` casts between them are the
 # spec, not a smell.

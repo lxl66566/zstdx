@@ -136,7 +136,7 @@ impl std::str::FromStr for LevelSel {
 
 /// Tier-axis selection: tier names match themselves, numbers the tier at
 /// that level. Empty selection means every tier.
-pub fn want_tier(selected: &[LevelSel], t: &LevelName) -> bool {
+pub fn want_tier(selected: &[LevelSel], t: LevelName) -> bool {
     selected.is_empty() || selected.iter().any(|s| s.numeric() == t.pair().0)
 }
 

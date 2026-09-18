@@ -249,9 +249,6 @@ const KEEP_LANDSLIDE: f64 = 1.25;
 /// lowered measured keep costs); a landslide keeps outright; the
 /// contested band converts the true keep cost back to the feedback-free
 /// scale through the gain measured on a cheap twice-parsed prefix.
-/// Float equality is the point in the tie shortcut: it fires on
-/// bit-identical model costs (identical parses), not near-equal ones.
-#[allow(clippy::float_cmp)]
 pub(crate) fn decide_donated(
     keep: f64,
     shrink: f64,
@@ -266,7 +263,9 @@ pub(crate) fn decide_donated(
 }
 
 /// [`decide_donated`] on a caller-supplied pooled driver (see
-/// [`parse_cost_with`]).
+/// [`parse_cost_with`]). Float equality is the point in the tie shortcut: it
+/// fires on bit-identical model costs (identical parses), not near-equal ones.
+#[allow(clippy::float_cmp)]
 pub(crate) fn decide_donated_with(
     probe: &mut MatchGeneratorDriver,
     keep: f64,

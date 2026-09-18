@@ -24,9 +24,9 @@ pub mod job_trace;
 mod levels;
 use alloc::vec::Vec;
 
+pub(crate) use frame_compressor::compress_slice_with_dictionary;
 pub use frame_compressor::{
     FrameCompressor, compress_slice_opts, compress_slice_shaped, compress_slice_to_vec,
-    compress_slice_with_dictionary,
 };
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
@@ -116,7 +116,7 @@ mod tests {
         for i in 0..2000u32 {
             use core::fmt::Write;
             fragment.clear();
-            let _ = write!(fragment, "level-ladder row {i} alpha beta gamma\n");
+            let _ = writeln!(fragment, "level-ladder row {i} alpha beta gamma");
             input.extend_from_slice(fragment.as_bytes());
             input.extend_from_slice(&rand().to_le_bytes());
         }

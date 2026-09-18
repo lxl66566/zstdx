@@ -62,7 +62,7 @@ const POS_BIAS: u32 = 1;
 /// an in-window phantom that the byte verify then arbitrates — the same
 /// accepted class the u32 chain tables carry. Live entries rebuild
 /// exactly: the true distance is far below 2^32.
-
+///
 /// Whole-bit weight: `highbit32(stat+1)` scaled (libzstd's `ZSTD_bitWeight`).
 #[inline(always)]
 fn bit_weight(stat: u32) -> u32 {

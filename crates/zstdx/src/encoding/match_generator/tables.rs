@@ -279,6 +279,7 @@ pub(in crate::encoding) fn push_seq_packed(
 /// need HASH_READ bytes of window ahead; a match reaching the insert bound
 /// simply leaves them out. Outlined from [`TableEmit::emit`] (see there).
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn insert_covered(
     win: &[u8],
     table: &mut [u32],

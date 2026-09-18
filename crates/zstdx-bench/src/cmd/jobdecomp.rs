@@ -220,7 +220,7 @@ mod trace {
         acc.hash3_bytes += hash3_bytes;
     }
 
-    fn mode_name(mode: &DecompMode) -> &'static str {
+    fn mode_name(mode: DecompMode) -> &'static str {
         match mode {
             DecompMode::BulkMt => "bulk-mt",
             DecompMode::StreamMt => "stream-mt",
@@ -234,7 +234,7 @@ mod trace {
         for mode in &args.modes {
             for name in &args.level {
                 let level = name.pair().0;
-                let label = format!("{} {}", mode_name(mode), name.tag());
+                let label = format!("{} {}", mode_name(*mode), name.tag());
                 match mode {
                     DecompMode::BulkMt => {
                         run_cell(

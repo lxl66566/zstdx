@@ -112,7 +112,7 @@ type LevelCell = (String, Level, i32);
 /// The tier axis (default): a section's ladder subset filtered by `--level`.
 fn ladder_axis(args: &Args, of: &[LevelName]) -> Vec<LevelCell> {
     of.iter()
-        .filter(|l| want_tier(&args.level, l))
+        .filter(|&&l| want_tier(&args.level, l))
         .map(|l| {
             let (ours, z) = l.pair();
             (l.tag().to_owned(), ours, z)
@@ -327,7 +327,7 @@ fn t3_enc_st(ab: &Ab, args: &Args) {
         }
     }
 
-    if !want_tier(&args.level, &LevelName::Fast) {
+    if !want_tier(&args.level, LevelName::Fast) {
         return;
     }
     // checksum overhead on our side (A = off, B = on; ratio < 1 means on is slower)

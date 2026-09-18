@@ -502,7 +502,7 @@ mod mt {
     /// lands and however the writes are chunked.
     #[test]
     fn reach_probe_unpledged_mt_write_independent() {
-        let gate = crate::encoding::reach_probe::PROBE_MIN_FRAME as usize;
+        let gate = encoding::reach_probe::PROBE_MIN_FRAME as usize;
         for (name, data) in [
             ("jsonish", jsonish(gate + 1024 * 1024)),
             ("near_local", near_local(gate + 1024 * 1024)),
@@ -654,17 +654,16 @@ mod mt {
         };
         let data = jsonish(11 * 1024 * 1024 + 100 * 1024);
         let shape = crate::InputShape::default();
-        let reset = |st: &mut crate::encoding::frame_compressor::CompressState<
-            crate::encoding::MatchGeneratorDriver,
-        >| {
-            reset_slice_state(
-                st,
-                Level::Balanced,
-                shape,
-                ReachChoice::Shrink,
-                LdmArming::Job,
-            );
-        };
+        let reset =
+            |st: &mut encoding::frame_compressor::CompressState<encoding::MatchGeneratorDriver>| {
+                reset_slice_state(
+                    st,
+                    Level::Balanced,
+                    shape,
+                    ReachChoice::Shrink,
+                    LdmArming::Job,
+                );
+            };
         let mk = || {
             let mut st = new_slice_state();
             reset(&mut st);
@@ -826,7 +825,7 @@ fn jsonish(len: usize) -> Vec<u8> {
 /// frame whichever way the decision lands.
 #[test]
 fn reach_probe_stream_roundtrips() {
-    let len = crate::encoding::reach_probe::PROBE_MIN_FRAME as usize + 123 * 1024;
+    let len = encoding::reach_probe::PROBE_MIN_FRAME as usize + 123 * 1024;
     let data = near_local(len);
     for (workers, label) in [(1, "st"), (4, "mt")] {
         let options = || {

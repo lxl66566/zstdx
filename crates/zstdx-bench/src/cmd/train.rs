@@ -49,7 +49,7 @@ pub fn run(args: &Args) {
     sources.sort();
     assert!(!sources.is_empty(), "no training files given");
     let samples: Vec<Vec<u8>> = sources.iter().map(|p| fs::read(p).unwrap()).collect();
-    let total: usize = samples.iter().map(|s| s.len()).sum();
+    let total: usize = samples.iter().map(Vec::len).sum();
     println!(
         "training on {} files, {} bytes -> {} ({} bytes)",
         sources.len(),

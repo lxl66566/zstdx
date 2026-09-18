@@ -524,6 +524,9 @@ fn mark_done(job: &Job) {
     }
 }
 
+// Independent per-stream flags (checksum, pending probe, emitted header,
+// finished) that clear at different points, not one state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MtEncoderCore {
     level: Level,
     checksum: bool,

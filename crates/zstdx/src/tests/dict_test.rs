@@ -271,13 +271,9 @@ fn test_dict_decoding() {
 fn test_dict_encoding() {
     extern crate std;
     use alloc::vec::Vec;
-    use std::{fs, io::Read as _};
+    use std::fs;
 
-    let dict: Vec<u8> = fs::File::open("./dict_tests/dictionary")
-        .unwrap()
-        .bytes()
-        .map(|x| x.unwrap())
-        .collect();
+    let dict: Vec<u8> = fs::read("./dict_tests/dictionary").unwrap();
 
     let mut files: Vec<_> = fs::read_dir("./dict_tests/files")
         .unwrap()
@@ -304,12 +300,12 @@ fn test_dict_encoding() {
             let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
             let roundtrip =
                 crate::bulk::decompress_with(&compressed, data.len(), &dec_opts).unwrap();
-            assert_eq!(roundtrip, data, "{:?} at {level:?}", path);
+            assert_eq!(roundtrip, data, "{path:?} at {level:?}");
             // libzstd decodes our dictionary frames
             let mut zdec = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
             let mut zout = alloc::vec![0u8; data.len()];
             let n = zdec.decompress_to_buffer(&compressed, &mut zout).unwrap();
-            assert_eq!(&zout[..n], &data[..], "libzstd decode of {:?}", path);
+            assert_eq!(&zout[..n], &data[..], "libzstd decode of {path:?}");
             // and encodes the same content for a size cross-check
             let mut zenc = zstd::bulk::Compressor::with_dictionary(level.as_i32(), &dict).unwrap();
             let zcomp = zenc.compress(&data).unwrap();

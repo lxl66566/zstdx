@@ -365,8 +365,6 @@ fn create_raw_dict_from_source_no_panics_on_small_input() {
 
 #[test]
 fn create_raw_dict_from_samples_is_deterministic() {
-    use std::vec;
-
     // Patterned samples: shared blocks separated by noise, enough for
     // several epochs and the sweep.
     let mut samples: Vec<Vec<u8>> = Vec::new();

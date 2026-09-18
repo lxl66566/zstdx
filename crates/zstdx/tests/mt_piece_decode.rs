@@ -16,7 +16,9 @@ use zstdx::{
 /// must not overlap: hold this lock for the whole test body.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 const RAMP: u64 = 2 * 1024 * 1024;

@@ -7,6 +7,7 @@ use core::convert::TryInto;
 use super::match_generator::StripSnapshot;
 use super::{
     Matcher,
+    block_enc::compressed::DictEntropy,
     block_header::BlockHeader,
     checksum::{BlockChecksum, FrameHasher, SliceChecksum},
     frame_header::FrameHeader,
@@ -82,7 +83,7 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) fse_tables: FseTables,
     /// Which reusable tables still carry dictionary statistics (see
     /// `DictEntropy`).
-    pub(crate) dict_entropy: super::block_enc::compressed::DictEntropy,
+    pub(crate) dict_entropy: DictEntropy,
     /// Pooled per-block scratch (literals, sequences, code streams): reused
     /// across blocks so steady-state blocks run allocation-free.
     pub(crate) scratch: super::block_enc::compressed::BlockScratch,
@@ -104,7 +105,7 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         matcher: MatchGeneratorDriver::new_direct(),
         last_huff_table: None,
         fse_tables: FseTables::new(),
-        dict_entropy: Default::default(),
+        dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
     }
 }
@@ -117,7 +118,7 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
         matcher: MatchGeneratorDriver::new(crate::common::MAX_BLOCK_SIZE as usize),
         last_huff_table: None,
         fse_tables: FseTables::new(),
-        dict_entropy: Default::default(),
+        dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
     }
 }
@@ -139,7 +140,7 @@ pub(crate) fn reset_slice_state(
     state.matcher.set_reach_choice(choice);
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
-    state.dict_entropy = Default::default();
+    state.dict_entropy = DictEntropy::default();
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_aligned(&mut state.scratch.huff);
     }
@@ -506,7 +507,7 @@ pub(crate) fn compress_with_state_dictionary(
 /// [`compress_slice_shaped`] with a parsed dictionary: dictionary content
 /// as match history, its entropy tables seeding the first blocks, its id
 /// in the header. Runs single-threaded through the owned-window matcher.
-pub fn compress_slice_with_dictionary(
+pub(crate) fn compress_slice_with_dictionary(
     src: &[u8],
     level: Level,
     checksum: bool,
@@ -632,7 +633,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             input_shape: crate::InputShape::default(),
             dictionary: None,
             state: CompressState {
-                dict_entropy: Default::default(),
+                dict_entropy: DictEntropy::default(),
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
@@ -650,7 +651,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data: None,
             compressed_data: None,
             state: CompressState {
-                dict_entropy: Default::default(),
+                dict_entropy: DictEntropy::default(),
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
@@ -731,7 +732,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_input_shape(self.input_shape);
             self.state.matcher.reset(self.compression_level);
             self.state.last_huff_table = None;
-            self.state.dict_entropy = Default::default();
+            self.state.dict_entropy = DictEntropy::default();
         }
         self.hasher = FrameHasher::new();
         // The probe's staged head (see reach_probe): the block loop below

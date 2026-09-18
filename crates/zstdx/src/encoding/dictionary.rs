@@ -116,10 +116,10 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     state.fse_tables.of_previous = None;
     state.dict_entropy = DictEntropy::default();
     if dict.id != 0 {
-        state.last_huff_table = dict.huff.clone();
-        state.fse_tables.ll_previous = dict.ll.clone();
-        state.fse_tables.ml_previous = dict.ml.clone();
-        state.fse_tables.of_previous = dict.of.clone();
+        state.last_huff_table.clone_from(&dict.huff);
+        state.fse_tables.ll_previous.clone_from(&dict.ll);
+        state.fse_tables.ml_previous.clone_from(&dict.ml);
+        state.fse_tables.of_previous.clone_from(&dict.of);
         state.dict_entropy = DictEntropy::ALL;
     }
 }

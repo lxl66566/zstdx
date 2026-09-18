@@ -64,7 +64,7 @@ pub fn run(args: &Args) {
             LevelSel::Tier(t) => t.pair(),
             LevelSel::Num(l) => (l, l.as_i32()),
         };
-        println!("level {} (zstdx vs libzstd at the same number)", zstd_level);
+        println!("level {zstd_level} (zstdx vs libzstd at the same number)");
         println!(
             "{:<16}{:>9}{:>9}  xslow  (MiB/s)",
             "shape",

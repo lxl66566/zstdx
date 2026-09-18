@@ -16,7 +16,7 @@ use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
         Matcher,
-        block_enc::compressed::BlockScratch,
+        block_enc::compressed::{BlockScratch, DictEntropy},
         block_header::BlockHeader,
         checksum::{BlockChecksum, FrameHasher},
         compress_fastest,
@@ -97,20 +97,20 @@ pub(crate) struct FrameEncoderCoreSt {
 
 impl FrameEncoderCoreSt {
     pub(crate) fn new(options: &EncoderOptions) -> Self {
-        Self::new_with_dictionary(options, None).expect("no dictionary to fail")
+        Self::new_with_dictionary(options, None)
     }
 
-    /// The dictionary variant is fallible (parse errors); without one this
-    /// reduces to the plain constructor.
+    /// The dictionary variant seeds the state from an already-parsed
+    /// dictionary.
     pub(crate) fn new_with_dictionary(
         options: &EncoderOptions,
         dict: Option<&crate::encoding::dictionary::EncDictionary>,
-    ) -> Result<Self> {
+    ) -> Self {
         // Owned-window driver like FrameCompressor::new: the streaming core
         // feeds blocks through block_tail/commit_block, so unlike the slice
         // path (new_direct, borrowed window) the matcher must own its window.
         let mut state = CompressState {
-            dict_entropy: Default::default(),
+            dict_entropy: DictEntropy::default(),
             matcher: MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize),
             last_huff_table: None,
             fse_tables: FseTables::new(),
@@ -157,7 +157,7 @@ impl FrameEncoderCoreSt {
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
         let block_size = state.matcher.block_size();
-        Ok(Self {
+        Self {
             state,
             hasher: if checksum {
                 StreamChecksum::On(FrameHasher::new())
@@ -174,7 +174,7 @@ impl FrameEncoderCoreSt {
             out_read: 0,
             blocks: 0,
             finished: false,
-        })
+        }
     }
 
     pub(crate) fn write(&mut self, data: &[u8]) {
@@ -333,7 +333,7 @@ impl FrameEncoderCore {
         if let Some(raw) = &options.dictionary {
             let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
             return Ok(Self::Single(alloc::boxed::Box::new(
-                FrameEncoderCoreSt::new_with_dictionary(options, Some(&dict))?,
+                FrameEncoderCoreSt::new_with_dictionary(options, Some(&dict)),
             )));
         }
         if options.workers > 1 {

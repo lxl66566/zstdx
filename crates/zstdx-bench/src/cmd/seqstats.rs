@@ -223,6 +223,7 @@ pub struct Args {
 
 /// Decoder-side repcode history resolution (mirrors
 /// `sequence_execution::do_offset_history`, wire values in, actual offset out).
+#[cfg(feature = "seq_dump")]
 fn resolve_actual(triples: &[(u32, u32, u32)]) -> Vec<(u32, u32, u64)> {
     let mut hist = [1u32, 4, 8];
     triples
@@ -262,6 +263,7 @@ fn resolve_actual(triples: &[(u32, u32, u32)]) -> Vec<(u32, u32, u64)> {
         .collect()
 }
 
+#[cfg(feature = "seq_dump")]
 struct ParseStats {
     nseq: usize,
     lit_bytes: u64,
@@ -274,6 +276,7 @@ struct ParseStats {
     lit_bits: f64, // order-0 entropy of the literal bytes
 }
 
+#[cfg(feature = "seq_dump")]
 fn parse_stats(raw: &[u8], triples: &[(u32, u32, u32)]) -> ParseStats {
     let resolved = resolve_actual(triples);
     let n = triples.len() as u64;
@@ -330,6 +333,10 @@ fn parse_stats(raw: &[u8], triples: &[(u32, u32, u32)]) -> ParseStats {
 
 /// Walk both parses aligned on absolute output position and classify where
 /// they disagree.
+#[cfg(feature = "seq_dump")]
+// Dense positional diff: o/r/o-/r- style names and i/j/p cursors keep the
+// alignment arithmetic readable.
+#[allow(clippy::many_single_char_names)]
 fn diff_parses(ours: &[(u32, u32, u32)], ref_: &[(u32, u32, u32)], raw: &[u8], show: usize) {
     let total_len = raw.len();
     let o = resolve_actual(ours);
@@ -460,13 +467,14 @@ fn diff_parses(ours: &[(u32, u32, u32)], ref_: &[(u32, u32, u32)], raw: &[u8], s
         .iter()
         .enumerate()
         .filter(|(_, c)| **c > 0)
-        .map(|(b, &n)| format!("{}x2^{}", n, b))
+        .map(|(b, &n)| format!("{n}x2^{b}"))
         .collect();
     if !top.is_empty() {
         println!("missed ref offset-log distribution: {}", top.join(" "));
     }
 }
 
+#[cfg(feature = "seq_dump")]
 fn ml_code_val(code: usize) -> u32 {
     const ML_META: [(u32, u8); 53] = [
         (3, 0),

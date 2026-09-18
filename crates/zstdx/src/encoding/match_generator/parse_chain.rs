@@ -66,7 +66,7 @@ impl MatchGeneratorDriver {
         // split lies behind the anchor) are dropped as emissions advance.
         let ldm_seqs = &self.ldm_seqs[..];
         let mut ldm_i = 0usize;
-        let mut ldm_won = LDM && false;
+        let mut ldm_won = false;
 
         // Chain-walk search from the hash head `entry` at window index `idx`,
         // returning the longest match's (length, candidate window index):

@@ -445,18 +445,16 @@ fn donate_job_zero_prefix(
 /// depth one (a frame has one donation, and the retained tables are the
 /// price).
 #[cfg(feature = "std")]
-static DONATION_KIT: std::sync::OnceLock<
-    Mutex<(
-        Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
-        Option<alloc::boxed::Box<MatchGeneratorDriver>>,
-    )>,
-> = std::sync::OnceLock::new();
-
-#[cfg(feature = "std")]
-fn donation_kit() -> &'static Mutex<(
+type DonationKit = (
     Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>,
     Option<alloc::boxed::Box<MatchGeneratorDriver>>,
-)> {
+);
+
+#[cfg(feature = "std")]
+static DONATION_KIT: std::sync::OnceLock<Mutex<DonationKit>> = std::sync::OnceLock::new();
+
+#[cfg(feature = "std")]
+fn donation_kit() -> &'static Mutex<DonationKit> {
     DONATION_KIT.get_or_init(|| Mutex::new((None, None)))
 }
 
@@ -642,6 +640,7 @@ pub(crate) fn prepare_job_state(
 /// window agree). `ldm` is the job's LDM arming context; `spf` the shared
 /// prefix fill's snapshot when the job adopts one instead of filling its
 /// strip from scratch (see `StripSnapshot`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_job_with(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -680,6 +679,7 @@ pub(crate) fn run_job_with(
 /// Compress one job on the calling (worker) thread through the per-thread
 /// pooled state, so steady-state jobs reuse their hash table allocation.
 /// Shared by the streaming burst driver.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_job(
     src: &[u8],
     job: Range<usize>,
@@ -862,13 +862,13 @@ mod tests {
         // the unit-to-unit copies below sit at 5 MiB periods — beyond the
         // chain reach, exactly LDM's class.
         let head_len = 256 * 1024;
-        let mut patterns = alloc::vec::Vec::with_capacity(96);
+        let mut patterns = Vec::with_capacity(96);
         let mut state = 0x243f_6a88_85a3_08d3u64;
         for _ in 0..96 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             patterns.push(state.to_le_bytes());
         }
-        let mut head = alloc::vec::Vec::with_capacity(head_len);
+        let mut head = Vec::with_capacity(head_len);
         let mut pick = 0xdead_beef_cafeu64;
         while head.len() < head_len {
             pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
