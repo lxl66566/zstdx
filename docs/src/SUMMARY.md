@@ -4,9 +4,9 @@
 
 ---
 
-# For Users (Reserved)
+# For Users
 
-- [User Documentation (Reserved)](user.md)
+- [User Guide](user.md)
 
 ---
 
