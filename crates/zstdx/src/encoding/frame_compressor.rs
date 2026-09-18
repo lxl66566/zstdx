@@ -329,10 +329,10 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) fse_tables: FseTables,
     /// Which reusable tables still carry dictionary statistics (see
     /// `DictEntropy`).
-    pub(crate) dict_entropy: super::blocks::compressed::DictEntropy,
+    pub(crate) dict_entropy: super::block_enc::compressed::DictEntropy,
     /// Pooled per-block scratch (literals, sequences, code streams): reused
     /// across blocks so steady-state blocks run allocation-free.
-    pub(crate) scratch: super::blocks::compressed::BlockScratch,
+    pub(crate) scratch: super::block_enc::compressed::BlockScratch,
 }
 
 // Per-thread pool for the slice entry point: the hash table, the three
@@ -352,7 +352,7 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         last_huff_table: None,
         fse_tables: FseTables::new(),
         dict_entropy: Default::default(),
-        scratch: super::blocks::compressed::BlockScratch::default(),
+        scratch: super::block_enc::compressed::BlockScratch::default(),
     }
 }
 
@@ -365,7 +365,7 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
         last_huff_table: None,
         fse_tables: FseTables::new(),
         dict_entropy: Default::default(),
-        scratch: super::blocks::compressed::BlockScratch::default(),
+        scratch: super::block_enc::compressed::BlockScratch::default(),
     }
 }
 
@@ -883,7 +883,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
-                scratch: super::blocks::compressed::BlockScratch::default(),
+                scratch: super::block_enc::compressed::BlockScratch::default(),
             },
             hasher: FrameHasher::new(),
         }
@@ -901,7 +901,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
-                scratch: super::blocks::compressed::BlockScratch::default(),
+                scratch: super::block_enc::compressed::BlockScratch::default(),
             },
             compression_level,
             input_shape: crate::InputShape::default(),

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::{
     Error, InputShape, Level,
     decoding::{Dictionary, dictionary::MAGIC_NUM},
-    encoding::{blocks::compressed::DictEntropy, frame_compressor::CompressState},
+    encoding::{block_enc::compressed::DictEntropy, frame_compressor::CompressState},
     fse::fse_encoder::{FSETable, build_table_from_probabilities},
     huff0::huff0_encoder::HuffmanTable,
 };

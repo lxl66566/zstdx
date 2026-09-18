@@ -4,12 +4,12 @@ use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
         Matcher,
-        block_header::BlockHeader,
-        blocks::{
+        block_enc::{
             compress_block,
             compressed::{BlockOutcome, PrevTable},
             split,
         },
+        block_header::BlockHeader,
         frame_compressor::{BlockChecksum, CompressState},
     },
     fse::fse_encoder::FSETable,

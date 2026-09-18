@@ -16,8 +16,8 @@ use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
         Matcher,
+        block_enc::compressed::BlockScratch,
         block_header::BlockHeader,
-        blocks::compressed::BlockScratch,
         compress_fastest,
         frame_compressor::{BlockChecksum, CompressState, FrameHasher, FseTables},
         frame_header::FrameHeader,

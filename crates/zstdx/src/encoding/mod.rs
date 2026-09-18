@@ -2,8 +2,8 @@
 
 #[cfg(all(feature = "std", feature = "hash"))]
 pub(crate) mod async_checksum;
+pub(crate) mod block_enc;
 pub(crate) mod block_header;
-pub(crate) mod blocks;
 pub(crate) mod btlazy;
 pub(crate) mod dictionary;
 pub(crate) mod dubt;
@@ -355,7 +355,7 @@ pub trait Matcher {
     fn note_literal_costs(&mut self, _lengths: &[u8; 256]) {}
     /// Whether the current frame's row splits 128 KiB blocks at entropy
     /// shifts (libzstd's post-parse block splitter; see
-    /// `blocks::split`). The default keeps the stock
+    /// `block_enc::split`). The default keeps the stock
     /// one-block-per-128-KiB shape.
     fn block_splitting_enabled(&self) -> bool {
         false
