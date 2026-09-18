@@ -4,7 +4,9 @@
 //! allocation, and no decode path may silently produce blocks larger than
 //! min(window, 128 KiB).
 
-use alloc::{string::ToString, vec, vec::Vec};
+#![cfg(test)]
+
+use alloc::{vec, vec::Vec};
 
 use crate::decoding::{
     BlockDecodingStrategy, Dictionary, FrameDecoder,
@@ -25,10 +27,11 @@ fn push_block(out: &mut Vec<u8>, last: bool, btype: u32, content: &[u8]) {
 /// bitstream carrying the 23 extra bits per sequence. The declared window is
 /// 1 MiB, so the per-block output cap is 128 KiB.
 ///
-/// With `history_block` the frame leads with a full 128 KiB Raw block, so the
-/// compressed block's offset-7 matches have history and a decoder without the
-/// cap would execute sequences until the caller's buffer runs out.
-fn greedy_match_frame(history_block: bool) -> Vec<u8> {
+/// With `history_blocks` the frame leads with that many full 128 KiB Raw
+/// blocks: the compressed block's offset-7 matches get history (a decoder
+/// without the cap executes sequences until the caller's buffer runs out)
+/// and the input crosses the MT decoder's size floor for 4 blocks.
+fn greedy_match_frame(history_blocks: usize) -> Vec<u8> {
     // The block content is header-capped at MAX_BLOCK_SIZE; the zero-filled
     // bitstream fills everything the sequence section header leaves.
     const SECTION_OVERHEAD: usize = 1 // literals header
@@ -59,7 +62,7 @@ fn greedy_match_frame(history_block: bool) -> Vec<u8> {
     frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
     frame.push(0x00); // FHD: no FCS, no checksum, no dict id
     frame.push(0x50); // window descriptor: 1 MiB
-    if history_block {
+    for _ in 0..history_blocks {
         push_block(&mut frame, false, 0, &vec![0xaau8; 128 * 1024]);
     }
     push_block(&mut frame, true, 2, &block);
@@ -67,14 +70,20 @@ fn greedy_match_frame(history_block: bool) -> Vec<u8> {
 }
 
 fn block_output_too_large(err: &FrameDecoderError) -> bool {
-    matches!(
-        err,
-        FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::DecompressBlockError(
-            DecompressBlockError::ExecuteSequencesError(
-                ExecuteSequencesError::BlockOutputTooLarge { .. }
-            )
-        ))
-    )
+    match err {
+        FrameDecoderError::FailedToReadBlockBody(inner) => match inner {
+            DecodeBlockContentError::BlockOutputTooLarge { .. } => true,
+            DecodeBlockContentError::DecompressBlockError(e) => matches!(
+                e,
+                DecompressBlockError::BlockOutputTooLarge { .. }
+                    | DecompressBlockError::ExecuteSequencesError(
+                        ExecuteSequencesError::BlockOutputTooLarge { .. }
+                    )
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The review's DoS shape on the ring path: with a dictionary registered the
@@ -84,7 +93,7 @@ fn block_output_too_large(err: &FrameDecoderError) -> bool {
 /// reserve instead.
 #[test]
 fn ring_path_rejects_huge_block_output_claim() {
-    let frame = greedy_match_frame(false);
+    let frame = greedy_match_frame(0);
 
     let mut src = frame.as_slice();
     let mut dec = FrameDecoder::new();
@@ -93,11 +102,9 @@ fn ring_path_rejects_huge_block_output_claim() {
     let err = dec
         .decode_blocks(&mut src, BlockDecodingStrategy::All)
         .expect_err("huge block output claim must be rejected");
-    assert!(
-        block_output_too_large(&err),
-        "unexpected error: {}",
-        err.to_string()
-    );
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
 }
 
 #[test]
@@ -144,4 +151,109 @@ fn execute_sequences_rejects_output_over_cap() {
     scratch.literals_buffer.extend_from_slice(b"abcd");
     execute_sequences(&mut scratch).unwrap();
     assert_eq!(scratch.buffer.len(), 12);
+}
+
+/// A 1 KiB-window frame holding one Raw block of `size` bytes: out of spec
+/// for any `size` above the window (libzstd: "Decompressed Block Size
+/// Exceeds Maximum"), legal at exactly `size == window`.
+fn small_window_raw_frame(size: usize) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+    frame.push(0x00); // FHD: no FCS, no checksum, no dict id
+    frame.push(0x00); // window descriptor: 1 KiB
+    push_block(&mut frame, true, 0, &vec![0xaau8; size]);
+    frame
+}
+
+/// Every decode path must enforce the per-block cap of min(window, 128 KiB)
+/// on Raw/RLE blocks too, and must still accept a block at the cap.
+#[test]
+fn small_window_rejects_oversized_raw_block() {
+    let frame = small_window_raw_frame(128 * 1024);
+
+    // Ring path (dictionary attached) via decode_block_content.
+    let mut src = frame.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.add_dict(Dictionary::load(b"history").unwrap()).unwrap();
+    dec.reset(&mut src).unwrap();
+    let err = dec
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .expect_err("oversized Raw block must be rejected");
+    assert!(matches!(
+        err,
+        FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::BlockOutputTooLarge {
+            max: 1024
+        })
+    ));
+
+    // Flat streaming path.
+    let mut src = frame.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.reset(&mut src).unwrap();
+    let err = dec
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .expect_err("oversized Raw block must be rejected");
+    assert!(matches!(
+        err,
+        FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::BlockOutputTooLarge {
+            max: 1024
+        })
+    ));
+
+    // decode_all's direct-into-slice path, with far more target room than
+    // any legal block could fill (it is the cap, not the target, that trips).
+    let mut dec = FrameDecoder::new();
+    let mut out = vec![0u8; 32 * 1024 * 1024];
+    let err = dec
+        .decode_all(frame.as_slice(), &mut out)
+        .expect_err("oversized Raw block must be rejected");
+    assert!(matches!(
+        err,
+        FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::BlockOutputTooLarge {
+            max: 1024
+        })
+    ));
+
+    // Control: a block at exactly the window decodes on the same shape.
+    let frame = small_window_raw_frame(1024);
+    let mut dec = FrameDecoder::new();
+    let mut out = vec![0u8; 4096];
+    assert_eq!(dec.decode_all(frame.as_slice(), &mut out).unwrap(), 1024);
+}
+
+/// Same claim on the flat path, into a far larger target than any block may
+/// fill: the executor must stop at the block cap instead of silently writing
+/// the sequences' full output (libzstd reports corruption there).
+#[test]
+fn flat_path_rejects_huge_block_output_claim() {
+    let frame = greedy_match_frame(1);
+
+    let mut dec = FrameDecoder::new();
+    let mut out = vec![0u8; 32 * 1024 * 1024];
+    let err = dec
+        .decode_all(frame.as_slice(), &mut out)
+        .expect_err("huge block output claim must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
+}
+
+/// The parallel decoder must apply the cap in stage A, before a segment's
+/// claimed output sizes the output buffer.
+#[cfg(feature = "std")]
+#[test]
+fn mt_stage_a_rejects_huge_block_output_claim() {
+    let frame = greedy_match_frame(4); // ~655 KB: crosses the MT input floor
+
+    let mut out = Vec::new();
+    let err = crate::decoding::mt_decode_to_vec_for_tests(
+        &frame,
+        &mut out,
+        4,
+        crate::decoding::DEFAULT_MAX_WINDOW_SIZE,
+    )
+    .expect_err("huge block output claim must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
 }

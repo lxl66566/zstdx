@@ -93,6 +93,10 @@ pub(super) struct SegmentPlan {
     /// This segment starts a frame: execution resets the repcode history
     /// and stage A gets fresh tables (frame starts are restart points).
     pub(super) frame_start: bool,
+    /// The frame's declared window: stage A bounds every block's output by
+    /// `min(window, MAX_BLOCK_SIZE)` so a hostile claim cannot size the
+    /// output buffer (same cap the sequential paths enforce).
+    pub(super) window_size: usize,
 }
 
 /// Scan output: the segment plans plus the expected content checksum per
@@ -387,9 +391,11 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         if frame_header.dictionary_id().is_some() {
             return None; // dictionary state cannot be split across segments
         }
-        if frame_header.window_size().ok()? > max_window_size {
+        let window_size = frame_header.window_size().ok()?;
+        if window_size > max_window_size {
             return None; // sequential path rejects with the proper error
         }
+        let window_size = window_size as usize;
         let checksummed = frame_header.descriptor.content_checksum_flag();
         let blocks_start = input.len() - reader.len();
 
@@ -471,6 +477,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
                 segments.push(SegmentPlan {
                     blocks: blocks[seg_start..r].to_vec(),
                     frame_start: seg_start == 0,
+                    window_size,
                 });
                 seg_start = r;
                 next_target += target_segment;
@@ -479,6 +486,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         segments.push(SegmentPlan {
             blocks: blocks[seg_start..].to_vec(),
             frame_start: seg_start == 0,
+            window_size,
         });
         cursor = scan_cur;
     }
@@ -512,11 +520,20 @@ pub(super) fn decode_segment(
     scratch.reset_tables();
     let staging = staging_take();
     let (mut literals, mut sequences) = (staging.literals, staging.sequences);
+    // Same per-block output cap the sequential paths enforce (libzstd
+    // blockSizeMax): stage A runs before the output buffer is sized, so an
+    // unchecked block_out would drive `place` into a huge allocation.
+    let block_out_max = crate::common::max_block_output(plan.window_size);
+    let output_too_large =
+        || block_body_err(DecompressBlockError::BlockOutputTooLarge { max: block_out_max });
     let mut out_size = 0usize;
     let mut blocks = Vec::with_capacity(plan.blocks.len());
     for blk in &plan.blocks {
         match blk.btype {
             BlockType::Raw => {
+                if blk.body.len() > block_out_max {
+                    return Err(output_too_large());
+                }
                 out_size += blk.body.len();
                 blocks.push(BlockPlan::Raw {
                     body: blk.body.clone(),
@@ -524,6 +541,9 @@ pub(super) fn decode_segment(
                 });
             },
             BlockType::RLE => {
+                if blk.raw_size as usize > block_out_max {
+                    return Err(output_too_large());
+                }
                 out_size += blk.raw_size as usize;
                 blocks.push(BlockPlan::Rle {
                     byte: input[blk.body.start],
@@ -537,6 +557,12 @@ pub(super) fn decode_segment(
                     .parse_from_header(body)
                     .map_err(DecompressBlockError::from)
                     .map_err(block_body_err)? as usize;
+                if section.regenerated_size as usize > block_out_max {
+                    // Reject before decode_literals sizes the staging buffer
+                    // from the claimed size (an RLE section can claim up to
+                    // 1 MiB from one payload byte).
+                    return Err(output_too_large());
+                }
                 let literals_len = match section.compressed_size {
                     Some(c) => c as usize,
                     None => match section.ls_type {
@@ -599,6 +625,9 @@ pub(super) fn decode_segment(
                     }
                     literals.len() - lits_start
                 };
+                if block_out > block_out_max {
+                    return Err(output_too_large());
+                }
                 out_size += block_out;
                 blocks.push(BlockPlan::Compressed {
                     lits: lits_start..literals.len(),

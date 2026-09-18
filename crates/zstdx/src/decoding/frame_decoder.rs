@@ -114,6 +114,23 @@ pub enum BlockDecodingStrategy {
     UptoBytes(usize),
 }
 
+/// Reject a Raw/RLE block whose declared output exceeds the per-block cap
+/// `min(window, MAX_BLOCK_SIZE)` (libzstd's blockSizeMax) before it is
+/// written. Compressed blocks enforce the same cap inside
+/// [`decoding::block_decoder::BlockDecoder::decompress_block_flat`] /
+/// `execute_sequences`.
+fn check_block_output_size(
+    window_size: usize,
+    declared: u32,
+) -> Result<(), decoding::errors::DecodeBlockContentError> {
+    let max = crate::common::max_block_output(window_size);
+    if declared as usize > max {
+        Err(decoding::errors::DecodeBlockContentError::BlockOutputTooLarge { max })
+    } else {
+        Ok(())
+    }
+}
+
 impl FrameDecoderState {
     fn new(
         source: impl Read,
@@ -461,6 +478,14 @@ impl FrameDecoder {
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += u64::from(block_header_size);
 
+            if matches!(block_header.block_type, BlockType::Raw | BlockType::RLE) {
+                check_block_output_size(
+                    state.decoder_scratch.buffer.window_size,
+                    block_header.decompressed_size,
+                )
+                .map_err(err::FailedToReadBlockBody)?;
+            }
+
             #[cfg(feature = "hash")]
             let hash_from = state.flat.end_abs();
 
@@ -633,6 +658,14 @@ impl FrameDecoder {
                 .read_block_header(&mut *source)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += 3;
+
+            if matches!(block_header.block_type, BlockType::Raw | BlockType::RLE) {
+                check_block_output_size(
+                    state.decoder_scratch.buffer.window_size,
+                    block_header.decompressed_size,
+                )
+                .map_err(err::FailedToReadBlockBody)?;
+            }
 
             #[cfg(feature = "hash")]
             let produced_before = written;
@@ -811,6 +844,14 @@ impl FrameDecoder {
                             break;
                         }
                         state.bytes_read_counter += u64::from(block_header_size);
+
+                        if matches!(block_header.block_type, BlockType::Raw | BlockType::RLE) {
+                            check_block_output_size(
+                                state.decoder_scratch.buffer.window_size,
+                                block_header.decompressed_size,
+                            )
+                            .map_err(err::FailedToReadBlockBody)?;
+                        }
 
                         #[cfg(feature = "hash")]
                         let hash_from = state.flat.end_abs();
