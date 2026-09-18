@@ -357,50 +357,97 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        writer.write_bits(self.acc_log() - 5, 4);
-        let mut probability_counter = 0usize;
-        let probability_sum = 1 << self.acc_log();
-        let probs = self.probs();
+        let acc_log = self.acc_log();
+        let table_size = 1usize << acc_log;
         let nsym = self.nsym as usize;
+        let probs = &self.probs()[..nsym];
 
-        let mut prob_idx = 0;
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_write = max_remaining_value.ilog2() + 1;
-            let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
-            let mask = (1 << (bits_to_write - 1)) - 1;
-
-            let prob = probs[prob_idx];
-            prob_idx += 1;
-            let value = (prob + 1) as u32;
-            if value < low_threshold as u32 {
-                writer.write_bits(value, bits_to_write as usize - 1);
-            } else if value > mask {
-                writer.write_bits(value + low_threshold as u32, bits_to_write as usize);
-            } else {
-                writer.write_bits(value, bits_to_write as usize);
-            }
-
-            if prob == -1 {
-                probability_counter += 1;
-            } else if prob > 0 {
-                probability_counter += prob as usize;
-            } else {
-                let mut zeros = 0u8;
-                // Trailing zero-probability symbols can run to the end of
-                // the live alphabet; the outer loop stops on the
-                // probability sum anyway.
-                while prob_idx < nsym && probs[prob_idx] == 0 {
-                    zeros += 1;
-                    prob_idx += 1;
-                    if zeros == 3 {
-                        writer.write_bits(3u8, 2);
-                        zeros = 0;
-                    }
-                }
-                writer.write_bits(zeros, 2);
-            }
+        // libzstd's FSE_writeNCount shape, widened to a 64-bit local
+        // accumulator over the writer's hot state: the description is
+        // assembled in registers and flushed as unaligned u64 stores
+        // instead of one BitWriter call per symbol, and `threshold`/
+        // `nb_bits` track ilog2(remaining) incrementally instead of a
+        // per-symbol lzcnt.
+        let (mut acc, mut nb, mut pos) = writer.hot_state();
+        let output = writer.out();
+        // Upper bound: 4 header bits, acc_log+1 (<= 13) bits per symbol and
+        // one 2-bit marker per zero symbol (zero runs cost less).
+        let bound = (4 + 15 * nsym) / 8 + 16;
+        if pos + bound > output.capacity() {
+            output.reserve(pos + bound - output.len());
         }
+        let ptr = output.as_mut_ptr();
+
+        // Push the full bytes of `acc` to the output; the u64 store's
+        // overshoot past pos + nb/8 is overwritten by the next store or cut
+        // off by set_hot_state. Entering any add below, nb <= 47, so the
+        // widest add (16 bits) never overflows the accumulator.
+        macro_rules! flush {
+            () => {
+                if nb >= 48 {
+                    // SAFETY: the reserve above covers pos + 8 for every
+                    // store; see `bound`.
+                    unsafe { ptr.add(pos).cast::<u64>().write_unaligned(acc.to_le()) };
+                    pos += nb >> 3;
+                    acc >>= (nb >> 3) * 8;
+                    nb &= 7;
+                }
+            };
+        }
+
+        // The writer may enter with up to 63 pending bits; one conditional
+        // flush establishes the nb <= 47 invariant every add below relies on.
+        flush!();
+        acc |= u64::from(acc_log - 5) << nb;
+        nb += 4;
+
+        let mut remaining = table_size + 1;
+        let mut threshold = table_size;
+        let mut nb_bits = acc_log as usize + 1;
+        let mut s = 0usize;
+        while s < nsym && remaining > 1 {
+            let prob = probs[s];
+            s += 1;
+            let max = 2 * threshold - 1 - remaining;
+            let mut value = (prob + 1) as usize;
+            remaining -= prob.unsigned_abs() as usize;
+            if value >= threshold {
+                value += max;
+            }
+            acc |= (value as u64) << nb;
+            nb += nb_bits - (value < max) as usize;
+            while remaining < threshold {
+                nb_bits -= 1;
+                threshold >>= 1;
+            }
+            flush!();
+            if prob == 0 {
+                // Zero-probability run: 2-bit markers, three zeros per
+                // marker, eight markers as one 0xFFFF pair. A run reaching
+                // the live alphabet's end needs no terminator: the outer
+                // loop stops on the probability sum.
+                let mut run = 0usize;
+                while s < nsym && probs[s] == 0 {
+                    s += 1;
+                    run += 1;
+                }
+                while run >= 24 {
+                    acc |= 0xffff_u64 << nb;
+                    nb += 16;
+                    flush!();
+                    run -= 24;
+                }
+                while run >= 3 {
+                    acc |= 3_u64 << nb;
+                    nb += 2;
+                    run -= 3;
+                }
+                acc |= (run as u64) << nb;
+                nb += 2;
+            }
+            flush!();
+        }
+        writer.set_hot_state(acc, nb, pos);
         writer.write_bits(0u8, writer.misaligned());
     }
 }
@@ -538,7 +585,11 @@ pub(crate) fn normalize_count(
     max_symbol: usize,
     use_low_prob: bool,
 ) -> bool {
-    debug_assert!(norm.len() > max_symbol);
+    debug_assert!(norm.len() > max_symbol && count.len() > max_symbol);
+    // Reslice to the live alphabet once: the per-symbol loop then runs
+    // bounds-check-free.
+    let norm = &mut norm[..=max_symbol];
+    let count = &count[..=max_symbol];
     let low_prob: i32 = if use_low_prob {
         -1
     } else {
@@ -553,6 +604,8 @@ pub(crate) fn normalize_count(
     let low_threshold = (total >> table_log) as u32;
 
     for s in 0..=max_symbol {
+        // count/norm are resliced to the live alphabet above, so these
+        // indexings are bounds-check-free.
         let c = count[s];
         if c == 0 {
             norm[s] = 0;
@@ -565,6 +618,8 @@ pub(crate) fn normalize_count(
             let scaled = c as u64 * step;
             let mut proba = (scaled >> scale) as i32;
             if proba < 8 {
+                // proba is a u64 shifted down by >= 50 bits, hence
+                // non-negative; the guard bounds it to the table.
                 let rest_to_beat = v_step * RTB_TABLE[proba as usize];
                 proba += (scaled - ((proba as u64) << scale) > rest_to_beat) as i32;
             }
@@ -876,7 +931,7 @@ fn build_table_body(
         let base = spread.as_mut_ptr();
         let mut sv = 0u64;
         let mut pos = 0usize;
-        for &prob in probs.iter() {
+        for &prob in probs {
             if prob > 0 {
                 // SAFETY: the runs tile [0, table_size) and each run's u64
                 // writes cover ceil(n / 8) * 8 bytes, so the farthest write

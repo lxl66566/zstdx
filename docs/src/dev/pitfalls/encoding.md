@@ -36,6 +36,7 @@
 - Three pitfalls of the FSE -1 symbol: the positive-probability sum of cross-check inputs must equal `table_size - count(-1)` (otherwise you generate malformed test inputs and false-positive); during SoA construction the -1 symbol is filtered out by `prob <= 0`, so its start state must be written explicitly at allocation time; the baseline packed into transitions (9 bits) requires baseline < 512, and widening acc_log must widen the packed width in lockstep.
 - of_value semantics: non-rep match = offset+3, rep match ∈ {1,2,3}; when diagnostics print offsets, 307203 = 307200+3 — do not treat it as an independent constant.
 - For pitfalls of parsing frame structure with python (nbSeq bit width, `+` binding tighter than `|`, sort mixing in kernel symbols), see [engineering methodology](workflow.md).
+- **BitWriter hot-state handover carries up to 63 pending bits** — a batched writer that takes `hot_state()` and then reasons "my adds are ≤ N bits, the flush keeps nb < 48" must establish that invariant with one conditional flush BEFORE the first add: the entry `bits_in_partial` is unbounded (0..=63), so the first add can silently shift bits past the u64 top. `FSETable::write_table` lost exactly the high bits of its first description entries this way; the symptom surfaced far downstream (sequence-section underflow in `ramp_frames_decode_byte_exact`), not at the write site.
 
 ## Memory safety
 
