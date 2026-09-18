@@ -11,6 +11,8 @@
 pub(crate) mod encoder_core;
 #[cfg(feature = "std")]
 pub(crate) mod encoder_mt;
+#[cfg(feature = "std")]
+pub(crate) mod mt_pool;
 pub mod read;
 pub mod write;
 
