@@ -431,6 +431,8 @@ fn donate_job_zero_prefix(
         shape,
         reach_probe::ReachChoice::Shrink,
         reach_probe::ProbeFeedback::Approx,
+        // Same landslide abort as the bulk-ST path.
+        Some(keep * reach_probe::KEEP_LANDSLIDE),
     );
     let choice = reach_probe::decide_donated(keep, shrink, src, level, shape);
     (choice, state, output)

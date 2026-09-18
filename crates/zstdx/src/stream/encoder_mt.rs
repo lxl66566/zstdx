@@ -505,6 +505,9 @@ fn run_claimed_job(
                 job.shape,
                 ReachChoice::Shrink,
                 ProbeFeedback::Approx,
+                // Runs concurrently with the keep donation, so the cap is
+                // unknown here; waiting for it would serialize the pair.
+                None,
             );
             crate::encoding::mt::return_donation_probe(probe);
             *outcome.lock().unwrap() = Some(shrink);

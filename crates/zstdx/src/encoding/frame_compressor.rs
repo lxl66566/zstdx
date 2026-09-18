@@ -392,6 +392,9 @@ fn compress_with_state_donated(
         shape,
         reach_probe::ReachChoice::Shrink,
         reach_probe::ProbeFeedback::Approx,
+        // The verdict keeps outright once the shrink cost reaches the
+        // landslide bound (text-class frames cross it a few blocks in).
+        Some(keep * reach_probe::KEEP_LANDSLIDE),
     );
     if reach_probe::decide_donated(keep, shrink, src, level, shape)
         == reach_probe::ReachChoice::Shrink

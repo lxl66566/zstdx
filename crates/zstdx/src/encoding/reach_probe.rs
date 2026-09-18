@@ -238,7 +238,7 @@ const FEEDBACK_PROBE: usize = 512 * 1024;
 /// only a keep side gaining >~20% from feedback (json, the most
 /// feedback-sensitive shape on record, gains 5%) could still bring the
 /// flat comparison inside the margin from there.
-const KEEP_LANDSLIDE: f64 = 1.25;
+pub(crate) const KEEP_LANDSLIDE: f64 = 1.25;
 
 /// The donated path's verdict. Its keep cost is the TRUE one (the frame's
 /// own parse, entropy feedback included) while the shrink side parses
@@ -315,6 +315,8 @@ fn feedback_gain_with(
         shape,
         ReachChoice::Keep,
         ProbeFeedback::Flat,
+        // Keep-side parses are always needed in full.
+        None,
     );
     let approx = parse_cost_with(
         probe,
@@ -323,6 +325,7 @@ fn feedback_gain_with(
         shape,
         ReachChoice::Keep,
         ProbeFeedback::Approx,
+        None,
     );
     if flat <= 0.0 {
         0.0
@@ -361,8 +364,24 @@ pub(crate) fn probe_staged(head: &[u8], level: Level, shape: InputShape) -> Reac
         return ReachChoice::Keep;
     }
     let head = &head[..PROBE_SPAN];
-    let keep = parse_cost(head, level, shape, ReachChoice::Keep, ProbeFeedback::Flat);
-    let shrink = parse_cost(head, level, shape, ReachChoice::Shrink, ProbeFeedback::Flat);
+    let keep = parse_cost(
+        head,
+        level,
+        shape,
+        ReachChoice::Keep,
+        ProbeFeedback::Flat,
+        None,
+    );
+    // The plain verdict keeps at any shrink cost above `keep`, so the
+    // shrink parse aborts once its lower bound crosses it.
+    let shrink = parse_cost(
+        head,
+        level,
+        shape,
+        ReachChoice::Shrink,
+        ProbeFeedback::Flat,
+        Some(keep),
+    );
     decide(keep, shrink)
 }
 
@@ -386,9 +405,10 @@ pub(crate) fn parse_cost(
     shape: InputShape,
     choice: ReachChoice,
     feedback: ProbeFeedback,
+    abort_cap: Option<f64>,
 ) -> f64 {
     let mut driver = probe_driver();
-    let cost = parse_cost_with(&mut driver, head, level, shape, choice, feedback);
+    let cost = parse_cost_with(&mut driver, head, level, shape, choice, feedback, abort_cap);
     return_probe_driver(driver);
     cost
 }
@@ -419,6 +439,20 @@ fn return_probe_driver(_driver: Box<MatchGeneratorDriver>) {}
 /// [`parse_cost`] on a caller-supplied pooled driver: a donation running
 /// on an ephemeral pool worker cannot warm the thread-local driver, so it
 /// carries its own across encoders (see `mt::donate_span`).
+///
+/// `abort_cap`: stop at the first block boundary whose running cost lower
+/// bound reaches the cap, returning the partial cost. The bound sums each
+/// completed block's own order-0 literal bits (entropy concavity: the
+/// merged histogram's cost is never below the per-block sum) plus the
+/// additive sequence bits, so the full parse's cost is >= the bound, and
+/// the returned partial (merged over the parsed blocks) is >= it too — a
+/// caller whose verdict is already decided at any cost >= cap (decide's
+/// Keep side at cap == keep, decide_donated's landslide at cap == keep x
+/// [`KEEP_LANDSLIDE`]) gets an identical verdict from the aborted parse.
+/// On shapes where the shrink side loses badly (text measures 6x the keep
+/// cost) the crossing sits inside the first blocks, skipping the rest of
+/// the span — the probe's dominant cost on exactly the frames it can
+/// never convert.
 pub(crate) fn parse_cost_with(
     driver: &mut MatchGeneratorDriver,
     head: &[u8],
@@ -426,6 +460,7 @@ pub(crate) fn parse_cost_with(
     shape: InputShape,
     choice: ReachChoice,
     feedback: ProbeFeedback,
+    abort_cap: Option<f64>,
 ) -> f64 {
     driver.set_input_shape(shape);
     driver.set_reach_choice(choice);
@@ -443,6 +478,8 @@ pub(crate) fn parse_cost_with(
     let mut seqs = Vec::new();
     let mut lit_hist = [0u64; 256];
     let mut seq_bits = 0u64;
+    // Running abort lower bound: per-block order-0 literal bits.
+    let mut lb_lit = 0.0f64;
     let mut fb_lens = [0u8; 256];
     let mut pos = 0usize;
     while pos < head.len() {
@@ -459,22 +496,34 @@ pub(crate) fn parse_cost_with(
             // frame never matches (random paid a full chain walk per gated
             // block, twice, to measure a cost the gate had already decided).
             // Its cost model is the block's own bytes as literals.
-            for (i, c) in byte_hist(&head[pos..end]).into_iter().enumerate() {
+            let hist = byte_hist(&head[pos..end]);
+            if abort_cap.is_some() {
+                lb_lit += block_order0_bits(&hist);
+            }
+            for (i, c) in hist.into_iter().enumerate() {
                 lit_hist[i] += c as u64;
             }
         } else {
             driver.start_matching_codes(&mut literals, &mut seqs);
             if seqs.is_empty() {
                 // A zero-sequence block's literals are the block itself.
-                for &b in &head[pos..end] {
-                    lit_hist[b as usize] += 1;
+                let hist = byte_hist(&head[pos..end]);
+                if abort_cap.is_some() {
+                    lb_lit += block_order0_bits(&hist);
+                }
+                for (i, c) in hist.into_iter().enumerate() {
+                    lit_hist[i] += c as u64;
                 }
                 if feedback == ProbeFeedback::Approx {
                     approx_lit_lens(&head[pos..end], &mut fb_lens);
                     driver.note_literal_costs(&fb_lens);
                 }
             } else {
-                for (i, c) in byte_hist(&literals).into_iter().enumerate() {
+                let hist = byte_hist(&literals);
+                if abort_cap.is_some() {
+                    lb_lit += block_order0_bits(&hist);
+                }
+                for (i, c) in hist.into_iter().enumerate() {
                     lit_hist[i] += c as u64;
                 }
                 for w in &seqs {
@@ -488,6 +537,9 @@ pub(crate) fn parse_cost_with(
                 seqs.clear();
             }
         }
+        if abort_cap.is_some_and(|cap| lb_lit + seq_bits as f64 >= cap) {
+            break;
+        }
         pos = end;
     }
 
@@ -497,6 +549,25 @@ pub(crate) fn parse_cost_with(
 
 /// Order-0 entropy of the literal bytes in bits.
 fn order0_bits(hist: &[u64; 256], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let mut bits = 0.0;
+    for &c in hist {
+        if c > 0 {
+            let p = c as f64 / total as f64;
+            bits -= p * f64_log2(p);
+        }
+    }
+    bits * total as f64
+}
+
+/// One block's order-0 literal bits: the abort bound's summand. Only ever
+/// compared against the cap, never returned, so its exact float form is
+/// free; concavity (`N*H(merged) >= sum n_b*H(block_b)`) is the load-
+/// bearing property.
+fn block_order0_bits(hist: &[u32; 256]) -> f64 {
+    let total: u64 = hist.iter().map(|&c| c as u64).sum();
     if total == 0 {
         return 0.0;
     }
