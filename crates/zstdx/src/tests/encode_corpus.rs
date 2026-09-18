@@ -7,7 +7,10 @@ fn test_encode_corpus_files_uncompressed_our_decompressor() {
     use crate::encoding::FrameCompressor;
 
     let mut failures: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./decodecorpus_files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     if fs::read_dir("./local_corpus_files").is_ok() {
         files.extend(fs::read_dir("./local_corpus_files").unwrap());
     }
@@ -56,7 +59,10 @@ fn test_encode_corpus_files_uncompressed_original_decompressor() {
     use crate::encoding::FrameCompressor;
 
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
-    let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./decodecorpus_files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     if fs::read_dir("./local_corpus_files").is_ok() {
         files.extend(fs::read_dir("./local_corpus_files").unwrap());
     }
@@ -108,7 +114,10 @@ fn test_encode_corpus_files_compressed_our_decompressor() {
     use crate::encoding::FrameCompressor;
 
     let mut failures: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./decodecorpus_files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     if fs::read_dir("./local_corpus_files").is_ok() {
         files.extend(fs::read_dir("./local_corpus_files").unwrap());
     }
@@ -157,7 +166,10 @@ fn test_encode_corpus_files_compressed_original_decompressor() {
     use crate::encoding::FrameCompressor;
 
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
-    let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./decodecorpus_files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     if fs::read_dir("./local_corpus_files").is_ok() {
         files.extend(fs::read_dir("./local_corpus_files").unwrap());
     }

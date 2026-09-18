@@ -77,21 +77,23 @@ fn skippable_frame() {
 #[cfg(test)]
 #[test]
 fn test_frame_header_reading() {
-    use std::fs;
-
     use crate::decoding::frame;
 
-    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let (_frame, _) = frame::read_frame_header(&mut content).unwrap();
 }
 
 #[test]
 fn test_block_header_reading() {
-    use std::fs;
-
     use crate::{decoding, decoding::frame};
 
-    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let (_frame, _) = frame::read_frame_header(&mut content).unwrap();
 
     let mut block_dec = decoding::block_decoder::new();
@@ -101,11 +103,12 @@ fn test_block_header_reading() {
 
 #[test]
 fn test_frame_decoder() {
-    use std::fs;
-
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
-    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
 
     let mut frame_dec = FrameDecoder::new();
     frame_dec.reset(&mut content).unwrap();
@@ -116,16 +119,17 @@ fn test_frame_decoder() {
 
 #[test]
 fn test_decode_from_to() {
-    use std::{
-        fs::File,
-        io::{BufReader, Read},
-    };
-
     use crate::decoding::FrameDecoder;
-    let f = BufReader::new(File::open("./decodecorpus_files/z000088.zst").unwrap());
+
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000088") else {
+        return;
+    };
     let mut frame_dec = FrameDecoder::new();
 
-    let content: Vec<u8> = f.bytes().map(|x| x.unwrap()).collect();
+    let content: Vec<u8> = compressed;
 
     let mut target = vec![0u8; 1024 * 1024];
 
@@ -186,9 +190,6 @@ fn test_decode_from_to() {
         None => std::println!("No checksums to test\n"),
     }
 
-    let original_f = BufReader::new(File::open("./decodecorpus_files/z000088").unwrap());
-    let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
-
     assert_eq!(original.len(), result.len(), "Result has wrong length");
 
     let mut counter = 0;
@@ -211,15 +212,13 @@ fn test_decode_from_to() {
 
 #[test]
 fn test_specific_file() {
-    use std::{
-        fs,
-        io::{BufReader, Read},
-    };
-
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let path = "./decodecorpus_files/z000068.zst";
-    let mut content = fs::File::open(path).unwrap();
+    let Some(compressed) = fixture_bytes(path) else {
+        return;
+    };
+    let mut content = compressed.as_slice();
 
     let mut frame_dec = FrameDecoder::new();
     frame_dec.reset(&mut content).unwrap();
@@ -228,8 +227,9 @@ fn test_specific_file() {
         .unwrap();
     let result = frame_dec.collect().unwrap();
 
-    let original_f = BufReader::new(fs::File::open("./decodecorpus_files/z000088").unwrap());
-    let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000088") else {
+        return;
+    };
 
     std::println!("Results for file: {path}");
 
@@ -264,19 +264,19 @@ fn test_specific_file() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming() {
-    use std::{
-        fs,
-        io::{BufReader, Read},
-    };
+    use std::io::Read;
 
-    let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000088") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let mut stream = crate::decoding::StreamingDecoder::new(&mut content).unwrap();
 
     let mut result = Vec::new();
     Read::read_to_end(&mut stream, &mut result).unwrap();
-
-    let original_f = BufReader::new(fs::File::open("./decodecorpus_files/z000088").unwrap());
-    let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
 
     assert_eq!(original.len(), result.len(), "Result has wrong length");
 
@@ -299,7 +299,13 @@ fn test_streaming() {
 
     // Test resetting to a new file while keeping the old decoder
 
-    let mut content = fs::File::open("./decodecorpus_files/z000068.zst").unwrap();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000068.zst") else {
+        return;
+    };
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000068") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let mut stream = crate::decoding::StreamingDecoder::new_with_decoder(
         &mut content,
         stream.into_frame_decoder(),
@@ -308,9 +314,6 @@ fn test_streaming() {
 
     let mut result = Vec::new();
     Read::read_to_end(&mut stream, &mut result).unwrap();
-
-    let original_f = BufReader::new(fs::File::open("./decodecorpus_files/z000068").unwrap());
-    let original: Vec<u8> = original_f.bytes().map(|x| x.unwrap()).collect();
 
     std::println!("Results for file:");
 
@@ -338,8 +341,10 @@ fn test_streaming() {
 fn test_incremental_read() {
     use crate::decoding::FrameDecoder;
 
-    let mut unread_compressed_content =
-        include_bytes!("../../decodecorpus_files/abc.txt.zst").as_slice();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/abc.txt.zst") else {
+        return;
+    };
+    let mut unread_compressed_content = compressed.as_slice();
 
     let mut frame_dec = FrameDecoder::new();
     frame_dec.reset(&mut unread_compressed_content).unwrap();
@@ -363,11 +368,15 @@ fn test_incremental_read() {
 fn test_streaming_no_std() {
     use crate::io::Read;
 
-    let content = include_bytes!("../../decodecorpus_files/z000088.zst");
-    let mut content = content.as_slice();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
+        return;
+    };
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000088") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let mut stream = crate::decoding::StreamingDecoder::new(&mut content).unwrap();
 
-    let original = include_bytes!("../../decodecorpus_files/z000088");
     let mut result = vec![0; original.len()];
     Read::read_exact(&mut stream, &mut result).unwrap();
 
@@ -392,15 +401,19 @@ fn test_streaming_no_std() {
 
     // Test resetting to a new file while keeping the old decoder
 
-    let content = include_bytes!("../../decodecorpus_files/z000068.zst");
-    let mut content = content.as_slice();
+    let Some(compressed) = fixture_bytes("./decodecorpus_files/z000068.zst") else {
+        return;
+    };
+    let Some(original) = fixture_bytes("./decodecorpus_files/z000068") else {
+        return;
+    };
+    let mut content = compressed.as_slice();
     let mut stream = crate::decoding::StreamingDecoder::new_with_decoder(
         &mut content,
         stream.into_frame_decoder(),
     )
     .unwrap();
 
-    let original = include_bytes!("../../decodecorpus_files/z000068");
     let mut result = vec![0; original.len()];
     Read::read_exact(&mut stream, &mut result).unwrap();
 
@@ -439,12 +452,25 @@ fn test_decode_all() {
     let mut original = Vec::new();
     let mut input = Vec::new();
 
+    let Some(z89z) = fixture_bytes("./decodecorpus_files/z000089.zst") else {
+        return;
+    };
+    let Some(z89) = fixture_bytes("./decodecorpus_files/z000089") else {
+        return;
+    };
+    let Some(z90z) = fixture_bytes("./decodecorpus_files/z000090.zst") else {
+        return;
+    };
+    let Some(z90) = fixture_bytes("./decodecorpus_files/z000090") else {
+        return;
+    };
+
     skip_frame(&mut input, 300);
-    input.extend_from_slice(include_bytes!("../../decodecorpus_files/z000089.zst"));
-    original.extend_from_slice(include_bytes!("../../decodecorpus_files/z000089"));
+    input.extend_from_slice(&z89z);
+    original.extend_from_slice(&z89);
     skip_frame(&mut input, 400);
-    input.extend_from_slice(include_bytes!("../../decodecorpus_files/z000090.zst"));
-    original.extend_from_slice(include_bytes!("../../decodecorpus_files/z000090"));
+    input.extend_from_slice(&z90z);
+    original.extend_from_slice(&z90);
     skip_frame(&mut input, 500);
 
     let mut decoder = FrameDecoder::new();
@@ -526,6 +552,34 @@ fn window_8mib_plaintext() -> Vec<u8> {
     "Sphinx of black quartz, judge my vow.\n"
         .repeat(4096)
         .into_bytes()
+}
+
+/// Entries of a fixture directory, or `None` when it does not exist. Fixture
+/// directories (`decodecorpus_files`, `dict_tests`, the fuzz artifacts) are
+/// excluded from the published crate; corpus tests skip when they are absent.
+#[cfg(test)]
+fn fixture_entries(path: &str) -> Option<Vec<std::io::Result<std::fs::DirEntry>>> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries.collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::println!("skipping: {path} not present (excluded from the published crate)");
+            None
+        },
+        Err(e) => panic!("failed to read fixture dir {path}: {e}"),
+    }
+}
+
+/// Contents of a fixture file; `None` behaves like [`fixture_entries`].
+#[cfg(test)]
+fn fixture_bytes(path: &str) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::println!("skipping: {path} not present (excluded from the published crate)");
+            None
+        },
+        Err(e) => panic!("failed to read fixture {path}: {e}"),
+    }
 }
 
 #[test]

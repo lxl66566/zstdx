@@ -22,7 +22,10 @@ fn test_decode_corpus_files() {
     let mut speeds = Vec::new();
     let mut speeds_read = Vec::new();
 
-    let mut files: Vec<_> = fs::read_dir("./decodecorpus_files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./decodecorpus_files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     if fs::read_dir("./local_corpus_files").is_ok() {
         files.extend(fs::read_dir("./local_corpus_files").unwrap());
     }

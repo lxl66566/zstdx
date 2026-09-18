@@ -3,6 +3,9 @@
 //! process-global statics, and the unit-test binary runs its tests on
 //! parallel threads where the override would leak into other tests'
 //! MT encodes (their mt-vs-st ratio gates assume ungated jobs).
+//!
+//! The overrides and the MT paths they exercise are std-gated.
+#![cfg(feature = "std")]
 
 use std::{io::Write, sync::MutexGuard};
 

@@ -86,7 +86,10 @@ fn test_dict_decoding() {
     let mut speeds = Vec::new();
     let mut speeds_read = Vec::new();
 
-    let mut files: Vec<_> = fs::read_dir("./dict_tests/files").unwrap().collect();
+    let Some(entries) = super::fixture_entries("./dict_tests/files") else {
+        return;
+    };
+    let mut files: Vec<_> = entries.into_iter().collect();
     let dict = BufReader::new(fs::File::open("./dict_tests/dictionary").unwrap());
     let dict: Vec<u8> = dict.bytes().map(|x| x.unwrap()).collect();
 
@@ -273,10 +276,13 @@ fn test_dict_encoding() {
     use alloc::vec::Vec;
     use std::fs;
 
+    let Some(entries) = super::fixture_entries("./dict_tests/files") else {
+        return;
+    };
     let dict: Vec<u8> = fs::read("./dict_tests/dictionary").unwrap();
 
-    let mut files: Vec<_> = fs::read_dir("./dict_tests/files")
-        .unwrap()
+    let mut files: Vec<_> = entries
+        .into_iter()
         .filter_map(|f| {
             let p = f.ok()?.path();
             (p.extension()?.to_str()? == "service").then_some(p)

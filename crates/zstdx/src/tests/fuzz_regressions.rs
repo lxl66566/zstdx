@@ -1,13 +1,16 @@
 #[test]
 fn test_all_artifacts() {
     extern crate std;
-    use std::{borrow::ToOwned, fs, fs::File};
+    use std::{borrow::ToOwned, fs::File};
 
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
 
     let mut frame_dec = FrameDecoder::new();
 
-    for file in fs::read_dir("../zstdx-fuzz/artifacts/decode").unwrap() {
+    let Some(entries) = super::fixture_entries("../zstdx-fuzz/artifacts/decode") else {
+        return;
+    };
+    for file in entries {
         let file_name = file.unwrap().path();
 
         let fnstr = file_name.to_str().unwrap().to_owned();

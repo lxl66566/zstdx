@@ -787,7 +787,7 @@ fn near_local(len: usize) -> Vec<u8> {
 /// shrink class of the reach probe (see `encoding::reach_probe`) — its far
 /// chain candidates displace nearer repcode reuse, so the shrunk reach
 /// parses the head cheaper.
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 fn jsonish(len: usize) -> Vec<u8> {
     use std::format;
     let mut state = 42u64;
@@ -827,7 +827,12 @@ fn jsonish(len: usize) -> Vec<u8> {
 fn reach_probe_stream_roundtrips() {
     let len = encoding::reach_probe::PROBE_MIN_FRAME as usize + 123 * 1024;
     let data = near_local(len);
-    for (workers, label) in [(1, "st"), (4, "mt")] {
+    // The mt leg needs the std-gated worker paths.
+    #[cfg(feature = "std")]
+    let legs = [(1, "st"), (4, "mt")];
+    #[cfg(not(feature = "std"))]
+    let legs = [(1, "st")];
+    for (workers, label) in legs {
         let options = || {
             EncoderOptions::new(Level::Balanced)
                 .pledged_size(Some(len as u64))
