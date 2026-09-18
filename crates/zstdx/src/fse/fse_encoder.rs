@@ -227,34 +227,44 @@ impl FseBuildScratch {
 
 #[derive(Debug, Clone)]
 pub struct FSETable {
-    /// Normalized probability per symbol: positive weight, -1 for the
-    /// low-probability wire form, 0 for absent symbols. `write_table`
-    /// serializes this array in symbol order.
-    probs: [i32; 256],
-    /// Biased encoding start state per symbol (`table_size + state index`,
-    /// the scale `tab`'s state table carries): the symbol's lowest spread
-    /// position, mirroring libzstd's `FSE_initCState2` ("the smallest state
-    /// value possible" — its decode entry always consumes >= 1 bit).
-    start: [u16; 256],
     /// Sum of all probabilities (2^acc_log).
     pub(crate) table_size: usize,
-    /// Arithmetic tANS transition tables (libzstd's `FSE_CTable` form) in
-    /// one buffer: `[tt: u64 x 256][state_table: u16 x table_size]`.
-    /// `tt[code]` packs `delta_nb_bits` (low u32) and `delta_find_state`
-    /// (high u32, two's complement); one step is
-    /// `nb = (state + delta_nb_bits) >> 16`,
+    /// Alphabet prefix length: symbols at or beyond it are dead. Bounds
+    /// every per-symbol scan, so the probs region past it never needs
+    /// clearing between pooled builds.
+    nsym: u16,
+    /// All per-table data in ONE pooled buffer, so moving the table (build
+    /// return, mode enum, previous-table slot) moves one pointer instead of
+    /// memcpy-ing the fat per-symbol arrays:
+    /// `[tt: u64 x 256][probs: i32 x 256][start: u16 x 256]
+    /// [state_table: u16 x table_size]`.
+    ///
+    /// `tt[code]` (libzstd's `FSE_CTable` arithmetic form) packs
+    /// `delta_nb_bits` (low u32) and `delta_find_state` (high u32, two's
+    /// complement); one step is `nb = (state + delta_nb_bits) >> 16`,
     /// `next = state_table[(state >> nb) + delta_find_state]`, and the
-    /// emitted value is the biased state's low `nb` bits. Replaces the
-    /// materialized `(max_symbol+1) x table_size` transition matrix: the
-    /// build writes O(table_size) entries instead of
-    /// O(max_symbol x table_size), and both tables stay L1-resident.
+    /// emitted value is the biased state's low `nb` bits. `probs` holds the
+    /// normalized probability per symbol (positive weight, -1 for the
+    /// low-probability wire form, 0 for absent symbols, serialized by
+    /// `write_table` in symbol order). `start` holds the biased encoding
+    /// start state per symbol (`table_size + state index`): the symbol's
+    /// lowest spread position, mirroring libzstd's `FSE_initCState2` ("the
+    /// smallest state value possible" — its decode entry always consumes
+    /// >= 1 bit).
     tab: Vec<u64>,
 }
 
 /// u64 length of the tt region of [`FSETable::tab`].
 const TT_LEN: usize = 256;
-/// u16 index of the state table inside [`FSETable::tab`] (byte 2048).
-const ST_U16_OFF: usize = TT_LEN * 4;
+/// i32 index of the probs region inside [`FSETable::tab`] (byte 2048).
+const PROB_I32_OFF: usize = TT_LEN * 2;
+/// u16 index of the start region inside [`FSETable::tab`] (byte 3072).
+const START_U16_OFF: usize = PROB_I32_OFF * 2 + 512;
+/// u16 index of the state table inside [`FSETable::tab`] (byte 3584).
+const ST_U16_OFF: usize = START_U16_OFF + 256;
+/// u64 length of the fixed regions (tt + probs + start) of
+/// [`FSETable::tab`]; the state table follows.
+const FIXED_U64_LEN: usize = ST_U16_OFF / 4;
 
 impl FSETable {
     /// One tANS encode step: `(nb_bits, emitted value, next state)` for
@@ -272,7 +282,7 @@ impl FSETable {
 
     /// Raw table pointers for hot encode loops: the tt base (`u64` entries)
     /// and the state-table base (`u16` entries at the fixed byte offset
-    /// 2048), so one base register serves both.
+    /// 3584), so one base register serves both.
     pub(crate) fn tab_parts(&self) -> (*const u64, *const u16) {
         let tt = self.tab.as_ptr();
         // SAFETY: the state table lives at ST_U16_OFF inside the same
@@ -284,7 +294,7 @@ impl FSETable {
     fn state_table(&self) -> &[u16] {
         // SAFETY: the state table is `table_size` u16 entries at a fixed
         // offset inside the tab allocation (the buffer's u64 length covers
-        // TT_LEN + ceil(table_size / 4)).
+        // FIXED_U64_LEN + ceil(table_size / 2)).
         unsafe {
             core::slice::from_raw_parts(
                 self.tab.as_ptr().cast::<u16>().add(ST_U16_OFF),
@@ -293,11 +303,28 @@ impl FSETable {
         }
     }
 
+    /// Normalized probabilities over the live alphabet prefix
+    /// (`nsym` entries; see [`Self::nsym`]).
+    fn probs(&self) -> &[i32] {
+        // SAFETY: 256 i32 at PROB_I32_OFF inside the tab allocation.
+        unsafe {
+            core::slice::from_raw_parts(self.tab.as_ptr().cast::<i32>().add(PROB_I32_OFF), 256)
+        }
+    }
+
+    /// Biased encoding start states over the live alphabet prefix.
+    fn start(&self) -> &[u16] {
+        // SAFETY: 256 u16 at START_U16_OFF inside the tab allocation.
+        unsafe {
+            core::slice::from_raw_parts(self.tab.as_ptr().cast::<u16>().add(START_U16_OFF), 256)
+        }
+    }
+
     /// Index of the state encoding a block's last `symbol` starts from
     /// (biased: `table_size + index`).
     #[inline(always)]
     pub(crate) fn start_index(&self, symbol: u8) -> u32 {
-        self.start[symbol as usize] as u32
+        self.start()[symbol as usize] as u32
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -308,8 +335,13 @@ impl FSETable {
     /// log2(table_size / prob). `None` when the symbol has no state, which
     /// disqualifies the table from being repeated for a histogram that uses
     /// it. The -1 low-probability wire form behaves like a single state.
+    /// The `nsym` bound is what makes a recycled table's stale probs tail
+    /// unobservable.
     pub(crate) fn symbol_bit_cost(&self, symbol: u8) -> Option<f64> {
-        let p = self.probs[symbol as usize];
+        if symbol as usize >= self.nsym as usize {
+            return None;
+        }
+        let p = self.probs()[symbol as usize];
         if p == 0 {
             return None;
         }
@@ -328,6 +360,8 @@ impl FSETable {
         writer.write_bits(self.acc_log() - 5, 4);
         let mut probability_counter = 0usize;
         let probability_sum = 1 << self.acc_log();
+        let probs = self.probs();
+        let nsym = self.nsym as usize;
 
         let mut prob_idx = 0;
         while probability_counter < probability_sum {
@@ -336,7 +370,7 @@ impl FSETable {
             let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
             let mask = (1 << (bits_to_write - 1)) - 1;
 
-            let prob = self.probs[prob_idx];
+            let prob = probs[prob_idx];
             prob_idx += 1;
             let value = (prob + 1) as u32;
             if value < low_threshold as u32 {
@@ -353,9 +387,10 @@ impl FSETable {
                 probability_counter += prob as usize;
             } else {
                 let mut zeros = 0u8;
-                // Trailing zero-probability symbols can run to the end of the
-                // table; the outer loop stops on the probability sum anyway.
-                while prob_idx < self.probs.len() && self.probs[prob_idx] == 0 {
+                // Trailing zero-probability symbols can run to the end of
+                // the live alphabet; the outer loop stops on the
+                // probability sum anyway.
+                while prob_idx < nsym && probs[prob_idx] == 0 {
                     zeros += 1;
                     prob_idx += 1;
                     if zeros == 3 {
@@ -442,7 +477,7 @@ pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize)
 pub(crate) fn rle_table(code: u8, scratch: &mut FseBuildScratch) -> FSETable {
     let mut probs = [0i32; 256];
     probs[code as usize] = 1;
-    build_table_from_probabilities_into(&probs, 0, scratch)
+    build_table_from_probabilities_into(&probs[..=code as usize], 0, scratch)
 }
 
 /// libzstd's set_compressed table build for sequence code histograms: the
@@ -740,8 +775,14 @@ pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     let table_size = 1usize << acc_log;
     let mut owner = alloc::vec![0u8; table_size];
     let mut spread = alloc::vec![0u8; table_size + 8];
-    let mut tab = alloc::vec![0u64; TT_LEN + table_size.div_ceil(4)];
+    let mut tab = alloc::vec![0u64; tab_len(table_size)];
     build_table_body(probs, acc_log, &mut owner, &mut spread, &mut tab)
+}
+
+/// u64 length of a tab buffer covering the fixed regions plus the state
+/// table for `table_size` states.
+fn tab_len(table_size: usize) -> usize {
+    FIXED_U64_LEN + table_size.div_ceil(2)
 }
 
 /// The pooled [`build_table_from_probabilities`]: recycles the table buffer
@@ -752,7 +793,7 @@ pub(crate) fn build_table_from_probabilities_into(
     scratch: &mut FseBuildScratch,
 ) -> FSETable {
     let table_size = 1usize << acc_log;
-    let mut tab = scratch.take_tab(TT_LEN + table_size.div_ceil(4));
+    let mut tab = scratch.take_tab(tab_len(table_size));
     // High-water growth only: the build overwrites every slot it reads.
     if scratch.owner.len() < table_size {
         scratch.owner.resize(table_size, 0);
@@ -782,17 +823,32 @@ fn build_table_body(
     );
     debug_assert!(owner.len() >= 1usize << acc_log);
     debug_assert!(spread.len() >= (1usize << acc_log) + 8);
+    debug_assert!(probs.len() <= 256);
     let table_size = 1usize << acc_log;
     let owner = &mut owner[..table_size];
     let spread = &mut spread[..table_size + 8];
-    let mut probs_full = [0i32; 256];
+    // The per-symbol regions of the tab buffer: probs and start are written
+    // in place (no staging arrays to move out), and `start` doubles as the
+    // state-table walk's cursor below, then transforms into the biased
+    // encode start state.
+    // SAFETY: the tt region is 256 u64 at the buffer base, the probs region
+    // 256 i32 at PROB_I32_OFF and the start region 256 u16 at START_U16_OFF
+    // inside the tab allocation (whose u64 length covers all three, see
+    // [`tab_len`]); the three regions are disjoint.
+    let (tt, probs_full, start) = unsafe {
+        let base = tab.as_mut_ptr().cast::<u8>();
+        let tt = core::slice::from_raw_parts_mut(base.cast::<u64>(), TT_LEN);
+        let probs = core::slice::from_raw_parts_mut(base.cast::<i32>().add(PROB_I32_OFF), 256);
+        let start = core::slice::from_raw_parts_mut(base.cast::<u16>().add(START_U16_OFF), 256);
+        (tt, probs, start)
+    };
     probs_full[..probs.len()].copy_from_slice(probs);
+    // The tail past the live prefix is dead by construction: every reader
+    // (`write_table`'s serialization, `symbol_bit_cost`'s coverage check)
+    // scans only up to `nsym`.
 
     // Row starts + low-prob placement in one pass (libzstd's symbol start
-    // positions): `start[s]` doubles as the state-table walk's cursor below,
-    // then transforms into the biased encode start state. -1 weights take
-    // state indices from the top downward.
-    let mut start = [0u16; 256];
+    // positions). -1 weights take state indices from the top downward.
     let mut total = 0u32;
     let mut high_threshold = table_size as i32 - 1;
     for (s, &prob) in probs.iter().enumerate() {
@@ -870,7 +926,8 @@ fn build_table_body(
     // consumes `start` as its per-symbol cursor (libzstd mutates `cumul`
     // in place the same way).
     // SAFETY: the state table is `table_size` u16 entries at ST_U16_OFF in
-    // the tab buffer (whose u64 length covers TT_LEN + ceil(table_size/4)).
+    // the tab buffer (whose u64 length covers FIXED_U64_LEN +
+    // ceil(table_size/2)), disjoint from the tt/probs/start regions.
     let st = unsafe {
         core::slice::from_raw_parts_mut(tab.as_mut_ptr().cast::<u16>().add(ST_U16_OFF), table_size)
     };
@@ -916,7 +973,7 @@ fn build_table_body(
                 )
             },
         };
-        tab[s] = u64::from(dnb) | u64::from(dfs) << 32;
+        tt[s] = u64::from(dnb) | u64::from(dfs) << 32;
         if prob != 0 {
             start[s] = st[total as usize];
         }
@@ -928,9 +985,8 @@ fn build_table_body(
     }
 
     FSETable {
-        probs: probs_full,
-        start,
         table_size,
+        nsym: probs.len() as u16,
         tab: core::mem::take(tab),
     }
 }
@@ -1137,7 +1193,8 @@ mod soa_tests {
                     0
                 };
                 assert_eq!(
-                    table.start[s], expect,
+                    table.start()[s],
+                    expect,
                     "case {case} start {s} probs {probs:?} acc {acc_log}"
                 );
             }
