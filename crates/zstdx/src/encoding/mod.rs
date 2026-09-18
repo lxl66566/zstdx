@@ -5,6 +5,7 @@ pub(crate) mod async_checksum;
 pub(crate) mod block_enc;
 pub(crate) mod block_header;
 pub(crate) mod btlazy;
+pub(crate) mod checksum;
 pub(crate) mod dictionary;
 pub(crate) mod dubt;
 pub(crate) mod frame_header;

@@ -59,9 +59,9 @@ use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
         block_header::BlockHeader,
+        checksum::{BlockChecksum as _, FrameHasher},
         frame_compressor::{
-            BlockChecksum as _, CompressState, FrameHasher, compress_job_blocks_inner,
-            new_slice_state, reset_slice_state,
+            CompressState, compress_job_blocks_inner, new_slice_state, reset_slice_state,
         },
         frame_header::FrameHeader,
         match_generator::{

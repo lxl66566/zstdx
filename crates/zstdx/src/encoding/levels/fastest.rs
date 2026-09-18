@@ -10,7 +10,8 @@ use crate::{
             split,
         },
         block_header::BlockHeader,
-        frame_compressor::{BlockChecksum, CompressState},
+        checksum::BlockChecksum,
+        frame_compressor::CompressState,
     },
     fse::fse_encoder::FSETable,
 };

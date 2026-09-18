@@ -26,10 +26,12 @@ use core::{
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
-    Matcher, compress_fastest,
+    Matcher,
+    checksum::SliceChecksum,
+    compress_fastest,
     frame_compressor::{
-        CompressState, SliceChecksum, compress_job_blocks, compress_job_blocks_inner,
-        new_slice_state, reset_slice_state, return_slice_state, take_slice_state,
+        CompressState, compress_job_blocks, compress_job_blocks_inner, new_slice_state,
+        reset_slice_state, return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
