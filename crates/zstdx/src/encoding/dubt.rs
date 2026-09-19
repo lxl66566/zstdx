@@ -280,6 +280,19 @@ impl DubtFinder<'_, '_> {
                         };
                         best_len = rep_len;
                         if rep_len > self.sufficient_len || idx + rep_len >= self.block_end_idx {
+                            // Same table contract as the normal exit: the searched
+                            // position is inserted — fill form, head + chain link
+                            // + unsorted mark, exactly what the next fill_to would
+                            // write — and next_update moves past it, so no later
+                            // fill re-inserts it. (Runs before the main hash/head
+                            // handling below; cold path.)
+                            let h = self.hash_main(idx);
+                            let v = pack_pos(pos);
+                            let slot = 2 * (v as usize & self.bt_mask);
+                            self.bt[slot] = self.table[h];
+                            self.bt[slot + 1] = UNSORTED;
+                            self.table[h] = v;
+                            *self.next_update = (*self.next_update).max(pos + 1);
                             return found;
                         }
                     }
