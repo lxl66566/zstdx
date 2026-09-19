@@ -935,36 +935,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zzz_probe_ldm_tiling() {
-        const MIB: usize = 1024 * 1024;
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rand = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let unit: Vec<u8> = (0..(9 * MIB / 2)).map(|_| (rand() & 0xff) as u8).collect();
-        let mut tiled = unit.clone();
-        while tiled.len() < 28 * MIB {
-            let take = unit.len().min(28 * MIB - tiled.len());
-            tiled.extend_from_slice(&unit[..take]);
-        }
-        let head = pattern_head(256 * 1024);
-        let mut tiled_head = head.clone();
-        tiled_head.extend_from_slice(&tiled[..28 * MIB - head.len()]);
-        let st_unit = compress_slice_mt(&unit, Level::from_zstd(9), true, 1, None);
-        let st_tiled = compress_slice_mt(&tiled, Level::from_zstd(9), true, 1, None);
-        let st_tiled_head = compress_slice_mt(&tiled_head, Level::from_zstd(9), true, 1, None);
-        std::println!(
-            "unit={} tiled={} tiled_head={}",
-            st_unit.len(),
-            st_tiled.len(),
-            st_tiled_head.len()
-        );
-    }
-
     fn lcg(len: usize) -> Vec<u8> {
         let mut state = 0x1234_5678_9abc_def0u64;
         let mut rand = move || {
