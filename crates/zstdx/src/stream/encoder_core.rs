@@ -272,8 +272,9 @@ impl FrameEncoderCoreSt {
         self.finished
     }
 
-    pub(crate) fn has_output(&self) -> bool {
-        self.out_read < self.output.len()
+    /// Encoded bytes not yet consumed by the enclosing encoder.
+    pub(crate) fn pending_output(&self) -> usize {
+        self.output.len() - self.out_read
     }
 
     /// Hand the encoded bytes to `w`, keeping the output buffer's
@@ -451,10 +452,15 @@ impl FrameEncoderCore {
     }
 
     pub(crate) fn has_output(&self) -> bool {
+        self.pending_output() != 0
+    }
+
+    /// Encoded bytes not yet consumed by the enclosing encoder.
+    pub(crate) fn pending_output(&self) -> usize {
         match self {
-            Self::Single(core) => core.has_output(),
+            Self::Single(core) => core.pending_output(),
             #[cfg(feature = "std")]
-            Self::Mt(core) => core.has_output(),
+            Self::Mt(core) => core.pending_output(),
         }
     }
 

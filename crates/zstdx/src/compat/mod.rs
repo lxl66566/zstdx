@@ -6,9 +6,8 @@
 //! Known differences, all forced by what this crate implements today:
 //!
 //! - Numeric levels map exactly through [`Level::from_zstd`][crate::Level::from_zstd].
-//! - `multithread(n)` with `n > 1` on the streaming encoders fails with an error (the native
-//!   [`EncoderOptions`][crate::EncoderOptions] surface exists; the streaming backends do not yet).
-//!   Dictionary-taking constructors are supported (single-threaded).
+//! - `multithread(n)` with `n > 1` runs the native multithreaded streaming encoder; it must be set
+//!   before the stream starts. Dictionary-taking constructors are supported (single-threaded).
 //! - `zstd_safe` and `zstd::dict` (trained dictionaries) have no equivalent; the native low-level
 //!   API is [`crate::encoding`]/[`crate::decoding`].
 //!
@@ -19,8 +18,6 @@ pub mod stream;
 
 #[cfg(test)]
 mod tests;
-
-use std::io;
 
 use crate::Level;
 
@@ -41,8 +38,4 @@ pub(crate) fn map_level(level: i32) -> Level {
     } else {
         Level::from_zstd(level)
     }
-}
-
-pub(crate) fn unsupported_io(feature: crate::Feature) -> io::Error {
-    io::Error::other(crate::Error::Unsupported { feature })
 }

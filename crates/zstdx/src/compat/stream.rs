@@ -119,12 +119,14 @@ pub mod write {
             Ok(())
         }
 
-        /// Enables multithreaded compression; more than one worker is not
-        /// implemented yet.
+        /// Enables multithreaded compression: `workers > 1` engages the
+        /// native multithreaded streaming core (raw-block levels and
+        /// single-core processes fall back to the single-threaded core, as
+        /// in the native API; `workers <= 1` keeps it single-threaded).
+        /// Fails once streaming started, like the other parameter setters.
         pub fn multithread(&mut self, workers: u32) -> io::Result<()> {
-            if workers > 1 {
-                return Err(super::super::unsupported_io(crate::Feature::Multithread));
-            }
+            self.state.set_started()?;
+            self.state.options.workers = workers;
             Ok(())
         }
 
@@ -387,7 +389,9 @@ pub mod read {
         }
 
         /// Destructures this object into the underlying reader. Fails when a
-        /// pledged content size was not met by the bytes consumed so far.
+        /// pledged content size was not met by the bytes consumed so far, or
+        /// when encoded bytes are still unread (read the encoder to end of
+        /// stream before finishing).
         pub fn finish(self) -> io::Result<R> {
             self.inner.finish().map_err(io::Error::from)
         }

@@ -75,7 +75,7 @@ let compressed = compat::bulk::compress(data, 3)?;
 let original = compat::bulk::decompress(&compressed, 0)?;
 ```
 
-`compat::stream` provides `Encoder`/`Decoder` and `copy_encode`/`copy_decode`. Not covered: `zstd_safe`, trained-dict generation via `zstd::dict` (use `zstdx::dict`), and `multithread(n > 1)` on streaming encoders (use the native `EncoderOptions::workers`).
+`compat::stream` provides `Encoder`/`Decoder` and `copy_encode`/`copy_decode`. Not covered: `zstd_safe` and trained-dict generation via `zstd::dict` (use `zstdx::dict`).
 
 ## Levels
 
@@ -205,7 +205,6 @@ zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
 
 - Encoder speed is split by tier and corpus shape (ahead on several tiers, behind on the json fastest scan core and the best-tier tree core); bulk decode is ahead across the board. Measured numbers in [Current Status](dev/status.md).
 - No superblock, preSplit, or C FFI.
-- `compat` streaming encoders reject multithreading (the native streaming API supports it).
 
 [`Level::from_zstd(i32)`]: https://docs.rs/zstdx/latest/zstdx/level/struct.Level.html#method.from_zstd
 [`stream::encode_all`]: https://docs.rs/zstdx/latest/zstdx/stream/fn.encode_all.html

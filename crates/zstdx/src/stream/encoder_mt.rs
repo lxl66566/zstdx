@@ -959,8 +959,9 @@ impl MtEncoderCore {
         self.finished
     }
 
-    pub(crate) fn has_output(&self) -> bool {
-        self.out_read < self.output.len()
+    /// Encoded bytes not yet consumed by the enclosing encoder.
+    pub(crate) fn pending_output(&self) -> usize {
+        self.output.len() - self.out_read
     }
 
     /// Hand the encoded bytes to `w`, keeping the output buffer's
@@ -2135,7 +2136,7 @@ mod tests {
                 other => panic!("pledge {pledged}: got {other:?}"),
             }
             assert!(!core.is_finished());
-            assert!(!core.has_output());
+            assert_eq!(core.pending_output(), 0);
         }
     }
 
@@ -2159,7 +2160,7 @@ mod tests {
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
         core.flush_block();
-        assert!(core.has_output());
+        assert!(core.pending_output() > 0);
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -2204,7 +2205,7 @@ mod tests {
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&data);
         core.flush_block();
-        assert!(core.has_output());
+        assert!(core.pending_output() > 0);
         let mut flaky = ScriptedWriter {
             script: [
                 Ok(1),
@@ -2215,7 +2216,7 @@ mod tests {
         };
         assert!(core.write_output_to(&mut flaky).is_err());
         assert_eq!(flaky.received.len(), 1);
-        assert!(core.has_output());
+        assert!(core.pending_output() > 0);
         // The retry resumes into the same writer; finish closes the frame.
         core.write_output_to(&mut flaky).unwrap();
         core.finish().unwrap();

@@ -42,6 +42,17 @@ pub enum Error {
          would be rejected by decoders"
     )]
     PledgedSizeMismatch { pledged: u64, actual: u64 },
+    /// A read-side [`stream::Encoder`][crate::stream::read::Encoder] was
+    /// finished while encoded bytes were still pending in its output buffer.
+    /// The pending tail carries the frame's closing block, so dropping it
+    /// would leave every byte already read a truncated stream; read the
+    /// encoder to end of stream (the final read returns `Ok(0)`) before
+    /// finishing.
+    #[error(
+        "encoder finished with {bytes} unread encoded bytes; read it to end of stream before \
+         finishing"
+    )]
+    UnreadOutput { bytes: usize },
 }
 
 /// Capabilities whose API surface exists ahead of the implementation.

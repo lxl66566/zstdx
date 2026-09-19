@@ -216,8 +216,14 @@ impl<W: Write, F: FnMut(Result<W>)> Drop for AutoFinishEncoder<W, F> {
 pub struct Decoder<W: Write> {
     writer: W,
     inner: FrameDecoder,
-    /// Compressed bytes that arrived but were not consumed yet.
+    /// Compressed bytes that arrived but were not consumed yet;
+    /// `input[..start]` is already decoded.
     input: Vec<u8>,
+    /// Consumed prefix of [`Decoder::input`]. Advancing a cursor instead of
+    /// draining per block keeps the O(remaining) memmove off the per-block
+    /// path; the prefix is compacted at [`COMPACT_LIMIT`] (see
+    /// [`Decoder::compact`]) so the buffer stays bounded to the staged tail.
+    start: usize,
     /// False until a frame header was parsed from the input; reset at every
     /// frame boundary.
     inited: bool,
@@ -225,6 +231,12 @@ pub struct Decoder<W: Write> {
     /// final block's 4-byte trailer can be accounted for before decoding.
     checksummed: bool,
 }
+
+/// Consumed-cursor offset that triggers a staging compaction: one memmove
+/// of the staged tail (bounded by a block extent plus a write batch) per
+/// this many consumed bytes. Well above the 128 KiB format block maximum,
+/// so the steady state never touches it within a single write batch.
+const COMPACT_LIMIT: usize = 512 * 1024;
 
 impl<W: Write> Decoder<W> {
     /// Create a decoder with default options.
@@ -248,6 +260,7 @@ impl<W: Write> Decoder<W> {
             writer,
             inner,
             input: Vec::new(),
+            start: 0,
             inited: false,
             checksummed: false,
         })
@@ -302,34 +315,49 @@ impl<W: Write> Decoder<W> {
             }
             if self.inner.is_finished() {
                 self.inner.collect_to_writer(&mut self.writer)?;
-                if self.input.is_empty() {
+                if self.start == self.input.len() {
+                    self.compact();
                     return Ok(());
                 }
                 self.inited = false;
                 continue;
             }
             match self.next_block_need()? {
-                Some(need) if self.input.len() >= need => {},
+                Some(need) if self.input.len() - self.start >= need => {},
                 _ => return Ok(()),
             }
             let read_before = self.inner.bytes_read_from_source();
-            let mut source = &self.input[..];
+            let mut source = &self.input[self.start..];
             self.inner
                 .decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1))
                 .map_err(|e| crate::error::into_io(crate::Error::Frame(e)))?;
             let consumed = (self.inner.bytes_read_from_source() - read_before) as usize;
-            self.input.drain(..consumed);
+            self.start += consumed;
+            self.compact();
             self.inner.collect_to_writer(&mut self.writer)?;
+        }
+    }
+
+    /// Drop the consumed prefix. The steady state only advances the cursor;
+    /// the staged tail is memmoved once it walks past [`COMPACT_LIMIT`]
+    /// bytes (or when the buffer empties outright), keeping the live region
+    /// inside a bounded, cache-warm window — a slide-anywhere cursor pays
+    /// for its zero-copy in page faults and a whole-stream-capacity Vec.
+    fn compact(&mut self) {
+        if self.start == self.input.len() || self.start >= COMPACT_LIMIT {
+            self.input.drain(..self.start);
+            self.start = 0;
         }
     }
 
     /// Bytes the next block needs before it can be decoded safely:
     /// `None` when too little is staged to even parse its header.
     fn next_block_need(&self) -> Result<Option<usize>> {
-        if self.input.len() < 3 {
+        let staged = &self.input[self.start..];
+        if staged.len() < 3 {
             return Ok(None);
         }
-        let [b0, b1, b2, ..] = self.input[..] else {
+        let [b0, b1, b2, ..] = *staged else {
             return Ok(None);
         };
         let last = b0 & 1 == 1;
@@ -359,21 +387,23 @@ impl<W: Write> Decoder<W> {
     /// needed; the staging is then left untouched for the retry.
     fn init_frame(&mut self) -> Result<bool> {
         loop {
-            if self.input.len() < 4 {
+            let staged = &self.input[self.start..];
+            if staged.len() < 4 {
                 return Ok(false);
             }
             // Pre-parse the header for the checksum flag (the decoder itself
             // keeps that flag private). A starvation error here just means
             // the header is not fully staged yet.
-            let mut probe = &self.input[..];
+            let mut probe = staged;
             let checksummed = match crate::decoding::frame::read_frame_header(&mut probe) {
                 Ok((header, _)) => header.descriptor.content_checksum_flag(),
                 Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
                     let total = 8 + length as usize;
-                    if self.input.len() < total {
+                    if self.input.len() - self.start < total {
                         return Ok(false);
                     }
-                    self.input.drain(..total);
+                    self.start += total;
+                    self.compact();
                     continue;
                 },
                 Err(e) => {
@@ -390,10 +420,11 @@ impl<W: Write> Decoder<W> {
                     return Err(FrameDecoderError::ReadFrameHeaderError(e).into());
                 },
             };
-            let mut source = &self.input[..];
+            let mut source = &self.input[self.start..];
             self.inner.reset(&mut source).map_err(crate::Error::Frame)?;
-            let consumed = self.input.len() - source.len();
-            self.input.drain(..consumed);
+            let consumed = self.input.len() - self.start - source.len();
+            self.start += consumed;
+            self.compact();
             self.checksummed = checksummed;
             self.inited = true;
             return Ok(true);
