@@ -11,7 +11,9 @@ use crate::{
 /// frame through [`Read`].
 ///
 /// The frame is closed once the source reports end of file; reads after that
-/// return `Ok(0)`.
+/// return `Ok(0)`. Read to that end before [`Encoder::finish`], which
+/// reclaims the underlying reader and refuses to drop undelivered frame
+/// bytes.
 ///
 /// ```rust
 /// use zstdx::{Level, io::Read, stream::read::Encoder};
@@ -68,10 +70,21 @@ impl<R: Read> Encoder<R> {
     }
 
     /// Reclaim the underlying reader. The frame is closed with whatever has
-    /// been consumed so far; the rest of the source stays unread. Fails when
-    /// a pledged content size was not met by those bytes.
+    /// been consumed so far; the rest of the source stays unread.
+    ///
+    /// The encoder must be read to end of stream first (the final [`Read`]
+    /// call returns `Ok(0)`): the pending encoded bytes carry the frame's
+    /// closing block, so finishing before that fails with
+    /// [`Error::UnreadOutput`][crate::Error::UnreadOutput] instead of
+    /// silently truncating everything already read. Fails with
+    /// [`Error::PledgedSizeMismatch`][crate::Error::PledgedSizeMismatch]
+    /// when a pledged content size was not met by those bytes.
     pub fn finish(mut self) -> Result<R> {
         self.core.finish()?;
+        let pending = self.core.pending_output();
+        if pending != 0 {
+            return Err(crate::Error::UnreadOutput { bytes: pending });
+        }
         Ok(self.source.take().unwrap())
     }
 }

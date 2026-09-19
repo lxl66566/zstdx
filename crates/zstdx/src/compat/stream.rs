@@ -381,7 +381,9 @@ pub mod read {
         }
 
         /// Destructures this object into the underlying reader. Fails when a
-        /// pledged content size was not met by the bytes consumed so far.
+        /// pledged content size was not met by the bytes consumed so far, or
+        /// when encoded bytes are still unread (read the encoder to end of
+        /// stream before finishing).
         pub fn finish(self) -> io::Result<R> {
             self.inner.finish().map_err(io::Error::from)
         }

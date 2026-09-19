@@ -182,6 +182,31 @@ fn pledged_size_mismatch_fails_read_encoder() {
     }
 }
 
+/// Finishing while encoded bytes are still pending would drop the frame's
+/// closing block (the last block + checksum are the pending tail), leaving
+/// every byte already read a truncated stream decoders reject. finish()
+/// rejects that state instead; the escape is reading to end of stream.
+#[test]
+fn finish_with_unread_output_errors() {
+    let data: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut enc = read::Encoder::new(data.as_slice(), Level::Fastest).unwrap();
+    let mut partial = [0u8; 128];
+    let n = crate::io::Read::read(&mut enc, &mut partial).unwrap();
+    assert!(n > 0);
+    match enc.finish() {
+        Err(crate::Error::UnreadOutput { bytes }) => assert!(bytes > 0, "{bytes}"),
+        other => panic!("expected UnreadOutput, got {other:?}"),
+    }
+
+    // the documented contract: read to end of stream, then finish reclaims
+    // the reader and the delivered frame decodes
+    let mut enc = read::Encoder::new(data.as_slice(), Level::Fastest).unwrap();
+    let mut comp = Vec::new();
+    crate::io::Read::read_to_end(&mut enc, &mut comp).unwrap();
+    enc.finish().unwrap();
+    assert_eq!(bulk::decompress(&comp, 0).unwrap(), data);
+}
+
 #[test]
 fn checksum_option_toggles_trailer() {
     let data = vec![b'c'; 64 * 1024];
