@@ -3,7 +3,9 @@ use alloc::vec::Vec;
 use crate::{
     bit_io::BitWriter,
     encoding::{Matcher, seq_codes::SEQ_CODE_SPACE},
-    fse::fse_encoder::{FSETable, FseBuildScratch, approx_log2, build_normalized_table, rle_table},
+    fse::fse_encoder::{
+        FSETable, FseBuildScratch, approx_log2, build_normalized_table, flat_table, rle_table,
+    },
     huff0::huff0_encoder,
 };
 
@@ -449,17 +451,6 @@ pub(super) fn select_from_counts<'a>(
             }
         }
     }
-    if most_frequent as usize == nb_seq {
-        // With two or fewer sequences the predefined table's description is
-        // cheaper than even the one RLE byte.
-        if nb_seq <= 2 {
-            return FseTableMode::Predefined(default_table);
-        }
-        return FseTableMode::Rle {
-            code: first_code,
-            table: rle_table(first_code, fse_scratch),
-        };
-    }
     // The predefined table must cover every code that occurs; its
     // coverage bound rides the table itself (the distribution's last
     // symbol, pinned by the const asserts on the default dists): the
@@ -467,6 +458,19 @@ pub(super) fn select_from_counts<'a>(
     // libzstd's DefaultMaxOff, since the OF default distribution has no
     // probability beyond code 28 while the wire space reaches 31.
     let default_covers = max_symbol <= default_table.max_symbol() as usize;
+    if most_frequent as usize == nb_seq {
+        // With two or fewer sequences the predefined table's description is
+        // cheaper than even the one RLE byte — but only when the default
+        // table covers the single code (libzstd's isDefaultAllowed gate on
+        // set_basic); otherwise RLE is the only encodable form.
+        if nb_seq <= 2 && default_covers {
+            return FseTableMode::Predefined(default_table);
+        }
+        return FseTableMode::Rle {
+            code: first_code,
+            table: rle_table(first_code, fse_scratch),
+        };
+    }
     if dict_seeded {
         // libzstd's lazy+ selection for dictionary-provided tables: a pure
         // cost comparison, predefined included — the small-block heuristic
@@ -529,8 +533,33 @@ pub(super) fn select_from_counts<'a>(
     }
     match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code, fse_scratch) {
         Some(table) => FseTableMode::Encoded(table),
-        // Normalization corner case: fall back to the predefined table.
-        None => FseTableMode::Predefined(default_table),
+        // Normalization corner case (the M2 staircase's weight<1 round):
+        // the predefined table only when it covers the histogram.
+        None => normalization_fallback(
+            default_table,
+            default_covers,
+            counts,
+            max_symbol,
+            fse_scratch,
+        ),
+    }
+}
+
+/// Mode for the normalization corner: the predefined table when it covers
+/// the histogram (cheaper than any dynamic description), otherwise a flat
+/// table over the live symbols — a predefined table past its coverage
+/// would silently drop every uncovered code from the frame.
+fn normalization_fallback<'a>(
+    default_table: &'a FSETable,
+    default_covers: bool,
+    counts: &[u32; SEQ_CODE_SPACE],
+    max_symbol: usize,
+    fse_scratch: &mut FseBuildScratch,
+) -> FseTableMode<'a> {
+    if default_covers {
+        FseTableMode::Predefined(default_table)
+    } else {
+        FseTableMode::Encoded(flat_table(counts, max_symbol, fse_scratch))
     }
 }
 
@@ -1256,7 +1285,7 @@ fn compress_literals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fse::fse_encoder::default_ll_table;
+    use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table};
 
     fn counts_from(symbols: &[u8]) -> [u32; SEQ_CODE_SPACE] {
         let mut counts = [0u32; SEQ_CODE_SPACE];
@@ -1350,5 +1379,122 @@ mod tests {
             matches!(mode, FseTableMode::Encoded(_)),
             "drifted distribution must rebuild"
         );
+    }
+
+    /// Both `nb_seq <= 2` fallback sites must honor the predefined table's
+    /// coverage: an uncovered single code takes RLE (libzstd's set_rle when
+    /// default is disallowed), never a predefined table that would drop it.
+    #[test]
+    fn rle_when_default_table_uncovered() {
+        let of_default = default_of_table();
+        for nb_seq in [1, 2] {
+            let mut counts = counts_from(&[29u8; 2][..nb_seq]);
+            let mode = select_from_counts(
+                &mut counts,
+                nb_seq,
+                29,
+                29,
+                &of_default,
+                None,
+                false,
+                8,
+                &mut FseBuildScratch::default(),
+            );
+            assert!(
+                matches!(mode, FseTableMode::Rle { code: 29, .. }),
+                "uncovered OF code 29 at nb_seq={nb_seq} must RLE"
+            );
+        }
+        // Covered codes keep the cheap predefined form (byte-identical to
+        // libzstd's set_basic at nb_seq <= 2).
+        let mut counts = counts_from(&[28u8; 2]);
+        let mode = select_from_counts(
+            &mut counts,
+            2,
+            28,
+            28,
+            &of_default,
+            None,
+            false,
+            8,
+            &mut FseBuildScratch::default(),
+        );
+        assert!(matches!(mode, FseTableMode::Predefined(_)));
+    }
+
+    /// A histogram past the default table's coverage must never select the
+    /// predefined mode on the normalization path, whatever its shape.
+    #[test]
+    fn uncovered_histogram_never_selects_predefined() {
+        // (default table, codes below/above the coverage bound, max_log)
+        let cases: [(fn() -> FSETable, u8, u8, u8); 3] = [
+            (default_of_table, 28, 29, 8),
+            (default_ll_table, 35, 36, 9),
+            (default_ml_table, 52, 53, 9),
+        ];
+        for (table, covered, uncovered, max_log) in cases {
+            let default = table();
+            assert_eq!(default.max_symbol(), covered);
+            let mut symbols = alloc::vec![];
+            for i in 0..999 {
+                symbols.push(if i % 3 == 0 {
+                    uncovered
+                } else {
+                    covered
+                });
+            }
+            let nb_seq = symbols.len();
+            let mut counts = counts_from(&symbols);
+            let mode = select_from_counts(
+                &mut counts,
+                nb_seq,
+                symbols[0],
+                symbols[nb_seq - 1],
+                &default,
+                None,
+                false,
+                max_log,
+                &mut FseBuildScratch::default(),
+            );
+            match mode {
+                FseTableMode::Encoded(t) => assert_eq!(t.max_symbol(), uncovered),
+                _ => panic!("uncovered max symbol {uncovered} chose non-encoded mode"),
+            }
+        }
+    }
+
+    /// The normalization-corner fallback (`build_normalized_table`'s None,
+    /// the M2 weight<1 round — unreachable through real histograms, so
+    /// driven through the corner's own decision): covered keeps the
+    /// predefined choice, uncovered still emits an encoding table that
+    /// covers every live symbol.
+    #[test]
+    fn normalization_fallback_honors_coverage() {
+        let of_default = default_of_table();
+        let mut symbols = alloc::vec![29u8, 28];
+        symbols.extend(core::iter::repeat_n(29, 4));
+        let mut counts = counts_from(&symbols);
+        let mode = normalization_fallback(
+            &of_default,
+            false,
+            &counts,
+            29,
+            &mut FseBuildScratch::default(),
+        );
+        match mode {
+            FseTableMode::Encoded(t) => {
+                assert_eq!(t.max_symbol(), 29);
+                assert!(t.acc_log() >= 5);
+            },
+            _ => panic!("uncovered corner must not go predefined"),
+        }
+        let mode = normalization_fallback(
+            &of_default,
+            true,
+            &counts,
+            29,
+            &mut FseBuildScratch::default(),
+        );
+        assert!(matches!(mode, FseTableMode::Predefined(_)));
     }
 }

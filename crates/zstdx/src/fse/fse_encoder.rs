@@ -580,6 +580,41 @@ pub(crate) fn build_normalized_table(
 /// vStep that justify rounding a small probability up.
 const RTB_TABLE: [u64; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
 
+/// Termination-guaranteed table for the normalization corner
+/// (`build_normalized_table`'s `None`): one state per live symbol, the
+/// remainder to the most frequent symbol. Only reached when the predefined
+/// table does not cover the histogram, so encoding quality is irrelevant —
+/// validity of the coverage is the whole contract.
+pub(crate) fn flat_table(
+    counts: &[u32; SEQ_CODE_SPACE],
+    max_symbol: usize,
+    scratch: &mut FseBuildScratch,
+) -> FSETable {
+    let live = counts[..=max_symbol].iter().filter(|&&c| c > 0).count();
+    // The site guarantees at least two live symbols (a single code took the
+    // RLE mode before the normalizer runs).
+    debug_assert!(live >= 2);
+    // ceil_log2(live) keeps one state per symbol; the floor of 5 is the
+    // format's minimum accuracy log. The sequence code spaces cap live at
+    // 64 symbols, so the log never exceeds 6 and always fits the tab ranges.
+    let table_log = (u32::BITS - (live as u32 - 1).leading_zeros()) as u8;
+    let table_log = table_log.max(5);
+    let mut norm = [0i32; SEQ_CODE_SPACE];
+    let mut largest = 0usize;
+    let mut largest_c = 0u32;
+    for (s, &c) in counts.iter().enumerate().take(max_symbol + 1) {
+        if c > 0 {
+            norm[s] = 1;
+            if c > largest_c {
+                largest_c = c;
+                largest = s;
+            }
+        }
+    }
+    norm[largest] += (1 << table_log) - live as i32;
+    build_table_from_probabilities_into(&norm[..=max_symbol], table_log, scratch)
+}
+
 /// Port of libzstd's FSE_normalizeCount: scale `count` (total `total` over
 /// symbols 0..=max_symbol) to probabilities summing to exactly
 /// `1 << table_log`, using -1 (or 1 when `use_low_prob` is false) as the
