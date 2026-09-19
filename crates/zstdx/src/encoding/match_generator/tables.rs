@@ -495,6 +495,12 @@ impl TableEmit<'_> {
             self.seqs,
         );
         let chain_mask = chain.len() - 1;
+        // Covered-fill stride: dense up to 64 match bytes, every 4th
+        // position beyond. libzstd's lazy rows index every interior
+        // position; the grid bounds the fill work of huge same-hash runs
+        // at 1/4 interior candidate density — a deliberate speed-for-ratio
+        // trade, the first knob to re-check on a chain-band ratio
+        // regression.
         let step = (if match_len <= 64 {
             1
         } else {
