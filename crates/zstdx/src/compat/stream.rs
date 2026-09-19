@@ -39,9 +39,15 @@ impl<W: io::Write> EncoderState<W> {
     fn materialize(&mut self) -> io::Result<&mut crate::stream::write::Encoder<W>> {
         if self.encoder.is_none() {
             let writer = self.writer.take().expect("writer kept until start");
-            let encoder = crate::stream::write::Encoder::with_options(writer, self.options.clone())
-                .map_err(io::Error::from)?;
-            self.encoder = Some(encoder);
+            match crate::stream::write::Encoder::try_with_options(writer, self.options.clone()) {
+                Ok(encoder) => self.encoder = Some(encoder),
+                // Put the writer back so get_mut/finish still work after a
+                // failed start.
+                Err((writer, err)) => {
+                    self.writer = Some(writer);
+                    return Err(io::Error::from(err));
+                },
+            }
         }
         Ok(self.encoder.as_mut().unwrap())
     }

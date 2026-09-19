@@ -43,10 +43,22 @@ impl<W: Write> Encoder<W> {
     // options are consumed builder data; by value keeps the chaining API
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(writer: W, options: EncoderOptions) -> Result<Self> {
-        Ok(Self {
-            writer: Some(writer),
-            core: FrameEncoderCore::new(&options)?,
-        })
+        Self::try_with_options(writer, options).map_err(|(_, err)| err)
+    }
+
+    /// Like [`Encoder::with_options`], but hands the writer back when the
+    /// options fail to materialize, so callers keep ownership of it.
+    pub(crate) fn try_with_options(
+        writer: W,
+        options: EncoderOptions,
+    ) -> Result<Self, (W, crate::Error)> {
+        match FrameEncoderCore::new(&options) {
+            Ok(core) => Ok(Self {
+                writer: Some(writer),
+                core,
+            }),
+            Err(err) => Err((writer, err)),
+        }
     }
 
     /// Wrap this encoder so the frame is finished when it is dropped.

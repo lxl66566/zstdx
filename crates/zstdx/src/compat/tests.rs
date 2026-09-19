@@ -244,3 +244,19 @@ fn dictionary_decoding_interop() {
     dec.read_to_end(&mut out).unwrap();
     assert_eq!(out, content);
 }
+
+/// A failed materialize must hand the writer back instead of dropping it:
+/// `get_mut` and `get_ref` stay usable afterwards.
+#[test]
+fn failed_materialize_keeps_writer() {
+    use crate::decoding::dictionary::MAGIC_NUM;
+    // the dictionary magic alone does not parse as a dictionary
+    let mut encoder =
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &MAGIC_NUM).unwrap();
+    assert!(encoder.write(b"payload").is_err());
+    encoder.get_mut().extend_from_slice(b"kept");
+    assert_eq!(encoder.get_ref().as_slice(), b"kept");
+    // retrying keeps failing on the same options without swallowing the writer
+    assert!(encoder.write(b"more").is_err());
+    assert_eq!(encoder.get_ref().as_slice(), b"kept");
+}
