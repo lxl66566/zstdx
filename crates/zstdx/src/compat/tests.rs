@@ -107,9 +107,26 @@ fn stream_write_encoder_shapes() {
 }
 
 #[test]
-fn stream_write_encoder_unsupported_bits() {
-    let mut enc = compat::stream::write::Encoder::new(Vec::new(), 3).unwrap();
-    assert!(enc.multithread(4).is_err());
+fn stream_write_encoder_multithread() {
+    let data = payload();
+    // multithread(4) before the first write engages the native MT core; the
+    // frame decodes through the compat layer like any other
+    let mut sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(&mut sink, 3).unwrap();
+    enc.multithread(4).unwrap();
+    enc.write_all(&data).unwrap();
+    // parameters (including multithread itself) fail once streaming started
+    assert!(enc.multithread(2).is_err());
+    enc.finish().unwrap();
+    assert_eq!(compat::bulk::decompress(&sink, data.len()).unwrap(), data);
+
+    // workers <= 1 stays single-threaded and still roundtrips
+    let mut sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(&mut sink, 3).unwrap();
+    enc.multithread(0).unwrap();
+    enc.write_all(&data).unwrap();
+    enc.finish().unwrap();
+    assert_eq!(compat::bulk::decompress(&sink, data.len()).unwrap(), data);
 }
 
 #[test]
