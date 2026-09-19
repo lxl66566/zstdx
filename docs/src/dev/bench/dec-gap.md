@@ -67,4 +67,27 @@ Both surgical Ir cuts below are correct at the instruction level and lose at the
 1. Read-side serial-chain folds (reload window rebuild into the next read; `consumed` into `ip`) — the family with a proven conversion record (fused bit-read), cuts the T3-3 stack round-trips AND chain segments; but every such change pays the same re-roll tax, so each must carry its own A/B/B/A including text.
 2. Entry-struct layout swap (libzstd's `{u16 next, u8 nbAdd, u8 nbBits, u32 base}` per-stream, loads as extracts): −10 Ir/seq equivalent, kills the serial shr-unpack chain, and shifts the port mix (12 L1 loads vs 24 ALU) — the one remaining lever that changes the loop's *resource* profile rather than shaving uops; needs the full table-build/decode rework and the same lottery hedge. Ir-neutral load-port risk: 15 loads/seq at the target 4+ seq/cycle sits at the 3-load-port ceiling (libzstd lives exactly there at IPC 3.4–3.5).
 3. Offset-history fold (the falsified candidate's −8.7 Ir/seq) is worth revisiting only bundled with a lever big enough to dominate the tax (≥5% expected), or if a placement-stabilizing trick appears — none is known (outlining variants are falsified).
-4. text's residual is latency exposure in the copy/literal tails, not loop Ir — no instruction-count lever applies there.
+4. ~~text's residual is latency exposure in the copy/literal tails~~ — falsified by T4 below: the copy tail sits at the per-core L3 ceiling with a healthy-loop IPC 3.57 and no kernel lever; the unchecked text gap is the same instruction-volume family as the dense shapes, diluted to x1.07 on the checked wall by an exactly-parity absorb.
+
+## T4: the text exception re-attributed (2026-09-20, follow-up round)
+
+T1 read text as "latency exposure in the copy tails" from the IPC 2.52/2.94 contrast. A dedicated decomposition round falsifies that mechanism: the text residual is the same instruction-volume class as the other shapes, and the checked-wall ratio is diluted by a checksum cost that is *exactly* parity. Also corrected: T1's "avg ll 273" is wrong — the reference parse of text.zst3 carries ~1 literal per sequence (~0 literal bytes per 32 MiB); there is no literal tail at all.
+
+**Copy-domain shape** (seq_dump exec trace of the reference frames, per 32 MiB): text.zst3 = 57,443 sequences, 17.9 MB match bytes, avg ml 311; **94.3% of match bytes sit in 151 matches of avg ~112 KB at offsets 256K–2M** (the flattened-tree tile copies); zst9/zst19 the same at 97%. Offsets <32 carry 1.5% of match bytes. The other ~47% of the output is ~15.6 MB/decode of 128 KiB RLE fills (memset; corpus padding) — data-inherent, equal Ir on both sides (ours 16.0 M, theirs 15.7 M per decode).
+
+**Checksum-less pair differential** (`zstd -3` vs `zstd -3 --no-check` on text.raw; 40×32 MiB solo, back-to-back, reproduced twice): ours 676.3 M / 330.3 M cycles (checked/unchecked) → absorb = 346.0 M; zstd 631.2 M / 285.7 M → absorb = 345.5 M. The xxh64 absorb is exact parity (8.65 M cyc/decode; 51%/55% of the two checked decodes) — it contributes nothing to the gap, it only dilutes its ratio: **x1.071 checked, x1.151–1.156 unchecked**. On the unchecked pair the per-function Ir split is the json picture again: their sequence loop 10.7 M Ir vs our fused 14.0 M per decode; drain memcpy ours 34.2 M vs theirs 36.7 M Ir (ours ~0.4 M cyc faster — our contiguous flat buffer vs their sliding window).
+
+**Kernel replay on the recorded trace** (the exact (pos, ml, offset) triples replayed over a frame-sized buffer; one kernel per process, 4 interleaved rounds; ps/B over the offset≥32 domain = 99.2% of match bytes):
+
+| kernel | ps/B | vs current |
+|---|---:|---|
+| current 16B loop | 23.0 | — |
+| libzstd shape (first-16 peel + 2×16B/iter, overshoot 32) | 22.2 | −3.5% copy-only ≈ −0.8% decode |
+| 2×16B/iter, exact backward tail | 30.2 | +31% |
+| 4×16B/iter, exact backward tail | 30.5 | +33% |
+| AVX2 256-bit chunks | 48.3 | +110% |
+| AVX-512 512-bit chunks | 32.0 | +39% |
+| libc memcpy per match | 27.7 | +20% |
+| NT streaming stores (movntdq 16/32/64B) | 157–162 | ~7× |
+
+In situ the loop runs at IPC 3.57 (callgrind 14.0 M Ir vs perf 3.92 M cycles per decode) at ~10 B/cycle — the per-core L3-bandwidth ceiling for a 2.3 MiB streaming window, not a latency chain and not issue-bound (the ALU ceiling would be ~21 B/cycle). No copy-side lever exists for text: the earlier "AVX2 copy32 / SIMD copy scheduling" falsifications hold unchanged under the long-match premise, and the one shape that wins on copy time alone (libzstd's peel schedule) is below the documented fused-symbol re-roll tax (+3–5% text-stream). The unchecked text gap (x1.15) belongs to the instruction-volume/fixed-cost family of the dense shapes — entry layout, offset history, stack round-trips — plus their cheaper non-loop staging, not to the executor's copy tail.
