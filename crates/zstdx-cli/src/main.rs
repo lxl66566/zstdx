@@ -434,12 +434,22 @@ fn compress(
     // The whole write phase runs in a closure so the output handles are
     // dropped before the partial output is removed on failure.
     let written: AnyResult<u64> = (|| {
-        let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
-        io::copy(&mut reader, &mut encoder)?;
-        encoder.finish()?;
         match out_file {
-            Some(file) => Ok(file.metadata()?.len()),
-            None => Ok(0),
+            Some(file) => {
+                let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
+                io::copy(&mut reader, &mut encoder)?;
+                encoder.finish()?;
+                Ok(file.metadata()?.len())
+            },
+            // stdout and the test-mode sink have no file to stat; count the
+            // bytes pushed through the writer instead
+            None => {
+                let mut out = CountingWriter::new(writer);
+                let mut encoder = zstdx::stream::write::Encoder::with_options(&mut out, options)?;
+                io::copy(&mut reader, &mut encoder)?;
+                encoder.finish()?;
+                Ok(out.count)
+            },
         }
     })();
     if written.is_err() {
@@ -495,6 +505,31 @@ fn open_output(output: &Output) -> AnyResult<(Box<dyn Write>, Option<File>)> {
             let file = File::create(path)?;
             Ok((Box::new(file.try_clone()?), Some(file)))
         },
+    }
+}
+
+/// A passthrough writer that tallies the bytes accepted by the inner writer,
+/// so output sizes can be reported where no file exists to stat.
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -636,6 +671,33 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!out.exists(), "empty output must be removed");
+    }
+
+    /// Compressing to a sink (the stdout-shaped output) must report the real
+    /// compressed byte count, matching a reference encoding of the same
+    /// input and options.
+    #[test]
+    fn compress_to_sink_reports_compressed_bytes() {
+        let data = vec![7u8; 300 * 1024];
+        let written = compress(
+            Box::new(Cursor::new(data.clone())),
+            &Output::Sink,
+            3,
+            1,
+            data.len(),
+            None,
+        )
+        .unwrap();
+        assert!(written > 0, "reported compressed size must not be zero");
+
+        let options =
+            zstdx::EncoderOptions::new(Level::from_zstd(3)).pledged_size(Some(data.len() as u64));
+        let mut reference = Vec::new();
+        let mut encoder =
+            zstdx::stream::write::Encoder::with_options(&mut reference, options).unwrap();
+        encoder.write_all(&data).unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(written, reference.len() as u64);
     }
 
     #[test]
