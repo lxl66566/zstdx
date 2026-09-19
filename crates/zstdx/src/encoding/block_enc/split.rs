@@ -678,7 +678,6 @@ impl Estimator<'_> {
             self.defaults.0,
             self.prev.0.as_ref(),
             self.dict.ll,
-            6,
             9,
         );
         let ml = self.stream_size(
@@ -689,7 +688,6 @@ impl Estimator<'_> {
             self.defaults.1,
             self.prev.1.as_ref(),
             self.dict.ml,
-            6,
             9,
         );
         let of = self.stream_size(
@@ -700,7 +698,6 @@ impl Estimator<'_> {
             self.defaults.2,
             self.prev.2.as_ref(),
             self.dict.of,
-            5,
             8,
         );
         ll + ml
@@ -724,7 +721,6 @@ impl Estimator<'_> {
         default: &FSETable,
         prev: Option<&FSETable>,
         dict_seeded: bool,
-        default_norm_log: u32,
         max_log: u8,
     ) -> usize {
         // Selection consumes its copy (normalization mutates the last
@@ -738,7 +734,6 @@ impl Estimator<'_> {
             default,
             prev,
             dict_seeded,
-            default_norm_log,
             max_log,
             self.fse,
         );

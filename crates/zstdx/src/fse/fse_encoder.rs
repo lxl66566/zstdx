@@ -331,6 +331,14 @@ impl FSETable {
         self.table_size.ilog2() as u8
     }
 
+    /// The highest symbol the table has a probability entry for
+    /// (inclusive). For the predefined tables this is the coverage bound
+    /// that rules the predefined mode out (see `select_from_counts`);
+    /// for any table it bounds repeat-mode eligibility.
+    pub(crate) fn max_symbol(&self) -> u8 {
+        (self.nsym - 1) as u8
+    }
+
     /// Per-occurrence bit cost of `symbol` for repeat-table selection:
     /// log2(table_size / prob). `None` when the symbol has no state, which
     /// disqualifies the table from being repeated for a histogram that uses
@@ -1068,6 +1076,15 @@ const OF_DIST: &[i32] = &[
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
+// Predefined-table coverage (see `select_from_counts`): the highest
+// encodable code is each distribution's last index. The LL/ML defaults
+// cover their whole wire code spaces (35/52); the OF default stops at 28
+// (libzstd's DefaultMaxOff) although the OF wire space reaches 31, so
+// offset codes 29-31 always force a dynamic table.
+const _: () = assert!(LL_DIST.len() == 36);
+const _: () = assert!(ML_DIST.len() == 53);
+const _: () = assert!(OF_DIST.len() == 29);
+
 pub(crate) fn default_ml_table() -> FSETable {
     build_table_from_probabilities(ML_DIST, 6)
 }
@@ -1078,6 +1095,25 @@ pub(crate) fn default_ll_table() -> FSETable {
 
 pub(crate) fn default_of_table() -> FSETable {
     build_table_from_probabilities(OF_DIST, 5)
+}
+
+#[cfg(test)]
+mod predefined_tests {
+    use super::*;
+
+    /// The predefined-mode coverage bound rides the tables themselves
+    /// (`max_symbol`, see `select_from_counts`); pin the values the const
+    /// asserts on the default distributions imply. OF stops at 28
+    /// (libzstd's DefaultMaxOff) while its wire code space reaches 31.
+    #[test]
+    fn default_table_coverage() {
+        assert_eq!(default_ll_table().max_symbol(), 35);
+        assert_eq!(default_ml_table().max_symbol(), 52);
+        assert_eq!(default_of_table().max_symbol(), 28);
+        assert_eq!(default_ll_table().acc_log(), 6);
+        assert_eq!(default_ml_table().acc_log(), 6);
+        assert_eq!(default_of_table().acc_log(), 5);
+    }
 }
 
 #[cfg(test)]
