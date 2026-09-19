@@ -4,7 +4,7 @@ mod progress;
 use std::{
     ffi::OsString,
     fs::{self, File},
-    io::{self, BufReader, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -372,19 +372,21 @@ fn default_output_name(input: &Path, mode: Mode) -> AnyResult<PathBuf> {
 }
 
 /// Refuse to clobber an existing output file unless forced or confirmed.
+/// The answer is read from the controlling terminal, never from stdin: piped
+/// stdin is input data that must not be consumed as an answer. Without a
+/// terminal there is nobody to ask, so the file is not overwritten.
 fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
     if cli.force || !path.exists() {
         return Ok(());
     }
-    if io::stdin().is_terminal() {
+    if let Ok(mut tty) = File::open("/dev/tty").map(BufReader::new) {
         eprint!(
             "{PREFIX}{}: already exists; overwrite (y/N)? ",
             path.display()
         );
         io::stderr().flush()?;
         let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if matches!(answer.trim(), "y" | "Y" | "yes") {
+        if tty.read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes") {
             return Ok(());
         }
     }

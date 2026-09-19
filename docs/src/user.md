@@ -190,6 +190,7 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 - `-T N` sets worker threads (`-T0` = all cores); `-D DICT` (de)compresses against a dictionary.
 - `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity.
 - A failed (de)compression to a file removes the partial output it created, mirroring zstd.
+- Overwrite prompts are read from the controlling terminal (/dev/tty), never from piped stdin; without a terminal, existing outputs are refused unless `-f` is given.
 - A progress bar shows only on an interactive stderr; it never pollutes pipes.
 
 ```sh
