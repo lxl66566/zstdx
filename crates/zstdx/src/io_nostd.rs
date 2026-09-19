@@ -123,13 +123,30 @@ pub trait Read {
     }
 
     fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<(), Error> {
-        let mut buf = [0u8; 1024 * 16];
+        // Probe buffer: a fixed stack probe would re-loop 16 KiB at a time
+        // over whole streams. While a read fills the probe completely the
+        // reader likely has more, so the probe doubles into a bounded heap
+        // buffer (std's read_to_end heuristic); small readers never pay for
+        // the heap buffer.
+        const FIRST_PROBE: usize = 16 * 1024;
+        const MAX_PROBE: usize = 1024 * 1024;
+        let mut stack = [0u8; FIRST_PROBE];
+        let mut heap = alloc::vec::Vec::new();
         loop {
-            let bytes = self.read(&mut buf)?;
+            let probe: &mut [u8] = if heap.is_empty() {
+                &mut stack
+            } else {
+                &mut heap
+            };
+            let probe_len = probe.len();
+            let bytes = self.read(probe)?;
             if bytes == 0 {
                 break;
             }
-            output.extend_from_slice(&buf[..bytes]);
+            output.extend_from_slice(&probe[..bytes]);
+            if bytes == probe_len && probe_len < MAX_PROBE {
+                heap.resize(probe_len * 2, 0);
+            }
         }
         Ok(())
     }
