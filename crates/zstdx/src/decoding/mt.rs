@@ -616,8 +616,13 @@ pub(super) fn decode_segment(
                     )
                     .map_err(DecompressBlockError::from)
                     .map_err(block_body_err)?;
-                    let match_bytes: usize =
-                        sequences[seqs_start..].iter().map(|s| s.ml as usize).sum();
+                    // Saturating: 32-bit targets must not wrap the untrusted
+                    // Σml (a hostile block can claim ~2^33 match bytes); a
+                    // wrapped sum would slip past the block cap below.
+                    let match_bytes: usize = sequences[seqs_start..]
+                        .iter()
+                        .map(|s| s.ml as usize)
+                        .fold(0usize, usize::saturating_add);
                     literals.len() - lits_start + match_bytes
                 } else {
                     // Zero-sequence block: the FSE tables stay untouched (the

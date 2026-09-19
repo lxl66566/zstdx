@@ -14,11 +14,14 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     // so no per-sequence capacity check is needed (dict-backed appends
     // reserve their own share internally; both sides of the budget shrink
     // in lockstep with them, keeping the invariant).
+    // Saturating: 32-bit targets must not wrap the untrusted Σml (a hostile
+    // block can claim ~2^33 match bytes); a wrapped sum would slip past the
+    // block cap below. On 64-bit the sum cannot reach usize::MAX.
     let total_out: usize = scratch
         .sequences
         .iter()
         .map(|seq| seq.ml as usize)
-        .sum::<usize>()
+        .fold(0usize, usize::saturating_add)
         .saturating_add(scratch.literals_buffer.len());
     // A block's output is capped by Block_Maximum_Size = min(window, 128 KiB).
     // Enforce the cap before the reserve: a hostile sequence section claiming
