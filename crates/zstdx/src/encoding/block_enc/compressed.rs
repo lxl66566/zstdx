@@ -391,7 +391,6 @@ fn choose_tables_fast<'a>(
             default_tables.0,
             previous_tables.0,
             dict_entropy.ll,
-            6,
             9,
             fse_scratch,
         ),
@@ -403,7 +402,6 @@ fn choose_tables_fast<'a>(
             default_tables.1,
             previous_tables.1,
             dict_entropy.ml,
-            6,
             9,
             fse_scratch,
         ),
@@ -415,7 +413,6 @@ fn choose_tables_fast<'a>(
             default_tables.2,
             previous_tables.2,
             dict_entropy.of,
-            5,
             8,
             fse_scratch,
         ),
@@ -439,7 +436,6 @@ pub(super) fn select_from_counts<'a>(
     default_table: &'a FSETable,
     previous: Option<&'a FSETable>,
     dict_seeded: bool,
-    default_norm_log: u32,
     max_log: u8,
     fse_scratch: &mut FseBuildScratch,
 ) -> FseTableMode<'a> {
@@ -464,8 +460,13 @@ pub(super) fn select_from_counts<'a>(
             table: rle_table(first_code, fse_scratch),
         };
     }
-    // The predefined table must cover every code that occurs.
-    let default_covers = max_symbol < 31 || default_norm_log == 6;
+    // The predefined table must cover every code that occurs; its
+    // coverage bound rides the table itself (the distribution's last
+    // symbol, pinned by the const asserts on the default dists): the
+    // length streams' full code spaces (35/52), but 28 for offsets —
+    // libzstd's DefaultMaxOff, since the OF default distribution has no
+    // probability beyond code 28 while the wire space reaches 31.
+    let default_covers = max_symbol <= default_table.max_symbol() as usize;
     if dict_seeded {
         // libzstd's lazy+ selection for dictionary-provided tables: a pure
         // cost comparison, predefined included — the small-block heuristic
@@ -504,6 +505,8 @@ pub(super) fn select_from_counts<'a>(
         }
     } else {
         if default_covers {
+            // The predefined distribution's accuracy log (6/6/5).
+            let default_norm_log = u32::from(default_table.acc_log());
             let dynamic_min = ((1u32 << default_norm_log) * 9) >> 3;
             if (nb_seq as u32) < dynamic_min
                 || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
@@ -1297,7 +1300,6 @@ mod tests {
             &default,
             Some(&prev),
             false,
-            6,
             9,
             &mut FseBuildScratch::default(),
         );
@@ -1319,7 +1321,6 @@ mod tests {
             &default,
             Some(&prev),
             false,
-            6,
             9,
             &mut FseBuildScratch::default(),
         );
@@ -1342,7 +1343,6 @@ mod tests {
             &default,
             Some(&prev),
             false,
-            6,
             9,
             &mut FseBuildScratch::default(),
         );
