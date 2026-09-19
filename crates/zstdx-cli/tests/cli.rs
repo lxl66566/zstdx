@@ -53,6 +53,7 @@ fn run_piped(args: &[&str], input: &[u8]) -> (std::process::Output, Vec<u8>) {
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
@@ -103,6 +104,31 @@ fn force_overwrites() {
     // Second run must fail without -f and succeed with it.
     assert!(!run(&[input.to_str().unwrap()]).status.success());
     assert!(run(&["-f", input.to_str().unwrap()]).status.success());
+}
+
+/// The overwrite check guards `-o` targets fed from stdin too, not only
+/// file-to-file runs.
+#[test]
+fn stdin_output_refuses_overwrite() {
+    let scratch = Scratch::new("stdin-overwrite");
+    let out = scratch.path("out.zst");
+    fs::write(&out, b"existing content").unwrap();
+
+    // No tty to answer the prompt on, so the existing file must stay.
+    let (output, _) = run_piped(&["-o", out.to_str().unwrap()], b"piped payload");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert_eq!(fs::read(&out).unwrap(), b"existing content");
+
+    // With -f the overwrite proceeds.
+    let (output, _) = run_piped(&["-f", "-o", out.to_str().unwrap()], b"piped payload");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        fs::read(&out)
+            .unwrap()
+            .starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+    );
 }
 
 #[test]

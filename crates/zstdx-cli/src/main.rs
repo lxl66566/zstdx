@@ -293,10 +293,15 @@ fn process(
     {
         return Err("refusing to write compressed data to a terminal (use -f to force)".into());
     }
-    if let (Input::File(in_path), Output::File(out_path)) = (input, &output) {
-        if in_path == out_path {
-            return Err("input and output cannot be the same file".into());
-        }
+    if let (Input::File(in_path), Output::File(out_path)) = (input, &output)
+        && in_path == out_path
+    {
+        return Err("input and output cannot be the same file".into());
+    }
+    // The overwrite check guards every file output, no matter where the
+    // input comes from: piped stdin clobbers an `-o` target just as well as
+    // a file input does (the same-file check above is inherently File-only).
+    if let Output::File(out_path) = &output {
         check_overwrite(out_path, cli)?;
     }
 
