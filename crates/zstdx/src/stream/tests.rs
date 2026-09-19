@@ -272,6 +272,74 @@ fn finish_with_unread_output_errors() {
     assert_eq!(bulk::decompress(&comp, 0).unwrap(), data);
 }
 
+/// try_finish is the abandon path: where finish drops the reader together
+/// with the error, it hands both back, so a caller giving up on the frame
+/// keeps the source.
+#[test]
+fn try_finish_hands_reader_back_on_error() {
+    #[derive(Debug)]
+    enum Stage {
+        Serving,
+        Blocked,
+        Recovered,
+    }
+    #[derive(Debug)]
+    struct BlockingSource {
+        data: Vec<u8>,
+        pos: usize,
+        stage: Stage,
+    }
+    impl crate::io::Read for BlockingSource {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+            if let Stage::Blocked = self.stage {
+                // a one-shot transient error; the source recovers afterwards
+                self.stage = Stage::Recovered;
+                return Err(crate::io::Error::from(crate::io::ErrorKind::WouldBlock));
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            if let Stage::Serving = self.stage {
+                self.stage = Stage::Blocked;
+            }
+            Ok(n)
+        }
+    }
+
+    let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut enc = read::Encoder::new(
+        BlockingSource {
+            data: data.clone(),
+            pos: 0,
+            stage: Stage::Serving,
+        },
+        Level::Fastest,
+    )
+    .unwrap();
+    // the source blocks on the second pull: no block completed, nothing is
+    // readable yet, and the read surfaces the source error
+    assert!(crate::io::Read::read(&mut enc, &mut [0u8; 16]).is_err());
+    let mut reader = match enc.try_finish() {
+        Err((crate::Error::UnreadOutput { bytes }, reader)) => {
+            assert!(bytes > 0, "{bytes}");
+            reader
+        },
+        other => panic!("expected (UnreadOutput, reader), got {other:?}"),
+    };
+    // the reclaimed reader still serves the unconsumed remainder
+    let mut rest = Vec::new();
+    crate::io::Read::read_to_end(&mut reader, &mut rest).unwrap();
+    assert!(!rest.is_empty());
+    assert_eq!(&data[data.len() - rest.len()..], &rest[..]);
+
+    // on success it behaves like finish
+    let mut enc = read::Encoder::new(data.as_slice(), Level::Fastest).unwrap();
+    let mut comp = Vec::new();
+    crate::io::Read::read_to_end(&mut enc, &mut comp).unwrap();
+    enc.try_finish().unwrap();
+    assert_eq!(bulk::decompress(&comp, 0).unwrap(), data);
+}
+
 #[test]
 fn checksum_option_toggles_trailer() {
     let data = vec![b'c'; 64 * 1024];

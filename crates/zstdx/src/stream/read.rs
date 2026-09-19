@@ -92,13 +92,29 @@ impl<R: Read> Encoder<R> {
     /// silently truncating everything already read. Fails with
     /// [`Error::PledgedSizeMismatch`][crate::Error::PledgedSizeMismatch]
     /// when a pledged content size was not met by those bytes.
-    pub fn finish(mut self) -> Result<R> {
-        self.core.finish()?;
-        let pending = self.core.pending_output();
-        if pending != 0 {
-            return Err(crate::Error::UnreadOutput { bytes: pending });
+    pub fn finish(self) -> Result<R> {
+        self.try_finish().map_err(|(err, _reader)| err)
+    }
+
+    /// Finish the stream, reclaiming the underlying reader even on failure.
+    ///
+    /// [`Encoder::finish`] drops the reader together with the error; this
+    /// hands both back, so a caller abandoning the output (the source
+    /// errored mid-stream, the frame is no longer wanted) keeps the reader
+    /// for whatever comes after it. The undelivered encoded bytes are
+    /// dropped, truncating everything the encoder already read.
+    // the Err variant hands the reader back; boxing the error would change
+    // the public signature
+    #[allow(clippy::result_large_err)]
+    pub fn try_finish(mut self) -> Result<R, (crate::Error, R)> {
+        let source = self.source.take().unwrap();
+        match self.core.finish() {
+            Ok(()) => match self.core.pending_output() {
+                0 => Ok(source),
+                pending => Err((crate::Error::UnreadOutput { bytes: pending }, source)),
+            },
+            Err(err) => Err((err, source)),
         }
-        Ok(self.source.take().unwrap())
     }
 }
 

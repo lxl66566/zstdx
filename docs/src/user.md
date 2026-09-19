@@ -64,6 +64,8 @@ dec.read_to_end(&mut original)?;
 
 `read::Decoder` transparently decodes concatenated frames; `.single_frame()` stops after the first. Convenience wrappers over the same machinery: [`stream::encode_all`], [`stream::decode_all`], [`stream::copy_encode`], [`stream::copy_decode`].
 
+`read::Encoder::finish` requires reading the encoder to end of stream first (it refuses with `UnreadOutput` rather than truncate); `try_finish` is the abandon path — it hands the reader back together with the error, so a caller dropping a half-read frame keeps the source.
+
 ## Porting from the `zstd` crate (`zstdx::compat`)
 
 `compat` mirrors the libzstd-bindings crate (`zstd` on crates.io): numeric `i32` levels, `io::Result`, same module layout and type names. Replace `zstd::` with `zstdx::compat::`:
