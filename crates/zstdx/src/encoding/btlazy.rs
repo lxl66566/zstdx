@@ -395,8 +395,14 @@ pub(crate) fn run_block_lazy(
         // stays unindexed. Indexing it feeds the resume-point search
         // twin-period candidates whose equal runs scan to the block cap
         // (measured 3x the whole-block scan volume on dll-class content).
+        // The backstep is also capped at the gap past the 1024 bar (C's
+        // MIN(512, curr - nextToUpdate - 1024)): the update point never
+        // lands below next_update + 1024, where the bare -512 stepped
+        // deeper into the gap when the emission only just cleared the bar.
+        // The guard makes the subtraction positive; u64 has no C-underflow.
         if next > *finder.next_update + 1024 {
-            *finder.next_update = next - 512;
+            let backstep = 512.min(next - *finder.next_update - 1024);
+            *finder.next_update = next - backstep;
         }
         if next >= block_end {
             break 'segments;
