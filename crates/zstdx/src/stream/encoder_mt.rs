@@ -79,10 +79,7 @@ use crate::{
             LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
             far_repeat_dominant, ldm_head_parses,
         },
-        mt::{
-            MAX_JOB_SIZE, MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state,
-            run_job_with,
-        },
+        mt::{MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state, run_job_with},
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
 };
@@ -97,7 +94,8 @@ enum JobGrid {
     Fixed(usize),
     /// Unpledged stream: jobs quantize into epochs of `burst_jobs` equal
     /// jobs, each epoch doubling the job size (floored at the bulk formula's
-    /// floor, capped at its ceiling). Equal sizes keep a burst's barrier
+    /// floor, capped at the buffer-scale ceiling — see
+    /// `MtEncoderCore::growing_job_cap`). Equal sizes keep a burst's barrier
     /// utilization at ~1 (a growing-per-job schedule puts a burst's largest
     /// and smallest job a growth-factor^burst_jobs apart, so the barrier
     /// idled half the workers), the epoch grid still converges toward the
@@ -1301,11 +1299,27 @@ impl MtEncoderCore {
         start + size
     }
 
+    /// The Growing grid's job-size ceiling: `post_due` stages a whole epoch
+    /// (`burst_jobs` jobs) plus the next job's strip before any of it posts,
+    /// so the buffer's live span is `strip + burst_jobs x job_size`. The
+    /// `MAX_JOB_SIZE` ceiling let that scale with the worker count up to
+    /// workers x 1 GiB on long unpledged streams (measured VmHWM: 1.4 GiB at
+    /// w8/3 GiB, 1.5 GiB at w2/3 GiB — OOM scale on small machines). Tie the
+    /// ceiling to the accumulate buffer's own cap instead, so the staged
+    /// epoch stays at its scale for any stream length. The strip estimate is
+    /// `overlap`, not `strip_span`: the far-class screen resolves only at the
+    /// first post, and the grid must stay a pure function of offset.
+    fn growing_job_cap(&self) -> usize {
+        (BUF_CAP_MAX.saturating_sub(self.overlap) / self.burst_jobs).max(MIN_JOB_SIZE)
+    }
+
     /// Growing grid: start offset and job size of the epoch containing `o`.
     /// Epochs tile from offset 0, each holding `burst_jobs` equal jobs and
-    /// doubling the job size per epoch (from the bulk floor to its ceiling).
+    /// doubling the job size per epoch up to [`Self::growing_job_cap`] (the
+    /// first epoch starts at the cap too when the overlap alone exceeds it).
     fn growing_epoch(&self, o: u64) -> (u64, u64) {
-        let mut size = MIN_JOB_SIZE.max(self.overlap) as u64;
+        let cap = self.growing_job_cap();
+        let mut size = MIN_JOB_SIZE.max(self.overlap).min(cap) as u64;
         let mut lo = 0u64;
         loop {
             let hi = lo + self.burst_jobs as u64 * size;
@@ -1313,14 +1327,15 @@ impl MtEncoderCore {
                 return (lo, size);
             }
             lo = hi;
-            size = (size * 2).min(MAX_JOB_SIZE as u64);
+            size = (size * 2).min(cap as u64);
         }
     }
 
     /// Growing grid: start offset of the epoch containing `o` (an epoch
     /// boundary when `o` is one).
     fn growing_epoch_floor(&self, o: u64) -> u64 {
-        let mut size = MIN_JOB_SIZE.max(self.overlap) as u64;
+        let cap = self.growing_job_cap();
+        let mut size = MIN_JOB_SIZE.max(self.overlap).min(cap) as u64;
         let mut lo = 0u64;
         loop {
             let hi = lo + self.burst_jobs as u64 * size;
@@ -1328,7 +1343,7 @@ impl MtEncoderCore {
                 return lo;
             }
             lo = hi;
-            size = (size * 2).min(MAX_JOB_SIZE as u64);
+            size = (size * 2).min(cap as u64);
         }
     }
 
@@ -2145,6 +2160,45 @@ mod tests {
             pledged.job_end(0),
             pledged.job_end(32 * 1024 * 1024) - 32 * 1024 * 1024
         );
+    }
+
+    /// The Growing grid's job size stops doubling at the buffer-scale cap
+    /// (see `growing_job_cap`), and an overlap above the cap clamps the
+    /// first epoch too — a whole epoch stages before it posts, so the
+    /// staged span must stay bounded for any stream length.
+    #[test]
+    fn growing_grid_caps_job_size() {
+        let mib = 1024 * 1024u64;
+        // Fastest at w8: overlap 768 KiB, so the cap is the strip-adjusted
+        // BUF_CAP_MAX share. Deep in the stream every epoch runs at it.
+        let core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(8));
+        let cap = core.growing_job_cap() as u64;
+        assert_eq!(cap, (BUF_CAP_MAX as u64 - core.overlap as u64) / 8);
+        for o in [512 * mib, 4096 * mib] {
+            let (lo, size) = core.growing_epoch(o);
+            assert_eq!(size, cap, "past the ladder the epoch size sits at the cap");
+            assert_eq!(
+                core.growing_epoch(o + 1024 * mib).1,
+                cap,
+                "no further growth"
+            );
+            assert_eq!(
+                core.growing_epoch_end(o),
+                lo + 8 * cap,
+                "capped epochs keep the burst span bounded"
+            );
+        }
+        // Balanced at w8: the 64 MiB whole-window strip exceeds the cap, so
+        // the first epoch's jobs clamp to it instead of staging
+        // burst_jobs x 64 MiB up front.
+        let core = MtEncoderCore::new(&EncoderOptions::new(Level::Balanced).workers(8));
+        let cap = core.growing_job_cap() as u64;
+        assert_eq!(core.overlap as u64, 64 * mib);
+        assert!(cap < core.overlap as u64);
+        assert_eq!(core.job_end(0), cap);
+        assert_eq!(core.growing_epoch_end(0), 8 * cap);
+        // strip + staged epoch stays at the buffer's own scale.
+        assert!(core.overlap as u64 + 8 * cap <= BUF_CAP_MAX as u64);
     }
 
     /// The pledged-size contract on the mt core itself: a write pushing the
