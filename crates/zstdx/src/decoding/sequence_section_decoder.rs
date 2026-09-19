@@ -459,50 +459,38 @@ pub(crate) fn decode_step(
     // All three add-bit widths are known before reading, so the fields (of,
     // then ml, then ll in read order, from the top) can be extracted with a
     // single serial window read and split in parallel off the extracted
-    // value — one dependent chain instead of three. sum <= 31 keeps the
-    // extraction shift in range, and 7 + sum + 26 transition bits <= 64
-    // means the post-reload window always covers it: the mid-sequence reload
-    // guard (libzstd's totalBits guard) only applies to the unbatched path.
-    // All fields are masked, so a zero-width total (rep0-heavy sequences)
-    // needs no branch: every mask is zero exactly then.
+    // value — one dependent chain instead of three. The three state
+    // transitions (ll, then ml, then of) sit directly behind them in the
+    // stream, so when more sequences follow they join the same read: at most
+    // 31 + 26 = 57 bits, and 7 + 57 <= 64 means the post-reload window
+    // always covers both groups — the mid-sequence reload guard (libzstd's
+    // totalBits guard) only applies to the unbatched path. The last sequence
+    // has no transitions to feed, so it reads the add-bits group alone (the
+    // reload behind it would read past the stream's end). All fields are
+    // masked, so a zero-width total (rep0-heavy sequences) needs no branch:
+    // every mask is zero exactly then.
     let sum = ll_nb + ml_nb + of_nb;
-    let (obits, ml_add, ll_add) = if sum <= 31 {
-        let v = read(win, consumed, sum);
-        (
-            (v >> (ml_nb + ll_nb)) & ((1u64 << of_nb) - 1),
-            (v >> ll_nb) & ((1u64 << ml_nb) - 1),
-            v & ((1u64 << ll_nb) - 1),
-        )
-    } else {
-        // Cold: fields too wide to batch. of+ml+ll add bits sum above the 57
-        // bits guaranteed after a reload; reload mid-sequence then
-        let obits = read(win, consumed, of_nb) & ((1u64 << of_nb) - 1);
-        let ml_add = read(win, consumed, ml_nb) & ((1u64 << ml_nb) - 1);
-        if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-        let ll_add = read(win, consumed, ll_nb) & ((1u64 << ll_nb) - 1);
-        (obits, ml_add, ll_add)
-    };
-    let seq = Sequence {
-        ll: ll_base + ll_add as u32,
-        ml: ml_base + ml_add as u32,
-        of: of_base + obits as u32,
-    };
-
     *rem -= 1;
-    if *rem > 0 {
+    let v = if *rem > 0 {
+        if sum > 31 {
+            return decode_step_wide(
+                src_ptr, ip, win, consumed, ll_state, ml_state, of_state, ll_entry, ml_entry,
+                of_entry, ll_nb, ml_nb, of_nb, ll_base, ml_base, of_base,
+            );
+        }
         let ll_nb_t = (ll_entry & 0xff) as u32;
         let ml_nb_t = (ml_entry & 0xff) as u32;
         let of_nb_t = (of_entry & 0xff) as u32;
         let ll_base_t = ((ll_entry >> 8) & 0xffff) as u32;
         let ml_base_t = ((ml_entry >> 8) & 0xffff) as u32;
         let of_base_t = ((of_entry >> 8) & 0xffff) as u32;
-        // Same batching for the three state transitions (ll, then ml, then
-        // of): at most 9+9+8 = 26 bits, always extractable in one read, with
-        // every field masked so a zero-width total needs no branch
+        // Same batching for the transitions: at most 9+9+8 = 26 bits, always
+        // extractable in one read, with every field masked so a zero-width
+        // total needs no branch. Their bit positions sit below the add-bits
+        // group, so both groups split off the single fused `v`.
         let sum_t = ll_nb_t + ml_nb_t + of_nb_t;
-        let v = read(win, consumed, sum_t);
+        let v = read(win, consumed, sum + sum_t);
+        let g = v >> sum_t;
         let (s_ll, s_ml, s_of) = (
             ll_base_t + (((v >> (ml_nb_t + of_nb_t)) & ((1u64 << ll_nb_t) - 1)) as u32),
             ml_base_t + (((v >> of_nb_t) & ((1u64 << ml_nb_t) - 1)) as u32),
@@ -514,11 +502,96 @@ pub(crate) fn decode_step(
         if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
         }
-    }
+        g
+    } else {
+        if sum > 31 {
+            // Cold: fields too wide to batch against the 57 bits a reload
+            // guarantees (rare even here: this is the block's last sequence).
+            // The mid-read reload is required for the ll bits to be in the
+            // window at all.
+            let obits = read(win, consumed, of_nb) & ((1u64 << of_nb) - 1);
+            let ml_add = read(win, consumed, ml_nb) & ((1u64 << ml_nb) - 1);
+            if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
+                return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+            }
+            let ll_add = read(win, consumed, ll_nb) & ((1u64 << ll_nb) - 1);
+            let seq = Sequence {
+                ll: ll_base + ll_add as u32,
+                ml: ml_base + ml_add as u32,
+                of: of_base + obits as u32,
+            };
+            #[cfg(feature = "seq_dump")]
+            super::seq_dump::record(seq.ll, seq.ml, seq.of);
+            return Ok(seq);
+        }
+        read(win, consumed, sum)
+    };
+    let seq = Sequence {
+        ll: ll_base + (v & ((1u64 << ll_nb) - 1)) as u32,
+        ml: ml_base + ((v >> ll_nb) & ((1u64 << ml_nb) - 1)) as u32,
+        of: of_base + ((v >> (ml_nb + ll_nb)) & ((1u64 << of_nb) - 1)) as u32,
+    };
     // Dev-feature differential dump: records every decoded sequence for
     // parse comparison against a reference frame (see decoding::seq_dump).
     // Compiled out unless `seq_dump` is enabled, so release builds are
     // untouched.
+    #[cfg(feature = "seq_dump")]
+    super::seq_dump::record(seq.ll, seq.ml, seq.of);
+    Ok(seq)
+}
+
+/// Cold continuation of [`decode_step`] for wide-symbol sequences (add-bit
+/// widths summing above 31) that are not the block's last: reads the fields
+/// one by one with a mid-sequence reload, then the state transitions on their
+/// own. Outlined so the fused hot body stays tight; the caller has already
+/// decremented `rem` and guarantees it stayed above zero.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decode_step_wide(
+    src_ptr: *const u8,
+    ip: &mut usize,
+    win: &mut u64,
+    consumed: &mut u32,
+    ll_state: &mut u32,
+    ml_state: &mut u32,
+    of_state: &mut u32,
+    ll_entry: u64,
+    ml_entry: u64,
+    of_entry: u64,
+    ll_nb: u32,
+    ml_nb: u32,
+    of_nb: u32,
+    ll_base: u32,
+    ml_base: u32,
+    of_base: u32,
+) -> Result<Sequence, DecodeSequenceError> {
+    let obits = read(win, consumed, of_nb) & ((1u64 << of_nb) - 1);
+    let ml_add = read(win, consumed, ml_nb) & ((1u64 << ml_nb) - 1);
+    if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
+        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+    }
+    let ll_add = read(win, consumed, ll_nb) & ((1u64 << ll_nb) - 1);
+    let seq = Sequence {
+        ll: ll_base + ll_add as u32,
+        ml: ml_base + ml_add as u32,
+        of: of_base + obits as u32,
+    };
+
+    let ll_nb_t = (ll_entry & 0xff) as u32;
+    let ml_nb_t = (ml_entry & 0xff) as u32;
+    let of_nb_t = (of_entry & 0xff) as u32;
+    let ll_base_t = ((ll_entry >> 8) & 0xffff) as u32;
+    let ml_base_t = ((ml_entry >> 8) & 0xffff) as u32;
+    let of_base_t = ((of_entry >> 8) & 0xffff) as u32;
+    let sum_t = ll_nb_t + ml_nb_t + of_nb_t;
+    let v = read(win, consumed, sum_t);
+    *ll_state = ll_base_t + (((v >> (ml_nb_t + of_nb_t)) & ((1u64 << ll_nb_t) - 1)) as u32);
+    *ml_state = ml_base_t + (((v >> of_nb_t) & ((1u64 << ml_nb_t) - 1)) as u32);
+    *of_state = of_base_t + ((v & ((1u64 << of_nb_t) - 1)) as u32);
+    if matches!(reload(src_ptr, ip, win, consumed), Reload::Overflow) {
+        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+    }
     #[cfg(feature = "seq_dump")]
     super::seq_dump::record(seq.ll, seq.ml, seq.of);
     Ok(seq)
