@@ -88,9 +88,10 @@ impl EncDictionary {
 
     /// The dictID to declare in the frame header: a zero id means "no id"
     /// (the format's null dictID) — entropy seeding is skipped there too,
-    /// so the frame stays decodable without the dictionary.
-    pub fn header_id(&self) -> Option<u64> {
-        (self.id != 0).then_some(self.id as u64)
+    /// so the frame stays decodable without the dictionary. u32 caps the
+    /// value at the Dictionary_ID field's 4-byte wire limit.
+    pub fn header_id(&self) -> Option<u32> {
+        (self.id != 0).then_some(self.id)
     }
 }
 

@@ -21,8 +21,10 @@ pub struct FrameHeader {
     /// If set to true, a 32 bit content checksum will be present
     /// at the end of the frame.
     pub content_checksum: bool,
-    /// If a dictionary ID is provided, the ID of that dictionary.
-    pub dictionary_id: Option<u64>,
+    /// If a dictionary ID is provided, the ID of that dictionary. The wire
+    /// field is at most 4 bytes (RFC 8878 Dictionary_ID_flag 1/2/3), so the
+    /// u32 type itself rules out unserializable ids at compile time.
+    pub dictionary_id: Option<u32>,
     /// The minimum memory buffer required to compress a frame. If not present,
     /// `single_segment` will be set to true. If present, this value must be greater than 1KB
     /// and less than 3.75TB. Encoders should not generate a frame that requires a window size
@@ -59,7 +61,7 @@ impl FrameHeader {
         }
 
         if let Some(id) = header.dictionary_id {
-            output.extend(minify_val(id));
+            output.extend(minify_val(u64::from(id)));
         }
 
         if let Some(frame_content_size) = header.frame_content_size {
@@ -110,12 +112,14 @@ impl FrameHeader {
 
         // `Dictionary_ID_flag`:
         if let Some(id) = self.dictionary_id {
-            let flag_value: u8 = match find_min_size(id) {
-                0 => 0,
+            // RFC 8878: 1 -> 1 byte, 2 -> 2, 3 -> 4; the flag's 0 means no
+            // field. A u32 id keeps find_min_size in 1/2/4, so the wider
+            // classes are unrepresentable, not runtime-checked.
+            let flag_value: u8 = match find_min_size(u64::from(id)) {
                 1 => 1,
                 2 => 2,
                 4 => 3,
-                _ => panic!(),
+                _ => unreachable!("find_min_size of a u32 yields 1, 2 or 4"),
             };
             bw.write_bits(flag_value, 2);
         } else {
@@ -254,6 +258,42 @@ mod tests {
             assert_eq!(&serialized[5..], field, "fcs {fcs}");
             let parsed = read_frame_header(serialized.as_slice()).unwrap().0;
             assert_eq!(parsed.frame_content_size(), fcs, "fcs {fcs}");
+        }
+    }
+
+    /// The Dictionary_ID field's three wire classes (RFC 8878 flag 1/2/3 =
+    /// 1/2/4 bytes), exercised at each class's boundary: the descriptor
+    /// carries the matching flag, the field the matching width, and our
+    /// decoder reads the id back. Wider ids are unrepresentable — the u32
+    /// field type replaced the old `_ => panic!()` arm a > u32::MAX id
+    /// could reach on the publicly-constructible header.
+    #[test]
+    fn frame_header_dict_id_field_sizes() {
+        // (dictionary_id, Dictionary_ID_flag, serialized field bytes)
+        let cases: &[(u32, u8, &[u8])] = &[
+            (1, 1, &[0x01]),
+            (0xff, 1, &[0xff]),
+            (0x100, 2, &[0x00, 0x01]),
+            (0xffff, 2, &[0xff, 0xff]),
+            (0x1_0000, 3, &[0x00, 0x00, 0x01, 0x00]),
+            (u32::MAX, 3, &[0xff, 0xff, 0xff, 0xff]),
+        ];
+        for &(id, flag, field) in cases {
+            let header = FrameHeader {
+                frame_content_size: Some(1),
+                single_segment: true,
+                content_checksum: false,
+                dictionary_id: Some(id),
+                window_size: None,
+            };
+            let mut serialized = Vec::new();
+            header.serialize(&mut serialized);
+            // Single-segment: magic + descriptor + dict id + 1-byte FCS.
+            assert_eq!(&serialized[..4], &crate::common::MAGIC_NUM.to_le_bytes());
+            assert_eq!(serialized[4] & 0b11, flag, "id {id:#x}");
+            assert_eq!(&serialized[5..5 + field.len()], field, "id {id:#x}");
+            let parsed = read_frame_header(serialized.as_slice()).unwrap().0;
+            assert_eq!(parsed.dictionary_id(), Some(id), "id {id:#x}");
         }
     }
 

@@ -469,7 +469,7 @@ fn compress_with_state_donated(
 pub(crate) fn compress_with_state_dictionary(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
-    dict_id: Option<u64>,
+    dict_id: Option<u32>,
     checksum: bool,
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
