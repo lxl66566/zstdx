@@ -218,6 +218,21 @@ fn test_mode() {
     assert!(!run(&["-t", garbage.to_str().unwrap()]).status.success());
 }
 
+/// `-t` must report the number of verified bytes, not a constant zero.
+#[test]
+fn test_mode_reports_decoded_bytes() {
+    let scratch = Scratch::new("test-stats");
+    let input = scratch.path("data.bin");
+    fs::write(&input, payload()).unwrap();
+    run(&[input.to_str().unwrap()]);
+
+    let output = run(&["-t", scratch.path("data.bin.zst").to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tested ok"), "{stderr}");
+    assert!(!stderr.contains("0B tested ok"), "{stderr}");
+}
+
 #[test]
 fn directory_requires_recursive() {
     let scratch = Scratch::new("recursive");

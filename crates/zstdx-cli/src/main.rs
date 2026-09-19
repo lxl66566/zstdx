@@ -463,11 +463,13 @@ fn decompress(
     // The whole write phase runs in a closure so the output handles are
     // dropped before the partial output is removed on failure.
     let written: AnyResult<u64> = (|| {
-        io::copy(&mut decoder, &mut writer)?;
+        let copied = io::copy(&mut decoder, &mut writer)?;
         writer.flush()?;
         match out_file {
             Some(file) => Ok(file.metadata()?.len()),
-            None => Ok(0),
+            // stdout and the test-mode sink have no file to stat; the copied
+            // count is the decompressed size either way
+            None => Ok(copied),
         }
     })();
     if written.is_err() {
