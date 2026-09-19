@@ -226,9 +226,11 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             data = self.write_uniform4_bulk(packed, data);
         }
         // BMI2 compiles the loop's variable shifts to single-uop shrx, which
-        // also frees the shift count from the cl register (one masked `nb`
-        // per symbol instead of two); the detection cache amortizes the
-        // dispatch over a literals stream.
+        // also frees the shift count from the cl register; the impl is
+        // `inline(always)` so this wrapper carries its own feature-compiled
+        // copy (a plain delegation compiles nothing — the wrapper degenerates
+        // to a tail jump and the shrx never materializes); the detection
+        // cache amortizes the dispatch over a literals stream.
         #[cfg(all(target_arch = "x86_64", feature = "std"))]
         {
             if std::is_x86_feature_detected!("bmi2") {
@@ -242,14 +244,21 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// Left-aligned dual-accumulator variable-length code writer (libzstd
     /// `HUF_CStream`'s design). `aligned[sym]` holds the code in the top
     /// `nb` bits of a u64 with `nb` in the low nibble, so a single load
-    /// feeds the container shift, the OR and the bit counter. The pending
-    /// bits grow downward from the top of the container; a flush shifts the
-    /// pending window into the low bytes, stores eight bytes and leaves the
-    /// container untouched. The OR of the raw element dirties the four low
-    /// bits, which a following `>>=` discards before it can reach the
-    /// pending window — so only each round's last add needs a cleaned
-    /// operand. Two containers alternate, giving two independent shift/OR
-    /// chains instead of one serial dependency per symbol.
+    /// feeds the container shift, the OR and the bit counter — libzstd's
+    /// whole-element discipline: the shift count IS the element (x86 masks
+    /// it to six bits = nb, since element bits 4..7 are zero), the OR
+    /// payload is the raw element, and the bit counter accumulates the
+    /// WHOLE element (its low byte is exactly nb, and carries propagate
+    /// only upward, so the counter's low byte — and a fortiori its low six
+    /// bits — stay exact through garbage-high adds). One `add` per symbol,
+    /// no nb extraction. The pending bits grow downward from the top of the
+    /// container; a flush shifts the pending window into the low bytes,
+    /// stores eight bytes and leaves the container untouched. The OR of the
+    /// raw element dirties the four low bits, which a following `>>=`
+    /// discards before it can reach the pending window — so only each
+    /// round's last add needs a cleaned operand. Two containers alternate,
+    /// giving two independent shift/OR chains instead of one serial
+    /// dependency per symbol.
     ///
     /// Safety of the round structure: codes are at most 11 bits
     /// (`MAX_CODE_LENGTH`), a round is five symbols per container and a
@@ -258,12 +267,17 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// bit 13) and the clean fifth at 62 <= 64; the merged container holds
     /// at most 7 + 55 bits and both operands are clean below their pending
     /// windows (their last add was cleaned and `>>=` drops older dirt).
+    /// The counter's exact low bits are only ever used as (b & 0xff) for
+    /// the flush test/advance, (b & 0x3f) for the container shift (the
+    /// round bound keeps the true value <= 62 < 64) and (b & 7) for the
+    /// carried remainder.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[target_feature(enable = "bmi2")]
     unsafe fn write_packed_codes_dual_bmi2(&mut self, aligned: &[u64; 256], data: &[u8]) {
         self.write_packed_codes_dual_impl(aligned, data);
     }
 
+    #[inline(always)]
     fn write_packed_codes_dual_impl(&mut self, aligned: &[u64; 256], data: &[u8]) {
         const ROUND: usize = 5;
         const MAX_NB: u32 = 11;
@@ -276,7 +290,12 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         } else {
             self.partial << (64 - entry_bits)
         };
-        let mut b0 = entry_bits;
+        // Bit counter as a whole-element accumulator: each element's low
+        // BYTE is exactly its nb (codes start at bit 64-nb >= 53), and
+        // addition carries only upward, so the counter's low byte (and
+        // a fortiori its low six bits) stays exact through garbage-high
+        // adds — one `add` per symbol replaces the nb extract + add pair.
+        let mut b0 = entry_bits as u64;
         let output = self.output.as_mut();
         let mut pos = self.bit_idx / 8;
         // One reserve covers every flush store below (n symbols of <= 11
@@ -294,16 +313,17 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         // keep their top-aligned positions for the next round.
         macro_rules! flush {
             () => {
-                if b0 >= 8 {
+                if b0 & 0xff >= 8 {
                     // SAFETY: the reserve above covers the store; bytes past
                     // the semantic end are overwritten by later stores or
                     // snapped off by the final set_len.
                     unsafe {
+                        let bc = (b0 & 0x3f) as u32;
                         ptr.add(pos)
                             .cast::<u64>()
-                            .write_unaligned((c0 >> (64 - b0)).to_le());
+                            .write_unaligned((c0 >> (64 - bc)).to_le());
                     }
-                    pos += b0 >> 3;
+                    pos += (b0 & 0xff) as usize >> 3;
                     b0 &= 7;
                 }
             };
@@ -318,14 +338,13 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 // own offset).
                 let sym = unsafe { *data.get_unchecked($i) };
                 let e = aligned[sym as usize];
-                let nb = (e & 15) as u32;
-                $c >>= nb;
+                $c >>= (e & 63) as u32;
                 $c |= if $clean {
                     e & !0xf
                 } else {
                     e
                 };
-                $b += nb as usize;
+                $b = $b.wrapping_add(e);
             }};
         }
         let mut i = n;
@@ -341,7 +360,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             add!(c0, b0, i - 5, true);
             flush!();
             let mut c1 = 0u64;
-            let mut b1 = 0usize;
+            let mut b1 = 0u64;
             add!(c1, b1, i - 6, false);
             add!(c1, b1, i - 7, false);
             add!(c1, b1, i - 8, false);
@@ -350,9 +369,9 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             // Merge container 1 into container 0: its pending bits are
             // top-aligned, so one shift + OR appends them below container
             // 0's window.
-            c0 >>= b1 as u32;
+            c0 >>= (b1 & 63) as u32;
             c0 |= c1;
-            b0 += b1;
+            b0 = b0.wrapping_add(b1);
             flush!();
             i -= ROUND * 2;
         }
@@ -370,12 +389,13 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         // growing within the reserved capacity keeps the invariant that the
         // length equals bit_idx / 8.
         unsafe { output.set_len(pos) };
-        self.partial = if b0 == 0 {
+        let pending = (b0 & 7) as u32;
+        self.partial = if pending == 0 {
             0
         } else {
-            c0 >> (64 - b0)
+            c0 >> (64 - pending)
         };
-        self.bits_in_partial = b0;
+        self.bits_in_partial = pending as usize;
         self.bit_idx = pos * 8;
     }
 
