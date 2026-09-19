@@ -2075,9 +2075,10 @@ impl MatchGeneratorDriver {
     /// gate→scan transition — an all-random input never pays it, and mixed
     /// input pays it once per gated streak. The fill is dense and
     /// oldest-to-newest exactly like a scan's miss-path inserts, so the
-    /// tables end in the state a full scan would have left; positions older
-    /// than the match window cannot resolve and are skipped (the same clamp
-    /// as the opt tree's fill).
+    /// tables come back scan-equivalent up to the fill convention's
+    /// one-position tail margin (see the bound note inside); positions
+    /// older than the match window cannot resolve and are skipped (the
+    /// same clamp as the opt tree's fill).
     #[inline(never)]
     fn catch_up_insertions(&mut self) {
         if self.gap_start == u64::MAX {
@@ -2092,10 +2093,14 @@ impl MatchGeneratorDriver {
         // Each insert hashes HASH_READ bytes at `idx`, but the window only
         // guarantees coverage up to the gated block's end: a block of fewer
         // than HASH_READ bytes right after a gated one (bulk/MT windows
-        // borrow the caller's slice) would overread. The scan itself never
-        // inserts at or past `block_end - HASH_READ` either, so this bound
-        // also leaves the tables exactly in the state a full scan would
-        // have produced.
+        // borrow the caller's slice) would overread. A scan of the gated
+        // block itself inserts through `block_start - HASH_READ` inclusive
+        // (its loop stops with `block_end - pos >= HASH_READ` yet still
+        // stores at that pos); this exclusive bound stops one position
+        // earlier — the same tail margin as every other fill path
+        // (`last = len - HASH_READ; while idx < last`), so the tables come
+        // back scan-equivalent up to that shared conservatism and never
+        // past the coverage the window guarantees.
         let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut idx = (from - win_base) as usize;
