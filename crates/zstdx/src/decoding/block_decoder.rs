@@ -282,6 +282,13 @@ impl BlockDecoder {
         block_out_max: usize,
         source: &mut impl Read,
     ) -> Result<(SequencesHeader, &'a [u8]), DecompressBlockError> {
+        // The stored (compressed) body is bounded by the same per-block cap
+        // as the output (libzstd's header-stage `cBlockSize > blockSizeMax`
+        // for every block type): a small-window frame cannot carry a block
+        // body larger than its window. Checked before the body is read.
+        if header.content_size as usize > block_out_max {
+            return Err(DecompressBlockError::BlockOutputTooLarge { max: block_out_max });
+        }
         block_content_buffer.resize(header.content_size as usize, 0);
 
         source.read_exact(block_content_buffer.as_mut_slice())?;

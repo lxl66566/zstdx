@@ -57,13 +57,10 @@ use super::{
     sequence_execution::{do_offset_history, wildcopy_match},
     sequence_section_decoder::decode_sequences_into,
 };
-use crate::{
-    blocks::{
-        block::BlockType,
-        literals_section::{LiteralsSection, LiteralsSectionType},
-        sequence_section::{ModeType, Sequence, SequencesHeader},
-    },
-    common::MAX_BLOCK_SIZE,
+use crate::blocks::{
+    block::BlockType,
+    literals_section::{LiteralsSection, LiteralsSectionType},
+    sequence_section::{ModeType, Sequence, SequencesHeader},
 };
 
 /// Below this (compressed) input size the scan, spawn and hand-off overhead
@@ -420,7 +417,10 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
                 _ => return None, // reserved block
             };
             let size = raw >> 3;
-            if size > MAX_BLOCK_SIZE {
+            // Every block's stored size is bounded by min(window, 128K)
+            // (libzstd's header-stage blockSizeMax); a violation falls back
+            // to the sequential path, which reports it.
+            if size as usize > crate::common::max_block_output(window_size) {
                 return None;
             }
             let body_len = match btype {

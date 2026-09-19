@@ -257,3 +257,129 @@ fn mt_stage_a_rejects_huge_block_output_claim() {
         err
     });
 }
+
+/// A 1 KiB-window frame whose single Compressed block declares a 2 KiB
+/// stored body. libzstd bounds every block's *stored* size by
+/// min(window, 128K) at the header stage ("Block Size Exceeds Maximum"),
+/// so the frame is corrupt before its body is even read — the output-side
+/// cap alone never sees it (a compressed body this small claims little
+/// output).
+fn small_window_oversized_stored_block() -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+    frame.push(0x00); // FHD: no FCS, no checksum, no dict id
+    frame.push(0x00); // window descriptor: 1 KiB
+    push_block(&mut frame, true, 2, &[0x00; 2048]);
+    frame
+}
+
+/// The stored-size cap must fire on every decode path, and the reference
+/// decoder must reject the same frame.
+#[cfg(feature = "std")]
+#[test]
+fn small_window_rejects_oversized_compressed_stored_size() {
+    let frame = small_window_oversized_stored_block();
+
+    // Flat one-shot path.
+    let mut dec = FrameDecoder::new();
+    let mut out = vec![0u8; 1024 * 1024];
+    let err = dec
+        .decode_all(frame.as_slice(), &mut out)
+        .expect_err("oversized stored body must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
+
+    // Flat streaming path.
+    let mut src = frame.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.reset(&mut src).unwrap();
+    let err = dec
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .expect_err("oversized stored body must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
+
+    // Ring path (dictionary attached).
+    let mut src = frame.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.add_dict(Dictionary::load(b"history").unwrap()).unwrap();
+    dec.reset(&mut src).unwrap();
+    let err = dec
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .expect_err("oversized stored body must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
+
+    // Parallel decoder: the scan declines the frame and the sequential
+    // fallback reports it.
+    let mut out = Vec::new();
+    let err = crate::decoding::mt_decode_to_vec_for_tests(
+        &frame,
+        &mut out,
+        4,
+        crate::decoding::DEFAULT_MAX_WINDOW_SIZE,
+    )
+    .expect_err("oversized stored body must be rejected");
+    assert!(block_output_too_large(&err), "unexpected error: {}", {
+        err
+    });
+
+    // Reference agreement.
+    assert!(
+        zstd::decode_all(frame.as_slice()).is_err(),
+        "libzstd must reject the oversized stored body"
+    );
+}
+
+/// The cap must not reject our own encoder's frames: a forced small window
+/// shrinks the block size (and with it every stored body) below the window.
+/// Roundtrips through the sequential and parallel decoders and libzstd.
+#[cfg(feature = "std")]
+#[test]
+fn tiny_window_encoder_frames_roundtrip() {
+    let unit = b"the quick brown fox jumps over the lazy dog; ";
+    let mut data = Vec::with_capacity(2 * 1024 * 1024);
+    while data.len() < 2 * 1024 * 1024 {
+        data.extend_from_slice(unit);
+    }
+    let opts = |level: crate::Level, workers: u32| {
+        crate::EncoderOptions::new(level)
+            .workers(workers)
+            .with_input_shape(crate::InputShape::default().with_window_log(10))
+    };
+    for level in [
+        crate::Level::Fastest,
+        crate::Level::Fast,
+        crate::Level::Balanced,
+        crate::Level::Best,
+    ] {
+        for workers in [1u32, 2] {
+            let compressed = crate::bulk::compress_with(&data, &opts(level, workers)).unwrap();
+            // Premise: the frame really declares the tiny window.
+            let (header, _) =
+                crate::decoding::frame::read_frame_header(&mut compressed.as_slice()).unwrap();
+            assert!(header.window_size().unwrap() <= 4096);
+
+            let mut out = vec![0u8; data.len()];
+            let n = FrameDecoder::new()
+                .decode_all(compressed.as_slice(), &mut out)
+                .unwrap();
+            assert_eq!(&out[..n], &data[..], "{level:?}/{workers}");
+
+            let mt = crate::bulk::decompress_with(
+                compressed.as_slice(),
+                0,
+                &crate::DecoderOptions::new().threads(2),
+            )
+            .unwrap();
+            assert_eq!(mt, data, "{level:?}/{workers}");
+
+            let mut lib = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut lib).unwrap();
+            assert_eq!(lib, data, "{level:?}/{workers}");
+        }
+    }
+}
