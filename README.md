@@ -53,29 +53,41 @@ Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming and the lo
 
 ## Performance
 
-Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MB real-binary payload (dll, concatenated system ELF files via [gen_big.sh](bench/gen_big.sh)); x = zstdx time / zstd time (<1 = zstdx is faster):
+Benchmarked against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MB real-binary payload (dll, concatenated system ELF binaries via [gen_big.sh](bench/gen_big.sh)); single-threaded unless noted, checksums off, every cell roundtrip-verified, ±10% run-to-run noise. Numbers read `ours / zstd` as throughput in MiB/s; **speedup** = zstd time ÷ zstdx time, so above 1× means zstdx finishes sooner. Full tables (streaming, MT, the 1-22 ladder): [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md).
+
+Encode speed vs ratio — points labelled with the numeric level, curves are each side's Pareto frontier (upper right is better):
+
+![Encode speed/ratio trade-off](assets/encode-pareto.svg)
+
+At equal ratio zstdx stays on or above the libzstd curve: on json, everything libzstd compresses between ratio 6.2 and 7.4 runs below 40 MiB/s while zstdx holds 142 MiB/s at ratio 7.2; on the dll payload it is 8–13% smaller than libzstd from level 9 up.
+
+Decode speedup over libzstd (bulk; hatched bars are our multi-threaded decoder, a dimension libzstd does not have):
+
+![Decode speedup](assets/decode-speedup.svg)
 
 <!-- prettier-ignore -->
-| level | shape | enc ST x | enc MT8 (bulk) x | dec ST bulk x |
-|---|---|---:|---:|---:|
-| 1 | json | 1.43 | 1.18 | 0.74 |
-| 1 | text | 0.74 | 0.52 | 0.38 |
-| 1 | skewed | 0.43 | 0.77 | 0.67 |
-| 1 | dll | 1.36 | — | 0.89 |
-| 3 | json | 1.04 | 0.41 | 0.80 |
-| 3 | text | 0.52 | 0.18 | 0.29 |
-| 3 | skewed | 1.05 | 0.50 | 0.85 |
-| 3 | dll | 1.06 | — | 0.89 |
-| 9 | json | 0.86 | 0.61 | 0.71 |
-| 9 | text | 1.47 | 1.48 | 0.27 |
-| 9 | skewed | 0.04 | 0.18 | 1.01 |
-| 9 | dll | 1.49 | — | 0.82 |
-| 19 | json | 1.11 | — | 0.60 |
-| 19 | text | 0.69 | — | 0.27 |
-| 19 | skewed | 1.09 | — | 0.68 |
-| 19 | dll | 1.19 | — | 0.86 |
+| level | shape | enc ST MiB/s | enc MT8 MiB/s | enc size | dec ST bulk MiB/s |
+|---|---|---|---|---|---|
+| 1 | json | 600 / 858 (0.70×) | 3702 / 4332 (0.85×) | −4.5% | 1731 / 1277 (1.36×) |
+| 1 | text | 14212 / 10455 (1.36×) | 22185 / 11496 (1.93×) | −0.1% | 5971 / 2258 (2.64×) |
+| 1 | skewed | 2962 / 1274 (2.32×) | 4302 / 3310 (1.30×) | 0.0% | 2310 / 1536 (1.50×) |
+| 1 | dll | 392 / 530 (0.74×) | — | +1.8% | 1144 / 1023 (1.12×) |
+| 3 | json | 458 / 477 (0.96×) | 2605 / 1069 (2.44×) | 0.0% | 1438 / 1144 (1.26×) |
+| 3 | text | 14085 / 7275 (1.94×) | 12782 / 2319 (5.51×) | 0.0% | 8760 / 2515 (3.48×) |
+| 3 | skewed | 210 / 224 (0.94×) | 1302 / 645 (2.02×) | 0.0% | 1246 / 1061 (1.17×) |
+| 3 | dll | 411 / 434 (0.95×) | — | −2.2% | 1226 / 1094 (1.12×) |
+| 9 | json | 142 / 122 (1.16×) | 337 / 204 (1.65×) | −17.4% | 1724 / 1231 (1.40×) |
+| 9 | text | 1178 / 1734 (0.68×) | 855 / 1259 (0.68×) | −1.6% | 9364 / 2544 (3.68×) |
+| 9 | skewed | 1860 / 75 (24.8×) | 699 / 122 (5.73×) | −8.1% | 650 / 660 (0.98×) |
+| 9 | dll | 101 / 151 (0.67×) | — | −8.4% | 1527 / 1247 (1.22×) |
+| 19 | json | 3 / 3 (0.90×) | — | −0.1% | 2166 / 1293 (1.68×) |
+| 19 | text | 393 / 272 (1.45×) | — | 0.0% | 9382 / 2519 (3.72×) |
+| 19 | skewed | 2 / 2 (0.92×) | — | 0.0% | 2203 / 1491 (1.48×) |
+| 19 | dll | 8 / 9 (0.84×) | — | −10.5% | 1322 / 1134 (1.17×) |
 
-Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels; on the dll payload the encoder is 8–13% denser from level 9 up (level 9: x 1.49 at −8.4% size). MT decode (no libzstd counterpart) reaches 1.17× zstd's streaming decode on json at 16 workers and 1.30× on the 100 MB dll payload.
+Throughputs are rounded; speedups come from the measured medians. enc size = compressed-size change vs libzstd at the same numeric level (negative = zstdx smaller); MT8 = 8-worker encode, cold pool on both sides.
+
+Compression-ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.17× (json) and 1.30× (dll100) of libzstd's single-threaded streaming decode at 16 workers. The one decode column where libzstd stays ahead is streaming on compressible shapes; every raw table lives in the docs linked above.
 
 Full per-level tables (1-22), methodology and noise caveats: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/matrix.md).
 
