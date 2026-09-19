@@ -77,6 +77,8 @@ let original = compat::bulk::decompress(&compressed, 0)?;
 
 `compat::stream` provides `Encoder`/`Decoder` and `copy_encode`/`copy_decode`. Not covered: `zstd_safe` and trained-dict generation via `zstd::dict` (use `zstdx::dict`).
 
+The streaming types materialize their native backend on the first read/write. A failed start hands the wrapped reader/writer back (`get_mut`/`finish` stay usable, a retry re-runs the start); bytes the native read decoder's eager first-frame parse already consumed before failing are not replayed, so a retried start keeps reading from wherever the source stands.
+
 ## Levels
 
 `Level` is the numeric libzstd level (0–22); [`Level::from_zstd(i32)`] maps exactly (negatives clamp to 1, values above 22 to 22). Named constants alias representative levels:

@@ -490,12 +490,26 @@ pub mod read {
         fn materialize(&mut self) -> io::Result<&mut crate::stream::read::Decoder<R>> {
             if self.inner.is_none() {
                 let source = self.source.take().expect("source kept until start");
-                let mut decoder =
-                    crate::stream::read::Decoder::with_options(source, self.options.clone())
-                        .map_err(io::Error::from)?;
-                if self.single_frame {
-                    decoder = decoder.single_frame();
-                }
+                // On failure the source goes back before the error leaves,
+                // mirroring the write side's try_with_options: get_mut and
+                // finish stay usable, and a retry re-runs the construction.
+                // Bytes a failed first-frame parse already consumed from the
+                // source are not replayed.
+                let decoder = match crate::stream::read::Decoder::try_with_options(
+                    source,
+                    self.options.clone(),
+                ) {
+                    Ok(decoder) => decoder,
+                    Err((source, err)) => {
+                        self.source = Some(source);
+                        return Err(io::Error::from(err));
+                    },
+                };
+                let decoder = if self.single_frame {
+                    decoder.single_frame()
+                } else {
+                    decoder
+                };
                 self.inner = Some(decoder);
             }
             Ok(self.inner.as_mut().unwrap())

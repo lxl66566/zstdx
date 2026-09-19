@@ -132,22 +132,42 @@ impl<R: Read> Decoder<R> {
     /// Create a decoder from a builder option set.
     // options are consumed builder data; by value keeps the chaining API
     #[allow(clippy::needless_pass_by_value)]
-    pub fn with_options(mut source: R, options: DecoderOptions) -> Result<Self> {
+    pub fn with_options(source: R, options: DecoderOptions) -> Result<Self> {
+        Self::try_with_options(source, options).map_err(|(_, err)| err)
+    }
+
+    /// Like [`Decoder::with_options`], but hands the source back when
+    /// construction fails, so callers keep ownership of it (the same shape
+    /// as the write encoder's `try_with_options`).
+    ///
+    /// The eager first-frame parse may already have consumed bytes from the
+    /// source when it fails; a retried construction keeps reading from
+    /// wherever the source then stands.
+    pub(crate) fn try_with_options(
+        mut source: R,
+        options: DecoderOptions,
+    ) -> Result<Self, (R, crate::Error)> {
         let mut decoder = FrameDecoder::new();
         if let Some(max) = options.max_window_size {
             decoder.set_max_window_size(max);
         }
-        if let Some(dict) = &options.dictionary {
-            let dict = crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
-            decoder.add_dict(dict)?;
+        let mut build = || -> Result<()> {
+            if let Some(dict) = &options.dictionary {
+                let dict =
+                    crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
+                decoder.add_dict(dict)?;
+            }
+            Self::init_first_frame(&mut source, &mut decoder)
+        };
+        match build() {
+            Ok(()) => Ok(Self {
+                source,
+                inner: decoder,
+                single_frame: false,
+                finished: false,
+            }),
+            Err(err) => Err((source, err)),
         }
-        Self::init_first_frame(&mut source, &mut decoder)?;
-        Ok(Self {
-            source,
-            inner: decoder,
-            single_frame: false,
-            finished: false,
-        })
     }
 
     /// Recommended size for read batches: one full block.

@@ -277,3 +277,60 @@ fn failed_materialize_keeps_writer() {
     assert!(encoder.write(b"more").is_err());
     assert_eq!(encoder.get_ref().as_slice(), b"kept");
 }
+
+/// The read decoder mirrors the writer contract: a failed materialize hands
+/// the source back, so repeated reads fail deterministically (no panic on a
+/// missing source) and get_mut/finish stay usable.
+#[test]
+fn failed_materialize_keeps_source() {
+    use crate::decoding::dictionary::MAGIC_NUM;
+    // the dictionary magic alone does not parse as a dictionary, so nothing
+    // is read from the source before the failure
+    let mut decoder =
+        compat::stream::read::Decoder::with_dictionary(b"compressed".as_slice(), &MAGIC_NUM)
+            .unwrap();
+    let mut out = [0u8; 4];
+    let first = format!("{:?}", decoder.read(&mut out).unwrap_err());
+    assert_eq!(format!("{:?}", decoder.read(&mut out).unwrap_err()), first);
+    assert_eq!(*decoder.get_mut(), b"compressed");
+    assert_eq!(decoder.finish(), b"compressed");
+}
+
+/// A transient error while materializing the first frame must not brick the
+/// decoder: the retry re-runs the construction and succeeds once the source
+/// serves data.
+#[test]
+fn transient_materialize_error_is_retryable() {
+    struct FlakySource {
+        data: Vec<u8>,
+        pos: usize,
+        failed: bool,
+    }
+    impl std::io::Read for FlakySource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.failed {
+                self.failed = true;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    let data = payload();
+    let compressed = compat::bulk::compress(&data, 3).unwrap();
+    let mut decoder = compat::stream::read::Decoder::new(FlakySource {
+        data: compressed,
+        pos: 0,
+        failed: false,
+    })
+    .unwrap();
+    // the first read hits the transient error ...
+    assert!(decoder.read(&mut [0u8; 16]).is_err());
+    // ... and the retry decodes the whole stream once the source recovers
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+}
