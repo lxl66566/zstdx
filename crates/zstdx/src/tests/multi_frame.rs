@@ -390,3 +390,49 @@ fn transient_error_mid_skippable_frame_resumes() {
         b"aaaabbbbb"
     );
 }
+
+/// Hunt staging belongs to the stream its bytes were read from: a decoder
+/// abandoned mid next-frame hunt (staging holding the peeked magic) and
+/// rebound to a new source must decode the new stream from byte zero — the
+/// stale magic used to replay into the new stream's head and misparse it.
+#[test]
+fn staging_does_not_leak_across_streams() {
+    let stream1 = concat(&[&frame(b"aaaa"), &frame(b"bbbbb")]);
+    let stream2 = concat(&[&frame(b"ccccc"), &frame(b"ddddd")]);
+
+    let mut dec = FrameDecoder::new();
+    // Stream 1: frame 1 decodes, then frame 2's hunt stages the magic and
+    // fails with WouldBlock right behind it; the caller abandons the stream.
+    let boundary = stream1.len() - frame(b"bbbbb").len();
+    {
+        let mut s1 = StreamingDecoder::new_with_decoder(
+            OneShotWouldBlock::new(&stream1, boundary + 4),
+            &mut dec,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut sink = [0u8; 7];
+        loop {
+            match s1.read(&mut sink) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&sink[..n]),
+                Err(_) => break, // the injected WouldBlock: abandon stream 1
+            }
+        }
+        assert_eq!(out, b"aaaa");
+    }
+
+    // The reclaimed decoder carries the staged magic; stream 2 must still
+    // decode completely.
+    let mut s2 = StreamingDecoder::new_with_decoder(stream2.as_slice(), &mut dec).unwrap();
+    let mut out = Vec::new();
+    let mut sink = [0u8; 7];
+    loop {
+        match s2.read(&mut sink) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&sink[..n]),
+            Err(e) => panic!("stream 2 misparsed: {e}"),
+        }
+    }
+    assert_eq!(out, b"cccccddddd");
+}

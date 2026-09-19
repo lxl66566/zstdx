@@ -291,6 +291,11 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        // A reset binds the decoder to `source`: hunt bytes staged from any
+        // earlier source must not survive into it. The next-frame hunt also
+        // resets, but `start_frame` lifts the staging out for the attempt,
+        // so an in-flight hunt keeps its bytes.
+        self.next_frame_staging = NextFrameStaging::Idle;
         let state = if let Some(s) = &mut self.state {
             s.reset(source, self.max_window_size)?;
             s

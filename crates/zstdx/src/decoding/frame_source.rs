@@ -64,6 +64,11 @@ pub(crate) fn init_first_frame<R: Read>(
     source: &mut R,
     decoder: &mut FrameDecoder,
 ) -> Result<(), FrameDecoderError> {
+    // Binding to a fresh source discards any hunt staging left over from a
+    // previous stream: staged bytes belong to the source they were read
+    // from, and replaying them would prepend them to the new stream's head
+    // (the next hunt would peek the stale magic instead of the source's).
+    decoder.next_frame_staging = NextFrameStaging::Idle;
     start_frame(source, decoder, StreamPosition::Start).map(|_| ())
 }
 
