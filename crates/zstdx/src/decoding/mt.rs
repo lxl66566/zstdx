@@ -105,6 +105,11 @@ pub(super) struct ScanPlan {
     pub(super) segments: Vec<SegmentPlan>,
     #[cfg(feature = "hash")]
     pub(super) checksums: Vec<Option<u32>>,
+    /// Declared Frame_Content_Size per frame in scan order (`None` when the
+    /// header carries none). The parallel executors never see a frame tail,
+    /// so every frame's output length is verified against its entry after
+    /// execution.
+    pub(super) frame_pledges: Vec<Option<u64>>,
     /// The pledged content size when the input is exactly one frame
     /// carrying it (`None` for multi-frame/skippable inputs or frames
     /// without a size pledge). The piece-parallel executor needs it.
@@ -360,6 +365,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     let mut segments: Vec<SegmentPlan> = Vec::new();
     #[cfg(feature = "hash")]
     let mut checksums: Vec<Option<u32>> = Vec::new();
+    let mut frame_pledges: Vec<Option<u64>> = Vec::new();
     let mut n_frames = 0usize;
     let mut saw_skip = false;
     let mut pledged_single: Option<u64> = None;
@@ -383,6 +389,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         n_frames += 1;
         let fcs_present = frame_header.descriptor.frame_content_size_flag() != 0
             || frame_header.descriptor.single_segment_flag();
+        frame_pledges.push(fcs_present.then(|| frame_header.frame_content_size()));
         pledged_single = if n_frames == 1 && fcs_present && !saw_skip {
             Some(frame_header.frame_content_size())
         } else {
@@ -494,6 +501,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         segments,
         #[cfg(feature = "hash")]
         checksums,
+        frame_pledges,
         pledged_single,
     };
     // A high-ratio frame (compressed input under the MT floor, pledge in
@@ -839,6 +847,29 @@ unsafe fn copy16_chunks(mut d: *mut u8, mut s: *const u8, len: usize) {
     }
 }
 
+/// Verify every frame's executed output length against its declared
+/// Frame_Content_Size (the sequential paths run the same check at the frame
+/// tail, which the parallel executors never see). Frames decode
+/// sequentially, so a frame's output is the gap between consecutive frame
+/// starts (`starts`, aligned with `pledges` in scan order); frames without
+/// a pledge are skipped.
+pub(super) fn verify_frame_content_sizes(
+    pledges: &[Option<u64>],
+    starts: &[usize],
+    total: usize,
+) -> Result<(), FrameDecoderError> {
+    debug_assert_eq!(pledges.len(), starts.len(), "every frame records one start");
+    for (i, pledged) in pledges.iter().enumerate() {
+        let Some(declared) = *pledged else { continue };
+        let end = starts.get(i + 1).copied().unwrap_or(total);
+        let actual = (end - starts[i]) as u64;
+        if actual != declared {
+            return Err(FrameDecoderError::ContentSizeMismatch { declared, actual });
+        }
+    }
+    Ok(())
+}
+
 /// Two-stage pipeline driver. `place(start, end)` makes the output region
 /// valid for absolute positions `[0, end)` and returns its base pointer
 /// (called per segment, so a growing Vec may move between calls). Returns
@@ -847,6 +878,7 @@ fn decode_parallel(
     input: &[u8],
     workers: u32,
     segments: &[SegmentPlan],
+    frame_pledges: &[Option<u64>],
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
     #[cfg(feature = "hash")] after_segment: &mut dyn FnMut(*const u8, Range<usize>),
 ) -> Result<usize, FrameDecoderError> {
@@ -910,6 +942,8 @@ fn decode_parallel(
         let mut offset_hist = [1u32, 4, 8];
         let exec_result = (|| -> Result<usize, FrameDecoderError> {
             let mut written = 0usize;
+            // Output offset where each frame began, in scan order.
+            let mut frame_starts = Vec::with_capacity(frame_pledges.len());
             for (id, seg_plan) in segments.iter().enumerate() {
                 let staged = {
                     let mut guard = slots[id].lock().unwrap();
@@ -921,6 +955,7 @@ fn decode_parallel(
                 let seg = staged?;
                 if seg_plan.frame_start {
                     offset_hist = [1, 4, 8];
+                    frame_starts.push(written);
                 }
                 #[cfg(feature = "hash")]
                 let seg_out_start = written;
@@ -938,6 +973,7 @@ fn decode_parallel(
                 consumed.store(id + 1, Ordering::Release);
                 ready.notify_all();
             }
+            verify_frame_content_sizes(frame_pledges, &frame_starts, written)?;
             Ok(written)
         })();
         if exec_result.is_err() {
@@ -1050,6 +1086,7 @@ pub fn decode_all_mt(
             input,
             workers,
             &plan.segments,
+            &plan.frame_pledges,
             &mut place,
             &mut after_segment,
         )?;
@@ -1058,7 +1095,13 @@ pub fn decode_all_mt(
             return Err(err);
         }
         #[cfg(not(feature = "hash"))]
-        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
+        let written = decode_parallel(
+            input,
+            workers,
+            &plan.segments,
+            &plan.frame_pledges,
+            &mut place,
+        )?;
         Ok(written)
     } else {
         let mut decoder = FrameDecoder::new();
@@ -1132,6 +1175,7 @@ pub fn decode_to_vec_mt(
             input,
             workers,
             &plan.segments,
+            &plan.frame_pledges,
             &mut place,
             &mut after_segment,
         )?;
@@ -1143,7 +1187,13 @@ pub fn decode_to_vec_mt(
             return Err(err);
         }
         #[cfg(not(feature = "hash"))]
-        let written = decode_parallel(input, workers, &plan.segments, &mut place)?;
+        let written = decode_parallel(
+            input,
+            workers,
+            &plan.segments,
+            &plan.frame_pledges,
+            &mut place,
+        )?;
         // SAFETY: every byte in [start_len, start_len + written) was written
         // by execute_segment.
         unsafe { output.set_len(start_len + written) };
@@ -1376,6 +1426,83 @@ mod tests {
     }
 
     use super::{HuffmanState, RestartProbe, probe_restart, restart_candidates};
+
+    /// A single frame carrying its declared content size (the one-shot
+    /// compressors emit no FCS field).
+    fn pledged_frame(data: &[u8]) -> Vec<u8> {
+        use crate::io::Write;
+        let mut sink = Vec::new();
+        let mut enc = crate::stream::write::Encoder::with_options(
+            &mut sink,
+            crate::EncoderOptions::new(Level::Fastest).pledged_size(Some(data.len() as u64)),
+        )
+        .unwrap();
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+        sink
+    }
+
+    /// Byte offset of a pledged frame's Frame_Content_Size field (our
+    /// encoder always emits the window descriptor and no dictionary id, so
+    /// the field starts right behind them).
+    fn fcs_at(frame: &[u8]) -> usize {
+        let fhd = frame[4];
+        assert_eq!(fhd & 3, 0, "no dictionary id expected");
+        assert_eq!((fhd >> 5) & 1, 0, "no single-segment flag expected");
+        assert!(fhd >> 6 != 0, "no FCS field present");
+        5 + 1
+    }
+
+    /// A frame's declared Frame_Content_Size is a contract on every path:
+    /// the parallel executor never sees a frame tail, so a two-frame input
+    /// whose first frame's pledge is patched one byte high must fail exactly
+    /// like the sequential decoder.
+    #[test]
+    fn content_size_mismatch_is_an_error() {
+        let a = textish(3 * 1024 * 1024);
+        let b: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 61) as u8).collect();
+        let mut frame_a = pledged_frame(&a);
+        let at = fcs_at(&frame_a);
+        frame_a[at] += 1;
+        let mut input = frame_a;
+        input.extend_from_slice(&pledged_frame(&b));
+
+        // Sequential baseline: the mismatch is reported.
+        let mut out = vec![0u8; a.len() + b.len()];
+        assert!(matches!(
+            FrameDecoder::new().decode_all(input.as_slice(), &mut out),
+            Err(crate::decoding::errors::FrameDecoderError::ContentSizeMismatch {
+                declared,
+                actual
+            }) if declared == a.len() as u64 + 1 && actual == a.len() as u64
+        ));
+
+        // Both parallel entry points must agree, frame-scoped: the second
+        // frame's untouched pledge is not what trips.
+        let err = decode_to_vec_mt(&input, &mut Vec::new(), 2, MAX_WINDOW).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::ContentSizeMismatch {
+                declared,
+                actual
+            } if declared == a.len() as u64 + 1 && actual == a.len() as u64
+        ));
+        let mut placed = vec![0u8; a.len() + b.len() + 1];
+        let err = decode_all_mt(&input, &mut placed, 2, MAX_WINDOW).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::ContentSizeMismatch { .. }
+        ));
+
+        // Control: the unpatched pair decodes through the parallel path.
+        let mut clean = pledged_frame(&a);
+        clean.extend_from_slice(&pledged_frame(&b));
+        let mut expect = a.clone();
+        expect.extend_from_slice(&b);
+        let mut vec_out = Vec::new();
+        decode_to_vec_mt(&clean, &mut vec_out, 2, MAX_WINDOW).unwrap();
+        assert_eq!(vec_out, expect);
+    }
 
     /// One sequence with all three FSE streams in RLE mode (ll code 4 = 4
     /// literals, of code 0 = offset 1, ml code 0 = match 3): explicit tables

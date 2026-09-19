@@ -369,8 +369,9 @@ impl Driver {
     fn refresh_grids(&mut self, complete: bool) -> bool {
         let mut new_work = false;
         if complete && self.staged_pos != self.fcs {
-            // Corrupt pledge: the serial path reports it with its own
-            // errors.
+            // Corrupt pledge: no grid can tile the output, so every grid
+            // dies and the serial fallback below verifies the frame's
+            // declared size (verify_frame_content_sizes).
             self.grids.iter_mut().for_each(|g| g.alive = false);
             return false;
         }
@@ -961,9 +962,12 @@ fn run_serial(
 ) -> Result<usize, FrameDecoderError> {
     let mut offset_hist = [1u32, 4, 8];
     let mut written = 0usize;
+    // Output offset where each frame began, in scan order.
+    let mut frame_starts = Vec::with_capacity(plan.frame_pledges.len());
     for (id, seg) in segs.iter().enumerate() {
         if plan.segments[id].frame_start {
             offset_hist = [1, 4, 8];
+            frame_starts.push(written);
         }
         let (base, buf_limit) = place(written, written + seg.out_size)?;
         // SAFETY: place made [0, written + out_size) valid; every match
@@ -981,6 +985,9 @@ fn run_serial(
         }
         written += seg.out_size;
     }
+    // The pledge check precedes the checksum, matching the sequential
+    // paths' frame-tail ordering.
+    super::mt::verify_frame_content_sizes(&plan.frame_pledges, &frame_starts, written)?;
     #[cfg(feature = "hash")]
     if let Some((h, expected)) = hash.as_ref() {
         let calculated = h.finish() as u32;

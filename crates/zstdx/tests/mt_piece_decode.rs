@@ -359,3 +359,44 @@ fn small_pledge_does_not_engage() {
     set_mt_ramp_depth_for_tests(u64::MAX);
     set_piece_decode_for_tests(false);
 }
+
+/// Byte offset of a pledged frame's Frame_Content_Size field (the encoder
+/// always emits the window descriptor and no dictionary id, so the field
+/// starts right behind them).
+fn fcs_at(frame: &[u8]) -> usize {
+    let fhd = frame[4];
+    assert_eq!(fhd & 3, 0, "no dictionary id expected");
+    assert_eq!((fhd >> 5) & 1, 0, "no single-segment flag expected");
+    assert!(fhd >> 6 != 0, "no FCS field present");
+    5 + 1
+}
+
+/// A patched pledge kills every candidate grid (staged output cannot tile
+/// it), so the piece driver falls back to its serial stage B — which must
+/// verify the frame's declared size like the sequential decoder instead of
+/// returning the executed byte count.
+#[test]
+fn pledged_fcs_mismatch_errors_through_serial_fallback() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    let data = textish(8 * 1024 * 1024);
+    let opts = EncoderOptions::new(Level::Fastest)
+        .workers(4)
+        .checksum(true)
+        .pledged_size(Some(data.len() as u64));
+    let mut enc = zstdx::stream::write::Encoder::with_options(Vec::new(), opts).unwrap();
+    enc.write_all(&data).unwrap();
+    let mut compressed = enc.finish().unwrap();
+    let at = fcs_at(&compressed);
+    compressed[at] += 1;
+
+    let err =
+        bulk::decompress_with(&compressed, 1 << 20, &DecoderOptions::new().threads(4)).unwrap_err();
+    assert!(
+        err.to_string().contains("Frame_Content_Size mismatch"),
+        "{err}"
+    );
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(false);
+}
