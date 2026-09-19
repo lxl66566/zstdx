@@ -1950,9 +1950,10 @@ impl MtEncoderCore {
     /// - `(true, Some)`: a live poison — take it, abort the unclaimed queue, wait out the in-flight
     ///   jobs, resume the unwind.
     /// - `(true, None)`: unreachable — the flag never precedes the payload, and once taken this
-    ///   thread resumes before any re-entry (the posting thread is the only caller). The early
-    ///   return stays as the fail-safe: there is no payload to resume, so surfacing nothing beats
-    ///   fabricating state.
+    ///   thread resumes before any re-entry (the posting thread is the only caller). It panics
+    ///   rather than returns: returning would assemble a frame missing the poisoned job's bytes as
+    ///   Ok — the exact corruption the publish ordering exists to prevent — so an invariant breach
+    ///   here must fail fast, not deliver silently.
     fn surface_poison(&mut self) {
         if !self.shared.poisoned.load(Ordering::Acquire) {
             return;
@@ -1960,7 +1961,10 @@ impl MtEncoderCore {
         let payload = {
             let mut inner = self.shared.inner.lock().unwrap();
             match inner.poison.take() {
-                None => return,
+                None => panic!(
+                    "poison flag set but the payload is gone: the flag must never be observed \
+                     ahead of the payload (see QueueShared::publish_poison)"
+                ),
                 Some(payload) => {
                     while let Some(job) = inner.queue.pop_front() {
                         job.abort();
@@ -2423,6 +2427,28 @@ mod tests {
         }));
         let payload = attempt.expect_err("a published poison must resume, not drain as Ok");
         assert_eq!(payload.downcast_ref::<u32>(), Some(&41));
+    }
+
+    /// The fail-safe arm of the `(poisoned, poison)` table: a set flag with
+    /// no payload behind it is unreachable by the publish ordering, but a
+    /// silent return there would assemble a frame missing the poisoned
+    /// job's bytes as Ok — the corruption 08df499c fixed. The breach must
+    /// fail fast instead. State built by hand, like the test above.
+    #[test]
+    fn surface_poison_without_payload_panics() {
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(2));
+        core.shared.poisoned.store(true, Ordering::Release);
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.surface_poison();
+        }));
+        let payload = attempt.expect_err("flag-without-payload must panic, not return");
+        let msg = payload
+            .downcast_ref::<&'static str>()
+            .expect("panic payload is the invariant message");
+        assert!(
+            msg.contains("the flag must never be observed ahead of the payload"),
+            "{msg}"
+        );
     }
 
     /// The publish order behind the flag invariant: after
