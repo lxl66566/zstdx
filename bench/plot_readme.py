@@ -47,18 +47,32 @@ ENCODE = {
     },
 }
 
-# Decode ST bulk speedup (zstd MiB/s ÷ zstdx MiB/s) per corpus cell.
+# Decode speedup over libzstd per corpus cell: (label, bulk, streaming, mt).
+# Both sides single-threaded; streaming = 64 KiB read loop. The two mt rows
+# are our MT decode (16 workers) vs libzstd's ST streaming reference (it has
+# no MT decode); they have no streaming cell of their own.
 DECODE = [
-    ("json", [("zst1", 1.36), ("zst3", 1.26), ("zst9", 1.40), ("zst19", 1.68)]),
-    ("text", [("zst1", 2.64), ("zst3", 3.48), ("zst9", 3.68), ("zst19", 3.72)]),
-    ("skewed", [("zst1", 1.50), ("zst3", 1.17), ("zst9", 0.98), ("zst19", 1.48)]),
-    ("random", [("zst3", 3.80)]),
-    ("zeros", [("zst3", 4.73)]),
-    ("dll100", [("zst1", 1.12), ("zst3", 1.12), ("zst9", 1.22), ("zst19", 1.17)]),
+    ("json zst1", 1.36, 0.79, False),
+    ("json zst3", 1.26, 0.73, False),
+    ("json zst9", 1.40, 0.77, False),
+    ("json zst19", 1.68, 0.84, False),
+    ("text zst1", 2.64, 0.82, False),
+    ("text zst3", 3.48, 0.94, False),
+    ("text zst9", 3.68, 0.96, False),
+    ("text zst19", 3.72, 0.95, False),
+    ("skewed zst1", 1.50, 0.91, False),
+    ("skewed zst3", 1.17, 0.82, False),
+    ("skewed zst9", 0.98, 0.76, False),
+    ("skewed zst19", 1.48, 0.90, False),
+    ("random zst3", 3.80, 1.25, False),
+    ("zeros zst3", 4.73, 1.00, False),
+    ("dll100 zst1", 1.12, 0.77, False),
+    ("dll100 zst3", 1.12, 0.73, False),
+    ("dll100 zst9", 1.22, 0.74, False),
+    ("dll100 zst19", 1.17, 0.74, False),
+    ("json zst3 · 16 threads", 1.17, None, True),
+    ("dll100 zst3 · 16 threads", 1.30, None, True),
 ]
-# MT decode (16 workers); libzstd has no MT decode — reference is its
-# single-threaded streaming decoder.
-DECODE_MT = [("json zst3 · 16 threads", 1.17), ("dll100 zst3 · 16 threads", 1.30)]
 
 
 def frontier(pts: dict[int, tuple[float, float]]) -> list[tuple[float, float]]:
@@ -116,44 +130,52 @@ def plot_encode() -> None:
         ax.set_xlabel("compression ratio (higher is denser)", fontsize=9)
     axes[0].set_ylabel("encode throughput (MiB/s, log)", fontsize=9)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside upper center", ncol=4, frameon=False, fontsize=9)
+    # title rides inside the legend block so constrained layout keeps them
+    # together (a separate suptitle collides with the outside legend row)
+    fig.legend(
+        handles, labels, loc="outside upper center", ncol=4, frameon=False,
+        fontsize=9, alignment="center", title_fontsize=11.5,
+        title="Encode: throughput vs compression ratio (single-threaded; points labelled by numeric level)",
+    )
     fig.savefig(ASSETS / "encode-pareto.svg", bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_decode() -> None:
-    rows: list[tuple[str, float, bool]] = []
-    for shape, cells in DECODE:
-        for tag, speedup in cells:
-            rows.append((f"{shape} {tag}", speedup, False))
-    for label, speedup in DECODE_MT:
-        rows.append((label, speedup, True))
-
-    fig, ax = plt.subplots(figsize=(9.0, 6.4), constrained_layout=True)
-    n = len(rows)
+    fig, (ax_b, ax_s) = plt.subplots(
+        1, 2, figsize=(11.6, 6.2), sharey=True, constrained_layout=True
+    )
+    n = len(DECODE)
     ys = list(range(n, 0, -1))
-    for (label, speedup, mt), y in zip(rows, ys):
-        color = "#93c5fd" if mt else OURS
-        ax.barh(y, speedup, height=0.62, color=color, edgecolor=OURS if mt else "none",
-                hatch="//" if mt else None, zorder=3)
-        ax.text(speedup + 0.06, y, f"{speedup:.2f}×", va="center", fontsize=8.5, color="#111827")
-        ax.text(-0.12, y, label, ha="right", va="center", fontsize=8.5,
-                color="#374151", transform=ax.get_yaxis_transform())
-    ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.1, zorder=2)
-    ax.text(1.0, n + 0.75, "libzstd parity", ha="center", fontsize=8.5, color="#6b7280")
-    ax.set_yticks([])
-    ax.set_xlim(0, 5.4)
-    ax.set_ylim(0.1, n + 1.1)
-    ax.set_xlabel("decode speedup over libzstd (×, higher is better)", fontsize=10)
-    ax.grid(axis="x", alpha=0.3, lw=0.5)
-    ax.spines[["top", "right", "left"]].set_visible(False)
-    ax.text(
-        0.0, -0.115,
-        "hatched: our multi-threaded decode (16 workers); libzstd has no MT decode, "
-        "reference = its single-threaded streaming decoder.\n"
-        "bulk single-threaded elsewhere; streaming decode is the one column where "
-        "libzstd stays ahead on compressible shapes (see docs).",
-        transform=ax.transAxes, fontsize=7.8, color="#6b7283", va="top",
+    for ax, col, xlim, title in (
+        (ax_b, 1, 5.4, "bulk (single-threaded)"),
+        (ax_s, 2, 1.5, "streaming (64 KiB reads)"),
+    ):
+        for (label, bulk, stream, mt), y in zip(DECODE, ys):
+            v = (bulk, stream)[col - 1]
+            if v is None:
+                continue
+            color = "#93c5fd" if mt else OURS
+            ax.barh(
+                y, v, height=0.62, color=color,
+                edgecolor=OURS if mt else "none", hatch="//" if mt else None, zorder=3,
+            )
+            ax.text(v + xlim * 0.012, y, f"{v:.2f}×", va="center", fontsize=8, color="#111827")
+        ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.1, zorder=2)
+        ax.set_xlim(0, xlim)
+        ax.set_ylim(0.1, n + 1.1)
+        ax.set_title(title, fontsize=10.5)
+        ax.set_xlabel("speedup over libzstd (×)", fontsize=9.5)
+        ax.grid(axis="x", alpha=0.3, lw=0.5)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+    ax_b.text(1.0, n + 0.55, "libzstd parity", ha="center", fontsize=8.5, color="#6b7280")
+    ax_b.set_yticks(ys, [r[0] for r in DECODE], fontsize=9)
+    ax_b.tick_params(axis="y", length=0)
+    fig.suptitle("Decode speedup over libzstd (higher is better)", fontsize=12)
+    fig.supxlabel(
+        "hatched bars: our multi-threaded decode — libzstd has no MT decode; "
+        "reference = its single-threaded streaming decode",
+        fontsize=8, color="#6b7283",
     )
     fig.savefig(ASSETS / "decode-speedup.svg", bbox_inches="tight")
     plt.close(fig)
