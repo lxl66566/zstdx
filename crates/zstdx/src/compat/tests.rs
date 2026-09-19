@@ -194,6 +194,38 @@ fn read_encoder_shape() {
     assert_eq!(compat::bulk::decompress(&compressed, 0).unwrap(), data);
 }
 
+/// The read encoder takes multithread like the write encoder: worker counts
+/// engage the native MT core before the first read, and the parameter is
+/// rejected once streaming started.
+#[test]
+fn stream_read_encoder_multithread() {
+    let data = payload();
+    for workers in [2u32, 4] {
+        let mut enc = compat::stream::read::Encoder::new(data.as_slice(), 3).unwrap();
+        enc.multithread(workers).unwrap();
+        let mut compressed = Vec::new();
+        enc.read_to_end(&mut compressed).unwrap();
+        // parameters fail once streaming started
+        assert!(enc.multithread(2).is_err());
+        enc.finish().unwrap();
+        assert_eq!(
+            compat::bulk::decompress(&compressed, data.len()).unwrap(),
+            data
+        );
+    }
+
+    // workers <= 1 stays single-threaded and still roundtrips
+    let mut enc = compat::stream::read::Encoder::new(data.as_slice(), 3).unwrap();
+    enc.multithread(0).unwrap();
+    let mut compressed = Vec::new();
+    enc.read_to_end(&mut compressed).unwrap();
+    enc.finish().unwrap();
+    assert_eq!(
+        compat::bulk::decompress(&compressed, data.len()).unwrap(),
+        data
+    );
+}
+
 #[test]
 fn one_liners() {
     let data = payload();

@@ -45,11 +45,24 @@ impl<R: Read> Encoder<R> {
     // options are consumed builder data; by value keeps the chaining API
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(source: R, options: EncoderOptions) -> Result<Self> {
-        Ok(Self {
-            source: Some(source),
-            core: FrameEncoderCore::new(&options)?,
-            chunk: alloc::vec![0u8; 16 * 1024],
-        })
+        Self::try_with_options(source, options).map_err(|(_, err)| err)
+    }
+
+    /// Like [`Encoder::with_options`], but hands the source back when the
+    /// options fail to materialize, so callers keep ownership of it (the
+    /// same shape as the write encoder's `try_with_options`).
+    pub(crate) fn try_with_options(
+        source: R,
+        options: EncoderOptions,
+    ) -> Result<Self, (R, crate::Error)> {
+        match FrameEncoderCore::new(&options) {
+            Ok(core) => Ok(Self {
+                source: Some(source),
+                core,
+                chunk: alloc::vec![0u8; 16 * 1024],
+            }),
+            Err(err) => Err((source, err)),
+        }
     }
 
     /// Recommended size for read buffers: one full block.

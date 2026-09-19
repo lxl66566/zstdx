@@ -82,7 +82,7 @@ impl fmt::Display for Feature {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParameterError {
-    #[error("streaming already started; set parameters before the first write")]
+    #[error("streaming already started; parameters must be set before the first read or write")]
     AlreadyStreaming,
 }
 

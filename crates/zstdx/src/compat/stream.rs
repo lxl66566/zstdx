@@ -360,17 +360,40 @@ pub mod read {
 
     /// A compression encoder exposing compressed bytes through `io::Read`,
     /// mirroring `zstd::stream::read::Encoder`.
+    ///
+    /// The native encoder materializes on the first read; parameters may be
+    /// set until then.
     pub struct Encoder<R: io::Read> {
-        inner: crate::stream::read::Encoder<R>,
+        source: Option<R>,
+        options: EncoderOptions,
+        inner: Option<crate::stream::read::Encoder<R>>,
     }
 
     impl<R: io::Read> Encoder<R> {
-        /// Creates a new encoder over the reader.
+        /// Creates a new encoder. A level of 0 or any negative/positive
+        /// value compresses with the fast strategy.
         pub fn new(source: R, level: i32) -> io::Result<Self> {
             Ok(Self {
-                inner: crate::stream::read::Encoder::new(source, map_level(level))
-                    .map_err(io::Error::from)?,
+                source: Some(source),
+                options: EncoderOptions::new(map_level(level)),
+                inner: None,
             })
+        }
+
+        /// Enables multithreaded compression: `workers > 1` engages the
+        /// native multithreaded streaming core (raw-block levels and
+        /// single-core processes fall back to the single-threaded core, as
+        /// in the native API; `workers <= 1` keeps it single-threaded).
+        /// Fails once streaming started, like the write-side parameter
+        /// setters.
+        pub fn multithread(&mut self, workers: u32) -> io::Result<()> {
+            if self.inner.is_some() {
+                return Err(io::Error::other(crate::Error::Parameter(
+                    crate::ParameterError::AlreadyStreaming,
+                )));
+            }
+            self.options.workers = workers;
+            Ok(())
         }
 
         /// Recommended size of read batches: one full block.
@@ -380,31 +403,65 @@ pub mod read {
 
         /// Acquires a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
-            self.inner.get_ref()
+            match &self.inner {
+                Some(encoder) => encoder.get_ref(),
+                None => self.source.as_ref().expect("source kept until start"),
+            }
         }
 
         /// Acquires a mutable reference to the underlying reader.
         pub fn get_mut(&mut self) -> &mut R {
-            self.inner.get_mut()
+            match &mut self.inner {
+                Some(encoder) => encoder.get_mut(),
+                None => self.source.as_mut().expect("source kept until start"),
+            }
         }
 
         /// Destructures this object into the underlying reader. Fails when a
         /// pledged content size was not met by the bytes consumed so far, or
         /// when encoded bytes are still unread (read the encoder to end of
         /// stream before finishing).
-        pub fn finish(self) -> io::Result<R> {
-            self.inner.finish().map_err(io::Error::from)
+        pub fn finish(mut self) -> io::Result<R> {
+            // A never-started encoder still owns its whole unread frame:
+            // materialize so finish reports it instead of dropping it
+            // silently.
+            self.materialize()?;
+            self.inner
+                .take()
+                .expect("inner kept until start")
+                .finish()
+                .map_err(io::Error::from)
         }
 
         /// Tries to fill `out` with encoded bytes.
         pub fn flush(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            self.inner.read(out)
+            self.materialize()?.read(out)
+        }
+
+        fn materialize(&mut self) -> io::Result<&mut crate::stream::read::Encoder<R>> {
+            if self.inner.is_none() {
+                let source = self.source.take().expect("source kept until start");
+                // On failure the source goes back before the error leaves,
+                // mirroring the read decoder's materialize.
+                let encoder = match crate::stream::read::Encoder::try_with_options(
+                    source,
+                    self.options.clone(),
+                ) {
+                    Ok(encoder) => encoder,
+                    Err((source, err)) => {
+                        self.source = Some(source);
+                        return Err(io::Error::from(err));
+                    },
+                };
+                self.inner = Some(encoder);
+            }
+            Ok(self.inner.as_mut().unwrap())
         }
     }
 
     impl<R: io::Read> io::Read for Encoder<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.inner.read(buf)
+            self.materialize()?.read(buf)
         }
     }
 
