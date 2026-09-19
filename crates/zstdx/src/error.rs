@@ -35,8 +35,11 @@ pub enum Error {
     #[error("{0}")]
     Parameter(#[from] ParameterError),
     /// The stream was pledged a content size that does not match the bytes
-    /// actually written. The frame header declares the pledge, so the frame
-    /// would be rejected by every decoder; it is not emitted.
+    /// actually written. The frame header declares the pledge, so a
+    /// completed frame would be rejected by every decoder; the encoder
+    /// refuses to emit the closing block instead (an over-run is refused
+    /// at the offending write, so earlier drained bytes may already have
+    /// left for the sink).
     #[error(
         "pledged content size {pledged} does not match the {actual} bytes written; the frame \
          would be rejected by decoders"

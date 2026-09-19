@@ -117,39 +117,76 @@ fn small_pledged_streams_roundtrip() {
     }
 }
 
-/// A stream pledged a content size it did not write fails at finish instead
-/// of emitting a frame every decoder rejects (libzstd treats the pledge as a
-/// hard contract). Both directions (over- and undershoot) on the
-/// single-threaded core and, on multi-core builds, the mt core: workers(4)
-/// keeps the output empty because neither core encodes a 20-byte tail ahead
-/// of finish.
+/// The pledged-size contract: a write pushing the fed total past the
+/// pledge fails that write itself (libzstd's srcSize_wrong at the first
+/// overrun — deterministic, before anything is staged), a stream ending
+/// exactly on the pledge finishes cleanly, and an under-run fails at
+/// finish instead of emitting a closing block over wrong content. On
+/// multi-core builds the mt core keeps the same contract.
 #[test]
-fn pledged_size_mismatch_fails_finish() {
+fn pledged_size_mismatch_fails_write_and_finish() {
     let data = vec![b'q'; 20];
     #[cfg(feature = "std")]
     let workers = [1u32, 4];
     #[cfg(not(feature = "std"))]
     let workers = [1u32];
     for w in workers {
-        for pledged in [10u64, 100] {
-            let mut sink = Vec::new();
-            let mut enc = write::Encoder::with_options(
-                &mut sink,
-                EncoderOptions::new(Level::Fastest)
-                    .workers(w)
-                    .pledged_size(Some(pledged)),
-            )
-            .unwrap();
-            enc.write_all(&data).unwrap();
-            match enc.finish() {
-                Err(crate::Error::PledgedSizeMismatch {
-                    pledged: p,
-                    actual: a,
-                }) => assert_eq!((p, a), (pledged, data.len() as u64)),
-                other => panic!("workers {w} pledge {pledged}: got {other:?}"),
-            }
-            assert!(sink.is_empty(), "no frame may be emitted");
+        // Over-run: the offending write errors, the stream stays open but
+        // unusable (a rejected retry then finish both fail).
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(w)
+                .pledged_size(Some(10)),
+        )
+        .unwrap();
+        let err = enc.write_all(&data).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(
+            msg.contains("pledged content size 10 does not match the 20 bytes written"),
+            "workers {w}: {err}"
+        );
+        match enc.finish() {
+            Err(crate::Error::PledgedSizeMismatch { pledged: 10, .. }) => {},
+            other => panic!("workers {w} finish after over-run: got {other:?}"),
         }
+        assert!(sink.is_empty(), "no frame byte may be emitted");
+
+        // Exactly-pledged: writes and finish all succeed and roundtrip.
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(w)
+                .pledged_size(Some(data.len() as u64)),
+        )
+        .unwrap();
+        enc.write_all(&data[..10]).unwrap();
+        enc.write_all(&data[10..]).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(crate::stream::decode_all(&sink[..]).unwrap(), data);
+
+        // Under-run (pledged 100, fed 20): only finish can see it; workers(4)
+        // keeps the output empty because neither core encodes a 20-byte tail
+        // ahead of finish.
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(w)
+                .pledged_size(Some(100)),
+        )
+        .unwrap();
+        enc.write_all(&data).unwrap();
+        match enc.finish() {
+            Err(crate::Error::PledgedSizeMismatch {
+                pledged: p,
+                actual: a,
+            }) => assert_eq!((p, a), (100, data.len() as u64)),
+            other => panic!("workers {w} under-run: got {other:?}"),
+        }
+        assert!(sink.is_empty(), "no frame may be emitted");
     }
 }
 
@@ -179,6 +216,34 @@ fn pledged_size_mismatch_fails_read_encoder() {
             actual: 40,
         }) => {},
         other => panic!("expected PledgedSizeMismatch, got {other:?}"),
+    }
+}
+
+/// The read-side encoder's over-run arm: a source longer than the pledge
+/// errors on the read that carried the crossing bytes (both cores), not
+/// only at the EOF finish.
+#[test]
+fn pledged_overrun_fails_read_encoder() {
+    let data = vec![b'r'; 40];
+    #[cfg(feature = "std")]
+    let workers = [1u32, 4];
+    #[cfg(not(feature = "std"))]
+    let workers = [1u32];
+    for w in workers {
+        let mut enc = read::Encoder::with_options(
+            data.as_slice(),
+            EncoderOptions::new(Level::Fastest)
+                .workers(w)
+                .pledged_size(Some(10)),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let err = crate::io::Read::read_to_end(&mut enc, &mut out).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(
+            msg.contains("pledged content size 10 does not match the 40 bytes written"),
+            "workers {w}: {err}"
+        );
     }
 }
 

@@ -98,8 +98,8 @@ impl<W: Write> Encoder<W> {
 
     /// Finish the stream without consuming the encoder; every following
     /// [`Write::write`] panics, mirroring the libzstd bindings. Fails when a
-    /// pledged content size was not met (the frame would be rejected by
-    /// decoders and is not emitted).
+    /// pledged content size was not met (the closing block is not emitted;
+    /// over-runs are already refused by [`Write::write`] itself).
     pub fn do_finish(&mut self) -> Result<()> {
         self.core.finish()?;
         self.drain()
@@ -142,7 +142,7 @@ impl<W: Write> Write for Encoder<W> {
     // another write/flush/finish) delivers exactly the encoded bytes once.
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         assert!(!self.core.is_finished(), "write after finish");
-        self.core.write(buf);
+        self.core.write(buf)?;
         self.drain()?;
         Ok(buf.len())
     }

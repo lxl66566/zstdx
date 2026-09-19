@@ -78,8 +78,10 @@ pub(crate) struct FrameEncoderCoreSt {
     /// blocks; RFC 8878 Block_Maximum_Size).
     block_size: usize,
     header: Vec<u8>,
-    /// The pledged content size, verbatim from the options: enforced against
-    /// [`FrameEncoderCoreSt::pos`] at [`FrameEncoderCoreSt::finish`].
+    /// The pledged content size, verbatim from the options: enforced
+    /// against [`FrameEncoderCoreSt::pos`] at [`FrameEncoderCoreSt::write`]
+    /// (the first overrun) and [`FrameEncoderCoreSt::finish`] (any
+    /// mismatch).
     pledged: Option<u64>,
     /// Total input bytes fed.
     pos: u64,
@@ -184,8 +186,21 @@ impl FrameEncoderCoreSt {
         }
     }
 
-    pub(crate) fn write(&mut self, data: &[u8]) {
+    /// Stage input for the frame. Fails with
+    /// [`Error::PledgedSizeMismatch`] at the first write whose bytes push
+    /// the fed total past the pledge (libzstd's srcSize_wrong at the first
+    /// overrun), before anything is staged — the error surfaces from the
+    /// offending write itself, not only at finish.
+    pub(crate) fn write(&mut self, data: &[u8]) -> Result<()> {
         debug_assert!(!self.finished);
+        if let Some(pledged) = self.pledged
+            && self.pos + data.len() as u64 > pledged
+        {
+            return Err(Error::PledgedSizeMismatch {
+                pledged,
+                actual: self.pos + data.len() as u64,
+            });
+        }
         self.pos += data.len() as u64;
         let mut data = data;
         while !data.is_empty() {
@@ -211,6 +226,7 @@ impl FrameEncoderCoreSt {
                 self.drain_full_blocks();
             }
         }
+        Ok(())
     }
 
     /// Encode every full staged block. Outside the probe's staging window
@@ -224,9 +240,12 @@ impl FrameEncoderCoreSt {
 
     /// Close the frame: the staged bytes (or an empty block) become the last
     /// block and the checksum, if enabled, is appended. A stream pledged a
-    /// content size it did not meet fails here, before any frame byte is
-    /// produced: the header declares the pledge and decoders reject a frame
-    /// whose content disagrees with it.
+    /// content size it did not meet fails here, before the closing block is
+    /// emitted — the frame is never completed over wrong content. Earlier
+    /// frame bytes may already sit in the enclosing writer: writes drain
+    /// eagerly, so the mismatch surfaces as a truncated, unclosed frame
+    /// there (the over-run direction is caught earlier, at the offending
+    /// [`FrameEncoderCoreSt::write`]).
     pub(crate) fn finish(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
@@ -414,7 +433,10 @@ impl FrameEncoderCore {
         )))
     }
 
-    pub(crate) fn write(&mut self, data: &[u8]) {
+    /// Stage input for the frame. Fails with
+    /// [`Error::PledgedSizeMismatch`] at the first write that pushes the
+    /// fed total past a pledged content size, before anything is staged.
+    pub(crate) fn write(&mut self, data: &[u8]) -> Result<()> {
         match self {
             Self::Single(core) => core.write(data),
             #[cfg(feature = "std")]
@@ -424,7 +446,8 @@ impl FrameEncoderCore {
 
     /// Close the frame: the staged bytes (or an empty block) become the last
     /// block and the checksum, if enabled, is appended. Fails when a pledged
-    /// content size was not met; no frame is produced then.
+    /// content size was not met; the closing block is not emitted then
+    /// (earlier drained bytes may already have left for the sink).
     pub(crate) fn finish(&mut self) -> Result<()> {
         match self {
             Self::Single(core) => core.finish(),
@@ -499,7 +522,9 @@ impl FrameEncoderCore {
         }
         match source.read(chunk).map_err(Error::from) {
             Ok(0) => return self.finish(),
-            Ok(n) => self.write(&chunk[..n]),
+            Ok(n) => {
+                self.write(&chunk[..n])?;
+            },
             Err(e) => return Err(e),
         }
         Ok(())

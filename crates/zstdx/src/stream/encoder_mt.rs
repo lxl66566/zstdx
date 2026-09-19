@@ -813,8 +813,21 @@ impl MtEncoderCore {
         }
     }
 
-    pub(crate) fn write(&mut self, data: &[u8]) {
+    /// Stage input for the frame. Fails with
+    /// [`crate::Error::PledgedSizeMismatch`] at the first write whose bytes
+    /// push the fed total past the pledge (libzstd's srcSize_wrong at the
+    /// first overrun), before anything is buffered or any job posted — the
+    /// error surfaces from the offending write itself, not only at finish.
+    pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
+        if let Some(pledged) = self.shape.len
+            && self.pos + data.len() as u64 > pledged
+        {
+            return Err(crate::Error::PledgedSizeMismatch {
+                pledged,
+                actual: self.pos + data.len() as u64,
+            });
+        }
         let mut data = data;
         while !data.is_empty() {
             let space = self.buf.capacity() - self.buf.len();
@@ -834,6 +847,7 @@ impl MtEncoderCore {
             self.pos += n as u64;
             self.post_ready();
         }
+        Ok(())
     }
 
     /// Pull once from `source` straight into the buffer's spare capacity:
@@ -884,6 +898,16 @@ impl MtEncoderCore {
                 // SAFETY: `read` wrote n initialized bytes into spare[..n].
                 unsafe { self.buf.set_len(len + n) };
                 self.pos += n as u64;
+                // Same contract as write: a fed total past the pledge fails
+                // the read that carried it, not only the EOF finish.
+                if let Some(pledged) = self.shape.len
+                    && self.pos > pledged
+                {
+                    return Err(crate::Error::PledgedSizeMismatch {
+                        pledged,
+                        actual: self.pos,
+                    });
+                }
                 self.post_ready();
             },
             Err(e) => return Err(e),
@@ -893,9 +917,12 @@ impl MtEncoderCore {
 
     /// Close the frame: the pending jobs (or an empty block) become the last
     /// block and the checksum, if enabled, is appended. A stream pledged a
-    /// content size it did not meet fails here, before any job is posted or
-    /// frame byte produced: the header declares the pledge and decoders
-    /// reject a frame whose content disagrees with it.
+    /// content size it did not meet fails here, before the closing block is
+    /// emitted — the frame is never completed over wrong content. Earlier
+    /// frame bytes (and jobs) may already have left for the sink: writes
+    /// post and drain eagerly, so the mismatch surfaces as a truncated,
+    /// unclosed frame there (the over-run direction is caught earlier, at
+    /// the offending write or read).
     pub(crate) fn finish(&mut self) -> crate::Result<()> {
         if self.finished {
             return Ok(());
@@ -2116,28 +2143,47 @@ mod tests {
         );
     }
 
-    /// The pledged-size contract on the mt core itself: over- and
-    /// undershooting the pledge fails finish before anything is posted,
-    /// assembled or emitted.
+    /// The pledged-size contract on the mt core itself: a write pushing the
+    /// fed total past the pledge fails that write itself (libzstd's
+    /// srcSize_wrong at the first overrun); an under-run still slips past
+    /// every write and fails finish before anything is assembled or closed.
     #[test]
-    fn pledged_mismatch_fails_finish() {
-        for (pledged, fed) in [(10u64, 20usize), (100, 20)] {
-            let mut core = MtEncoderCore::new(
-                &EncoderOptions::new(Level::Fastest)
-                    .workers(4)
-                    .pledged_size(Some(pledged)),
-            );
-            core.write(&vec![b'x'; fed]);
-            match core.finish() {
-                Err(crate::Error::PledgedSizeMismatch {
-                    pledged: p,
-                    actual: a,
-                }) => assert_eq!((p, a), (pledged, fed as u64)),
-                other => panic!("pledge {pledged}: got {other:?}"),
-            }
-            assert!(!core.is_finished());
-            assert_eq!(core.pending_output(), 0);
+    fn pledged_mismatch_fails_write_and_finish() {
+        // Over-run: the offending write refuses, nothing staged.
+        let mut core = MtEncoderCore::new(
+            &EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .pledged_size(Some(10)),
+        );
+        match core.write(&vec![b'x'; 20]) {
+            Err(crate::Error::PledgedSizeMismatch {
+                pledged: 10,
+                actual: 20,
+            }) => {},
+            other => panic!("over-run: got {other:?}"),
         }
+        assert!(!core.is_finished());
+        assert_eq!(core.pending_output(), 0);
+        // Exactly-pledged input must still succeed through finish.
+        core.write(&vec![b'x'; 10]).unwrap();
+        core.finish().unwrap();
+
+        // Under-run: detected at finish.
+        let mut core = MtEncoderCore::new(
+            &EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .pledged_size(Some(100)),
+        );
+        core.write(&vec![b'x'; 20]).unwrap();
+        match core.finish() {
+            Err(crate::Error::PledgedSizeMismatch {
+                pledged: 100,
+                actual: 20,
+            }) => {},
+            other => panic!("under-run: got {other:?}"),
+        }
+        assert!(!core.is_finished());
+        assert_eq!(core.pending_output(), 0);
     }
 
     /// A stream ending exactly on an epoch boundary has its last jobs
