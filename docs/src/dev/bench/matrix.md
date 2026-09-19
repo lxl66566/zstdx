@@ -45,7 +45,7 @@
 | dll100.zst9 | 1527 | 1247 | 0.82 | 1539 | 2084 | 1.35 |
 | dll100.zst19 | 1322 | 1134 | 0.86 | 1343 | 1803 | 1.34 |
 
-Corpus cells reproduce the 09-18/09-19 tables within noise except where the two decoder-stream staging commits land: **text stream narrowed to x1.04-1.07** (was 1.09-1.10 on zst3/9/19) and json.zst19 stream 1.20→1.19; json zst9/zst19 bulk also ticked up (0.73→0.71, 0.62→0.60). dll rows: bulk wins every level (x0.82-0.89, 1144-1527 MiB/s ours); stream x1.30-1.37 like every compressible shape.
+Corpus cells reproduce the 09-18/09-19 tables within noise except where the two decoder-stream staging commits land: **text stream narrowed to x1.04-1.07** (was 1.09-1.10 on zst3/9/19) and json.zst19 stream 1.20→1.19; json zst9/zst19 bulk also ticked up (0.73→0.71, 0.62→0.60). Conclusions: [snapshot.md](snapshot.md).
 
 ## T2 decode MT scaling (solo; libzstd has no MT decode; MiB/s)
 
@@ -59,7 +59,7 @@ The dll row comes from `files --threads` (solo tool, same budget); its zstd-ref 
 | random.zst3 | 9749 | 8977 | 9532 | 9561 | 9567 | 9560 |
 | dll100.zst3 | 1220 | 1708 | 1774 | 2004 | 2192 | 2217 |
 
-**dll100.zst3 is the strongest scaling row: mt16 = 1.82× our ST = 1.30× the zstd stream reference** — the restart-point parallel decode pays off best on the large real-binary payload. json.zst3 mt16 = 1.57× ST = 1.17× ref (09-18: 1.60×/1.21×, inside the noise band). skewed.zst9 1.09-1.21× ST / 0.84-0.93× ref; text flat 0.97-0.98× on both; random 0.98× ST = 1.06-1.07× ref.
+json.zst3 mt16 = 1.57× ST = 1.17× ref (09-18: 1.60×/1.21×, inside the noise band). Scaling verdicts: [snapshot.md](snapshot.md).
 
 ## T3 encode ST bulk (checksums off both sides; MiB/s of raw; pairs 1/3/9/13/17/19)
 
@@ -104,7 +104,7 @@ dll = `bench/big/dll100.raw` (100 MB, `bench/gen_big.sh`); its ratios are payloa
 | ultra | zeros | 39985 | 32483 | 675 | 32202 | 0.017 |
 | ultra | dll | 8 | 5.89 | 9 | 5.28 | 1.19 |
 
-Corpus cells sit within ±0.03 of the 09-18 table (text.balanced 1.51→1.47 the largest move, still +1.65% denser than zstd-9). dll: fastest x1.36 gives up 1.8% size; from fast up every tier is denser — fast −2.2%, balanced −8.4%, best −12.8%, opt −10.3%, ultra −10.5% — while balanced stays the open speed cell (x1.49); best/opt/ultra (x1.39/1.10/1.19) are first measured this pass.
+Corpus cells sit within ±0.03 of the 09-18 table (text.balanced 1.51→1.47 the largest move). dll best/opt/ultra are first measured this pass; conclusions in [snapshot.md](snapshot.md).
 
 Checksum overhead (ours, on/off time ratio): json.fast 1.03, text.fast 0.84.
 
@@ -122,7 +122,7 @@ Checksum overhead (ours, on/off time ratio): json.fast 1.03, text.fast 0.84.
 | skewed.fast | 1302 | 645 | 0.50 | 1664 | 647 | 0.39 | 1.92 | 1.92 |
 | skewed.balanced | 699 | 122 | 0.18 | 697 | 122 | 0.17 | 2.00 | 1.84 |
 
-json.fastest.mt8 stays the one mt cell zstd wins, x1.18 (spread 0.92-1.57, still the noisiest cell); mt16 is ours x0.34. text.balanced improved to x1.48 both widths (was 1.51-1.54). Our cold-pool mt16 json.fast (3402) still beats zstd's warm-pool reference (1636/1652 across the two runs). MT ratio preservation vs own ST holds within ±0.5%.
+text.balanced improved to x1.48 both widths (was 1.51-1.54). MT ratio preservation vs own ST holds within ±0.5%. Conclusions: [snapshot.md](snapshot.md).
 
 ## T5 encode streaming (64KiB pulls; interleaved medians)
 
@@ -141,7 +141,7 @@ json.fastest.mt8 stays the one mt cell zstd wins, x1.18 (spread 0.92-1.57, still
 | text.opt | — | — | — | 647 | 378 | 0.59 |
 | text.ultra | — | — | — | 353 | 239 | 0.68 |
 
-text.balanced stream-mt8 x1.52 remains the last behind cell; text.opt/ultra (0.59/0.68) still beat their printed bulk-mt8 ceilings (the shared finish-tail fill is streaming-only; ceiling refs are stale by design). Stream-mt8 vs own ceilings: json 84/82/99/102/123/120%, text 33/38/78/110/153/147%. Ceilings (solo refs, this run): json 3796/2671/337/70/13/5, text 23820/16083/853/477/422/241.
+Stream-mt8 vs own ceilings: json 84/82/99/102/123/120%, text 33/38/78/110/153/147%. Ceilings (solo refs, this run): json 3796/2671/337/70/13/5, text 23820/16083/853/477/422/241. The ceiling refs are stale by design — text.opt/ultra stream-mt8 still beat their printed bulk-mt8 ceilings (the shared finish-tail fill is streaming-only).
 
 ## T6 compression-ratio sweep (`zstdx-bench ratio`)
 

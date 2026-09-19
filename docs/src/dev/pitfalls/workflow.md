@@ -6,7 +6,7 @@
 - **Analysis pieces must be cut at the ENCODER's real job boundaries** (`mt_job_size_for`, printed by `emitframe`): a uniform guess drifts whenever the input is not divisible by 2×workers (32 MiB json: jobs 4,194,316 B vs a 4 MiB guess), and every misaligned cut manufactures depth-guarantee "violations" from legal mid-job shallow reads — including an entire phantom tail piece when the last job is short. Streaming's unpledged growing grid (epoch-doubling, finish-time tail split by worker count) is not recoverable from the frame at all.
 - This machine (Zen4 32C) has ±10% noise with a **slow-drift phase**: mornings stable at ±1%; in the afternoon the same binary can be 25-50% slower. Cross-time-of-day conclusions count only as git-stash back-to-back same-machine A/B; every single bench must be re-run a second time.
 - random's bimodality (1388↔2027 MiB/s) is frequency drift (lscpu scaling 73%) + SMT sibling scheduling; skewed.Fastest readings are heavily affected by the sibling core and settle back after one re-run round.
-- **Deterministic output sizes are the only free, trustworthy A/B signal** (for changes that should not alter output); speed conclusions need multi-round medians or in-process toggles; "gains" within ±10% in a single round are untrustworthy. bench_matrix's x factor drifts ±10% across runs (even unchanged cells drift).
+- bench_matrix's x factor drifts ±10% across runs (even unchanged cells drift); the canonical criteria list is [methodology](../bench/methodology.md).
 - Bench position bias: within one test, the binary that runs later consistently gets a 4-5% advantage (cache/frequency phase) — A/B must be position-aligned (alternate first/second, compare by position).
 - **Allocator cross-contamination**: when serially running multiple impls/sizes in one process, zstd-side CCtx allocation churn shreds the malloc arena → subsequent timed segments distorted 3× (random-64K serial ~3000 vs 9200 in a single-shape process). Small-load criteria must pin IMPL+SIZE to a single-shape, single-size process.
 - glibc's dynamic mmap/trim thresholds drift with the allocation sequence: pinning `MALLOC_TRIM_THRESHOLD_` actually disables zstd's adaptivity (its random-64K collapses 3×); for small corpora, either pin it or run isolated.
@@ -45,8 +45,9 @@
 
 ## Corpus and reproducibility
 
-- **The corpus is not comparable**: gen_corpus.sh's text.raw flattens the src tree — any src change changes the corpus; historically text's two shape phase transitions (the cross-tile match unlocks at ratios 299.6 / 239) both depended on the repeat period landing inside the window range; once src bloats past 768K the shape will collapse again. **Consider pinning a tar snapshot.**
-- Cross-session absolute-value drift: l6 json read 171-179 this session vs 177 recorded last round — rolling match_generator back to the previous version gave the same readings, confirming no regression. **For cross-comparisons trust only same-session A/B.**
+Corpus-comparability and cross-session-drift pitfalls (the text.raw shape transitions, same-session A/B rule) live in [benchmark methodology](../bench/methodology.md).
+
+- **Published-crate test portability: all fixture access goes through `fixture_entries`/`fixture_bytes`** (corpus/dict dirs, single corpus files, fuzz artifacts in `tests/`): they skip with a note on `NotFound` but still panic on real IO errors, so the standalone `.crate` `cargo test` (no untracked corpus present) passes while genuine breakage still fails. Bypassing them with a direct `Path` read reintroduces the corpus-not-in-git dependency at publish time.
 
 ## Editing tools
 

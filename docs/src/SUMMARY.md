@@ -31,10 +31,6 @@
 - [Matchers and Compression Levels](dev/perf/matchers.md)
 - [Multithreading and Streaming](dev/perf/mt-stream.md)
 
-## Completed
-
-- [Features and Infrastructure Record](dev/completed.md)
-
 ## Remaining Improvements
 
 - [Todo List](dev/todo.md)

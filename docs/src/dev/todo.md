@@ -1,6 +1,6 @@
 # Todo list
 
-> Only remaining workable items. Landed work lives in [perf/](perf/) and [completed](completed.md); falsified directions are in [negative.md](negative.md) — do not resurrect the falsified *mechanism*; changing its premise (algorithm class, window regime, corpus shape) reopens the goal.
+> Only remaining workable items. Landed work lives in [perf/](perf/) and git history; falsified directions in [negative.md](negative.md) — do not resurrect the falsified *mechanism*; changing its premise (algorithm class, window regime, corpus shape) reopens the goal.
 >
 > Item numbers are stable labels: deleted numbers (5, 9-13) were landed or folded. Older pages citing "todo 9-13" refer to the archived list (see this file's git history).
 >

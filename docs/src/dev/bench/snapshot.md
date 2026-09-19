@@ -1,6 +1,6 @@
 # Perf vs zstd crate · current snapshot (2026-09-19)
 
-> Release pass at `e0b6078b` (zstdx / zstdx-cli 0.1.0), one machine, one corpus, same flags. The 67 commits since the 09-18/09-19 passes were correctness/review fixes plus two decoder-stream staging commits (`read_to_end` probe growth, `write::Decoder` bounded cursor) — corpus encoder outputs are byte-identical (the ratio sweep reproduces +8.67% exactly), so speed moved only where those commits touch and the dll rows are new. **dll100 (100 MB of real system ELF binaries, `bench/gen_big.sh`) is promoted to a formal shape**: full six-tier encode, four-level decode and an MT-decode scaling row now sit in the shape axes. Raw tables + per-chunk commands: [matrix.md](matrix.md), including the full 1-22 numeric ladder (T7) and the small-payload table (T8). Comparison target: zstd crate / libzstd 1.5.7 (zstdmt), rustc 1.100.0-nightly, AMD Zen4-class 32C (Eng Sample 100-000000870-32_Y). Ladder pairs numeric levels (fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19). Caveats: ±10% noise between runs; per-side budget 1s (500 ms on the full ladder and small); interleaved medians, spreads in the raw tables.
+> Release pass at `e0b6078b`, 2026-09-19, one machine, one corpus, same flags. Provenance, raw tables and per-chunk commands: [matrix.md](matrix.md), including the full 1-22 numeric ladder (T7) and the small-payload table (T8). The 67 commits since the 09-18/09-19 passes were correctness/review fixes plus two decoder-stream staging commits (`read_to_end` probe growth, `write::Decoder` bounded cursor) — corpus encoder outputs are byte-identical (the ratio sweep reproduces +8.67% exactly), so speed moved only where those commits touch and the dll rows are new. **dll100 (100 MB of real system ELF binaries, `bench/gen_big.sh`) is promoted to a formal shape**: full six-tier encode, four-level decode and an MT-decode scaling row now sit in the shape axes. Comparison target: zstd crate / libzstd 1.5.7 (zstdmt); the ladder pairs fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19. Caveats: ±10% noise between runs; per-side budget 1s (500 ms on the full ladder and small); interleaved medians, spreads in the raw tables.
 
 ## Headline
 
@@ -111,7 +111,7 @@ Ratio verdict: denser or at parity on json and text at every level (json.opt 9 B
 | text.opt | — | — | — | 647 | 378 | 0.59 |
 | text.ultra | — | — | — | 353 | 239 | 0.68 |
 
-Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). Stream/ceiling ratios in [matrix.md](matrix.md) T5 — text.opt/ultra stream-mt8 still beat the bulk-mt8 ceiling refs (the shared finish-tail fill is streaming-only).
+Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). Stream/ceiling ratios in [matrix.md](matrix.md) T5.
 
 ## Decode MT scaling (1 pass; our solo dimension; MiB/s)
 
@@ -123,7 +123,7 @@ Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB
 | random.zst3 | 9749 | 9532 | 9561 | 9567 | 9560 | 8977 |
 | dll100.zst3 | 1220 | 1774 | 2004 | 2192 | 2217 | 1708 |
 
-dll100 measured via `files --threads` (see [matrix.md](matrix.md) T2); json mt16 = 1.57× ST = 1.17× ref, dll mt16 = 1.82× ST = 1.30× ref — the restart-point decode scales best on the large real-binary payload.
+dll100 measured via `files --threads` (see [matrix.md](matrix.md) T2) — the restart-point decode scales best on the large real-binary payload.
 
 ## Compression-ratio sweep (`zstdx-bench ratio`, 2026-09-19)
 
@@ -131,13 +131,13 @@ Geo-mean Δ over 120 cells **+8.67%**; per mode bulk-st +1.42% / bulk-mt +11.08%
 
 ## Top open deficits (from this run, x = ours/zstd wall time)
 
-1. **text.balanced speed x1.47 ST / x1.48 mt / x1.52 stream-mt8** — the residual cold-start DUBT head per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](todo.md)).
+1. **text.balanced speed x1.47 ST / x1.48 mt / x1.52 stream-mt8** — the residual cold-start DUBT head per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](../todo.md)).
 2. **Streaming decode on compressible shapes**: json x1.19-1.37, skewed x1.10-1.32, text x1.04-1.22 — narrowed by the staging commits; the fused-loop serial chain remains (todo 2).
 3. **json.fastest x1.43 ST / x1.18 mt8** — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.04 is near closed.
-4. **Best-tier core**: json x1.40, skewed x2.12 (memory-latency tree walk; floor in [todo](todo.md)). Caps the two stream ST cells (json/text.best x1.46/1.40).
-5. **json opt/ultra x1.10-1.11, skewed.ultra x1.09** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](todo.md)).
+4. **Best-tier core**: json x1.40, skewed x2.12 (memory-latency tree walk; floor in [todo](../todo.md)). Caps the two stream ST cells (json/text.best x1.46/1.40).
+5. **json opt/ultra x1.10-1.11, skewed.ultra x1.09** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](../todo.md)).
 6. **json chain rows 5-8 and 10-12** (full-ladder T7): x1.19-1.62 and x1.82-2.87, the weakest speed band — the deep-chain rows lose to libzstd's chain on both axes while our own level-9 row beats them; a ladder-tuning question, not a matcher-core one.
 7. **MT decode**: text flat ~0.98×, skewed below the zstd stream ref — decoder-side piece-parallel stage B to spend the ramp guarantee (todo 1's open half). json (1.17× ref) and dll (1.30× ref) scale well.
-8. **dll100 low-tier encode** (full tier rows now in the tables above; floor in [todo](todo.md)): fastest x1.36, fast x1.06, balanced x1.49 at −8.4% size — matcher-side instruction counts; emit live-set shrink the one untried lever. High tiers x1.10-1.39 at −10..−13% size.
+8. **dll100 low-tier encode** (full tier rows now in the tables above; floor in [todo](../todo.md)): fastest x1.36, fast x1.06, balanced x1.49 at −8.4% size — matcher-side instruction counts; emit live-set shrink the one untried lever. High tiers x1.10-1.39 at −10..−13% size.
 9. **Small band 64K-1M** fastest x~1.36-1.48 (this run: json-64K/1M x1.41/1.36, text x1.41/1.48; level 3 near parity 0.96-1.31; level 9 ahead 0.54-0.90 except the 1M cells x1.04-1.06) (todo 4).
 10. **Ratio residues**: json.fast mt −0.12..−0.14%, skewed.opt −0.07% (near-tie), dictionary small-payload +3% parse-side (todo 6).
