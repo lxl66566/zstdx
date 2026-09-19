@@ -184,6 +184,26 @@ fn rm_removes_input() {
     assert!(scratch.path("data.bin.zst").exists());
 }
 
+/// A failure after the output file was created must not leave the partial
+/// output on disk.
+#[test]
+fn failed_decompress_removes_partial_output() {
+    let scratch = Scratch::new("partial");
+    let input = scratch.path("data.bin");
+    fs::write(&input, payload()).unwrap();
+    run(&[input.to_str().unwrap()]);
+    let mut compressed = fs::read(scratch.path("data.bin.zst")).unwrap();
+    // cut the frame tail: the header still parses, decoding fails mid-frame
+    compressed.truncate(compressed.len() - 8);
+    let corrupt = scratch.path("corrupt.zst");
+    fs::write(&corrupt, &compressed).unwrap();
+
+    let out = scratch.path("restored.bin");
+    let output = run(&["-d", corrupt.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(!out.exists(), "partial output must be removed");
+}
+
 #[test]
 fn test_mode() {
     let scratch = Scratch::new("test");

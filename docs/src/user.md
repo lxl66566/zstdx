@@ -189,6 +189,7 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 - Levels: `-1`..`-19` (default 3), `--fast[=N]` for negative levels, `--ultra` unlocks 20–22.
 - `-T N` sets worker threads (`-T0` = all cores); `-D DICT` (de)compresses against a dictionary.
 - `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity.
+- A failed (de)compression to a file removes the partial output it created, mirroring zstd.
 - A progress bar shows only on an interactive stderr; it never pollutes pipes.
 
 ```sh

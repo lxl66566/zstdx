@@ -424,13 +424,21 @@ fn compress(
     }
 
     let (writer, out_file) = open_output(output)?;
-    let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
-    io::copy(&mut reader, &mut encoder)?;
-    encoder.finish()?;
-    match out_file {
-        Some(file) => Ok(file.metadata()?.len()),
-        None => Ok(0),
+    // The whole write phase runs in a closure so the output handles are
+    // dropped before the partial output is removed on failure.
+    let written: AnyResult<u64> = (|| {
+        let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
+        io::copy(&mut reader, &mut encoder)?;
+        encoder.finish()?;
+        match out_file {
+            Some(file) => Ok(file.metadata()?.len()),
+            None => Ok(0),
+        }
+    })();
+    if written.is_err() {
+        remove_partial_output(output);
     }
+    written
 }
 
 /// Returns the number of bytes written.
@@ -448,14 +456,24 @@ fn decompress(
         options = options.dictionary(dict);
     }
 
+    // Decoder construction precedes output creation: a failure here must
+    // not touch the output path at all.
     let mut decoder = zstdx::stream::read::Decoder::with_options(reader, options)?;
     let (mut writer, out_file) = open_output(output)?;
-    io::copy(&mut decoder, &mut writer)?;
-    writer.flush()?;
-    match out_file {
-        Some(file) => Ok(file.metadata()?.len()),
-        None => Ok(0),
+    // The whole write phase runs in a closure so the output handles are
+    // dropped before the partial output is removed on failure.
+    let written: AnyResult<u64> = (|| {
+        io::copy(&mut decoder, &mut writer)?;
+        writer.flush()?;
+        match out_file {
+            Some(file) => Ok(file.metadata()?.len()),
+            None => Ok(0),
+        }
+    })();
+    if written.is_err() {
+        remove_partial_output(output);
     }
+    written
 }
 
 /// Open the output writer; the `File` is kept alongside so its final size can
@@ -468,6 +486,15 @@ fn open_output(output: &Output) -> AnyResult<(Box<dyn Write>, Option<File>)> {
             let file = File::create(path)?;
             Ok((Box::new(file.try_clone()?), Some(file)))
         },
+    }
+}
+
+/// Remove the output file a failed operation created, so no corrupt partial
+/// output is left behind (mirrors zstd). Only `Output::File` names a file we
+/// created; removal errors must not mask the original failure.
+fn remove_partial_output(output: &Output) {
+    if let Output::File(path) = output {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -540,9 +567,67 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        io::{Cursor, Write as _},
+        path::PathBuf,
+    };
 
-    use crate::{Mode, add_extension, default_output_name, normalize_args};
+    use zstdx::Level;
+
+    use crate::{
+        Mode, Output, add_extension, compress, decompress, default_output_name, normalize_args,
+    };
+
+    /// A per-test temp path, pre-cleaned so reruns start from nothing.
+    fn temp_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("zstdx-cli-{}-{tag}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// A valid multi-block frame.
+    fn compressed_payload() -> Vec<u8> {
+        let payload = vec![7u8; 300 * 1024];
+        let mut encoder =
+            zstdx::stream::write::Encoder::new(Vec::new(), Level::from_zstd(3)).unwrap();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A decompress failure after the output file was created must not leave
+    /// the partial output on disk.
+    #[test]
+    fn failed_decompress_removes_partial_output() {
+        let mut compressed = compressed_payload();
+        compressed.truncate(compressed.len() - 8);
+        let out = temp_path("decompress-partial");
+        let result = decompress(
+            Box::new(Cursor::new(compressed)),
+            &Output::File(out.clone()),
+            1,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!out.exists(), "partial output must be removed");
+    }
+
+    /// A compress failure (the dictionary magic alone does not parse) after
+    /// the output file was created must not leave the output on disk.
+    #[test]
+    fn failed_compress_removes_partial_output() {
+        let out = temp_path("compress-partial");
+        let result = compress(
+            Box::new(&b"payload"[..]),
+            &Output::File(out.clone()),
+            3,
+            1,
+            0,
+            Some(&[0x37, 0xa4, 0x30, 0xec]),
+        );
+        assert!(result.is_err());
+        assert!(!out.exists(), "empty output must be removed");
+    }
 
     #[test]
     fn extension_added() {
