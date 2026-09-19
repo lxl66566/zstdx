@@ -53,25 +53,29 @@ Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming and the lo
 
 ## Performance
 
-Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes, x = zstdx time / zstd time (<1 = zstdx is faster):
+Measured against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MB real-binary payload (dll, concatenated system ELF files via [gen_big.sh](bench/gen_big.sh)); x = zstdx time / zstd time (<1 = zstdx is faster):
 
 <!-- prettier-ignore -->
 | level | shape | enc ST x | enc MT8 (bulk) x | dec ST bulk x |
 |---|---|---:|---:|---:|
-| 1 | json | 1.43 | 1.16 | 0.74 |
-| 1 | text | 0.74 | 0.50 | 0.41 |
-| 1 | skewed | 0.43 | 0.78 | 0.67 |
-| 3 | json | 1.03 | 0.41 | 0.82 |
-| 3 | text | 0.52 | 0.19 | 0.30 |
-| 3 | skewed | 1.07 | 0.50 | 0.85 |
-| 9 | json | 0.85 | 0.64 | 0.73 |
-| 9 | text | 1.51 | 1.54 | 0.28 |
-| 9 | skewed | 0.04 | 0.17 | 1.02 |
-| 19 | json | 1.10 | — | 0.62 |
+| 1 | json | 1.43 | 1.18 | 0.74 |
+| 1 | text | 0.74 | 0.52 | 0.38 |
+| 1 | skewed | 0.43 | 0.77 | 0.67 |
+| 1 | dll | 1.36 | — | 0.89 |
+| 3 | json | 1.04 | 0.41 | 0.80 |
+| 3 | text | 0.52 | 0.18 | 0.29 |
+| 3 | skewed | 1.05 | 0.50 | 0.85 |
+| 3 | dll | 1.06 | — | 0.89 |
+| 9 | json | 0.86 | 0.61 | 0.71 |
+| 9 | text | 1.47 | 1.48 | 0.27 |
+| 9 | skewed | 0.04 | 0.18 | 1.01 |
+| 9 | dll | 1.49 | — | 0.82 |
+| 19 | json | 1.11 | — | 0.60 |
 | 19 | text | 0.69 | — | 0.27 |
-| 19 | skewed | 1.07 | — | 0.67 |
+| 19 | skewed | 1.09 | — | 0.68 |
+| 19 | dll | 1.19 | — | 0.86 |
 
-Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels. MT decode (no libzstd counterpart) reaches 1.21× zstd's streaming decode on json at 16 workers. On a 100 MB real-binary payload (concatenated system ELF files, [gen_big.sh](bench/gen_big.sh)): decode bulk x 0.81–0.89 across levels 1–19, encode x 1.37/1.04/1.53 at levels 1/3/9.
+Compression ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels; on the dll payload the encoder is 8–13% denser from level 9 up (level 9: x 1.49 at −8.4% size). MT decode (no libzstd counterpart) reaches 1.17× zstd's streaming decode on json at 16 workers and 1.30× on the 100 MB dll payload.
 
 Full per-level tables (1-22), methodology and noise caveats: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/matrix.md).
 

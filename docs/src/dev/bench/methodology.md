@@ -4,7 +4,7 @@
 
 ## Corpus
 
-`bench/corpus`, 32MiB × 5 shapes: json (semi-structured records) / text (flattened source tree) / skewed (16-letter alphabet) / random (incompressible) / zeros. Decoding uses zst1/3/9 pre-compressed by the zstd CLI, plus zst19 for json/text/skewed. Payloads beyond the corpus are passed via `matrix --file` (a `.zst*` path → dec-st cells, a raw path → enc-st cells); `bench/gen_big.sh` builds the standard 100 MB system-ELF payload `bench/big/dll100.raw` (+ `.zst1/3/9/19`).
+`bench/corpus`, 32MiB × 5 shapes: json (semi-structured records) / text (flattened source tree) / skewed (16-letter alphabet) / random (incompressible) / zeros. Decoding uses zst1/3/9 pre-compressed by the zstd CLI, plus zst19 for json/text/skewed. `bench/gen_big.sh` builds the 100 MB system-ELF payload `bench/big/dll100.raw` (+ `.zst1/3/9/19`) — since the 2026-09-19 release pass it is a **formal bench shape** (dll): six-tier encode rows and four decode levels ride in the dec-st/enc-st tables via `matrix --file`, the MT-decode scaling row via `files --threads`. Any further ad-hoc payload also goes through `--file` (a `.zst*` path → dec-st cells, a raw path → enc-st cells).
 
 Pitfalls:
 
