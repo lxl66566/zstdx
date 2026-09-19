@@ -20,6 +20,7 @@
 - [Wide Matrix Data](dev/bench/matrix.md)
 - [Benchmark Methodology](dev/bench/methodology.md)
 - [Decode Gap vs libzstd — Differential Attribution](dev/bench/dec-gap.md)
+- [Encode dll100 Gap vs libzstd — Differential Attribution](dev/bench/enc-dll-gap.md)
 
 ## Upstream Comparison
 
