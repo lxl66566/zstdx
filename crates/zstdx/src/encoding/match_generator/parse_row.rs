@@ -1,4 +1,4 @@
-//! The tagged row-matcher strategy loop (rows 5-8, libzstd's
+//! The tagged row-matcher strategy loop (rows 5-12, libzstd's
 //! `ZSTD_RowFindBestMatch` storage under this crate's chain selection
 //! semantics) — a method of [`super::MatchGeneratorDriver`], split out of
 //! the driver file for size. Field and helper access resolves through the
@@ -150,8 +150,10 @@ pub(super) fn row_match_mask<const ROW_LOG: u32>(row: *const u32, tag: u8) -> u6
 /// verified exactly like the chain walk (beat-check + extend). Slots are
 /// position-indexed (see row_insert), so the collection has no age
 /// order; they are few (the tag is 8 bits of the same hash that selected
-/// the row), and the buffer caps at 16 — no shipped row exceeds sixteen
-/// attempts (rows 5-8 run 8/8/15/15).
+/// the row), and the buffer caps at the row width (rows 5-8 run
+/// 8/8/15/15 attempts, rows 10-12 run 31/63/63 — the width-minus-one cap
+/// matches libzstd's effective candidate count, whose tag-row byte 0
+/// is the insertion head).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
@@ -166,7 +168,41 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     max_window: u64,
     ramp: RampGate,
 ) -> (usize, usize) {
-    const CAND_CAP: usize = 16;
+    // The candidate buffer spans the row (one u32 per slot; 64 entries
+    // = 256 B at ROW_LOG 6). An array length cannot key off a const
+    // generic through arithmetic (generic_const_exprs), so the shipped
+    // widths materialize through this compile-time dispatch — each
+    // ROW_LOG instantiation carries exactly its row.
+    if ROW_LOG >= 6 {
+        row_search_cap::<ROW_LOG, 64, RAMPED>(
+            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+        )
+    } else if ROW_LOG >= 5 {
+        row_search_cap::<ROW_LOG, 32, RAMPED>(
+            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+        )
+    } else {
+        row_search_cap::<ROW_LOG, 16, RAMPED>(
+            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+        )
+    }
+}
+
+/// [`row_search`]'s body at a fixed candidate-buffer width.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>(
+    win: &[u8],
+    table: *const u32,
+    heads: *const u8,
+    idx: usize,
+    hash: u32,
+    win_base: u64,
+    block_end: u64,
+    attempts: usize,
+    max_window: u64,
+    ramp: RampGate,
+) -> (usize, usize) {
     let rel_row = ((hash >> ROW_TAG_BITS) << ROW_LOG) as usize;
     let row = table.wrapping_add(rel_row);
     let tag = (hash & ROW_TAG_MASK) as u8;
@@ -182,8 +218,18 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     // SAFETY: the head byte is the row's own (bounds as row_insert).
     let head = unsafe { *heads.add((hash >> ROW_TAG_BITS) as usize) } as usize & row_mask;
     if head != 0 {
-        matches = ((matches >> head) | (matches << (row_mask + 1 - head)))
-            & ((1u64 << (row_mask + 1)) - 1);
+        // The rotated field spans exactly the row's entries. At ROW_LOG 6
+        // the field is the whole u64 and `1u64 << entries` would overflow
+        // (debug panic; release x86 masks the count to 0, the mask
+        // collapses to 0 and the row would find nothing) — the full-row
+        // case rotates without a mask instead. `head` sits in [1,
+        // row_mask] here, so the other shift is always in range.
+        matches = if ROW_LOG >= 6 {
+            matches.rotate_right(head as u32)
+        } else {
+            ((matches >> head) | (matches << (row_mask + 1 - head)))
+                & ((1u64 << (row_mask + 1)) - 1)
+        };
     }
     let pos_abs = win_base + idx as u64;
     // Oldest usable candidate distance: within the level window and
