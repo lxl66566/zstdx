@@ -116,6 +116,17 @@ pub struct MatchGeneratorDriver {
     /// Length of the head table inside `tables` (== `tables.len()` when
     /// the strategy has no second table).
     second: usize,
+    /// The row strategy's per-row insertion heads (one byte per row,
+    /// libzstd's `ZSTD_row_nextIndex` state): the byte names the slot the
+    /// row's last insert took, the next insert takes its predecessor, so a
+    /// full row evicts its oldest entry and the search's age order is the
+    /// head rotation. One byte per row keeps it 32-64 KiB (L2-resident
+    /// against the multi-MiB entry table) and off the entry line, so the
+    /// fill loop's head load never serializes behind its own cold-line
+    /// stores. Cleared per job with the head table (see
+    /// [`Self::fill_window_grid`]): slot choice depends on it, so residue
+    /// would leak the worker-claim order into the bytes.
+    row_heads: Vec<u8>,
     /// Head hash table for the opt strategies, u32 origin-biased entries
     /// (see [`super::opt`]).
     opt_table: Vec<u32>,
@@ -526,6 +537,7 @@ impl MatchGeneratorDriver {
             block_start: 0,
             tables: alloc::vec![0u32; 1usize << HASH_LOG],
             second: 1usize << HASH_LOG,
+            row_heads: Vec::new(),
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
@@ -585,6 +597,7 @@ impl MatchGeneratorDriver {
             block_start: 0,
             tables: alloc::vec![0u32; 1usize << HASH_LOG],
             second: 1usize << HASH_LOG,
+            row_heads: Vec::new(),
             opt_table: Vec::new(),
             bt: Vec::new(),
             hash3: Vec::new(),
@@ -700,6 +713,29 @@ impl MatchGeneratorDriver {
                     } else {
                         self.tables = alloc::vec![0u32; total];
                         self.second = heads_len;
+                    }
+                },
+                Strategy::Row(row_log) => {
+                    // The row layout is structurally different from the
+                    // single-head families (packed tag+position entries,
+                    // cycling insertion), so a kept same-sized buffer
+                    // would carry heads-family residue: reallocate on any
+                    // switch, keep only a same-row resize. The head bytes
+                    // follow the same keep/refresh rule over the row
+                    // count (a row_log change inside one hash_log
+                    // resizes them).
+                    let rows = 1usize << params.hash_log.saturating_sub(row_log);
+                    let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
+                        && self.row_heads.len() == rows;
+                    if !rows_kept {
+                        self.tables = alloc::vec![0u32; heads_len];
+                        self.second = heads_len;
+                        self.row_heads = alloc::vec![0u8; rows];
+                    } else if self.tables.len() != heads_len {
+                        self.tables.truncate(heads_len);
+                        self.tables.resize(heads_len, 0);
+                        self.row_heads.truncate(rows);
+                        self.row_heads.resize(rows, 0);
                     }
                 },
                 Strategy::Opt(knobs) => {
@@ -859,13 +895,15 @@ impl MatchGeneratorDriver {
         // and widths stay put (byte-identical no-dict output).
         if matches!(
             self.params.strategy,
-            Strategy::Chain(_) | Strategy::Dfast(_)
+            Strategy::Chain(_) | Strategy::Dfast(_) | Strategy::Row(_)
         ) {
             self.dict_row = true;
         }
+        if matches!(self.params.strategy, Strategy::Chain(_) | Strategy::Row(_)) {
+            self.params.min_match = MIN_MATCH as u32;
+        }
         if matches!(self.params.strategy, Strategy::Chain(_)) {
             self.params.search_depth *= 8;
-            self.params.min_match = MIN_MATCH as u32;
         }
         // The owned window is filled above; prefill over the caller's slice
         // avoids the self-borrow (identical bytes). The dictionary grid:
@@ -1178,6 +1216,10 @@ impl MatchGeneratorDriver {
             BtStepPhase::Off
         };
         clear_table(&mut self.tables[..self.second]);
+        // The row heads choose slots, so they carry the same per-job
+        // determinism contract as the head table (a stale head would make
+        // this job's slot layout depend on the pooled state's history).
+        self.row_heads.fill(0);
         // The DUBT finder's entries carry no epoch tag, so a job restarts
         // its tree from scratch regardless of strip length: cleared heads
         // make every descent start at a strip chain node, and the strip
@@ -1350,6 +1392,41 @@ impl MatchGeneratorDriver {
                     self.acquire_seed(data, last);
                 }
             },
+            Strategy::Row(row_log) => {
+                let hash_log = self.params.hash_log;
+                let width = ChainHashWidth::of(self.dict_row);
+                let table = self.tables.as_mut_ptr();
+                let heads = self.row_heads.as_mut_ptr();
+                // Same geometry decision as the chain arm: the strip is a
+                // full window, so it takes the stride grid; dictionary
+                // content is at most one window and parses against it, so
+                // every position enters a row (the eviction age is the
+                // only reach a row has — a strided dict fill would leave
+                // two thirds of it unreachable).
+                let stride = if grid == FillGrid::Strip {
+                    PREFILL_STRIDE
+                } else {
+                    1
+                };
+                let mut idx = 0;
+                while idx < last {
+                    let abs = base + idx as u64;
+                    let h = row_hash_at(data, idx, hash_log, row_log, width);
+                    match row_log {
+                        4 => row_insert_fill::<4>(table, heads, h, abs),
+                        5 => row_insert_fill::<5>(table, heads, h, abs),
+                        _ => row_insert_fill::<6>(table, heads, h, abs),
+                    }
+                    idx += stride;
+                }
+                // The row's candidates evict at 15/31/63 same-bucket
+                // inserts: a period-long repeat riding the strip survives
+                // in its row only when the bucket stays quiet, so the
+                // strip keeps the seed path (dictionary fills are dense).
+                if grid == FillGrid::Strip {
+                    self.acquire_seed(data, last);
+                }
+            },
         }
     }
 
@@ -1411,6 +1488,9 @@ impl Matcher for MatchGeneratorDriver {
         self.reset(level);
         if !self.tables.is_empty() {
             clear_table(&mut self.tables[..self.second]);
+            // Same fresh-state contract for the row heads (see
+            // fill_window_grid).
+            self.row_heads.fill(0);
         }
         if !self.tables[self.second..].is_empty()
             && matches!(self.params.strategy, Strategy::Chain(_))
@@ -1738,6 +1818,25 @@ impl Matcher for MatchGeneratorDriver {
                     self.start_matching_chain::<false>(literals, seqs);
                 }
             },
+            Strategy::Row(row_log) => {
+                // The ramp gate folds out of the per-candidate loop on
+                // disarmed frames (the fast loop's RAMPED discipline; the
+                // env-gated ramp never arms on default paths).
+                let ramped = self.ramp.is_armed();
+                if ramped {
+                    match row_log {
+                        4 => self.start_matching_row::<4, true>(literals, seqs),
+                        5 => self.start_matching_row::<5, true>(literals, seqs),
+                        _ => self.start_matching_row::<6, true>(literals, seqs),
+                    }
+                } else {
+                    match row_log {
+                        4 => self.start_matching_row::<4, false>(literals, seqs),
+                        5 => self.start_matching_row::<5, false>(literals, seqs),
+                        _ => self.start_matching_row::<6, false>(literals, seqs),
+                    }
+                }
+            },
             Strategy::Opt(knobs) => {
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
@@ -1949,6 +2048,25 @@ impl Matcher for MatchGeneratorDriver {
                         self.params.hash_log,
                     );
                 },
+                Strategy::Row(row_log) => {
+                    // Same single-insert policy as the chain arm: a uniform
+                    // run hashes every position to one row, and the newest
+                    // insert covers it.
+                    let h = row_hash_at(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        row_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
+                    let table = self.tables.as_mut_ptr();
+                    let heads = self.row_heads.as_mut_ptr();
+                    match row_log {
+                        4 => row_insert::<4>(table, heads, h, self.block_start),
+                        5 => row_insert::<5>(table, heads, h, self.block_start),
+                        _ => row_insert::<6>(table, heads, h, self.block_start),
+                    }
+                },
             }
         }
         self.ldm_fill_block(LdmFill::Skipped);
@@ -2152,6 +2270,21 @@ impl MatchGeneratorDriver {
                     idx += 1;
                 }
             },
+            Strategy::Row(row_log) => {
+                let hash_log = self.params.hash_log;
+                let width = ChainHashWidth::of(self.dict_row);
+                let table = self.tables.as_mut_ptr();
+                let heads = self.row_heads.as_mut_ptr();
+                while idx < to {
+                    let h = row_hash_at(win, idx, hash_log, row_log, width);
+                    match row_log {
+                        4 => row_insert_fill::<4>(table, heads, h, win_base + idx as u64),
+                        5 => row_insert_fill::<5>(table, heads, h, win_base + idx as u64),
+                        _ => row_insert_fill::<6>(table, heads, h, win_base + idx as u64),
+                    }
+                    idx += 1;
+                }
+            },
             // The tree strategies fill their tree lazily from `next_update`.
             Strategy::Opt(_) | Strategy::BtLazy(_) => {},
         }
@@ -2167,6 +2300,7 @@ mod parse_chain;
 mod parse_dfast;
 mod parse_fast;
 mod parse_opt;
+mod parse_row;
 mod price;
 mod tables;
 #[cfg(test)]
@@ -2186,6 +2320,7 @@ use params::{
 };
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
+use parse_row::{row_hash_at, row_insert, row_insert_fill};
 use price::*;
 use tables::*;
 pub(in crate::encoding) use tables::{pack_pos, push_seq_packed};
