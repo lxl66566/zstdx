@@ -1,6 +1,6 @@
 # Decode stream gap vs libzstd — differential attribution (2026-09-20)
 
-> Core-vs-core decomposition of the ST streaming decode gap (todo item 2), measured against the real opponent instead of our own profile: same files through both implementations, per-function Ir, per-symbol cycles, and an instruction-level diff of the two hot loops. All numbers from the bench machine (Zen4), zstd-sys 2.1.0 (libzstd 1.5.7) as linked by the `zstd` crate.
+> Core-vs-core decomposition of the ST streaming decode gap (the former todo item 2, closed by T5 below), measured against the real opponent instead of our own profile: same files through both implementations, per-function Ir, per-symbol cycles, and an instruction-level diff of the two hot loops. All numbers from the bench machine (Zen4), zstd-sys 2.1.0 (libzstd 1.5.7) as linked by the `zstd` crate.
 
 ## Method
 
@@ -91,3 +91,22 @@ T1 read text as "latency exposure in the copy tails" from the IPC 2.52/2.94 cont
 | NT streaming stores (movntdq 16/32/64B) | 157–162 | ~7× |
 
 In situ the loop runs at IPC 3.57 (callgrind 14.0 M Ir vs perf 3.92 M cycles per decode) at ~10 B/cycle — the per-core L3-bandwidth ceiling for a 2.3 MiB streaming window, not a latency chain and not issue-bound (the ALU ceiling would be ~21 B/cycle). No copy-side lever exists for text: the earlier "AVX2 copy32 / SIMD copy scheduling" falsifications hold unchanged under the long-match premise, and the one shape that wins on copy time alone (libzstd's peel schedule) is below the documented fused-symbol re-roll tax (+3–5% text-stream). The unchecked text gap (x1.15) belongs to the instruction-volume/fixed-cost family of the dense shapes — entry layout, offset history, stack round-trips — plus their cheaper non-loop staging, not to the executor's copy tail.
+
+## T5: the front-end measured directly — op-cache occupancy + issue-stall profile (2026-09-21)
+
+The last piece left inferred after T1–T4: the issue/latency saturation was concluded from IPC conversion, never from front-end events. Zen4 has no Intel DSB/LSD events; the equivalents are the **op cache** (µop cache, the DSB counterpart: up to 8 µops/cycle delivery) and the **loop buffer** (the LSD counterpart). Measured with `perf stat` event groups on the two solo harnesses (ours `prof dec`, the /tmp libzstd twin; taskset-pinned, interleaved rounds, medians) plus **IBS fetch sampling** (`perf record -R -e ibs_fetch//`, per-sample fetch_ctl decode: latency, icache/op-cache/ITLB-miss bits, symbolized through the PIE map + nm ranges). Shapes json.zst3 / dll100.zst3 / text.zst3 (skewed shares json's loop structure; redundant). Events: `de_src_op_disp.{op_cache,decoder,loop_buffer}`, `de_no_dispatch_per_slot.*` (per-slot over the 6-wide dispatch → cycle-equivalent share = slots/6/cycles), `de_op_queue_empty`, `ex_no_retire.empty`, `op_cache_hit_miss.*`, `ic_tag_hit_miss.*`, `bp_l1_tlb_miss_*`, `bp_de_redirect`, `ex_ret_ucode_ops`, `de_dis_dispatch_token_stalls1/2.*`.
+
+| shape | side | IPC | ops dispatched/cycle | op-cache share of ops | loop-buffer share | FE-stall %cy | op-queue-empty %cy | nothing-to-retire %cy | backend-stall %cy |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| json.zst3 | ours | 3.67 | 4.22 | 99.50% | 0 | 11.97 | 9.23 | 3.39 | 17.7 |
+| json.zst3 | zstd | 3.59 | 4.11 | 99.45% | 0 | 11.56 | 8.59 | 2.26 | 19.7 |
+| dll100.zst3 | ours | 3.63 | 4.08 | 99.54% | 0 | 12.35 | 9.29 | 4.61 | 19.6 |
+| dll100.zst3 | zstd | 3.45 | 3.97 | 99.19% | 0 | 10.61 | 7.67 | 3.82 | 23.1 |
+| text.zst3 | ours | 2.55 | 2.58 | 99.22% | 0 | 5.32 | 2.94 | 1.37 | 51.2 |
+| text.zst3 | zstd | 3.04 | 3.02 | 99.38% | 0 | 2.92 | 2.22 | 0.88 | 46.2 |
+
+Miss and issue-side sources, ours vs zstd: op-cache miss rate 0.55/0.49% (json), 0.50/0.76% (dll), ~0.9/~0.9% (text, ±0.1pp round noise); icache miss rate 27.0/28.0% (json) at ≤0.32 misses per 1000 instructions on both sides (L2-resident); ITLB misses and fetch redirects ≤60 K per 60×32 MiB run (≈0); microcode ops 0.06% (json) / 0.10% (dll) of instructions, equal on both sides; issue-resource stalls LOWER for ours on every counter (json: int-scheduler-token stalls 4.6% vs 7.8% of cycles, int-physreg-file 1.5% vs 3.8%, store-queue 2.1% vs 2.6%).
+
+IBS fetch attribution on the hot loops (`execute_decoded_flat_bmi2` = 85.9/74.4/42.3% of samples on json/dll/text; libzstd `ZSTD_decompressSequences_bmi2.constprop.0` = 85.5/74.4/28.9%): mean fetch latency 0.01/0.00/0.04 cycles ours vs 0.00/0.00/0.09 theirs; icache miss 0.011–0.053% of tagged fetches; op-cache miss 0.077–0.105%; zero incomplete fetches and zero ITLB events in-loop. On text our loop fetches strictly cleaner than theirs.
+
+**Verdict: no front-end lever, on any shape.** (1) Both loops dispatch ~99.5% of ops from the op cache and 0% from the loop buffer (neither loop fits it — LSD occupancy is a non-factor by construction). (2) The FE-stall differential ours-vs-zstd is +0.4/+1.7/+2.4 cycle-equivalent pp on json/dll/text, and the IBS per-block view shows it is not concentrated in the fused loop (its own fetch sits at ~0 latency; on text our loop fetches strictly cleaner than theirs). The maximal fantasy bound — our FE-stall cycle-equivalents per dispatched op dropped exactly to libzstd's — buys json nothing (equal per op: 0.0283-0.0286 ours vs 0.0280-0.0296 zstd across rounds), dll +1.4% of cycles (0.0302 vs 0.0268 FE-stall cycle-equivalents/op, consistent across rounds), and text +2.8% that sits in the memory-ceiling copy/absorb tails (backend stalls 51% of cycles, the loop 11-21%), not in fetch; every case is below the 3%-wall bar and none of it is addressable by code layout. (3) Ours dispatches MORE ops/cycle than libzstd on the dense shapes (4.22 vs 4.11 json, 4.08 vs 3.97 dll) from the same occupancy structure, and the cycle gap tracks the dispatched-op ratio (json: ops 1.369×, cycles 1.333×) — exactly the T1 inference, now measured at the front-end. Layout-class levers (loop alignment, hot/cold outlining) have no measured loss to recover; todo item 2's residual is op volume × execution ports, and the item is closed with this evidence.
