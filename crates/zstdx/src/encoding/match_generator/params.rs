@@ -23,6 +23,14 @@ pub(super) enum Strategy {
     /// with lazy deferral (levels above Fast, libzstd's `lazy` family).
     /// The payload is the chain-table log.
     Chain(u32),
+    /// Tagged row matcher (libzstd's `ZSTD_RowFindBestMatch`): the head
+    /// table is an array of rows of `1 << payload` u32 entries, each with
+    /// a parallel tag byte per slot (the tag row's byte 0 doubles as the
+    /// insertion head, cycling backwards). Candidates live in one cache
+    /// line per row instead of a chain-link chase, so the search iterates
+    /// the row's tag matches newest-first with no dependent loads between
+    /// them. Rows 5-8.
+    Row(u32),
     /// Optimal-price parser over a binary match tree (levels Opt/Ultra,
     /// libzstd's btopt/btultra). The `chain` buffer holds the tree ring.
     Opt(OptKnobs),
@@ -104,6 +112,28 @@ const fn chain(
         hash_log,
         window,
         strategy: Strategy::Chain(chain_log),
+        search_depth,
+        lazy_depth,
+        min_match: 5,
+        dubt_head: false,
+        ldm: false,
+        chain_reach: None,
+    }
+}
+
+/// A [`Strategy::Row`] row: `search_depth` is the per-search candidate
+/// budget (libzstd's `1 << min(searchLog, rowLog)` attempts).
+const fn row(
+    hash_log: u32,
+    row_log: u32,
+    window: usize,
+    search_depth: u32,
+    lazy_depth: u32,
+) -> LevelParams {
+    LevelParams {
+        hash_log,
+        window,
+        strategy: Strategy::Row(row_log),
         search_depth,
         lazy_depth,
         min_match: 5,
@@ -483,10 +513,20 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     // Chain rows 5-12: search depths are half libzstd's 1 << searchLog
     // (8/8/16/16/16/32/64/64 there) — the old Balanced tier calibrated
     // depth 8 as its zstd-9 row (S4), our per-probe walk being the dearer.
-    chain(19, 18, 1 << 21, 4, 0),
-    chain(19, 18, 1 << 21, 4, 1),
-    chain(20, 19, 1 << 21, 8, 1),
-    chain(20, 19, 1 << 21, 8, 2),
+    // 5-8: the tagged row matcher (libzstd's L5-8 rows run it: H19/H19/
+    // H20/H20, S3/S3/S4/S4 => 8/8/16/16 row attempts, greedy/lazy/lazy/
+    // lazy2, the attempt counts at libzstd parity — halving l7/l8 to 8
+    // measured -15% json time for +1.2pp text and +1.1pp dll32 size, a
+    // trade the tier's ratio identity refuses). The chain's link chase is
+    // latency-bound (~66 cyc/step over a 4-6 MiB two-table working set); a
+    // row keeps its 16 newest same-bucket candidates inside one cache
+    // line, trading unbounded chain depth for scan-locality. Selection
+    // semantics (literal-aware lazy walk, store gate, miss ramp) stay the
+    // chain's.
+    row(19, 4, 1 << 21, 8, 0),
+    row(19, 4, 1 << 21, 8, 1),
+    row(20, 4, 1 << 21, 16, 1),
+    row(20, 4, 1 << 21, 16, 2),
     // 9: the Balanced tier's row. libzstd's L9 is W22; the chain stays
     // C20, aliasing beyond 1 MiB like libzstd's cLog-below-wLog chains.
     // The cold-start head parses the first HEAD_LIMIT bytes through the
@@ -597,6 +637,10 @@ fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
     p.strategy = match p.strategy {
         Strategy::Dfast(small) => Strategy::Dfast(small.min(wlog + 1)),
         Strategy::Chain(c) => Strategy::Chain(c.min(wlog)),
+        // The row layout is size-invariant: rel_row + entries lands below
+        // 2^hash_log for any row_log (the hash width shrinks with it), so
+        // only a degenerate row_log at or above hash_log needs the clamp.
+        Strategy::Row(rl) => Strategy::Row(rl.min(wlog)),
         Strategy::Opt(mut knobs) => {
             knobs.bt_log = knobs.bt_log.min(wlog);
             knobs.hash3_log = knobs.hash3_log.min(wlog);
