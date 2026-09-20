@@ -29,7 +29,7 @@ pub(super) enum Strategy {
     /// insertion head, cycling backwards). Candidates live in one cache
     /// line per row instead of a chain-link chase, so the search iterates
     /// the row's tag matches newest-first with no dependent loads between
-    /// them. Rows 5-8.
+    /// them. Rows 5-12.
     Row(u32),
     /// Optimal-price parser over a binary match tree (levels Opt/Ultra,
     /// libzstd's btopt/btultra). The `chain` buffer holds the tree ring.
@@ -510,17 +510,24 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     // libzstd's L3 dfast (H17 long / C16 short).
     dfast(17, 16, 1 << 21),
     dfast(18, 18, 1 << 21),
-    // Chain rows 5-12: search depths are half libzstd's 1 << searchLog
-    // (8/8/16/16/16/32/64/64 there) — the old Balanced tier calibrated
-    // depth 8 as its zstd-9 row (S4), our per-probe walk being the dearer.
-    // 5-8: the tagged row matcher (libzstd's L5-8 rows run it: H19/H19/
-    // H20/H20, S3/S3/S4/S4 => 8/8/16/16 row attempts, greedy/lazy/lazy/
-    // lazy2, the attempt counts at libzstd parity — halving l7/l8 to 8
-    // measured -15% json time for +1.2pp text and +1.1pp dll32 size, a
-    // trade the tier's ratio identity refuses). The chain's link chase is
-    // latency-bound (~66 cyc/step over a 4-6 MiB two-table working set); a
-    // row keeps its 16 newest same-bucket candidates inside one cache
-    // line, trading unbounded chain depth for scan-locality. Selection
+    // Lazy band 5-12: the tagged row matcher (libzstd's own storage for
+    // these rows). 5-8 (libzstd's L5-8: H19/H19/H20/H20, S3/S3/S4/S4,
+    // greedy/lazy/lazy/lazy2) run 8/8/15/15 attempts at libzstd parity
+    // — halving l7/l8 to 8 measured -15% json time for +1.2pp text and
+    // +1.1pp dll32 size, a trade the tier's ratio identity refuses.
+    // 10-12 (libzstd's L10-12: H22/H22/H23, S5/S6/S6, lazy2, TL16/16/32)
+    // take rowLog BOUNDED(4, searchLog, 6) = 5/6/6 at 31/63/63 attempts
+    // — the old chain rows ran depth 16/32/32, half libzstd's
+    // searchLog by the old Balanced calibration. The 2026-09-21 two-axis
+    // calibration kept parity: halving to 16/31/31 buys json x1.65->1.36
+    // and text x0.52->0.48 but costs size on every column (+0.4-0.6%
+    // json, +0.5-0.8% text, +0.1-0.15% dll32, +0.2-0.3% dll100);
+    // rowLog 5 on 11/12 and L12 at H22 both lose size and collapse the
+    // rungs onto their neighbors. The chain's link chase is latency-bound
+    // (~66 cyc/step over a 4-6 MiB two-table working set); a row keeps its
+    // 1<<rowLog
+    // newest same-bucket candidates inside rowLog 5-6's 2-4 cache lines,
+    // trading unbounded chain depth for scan-locality. Selection
     // semantics (literal-aware lazy walk, store gate, miss ramp) stay the
     // chain's.
     row(19, 4, 1 << 21, 8, 0),
@@ -539,9 +546,9 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
         chain(21, 20, 1 << 26, 8, 2),
         1 << 22,
     ))),
-    chain(22, 21, 1 << 22, 16, 2),
-    chain(22, 21, 1 << 22, 32, 2),
-    chain(23, 22, 1 << 22, 32, 2),
+    row(22, 5, 1 << 22, 32, 2),
+    row(22, 6, 1 << 22, 64, 2),
+    row(23, 6, 1 << 22, 64, 2),
     // 13: the Best tier: btlazy2 — the DUBT tree (O(1) fill, search-time
     // batch sort) under lazy2 selection, libzstd's L13-15 rows (S4/5/6,
     // searchLength 5, TL 32). The frame window rides LDM's W26 far reach
