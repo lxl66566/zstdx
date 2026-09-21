@@ -141,6 +141,13 @@ pub(super) enum CoveredFill {
     /// both strides' phases (any two adjacent probes span the parities),
     /// so the halved insert volume keeps the coverage at ~0.04% size.
     Strided,
+    /// Every covered position at every length — the dictionary-row chain
+    /// emits. libzstd's lazy-family fill is dense through a stored
+    /// sequence's interior (its row update skips only past 384-byte jumps,
+    /// 96 head + 32 tail); the tuned stride grids exist for no-dict speed,
+    /// and a small dictionary frame's parse rides near-duplicate twins
+    /// sitting exactly on the skipped phases.
+    DictDense,
 }
 
 /// Sequence floor of the covered-fill density gate: below it a block's
