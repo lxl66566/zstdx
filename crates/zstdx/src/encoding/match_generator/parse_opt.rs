@@ -133,8 +133,11 @@ impl MatchGeneratorDriver {
         if self.dubt_table.len() == 1 << HEAD_HASH_LOG
             && self.dubt_bt.len() == 2 << HEAD_KNOBS.bt_log
         {
+            // Heads only: with the heads zeroed, no this-frame link can
+            // name a position whose ring slots were not rewritten by the
+            // fill (the same provenance argument as the BtLazy arm's
+            // deferred clear), so the ring keeps its pooled content.
             self.dubt_table.fill(0);
-            self.dubt_bt.fill(0);
         } else {
             self.dubt_table = alloc::vec![0u32; 1 << HEAD_HASH_LOG];
             self.dubt_bt = alloc::vec![0u32; 2 << HEAD_KNOBS.bt_log];

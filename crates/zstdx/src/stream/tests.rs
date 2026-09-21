@@ -1013,6 +1013,57 @@ mod mt {
         }
     }
 
+    /// Text-like wide-alphabet input (the local `mt` module's shape, so the
+    /// balanced tier's cold-start DUBT head arms on it: >= 4 MiB,
+    /// >= 48 distinct bytes).
+    #[cfg(feature = "std")]
+    fn words(len: usize) -> Vec<u8> {
+        use std::format;
+        const WORDS: [&[u8]; 13] = [
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
+            b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
+        ];
+        let mut state = 7u64;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let w = WORDS[((state >> 33) as usize) % WORDS.len()];
+            let take = w.len().min(len - out.len());
+            out.extend_from_slice(&w[..take]);
+        }
+        out
+    }
+
+    /// A plain stream encoded on a fresh core vs on the pooled core a
+    /// prior stream on the same thread returned (the ST core pool):
+    /// pooled table residue must never shape the bytes. The best tier
+    /// covers the DUBT tables — whose ring keeps stale content under the
+    /// heads-only frame-start clear (link provenance, see `dubt.rs`) —
+    /// and the balanced tier the row-9 head's ring; a cross-level burn
+    /// additionally rides `apply_level`'s realloc path.
+    #[cfg(feature = "std")]
+    #[test]
+    fn pooled_st_core_reuse_is_output_neutral() {
+        let stream = |data: &[u8], level: Level| {
+            let mut enc =
+                read::Encoder::with_options(data, EncoderOptions::new(level).checksum(false))
+                    .unwrap();
+            let mut out = Vec::new();
+            crate::io::Read::read_to_end(&mut enc, &mut out).unwrap();
+            enc.finish().unwrap();
+            out
+        };
+        let a = words(5 * 1024 * 1024 + 7);
+        let b = words(4 * 1024 * 1024 + 999);
+        for level in [Level::Best, Level::Balanced] {
+            let fresh = stream(&b, level);
+            let _ = stream(&a, level);
+            assert_eq!(stream(&b, level), fresh, "same-level burn at {level:?}");
+            let _ = stream(&a, Level::Fastest);
+            assert_eq!(stream(&b, level), fresh, "cross-level burn at {level:?}");
+        }
+    }
+
     /// A flush makes the pending bytes visible early at the cost of a
     /// re-gridded job boundary; the reassembled stream must still decode.
     #[test]

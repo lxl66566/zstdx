@@ -18,6 +18,18 @@
 //! measured x2.87 vs libzstd on skewed.best, memory-latency-bound (200M L1
 //! + 100M dTLB misses per 32 MiB, one serialized load per tree step).
 //!
+//! Ring-residue provenance (why a frame restart needs no ring clear, only
+//! a heads clear): every ring read is reached through a link whose value
+//! names a position the current parse already filled — the entry points are
+//! the heads and the fill-time chain link (`*slot = *table[h]`, zeroed
+//! heads make both this-parse), and every followed link (unsorted chain,
+//! descent child) was written by this parse's own fill or descents. The
+//! fill rewrites BOTH ring slots of every position it covers, so a slot
+//! holding stale content belongs to a position no this-parse link can
+//! name — stale ring data is unreachable, not merely range-checked.
+//! (`next_update` only ever advances past the scan, so a link never names
+//! a skipped, unfilled interior position.)
+//!
 //! Where C's search returns the single longest match, ours prices every
 //! strictly improving candidate against the position's literal scale and
 //! keeps the two argmaxes the lazy selection consumes ([`Found`]) — fused
@@ -30,10 +42,9 @@
 //! backtrack link during a search's chain walk) and the larger child once
 //! sorted. Because children are always older than their parent and every
 //! sorted node's slots were written by a completed descent, a descent never
-//! crosses an unsorted node; a stale ring read resolves as a candidate
-//! outside the window and dies on the floor check, and every candidate's
-//! bytes are verified before use, so a corrupted link can only waste
-//! compares, never falsify a match.
+//! crosses an unsorted node; a corrupted or stale link can only waste
+//! compares, never falsify a match — every candidate's bytes are verified
+//! before use.
 
 use super::opt::{Match, OPT_NUM, count_from, hash3_at, hash4_at, hash5_at, read4};
 

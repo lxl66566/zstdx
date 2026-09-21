@@ -1295,13 +1295,15 @@ impl MatchGeneratorDriver {
         // this job's slot layout depend on the pooled state's history).
         self.row_heads.fill(0);
         // The DUBT finder's entries carry no epoch tag, so a job restarts
-        // its tree from scratch regardless of strip length: cleared heads
-        // make every descent start at a strip chain node, and the strip
-        // fill rewrites each position's ring slots. bt slots below the
-        // strip are never read — their owners can no longer resolve as
-        // candidates.
+        // its tree from scratch regardless of strip length. The eager
+        // heads clear is deferred to the first searching block instead
+        // (`dubt_stale`): nothing between the prefill and it reads the
+        // heads (the BtLazy arm prefills nothing into the tree — the fill
+        // is the finder's own, from `next_update`), so the deferred clear
+        // is the only one, and the ring needs no clear at all (see the
+        // BtLazy arm's provenance note).
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
-            self.dubt_table.fill(0);
+            self.dubt_stale = true;
         }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
             self.tables[self.second..].fill(0);
@@ -1606,6 +1608,9 @@ impl Matcher for MatchGeneratorDriver {
         // the first searching block (`dubt_stale`): frame positions
         // restart at zero and old absolute positions would alias the new
         // window, while RLE/raw-only frames never read the tables at all.
+        // The deferred clear covers the heads only — the ring is
+        // unreachable residue once the heads are zeroed (see the BtLazy
+        // arm's provenance note).
         self.opt_origin += self.pos + 1;
         self.ext = None;
         self.win.clear();
@@ -1947,10 +1952,16 @@ impl Matcher for MatchGeneratorDriver {
             },
             Strategy::BtLazy(knobs) => {
                 // The reset's deferred clear lands at the first searching
-                // block (see `dubt_stale`).
+                // block (see `dubt_stale`). Heads only: the ring needs no
+                // clear once the heads are zeroed — every ring read is
+                // reached through a link (a fill-time chain link, a head, a
+                // descent child) whose value names a position this frame
+                // already filled, and the fill rewrites both ring slots of
+                // every position it covers, so stale ring slots sit at
+                // positions no this-frame link can ever name (see
+                // `dubt.rs`'s provenance note).
                 if self.dubt_stale {
                     self.dubt_table.fill(0);
-                    self.dubt_bt.fill(0);
                     self.dubt_stale = false;
                 }
                 let step = self.bt_lazy_step();
