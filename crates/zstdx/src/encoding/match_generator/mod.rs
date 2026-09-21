@@ -309,6 +309,11 @@ pub struct MatchGeneratorDriver {
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
+    /// Chain-scan catch-up cursor for dictionary rows (libzstd's
+    /// `nextToUpdate`): the first position the next probe's catch-up fill
+    /// has not inserted. `u64::MAX` disables the fill — the no-dict rows
+    /// keep their tuned sparse insert grid (byte-load-bearing output).
+    chain_filled: u64,
 }
 
 /// Borrowed window for the slice-compression path. The caller guarantees the
@@ -330,8 +335,19 @@ use super::ldm::LdmSnapshot;
 /// <= 16 KiB clevels table boundary, keyed on the payload alone on the
 /// loadDictionary route — see `load_dictionary`).
 const SMALL_DICT_PAYLOAD_MAX: u64 = 16 * 1024;
-/// Hash/chain log of the <= 16 KiB table's chain rows (W14/H14/C14).
-const SMALL_DICT_TABLE_LOG: u32 = 14;
+/// Hash log of the <= 16 KiB table's chain rows, R12 geometry: the table's
+/// H14 dilutes 4-byte candidate classes once the dictionary's content and
+/// the payload share one table (~20 KiB of positions over 16 KiB of
+/// buckets — hot 4-grams bury their older dict twins past any walk depth;
+/// H15/H16 measure byte-identical, H14 loses ~11 B on the fixture).
+const SMALL_DICT_HASH_LOG: u32 = 15;
+/// Chain ring log of the same rows, R12 geometry: the ring must cover the
+/// dict content plus the payload (up to 32 KiB — exactly C15). At the
+/// table's C14 the payload's inserts alias the dict head's chain slots and
+/// sever every walk into it (libzstd never runs this shape: its chainLog
+/// clamps through `ZSTD_dictAndWindowLog`, and the CDict route keeps the
+/// dict in its own match state).
+const SMALL_DICT_CHAIN_LOG: u32 = 15;
 /// Smallest largest prefix strip that engages the shared prefix fill;
 /// below it the tail jobs' own parallel fills are the cheaper schedule.
 #[cfg(feature = "std")]
@@ -596,6 +612,7 @@ impl MatchGeneratorDriver {
             seed_budget: 0,
             slice_size,
             ramp: RampGate::OFF,
+            chain_filled: u64::MAX,
         }
     }
 
@@ -657,6 +674,7 @@ impl MatchGeneratorDriver {
             seed_budget: 0,
             slice_size: 0,
             ramp: RampGate::OFF,
+            chain_filled: u64::MAX,
         }
     }
 
@@ -970,11 +988,12 @@ impl MatchGeneratorDriver {
                 // (16/8/16/64/256): the dict's dense twin field converts
                 // extra attempts at 4-6 (fixture sweep 1x/4x/8x: -4
                 // +1.6/+0.9/+0.8%, -5 +3.0/+1.4/+1.2%, -6 +2.4/+2.1/flat,
-                // 7-8 flat from 64/256 up).
+                // 7-8 flat from 64/256 up — re-confirmed saturated under
+                // the R12 ring/hash/fill geometry).
                 Some(SmallDictRow::Chain { depth, lazy }) => {
                     let mut row = self.params;
-                    row.hash_log = SMALL_DICT_TABLE_LOG;
-                    row.strategy = Strategy::Chain(SMALL_DICT_TABLE_LOG);
+                    row.hash_log = SMALL_DICT_HASH_LOG;
+                    row.strategy = Strategy::Chain(SMALL_DICT_CHAIN_LOG);
                     row.search_depth = depth;
                     row.lazy_depth = lazy;
                     row.min_match = MIN_MATCH as u32;
@@ -1491,6 +1510,11 @@ impl MatchGeneratorDriver {
                 if grid == FillGrid::Strip {
                     self.acquire_seed(data, last);
                 }
+                // The catch-up cursor for dictionary-row scans starts at
+                // the fill's frontier: everything below it is table
+                // content (dense on the dictionary grid, the tuned stride
+                // grid on strips — whose sparse layout stands).
+                self.chain_filled = base + last as u64;
             },
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
@@ -1684,6 +1708,7 @@ impl Matcher for MatchGeneratorDriver {
         self.ldm_checked = false;
         self.strip_parse = false;
         self.dict_row = false;
+        self.chain_filled = u64::MAX;
         self.opt_state.reset();
     }
 
@@ -1801,6 +1826,14 @@ impl Matcher for MatchGeneratorDriver {
         }
         if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
             self.catch_up_insertions();
+            // The reopened gap is now table content (the helper filled it
+            // up to its HASH_READ tail margin); the dictionary rows'
+            // catch-up cursor must not re-insert the range — a re-linked
+            // position resurfaces as the bucket's newest (phantom
+            // recency) — and continues from the helper's own bound.
+            if self.dict_row {
+                self.chain_filled = self.block_start.saturating_sub(HASH_READ as u64);
+            }
         }
         match self.params.strategy {
             Strategy::Fast => {

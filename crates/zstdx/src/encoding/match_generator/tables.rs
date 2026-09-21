@@ -339,6 +339,19 @@ pub(super) fn insert_covered(
             put!((p + 1 - win_base) as usize, p + 1);
             p += 2;
         }
+    } else if fill == CoveredFill::DictDense {
+        // Dictionary-row chain emits fill the whole interior (see the
+        // variant): near-duplicate dict twins sit on every phase.
+        let end = (win_base + (start + match_len) as u64).min(insert_max);
+        let mut p = win_base + start as u64;
+        if p < end && (end - p) & 1 == 1 {
+            put!((p - win_base) as usize, p);
+            p += 1;
+        }
+        while p < end {
+            put!((p - win_base) as usize, p);
+            p += 1;
+        }
     } else {
         let base = win_base + start as u64;
         let hi = base + match_len as u64 - 2;
@@ -500,8 +513,10 @@ impl TableEmit<'_> {
         // position; the grid bounds the fill work of huge same-hash runs
         // at 1/4 interior candidate density — a deliberate speed-for-ratio
         // trade, the first knob to re-check on a chain-band ratio
-        // regression.
-        let step = (if match_len <= 64 {
+        // regression. Dictionary rows fill dense (their parse rides
+        // near-duplicate twins on the skipped phases; the fill cost is
+        // bounded by the small payload).
+        let step = (if match_len <= 64 || self.covered_fill == CoveredFill::DictDense {
             1
         } else {
             4

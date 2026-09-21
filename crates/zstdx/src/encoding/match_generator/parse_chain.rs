@@ -46,12 +46,21 @@ impl MatchGeneratorDriver {
             win_base,
             insert_max,
             hash_log,
-            // The chain's emits go through `emit_chain`; the fast-only
-            // covered-fill policy is dead state here.
-            covered_fill: CoveredFill::Dense,
+            // The chain's emits go through `emit_chain`; the covered-fill
+            // policy only separates the dictionary rows' dense interior
+            // fill from the no-dict stride grids.
+            covered_fill: if dict_row {
+                CoveredFill::DictDense
+            } else {
+                CoveredFill::Dense
+            },
             width,
         };
         let hash_read = HASH_READ as u64;
+        // Catch-up cursor (dictionary rows only; see `chain_filled`) —
+        // the cursor updates unconditionally below, so the fill's guard
+        // carries the `dict_row` term (no-dict frames must never take it).
+        let mut next_ins = self.chain_filled;
         let mut pos = self.pos;
         let mut anchor = self.anchor;
         let mut rep = self.rep;
@@ -101,6 +110,31 @@ impl MatchGeneratorDriver {
         // instantiation.
         macro_rules! scan_chain {
             ($restart:lifetime, $gated:literal, $ldm:expr) => {
+            // Dictionary rows take libzstd's catch-up fill
+            // (`ZSTD_row_update_internal` / `ZSTD_insertAndFindFirstIndex`):
+            // every position stepped over since the last insert — the
+            // literal-run ramp steps, the lazy walk's probes — enters the
+            // tables before this probe searches, so a later duplicate of
+            // any skipped byte finds its twin (match interiors are
+            // `emit_chain`'s own covered fill). The no-dict rows keep the
+            // tuned sparse grid (their output is byte-load-bearing).
+            if dict_row && pos > next_ins {
+                let cap = (pos.min(insert_max) - win_base) as usize;
+                let mut ci = (next_ins - win_base) as usize;
+                while ci < cap {
+                    let abs = win_base + ci as u64;
+                    // SAFETY: the hash masks to hash_log bits, the
+                    // absolute position to the chain size (absolute key;
+                    // see emit_chain's note on the walk side's indexing).
+                    unsafe {
+                        let h = hash_at_width(win, ci, hash_log, width);
+                        let head = *table_ptr.add(h);
+                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
+                        *table_ptr.add(h) = pack_pos(abs);
+                    }
+                    ci += 1;
+                }
+            }
             let idx = (pos - win_base) as usize;
             // Hash and head read once per position: the search, and the
             // insert below (whose chain link wants the same previous head),
@@ -240,6 +274,7 @@ impl MatchGeneratorDriver {
                 *chain.get_unchecked_mut(pos as usize & chain_mask) = entry;
                 *table_ptr.add(h) = pack_pos(pos);
             }
+            next_ins = pos + 1;
 
             // Resolve the pipelined head for the lazy walk below: the
             // insert above wrote table[h], so a pre-read of that very slot
@@ -485,6 +520,9 @@ impl MatchGeneratorDriver {
                 );
             }
             anchor = pos;
+            // The emission's covered fill indexed the sequence interior;
+            // the catch-up continues from the new frontier.
+            next_ins = next_ins.max(pos);
             };
         }
         // Seeded phase: job starts only (bulk-ST skips it entirely); each
@@ -513,5 +551,6 @@ impl MatchGeneratorDriver {
         self.seed_offset = seed_offset;
         self.seed_hits = seed_hits;
         self.seed_budget = seed_budget;
+        self.chain_filled = next_ins;
     }
 }
