@@ -734,6 +734,7 @@ impl Estimator<'_> {
             default,
             prev,
             dict_seeded,
+            self.dict.cost_mode,
             max_log,
             self.fse,
         );
