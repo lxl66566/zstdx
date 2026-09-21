@@ -119,6 +119,72 @@ pub(crate) struct FrameEncoderCoreSt {
     out_read: usize,
     blocks: u64,
     finished: bool,
+    /// Whether the core was configured from a dictionary: dict-loaded
+    /// table residue must never enter [`ST_CORE_POOL`] (see
+    /// [`FrameEncoderCoreSt::reinit`]).
+    from_dict: bool,
+}
+
+// Pooled single-threaded cores, one deep per thread (std only). A fresh
+// encoder otherwise allocates and first-touch-faults the matcher's whole
+// table set per stream — ~50 MiB at the best tier (DUBT heads + ring,
+// owned window, LDM state), measured at ~16K page faults against a
+// ~40 ms bulk encode of the same bytes on the bench machine; the mt
+// streaming core pools the same class of buffers for the same reason
+// (see the accumulate-buffer pool). Plain frames only: a dictionary
+// frame's re-init would have to retire table residue the bulk pools
+// never exercise, so dict cores stay one-shot.
+#[cfg(feature = "std")]
+std::thread_local! {
+    static ST_CORE_POOL: core::cell::RefCell<Option<alloc::boxed::Box<FrameEncoderCoreSt>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "std")]
+fn take_pooled_st_core() -> Option<alloc::boxed::Box<FrameEncoderCoreSt>> {
+    ST_CORE_POOL.with(|p| p.borrow_mut().take())
+}
+
+#[cfg(feature = "std")]
+fn return_pooled_st_core(core: alloc::boxed::Box<FrameEncoderCoreSt>) {
+    ST_CORE_POOL.with(|p| *p.borrow_mut() = Some(core));
+}
+
+/// The single-threaded core behind an owning handle that returns it to
+/// [`ST_CORE_POOL`] on drop (std), so every stream end — finish, error,
+/// abandonment — recycles the tables. `Deref` keeps the call sites
+/// oblivious; the `Option` exists only so `Drop` can take the box.
+pub(crate) struct StCore(Option<alloc::boxed::Box<FrameEncoderCoreSt>>);
+
+impl StCore {
+    fn new(core: FrameEncoderCoreSt) -> Self {
+        Self(Some(alloc::boxed::Box::new(core)))
+    }
+}
+
+impl core::ops::Deref for StCore {
+    type Target = FrameEncoderCoreSt;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("live core")
+    }
+}
+
+impl core::ops::DerefMut for StCore {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("live core")
+    }
+}
+
+impl Drop for StCore {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        if let Some(core) = self.0.take()
+            && !core.from_dict
+        {
+            return_pooled_st_core(core);
+        }
+    }
 }
 
 impl FrameEncoderCoreSt {
@@ -132,16 +198,82 @@ impl FrameEncoderCoreSt {
         options: &EncoderOptions,
         dict: Option<&crate::encoding::dictionary::EncDictionary>,
     ) -> Self {
+        #[cfg(feature = "std")]
+        if dict.is_none()
+            && let Some(mut core) = take_pooled_st_core()
+        {
+            core.reinit(options);
+            return *core;
+        }
         // Owned-window driver like FrameCompressor::new: the streaming core
         // feeds blocks through block_tail/commit_block, so unlike the slice
         // path (new_direct, borrowed window) the matcher must own its window.
-        let mut state = CompressState {
-            dict_entropy: DictEntropy::default(),
-            matcher: MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize),
-            last_huff_table: None,
-            fse_tables: FseTables::new(),
-            scratch: BlockScratch::default(),
+        let mut core = Self {
+            state: CompressState {
+                dict_entropy: DictEntropy::default(),
+                matcher: MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize),
+                last_huff_table: None,
+                fse_tables: FseTables::new(),
+                scratch: BlockScratch::default(),
+            },
+            hasher: StreamChecksum::Off,
+            level: options.level,
+            checksum: false,
+            block_size: 0,
+            header: Vec::new(),
+            pledged: None,
+            pos: 0,
+            tail: BlockTail::None,
+            staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
+            probe_pending: false,
+            output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
+            out_read: 0,
+            blocks: 0,
+            finished: false,
+            from_dict: dict.is_some(),
         };
+        core.configure(options, dict);
+        core
+    }
+
+    /// Reset a pooled core for a fresh frame: recycle the entropy tables
+    /// exactly like the bulk slice pool (`reset_slice_state`), then
+    /// reconfigure. The matcher's `reset` retires every table-residue
+    /// carryover the pool could observe (newest-wins slots plus
+    /// byte-verify arbitration, the DUBT deferred clear), the same
+    /// contract the bulk pools run under.
+    #[cfg(feature = "std")]
+    fn reinit(&mut self, options: &EncoderOptions) {
+        self.state.dict_entropy = DictEntropy::default();
+        if let Some(table) = self.state.last_huff_table.take() {
+            table.recycle_aligned(&mut self.state.scratch.huff);
+        }
+        // Retired tables return their transition buffers to the block
+        // scratch (three statements for the same reason as
+        // `reset_slice_state`: materializing an array would memcpy even
+        // the empty slots).
+        let fse = &mut self.state.scratch.fse;
+        if let Some(table) = self.state.fse_tables.ll_previous.take() {
+            table.recycle(fse);
+        }
+        if let Some(table) = self.state.fse_tables.ml_previous.take() {
+            table.recycle(fse);
+        }
+        if let Some(table) = self.state.fse_tables.of_previous.take() {
+            table.recycle(fse);
+        }
+        self.configure(options, None);
+    }
+
+    /// Derive the frame-level state from the options, shared by fresh
+    /// construction and pooled reinits: matcher strategy, header shape,
+    /// checksum arm and the block grid. Beyond the matcher's strategy
+    /// tables (`apply_level`) and the header bytes, nothing allocates.
+    fn configure(
+        &mut self,
+        options: &EncoderOptions,
+        dict: Option<&crate::encoding::dictionary::EncDictionary>,
+    ) {
         let dict_id = if let Some(dict) = dict {
             let mut shape = crate::InputShape {
                 len: options.pledged_size,
@@ -150,7 +282,7 @@ impl FrameEncoderCoreSt {
             // libzstd clamps the window by src + dict.
             shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
             crate::encoding::dictionary::reset_with_dictionary(
-                &mut state,
+                &mut self.state,
                 dict,
                 options.level,
                 shape,
@@ -161,8 +293,8 @@ impl FrameEncoderCoreSt {
                 len: options.pledged_size,
                 window_log: options.input_shape.window_log,
             };
-            state.matcher.set_input_shape(shape);
-            state.matcher.reset(options.level);
+            self.state.matcher.set_input_shape(shape);
+            self.state.matcher.reset(options.level);
             None
         };
         let checksum = options.checksum && cfg!(feature = "hash");
@@ -177,7 +309,7 @@ impl FrameEncoderCoreSt {
         // covers drops the window descriptor for the single-segment form
         // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=
         // pledgedSrcSize`). Dictionary frames keep the windowed form.
-        let window = state.matcher.window_size();
+        let window = self.state.matcher.window_size();
         let single_segment = dict_id.is_none() && options.pledged_size.is_some_and(|n| n <= window);
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
@@ -186,30 +318,26 @@ impl FrameEncoderCoreSt {
             dictionary_id: dict_id,
             window_size: Some(window),
         };
-        let mut serialized = Vec::with_capacity(18);
-        header.serialize(&mut serialized);
-        let block_size = state.matcher.block_size();
-        Self {
-            state,
-            hasher: if checksum {
-                StreamChecksum::On(FrameHasher::new())
-            } else {
-                StreamChecksum::Off
-            },
-            level: options.level,
-            checksum,
-            block_size,
-            header: serialized,
-            pledged: options.pledged_size,
-            pos: 0,
-            tail: BlockTail::None,
-            staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
-            probe_pending,
-            output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
-            out_read: 0,
-            blocks: 0,
-            finished: false,
-        }
+        self.header.clear();
+        header.serialize(&mut self.header);
+        self.block_size = self.state.matcher.block_size();
+        self.hasher = if checksum {
+            StreamChecksum::On(FrameHasher::new())
+        } else {
+            StreamChecksum::Off
+        };
+        self.level = options.level;
+        self.checksum = checksum;
+        self.pledged = options.pledged_size;
+        self.pos = 0;
+        self.tail = BlockTail::None;
+        self.staged.clear();
+        self.probe_pending = probe_pending;
+        self.output.clear();
+        self.out_read = 0;
+        self.blocks = 0;
+        self.finished = false;
+        self.from_dict = dict.is_some();
     }
 
     /// Stage input for the frame. Fails with
@@ -460,7 +588,7 @@ pub(crate) fn write_pending_output(
 /// inline.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum FrameEncoderCore {
-    Single(alloc::boxed::Box<FrameEncoderCoreSt>),
+    Single(StCore),
     #[cfg(feature = "std")]
     Mt(super::encoder_mt::MtEncoderCore),
 }
@@ -471,7 +599,7 @@ impl FrameEncoderCore {
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
         if let Some(raw) = &options.dictionary {
             let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
-            return Ok(Self::Single(alloc::boxed::Box::new(
+            return Ok(Self::Single(StCore::new(
                 FrameEncoderCoreSt::new_with_dictionary(options, Some(&dict)),
             )));
         }
@@ -486,17 +614,13 @@ impl FrameEncoderCore {
                 return Ok(Self::Mt(super::encoder_mt::MtEncoderCore::new(options)));
             }
             #[cfg(feature = "std")]
-            return Ok(Self::Single(alloc::boxed::Box::new(
-                FrameEncoderCoreSt::new(options),
-            )));
+            return Ok(Self::Single(StCore::new(FrameEncoderCoreSt::new(options))));
             #[cfg(not(feature = "std"))]
             return Err(Error::Unsupported {
                 feature: crate::Feature::Multithread,
             });
         }
-        Ok(Self::Single(alloc::boxed::Box::new(
-            FrameEncoderCoreSt::new(options),
-        )))
+        Ok(Self::Single(StCore::new(FrameEncoderCoreSt::new(options))))
     }
 
     /// Stage input for the frame. Fails with
