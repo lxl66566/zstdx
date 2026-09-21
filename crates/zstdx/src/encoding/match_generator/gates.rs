@@ -199,6 +199,57 @@ pub(super) fn covered_lit_symbols(lit_lens: &[u8; 256]) -> usize {
     lit_lens.iter().filter(|&&l| l < 11).count()
 }
 
+/// Wide-alphabet screen of the small-input dense policy (the first-block
+/// analog of [`DENSE_GATE_SYMS_MAX`]'s covered-symbol signal, which needs
+/// a previous block's fed-back prices and so can never fire on a
+/// single-block frame). Cost contract: O(<= 640 strided samples), never
+/// O(n) — the screen runs once per window on paths where one extra
+/// window-sized pass costs a fifth to half of the whole call (a
+/// full-window distinct scan measured skewed-16 KiB fastest at -47%;
+/// an unconditional dense tier below 2 KiB measured skewed-1K at -15%
+/// with zero ratio change).
+///
+/// Two strided passes, calibrated on the corpus classes (skewed 16
+/// symbols, json 38-39, text 66-99) at every size 1-128 KiB: a
+/// 128-sample narrow pass exits tiny-alphabet inputs (skewed reads 16
+/// of 16, json never below 27; exit bar [`SMALL_DENSE_NARROW_MAX`]),
+/// then a 512-sample pass decides — the wide classes read 46-62, the
+/// structured ones 32-39, and the bar [`SMALL_DENSE_WIDE_MIN`] splits
+/// that gap (margins >= 3 on both sides down to 1 KiB windows, where
+/// the 512-sample stride is 2).
+pub(super) const SMALL_DENSE_NARROW_MAX: u32 = 20;
+pub(super) const SMALL_DENSE_WIDE_MIN: u32 = 42;
+
+pub(super) fn small_dense_wide(win: &[u8]) -> bool {
+    if sampled_distinct(win, 128) <= SMALL_DENSE_NARROW_MAX {
+        return false;
+    }
+    sampled_distinct(win, 512) >= SMALL_DENSE_WIDE_MIN
+}
+
+/// Distinct byte values among `samples` strided reads of `win`. The
+/// four bitmap words live in registers (a `[u64; 4]` indexed by
+/// `b >> 6` compiles to a store-forwarding chain through memory, ~2.8
+/// cycles per sample — half again the cost this screen may spend on a
+/// 1 KiB fastest-tier call).
+fn sampled_distinct(win: &[u8], samples: usize) -> u32 {
+    let stride = (win.len() / samples).max(1);
+    let (mut w0, mut w1, mut w2, mut w3) = (0u64, 0u64, 0u64, 0u64);
+    let mut i = 0usize;
+    while i < win.len() {
+        let b = win[i];
+        let bit = 1u64 << (b & 63);
+        match b >> 6 {
+            0 => w0 |= bit,
+            1 => w1 |= bit,
+            2 => w2 |= bit,
+            _ => w3 |= bit,
+        }
+        i += stride;
+    }
+    w0.count_ones() + w1.count_ones() + w2.count_ones() + w3.count_ones()
+}
+
 /// Nearest `u < last` with the anchor's 8 bytes and [`SEED_AGREE`]
 /// agreeing bytes before it (see [`MatchGeneratorDriver::acquire_seed`]).
 /// The 8-byte compare subsumes the 4-byte prefilter the scalar walk used

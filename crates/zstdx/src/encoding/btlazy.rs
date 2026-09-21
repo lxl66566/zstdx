@@ -107,6 +107,7 @@ pub(crate) enum LazyStep {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_block_lazy(
     knobs: &OptKnobs,
+    tree_mls: usize,
     step: LazyStep,
     win: &[u8],
     win_base: u64,
@@ -137,7 +138,10 @@ pub(crate) fn run_block_lazy(
         next_update,
         table_log,
         bt_mask,
-        mls: knobs.mls as usize,
+        // Tree hash width: the caller's policy (the small-frame screen
+        // lives in the bridge, which knows the declared input shape; the
+        // knob's default is the row's searchLength).
+        mls: tree_mls,
         nb_compares: 1usize << knobs.search_log,
         min_match: knobs.min_match as usize,
         sufficient_len: knobs.sufficient_len as usize,

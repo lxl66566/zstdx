@@ -237,6 +237,14 @@ pub struct MatchGeneratorDriver {
     /// Caller-declared input shape (see [`Matcher::set_input_shape`]);
     /// applied at the next `reset` via [`params_for`].
     shape: InputShape,
+    /// Cached small-band alphabet screen (see [`win_small_wide`]),
+    /// keyed by the window it was computed from: a pooled state sees
+    /// the same caller buffer across repeat calls (the small-payload
+    /// pattern), and the screen is the one pass over it those calls
+    /// would otherwise pay every time. A stale verdict (same buffer,
+    /// mutated content) only shifts parse style, never safety.
+    small_wide: Option<bool>,
+    small_wide_key: (usize, usize),
     /// The frame's reach probe result (see [`super::reach_probe`]); applied
     /// inside `apply_level`, so entry points set it before `reset` or
     /// re-apply through [`Matcher::consider_reach_probe`].
@@ -557,6 +565,8 @@ impl MatchGeneratorDriver {
             scan_density: ScanDensity::Plain,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            small_wide: None,
+            small_wide_key: (0, 0),
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
@@ -616,6 +626,8 @@ impl MatchGeneratorDriver {
             scan_density: ScanDensity::Plain,
             params: LEVEL_PARAMS[1],
             shape: InputShape::default(),
+            small_wide: None,
+            small_wide_key: (0, 0),
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
             dubt_head: HeadPhase::Off,
@@ -640,6 +652,19 @@ impl MatchGeneratorDriver {
             slice_size: 0,
             ramp: RampGate::OFF,
         }
+    }
+
+    /// The small-band alphabet screen over the adopted window (see
+    /// [`small_dense_wide`]), cached by window identity (the field's
+    /// contract). True only for wide-alphabet (text-class) frames.
+    fn win_small_wide(&mut self) -> bool {
+        let win = window_slice(&self.win, self.ext.as_ref());
+        let key = (win.as_ptr() as usize, win.len());
+        if self.small_wide.is_none() || self.small_wide_key != key {
+            self.small_wide = Some(small_dense_wide(win));
+            self.small_wide_key = key;
+        }
+        self.small_wide.unwrap()
     }
 
     /// Size the search tables for `level` (no-op when unchanged), so pooled
@@ -1714,23 +1739,45 @@ impl Matcher for MatchGeneratorDriver {
                 // instantiation either way.
                 match (self.ramp.is_armed(), self.scan_density) {
                     (false, ScanDensity::Plain) => {
-                        self.start_matching_fast::<false, false, RUNTIME_LOG>(literals, seqs);
+                        if self.params.small_src && self.win_small_wide() {
+                            self.start_matching_fast::<false, false, RUNTIME_LOG, true>(
+                                literals, seqs,
+                            );
+                        } else {
+                            self.start_matching_fast::<false, false, RUNTIME_LOG, false>(
+                                literals, seqs,
+                            );
+                        }
                     },
                     (true, ScanDensity::Plain) => {
-                        self.start_matching_fast::<true, false, RUNTIME_LOG>(literals, seqs);
+                        if self.params.small_src && self.win_small_wide() {
+                            self.start_matching_fast::<true, false, RUNTIME_LOG, true>(
+                                literals, seqs,
+                            );
+                        } else {
+                            self.start_matching_fast::<true, false, RUNTIME_LOG, false>(
+                                literals, seqs,
+                            );
+                        }
                     },
                     (false, ScanDensity::Dense) => {
                         if self.params.hash_log == HASH_LOG {
-                            self.start_matching_fast::<false, true, HASH_LOG>(literals, seqs);
+                            self.start_matching_fast::<false, true, HASH_LOG, false>(
+                                literals, seqs,
+                            );
                         } else {
-                            self.start_matching_fast::<false, true, RUNTIME_LOG>(literals, seqs);
+                            self.start_matching_fast::<false, true, RUNTIME_LOG, false>(
+                                literals, seqs,
+                            );
                         }
                     },
                     (true, ScanDensity::Dense) => {
                         if self.params.hash_log == HASH_LOG {
-                            self.start_matching_fast::<true, true, HASH_LOG>(literals, seqs);
+                            self.start_matching_fast::<true, true, HASH_LOG, false>(literals, seqs);
                         } else {
-                            self.start_matching_fast::<true, true, RUNTIME_LOG>(literals, seqs);
+                            self.start_matching_fast::<true, true, RUNTIME_LOG, false>(
+                                literals, seqs,
+                            );
                         }
                     },
                 }
@@ -1769,7 +1816,13 @@ impl Matcher for MatchGeneratorDriver {
                 // body whatever their table sizes — dict frames are not a
                 // hot path, and keeping them off the const-log arms leaves
                 // every no-dict instantiation untouched.
-                if self.dict_row {
+                // Small-input policy (libzstd's small-src rows run the
+                // dfast short table at minMatch 4, i.e. a 4-byte hash): a
+                // <= 128 KiB wide-alphabet frame takes the MM4 runtime-log body —
+                // the dict rows' instantiation, so no new codegen — while
+                // structured frames keep the 5-byte width (their 4-byte
+                // candidates are net-negative).
+                if self.dict_row || (self.params.small_src && self.win_small_wide()) {
                     if self.ramp.is_armed() {
                         self.start_matching_dfast::<true, true, RUNTIME_LOG, RUNTIME_LOG>(
                             literals, seqs,

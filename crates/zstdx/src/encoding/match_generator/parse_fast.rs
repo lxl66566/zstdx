@@ -11,6 +11,7 @@ impl MatchGeneratorDriver {
         const RAMPED: bool,
         const DENSE: bool,
         const HASH_LOG: u32,
+        const SMALL_WIDE: bool,
     >(
         &mut self,
         literals: &mut Vec<u8>,
@@ -118,6 +119,31 @@ impl MatchGeneratorDriver {
         // text.fastest wall by 7% — the third macro instantiation displaces
         // the hot blocks; do not retry without a code-layout story.
         let ramp = self.ramp;
+        // Small-input policy bars, compile-time per instantiation (a
+        // runtime-variable bar in this loop cost text-16K fastest -22%
+        // wall — the compare and the shift must fold): the stock bars
+        // are large-input tunings — the sparse miss ramp exists to keep
+        // incompressible spans cheap on big inputs, and the ml >= 6
+        // hash bar prices literals against long-run entropy. A <= 128
+        // KiB wide-alphabet block has neither (libzstd's small-src
+        // tables switch their fast rows there: any 4-byte hash match
+        // accepted, step grown one per 128 missed bytes). The alphabet
+        // screen at the dispatch keeps the structured classes on the
+        // stock scan — their short matches are net-negative (json 16
+        // KiB: +171 B under the dense policy), while text-class short
+        // matches are payload.
+        #[allow(non_snake_case)]
+        let MIN_ML: usize = if SMALL_WIDE {
+            4
+        } else {
+            6
+        };
+        #[allow(non_snake_case)]
+        let RAMP_SHIFT: u32 = if SMALL_WIDE {
+            7
+        } else {
+            2
+        };
         macro_rules! scan_fast {
             ($restart:lifetime, $gated:literal) => {
                 let idx0 = (pos - win_base) as usize;
@@ -324,7 +350,7 @@ impl MatchGeneratorDriver {
                         // it covers, and rejecting it lets the scan try
                         // the next position where a longer match may
                         // start.
-                        if ml >= 6 && !ramp_blocks::<RAMPED>(ramp, pos, win_base + cand0 as u64) {
+                        if ml >= MIN_ML && !ramp_blocks::<RAMPED>(ramp, pos, win_base + cand0 as u64) {
                             let anchor_idx = (anchor - win_base) as usize;
                             let mut start = idx0;
                             let cfl = ramp_ext_floor::<RAMPED>(ramp, cand0, win_base);
@@ -412,7 +438,7 @@ impl MatchGeneratorDriver {
 
                 if m1 == 0 {
                     let mut ml = extend_match(win, idx1, cand1);
-                    if ml >= 6 && !ramp_blocks::<RAMPED>(ramp, pos1, win_base + cand1 as u64) {
+                    if ml >= MIN_ML && !ramp_blocks::<RAMPED>(ramp, pos1, win_base + cand1 as u64) {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
                         let cfl = ramp_ext_floor::<RAMPED>(ramp, cand1, win_base);
@@ -465,7 +491,7 @@ impl MatchGeneratorDriver {
             // Fastest +9% size), and skipping is what keeps sparse-match
             // corpora fast.
             miss_count += pair_len as usize;
-            let step = 1 + (miss_count >> 2).min(255) as u64;
+            let step = 1 + (miss_count >> RAMP_SHIFT).min(255) as u64;
             // Dense-mode miss-run stepping: once a miss run outgrows
             // DENSE_STEP_AFTER bytes, double the pair advance — weak
             // mid-run matches on match-dense parses are net-negative.

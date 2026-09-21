@@ -71,6 +71,11 @@ pub(super) struct LevelParams {
     /// the window (frame header, buffer, LDM reach) stays the row's
     /// `window`; `None` keeps search domain == window.
     pub(super) chain_reach: Option<usize>,
+    /// Known-declared source at or below libzstd's small-input cParams
+    /// boundary (srcSize <= 128 KiB): the small-input policy band, where
+    /// row switch shortens accepted matches and slows the miss ramp
+    /// (see the parse loops). Never set for unknown-length streams.
+    pub(super) small_src: bool,
 }
 
 const fn fast(hash_log: u32, window: usize) -> LevelParams {
@@ -84,6 +89,7 @@ const fn fast(hash_log: u32, window: usize) -> LevelParams {
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -98,6 +104,7 @@ const fn dfast(hash_log: u32, small_log: u32, window: usize) -> LevelParams {
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -118,6 +125,7 @@ const fn chain(
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -140,6 +148,7 @@ const fn row(
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -174,6 +183,7 @@ const fn opt(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -188,6 +198,7 @@ const fn btlazy(hash_log: u32, window: usize, knobs: OptKnobs) -> LevelParams {
         dubt_head: false,
         ldm: false,
         chain_reach: None,
+        small_src: false,
     }
 }
 
@@ -604,6 +615,10 @@ fn params_for_level(level: Level) -> LevelParams {
     LEVEL_PARAMS[level.as_i32().clamp(0, 22) as usize]
 }
 
+/// Upper bound of the small-input policy band: libzstd's small-src
+/// cParams table boundary (srcSize <= 128 KiB).
+pub(crate) const SMALL_SRC_MAX: u64 = 128 * 1024;
+
 /// [`params_for_level`] adjusted to what the caller declared about the
 /// input: a forced window log overrides the row's window first, then a
 /// known length downsizes (libzstd's override-then-adjust order, so a
@@ -614,6 +629,29 @@ pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
         p.window = 1usize << wl.clamp(10, 27);
+    }
+    p.small_src = matches!(shape.len, Some(n) if n <= SMALL_SRC_MAX);
+    // Small-input policy for the balanced tier (libzstd's <= 16 KiB table
+    // swaps its level 9-10 lazy2 rows to btlazy2, searchLog 5): the
+    // chain's newest-first selection accepts nearer-shorter candidates
+    // where the tiny window leaves the tree's full coverage cheap, and
+    // the DUBT parse measured strictly smaller on every class (text 16
+    // KiB -282 B vs the chain, json -107, skewed +9).
+    if p.small_src && matches!(level.as_i32(), 9 | 10) {
+        let mut p = adjust_params(btlazy(17, 1 << 17, bt_knobs(5, 16)), shape.len);
+        // The replacement row's constructor defaults the flag to
+        // false; the frame IS small — the downstream small-src gates
+        // (the btlazy tree's hash width screen) read it from the
+        // adopted row, not from this branch.
+        p.small_src = true;
+        return p;
+    }
+    // Small-input policy (libzstd's small-src rows run searchLength 4 at
+    // every lazy-family level): the row matcher's default 5 prices
+    // literals against long-run entropy; a <= 128 KiB block accepts the
+    // shorter matches its tiny window makes common.
+    if p.small_src && matches!(p.strategy, Strategy::Row(_)) {
+        p.min_match = 4;
     }
     if level == Level::Uncompressed {
         p
