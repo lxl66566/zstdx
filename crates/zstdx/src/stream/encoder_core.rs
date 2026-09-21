@@ -68,6 +68,23 @@ impl BlockChecksum for StreamChecksum {
     }
 }
 
+/// Where the block stream's tail sits, for [`FrameEncoderCoreSt::finish`]'s
+/// closing shape: the newest block's header stays patchable to the
+/// last-block form until its bytes leave `output`, while a pledge closed
+/// at `write` time already marked the final block last.
+#[derive(Clone, Copy, Default)]
+enum BlockTail {
+    /// No block emitted yet.
+    #[default]
+    None,
+    /// The newest block's 3-byte header sits at this `output` offset,
+    /// still patchable in place to the last-block form.
+    Open(usize),
+    /// The final block already carries the last-block flag (a pledged
+    /// grid-close at `write` time); `finish` appends the checksum only.
+    Closed,
+}
+
 pub(crate) struct FrameEncoderCoreSt {
     state: CompressState<MatchGeneratorDriver>,
     hasher: StreamChecksum,
@@ -85,6 +102,8 @@ pub(crate) struct FrameEncoderCoreSt {
     pledged: Option<u64>,
     /// Total input bytes fed.
     pos: u64,
+    /// Tail state of the emitted block stream (see [`BlockTail`]).
+    tail: BlockTail,
     /// Input bytes of the block currently being assembled; always shorter
     /// than the block size outside [`FrameEncoderCoreSt::write`].
     staged: Vec<u8>,
@@ -154,12 +173,18 @@ impl FrameEncoderCoreSt {
                 len: options.pledged_size,
                 window_log: options.input_shape.window_log,
             });
+        // libzstd's frame-header shape: a pledged size the window already
+        // covers drops the window descriptor for the single-segment form
+        // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=
+        // pledgedSrcSize`). Dictionary frames keep the windowed form.
+        let window = state.matcher.window_size();
+        let single_segment = dict_id.is_none() && options.pledged_size.is_some_and(|n| n <= window);
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
-            single_segment: false,
+            single_segment,
             content_checksum: checksum,
             dictionary_id: dict_id,
-            window_size: Some(state.matcher.window_size()),
+            window_size: Some(window),
         };
         let mut serialized = Vec::with_capacity(18);
         header.serialize(&mut serialized);
@@ -177,6 +202,7 @@ impl FrameEncoderCoreSt {
             header: serialized,
             pledged: options.pledged_size,
             pos: 0,
+            tail: BlockTail::None,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             probe_pending,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
@@ -225,6 +251,23 @@ impl FrameEncoderCoreSt {
                 }
                 self.drain_full_blocks();
             }
+            // The pledge is met and every fed byte is staged: the staging
+            // loop's emissions cannot know a block is final while `data`
+            // may still hold more of this write, so the final full block
+            // (if any) closes here — 3 bytes shorter than the empty
+            // closing block, and identical to the one-shot slice path
+            // whatever the consumer drained. A staged tail below one
+            // block stays for `finish`.
+            if self.pledged == Some(self.pos) {
+                while self.staged.len() >= self.block_size {
+                    let last = self.staged.len() == self.block_size;
+                    self.encode_block(last);
+                    if last {
+                        self.tail = BlockTail::Closed;
+                        break;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -260,13 +303,28 @@ impl FrameEncoderCoreSt {
         }
         // A frame needs at least one block: empty input, and an input that
         // is an exact multiple of the block size, encode one empty raw last
-        // block (mirroring the legacy streaming path).
+        // block. When the last real block's header is still pending in the
+        // output buffer, set its last-block flag instead (libzstd's
+        // one-shot shape, 3 bytes shorter); an eagerly drained consumer
+        // that already took those bytes keeps the empty-block form.
         //
         // A still-pending probe means the frame never staged its head (a
         // short input or an early finish): the stock reach stays.
         self.probe_pending = false;
         self.drain_full_blocks();
-        self.encode_block(true);
+        match self.tail {
+            // The pledged grid's final block already carries the last
+            // flag.
+            BlockTail::Closed => {},
+            BlockTail::Open(off)
+                if self.staged.is_empty() && self.blocks > 0 && off < self.output.len() =>
+            {
+                self.output[off] |= 1;
+            },
+            BlockTail::None | BlockTail::Open(_) => {
+                self.encode_block(true);
+            },
+        }
         if self.checksum {
             let checksum = self.hasher.finish32();
             self.output.extend_from_slice(&checksum.to_le_bytes());
@@ -336,6 +394,14 @@ impl FrameEncoderCoreSt {
         if self.blocks == 0 {
             self.output.extend_from_slice(&self.header);
         }
+        // Offset of this block's 3-byte header inside `output`: every
+        // encode path (compress_fastest reserves it first, the raw/RLE
+        // fallbacks serialize it first) starts there, so `finish` can set
+        // the last-block flag in place when the buffer ends on the grid.
+        // The closing `encode_block(true)` call overwrites this with a
+        // header that already carries the flag; nothing reads the tail
+        // afterwards (`finish` is one-shot).
+        self.tail = BlockTail::Open(self.output.len());
         self.blocks += 1;
         // An empty block only occurs as the frame-closing block (empty
         // input or an exact block-size multiple) and is always raw; the

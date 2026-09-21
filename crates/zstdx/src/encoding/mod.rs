@@ -180,12 +180,30 @@ mod tests {
                 "mismatch at len {}",
                 input.len()
             );
-            assert_eq!(
-                compress_slice_to_vec(input, Level::Uncompressed),
-                compress_to_vec(input.as_slice(), Level::Uncompressed),
-                "uncompressed mismatch at len {}",
-                input.len()
-            );
+            // The unshaped streaming leg cannot know EOF until a read
+            // returns zero, so a grid-exact length closes with the empty
+            // last block (3 bytes) where the slice path marks the real
+            // final block: identical content, one documented frame shape
+            // apart.
+            let sliced = compress_slice_to_vec(input, Level::Uncompressed);
+            let streamed = compress_to_vec(input.as_slice(), Level::Uncompressed);
+            if !input.is_empty() && input.len().is_multiple_of(128 * 1024) {
+                // Grid-exact: the streaming frame differs in the final
+                // block's last-block bit plus the 3-byte empty closing
+                // block; the content is identical.
+                assert_eq!(streamed.len(), sliced.len() + 3, "len {}", input.len());
+                assert_eq!(
+                    crate::bulk::decompress(&streamed, input.len()).unwrap(),
+                    *input
+                );
+            } else {
+                assert_eq!(
+                    sliced,
+                    streamed,
+                    "uncompressed mismatch at len {}",
+                    input.len()
+                );
+            }
         }
     }
 }

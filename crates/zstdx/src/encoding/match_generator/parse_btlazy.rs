@@ -16,6 +16,20 @@ impl MatchGeneratorDriver {
         seqs: &mut Vec<SeqWord>,
         step: LazyStep,
     ) -> bool {
+        // Small-frame tree hash width (libzstd's small-input cParams
+        // rows run searchLength 4 at every level): a declared <= 128 KiB
+        // wide-alphabet frame — text class — hashes the tree on 4 bytes
+        // like the rows it mirrors, while structured frames keep the
+        // knob's 5 (their 4-byte candidates are net-negative: json 4 KiB
+        // +8 B, skewed 16 KiB +255 B under 4). The DECLARED shape gates
+        // it — the live window slice's length is capped near one block
+        // and fired on every block of large text frames when used here
+        // (32 MiB text +30% at the Best tier before the gate moved).
+        let tree_mls = if self.params.small_src && self.win_small_wide() {
+            4
+        } else {
+            knobs.mls as usize
+        };
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
@@ -28,6 +42,7 @@ impl MatchGeneratorDriver {
         // Disjoint field borrows: the window (win/ext) against the tables.
         let ldm_won = crate::encoding::btlazy::run_block_lazy(
             &knobs,
+            tree_mls,
             step,
             win,
             self.win_base,

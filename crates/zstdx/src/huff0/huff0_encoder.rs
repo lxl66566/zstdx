@@ -302,7 +302,7 @@ impl HuffmanTable {
     /// the aligned-form box are recycled through `scratch`.
     pub(crate) fn build_from_counts_into(counts: &[usize], scratch: &mut HuffScratch) -> Self {
         assert!(counts.len() <= 256);
-        build_lengths_into(counts, MAX_CODE_LENGTH as u8, scratch);
+        build_lengths_into(counts, optimal_literal_log(counts), scratch);
         let n = counts.len();
         let max_len = scratch.lengths[..n].iter().copied().max().unwrap_or(1) as usize;
         let weights = &mut scratch.weights;
@@ -612,6 +612,24 @@ fn rank_of(count: u32) -> usize {
     } else {
         (count.ilog2() + RANK_LOG_BEGIN) as usize
     }
+}
+
+/// The literal tree's depth cap: libzstd's cheap `HUF_optimalTableLog`
+/// path (`FSE_optimalTableLog_internal(11, srcSize, maxSymbolValue, 1)`):
+/// `highbit(total - 1) - 1` bits of accuracy, raised to the minimum that
+/// safely represents the observed alphabet
+/// (`min(highbit(total) + 1, highbit(max_symbol) + 2)`), clamped to
+/// 5..=11. A depth cap below 11 flattens the tree and shrinks the weight
+/// description (json 4 KiB level 1: desc 34 -> 26 B, text 1 KiB level 19:
+/// 45 -> 32 B).
+pub(crate) fn optimal_literal_log(counts: &[usize]) -> u8 {
+    let total: usize = counts.iter().sum();
+    debug_assert!(total > 1);
+    let max_symbol = counts.iter().rposition(|&c| c > 0).unwrap_or(0) as u32;
+    let highbit = |x: u32| (u32::BITS - x.leading_zeros()) - 1;
+    let max_bits_src = highbit(total as u32 - 1).saturating_sub(1);
+    let min_bits = (highbit(total as u32) + 1).min(highbit(max_symbol) + 2);
+    11u32.min(max_bits_src).max(min_bits).clamp(5, 11) as u8
 }
 
 /// Fill `scratch.lengths[..counts.len()]` with code lengths: a two-queue
@@ -1094,4 +1112,29 @@ fn from_data() {
 
     assert_eq!(table.packed, table2.packed);
     assert_eq!(table.uniform_nb, table2.uniform_nb);
+}
+
+#[cfg(test)]
+mod optimal_literal_log_tests {
+    use super::optimal_literal_log;
+
+    #[test]
+    fn caps_by_total_and_alphabet() {
+        let mut counts = [0usize; 256];
+        counts[34] = 200;
+        counts[44] = 90;
+        counts[58] = 60;
+        counts[125] = 40;
+        counts[97] = 120;
+        counts[101] = 110;
+        counts[110] = 80;
+        counts[116] = 50;
+        counts[48] = 20;
+        counts[49] = 11;
+        // total 781: maxBitsSrc highbit(780)-1 = 8, minBits min(10, 8) = 8
+        assert_eq!(optimal_literal_log(&counts), 8);
+        counts[34] = 2000;
+        // total 2781: maxBitsSrc 10, minBits 8
+        assert_eq!(optimal_literal_log(&counts), 10);
+    }
 }

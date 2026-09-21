@@ -260,11 +260,6 @@ fn compress_with_state(
     };
     header.serialize(&mut output);
     let max_window = state.matcher.window_size();
-    // The streaming reader cannot mark a just-filled block as last until the
-    // next read returns EOF, so an input that is an exact multiple of the
-    // block size ends with one empty raw block; emit the same shape to keep
-    // the outputs byte-identical.
-    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
     emit_slice_blocks(
         state,
         src,
@@ -275,10 +270,11 @@ fn compress_with_state(
         0,
         usize::MAX,
     );
-    // A frame needs at least one block: empty input, and the exact-multiple
-    // tail above, encode one empty raw last block (mirroring the streaming
-    // path).
-    if src.is_empty() || trailing_empty {
+    // A frame needs at least one block: empty input encodes one empty raw
+    // last block. Non-empty inputs mark their final real block last (the
+    // slice path knows the whole input up front, so no empty tail block is
+    // needed — libzstd's one-shot shape).
+    if src.is_empty() {
         let header = BlockHeader {
             last_block: true,
             block_type: crate::blocks::block::BlockType::Raw,
@@ -308,15 +304,10 @@ fn emit_slice_blocks(
     next: usize,
 ) {
     let block_size = state.matcher.block_size();
-    // The streaming reader cannot mark a just-filled block as last until the
-    // next read returns EOF, so an input that is an exact multiple of the
-    // block size ends with one empty raw block; emit the same shape to keep
-    // the outputs byte-identical.
-    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
     for (i, block) in src.chunks(block_size).enumerate().take(next).skip(first) {
         let block_start = (i * block_size) as u64;
         let block_end = block_start + block.len() as u64;
-        let last_block = block_end == src.len() as u64 && !trailing_empty;
+        let last_block = block_end == src.len() as u64;
         let hist = block_start.saturating_sub(max_window);
         state
             .matcher
@@ -445,8 +436,7 @@ fn compress_with_state_donated(
             usize::MAX,
         );
     }
-    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
-    if src.is_empty() || trailing_empty {
+    if src.is_empty() {
         let header = BlockHeader {
             last_block: true,
             block_type: crate::blocks::block::BlockType::Raw,
@@ -484,15 +474,14 @@ pub(crate) fn compress_with_state_dictionary(
         window_size: Some(state.matcher.window_size()),
     };
     header.serialize(&mut output);
-    let trailing_empty = !src.is_empty() && src.len().is_multiple_of(block_size);
     for (i, block) in src.chunks(block_size).enumerate() {
-        let last_block = (i + 1) * block_size >= src.len() && !trailing_empty;
+        let last_block = (i + 1) * block_size >= src.len();
         let tail = state.matcher.block_tail();
         tail[..block.len()].copy_from_slice(block);
         state.matcher.commit_block(block.len());
         compress_fastest(state, last_block, &mut output, &mut hasher);
     }
-    if src.is_empty() || trailing_empty {
+    if src.is_empty() {
         let header = BlockHeader {
             last_block: true,
             block_type: crate::blocks::block::BlockType::Raw,
@@ -776,6 +765,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `staged_read` tracks the probe's staged head replay across
         // blocks (it spans sixteen of them).
         let mut staged_read = 0usize;
+        // Content bytes fed so far, against the declared input length (the
+        // dictionary's content excluded — `shape.len` was widened by it):
+        // a caller-declared length certifies the block that exactly fills
+        // it as final, avoiding the empty closing block on grid-exact
+        // inputs (the reader itself cannot see EOF until a read returns
+        // zero). A wrong declaration ends the frame at the declared size.
+        let dict_len = dict.as_ref().map_or(0, |d| d.content.len()) as u64;
+        let declared = self.input_shape.len.map(|n| n.saturating_sub(dict_len));
+        let mut fed: u64 = 0;
         // Now compress block by block. `staged_read` tracks the probe's
         // staged head replay across blocks (it spans sixteen of them).
         loop {
@@ -803,10 +801,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     read_bytes += new_bytes;
                 }
                 if read_bytes == tail.len() {
-                    last_block = false;
+                    last_block = Some(fed + read_bytes as u64) == declared;
                     break 'read_loop;
                 }
             }
+            fed += read_bytes as u64;
             self.state.matcher.commit_block(read_bytes);
             // Special handling is needed for compression of a totally empty file (why you'd want to
             // do that, I don't know)
