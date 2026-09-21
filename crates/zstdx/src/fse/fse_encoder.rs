@@ -166,6 +166,9 @@ pub(crate) struct FseBuildScratch {
     /// per-sequence increments with unmasked u8 wire codes remain
     /// bounds-check-free.
     seq_lanes: Box<[[u32; 256]; 12]>,
+    /// Serialization probe for [`ncount_cost_bytes`] (selection-side
+    /// description measuring).
+    ncount_probe: Vec<u8>,
 }
 
 /// Pool depth: the three sequence tables plus the Huffman weight table can
@@ -179,6 +182,7 @@ impl Default for FseBuildScratch {
             spread: Vec::new(),
             spare: Vec::new(),
             seq_lanes: Box::new([[0; 256]; 12]),
+            ncount_probe: Vec::new(),
         }
     }
 }
@@ -305,6 +309,12 @@ impl FSETable {
 
     /// Normalized probabilities over the live alphabet prefix
     /// (`nsym` entries; see [`Self::nsym`]).
+    /// The normalized probabilities (the NCount domain: `-1` marks the
+    /// low-probability wire form), read by cross-entropy costing.
+    pub(crate) fn probs_slice(&self) -> &[i32] {
+        self.probs()
+    }
+
     fn probs(&self) -> &[i32] {
         // SAFETY: 256 i32 at PROB_I32_OFF inside the tab allocation.
         unsafe {
@@ -365,99 +375,141 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        let acc_log = self.acc_log();
-        let table_size = 1usize << acc_log;
-        let nsym = self.nsym as usize;
-        let probs = &self.probs()[..nsym];
-
-        // libzstd's FSE_writeNCount shape, widened to a 64-bit local
-        // accumulator over the writer's hot state: the description is
-        // assembled in registers and flushed as unaligned u64 stores
-        // instead of one BitWriter call per symbol, and `threshold`/
-        // `nb_bits` track ilog2(remaining) incrementally instead of a
-        // per-symbol lzcnt.
-        let (mut acc, mut nb, mut pos) = writer.hot_state();
-        let output = writer.out();
-        // Upper bound: 4 header bits, acc_log+1 (<= 13) bits per symbol and
-        // one 2-bit marker per zero symbol (zero runs cost less).
-        let bound = (4 + 15 * nsym) / 8 + 16;
-        if pos + bound > output.capacity() {
-            output.reserve(pos + bound - output.len());
-        }
-        let ptr = output.as_mut_ptr();
-
-        // Push the full bytes of `acc` to the output; the u64 store's
-        // overshoot past pos + nb/8 is overwritten by the next store or cut
-        // off by set_hot_state. Entering any add below, nb <= 47, so the
-        // widest add (16 bits) never overflows the accumulator.
-        macro_rules! flush {
-            () => {
-                if nb >= 48 {
-                    // SAFETY: the reserve above covers pos + 8 for every
-                    // store; see `bound`.
-                    unsafe { ptr.add(pos).cast::<u64>().write_unaligned(acc.to_le()) };
-                    pos += nb >> 3;
-                    acc >>= (nb >> 3) * 8;
-                    nb &= 7;
-                }
-            };
-        }
-
-        // The writer may enter with up to 63 pending bits; one conditional
-        // flush establishes the nb <= 47 invariant every add below relies on.
-        flush!();
-        acc |= u64::from(acc_log - 5) << nb;
-        nb += 4;
-
-        let mut remaining = table_size + 1;
-        let mut threshold = table_size;
-        let mut nb_bits = acc_log as usize + 1;
-        let mut s = 0usize;
-        while s < nsym && remaining > 1 {
-            let prob = probs[s];
-            s += 1;
-            let max = 2 * threshold - 1 - remaining;
-            let mut value = (prob + 1) as usize;
-            remaining -= prob.unsigned_abs() as usize;
-            if value >= threshold {
-                value += max;
-            }
-            acc |= (value as u64) << nb;
-            nb += nb_bits - (value < max) as usize;
-            while remaining < threshold {
-                nb_bits -= 1;
-                threshold >>= 1;
-            }
-            flush!();
-            if prob == 0 {
-                // Zero-probability run: 2-bit markers, three zeros per
-                // marker, eight markers as one 0xFFFF pair. A run reaching
-                // the live alphabet's end needs no terminator: the outer
-                // loop stops on the probability sum.
-                let mut run = 0usize;
-                while s < nsym && probs[s] == 0 {
-                    s += 1;
-                    run += 1;
-                }
-                while run >= 24 {
-                    acc |= 0xffff_u64 << nb;
-                    nb += 16;
-                    flush!();
-                    run -= 24;
-                }
-                while run >= 3 {
-                    acc |= 3_u64 << nb;
-                    nb += 2;
-                    run -= 3;
-                }
-                acc |= (run as u64) << nb;
-                nb += 2;
-            }
-            flush!();
-        }
-        writer.set_hot_state(acc, nb, pos);
-        writer.write_bits(0u8, writer.misaligned());
+        write_ncount(&self.probs()[..self.nsym as usize], self.acc_log(), writer);
     }
+}
+
+/// Serialize one normalized distribution as the wire NCount stream
+/// (`FSE_writeNCount`'s shape — see [`FSETable::write_table`]).
+pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
+    probs: &[i32],
+    acc_log: u8,
+    writer: &mut BitWriter<V>,
+) {
+    let table_size = 1usize << acc_log;
+    let nsym = probs.len();
+
+    // libzstd's FSE_writeNCount shape, widened to a 64-bit local
+    // accumulator over the writer's hot state: the description is
+    // assembled in registers and flushed as unaligned u64 stores
+    // instead of one BitWriter call per symbol, and `threshold`/
+    // `nb_bits` track ilog2(remaining) incrementally instead of a
+    // per-symbol lzcnt.
+    let (mut acc, mut nb, mut pos) = writer.hot_state();
+    let output = writer.out();
+    // Upper bound: 4 header bits, acc_log+1 (<= 13) bits per symbol and
+    // one 2-bit marker per zero symbol (zero runs cost less).
+    let bound = (4 + 15 * nsym) / 8 + 16;
+    if pos + bound > output.capacity() {
+        output.reserve(pos + bound - output.len());
+    }
+    let ptr = output.as_mut_ptr();
+
+    // Push the full bytes of `acc` to the output; the u64 store's
+    // overshoot past pos + nb/8 is overwritten by the next store or cut
+    // off by set_hot_state. Entering any add below, nb <= 47, so the
+    // widest add (16 bits) never overflows the accumulator.
+    macro_rules! flush {
+        () => {
+            if nb >= 48 {
+                // SAFETY: the reserve above covers pos + 8 for every
+                // store; see `bound`.
+                unsafe { ptr.add(pos).cast::<u64>().write_unaligned(acc.to_le()) };
+                pos += nb >> 3;
+                acc >>= (nb >> 3) * 8;
+                nb &= 7;
+            }
+        };
+    }
+
+    // The writer may enter with up to 63 pending bits; one conditional
+    // flush establishes the nb <= 47 invariant every add below relies on.
+    flush!();
+    acc |= u64::from(acc_log - 5) << nb;
+    nb += 4;
+
+    let mut remaining = table_size + 1;
+    let mut threshold = table_size;
+    let mut nb_bits = acc_log as usize + 1;
+    let mut s = 0usize;
+    while s < nsym && remaining > 1 {
+        let prob = probs[s];
+        s += 1;
+        let max = 2 * threshold - 1 - remaining;
+        let mut value = (prob + 1) as usize;
+        remaining -= prob.unsigned_abs() as usize;
+        if value >= threshold {
+            value += max;
+        }
+        acc |= (value as u64) << nb;
+        nb += nb_bits - (value < max) as usize;
+        while remaining < threshold {
+            nb_bits -= 1;
+            threshold >>= 1;
+        }
+        flush!();
+        if prob == 0 {
+            // Zero-probability run: 2-bit markers, three zeros per
+            // marker, eight markers as one 0xFFFF pair. A run reaching
+            // the live alphabet's end needs no terminator: the outer
+            // loop stops on the probability sum.
+            let mut run = 0usize;
+            while s < nsym && probs[s] == 0 {
+                s += 1;
+                run += 1;
+            }
+            while run >= 24 {
+                acc |= 0xffff_u64 << nb;
+                nb += 16;
+                flush!();
+                run -= 24;
+            }
+            while run >= 3 {
+                acc |= 3_u64 << nb;
+                nb += 2;
+                run -= 3;
+            }
+            acc |= (run as u64) << nb;
+            nb += 2;
+        }
+        flush!();
+    }
+    writer.set_hot_state(acc, nb, pos);
+    writer.write_bits(0u8, writer.misaligned());
+}
+
+/// libzstd's `ZSTD_NCountCost`: the exact serialized description size of a
+/// fresh table for this histogram — normalization at the selection
+/// semantics (no last-code decrement, total = `nb_seq`,
+/// `useLowProbCount(nb_seq)`), then the real serializer into a probe
+/// buffer. `None` when normalization fails (the caller treats the fresh
+/// candidate as unavailable, like C's forwarded error).
+pub(crate) fn ncount_cost_bytes(
+    counts: &[u32; SEQ_CODE_SPACE],
+    nb_seq: usize,
+    max_symbol: usize,
+    max_log: u8,
+    scratch: &mut FseBuildScratch,
+) -> Option<usize> {
+    debug_assert!(nb_seq > 1);
+    let table_log = optimal_table_log(max_log, nb_seq, max_symbol);
+    let mut norm = [0i32; SEQ_CODE_SPACE];
+    if !normalize_count(
+        &mut norm,
+        table_log,
+        counts,
+        nb_seq,
+        max_symbol,
+        nb_seq >= 2048,
+    ) {
+        return None;
+    }
+    let probe = &mut scratch.ncount_probe;
+    probe.clear();
+    let mut writer = BitWriter::from(&mut *probe);
+    write_ncount(&norm[..=max_symbol], table_log, &mut writer);
+    writer.flush();
+    Some(probe.len())
 }
 
 /// Legacy histogram normalization, only used by the FSE round-trip test

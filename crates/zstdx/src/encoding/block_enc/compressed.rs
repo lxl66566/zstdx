@@ -4,7 +4,8 @@ use crate::{
     bit_io::BitWriter,
     encoding::{Matcher, seq_codes::SEQ_CODE_SPACE},
     fse::fse_encoder::{
-        FSETable, FseBuildScratch, approx_log2, build_normalized_table, flat_table, rle_table,
+        FSETable, FseBuildScratch, approx_log2, build_normalized_table, flat_table,
+        ncount_cost_bytes, rle_table,
     },
     huff0::huff0_encoder,
 };
@@ -99,6 +100,29 @@ pub(crate) struct DictEntropy {
     pub ll: bool,
     pub ml: bool,
     pub of: bool,
+    /// Which selection semantics the frame's sequence tables run: sticky
+    /// per frame (a strategy property, unlike the per-stream seeding flags
+    /// above), set by the dictionary load. `Stock` keeps every no-dict
+    /// frame's output byte-identical.
+    pub cost_mode: SeqCostMode,
+}
+
+/// Sequence-table selection semantics for one frame, mirroring which arm
+/// of libzstd's `ZSTD_selectEncodingType` the frame's strategy takes.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SeqCostMode {
+    /// The fast-strategy heuristic (dynamic-table threshold at mult 9)
+    /// plus the repeat cost check — the stock behavior of every no-dict
+    /// frame.
+    #[default]
+    Stock,
+    /// libzstd's greedy variant of the same heuristic: the predefined
+    /// bar tightens to mult 7 (`10 - ZSTD_greedy`), so small histograms
+    /// build fresh tables sooner.
+    Greedy,
+    /// libzstd's lazy+ arm: the exact three-way predefined/repeat/fresh
+    /// comparison on integer bit costs.
+    Exact,
 }
 
 impl DictEntropy {
@@ -108,6 +132,7 @@ impl DictEntropy {
         ll: true,
         ml: true,
         of: true,
+        cost_mode: SeqCostMode::Stock,
     };
 }
 
@@ -393,6 +418,7 @@ fn choose_tables_fast<'a>(
             default_tables.0,
             previous_tables.0,
             dict_entropy.ll,
+            dict_entropy.cost_mode,
             9,
             fse_scratch,
         ),
@@ -404,6 +430,7 @@ fn choose_tables_fast<'a>(
             default_tables.1,
             previous_tables.1,
             dict_entropy.ml,
+            dict_entropy.cost_mode,
             9,
             fse_scratch,
         ),
@@ -415,10 +442,135 @@ fn choose_tables_fast<'a>(
             default_tables.2,
             previous_tables.2,
             dict_entropy.of,
+            dict_entropy.cost_mode,
             8,
             fse_scratch,
         ),
     )
+}
+
+/// Which selection semantics one table's mode decision runs (resolved from
+/// the frame's [`SeqCostMode`] and the stream's dict seeding).
+#[derive(PartialEq)]
+enum SeqPolicy {
+    /// The landed measured-cost compare for dict-seeded tables on heuristic
+    /// rows.
+    Seeded,
+    /// The stock fast-row heuristic (mult 9).
+    Stock,
+    /// libzstd's greedy heuristic (mult 7).
+    Greedy,
+    /// libzstd's lazy+ exact three-way comparison.
+    Exact,
+}
+
+/// Stand-in for libzstd's `ERROR(GENERIC)` in the cost comparison: any
+/// real cost is far below it.
+const ERROR_COST: u64 = u64::MAX / 2;
+
+/// `-log2(x / 256) * 256` as libzstd's `kInverseProbabilityLog256` floor
+/// table (0 for x = 0). The exact integer values decide the lazy+ selection
+/// ties the same way C's do.
+#[rustfmt::skip]
+const INV_PROB_LOG256: [u16; 256] = [
+    0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162,
+    1130, 1100, 1073, 1047, 1024, 1001, 980, 960, 941, 923, 906, 889,
+    874, 859, 844, 830, 817, 804, 791, 779, 768, 756, 745, 734,
+    724, 714, 704, 694, 685, 676, 667, 658, 650, 642, 633, 626,
+    618, 610, 603, 595, 588, 581, 574, 567, 561, 554, 548, 542,
+    535, 529, 523, 517, 512, 506, 500, 495, 489, 484, 478, 473,
+    468, 463, 458, 453, 448, 443, 438, 434, 429, 424, 420, 415,
+    411, 407, 402, 398, 394, 390, 386, 382, 377, 373, 370, 366,
+    362, 358, 354, 350, 347, 343, 339, 336, 332, 329, 325, 322,
+    318, 315, 311, 308, 305, 302, 298, 295, 292, 289, 286, 283,
+    280, 277, 274, 271, 268, 265, 262, 259, 256, 253, 250, 247,
+    244, 241, 239, 236, 233, 230, 228, 225, 222, 220, 217, 215,
+    212, 209, 207, 204, 202, 199, 197, 194, 192, 190, 187, 185,
+    182, 180, 178, 175, 173, 171, 168, 166, 164, 162, 159, 157,
+    155, 153, 151, 149, 146, 144, 142, 140, 138, 136, 134, 132,
+    130, 128, 126, 123, 121, 119, 117, 115, 114, 112, 110, 108,
+    106, 104, 102, 100, 98, 96, 94, 93, 91, 89, 87, 85,
+    83, 82, 80, 78, 76, 74, 73, 71, 69, 67, 66, 64,
+    62, 61, 59, 57, 55, 54, 52, 50, 49, 47, 46, 44,
+    42, 41, 39, 37, 36, 34, 33, 31, 30, 28, 26, 25,
+    23, 22, 20, 19, 17, 16, 14, 13, 11, 10, 8, 7,
+    5, 4, 2, 1,
+];
+
+/// libzstd's `ZSTD_crossEntropyCost`: the histogram's cost in bits under
+/// the predefined distribution (accuracy-log scaled through the integer
+/// table).
+fn cross_entropy_bits(
+    default: &FSETable,
+    counts: &[u32; SEQ_CODE_SPACE],
+    max_symbol: usize,
+) -> u64 {
+    let shift = 8 - default.acc_log();
+    let probs = default.probs_slice();
+    let mut cost = 0u64;
+    for (s, &c) in counts.iter().enumerate().take(max_symbol + 1) {
+        if c > 0 {
+            let norm256 = (probs[s] as u32) << shift;
+            cost += u64::from(c) * u64::from(INV_PROB_LOG256[norm256 as usize]);
+        }
+    }
+    cost >> 8
+}
+
+/// libzstd's `ZSTD_entropyCost`: the histogram's Shannon-ish bound in bits
+/// through the integer table (probability `256 * c / total`, floored at 1
+/// for live symbols).
+fn entropy_cost_bits(counts: &[u32; SEQ_CODE_SPACE], nb_seq: usize, max_symbol: usize) -> u64 {
+    let mut cost = 0u64;
+    for &c in &counts[..=max_symbol] {
+        if c > 0 {
+            let mut norm = ((256 * c as u64) / nb_seq as u64) as usize;
+            if norm == 0 {
+                norm = 1;
+            }
+            cost += c as u64 * u64::from(INV_PROB_LOG256[norm]);
+        }
+    }
+    cost >> 8
+}
+
+/// libzstd's `ZSTD_fseBitCost`: the histogram's cost in bits through a real
+/// table's arithmetic form — `FSE_bitCost`'s fixed-point interpolation of
+/// the deltaNbBits fraction. `None` disqualifies the table (a live symbol
+/// with no state, the cost hitting libzstd's `badCost`).
+fn fse_bit_cost_bits(
+    prev: &FSETable,
+    counts: &[u32; SEQ_CODE_SPACE],
+    max_symbol: usize,
+) -> Option<u64> {
+    let table_log = u32::from(prev.acc_log());
+    let table_size = 1u32 << table_log;
+    let bad_cost = (u64::from(table_log) + 1) << 8;
+    let (tt, _) = prev.tab_parts();
+    let probs = prev.probs_slice();
+    let mut cost = 0u64;
+    for s in 0..=max_symbol {
+        let c = counts[s];
+        if c == 0 {
+            continue;
+        }
+        // A symbol beyond the table's alphabet (stale pooled tails read as
+        // garbage) or with no state in it: libzstd's badCost error.
+        if s > prev.max_symbol() as usize || probs[s] == 0 {
+            return None;
+        }
+        let dnb = unsafe { *tt.add(s) as u32 };
+        let min_nb = dnb >> 16;
+        let threshold = (min_nb + 1) << 16;
+        let delta_from_threshold = threshold - (dnb + table_size);
+        let normalized_delta = (delta_from_threshold << 8) >> table_log;
+        let bit_cost = ((u64::from(min_nb) + 1) << 8) - u64::from(normalized_delta);
+        if bit_cost >= bad_cost {
+            return None;
+        }
+        cost += c as u64 * bit_cost;
+    }
+    Some(cost >> 8)
 }
 
 /// Per-table mode selection from a filled histogram: RLE when a single code
@@ -438,6 +590,7 @@ pub(super) fn select_from_counts<'a>(
     default_table: &'a FSETable,
     previous: Option<&'a FSETable>,
     dict_seeded: bool,
+    cost_mode: SeqCostMode,
     max_log: u8,
     fse_scratch: &mut FseBuildScratch,
 ) -> FseTableMode<'a> {
@@ -458,6 +611,13 @@ pub(super) fn select_from_counts<'a>(
     // libzstd's DefaultMaxOff, since the OF default distribution has no
     // probability beyond code 28 while the wire space reaches 31.
     let default_covers = max_symbol <= default_table.max_symbol() as usize;
+    let policy = match cost_mode {
+        SeqCostMode::Exact => SeqPolicy::Exact,
+        SeqCostMode::Greedy if !dict_seeded => SeqPolicy::Greedy,
+        _ if dict_seeded => SeqPolicy::Seeded,
+        SeqCostMode::Stock => SeqPolicy::Stock,
+        SeqCostMode::Greedy => SeqPolicy::Greedy,
+    };
     if most_frequent as usize == nb_seq {
         // With two or fewer sequences the predefined table's description is
         // cheaper than even the one RLE byte — but only when the default
@@ -471,65 +631,107 @@ pub(super) fn select_from_counts<'a>(
             table: rle_table(first_code, fse_scratch),
         };
     }
-    if dict_seeded {
-        // libzstd's lazy+ selection for dictionary-provided tables: a pure
-        // cost comparison, predefined included — the small-block heuristic
-        // gates below would preempt the repeat mode that carries the
-        // dictionary's statistics. Measured against two alternatives on the
-        // dict fixture (54-file holdout, fast rows): blind repeat (C's
-        // fast-row shortcut, valid below 1000 sequences) loses +8/+9 B per
-        // file — this encoder's parse distributions fit the seeded tables
-        // worse than libzstd's own parses do — and pricing the fresh table
-        // exactly (build, then cost through it) flipped no decision the
-        // entropy-bound compare got wrong.
-        let basic_bits = if default_covers {
-            repeat_bit_cost(default_table, counts, max_symbol)
-        } else {
-            None
-        };
-        if let Some(prev) = previous
-            && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
-        {
-            let fresh_bits =
-                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+    match policy {
+        SeqPolicy::Exact => {
+            // libzstd's lazy+ arm, verbatim costs: `ZSTD_crossEntropyCost`
+            // for the predefined table, `ZSTD_fseBitCost` through the real
+            // previous table (the integer approximations are load-bearing
+            // for tie-breaking), and the fresh candidate priced as the
+            // exact serialized NCount bytes plus `ZSTD_entropyCost`. The
+            // old flat description estimate overpriced small alphabets'
+            // fresh tables (a 5-byte description charged as ~12) and the
+            // heuristic thresholds below preempted the comparison entirely.
+            let basic_bits =
+                default_covers.then(|| cross_entropy_bits(default_table, counts, max_symbol));
+            let repeat_bits = previous.and_then(|prev| fse_bit_cost_bits(prev, counts, max_symbol));
+            let fresh_bits = ncount_cost_bytes(counts, nb_seq, max_symbol, max_log, fse_scratch)
+                .map(|desc| entropy_cost_bits(counts, nb_seq, max_symbol) + 8 * desc as u64);
             if let Some(basic) = basic_bits
-                && basic <= repeat_bits
-                && basic <= fresh_bits
+                && basic <= repeat_bits.unwrap_or(ERROR_COST)
+                && basic <= fresh_bits.unwrap_or(ERROR_COST)
             {
                 return FseTableMode::Predefined(default_table);
             }
-            if repeat_bits <= fresh_bits {
+            if let Some(r) = repeat_bits
+                && r <= fresh_bits.unwrap_or(ERROR_COST)
+                && let Some(prev) = previous
+            {
                 return FseTableMode::Repeat(prev);
             }
-        } else if let Some(basic) = basic_bits
-            && basic
-                <= entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol)
-        {
-            return FseTableMode::Predefined(default_table);
-        }
-    } else {
-        if default_covers {
-            // The predefined distribution's accuracy log (6/6/5).
-            let default_norm_log = u32::from(default_table.acc_log());
-            let dynamic_min = ((1u32 << default_norm_log) * 9) >> 3;
-            if (nb_seq as u32) < dynamic_min
-                || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
+            // Fresh table: falls through to the build below (its
+            // normalization takes the last-code decrement, exactly
+            // libzstd's split between selection and `ZSTD_buildCTable`).
+        },
+        SeqPolicy::Seeded => {
+            // libzstd's selection for dictionary-provided tables on the
+            // heuristic rows, on measured costs: the small-block gates
+            // below would preempt the repeat mode that carries the
+            // dictionary's statistics. Measured against two alternatives on
+            // the dict fixture (54-file holdout, fast rows): blind repeat
+            // (C's fast-row shortcut, valid below 1000 sequences) loses
+            // +8/+9 B per file — this encoder's parse distributions fit the
+            // seeded tables worse than libzstd's own parses do — and pricing
+            // the fresh table exactly (build, then cost through it) flipped
+            // no decision the entropy-bound compare got wrong.
+            let basic_bits = if default_covers {
+                repeat_bit_cost(default_table, counts, max_symbol)
+            } else {
+                None
+            };
+            if let Some(prev) = previous
+                && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
+            {
+                let fresh_bits =
+                    entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+                if let Some(basic) = basic_bits
+                    && basic <= repeat_bits
+                    && basic <= fresh_bits
+                {
+                    return FseTableMode::Predefined(default_table);
+                }
+                if repeat_bits <= fresh_bits {
+                    return FseTableMode::Repeat(prev);
+                }
+            } else if let Some(basic) = basic_bits
+                && basic
+                    <= entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol)
             {
                 return FseTableMode::Predefined(default_table);
             }
-        }
-        if let Some(prev) = previous
-            && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
-        {
-            // The bound understates a fresh table's bitstream and the
-            // description term is under two percent of the comparison, so
-            // the estimate leans toward rebuilding: ratio-safe.
-            let fresh_bits =
-                entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
-            if repeat_bits <= fresh_bits {
-                return FseTableMode::Repeat(prev);
+        },
+        SeqPolicy::Stock | SeqPolicy::Greedy => {
+            // libzstd's strategy < lazy heuristic: predefined below the
+            // dynamic-table threshold (mult = 10 - strategy: 9 for the fast
+            // row, 7 for greedy) or when the histogram is too skewed to pay
+            // for one.
+            let mult = if policy == SeqPolicy::Greedy {
+                7
+            } else {
+                9
+            };
+            if default_covers {
+                // The predefined distribution's accuracy log (6/6/5).
+                let default_norm_log = u32::from(default_table.acc_log());
+                let dynamic_min = ((1u32 << default_norm_log) * mult) >> 3;
+                if (nb_seq as u32) < dynamic_min
+                    || most_frequent < (nb_seq as u32) >> (default_norm_log - 1)
+                {
+                    return FseTableMode::Predefined(default_table);
+                }
             }
-        }
+            if let Some(prev) = previous
+                && let Some(repeat_bits) = repeat_bit_cost(prev, counts, max_symbol)
+            {
+                // The bound understates a fresh table's bitstream and the
+                // description term is under two percent of the comparison,
+                // so the estimate leans toward rebuilding: ratio-safe.
+                let fresh_bits =
+                    entropy_bound_bits(counts, nb_seq, max_symbol) + description_bits(max_symbol);
+                if repeat_bits <= fresh_bits {
+                    return FseTableMode::Repeat(prev);
+                }
+            }
+        },
     }
     match build_normalized_table(counts, nb_seq, max_symbol, max_log, last_code, fse_scratch) {
         Some(table) => FseTableMode::Encoded(table),
@@ -1329,6 +1531,7 @@ mod tests {
             &default,
             Some(&prev),
             false,
+            SeqCostMode::Stock,
             9,
             &mut FseBuildScratch::default(),
         );
@@ -1350,6 +1553,7 @@ mod tests {
             &default,
             Some(&prev),
             false,
+            SeqCostMode::Stock,
             9,
             &mut FseBuildScratch::default(),
         );
@@ -1372,6 +1576,7 @@ mod tests {
             &default,
             Some(&prev),
             false,
+            SeqCostMode::Stock,
             9,
             &mut FseBuildScratch::default(),
         );
@@ -1397,6 +1602,7 @@ mod tests {
                 &of_default,
                 None,
                 false,
+                SeqCostMode::Stock,
                 8,
                 &mut FseBuildScratch::default(),
             );
@@ -1416,6 +1622,7 @@ mod tests {
             &of_default,
             None,
             false,
+            SeqCostMode::Stock,
             8,
             &mut FseBuildScratch::default(),
         );
@@ -1453,6 +1660,7 @@ mod tests {
                 &default,
                 None,
                 false,
+                SeqCostMode::Stock,
                 max_log,
                 &mut FseBuildScratch::default(),
             );

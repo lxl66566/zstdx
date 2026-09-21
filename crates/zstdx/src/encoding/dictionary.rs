@@ -8,7 +8,10 @@ use alloc::vec::Vec;
 use crate::{
     Error, InputShape, Level,
     decoding::{Dictionary, dictionary::MAGIC_NUM},
-    encoding::{block_enc::compressed::DictEntropy, frame_compressor::CompressState},
+    encoding::{
+        block_enc::compressed::{DictEntropy, SeqCostMode},
+        frame_compressor::CompressState,
+    },
     fse::fse_encoder::{FSETable, build_table_from_probabilities},
     huff0::huff0_encoder::HuffmanTable,
 };
@@ -125,4 +128,16 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
         state.fse_tables.of_previous.clone_from(&dict.of);
         state.dict_entropy = DictEntropy::ALL;
     }
+    // Sequence-table selection semantics: mirror which arm of libzstd's
+    // `ZSTD_selectEncodingType` the frame's strategy takes. Levels 5+ are
+    // the lazy family or above in both of libzstd's cParams tables, so
+    // dictionary frames there run the exact three-way cost comparison;
+    // level 4 is greedy's tighter heuristic bar. Fast rows (1-3) keep the
+    // stock heuristic. Sticky per frame (survives the seeding flags
+    // clearing above); no-dict frames never see it.
+    state.dict_entropy.cost_mode = match level.as_i32() {
+        1..=3 => SeqCostMode::Stock,
+        4 => SeqCostMode::Greedy,
+        _ => SeqCostMode::Exact,
+    };
 }
