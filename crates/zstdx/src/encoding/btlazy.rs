@@ -128,24 +128,67 @@ pub(crate) fn run_block_lazy(
     let block_end_idx = (block_end - win_base) as usize;
     let table_log = table.len().trailing_zeros();
     let bt_mask = bt.len() / 2 - 1;
-    let mut finder = DubtFinder {
-        win,
-        win_base,
-        block_end_idx,
-        max_window,
-        table,
-        bt,
-        next_update,
-        table_log,
-        bt_mask,
-        // Tree hash width: the caller's policy (the small-frame screen
-        // lives in the bridge, which knows the declared input shape; the
-        // knob's default is the row's searchLength).
-        mls: tree_mls,
-        nb_compares: 1usize << knobs.search_log,
-        min_match: knobs.min_match as usize,
-        sufficient_len: knobs.sufficient_len as usize,
-    };
+    macro_rules! go {
+        ($m:literal) => {{
+            let mut finder = DubtFinder {
+                win,
+                win_base,
+                block_end_idx,
+                max_window,
+                table,
+                bt,
+                next_update,
+                table_log,
+                bt_mask,
+                nb_compares: 1usize << knobs.search_log,
+                min_match: knobs.min_match as usize,
+                sufficient_len: knobs.sufficient_len as usize,
+            };
+            block_lazy_segments::<$m>(
+                step,
+                &mut finder,
+                lit_lens,
+                ldm_seqs,
+                block_start,
+                block_end,
+                win,
+                win_base,
+                rep,
+                rep_pending,
+                literals,
+                seqs,
+            )
+        }};
+    }
+    // Tree hash width: the caller's policy (the small-frame screen lives
+    // in the bridge, which knows the declared input shape; the knob's
+    // default is the row's searchLength). The const parameter monomorphizes
+    // the block loop per width — the hash selection and its constants fold,
+    // the constprop libzstd gets from its `ZSTD_BtFindBestMatch_noDict_5`
+    // template instantiations.
+    match tree_mls {
+        3 => go!(3),
+        4 => go!(4),
+        _ => go!(5),
+    }
+}
+
+/// The block loop proper, monomorphized over the tree hash width.
+#[allow(clippy::too_many_arguments)]
+fn block_lazy_segments<const MLS: usize>(
+    step: LazyStep,
+    finder: &mut DubtFinder<'_, '_, MLS>,
+    lit_lens: &[u8; 256],
+    ldm_seqs: &[LdmSeq],
+    block_start: u64,
+    block_end: u64,
+    win: &[u8],
+    win_base: u64,
+    rep: &mut [u32; 3],
+    rep_pending: &mut u8,
+    literals: &mut Vec<u8>,
+    seqs: &mut Vec<SeqWord>,
+) -> bool {
     let mut lit_clamp = [0i32; 256];
     for (dst, &len) in lit_clamp.iter_mut().zip(lit_lens.iter()) {
         *dst = (len as i32).min(6);

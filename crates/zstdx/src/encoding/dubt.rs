@@ -116,7 +116,12 @@ fn unpack_pos(v: u32, pos: u64) -> u64 {
 
 /// The DUBT finder: hash heads (`table`) plus the two-slot ring (`bt`),
 /// both u32 like libzstd's btlazy2 tables.
-pub(crate) struct DubtFinder<'a, 'b> {
+///
+/// `MLS` (the tree hash width) is a const parameter: the hash selection and
+/// its constants fold at compile time, the constprop libzstd gets for free
+/// from its `_noDict_5` template instantiations. All live rows hash 5; the
+/// 4-instantiation is the small-frame wide-alphabet row, 3 the ultra rows.
+pub(crate) struct DubtFinder<'a, 'b, const MLS: usize> {
     pub(crate) win: &'a [u8],
     pub(crate) win_base: u64,
     pub(crate) block_end_idx: usize,
@@ -125,14 +130,13 @@ pub(crate) struct DubtFinder<'a, 'b> {
     pub(crate) table_log: u32,
     pub(crate) bt: &'b mut [u32],
     pub(crate) bt_mask: usize,
-    pub(crate) mls: usize,
     pub(crate) nb_compares: usize,
     pub(crate) min_match: usize,
     pub(crate) sufficient_len: usize,
     pub(crate) next_update: &'b mut u64,
 }
 
-impl DubtFinder<'_, '_> {
+impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
     /// Lowest absolute position usable as a candidate when scanning `pos`.
     #[inline]
     fn cand_floor(&self, pos: u64) -> u64 {
@@ -141,7 +145,7 @@ impl DubtFinder<'_, '_> {
 
     #[inline(always)]
     fn hash_main(&self, idx: usize) -> usize {
-        match self.mls {
+        match MLS {
             3 => hash3_at(self.win, idx, self.table_log),
             4 => hash4_at(self.win, idx, self.table_log),
             _ => hash5_at(self.win, idx, self.table_log),
@@ -155,23 +159,17 @@ impl DubtFinder<'_, '_> {
         debug_assert!(target_idx + super::match_generator::HASH_READ <= self.block_end_idx);
         let target_abs = self.win_base + target_idx as u64;
         let fill_floor = target_abs.saturating_sub(self.max_window);
-        let mut idx =
-            ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
-        // SAFETY: the hash masks to the table size and the ring slot to the
-        // ring by construction; positions are live window offsets.
-        unsafe {
-            let table = self.table.as_mut_ptr();
-            let bt = self.bt.as_mut_ptr();
-            while idx < target_idx {
-                let h = self.hash_main(idx);
-                let v = pack_pos(self.win_base + idx as u64);
-                let slot = bt.add(2 * (v as usize & self.bt_mask));
-                *slot = *table.add(h);
-                *slot.add(1) = UNSORTED;
-                *table.add(h) = v;
-                idx += 1;
-            }
-        }
+        let idx = ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
+        fill_range::<MLS>(
+            self.win,
+            self.table,
+            self.bt,
+            self.win_base,
+            self.table_log,
+            self.bt_mask,
+            idx,
+            target_idx,
+        );
         *self.next_update = target_abs;
     }
 
@@ -196,9 +194,12 @@ impl DubtFinder<'_, '_> {
             let mut smaller: *mut u32 = own;
             let mut larger: *mut u32 = own.add(1);
             let mut v = *smaller; // the fill-time chain link
+            // Fused range check: `floor < cand < curr` as one unsigned
+            // compare (`floor < curr` always holds, so the span is the bound).
+            let span = curr - (floor + 1);
             while nb > 0 {
                 let cand = unpack_pos(v, curr);
-                if !(cand > floor && cand < curr) {
+                if cand - (floor + 1) >= span {
                     break;
                 }
                 nb -= 1;
@@ -325,9 +326,11 @@ impl DubtFinder<'_, '_> {
             // a backtrack link toward newer nodes.
             let mut cand = *self.table.as_ptr().add(h);
             let mut prev = 0u32;
+            // Fused `unsort_limit < cand < pos` range check (one compare).
+            let unsort_span = pos - (unsort_limit + 1);
             loop {
                 let cand_abs = unpack_pos(cand, pos);
-                if !(cand_abs > unsort_limit && cand_abs < pos) {
+                if cand_abs - (unsort_limit + 1) >= unsort_span {
                     break;
                 }
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
@@ -379,9 +382,12 @@ impl DubtFinder<'_, '_> {
             let own = bt.add(2 * (pack_pos(pos) as usize & self.bt_mask));
             let mut smaller: *mut u32 = own;
             let mut larger: *mut u32 = own.add(1);
+            // Fused range check as in insert_dubt1: `floor < cand < pos` in
+            // one unsigned compare.
+            let span = pos - (floor + 1);
             while nb > 0 {
                 let cand_abs = unpack_pos(cand, pos);
-                if !(cand_abs > floor && cand_abs < pos) {
+                if cand_abs - (floor + 1) >= span {
                     break;
                 }
                 nb -= 1;
@@ -437,5 +443,41 @@ impl DubtFinder<'_, '_> {
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
         found
+    }
+}
+
+/// The fill proper, as a free function so the table and ring bases arrive
+/// as `&mut` slices (noalias): stores through either no longer alias the
+/// locals holding the bases, so both stay pinned in registers across the
+/// loop instead of reloading off the frame per position.
+#[inline]
+fn fill_range<const MLS: usize>(
+    win: &[u8],
+    table: &mut [u32],
+    bt: &mut [u32],
+    win_base: u64,
+    table_log: u32,
+    bt_mask: usize,
+    mut idx: usize,
+    target_idx: usize,
+) {
+    // SAFETY: the hash masks to the table size and the ring slot to the
+    // ring by construction; positions are live window offsets.
+    unsafe {
+        let table = table.as_mut_ptr();
+        let bt = bt.as_mut_ptr();
+        while idx < target_idx {
+            let h = match MLS {
+                3 => hash3_at(win, idx, table_log),
+                4 => hash4_at(win, idx, table_log),
+                _ => hash5_at(win, idx, table_log),
+            };
+            let v = pack_pos(win_base + idx as u64);
+            let slot = bt.add(2 * (v as usize & bt_mask));
+            *slot = *table.add(h);
+            *slot.add(1) = UNSORTED;
+            *table.add(h) = v;
+            idx += 1;
+        }
     }
 }
