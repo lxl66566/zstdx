@@ -176,9 +176,7 @@ impl SpfPlan {
 /// bytes (nothing posts or wraps before the verdict resolves, so the
 /// buffer's head is still the frame's).
 fn midsize_capture_window(level: Level, shape: crate::InputShape, head: &[u8]) -> Option<u64> {
-    if shape.len.is_none() {
-        return None;
-    }
+    shape.len?;
     let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, ReachChoice::Keep)?;
     let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
     ldm_head_parses(head).then_some(window)
