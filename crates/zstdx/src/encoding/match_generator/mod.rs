@@ -673,6 +673,135 @@ impl MatchGeneratorDriver {
         self.small_wide.unwrap()
     }
 
+    /// Size the search tables for `params` — the table-family body of
+    /// [`Self::apply_level`], shared with the dictionary row swap in
+    /// [`Self::load_dictionary`] (a swapped frame re-keys its tables the
+    /// same way a level change does). Exactly one table family is live
+    /// per strategy; switching families drops the other's buffers. Within
+    /// a family the reallocation keys on the tables' lengths, not on the
+    /// whole params struct: a params-only change (the reach probe's
+    /// chain_reach switch, a window clamp that leaves the logs) must not
+    /// drop and re-zero same-sized tables — the probe's Keep/Shrink
+    /// alternation once re-zeroed the chain family on every parse, a
+    /// fixed cost that dwarfed RLE-class frames (zeros.balanced's 2.9x
+    /// regression). Kept tables carry the previous parse's entries;
+    /// candidates are window-guarded and byte-verified, the same
+    /// accepted residue as the equal-params path (which never cleared
+    /// either).
+    fn resize_tables(&mut self, params: &LevelParams) {
+        let heads_len = 1usize << params.hash_log;
+        let heads_kept = self.second == heads_len;
+        // The fused buffer preserves the two-table keep/refresh
+        // semantics exactly: a kept head with a resized second table
+        // truncates and re-extends (resize zeroes only the new tail),
+        // which is today's fresh-second-table behavior; any head-size
+        // change drops the whole buffer like the old two allocations.
+        match params.strategy {
+            Strategy::Fast => {
+                if !heads_kept {
+                    self.tables = alloc::vec![0u32; heads_len];
+                    self.second = heads_len;
+                } else if self.tables.len() != heads_len {
+                    self.tables.truncate(heads_len);
+                }
+            },
+            Strategy::Dfast(small_log) => {
+                let total = heads_len + (1usize << small_log);
+                if heads_kept && self.tables.len() == total {
+                    // both kept
+                } else if heads_kept {
+                    self.tables.truncate(heads_len);
+                    self.tables.resize(total, 0);
+                } else {
+                    self.tables = alloc::vec![0u32; total];
+                    self.second = heads_len;
+                }
+            },
+            Strategy::Chain(chain_log) => {
+                let total = heads_len + (1usize << chain_log);
+                if heads_kept && self.tables.len() == total {
+                    // both kept
+                } else if heads_kept {
+                    self.tables.truncate(heads_len);
+                    self.tables.resize(total, 0);
+                } else {
+                    self.tables = alloc::vec![0u32; total];
+                    self.second = heads_len;
+                }
+            },
+            Strategy::Row(row_log) => {
+                // The row layout is structurally different from the
+                // single-head families (packed tag+position entries,
+                // cycling insertion), so a kept same-sized buffer
+                // would carry heads-family residue: reallocate on any
+                // switch, keep only a same-row resize. The head bytes
+                // follow the same keep/refresh rule over the row
+                // count (a row_log change inside one hash_log
+                // resizes them).
+                let rows = 1usize << params.hash_log.saturating_sub(row_log);
+                let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
+                    && self.row_heads.len() == rows;
+                if !rows_kept {
+                    self.tables = alloc::vec![0u32; heads_len];
+                    self.second = heads_len;
+                    self.row_heads = alloc::vec![0u8; rows];
+                } else if self.tables.len() != heads_len {
+                    self.tables.truncate(heads_len);
+                    self.tables.resize(heads_len, 0);
+                    self.row_heads.truncate(rows);
+                    self.row_heads.resize(rows, 0);
+                }
+            },
+            Strategy::Opt(knobs) => {
+                if self.opt_table.len() != 1usize << params.hash_log {
+                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                }
+                // The tree ring: two link slots per ring position.
+                if self.bt.len() != 2usize << knobs.bt_log {
+                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                }
+                let want_h3 = usize::from(knobs.hash3_log > 0) << knobs.hash3_log;
+                if self.hash3.len() != want_h3 {
+                    self.hash3 = if knobs.hash3_log > 0 {
+                        alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+                    } else {
+                        Vec::new()
+                    };
+                }
+                self.tables = Vec::new();
+                self.second = 0;
+            },
+            Strategy::BtLazy(knobs) => {
+                if self.dubt_table.len() != 1usize << params.hash_log {
+                    self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
+                }
+                if self.dubt_bt.len() != 2usize << knobs.bt_log {
+                    self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
+                }
+                self.opt_table = Vec::new();
+                self.bt = Vec::new();
+                self.hash3 = Vec::new();
+                self.tables = Vec::new();
+                self.second = 0;
+            },
+        }
+        if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
+            self.opt_table = Vec::new();
+            self.bt = Vec::new();
+            self.hash3 = Vec::new();
+        }
+        if !matches!(params.strategy, Strategy::BtLazy(_)) {
+            self.dubt_table = Vec::new();
+            self.dubt_bt = Vec::new();
+        }
+        if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
+            self.opt_scratch = Some(OptScratch::new());
+        }
+        if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
+            self.lazy_scratch = Some(LazyScratch::new());
+        }
+    }
+
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
@@ -694,129 +823,7 @@ impl MatchGeneratorDriver {
             || params.hash_log != self.params.hash_log
             || params.window != self.params.window;
         if tables_change {
-            // Exactly one table family is live per strategy; switching
-            // families drops the other's buffers. Within a family the
-            // reallocation keys on the tables' lengths, not on the whole
-            // params struct: a params-only change (the reach probe's
-            // chain_reach switch, a window clamp that leaves the logs)
-            // must not drop and re-zero same-sized tables — the probe's
-            // Keep/Shrink alternation once re-zeroed the chain family on
-            // every parse, a fixed cost that dwarfed RLE-class frames
-            // (zeros.balanced's 2.9x regression). Kept tables carry the
-            // previous parse's entries; candidates are window-guarded and
-            // byte-verified, the same accepted residue as the
-            // equal-params path (which never cleared either).
-            let heads_len = 1usize << params.hash_log;
-            let heads_kept = self.second == heads_len;
-            // The fused buffer preserves the two-table keep/refresh
-            // semantics exactly: a kept head with a resized second table
-            // truncates and re-extends (resize zeroes only the new tail),
-            // which is today's fresh-second-table behavior; any head-size
-            // change drops the whole buffer like the old two allocations.
-            match params.strategy {
-                Strategy::Fast => {
-                    if !heads_kept {
-                        self.tables = alloc::vec![0u32; heads_len];
-                        self.second = heads_len;
-                    } else if self.tables.len() != heads_len {
-                        self.tables.truncate(heads_len);
-                    }
-                },
-                Strategy::Dfast(small_log) => {
-                    let total = heads_len + (1usize << small_log);
-                    if heads_kept && self.tables.len() == total {
-                        // both kept
-                    } else if heads_kept {
-                        self.tables.truncate(heads_len);
-                        self.tables.resize(total, 0);
-                    } else {
-                        self.tables = alloc::vec![0u32; total];
-                        self.second = heads_len;
-                    }
-                },
-                Strategy::Chain(chain_log) => {
-                    let total = heads_len + (1usize << chain_log);
-                    if heads_kept && self.tables.len() == total {
-                        // both kept
-                    } else if heads_kept {
-                        self.tables.truncate(heads_len);
-                        self.tables.resize(total, 0);
-                    } else {
-                        self.tables = alloc::vec![0u32; total];
-                        self.second = heads_len;
-                    }
-                },
-                Strategy::Row(row_log) => {
-                    // The row layout is structurally different from the
-                    // single-head families (packed tag+position entries,
-                    // cycling insertion), so a kept same-sized buffer
-                    // would carry heads-family residue: reallocate on any
-                    // switch, keep only a same-row resize. The head bytes
-                    // follow the same keep/refresh rule over the row
-                    // count (a row_log change inside one hash_log
-                    // resizes them).
-                    let rows = 1usize << params.hash_log.saturating_sub(row_log);
-                    let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
-                        && self.row_heads.len() == rows;
-                    if !rows_kept {
-                        self.tables = alloc::vec![0u32; heads_len];
-                        self.second = heads_len;
-                        self.row_heads = alloc::vec![0u8; rows];
-                    } else if self.tables.len() != heads_len {
-                        self.tables.truncate(heads_len);
-                        self.tables.resize(heads_len, 0);
-                        self.row_heads.truncate(rows);
-                        self.row_heads.resize(rows, 0);
-                    }
-                },
-                Strategy::Opt(knobs) => {
-                    if self.opt_table.len() != 1usize << params.hash_log {
-                        self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
-                    }
-                    // The tree ring: two link slots per ring position.
-                    if self.bt.len() != 2usize << knobs.bt_log {
-                        self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
-                    }
-                    let want_h3 = usize::from(knobs.hash3_log > 0) << knobs.hash3_log;
-                    if self.hash3.len() != want_h3 {
-                        self.hash3 = if knobs.hash3_log > 0 {
-                            alloc::vec![EMPTY; 1usize << knobs.hash3_log]
-                        } else {
-                            Vec::new()
-                        };
-                    }
-                    self.tables = Vec::new();
-                    self.second = 0;
-                },
-                Strategy::BtLazy(knobs) => {
-                    if self.dubt_table.len() != 1usize << params.hash_log {
-                        self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
-                    }
-                    if self.dubt_bt.len() != 2usize << knobs.bt_log {
-                        self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
-                    }
-                    self.opt_table = Vec::new();
-                    self.bt = Vec::new();
-                    self.hash3 = Vec::new();
-                    self.tables = Vec::new();
-                    self.second = 0;
-                },
-            }
-            if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
-                self.opt_table = Vec::new();
-                self.bt = Vec::new();
-                self.hash3 = Vec::new();
-            }
-            if !matches!(params.strategy, Strategy::BtLazy(_)) {
-                self.dubt_table = Vec::new();
-                self.dubt_bt = Vec::new();
-            }
-            if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
-                self.opt_scratch = Some(OptScratch::new());
-            }
-            if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
-                self.lazy_scratch = Some(LazyScratch::new());
-            }
+            self.resize_tables(&params);
             // The owned window (streaming path) compacts down to the level's
             // window; grow the buffer so block_tail's set_len stays inside
             // the capacity. Direct-window matchers (slice size zero) never
@@ -940,43 +947,60 @@ impl MatchGeneratorDriver {
         // libzstd resolves a copied dictionary frame's parameters by the
         // PAYLOAD's size alone — the dict's bytes are match-state content,
         // not counted (`ZSTD_getCParamRowSize` on the loadDictionary route):
-        // a payload <= 16 KiB selects the <= 16 KiB clevels table, whose
-        // levels 4-8 swap the large table's dfast/lazy-band rows for
-        // plain-chain greedy/lazy/lazy2 at W14/H14/C14, searchLength 4,
-        // depth 1<<S (verified on the fixture: the CLI's default -4 output
-        // equals its forced strat=greedy, not dfast; the row matchfinder
-        // stays off, its auto rule needs windowLog > 14). Our rows keep the
-        // large-table classes — the -4..-8 dict residue (+3-8%) — so adopt
-        // the small-table row wholesale on the chain family. The frame
-        // window keeps its shape-clamped size (>= libzstd's W14): the swap
-        // targets the strategy class, not the reach. Unknown payload sizes
-        // (unpledged streams) keep the large-table row, like libzstd's
-        // CONTENTSIZE_UNKNOWN.
+        // a payload <= 16 KiB selects the <= 16 KiB clevels table (verified
+        // per knob on the fixture: overriding the CLI's default -4/-12/-16
+        // row value by value — wlog/clog/hlog/slog/mml/tlen — leaves its
+        // output byte-identical; its rows 4-8 are plain-chain greedy/lazy/
+        // lazy2 at W14/H14/C14, 9-10 btlazy2, 11-12 btopt, 13-15 btultra,
+        // 16+ btultra2, all at C15). Our ladder keeps the large-table
+        // strategy classes with only window/hash clamps — the -4..-8 and
+        // -11..-17 dict residues — so the frame adopts the small-table row
+        // wholesale: the chain rows 4-8 and the opt rows 11-22 (the tree
+        // rows 9-10 stay ours; the fixture has them at or past the CLI).
+        // The frame window keeps its shape-clamped size (>= libzstd's
+        // W14): the swap targets the strategy class and table geometry,
+        // not the reach. Unknown payload sizes (unpledged streams) keep
+        // the large-table row, like libzstd's CONTENTSIZE_UNKNOWN.
         let payload = self.shape.len.map(|n| n.saturating_sub(dict_len));
         if let Some(payload) = payload
             && payload <= SMALL_DICT_PAYLOAD_MAX
         {
-            let swap = match level.as_i32() {
-                4 => Some((128, 0)),
-                5 => Some((64, 1)),
-                6 => Some((64, 2)),
-                7 => Some((64, 2)),
-                8 => Some((256, 2)),
-                _ => None,
-            };
-            // Depths are tuned past libzstd's 1<<S (16/8/16/64/256): the
-            // dict's dense twin field converts extra attempts at 4-6
-            // (fixture sweep 1x/4x/8x: -4 +1.6/+0.9/+0.8%, -5 +3.0/+1.4/
-            // +1.2%, -6 +2.4/+2.1/flat, 7-8 flat from 64/256 up).
-            if let Some((depth, lazy)) = swap {
-                self.params.hash_log = SMALL_DICT_TABLE_LOG;
-                self.params.strategy = Strategy::Chain(SMALL_DICT_TABLE_LOG);
-                self.params.search_depth = depth;
-                self.params.lazy_depth = lazy;
-                self.params.min_match = MIN_MATCH as u32;
-                self.dict_row = true;
-                self.second = 1usize << SMALL_DICT_TABLE_LOG;
-                self.tables = alloc::vec![0u32; 2 * self.second];
+            match small_dict_row(level.as_i32(), self.params.window, self.shape) {
+                // Chain depths are tuned past libzstd's 1<<S
+                // (16/8/16/64/256): the dict's dense twin field converts
+                // extra attempts at 4-6 (fixture sweep 1x/4x/8x: -4
+                // +1.6/+0.9/+0.8%, -5 +3.0/+1.4/+1.2%, -6 +2.4/+2.1/flat,
+                // 7-8 flat from 64/256 up).
+                Some(SmallDictRow::Chain { depth, lazy }) => {
+                    let mut row = self.params;
+                    row.hash_log = SMALL_DICT_TABLE_LOG;
+                    row.strategy = Strategy::Chain(SMALL_DICT_TABLE_LOG);
+                    row.search_depth = depth;
+                    row.lazy_depth = lazy;
+                    row.min_match = MIN_MATCH as u32;
+                    self.dict_row = true;
+                    // The adopted row starts from fresh tables whatever
+                    // the previous family left (a kept dfast/row buffer
+                    // would seed the head with foreign-layout entries on
+                    // <= 8 KiB frames, where the logs clamp to 14).
+                    self.second = 0;
+                    self.resize_tables(&row);
+                    self.params = row;
+                },
+                // The opt rows keep the table's searchLog and hashLog
+                // (ring C15) with the price model, searchLength and
+                // targetLength tuned past the table rows on the fixture
+                // (see `small_dict_opt_row`): the early-stop targetLength
+                // and btopt's integer prices each lose 1-2.5 pp raw here,
+                // and the knobs saturate — every level 11-22 parses to the
+                // same bytes. The tree indexes the dictionary lazily from
+                // `next_update` 0 (the `fill_window_grid` arm below),
+                // matching libzstd's load-time `ZSTD_updateTree` coverage.
+                Some(SmallDictRow::Opt(row)) => {
+                    self.resize_tables(&row);
+                    self.params = row;
+                },
+                None => {},
             }
         }
         // The owned window is filled above; prefill over the caller's slice
@@ -2429,7 +2453,8 @@ pub(crate) use params::LdmArming;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_FULL_WINDOW, LDM_QUIET, LDM_SYMS_MIN, LEVEL_PARAMS,
-    LdmFill, LevelParams, Strategy, ldm_min_window, params_for, sampled_distinct,
+    LdmFill, LevelParams, SmallDictRow, Strategy, ldm_min_window, params_for, sampled_distinct,
+    small_dict_row,
 };
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
