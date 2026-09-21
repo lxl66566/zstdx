@@ -497,7 +497,19 @@ impl MatchGeneratorDriver {
             } else {
                 (start - cand + 3) as u32
             };
-            anchor = emit.emit_chain(win, chain, hash_log, anchor, start, ml, of_value, &mut rep);
+            // `next_ins` is the insert frontier right after the scan's
+            // own probe insert (see emit_chain's fill-start note).
+            anchor = emit.emit_chain(
+                win,
+                chain,
+                hash_log,
+                anchor,
+                start,
+                ml,
+                of_value,
+                &mut rep,
+                next_ins,
+            );
             if $gated && rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
