@@ -199,7 +199,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
             let span = curr - (floor + 1);
             while nb > 0 {
                 let cand = unpack_pos(v, curr);
-                if cand - (floor + 1) >= span {
+                if cand.wrapping_sub(floor + 1) >= span {
                     break;
                 }
                 nb -= 1;
@@ -330,7 +330,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
             let unsort_span = pos - (unsort_limit + 1);
             loop {
                 let cand_abs = unpack_pos(cand, pos);
-                if cand_abs - (unsort_limit + 1) >= unsort_span {
+                if cand_abs.wrapping_sub(unsort_limit + 1) >= unsort_span {
                     break;
                 }
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
@@ -387,7 +387,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
             let span = pos - (floor + 1);
             while nb > 0 {
                 let cand_abs = unpack_pos(cand, pos);
-                if cand_abs - (floor + 1) >= span {
+                if cand_abs.wrapping_sub(floor + 1) >= span {
                     break;
                 }
                 nb -= 1;

@@ -700,3 +700,74 @@ fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
     };
     p
 }
+
+/// The <= 16 KiB clevels table's row a dictionary frame adopts when its
+/// pledged payload is small (see `load_dictionary`): the chain rows
+/// (levels 4-8) carry their fixture-tuned depths; the opt rows (11-22)
+/// are [`small_dict_opt_row`]'s strategy-class swap. Levels 9-10 map to
+/// `None` — their small-table rows are btlazy2, and the fixture has our
+/// rows at or past the CLI there (2026-09-21: -9 raw -0.2%).
+pub(super) enum SmallDictRow {
+    /// The table's greedy/lazy/lazy2 row as a plain-chain parse at
+    /// H14/C14 (`depth`/`lazy` tuned past libzstd's 1<<S on the fixture).
+    Chain { depth: u32, lazy: u32 },
+    /// The table's btopt/btultra/btultra2 row as a [`Strategy::Opt`]
+    /// parse.
+    Opt(LevelParams),
+}
+
+/// Resolve the <= 16 KiB clevels row for a dictionary frame's level (see
+/// [`SmallDictRow`]); `window`/`shape` feed the opt rows' construction.
+pub(super) fn small_dict_row(level: i32, window: usize, shape: InputShape) -> Option<SmallDictRow> {
+    match level {
+        4 => Some(SmallDictRow::Chain {
+            depth: 128,
+            lazy: 0,
+        }),
+        5 => Some(SmallDictRow::Chain { depth: 64, lazy: 1 }),
+        6 | 7 => Some(SmallDictRow::Chain { depth: 64, lazy: 2 }),
+        8 => Some(SmallDictRow::Chain {
+            depth: 256,
+            lazy: 2,
+        }),
+        11..=22 => small_dict_opt_row(level, window, shape).map(SmallDictRow::Opt),
+        _ => None,
+    }
+}
+
+/// The <= 16 KiB clevels table's opt-family rows (levels 11-22): btopt at
+/// 11-12, btultra at 13-15, btultra2 from 16 — one [`Strategy::Opt`] row
+/// per level carrying the table's (searchLog, searchLength, targetLength)
+/// knobs at hash H14 through row 13 and H15 from 14, ring C15. `window`
+/// is the live shape-clamped frame window (the swap replaces the strategy
+/// class and table geometry, not the reach — the landed chain swap's
+/// rule); `adjust_params` then clamps the logs exactly like libzstd's
+/// `ZSTD_adjustCParams_internal` (ring and hash3 floored by the source's
+/// log, mirroring its `hashLog3 = MIN(17, windowLog)`).
+fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<LevelParams> {
+    // The row's searchLog (floored at 4: the tree saturates from 1<<4 up,
+    // a 1<<3 budget leaves 27 B on the fixture) and hashLog (H14 through
+    // row 13, H15 from 14). The remaining knobs are tuned past the table
+    // on the fixture (see `load_dictionary`): the price model is ultra for
+    // every row (the table's btopt rows at 11-12 lose 2.4 pp raw with
+    // integer prices on this parser), searchLength is 3 (row 11's 4 loses
+    // 27 B), and targetLength is off — 999 (every row T 12-512 loses to
+    // the full DP; the early-stop jump is a large-input speed knob).
+    let (search_log, hash_log) = match level {
+        11 | 12 => (4, 14),
+        13 => (5, 14),
+        14 => (6, 15),
+        15 => (7, 15),
+        16 => (5, 15),
+        17 => (6, 15),
+        18 => (7, 15),
+        19 | 20 => (8, 15),
+        21 => (9, 15),
+        22 => (10, 15),
+        _ => return None,
+    };
+    Some(adjust_params(
+        opt(hash_log, window, knobs(search_log, 999, 3, 15, true)),
+        shape.len,
+    ))
+}
