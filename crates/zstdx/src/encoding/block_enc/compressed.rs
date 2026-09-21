@@ -505,12 +505,21 @@ fn cross_entropy_bits(
     counts: &[u32; SEQ_CODE_SPACE],
     max_symbol: usize,
 ) -> u64 {
-    let shift = 8 - default.acc_log();
+    let shift = 8 - u32::from(default.acc_log());
     let probs = default.probs_slice();
     let mut cost = 0u64;
     for (s, &c) in counts.iter().enumerate().take(max_symbol + 1) {
         if c > 0 {
-            let norm256 = (probs[s] as u32) << shift;
+            // libzstd prices a `-1` norm (the low-probability wire form) at
+            // the minimum probability 1: reading it raw wraps the index
+            // past the table (a >=2051-byte literal run hits the LL
+            // default distribution's `-1` tail on dict frames).
+            let norm = if probs[s] == -1 {
+                1
+            } else {
+                probs[s] as u32
+            };
+            let norm256 = norm << shift;
             cost += u64::from(c) * u64::from(INV_PROB_LOG256[norm256 as usize]);
         }
     }
