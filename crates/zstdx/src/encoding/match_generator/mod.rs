@@ -326,6 +326,12 @@ unsafe impl Send for MatchGeneratorDriver {}
 #[cfg(feature = "std")]
 use super::ldm::LdmSnapshot;
 
+/// Payload ceiling for the small-dictionary strategy swap (libzstd's
+/// <= 16 KiB clevels table boundary, keyed on the payload alone on the
+/// loadDictionary route — see `load_dictionary`).
+const SMALL_DICT_PAYLOAD_MAX: u64 = 16 * 1024;
+/// Hash/chain log of the <= 16 KiB table's chain rows (W14/H14/C14).
+const SMALL_DICT_TABLE_LOG: u32 = 14;
 /// Smallest largest prefix strip that engages the shared prefix fill;
 /// below it the tail jobs' own parallel fills are the cheaper schedule.
 #[cfg(feature = "std")]
@@ -881,8 +887,9 @@ impl MatchGeneratorDriver {
     /// dictionary grid (see `FillGrid::Dictionary`; seed detection
     /// included), so matches into the dictionary cost nothing extra at
     /// scan time.
-    pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
+    pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
         debug_assert!(self.ext.is_none() && self.win.is_empty() && self.pos == 0);
+        let dict_len = content.len() as u64;
         let keep = content.len().min(self.params.window);
         let content = &content[content.len() - keep..];
         self.win.clear();
@@ -929,6 +936,48 @@ impl MatchGeneratorDriver {
         }
         if matches!(self.params.strategy, Strategy::Chain(_)) {
             self.params.search_depth *= 8;
+        }
+        // libzstd resolves a copied dictionary frame's parameters by the
+        // PAYLOAD's size alone — the dict's bytes are match-state content,
+        // not counted (`ZSTD_getCParamRowSize` on the loadDictionary route):
+        // a payload <= 16 KiB selects the <= 16 KiB clevels table, whose
+        // levels 4-8 swap the large table's dfast/lazy-band rows for
+        // plain-chain greedy/lazy/lazy2 at W14/H14/C14, searchLength 4,
+        // depth 1<<S (verified on the fixture: the CLI's default -4 output
+        // equals its forced strat=greedy, not dfast; the row matchfinder
+        // stays off, its auto rule needs windowLog > 14). Our rows keep the
+        // large-table classes — the -4..-8 dict residue (+3-8%) — so adopt
+        // the small-table row wholesale on the chain family. The frame
+        // window keeps its shape-clamped size (>= libzstd's W14): the swap
+        // targets the strategy class, not the reach. Unknown payload sizes
+        // (unpledged streams) keep the large-table row, like libzstd's
+        // CONTENTSIZE_UNKNOWN.
+        let payload = self.shape.len.map(|n| n.saturating_sub(dict_len));
+        if let Some(payload) = payload
+            && payload <= SMALL_DICT_PAYLOAD_MAX
+        {
+            let swap = match level.as_i32() {
+                4 => Some((128, 0)),
+                5 => Some((64, 1)),
+                6 => Some((64, 2)),
+                7 => Some((64, 2)),
+                8 => Some((256, 2)),
+                _ => None,
+            };
+            // Depths are tuned past libzstd's 1<<S (16/8/16/64/256): the
+            // dict's dense twin field converts extra attempts at 4-6
+            // (fixture sweep 1x/4x/8x: -4 +1.6/+0.9/+0.8%, -5 +3.0/+1.4/
+            // +1.2%, -6 +2.4/+2.1/flat, 7-8 flat from 64/256 up).
+            if let Some((depth, lazy)) = swap {
+                self.params.hash_log = SMALL_DICT_TABLE_LOG;
+                self.params.strategy = Strategy::Chain(SMALL_DICT_TABLE_LOG);
+                self.params.search_depth = depth;
+                self.params.lazy_depth = lazy;
+                self.params.min_match = MIN_MATCH as u32;
+                self.dict_row = true;
+                self.second = 1usize << SMALL_DICT_TABLE_LOG;
+                self.tables = alloc::vec![0u32; 2 * self.second];
+            }
         }
         // The owned window is filled above; prefill over the caller's slice
         // avoids the self-borrow (identical bytes). The dictionary grid:
@@ -1544,8 +1593,8 @@ impl Matcher for MatchGeneratorDriver {
 
     /// See the inherent [`MatchGeneratorDriver::load_dictionary`] — the
     /// trait view.
-    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
-        self.load_dictionary(content, rep);
+    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
+        self.load_dictionary(content, rep, level);
     }
 
     fn reset(&mut self, level: Level) {

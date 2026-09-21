@@ -338,7 +338,7 @@ pub trait Matcher {
     /// implementations only; the default drops it, and the encoder still
     /// declares the dictionary id and entropy tables — sequences simply
     /// never reference the content).
-    fn load_dictionary(&mut self, _content: &[u8], _rep: [u32; 3]) {}
+    fn load_dictionary(&mut self, _content: &[u8], _rep: [u32; 3], _level: Level) {}
     /// The size of the window the decoder will need to execute all sequences produced by this
     /// matcher
     ///

@@ -76,8 +76,8 @@ impl Matcher for RecordingMatcher {
         self.inner.restore_repcode(rep);
     }
 
-    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3]) {
-        self.inner.load_dictionary(content, rep);
+    fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
+        self.inner.load_dictionary(content, rep, level);
     }
 }
 

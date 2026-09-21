@@ -272,7 +272,18 @@ impl MatchGeneratorDriver {
                 // and skipping over sparse-match gaps is what keeps the
                 // Balanced levels fast on them.
                 miss_count += 1;
-                let step = 1 + (miss_count >> 2).min(255) as u64;
+                // Dictionary frames take libzstd's anchor-distance grid
+                // exactly (step 1 for the first 256 literal bytes): the
+                // ramp's skipped positions are the small-dict parse's
+                // missed ml-4 twins (the literal-volume residue in the -5
+                // seqstats decomposition), and dict frames are not a hot
+                // path. `dict_row` is constant per frame, so the no-dict
+                // bodies keep the ramp alone.
+                let step = if dict_row {
+                    1 + ((pos - anchor) >> 8)
+                } else {
+                    1 + (miss_count >> 2).min(255) as u64
+                };
                 if $ldm && ldm_i < ldm_seqs.len() {
                     // Never step over an unconsumed split: its candidate
                     // dies with the position (the scan is its only

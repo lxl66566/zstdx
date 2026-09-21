@@ -110,7 +110,9 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
 ) {
     state.matcher.set_input_shape(shape);
     state.matcher.reset(level);
-    state.matcher.load_dictionary(&dict.content, dict.rep);
+    state
+        .matcher
+        .load_dictionary(&dict.content, dict.rep, level);
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
     state.fse_tables.ml_previous = None;
