@@ -56,6 +56,14 @@ impl Matcher for RecordingMatcher {
         self.inner.consider_reach_probe(head, level);
     }
 
+    fn staged_tail(&self) -> &[u8] {
+        self.inner.staged_tail()
+    }
+
+    fn pre_split_effort(&self) -> u8 {
+        self.inner.pre_split_effort()
+    }
+
     fn set_input_shape(&mut self, shape: zstdx::InputShape) {
         self.inner.set_input_shape(shape);
     }
