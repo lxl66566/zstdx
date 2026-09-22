@@ -145,7 +145,7 @@ pub(crate) fn reset_slice_state(
     state.matcher.set_reach_choice(choice);
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
-    state.dict_entropy = DictEntropy::default();
+    state.dict_entropy = DictEntropy::plain(level, shape.len);
     state.split = pre_split::FrameSavings::new();
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_aligned(&mut state.scratch.huff);
@@ -783,7 +783,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_input_shape(self.input_shape);
             self.state.matcher.reset(self.compression_level);
             self.state.last_huff_table = None;
-            self.state.dict_entropy = DictEntropy::default();
+            self.state.dict_entropy =
+                DictEntropy::plain(self.compression_level, self.input_shape.len);
         }
         self.hasher = FrameHasher::new();
         // The probe's staged head (see reach_probe): the block loop below
