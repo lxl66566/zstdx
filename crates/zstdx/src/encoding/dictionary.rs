@@ -121,6 +121,7 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     state.fse_tables.ml_previous = None;
     state.fse_tables.of_previous = None;
     state.dict_entropy = DictEntropy::default();
+    state.split = super::pre_split::FrameSavings::new();
     if dict.id != 0 {
         state.last_huff_table.clone_from(&dict.huff);
         state.fse_tables.ll_previous.clone_from(&dict.ll);
