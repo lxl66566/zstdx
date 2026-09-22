@@ -186,6 +186,31 @@ pub struct MatchGeneratorDriver {
     /// every reset advances it past every position the state has written,
     /// retiring all stale entries at read time instead of clearing.
     opt_origin: u64,
+    /// Coordinate origin of the chain strategy's head entries (the opt
+    /// tables' scheme applied to `tables[..second]`): each strip prefill —
+    /// every MT job, including job zero's empty strip — advances it past
+    /// every position the state has written since the last advance, so
+    /// stale entries rebuild as beyond-reach distances at read time and
+    /// the per-job head clear disappears (an 8 MiB H21 clear that dominated
+    /// fast-compressing shapes: zeros.balanced stream-mt measured the
+    /// clear at ~35% of summed job time). ST frames never advance it:
+    /// their cross-frame residue semantics (window-domain validation plus
+    /// byte verification) are the documented don't-clear design and stay
+    /// bit-exact. The fast/dfast/row tables never advance it either —
+    /// their per-job clears stand (the row's 24-bit packed positions
+    /// cannot carry a 32-bit shift, and their table sizes make the clear
+    /// cheap).
+    head_origin: u64,
+    /// High-water mark of the positions this state has written into the
+    /// chain heads since the last origin advance, stashed at each reset
+    /// (before the cursor zeroes; `max` because the pooled bulk path
+    /// resets twice and the second reset would overwrite the mark with 0)
+    /// and at each strip fill (fill sites do not run the scan cursor).
+    /// The next strip prefill advances `head_origin` past it — the
+    /// invalidation invariant "advance exceeds every written position"
+    /// (`chain_search`'s stale-entry rejection) needs the mark to cover
+    /// exactly the writes since the last advance.
+    strip_mark: u64,
     miss_count: usize,
     /// Short-match interior fill policy for the current block's fast scan,
     /// decided from the previous block's parse density: at least
@@ -358,6 +383,13 @@ pub(crate) const SPF_MIN_PREFIX: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "std")]
 pub(crate) const SPF_SEG: u64 = 1024 * 1024;
 
+/// Ceiling for the chain heads' coordinate origin (`head_origin`): the
+/// u64-domain entry resolve needs `pos + origin + 1 < 2^32` for live
+/// entries, so the advance degrades into a real clear once the origin
+/// would pass this bar — once per ~1 GiB of cumulative positions on one
+/// pooled state, keeping frames below 3 GiB on exact semantics.
+const HEAD_ORIGIN_CAP: u64 = 1 << 30;
+
 /// Captured strip-fill state of a [`MatchGeneratorDriver`] (the streaming
 /// core's shared prefix fill): the chain row's head/chain grid tables plus
 /// the LDM fill state after a fill covering `[base, base + upto)` —
@@ -373,6 +405,10 @@ pub(crate) struct StripSnapshot {
     tables: Vec<u32>,
     second: usize,
     ldm: Option<LdmSnapshot>,
+    /// The builder's head coordinate origin: the adopted entries resolve
+    /// against it, so the adopter must take it with the tables (its own
+    /// origin is unrelated history).
+    origin: u64,
     /// Absolute stream offset the fill covered.
     upto: u64,
 }
@@ -611,6 +647,8 @@ impl MatchGeneratorDriver {
             gap_start: u64::MAX,
             // Epoch 0 is the never-valid state of a zeroed table.
             opt_origin: 0,
+            head_origin: 0,
+            strip_mark: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
             scan_density: ScanDensity::Plain,
@@ -673,6 +711,8 @@ impl MatchGeneratorDriver {
             next_update: 0,
             gap_start: u64::MAX,
             opt_origin: 0,
+            head_origin: 0,
+            strip_mark: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
             scan_density: ScanDensity::Plain,
@@ -1171,6 +1211,7 @@ impl MatchGeneratorDriver {
             tables: self.tables.clone(),
             second: self.second,
             ldm: self.ldm.as_ref().map(LdmState::snapshot),
+            origin: self.head_origin,
             upto,
         }
     }
@@ -1245,6 +1286,10 @@ impl MatchGeneratorDriver {
         self.dubt_head = HeadPhase::Off;
         self.bt_step = BtStepPhase::Off;
         self.tables.clone_from(&snap.tables);
+        // The snapshot's entries carry the builder's origin; the full
+        // table copy leaves no adopter residue, so no invalidation is
+        // needed — the origins simply swap.
+        self.head_origin = snap.origin;
         self.gap_start = u64::MAX;
         self.gate_hold = false;
         self.strip_parse = true;
@@ -1321,6 +1366,7 @@ impl MatchGeneratorDriver {
             .saturating_sub(HASH_READ)
             .div_ceil(PREFILL_STRIDE)
             * PREFILL_STRIDE;
+        let origin = self.head_origin;
         while idx < last {
             let abs = base + idx as u64;
             // SAFETY: the hash masks to hash_log bits, the absolute
@@ -1330,10 +1376,14 @@ impl MatchGeneratorDriver {
                 let h = hash_at_log(data, idx, hash_log);
                 let head = *table.get_unchecked(h);
                 *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                *table.get_unchecked_mut(h) = pack_pos(abs);
+                *table.get_unchecked_mut(h) = pack_head(abs, origin);
             }
             idx += PREFILL_STRIDE;
         }
+        // A fill writer the scan cursor never sees (spf builders and
+        // adopters run fills without scanning): fold its extent into the
+        // origin's write mark.
+        self.strip_mark = self.strip_mark.max(base + last as u64);
     }
 
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
@@ -1361,7 +1411,37 @@ impl MatchGeneratorDriver {
         } else {
             BtStepPhase::Off
         };
-        clear_table(&mut self.tables[..self.second]);
+        if matches!(self.params.strategy, Strategy::Chain(_)) && grid == FillGrid::Strip {
+            // The chain row's head invalidation is the coordinate-origin
+            // advance (see `head_origin`), not the clear: `strip_mark`
+            // covers every position this state has written since the last
+            // advance, so every stale entry rebuilds as a beyond-reach
+            // distance — exactly the clear's semantics, at O(1) cost
+            // instead of an 8 MiB NT clear per job. The resolve runs in
+            // the u64 domain, where the empty sentinel dies by arithmetic
+            // (`q >= pos+1 > reach`) — that needs a live entry's
+            // `pos + origin + 1` below 2^32, so the origin stays capped:
+            // once it would pass [`HEAD_ORIGIN_CAP`] the advance becomes a
+            // real clear and the origin restarts (one clear per ~1 GiB of
+            // cumulative positions on a pooled state, amortized to noise
+            // against the per-job clear it replaced; frames past 3 GiB
+            // degrade exactly where today's u32 positions already wrap).
+            // Dictionary loads keep the clear below: the dtlm backfills
+            // read the empty sentinel off the slots themselves.
+            if self.head_origin + self.strip_mark + 1 > HEAD_ORIGIN_CAP {
+                clear_table(&mut self.tables[..self.second]);
+                self.head_origin = 0;
+            } else {
+                self.head_origin += self.strip_mark + 1;
+            }
+            self.strip_mark = 0;
+        } else {
+            #[cfg(feature = "job_trace")]
+            let trace_clear = std::time::Instant::now();
+            clear_table(&mut self.tables[..self.second]);
+            #[cfg(feature = "job_trace")]
+            super::job_trace::add_clear(trace_clear);
+        }
         // The row heads choose slots, so they carry the same per-job
         // determinism contract as the head table (a stale head would make
         // this job's slot layout depend on the pooled state's history).
@@ -1518,6 +1598,7 @@ impl MatchGeneratorDriver {
                 } else {
                     1
                 };
+                let origin = self.head_origin;
                 let mut idx = 0;
                 while idx < last {
                     let abs = base + idx as u64;
@@ -1528,10 +1609,14 @@ impl MatchGeneratorDriver {
                         let h = hash_at_width(data, idx, hash_log, width);
                         let head = *table.get_unchecked(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table.get_unchecked_mut(h) = pack_pos(abs);
+                        *table.get_unchecked_mut(h) = pack_head(abs, origin);
                     }
                     idx += stride;
                 }
+                // The fill is a table writer the scan cursor never sees
+                // (fill-only states, spf builders): fold its extent into
+                // the origin's write mark.
+                self.strip_mark = self.strip_mark.max(base + last as u64);
                 // The head table's first hop is as burial-prone as the fast
                 // strategy's single probe; seed the walk-independent path.
                 // (The dictionary grid's dense links make every position a
@@ -1707,6 +1792,10 @@ impl Matcher for MatchGeneratorDriver {
         // unreachable residue once the heads are zeroed (see the BtLazy
         // arm's provenance note).
         self.opt_origin += self.pos + 1;
+        // Stash the chain heads' write high-water before the cursor zeroes
+        // (see `strip_mark`): the next strip prefill advances `head_origin`
+        // past it.
+        self.strip_mark = self.strip_mark.max(self.pos);
         self.ext = None;
         self.win.clear();
         self.win_base = 0;
@@ -2243,7 +2332,8 @@ impl Matcher for MatchGeneratorDriver {
                         *self.tables.get_unchecked_mut(
                             self.second + (self.block_start as usize & chain_mask),
                         ) = head;
-                        *self.tables.get_unchecked_mut(h) = pack_pos(self.block_start);
+                        *self.tables.get_unchecked_mut(h) =
+                            pack_head(self.block_start, self.head_origin);
                     }
                 },
                 Strategy::Dfast(small_log) => {
@@ -2473,6 +2563,7 @@ impl MatchGeneratorDriver {
                 let width = ChainHashWidth::of(self.dict_row);
                 let (table, chain) = self.tables.split_at_mut(self.second);
                 let chain_mask = chain.len() - 1;
+                let origin = self.head_origin;
                 while idx < to {
                     let abs = win_base + idx as u64;
                     // SAFETY: the hash masks to hash_log bits, the absolute
@@ -2482,7 +2573,7 @@ impl MatchGeneratorDriver {
                         let h = hash_at_width(win, idx, hash_log, width);
                         let head = *table.get_unchecked(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table.get_unchecked_mut(h) = pack_pos(abs);
+                        *table.get_unchecked_mut(h) = pack_head(abs, origin);
                     }
                     idx += 1;
                 }

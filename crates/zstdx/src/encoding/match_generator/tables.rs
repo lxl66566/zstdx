@@ -27,6 +27,32 @@ pub(in crate::encoding) fn pack_pos(abs: u64) -> u32 {
     (abs as u32).wrapping_add(1)
 }
 
+/// [`pack_pos`] on the chain heads' origin-shifted coordinates: the scan
+/// side subtracts the same shift back out of its own position (see
+/// `chain_search`'s `q`), so the shift cancels for live entries while a
+/// stale entry — written under an earlier origin — keeps its advance and
+/// lands far beyond the window reach. `head_origin` on the driver owns
+/// the shift; the fast/dfast tables never advance it and stay on plain
+/// `pack_pos` semantics.
+#[inline(always)]
+pub(super) fn pack_head(abs: u64, origin: u64) -> u32 {
+    pack_pos(abs).wrapping_add(origin as u32)
+}
+
+/// Resolve a chain head/link entry (see [`pack_head`]) against the scan
+/// position's own entry value `q = pos + origin + 1` in the u64 domain:
+/// live entries (written under the current origin, whose `p + origin + 1`
+/// the origin cap keeps below 2^32) resolve to their exact distance;
+/// stale entries carry their advance and land far beyond the reach; the
+/// empty sentinel resolves to `q >= pos + 1 > reach` — rejected by the
+/// admission compare's own arithmetic, no explicit check (the u32-domain
+/// form saved the u64 add per read but needed one, a measured +4% Ir on
+/// the walk-heavy shapes).
+#[inline(always)]
+fn entry_dist(entry: u32, q: u64) -> u64 {
+    q.wrapping_sub(entry as u64)
+}
+
 /// Decode a fast/dfast/chain entry against the scanning position `pos`:
 /// the entry's high bits were truncated, so rebuild them from `pos` and
 /// unwrap one 4 GiB cycle when the value landed above it. Live entries are
@@ -80,6 +106,7 @@ pub(super) fn chain_search(
     search_depth: usize,
     chain_mask: usize,
     max_window: u64,
+    origin: u64,
     ramp: RampGate,
 ) -> (usize, usize) {
     let pos_abs = win_base + idx as u64;
@@ -90,17 +117,20 @@ pub(super) fn chain_search(
     let mut best_len = 0usize;
     let mut best_cand = usize::MAX;
     let mut tried = 0usize;
-    let mut dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
-    // `dist - 1 < reach` admits exactly dist ∈ [1, reach]: dist 0 is a stale
-    // slot holding this very position (pack_pos is injective per 4-GiB
-    // cycle, but old-cycle slots alias anything), whose candidate would
-    // byte-compare against itself; larger dist wraps huge for the empty
-    // sentinel, stale 4-GiB-cycle entries and at-or-newer-than-pos
-    // reconstructions. The walk's monotone (links target strictly older
-    // positions) keeps an out-of-window dist the exact break the old
-    // candidate-floor check was. The subtraction is wrapping for the same
-    // reason: dist 0 must wrap to u64::MAX to be rejected, not panic in
-    // debug builds.
+    // The scan position's own entry value under the current origin (u64
+    // domain; see [`entry_dist`]).
+    let q = pos_abs.wrapping_add(origin).wrapping_add(1);
+    let mut dist = entry_dist(entry, q);
+    // `dist - 1 < reach` admits exactly dist ∈ [1, reach]: dist 0 is a
+    // stale slot holding this very position (pack_pos is injective per
+    // 4-GiB cycle, but old-cycle slots alias anything), whose candidate
+    // would byte-compare against itself; larger dist covers the empty
+    // sentinel's mapped 0 via the wrap, stale-origin and 4-GiB-cycle
+    // entries, and at-or-newer-than-pos reconstructions. The walk's
+    // monotone (links target strictly older positions) keeps an
+    // out-of-window dist the exact break the old candidate-floor check
+    // was. The subtraction is wrapping for the same reason: dist 0 must
+    // wrap to u64::MAX to be rejected, not panic in debug builds.
     while tried < search_depth && dist.wrapping_sub(1) < reach {
         let cand_abs = pos_abs - dist;
         let cand = (cand_abs - win_base) as usize;
@@ -126,7 +156,7 @@ pub(super) fn chain_search(
         tried += 1;
         // SAFETY: masked to the chain table size.
         let entry = unsafe { *chain.add(cand_abs as usize & chain_mask) };
-        dist = pos_abs.wrapping_sub(entry as u64).wrapping_add(1);
+        dist = entry_dist(entry, q);
     }
     (best_len, best_cand)
 }
@@ -208,6 +238,7 @@ pub(super) fn insert_linked_at(
     abs: u64,
     log: u32,
     width: ChainHashWidth,
+    origin: u64,
 ) {
     // SAFETY: hash_at_width masks to log bits and the tables hold 1 << log
     // and chain.len() slots; the absolute position masks to the chain size
@@ -216,7 +247,7 @@ pub(super) fn insert_linked_at(
         let h = hash_at_width(win, idx, log, width);
         let head = *table.get_unchecked(h);
         *chain.get_unchecked_mut(abs as usize & (chain.len() - 1)) = head;
-        *table.get_unchecked_mut(h) = pack_pos(abs);
+        *table.get_unchecked_mut(h) = pack_head(abs, origin);
     }
 }
 
@@ -291,14 +322,16 @@ pub(super) fn insert_covered(
     log: u32,
     fill: CoveredFill,
     width: ChainHashWidth,
+    origin: u64,
 ) {
     // One insert form per fill site: the chain strategies link every
     // covered position they head-insert (see `insert_linked_at`), the fast
-    // strategy has no chain to link.
+    // strategy has no chain to link (and no origin — its tables are
+    // cleared per job, the shift stays 0).
     macro_rules! put {
         ($idx:expr, $abs:expr) => {
             match chain.as_deref_mut() {
-                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log, width),
+                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log, width, origin),
                 None => insert_at(win, table, $idx, $abs, log),
             }
         };
@@ -385,6 +418,10 @@ pub(super) struct TableEmit<'a> {
     /// The chain-table hash width (fast rows always pass `Six`; only the
     /// linked arm of `insert_covered` reads it).
     pub(super) width: ChainHashWidth,
+    /// The chain heads' coordinate origin (`head_origin` on the driver);
+    /// only the chain emit paths read it — the fast strategy's tables
+    /// never advance it.
+    pub(super) origin: u64,
 }
 
 impl TableEmit<'_> {
@@ -430,6 +467,7 @@ impl TableEmit<'_> {
             self.hash_log,
             self.covered_fill,
             ChainHashWidth::Five,
+            0,
         );
         self.win_base + match_end as u64
     }
@@ -471,6 +509,7 @@ impl TableEmit<'_> {
             self.hash_log,
             self.covered_fill,
             self.width,
+            self.origin,
         );
         self.win_base + match_end as u64
     }
@@ -536,7 +575,7 @@ impl TableEmit<'_> {
             unsafe {
                 let head = *self.table.get_unchecked(h);
                 *chain.get_unchecked_mut(p as usize & chain_mask) = head;
-                *self.table.get_unchecked_mut(h) = pack_pos(p);
+                *self.table.get_unchecked_mut(h) = pack_head(p, self.origin);
             }
             p += step;
         }

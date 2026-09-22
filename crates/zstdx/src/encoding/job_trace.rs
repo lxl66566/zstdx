@@ -34,6 +34,9 @@ pub struct Snapshot {
     pub job_ns: u64,
     /// `prefill_window`: table clears plus the LDM strip pass.
     pub prefill_ns: u64,
+    /// The per-job head-table clear inside `prefill_window` (the
+    /// strategy's heads, `clear_table`; a sub-span of `prefill_ns`).
+    pub clear_ns: u64,
     /// Per-job `reset_slice_state` (state, stats and table reset).
     pub reset_ns: u64,
     /// Ultra's seed parse (`ZSTD_initStats_ultra` port).
@@ -79,6 +82,7 @@ counters! {
     jobs,
     job_ns,
     prefill_ns,
+    clear_ns,
     reset_ns,
     seed_ns,
     strip_fill_ns,
@@ -107,6 +111,12 @@ pub fn add_job(started: Instant) {
 #[inline]
 pub fn add_prefill(started: Instant) {
     add_ns(&C.prefill_ns, started.elapsed());
+}
+
+/// Record one head-table clear span inside `prefill_window`.
+#[inline]
+pub fn add_clear(started: Instant) {
+    add_ns(&C.clear_ns, started.elapsed());
 }
 
 /// Record one state-reset span.

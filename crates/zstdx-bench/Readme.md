@@ -161,7 +161,9 @@ Runs one raw file through the bulk-mt / stream-mt / single-threaded
 encoders and reports the `job_trace` spans per component — the strip
 tree-fill (the job history the opt tier re-indexes through its binary
 tree), in-job block-boundary refills, the hash3 strip ingestion, ultra's
-job-boundary seed parse, the per-job state reset and the LDM prefill —
+job-boundary seed parse, the per-job state reset, the LDM prefill and
+the per-job head-table clear (`head clear`, a sub-span of `prefill`;
+zero on chain rows since the head origin landed) —
 each against the summed job time (which exceeds the wall clock on the mt
 paths: jobs run in parallel). Component shares, not walls, are the
 verdict; interleaved A/B stays the wall tool. Needs the encoder trace
