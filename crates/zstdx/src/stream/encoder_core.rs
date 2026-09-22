@@ -23,7 +23,7 @@ use crate::{
         frame_compressor::{CompressState, FseTables},
         frame_header::FrameHeader,
         match_generator::MatchGeneratorDriver,
-        reach_probe, util,
+        pre_split, reach_probe, util,
     },
 };
 
@@ -215,6 +215,7 @@ impl FrameEncoderCoreSt {
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
                 scratch: BlockScratch::default(),
+                split: pre_split::FrameSavings::new(),
             },
             hasher: StreamChecksum::Off,
             level: options.level,
@@ -321,6 +322,7 @@ impl FrameEncoderCoreSt {
         self.header.clear();
         header.serialize(&mut self.header);
         self.block_size = self.state.matcher.block_size();
+        self.state.split = pre_split::FrameSavings::new();
         self.hasher = if checksum {
             StreamChecksum::On(FrameHasher::new())
         } else {
@@ -388,7 +390,9 @@ impl FrameEncoderCoreSt {
             // block stays for `finish`.
             if self.pledged == Some(self.pos) {
                 while self.staged.len() >= self.block_size {
-                    let last = self.staged.len() == self.block_size;
+                    // Final only when the decided block consumes everything
+                    // staged (a split leaves the cut's remainder open).
+                    let last = self.next_block_len() >= self.staged.len();
                     self.encode_block(last);
                     if last {
                         self.tail = BlockTail::Closed;
@@ -510,10 +514,23 @@ impl FrameEncoderCoreSt {
         n
     }
 
+    /// The next block's input size: the pre-split detector over the staged
+    /// bytes when it can run (see `pre_split`), the whole staged tail
+    /// otherwise. Sub-block-size staging and the raw-block level keep the
+    /// fixed grid, so only proven full windows ever cut.
+    fn next_block_len(&mut self) -> usize {
+        if self.level == Level::Uncompressed || self.staged.len() < self.block_size {
+            return self.staged.len().min(self.block_size);
+        }
+        let level = self.state.matcher.pre_split_level();
+        let window = &self.staged[..self.block_size];
+        self.state.split.block_size(window, level)
+    }
+
     fn encode_block(&mut self, last: bool) {
         // At most one block's worth: outside the probe's staging window the
         // staged bytes are always shorter than the block size.
-        let n = self.staged.len().min(self.block_size);
+        let n = self.next_block_len().min(self.staged.len());
         debug_assert!(n <= MAX_BLOCK_SIZE as usize);
         let tail = self.state.matcher.block_tail();
         tail[..n].copy_from_slice(&self.staged[..n]);
@@ -534,8 +551,10 @@ impl FrameEncoderCoreSt {
         // An empty block only occurs as the frame-closing block (empty
         // input or an exact block-size multiple) and is always raw; the
         // compressed path has never seen a zero-byte block.
+        let before = self.output.len();
         if self.level != Level::Uncompressed && n > 0 {
             compress_fastest(&mut self.state, last, &mut self.output, &mut self.hasher);
+            self.state.split.note_block(n, self.output.len() - before);
         } else {
             let header = BlockHeader {
                 last_block: last,

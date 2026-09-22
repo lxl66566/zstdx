@@ -18,6 +18,7 @@ pub(crate) mod match_generator;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
 pub(crate) mod opt;
+pub(crate) mod pre_split;
 pub(crate) mod reach_probe;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
@@ -98,7 +99,7 @@ pub fn compress_to_vec_shaped<R: Read>(
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{string::ToString, vec, vec::Vec};
 
     use super::{compress_slice_to_vec, compress_to_vec};
     use crate::Level;
@@ -141,6 +142,60 @@ mod tests {
             top * 6 < bottom * 5,
             "level 22 ({top}) must beat level 1 ({bottom})"
         );
+    }
+
+    /// The pre-split detector must keep the slice and Read-stream paths
+    /// byte-identical on heterogeneous content that actually triggers
+    /// cuts (dll-shaped: interleaved byte-code, text-ish and structured
+    /// binary phases), at levels from both detector families.
+    #[test]
+    fn pre_split_paths_stay_identical() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut input: Vec<u8> = Vec::with_capacity(1600 * 1024);
+        while input.len() < 1600 * 1024 {
+            let phase = (input.len() / (128 * 1024)) % 3;
+            match phase {
+                // Byte-code-ish: wide alphabet over random u64s.
+                0 => input.extend_from_slice(&rand().to_le_bytes()),
+                // Text-ish: a fixed template plus drifting digits.
+                1 => {
+                    input.extend_from_slice(b"{\"k\":1234567890,\"v\":[1,2,3,4,5]}\n");
+                    input.extend_from_slice((rand() % 100).to_string().as_bytes());
+                },
+                // Structured binary: length-prefixed random runs.
+                _ => {
+                    let n = 8 + (rand() % 24) as usize;
+                    input.push(n as u8);
+                    input.extend((0..n).map(|_| (rand() & 0xff) as u8));
+                },
+            }
+        }
+        for level in [
+            crate::Level::Fastest,
+            crate::Level::Fast,
+            crate::Level::Balanced,
+        ] {
+            let sliced = super::compress_slice_to_vec(&input, level);
+            let read_streamed = super::compress_to_vec_shaped(
+                input.as_slice(),
+                level,
+                crate::InputShape::default().with_len(input.len() as u64),
+            );
+            assert_eq!(
+                sliced,
+                read_streamed,
+                "slice vs Read stream at {level:?} ({} bytes)",
+                input.len()
+            );
+            let decoded = crate::bulk::decompress(&sliced, input.len()).unwrap();
+            assert_eq!(decoded, input, "roundtrip at {level:?}");
+        }
     }
 
     /// The slice path (borrowed matcher window, no staging) must produce the
@@ -258,6 +313,18 @@ pub trait Matcher {
     fn commit_block(&mut self, read: usize);
     /// Just process the data in the last commited space for future matching
     fn skip_matching(&mut self);
+    /// The pre-split detector's effort row for the active strategy, as
+    /// libzstd's numeric `splitLevel` (0-4); `u8::MAX` exempts the row
+    /// (see `pre_split`). The default exempts.
+    fn pre_split_effort(&self) -> u8 {
+        u8::MAX
+    }
+    /// The staged tail region behind the last `block_tail` extension (the
+    /// bytes the caller filled, ready for the pre-split decision);
+    /// owned-window drivers only. The default hands back nothing.
+    fn staged_tail(&self) -> &[u8] {
+        &[]
+    }
     /// Process the data in the last commited space for future matching AND generate matches for the
     /// data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));

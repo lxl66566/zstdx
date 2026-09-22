@@ -442,13 +442,21 @@ pub(crate) fn donate_keep_span(
     state.matcher.begin_probe_stats();
     let mut cursor = 0usize;
     while cursor < span {
-        let block_end = (cursor + block_size).min(span);
+        // Pre-split decisions with the block cap and span-end clamp,
+        // matching the continuation's grid (see `pre_split`).
+        let window_end = (cursor + block_size).min(span);
+        let decided = state
+            .split
+            .block_size(&head[cursor..window_end], state.matcher.pre_split_level());
+        let block_end = cursor + decided;
         let hist = cursor.saturating_sub(max_window);
         state
             .matcher
             .adopt_window(&head[hist..block_end], hist as u64);
         state.matcher.set_block(cursor as u64, block_end as u64);
+        let before = output.len();
         compress_fastest(state, false, &mut output, &mut hasher);
+        state.split.note_block(decided, output.len() - before);
         cursor = block_end;
     }
     let keep = state

@@ -551,6 +551,35 @@ impl MatchGeneratorDriver {
         (crate::common::MAX_BLOCK_SIZE as usize).min(self.params.window)
     }
 
+    /// The staged tail region behind `block_tail`'s current extension:
+    /// the bytes the Read-path fill wrote, for the pre-split decision
+    /// (owned-window drivers only).
+    pub(crate) fn staged_window(&self) -> &[u8] {
+        debug_assert!(self.ext.is_none());
+        &self.win[self.win.len() - self.slice_size..]
+    }
+
+    /// The pre-split detector's effort level for the active row (see
+    /// [`super::pre_split`]): libzstd's `splitLevels[]` strategy mapping —
+    /// the lazy family walks chunk fingerprints (greedy and lazy share a
+    /// row). Three exemptions, all measured on dll100/dll32 (see
+    /// docs/src/dev/perf/encoding.md): the single-probe rows (fast/dfast)
+    /// pay 4-6% of their throughput for noise-level size deltas, the
+    /// tree-fill rows (btlazy2/opt) restart their per-block tree state on
+    /// every cut (dll100 best −10% wall for a +0.06% size, opt +1.0%
+    /// size), and the opt rows additionally carry the post-parse splitter
+    /// on the same inputs.
+    pub(crate) fn pre_split_level(&self) -> Option<super::pre_split::SplitLevel> {
+        use super::pre_split::SplitLevel;
+        match self.params.strategy {
+            Strategy::Fast | Strategy::Dfast(_) | Strategy::BtLazy(_) | Strategy::Opt(_) => None,
+            Strategy::Row(_) | Strategy::Chain(_) => match self.params.lazy_depth {
+                0 | 1 => Some(SplitLevel::chunked(1)),
+                _ => Some(SplitLevel::chunked(2)),
+            },
+        }
+    }
+
     /// Create a matcher whose blocks hold `slice_size` bytes of input (the
     /// zstd block maximum is 128 KiB).
     pub fn new(slice_size: usize) -> Self {
@@ -1580,6 +1609,24 @@ impl MatchGeneratorDriver {
 }
 
 impl Matcher for MatchGeneratorDriver {
+    /// The effort row through the trait's u8 routing (see `pre_split`).
+    fn pre_split_effort(&self) -> u8 {
+        match self.pre_split_level() {
+            None => u8::MAX,
+            Some(super::pre_split::SplitLevel::Borders) => 0,
+            Some(super::pre_split::SplitLevel::Chunks { rate, .. }) => match rate {
+                43 => 1,
+                11 => 2,
+                5 => 3,
+                _ => 4,
+            },
+        }
+    }
+
+    fn staged_tail(&self) -> &[u8] {
+        self.staged_window()
+    }
+
     fn set_input_shape(&mut self, shape: InputShape) {
         self.shape = shape;
     }

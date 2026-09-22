@@ -13,7 +13,7 @@ use super::{
     frame_header::FrameHeader,
     levels::*,
     match_generator::{LdmArming, MatchGeneratorDriver},
-    reach_probe,
+    pre_split, reach_probe,
 };
 use crate::{
     Level,
@@ -87,6 +87,9 @@ pub(crate) struct CompressState<M: Matcher> {
     /// Pooled per-block scratch (literals, sequences, code streams): reused
     /// across blocks so steady-state blocks run allocation-free.
     pub(crate) scratch: super::block_enc::compressed::BlockScratch,
+    /// The pre-split gate's savings accumulator (see `pre_split`): reset
+    /// with the rest of the frame state, carried across a donated span.
+    pub(crate) split: pre_split::FrameSavings,
 }
 
 // Per-thread pool for the slice entry point: the hash table, the three
@@ -107,6 +110,7 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         fse_tables: FseTables::new(),
         dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
+        split: pre_split::FrameSavings::new(),
     }
 }
 
@@ -120,6 +124,7 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
         fse_tables: FseTables::new(),
         dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
+        split: pre_split::FrameSavings::new(),
     }
 }
 
@@ -141,6 +146,7 @@ pub(crate) fn reset_slice_state(
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
     state.dict_entropy = DictEntropy::default();
+    state.split = pre_split::FrameSavings::new();
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_aligned(&mut state.scratch.huff);
     }
@@ -249,7 +255,7 @@ fn compress_with_state(
     // untouched tail of the reservation only costs address space.
     // A window below 128 KiB (forced or source-downsized) caps blocks too.
     let block_size = state.matcher.block_size();
-    let block_overhead = 3 * (src.len() / block_size + 1);
+    let block_overhead = 3 * (src.len() / header_floor(level, block_size) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     let header = FrameHeader {
         frame_content_size: None,
@@ -268,7 +274,7 @@ fn compress_with_state(
         &mut hasher,
         max_window,
         0,
-        usize::MAX,
+        src.len(),
     );
     // A frame needs at least one block: empty input encodes one empty raw
     // last block. Non-empty inputs mark their final real block last (the
@@ -289,10 +295,11 @@ fn compress_with_state(
     output
 }
 
-/// Drive block indices `[first, next)` of the bulk slice loop: window
-/// adoption, block declaration, per-block encode. `next` clamps to the
-/// block count, so `usize::MAX` means "to the end". Shared by the plain
-/// slice path and the donating probe's prefix/continuation.
+/// Drive the byte range `[from, to)` of the bulk slice loop: window
+/// adoption, block declaration, per-block encode. Block boundaries come
+/// from the pre-split detector while the frame's savings prove it (see
+/// `pre_split`); the raw-block level keeps the fixed grid. Shared by the
+/// plain slice path and the donating probe's prefix/continuation.
 fn emit_slice_blocks(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -300,30 +307,59 @@ fn emit_slice_blocks(
     output: &mut Vec<u8>,
     hasher: &mut SliceChecksum,
     max_window: u64,
-    first: usize,
-    next: usize,
+    from: usize,
+    to: usize,
 ) {
-    let block_size = state.matcher.block_size();
-    for (i, block) in src.chunks(block_size).enumerate().take(next).skip(first) {
-        let block_start = (i * block_size) as u64;
-        let block_end = block_start + block.len() as u64;
-        let last_block = block_end == src.len() as u64;
-        let hist = block_start.saturating_sub(max_window);
+    let split = level != Level::Uncompressed;
+    let mut cursor = from;
+    while cursor < to {
+        // The decision window: the next block-shaped span (a window below
+        // 128 KiB shrinks blocks with it and disables the detector),
+        // clamped at the range end — the donated span and its continuation
+        // must agree with the streaming core's staged decisions, which
+        // clamp the same way.
+        let cap = state.matcher.block_size();
+        let window_end = (cursor + cap).min(to);
+        let decided = if split {
+            state
+                .split
+                .block_size(&src[cursor..window_end], state.matcher.pre_split_level())
+        } else {
+            window_end - cursor
+        };
+        let block_end = cursor + decided;
+        let last_block = block_end == src.len();
+        let hist = (cursor as u64).saturating_sub(max_window);
         state
             .matcher
-            .adopt_window(&src[hist as usize..block_end as usize], hist);
-        state.matcher.set_block(block_start, block_end);
+            .adopt_window(&src[hist as usize..block_end], hist);
+        state.matcher.set_block(cursor as u64, block_end as u64);
+        let before = output.len();
         if level == Level::Uncompressed {
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
-                block_size: block.len() as u32,
+                block_size: decided as u32,
             };
             header.serialize(output);
             BlockChecksum::raw_out(hasher, output, state.matcher.get_last_space(), 0);
         } else {
             compress_fastest(state, last_block, output, hasher);
+            state.split.note_block(decided, output.len() - before);
         }
+        cursor = block_end;
+    }
+}
+
+/// The divisor for the worst-case block-header reservation: a splittable
+/// frame can carry a header per [`pre_split::SPLIT_MIN`] bytes (the borders
+/// strategy's coarsest cut; the by-chunks 8 KiB minimum is rare enough
+/// that the occasional reservation shortfall is not worth 4x the reserve).
+fn header_floor(level: Level, block_size: usize) -> usize {
+    if level != Level::Uncompressed && block_size >= pre_split::SPLIT_BLOCK {
+        pre_split::SPLIT_MIN
+    } else {
+        block_size
     }
 }
 
@@ -346,7 +382,7 @@ fn compress_with_state_donated(
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
     let block_size = state.matcher.block_size();
-    let block_overhead = 3 * (src.len() / block_size + 1);
+    let block_overhead = 3 * (src.len() / header_floor(level, block_size) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     let header = FrameHeader {
         frame_content_size: None,
@@ -357,10 +393,11 @@ fn compress_with_state_donated(
     };
     header.serialize(&mut output);
     let max_window = state.matcher.window_size();
-    // The span is whole blocks (2 MiB against the 128 KiB block size); the
-    // eligibility gate keeps the frame far above it.
-    let span_blocks = reach_probe::PROBE_SPAN / block_size;
-    debug_assert_eq!(span_blocks * block_size, reach_probe::PROBE_SPAN);
+    // The span's blocks carry the pre-split detector's own boundaries, so
+    // its end is a byte clamp (the last span block may be cut short at the
+    // span exactly like the streaming core's staged decisions); the
+    // eligibility gate keeps the frame far above it either way.
+    let span = reach_probe::PROBE_SPAN;
 
     state.matcher.begin_probe_stats();
     emit_slice_blocks(
@@ -371,7 +408,7 @@ fn compress_with_state_donated(
         &mut hasher,
         max_window,
         0,
-        span_blocks,
+        span.min(src.len()),
     );
     let keep = state
         .matcher
@@ -422,7 +459,7 @@ fn compress_with_state_donated(
             &mut hasher,
             max_window,
             0,
-            usize::MAX,
+            src.len(),
         );
     } else {
         emit_slice_blocks(
@@ -432,8 +469,8 @@ fn compress_with_state_donated(
             &mut output,
             &mut hasher,
             max_window,
-            span_blocks,
-            usize::MAX,
+            span,
+            src.len(),
         );
     }
     if src.is_empty() {
@@ -464,7 +501,7 @@ pub(crate) fn compress_with_state_dictionary(
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
     let block_size = state.matcher.block_size();
-    let block_overhead = 3 * (src.len() / block_size + 1);
+    let block_overhead = 3 * (src.len() / block_size.min(pre_split::SPLIT_MIN) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     let header = FrameHeader {
         frame_content_size: None,
@@ -474,12 +511,21 @@ pub(crate) fn compress_with_state_dictionary(
         window_size: Some(state.matcher.window_size()),
     };
     header.serialize(&mut output);
-    for (i, block) in src.chunks(block_size).enumerate() {
-        let last_block = (i + 1) * block_size >= src.len();
+    let mut cursor = 0usize;
+    while cursor < src.len() {
+        let window_end = (cursor + block_size).min(src.len());
+        let decided = state
+            .split
+            .block_size(&src[cursor..window_end], state.matcher.pre_split_level());
+        let block = &src[cursor..cursor + decided];
+        let last_block = cursor + decided >= src.len();
         let tail = state.matcher.block_tail();
         tail[..block.len()].copy_from_slice(block);
         state.matcher.commit_block(block.len());
+        let before = output.len();
         compress_fastest(state, last_block, &mut output, &mut hasher);
+        state.split.note_block(block.len(), output.len() - before);
+        cursor += decided;
     }
     if src.is_empty() {
         let header = BlockHeader {
@@ -566,7 +612,10 @@ pub(crate) fn compress_job_blocks_inner(
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
     let mut output = prefix;
-    output.reserve(job.len() + 3 * (job.len() / block_size + 1) + 8);
+    // Jobs never carry the raw-block level, so the splittable floor
+    // applies wherever the window allows full blocks.
+    let floor = block_size.min(pre_split::SPLIT_MIN);
+    output.reserve(job.len() + 3 * (job.len() / floor + 1) + 8);
     // Uniform detection still runs (the RLE path), but the frame checksum is
     // the mt driver's job over the whole input.
     let mut hasher = SliceChecksum::new(0, false);
@@ -596,7 +645,11 @@ pub(crate) fn compress_job_blocks_inner(
     debug_assert!(start_cursor >= job.start);
     let mut cursor = start_cursor.max(job.start);
     while cursor < job.end {
-        let block_end = (cursor + block_size).min(job.end);
+        let window_end = (cursor + block_size).min(job.end);
+        let decided = state
+            .split
+            .block_size(&src[cursor..window_end], state.matcher.pre_split_level());
+        let block_end = cursor + decided;
         let last_block = is_last_job && block_end == job.end;
         // Candidates never precede this job's first indexed position, so the
         // window only needs the overlap strip plus the in-job history room.
@@ -607,7 +660,9 @@ pub(crate) fn compress_job_blocks_inner(
             .matcher
             .adopt_window(&src[hist..block_end], hist as u64);
         state.matcher.set_block(cursor as u64, block_end as u64);
+        let before = output.len();
         compress_fastest(state, last_block, &mut output, &mut hasher);
+        state.split.note_block(decided, output.len() - before);
         cursor = block_end;
     }
     #[cfg(feature = "job_trace")]
@@ -630,6 +685,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
                 scratch: super::block_enc::compressed::BlockScratch::default(),
+                split: pre_split::FrameSavings::new(),
             },
             hasher: FrameHasher::new(),
         }
@@ -648,6 +704,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
                 scratch: super::block_enc::compressed::BlockScratch::default(),
+                split: pre_split::FrameSavings::new(),
             },
             compression_level,
             input_shape: crate::InputShape::default(),
@@ -774,6 +831,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let dict_len = dict.as_ref().map_or(0, |d| d.content.len()) as u64;
         let declared = self.input_shape.len.map(|n| n.saturating_sub(dict_len));
         let mut fed: u64 = 0;
+        // Staged remainder after a pre-split cut, in bytes: the fill stages
+        // a whole block's tail, the detector may emit only the first cut of
+        // it, and the rest stays physically at the head of the next
+        // `block_tail` (the commit shrinks the window past it without
+        // touching the bytes), so the next fill reads in behind it — no
+        // copy, on any frame.
+        let mut carry = 0usize;
         // Now compress block by block. `staged_read` tracks the probe's
         // staged head replay across blocks (it spans sixteen of them).
         loop {
@@ -782,7 +846,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // A window below 128 KiB caps the block size with it.
             let cap = self.state.matcher.block_size();
             let tail = &mut self.state.matcher.block_tail()[..cap];
-            let mut read_bytes = 0;
+            let mut read_bytes = carry;
             let last_block;
             'read_loop: loop {
                 if staged_read < probe_staged.len() {
@@ -801,12 +865,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     read_bytes += new_bytes;
                 }
                 if read_bytes == tail.len() {
-                    last_block = Some(fed + read_bytes as u64) == declared;
+                    // The staged span (carried remainder included) ends at
+                    // `fed` plus this fill's fresh bytes.
+                    last_block = Some(fed + (read_bytes - carry) as u64) == declared;
                     break 'read_loop;
                 }
             }
-            fed += read_bytes as u64;
-            self.state.matcher.commit_block(read_bytes);
+            fed += (read_bytes - carry) as u64;
+            // The staged span decides its own block boundary: the raw-block
+            // level and sub-128 KiB tails always emit whole (the slice
+            // path's decisions agree — the detector only ever reads the
+            // first 128 KiB at the cursor).
+            let decided = if self.compression_level == Level::Uncompressed {
+                read_bytes
+            } else {
+                let level =
+                    pre_split::SplitLevel::from_effort(self.state.matcher.pre_split_effort());
+                let tail = self.state.matcher.staged_tail();
+                self.state.split.block_size(&tail[..read_bytes], level)
+            };
+            let emit_last = last_block && decided == read_bytes;
+            carry = read_bytes - decided;
+            self.state.matcher.commit_block(decided);
             // Special handling is needed for compression of a totally empty file (why you'd want to
             // do that, I don't know)
             if read_bytes == 0 {
@@ -822,22 +902,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 break;
             }
 
+            let before = output.len();
             if self.compression_level == Level::Uncompressed {
                 let header = BlockHeader {
-                    last_block,
+                    last_block: emit_last,
                     block_type: crate::blocks::block::BlockType::Raw,
-                    block_size: read_bytes.try_into().unwrap(),
+                    block_size: decided.try_into().unwrap(),
                 };
                 // Write the header, then the block (hashing as it goes)
                 header.serialize(output);
                 self.hasher
                     .write_appending(output, self.state.matcher.get_last_space());
             } else {
-                compress_fastest(&mut self.state, last_block, output, &mut self.hasher);
+                compress_fastest(&mut self.state, emit_last, output, &mut self.hasher);
+                self.state.split.note_block(decided, output.len() - before);
             }
             drain.write_all(output).unwrap();
             output.clear();
-            if last_block {
+            if emit_last {
                 break;
             }
         }
