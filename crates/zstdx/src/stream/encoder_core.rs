@@ -377,7 +377,15 @@ impl FrameEncoderCoreSt {
                         .consider_reach_probe(&self.staged, self.level);
                     self.probe_pending = false;
                 }
-                self.drain_full_blocks();
+                // When this staging round consumed the write's last bytes
+                // and the pledge is met, the closing pass below owns the
+                // emission: draining here first would emit the final block
+                // non-last, and once a consumer drains eagerly (a write
+                // per call, like the CLI) `finish` has no patchable
+                // header left — the 3-byte empty closing block returns.
+                if !(data.is_empty() && self.pledged == Some(self.pos)) {
+                    self.drain_full_blocks();
+                }
             }
             // The pledge is met and every fed byte is staged: the staging
             // loop's emissions cannot know a block is final while `data`
