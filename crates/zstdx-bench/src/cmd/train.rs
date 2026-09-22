@@ -9,6 +9,8 @@ use std::{
     path::PathBuf,
 };
 
+use zstdx::dict::{DmerHash, KGrid, MetricMode, StatsSet, TrainConfig};
+
 #[derive(clap::Args)]
 pub struct Args {
     /// Training files (or directories, recursed)
@@ -26,6 +28,67 @@ pub struct Args {
     /// `zstd --train` shape) instead of raw content
     #[arg(long)]
     pub formatted: bool,
+    /// Do not train; finalize this raw content file with the training
+    /// split's entropy stats (decomposition of content vs tables)
+    #[arg(long)]
+    pub format_content: Option<PathBuf>,
+    /// Segment-size candidate grid: compact, cli (libzstd's optimizer
+    /// steps=4 ladder), or a forced k (default: the library default)
+    #[arg(long)]
+    pub grid: Option<String>,
+    /// Selection metric the k sweep scores: raw (the content itself) or
+    /// formatted (the finalized dict, like libzstd's optimizer)
+    #[arg(long)]
+    pub metric: Option<String>,
+    /// Frequency-table hashing: exact 64-bit fingerprints or libzstd's
+    /// f-bit colliding buckets
+    #[arg(long)]
+    pub hash: Option<String>,
+    /// Count k-mers spanning sample boundaries (cross) or skip them like
+    /// libzstd's per-sample frequency loop (stop)
+    #[arg(long)]
+    pub boundary: Option<String>,
+    /// Print the sweep's chosen parameters
+    #[arg(short, long)]
+    pub verbose: bool,
+    /// Stats-parse level for --format-content (default 3, C's default)
+    #[arg(long)]
+    pub stats_level: Option<i32>,
+    /// Stats sample set for --format-content: train split or all samples
+    #[arg(long, default_value = "train")]
+    pub stats_samples: String,
+}
+
+fn parse_grid(s: &str) -> KGrid {
+    match s {
+        "compact" => KGrid::Compact,
+        "cli" => KGrid::LibzstdCli,
+        other => KGrid::Fixed(other.parse().expect("grid: compact|cli|<k>")),
+    }
+}
+
+fn parse_metric(s: &str) -> MetricMode {
+    match s {
+        "raw" => MetricMode::RawContent,
+        "formatted" => MetricMode::Formatted,
+        other => panic!("metric: raw|formatted, got {other}"),
+    }
+}
+
+fn parse_hash(s: &str) -> DmerHash {
+    match s {
+        "exact" => DmerHash::Exact,
+        "buckets" => DmerHash::LibzstdBuckets,
+        other => panic!("hash: exact|buckets, got {other}"),
+    }
+}
+
+fn parse_boundary(s: &str) -> bool {
+    match s {
+        "cross" => true,
+        "stop" => false,
+        other => panic!("boundary: cross|stop, got {other}"),
+    }
 }
 
 pub fn run(args: &Args) {
@@ -50,6 +113,19 @@ pub fn run(args: &Args) {
     assert!(!sources.is_empty(), "no training files given");
     let samples: Vec<Vec<u8>> = sources.iter().map(|p| fs::read(p).unwrap()).collect();
     let total: usize = samples.iter().map(Vec::len).sum();
+    let mut config = TrainConfig::default();
+    if let Some(grid) = &args.grid {
+        config.k_grid = parse_grid(grid);
+    }
+    if let Some(metric) = &args.metric {
+        config.metric = parse_metric(metric);
+    }
+    if let Some(hash) = &args.hash {
+        config.hash = parse_hash(hash);
+    }
+    if let Some(boundary) = &args.boundary {
+        config.cross_sample_kmers = parse_boundary(boundary);
+    }
     println!(
         "training on {} files, {} bytes -> {} ({} bytes)",
         sources.len(),
@@ -58,14 +134,52 @@ pub fn run(args: &Args) {
         args.size
     );
     let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+
+    if let Some(content_path) = &args.format_content {
+        // Decomposition tool: our finalize over an arbitrary content file
+        // (e.g. a CLI trainer's content), stats from the training split.
+        let content = fs::read(content_path).unwrap();
+        let stats = if args.stats_samples == "all" {
+            StatsSet::All
+        } else {
+            StatsSet::TrainSplit
+        };
+        let mut dict = Vec::new();
+        zstdx::dict::finalize_content_with_samples(
+            &refs,
+            &content,
+            &mut dict,
+            args.size,
+            stats,
+            args.stats_level,
+        );
+        fs::write(&args.out, &dict).unwrap();
+        println!(
+            "formatted {} bytes of content -> {}",
+            content.len(),
+            dict.len()
+        );
+        return;
+    }
+
+    let outcome = if args.formatted {
+        zstdx::dict::train_formatted(&refs, args.size, &config)
+    } else {
+        zstdx::dict::train_raw(&refs, args.size, &config)
+    };
     let out = fs::File::create(&args.out).unwrap();
     let mut out = BufWriter::new(out);
-    if args.formatted {
-        zstdx::dict::create_formatted_dict_from_samples(&refs, &mut out, args.size);
-    } else {
-        zstdx::dict::create_raw_dict_from_samples(&refs, &mut out, args.size);
-    }
+    out.write_all(&outcome.dict).unwrap();
     out.flush().unwrap();
+    if args.verbose {
+        println!(
+            "grid={:?} metric={:?} hash={:?} cross_sample={} -> k={}",
+            config.k_grid, config.metric, config.hash, config.cross_sample_kmers, outcome.k
+        );
+        for &(k, score) in &outcome.sweep {
+            println!("  k={k} metric={score}");
+        }
+    }
     println!(
         "trained dict: {} bytes",
         fs::metadata(&args.out).unwrap().len()

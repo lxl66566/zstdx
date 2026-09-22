@@ -21,31 +21,106 @@ use std::{
     vec::Vec,
 };
 
+pub use cover::DmerHash;
 use cover::KMerTable;
 pub use finalize::finalize_dictionary;
+use finalize::{STATS_LEVEL, finalize_dictionary_ex};
 
 use crate::{EncoderOptions, Level};
 
 /// Upper bound on buffered training data (matches libzstd's trainer).
 const SOURCE_CAP: usize = 128 << 20;
-/// K-mer size, libzstd's dmer granularity: shared template text usually
-/// differs in embedded values, so 8-byte matches survive where 16-byte ones
-/// do not.
+/// K-mer size, libzstd's dmer granularity (`d`; the CLI trainer pins 8):
+/// shared template text usually differs in embedded values, so 8-byte
+/// matches survive where 16-byte ones do not.
 const K: usize = 8;
-/// Segment sizes tried when a holdout split exists; the winner is decided
-/// by compressing the held-out samples (libzstd's optimizer approach).
-const K_SWEEP: [usize; 9] = [200, 300, 400, 500, 650, 800, 1024, 1400, 2000];
 /// Without a holdout there is nothing to score the sweep against.
 const K_DEFAULT: usize = 1024;
 /// Samples below this count train on everything and skip the sweep.
 const MIN_SAMPLES_FOR_SPLIT: usize = 8;
-/// Fraction of samples used for training, the rest score the sweep.
+/// Fraction of samples used for training, the rest score the sweep
+/// (libzstd's `splitPoint` 0.75).
 const TRAIN_SPLIT_NUM: usize = 3;
 const TRAIN_SPLIT_DEN: usize = 4;
 /// Cap on held-out bytes scored per candidate.
 const EVAL_CAP: usize = 2 << 20;
 /// Consecutive scoreless epochs before the content is considered spent.
 const ZERO_SCORE_RUN_MAX: usize = 10;
+
+/// Segment sizes tried when a holdout split exists; the winner is decided
+/// by compressing the held-out samples (libzstd's optimizer approach).
+#[derive(Clone, Copy, Debug)]
+pub enum KGrid {
+    /// The in-tree sweep: a denser ladder over the useful band than the
+    /// CLI's 4-step default.
+    Compact,
+    /// libzstd CLI's optimizer grid (`steps = 4`): k = 50, 537, 1024,
+    /// 1511, 2000.
+    LibzstdCli,
+    /// One forced segment size (experiments; keeps the holdout split, so
+    /// unlike C's forced `--train-fastcover=k=` path there is no leak).
+    Fixed(usize),
+}
+
+impl KGrid {
+    fn candidates(&self, dict_size: usize, train_len: usize) -> Vec<usize> {
+        const COMPACT: [usize; 9] = [200, 300, 400, 500, 650, 800, 1024, 1400, 2000];
+        const CLI: [usize; 5] = [50, 537, 1024, 1511, 2000];
+        let grid: &[usize] = match self {
+            Self::Compact => &COMPACT,
+            Self::LibzstdCli => &CLI,
+            Self::Fixed(k) => return vec![*k],
+        };
+        grid.iter()
+            .copied()
+            .filter(|&k| k <= dict_size && k <= train_len)
+            .collect()
+    }
+}
+
+/// What the k sweep compresses to rank candidates.
+#[derive(Clone, Copy, Debug)]
+pub enum MetricMode {
+    /// The raw content itself — the metric for raw-content products.
+    RawContent,
+    /// The finalized formatted dict (entropy tables included), like C's
+    /// optimizer, which scores `ZDICT_finalizeDictionary` output — content
+    /// that also carries the entropy preload well gets picked.
+    Formatted,
+}
+
+/// Trainer knobs; `Default` is the in-tree behavior. The bench `train`
+/// command exposes them for A/B isolation of content quality.
+#[derive(Clone)]
+pub struct TrainConfig {
+    pub k_grid: KGrid,
+    pub metric: MetricMode,
+    pub hash: DmerHash,
+    /// Count k-mers spanning sample boundaries (frequency noise; C's
+    /// frequency loop never crosses a sample).
+    pub cross_sample_kmers: bool,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        Self {
+            k_grid: KGrid::LibzstdCli,
+            metric: MetricMode::RawContent,
+            hash: DmerHash::Exact,
+            cross_sample_kmers: false,
+        }
+    }
+}
+
+/// The trained dictionary plus the sweep's decision, for diagnostics.
+pub struct TrainOutcome {
+    pub dict: Vec<u8>,
+    /// The winning segment size (0 when no sweep ran).
+    pub k: usize,
+    /// Every scored candidate `(k, metric)` in sweep order (empty when the
+    /// sweep did not run).
+    pub sweep: Vec<(usize, usize)>,
+}
 
 /// Creates a "raw content" dictionary from every file under `path`
 /// (recursed), written to `output` with at most `dict_size` bytes.
@@ -165,9 +240,24 @@ impl TrainingSet {
             .collect()
     }
 
+    /// All samples of the shuffled body in order (the entropy-stats set can
+    /// legitimately span the scoring split: every sample is training
+    /// input).
+    fn all_samples(&self) -> Vec<&[u8]> {
+        let mut offset = 0;
+        self.lens
+            .iter()
+            .map(|&len| {
+                let sample = &self.body[offset..offset + len];
+                offset += len;
+                sample
+            })
+            .collect()
+    }
+
     /// Select the dictionary content (the fastCover pass with its
     /// segment-size sweep, scored on the holdout).
-    fn select_content(&self, dict_size: usize) -> Vec<u8> {
+    fn select_content(&self, dict_size: usize, config: &TrainConfig) -> TrainOutcome {
         let train_len: usize = self.lens[..self.train_end].iter().sum();
         let train_body = &self.body[..train_len];
         let test_samples: Vec<&[u8]> = self.lens[self.train_end..]
@@ -179,17 +269,20 @@ impl TrainingSet {
             })
             .collect();
 
-        let counts = KMerTable::build(train_body);
+        let counts = KMerTable::build(
+            train_body,
+            &self.lens[..self.train_end],
+            config.cross_sample_kmers,
+            config.hash.into(),
+        );
         let candidates: Vec<usize> = if test_samples.is_empty() {
             vec![K_DEFAULT]
         } else {
-            K_SWEEP
-                .iter()
-                .copied()
-                .filter(|&k| k <= dict_size && k <= train_body.len())
-                .collect()
+            config.k_grid.candidates(dict_size, train_body.len())
         };
-        let mut best: Option<(usize, Vec<u8>)> = None;
+        let train_samples = self.train_samples();
+        let mut best: Option<(usize, Vec<u8>, usize)> = None;
+        let mut sweep: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
         for &k in &candidates {
             let dict = build_dict(&mut counts.clone(), train_body, k, dict_size);
             if dict.is_empty() {
@@ -200,35 +293,69 @@ impl TrainingSet {
             let score = if test_samples.is_empty() {
                 0
             } else {
-                evaluate(&dict, &test_samples)
+                match config.metric {
+                    MetricMode::RawContent => evaluate(&dict, &test_samples),
+                    MetricMode::Formatted => {
+                        match finalize_dictionary(&dict, &train_samples, dict_size) {
+                            Some(formatted) => evaluate(&formatted, &test_samples),
+                            // A candidate that cannot carry a header is
+                            // worthless for a formatted product; rank it
+                            // last.
+                            None => usize::MAX,
+                        }
+                    },
+                }
             };
             vprintln!("create_dict: k={k} -> {} bytes, eval {score}", dict.len());
-            if best.as_ref().is_none_or(|(s, _)| score < *s) {
-                best = Some((score, dict));
+            sweep.push((k, score));
+            if best.as_ref().is_none_or(|(s, ..)| score < *s) {
+                best = Some((score, dict, k));
             }
         }
-        best.map_or_else(Vec::new, |(_, dict)| dict)
+        match best {
+            None => TrainOutcome {
+                dict: Vec::new(),
+                k: 0,
+                sweep,
+            },
+            Some((_, dict, k)) => TrainOutcome { dict, k, sweep },
+        }
     }
 }
 
 /// Train a "raw content" dictionary of at most `dict_size` bytes from
 /// `samples`, written to `output`.
 pub fn create_raw_dict_from_samples<W: Write>(samples: &[&[u8]], output: &mut W, dict_size: usize) {
+    let outcome = train_raw(samples, dict_size, &TrainConfig::default());
+    output
+        .write_all(&outcome.dict)
+        .expect("could not write to output");
+}
+
+/// The configured raw-content trainer, returning the sweep decision.
+pub fn train_raw(samples: &[&[u8]], dict_size: usize, config: &TrainConfig) -> TrainOutcome {
     if samples.is_empty() {
-        return;
+        return TrainOutcome {
+            dict: Vec::new(),
+            k: 0,
+            sweep: Vec::new(),
+        };
     }
     let set = TrainingSet::build(samples);
-    let dict = if set.trainable() {
+    if set.trainable() {
         vprintln!(
             "create_dict: training {dict_size} byte dict from {} samples, {} bytes",
             set.lens.len(),
             set.body.len()
         );
-        set.select_content(dict_size)
+        set.select_content(dict_size, config)
     } else {
-        set.body
-    };
-    output.write_all(&dict).expect("could not write to output");
+        TrainOutcome {
+            dict: set.body,
+            k: 0,
+            sweep: Vec::new(),
+        }
+    }
 }
 
 /// Train a formatted dictionary of at most `dict_size` bytes from
@@ -240,35 +367,97 @@ pub fn create_formatted_dict_from_samples<W: Write>(
     output: &mut W,
     dict_size: usize,
 ) {
+    let outcome = train_formatted(samples, dict_size, &TrainConfig::default());
+    output
+        .write_all(&outcome.dict)
+        .expect("could not write to output");
+}
+
+/// The configured formatted-dictionary trainer, returning the sweep
+/// decision (the emitted dictionary is already finalized).
+pub fn train_formatted(samples: &[&[u8]], dict_size: usize, config: &TrainConfig) -> TrainOutcome {
     if samples.is_empty() {
-        return;
+        return TrainOutcome {
+            dict: Vec::new(),
+            k: 0,
+            sweep: Vec::new(),
+        };
     }
     let set = TrainingSet::build(samples);
     if !set.trainable() {
-        output
-            .write_all(&set.body)
-            .expect("could not write to output");
-        return;
+        return TrainOutcome {
+            dict: set.body,
+            k: 0,
+            sweep: Vec::new(),
+        };
     }
     vprintln!(
         "create_dict: training {dict_size} byte dict from {} samples, {} bytes",
         set.lens.len(),
         set.body.len()
     );
-    let content = set.select_content(dict_size);
-    let dict = match finalize_dictionary(&content, &set.train_samples(), dict_size) {
+    let content = set.select_content(dict_size, config);
+    let dict = match finalize_dictionary_ex(
+        &content.dict,
+        &set.all_samples(),
+        dict_size,
+        finalize::STATS_LEVEL,
+    ) {
         Some(dict) => dict,
-        None => content,
+        None => content.dict,
     };
+    TrainOutcome {
+        dict,
+        k: content.k,
+        sweep: content.sweep,
+    }
+}
+
+/// Finalize externally supplied content over the training split of
+/// `samples` (the same shuffled 75/25 split the trainer scores against):
+/// the stats-parse sample set matches C's `nbFinalizeSamples`, not the
+/// caller's full list.
+pub fn finalize_content_with_samples<W: Write>(
+    samples: &[&[u8]],
+    content: &[u8],
+    output: &mut W,
+    dict_size: usize,
+    stats: StatsSet,
+    stats_level: Option<i32>,
+) {
+    let set = TrainingSet::build(samples);
+    let stats_samples: Vec<&[u8]> = if set.trainable() {
+        match stats {
+            StatsSet::TrainSplit => set.train_samples(),
+            StatsSet::All => set.all_samples(),
+        }
+    } else {
+        samples.iter().copied().collect()
+    };
+    let dict = match stats_level {
+        Some(level) => finalize_dictionary_ex(content, &stats_samples, dict_size, level),
+        None => finalize_dictionary(content, &stats_samples, dict_size),
+    };
+    let dict = dict.unwrap_or_else(|| content.to_vec());
     output.write_all(&dict).expect("could not write to output");
+}
+
+/// Which samples feed the entropy stats of a formatted dictionary.
+#[derive(Clone, Copy)]
+pub enum StatsSet {
+    /// The scoring split's training share (C's `nbFinalizeSamples`).
+    TrainSplit,
+    /// Every input sample: the split exists to score the k sweep, but all
+    /// samples describe the payload distribution equally well.
+    All,
 }
 
 /// Deterministic Fisher-Yates over sample order (libzstd's `DiB_shuffle`):
 /// caller-supplied sample lists are usually sorted, and a sorted
 /// concatenation makes every epoch a cluster of similar files — the
-/// selected segments then describe the cluster, not the collection, and the
-/// positional train/test split lands on a distribution shift. A fixed seed
-/// keeps training reproducible.
+/// selected segments then describe the cluster, not the collection, and
+/// the positional train/test split lands on a distribution shift. A fixed
+/// seed keeps training reproducible.
 fn shuffle<T>(items: &mut [T]) {
     let mut seed: u32 = 0xfd2fb528;
     for i in (1..items.len()).rev() {
@@ -385,6 +574,42 @@ fn create_raw_dict_from_samples_is_deterministic() {
     create_raw_dict_from_samples(&refs, &mut b, 4096);
     assert_eq!(a, b);
     assert!(a.len() <= 4096);
+}
+
+#[test]
+fn train_config_variants_are_deterministic() {
+    // Every knob combination must train reproducibly.
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for i in 0..16u8 {
+        let mut sample = Vec::new();
+        for _ in 0..4 {
+            sample.extend_from_slice(b"[Unit]\nDescription=shared boilerplate block\n");
+            for j in 0..24u32 {
+                sample.push((i as u32 * 131 + j * 17) as u8);
+            }
+        }
+        samples.push(sample);
+    }
+    let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+    for k_grid in [KGrid::Compact, KGrid::LibzstdCli, KGrid::Fixed(700)] {
+        for metric in [MetricMode::RawContent, MetricMode::Formatted] {
+            for hash in [DmerHash::Exact, DmerHash::LibzstdBuckets] {
+                for cross in [true, false] {
+                    let config = TrainConfig {
+                        k_grid: k_grid.clone(),
+                        metric,
+                        hash,
+                        cross_sample_kmers: cross,
+                    };
+                    let a = train_raw(&refs, 4096, &config);
+                    let b = train_raw(&refs, 4096, &config);
+                    assert_eq!(a.dict, b.dict);
+                    assert_eq!(a.k, b.k);
+                    assert_eq!(a.sweep, b.sweep);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "hash")]

@@ -30,8 +30,12 @@ use crate::{
 
 /// The only rep triple a finalized dictionary writes: C's `repStartValue`.
 pub(crate) const REP_START: [u32; 3] = [1, 4, 8];
-/// Stats-parse level, C's `ZSTD_CLEVEL_DEFAULT`.
-const STATS_LEVEL: i32 = 3;
+/// Stats-parse level. C parses at `ZSTD_CLEVEL_DEFAULT` (3); our row
+/// there is a denser dfast than libzstd's (more matches, fewer literals)
+/// and its histograms seed measurably worse tables than every sparser or
+/// deeper row — level 4 (greedy) sits on the measured quality plateau
+/// (fixture: 3 seeds x referee levels, fixed content; see docs).
+pub(crate) const STATS_LEVEL: i32 = 4;
 /// Format maxima for the code histograms.
 const MAX_LL_CODE: usize = 35;
 const MAX_ML_CODE: usize = 52;
@@ -51,9 +55,21 @@ const MIN_CONTENT: usize = REP_START[2] as usize;
 /// over `samples`. Returns `None` when the header plus the minimum content
 /// cannot fit.
 pub fn finalize_dictionary(content: &[u8], samples: &[&[u8]], capacity: usize) -> Option<Vec<u8>> {
+    finalize_dictionary_ex(content, samples, capacity, STATS_LEVEL)
+}
+
+/// The configurable-stats form: the parse level selects the histogram
+/// source (C pins `ZSTD_CLEVEL_DEFAULT`; the engine's row at that level
+/// differs from libzstd's, so the level is tunable here).
+pub fn finalize_dictionary_ex(
+    content: &[u8],
+    samples: &[&[u8]],
+    capacity: usize,
+    stats_level: i32,
+) -> Option<Vec<u8>> {
     let mut fse = FseBuildScratch::default();
     let mut huff = HuffScratch::default();
-    let header = serialize_header(content, samples, capacity, &mut fse, &mut huff)?;
+    let header = serialize_header_ex(content, samples, capacity, stats_level, &mut fse, &mut huff)?;
 
     // C's shrink: the header takes its bytes out of the content budget,
     // keeping the content's front (the trainer spends the full budget, the
@@ -83,10 +99,21 @@ fn serialize_header(
     fse: &mut FseBuildScratch,
     huff: &mut HuffScratch,
 ) -> Option<Vec<u8>> {
+    serialize_header_ex(content, samples, capacity, STATS_LEVEL, fse, huff)
+}
+
+fn serialize_header_ex(
+    content: &[u8],
+    samples: &[&[u8]],
+    capacity: usize,
+    stats_level: i32,
+    fse: &mut FseBuildScratch,
+    huff: &mut HuffScratch,
+) -> Option<Vec<u8>> {
     // The id is computed over the untruncated content, like C (the header
     // is built before the content budget is settled).
     let id = dict_id(content);
-    let stats = collect_stats(content, samples);
+    let stats = collect_stats_ex(content, samples, stats_level);
 
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(&MAGIC_NUM);
@@ -159,14 +186,26 @@ impl EntropyStats {
 /// Parse every sample's first block against the content as raw match
 /// history and count the emitted literals and code triples.
 fn collect_stats(content: &[u8], samples: &[&[u8]]) -> EntropyStats {
-    let level = Level::from_zstd(STATS_LEVEL);
+    collect_stats_ex(content, samples, STATS_LEVEL)
+}
+
+fn collect_stats_ex(content: &[u8], samples: &[&[u8]], stats_level: i32) -> EntropyStats {
+    let level = Level::from_zstd(stats_level);
+    // C sizes the stats parse's cParams once from the average sample size
+    // (`ZDICT_analyzeEntropy`'s `ZSTD_getParams(level, average, dict)`);
+    // a per-sample shape would re-clamp the tables on every file.
+    let average: u64 = if samples.is_empty() {
+        0
+    } else {
+        samples.iter().map(|s| s.len() as u64).sum::<u64>() / samples.len() as u64
+    };
     let dict = EncDictionary::raw_content(content);
     let mut stats = EntropyStats::new(offcode_max(content.len()));
     let mut state = new_owned_state();
     let mut literals = Vec::new();
     let mut seqs = Vec::new();
     for &sample in samples {
-        let shape = InputShape::default().with_len(sample.len() as u64 + content.len() as u64);
+        let shape = InputShape::default().with_len(average + content.len() as u64);
         reset_with_dictionary(&mut state, &dict, level, shape);
         // One block per sample, like C's per-file compressBegin (block
         // bound below the level's window).

@@ -40,6 +40,7 @@
   - [Decoding](dev/negative/decoding.md)
   - [Encoding · Matchers](dev/negative/matchers.md)
   - [Encoding · Entropy / Checksum / Misc](dev/negative/entropy.md)
+  - [Dictionary Trainer](dev/negative/dict.md)
   - [MT / Streaming](dev/negative/mt-stream.md)
 
 ## Pitfalls
