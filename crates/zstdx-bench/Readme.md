@@ -251,7 +251,10 @@ Trains a dictionary with the in-tree trainer from files or directories
 dictionary with entropy tables (`--formatted`, the `zstd --train` shape —
 accepted by libzstd verbatim). `--content-of <dict>` dumps the content
 section of a formatted dict so content selection and entropy-table
-seeding can be A/B'd in isolation against `zstd --train`. `-v` prints the
+seeding can be A/B'd in isolation against `zstd --train`; conversely
+`--format-content <content.bin>` finalizes an arbitrary content file
+(e.g. the CLI trainer's extracted content) with the training split's
+stats, isolating table quality from content quality. `-v` prints the
 sweep's per-k metric and the winner.
 
 Trainer-knob overrides for A/B isolation (defaults are the library's):
@@ -259,7 +262,8 @@ Trainer-knob overrides for A/B isolation (defaults are the library's):
 optimizer ladder), `--metric raw|formatted` (what the sweep scores),
 `--hash exact|buckets` (frequency-table key, exact fingerprints vs
 libzstd's colliding f-bit buckets), `--boundary cross|stop` (whether
-sample-boundary-spanning k-mers count).
+sample-boundary-spanning k-mers count), `--stats-level <n>` and
+`--stats-samples train|all` (finalize stats parse).
 
 ```bash
 cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384

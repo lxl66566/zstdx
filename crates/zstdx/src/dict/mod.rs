@@ -24,6 +24,7 @@ use std::{
 pub use cover::DmerHash;
 use cover::KMerTable;
 pub use finalize::finalize_dictionary;
+use finalize::{STATS_LEVEL, finalize_dictionary_ex};
 
 use crate::{EncoderOptions, Level};
 
@@ -239,6 +240,21 @@ impl TrainingSet {
             .collect()
     }
 
+    /// All samples of the shuffled body in order (the entropy-stats set can
+    /// legitimately span the scoring split: every sample is training
+    /// input).
+    fn all_samples(&self) -> Vec<&[u8]> {
+        let mut offset = 0;
+        self.lens
+            .iter()
+            .map(|&len| {
+                let sample = &self.body[offset..offset + len];
+                offset += len;
+                sample
+            })
+            .collect()
+    }
+
     /// Select the dictionary content (the fastCover pass with its
     /// segment-size sweep, scored on the holdout).
     fn select_content(&self, dict_size: usize, config: &TrainConfig) -> TrainOutcome {
@@ -381,7 +397,12 @@ pub fn train_formatted(samples: &[&[u8]], dict_size: usize, config: &TrainConfig
         set.body.len()
     );
     let content = set.select_content(dict_size, config);
-    let dict = match finalize_dictionary(&content.dict, &set.train_samples(), dict_size) {
+    let dict = match finalize_dictionary_ex(
+        &content.dict,
+        &set.all_samples(),
+        dict_size,
+        finalize::STATS_LEVEL,
+    ) {
         Some(dict) => dict,
         None => content.dict,
     };
@@ -390,6 +411,45 @@ pub fn train_formatted(samples: &[&[u8]], dict_size: usize, config: &TrainConfig
         k: content.k,
         sweep: content.sweep,
     }
+}
+
+/// Finalize externally supplied content over the training split of
+/// `samples` (the same shuffled 75/25 split the trainer scores against):
+/// the stats-parse sample set matches C's `nbFinalizeSamples`, not the
+/// caller's full list.
+pub fn finalize_content_with_samples<W: Write>(
+    samples: &[&[u8]],
+    content: &[u8],
+    output: &mut W,
+    dict_size: usize,
+    stats: StatsSet,
+    stats_level: Option<i32>,
+) {
+    let set = TrainingSet::build(samples);
+    let stats_samples: Vec<&[u8]> = if set.trainable() {
+        match stats {
+            StatsSet::TrainSplit => set.train_samples(),
+            StatsSet::All => set.all_samples(),
+        }
+    } else {
+        samples.iter().copied().collect()
+    };
+    let dict = match stats_level {
+        Some(level) => finalize_dictionary_ex(content, &stats_samples, dict_size, level),
+        None => finalize_dictionary(content, &stats_samples, dict_size),
+    };
+    let dict = dict.unwrap_or_else(|| content.to_vec());
+    output.write_all(&dict).expect("could not write to output");
+}
+
+/// Which samples feed the entropy stats of a formatted dictionary.
+#[derive(Clone, Copy)]
+pub enum StatsSet {
+    /// The scoring split's training share (C's `nbFinalizeSamples`).
+    TrainSplit,
+    /// Every input sample: the split exists to score the k sweep, but all
+    /// samples describe the payload distribution equally well.
+    All,
 }
 
 /// Deterministic Fisher-Yates over sample order (libzstd's `DiB_shuffle`):

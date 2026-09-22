@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
 };
 
-use zstdx::dict::{DmerHash, KGrid, MetricMode, TrainConfig};
+use zstdx::dict::{DmerHash, KGrid, MetricMode, StatsSet, TrainConfig};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -28,6 +28,10 @@ pub struct Args {
     /// `zstd --train` shape) instead of raw content
     #[arg(long)]
     pub formatted: bool,
+    /// Do not train; finalize this raw content file with the training
+    /// split's entropy stats (decomposition of content vs tables)
+    #[arg(long)]
+    pub format_content: Option<PathBuf>,
     /// Segment-size candidate grid: compact, cli (libzstd's optimizer
     /// steps=4 ladder), or a forced k (default: the library default)
     #[arg(long)]
@@ -47,6 +51,12 @@ pub struct Args {
     /// Print the sweep's chosen parameters
     #[arg(short, long)]
     pub verbose: bool,
+    /// Stats-parse level for --format-content (default 3, C's default)
+    #[arg(long)]
+    pub stats_level: Option<i32>,
+    /// Stats sample set for --format-content: train split or all samples
+    #[arg(long, default_value = "train")]
+    pub stats_samples: String,
 }
 
 fn parse_grid(s: &str) -> KGrid {
@@ -124,6 +134,33 @@ pub fn run(args: &Args) {
         args.size
     );
     let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+
+    if let Some(content_path) = &args.format_content {
+        // Decomposition tool: our finalize over an arbitrary content file
+        // (e.g. a CLI trainer's content), stats from the training split.
+        let content = fs::read(content_path).unwrap();
+        let stats = if args.stats_samples == "all" {
+            StatsSet::All
+        } else {
+            StatsSet::TrainSplit
+        };
+        let mut dict = Vec::new();
+        zstdx::dict::finalize_content_with_samples(
+            &refs,
+            &content,
+            &mut dict,
+            args.size,
+            stats,
+            args.stats_level,
+        );
+        fs::write(&args.out, &dict).unwrap();
+        println!(
+            "formatted {} bytes of content -> {}",
+            content.len(),
+            dict.len()
+        );
+        return;
+    }
 
     let outcome = if args.formatted {
         zstdx::dict::train_formatted(&refs, args.size, &config)
