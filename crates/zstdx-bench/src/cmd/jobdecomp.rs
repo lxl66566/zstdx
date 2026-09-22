@@ -143,6 +143,12 @@ mod trace {
             ms(rest),
             share(rest, s.job_ns),
         );
+        println!(
+            "  head clear {:>7.2} ms ({:4.1}% of job, {:>6.2} ms/job)",
+            ms(s.clear_ns),
+            share(s.clear_ns, s.job_ns),
+            ms(s.clear_ns) / jobs as f64,
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -204,6 +210,7 @@ mod trace {
             lag_fill_calls,
             hash3_ns,
             hash3_bytes,
+            clear_ns,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
@@ -218,6 +225,7 @@ mod trace {
         acc.lag_fill_calls += lag_fill_calls;
         acc.hash3_ns += hash3_ns;
         acc.hash3_bytes += hash3_bytes;
+        acc.clear_ns += clear_ns;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {
