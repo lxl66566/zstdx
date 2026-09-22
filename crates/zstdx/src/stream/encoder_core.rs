@@ -16,7 +16,7 @@ use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
         Matcher,
-        block_enc::compressed::{BlockScratch, DictEntropy},
+        block_enc::compressed::{BlockScratch, DictEntropy, SeqCostMode},
         block_header::BlockHeader,
         checksum::{BlockChecksum, FrameHasher},
         compress_fastest,
@@ -295,6 +295,8 @@ impl FrameEncoderCoreSt {
             };
             self.state.matcher.set_input_shape(shape);
             self.state.matcher.reset(options.level);
+            self.state.dict_entropy.cost_mode =
+                SeqCostMode::for_plain_level(options.level, shape.len);
             None
         };
         let checksum = options.checksum && cfg!(feature = "hash");

@@ -227,6 +227,18 @@ pub(super) fn covered_lit_symbols(lit_lens: &[u8; 256]) -> usize {
 pub(super) const SMALL_DENSE_NARROW_MAX: u32 = 20;
 pub(super) const SMALL_DENSE_WIDE_MIN: u32 = 42;
 
+/// Tiny frames join the dense bars whatever their alphabet shape (minus
+/// the narrow exit): the cold start dominates the frame, so every-position
+/// probing wins — json 1-3 KiB fast rows gain 7-17 B, dfast 1 KiB 7 B,
+/// 4 KiB byte-neutral — while the same bars on structured alphabets lose
+/// from 8 KiB up (json 16 KiB +170 B, 64 KiB +1051 B), which is where the
+/// alphabet screen keeps excluding them. 4096 sits at the measured
+/// crossover. Fast/dfast rows only (see
+/// [`MatchGeneratorDriver::win_small_wide_fast`]): the btlazy head's hash
+/// width dilutes on structured content under the join (json 2 KiB l9
+/// +7 B) and keeps the strict verdict.
+pub(super) const SMALL_DENSE_TINY_MAX: usize = 4096;
+
 pub(super) fn small_dense_wide(win: &[u8]) -> bool {
     if sampled_distinct(win, 128) <= SMALL_DENSE_NARROW_MAX {
         return false;

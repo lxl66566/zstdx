@@ -125,6 +125,34 @@ pub(crate) enum SeqCostMode {
     Exact,
 }
 
+/// A known source at or below this size runs the exact selection arm:
+/// such a frame is a single block (the 128 KiB format maximum), so the
+/// arm's only divergence from the heuristic is the predefined/fresh
+/// choice — where the heuristic's flat description estimate misprices
+/// small alphabets. Multi-block frames keep the rebuild-leaning
+/// heuristic: measured over the corpus, the exact arm's extra repeat
+/// acceptances lose json +68..+4423 B from 1 MiB up (this encoder's
+/// parses fit repeated tables worse than libzstd's own — the dict-side
+/// finding's no-dict twin), so it stays gated to the small-frame band
+/// the residue lives in.
+const EXACT_ARM_MAX_LEN: u64 = 128 * 1024;
+
+impl SeqCostMode {
+    /// The selection arm a no-dict frame's level takes, mirroring
+    /// `ZSTD_selectEncodingType`'s strategy split: this ladder's rows 6+
+    /// are the lazy family or above (libzstd's `ZSTD_lazy` boundary), so
+    /// small known frames there run the exact comparison like every
+    /// libzstd frame; rows below (and unknown-length or multi-block
+    /// frames, see [`EXACT_ARM_MAX_LEN`]) keep the heuristic. Row 5 is
+    /// greedy here as in libzstd's L5 and keeps the heuristic with it.
+    pub(crate) fn for_plain_level(level: crate::Level, known_len: Option<u64>) -> Self {
+        match (level.as_i32(), known_len) {
+            (6..=22, Some(len)) if len <= EXACT_ARM_MAX_LEN => Self::Exact,
+            _ => Self::Stock,
+        }
+    }
+}
+
 impl DictEntropy {
     /// Every stream seeded (a formatted dictionary with an id).
     pub const ALL: Self = Self {
@@ -134,6 +162,15 @@ impl DictEntropy {
         of: true,
         cost_mode: SeqCostMode::Stock,
     };
+
+    /// A plain (no-dict) frame's entropy state: nothing seeded, the
+    /// sequence-selection arm taken from the level's strategy.
+    pub(crate) fn plain(level: crate::Level, known_len: Option<u64>) -> Self {
+        Self {
+            cost_mode: SeqCostMode::for_plain_level(level, known_len),
+            ..Self::default()
+        }
+    }
 }
 
 pub(crate) fn compress_block<M: Matcher>(

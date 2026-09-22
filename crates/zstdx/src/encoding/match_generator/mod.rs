@@ -691,6 +691,14 @@ impl MatchGeneratorDriver {
         self.small_wide.unwrap()
     }
 
+    /// The dense bars' verdict for the fast/dfast rows: the alphabet
+    /// screen, or a tiny frame joined in unconditionally
+    /// ([`SMALL_DENSE_TINY_MAX`]; the cached key's length is the screened
+    /// window's).
+    fn win_small_wide_fast(&mut self) -> bool {
+        self.win_small_wide() || self.small_wide_key.1 <= SMALL_DENSE_TINY_MAX
+    }
+
     /// Size the search tables for `params` — the table-family body of
     /// [`Self::apply_level`], shared with the dictionary row swap in
     /// [`Self::load_dictionary`] (a swapped frame re-keys its tables the
@@ -1850,7 +1858,7 @@ impl Matcher for MatchGeneratorDriver {
                 // instantiation either way.
                 match (self.ramp.is_armed(), self.scan_density) {
                     (false, ScanDensity::Plain) => {
-                        if self.params.small_src && self.win_small_wide() {
+                        if self.params.small_src && self.win_small_wide_fast() {
                             self.start_matching_fast::<false, false, RUNTIME_LOG, true>(
                                 literals, seqs,
                             );
@@ -1861,7 +1869,7 @@ impl Matcher for MatchGeneratorDriver {
                         }
                     },
                     (true, ScanDensity::Plain) => {
-                        if self.params.small_src && self.win_small_wide() {
+                        if self.params.small_src && self.win_small_wide_fast() {
                             self.start_matching_fast::<true, false, RUNTIME_LOG, true>(
                                 literals, seqs,
                             );
@@ -1933,7 +1941,7 @@ impl Matcher for MatchGeneratorDriver {
                 // the dict rows' instantiation, so no new codegen — while
                 // structured frames keep the 5-byte width (their 4-byte
                 // candidates are net-negative).
-                if self.dict_row || (self.params.small_src && self.win_small_wide()) {
+                if self.dict_row || (self.params.small_src && self.win_small_wide_fast()) {
                     if self.ramp.is_armed() {
                         self.start_matching_dfast::<true, true, RUNTIME_LOG, RUNTIME_LOG>(
                             literals, seqs,
