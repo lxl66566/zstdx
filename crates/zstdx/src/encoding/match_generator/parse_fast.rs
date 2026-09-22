@@ -53,6 +53,9 @@ impl MatchGeneratorDriver {
             hash_log,
             covered_fill: self.covered_fill,
             width: ChainHashWidth::Five,
+            // The fast strategy's tables never advance the origin (see
+            // `head_origin`); zero keeps its emit math on plain pack_pos.
+            origin: 0,
         };
         let max_window = self.params.window as u64;
         let mut pos = self.pos;

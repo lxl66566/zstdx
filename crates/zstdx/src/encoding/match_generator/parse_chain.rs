@@ -21,6 +21,10 @@ impl MatchGeneratorDriver {
         let chain_mask = chain.len() - 1;
         let win_base = self.win_base;
         let ramp = self.ramp;
+        // The chain heads' coordinate origin (see `head_origin`): a
+        // loop-invariant shift folded into every head insert and the walk's
+        // distance resolve.
+        let origin = self.head_origin;
         let block_end = self.block_end;
         let hash_log = self.params.hash_log;
         let search_depth = self.params.search_depth as usize;
@@ -55,6 +59,7 @@ impl MatchGeneratorDriver {
                 CoveredFill::Dense
             },
             width,
+            origin,
         };
         let hash_read = HASH_READ as u64;
         // Catch-up cursor (dictionary rows only; see `chain_filled`) —
@@ -93,6 +98,7 @@ impl MatchGeneratorDriver {
                 search_depth,
                 chain_mask,
                 max_window,
+                origin,
                 ramp,
             )
         };
@@ -130,7 +136,7 @@ impl MatchGeneratorDriver {
                         let h = hash_at_width(win, ci, hash_log, width);
                         let head = *table_ptr.add(h);
                         *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table_ptr.add(h) = pack_pos(abs);
+                        *table_ptr.add(h) = pack_head(abs, origin);
                     }
                     ci += 1;
                 }
@@ -272,7 +278,7 @@ impl MatchGeneratorDriver {
             // SAFETY: both indices are masked to their tables' sizes.
             unsafe {
                 *chain.get_unchecked_mut(pos as usize & chain_mask) = entry;
-                *table_ptr.add(h) = pack_pos(pos);
+                *table_ptr.add(h) = pack_head(pos, origin);
             }
             next_ins = pos + 1;
 
@@ -285,7 +291,7 @@ impl MatchGeneratorDriver {
             if piped && (pos - win_base) as usize == idx {
                 let (ph, mut pe) = pre1;
                 if ph == h {
-                    pe = pack_pos(pos);
+                    pe = pack_head(pos, origin);
                 }
                 pipe = Some(pe);
             }
