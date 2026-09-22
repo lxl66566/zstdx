@@ -495,6 +495,7 @@ impl TableEmit<'_> {
         match_len: usize,
         of_value: u32,
         rep: &mut [u32; 3],
+        filled_from: u64,
     ) -> u64 {
         let (_ll, match_end) = push_seq_packed(
             win,
@@ -522,7 +523,23 @@ impl TableEmit<'_> {
             4
         }) as u64;
         let end_abs = (self.win_base + match_end as u64).min(self.insert_max);
-        let mut p = self.win_base + start as u64;
+        // Dictionary rows start the fill past the scan's own insert: a
+        // greedy emission starts exactly at its probed position, which the
+        // scan already linked — re-inserting it links the slot to the head
+        // it just became (a self-reference), and every later walk reaching
+        // the position spins on it until the depth budget dies, severing
+        // the bucket's older history (the dict twins behind a hot 4-gram).
+        // libzstd never re-inserts: `ZSTD_insertAndFindFirstIndex` fills
+        // [nextToUpdate, ip) exclusive and a stored match's interior rides
+        // the NEXT search's catch-up. `filled_from` is that frontier (the
+        // first position no fill has linked yet); the no-dict grid keeps
+        // [start, ..) — its output is byte-load-bearing.
+        let from_abs = if self.covered_fill == CoveredFill::DictDense {
+            (self.win_base + start as u64).max(filled_from)
+        } else {
+            self.win_base + start as u64
+        };
+        let mut p = from_abs;
         while p < end_abs {
             let i = (p - self.win_base) as usize;
             let h = hash_at_width(win, i, hash_log, self.width);
