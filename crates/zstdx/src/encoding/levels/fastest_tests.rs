@@ -1,4 +1,6 @@
 use alloc::vec::Vec;
+#[cfg(test)]
+#[cfg(feature = "std")]
 use std::io::Write as _;
 
 use crate::{Level, encoding::compress_to_vec};
@@ -32,6 +34,7 @@ fn assert_fastest_does_not_exceed_raw(len: usize) {
 /// ride them wholesale while the unpledged stream (which never arms on
 /// these rows) re-encodes each copy from scratch. Decodes through both
 /// implementations either way.
+#[cfg(feature = "std")]
 #[test]
 fn fast_rows_far_repeats_ride_ldm_at_full_window() {
     let unit_len = 16 * 1024 * 1024;
@@ -48,7 +51,7 @@ fn fast_rows_far_repeats_ride_ldm_at_full_window() {
             });
         }
     }
-    for level in [Level::Fast] {
+    for level in [Level::Fastest, Level::Fast] {
         let armed = crate::encoding::compress_slice_to_vec(data.as_slice(), level);
         let mut sink = Vec::new();
         {

@@ -514,9 +514,11 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     // 0: raw blocks.
     fast(HASH_LOG, MAX_WINDOW),
     // 1: libzstd L1 keeps a W19/H14 table; our H15/768 KiB row is the
-    // tuned Fastest tier (beyond-W21 expansion measured a loss).
-    fast(HASH_LOG, MAX_WINDOW),
-    fast(16, 1 << 20),
+    // tuned Fastest tier (beyond-W21 expansion measured a loss). LDM arms
+    // only where the arming context widens the window to the far domain
+    // (see `apply_level`); every stock-window frame stays byte-identical.
+    with_ldm(fast(HASH_LOG, MAX_WINDOW)),
+    with_ldm(fast(16, 1 << 20)),
     // 3: the tuned Fast tier; same-window A/B sits within 0.03% of
     // libzstd's L3 dfast (H17 long / C16 short). LDM arms only where the
     // arming context widens the window to the far domain (see

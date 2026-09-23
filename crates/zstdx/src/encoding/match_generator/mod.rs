@@ -2142,9 +2142,9 @@ impl Matcher for MatchGeneratorDriver {
                     };
                 }
                 if self.ldm.is_some() {
-                    scan_fast!(true)
+                    scan_fast!(true);
                 } else {
-                    scan_fast!(false)
+                    scan_fast!(false);
                 }
                 // This block's parse density picks the next block's
                 // covered-fill policy. Structured shapes never fire
@@ -2261,9 +2261,9 @@ impl Matcher for MatchGeneratorDriver {
                     };
                 }
                 if self.ldm.is_some() {
-                    scan_dfast!(true)
+                    scan_dfast!(true);
                 } else {
-                    scan_dfast!(false)
+                    scan_dfast!(false);
                 }
             },
             Strategy::Chain(_) => {
