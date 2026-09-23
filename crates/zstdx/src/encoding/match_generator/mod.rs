@@ -906,6 +906,26 @@ impl MatchGeneratorDriver {
         if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
             params.chain_reach = Some(SHRINK_REACH);
         }
+        // Fast/dfast LDM arming (R19): the row's stock window (768 KiB-2 MiB)
+        // is the SCAN's domain; a frame-continuous caller whose declared
+        // length reaches the full far window widens the declared window to
+        // the far domain (the buffer, frame header and LDM reach) with the
+        // scan domain preserved through `chain_reach` — the opt rows'
+        // window/domain split. The length bar keeps every smaller frame's
+        // header and parse byte-identical (the 32 MiB corpus population
+        // included), and the arming-context check keeps MT jobs stock
+        // (their per-job LDM restart would need the capture machinery;
+        // recorded residue). A forced window at or past the far domain arms
+        // on its own geometry.
+        if params.ldm
+            && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
+            && self.ldm_arming == LdmArming::Frame
+            && params.window < LDM_FULL_WINDOW
+            && matches!(self.shape.len, Some(n) if n >= LDM_FULL_WINDOW as u64)
+        {
+            params.chain_reach = Some(params.window);
+            params.window = LDM_FULL_WINDOW;
+        }
         // The reach change alone must not re-derive anything: the tables'
         // sizes are reach-independent, and the reach flips twice per probe
         // (keep, shrink, then the executed choice) plus once per shrunk
@@ -945,7 +965,11 @@ impl MatchGeneratorDriver {
             && params.chain_reach != Some(SHRINK_REACH)
             && matches!(
                 params.strategy,
-                Strategy::Chain(_) | Strategy::Opt(_) | Strategy::BtLazy(_)
+                Strategy::Fast
+                    | Strategy::Dfast(_)
+                    | Strategy::Chain(_)
+                    | Strategy::Opt(_)
+                    | Strategy::BtLazy(_)
             )
             && ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar);
         let ldm_sized = self
@@ -2047,6 +2071,11 @@ impl Matcher for MatchGeneratorDriver {
         }
         match self.params.strategy {
             Strategy::Fast => {
+                // The LDM candidate set is generated ahead of the scan
+                // (the chain row's order: alphabet gate first, then
+                // generate); the consuming axis is compile-time below.
+                self.ldm_alphabet_gate();
+                self.ldm_generate();
                 // The instantiation pair is compile-time: plain blocks run
                 // a body with every dense-mode lever folded out.
                 // The log axis instantiates the row's full value (HASH_LOG,
@@ -2057,50 +2086,65 @@ impl Matcher for MatchGeneratorDriver {
                 // negative notes' lesson), so the plain body keeps the
                 // runtime-log codegen byte for byte. Clamped-window shapes
                 // (hash log below the row) take the [`RUNTIME_LOG`]
-                // instantiation either way.
-                match (self.ramp.is_armed(), self.scan_density) {
-                    (false, ScanDensity::Plain) => {
-                        if self.params.small_src && self.win_small_wide_fast() {
-                            self.start_matching_fast::<false, false, RUNTIME_LOG, true>(
-                                literals, seqs,
-                            );
-                        } else {
-                            self.start_matching_fast::<false, false, RUNTIME_LOG, false>(
-                                literals, seqs,
-                            );
+                // instantiation either way. The LDM axis follows the chain
+                // row's pattern: the empty candidate set (LDM off, gated,
+                // latched, far-less) takes the `LDM = false` instantiation,
+                // which binds the empty slice constant and folds back to
+                // the stock single-segment scan.
+                macro_rules! scan_fast {
+                    ($ldm:literal) => {
+                        match (self.ramp.is_armed(), self.scan_density) {
+                            (false, ScanDensity::Plain) => {
+                                if self.params.small_src && self.win_small_wide_fast() {
+                                    self.start_matching_fast::<false, false, RUNTIME_LOG, true, $ldm>(
+                                        literals, seqs,
+                                    );
+                                } else {
+                                    self.start_matching_fast::<false, false, RUNTIME_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                }
+                            },
+                            (true, ScanDensity::Plain) => {
+                                if self.params.small_src && self.win_small_wide_fast() {
+                                    self.start_matching_fast::<true, false, RUNTIME_LOG, true, $ldm>(
+                                        literals, seqs,
+                                    );
+                                } else {
+                                    self.start_matching_fast::<true, false, RUNTIME_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                }
+                            },
+                            (false, ScanDensity::Dense) => {
+                                if self.params.hash_log == HASH_LOG {
+                                    self.start_matching_fast::<false, true, HASH_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                } else {
+                                    self.start_matching_fast::<false, true, RUNTIME_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                }
+                            },
+                            (true, ScanDensity::Dense) => {
+                                if self.params.hash_log == HASH_LOG {
+                                    self.start_matching_fast::<true, true, HASH_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                } else {
+                                    self.start_matching_fast::<true, true, RUNTIME_LOG, false, $ldm>(
+                                        literals, seqs,
+                                    );
+                                }
+                            },
                         }
-                    },
-                    (true, ScanDensity::Plain) => {
-                        if self.params.small_src && self.win_small_wide_fast() {
-                            self.start_matching_fast::<true, false, RUNTIME_LOG, true>(
-                                literals, seqs,
-                            );
-                        } else {
-                            self.start_matching_fast::<true, false, RUNTIME_LOG, false>(
-                                literals, seqs,
-                            );
-                        }
-                    },
-                    (false, ScanDensity::Dense) => {
-                        if self.params.hash_log == HASH_LOG {
-                            self.start_matching_fast::<false, true, HASH_LOG, false>(
-                                literals, seqs,
-                            );
-                        } else {
-                            self.start_matching_fast::<false, true, RUNTIME_LOG, false>(
-                                literals, seqs,
-                            );
-                        }
-                    },
-                    (true, ScanDensity::Dense) => {
-                        if self.params.hash_log == HASH_LOG {
-                            self.start_matching_fast::<true, true, HASH_LOG, false>(literals, seqs);
-                        } else {
-                            self.start_matching_fast::<true, true, RUNTIME_LOG, false>(
-                                literals, seqs,
-                            );
-                        }
-                    },
+                    };
+                }
+                if self.ldm.is_some() {
+                    scan_fast!(true);
+                } else {
+                    scan_fast!(false);
                 }
                 // This block's parse density picks the next block's
                 // covered-fill policy. Structured shapes never fire
@@ -2129,6 +2173,12 @@ impl Matcher for MatchGeneratorDriver {
                 };
             },
             Strategy::Dfast(_) => {
+                // The LDM candidate set is generated ahead of the scan
+                // (the chain row's order); the consuming axis is
+                // compile-time below, folding to the stock scan on the
+                // empty set exactly like the fast arm.
+                self.ldm_alphabet_gate();
+                self.ldm_generate();
                 // Key on the tables' actual lengths (what the scan body
                 // derives): the two full rows cover every input the level
                 // clamp leaves at full tables; smaller inputs (clamped
@@ -2143,44 +2193,77 @@ impl Matcher for MatchGeneratorDriver {
                 // the dict rows' instantiation, so no new codegen — while
                 // structured frames keep the 5-byte width (their 4-byte
                 // candidates are net-negative).
-                if self.dict_row || (self.params.small_src && self.win_small_wide_fast()) {
-                    if self.ramp.is_armed() {
-                        self.start_matching_dfast::<true, true, RUNTIME_LOG, RUNTIME_LOG>(
-                            literals, seqs,
-                        );
-                    } else {
-                        self.start_matching_dfast::<false, true, RUNTIME_LOG, RUNTIME_LOG>(
-                            literals, seqs,
-                        );
-                    }
-                } else {
-                    let long_log = self.second.trailing_zeros();
-                    let small_log = (self.tables.len() - self.second).trailing_zeros();
-                    match (self.ramp.is_armed(), long_log, small_log) {
-                        (false, 17, 16) => {
-                            self.start_matching_dfast::<false, false, 17, 16>(literals, seqs);
-                        },
-                        (true, 17, 16) => {
-                            self.start_matching_dfast::<true, false, 17, 16>(literals, seqs);
-                        },
-                        (false, 18, 18) => {
-                            self.start_matching_dfast::<false, false, 18, 18>(literals, seqs);
-                        },
-                        (true, 18, 18) => {
-                            self.start_matching_dfast::<true, false, 18, 18>(literals, seqs);
-                        },
-                        (armed, ..) => {
-                            if armed {
-                                self.start_matching_dfast::<true, false, RUNTIME_LOG, RUNTIME_LOG>(
-                                    literals, seqs,
-                                );
+                macro_rules! scan_dfast {
+                    ($ldm:literal) => {
+                        if self.dict_row || (self.params.small_src && self.win_small_wide_fast()) {
+                            if self.ramp.is_armed() {
+                                self.start_matching_dfast::<
+                                                            true,
+                                                            true,
+                                                            RUNTIME_LOG,
+                                                            RUNTIME_LOG,
+                                                            $ldm,
+                                                        >(literals, seqs);
                             } else {
-                                self.start_matching_dfast::<false, false, RUNTIME_LOG, RUNTIME_LOG>(
-                                literals, seqs,
-                            );
+                                self.start_matching_dfast::<
+                                                            false,
+                                                            true,
+                                                            RUNTIME_LOG,
+                                                            RUNTIME_LOG,
+                                                            $ldm,
+                                                        >(literals, seqs);
                             }
-                        },
-                    }
+                        } else {
+                            let long_log = self.second.trailing_zeros();
+                            let small_log = (self.tables.len() - self.second).trailing_zeros();
+                            match (self.ramp.is_armed(), long_log, small_log) {
+                                (false, 17, 16) => {
+                                    self.start_matching_dfast::<false, false, 17, 16, $ldm>(
+                                        literals, seqs,
+                                    );
+                                },
+                                (true, 17, 16) => {
+                                    self.start_matching_dfast::<true, false, 17, 16, $ldm>(
+                                        literals, seqs,
+                                    );
+                                },
+                                (false, 18, 18) => {
+                                    self.start_matching_dfast::<false, false, 18, 18, $ldm>(
+                                        literals, seqs,
+                                    );
+                                },
+                                (true, 18, 18) => {
+                                    self.start_matching_dfast::<true, false, 18, 18, $ldm>(
+                                        literals, seqs,
+                                    );
+                                },
+                                (armed, ..) => {
+                                    if armed {
+                                        self.start_matching_dfast::<
+                                                                    true,
+                                                                    false,
+                                                                    RUNTIME_LOG,
+                                                                    RUNTIME_LOG,
+                                                                    $ldm,
+                                                                >(literals, seqs);
+                                    } else {
+                                        self.start_matching_dfast::<
+                                                                    false,
+                                                                    false,
+                                                                    RUNTIME_LOG,
+                                                                    RUNTIME_LOG,
+                                                                    $ldm,
+                                                                >(literals, seqs);
+                                    }
+                                },
+                            }
+                        }
+                    };
+                }
+                if self.ldm.is_some() {
+                    scan_dfast!(true);
+                } else {
+                    scan_dfast!(false);
                 }
             },
             Strategy::Chain(_) => {
@@ -2468,14 +2551,18 @@ impl MatchGeneratorDriver {
     /// fill unconditionally (its bytes are frozen).
     fn ldm_fill_block(&mut self, why: LdmFill) {
         self.ldm_alphabet_gate();
-        // Skipped blocks stop filling except for the chain row's full-window
-        // population, whose bytes are frozen. The opt rows have no frozen
+        // Skipped blocks stop filling except for the full-window population
+        // (the chain row, and the armed fast/dfast rows whose widened
+        // window is that same frozen population), whose bytes are frozen.
+        // The opt rows have no frozen
         // population, so they exempt Skipped blocks at every window: the
         // latch cannot fire through them either way (no scan runs), and
         // max-entropy or uniform windows carry no far class.
         if why == LdmFill::Skipped
-            && !(matches!(self.params.strategy, Strategy::Chain(_))
-                && self.params.window >= LDM_FULL_WINDOW)
+            && !(matches!(
+                self.params.strategy,
+                Strategy::Chain(_) | Strategy::Fast | Strategy::Dfast(_)
+            ) && self.params.window >= LDM_FULL_WINDOW)
         {
             return;
         }
