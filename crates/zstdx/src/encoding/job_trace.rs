@@ -37,6 +37,17 @@ pub struct Snapshot {
     /// The per-job head-table clear inside `prefill_window` (the
     /// strategy's heads, `clear_table`; a sub-span of `prefill_ns`).
     pub clear_ns: u64,
+    /// The strategy grid fill inside `prefill_window` (chain/row/fast strip
+    /// inserts; a sub-span of `prefill_ns`).
+    pub grid_fill_ns: u64,
+    /// The strip seed scan (`acquire_seed`; a sub-span of `prefill_ns`).
+    pub seed_scan_ns: u64,
+    /// The incompressibility probe's strip sample pass (`seed_gate_probe`;
+    /// a sub-span of `prefill_ns`).
+    pub gate_ns: u64,
+    /// The LDM strip fill inside `prefill_window` (a sub-span of
+    /// `prefill_ns`).
+    pub ldm_fill_ns: u64,
     /// Per-job `reset_slice_state` (state, stats and table reset).
     pub reset_ns: u64,
     /// Ultra's seed parse (`ZSTD_initStats_ultra` port).
@@ -80,6 +91,10 @@ macro_rules! counters {
 
 counters! {
     jobs,
+    grid_fill_ns,
+    seed_scan_ns,
+    gate_ns,
+    ldm_fill_ns,
     job_ns,
     prefill_ns,
     clear_ns,
@@ -111,6 +126,30 @@ pub fn add_job(started: Instant) {
 #[inline]
 pub fn add_prefill(started: Instant) {
     add_ns(&C.prefill_ns, started.elapsed());
+}
+
+/// Record one strategy grid-fill span inside `prefill_window`.
+#[inline]
+pub fn add_grid_fill(started: Instant) {
+    add_ns(&C.grid_fill_ns, started.elapsed());
+}
+
+/// Record one strip seed-scan span inside `prefill_window`.
+#[inline]
+pub fn add_seed_scan(started: Instant) {
+    add_ns(&C.seed_scan_ns, started.elapsed());
+}
+
+/// Record one probe sample-pass span inside `prefill_window`.
+#[inline]
+pub fn add_gate(started: Instant) {
+    add_ns(&C.gate_ns, started.elapsed());
+}
+
+/// Record one LDM strip fill span inside `prefill_window`.
+#[inline]
+pub fn add_ldm_fill(started: Instant) {
+    add_ns(&C.ldm_fill_ns, started.elapsed());
 }
 
 /// Record one head-table clear span inside `prefill_window`.

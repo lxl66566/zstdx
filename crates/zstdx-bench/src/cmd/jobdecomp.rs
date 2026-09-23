@@ -149,6 +149,18 @@ mod trace {
             share(s.clear_ns, s.job_ns),
             ms(s.clear_ns) / jobs as f64,
         );
+        println!(
+            "  prefill split: grid_fill {:>7.2} ms ({:4.1}% of job)  seed_scan {:>7.2} ms \
+             ({:4.1}%)  gate {:>7.2} ms ({:4.1}%)  ldm {:>7.2} ms ({:4.1}%)",
+            ms(s.grid_fill_ns),
+            share(s.grid_fill_ns, s.job_ns),
+            ms(s.seed_scan_ns),
+            share(s.seed_scan_ns, s.job_ns),
+            ms(s.gate_ns),
+            share(s.gate_ns, s.job_ns),
+            ms(s.ldm_fill_ns),
+            share(s.ldm_fill_ns, s.job_ns),
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -211,6 +223,10 @@ mod trace {
             hash3_ns,
             hash3_bytes,
             clear_ns,
+            grid_fill_ns,
+            seed_scan_ns,
+            gate_ns,
+            ldm_fill_ns,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
@@ -226,6 +242,10 @@ mod trace {
         acc.hash3_ns += hash3_ns;
         acc.hash3_bytes += hash3_bytes;
         acc.clear_ns += clear_ns;
+        acc.grid_fill_ns += grid_fill_ns;
+        acc.seed_scan_ns += seed_scan_ns;
+        acc.gate_ns += gate_ns;
+        acc.ldm_fill_ns += ldm_fill_ns;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {
