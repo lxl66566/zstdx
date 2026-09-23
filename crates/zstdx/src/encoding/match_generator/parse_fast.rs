@@ -84,6 +84,15 @@ impl MatchGeneratorDriver {
         // predictable branch instead of a three-way check per probe
         // (libzstd's selectAddr trick).
         //
+        // Known regime cost: the zero-extended entry subtraction keeps
+        // dist >= pos + 1 - 2^32, which exceeds every window reach once pos
+        // passes 2^32 + max_window — from there on all hash candidates
+        // stay rejected for the rest of the frame (repcodes and the miss
+        // ramp keep the output valid; ratio degrades toward rep-only).
+        // The u32 wrap-domain resolve admits in-window candidates at any
+        // stream size but costs hot-path instructions here — measured out
+        // four ways, see the negative notes before retrying.
+        //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
         let resolve = |entry: u32, pos_abs: u64, reach: u64, ip: usize| -> usize {
