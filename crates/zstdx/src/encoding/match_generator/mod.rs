@@ -1309,7 +1309,12 @@ impl MatchGeneratorDriver {
             (None, None) => {},
             _ => unreachable!("same row params arm LDM identically"),
         }
-        self.seed_gate_probe(data);
+        // The adopter's probe walk collapses on a uniform strip exactly
+        // like the from-scratch fill's (the remainder fill below stays on
+        // the stock loop — snapshot continuations are alive-frame
+        // exotica, not the zeros-class fast path).
+        let uniform = strip_is_uniform(data);
+        self.seed_gate_probe(data, uniform);
         self.strip_fill_continue(data, base, snap.upto - base);
         if data.len() < HASH_READ {
             return;
@@ -1332,7 +1337,7 @@ impl MatchGeneratorDriver {
     /// the replay: a pooled matcher's probe otherwise carries whatever
     /// earlier jobs sampled, so the gate's verdicts (and the frame bytes)
     /// depended on which worker ran which job.
-    fn seed_gate_probe(&mut self, data: &[u8]) {
+    fn seed_gate_probe(&mut self, data: &[u8], uniform: bool) {
         if self.probe.is_empty() {
             if data.len() < GATE_MIN_BLOCK {
                 return;
@@ -1341,6 +1346,16 @@ impl MatchGeneratorDriver {
         } else {
             self.probe.fill(0);
         }
+        if uniform {
+            // Every sample of a uniform strip hashes to one slot with one
+            // tag: the walk's final table is the clear plus a single
+            // store (any position reads the same 8 bytes).
+            let h = read8(data, 0).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            self.probe[(h >> (64 - GATE_PROBE_LOG)) as usize] = h as u32;
+            return;
+        }
+        #[cfg(feature = "job_trace")]
+        let trace_gate = std::time::Instant::now();
         let block = self.block_size();
         let mut off = 0;
         while off < data.len() {
@@ -1356,6 +1371,8 @@ impl MatchGeneratorDriver {
             }
             off += seg;
         }
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_gate(trace_gate);
     }
 
     /// The chain row's stride-3 grid fill over `[resume, last)` (see
@@ -1492,10 +1509,20 @@ impl MatchGeneratorDriver {
             let gated = matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_))
                 && sampled_distinct(data, 0, data.len()) < LDM_SYMS_MIN;
             if data.len() >= super::ldm::MIN_MATCH_LENGTH && !gated {
+                #[cfg(feature = "job_trace")]
+                let trace_ldm = std::time::Instant::now();
                 ldm.fill(data, base, base, base + data.len() as u64);
+                #[cfg(feature = "job_trace")]
+                super::job_trace::add_ldm_fill(trace_ldm);
             }
         }
-        self.seed_gate_probe(data);
+        // A fully uniform strip (see `strip_is_uniform`) collapses both the
+        // probe walk above and the strategy grid fills below to O(1)
+        // table state; non-uniform strips exit the check on the first
+        // 64-byte block. Dictionary loads keep the stock paths (cold,
+        // once per dictionary).
+        let uniform = grid == FillGrid::Strip && strip_is_uniform(data);
+        self.seed_gate_probe(data, uniform);
         if data.len() < HASH_READ {
             return;
         }
@@ -1607,20 +1634,55 @@ impl MatchGeneratorDriver {
                     1
                 };
                 let origin = self.head_origin;
-                let mut idx = 0;
-                while idx < last {
-                    let abs = base + idx as u64;
-                    // SAFETY: the hash masks to hash_log bits, the absolute
-                    // position to the chain size (absolute key; see
-                    // emit_chain's note on the walk side's indexing).
+                #[cfg(feature = "job_trace")]
+                let trace_grid = std::time::Instant::now();
+                // Uniform strip: every grid position hashes to one slot
+                // and links to its predecessor, so the stock fill's
+                // observable final state is the newest grid position in
+                // that head slot plus the top of its chain column. A walk
+                // reads one chain slot per admitted candidate and admits
+                // at most `search_depth` candidates, and every candidate
+                // below the strip's top can only be reached through those
+                // top links (heads are identical to the stock fill's, and
+                // every other slot holds the same stale entries the stock
+                // fill leaves in place — uniformity keeps it from writing
+                // any other head), so links below depth+1 are unreachable
+                // state. The guard keeps strips whose grid is shallower
+                // than the written links on the stock loop (there the
+                // column bottoms out at the first grid position's stale
+                // link and the stock path is cheap anyway).
+                let depth = self.params.search_depth as usize;
+                if grid == FillGrid::Strip && uniform && last > (depth + 2) * PREFILL_STRIDE {
+                    // SAFETY: the hash masks to hash_log bits, the
+                    // positions to the chain size (absolute key).
                     unsafe {
-                        let h = hash_at_width(data, idx, hash_log, width);
-                        let head = *table.get_unchecked(h);
-                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table.get_unchecked_mut(h) = pack_head(abs, origin);
+                        let h0 = hash_at_width(data, 0, hash_log, width);
+                        let newest = base + (((last - 1) / PREFILL_STRIDE) * PREFILL_STRIDE) as u64;
+                        for k in 0..=depth {
+                            let pos = newest - k as u64 * PREFILL_STRIDE as u64;
+                            *chain.get_unchecked_mut(pos as usize & chain_mask) =
+                                pack_head(pos - PREFILL_STRIDE as u64, origin);
+                        }
+                        *table.get_unchecked_mut(h0) = pack_head(newest, origin);
                     }
-                    idx += stride;
+                } else {
+                    let mut idx = 0;
+                    while idx < last {
+                        let abs = base + idx as u64;
+                        // SAFETY: the hash masks to hash_log bits, the absolute
+                        // position to the chain size (absolute key; see
+                        // emit_chain's note on the walk side's indexing).
+                        unsafe {
+                            let h = hash_at_width(data, idx, hash_log, width);
+                            let head = *table.get_unchecked(h);
+                            *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
+                            *table.get_unchecked_mut(h) = pack_head(abs, origin);
+                        }
+                        idx += stride;
+                    }
                 }
+                #[cfg(feature = "job_trace")]
+                super::job_trace::add_grid_fill(trace_grid);
                 // The fill is a table writer the scan cursor never sees
                 // (fill-only states, spf builders): fold its extent into
                 // the origin's write mark.
@@ -1692,12 +1754,16 @@ impl MatchGeneratorDriver {
     /// encodable. `last` is the strip's final insertable index; the anchor
     /// bytes `[last, last + 8)` abut the job start.
     fn acquire_seed(&mut self, data: &[u8], last: usize) {
+        #[cfg(feature = "job_trace")]
+        let trace_seed = std::time::Instant::now();
         let a8 = read8(data, last);
         if let Some(u) = seed_scan(data, last, a8) {
             self.seed_offset = (last - u) as u32;
             self.seed_hits = 0;
             self.seed_budget = SEED_BUDGET;
         }
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_seed_scan(trace_seed);
     }
 }
 

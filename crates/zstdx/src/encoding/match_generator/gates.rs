@@ -269,6 +269,45 @@ fn sampled_distinct(win: &[u8], samples: usize) -> u32 {
     w0.count_ones() + w1.count_ones() + w2.count_ones() + w3.count_ones()
 }
 
+/// Whether every byte of `win` is equal — a fully uniform strip. The
+/// strategy grid fills and the probe walk below collapse to O(1) table
+/// state on such strips (every hashed window is the same value, so the
+/// whole grid lands in one head slot and the samples in one probe slot),
+/// which is what makes a zeros-class strip's per-job prefill cost constant
+/// instead of strip-proportional. Real corpus shapes exit on the first
+/// block: the compare runs per 64 bytes with an early return.
+pub(super) fn strip_is_uniform(win: &[u8]) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if win.len() >= 64 && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: the feature was just detected; every load reads a full
+        // 64-byte block inside `win`.
+        return unsafe { strip_is_uniform_avx512(win) };
+    }
+    let Some(&v0) = win.first() else { return true };
+    win.iter().all(|&b| b == v0)
+}
+
+/// AVX-512 form of [`strip_is_uniform`]: one broadcast byte against one
+/// 64-byte load per block, exiting at the first mismatch.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn strip_is_uniform_avx512(win: &[u8]) -> bool {
+    unsafe {
+        use core::arch::x86_64::*;
+        let pat = _mm512_set1_epi8(win[0] as i8);
+        let (blocks, tail) = win.as_chunks::<64>();
+        for b in blocks {
+            // SAFETY: `b` is a 64-byte slice of `win`.
+            let v = _mm512_loadu_si512(b.as_ptr().cast());
+            if _mm512_cmpeq_epi8_mask(v, pat) != 0xffff_ffff_ffff_ffff {
+                return false;
+            }
+        }
+        let v0 = win[0];
+        tail.iter().all(|&b| b == v0)
+    }
+}
+
 /// Nearest `u < last` with the anchor's 8 bytes and [`SEED_AGREE`]
 /// agreeing bytes before it (see [`MatchGeneratorDriver::acquire_seed`]).
 /// The 8-byte compare subsumes the 4-byte prefilter the scalar walk used
