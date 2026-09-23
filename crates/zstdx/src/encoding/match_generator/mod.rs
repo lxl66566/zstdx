@@ -1410,6 +1410,14 @@ impl MatchGeneratorDriver {
             self.probe.resize(1 << GATE_PROBE_LOG, 0);
         } else {
             self.probe.fill(0);
+            // The clear is the whole replay for a strip that cannot hold
+            // one gate block: the uniform sample below would read off a
+            // zero-length strip's dangling pointer (a pooled probe warm
+            // from a previous job met an empty segment at a freeze
+            // boundary and faulted at address 1).
+            if data.len() < GATE_MIN_BLOCK {
+                return;
+            }
         }
         if uniform {
             // Every sample of a uniform strip hashes to one slot with one

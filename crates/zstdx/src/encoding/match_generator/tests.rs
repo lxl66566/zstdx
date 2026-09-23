@@ -974,3 +974,19 @@ fn dubt_head_hands_off_across_gated_block() {
     assert_eq!(reconstructed, data);
     assert_eq!(driver.dubt_head, super::HeadPhase::Done);
 }
+
+#[test]
+fn gate_probe_empty_strip_on_warm_table() {
+    // A pooled matcher whose probe table is warm from a previous job's
+    // replay can meet a zero-length strip at a staging/freeze boundary;
+    // `strip_is_uniform` reports an empty strip uniform, so the guard
+    // must return after the clear — the uniform sample's `read8` cannot
+    // touch the empty slice's dangling pointer (found as a flaky
+    // stream-mt finish segfault, faulting at address 1).
+    let mut d = MatchGeneratorDriver::new_direct();
+    d.reset(crate::Level::Balanced);
+    let warm: Vec<u8> = (0..32 * 1024).map(|i| (i % 251 * 7) as u8).collect();
+    d.prefill_job_strip(&warm, 0);
+    assert!(!d.probe.is_empty());
+    d.prefill_job_strip(&[], 0);
+}
