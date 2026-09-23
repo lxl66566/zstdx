@@ -161,6 +161,11 @@ mod trace {
             ms(s.ldm_fill_ns),
             share(s.ldm_fill_ns, s.job_ns),
         );
+        println!(
+            "  spf build  {:>8.2} ms (caller-side; not in the job sums above — retired builds \
+             included)",
+            ms(s.spf_build_ns),
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -227,9 +232,11 @@ mod trace {
             seed_scan_ns,
             gate_ns,
             ldm_fill_ns,
+            spf_build_ns,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
+        acc.spf_build_ns += spf_build_ns;
         acc.prefill_ns += prefill_ns;
         acc.reset_ns += reset_ns;
         acc.seed_ns += seed_ns;

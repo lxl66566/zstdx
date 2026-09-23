@@ -327,12 +327,15 @@ pub fn compress_slice_mt(
         if let Some(plan) = &spf {
             #[cfg(feature = "job_trace")]
             let trace_spf = std::time::Instant::now();
+            // Caller-side span, its own counter (see Snapshot::spf_build_ns):
+            // the build is posting-thread work that the per-job prefill
+            // spans cannot see.
             let build = build_prefix_snapshot(src, level, shape, plan.med)
                 .map(|(upto, snapshot)| PrefixBuild { upto, snapshot });
             *plan.share.lock().unwrap() = build;
             ready.notify_all();
             #[cfg(feature = "job_trace")]
-            super::job_trace::add_prefill(trace_spf);
+            super::job_trace::add_spf_build(trace_spf);
         }
 
         // The frame checksum is independent of the job split; hash it while

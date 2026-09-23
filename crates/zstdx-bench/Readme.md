@@ -163,7 +163,9 @@ tree-fill (the job history the opt tier re-indexes through its binary
 tree), in-job block-boundary refills, the hash3 strip ingestion, ultra's
 job-boundary seed parse, the per-job state reset, the LDM prefill and
 the per-job head-table clear (`head clear`, a sub-span of `prefill`;
-zero on chain rows since the head origin landed) —
+zero on chain rows since the head origin landed), plus the
+caller-side shared-prefix-fill build (`spf build` — posting-thread
+work the job sums cannot see, retired/discarded builds included) —
 each against the summed job time (which exceeds the wall clock on the mt
 paths: jobs run in parallel). Component shares, not walls, are the
 verdict; interleaved A/B stays the wall tool. Needs the encoder trace

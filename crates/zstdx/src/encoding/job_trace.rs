@@ -48,6 +48,12 @@ pub struct Snapshot {
     /// The LDM strip fill inside `prefill_window` (a sub-span of
     /// `prefill_ns`).
     pub ldm_fill_ns: u64,
+    /// The caller-side shared-prefix-fill build (`build_spf`'s segment
+    /// loop plus its snapshot clone; the bulk path's
+    /// `build_prefix_snapshot`). NOT a sub-span of `prefill_ns` — it runs
+    /// on the posting thread, so without its own span the build is
+    /// invisible to the decomposition (the r17 lesson).
+    pub spf_build_ns: u64,
     /// Per-job `reset_slice_state` (state, stats and table reset).
     pub reset_ns: u64,
     /// Ultra's seed parse (`ZSTD_initStats_ultra` port).
@@ -95,6 +101,7 @@ counters! {
     seed_scan_ns,
     gate_ns,
     ldm_fill_ns,
+    spf_build_ns,
     job_ns,
     prefill_ns,
     clear_ns,
@@ -150,6 +157,14 @@ pub fn add_gate(started: Instant) {
 #[inline]
 pub fn add_ldm_fill(started: Instant) {
     add_ns(&C.ldm_fill_ns, started.elapsed());
+}
+
+/// Record one caller-side shared-prefix-fill build span (the stream core's
+/// `build_spf` fill loop plus its snapshot clone, the bulk path's
+/// `build_prefix_snapshot` — see [`Snapshot::spf_build_ns`]).
+#[inline]
+pub fn add_spf_build(started: Instant) {
+    add_ns(&C.spf_build_ns, started.elapsed());
 }
 
 /// Record one head-table clear span inside `prefill_window`.

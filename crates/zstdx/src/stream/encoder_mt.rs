@@ -1501,9 +1501,11 @@ impl MtEncoderCore {
             spf = None;
         }
         // The far-class screen runs after the probe settles (a verdict can
-        // re-grid and re-arm); a dead verdict re-bases every tail strip at
-        // the row's reach — not the whole prefixes the build filled — so
-        // the plan drops unused, exactly like the shrunk one above.
+        // re-grid and re-arm); the build's segment loop resolves it the
+        // moment the probe machinery is settled (same inputs, same
+        // verdict — see the loop), so a dead far class usually never
+        // builds at all; this is the belt for the screen still pending
+        // at a build-less flush/finish.
         self.resolve_far_class();
         if spf.is_some() && matches!(self.far_class, FarClass::Dead) {
             spf = None;
@@ -1544,7 +1546,12 @@ impl MtEncoderCore {
     /// The build fills in bounded segments, polling the probe donation
     /// between them: a shrink verdict retires the build immediately (its
     /// strips are not these prefixes), and the wasted segments ran inside
-    /// the donation wait the caller would spend either way.
+    /// the donation wait the caller would spend either way. A far-dead
+    /// screen retires it the same way the moment the probe machinery has
+    /// settled — the strips a dead verdict leaves are reach-capped, none
+    /// of them the prefixes this build fills, and on the shapes where the
+    /// donation wait drained during the write phase the whole build would
+    /// otherwise land on the finish tail built-to-be-dropped.
     fn build_spf(&mut self, hi: u64) -> Option<SpfPlan> {
         // Eligibility: the growing grid with nothing posted yet (every
         // tail strip is then the prefix [0, start)), buffers still at
@@ -1554,10 +1561,10 @@ impl MtEncoderCore {
         // large enough to pay for the machinery. The strategy gate plus
         // the threshold admit exactly the whole-window chain rows: every
         // other row's stream strip is its search domain (<= 8 MiB). A
-        // far-dead frame skips the build (its strips cap at the row's
-        // reach — no nesting, nothing to share); the screen may still be
-        // pending here (the probe settles after this), and `encode_jobs`
-        // drops the plan if it lands dead.
+        // A far-dead frame skips the build (its strips cap at the row's
+        // reach — no nesting, nothing to share); the segment loop below
+        // resolves a still-pending screen as soon as the probe machinery
+        // settles, retiring the build before any segment runs.
         if !matches!(self.grid, JobGrid::Growing)
             || self.job_start != 0
             || self.buf_base != 0
@@ -1596,7 +1603,12 @@ impl MtEncoderCore {
         // The clears of a stock prefill, then the fill itself segmented at
         // LDM batch-freeze points (the exact boundaries — see
         // `LdmState::fill_to_freeze`), each segment past `upto` bounded by
-        // `med` plus slack so the loop cannot run the whole strip.
+        // `med` plus slack so the loop cannot run the whole strip. The
+        // caller-side span covers the whole build — fill loop included,
+        // discards included (the r17 lesson: a snapshot-only span made the
+        // built-then-dropped builds invisible to the decomposition).
+        #[cfg(feature = "job_trace")]
+        let trace_spf = std::time::Instant::now();
         state.matcher.prefill_window(&[], 0);
         let cap = med + SPF_SEG;
         let mut upto = 0u64;
@@ -1608,7 +1620,29 @@ impl MtEncoderCore {
             {
                 self.resolve_probe();
             }
-            if self.choice == ReachChoice::Shrink {
+            // With the probe machinery settled, the far-class screen
+            // is safe to run here and cannot disagree with the
+            // post-time resolve: this build's eligibility pins the
+            // growing grid (the mid-size capture flips Fixed grids
+            // only, so its JobPrefix arming cannot race), and the
+            // screen's inputs — buffer extent, grid, choice — do
+            // not move between here and `encode_jobs`'s own resolve.
+            // Resolving early lets a dead far class retire the build
+            // before it burns the finish tail: a far-dead frame caps
+            // every strip at the row's reach, so the prefixes the
+            // build fills are exactly the strips the cap removes
+            // (measured: the whole 16-20 ms build was built and
+            // dropped on the text class, the donation wait it was
+            // meant to hide inside having already drained).
+            if !self.probe_pending
+                && self.probe_wait.is_none()
+                && matches!(self.far_class, FarClass::Pending)
+            {
+                self.resolve_far_class();
+            }
+            if self.choice == ReachChoice::Shrink || matches!(self.far_class, FarClass::Dead) {
+                #[cfg(feature = "job_trace")]
+                crate::encoding::job_trace::add_spf_build(trace_spf);
                 return_pooled_state(state);
                 return None;
             }
@@ -1620,6 +1654,8 @@ impl MtEncoderCore {
             else {
                 // No freeze before the cap: not a shape the snapshot can
                 // be cut at; the tail jobs keep their stock fills.
+                #[cfg(feature = "job_trace")]
+                crate::encoding::job_trace::add_spf_build(trace_spf);
                 return_pooled_state(state);
                 return None;
             };
@@ -1628,14 +1664,9 @@ impl MtEncoderCore {
                 break;
             }
         }
-        #[cfg(feature = "job_trace")]
-        let trace_spf = std::time::Instant::now();
         let snapshot = Arc::new(state.matcher.snapshot_strip_fill(upto));
         #[cfg(feature = "job_trace")]
-        {
-            let t = trace_spf;
-            crate::encoding::job_trace::add_prefill(t);
-        }
+        crate::encoding::job_trace::add_spf_build(trace_spf);
         return_pooled_state(state);
         Some(SpfPlan {
             upto,
