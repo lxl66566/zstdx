@@ -82,6 +82,15 @@ enum FillGrid {
     /// tree rows keep the lazy whole-content fill.
     Dictionary,
 }
+/// Whether [`MatchGeneratorDriver::fill_window_grid`] ingests the strip
+/// into the LDM state itself or leaves it to the caller (the windowed
+/// capture band's split prefill — see `prefill_job_strip_chain`).
+#[derive(Clone, Copy, PartialEq)]
+enum LdmStripFill {
+    Ingest,
+    Defer,
+}
+
 /// History kept for matching; also the window size declared in the frame header.
 const MAX_WINDOW: usize = 0xc0000;
 
@@ -413,6 +422,24 @@ pub(crate) struct StripSnapshot {
     upto: u64,
 }
 
+/// Captured LDM fill state for the windowed capture band (the full-window
+/// population of [`MatchGeneratorDriver::prefix_ldm_window`]): the LDM
+/// table after a sequential fill of `[0, upto)` stopped at a batch-freeze
+/// point. A windowed job adopts it and continues the fill to its own
+/// start — and the adoption is byte-invariant in `upto`: a freeze-point
+/// continuation is exact, so restoring any snapshot with `upto <= start`
+/// and filling the remainder produces the same usable candidates as the
+/// from-scratch fill of `[0, start)` (entries older than the job's window
+/// die on the distance filter, and the round-robin bucket holds the
+/// newest inserts either way). Which snapshot a job gets is therefore
+/// pure scheduling, never output.
+#[cfg(feature = "std")]
+pub(crate) struct LdmPrefixSnapshot {
+    pub(super) ldm: LdmSnapshot,
+    /// Absolute stream offset the fill covered (the freeze point).
+    pub(crate) upto: u64,
+}
+
 /// Resolve the active window (owned or borrowed). A free function so callers
 /// can split-borrow `win`/`ext` against `&mut table`.
 fn window_slice<'a>(win: &'a [u8], ext: Option<&'a ExtWindow>) -> &'a [u8] {
@@ -485,13 +512,16 @@ impl MatchGeneratorDriver {
         matches!(params_for(level, shape).strategy, Strategy::Chain(_))
     }
 
-    /// The window whose jobs run prefix strips under
-    /// [`LdmArming::JobPrefix`] (the bulk path's mid-size LDM capture):
-    /// the chain row at its stock reach, a Keep verdict (a shrunk frame
-    /// abandons LDM) and a window the source clamp left inside
-    /// `[LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW)` — wide enough that the far
-    /// class pays, narrow enough that every job's window strip is a whole
-    /// frame prefix. `None` keeps the per-job [`LdmArming::Job`] model.
+    /// The window whose jobs run cross-job LDM history under
+    /// [`LdmArming::JobPrefix`] (the bulk path's LDM capture): the chain
+    /// row at its stock reach, a Keep verdict (a shrunk frame abandons
+    /// LDM) and a window at least the mid-size bar. Two bands share the
+    /// arming: `[LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW)` runs whole-prefix
+    /// strips (every job's window strip is a frame prefix), while
+    /// `LDM_FULL_WINDOW` and beyond runs the windowed model (see
+    /// [`Self::windowed_ldm_capture`]) — chain tables over the reach tail,
+    /// LDM over the whole window through the shared prefix build's
+    /// snapshots. `None` keeps the per-job [`LdmArming::Job`] model.
     #[cfg(feature = "std")]
     pub(crate) fn prefix_ldm_window(
         level: Level,
@@ -502,9 +532,20 @@ impl MatchGeneratorDriver {
         (Self::spf_strip_fill(level, shape)
             && p.ldm
             && choice == ReachChoice::Keep
-            && p.window >= LDM_MIDSIZE_WINDOW
-            && p.window < LDM_FULL_WINDOW)
+            && p.window >= LDM_MIDSIZE_WINDOW)
             .then_some(p.window as u64)
+    }
+
+    /// Whether the capture window runs the windowed job model (the
+    /// full-window band of [`Self::prefix_ldm_window`]): beyond
+    /// [`LDM_FULL_WINDOW`] a job's window strip reaches back past the
+    /// frame prefix into mid-stream history, so the job keeps its chain
+    /// strip at the reach (the beyond-reach strip has exactly one reader,
+    /// LDM) and takes its LDM history from the shared prefix build's
+    /// snapshots instead (see `LdmPrefixSnapshot`).
+    #[cfg(feature = "std")]
+    pub(crate) fn windowed_ldm_capture(window: u64) -> bool {
+        window >= LDM_FULL_WINDOW as u64
     }
 
     /// Whether the shape-adaptive reach probe (see `super::reach_probe`)
@@ -1128,7 +1169,7 @@ impl MatchGeneratorDriver {
         // libzstd fills dictionary content more densely than an mt strip
         // (see FillGrid::Dictionary) — small payloads parse against this
         // window, so candidate coverage dominates.
-        self.fill_window_grid(content, 0, FillGrid::Dictionary);
+        self.fill_window_grid(content, 0, FillGrid::Dictionary, LdmStripFill::Ingest);
     }
 
     /// Declare `[start, end)` (absolute offsets inside the adopted window)
@@ -1436,13 +1477,116 @@ impl MatchGeneratorDriver {
     }
 
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
-        self.fill_window_grid(data, base, FillGrid::Strip);
+        self.fill_window_grid(data, base, FillGrid::Strip, LdmStripFill::Ingest);
+    }
+
+    /// The windowed capture band's job prefill, chain side only: exactly
+    /// [`Self::prefill_window`] over the job's reach tail (heads, links,
+    /// gate replay and seed scan identical to a stock job's), except the
+    /// LDM state is left untouched — [`Self::windowed_ldm_prefill`] owns
+    /// it, filling the whole window span instead of the strip.
+    #[cfg(feature = "std")]
+    pub(crate) fn prefill_job_strip_chain(&mut self, data: &[u8], base: u64) {
+        self.fill_window_grid(data, base, FillGrid::Strip, LdmStripFill::Defer);
+    }
+
+    /// The windowed capture band's LDM half (see
+    /// [`MatchGeneratorDriver::windowed_ldm_capture`]): seed the LDM state
+    /// for a job starting at `job_start` whose LDM window is
+    /// `[ldm_base, job_start)` inside `ldm_win`, either from scratch
+    /// (`snap = None`; `ldm_base` must be 0, so the restart-and-fill
+    /// reproduces the shared build's own `[0, job_start)` fill bit for
+    /// bit) or by adopting a snapshot and continuing the fill from its
+    /// freeze point (byte-invariant in `upto`; a snapshot older than
+    /// `ldm_base` re-arms there — the byte-derived rolling state equals
+    /// the continuous one, and the entries the gap leaves missing sit
+    /// beyond the job's window and die on the distance filter).
+    #[cfg(feature = "std")]
+    pub(crate) fn windowed_ldm_prefill(
+        &mut self,
+        ldm_win: &[u8],
+        ldm_base: u64,
+        job_start: u64,
+        snap: Option<&LdmPrefixSnapshot>,
+    ) {
+        debug_assert_eq!(ldm_base + ldm_win.len() as u64, job_start);
+        let Some(ldm) = self.ldm.as_mut() else {
+            debug_assert!(snap.is_none(), "same row params arm LDM identically");
+            return;
+        };
+        self.ldm_quiet = 0;
+        self.ldm_dead = false;
+        self.ldm_canary = 0;
+        match snap {
+            Some(s) => ldm.restore(&s.ldm),
+            None => {
+                debug_assert_eq!(ldm_base, 0, "stock windowed jobs are prefix strips");
+                ldm.restart(0);
+            },
+        }
+        #[cfg(feature = "job_trace")]
+        let trace_ldm = std::time::Instant::now();
+        let from = ldm.fed().max(ldm_base);
+        if from < job_start {
+            ldm.fill(ldm_win, ldm_base, from, job_start);
+        }
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_ldm_fill(trace_ldm);
+        // The job-start screens must see the history the LDM serves, not
+        // just the chain's reach tail: the incompressibility gate's probe
+        // replay and the periodic seed scan run over the window span
+        // (replacing the tail replay the chain prefill did — the same
+        // whole-strip seeding the mid-size capture's jobs get, and
+        // load-bearing for exactly its reason: a fresh worker's gate
+        // otherwise kills far-only blocks before LDM sees them, and a
+        // repeat period between the reach and the window loses its seed).
+        let uniform = strip_is_uniform(ldm_win);
+        self.seed_gate_probe(ldm_win, uniform);
+        if ldm_win.len() >= HASH_READ {
+            self.acquire_seed(ldm_win, ldm_win.len() - HASH_READ);
+        }
+    }
+
+    /// The windowed capture band's builder half (see
+    /// `LdmPrefixSnapshot`): advance this driver's LDM fill from
+    /// `[base, base + from)` to the first batch-freeze at or beyond
+    /// `soft` (bounded by `data.len()`), chain tables untouched. `None`
+    /// when no freeze lands before the end.
+    #[cfg(feature = "std")]
+    pub(crate) fn ldm_fill_segment(
+        &mut self,
+        data: &[u8],
+        base: u64,
+        from: u64,
+        soft: u64,
+    ) -> Option<u64> {
+        let ldm = self.ldm.as_mut()?;
+        debug_assert_eq!(ldm.fed(), base + from);
+        if data.len() as u64 > from {
+            ldm.fill_to_freeze(data, base, base + from, base + data.len() as u64, soft)
+        } else {
+            None
+        }
+    }
+
+    /// Capture the LDM fill state for [`Self::windowed_ldm_prefill`];
+    /// valid right after `ldm_fill_segment` (or the empty-strip restart
+    /// of `prefill_window`).
+    #[cfg(feature = "std")]
+    pub(crate) fn ldm_snapshot(&self, upto: u64) -> LdmPrefixSnapshot {
+        let ldm = self.ldm.as_ref().expect("the capture class arms LDM");
+        LdmPrefixSnapshot {
+            ldm: ldm.snapshot(),
+            upto,
+        }
     }
 
     /// Index a history window into the search tables under one of the two
     /// fill geometries (see [`FillGrid`]): the shared prologue and strategy
     /// dispatch of [`Self::prefill_window`] and the dictionary load.
-    fn fill_window_grid(&mut self, data: &[u8], base: u64, grid: FillGrid) {
+    /// `ldm_fill` defers the strip's LDM ingestion to the caller (the
+    /// windowed capture band's split prefill).
+    fn fill_window_grid(&mut self, data: &[u8], base: u64, grid: FillGrid, ldm_fill: LdmStripFill) {
         // The head applies only to a genuinely cold start: a non-empty
         // strip (mt jobs with history, dictionary content) is warm, while
         // the empty strip is mt job zero — a frame start, so the head
@@ -1525,7 +1669,10 @@ impl MatchGeneratorDriver {
         // ungated flow.
         self.strip_parse = true;
         // (the opt rows' tree-fill bound lives in `prefill_job_strip`)
-        if let Some(ldm) = &mut self.ldm {
+        if ldm_fill == LdmStripFill::Defer {
+            // The windowed capture band: `windowed_ldm_prefill` owns the
+            // LDM state (whole-window span, snapshot adoption).
+        } else if let Some(ldm) = &mut self.ldm {
             ldm.restart(base);
             self.ldm_quiet = 0;
             self.ldm_dead = false;

@@ -30,12 +30,13 @@ use super::{
     checksum::SliceChecksum,
     compress_fastest,
     frame_compressor::{
-        CompressState, compress_job_blocks, compress_job_blocks_inner, new_slice_state,
-        reset_slice_state, return_slice_state, take_slice_state,
+        CompressState, JobSpf, compress_job_blocks_inner, new_slice_state, reset_slice_state,
+        return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
-        LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, ldm_head_parses,
+        LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
+        ldm_head_parses,
     },
     reach_probe,
 };
@@ -51,6 +52,10 @@ pub(crate) const MIN_JOB_SIZE: usize = 1024 * 1024;
 /// and with it the streaming burst buffer (which holds a whole burst) into
 /// memory failure. libzstd's zstdmt caps its job size the same way.
 pub(crate) const MAX_JOB_SIZE: usize = 1024 * 1024 * 1024;
+/// The capture grid's job-size ceiling (see `capture_grid`): keeps huge
+/// capture-class inputs finely gridded instead of growing one job per
+/// eighth of the input forever.
+const CAPTURE_JOB_CAP: u64 = 16 * 1024 * 1024;
 
 /// Job size for an input of `len` bytes at `workers` threads: twice as many
 /// jobs as workers keeps the tail balanced, the floor keeps the overlap
@@ -80,7 +85,11 @@ pub fn mt_job_size_for(
     // with it.
     let choice = reach_probe::probe_reach_choice(head, level, shape);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
-    job_size_for(len, workers.max(2), overlap)
+    // Capture frames pin the grid at the reach floor (worker-independent
+    // — see `capture_grid`); the analysis tools must cut at the grid the
+    // encoder actually runs.
+    capture_grid(len, level, shape, choice, head)
+        .unwrap_or_else(|| job_size_for(len, workers.max(2), overlap))
 }
 
 /// Compress `src` into one frame using up to `workers` threads.
@@ -132,7 +141,7 @@ pub fn compress_slice_mt(
     // a Shrink verdict pays a re-parse. The keep grid must leave job zero
     // work beyond the span for the continuation to take over.
     let mut donation = None;
-    // Whether the donated state arms with the mid-size capture's arming
+    // Whether the donated state arms with the capture's arming
     // (see `donation_arming`): the pairing invariant below checks the
     // capture the frame finally runs against it.
     let mut donation_prefix = false;
@@ -141,6 +150,7 @@ pub fn compress_slice_mt(
     // plan when the verdict keeps.
     let mut keep_plan = None;
     let choice;
+    let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
     if reach_probe::eligible(level, shape)
         && job_size_for(
             src.len() as u64,
@@ -152,7 +162,20 @@ pub fn compress_slice_mt(
         let keep_strip =
             MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
                 as usize;
-        let keep_job_size = job_size_for(src.len() as u64, workers.max(2), keep_strip);
+        // Capture frames pin the job grid at the reach floor instead of
+        // the worker-scaled formula: the grid (and with it the frame
+        // bytes) stays identical at every worker count, and the floor
+        // already dominates the formula wherever the mid-size band
+        // engaged before (a 32 MiB capture source grids 4 MiB jobs at
+        // any worker count).
+        let keep_job_size = capture_grid(
+            src.len() as u64,
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            head,
+        )
+        .unwrap_or_else(|| job_size_for(src.len() as u64, workers.max(2), keep_strip));
         keep_plan = plan_prefix_ldm(
             src,
             level,
@@ -179,7 +202,8 @@ pub fn compress_slice_mt(
     }
     let donation = Mutex::new(donation);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
-    let job_size = job_size_for(src.len() as u64, workers, overlap);
+    let job_size = capture_grid(src.len() as u64, level, shape, choice, head)
+        .unwrap_or_else(|| job_size_for(src.len() as u64, workers, overlap));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -254,21 +278,44 @@ pub fn compress_slice_mt(
                     // Adopters of the shared prefix fill wait for the
                     // calling thread's build (it runs while the workers
                     // encode the below-boundary jobs); a start the build's
-                    // freeze overshot keeps the stock whole-prefix fill.
+                    // freeze overshot keeps the stock whole-prefix fill,
+                    // and the windowed band takes the newest LDM snapshot
+                    // at or below its start (the adoption is byte-invariant
+                    // in the snapshot's boundary, so which one lands is
+                    // pure scheduling).
                     let snapshot = match spf.as_ref() {
-                        Some(plan) if start as u64 > plan.med => {
-                            if let Some((upto, snap)) = wait_prefix_build(plan, &ready, &poison) {
-                                (start as u64 > upto).then_some(snap)
-                            } else {
-                                // Poisoned while waiting: release the
-                                // slot so the ordered assembly drains
-                                // before the panic resumes.
-                                *slots[id].lock().unwrap() = Some(Vec::new());
-                                ready.notify_all();
-                                break;
-                            }
+                        Some(plan) if start as u64 > plan_med(plan) => match plan {
+                            PrefixPlan::Whole { med: _, share } => {
+                                match wait_prefix_build(share, &ready, &poison) {
+                                    Some((upto, snap)) => {
+                                        JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
+                                    },
+                                    None => {
+                                        // Poisoned while waiting: release the
+                                        // slot so the ordered assembly drains
+                                        // before the panic resumes.
+                                        *slots[id].lock().unwrap() = Some(Vec::new());
+                                        ready.notify_all();
+                                        break;
+                                    },
+                                }
+                            },
+                            PrefixPlan::Windowed(w) => {
+                                match wait_ldm_snapshot(w, &ready, &poison, start as u64) {
+                                    Some(snap) => JobSpfOwned::Windowed(Some(snap)),
+                                    None if poison.lock().unwrap().is_some() => {
+                                        *slots[id].lock().unwrap() = Some(Vec::new());
+                                        ready.notify_all();
+                                        break;
+                                    },
+                                    // The build ended without a usable
+                                    // publish: the stock from-zero fill
+                                    // (byte-equal to an adoption there).
+                                    None => JobSpfOwned::Windowed(None),
+                                }
+                            },
                         },
-                        _ => None,
+                        _ => JobSpfOwned::None,
                     };
                     // The first job starts where the decoder's repeated-offset
                     // history is still the format default [1, 4, 8]; the gate
@@ -288,7 +335,8 @@ pub fn compress_slice_mt(
                                 end == src.len(),
                                 reach_probe::PROBE_SPAN,
                                 prefix,
-                                None,
+                                job_overlap,
+                                JobSpf::None,
                             );
                             return_slice_state(dstate);
                             return out;
@@ -302,7 +350,7 @@ pub fn compress_slice_mt(
                             shape,
                             choice,
                             job_ldm,
-                            snapshot.as_deref(),
+                            snapshot.job_spf(),
                         )
                     }));
                     match attempt {
@@ -330,9 +378,19 @@ pub fn compress_slice_mt(
             // Caller-side span, its own counter (see Snapshot::spf_build_ns):
             // the build is posting-thread work that the per-job prefill
             // spans cannot see.
-            let build = build_prefix_snapshot(src, level, shape, plan.med)
-                .map(|(upto, snapshot)| PrefixBuild { upto, snapshot });
-            *plan.share.lock().unwrap() = build;
+            match plan {
+                PrefixPlan::Whole { med, share } => {
+                    let build = build_prefix_snapshot(src, level, shape, *med)
+                        .map(|(upto, snapshot)| PrefixBuild { upto, snapshot });
+                    *share.lock().unwrap() = build;
+                },
+                // The windowed band's LDM-only build: one sequential fill
+                // of the prefix, publishing a snapshot at every cadence
+                // step so each adopting job's own remainder fill stays
+                // bounded wherever the build has reached when the job's
+                // worker picks it up.
+                PrefixPlan::Windowed(w) => build_ldm_prefix_chain(src, level, shape, w, &ready),
+            }
             ready.notify_all();
             #[cfg(feature = "job_trace")]
             super::job_trace::add_spf_build(trace_spf);
@@ -568,20 +626,122 @@ struct PrefixBuild {
     snapshot: Arc<StripSnapshot>,
 }
 
-/// The bulk path's shared prefix fill plan (the mid-size prefix-LDM
-/// class): jobs starting above `med` wait for the calling thread's build
-/// and adopt its snapshot when their strip extends it, instead of filling
-/// their whole frame prefix from scratch.
-struct PrefixPlan {
-    med: u64,
-    share: Arc<Mutex<Option<PrefixBuild>>>,
+/// The bulk path's shared prefix fill plan (the LDM capture classes, see
+/// `compress_slice_mt`): jobs starting above the median boundary `med`
+/// draw their history from the calling thread's build instead of filling
+/// their whole frame prefix from scratch. Two bands share the schedule:
+/// the mid-size band builds one whole-strip snapshot to `med`, the
+/// full-window band runs an LDM-only chain of snapshots through the last
+/// adopter's start.
+enum PrefixPlan {
+    Whole {
+        med: u64,
+        share: Arc<Mutex<Option<PrefixBuild>>>,
+    },
+    Windowed(WindowPlan),
 }
 
-/// Whether the bulk path runs a frame on prefix-strip LDM jobs (the
-/// dll32-class capture, see `compress_slice_mt`): the row/window/verdict
+/// The windowed band's plan: an LDM-only build that starts at `med` and
+/// publishes snapshots every `cadence` bytes up to `stop`, the last
+/// adopting job's start.
+struct WindowPlan {
+    med: u64,
+    stop: u64,
+    cadence: u64,
+    share: Arc<Mutex<WindowShare>>,
+}
+
+/// The windowed build's published state. The snapshot list is never
+/// pruned: the cadence spans `med..stop` in at most ~13 steps, and every
+/// adopter (start > med) must always find an entry at or below its start
+/// whatever the build's progress when its worker arrives.
+struct WindowShare {
+    publishes: Vec<Arc<LdmPrefixSnapshot>>,
+    done: bool,
+}
+
+/// The median boundary shared by both bands' schedules.
+fn plan_med(plan: &PrefixPlan) -> u64 {
+    match plan {
+        PrefixPlan::Whole { med, .. } => *med,
+        PrefixPlan::Windowed(w) => w.med,
+    }
+}
+
+/// The job-side artifact of the shared prefix fill: what `run_job` hands
+/// down as the job's [`JobSpf`].
+enum JobSpfOwned {
+    None,
+    Whole(Option<Arc<StripSnapshot>>),
+    Windowed(Option<Arc<LdmPrefixSnapshot>>),
+}
+
+impl JobSpfOwned {
+    fn job_spf(&self) -> JobSpf<'_> {
+        match self {
+            JobSpfOwned::None => JobSpf::None,
+            JobSpfOwned::Whole(snap) => match snap {
+                Some(s) => JobSpf::Whole(s),
+                // A build that overshot this job's start: the stock
+                // whole-strip fill.
+                None => JobSpf::None,
+            },
+            JobSpfOwned::Windowed(snap) => JobSpf::Windowed(snap.as_deref()),
+        }
+    }
+}
+
+/// The capture grid's job size for a source of `len` bytes at a chain
+/// reach of `reach` (see `capture_grid`): shared by the bulk planner and
+/// the pledged stream's re-grid so the two run the same lattice.
+pub(crate) fn capture_job_size(len: u64, reach: usize) -> usize {
+    let floor = MIN_JOB_SIZE.max(reach);
+    len.div_ceil(8).clamp(floor as u64, CAPTURE_JOB_CAP) as usize
+}
+
+/// The capture grid's job size when the frame's class engages the shared
+/// prefix fill (see `plan_prefix_ldm`): pinned at the reach floor — the
+/// same gates as the plan, so the grid the plan was laid out on is the
+/// one the encoder runs, and it is independent of the worker count (the
+/// frame bytes cannot depend on how many workers pick the jobs up).
+fn capture_grid(
+    len: u64,
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    head: &[u8],
+) -> Option<usize> {
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice)?;
+    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
+    if !ldm_head_parses(head) {
+        return None;
+    }
+    let job_size = capture_job_size(
+        len,
+        MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize,
+    );
+    // Eight jobs' worth of input, clamped to the [reach floor, 16 MiB]
+    // band (see `capture_job_size`): the floor is where the mid-size
+    // capture always gridded (a 32 MiB source keeps its exact 4 MiB
+    // lattice), and the 16 MiB side keeps huge inputs finely gridded.
+    // Below ~3x the reach the per-job LDM refills measurably erode the
+    // far class: each small job's exhaustive fill of its recent history
+    // floods the 16-deep LDM buckets and evicts older unique twins that a
+    // long job's parse-indexed history (matched interiors skipped) would
+    // keep (dll100 at 4 MiB jobs: +0.97 MB over st; at 13.1 MiB: +12 KB).
+    let n_jobs = len.div_ceil(job_size as u64) as usize;
+    let prefix_last = (1..n_jobs)
+        .filter(|&i| (i * job_size) as u64 <= window)
+        .last()?;
+    ((prefix_last * job_size) as u64 >= SPF_MIN_PREFIX).then_some(job_size)
+}
+
+/// Whether the bulk path runs a frame on prefix-strip LDM jobs (the LDM
+/// capture classes, see `compress_slice_mt`): the row/window/verdict
 /// class plus a head that both parses and carries a wide alphabet, and a
 /// job grid whose prefix strips are large enough to pay for the shared
-/// fill. Deterministic in the input, level and worker count alone.
+/// fill. Deterministic in the input and level alone (the grid is pinned,
+/// see `capture_grid`).
 fn plan_prefix_ldm(
     src: &[u8],
     level: Level,
@@ -595,9 +755,16 @@ fn plan_prefix_ldm(
     if !ldm_head_parses(head) {
         return None;
     }
+    debug_assert_eq!(
+        shape
+            .len
+            .and_then(|len| capture_grid(len, level, shape, choice, head)),
+        Some(job_size),
+        "the caller pinned the capture grid"
+    );
     // Tail jobs whose window strip is a whole frame prefix: the source
-    // sits inside the clamped window in this class, but the bound stays
-    // explicit — a mid-stream strip keeps the stock fill either way.
+    // sits inside the clamped window in the mid-size band, but the bound
+    // stays explicit — a mid-stream strip keeps the stock fill either way.
     let prefix_jobs: Vec<usize> = (1..n_jobs)
         .filter(|&i| (i * job_size) as u64 <= window)
         .collect();
@@ -609,10 +776,29 @@ fn plan_prefix_ldm(
     // adopters' parallel remainder fills (the same balance point the
     // streaming core's finish tail picks).
     let med = (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64;
-    Some(PrefixPlan {
-        med,
-        share: Arc::new(Mutex::new(None)),
-    })
+    if MatchGeneratorDriver::windowed_ldm_capture(window) {
+        // The last adopting job's start: the build needs to reach it (its
+        // own remainder fill then covers the rest), and no further.
+        let stop = ((n_jobs - 1) * job_size) as u64;
+        // At most ~13 publishes span med..stop, so the unpruned snapshot
+        // list stays bounded while every adopter can find an entry at or
+        // below its start.
+        let cadence = ((stop - med) / 12).max(SPF_SEG);
+        Some(PrefixPlan::Windowed(WindowPlan {
+            med,
+            stop,
+            cadence,
+            share: Arc::new(Mutex::new(WindowShare {
+                publishes: Vec::new(),
+                done: false,
+            })),
+        }))
+    } else {
+        Some(PrefixPlan::Whole {
+            med,
+            share: Arc::new(Mutex::new(None)),
+        })
+    }
 }
 
 /// Fill `[0, med)` once on the calling thread through a pooled state,
@@ -660,11 +846,11 @@ fn build_prefix_snapshot(
 /// completions already use. Lock order share→poison is one-sided, like
 /// the assembly's slot→poison.
 fn wait_prefix_build(
-    plan: &PrefixPlan,
+    share: &Arc<Mutex<Option<PrefixBuild>>>,
     ready: &Condvar,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
 ) -> Option<(u64, Arc<StripSnapshot>)> {
-    let mut guard = plan.share.lock().unwrap();
+    let mut guard = share.lock().unwrap();
     loop {
         if let Some(build) = guard.as_ref() {
             return Some((build.upto, Arc::clone(&build.snapshot)));
@@ -674,6 +860,72 @@ fn wait_prefix_build(
         }
         guard = ready.wait(guard).unwrap();
     }
+}
+
+/// The windowed band's adopter wait: the newest published LDM snapshot at
+/// or below `start` (which one lands is pure scheduling — the adoption's
+/// bytes are invariant in the snapshot's boundary, see
+/// `LdmPrefixSnapshot`; the newest just minimizes this job's own
+/// remainder fill). `None` once the build is done without a usable
+/// publish (a build that found no freeze — the job then fills its whole
+/// prefix from zero, byte-equal to an adoption) or the pool is poisoned.
+fn wait_ldm_snapshot(
+    plan: &WindowPlan,
+    ready: &Condvar,
+    poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+    start: u64,
+) -> Option<Arc<LdmPrefixSnapshot>> {
+    let mut guard = plan.share.lock().unwrap();
+    loop {
+        if let Some(snap) = guard.publishes.iter().rev().find(|s| s.upto <= start) {
+            return Some(Arc::clone(snap));
+        }
+        if guard.done || poison.lock().unwrap().is_some() {
+            return None;
+        }
+        guard = ready.wait(guard).unwrap();
+    }
+}
+
+/// The windowed band's caller-side build: one sequential LDM fill of the
+/// prefix through `stop`, segmented at batch-freeze points, publishing a
+/// snapshot whenever the fill crosses the next cadence target (and at
+/// `med`, the first target, which every adopter can use). Publishing
+/// wakes the waiting adopters through the shared `ready` condvar.
+fn build_ldm_prefix_chain(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+    plan: &WindowPlan,
+    ready: &Condvar,
+) {
+    let mut state = take_slice_state(
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        LdmArming::JobPrefix,
+    );
+    // The stock prefill's LDM restart (fresh at 0, entry floor 0) — the
+    // chain tables stay untouched: this build only feeds the LDM state.
+    state.matcher.prefill_window(&[], 0);
+    let cap = ((plan.stop + SPF_SEG) as usize).min(src.len());
+    let mut upto = 0u64;
+    let mut next_pub = plan.med;
+    while upto < plan.stop {
+        let soft = (upto + SPF_SEG).min(plan.stop);
+        let Some(freeze) = state.matcher.ldm_fill_segment(&src[..cap], 0, upto, soft) else {
+            break;
+        };
+        upto = freeze;
+        if upto >= next_pub && upto <= plan.stop {
+            let snap = Arc::new(state.matcher.ldm_snapshot(upto));
+            plan.share.lock().unwrap().publishes.push(snap);
+            next_pub = upto + plan.cadence;
+            ready.notify_all();
+        }
+    }
+    plan.share.lock().unwrap().done = true;
+    return_slice_state(state);
 }
 
 /// Reset a state for a job and apply the job-start gates: fresh entropy
@@ -706,8 +958,9 @@ pub(crate) fn prepare_job_state(
 /// `shape` is the whole frame's declared shape (length known for bulk,
 /// pledge or none for streaming; jobs share it so tables and the header
 /// window agree). `ldm` is the job's LDM arming context; `spf` the shared
-/// prefix fill's snapshot when the job adopts one instead of filling its
-/// strip from scratch (see `StripSnapshot`).
+/// prefix fill's engagement (see [`JobSpf`]) — the windowed band prefill
+/// indexes only the chain's reach tail while the job's window (`overlap`)
+/// spans the whole LDM history.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_job_with(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -719,29 +972,32 @@ pub(crate) fn run_job_with(
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
-    spf: Option<&StripSnapshot>,
+    spf: JobSpf<'_>,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
     prepare_job_state(state, level, shape, choice, ldm, job.start as u64);
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
-    match spf {
-        Some(snap) => {
-            let start = job.start;
-            compress_job_blocks_inner(
-                state,
-                src,
-                job,
-                overlap,
-                is_last_job,
-                start,
-                Vec::new(),
-                Some(snap),
-            )
-        },
-        None => compress_job_blocks(state, src, job, overlap, is_last_job),
-    }
+    // The windowed band's chain tables cover the reach tail; every other
+    // engagement indexes the whole strip `overlap` names.
+    let chain_overlap = if matches!(spf, JobSpf::Windowed(_)) {
+        MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize
+    } else {
+        overlap
+    };
+    let start = job.start;
+    compress_job_blocks_inner(
+        state,
+        src,
+        job,
+        overlap,
+        is_last_job,
+        start,
+        Vec::new(),
+        chain_overlap,
+        spf,
+    )
 }
 
 /// Compress one job on the calling (worker) thread through the per-thread
@@ -757,7 +1013,7 @@ pub(crate) fn run_job(
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
-    spf: Option<&StripSnapshot>,
+    spf: JobSpf<'_>,
 ) -> Vec<u8> {
     let mut state = take_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
@@ -781,8 +1037,8 @@ mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::{
-        compress_slice_mt, donation_arming, job_size_for, plan_prefix_ldm, reach_probe,
-        take_slice_state,
+        capture_grid, compress_slice_mt, donation_arming, job_size_for, plan_prefix_ldm,
+        reach_probe, take_slice_state,
     };
     use crate::{
         Level,
@@ -822,14 +1078,16 @@ mod tests {
         let src = pattern_head(MAX_BLOCK_SIZE as usize);
         let mib: u64 = 1024 * 1024;
         let cases: &[(u64, u32, Option<u32>, bool)] = &[
-            // The band: row 9's source-clamped window is W25.
+            // The mid-size band: row 9's source-clamped window is W25.
             (24 * mib, 2, None, true),
             (17 * mib, 4, None, true),
             // A forced window inside the band engages on a large source.
             (128 * mib, 4, Some(25), true),
-            // Above the band (window W26) the `Job` bar holds.
-            (64 * mib, 4, None, false),
-            // Below it there are no prefix strips worth sharing.
+            // The full-window band (window W26) engages too — on the
+            // windowed job model (chain tables over the reach tail, LDM
+            // through the snapshot ring).
+            (64 * mib, 4, None, true),
+            // Below the band there are no prefix strips worth sharing.
             (8 * mib, 4, None, false),
         ];
         for &(len, workers, window_log, engages) in cases {
@@ -840,7 +1098,9 @@ mod tests {
             let strip =
                 MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
                     as usize;
-            let job_size = job_size_for(len, workers.max(2), strip);
+            // The planner pins the capture grid (see `compress_slice_mt`).
+            let job_size = capture_grid(len, Level::Balanced, shape, ReachChoice::Keep, &src)
+                .unwrap_or_else(|| job_size_for(len, workers.max(2), strip));
             let n_jobs = len.div_ceil(job_size as u64) as usize;
             let plan = plan_prefix_ldm(
                 &src,
@@ -1133,6 +1393,81 @@ mod tests {
         assert_eq!(decoded, data);
         // Same job grid at this size, so the worker count cannot show in
         // the bytes; and repeated runs are identical by construction.
+        if mt4 != mt8 {
+            let at = mt4.iter().zip(mt8.iter()).position(|(a, b)| a != b);
+            panic!(
+                "mt4 {} mt8 {} st {} first-diff {at:?}",
+                mt4.len(),
+                mt8.len(),
+                st.len()
+            );
+        }
+        assert_eq!(
+            mt4,
+            compress_slice_mt(&data, Level::Balanced, true, 4, None)
+        );
+        assert!(
+            mt4.len() <= st.len() + st.len() / 50,
+            "the far class must survive the job split: mt {} vs st {}",
+            mt4.len(),
+            st.len()
+        );
+    }
+
+    /// The windowed capture band (window at the full W26 bar): a wide-
+    /// alphabet keep-class frame larger than the window grids pinned
+    /// capture jobs whose LDM history spans the whole window — the far
+    /// class beyond the chain reach survives the job split at every
+    /// worker count, including the mid-stream jobs whose window strips
+    /// reach back past the frame prefix (start > window). 76 MiB grids
+    /// eight 9.5 MiB jobs, the last starting at 66.5 MiB.
+    #[test]
+    fn mt_windowed_ldm_capture_is_worker_independent() {
+        const MIB: usize = 1024 * 1024;
+        let total = 76 * MIB;
+        // A 5 MiB unit tiled with per-copy mutations: the unit-to-unit
+        // copies sit at 5 MiB periods — beyond the row's W22 chain reach,
+        // exactly LDM's class — and the flipped byte per 4 KiB keeps
+        // every 64-byte window intact while no copy is exact.
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        unit[..head_len].copy_from_slice(&pattern_head(head_len));
+        // A 1 MiB re-copy of the head inside the unit: a near repeat the
+        // stock W22 reach finds, so the probe's keep parse wins and the
+        // frame keeps its LDM (a shrink verdict abandons the far class).
+        let head_copy = unit[..head_len].to_vec();
+        unit[MIB..MIB + head_len].copy_from_slice(&head_copy);
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None);
+        // Roundtrip through both decoders.
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&mt8, &mut out)
+            .unwrap_or_else(|e| panic!("windowed decode: {e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(mt8.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+        // The pinned grid keeps the bytes worker-independent, and repeated
+        // runs are identical by construction.
         if mt4 != mt8 {
             let at = mt4.iter().zip(mt8.iter()).position(|(a, b)| a != b);
             panic!(
