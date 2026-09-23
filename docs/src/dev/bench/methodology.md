@@ -43,7 +43,7 @@ Deleted one-off tools (all covered): bench_compare / bench_encode (matrix `dec-s
 1. **Every single-run conclusion must be re-run a second time**; across time-of-day trust only git-stash back-to-back same-machine A/B.
 2. **Deterministic output sizes are the only free, trustworthy A/B signal** (for changes that should not alter output); speed needs multi-round medians or in-process toggles; "gains" within ±10% in a single round are untrustworthy.
 3. In a full bench run, the encode segment that comes after the decode segment reads uniformly low in absolute terms (zstd's side also 18% slower) — for cross-comparisons trust dedicated A/B tools; from bench trust only cells stable within ±mad.
-4. Late-stage micro changes are judged by `perf stat` **instruction counts** (wall-clock ±5-25% swings are usually layout/scheduling noise); end-to-end changes use interleaved wall-clock.
+4. Late-stage micro changes are judged by `perf stat` **instruction counts** (wall-clock ±5-25% swings are usually layout/scheduling noise); end-to-end changes use interleaved wall-clock. Gungraun Ir comparisons are only valid **within one build lineage** (the worktree's cached previous run): rebuilding the same source in a fresh worktree shifts crate hashes/inlining by up to ~±0.9% Ir (measured 2026-09-23: json fastest 30.98M vs 31.34M at identical source) — always re-baseline the comparison column in the same worktree before reading a delta.
 5. Small-load criteria always use a single-shape, single-size process (allocator cross-contamination can distort 3×).
 6. Wall-clock is untrustworthy for 10GB/s-class loads (text.zst3/z9): look at cycles or trust only <9GB/s cells.
 
