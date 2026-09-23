@@ -10,6 +10,17 @@ impl MatchGeneratorDriver {
     /// search depth, prefer repcode candidates (they encode nearly free),
     /// and defer emission across up to `lazy_depth` further positions when
     /// a longer match may start there — libzstd's lazy family.
+    ///
+    /// Armed LDM segments the block (libzstd's `ZSTD_ldm_blockCompress`
+    /// for the lazy family, the btlazy row's model): each long-distance
+    /// candidate ends the current segment at its split and is emitted
+    /// wholesale there, and the scan parses only the literal gap ahead of
+    /// it, bounded at the split like C's per-gap compressor call (forward
+    /// counts, the lazy walk and the offset-2 chain all stop there). The
+    /// seam carries C's `ZSTD_ldm_limitTableUpdate`: the chain table
+    /// catches up at most 512 bytes behind the emission. An empty
+    /// candidate set (LDM off, gated or far-less shapes) is one segment —
+    /// the stock parse, byte-identical.
     #[allow(clippy::too_many_lines)]
     pub(super) fn start_matching_chain<const LDM: bool>(
         &mut self,
@@ -76,9 +87,16 @@ impl MatchGeneratorDriver {
         let mut seed_budget = self.seed_budget;
         let lit_lens = &self.lit_lens;
         // Long-distance candidates of this block ([`Self::ldm_generate`]):
-        // `ldm_i` is the first unconsumed one; covered candidates (their
-        // split lies behind the anchor) are dropped as emissions advance.
-        let ldm_seqs = &self.ldm_seqs[..];
+        // `ldm_i` is the first unconsumed one, each ending a segment at
+        // its split. Generate's anchor skip keeps spans disjoint and
+        // splits ascending. The `LDM = false` instantiation binds the
+        // empty slice constant, so the segment loop folds to the stock
+        // single-segment scan.
+        let ldm_seqs: &[LdmSeq] = if LDM {
+            &self.ldm_seqs[..]
+        } else {
+            &[]
+        };
         let mut ldm_i = 0usize;
         let mut ldm_won = false;
 
@@ -86,23 +104,31 @@ impl MatchGeneratorDriver {
         // returning the longest match's (length, candidate window index):
         // the module-level [`chain_search`], inlined here and in the lazy
         // walk below. The head entry is computed once by the caller (the
-        // insert block links the same value — see there).
-        let search = |win: &[u8], chain: *const u32, idx: usize, entry: u32| -> (usize, usize) {
-            chain_search(
-                win,
-                chain,
-                idx,
-                entry,
-                win_base,
-                block_end,
-                search_depth,
-                chain_mask,
-                max_window,
-                origin,
-                ramp,
-            )
-        };
+        // insert block links the same value — see there). `bound` is the
+        // current segment end — the block end, or the next candidate's
+        // split.
+        let search =
+            |win: &[u8], chain: *const u32, idx: usize, entry: u32, bound: u64| -> (usize, usize) {
+                chain_search(
+                    win,
+                    chain,
+                    idx,
+                    entry,
+                    win_base,
+                    bound,
+                    search_depth,
+                    chain_mask,
+                    max_window,
+                    origin,
+                    ramp,
+                )
+            };
 
+        // The current segment's end: the block end, or the next
+        // long-distance candidate's split (retargeted per segment below).
+        // Declared before the scan macro: macro-internal identifiers
+        // resolve against the definition site's locals.
+        let mut end;
         // The body exists in two phases (the fast loop's pattern): the
         // seeded phase carries the job-start state (`seed_offset`/
         // `seed_hits`/`seed_budget`, `rep_pending`), which only ever winds
@@ -113,7 +139,8 @@ impl MatchGeneratorDriver {
         // walk's own loop values (win_base/pos_abs/reach/depth/mask
         // reloaded from the stack on every walk step). `$gated` is a
         // literal, so the phase-only paths constant-fold away in the steady
-        // instantiation.
+        // instantiation. `$ldm` likewise: the gap bounds only exist in the
+        // segmenting instantiation.
         macro_rules! scan_chain {
             ($restart:lifetime, $gated:literal, $ldm:expr) => {
             // Dictionary rows take libzstd's catch-up fill
@@ -159,51 +186,22 @@ impl MatchGeneratorDriver {
             // shadow evaporates (measured: dll +4.5% pre-walk vs +0.5%
             // post-walk). When the depth-0 rep probe advances pos the walk
             // starts at pos+2 instead and computes fresh (the None arm).
-            // Skipped on the block tail (hashing idx+1 needs HASH_READ+1
+            // Skipped on the segment tail (hashing idx+1 needs HASH_READ+1
             // bytes ahead).
             let mut pre1 = (0usize, 0u32);
-            let piped = block_end - pos > hash_read;
+            let piped = end - pos > hash_read;
             if piped {
                 pre1.0 = hash_at_width(win, idx + 1, hash_log, width);
                 // SAFETY: the hash masks to hash_log bits and the table
                 // holds 1 << hash_log slots.
                 pre1.1 = unsafe { *table_ptr.add(pre1.0) };
             }
-            let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry);
-
-            // Long-distance candidate ([`super::ldm`]): a split whose far
-            // 64-byte-window twin the sparse table retained. Probed before
-            // the rep probe (which may advance pos past the split) and
-            // after the chain search — a plain length competition; the
-            // store gate and the lazy walk price the far offset. The live
-            // length re-derivation cannot fall below MIN_MATCH_LENGTH
-            // against the same bytes generation verified.
-            if $ldm && ldm_i < ldm_seqs.len() {
-                while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < anchor {
-                    ldm_i += 1;
-                }
-                if ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split == pos {
-                    let seq = ldm_seqs[ldm_i];
-                    ldm_i += 1;
-                    let cand_abs = pos - seq.offset as u64;
-                    // The rep probe above may have advanced `pos` past this
-                    // iteration's `idx`; an offset equal to that advance
-                    // (offset 1) then resolves the candidate to `idx`
-                    // itself — a self-compare whose zero offset the store
-                    // gate below prices (ilog2(0)). Candidates must be
-                    // strictly older than the probed position.
-                    if cand_abs >= win_base {
-                        let ci = (cand_abs - win_base) as usize;
-                        if ci < idx && read4(win, ci) == read4(win, idx) {
-                            let ml = extend_match(win, idx, ci);
-                            if ml > best_len {
-                                best_len = ml;
-                                best_cand = ci;
-                                ldm_won = true;
-                            }
-                        }
-                    }
-                }
+            let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry, end);
+            // Gap bound (C's per-gap compressor call counts to the gap
+            // end): a chain candidate's forward run stops at the split —
+            // the wholesale emission owns the bytes from there.
+            if $ldm {
+                best_len = best_len.min((end - pos) as usize);
             }
 
             // Repcode probe first when armed: with literals pending it runs
@@ -224,7 +222,10 @@ impl MatchGeneratorDriver {
                     let pidx = (probe - win_base) as usize;
                     let cand = (cand_abs - win_base) as usize;
                     if read4(win, cand) == read4(win, pidx) {
-                        let ml = extend_match(win, pidx, cand);
+                        let mut ml = extend_match(win, pidx, cand);
+                        if $ldm {
+                            ml = ml.min((end - probe) as usize);
+                        }
                         if ml >= MIN_MATCH
                             && ml + 3 > best_len
                             && !ramp.blocks(probe, cand_abs)
@@ -254,7 +255,14 @@ impl MatchGeneratorDriver {
                 // (ilog2(0)). The seed's twin must be strictly older than
                 // the probed position.
                 if ci < idx && read4(win, ci) == read4(win, idx) {
-                    let ml = extend_match(win, idx, ci);
+                    let mut ml = extend_match(win, idx, ci);
+                    // Bound against `pos`, not `idx`: the rep probe may
+                    // have advanced pos one byte past this iteration's
+                    // idx, and the emission start is `pos` — the match
+                    // end must stay inside the segment.
+                    if $ldm {
+                        ml = ml.min((end - pos) as usize);
+                    }
                     if ml >= 6 && ml + 3 > best_len && !ramp.blocks(pos, win_base + ci as u64) {
                         best_len = ml;
                         best_cand = ci;
@@ -311,7 +319,9 @@ impl MatchGeneratorDriver {
                 // chain walk per byte. Faster-growing than libzstd's
                 // anchor-distance grid: our per-probe chain walk is dearer,
                 // and skipping over sparse-match gaps is what keeps the
-                // Balanced levels fast on them.
+                // Balanced levels fast on them. A step may overshoot the
+                // segment end; the loop bound ends the gap there and the
+                // overshoot bytes stay pending literals.
                 miss_count += 1;
                 // Dictionary frames take libzstd's anchor-distance grid
                 // exactly (step 1 for the first 256 literal bytes): the
@@ -325,14 +335,7 @@ impl MatchGeneratorDriver {
                 } else {
                     1 + (miss_count >> 2).min(255) as u64
                 };
-                if $ldm && ldm_i < ldm_seqs.len() {
-                    // Never step over an unconsumed split: its candidate
-                    // dies with the position (the scan is its only
-                    // consumer).
-                    pos = (pos + step).min(ldm_seqs[ldm_i].split);
-                } else {
-                    pos += step;
-                }
+                pos += step;
                 continue $restart;
             }
             miss_count = 0;
@@ -371,7 +374,7 @@ impl MatchGeneratorDriver {
                             break;
                         }
                         let p2 = pos + 1;
-                        if block_end.saturating_sub(p2) < hash_read {
+                        if end.saturating_sub(p2) < hash_read {
                             break 'lazy;
                         }
                         pos = p2;
@@ -382,7 +385,7 @@ impl MatchGeneratorDriver {
                         // no table writes happen inside the lazy walk, and
                         // every path to the next search steps exactly one
                         // position. None only before the first search and
-                        // at the block tail.
+                        // at the segment tail.
                         let entry2 = match pipe.take() {
                             Some(pre) => pre,
                             None => {
@@ -397,7 +400,7 @@ impl MatchGeneratorDriver {
                         // position +1); the guard equals the next attempt's
                         // own break condition, so a skipped refresh is
                         // never consumed.
-                        if block_end.saturating_sub(p2 + 1) >= hash_read {
+                        if end.saturating_sub(p2 + 1) >= hash_read {
                             let hn = hash_at_width(win, idx2 + 1, hash_log, width);
                             // SAFETY: as above.
                             pipe = Some(unsafe { *table_ptr.add(hn) });
@@ -418,7 +421,10 @@ impl MatchGeneratorDriver {
                         {
                             let ci = (cand_abs - win_base) as usize;
                             if read4(win, ci) == read4(win, idx2) {
-                                let ml = extend_match(win, idx2, ci);
+                                let mut ml = extend_match(win, idx2, ci);
+                                if $ldm {
+                                    ml = ml.min((end - p2) as usize);
+                                }
                                 if ml >= MIN_MATCH {
                                     // Same gain-cap cheap reject as the
                                     // chain probe: lit_value tops out at 6
@@ -449,7 +455,11 @@ impl MatchGeneratorDriver {
                         }
                         // Chain search at the stepped position, on the
                         // pipelined hash+head read above.
-                        let (len2, cand2) = search(win, chain_ptr, idx2, entry2);
+                        let (len2, cand2) = search(win, chain_ptr, idx2, entry2, end);
+                        let mut len2 = len2;
+                        if $ldm {
+                            len2 = len2.min((end - p2) as usize);
+                        }
                         let price2 = if len2 >= min_match {
                             price_of((p2 - win_base) as usize, cand2)
                         } else {
@@ -520,7 +530,7 @@ impl MatchGeneratorDriver {
                     win,
                     Some(&mut *chain),
                     anchor,
-                    block_end,
+                    end,
                     &mut rep,
                     ramp,
                 );
@@ -531,20 +541,143 @@ impl MatchGeneratorDriver {
             next_ins = next_ins.max(pos);
             };
         }
-        // Seeded phase: job starts only (bulk-ST skips it entirely); each
-        // emit re-checks convergence at the head, and the values only ever
-        // wind down.
-        'seeded: while (rep_pending != 0 || seed_offset != 0)
-            && block_end.saturating_sub(pos) >= hash_read
-        {
-            scan_chain!('seeded, true, LDM);
-        }
-        'restart: while block_end.saturating_sub(pos) >= hash_read {
-            scan_chain!('restart, false, LDM);
-        }
-        if !emit.seqs.is_empty() && anchor < block_end {
-            let tail = (anchor - win_base) as usize..(block_end - win_base) as usize;
-            emit.literals.extend_from_slice(&win[tail]);
+        // One segment per long-distance candidate (plus the final one to
+        // the block end): the gap scans run the stock two-phase loop with
+        // every bound retargeted at the segment end (`end`), then the
+        // candidate emits wholesale at its split.
+        'segments: loop {
+            let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
+                end = s.split;
+                Some(*s)
+            } else {
+                end = block_end;
+                None
+            };
+            // Seeded phase: job starts only (bulk-ST skips it entirely); each
+            // emit re-checks convergence at the head, and the values only
+            // ever wind down. The phase spans segments like blocks — the
+            // seeded state is the scan's, not a segment's.
+            'seeded: while (rep_pending != 0 || seed_offset != 0)
+                && end.saturating_sub(pos) >= hash_read
+            {
+                scan_chain!('seeded, true, LDM);
+            }
+            'restart: while end.saturating_sub(pos) >= hash_read {
+                scan_chain!('restart, false, LDM);
+            }
+            let Some(seq) = seq else {
+                // Last segment: the stock literals-only tail rule.
+                if !emit.seqs.is_empty() && anchor < end {
+                    let tail = (anchor - win_base) as usize..(end - win_base) as usize;
+                    emit.literals.extend_from_slice(&win[tail]);
+                }
+                break 'segments;
+            };
+            ldm_i += 1;
+            debug_assert_eq!(seq.split, end);
+            // The 4-byte guard only defends a stale candidate (generate
+            // verified the whole span at fill time); a failure drops it and
+            // re-opens the split as gap bytes of the next segment, the
+            // pending literals still attached.
+            let cand_abs = end.checked_sub(seq.offset as u64);
+            let valid = match cand_abs {
+                Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
+                    read4(win, (c - win_base) as usize) == read4(win, (end - win_base) as usize)
+                },
+                _ => false,
+            };
+            if !valid {
+                pos = end;
+                continue 'segments;
+            }
+            // The wholesale emission: the gap's pending literals become the
+            // candidate's own literal run, the match carries generate's
+            // measured span, and the offset enters the repcode history like
+            // any literal-offset sequence. The split lands where the gear
+            // hash triggered, mid-match for misaligned twins — the
+            // emission backward-extends into the pending gap literals like
+            // every other chain emission (the offset stays constant).
+            let mut start = (end - win_base) as usize;
+            let mut cand = (cand_abs.unwrap() - win_base) as usize;
+            let mut ml = seq.len as usize;
+            let floor = (anchor - win_base) as usize;
+            let cfl = ramp.ext_floor(cand, win_base);
+            while start > floor && cand > cfl && win[cand - 1] == win[start - 1] {
+                cand -= 1;
+                start -= 1;
+                ml += 1;
+            }
+            let (_, match_end) = push_seq_packed(
+                win,
+                win_base,
+                anchor,
+                start,
+                ml,
+                seq.offset + 3,
+                &mut rep,
+                emit.literals,
+                emit.seqs,
+            );
+            ldm_won = true;
+            // A wholesale emission is a literal-offset sequence: the
+            // job-start rep gate counts it.
+            rep_pending = rep_pending.saturating_sub(1);
+            let next = win_base + match_end as u64;
+            // libzstd's ZSTD_ldm_limitTableUpdate seam: the chain table
+            // catches up at most 512 bytes behind the emission, and never
+            // behind the split — the interior's head stays unindexed.
+            // Bulk-filling it instead feeds resume-point searches
+            // twin-period candidates whose equal runs scan to the block
+            // cap (the btlazy row measured the uncapped form at 238x block
+            // time), and the interior is already far-matchable history
+            // through the LDM table itself. Deviations from C's exact
+            // `curr > nextToUpdate + 1024` guard, both measured: the fill
+            // starts at the split (the gap's ramp grid stays sparse), and
+            // short interiors catch up too (dll32 -853 B, dll100 -44 KB
+            // against the 1024-bar form — the mid-size population's
+            // 64-300 B twins need their tails indexed for later
+            // in-reach chain matches).
+            {
+                let to = next.min(insert_max);
+                let mut p = (next - 512).max(end).max(win_base);
+                while p < to {
+                    insert_linked_at(
+                        win,
+                        emit.table,
+                        &mut *chain,
+                        (p - win_base) as usize,
+                        p,
+                        hash_log,
+                        width,
+                        origin,
+                    );
+                    p += 1;
+                }
+            }
+            next_ins = next_ins.max(next);
+            // Offset-2 chain after the emission (the row's convention: every
+            // literal-offset emission rides rep1 while it pays), bounded at
+            // the next candidate's split; a chain that covers a split drops
+            // that candidate (the coverage rule — its span is emitted
+            // content).
+            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split);
+            let mut cursor = next;
+            if rep_pending == 0 {
+                cursor =
+                    emit.rep1_chain::<true>(win, Some(&mut *chain), next, bound, &mut rep, ramp);
+            }
+            next_ins = next_ins.max(cursor);
+            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < cursor {
+                ldm_i += 1;
+            }
+            // Fresh segment, fresh literal-run ramp (the emission reset the
+            // miss streak's meaning across the skipped interior).
+            miss_count = 0;
+            if cursor >= block_end {
+                break 'segments;
+            }
+            pos = cursor;
+            anchor = cursor;
         }
         if LDM {
             self.ldm_note_block(ldm_won);
