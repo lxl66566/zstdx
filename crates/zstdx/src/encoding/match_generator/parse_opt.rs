@@ -20,7 +20,22 @@ impl MatchGeneratorDriver {
         let win_base = self.win_base;
         let block_start = self.block_start;
         let block_end = self.block_end;
-        let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        let mut max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        // The far-class domain widening: on frames whose LDM stayed armed
+        // (size gate passed, alphabet gate passed — `ldm.is_none()` means
+        // gated off, so near shapes keep the stock domain and their bytes),
+        // the tree search prices candidates down to the full declared
+        // window, libzstd's `windowLow` semantics: its descent loop runs to
+        // windowLog while link threading still breaks at the ring's
+        // `btLow`, so beyond-ring candidates resolve only as the
+        // head-named terminal step of each descent branch (plus repcode
+        // probes, which C bounds by windowLow too). Ring, fill, strips and
+        // the LDM retain filter all stay keyed to the stock domain — this
+        // lift only removes the floor clamp. MT jobs are inert here: their
+        // per-job windows already bind the floor at `win_base`.
+        if self.ldm.is_some() {
+            max_window = max_window.max(self.params.window as u64);
+        }
         let ldm_seqs: &[LdmSeq] = &self.ldm_seqs[..];
         let mut origin = self.opt_origin;
         let mut next_update = self.next_update;
