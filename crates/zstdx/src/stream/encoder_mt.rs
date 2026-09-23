@@ -73,13 +73,16 @@ use crate::{
     encoding::{
         block_header::BlockHeader,
         checksum::{BlockChecksum as _, FrameHasher},
-        frame_compressor::{CompressState, compress_job_blocks_inner, reset_slice_state},
+        frame_compressor::{CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state},
         frame_header::FrameHeader,
         match_generator::{
             LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
             far_repeat_dominant, ldm_head_parses,
         },
-        mt::{MIN_JOB_SIZE, donate_keep_span, job_size_for, prepare_job_state, run_job_with},
+        mt::{
+            MIN_JOB_SIZE, capture_job_size, donate_keep_span, job_size_for, prepare_job_state,
+            run_job_with,
+        },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
 };
@@ -178,6 +181,17 @@ impl SpfPlan {
 fn midsize_capture_window(level: Level, shape: crate::InputShape, head: &[u8]) -> Option<u64> {
     shape.len?;
     let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, ReachChoice::Keep)?;
+    // The pledged stream's capture stays at the mid-size band: the
+    // full-window band runs windowed jobs on the bulk side (chain tables
+    // over the reach tail, LDM through the shared build's snapshot ring)
+    // and the stream core keeps its whole-window strip schedule there —
+    // a pledged W26 stream grids its stock 64 MiB jobs with LDM armed at
+    // the `Job` bar (the window equals it), carrying the far class
+    // already; the two paths' bytes diverge on that band either way (the
+    // pre-existing divergence, now recorded in dev/perf/mt-stream).
+    if MatchGeneratorDriver::windowed_ldm_capture(window) {
+        return None;
+    }
     let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
     ldm_head_parses(head).then_some(window)
 }
@@ -523,7 +537,8 @@ fn run_claimed_job(
                     *last_frame_block,
                     reach_probe::PROBE_SPAN,
                     don.prefix,
-                    None,
+                    *overlap,
+                    JobSpf::None,
                 );
                 crate::encoding::mt::return_donation_state(dstate);
                 out
@@ -550,7 +565,8 @@ fn run_claimed_job(
                             *last_frame_block,
                             *first,
                             Vec::new(),
-                            Some(snap),
+                            *overlap,
+                            JobSpf::Whole(snap),
                         )
                     },
                     _ => run_job_with(
@@ -563,7 +579,7 @@ fn run_claimed_job(
                         job.shape,
                         job.choice,
                         *ldm,
-                        None,
+                        JobSpf::None,
                     ),
                 }
             };
@@ -1199,13 +1215,17 @@ impl MtEncoderCore {
         let Some(window) = midsize_capture_window(self.level, self.shape, head) else {
             return;
         };
-        let n = self.shape.len.expect("the capture gate checked the pledge");
         debug_assert_eq!(
             self.overlap as u64, window,
             "the strip is the clamped window"
         );
         let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
-        self.grid = JobGrid::Fixed(job_size_for(n, self.workers, reach as usize));
+        // The bulk capture's grid is pinned (see `mt::capture_grid`):
+        // worker-independent, so the pledged stream re-grids onto the
+        // same lattice the bulk path runs and the two stay byte-identical
+        // at every worker count.
+        let n = self.shape.len.expect("the capture gate checked the pledge");
+        self.grid = JobGrid::Fixed(capture_job_size(n, reach as usize));
         self.job_ldm = LdmArming::JobPrefix;
     }
 
@@ -1702,7 +1722,7 @@ impl MtEncoderCore {
             self.shape,
             self.choice,
             self.job_ldm,
-            None,
+            JobSpf::None,
         );
         return_pooled_state(state);
         self.output.extend_from_slice(&bytes);

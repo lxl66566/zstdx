@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 #[cfg(feature = "std")]
-use super::match_generator::StripSnapshot;
+use super::match_generator::{LdmPrefixSnapshot, StripSnapshot};
 use super::{
     Matcher,
     block_enc::compressed::DictEntropy,
@@ -570,7 +570,7 @@ pub(crate) fn compress_slice_with_dictionary(
 /// `src` is the whole frame input and must stay alive and unchanged for the
 /// call (the matcher window borrows into it); `job` is the byte range this
 /// job encodes and `overlap` the preceding history the matcher may reference.
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 pub(crate) fn compress_job_blocks(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -587,17 +587,34 @@ pub(crate) fn compress_job_blocks(
         is_last_job,
         start,
         Vec::new(),
-        None,
+        overlap,
+        JobSpf::None,
     )
+}
+
+/// The job's shared-prefix-fill engagement: the mid-size band adopts a
+/// whole-strip snapshot ([`StripSnapshot`], chain tables and LDM), the
+/// windowed full-window band runs the split prefill — chain tables over
+/// the reach tail, LDM over the whole window through an adopted
+/// [`LdmPrefixSnapshot`] (`None` = the stock from-zero fill below the
+/// build's first boundary; byte-equal to an adoption there).
+#[cfg(feature = "std")]
+pub(crate) enum JobSpf<'a> {
+    None,
+    Whole(&'a StripSnapshot),
+    Windowed(Option<&'a LdmPrefixSnapshot>),
 }
 
 /// [`compress_job_blocks`] with a donated prefix: `start_cursor` blocks of
 /// the job were already parsed and encoded on the calling side (the reach
 /// probe's keep-side donation for job zero — same state, same emit
 /// machinery, so the job's bytes are exactly an undonated run's), and
-/// `prefix` carries their encoded output verbatim. `snapshot` is the
-/// shared prefix fill's snapshot when the job adopts one instead of
-/// filling its strip from scratch (see `StripSnapshot`).
+/// `prefix` carries their encoded output verbatim. `spf` is the shared
+/// prefix fill's engagement when the job adopts one instead of filling
+/// its strip from scratch. `chain_overlap` is the history span the
+/// prefill indexes — `overlap` itself stays the job's window (the
+/// windowed band adopts the whole window while prefilling only the
+/// chain's reach tail into the dense tables).
 #[cfg(feature = "std")]
 pub(crate) fn compress_job_blocks_inner(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -607,7 +624,8 @@ pub(crate) fn compress_job_blocks_inner(
     is_last_job: bool,
     start_cursor: usize,
     prefix: Vec<u8>,
-    snapshot: Option<&StripSnapshot>,
+    chain_overlap: usize,
+    spf: JobSpf<'_>,
 ) -> Vec<u8> {
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
@@ -626,19 +644,55 @@ pub(crate) fn compress_job_blocks_inner(
     // can ever resolve into.
     #[cfg(feature = "job_trace")]
     let trace_job = std::time::Instant::now();
-    let strip = job.start.saturating_sub(overlap);
+    let strip = job.start.saturating_sub(chain_overlap);
     #[cfg(feature = "job_trace")]
     let trace_prefill = std::time::Instant::now();
     // A donated continuation already prefilled (and parsed): the prefill
     // would clear the very tables the donation built.
-    if let Some(snap) = snapshot {
-        state
-            .matcher
-            .adopt_strip_snapshot(snap, &src[strip..job.start], strip as u64);
-    } else if start_cursor <= job.start {
-        state
-            .matcher
-            .prefill_job_strip(&src[strip..job.start], strip as u64);
+    match spf {
+        JobSpf::Whole(snap) => {
+            state
+                .matcher
+                .adopt_strip_snapshot(snap, &src[strip..job.start], strip as u64);
+        },
+        JobSpf::Windowed(snap) => {
+            if start_cursor <= job.start {
+                state
+                    .matcher
+                    .prefill_job_strip_chain(&src[strip..job.start], strip as u64);
+                match snap {
+                    Some(s) => {
+                        // The window span continues the snapshot's fill
+                        // (a snapshot older than the window base re-arms
+                        // there — same candidates, see
+                        // `windowed_ldm_prefill`).
+                        let ldm_base = job.start.saturating_sub(overlap) as u64;
+                        state.matcher.windowed_ldm_prefill(
+                            &src[ldm_base as usize..job.start],
+                            ldm_base,
+                            job.start as u64,
+                            Some(s),
+                        );
+                    },
+                    // Stock (below the build's first boundary, or a build
+                    // that never published): fill the whole frame prefix
+                    // — bit-identical to what an adoption would leave.
+                    None => state.matcher.windowed_ldm_prefill(
+                        &src[..job.start],
+                        0,
+                        job.start as u64,
+                        None,
+                    ),
+                }
+            }
+        },
+        JobSpf::None => {
+            if start_cursor <= job.start {
+                state
+                    .matcher
+                    .prefill_job_strip(&src[strip..job.start], strip as u64);
+            }
+        },
     }
     #[cfg(feature = "job_trace")]
     super::job_trace::add_prefill(trace_prefill);
