@@ -615,6 +615,11 @@ impl TableEmit<'_> {
                 break;
             }
             let ml = extend_match(win, pidx, cand);
+            // The bound also clamps the emitted length: single-segment
+            // scans pass the window end (a no-op — the window buffer ends
+            // there), the chain's gap-parse pass a segment end so no
+            // chained match may cross a wholesale LDM emission's split.
+            let ml = ml.min((block_end - pos) as usize);
             debug_assert!(ml >= MIN_MATCH);
             pos = match chain.as_deref_mut() {
                 Some(chain) => self.emit_linked(win, chain, pos, pidx, ml, rep),

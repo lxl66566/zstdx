@@ -2488,13 +2488,18 @@ impl MatchGeneratorDriver {
     /// The mid-size population's alphabet gate ([`LDM_SYMS_MIN`]): run
     /// once per frame at the first block that reaches LDM, before any of
     /// its own indexing — a poor alphabet disarms outright, bounding the
-    /// split-pass tax at the head span already filled. The chain row's
-    /// full-window population is the one exception (its bytes are frozen,
-    /// so the gate stays skipped there); the opt rows gate at every window.
+    /// split-pass tax at the head span already filled. Every population
+    /// gates at every window (2026-09-24, with the chain row's gap-parse
+    /// consumer): the full-window exemption's blind spot was the unpledged
+    /// stream, whose unknown size leaves the row window unclamped at W26 —
+    /// a low-alphabet stream then armed LDM with no latch floor (quiet
+    /// never counts inside the first window), and the wholesale consumer
+    /// emits its structural candidates where the injection model merely
+    /// priced them (text.balanced stream +436 B). Binary heads pass with
+    /// margin (dll 209-231 sampled distinct); dll100's bytes are
+    /// unaffected.
     fn ldm_alphabet_gate(&mut self) {
-        let chain_frozen = matches!(self.params.strategy, Strategy::Chain(_))
-            && self.params.window >= LDM_FULL_WINDOW;
-        if self.ldm_checked || self.ldm.is_none() || chain_frozen {
+        if self.ldm_checked || self.ldm.is_none() {
             return;
         }
         self.ldm_checked = true;
