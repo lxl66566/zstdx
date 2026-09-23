@@ -10,8 +10,8 @@
 | Lazy band | 5-12 | tagged row matcher + the chain scan's selection semantics | 5-8: H19/H19/H20/H20, rowLog 4, attempts 8/8/15/15, greedy/lazy/lazy/lazy2; 10-12: H22/H22/H23, rowLog 5/6/6, attempts 31/63/63, lazy2 (libzstd parity) |
 | Balanced | 6-9 | hash chain + lazy (+ LDM: ≥64 MiB windows, ≥32 MiB frame-continuous) | window W26 / chain reach W22 / H21 / C20 / depth 8 / lazy2, u32 tables |
 | Best | 13-15 | btlazy2: lazy2 selection over the DUBT tree (+ LDM: ≥32 MiB frame-continuous) | window W26 / tree domain W22 / H22-23, S4/5/6 search (C's L13-15 rows), mls 5, literal-aware lazy margins |
-| Opt | 16-17 | btopt (full port, + LDM: ≥32 MiB frame-continuous) | window W26 / tree domain W22-W23 / H22 / C22 (L17 row, ring capped one below libzstd's C23) |
-| Ultra | 18-22 | btultra(+2), + LDM | window W26 / tree domain W23 / H22 / C23, 2-pass first-block statistics seeding |
+| Opt | 16-17 | btopt (full port, + LDM: ≥32 MiB frame-continuous) | window W26 / tree domain W22-W23, far-class floor lifted to the window (R18) / H22 / C22 (C -17's own ring) |
+| Ultra | 18-22 | btultra(+2), + LDM | window W26 / tree domain W23, far-class floor lifted to the window (R18) / H22 / C23 (= C -19's own ring), 2-pass first-block statistics seeding |
 
 ## Fastest (fast)
 
