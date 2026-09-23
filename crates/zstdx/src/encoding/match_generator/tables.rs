@@ -739,7 +739,7 @@ impl DfastEmit<'_> {
     /// `#[inline]` judgment the helper flips to an outlined call in the
     /// steady phase and every dense-match emit pays the argument setup.
     #[inline(always)]
-    pub(super) fn rep_chain<const RAMPED: bool>(
+    pub(super) fn rep_chain<const RAMPED: bool, const CLAMP: bool>(
         &mut self,
         win: &[u8],
         pos_idx: usize,
@@ -763,6 +763,18 @@ impl DfastEmit<'_> {
                 break;
             }
             let ml = extend_match(win, pos, cand);
+            // The gap-parse segment pass bounds the chain at the segment
+            // end, `HASH_READ` past the probe margin `ilimit_idx` (C's
+            // per-gap compressor call counts to the gap end): a chained
+            // match may cover bytes up to the split but never cross it —
+            // the wholesale emission owns the bytes from there. The stock
+            // single-segment callers pass `CLAMP = false` (the window ends
+            // at their block end, the clamp would be a no-op).
+            let ml = if CLAMP {
+                ml.min(ilimit_idx + super::HASH_READ - pos)
+            } else {
+                ml
+            };
             debug_assert!(ml >= MIN_MATCH);
             self.insert_both(win, pos);
             let (_ll, match_end) = push_seq_packed(

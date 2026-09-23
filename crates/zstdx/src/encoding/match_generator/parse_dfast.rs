@@ -13,12 +13,23 @@ impl MatchGeneratorDriver {
     /// matched ranges re-seed both tables through a few anchors (see
     /// [`DfastEmit::emit`]). The miss step grows with the literal run
     /// (one per 256 B, libzstd's `kSearchStrength` grid).
+    ///
+    /// Armed LDM segments the block exactly like the fast loop (see
+    /// [`Self::start_matching_fast`]): each retained candidate ends the
+    /// current segment at its split and is emitted wholesale there, the
+    /// scan parses only the literal gap ahead of it (probe margins at
+    /// `seg_limit`, forward extensions clamped at the segment end, the
+    /// repcode chains bounded and clamped), and the wholesale emission
+    /// rides [`DfastEmit::emit`] so the anchor backfill keeps the stock
+    /// policy. An empty candidate set is one segment — the stock parse,
+    /// byte-identical.
     #[allow(clippy::too_many_lines)]
     pub(super) fn start_matching_dfast<
         const RAMPED: bool,
         const MM4: bool,
         const LONG_LOG: u32,
         const SMALL_LOG: u32,
+        const LDM: bool,
     >(
         &mut self,
         literals: &mut Vec<u8>,
@@ -40,7 +51,8 @@ impl MatchGeneratorDriver {
         };
         let win_base = self.win_base;
         let ramp = self.ramp;
-        let block_len = (self.block_end - win_base) as usize;
+        let block_end = self.block_end;
+        let block_len = (block_end - win_base) as usize;
         // Probing hashes 8 bytes, so the last probeable window index; the
         // insert bound coincides with it (the window ends at the block), so
         // one shared limit serves both.
@@ -48,7 +60,9 @@ impl MatchGeneratorDriver {
             .saturating_sub(HASH_READ)
             .min(win.len().saturating_sub(HASH_READ));
         let insert_max_idx = limit_idx;
-        let max_window = self.params.window as u64;
+        // Armed frames keep the stock scan domain through `chain_reach`
+        // (the widened window is the far domain); stock frames have none.
+        let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
         let mut seed_offset = self.seed_offset;
@@ -97,6 +111,20 @@ impl MatchGeneratorDriver {
             width: short_width,
         };
 
+        // Long-distance candidates of this block ([`Self::ldm_generate`]):
+        // `ldm_i` is the first unconsumed one, each ending a segment at
+        // its split. Generate's anchor skip keeps spans disjoint and
+        // splits ascending. The `LDM = false` instantiation binds the
+        // empty slice constant, so the segment loop folds to the stock
+        // single-segment scan.
+        let ldm_seqs: &[LdmSeq] = if LDM {
+            &self.ldm_seqs[..]
+        } else {
+            &[]
+        };
+        let mut ldm_i = 0usize;
+        let mut ldm_won = false;
+
         // Resolve a table entry to a window index. Same distance trick as
         // the fast loop's `resolve`: `dist = pos - (entry - 1)` wraps huge
         // for the empty sentinel and previous-4-GiB-cycle entries, so
@@ -118,6 +146,17 @@ impl MatchGeneratorDriver {
             }
         };
 
+        // The current segment's bounds, retargeted per segment: `seg_limit`
+        // is the probe margin (the stock `limit_idx` semantics inside the
+        // segment), `seg_end` the clamp target for forward extensions — C's
+        // per-gap compressor call counts to the gap end, so an emission may
+        // cover bytes up to the split but never past it. Declared before
+        // the scan macro: macro-internal identifiers resolve against the
+        // definition site's locals. `$ldm` likewise: the gap bounds only
+        // exist in the segmenting instantiation.
+        let mut seg_limit;
+        let mut seg_end;
+
         // Outer loop: one pass per emitted match; re-entering resets the
         // miss step. The inner loop walks single positions until a match
         // or the block tail. Like the fast loop, the body runs in two
@@ -126,10 +165,10 @@ impl MatchGeneratorDriver {
         // set is even larger (two tables, two hash logs), so the dead
         // weight cost more here.
         macro_rules! scan_dfast {
-            ($outer:lifetime, $gated:literal) => {
+            ($outer:lifetime, $gated:literal, $ldm:expr) => {
                 // The short-match upgrade probes at ip + 1, so a pass needs a
-                // full position pair inside the block.
-                if ip_idx + 1 > limit_idx {
+                // full position pair inside the segment.
+                if ip_idx + 1 > seg_limit {
                     break $outer;
                 }
                 let mut ip1_idx = ip_idx + 1;
@@ -170,11 +209,16 @@ impl MatchGeneratorDriver {
                                 win_base + cand as u64,
                             )
                         {
-                            let ml = extend_match(win, probe, cand);
+                            let mut ml = extend_match(win, probe, cand);
+                            // Gap bound: the chained emission below must
+                            // not cover bytes past the split.
+                            if $ldm {
+                                ml = ml.min(seg_end - probe);
+                            }
                             debug_assert!(ml >= MIN_MATCH);
                             anchor_idx =
                                 emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
-                            ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
+                            ip_idx = emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp);
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
                             continue $outer;
@@ -194,6 +238,10 @@ impl MatchGeneratorDriver {
                     // pays gate's ilog2(0)).
                     if ci < ip_idx && read4(win, ci) == read4(win, ip_idx) {
                         let mut ml = extend_match(win, ip_idx, ci);
+                        // Gap bound, as above (the match starts at ip_idx).
+                        if $ldm {
+                            ml = ml.min(seg_end - ip_idx);
+                        }
                         if ml >= 6
                             && pays_for_offset(ml, ip_idx, ci, false)
                             && !ramp_blocks::<RAMPED>(ramp, pos_abs, win_base + ci as u64)
@@ -215,7 +263,7 @@ impl MatchGeneratorDriver {
                                 seed_offset = 0;
                             }
                             ip_idx = if rep_pending == 0 {
-                                emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp)
                             } else {
                                 anchor_idx
                             };
@@ -241,6 +289,10 @@ impl MatchGeneratorDriver {
                         let mut start = ip_idx;
                         let mut c = cand;
                         let mut ml = extend_match(win, ip_idx, cand);
+                        // Gap bound, as above.
+                        if $ldm {
+                            ml = ml.min(seg_end - ip_idx);
+                        }
                         let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
                         // Backward catch-up into the pending literals; the
                         // offset (start - c) stays constant.
@@ -268,12 +320,12 @@ impl MatchGeneratorDriver {
                         if $gated {
                             rep_pending = rep_pending.saturating_sub(1);
                             ip_idx = if rep_pending == 0 {
-                                emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp)
                             } else {
                                 anchor_idx
                             };
                         } else {
-                            ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
+                            ip_idx = emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp);
                         }
                         // The chain's matches advance the anchor too.
                         anchor_idx = ip_idx;
@@ -292,11 +344,20 @@ impl MatchGeneratorDriver {
                         let mut start = ip_idx;
                         let mut c = cand;
                         let mut ml = extend_match(win, ip_idx, cand);
+                        // Gap bound, as above.
+                        if $ldm {
+                            ml = ml.min(seg_end - ip_idx);
+                        }
                         let pos1_abs = win_base + ip1_idx as u64;
                         let reach1 = (pos1_abs - win_base).min(max_window);
                         let c1 = resolve(entry_l1, pos1_abs, reach1, ip1_idx);
                         if c1 != ip1_idx && read8(win, c1) == read8(win, ip1_idx) {
-                            let l1len = extend_match(win, ip1_idx, c1);
+                            let mut l1len = extend_match(win, ip1_idx, c1);
+                            // Gap bound for the upgrade candidate (its
+                            // match starts at ip1).
+                            if $ldm {
+                                l1len = l1len.min(seg_end - ip1_idx);
+                            }
                             if l1len > ml {
                                 start = ip1_idx;
                                 c = c1;
@@ -329,12 +390,12 @@ impl MatchGeneratorDriver {
                             if $gated {
                                 rep_pending = rep_pending.saturating_sub(1);
                                 ip_idx = if rep_pending == 0 {
-                                    emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp)
+                                    emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp)
                                 } else {
                                     anchor_idx
                                 };
                             } else {
-                                ip_idx = emit.rep_chain::<RAMPED>(win, anchor_idx, limit_idx, &mut rep, ramp);
+                                ip_idx = emit.rep_chain::<RAMPED, $ldm>(win, anchor_idx, seg_limit, &mut rep, ramp);
                             }
                             // The chain's matches advance the anchor too.
                             anchor_idx = ip_idx;
@@ -345,29 +406,122 @@ impl MatchGeneratorDriver {
 
                 // Miss: advance the pair; the step grows with the literal
                 // run (one per 256 B), so compressible data keeps probing
-                // every byte while incompressible runs accelerate.
+                // every byte while incompressible runs accelerate. A step
+                // may overshoot the segment end; the loop bound ends the
+                // gap there and the overshoot bytes stay pending literals.
                 ip_idx = ip1_idx;
                 ip1_idx += 1 + ((ip1_idx - anchor_idx) >> 8);
                 hl0 = hl1;
                 entry_l0 = entry_l1;
-                if ip1_idx > limit_idx {
+                if ip1_idx > seg_limit {
                     break;
                 }
             }
-            // The pair left the block: nothing left to probe.
+            // The pair left the segment: nothing left to probe.
             break $outer;
             };
         }
-        // Seeded phase (job starts only; bulk-ST skips it entirely), then
-        // the steady phase — same convergence contract as `scan_fast`.
-        'seeded: while (rep_pending != 0 || seed_offset != 0) && ip_idx < limit_idx {
-            scan_dfast!('seeded, true);
+        // One segment per long-distance candidate (plus the final one to
+        // the block end): the gap scans run the stock two-phase loop with
+        // every bound retargeted at the segment's, then the candidate
+        // emits wholesale at its split. The phases span segments like
+        // blocks — the seeded state is the scan's, not a segment's.
+        'segments: loop {
+            let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
+                let e = s.split;
+                seg_end = (e - win_base) as usize;
+                Some(*s)
+            } else {
+                seg_end = block_len;
+                None
+            };
+            seg_limit = seg_end.saturating_sub(HASH_READ);
+            // Seeded phase (job starts only; bulk-ST skips it entirely),
+            // then the steady phase — same convergence contract as
+            // `scan_fast`.
+            'seeded: while (rep_pending != 0 || seed_offset != 0) && ip_idx < seg_limit {
+                scan_dfast!('seeded, true, LDM);
+            }
+            'outer: loop {
+                scan_dfast!('outer, false, LDM);
+            }
+            let Some(seq) = seq else {
+                // Last segment: the stock literals-only tail rule.
+                if !emit.seqs.is_empty() && anchor_idx < block_len {
+                    emit.literals.extend_from_slice(&win[anchor_idx..block_len]);
+                }
+                break 'segments;
+            };
+            ldm_i += 1;
+            debug_assert_eq!(seq.split, win_base + seg_end as u64);
+            // The 4-byte guard only defends a stale candidate (generate
+            // verified the whole span at fill time); a failure drops it and
+            // re-opens the split as gap bytes of the next segment, the
+            // pending literals still attached.
+            let cand_abs = (win_base + seg_end as u64).checked_sub(seq.offset as u64);
+            let valid = match cand_abs {
+                Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
+                    read4(win, (c - win_base) as usize) == read4(win, seg_end)
+                },
+                _ => false,
+            };
+            if !valid {
+                ip_idx = seg_end;
+                continue 'segments;
+            }
+            // The wholesale emission: the gap's pending literals become the
+            // candidate's own literal run, the match carries generate's
+            // measured span, and the offset enters the repcode history like
+            // any literal-offset sequence. The split lands where the gear
+            // hash triggered, mid-match for misaligned twins — the emission
+            // backward-extends into the pending gap literals like every
+            // other emission (the offset stays constant), and rides the
+            // row's own emit so the anchor backfill keeps the stock policy.
+            let mut start = seg_end;
+            let mut cand = (cand_abs.unwrap() - win_base) as usize;
+            let mut ml = seq.len as usize;
+            let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
+            while start > anchor_idx && cand > cfl && win[cand - 1] == win[start - 1] {
+                cand -= 1;
+                start -= 1;
+                ml += 1;
+            }
+            anchor_idx = emit.emit(
+                win,
+                anchor_idx,
+                seg_end,
+                start,
+                ml,
+                seq.offset + 3,
+                &mut rep,
+            );
+            ldm_won = true;
+            // A wholesale emission is a literal-offset sequence: the
+            // job-start rep gate counts it.
+            rep_pending = rep_pending.saturating_sub(1);
+            // Offset-2 chain after the emission (the row's convention:
+            // every literal-offset emission rides rep1 while it pays),
+            // bounded at the next candidate's split; a chain that covers a
+            // split drops that candidate (the coverage rule — its span is
+            // emitted content).
+            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split);
+            let mut cursor = anchor_idx;
+            if rep_pending == 0 {
+                let bound_limit = ((bound - win_base) as usize).saturating_sub(HASH_READ);
+                cursor =
+                    emit.rep_chain::<RAMPED, true>(win, anchor_idx, bound_limit, &mut rep, ramp);
+            }
+            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < win_base + cursor as u64 {
+                ldm_i += 1;
+            }
+            if cursor >= block_len {
+                break 'segments;
+            }
+            ip_idx = cursor;
+            anchor_idx = cursor;
         }
-        'outer: loop {
-            scan_dfast!('outer, false);
-        }
-        if !emit.seqs.is_empty() && anchor_idx < block_len {
-            emit.literals.extend_from_slice(&win[anchor_idx..block_len]);
+        if LDM {
+            self.ldm_note_block(ldm_won);
         }
         self.pos = self.block_end;
         self.anchor = self.block_end;

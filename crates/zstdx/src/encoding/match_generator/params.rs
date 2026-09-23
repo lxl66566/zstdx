@@ -518,9 +518,11 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     fast(HASH_LOG, MAX_WINDOW),
     fast(16, 1 << 20),
     // 3: the tuned Fast tier; same-window A/B sits within 0.03% of
-    // libzstd's L3 dfast (H17 long / C16 short).
-    dfast(17, 16, 1 << 21),
-    dfast(18, 18, 1 << 21),
+    // libzstd's L3 dfast (H17 long / C16 short). LDM arms only where the
+    // arming context widens the window to the far domain (see
+    // `apply_level`); every stock-window frame stays byte-identical.
+    with_ldm(dfast(17, 16, 1 << 21)),
+    with_ldm(dfast(18, 18, 1 << 21)),
     // Lazy band 5-12: the tagged row matcher (libzstd's own storage for
     // these rows). 5-8 (libzstd's L5-8: H19/H19/H20/H20, S3/S3/S4/S4,
     // greedy/lazy/lazy/lazy2) run 8/8/15/15 attempts at libzstd parity
