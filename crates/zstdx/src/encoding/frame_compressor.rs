@@ -10,9 +10,10 @@ use super::{
     block_enc::compressed::DictEntropy,
     block_header::BlockHeader,
     checksum::{BlockChecksum, FrameHasher, SliceChecksum},
+    far_screen,
     frame_header::FrameHeader,
     levels::*,
-    match_generator::{LdmArming, MatchGeneratorDriver},
+    match_generator::{LdmArming, MatchGeneratorDriver, fast_row_screen_pending},
     pre_split, reach_probe,
 };
 use crate::{
@@ -221,23 +222,29 @@ pub fn compress_slice_shaped(
 ) -> Vec<u8> {
     let mut shape = shape;
     shape.len = Some(src.len() as u64);
+    // The fast rows' mid-size band arms on the pre-header far-class
+    // screen (R20): the whole source is in hand at header time, so the
+    // head sample decides before the header serializes — the same sample,
+    // and hence the same verdict, the pledged stream core stages (the
+    // probe paths never reach here with a screen pending: the probe is
+    // row 9's, the screen the fast rows').
+    let ldm = if fast_row_screen_pending(level, shape) {
+        far_screen::frame_arming(&src[..src.len().min(far_screen::SCREEN_SPAN)])
+    } else {
+        LdmArming::Frame
+    };
     if reach_probe::eligible(level, shape) {
         // The probe's keep side donates: the first span blocks run as the
         // frame's own blocks through the full pipeline, and only a Shrink
         // verdict restarts the frame (see `compress_with_state_donated`).
-        let mut state = take_slice_state(
-            level,
-            shape,
-            reach_probe::ReachChoice::Keep,
-            LdmArming::Frame,
-        );
+        let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
         let output = compress_with_state_donated(&mut state, src, level, checksum, shape);
         return_slice_state(state);
         return output;
     }
     // The frame's head decides its chain reach (see reach_probe).
     let choice = reach_probe::probe_reach_choice(src, level, shape);
-    let mut state = take_slice_state(level, shape, choice, LdmArming::Frame);
+    let mut state = take_slice_state(level, shape, choice, ldm);
     let output = compress_with_state(&mut state, src, level, checksum);
     return_slice_state(state);
     output

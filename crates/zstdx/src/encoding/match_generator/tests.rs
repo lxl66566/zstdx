@@ -975,6 +975,7 @@ fn dubt_head_hands_off_across_gated_block() {
     assert_eq!(driver.dubt_head, super::HeadPhase::Done);
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn gate_probe_empty_strip_on_warm_table() {
     // A pooled matcher whose probe table is warm from a previous job's
