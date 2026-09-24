@@ -282,7 +282,7 @@ pub(super) const LDM_FULL_WINDOW: usize = 1 << 26;
 /// near-always-on duty (skewed measured −35% solo). Binary content (dll,
 /// 256) clears it by a wide margin. The full-window population skips the
 /// check (its bytes are frozen).
-pub(super) const LDM_SYMS_MIN: u32 = 128;
+pub(crate) const LDM_SYMS_MIN: u32 = 128;
 
 /// Why a block the scan will not parse reaches the LDM indexer.
 #[derive(Clone, Copy, PartialEq)]
@@ -389,6 +389,12 @@ pub(crate) enum LdmArming {
     /// shapes whose far class never shows.
     #[default]
     Frame,
+    /// [`Frame`] on a source whose pre-header far-class screen accepted
+    /// the head sample (encoding::far_screen): identical semantics, plus
+    /// the fast rows' window widening reaches the mid-size band (declared
+    /// length >= LDM_MIDSIZE_WINDOW) instead of requiring the full
+    /// window.
+    FrameScreened,
     /// A multithreaded job: the table restarts per job, so only strip- and
     /// own-span-sourced candidates exist — the strip fill is an
     /// unconditional per-job split pass that far-less shapes pay in full,
@@ -429,7 +435,7 @@ pub(crate) enum LdmArming {
 /// that arms LDM under `arming`, or `None` to never arm.
 pub(super) const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
     match arming {
-        LdmArming::Frame => Some(LDM_MIDSIZE_WINDOW),
+        LdmArming::Frame | LdmArming::FrameScreened => Some(LDM_MIDSIZE_WINDOW),
         #[cfg(feature = "std")]
         LdmArming::Job => Some(LDM_FULL_WINDOW),
         #[cfg(feature = "std")]

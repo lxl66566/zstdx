@@ -957,12 +957,20 @@ impl MatchGeneratorDriver {
         // included), and the arming-context check keeps MT jobs stock
         // (their per-job LDM restart would need the capture machinery;
         // recorded residue). A forced window at or past the far domain arms
-        // on its own geometry.
+        // on its own geometry. R20: a frame-continuous caller that ran the
+        // pre-header far-class screen (`FrameScreened`, see
+        // `fast_row_screen_pending`) arms the mid-size band too — the
+        // screen, not the header-time geometry, separated the far-class
+        // source from the same-size random one.
+        let declared = |bar: u64| matches!(self.shape.len, Some(n) if n >= bar);
         if params.ldm
             && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
-            && self.ldm_arming == LdmArming::Frame
             && params.window < LDM_FULL_WINDOW
-            && matches!(self.shape.len, Some(n) if n >= LDM_FULL_WINDOW as u64)
+            && match self.ldm_arming {
+                LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
+                LdmArming::FrameScreened => declared(LDM_MIDSIZE_WINDOW as u64),
+                _ => false,
+            }
         {
             params.chain_reach = Some(params.window);
             params.window = LDM_FULL_WINDOW;
@@ -2939,17 +2947,35 @@ pub(super) use gates::RampGate;
 use gates::*;
 pub(in crate::encoding) use hash::extend_match;
 use hash::*;
-#[cfg(feature = "std")]
-use params::LDM_MIDSIZE_WINDOW;
-pub(crate) use params::LdmArming;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
-    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_FULL_WINDOW, LDM_QUIET, LDM_SYMS_MIN, LEVEL_PARAMS,
-    LdmFill, LevelParams, SmallDictRow, Strategy, ldm_min_window, params_for, sampled_distinct,
-    small_dict_row,
+    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_QUIET,
+    LEVEL_PARAMS, LdmFill, LevelParams, SmallDictRow, Strategy, ldm_min_window, params_for,
+    sampled_distinct, small_dict_row,
 };
+pub(crate) use params::{LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
+
+/// Whether a frame at `level`/`shape` should run the pre-header far-class
+/// screen (encoding::far_screen): a fast/dfast row with LDM whose stock
+/// window sits below the far domain and whose declared length lands in
+/// the mid-size band [LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW) — at the full
+/// window the declared length arms on its own geometry, below the band
+/// the row never arms, so neither side runs a screen (and no screen may
+/// run at the full window: a far-class file whose repeats start past the
+/// sample would be falsely rejected there, where geometry must keep
+/// arming it).
+pub(crate) fn fast_row_screen_pending(level: Level, shape: InputShape) -> bool {
+    let params = params_for(level, shape);
+    params.ldm
+        && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
+        && params.window < LDM_FULL_WINDOW
+        && matches!(
+            shape.len,
+            Some(n) if (LDM_MIDSIZE_WINDOW as u64..LDM_FULL_WINDOW as u64).contains(&n)
+        )
+}
 use parse_row::{row_hash_at, row_insert, row_insert_fill};
 use price::*;
 use tables::*;

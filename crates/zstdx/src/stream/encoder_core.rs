@@ -19,10 +19,10 @@ use crate::{
         block_enc::compressed::{BlockScratch, DictEntropy, SeqCostMode},
         block_header::BlockHeader,
         checksum::{BlockChecksum, FrameHasher},
-        compress_fastest,
+        compress_fastest, far_screen,
         frame_compressor::{CompressState, FseTables},
         frame_header::FrameHeader,
-        match_generator::MatchGeneratorDriver,
+        match_generator::{LdmArming, MatchGeneratorDriver, fast_row_screen_pending},
         pre_split, reach_probe, util,
     },
 };
@@ -111,6 +111,12 @@ pub(crate) struct FrameEncoderCoreSt {
     /// pending: the first [`reach_probe::PROBE_SPAN`] bytes stage as one
     /// contiguous unit before the first block is matched.
     probe_pending: bool,
+    /// Whether the fast rows' pre-header far-class screen (see
+    /// [`far_screen`]) is still pending: like the probe, the first
+    /// [`far_screen::SCREEN_SPAN`] bytes stage as one unit, and the
+    /// screen's verdict re-derives the frame's arming (and header) before
+    /// the first block emits.
+    screen_pending: bool,
     /// Encoded bytes not yet consumed by the enclosing encoder, starting
     /// with the frame header before the first block. `out_read` is the
     /// consumed prefix: serving reads advances the cursor instead of
@@ -227,6 +233,7 @@ impl FrameEncoderCoreSt {
             tail: BlockTail::None,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             probe_pending: false,
+            screen_pending: false,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
             out_read: 0,
             blocks: 0,
@@ -275,6 +282,13 @@ impl FrameEncoderCoreSt {
         options: &EncoderOptions,
         dict: Option<&crate::encoding::dictionary::EncDictionary>,
     ) {
+        // The arming context survives resets by contract (the pooled
+        // matcher carries it across frames; `set_ldm_arming`'s doc), so
+        // each frame re-declares the stock context before its reset — a
+        // FrameScreened residue from a previous frame would arm this
+        // one's header without a screen (the mid-band fast rows) and a
+        // ProbeKeep residue would ride the wrong strip policy.
+        self.state.matcher.set_ldm_arming(LdmArming::Frame);
         let dict_id = if let Some(dict) = dict {
             let mut shape = crate::InputShape {
                 len: options.pledged_size,
@@ -302,9 +316,16 @@ impl FrameEncoderCoreSt {
         };
         let checksum = options.checksum && cfg!(feature = "hash");
         // Dictionary frames keep the stock reach (see reach_probe), so only
-        // a plain frame stages the probe's head.
+        // a plain frame stages the probe's head. The fast rows' mid-size
+        // far-class screen stages the same way (see far_screen): the two
+        // are mutually exclusive by row.
         let probe_pending = dict_id.is_none()
             && reach_probe::eligible(options.level, crate::InputShape {
+                len: options.pledged_size,
+                window_log: options.input_shape.window_log,
+            });
+        let screen_pending = dict_id.is_none()
+            && fast_row_screen_pending(options.level, crate::InputShape {
                 len: options.pledged_size,
                 window_log: options.input_shape.window_log,
             });
@@ -337,6 +358,7 @@ impl FrameEncoderCoreSt {
         self.tail = BlockTail::None;
         self.staged.clear();
         self.probe_pending = probe_pending;
+        self.screen_pending = screen_pending;
         self.output.clear();
         self.out_read = 0;
         self.blocks = 0;
@@ -367,6 +389,8 @@ impl FrameEncoderCoreSt {
             // the probe parses them as a whole before any block is matched.
             let limit = if self.probe_pending {
                 reach_probe::PROBE_SPAN
+            } else if self.screen_pending {
+                far_screen::SCREEN_SPAN
             } else {
                 self.block_size
             };
@@ -380,6 +404,9 @@ impl FrameEncoderCoreSt {
                         .matcher
                         .consider_reach_probe(&self.staged, self.level);
                     self.probe_pending = false;
+                }
+                if self.screen_pending {
+                    self.resolve_far_screen();
                 }
                 // When this staging round consumed the write's last bytes
                 // and the pledge is met, the closing pass below owns the
@@ -412,6 +439,36 @@ impl FrameEncoderCoreSt {
             }
         }
         Ok(())
+    }
+
+    /// The staged head sample has reached [`far_screen::SCREEN_SPAN`]:
+    /// run the pre-header far-class screen and, when it accepts, re-derive
+    /// the frame on the screened arming — the matcher re-resets (nothing
+    /// has parsed: the first block emits only after this returns) and the
+    /// header re-serializes with the widened window, exactly as
+    /// `configure` would have (the header is flushed per first block, so
+    /// no encoded byte has left). The sample equals the bulk path's head
+    /// sample, so both entries reach the same verdict (determinism).
+    fn resolve_far_screen(&mut self) {
+        self.screen_pending = false;
+        let arming = far_screen::frame_arming(&self.staged);
+        if arming == LdmArming::Frame {
+            return;
+        }
+        self.state.matcher.set_ldm_arming(arming);
+        self.state.matcher.reset(self.level);
+        let window = self.state.matcher.window_size();
+        let single_segment = self.pledged.is_some_and(|n| n <= window);
+        let header = FrameHeader {
+            frame_content_size: self.pledged,
+            single_segment,
+            content_checksum: self.checksum,
+            dictionary_id: None,
+            window_size: Some(window),
+        };
+        self.header.clear();
+        header.serialize(&mut self.header);
+        self.block_size = self.state.matcher.block_size();
     }
 
     /// Encode every full staged block. Outside the probe's staging window
@@ -450,9 +507,10 @@ impl FrameEncoderCoreSt {
         // one-shot shape, 3 bytes shorter); an eagerly drained consumer
         // that already took those bytes keeps the empty-block form.
         //
-        // A still-pending probe means the frame never staged its head (a
-        // short input or an early finish): the stock reach stays.
+        // A still-pending probe or screen means the frame never staged its
+        // head (a short input or an early finish): the stock frame stays.
         self.probe_pending = false;
+        self.screen_pending = false;
         self.drain_full_blocks();
         match self.tail {
             // The pledged grid's final block already carries the last
@@ -479,9 +537,11 @@ impl FrameEncoderCoreSt {
     /// is staged.
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
-        // A flush inside the probe's staging window cancels the probe (the
-        // stock reach stays) and emits the staged head block by block.
+        // A flush inside the probe's or the screen's staging window cancels
+        // it (the stock reach/frame stays) and emits the staged head block
+        // by block.
         self.probe_pending = false;
+        self.screen_pending = false;
         while !self.staged.is_empty() {
             self.encode_block(false);
         }
