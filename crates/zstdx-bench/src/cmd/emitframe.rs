@@ -22,6 +22,10 @@ pub struct Args {
     /// Streaming encode path instead of bulk
     #[arg(long)]
     stream: bool,
+    /// Pledge the input size on the stream path (mid-band far-class
+    /// screens key on the declared length)
+    #[arg(long)]
+    pledge: bool,
 }
 
 fn parse_level(s: &str) -> Level {
@@ -42,9 +46,12 @@ fn parse_level(s: &str) -> Level {
 pub fn run(args: &Args) {
     let raw = fs::read(&args.input).expect("read input");
     let level = parse_level(&args.level);
-    let opts = EncoderOptions::new(level)
+    let mut opts = EncoderOptions::new(level)
         .workers(args.workers)
         .checksum(true);
+    if args.pledge {
+        opts = opts.pledged_size(Some(raw.len() as u64));
+    }
     let frame = if args.stream {
         let mut enc =
             zstdx::stream::write::Encoder::with_options(Vec::new(), opts).expect("stream encoder");
