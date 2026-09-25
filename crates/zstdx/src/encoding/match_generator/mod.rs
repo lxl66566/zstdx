@@ -980,8 +980,14 @@ impl MatchGeneratorDriver {
             && match self.ldm_arming {
                 LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
                 LdmArming::FrameScreened => screened(LDM_MIDSIZE_WINDOW as u64),
+                // The screened form, not the declared one: the unpledged
+                // stream's engaged capture jobs (R24) carry `JobPrefix`
+                // with no declared length — the screen that armed the
+                // frame is the evidence, exactly the FrameScreened rule.
+                // Every other JobPrefix site holds a declared length, so
+                // the two predicates agree there.
                 #[cfg(feature = "std")]
-                LdmArming::JobPrefix => declared(LDM_MIDSIZE_WINDOW as u64),
+                LdmArming::JobPrefix => screened(LDM_MIDSIZE_WINDOW as u64),
                 _ => false,
             }
         {
