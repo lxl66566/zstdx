@@ -803,6 +803,33 @@ fn capture_grid(
     ((prefix_last * job_size) as u64 >= SPF_MIN_PREFIX).then_some(job_size)
 }
 
+/// The fast rows' capture schedule for a window the frame's own evidence
+/// armed (`far_screen::mt_capture_window`): the pinned capture grid plus
+/// the [`PrefixPlan::SelfFill`] median boundary, shared by the bulk
+/// planner and the pledged stream port (see `encoder_mt`) so the two run
+/// the same lattice and the same above/below-median split. `head` is the
+/// frame's first block (the collision screen's span, clamped inside).
+pub(crate) fn fast_capture_schedule(
+    len: u64,
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    head: &[u8],
+    window: u64,
+) -> Option<(usize, u64)> {
+    let job_size = capture_grid(len, level, shape, choice, head, Some(window))?;
+    let n_jobs = len.div_ceil(job_size as u64) as usize;
+    // Non-empty by `capture_grid`'s own prefix_last gate; the median is
+    // the same balance point `plan_prefix_ldm` splits its schedule at.
+    let prefix_jobs: Vec<usize> = (1..n_jobs)
+        .filter(|&i| (i * job_size) as u64 <= window)
+        .collect();
+    Some((
+        job_size,
+        (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64,
+    ))
+}
+
 /// Whether the bulk path runs a frame on prefix-strip LDM jobs (the LDM
 /// capture classes, see `compress_slice_mt`): the row/window/verdict
 /// class plus a head that both parses and carries a wide alphabet, and a

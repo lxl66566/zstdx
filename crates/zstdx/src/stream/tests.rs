@@ -970,6 +970,186 @@ mod mt {
         }
     }
 
+    /// The fast rows' far-class capture on the pledged stream (the R23
+    /// port of the R21/R22 bulk capture): a mid-band far-class frame —
+    /// the `encoding::mt` fixture class, near-field head twins clearing
+    /// the screen's cheap-reject bar and 3 MiB unit copies carrying the
+    /// paying 2-4 MiB class — arms exactly as the bulk planner arms it,
+    /// so the pledged stream is byte-identical to the bulk mt frame at
+    /// every worker count and write pattern, and lands far under the
+    /// stock unpledged stream. A same-size random pledge stays stock
+    /// (header byte-for-byte a below-band pledge's), and a flush inside
+    /// the staging span cancels the capture back to the stock schedule.
+    #[test]
+    fn fast_row_midband_stream_capture_arms_and_random_stays_stock() {
+        let mib = 1024 * 1024;
+        let head = lcg(256 * 1024);
+        let unit = lcg(3 * mib);
+        let mut data = Vec::with_capacity(4 * head.len() + 11 * unit.len());
+        for (src, copies) in [(&head, 4u32), (&unit, 11u32)] {
+            for copy in 0..copies {
+                for (i, &b) in src.iter().enumerate() {
+                    data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                        b ^ 0x5a
+                    } else {
+                        b
+                    });
+                }
+            }
+        }
+        for level in [Level::Fastest, Level::Fast] {
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None);
+            for workers in [4u32, 8] {
+                let streamed = encode_write(
+                    &data,
+                    1024 * 1024,
+                    level,
+                    workers,
+                    true,
+                    Some(data.len() as u64),
+                );
+                assert_eq!(streamed, bulk_mt4, "{level:?} workers {workers}");
+            }
+            // The staging gate holds no schedule input: the write pattern
+            // cannot reach the frame bytes.
+            let fine = encode_write(&data, 128 * 1024, level, 4, true, Some(data.len() as u64));
+            assert_eq!(fine, bulk_mt4, "{level:?}: write-pattern independence");
+            assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} armed stream"));
+            // The armed capture carries the far class cross-job: under
+            // half the stock unpledged stream of the same bytes.
+            let stock = encode_write(&data, 1024 * 1024, level, 4, true, None);
+            assert!(
+                bulk_mt4.len() * 2 < stock.len(),
+                "{level:?}: armed {} vs stock unpledged {}",
+                bulk_mt4.len(),
+                stock.len()
+            );
+        }
+        // A random mid-band pledge fails the screen and keeps the stock
+        // header: byte-for-byte the prefix a below-band random pledge
+        // carries (the FCS tail differs; the prefix compared here does
+        // not).
+        let random = lcg(data.len());
+        let screened = encode_write(
+            &random,
+            512 * 1024,
+            Level::Fastest,
+            4,
+            false,
+            Some(random.len() as u64),
+        );
+        let below_band = encode_write(
+            &random[..15 * mib],
+            512 * 1024,
+            Level::Fastest,
+            4,
+            false,
+            Some(15 * mib as u64),
+        );
+        assert_eq!(&screened[..6], &below_band[..6], "stock header moved");
+        assert_both_decoders(&screened, &random, "screened random pledge");
+        // A flush inside the staging span cancels the capture: the frame
+        // stays decodable, deterministic in its write pattern, and pays
+        // the stock parse (the far class lost — well above the armed
+        // size).
+        let flushed = |chunk: usize| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Fastest)
+                    .workers(4)
+                    .checksum(false)
+                    .pledged_size(Some(data.len() as u64)),
+            )
+            .unwrap();
+            enc.write_all(&data[..mib]).unwrap();
+            enc.flush().unwrap();
+            for piece in data[mib..].chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        let a = flushed(1024 * 1024);
+        assert_eq!(a, flushed(128 * 1024), "flush-cancelled determinism");
+        assert_both_decoders(&a, &data, "flush-cancelled mid-band");
+        let armed = encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None);
+        assert!(
+            a.len() > armed.len() + armed.len() / 2,
+            "the flush-cancelled frame must pay the stock parse: {} vs armed {}",
+            a.len(),
+            armed.len()
+        );
+    }
+
+    /// The fast rows' full-band stream capture (>= LDM_FULL_WINDOW
+    /// pledged): geometry arms the window, the collision screen gates on
+    /// the staged first block, and the late jobs cold re-arm their
+    /// mid-stream window spans — the R22 SelfFill schedule on the stream
+    /// core. The pledged stream equals the bulk mt frame byte for byte
+    /// and stays worker-independent and run-to-run deterministic.
+    #[test]
+    fn fast_row_fullband_stream_capture_self_fills_midstream_jobs() {
+        const MIB: usize = 1024 * 1024;
+        let total = 76 * MIB;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        let mut patterns = Vec::with_capacity(96);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::with_capacity(head_len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        unit[..head_len].copy_from_slice(&head);
+        unit[MIB..MIB + head_len].copy_from_slice(&head);
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        for level in [Level::Fastest, Level::Fast] {
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None);
+            for workers in [4u32, 8] {
+                let streamed = encode_write(
+                    &data,
+                    3 * MIB,
+                    level,
+                    workers,
+                    true,
+                    Some(data.len() as u64),
+                );
+                assert_eq!(streamed, bulk_mt4, "{level:?} workers {workers}");
+            }
+            assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} fullband stream"));
+            let again = encode_write(&data, MIB, level, 8, true, Some(data.len() as u64));
+            assert_eq!(again, bulk_mt4, "{level:?}: run-to-run determinism");
+            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None);
+            assert!(
+                bulk_mt4.len() <= st.len() + st.len() / 20,
+                "{level:?}: the far class must survive the self-fill: stream-mt {} vs armed st {}",
+                bulk_mt4.len(),
+                st.len()
+            );
+        }
+    }
+
     #[test]
     fn pooled_state_reuse_is_output_neutral() {
         use crate::encoding::{

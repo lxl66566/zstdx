@@ -46,6 +46,19 @@
 //! reject (see [`FarClass`]) caps every job's strip at the row's chain
 //! reach and disarms job LDM — the capped bytes had no reader left, so
 //! the frame bytes cannot move.
+//!
+//! A pledged fast-row stream (Fast/Dfast with LDM, the R23 port of the
+//! R21/R22 bulk capture) rides the same capture the bulk path runs (see
+//! [`FastCapture`]): the mid-size band stages the far screen's head
+//! sample like the probe stages its span, the full band stages one block
+//! for the capture's collision screen, and an engaged frame re-grids
+//! onto the pinned capture lattice with the whole far window as its
+//! strip — byte-identical to the bulk mt frame at every worker count,
+//! the no-build [`FastCapture::Engaged`] schedule splitting jobs at the
+//! median boundary exactly as the bulk planner's `PrefixPlan::SelfFill`
+//! does. An open-ended stream never arms (the length the arming keys on
+//! is the pledge), and a stream that ends or flushes inside the staging
+//! span keeps the stock fast-row schedule.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -73,15 +86,16 @@ use crate::{
     encoding::{
         block_header::BlockHeader,
         checksum::{BlockChecksum as _, FrameHasher},
+        far_screen,
         frame_compressor::{CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state},
         frame_header::FrameHeader,
         match_generator::{
             LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
-            far_repeat_dominant, ldm_head_parses,
+            far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
-            MIN_JOB_SIZE, capture_job_size, donate_keep_span, job_size_for, prepare_job_state,
-            run_job_with,
+            MIN_JOB_SIZE, capture_job_size, donate_keep_span, fast_capture_schedule, job_size_for,
+            prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -131,6 +145,50 @@ enum FarClass {
     Dead,
 }
 
+/// The fast rows' far-class capture engagement (see the module docs and
+/// `encoding::mt`'s `PrefixPlan::SelfFill` — the bulk model this ports):
+/// a pledged Fast/Dfast row with LDM and a stock window below the far
+/// domain, staging the evidence the arming keys on before anything
+/// posts, then re-gridded onto the pinned capture lattice. Mutually
+/// exclusive with the reach probe by row (the probe is the Balanced
+/// chain row's machinery) and with the chain rows' capture (their window
+/// derives from the row's own parameters, see
+/// [`MtEncoderCore::engage_midsize_capture`]).
+enum FastCapture {
+    /// Not a fast-row capture class: chain rows, unpledged streams
+    /// (the arming keys on the declared length — the pledge), rows
+    /// without LDM or with a stock window already at the far domain.
+    Stock,
+    /// Pledged mid-size band [`LDM_MIDSIZE_WINDOW`, `LDM_FULL_WINDOW`):
+    /// the first [`far_screen::SCREEN_SPAN`] bytes stage before any
+    /// post, and the far screen's verdict over that sample arms the
+    /// capture (the R20 staging, the ST core's twin).
+    Screen,
+    /// Pledged at or beyond [`LDM_FULL_WINDOW`]: geometry arms the
+    /// window with no screen, but the capture grid's own collision
+    /// screen (`ldm_head_parses` over the first block) still gates —
+    /// the first [`MAX_BLOCK_SIZE`] bytes stage before any post.
+    Head,
+    /// Engaged: the SelfFill schedule's median boundary. Jobs starting
+    /// above it cold-fill their clamped window span
+    /// ([`JobSpf::Windowed`] with no snapshot); jobs at or below it
+    /// keep the stock strip fill — the same split the bulk planner
+    /// makes, so a source inside the window keeps its bulk bytes.
+    Engaged { med: u64 },
+}
+
+impl FastCapture {
+    /// The staging span the verdict still needs, if any: bytes stage
+    /// (and posts hold) until the frame holds it whole.
+    fn stage_span(&self) -> Option<usize> {
+        match self {
+            Self::Stock | Self::Engaged { .. } => None,
+            Self::Screen => Some(far_screen::SCREEN_SPAN),
+            Self::Head => Some(MAX_BLOCK_SIZE as usize),
+        }
+    }
+}
+
 /// The reach probe's donated keep side (see `post_donation`): job zero's
 /// parsed span as a continuation-ready state plus its encoded blocks. The
 /// verdict is taken at `resolve_probe`; a Shrink discards both — job zero
@@ -170,6 +228,30 @@ impl SpfPlan {
     }
 }
 
+/// The job's share of a frame-level prefix-fill schedule, as the posting
+/// core hands it to the worker: the finish tail's whole-strip snapshot
+/// (chain rows, see [`SpfPlan`]), or the fast rows' engaged capture
+/// (see [`FastCapture::Engaged`]) whose above-median jobs cold-fill
+/// their clamped window span — the bulk planner's `PrefixPlan::SelfFill`
+/// split, ported verbatim.
+enum JobSpfStream {
+    None,
+    Whole(Arc<StripSnapshot>),
+    /// [`JobSpf::Windowed`] with no snapshot: `windowed_ldm_prefill`
+    /// fills `[start - window, start)` from zero.
+    Windowed,
+}
+
+impl Clone for JobSpfStream {
+    fn clone(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Whole(snap) => Self::Whole(snap.clone()),
+            Self::Windowed => Self::Windowed,
+        }
+    }
+}
+
 /// The pledged mid-size capture's engagement (see
 /// [`MtEncoderCore::engage_midsize_capture`]): the pledge itself, the
 /// source-clamped window class and the head screen over the frame's first
@@ -188,7 +270,10 @@ fn midsize_capture_window(level: Level, shape: crate::InputShape, head: &[u8]) -
     // a pledged W26 stream grids its stock 64 MiB jobs with LDM armed at
     // the `Job` bar (the window equals it), carrying the far class
     // already; the two paths' bytes diverge on that band either way (the
-    // pre-existing divergence, now recorded in dev/perf/mt-stream).
+    // pre-existing divergence, now recorded in dev/perf/mt-stream). The
+    // fast rows never reach here (`prefix_ldm_window` is chain-row
+    // only): their both-bands capture is [`FastCapture`], which ports
+    // the R22 no-build schedule instead of this whole-strip snapshot.
     if MatchGeneratorDriver::windowed_ldm_capture(window) {
         return None;
     }
@@ -232,10 +317,10 @@ enum JobKind {
         /// `FarDead` when the frame's far-class screen rejected the far
         /// class (see `FarClass`), `Job` everywhere else.
         ldm: LdmArming,
-        /// The shared prefix fill's snapshot for this job, when the
-        /// finish tail engaged one and this job's strip extends it (see
-        /// `MtEncoderCore::build_spf`).
-        spf: Mutex<Option<Arc<StripSnapshot>>>,
+        /// The job's share of a frame-level prefix-fill schedule (see
+        /// [`JobSpfStream`]): the finish tail's snapshot, or the fast
+        /// rows' engaged capture cold-fill flag.
+        spf: Mutex<JobSpfStream>,
         /// The probe's donated keep side when this job is the frame's
         /// first: the continuation resumes the donated state at the span
         /// (skipping the strip prefill — it would clear the very tables
@@ -521,7 +606,7 @@ fn run_claimed_job(
             // SAFETY: the posting thread keeps the backing bytes stable for
             // this job's whole lifetime (see FrozenSrc).
             let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
-            let spf = spf.lock().unwrap().take();
+            let spf = spf.lock().unwrap().clone();
             let bytes = if let Some(don) = donation.lock().unwrap().take() {
                 // The donated continuation: job zero's state already carries
                 // its reset, strip prefill and parsed span — the
@@ -544,11 +629,11 @@ fn run_claimed_job(
                 out
             } else {
                 let state = state.get_or_insert_with(take_pooled_state);
-                match spf.as_ref() {
+                match spf {
                     // Adopt the shared prefix snapshot: reset and gates as
                     // any job's, then continue the fill to this job's own
                     // strip end instead of re-running its whole prefix.
-                    Some(snap) => {
+                    JobSpfStream::Whole(snap) => {
                         prepare_job_state(
                             state,
                             job.level,
@@ -566,10 +651,14 @@ fn run_claimed_job(
                             *first,
                             Vec::new(),
                             *overlap,
-                            JobSpf::Whole(snap),
+                            JobSpf::Whole(&snap),
                         )
                     },
-                    _ => run_job_with(
+                    // The fast rows' engaged capture: the SelfFill split's
+                    // above-median arm, `run_job_with`'s `JobSpf::Windowed`
+                    // path (chain tables over the reach tail, LDM
+                    // cold-filled over the clamped window span).
+                    cold @ (JobSpfStream::Windowed | JobSpfStream::None) => run_job_with(
                         state,
                         src,
                         *first..*len,
@@ -579,7 +668,10 @@ fn run_claimed_job(
                         job.shape,
                         job.choice,
                         *ldm,
-                        JobSpf::None,
+                        match cold {
+                            JobSpfStream::Windowed => JobSpf::Windowed(None),
+                            _ => JobSpf::None,
+                        },
                     ),
                 }
             };
@@ -660,6 +752,9 @@ pub(crate) struct MtEncoderCore {
     /// over fixed input spans (see [`Self::resolve_far_class`]) — a pure
     /// function of the input, never of the write cadence.
     far_class: FarClass,
+    /// The fast rows' far-class capture (see [`FastCapture`]): the
+    /// pledged fast row's staging state, then its engaged schedule.
+    fast_capture: FastCapture,
     /// Jobs buffered before a burst fires: at least one full round of
     /// workers, amortizing the thread spawn.
     burst_jobs: usize,
@@ -743,6 +838,24 @@ impl MtEncoderCore {
             Some(_) => reach_probe::eligible(options.level, shape),
             None => MatchGeneratorDriver::reach_probe_eligible(options.level, shape),
         };
+        // The fast rows' capture staging (see [`FastCapture`]): pledged
+        // only — the arming keys on the declared length, which is the
+        // pledge. The full band's window arms on geometry alone, but the
+        // capture grid's collision screen still reads the first block, so
+        // both bands stage before anything posts; the probe never runs on
+        // these rows (strategy-exclusive), so the two stagings never hold
+        // the same frame.
+        let fast_capture = if options.pledged_size.is_some() && !probe_pending {
+            if far_screen::mt_capture_window(options.level, shape, &[]).is_some() {
+                FastCapture::Head
+            } else if fast_row_screen_pending(options.level, shape) {
+                FastCapture::Screen
+            } else {
+                FastCapture::Stock
+            }
+        } else {
+            FastCapture::Stock
+        };
         let initial_job = match grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(overlap),
@@ -790,6 +903,7 @@ impl MtEncoderCore {
             probe_pending,
             probe_wait: None,
             donation: None,
+            fast_capture,
             choice: ReachChoice::Keep,
 
             shape,
@@ -1124,6 +1238,12 @@ impl MtEncoderCore {
         if self.probe_wait.is_some() {
             self.resolve_probe();
         }
+        // A flush or finish inside the fast-row capture's staging span
+        // cancels it back to stock (the R20 semantics: the verdict was
+        // never taken, so the schedule keeps its pure-function property).
+        if self.fast_capture.stage_span().is_some() {
+            self.fast_capture = FastCapture::Stock;
+        }
     }
 
     /// Consume the donation's verdict: a shrunk frame re-grids from offset
@@ -1227,6 +1347,68 @@ impl MtEncoderCore {
         let n = self.shape.len.expect("the capture gate checked the pledge");
         self.grid = JobGrid::Fixed(capture_job_size(n, reach as usize));
         self.job_ldm = LdmArming::JobPrefix;
+    }
+
+    /// Resolve the fast-row capture's staging verdict (see
+    /// [`FastCapture`]) and engage the capture when the frame's own
+    /// evidence arms it: the far window becomes the job strip and the
+    /// declared window, the grid re-pins onto the bulk capture lattice
+    /// (worker-independent) and the jobs flip to [`LdmArming::JobPrefix`]
+    /// — the schedule the bulk planner runs the same frame on, so the
+    /// pledged stream is byte-identical to the bulk mt output at every
+    /// worker count. Runs with nothing posted (the staging gate held
+    /// every post, so `job_start` and `buf_base` sit at zero and no
+    /// frozen view exists) and the header unemitted.
+    fn resolve_fast_capture(&mut self) {
+        let span = self
+            .fast_capture
+            .stage_span()
+            .expect("the staging gate resolves a pending capture only");
+        debug_assert_eq!(self.job_start, 0);
+        debug_assert_eq!(self.buf_base, 0);
+        // The mid band's verdict is the far screen over the staged sample
+        // (the same sample the ST core and the bulk planner screen, so
+        // every entry reaches the same decision); the full band arms on
+        // geometry — the span-independent call — leaving the collision
+        // screen to the schedule helper below.
+        let window = match self.fast_capture {
+            FastCapture::Screen => {
+                far_screen::mt_capture_window(self.level, self.shape, &self.buf[..span])
+            },
+            _ => far_screen::mt_capture_window(self.level, self.shape, &[]),
+        };
+        self.fast_capture = FastCapture::Stock;
+        let Some(window) = window else {
+            return;
+        };
+        let n = self
+            .shape
+            .len
+            .expect("the staging classes are pledged by construction");
+        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let Some((job_size, med)) =
+            fast_capture_schedule(n, self.level, self.shape, self.choice, head, window)
+        else {
+            return;
+        };
+        self.overlap = window as usize;
+        self.grid = JobGrid::Fixed(job_size);
+        self.job_ldm = LdmArming::JobPrefix;
+        self.fast_capture = FastCapture::Engaged { med };
+        // The header re-serializes with the far window before any byte of
+        // it left (the staging gate held every emit): the bulk mt form —
+        // windowed, pledged, W26 — so the armed stream and the bulk frame
+        // agree byte for byte.
+        let header = FrameHeader {
+            frame_content_size: self.shape.len,
+            single_segment: false,
+            content_checksum: self.checksum,
+            dictionary_id: None,
+            window_size: Some(window),
+        };
+        self.header.clear();
+        header.serialize(&mut self.header);
+        self.reserve_decided();
     }
 
     /// Resolve the far-class screen once per frame (see [`FarClass`]).
@@ -1390,6 +1572,16 @@ impl MtEncoderCore {
                 return;
             }
             self.post_donation();
+        }
+        if let Some(span) = self.fast_capture.stage_span() {
+            // The fast rows' capture stages its evidence the same way (see
+            // [`FastCapture`]): nothing posts until the verdict's span is
+            // buffered whole, so the engagement re-grids a frame whose
+            // head is still the buffer's and whose header never left.
+            if self.pos < span as u64 {
+                return;
+            }
+            self.resolve_fast_capture();
         }
         loop {
             // A verdict that already landed is consumed for free here (the
@@ -1712,6 +1904,13 @@ impl MtEncoderCore {
         self.hash_to(hi);
         let last_len = (bounds[1] - bounds[0]) as usize;
         let mut state = take_pooled_state();
+        // The engaged fast capture's SelfFill split applies to the inline
+        // tail job exactly as to a posted one (belt: an engaged frame has
+        // posted before, so the pool exists and this arm stays cold).
+        let spf = match &self.fast_capture {
+            FastCapture::Engaged { med } if self.job_start > *med => JobSpf::Windowed(None),
+            _ => JobSpf::None,
+        };
         let bytes = run_job_with(
             &mut state,
             &self.buf[..(hi - self.buf_base) as usize],
@@ -1722,7 +1921,7 @@ impl MtEncoderCore {
             self.shape,
             self.choice,
             self.job_ldm,
-            JobSpf::None,
+            spf,
         );
         return_pooled_state(state);
         self.output.extend_from_slice(&bytes);
@@ -1777,6 +1976,17 @@ impl MtEncoderCore {
         // SAFETY: strip_lo >= buf_base (asserted above); the view is the
         // buffer's [strip_lo, end), so `first` indexes from its head.
         let ptr = unsafe { self.buf.as_ptr().add((strip_lo - self.buf_base) as usize) };
+        // The job's prefix-fill share: the finish tail's snapshot (chain
+        // rows) or the engaged fast capture's SelfFill split — the two
+        // never coexist (the tail build is growing-grid-only, the capture
+        // fixed-grid-only), and both are pure functions of the job start.
+        let spf = match spf {
+            Some(snap) => JobSpfStream::Whole(snap),
+            None => match &self.fast_capture {
+                FastCapture::Engaged { med } if start > *med => JobSpfStream::Windowed,
+                _ => JobSpfStream::None,
+            },
+        };
         let job = Arc::new(Job {
             level: self.level,
             choice: self.choice,
@@ -2515,7 +2725,7 @@ mod tests {
                 last_frame_block: false,
                 overlap: 0,
                 ldm: LdmArming::Job,
-                spf: Mutex::new(None),
+                spf: Mutex::new(JobSpfStream::None),
                 donation: Mutex::new(None),
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),
@@ -2577,7 +2787,7 @@ mod tests {
                 last_frame_block: false,
                 overlap: 0,
                 ldm: LdmArming::Job,
-                spf: Mutex::new(None),
+                spf: Mutex::new(JobSpfStream::None),
                 donation: Mutex::new(None),
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),
