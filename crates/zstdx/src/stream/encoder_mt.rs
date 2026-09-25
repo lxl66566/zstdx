@@ -56,9 +56,14 @@
 //! strip — byte-identical to the bulk mt frame at every worker count,
 //! the no-build [`FastCapture::Engaged`] schedule splitting jobs at the
 //! median boundary exactly as the bulk planner's `PrefixPlan::SelfFill`
-//! does. An open-ended stream never arms (the length the arming keys on
-//! is the pledge), and a stream that ends or flushes inside the staging
-//! span keeps the stock fast-row schedule.
+//! does. An open-ended stream arms the same way (R24): no length exists
+//! to band-check, so the far screen's verdict over the staged sample is
+//! the evidence — the ST core's own rule — and the engaged frame re-grids
+//! onto a pinned capture lattice (see [`JobGrid::Capture`]) whose bands
+//! derive from absolute offsets alone, so the armed bytes stay
+//! deterministic across worker counts, write chunkings and run-to-run. A
+//! stream that ends or flushes inside the staging span keeps the stock
+//! fast-row schedule.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -90,12 +95,12 @@ use crate::{
         frame_compressor::{CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state},
         frame_header::FrameHeader,
         match_generator::{
-            LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
-            far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
+            LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG,
+            StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
-            MIN_JOB_SIZE, capture_job_size, donate_keep_span, fast_capture_schedule, job_size_for,
-            prepare_job_state, run_job_with,
+            CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_job_size, donate_keep_span,
+            fast_capture_schedule, job_size_for, prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -120,7 +125,32 @@ enum JobGrid {
     /// function of absolute offset — jobs post exactly on grid boundaries,
     /// so the queue never straddles an epoch.
     Growing,
+    /// An engaged open-length fast-row capture (see [`FastCapture`]): the
+    /// growing grid's length-free replacement, pinned bands of
+    /// [`CAPTURE_BAND_JOBS`] equal jobs with the size doubling per band
+    /// from the staging span's scale to the bulk capture cap (see
+    /// [`Self::capture_band`]). Set mid-stream at the engagement, with
+    /// `job_start == 0` still (the staging gate held every post), so the
+    /// lattice tiles the whole frame from offset zero. The band count is a
+    /// constant — never `burst_jobs` — so the armed bytes cannot depend on
+    /// the worker count the way the Growing grid's epochs do, and no
+    /// schedule input reads `pos` (how much is buffered when the verdict
+    /// lands is timing, not input). The bulk capture lattice it mirrors
+    /// (`capture_job_size`) is `len/8` clamped to the same cap: the bands
+    /// track that density locally — a stream of length L runs its last
+    /// band at the lattice a pledged twin within 2x of L would pin.
+    Capture,
 }
+
+/// Jobs per band on the [`JobGrid::Capture`] lattice. The count is a
+/// measured trade, not a derivation: the armed dll cells sit inside the
+/// ST-body ±0.5% class at three (dll100 l1 +0.14%, l3 -0.03%; dll32
+/// +0.16%/-0.42%) while four and five band jobs land up to +24% outside
+/// it — the per-job LDM refills' bucket flooding is boundary-coupled to
+/// the content, so the constant is pinned by the gate cells (a wider
+/// band count also floods the small-job erosion `capture_grid` measures
+/// on dll100).
+const CAPTURE_BAND_JOBS: u64 = 3;
 
 /// The frame's far-class screen verdict (see `MtEncoderCore::far_class`):
 /// whether the chain rows' whole-window cross-job strip carries a paying
@@ -155,15 +185,18 @@ enum FarClass {
 /// derives from the row's own parameters, see
 /// [`MtEncoderCore::engage_midsize_capture`]).
 enum FastCapture {
-    /// Not a fast-row capture class: chain rows, unpledged streams
-    /// (the arming keys on the declared length — the pledge), rows
-    /// without LDM or with a stock window already at the far domain.
+    /// Not a fast-row capture class: chain rows, rows without LDM or
+    /// with a stock window already at the far domain.
     Stock,
-    /// Pledged mid-size band [`LDM_MIDSIZE_WINDOW`, `LDM_FULL_WINDOW`):
-    /// the first [`far_screen::SCREEN_SPAN`] bytes stage before any
-    /// post, and the far screen's verdict over that sample arms the
-    /// capture (the R20 staging, the ST core's twin).
-    Screen,
+    /// Mid-size band staging: the first [`far_screen::SCREEN_SPAN`] bytes
+    /// stage before any post, and the far screen's verdict over that
+    /// sample arms the capture (the R20 staging, the ST core's twin). A
+    /// pledged frame (`open == false`) keys the verdict to the declared
+    /// length's band; an open-ended stream (`open == true`) has no length
+    /// to band-check — the verdict alone is the evidence, the ST
+    /// unpledged entry's own rule — and the full band's geometry arming
+    /// never exists without a length.
+    Screen { open: bool },
     /// Pledged at or beyond [`LDM_FULL_WINDOW`]: geometry arms the
     /// window with no screen, but the capture grid's own collision
     /// screen (`ldm_head_parses` over the first block) still gates —
@@ -173,7 +206,11 @@ enum FastCapture {
     /// above it cold-fill their clamped window span
     /// ([`JobSpf::Windowed`] with no snapshot); jobs at or below it
     /// keep the stock strip fill — the same split the bulk planner
-    /// makes, so a source inside the window keeps its bulk bytes.
+    /// makes, so a source inside the window keeps its bulk bytes. The
+    /// open-length engagement carries `med == 0`: below the window bar
+    /// the two arms are byte-identical (the windowed cold fill's own
+    /// contract; a fast row's dense coverage beyond the scan domain is
+    /// unreachable), so the cheap arm serves every nonzero job.
     Engaged { med: u64 },
 }
 
@@ -183,7 +220,7 @@ impl FastCapture {
     fn stage_span(&self) -> Option<usize> {
         match self {
             Self::Stock | Self::Engaged { .. } => None,
-            Self::Screen => Some(far_screen::SCREEN_SPAN),
+            Self::Screen { .. } => Some(far_screen::SCREEN_SPAN),
             Self::Head => Some(MAX_BLOCK_SIZE as usize),
         }
     }
@@ -845,13 +882,26 @@ impl MtEncoderCore {
         // both bands stage before anything posts; the probe never runs on
         // these rows (strategy-exclusive), so the two stagings never hold
         // the same frame.
-        let fast_capture = if options.pledged_size.is_some() && !probe_pending {
-            if far_screen::mt_capture_window(options.level, shape, &[]).is_some() {
-                FastCapture::Head
-            } else if fast_row_screen_pending(options.level, shape) {
-                FastCapture::Screen
-            } else {
-                FastCapture::Stock
+        let fast_capture = if !probe_pending {
+            match options.pledged_size {
+                Some(_) => {
+                    if far_screen::mt_capture_window(options.level, shape, &[]).is_some() {
+                        FastCapture::Head
+                    } else if fast_row_screen_pending(options.level, shape) {
+                        FastCapture::Screen { open: false }
+                    } else {
+                        FastCapture::Stock
+                    }
+                },
+                // An open-ended fast row stages the far screen the same
+                // way (`fast_row_screen_pending` accepts the open length):
+                // no band exists to check, so the verdict is the arming
+                // evidence — and no full-band geometry arming exists
+                // without a declared length, so `Head` is pledged-only.
+                None if fast_row_screen_pending(options.level, shape) => {
+                    FastCapture::Screen { open: true }
+                },
+                None => FastCapture::Stock,
             }
         } else {
             FastCapture::Stock
@@ -859,6 +909,8 @@ impl MtEncoderCore {
         let initial_job = match grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(overlap),
+            // Engaged mid-stream only; the band base is its floor.
+            JobGrid::Capture => far_screen::SCREEN_SPAN,
         };
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
@@ -1370,9 +1422,16 @@ impl MtEncoderCore {
         // (the same sample the ST core and the bulk planner screen, so
         // every entry reaches the same decision); the full band arms on
         // geometry — the span-independent call — leaving the collision
-        // screen to the schedule helper below.
+        // screen to the schedule helper below. The open form takes the
+        // verdict directly: no declared length exists to band-check (the
+        // ST unpledged entry's own rule), and the accept subsumes the
+        // capture grid's collision screen (the pledged mid band's own
+        // exemption — the twin evidence is strictly stronger).
         let window = match self.fast_capture {
-            FastCapture::Screen => {
+            FastCapture::Screen { open: true } => (far_screen::frame_arming(&self.buf[..span])
+                == LdmArming::FrameScreened)
+                .then_some(LDM_FULL_WINDOW as u64),
+            FastCapture::Screen { open: false } => {
                 far_screen::mt_capture_window(self.level, self.shape, &self.buf[..span])
             },
             _ => far_screen::mt_capture_window(self.level, self.shape, &[]),
@@ -1381,24 +1440,32 @@ impl MtEncoderCore {
         let Some(window) = window else {
             return;
         };
-        let n = self
-            .shape
-            .len
-            .expect("the staging classes are pledged by construction");
-        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
-        let Some((job_size, med)) =
-            fast_capture_schedule(n, self.level, self.shape, self.choice, head, window)
-        else {
-            return;
+        let (grid, med) = match self.shape.len {
+            Some(n) => {
+                let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+                let Some((job_size, med)) =
+                    fast_capture_schedule(n, self.level, self.shape, self.choice, head, window)
+                else {
+                    return;
+                };
+                (JobGrid::Fixed(job_size), med)
+            },
+            // The open-length lattice (see [`JobGrid::Capture`]): pinned
+            // bands in absolute offsets, worker- and cadence-free. The
+            // median boundary is zero — below the window bar the SelfFill
+            // split's two arms are byte-identical, so the cheap one (the
+            // scan-domain dense fill) serves every nonzero job.
+            None => (JobGrid::Capture, 0),
         };
         self.overlap = window as usize;
-        self.grid = JobGrid::Fixed(job_size);
+        self.grid = grid;
         self.job_ldm = LdmArming::JobPrefix;
         self.fast_capture = FastCapture::Engaged { med };
         // The header re-serializes with the far window before any byte of
         // it left (the staging gate held every emit): the bulk mt form —
-        // windowed, pledged, W26 — so the armed stream and the bulk frame
-        // agree byte for byte.
+        // windowed, W26 — with the FCS exactly when a pledge declared it,
+        // so an armed pledged stream and the bulk frame agree byte for
+        // byte, and an armed open stream carries the ST armed form.
         let header = FrameHeader {
             frame_content_size: self.shape.len,
             single_segment: false,
@@ -1478,6 +1545,7 @@ impl MtEncoderCore {
         let initial_job = match self.grid {
             JobGrid::Fixed(size) => size,
             JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
+            JobGrid::Capture => far_screen::SCREEN_SPAN,
         };
         let want = initial_reserve(self.workers, initial_job, self.overlap);
         if self.buf.capacity() < want {
@@ -1492,11 +1560,37 @@ impl MtEncoderCore {
 
     /// End offset of the job starting at absolute offset `start`.
     fn job_end(&self, start: u64) -> u64 {
-        let size = match self.grid {
-            JobGrid::Fixed(size) => size as u64,
-            JobGrid::Growing => self.growing_epoch(start).1,
-        };
-        start + size
+        match self.grid {
+            JobGrid::Fixed(size) => start + size as u64,
+            JobGrid::Growing => start + self.growing_epoch(start).1,
+            // The band edge clamp fires only on a flush-regridded start
+            // (a job never straddles a size doubling); an on-lattice
+            // start ends exactly on the next boundary.
+            JobGrid::Capture => {
+                let (size, edge) = Self::capture_band(start);
+                (start + size).min(edge)
+            },
+        }
+    }
+
+    /// The Capture lattice's band at absolute offset `o`: the band's job
+    /// size and the next size-doubling edge above `o` (`u64::MAX` once the
+    /// cap is reached — the lattice is a fixed grid from there). Bands of
+    /// [`CAPTURE_BAND_JOBS`] equal jobs double the size from the staging
+    /// span's own scale ([`far_screen::SCREEN_SPAN`], the least length the
+    /// verdict could have seen) to the bulk capture cap ([`CAPTURE_JOB_CAP`]
+    /// — the density huge capture-class sources pin). A pure function of
+    /// the offset alone: no worker count, no buffered extent, no write
+    /// cadence reaches it.
+    fn capture_band(o: u64) -> (u64, u64) {
+        let cap = CAPTURE_JOB_CAP;
+        let mut size = far_screen::SCREEN_SPAN as u64;
+        let mut edge = CAPTURE_BAND_JOBS * size;
+        while o >= edge && size < cap {
+            size = (size * 2).min(cap);
+            edge = edge.saturating_add(CAPTURE_BAND_JOBS * size);
+        }
+        (size, (size < cap).then_some(edge).unwrap_or(u64::MAX))
     }
 
     /// The Growing grid's job-size ceiling: `post_due` stages a whole epoch
@@ -1635,6 +1729,10 @@ impl MtEncoderCore {
                 true
             },
             JobGrid::Growing => self.pos >= self.growing_epoch_end(self.job_start),
+            // The capture lattice's boundaries are absolute like the fixed
+            // grid's (and no pledge exists to hold a final job back), so
+            // each job posts the moment its bytes complete.
+            JobGrid::Capture => self.pos >= end,
         }
     }
 
@@ -1649,7 +1747,12 @@ impl MtEncoderCore {
         let mut bounds = Vec::with_capacity(self.burst_jobs * 3 + 2);
         bounds.push(self.job_start);
         match self.grid {
-            JobGrid::Fixed(_) => {
+            // The capture lattice walks like the fixed grid — no tail
+            // re-slice: the growing grid's tail rule slices into
+            // `burst_jobs` jobs (a worker-count key that would break the
+            // armed stream's w4 == w8 == w16 contract), while a short
+            // final job is exactly the pledged capture's own finish tail.
+            JobGrid::Fixed(_) | JobGrid::Capture => {
                 while *bounds.last().unwrap() < hi {
                     let next = self.job_end(*bounds.last().unwrap()).min(hi);
                     bounds.push(next);
@@ -2801,6 +2904,231 @@ mod tests {
         // The caller (serve_queue) owns the counts: publish must not touch
         // them.
         assert_eq!(core.shared.n_incomplete.load(Ordering::Acquire), 0);
+    }
+
+    /// The open-length capture lattice's bands: three doubling steps from
+    /// the staging span's scale to the bulk capture cap, then a fixed grid.
+    #[test]
+    fn open_capture_lattice_bands() {
+        let mib = 1024 * 1024u64;
+        assert_eq!(MtEncoderCore::capture_band(0), (4 * mib, 12 * mib));
+        assert_eq!(MtEncoderCore::capture_band(4 * mib), (4 * mib, 12 * mib));
+        assert_eq!(MtEncoderCore::capture_band(11 * mib), (4 * mib, 12 * mib));
+        assert_eq!(MtEncoderCore::capture_band(12 * mib), (8 * mib, 36 * mib));
+        assert_eq!(MtEncoderCore::capture_band(35 * mib), (8 * mib, 36 * mib));
+        for o in [36 * mib, 512 * mib, 1 << 40] {
+            assert_eq!(MtEncoderCore::capture_band(o), (16 * mib, u64::MAX));
+        }
+        // An on-lattice start ends exactly on the next boundary; an
+        // off-lattice one (a flush-regridded grid) clamps at the band edge
+        // so the walk re-aligns — a job never straddles a size doubling
+        // (the clamp arithmetic `job_end` applies, checked on the band
+        // function directly: the Capture grid exists only mid-stream).
+        let (size, edge) = MtEncoderCore::capture_band(10 * mib);
+        assert_eq!(((10 * mib) + size).min(edge), 12 * mib);
+        let (size, edge) = MtEncoderCore::capture_band(34 * mib);
+        assert_eq!(((34 * mib) + size).min(edge), 36 * mib);
+    }
+
+    /// dll-shaped synthetic: wide-alphabet fragments with immediate near
+    /// repeats (the far screen's head evidence — twins inside the first
+    /// MiB and a dense count by the 4 MiB span) plus a whole-sequence
+    /// repeat at a distance past every fast row's stock window (the far
+    /// class only the armed capture serves).
+    fn dllish(len: usize) -> Vec<u8> {
+        let frag = 64 * 1024;
+        let pool = 24usize;
+        let mut frags = Vec::with_capacity(pool);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..pool {
+            let mut f = Vec::with_capacity(frag);
+            while f.len() < frag {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                f.extend_from_slice(&state.to_le_bytes());
+            }
+            frags.push(f);
+        }
+        let half = len / 2;
+        let mut base = Vec::with_capacity(half);
+        let mut pick = 0xdead_beef_cafeu64;
+        while base.len() < half {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let f = &frags[((pick >> 33) as usize) % pool];
+            // The immediate double seeds the near-field twins; the pool
+            // reuse spreads 64-byte windows across multi-MiB distances.
+            let take = f.len().min(half - base.len());
+            base.extend_from_slice(&f[..take]);
+            let take2 = f.len().min(half - base.len());
+            base.extend_from_slice(&f[f.len() - take2..]);
+        }
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(&base);
+        out.extend_from_slice(&base);
+        out.truncate(len);
+        out
+    }
+
+    /// The declared window log off a serialized frame header (magic + FHD
+    /// + window descriptor), for pinning the arming's header observable.
+    fn header_window_log(frame: &[u8]) -> u32 {
+        assert_eq!(&frame[..4], &[0x28, 0xb5, 0x2f, 0xfd], "frame magic");
+        let fhd = frame[4];
+        assert_eq!(fhd >> 5 & 1, 0, "unpledged frames keep the windowed form");
+        let wd = frame[5];
+        10 + u32::from(wd >> 3)
+    }
+
+    /// The unpledged fast-row stream arms the far-class capture: the
+    /// header declares the far window, the armed size stays in the armed
+    /// ST body's class (the accepted job-split cost), and the armed bytes
+    /// are identical across worker counts and write chunkings.
+    #[test]
+    fn open_capture_arms_deterministically() {
+        let data = dllish(20 * 1024 * 1024);
+        let mut reference = None;
+        for workers in [2u32, 4, 8, 16] {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(workers));
+            core.write(&data).unwrap();
+            core.finish().unwrap();
+            assert_eq!(
+                header_window_log(&core.output),
+                26,
+                "w{workers} armed header"
+            );
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            assert_eq!(
+                (n, &out[..n]),
+                (data.len(), &data[..]),
+                "w{workers} roundtrip"
+            );
+            match &reference {
+                Some(bytes) => assert_eq!(&core.output, bytes, "w{workers} bytes"),
+                None => reference = Some(core.output.clone()),
+            }
+        }
+        // Chunk-pattern invariance without a flush: ragged writes and 64
+        // KiB pulls emit the one-shot frame exactly.
+        for chunk in [7usize, 17, 64 * 1024, 1024 * 1024] {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(8));
+            let mut off = 0;
+            while off < data.len() {
+                // Ragged: the last piece of each round is one byte short.
+                let mut n = chunk.min(data.len() - off);
+                if n == chunk && off + n < data.len() {
+                    n -= 1;
+                }
+                core.write(&data[off..off + n]).unwrap();
+                off += n;
+            }
+            core.finish().unwrap();
+            assert_eq!(&core.output, reference.as_ref().unwrap(), "chunk {chunk}");
+        }
+        // The armed ST body (the same screen, frame-continuous) bounds the
+        // mt frame's split cost.
+        let mut st = crate::stream::encoder_core::FrameEncoderCoreSt::new(
+            &EncoderOptions::new(Level::Fast).workers(1),
+        );
+        st.write(&data).unwrap();
+        st.finish().unwrap();
+        let st_len = st.pending_output();
+        let mt_len = reference.as_ref().unwrap().len();
+        assert!(
+            mt_len <= st_len + st_len / 50,
+            "armed mt {mt_len} vs armed st {st_len} (split cost > 2%)"
+        );
+    }
+
+    /// A flush inside the staging span cancels the capture: the header
+    /// keeps the stock window and the frame is the stock growing-grid
+    /// shape (deterministic for an identical write/flush sequence).
+    #[test]
+    fn open_capture_flush_below_gate_stays_stock() {
+        let data = dllish(20 * 1024 * 1024);
+        let mut reference = None;
+        for _ in 0..2 {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
+            core.write(&data[..3 * 1024 * 1024]).unwrap();
+            core.flush_block();
+            core.write(&data[3 * 1024 * 1024..]).unwrap();
+            core.finish().unwrap();
+            assert!(
+                header_window_log(&core.output) < 25,
+                "a flush below the gate must keep the stock window"
+            );
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+            match &reference {
+                Some(bytes) => assert_eq!(&core.output, bytes),
+                None => reference = Some(core.output.clone()),
+            }
+        }
+    }
+
+    /// A stream ending inside the staging span never armed: the stock
+    /// window and the stock schedule stand.
+    #[test]
+    fn open_capture_end_below_gate_stays_stock() {
+        let data = dllish(3 * 1024 * 1024 + 5);
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
+        core.write(&data).unwrap();
+        core.finish().unwrap();
+        assert!(
+            header_window_log(&core.output) < 25,
+            "no arming below the gate"
+        );
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// A random head never arms (collision-level twins): the unpledged
+    /// stream keeps the stock window and schedule.
+    #[test]
+    fn open_capture_random_stays_stock() {
+        let mut data = vec![0u8; 8 * 1024 * 1024];
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for b in &mut data {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 56) as u8;
+        }
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
+        core.write(&data).unwrap();
+        core.finish().unwrap();
+        assert!(header_window_log(&core.output) < 25, "random stays stock");
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// A flush after the engagement is the documented rebases: the frame
+    /// re-grids at the flush point (the clamped band walk re-aligns) and
+    /// stays deterministic for an identical write/flush sequence.
+    #[test]
+    fn open_capture_flush_after_engagement_rebases_deterministically() {
+        let data = dllish(20 * 1024 * 1024);
+        let mut reference = None;
+        for _ in 0..2 {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(8));
+            core.write(&data[..10 * 1024 * 1024]).unwrap();
+            core.flush_block();
+            core.write(&data[10 * 1024 * 1024..]).unwrap();
+            core.finish().unwrap();
+            assert_eq!(header_window_log(&core.output), 26, "engaged stays armed");
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+            match &reference {
+                Some(bytes) => assert_eq!(&core.output, bytes),
+                None => reference = Some(core.output.clone()),
+            }
+        }
     }
 
     /// A huge pledge must not size the initial reserve to the job grid

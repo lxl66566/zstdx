@@ -1017,14 +1017,20 @@ mod mt {
             let fine = encode_write(&data, 128 * 1024, level, 4, true, Some(data.len() as u64));
             assert_eq!(fine, bulk_mt4, "{level:?}: write-pattern independence");
             assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} armed stream"));
-            // The armed capture carries the far class cross-job: under
-            // half the stock unpledged stream of the same bytes.
-            let stock = encode_write(&data, 1024 * 1024, level, 4, true, None);
+            // The armed capture carries the far class cross-job, and the
+            // unpledged stream joins the armed class (R24: its own
+            // length-free lattice, no pledged twin to equal): both mt
+            // forms stay inside the armed ST body's split class — the
+            // stock schedule this replaced sat far above it.
+            let unpledged = encode_write(&data, 1024 * 1024, level, 4, true, None);
+            let st = encode_write(&data, 1024 * 1024, level, 1, true, None);
             assert!(
-                bulk_mt4.len() * 2 < stock.len(),
-                "{level:?}: armed {} vs stock unpledged {}",
+                bulk_mt4.len() <= st.len() + st.len() / 50
+                    && unpledged.len() <= st.len() + st.len() / 50,
+                "{level:?}: armed bulk {} / unpledged {} vs armed st {}",
                 bulk_mt4.len(),
-                stock.len()
+                unpledged.len(),
+                st.len()
             );
         }
         // A random mid-band pledge fails the screen and keeps the stock

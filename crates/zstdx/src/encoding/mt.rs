@@ -54,8 +54,10 @@ pub(crate) const MIN_JOB_SIZE: usize = 1024 * 1024;
 pub(crate) const MAX_JOB_SIZE: usize = 1024 * 1024 * 1024;
 /// The capture grid's job-size ceiling (see `capture_grid`): keeps huge
 /// capture-class inputs finely gridded instead of growing one job per
-/// eighth of the input forever.
-const CAPTURE_JOB_CAP: u64 = 16 * 1024 * 1024;
+/// eighth of the input forever. Shared by the open-length stream capture
+/// lattice (see `encoder_mt`'s `JobGrid::Capture`), whose bands double up
+/// to it.
+pub(crate) const CAPTURE_JOB_CAP: u64 = 16 * 1024 * 1024;
 
 /// Job size for an input of `len` bytes at `workers` threads: twice as many
 /// jobs as workers keeps the tail balanced, the floor keeps the overlap
