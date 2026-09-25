@@ -166,11 +166,14 @@ the per-job head-table clear (`head clear`, a sub-span of `prefill`;
 zero on chain rows since the head origin landed), plus the
 caller-side shared-prefix-fill build (`spf build` — posting-thread
 work the job sums cannot see, retired/discarded builds included) —
-each against the summed job time (which exceeds the wall clock on the mt
-paths: jobs run in parallel). Component shares, not walls, are the
-verdict; interleaved A/B stays the wall tool. Needs the encoder trace
-hooks (`--features job_trace`; compiled out of timing builds like
-`seq_dump`):
+plus the spf build's ldm/chain split and the adopters' remainder fills,
+and the finish tail's own phases (`finish`/`settle` with the parked
+donation wait/`post`/`drain`). `--pledge` declares the input size on the
+stream-mt cells (the pledged stream shape). Each against the summed job
+time (which exceeds the wall clock on the mt paths: jobs run in
+parallel). Component shares, not walls, are the verdict; interleaved A/B
+stays the wall tool. Needs the encoder trace hooks (`--features
+job_trace`; compiled out of timing builds like `seq_dump`):
 
 ```bash
 cargo run --release -p zstdx-bench --features job_trace -- jobdecomp \

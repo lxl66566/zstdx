@@ -58,6 +58,27 @@ pub struct Snapshot {
     /// on the posting thread, so without its own span the build is
     /// invisible to the decomposition (the r17 lesson).
     pub spf_build_ns: u64,
+    /// The builder's LDM `fill_to_freeze` segments (a sub-span of
+    /// `spf_build_ns`).
+    pub spf_ldm_ns: u64,
+    /// The builder's chain grid segments (a sub-span of `spf_build_ns`).
+    pub spf_chain_ns: u64,
+    /// The adopters' LDM remainder fills (`strip_fill_continue`).
+    pub adopt_ldm_ns: u64,
+    /// The adopters' chain grid remainders (`strip_fill_continue`).
+    pub adopt_chain_ns: u64,
+    /// The whole `finish` call — the finish tail's total span.
+    pub fin_ns: u64,
+    /// `settle_probe` inside the finish/flush path (carries the donation
+    /// wait: `resolve_probe`'s waits for the two donated parses).
+    pub fin_settle_ns: u64,
+    /// The donation wait proper (`wait_donation` parking; a sub-span of
+    /// `fin_settle_ns`).
+    pub don_wait_ns: u64,
+    /// The finish/flush post loop (posting the tail jobs).
+    pub fin_post_ns: u64,
+    /// `drain_all` inside the finish/flush path — the parallel tail span.
+    pub fin_drain_ns: u64,
     /// Per-job `reset_slice_state` (state, stats and table reset).
     pub reset_ns: u64,
     /// Ultra's seed parse (`ZSTD_initStats_ultra` port).
@@ -107,6 +128,15 @@ macro_rules! counters {
 
 counters! {
     jobs,
+    spf_ldm_ns,
+    spf_chain_ns,
+    adopt_ldm_ns,
+    adopt_chain_ns,
+    fin_ns,
+    fin_settle_ns,
+    don_wait_ns,
+    fin_post_ns,
+    fin_drain_ns,
     grid_fill_ns,
     seed_scan_ns,
     gate_ns,
@@ -188,6 +218,62 @@ pub fn add_ldm_fill(started: Instant) {
 #[inline]
 pub fn add_spf_build(started: Instant) {
     add_ns(&C.spf_build_ns, started.elapsed());
+}
+
+/// Record one builder LDM segment span (`strip_fill_segment`'s
+/// `fill_to_freeze`).
+#[inline]
+pub fn add_spf_ldm(started: Instant) {
+    add_ns(&C.spf_ldm_ns, started.elapsed());
+}
+
+/// Record one builder chain-grid segment span (`strip_fill_segment`'s
+/// `chain_grid_fill`).
+#[inline]
+pub fn add_spf_chain(started: Instant) {
+    add_ns(&C.spf_chain_ns, started.elapsed());
+}
+
+/// Record one adopter LDM remainder span (`strip_fill_continue`).
+#[inline]
+pub fn add_adopt_ldm(started: Instant) {
+    add_ns(&C.adopt_ldm_ns, started.elapsed());
+}
+
+/// Record one adopter chain-grid remainder span (`strip_fill_continue`).
+#[inline]
+pub fn add_adopt_chain(started: Instant) {
+    add_ns(&C.adopt_chain_ns, started.elapsed());
+}
+
+/// Record one `finish` call span.
+#[inline]
+pub fn add_fin(started: Instant) {
+    add_ns(&C.fin_ns, started.elapsed());
+}
+
+/// Record one finish-path `settle_probe` span.
+#[inline]
+pub fn add_fin_settle(started: Instant) {
+    add_ns(&C.fin_settle_ns, started.elapsed());
+}
+
+/// Record one donation-wait parking span (`wait_donation`).
+#[inline]
+pub fn add_don_wait(started: Instant) {
+    add_ns(&C.don_wait_ns, started.elapsed());
+}
+
+/// Record one finish-path post-loop span.
+#[inline]
+pub fn add_fin_post(started: Instant) {
+    add_ns(&C.fin_post_ns, started.elapsed());
+}
+
+/// Record one finish-path `drain_all` span.
+#[inline]
+pub fn add_fin_drain(started: Instant) {
+    add_ns(&C.fin_drain_ns, started.elapsed());
 }
 
 /// Record one head-table clear span inside `prefill_window`.

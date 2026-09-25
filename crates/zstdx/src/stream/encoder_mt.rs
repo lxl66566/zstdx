@@ -1115,6 +1115,8 @@ impl MtEncoderCore {
                 actual: self.pos,
             });
         }
+        #[cfg(feature = "job_trace")]
+        let fin_t0 = std::time::Instant::now();
         self.surface_poison();
         if self.pos > self.job_start {
             // Post the tail before waiting: posting first lets workers
@@ -1140,6 +1142,8 @@ impl MtEncoderCore {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_fin(fin_t0);
         Ok(())
     }
 
@@ -1809,7 +1813,11 @@ impl MtEncoderCore {
         };
         // A flush or finish ahead of the staging gate decides the probe
         // with the stock reach (see the module docs).
+        #[cfg(feature = "job_trace")]
+        let settle_t0 = std::time::Instant::now();
         self.settle_probe();
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_fin_settle(settle_t0);
         if spf.is_some() && self.choice == ReachChoice::Shrink {
             // The shrunk re-grid's strips are not the prefixes the build
             // filled; drop the plan unused.
@@ -1831,6 +1839,8 @@ impl MtEncoderCore {
             self.run_inline_job(&bounds, hi, last_frame_block);
         } else {
             let last = bounds.len() - 2;
+            #[cfg(feature = "job_trace")]
+            let post_t0 = std::time::Instant::now();
             for (i, w) in bounds.windows(2).enumerate() {
                 let spf = spf
                     .as_ref()
@@ -1838,8 +1848,14 @@ impl MtEncoderCore {
                     .map(|p| p.snapshot.clone());
                 self.post_job(w[0], w[1], last_frame_block && i == last, spf);
             }
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_fin_post(post_t0);
             self.job_start = hi;
+            #[cfg(feature = "job_trace")]
+            let drain_t0 = std::time::Instant::now();
             self.drain_all();
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_fin_drain(drain_t0);
         }
     }
 
@@ -2201,6 +2217,14 @@ impl MtEncoderCore {
     /// never changes again; the done re-check and the bounded timeout keep
     /// the wait correct either way.
     fn wait_donation(&self, job: &Job) {
+        #[cfg(feature = "job_trace")]
+        let t0 = std::time::Instant::now();
+        self.wait_donation_inner(job);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_don_wait(t0);
+    }
+
+    fn wait_donation_inner(&self, job: &Job) {
         let mut inner = self.shared.inner.lock().unwrap();
         loop {
             if inner.poison.is_some() || inner.shutdown || job.is_done() {
