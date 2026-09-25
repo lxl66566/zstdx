@@ -151,7 +151,8 @@ mod trace {
         );
         println!(
             "  prefill split: grid_fill {:>7.2} ms ({:4.1}% of job)  seed_scan {:>7.2} ms \
-             ({:4.1}%)  gate {:>7.2} ms ({:4.1}%)  ldm {:>7.2} ms ({:4.1}%)",
+             ({:4.1}%)  gate {:>7.2} ms ({:4.1}%)  ldm {:>7.2} ms ({:4.1}%)  uniform {:>7.2} ms \
+             ({:4.1}%)",
             ms(s.grid_fill_ns),
             share(s.grid_fill_ns, s.job_ns),
             ms(s.seed_scan_ns),
@@ -160,6 +161,8 @@ mod trace {
             share(s.gate_ns, s.job_ns),
             ms(s.ldm_fill_ns),
             share(s.ldm_fill_ns, s.job_ns),
+            ms(s.uniform_ns),
+            share(s.uniform_ns, s.job_ns),
         );
         println!(
             "  spf build  {:>8.2} ms (caller-side; not in the job sums above — retired builds \
@@ -231,6 +234,7 @@ mod trace {
             grid_fill_ns,
             seed_scan_ns,
             gate_ns,
+            uniform_ns,
             ldm_fill_ns,
             spf_build_ns,
         } = s;
@@ -252,6 +256,7 @@ mod trace {
         acc.grid_fill_ns += grid_fill_ns;
         acc.seed_scan_ns += seed_scan_ns;
         acc.gate_ns += gate_ns;
+        acc.uniform_ns += uniform_ns;
         acc.ldm_fill_ns += ldm_fill_ns;
     }
 

@@ -381,6 +381,130 @@ fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
     gear4_asm(w, h)
 }
 
+/// Whole-loop gear scan (see `gear_scan`): feeds groups of four from `h`
+/// without returning, exiting at the FIRST checkpoint whose top bits
+/// (under `mask`) are zero — the state there and the fed byte count come
+/// back so the caller can apply the floor gate, stage the split and
+/// resume; a no-trigger run consumes every whole group and returns the
+/// final state. Resuming at the triggering checkpoint reproduces the
+/// stock loop's in-group order exactly (the next call's first
+/// checkpoints ARE the old group's c2..c4), so the split set and the
+/// exit states are unchanged whatever the call granularity.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn gear_run(win: &[u8], mut h: u64, mask: u64) -> (usize, u64, bool) {
+    debug_assert!(win.len() >= 4);
+    let mut p = win.as_ptr();
+    let (n, trig, s, c1, p2, c2, p3, c4, p4): (
+        usize,
+        u64,
+        *const u8,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    );
+    // SAFETY: baseline x86-64 instructions only; reads `win[0..4]` blocks
+    // and the 2 KiB GEAR_TAB, writes nothing but the outputs.
+    unsafe {
+        core::arch::asm!(
+            "mov {p}, {s}",
+            "2:",
+            "cmp {e4}, {p}",
+            "jae 8f",
+            "movzbl ({p}), {c1:e}",
+            "movzbl 1({p}), {p2:e}",
+            "movzbl 2({p}), {c2:e}",
+            "movzbl 3({p}), {p3:e}",
+            "mov ({t}, {c1}, 8), {c1}",
+            "mov ({t}, {p2}, 8), {p2}",
+            "mov ({t}, {c2}, 8), {c2}",
+            "mov ({t}, {p3}, 8), {p3}",
+            "lea ({c1}, {h}, 2), {c4}",
+            "test {m}, {c4}",
+            "jz 11f",
+            "lea ({p2}, {c1}, 2), {c1}",
+            "lea ({c1}, {h}, 4), {p4}",
+            "test {m}, {p4}",
+            "jz 12f",
+            "lea ({c2}, {c1}, 2), {c1}",
+            "lea ({c1}, {h}, 8), {c4}",
+            "test {m}, {c4}",
+            "jz 13f",
+            "lea ({p3}, {c1}, 2), {c1}",
+            "mov {h}, {c2}",
+            "shl $4, {c2}",
+            "lea ({c1}, {c2}), {c4}",
+            "test {m}, {c4}",
+            "jz 14f",
+            "mov {c4}, {h}",
+            "add $4, {p}",
+            "jmp 2b",
+            "11:",
+            "mov {c4}, {h}",
+            "add $1, {p}",
+            "mov $1, {trig:e}",
+            "jmp 9f",
+            "12:",
+            "mov {p4}, {h}",
+            "add $2, {p}",
+            "mov $1, {trig:e}",
+            "jmp 9f",
+            "13:",
+            "mov {c4}, {h}",
+            "add $3, {p}",
+            "mov $1, {trig:e}",
+            "jmp 9f",
+            "14:",
+            "mov {c4}, {h}",
+            "add $4, {p}",
+            "mov $1, {trig:e}",
+            "jmp 9f",
+            "8:",
+            "mov $0, {trig:e}",
+            "9:",
+            "mov {p}, {n}",
+            "sub {s}, {n}",
+            p = inout(reg) p,
+            e4 = in(reg) win.as_ptr().add(win.len() - 4),
+            t = in(reg) GEAR_TAB.as_ptr(),
+            m = in(reg) mask,
+            h = inout(reg) h,
+            s = out(reg) s,
+            trig = out(reg) trig,
+            c1 = out(reg) c1,
+            p2 = out(reg) p2,
+            c2 = out(reg) c2,
+            p3 = out(reg) p3,
+            c4 = out(reg) c4,
+            p4 = out(reg) p4,
+            n = lateout(reg) n,
+            options(nostack, att_syntax)
+        );
+    }
+    let _ = (p, s, c1, p2, c2, p3, c4, p4);
+    (n, h, trig != 0)
+}
+
+/// Portable [`gear_run`]: the same exit contract over `gear4` groups.
+#[cfg(not(target_arch = "x86_64"))]
+fn gear_run(win: &[u8], mut h: u64, mask: u64) -> (usize, u64, bool) {
+    let mut n = 0;
+    while n + 4 <= win.len() {
+        let (c1, c2, c3, c4) = gear4(&win[n..], h);
+        for (m, c) in [(1usize, c1), (2, c2), (3, c3), (4, c4)] {
+            if c & mask == 0 {
+                return (n + m, c, true);
+            }
+        }
+        h = c4;
+        n += 4;
+    }
+    (n, h, false)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
@@ -629,77 +753,19 @@ impl LdmState {
     ) -> (usize, usize) {
         debug_assert_eq!(self.fed, base);
         let mut hash = self.rolling;
-        let mask = self.stop_mask;
-        let win = &win[(base - win_base) as usize..(end - win_base) as usize];
-        let floor_trigger = floor + MIN_MATCH_LENGTH as u64;
-        let len = win.len();
-        let mut n = 0usize;
-        let mut count = 0usize;
-        // One trigger test per fed byte; `m` is the 1-based byte offset of
-        // checkpoint `c` within the group. A full batch exits with the
-        // state frozen at exactly the triggering checkpoint.
-        macro_rules! trigger {
-            ($c:expr, $m:expr) => {
-                if $c & mask == 0 && base + (n + $m) as u64 >= floor_trigger {
-                    if Self::record_split(
-                        splits,
-                        &mut count,
-                        base + (n + $m) as u64 - MIN_MATCH_LENGTH as u64,
-                    ) {
-                        self.rolling = $c;
-                        n += $m;
-                        self.fed = base + n as u64;
-                        return (n, count);
-                    }
-                }
-            };
-        }
-        // The serial chain `state -> 2*state + g` costs one dependent add
-        // per byte however it is shaped in source: LLVM reassociates the
-        // group-local prefix folds back into that chain and folds the
-        // table loads into memory-operand adds (two dependent adds per
-        // byte, measured at half the achievable speed). The asm `gear4`
-        // keeps the reassociated form — the interior checkpoints are
-        // `(state << k) + pk` with `pk = 2*p(k-1) + g` independent of the
-        // live state — so the state-to-state dependency is one add per
-        // four bytes. Checkpoint values are bit-identical to the serial
-        // form (exact mod-2^64 arithmetic), so the split set is unchanged.
-        while n + 4 <= len {
-            let (c1, c2, c3, c4) = gear4(&win[n..], hash);
-            trigger!(c1, 1);
-            trigger!(c2, 2);
-            trigger!(c3, 3);
-            trigger!(c4, 4);
-            hash = c4;
-            n += 4;
-        }
-        while n < len {
-            let g = GEAR_TAB[win[n] as usize];
-            hash = g.wrapping_add(hash << 1);
-            n += 1;
-            if hash & mask == 0
-                && base + n as u64 >= floor_trigger
-                && Self::record_split(
-                    splits,
-                    &mut count,
-                    base + n as u64 - MIN_MATCH_LENGTH as u64,
-                )
-            {
-                break;
-            }
-        }
+        let (n, count) = gear_scan(
+            win,
+            win_base,
+            base,
+            end,
+            floor,
+            self.stop_mask,
+            &mut hash,
+            splits,
+        );
         self.rolling = hash;
         self.fed = base + n as u64;
         (n, count)
-    }
-
-    /// Cold half of a gear trigger: stage one split and report a full batch.
-    #[cold]
-    #[inline(never)]
-    fn record_split(splits: &mut [u64; BATCH_SIZE], count: &mut usize, split: u64) -> bool {
-        splits[*count] = split;
-        *count += 1;
-        *count == BATCH_SIZE
     }
 
     /// Fingerprint a split's 64-byte window: eight multiply-xor lanes and
@@ -750,6 +816,17 @@ impl LdmState {
                 self.arm = base;
             }
         }
+        #[cfg(feature = "std")]
+        if end - base >= PARALLEL_FILL_MIN && parallel_fill_lanes() > 1 {
+            self.fill_parallel(win, win_base, base, end);
+            return;
+        }
+        self.fill_serial(win, win_base, base, end);
+    }
+
+    /// [`Self::fill`]'s stock one-lane scan-and-insert loop.
+    fn fill_serial(&mut self, win: &[u8], win_base: u64, base: u64, end: u64) {
+        self.ensure_fresh();
         let mut splits = [0u64; BATCH_SIZE];
         let mut pos = base;
         while pos < end {
@@ -760,6 +837,95 @@ impl LdmState {
                 self.insert(hash, split, checksum);
             }
             pos += n as u64;
+        }
+    }
+
+    /// The parallel large-span fill (spans of [`PARALLEL_FILL_MIN`] and
+    /// up — the windowed capture's job-start spans). The gear trigger
+    /// tests the state's top [`HASH_RATE_LOG`] bits, so the state at any
+    /// position is a function of exactly the last
+    /// [`MIN_MATCH_LENGTH`] bytes: every checkpoint value is
+    /// position-pure, and the split set of `[base, end)` is independent
+    /// of how the scan is partitioned. Each lane therefore scans its own
+    /// chunk — entering at the fold of the 64 bytes below its start,
+    /// which equals the serial state there exactly (any earlier
+    /// contribution has shifted out; lane zero keeps the true re-armed
+    /// state) — staging its splits with their fingerprints; the joiner
+    /// then inserts the concatenation in position order, which is the
+    /// stock loop's insert order, so the table contents, `rolling` and
+    /// `fed` are bit-identical to [`Self::fill_serial`]'s. Deterministic
+    /// in the input alone: no lane interleaving reaches the table.
+    #[cfg(feature = "std")]
+    fn fill_parallel(&mut self, win: &[u8], win_base: u64, base: u64, end: u64) {
+        debug_assert!(end - base >= MIN_MATCH_LENGTH as u64);
+        self.ensure_fresh();
+        let lanes = parallel_fill_lanes();
+        debug_assert!(lanes > 1);
+        let floor = self.arm.max(win_base);
+        let mask = self.stop_mask;
+        let hash_mask = self.hash_mask;
+        // Lane zero carries the first insert run on top of its scan, so it
+        // takes half a helper's share (1 part to their 2, of `2*lanes-1`).
+        let part = ((end - base) as usize).div_ceil(2 * lanes - 1) as u64;
+        let chunk = 2 * part;
+        let est = chunk as usize / MIN_MATCH_LENGTH + MIN_MATCH_LENGTH;
+        let entry0 = self.rolling;
+        std::thread::scope(|scope| {
+            // Interior lanes on helper threads; lane zero stays inline
+            // (and takes half a share below, carrying the first inserts).
+            let mut handles = Vec::with_capacity(lanes - 1);
+            for lane in 1..lanes {
+                let start = base + part + (lane as u64 - 1) * chunk;
+                let stop = (start + chunk).min(end);
+                handles.push(scope.spawn(move || {
+                    scan_lane(
+                        win,
+                        win_base,
+                        start,
+                        stop,
+                        floor,
+                        mask,
+                        hash_mask,
+                        gear_entry(win, win_base, start),
+                        est,
+                    )
+                }));
+            }
+            let stop = (base + part).min(end);
+            let first = scan_lane(
+                win, win_base, base, stop, floor, mask, hash_mask, entry0, est,
+            );
+            // Lane zero's hits are the span's lowest positions, so they
+            // can insert while the helper lanes still scan — order is
+            // preserved whatever the helpers' progress (they never touch
+            // the table).
+            self.insert_hits(&first);
+            for handle in handles {
+                let hits = handle.join().unwrap();
+                self.insert_hits(&hits);
+            }
+        });
+        // The exit state is position-pure like every checkpoint: the fold
+        // of the final 64 fed bytes (the span is far past any re-arm).
+        self.rolling = gear_entry(win, win_base, end);
+        self.fed = end;
+    }
+
+    /// The joiner's insert run over one lane's hits: position order
+    /// inside the lane, and the lanes insert in chunk order — the stock
+    /// loop's exact insert sequence. The stock loop interleaved these
+    /// round-robin inserts with the next gear batch, hiding each miss
+    /// under scanning compute; standing alone they serialize on one
+    /// outstanding table line at a time, so the loop prefetches the
+    /// [`INSERT_PREFETCH_DIST`]-ahead hits' bucket lines instead — same
+    /// inserts, overlapped misses.
+    #[cfg(feature = "std")]
+    fn insert_hits(&mut self, hits: &[SplitHit]) {
+        for (i, hit) in hits.iter().enumerate() {
+            if let Some(&ahead) = hits.get(i + INSERT_PREFETCH_DIST) {
+                prefetch_hit(&self.table, &self.bucket_offsets, ahead.hash as usize);
+            }
+            self.insert(hit.hash as usize, hit.split, hit.cks);
         }
     }
 
@@ -902,6 +1068,201 @@ impl LdmState {
         }
     }
 }
+
+/// The gear scan proper ([`LdmState::gear_feed`]'s body): feeds
+/// `[base, end)` from `*rolling`, staging up to [`BATCH_SIZE`] splits and
+/// leaving `*rolling` at the exit checkpoint (the mid-batch freeze
+/// included). Free so the parallel fill's lanes can scan their own chunk
+/// of a span without a whole [`LdmState`].
+#[inline(never)]
+fn gear_scan(
+    win: &[u8],
+    win_base: u64,
+    base: u64,
+    end: u64,
+    floor: u64,
+    mask: u64,
+    rolling: &mut u64,
+    splits: &mut [u64; BATCH_SIZE],
+) -> (usize, usize) {
+    let mut hash = *rolling;
+    let win = &win[(base - win_base) as usize..(end - win_base) as usize];
+    let floor_trigger = floor + MIN_MATCH_LENGTH as u64;
+    let len = win.len();
+    let mut n = 0usize;
+    let mut count = 0usize;
+    // The group scan runs in `gear_run` (whole-loop asm on x86-64, `gear4`
+    // groups elsewhere): one call feeds groups until the first
+    // top-bits-zero checkpoint, the Rust side applies the floor gate
+    // and staging, and the resume reproduces the stock in-group order
+    // exactly (the next call's first checkpoints ARE the old group's
+    // c2..c4). A full batch exits with the state frozen at exactly
+    // the triggering checkpoint.
+    while n + 4 <= len {
+        let (fed, h2, fired) = gear_run(&win[n..], hash, mask);
+        hash = h2;
+        n += fed;
+        if !fired {
+            break;
+        }
+        if base + n as u64 >= floor_trigger
+            && record_split(
+                splits,
+                &mut count,
+                base + n as u64 - MIN_MATCH_LENGTH as u64,
+            )
+        {
+            *rolling = hash;
+            return (n, count);
+        }
+    }
+    while n < len {
+        let g = GEAR_TAB[win[n] as usize];
+        hash = g.wrapping_add(hash << 1);
+        n += 1;
+        if hash & mask == 0
+            && base + n as u64 >= floor_trigger
+            && record_split(
+                splits,
+                &mut count,
+                base + n as u64 - MIN_MATCH_LENGTH as u64,
+            )
+        {
+            break;
+        }
+    }
+    *rolling = hash;
+    (n, count)
+}
+
+/// Cold half of a gear trigger: stage one split and report a full batch.
+#[cold]
+#[inline(never)]
+fn record_split(splits: &mut [u64; BATCH_SIZE], count: &mut usize, split: u64) -> bool {
+    splits[*count] = split;
+    *count += 1;
+    *count == BATCH_SIZE
+}
+
+/// The gear state at `pos` (absolute): the fold of the 64 input bytes
+/// below it. Exact wherever at least 64 bytes have been fed since the
+/// last (re)arm — the state's dependence on anything older shifts out —
+/// which is every interior position of a parallel fill's span.
+fn gear_entry(win: &[u8], win_base: u64, pos: u64) -> u64 {
+    let bytes =
+        &win[(pos - MIN_MATCH_LENGTH as u64 - win_base) as usize..(pos - win_base) as usize];
+    let mut hash = 0u64;
+    for &b in bytes {
+        hash = GEAR_TAB[b as usize].wrapping_add(hash << 1);
+    }
+    hash
+}
+
+/// One staged insert of a parallel fill's lane: the split position plus
+/// its bucket and checksum (the fingerprint the lane computes over its
+/// own — cache-warm — chunk, so the joiner touches nothing but the
+/// table).
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct SplitHit {
+    split: u64,
+    hash: u32,
+    cks: u32,
+}
+
+/// One lane of a parallel fill ([`LdmState::fill_parallel`]): scan
+/// `[start, stop)` from `entry`, returning the lane's splits with their
+/// fingerprints, in position order. `start == stop` (a rounding-exact
+/// lane) returns empty.
+#[cfg(feature = "std")]
+fn scan_lane(
+    win: &[u8],
+    win_base: u64,
+    start: u64,
+    stop: u64,
+    floor: u64,
+    mask: u64,
+    hash_mask: usize,
+    entry: u64,
+    est: usize,
+) -> Vec<SplitHit> {
+    let mut hits = Vec::with_capacity(est);
+    if start >= stop {
+        return hits;
+    }
+    let mut batch = [0u64; BATCH_SIZE];
+    let mut rolling = entry;
+    let mut pos = start;
+    while pos < stop {
+        let (n, count) = gear_scan(
+            win,
+            win_base,
+            pos,
+            stop,
+            floor,
+            mask,
+            &mut rolling,
+            &mut batch,
+        );
+        for &split in batch.iter().take(count) {
+            let fp = LdmState::split_fp(win, (split - win_base) as usize);
+            hits.push(SplitHit {
+                split,
+                hash: fp as u32 & hash_mask as u32,
+                cks: (fp >> 32) as u32,
+            });
+        }
+        pos += n as u64;
+    }
+    hits
+}
+
+/// Prefetch-distance (inserts) of [`insert_hits`]: covers the round-robin
+/// bucket line misses of the inserts ahead while the current one retires.
+#[cfg(feature = "std")]
+const INSERT_PREFETCH_DIST: usize = 16;
+
+/// Pull one hit's bucket entries and its cursor byte into the caches the
+/// next insert will need (the round-robin slot lives in the bucket's
+/// first two lines; the exact slot depends on the cursor, so both).
+#[cfg(feature = "std")]
+#[inline(always)]
+fn prefetch_hit(table: &[u64], offsets: &[u8], hash: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            offsets.as_ptr().add(hash) as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+        let base = table.as_ptr().add(hash * ENTS_PER_BUCKET);
+        core::arch::x86_64::_mm_prefetch(base as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        core::arch::x86_64::_mm_prefetch(base.add(8) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (table, offsets, hash);
+}
+
+/// Lanes a parallel fill spreads its scan over: three while the box has
+/// cores to spare (a captured frame's workers fill at job start, leaving
+/// the encode idle — the scan lanes take the idle half), one otherwise.
+/// Purely a scheduling choice: the split set is position-pure, so the
+/// lane count cannot move the output.
+#[cfg(feature = "std")]
+fn parallel_fill_lanes() -> usize {
+    if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 6) {
+        3
+    } else {
+        1
+    }
+}
+
+/// Span floor at which [`LdmState::fill`] takes the parallel scan (see
+/// [`LdmState::fill_parallel`]): the windowed capture's job-start spans
+/// are tens of MiB, while every other fill class (reach tails,
+/// dictionaries, block-model segments) stays an order below, where a
+/// thread spawn costs more than the scan it would share.
+#[cfg(feature = "std")]
+const PARALLEL_FILL_MIN: u64 = 8 << 20;
 
 #[cfg(test)]
 mod tests {
@@ -1144,6 +1505,56 @@ mod tests {
             serial[..],
             "asm checkpoints diverged from the serial gear"
         );
+    }
+
+    /// The parallel fill is bit-identical to the stock serial loop on
+    /// every lane-partition shape: position-pure checkpoints give the
+    /// same splits, the joiner inserts in position order, and the exit
+    /// fold equals the serial loop's final state.
+    #[cfg(feature = "std")]
+    #[test]
+    fn parallel_fill_matches_serial() {
+        for seed in [0x0ddb_a11, 0x5eed_5eed] {
+            let mut data = rand_bytes(1 << 19, seed);
+            // Data-dependent trigger density straddling the lane cuts: a
+            // low-entropy stripe every 64 bytes plus the random body.
+            for (i, b) in data.iter_mut().enumerate() {
+                if i % 64 < 4 {
+                    *b ^= ((i >> 6) & 0xff) as u8;
+                }
+            }
+            // (win_base, base): a mid-stream window exercises the
+            // lane-entry and exit folds against a non-zero window base.
+            for (win_base, base) in [(0u64, 0u64), (0, 4096), (32768, 65536)] {
+                let win = &data[win_base as usize..];
+                let max_span = win.len() - (base - win_base) as usize - 4096;
+                for span in [1 << 14, (1 << 17) + 123, 1 << 19].map(|sp| sp.min(max_span)) {
+                    let end = base + span as u64;
+                    let mut ser = LdmState::new(20, 1 << 20);
+                    ser.restart(base);
+                    let mut par = LdmState::new(20, 1 << 20);
+                    par.restart(base);
+                    ser.fill_serial(win, win_base, base, end);
+                    par.fill_parallel(win, win_base, base, end);
+                    assert!(
+                        ser.snapshot().same_as(&par.snapshot()),
+                        "table diverged: seed {seed:x} base {base} span {span}"
+                    );
+                    assert_eq!(ser.fed, par.fed);
+                    assert_eq!(ser.rolling, par.rolling);
+                    // A continuation fill (fed == base) exercises the
+                    // non-restart entry: the serial state carries forward,
+                    // lane zero adopts it directly.
+                    let end2 = end + 4096;
+                    ser.fill_serial(win, win_base, end, end2);
+                    par.fill_parallel(win, win_base, end, end2);
+                    assert!(
+                        ser.snapshot().same_as(&par.snapshot()),
+                        "continuation diverged: seed {seed:x} base {end}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
