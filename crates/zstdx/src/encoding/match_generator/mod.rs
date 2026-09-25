@@ -954,14 +954,17 @@ impl MatchGeneratorDriver {
         // scan domain preserved through `chain_reach` — the opt rows'
         // window/domain split. The length bar keeps every smaller frame's
         // header and parse byte-identical (the 32 MiB corpus population
-        // included), and the arming-context check keeps MT jobs stock
-        // (their per-job LDM restart would need the capture machinery;
-        // recorded residue). A forced window at or past the far domain arms
-        // on its own geometry. R20: a frame-continuous caller that ran the
-        // pre-header far-class screen (`FrameScreened`, see
+        // included), and the arming-context check keeps unengaged MT jobs
+        // stock. A forced window at or past the far domain arms on its own
+        // geometry. R20: a frame-continuous caller that ran the pre-header
+        // far-class screen (`FrameScreened`, see
         // `fast_row_screen_pending`) arms the mid-size band too — the
         // screen, not the header-time geometry, separated the far-class
-        // source from the same-size random one.
+        // source from the same-size random one. R21: a capture job
+        // (`JobPrefix`, an arming only the mt planner's own screen or
+        // geometry engages — see `far_screen::mt_capture_window`) parses
+        // with the far window its frame declared; chain rows take nothing
+        // here (their capture window is the row's own).
         let declared = |bar: u64| matches!(self.shape.len, Some(n) if n >= bar);
         if params.ldm
             && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
@@ -969,6 +972,8 @@ impl MatchGeneratorDriver {
             && match self.ldm_arming {
                 LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
                 LdmArming::FrameScreened => declared(LDM_MIDSIZE_WINDOW as u64),
+                #[cfg(feature = "std")]
+                LdmArming::JobPrefix => declared(LDM_MIDSIZE_WINDOW as u64),
                 _ => false,
             }
         {
@@ -2949,13 +2954,24 @@ pub(in crate::encoding) use hash::extend_match;
 use hash::*;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
-    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_QUIET,
-    LEVEL_PARAMS, LdmFill, LevelParams, SmallDictRow, Strategy, ldm_min_window, params_for,
-    sampled_distinct, small_dict_row,
+    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
+    SmallDictRow, Strategy, ldm_min_window, params_for, sampled_distinct, small_dict_row,
 };
-pub(crate) use params::{LDM_SYMS_MIN, LdmArming};
+pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
+
+/// Whether `level`/`shape` names a fast/dfast LDM row whose stock window
+/// sits below the far domain — the population the pre-header far-class
+/// screen (encoding::far_screen) serves. Every far-class arming context
+/// for these rows keys on this plus a declared-length bar (see
+/// `apply_level` and `far_screen::mt_capture_window`).
+pub(crate) fn fast_row_far_class(level: Level, shape: InputShape) -> bool {
+    let params = params_for(level, shape);
+    params.ldm
+        && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
+        && params.window < LDM_FULL_WINDOW
+}
 
 /// Whether a frame at `level`/`shape` should run the pre-header far-class
 /// screen (encoding::far_screen): a fast/dfast row with LDM whose stock
@@ -2967,10 +2983,7 @@ pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
 /// sample would be falsely rejected there, where geometry must keep
 /// arming it).
 pub(crate) fn fast_row_screen_pending(level: Level, shape: InputShape) -> bool {
-    let params = params_for(level, shape);
-    params.ldm
-        && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
-        && params.window < LDM_FULL_WINDOW
+    fast_row_far_class(level, shape)
         && matches!(
             shape.len,
             Some(n) if (LDM_MIDSIZE_WINDOW as u64..LDM_FULL_WINDOW as u64).contains(&n)

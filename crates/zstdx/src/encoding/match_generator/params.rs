@@ -268,11 +268,11 @@ pub(super) const LDM_CANARY: u8 = 8;
 /// (clamped to W25) still arms — the dll32-class far classes measured
 /// −19.7% size there — while the quiet latch bounds the discovery cost the
 /// same-size far-less shapes pay.
-pub(super) const LDM_MIDSIZE_WINDOW: usize = 1 << 25;
+pub(crate) const LDM_MIDSIZE_WINDOW: usize = 1 << 25;
 
 /// The [`LdmArming::Job`] bar: the row's full window, meaning the source
 /// clamp left it intact.
-pub(super) const LDM_FULL_WINDOW: usize = 1 << 26;
+pub(crate) const LDM_FULL_WINDOW: usize = 1 << 26;
 
 /// Sampled distinct-byte count the mid-size population's first parsed
 /// block must show to stay armed: low alphabets (skewed's 16 symbols,

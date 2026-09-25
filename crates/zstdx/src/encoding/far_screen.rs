@@ -22,7 +22,9 @@
 
 use alloc::vec;
 
-use super::match_generator::{LDM_SYMS_MIN, LdmArming};
+use super::match_generator::{
+    LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming, fast_row_far_class,
+};
 
 /// Head sample the screen reads. dll32's head measures 0.6% / 1.3% /
 /// 22.6% twin density at 1 / 2 / 4 MiB — the 2-4 MiB distance class
@@ -69,6 +71,32 @@ pub(crate) fn frame_arming(head: &[u8]) -> LdmArming {
     } else {
         LdmArming::Frame
     }
+}
+
+/// The bulk-mt planner's fast-row capture window (the R21 port of the
+/// R19/R20 far class to multithreaded frames): the far window a captured
+/// frame's jobs widen to, when the frame's own evidence arms it — the
+/// full band (declared length >= LDM_FULL_WINDOW) on geometry exactly as
+/// the frame-continuous entry, the mid-size band on this screen's verdict
+/// over `span` (the caller's head sample, clamped to [`SCREEN_SPAN`]).
+/// `None` for every other class: the chain rows derive their capture
+/// window from their own row parameters, and a rejected or below-band
+/// fast row keeps the stock per-job parse. Deterministic in the input and
+/// level alone, so the grid and the frame bytes stay worker-independent.
+pub(crate) fn mt_capture_window(
+    level: crate::Level,
+    shape: crate::InputShape,
+    span: &[u8],
+) -> Option<u64> {
+    let len = shape.len?;
+    if !fast_row_far_class(level, shape) || len < LDM_MIDSIZE_WINDOW as u64 {
+        return None;
+    }
+    if len >= LDM_FULL_WINDOW as u64 {
+        return Some(LDM_FULL_WINDOW as u64);
+    }
+    let span = &span[..span.len().min(SCREEN_SPAN)];
+    (screen(span) == FarHead::FarRepeats).then_some(LDM_FULL_WINDOW as u64)
 }
 
 /// One random u64 per byte value (libzstd's `ZSTD_ldm_gearTab` idiom).

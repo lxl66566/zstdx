@@ -28,15 +28,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use super::{
     Matcher,
     checksum::SliceChecksum,
-    compress_fastest,
+    compress_fastest, far_screen,
     frame_compressor::{
         CompressState, JobSpf, compress_job_blocks_inner, new_slice_state, reset_slice_state,
         return_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
-        LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
-        ldm_head_parses,
+        LDM_FULL_WINDOW, LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX,
+        SPF_SEG, StripSnapshot, ldm_head_parses,
     },
     reach_probe,
 };
@@ -87,8 +87,10 @@ pub fn mt_job_size_for(
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     // Capture frames pin the grid at the reach floor (worker-independent
     // — see `capture_grid`); the analysis tools must cut at the grid the
-    // encoder actually runs.
-    capture_grid(len, level, shape, choice, head)
+    // encoder actually runs. `head` is the whole input (the screen clamps
+    // its own span).
+    let fast_window = far_screen::mt_capture_window(level, shape, head);
+    capture_grid(len, level, shape, choice, head, fast_window)
         .unwrap_or_else(|| job_size_for(len, workers.max(2), overlap))
 }
 
@@ -133,6 +135,10 @@ pub fn compress_slice_mt(
     // a full-window strip would scale the job floor with the LDM reach and
     // starve parallelism.
     let window = MatchGeneratorDriver::window_for_level(level, shape);
+    // The fast rows' far-class capture window (R21): resolved from the
+    // same head sample the frame-continuous entries screen — None for
+    // every chain row (strategy-checked before any screen work runs).
+    let fast_window = far_screen::mt_capture_window(level, shape, src);
     // The frame's head decides its chain reach (see reach_probe), and with
     // it the strip: a shrunk search domain shrinks the strip to match.
     // Eligible frames donate the probe's keep side into job zero (see
@@ -174,6 +180,7 @@ pub fn compress_slice_mt(
             shape,
             reach_probe::ReachChoice::Keep,
             head,
+            fast_window,
         )
         .unwrap_or_else(|| job_size_for(src.len() as u64, workers.max(2), keep_strip));
         keep_plan = plan_prefix_ldm(
@@ -183,6 +190,7 @@ pub fn compress_slice_mt(
             reach_probe::ReachChoice::Keep,
             keep_job_size,
             src.len().div_ceil(keep_job_size),
+            fast_window,
         );
         donation_prefix = keep_plan.is_some();
         let (donated_choice, state, prefix) =
@@ -202,7 +210,7 @@ pub fn compress_slice_mt(
     }
     let donation = Mutex::new(donation);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
-    let job_size = capture_grid(src.len() as u64, level, shape, choice, head)
+    let job_size = capture_grid(src.len() as u64, level, shape, choice, head, fast_window)
         .unwrap_or_else(|| job_size_for(src.len() as u64, workers, overlap));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
@@ -220,16 +228,23 @@ pub fn compress_slice_mt(
         // plans from its final schedule.
         keep_plan
             .take()
-            .or_else(|| plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs))
+            .or_else(|| plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs, fast_window))
     } else {
         None
     };
-    // Pairing invariant: a capture the frame runs is one the donated job
-    // zero armed for. The reverse direction is trivially the gate's own
-    // computation; a capture without any donation cannot happen (the
-    // capture's window band keeps the frame probe-eligible, so the gate
-    // passed and the plan was computed there).
-    debug_assert!(spf.is_none() || donation_prefix);
+    // Pairing invariant: a chain-row capture the frame runs is one the
+    // donated job zero armed for (the capture's window band keeps the
+    // frame probe-eligible, so the gate passed and the plan was computed
+    // there). The fast rows' capture (`fast_window`) never donates — the
+    // rows are not probe subjects, and their grid is pinned the same way.
+    debug_assert!(spf.is_none() || donation_prefix || fast_window.is_some());
+    // A captured fast row declares and runs the far window its screen or
+    // geometry armed (the chain rows' capture window is already their own
+    // row window, so `window` moves only on the fast rows).
+    let window = match (&spf, fast_window) {
+        (Some(_), Some(far)) => far,
+        _ => window,
+    };
     let job_overlap = if spf.is_some() {
         window as usize
     } else {
@@ -699,21 +714,44 @@ pub(crate) fn capture_job_size(len: u64, reach: usize) -> usize {
     len.div_ceil(8).clamp(floor as u64, CAPTURE_JOB_CAP) as usize
 }
 
+/// The capture classes' head engagement screen, shared by `capture_grid`
+/// and `plan_prefix_ldm`: the chain rows and the fast rows' full band keep
+/// the near-repeat collision screen (`ldm_head_parses`) — what keeps a
+/// max-entropy head (random) or a low-alphabet one (json-class) out of
+/// the capture's per-job LDM machinery — while the fast rows' mid band
+/// carries the far screen's own verdict (the content-aligned twin count
+/// that armed the window in `far_screen::mt_capture_window`, strictly
+/// stronger evidence than the collision this checks for). `head_block` is
+/// the frame's first block.
+fn capture_head_parses(
+    shape: crate::InputShape,
+    fast_window: Option<u64>,
+    head_block: &[u8],
+) -> bool {
+    if fast_window.is_some() && shape.len.is_some_and(|n| n < LDM_FULL_WINDOW as u64) {
+        return true;
+    }
+    ldm_head_parses(head_block)
+}
+
 /// The capture grid's job size when the frame's class engages the shared
 /// prefix fill (see `plan_prefix_ldm`): pinned at the reach floor — the
 /// same gates as the plan, so the grid the plan was laid out on is the
 /// one the encoder runs, and it is independent of the worker count (the
 /// frame bytes cannot depend on how many workers pick the jobs up).
+/// `fast_window` is the fast rows' pre-screened capture window
+/// (`far_screen::mt_capture_window`; `None` for every other class).
 fn capture_grid(
     len: u64,
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
     head: &[u8],
+    fast_window: Option<u64>,
 ) -> Option<usize> {
-    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice)?;
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
     let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
-    if !ldm_head_parses(head) {
+    if !capture_head_parses(shape, fast_window, head) {
         return None;
     }
     let job_size = capture_job_size(
@@ -741,7 +779,9 @@ fn capture_grid(
 /// class plus a head that both parses and carries a wide alphabet, and a
 /// job grid whose prefix strips are large enough to pay for the shared
 /// fill. Deterministic in the input and level alone (the grid is pinned,
-/// see `capture_grid`).
+/// see `capture_grid`). `fast_window` is the fast rows' pre-screened
+/// capture window (`far_screen::mt_capture_window`; `None` for every
+/// other class).
 fn plan_prefix_ldm(
     src: &[u8],
     level: Level,
@@ -749,16 +789,17 @@ fn plan_prefix_ldm(
     choice: reach_probe::ReachChoice,
     job_size: usize,
     n_jobs: usize,
+    fast_window: Option<u64>,
 ) -> Option<PrefixPlan> {
-    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice)?;
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
     let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
-    if !ldm_head_parses(head) {
+    if !capture_head_parses(shape, fast_window, head) {
         return None;
     }
     debug_assert_eq!(
         shape
             .len
-            .and_then(|len| capture_grid(len, level, shape, choice, head)),
+            .and_then(|len| capture_grid(len, level, shape, choice, head, fast_window)),
         Some(job_size),
         "the caller pinned the capture grid"
     );
@@ -1045,7 +1086,7 @@ mod tests {
         common::MAX_BLOCK_SIZE,
         decoding::FrameDecoder,
         encoding::{
-            match_generator::{LdmArming, MatchGeneratorDriver},
+            match_generator::{LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver},
             reach_probe::ReachChoice,
         },
     };
@@ -1099,7 +1140,7 @@ mod tests {
                 MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
                     as usize;
             // The planner pins the capture grid (see `compress_slice_mt`).
-            let job_size = capture_grid(len, Level::Balanced, shape, ReachChoice::Keep, &src)
+            let job_size = capture_grid(len, Level::Balanced, shape, ReachChoice::Keep, &src, None)
                 .unwrap_or_else(|| job_size_for(len, workers.max(2), strip));
             let n_jobs = len.div_ceil(job_size as u64) as usize;
             let plan = plan_prefix_ldm(
@@ -1109,6 +1150,7 @@ mod tests {
                 ReachChoice::Keep,
                 job_size,
                 n_jobs,
+                None,
             );
             assert_eq!(
                 plan.is_some(),
@@ -1141,6 +1183,7 @@ mod tests {
             ReachChoice::Keep,
             job_size,
             shape.len.unwrap().div_ceil(job_size as u64) as usize,
+            None,
         );
         assert_eq!(plan.is_some(), false);
         assert_eq!(donation_arming(plan.is_some()), LdmArming::Job);
@@ -1215,6 +1258,113 @@ mod tests {
             state
         };
         (0..len).map(|_| (rand() & 0xff) as u8).collect()
+    }
+
+    /// The fast rows' far-class capture (R21): a mid-band far-class frame —
+    /// the R20 fixture class, near-field head twins clearing the screen's
+    /// cheap-reject bar and 3 MiB unit copies carrying the paying 2-4 MiB
+    /// class — grids onto the capture lattice with the far window declared
+    /// and the far class riding cross-job LDM, while a same-size random
+    /// source stays stock. The capture is deterministic in the input alone
+    /// (mt4 == mt8), and the armed multithreaded frame tracks the armed
+    /// single-threaded one (the workers-1 fallback runs the same screen).
+    #[test]
+    fn fast_row_midband_capture_arms_and_random_stays_stock() {
+        let mib = 1024 * 1024;
+        let head = lcg(256 * 1024);
+        let unit = lcg(3 * mib);
+        let mut data = Vec::with_capacity(4 * head.len() + 11 * unit.len());
+        for (src, copies) in [(&head, 4u32), (&unit, 11u32)] {
+            for copy in 0..copies {
+                for (i, &b) in src.iter().enumerate() {
+                    data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                        b ^ 0x5a
+                    } else {
+                        b
+                    });
+                }
+            }
+        }
+        let random = lcg(data.len());
+        for level in [Level::Fastest, Level::Fast] {
+            let st = compress_slice_mt(&data, level, true, 1, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None);
+            for (name, frame) in [("st", &st), ("mt4", &mt4)] {
+                let mut out = vec![0u8; data.len()];
+                let mut decoder = FrameDecoder::new();
+                let n = decoder
+                    .decode_all(frame, &mut out)
+                    .unwrap_or_else(|e| panic!("{level:?} {name}: {e}"));
+                assert_eq!((n, &out[..n]), (data.len(), &data[..]), "{level:?} {name}");
+                let mut libzstd = Vec::new();
+                zstd::stream::copy_decode(frame.as_slice(), &mut libzstd).unwrap();
+                assert_eq!(libzstd, data, "{level:?} {name} libzstd");
+            }
+            assert_eq!(mt4, mt8, "{level:?}: mt4 != mt8");
+            // The armed frame carries the far window (W26) in its window
+            // descriptor byte, at the same offset the single-threaded
+            // entry's does.
+            assert_eq!(mt4[5], 0x80, "{level:?}: armed window descriptor");
+            // The far class rides the cross-job LDM: within the job-split
+            // noise of the frame-continuous armed parse, and far under the
+            // stock parse a same-size random source takes.
+            assert!(
+                mt4.len() <= st.len() + st.len() / 20,
+                "{level:?}: mt {} vs armed st {}",
+                mt4.len(),
+                st.len()
+            );
+            let stock_random = compress_slice_mt(&random, level, true, 4, None);
+            assert!(
+                mt4.len() * 2 < stock_random.len(),
+                "{level:?}: armed {} vs random {}",
+                mt4.len(),
+                stock_random.len()
+            );
+            // The random head fails the screen: its frame keeps the stock
+            // window — the same header bytes a below-band random source
+            // carries (the FCS tail differs; the prefix compared here does
+            // not).
+            let below_band = compress_slice_mt(&random[..15 * mib], level, true, 4, None);
+            assert_eq!(
+                &stock_random[..6],
+                &below_band[..6],
+                "{level:?}: stock header moved"
+            );
+        }
+    }
+
+    /// The fast rows' full-band capture engages on geometry (no screen may
+    /// run there), gated by the same head engagement screen the chain rows
+    /// use — a max-entropy head keeps the per-job stock parse.
+    #[test]
+    fn fast_row_fullband_capture_engages_on_geometry() {
+        let parses = pattern_head(MAX_BLOCK_SIZE as usize);
+        let rejects = lcg(MAX_BLOCK_SIZE as usize);
+        let shape = crate::InputShape {
+            len: Some(100 * 1024 * 1024),
+            window_log: None,
+        };
+        for level in [Level::Fastest, Level::Fast] {
+            for (name, head) in [("parses", &parses), ("random", &rejects)] {
+                let fast_window = super::far_screen::mt_capture_window(level, shape, head);
+                assert_eq!(
+                    fast_window,
+                    Some(LDM_FULL_WINDOW as u64),
+                    "{level:?} {name}"
+                );
+                let grid = capture_grid(
+                    shape.len.unwrap(),
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    head,
+                    fast_window,
+                );
+                assert_eq!(grid.is_some(), name == "parses", "{level:?} {name}");
+            }
+        }
     }
 
     /// Text-like data: repeating vocabulary with variation, so matches,
