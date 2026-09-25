@@ -290,15 +290,23 @@ pub fn compress_slice_mt(
                     }
                     let start = id * job_size;
                     let end = (start + job_size).min(src.len());
-                    // Adopters of the shared prefix fill wait for the
-                    // calling thread's build (it runs while the workers
-                    // encode the below-boundary jobs); a start the build's
+                    // The no-build capture never waits: an above-median
+                    // job takes the snapshot-less windowed prefill and
+                    // cold-fills its own span, a below-median job the
+                    // stock strip fill. Adopters of the shared prefix
+                    // fill (the build bands) wait for the calling
+                    // thread's build (it runs while the workers encode
+                    // the below-boundary jobs); a start the build's
                     // freeze overshot keeps the stock whole-prefix fill,
                     // and the windowed band takes the newest LDM snapshot
-                    // at or below its start (the adoption is byte-invariant
-                    // in the snapshot's boundary, so which one lands is
-                    // pure scheduling).
+                    // at or below its start (the adoption is
+                    // byte-invariant in the snapshot's boundary, so which
+                    // one lands is pure scheduling).
                     let snapshot = match spf.as_ref() {
+                        Some(PrefixPlan::SelfFill { med }) if start as u64 > *med => {
+                            JobSpfOwned::Windowed(None)
+                        },
+                        Some(PrefixPlan::SelfFill { .. }) => JobSpfOwned::None,
                         Some(plan) if start as u64 > plan_med(plan) => match plan {
                             PrefixPlan::Whole { med: _, share } => {
                                 match wait_prefix_build(share, &ready, &poison) {
@@ -329,6 +337,8 @@ pub fn compress_slice_mt(
                                     None => JobSpfOwned::Windowed(None),
                                 }
                             },
+                            // Intercepted by the no-build arms above.
+                            PrefixPlan::SelfFill { .. } => unreachable!(),
                         },
                         _ => JobSpfOwned::None,
                     };
@@ -386,7 +396,9 @@ pub fn compress_slice_mt(
 
         // Build the shared prefix fill on the calling thread while the
         // workers encode: one sequential fill to the median boundary in
-        // place of the tail jobs' redundant whole-prefix fills.
+        // place of the tail jobs' redundant whole-prefix fills. The
+        // no-build capture skips this entirely — its jobs never wait for
+        // a snapshot, so a serial fill here would only extend the wall.
         if let Some(plan) = &spf {
             #[cfg(feature = "job_trace")]
             let trace_spf = std::time::Instant::now();
@@ -405,6 +417,7 @@ pub fn compress_slice_mt(
                 // bounded wherever the build has reached when the job's
                 // worker picks it up.
                 PrefixPlan::Windowed(w) => build_ldm_prefix_chain(src, level, shape, w, &ready),
+                PrefixPlan::SelfFill { .. } => {},
             }
             ready.notify_all();
             #[cfg(feature = "job_trace")]
@@ -647,13 +660,28 @@ struct PrefixBuild {
 /// their whole frame prefix from scratch. Two bands share the schedule:
 /// the mid-size band builds one whole-strip snapshot to `med`, the
 /// full-window band runs an LDM-only chain of snapshots through the last
-/// adopter's start.
+/// adopter's start. The fast rows' capture takes neither: their encode is
+/// too cheap to hide a serial build, so every job cold-fills its own
+/// window span on its worker (the no-build schedule).
 enum PrefixPlan {
     Whole {
         med: u64,
         share: Arc<Mutex<Option<PrefixBuild>>>,
     },
     Windowed(WindowPlan),
+    /// The fast rows' no-build capture (R22): no shared fill, no waits.
+    /// Jobs above `med` take the snapshot-less [`JobSpf::Windowed`] and
+    /// `windowed_ldm_prefill` cold-fills their clamped window span
+    /// (bit-identical to the adoption it replaces below the window bar —
+    /// where the whole frame prefix is the span; above it the cold re-arm
+    /// reshuffles equal-length tie-breaks, see `windowed_ldm_prefill`);
+    /// jobs at or below `med` keep the stock [`JobSpf::None`] strip fill
+    /// exactly as the build bands' below-boundary jobs — the same split
+    /// the shared build made, so a source inside the window keeps its
+    /// bytes untouched.
+    SelfFill {
+        med: u64,
+    },
 }
 
 /// The windowed band's plan: an LDM-only build that starts at `med` and
@@ -675,11 +703,12 @@ struct WindowShare {
     done: bool,
 }
 
-/// The median boundary shared by both bands' schedules.
+/// The median boundary shared by the build bands' schedules.
 fn plan_med(plan: &PrefixPlan) -> u64 {
     match plan {
         PrefixPlan::Whole { med, .. } => *med,
         PrefixPlan::Windowed(w) => w.med,
+        PrefixPlan::SelfFill { .. } => 0,
     }
 }
 
@@ -817,6 +846,13 @@ fn plan_prefix_ldm(
     // adopters' parallel remainder fills (the same balance point the
     // streaming core's finish tail picks).
     let med = (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64;
+    // The fast rows' capture runs the no-build schedule (see
+    // `PrefixPlan::SelfFill`): their encode cannot hide a serial build, so
+    // the engagement conditions above stay the only gates and every
+    // above-boundary job owns its fill.
+    if fast_window.is_some() {
+        return Some(PrefixPlan::SelfFill { med });
+    }
     if MatchGeneratorDriver::windowed_ldm_capture(window) {
         // The last adopting job's start: the build needs to reach it (its
         // own remainder fill then covers the rest), and no further.
@@ -1364,6 +1400,67 @@ mod tests {
                 );
                 assert_eq!(grid.is_some(), name == "parses", "{level:?} {name}");
             }
+        }
+    }
+
+    /// The fast rows' no-build capture (R22): a full-band frame runs every
+    /// job on the snapshot-less windowed prefill — the last jobs start
+    /// past the W26 window, so their spans cold re-arm at a non-zero
+    /// `ldm_base` (the distance-filter equivalence, see
+    /// `windowed_ldm_prefill`). The frame stays worker-independent and
+    /// deterministic (no scheduling input exists without a shared build)
+    /// and the far class rides the per-job LDM within the job-split noise
+    /// of the frame-continuous armed parse.
+    #[test]
+    fn fast_row_fullband_capture_self_fills_midstream_jobs() {
+        const MIB: usize = 1024 * 1024;
+        let total = 76 * MIB;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        unit[..head_len].copy_from_slice(&pattern_head(head_len));
+        let head_copy = unit[..head_len].to_vec();
+        unit[MIB..MIB + head_len].copy_from_slice(&head_copy);
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        for level in [Level::Fastest, Level::Fast] {
+            let st = compress_slice_mt(&data, level, true, 1, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None);
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder
+                .decode_all(&mt8, &mut out)
+                .unwrap_or_else(|e| panic!("{level:?}: {e}"));
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]), "{level:?}");
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(mt8.as_slice(), &mut decoded).unwrap();
+            assert_eq!(decoded, data, "{level:?} libzstd");
+            assert_eq!(mt4, mt8, "{level:?}: mt4 != mt8");
+            assert_eq!(
+                mt8,
+                compress_slice_mt(&data, level, true, 8, None),
+                "{level:?}: run-to-run determinism"
+            );
+            assert!(
+                mt8.len() <= st.len() + st.len() / 20,
+                "{level:?}: the far class must survive the self-fill: mt {} vs armed st {}",
+                mt8.len(),
+                st.len()
+            );
         }
     }
 

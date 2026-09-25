@@ -1515,13 +1515,18 @@ impl MatchGeneratorDriver {
     /// [`MatchGeneratorDriver::windowed_ldm_capture`]): seed the LDM state
     /// for a job starting at `job_start` whose LDM window is
     /// `[ldm_base, job_start)` inside `ldm_win`, either from scratch
-    /// (`snap = None`; `ldm_base` must be 0, so the restart-and-fill
-    /// reproduces the shared build's own `[0, job_start)` fill bit for
-    /// bit) or by adopting a snapshot and continuing the fill from its
-    /// freeze point (byte-invariant in `upto`; a snapshot older than
-    /// `ldm_base` re-arms there — the byte-derived rolling state equals
-    /// the continuous one, and the entries the gap leaves missing sit
-    /// beyond the job's window and die on the distance filter).
+    /// (`snap = None`; `ldm_base == 0` restarts and fills the whole frame
+    /// prefix — bit-identical to what an adoption would leave, while a
+    /// mid-stream `ldm_base > 0` cold re-arms there: the entries the gap
+    /// leaves missing sit beyond the job's window and die on the distance
+    /// filter, the re-arm's entry floor blinds only the span's first
+    /// 64 bytes, and the fresh round-robin start reshuffles which of two
+    /// equal-length bucket hits the first-longest tie-break takes — a
+    /// bounded per-job perturbation, not a candidate loss) or by adopting
+    /// a snapshot and continuing the fill from its freeze point
+    /// (byte-invariant in `upto`; a snapshot older than `ldm_base`
+    /// re-arms there — the byte-derived rolling state equals the
+    /// continuous one).
     #[cfg(feature = "std")]
     pub(crate) fn windowed_ldm_prefill(
         &mut self,
@@ -1540,10 +1545,7 @@ impl MatchGeneratorDriver {
         self.ldm_canary = 0;
         match snap {
             Some(s) => ldm.restore(&s.ldm),
-            None => {
-                debug_assert_eq!(ldm_base, 0, "stock windowed jobs are prefix strips");
-                ldm.restart(0);
-            },
+            None => ldm.restart(ldm_base),
         }
         #[cfg(feature = "job_trace")]
         let trace_ldm = std::time::Instant::now();

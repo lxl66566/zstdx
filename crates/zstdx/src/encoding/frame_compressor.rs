@@ -603,8 +603,10 @@ pub(crate) fn compress_job_blocks(
 /// whole-strip snapshot ([`StripSnapshot`], chain tables and LDM), the
 /// windowed full-window band runs the split prefill — chain tables over
 /// the reach tail, LDM over the whole window through an adopted
-/// [`LdmPrefixSnapshot`] (`None` = the stock from-zero fill below the
-/// build's first boundary; byte-equal to an adoption there).
+/// [`LdmPrefixSnapshot`] (`None` = the snapshot-less cold fill: the build
+/// bands' below-boundary jobs, or the fast rows' no-build capture whose
+/// every above-boundary job takes it — see `windowed_ldm_prefill` for
+/// what that costs past the window bar).
 #[cfg(feature = "std")]
 pub(crate) enum JobSpf<'a> {
     None,
@@ -667,30 +669,21 @@ pub(crate) fn compress_job_blocks_inner(
                 state
                     .matcher
                     .prefill_job_strip_chain(&src[strip..job.start], strip as u64);
-                match snap {
-                    Some(s) => {
-                        // The window span continues the snapshot's fill
-                        // (a snapshot older than the window base re-arms
-                        // there — same candidates, see
-                        // `windowed_ldm_prefill`).
-                        let ldm_base = job.start.saturating_sub(overlap) as u64;
-                        state.matcher.windowed_ldm_prefill(
-                            &src[ldm_base as usize..job.start],
-                            ldm_base,
-                            job.start as u64,
-                            Some(s),
-                        );
-                    },
-                    // Stock (below the build's first boundary, or a build
-                    // that never published): fill the whole frame prefix
-                    // — bit-identical to what an adoption would leave.
-                    None => state.matcher.windowed_ldm_prefill(
-                        &src[..job.start],
-                        0,
-                        job.start as u64,
-                        None,
-                    ),
-                }
+                // The job's clamped window span: an adopted snapshot
+                // continues its fill (a snapshot older than the window
+                // base re-arms there — same candidates, see
+                // `windowed_ldm_prefill`), and without one the cold fill
+                // of the same span is bit-identical below the window bar
+                // (a start inside the window keeps the whole-prefix fill);
+                // above it the cold re-arm's perturbation is bounded (see
+                // `windowed_ldm_prefill`).
+                let ldm_base = job.start.saturating_sub(overlap) as u64;
+                state.matcher.windowed_ldm_prefill(
+                    &src[ldm_base as usize..job.start],
+                    ldm_base,
+                    job.start as u64,
+                    snap,
+                );
             }
         },
         JobSpf::None => {
