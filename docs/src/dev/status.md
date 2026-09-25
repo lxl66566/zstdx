@@ -28,7 +28,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 <!-- prettier-ignore -->
 | Capability | Status |
 |---|---|
-| slice/bulk codec | ✅ zero-copy encoding + thread_local state pool; decoding writes directly into the flat output |
+| slice/bulk codec | ✅ zero-copy encoding + state pools (thread-local for ST, cross-thread shared with the stream leases for MT jobs — R25); decoding writes directly into the flat output |
 | streaming codec (read/write Encoder, Decoder) | ✅ streaming output byte-identical to bulk when no flush |
 | MT encoding | ✅ bulk (overlap jobs) + streaming (bursts); workers>1; no_std reports Unsupported |
 | MT decoding | ✅ segment-parallel (stage A pool + serial stage B) plus piece-parallel stage B on ramp frames (`decoding/mt_pieces.rs`, env-paired with the encoder ramp and engaged by measured validation — json.lvl3 mt8 3.2× serial-B at +0.00% size; see [mt-stream](perf/mt-stream.md)); plain frames: json 1.54× ST at mt16 (= 1.16× the zstd stream reference), text flat, skewed 1.06-1.22× — remaining floors in todo 1 |

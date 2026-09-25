@@ -166,6 +166,76 @@ pub(crate) fn reset_slice_state(
     }
 }
 
+/// Reusable compression states, global across threads and calls: the
+/// bulk path's jobs run on `thread::scope` workers that die with the call,
+/// so a thread-local slot would drop its tables at thread exit and every
+/// call would re-pay the tables' first-touch (the strip fill's dominant
+/// cost on a cold pool: ~2.5k page faults and 3x the warm fill time per
+/// chain-row job). The stream side's worker leases share this pool (see
+/// `stream::mt_pool`); every job clears what it reads, so state
+/// provenance cannot reach the bytes. Depth-capped so one-off worker
+/// counts do not pin memory forever.
+#[cfg(feature = "std")]
+static STATE_POOL: std::sync::OnceLock<
+    std::sync::Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+> = std::sync::OnceLock::new();
+#[cfg(feature = "std")]
+const STATE_POOL_DEPTH: usize = 32;
+
+/// Pop a state from the global pool, if one is parked there. Raw pair
+/// half: no reset, callers configure the state themselves.
+#[cfg(feature = "std")]
+pub(crate) fn pop_state_pool() -> Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>> {
+    STATE_POOL
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+}
+
+/// Return a state to the global pool (see [`STATE_POOL`]); at depth the
+/// state drops instead. Raw pair half of [`pop_state_pool`].
+#[cfg(feature = "std")]
+pub(crate) fn push_state_pool(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
+    let pool = STATE_POOL.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pool.len() < STATE_POOL_DEPTH {
+        pool.push(state);
+    }
+}
+
+/// Take a state for a caller whose worker threads do not outlive the
+/// call (the bulk path's `thread::scope` jobs): the cross-thread pool
+/// above, falling back to a fresh state, reset for a fresh frame at
+/// `level` exactly like [`take_slice_state`].
+pub(crate) fn take_pooled_slice_state(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
+) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    #[cfg(feature = "std")]
+    if let Some(mut s) = pop_state_pool() {
+        reset_slice_state(&mut s, level, shape, choice, ldm);
+        return s;
+    }
+    let mut fresh = alloc::boxed::Box::new(new_slice_state());
+    reset_slice_state(&mut fresh, level, shape, choice, ldm);
+    fresh
+}
+
+/// Return a state taken by [`take_pooled_slice_state`].
+pub(crate) fn return_pooled_slice_state(
+    state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+) {
+    #[cfg(feature = "std")]
+    push_state_pool(state);
+    #[cfg(not(feature = "std"))]
+    drop(state);
+}
+
 /// Take the per-thread pooled slice state, reset for a fresh frame at
 /// `level`. Fresh states are built (and reset) when the pool is empty.
 pub(crate) fn take_slice_state(

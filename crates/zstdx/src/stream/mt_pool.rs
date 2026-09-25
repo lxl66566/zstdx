@@ -17,33 +17,19 @@ use crate::encoding::{
     match_generator::MatchGeneratorDriver,
 };
 
-// Reusable worker states, global across encoders. The thread leases (see
-// `THREAD_POOL`) carry their state across encoders now, but a lease's
-// thread still starts cold whenever the pool misses or a worker retires,
-// and the inline-job path borrows from here — so states pool globally.
-// Every job clears what it reads, so state provenance cannot reach the
-// bytes. Depth-capped so one-off worker counts do not pin memory forever.
-static STATE_POOL: std::sync::OnceLock<
-    Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
-> = std::sync::OnceLock::new();
-const STATE_POOL_DEPTH: usize = 32;
-
+// Reusable worker states: the global cross-thread pool in
+// `encoding::frame_compressor`, shared with the bulk path's scope-thread
+// jobs since R25. The thread leases (see `THREAD_POOL`) carry their state
+// across encoders, but a lease's thread still starts cold whenever the
+// pool misses or a worker retires, and the inline-job path borrows from
+// here. Every job clears what it reads, so state provenance cannot reach
+// the bytes (the pool's depth cap lives with the pool).
 pub(super) fn take_pooled_state() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
-    let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
-    pool.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pop()
-        .unwrap_or_else(new_slice_state_boxed)
+    crate::encoding::frame_compressor::pop_state_pool().unwrap_or_else(new_slice_state_boxed)
 }
 
 pub(super) fn return_pooled_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
-    let pool = STATE_POOL.get_or_init(|| Mutex::new(Vec::new()));
-    let mut pool = pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if pool.len() < STATE_POOL_DEPTH {
-        pool.push(state);
-    }
+    crate::encoding::frame_compressor::push_state_pool(state);
 }
 
 fn new_slice_state_boxed() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
