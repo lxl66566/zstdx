@@ -1286,13 +1286,15 @@ impl MtEncoderCore {
     /// never cleared the staging gate keeps the stock reach (the schedule's
     /// pure-function property — the verdict was never taken), and a posted
     /// donation is waited out and applied.
-    fn settle_probe(&mut self) {
+    fn settle_probe(&mut self, finishing: bool) {
         if self.probe_pending {
             self.probe_pending = false;
-            self.reserve_decided();
+            if !finishing {
+                self.reserve_decided();
+            }
         }
         if self.probe_wait.is_some() {
-            self.resolve_probe();
+            self.resolve_probe(finishing);
         }
         // A flush or finish inside the fast-row capture's staging span
         // cancels it back to stock (the R20 semantics: the verdict was
@@ -1308,7 +1310,7 @@ impl MtEncoderCore {
     /// the donated state and prefix for job zero's continuation. Every
     /// outcome re-reserves the decided schedule's working scale (the
     /// pending reserve covers only the head).
-    fn resolve_probe(&mut self) {
+    fn resolve_probe(&mut self, finishing: bool) {
         let Some((keep_job, shrink_job)) = self.probe_wait.take() else {
             return;
         };
@@ -1367,8 +1369,11 @@ impl MtEncoderCore {
         }
         // Nothing else is in flight at this point (nothing posts while the
         // verdict is unconsumed and the donation tasks just completed), so
-        // the growth below needs no quiesce wait.
-        self.reserve_decided();
+        // the growth below needs no quiesce wait. The finish tail skips
+        // it: no append can follow a finish (see `settle_probe`).
+        if !finishing {
+            self.reserve_decided();
+        }
     }
 
     /// A pledged keep-class frame whose source-clamped window lands in the
@@ -1690,7 +1695,7 @@ impl MtEncoderCore {
                 .as_ref()
                 .is_some_and(|(k, s)| k.is_done() && s.is_done())
             {
-                self.resolve_probe();
+                self.resolve_probe(false);
             }
             let end = self.job_end(self.job_start);
             if !self.post_due(end) {
@@ -1699,7 +1704,7 @@ impl MtEncoderCore {
             if self.probe_wait.is_some() {
                 // The verdict re-derives the grid (a Shrink re-grids from
                 // offset zero) — recompute the schedule before posting.
-                self.resolve_probe();
+                self.resolve_probe(false);
                 continue;
             }
             self.post_job(self.job_start, end, false, None);
@@ -1815,7 +1820,7 @@ impl MtEncoderCore {
         // with the stock reach (see the module docs).
         #[cfg(feature = "job_trace")]
         let settle_t0 = std::time::Instant::now();
-        self.settle_probe();
+        self.settle_probe(last_frame_block);
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_fin_settle(settle_t0);
         if spf.is_some() && self.choice == ReachChoice::Shrink {
@@ -1949,7 +1954,8 @@ impl MtEncoderCore {
                 .as_ref()
                 .is_some_and(|(k, s)| k.is_done() && s.is_done())
             {
-                self.resolve_probe();
+                // The build only runs inside the finish tail.
+                self.resolve_probe(true);
             }
             // With the probe machinery settled, the far-class screen
             // is safe to run here and cannot disagree with the
