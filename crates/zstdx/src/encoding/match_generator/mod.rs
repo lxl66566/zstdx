@@ -960,24 +960,39 @@ impl MatchGeneratorDriver {
         // far-class screen (`FrameScreened`, see
         // `fast_row_screen_pending`) arms the mid-size band too — the
         // screen, not the header-time geometry, separated the far-class
-        // source from the same-size random one. R21: a capture job
+        // source from the same-size random one. R23: an unpledged stream
+        // (no declared length) passes the screened bar on the verdict
+        // alone — the same evidence with no geometry to check against,
+        // and a window descriptor is a maximum, so shorter content stays
+        // legal. R21: a capture job
         // (`JobPrefix`, an arming only the mt planner's own screen or
         // geometry engages — see `far_screen::mt_capture_window`) parses
         // with the far window its frame declared; chain rows take nothing
         // here (their capture window is the row's own).
         let declared = |bar: u64| matches!(self.shape.len, Some(n) if n >= bar);
+        // The screened bar minus the length: the screen's accept is the
+        // evidence, so an open-ended frame (declared length `None`, the
+        // unpledged stream entry) passes it too.
+        let screened = |bar: u64| !matches!(self.shape.len, Some(n) if n < bar);
         if params.ldm
             && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
             && params.window < LDM_FULL_WINDOW
             && match self.ldm_arming {
                 LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
-                LdmArming::FrameScreened => declared(LDM_MIDSIZE_WINDOW as u64),
+                LdmArming::FrameScreened => screened(LDM_MIDSIZE_WINDOW as u64),
                 #[cfg(feature = "std")]
                 LdmArming::JobPrefix => declared(LDM_MIDSIZE_WINDOW as u64),
                 _ => false,
             }
         {
-            params.chain_reach = Some(params.window);
+            // The preserved scan domain is the stock window as a power of
+            // two: a declared length at or past the row's window rounds it
+            // there (`adjust_params`), and an open-length frame that armed
+            // staged at least the screen's 4 MiB span, so the same rounding
+            // is the length a pledged twin would have declared — without it
+            // the Fastest row's 768 KiB domain would parse the 768 KiB-1 MiB
+            // offset band differently than every armed pledged frame.
+            params.chain_reach = Some(params.window.next_power_of_two());
             params.window = LDM_FULL_WINDOW;
         }
         // The reach change alone must not re-derive anything: the tables'
@@ -2983,13 +2998,17 @@ pub(crate) fn fast_row_far_class(level: Level, shape: InputShape) -> bool {
 /// the row never arms, so neither side runs a screen (and no screen may
 /// run at the full window: a far-class file whose repeats start past the
 /// sample would be falsely rejected there, where geometry must keep
-/// arming it).
+/// arming it). An unpledged stream (no declared length) always screens:
+/// no length exists to band-check, so the screen's own verdict is the
+/// arming evidence — a window descriptor is a maximum, content may run
+/// shorter — and a stream ending or flushing below the screen's staging
+/// span never pays it (the core cancels the pending screen there).
 pub(crate) fn fast_row_screen_pending(level: Level, shape: InputShape) -> bool {
     fast_row_far_class(level, shape)
-        && matches!(
-            shape.len,
-            Some(n) if (LDM_MIDSIZE_WINDOW as u64..LDM_FULL_WINDOW as u64).contains(&n)
-        )
+        && match shape.len {
+            None => true,
+            Some(n) => (LDM_MIDSIZE_WINDOW as u64..LDM_FULL_WINDOW as u64).contains(&n),
+        }
 }
 use parse_row::{row_hash_at, row_insert, row_insert_fill};
 use price::*;

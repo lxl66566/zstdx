@@ -105,8 +105,16 @@ pub(crate) struct FrameEncoderCoreSt {
     /// Tail state of the emitted block stream (see [`BlockTail`]).
     tail: BlockTail,
     /// Input bytes of the block currently being assembled; always shorter
-    /// than the block size outside [`FrameEncoderCoreSt::write`].
+    /// than the block size outside [`FrameEncoderCoreSt::write`]. The
+    /// [`Self::staged_start`] cursor holds the prefix already consumed by
+    /// emitted blocks (compacted once per staging round, not per block —
+    /// draining a multi-block staging window block-by-block would memmove
+    /// the whole remaining span per block, ~2x the input volume at the
+    /// screen's 4 MiB gate).
     staged: Vec<u8>,
+    /// Consumed prefix of [`Self::staged`]: `staged[staged_start..]` is the
+    /// un-emitted input.
+    staged_start: usize,
     /// Whether the frame's reach probe (see [`reach_probe`]) is still
     /// pending: the first [`reach_probe::PROBE_SPAN`] bytes stage as one
     /// contiguous unit before the first block is matched.
@@ -232,6 +240,7 @@ impl FrameEncoderCoreSt {
             pos: 0,
             tail: BlockTail::None,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
+            staged_start: 0,
             probe_pending: false,
             screen_pending: false,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
@@ -318,7 +327,10 @@ impl FrameEncoderCoreSt {
         // Dictionary frames keep the stock reach (see reach_probe), so only
         // a plain frame stages the probe's head. The fast rows' mid-size
         // far-class screen stages the same way (see far_screen): the two
-        // are mutually exclusive by row.
+        // are mutually exclusive by row. A pledged mid-band frame and an
+        // unpledged one (no length to band-check — the screen's verdict is
+        // the evidence) both stage here; a stream ending or flushing below
+        // the screen's span cancels it back to stock in write/finish.
         let probe_pending = dict_id.is_none()
             && reach_probe::eligible(options.level, crate::InputShape {
                 len: options.pledged_size,
@@ -357,8 +369,20 @@ impl FrameEncoderCoreSt {
         self.pos = 0;
         self.tail = BlockTail::None;
         self.staged.clear();
+        self.staged_start = 0;
         self.probe_pending = probe_pending;
         self.screen_pending = screen_pending;
+        // A pending gate stages its whole span through `staged` before the
+        // first block emits; reserving the span up front keeps the
+        // amortized growth's realloc copies (about the span itself per
+        // screened frame) off the staging path — the copy volume then
+        // equals the stock per-block staging exactly. Pooled cores keep
+        // the reservation across frames.
+        if screen_pending {
+            self.staged.reserve(far_screen::SCREEN_SPAN);
+        } else if probe_pending {
+            self.staged.reserve(reach_probe::PROBE_SPAN);
+        }
         self.output.clear();
         self.out_read = 0;
         self.blocks = 0;
@@ -394,15 +418,15 @@ impl FrameEncoderCoreSt {
             } else {
                 self.block_size
             };
-            let space = limit - self.staged.len();
+            let space = limit - (self.staged.len() - self.staged_start);
             let n = space.min(data.len());
             self.staged.extend_from_slice(&data[..n]);
             data = &data[n..];
-            if self.staged.len() == limit {
+            if self.staged.len() - self.staged_start == limit {
                 if self.probe_pending {
                     self.state
                         .matcher
-                        .consider_reach_probe(&self.staged, self.level);
+                        .consider_reach_probe(&self.staged[self.staged_start..], self.level);
                     self.probe_pending = false;
                 }
                 if self.screen_pending {
@@ -416,6 +440,7 @@ impl FrameEncoderCoreSt {
                 // header left — the 3-byte empty closing block returns.
                 if !(data.is_empty() && self.pledged == Some(self.pos)) {
                     self.drain_full_blocks();
+                    self.compact_staged();
                 }
             }
             // The pledge is met and every fed byte is staged: the staging
@@ -426,19 +451,35 @@ impl FrameEncoderCoreSt {
             // whatever the consumer drained. A staged tail below one
             // block stays for `finish`.
             if self.pledged == Some(self.pos) {
-                while self.staged.len() >= self.block_size {
+                while self.staged.len() - self.staged_start >= self.block_size {
                     // Final only when the decided block consumes everything
                     // staged (a split leaves the cut's remainder open).
-                    let last = self.next_block_len() >= self.staged.len();
+                    let last = self.next_block_len() >= self.staged.len() - self.staged_start;
                     self.encode_block(last);
                     if last {
                         self.tail = BlockTail::Closed;
                         break;
                     }
                 }
+                self.compact_staged();
             }
         }
         Ok(())
+    }
+
+    /// Un-emitted staged input (`staged[staged_start..]`).
+    fn staged_pending(&self) -> &[u8] {
+        &self.staged[self.staged_start..]
+    }
+
+    /// Drop the consumed staging prefix in one memmove of the remainder.
+    /// Called once per staging round (write, flush, finish), never per
+    /// block.
+    fn compact_staged(&mut self) {
+        if self.staged_start > 0 {
+            self.staged.drain(..self.staged_start);
+            self.staged_start = 0;
+        }
     }
 
     /// The staged head sample has reached [`far_screen::SCREEN_SPAN`]:
@@ -451,7 +492,7 @@ impl FrameEncoderCoreSt {
     /// sample, so both entries reach the same verdict (determinism).
     fn resolve_far_screen(&mut self) {
         self.screen_pending = false;
-        let arming = far_screen::frame_arming(&self.staged);
+        let arming = far_screen::frame_arming(self.staged_pending());
         if arming == LdmArming::Frame {
             return;
         }
@@ -475,7 +516,7 @@ impl FrameEncoderCoreSt {
     /// this is the plain per-block encode; after it, the staged head drains
     /// in block-sized pieces.
     fn drain_full_blocks(&mut self) {
-        while self.staged.len() >= self.block_size {
+        while self.staged.len() - self.staged_start >= self.block_size {
             self.encode_block(false);
         }
     }
@@ -508,16 +549,26 @@ impl FrameEncoderCoreSt {
         // that already took those bytes keeps the empty-block form.
         //
         // A still-pending probe or screen means the frame never staged its
-        // head (a short input or an early finish): the stock frame stays.
+        // head (a short input or an early finish): the stock frame stays,
+        // in the eagerly drained closing form too — the staging window
+        // deferred this frame's emissions to finish, but the one-shot Vec
+        // output an unpledged stream must match carries the empty closing
+        // block on the exact grid multiple, so the in-place patch is not
+        // taken (below the gate the stream is byte-identical to stock).
+        let staged_head = self.probe_pending || self.screen_pending;
         self.probe_pending = false;
         self.screen_pending = false;
         self.drain_full_blocks();
+        self.compact_staged();
         match self.tail {
             // The pledged grid's final block already carries the last
             // flag.
             BlockTail::Closed => {},
             BlockTail::Open(off)
-                if self.staged.is_empty() && self.blocks > 0 && off < self.output.len() =>
+                if !staged_head
+                    && self.staged_start == self.staged.len()
+                    && self.blocks > 0
+                    && off < self.output.len() =>
             {
                 self.output[off] |= 1;
             },
@@ -542,9 +593,10 @@ impl FrameEncoderCoreSt {
         // by block.
         self.probe_pending = false;
         self.screen_pending = false;
-        while !self.staged.is_empty() {
+        while self.staged_start < self.staged.len() {
             self.encode_block(false);
         }
+        self.compact_staged();
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -589,23 +641,26 @@ impl FrameEncoderCoreSt {
     /// otherwise. Sub-block-size staging and the raw-block level keep the
     /// fixed grid, so only proven full windows ever cut.
     fn next_block_len(&mut self) -> usize {
-        if self.level == Level::Uncompressed || self.staged.len() < self.block_size {
-            return self.staged.len().min(self.block_size);
+        let pending = self.staged_pending().len();
+        if self.level == Level::Uncompressed || pending < self.block_size {
+            return pending.min(self.block_size);
         }
         let level = self.state.matcher.pre_split_level();
-        let window = &self.staged[..self.block_size];
+        let window = &self.staged[self.staged_start..self.staged_start + self.block_size];
         self.state.split.block_size(window, level)
     }
 
     fn encode_block(&mut self, last: bool) {
         // At most one block's worth: outside the probe's staging window the
         // staged bytes are always shorter than the block size.
-        let n = self.next_block_len().min(self.staged.len());
+        let n = self
+            .next_block_len()
+            .min(self.staged.len() - self.staged_start);
         debug_assert!(n <= MAX_BLOCK_SIZE as usize);
         let tail = self.state.matcher.block_tail();
-        tail[..n].copy_from_slice(&self.staged[..n]);
+        tail[..n].copy_from_slice(&self.staged[self.staged_start..self.staged_start + n]);
         self.state.matcher.commit_block(n);
-        self.staged.drain(..n);
+        self.staged_start += n;
         if self.blocks == 0 {
             self.output.extend_from_slice(&self.header);
         }

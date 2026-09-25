@@ -393,7 +393,8 @@ pub(crate) enum LdmArming {
     /// the head sample (encoding::far_screen): identical semantics, plus
     /// the fast rows' window widening reaches the mid-size band (declared
     /// length >= LDM_MIDSIZE_WINDOW) instead of requiring the full
-    /// window.
+    /// window — and an open-ended frame (no declared length, the
+    /// unpledged stream entry) widens on the accept alone.
     FrameScreened,
     /// A multithreaded job: the table restarts per job, so only strip- and
     /// own-span-sourced candidates exist — the strip fill is an

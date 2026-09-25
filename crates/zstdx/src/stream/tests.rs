@@ -473,9 +473,11 @@ fn would_block() -> crate::io::Error {
 /// retried stream shipped corrupt (both decoder-refused and silent).
 #[test]
 fn partial_write_then_error_keeps_pending_output() {
-    // Two-plus full blocks: the first drain carries bytes the writer
-    // half-accepts before failing.
-    let data: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+    // Two-plus full blocks past the fast rows' screen-staging gate (4 MiB:
+    // below it a single write defers every emission to finish, so no drain
+    // could fail): the first drain carries bytes the writer half-accepts
+    // before failing.
+    let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let mut writer = ScriptedWriter {
         script: [Ok(1), Err(would_block())].into(),
         received: Vec::new(),
