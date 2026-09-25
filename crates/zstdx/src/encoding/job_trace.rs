@@ -45,6 +45,10 @@ pub struct Snapshot {
     /// The incompressibility probe's strip sample pass (`seed_gate_probe`;
     /// a sub-span of `prefill_ns`).
     pub gate_ns: u64,
+    /// The `strip_is_uniform` whole-span scan (`windowed_ldm_prefill`'s
+    /// window span plus the strip scans inside `fill_window_grid`; a
+    /// sub-span of `prefill_ns`).
+    pub uniform_ns: u64,
     /// The LDM strip fill inside `prefill_window` (a sub-span of
     /// `prefill_ns`).
     pub ldm_fill_ns: u64,
@@ -100,6 +104,7 @@ counters! {
     grid_fill_ns,
     seed_scan_ns,
     gate_ns,
+    uniform_ns,
     ldm_fill_ns,
     spf_build_ns,
     job_ns,
@@ -151,6 +156,13 @@ pub fn add_seed_scan(started: Instant) {
 #[inline]
 pub fn add_gate(started: Instant) {
     add_ns(&C.gate_ns, started.elapsed());
+}
+
+/// Record one `strip_is_uniform` span (the window-span scan of
+/// `windowed_ldm_prefill`, the strip scans inside `fill_window_grid`).
+#[inline]
+pub fn add_uniform(started: Instant) {
+    add_ns(&C.uniform_ns, started.elapsed());
 }
 
 /// Record one LDM strip fill span inside `prefill_window`.

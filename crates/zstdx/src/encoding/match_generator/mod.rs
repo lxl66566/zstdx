@@ -1578,7 +1578,11 @@ impl MatchGeneratorDriver {
         // load-bearing for exactly its reason: a fresh worker's gate
         // otherwise kills far-only blocks before LDM sees them, and a
         // repeat period between the reach and the window loses its seed).
+        #[cfg(feature = "job_trace")]
+        let trace_uniform = std::time::Instant::now();
         let uniform = strip_is_uniform(ldm_win);
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_uniform(trace_uniform);
         self.seed_gate_probe(ldm_win, uniform);
         if ldm_win.len() >= HASH_READ {
             self.acquire_seed(ldm_win, ldm_win.len() - HASH_READ);
@@ -1730,7 +1734,11 @@ impl MatchGeneratorDriver {
         // table state; non-uniform strips exit the check on the first
         // 64-byte block. Dictionary loads keep the stock paths (cold,
         // once per dictionary).
+        #[cfg(feature = "job_trace")]
+        let trace_uniform = std::time::Instant::now();
         let uniform = grid == FillGrid::Strip && strip_is_uniform(data);
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_uniform(trace_uniform);
         self.seed_gate_probe(data, uniform);
         if data.len() < HASH_READ {
             return;
