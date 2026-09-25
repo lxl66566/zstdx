@@ -74,6 +74,12 @@ pub struct Snapshot {
     /// The hash3 table's strip ingestion (`find_hash3` bulk stretches).
     pub hash3_ns: u64,
     pub hash3_bytes: u64,
+    /// The caller-side reach-probe donation (the keep-side probe parse,
+    /// the shrink-side `parse_cost` and the verdict's feedback prefix):
+    /// serial posting-thread work before any job starts, so without its
+    /// own span the wall's largest single piece is invisible to the
+    /// decomposition (the R25 lesson — the probe outruns every job).
+    pub probe_ns: u64,
 }
 
 macro_rules! counters {
@@ -120,6 +126,7 @@ counters! {
     lag_fill_calls,
     hash3_ns,
     hash3_bytes,
+    probe_ns,
 }
 
 #[inline]
@@ -142,6 +149,10 @@ pub fn add_prefill(started: Instant) {
 
 /// Record one strategy grid-fill span inside `prefill_window`.
 #[inline]
+pub fn add_probe(started: Instant) {
+    add_ns(&C.probe_ns, started.elapsed());
+}
+
 pub fn add_grid_fill(started: Instant) {
     add_ns(&C.grid_fill_ns, started.elapsed());
 }

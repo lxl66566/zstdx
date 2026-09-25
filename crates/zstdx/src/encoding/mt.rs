@@ -195,8 +195,12 @@ pub fn compress_slice_mt(
             fast_window,
         );
         donation_prefix = keep_plan.is_some();
+        #[cfg(feature = "job_trace")]
+        let trace_probe = std::time::Instant::now();
         let (donated_choice, state, prefix) =
             donate_job_zero_prefix(src, level, shape, donation_arming(donation_prefix));
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_probe(trace_probe);
         choice = donated_choice;
         if choice == reach_probe::ReachChoice::Keep {
             donation = Some((state, prefix));
