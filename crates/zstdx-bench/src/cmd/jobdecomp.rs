@@ -169,6 +169,11 @@ mod trace {
              included)",
             ms(s.spf_build_ns),
         );
+        println!(
+            "  probe      {:>8.2} ms (caller-side, pre-jobs; the reach donation's keep/shrink \
+             parses and verdict)",
+            ms(s.probe_ns),
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -237,10 +242,12 @@ mod trace {
             uniform_ns,
             ldm_fill_ns,
             spf_build_ns,
+            probe_ns,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
         acc.spf_build_ns += spf_build_ns;
+        acc.probe_ns += probe_ns;
         acc.prefill_ns += prefill_ns;
         acc.reset_ns += reset_ns;
         acc.seed_ns += seed_ns;

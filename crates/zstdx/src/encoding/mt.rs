@@ -31,7 +31,7 @@ use super::{
     compress_fastest, far_screen,
     frame_compressor::{
         CompressState, JobSpf, compress_job_blocks_inner, new_slice_state, reset_slice_state,
-        return_slice_state, take_slice_state,
+        return_pooled_slice_state, return_slice_state, take_pooled_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
@@ -195,8 +195,12 @@ pub fn compress_slice_mt(
             fast_window,
         );
         donation_prefix = keep_plan.is_some();
+        #[cfg(feature = "job_trace")]
+        let trace_probe = std::time::Instant::now();
         let (donated_choice, state, prefix) =
             donate_job_zero_prefix(src, level, shape, donation_arming(donation_prefix));
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_probe(trace_probe);
         choice = donated_choice;
         if choice == reach_probe::ReachChoice::Keep {
             donation = Some((state, prefix));
@@ -204,7 +208,7 @@ pub fn compress_slice_mt(
             // The shrink verdict discards the donation (and the plan: the
             // shrunk strips are not the prefixes it filled); job zero
             // parses from its own pooled state like an undonated frame.
-            return_slice_state(state);
+            return_pooled_slice_state(state);
             keep_plan = None;
         }
     } else {
@@ -365,7 +369,7 @@ pub fn compress_slice_mt(
                                 job_overlap,
                                 JobSpf::None,
                             );
-                            return_slice_state(dstate);
+                            return_pooled_slice_state(dstate);
                             return out;
                         }
                         run_job(
@@ -571,7 +575,7 @@ fn donate_job_zero_prefix(
     alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
     Vec<u8>,
 ) {
-    let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
+    let mut state = take_pooled_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
     let (keep, output) = donate_keep_span(
         &mut state,
         &src[..reach_probe::PROBE_SPAN],
@@ -1121,7 +1125,7 @@ pub(crate) fn run_job(
     ldm: LdmArming,
     spf: JobSpf<'_>,
 ) -> Vec<u8> {
-    let mut state = take_slice_state(level, shape, choice, ldm);
+    let mut state = take_pooled_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
         &mut state,
         src,
@@ -1134,7 +1138,7 @@ pub(crate) fn run_job(
         ldm,
         spf,
     );
-    return_slice_state(state);
+    return_pooled_slice_state(state);
     output
 }
 
@@ -1173,6 +1177,39 @@ mod tests {
             head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
         }
         head
+    }
+
+    /// Pooled-state provenance cannot reach the bytes (R25): the bulk
+    /// jobs' states come from the cross-thread pool now, so repeated
+    /// in-process calls, mixed worker counts and pool-level mixing must
+    /// all produce the exact fresh-call bytes.
+    #[test]
+    fn pooled_bulk_mt_matches_fresh() {
+        let mut src = pattern_head(3 << 20);
+        // A mid-span phase change: far repeats early, near-local later,
+        // so both reach verdicts and the fills see real content.
+        let tail = pattern_head(1 << 20);
+        for (i, b) in tail.iter().enumerate() {
+            src[(2 << 20) + i] = *b;
+        }
+        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        // Second call rides pooled states from the first.
+        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        assert_eq!(one, two);
+        // Mixed worker counts share one pool.
+        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None);
+        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        assert_eq!(one, w4);
+        assert_eq!(one, again8);
+        // A different level between two balanced calls: the pool must
+        // reconfigure without residue.
+        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None);
+        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        assert_eq!(one, mixed);
+        // And the frame still roundtrips.
+        let mut back = vec![0u8; src.len()];
+        let n = FrameDecoder::new().decode_all(&one, &mut back).unwrap();
+        assert_eq!((n, &back[..n]), (src.len(), &src[..]));
     }
 
     /// The capture plan (and with it the donation's arming) at the band
