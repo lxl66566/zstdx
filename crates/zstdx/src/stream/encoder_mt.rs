@@ -246,22 +246,37 @@ struct KeepOutcome {
 }
 
 /// The finish tail's shared prefix fill (see `MtEncoderCore::build_spf`):
-/// a snapshot of one state's strip fill covering `[0, upto)`.
+/// the serial build's snapshots, published at LDM batch-freeze boundaries
+/// as the fill crosses each prefix job's start. One state fills the whole
+/// prefix chain `[0, s_max)` once — every tail job then adopts the newest
+/// published snapshot at or below its own start and fills only the short
+/// remainder, instead of each stock-filling its own nested whole-prefix
+/// strip. Which freeze point a job adopts is pure scheduling: an adoption
+/// plus remainder at any freeze point is bit-identical to the stock fill
+/// of the same span (the r8 exactness contract), so the published set
+/// never reaches the bytes.
 struct SpfPlan {
-    upto: u64,
+    /// Snapshots in publication (= fill) order: `(freeze point, tables)`.
+    /// Strictly ascending in the freeze point.
+    snapshots: Vec<(u64, Arc<StripSnapshot>)>,
     /// Largest job start whose strip is the whole prefix `[0, start)`: the
     /// overlap at plan build. A job starting beyond it carries a
-    /// mid-stream strip `[start - overlap, start)` the snapshot's fill
-    /// does not cover — it keeps the stock path.
+    /// mid-stream strip `[start - overlap, start)` whose stock fill starts
+    /// above zero — adoption there diverges (see negative/mt-stream) — it
+    /// keeps the stock path.
     prefix_end: u64,
-    snapshot: Arc<StripSnapshot>,
 }
 
 impl SpfPlan {
-    /// Whether the tail job starting at `start` (strip `[0, start)` when a
-    /// prefix) adopts the snapshot instead of filling its whole strip.
-    fn covers(&self, start: u64) -> bool {
-        start > self.upto && start <= self.prefix_end
+    /// The snapshot the tail job starting at `start` (strip `[0, start)`
+    /// when a prefix) adopts instead of filling its whole strip: the
+    /// newest published at or below `start`, if one exists.
+    fn pick(&self, start: u64) -> Option<Arc<StripSnapshot>> {
+        if start > self.prefix_end {
+            return None;
+        }
+        let n = self.snapshots.partition_point(|(upto, _)| *upto <= start);
+        (n > 0).then(|| self.snapshots[n - 1].1.clone())
     }
 }
 
@@ -459,6 +474,14 @@ const PUMP_STEP_MAX: usize = 1024 * 1024;
 // negligible). The old burst model reserved epoch-scale windows of the
 // same magnitude.
 const BUF_CAP_MAX: usize = 256 * 1024 * 1024;
+
+/// Lookahead for the spf build's snapshot publication (see `build_spf`):
+/// a freeze publishes when a tail job's start lies this close ahead, so
+/// the segment that may jump past the start has already banked a snapshot
+/// at or below it. Bounded by the freeze overshoot a sparse batch can add
+/// past the segment's soft bound; a missed publication only lengthens
+/// that job's remainder fill, never the bytes.
+const SPF_PUBLISH_LOOK: u64 = 2 * 1024 * 1024;
 
 /// The accumulate buffer's initial reserve for a schedule: a full round of
 /// in-flight jobs plus the `extra` strip/slack, capped at [`BUF_CAP_MAX`].
@@ -1285,7 +1308,10 @@ impl MtEncoderCore {
     /// Settle the reach decision at a flush/finish boundary: a frame that
     /// never cleared the staging gate keeps the stock reach (the schedule's
     /// pure-function property — the verdict was never taken), and a posted
-    /// donation is waited out and applied.
+    /// donation is waited out and applied. `finishing` marks the frame's
+    /// last tail: no append can follow it, so the decided schedule's
+    /// buffer re-reserve is skipped there (a pure realloc+copy of the
+    /// whole live buffer with nothing left to feed it).
     fn settle_probe(&mut self, finishing: bool) {
         if self.probe_pending {
             self.probe_pending = false;
@@ -1510,23 +1536,33 @@ impl MtEncoderCore {
         if self.job_ldm != LdmArming::Job
             || self.choice == ReachChoice::Shrink
             || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
-        {
-            return;
-        }
-        let reach =
-            MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice) as usize;
-        if self.overlap <= reach
             || self.buf_base != 0
-            || self.buf.len() < reach_probe::PROBE_SPAN
-            || ldm_head_parses(&self.buf[..reach_probe::PROBE_SPAN])
         {
             return;
         }
-        let span = self.buf.len().min(self.job_end(0) as usize);
-        if !far_repeat_dominant(&self.buf[..span], reach) {
+        if self.far_screens_dead(self.choice) {
             self.far_class = FarClass::Dead;
             self.job_ldm = LdmArming::FarDead;
         }
+    }
+
+    /// The far-class screens over the live buffer: the head engagement
+    /// pass, then far-repeat dominance over the first job's span. Pure
+    /// buffer functions of `(buf, overlap, reach)` — the verdict
+    /// ([`Self::resolve_far_class`]) and the spf build's publication
+    /// gate both run them, the latter under the Keep assumption (a
+    /// Shrink verdict drops the plan, so the prediction never diverges
+    /// from a verdict that could keep it: same buffer, same reach).
+    fn far_screens_dead(&self, choice: ReachChoice) -> bool {
+        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, choice) as usize;
+        if self.overlap <= reach
+            || self.buf.len() < reach_probe::PROBE_SPAN
+            || ldm_head_parses(&self.buf[..reach_probe::PROBE_SPAN])
+        {
+            return false;
+        }
+        let span = self.buf.len().min(self.job_end(0) as usize);
+        !far_repeat_dominant(&self.buf[..span], reach)
     }
 
     /// The strip each job borrows and indexes: the level's overlap, capped
@@ -1847,10 +1883,7 @@ impl MtEncoderCore {
             #[cfg(feature = "job_trace")]
             let post_t0 = std::time::Instant::now();
             for (i, w) in bounds.windows(2).enumerate() {
-                let spf = spf
-                    .as_ref()
-                    .filter(|p| p.covers(w[0]))
-                    .map(|p| p.snapshot.clone());
+                let spf = spf.as_ref().and_then(|p| p.pick(w[0]));
                 self.post_job(w[0], w[1], last_frame_block && i == last, spf);
             }
             #[cfg(feature = "job_trace")]
@@ -1924,10 +1957,20 @@ impl MtEncoderCore {
         if s_max < SPF_MIN_PREFIX {
             return None;
         }
-        // Fill to the median prefix boundary (the balance point: the jobs
-        // above adopt and fill their remainders in parallel, the jobs
-        // below keep stock fills of the smaller half).
-        let med = bounds[prefix_jobs[prefix_jobs.len() / 2]];
+        // The serial chain covers every prefix boundary: snapshots are
+        // published as the fill approaches each tail job's start, so no
+        // job stock-fills a nested whole prefix (the median-boundary
+        // schedule — build to the median, jobs above adopt, jobs below
+        // stock-fill the smaller half — duplicated the below-median half's
+        // fills across workers and left the above-median remainders
+        // nested: ~2x the fill traffic of the chain for the same critical
+        // path, and the redundant streams contend with the parses).
+        let starts: Vec<u64> = prefix_jobs.iter().map(|&i| bounds[i]).collect();
+        // The minimum the build must reach for the plan to pay: the median
+        // boundary (the old bar — below it the tail jobs' own parallel
+        // fills are the cheaper schedule).
+        let med = starts[starts.len() / 2];
+        let s_max = *starts.last().unwrap();
         let mut state = take_pooled_state();
         reset_slice_state(
             &mut state,
@@ -1946,8 +1989,20 @@ impl MtEncoderCore {
         #[cfg(feature = "job_trace")]
         let trace_spf = std::time::Instant::now();
         state.matcher.prefill_window(&[], 0);
-        let cap = med + SPF_SEG;
+        let cap = (s_max + SPF_SEG).min(self.buf.len() as u64);
+        // Publication gate: a Dead verdict drops the whole plan, so
+        // clones published before the verdict resolves are pure waste —
+        // and their table copies ride the donation window's critical
+        // path (the SpecFill lesson: the verdict's own parses contend
+        // with table traffic). The screens are pure buffer functions and
+        // the build already assumes the Keep verdict, so the prediction
+        // is the verdict's own answer, precomputed: a surviving plan can
+        // never have needed a skipped publication (a missed one only
+        // lengthens that job's remainder fill).
+        let publish =
+            matches!(self.far_class, FarClass::Alive) || !self.far_screens_dead(ReachChoice::Keep);
         let mut upto = 0u64;
+        let mut snapshots: Vec<(u64, Arc<StripSnapshot>)> = Vec::new();
         loop {
             if self
                 .probe_wait
@@ -1983,32 +2038,69 @@ impl MtEncoderCore {
                 return_pooled_state(state);
                 return None;
             }
-            let soft = (upto + SPF_SEG).min(med);
+            // Publication: a job start inside the next segment's reach
+            // takes the current freeze as its snapshot — the next freeze
+            // may already sit past the start, and this one is the last
+            // guaranteed at or below it. The lookahead only bounds how
+            // close to its start a job's snapshot lands (a missed
+            // publication means a longer remainder, never different
+            // bytes); one publication serves every start in reach, and
+            // the starts are SPF_SEG-dense only on huge grids, where the
+            // per-start clones stay table-sized either way.
+            // At most one publication per lookahead window: the clones
+            // are table-sized, so a denser cadence only multiplies memcpy.
+            let fresh = snapshots
+                .last()
+                .is_none_or(|(u, _)| upto - u >= SPF_PUBLISH_LOOK);
+            if publish
+                && fresh
+                && starts
+                    .iter()
+                    .any(|&s| s > upto && s <= upto + SPF_PUBLISH_LOOK)
+            {
+                snapshots.push((upto, Arc::new(state.matcher.snapshot_strip_fill(upto))));
+            }
+            let soft = (upto + SPF_SEG).min(s_max);
             let Some(freeze) =
                 state
                     .matcher
                     .strip_fill_segment(&self.buf[..cap as usize], 0, upto, soft)
             else {
                 // No freeze before the cap: not a shape the snapshot can
-                // be cut at; the tail jobs keep their stock fills.
+                // be cut at; the tail jobs keep their stock fills (any
+                // snapshots already published would be exact, but a build
+                // that cannot pass the median bar pays more than it
+                // saves).
                 #[cfg(feature = "job_trace")]
                 crate::encoding::job_trace::add_spf_build(trace_spf);
                 return_pooled_state(state);
+                if upto >= med {
+                    return Some(SpfPlan {
+                        snapshots,
+                        prefix_end: self.overlap as u64,
+                    });
+                }
                 return None;
             };
             upto = freeze;
-            if upto >= med {
+            if upto >= s_max {
                 break;
             }
         }
-        let snapshot = Arc::new(state.matcher.snapshot_strip_fill(upto));
+        // The terminal snapshot serves the largest prefix job when the
+        // final freeze lands at or below its start (a freeze past it
+        // serves nobody — the lookahead already banked the last at-or-
+        // below snapshot, or none exists and that job keeps a longer
+        // remainder).
+        if upto <= s_max {
+            snapshots.push((upto, Arc::new(state.matcher.snapshot_strip_fill(upto))));
+        }
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_spf_build(trace_spf);
         return_pooled_state(state);
         Some(SpfPlan {
-            upto,
+            snapshots,
             prefix_end: self.overlap as u64,
-            snapshot,
         })
     }
 
