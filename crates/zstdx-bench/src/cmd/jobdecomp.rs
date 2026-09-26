@@ -46,6 +46,10 @@ pub struct JobDecompArgs {
     /// Encode paths to measure.
     #[arg(long, value_enum, value_delimiter = ',', default_values_t = vec![DecompMode::BulkMt, DecompMode::StreamMt])]
     pub modes: Vec<DecompMode>,
+    /// Declare the input size on the stream-mt cells (the pledged stream
+    /// shape; bulk-grid jobs, the reach probe staging at the head).
+    #[arg(long)]
+    pub pledge: bool,
 }
 
 pub fn run(args: &JobDecompArgs) {
@@ -85,12 +89,12 @@ mod trace {
         .unwrap()
     }
 
-    fn encode_stream(raw: &[u8], level: Level, workers: u32) -> Vec<u8> {
-        let mut enc = zstdx::stream::read::Encoder::with_options(
-            raw,
-            EncoderOptions::new(level).checksum(false).workers(workers),
-        )
-        .unwrap();
+    fn encode_stream(raw: &[u8], level: Level, workers: u32, pledge: bool) -> Vec<u8> {
+        let mut opts = EncoderOptions::new(level).checksum(false).workers(workers);
+        if pledge {
+            opts = opts.pledged_size(Some(raw.len() as u64));
+        }
+        let mut enc = zstdx::stream::read::Encoder::with_options(raw, opts).unwrap();
         let mut out = Vec::with_capacity(raw.len() / 4);
         let mut sink = vec![0u8; 64 * 1024];
         loop {
@@ -174,6 +178,23 @@ mod trace {
              parses and verdict)",
             ms(s.probe_ns),
         );
+        println!(
+            "  spf split: build ldm {:>7.2} ms  build chain {:>7.2} ms  adopt ldm {:>7.2} ms  \
+             adopt chain {:>7.2} ms",
+            ms(s.spf_ldm_ns),
+            ms(s.spf_chain_ns),
+            ms(s.adopt_ldm_ns),
+            ms(s.adopt_chain_ns),
+        );
+        println!(
+            "  finish   {:>8.2} ms  settle {:>7.2} (donation wait {:>7.2})  post {:>7.2} ms  \
+             drain {:>8.2} ms",
+            ms(s.fin_ns),
+            ms(s.fin_settle_ns),
+            ms(s.don_wait_ns),
+            ms(s.fin_post_ns),
+            ms(s.fin_drain_ns),
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -243,6 +264,15 @@ mod trace {
             ldm_fill_ns,
             spf_build_ns,
             probe_ns,
+            spf_ldm_ns,
+            spf_chain_ns,
+            adopt_ldm_ns,
+            adopt_chain_ns,
+            fin_ns,
+            fin_settle_ns,
+            don_wait_ns,
+            fin_post_ns,
+            fin_drain_ns,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
@@ -265,6 +295,15 @@ mod trace {
         acc.gate_ns += gate_ns;
         acc.uniform_ns += uniform_ns;
         acc.ldm_fill_ns += ldm_fill_ns;
+        acc.spf_ldm_ns += spf_ldm_ns;
+        acc.spf_chain_ns += spf_chain_ns;
+        acc.adopt_ldm_ns += adopt_ldm_ns;
+        acc.adopt_chain_ns += adopt_chain_ns;
+        acc.fin_ns += fin_ns;
+        acc.fin_settle_ns += fin_settle_ns;
+        acc.don_wait_ns += don_wait_ns;
+        acc.fin_post_ns += fin_post_ns;
+        acc.fin_drain_ns += fin_drain_ns;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {
@@ -292,10 +331,11 @@ mod trace {
                         );
                     },
                     DecompMode::StreamMt => {
+                        let pledge = args.pledge;
                         run_cell(
                             &label,
                             &raw,
-                            &mut || encode_stream(&raw, level, workers),
+                            &mut || encode_stream(&raw, level, workers, pledge),
                             args.iters,
                         );
                     },

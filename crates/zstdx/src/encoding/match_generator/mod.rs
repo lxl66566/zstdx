@@ -1335,14 +1335,22 @@ impl MatchGeneratorDriver {
         if let Some(ldm) = self.ldm.as_mut() {
             debug_assert_eq!(ldm.fed(), base + from);
             if data.len() as u64 > from {
+                #[cfg(feature = "job_trace")]
+                let trace_ldm = std::time::Instant::now();
                 ldm.fill(data, base, base + from, base + data.len() as u64);
+                #[cfg(feature = "job_trace")]
+                crate::encoding::job_trace::add_adopt_ldm(trace_ldm);
             }
         }
         if data.len() < HASH_READ {
             return;
         }
         let last = data.len() - HASH_READ;
+        #[cfg(feature = "job_trace")]
+        let trace_chain = std::time::Instant::now();
         self.chain_grid_fill(data, base, from, last);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_adopt_chain(trace_chain);
     }
 
     /// The builder's half of the shared prefix fill: advance the strip
@@ -1360,6 +1368,8 @@ impl MatchGeneratorDriver {
         soft: u64,
     ) -> Option<u64> {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        #[cfg(feature = "job_trace")]
+        let trace_ldm = std::time::Instant::now();
         let upto = self.ldm.as_mut().and_then(|ldm| {
             debug_assert_eq!(ldm.fed(), base + from);
             if data.len() as u64 > from {
@@ -1367,13 +1377,20 @@ impl MatchGeneratorDriver {
             } else {
                 None
             }
-        })?;
+        });
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_spf_ldm(trace_ldm);
+        let upto = upto?;
         // The grid fill covers the same prefix [0, upto): its stride
         // alignment resumes from `from` and its extent is the freeze
         // point's HASH_READ margin, exactly as a from-scratch fill of
         // that prefix would cover.
         if upto > base + HASH_READ as u64 {
+            #[cfg(feature = "job_trace")]
+            let trace_chain = std::time::Instant::now();
             self.chain_grid_fill(data, base, from, (upto - base - HASH_READ as u64) as usize);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_spf_chain(trace_chain);
         }
         Some(upto)
     }
