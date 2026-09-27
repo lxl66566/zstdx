@@ -208,7 +208,7 @@ zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
 ## Current limitations
 
 - Encoder speed is split by tier and corpus shape (ahead on several tiers, behind on the json fastest scan core and the best-tier tree core); bulk decode is ahead across the board. Measured numbers in [Current Status](dev/status.md).
-- No superblock, preSplit, or C FFI.
+- No superblock or C FFI.
 
 [`Level::from_zstd(i32)`]: https://docs.rs/zstdx/latest/zstdx/level/struct.Level.html#method.from_zstd
 [`stream::encode_all`]: https://docs.rs/zstdx/latest/zstdx/stream/fn.encode_all.html

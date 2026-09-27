@@ -135,7 +135,7 @@ Geo-mean Δ over 120 cells **+8.69%**; per mode bulk-st +1.48% / bulk-mt +11.08%
 1. **Small-payload level 9** (todo 4): the whole 1K-1M band flipped from ahead (x0.54-0.90 on 09-19) to behind — json x1.39/1.40/2.04/1.07, text x1.65/1.45/2.78/1.08, worst at 64K. Level 1 also slid at 1K-4K and text-64K (to x1.49-1.77). Suspects: the R14 small-frame entropy tails and the R20 mid-band pre-header far-class screen (per-call costs on exactly this band).
 2. **json chain rows 5-8 and 10-12** (full-ladder T7): x1.40-1.61 and x1.63-1.65 — 10-12 improved from 1.82-2.87 but 5-6 worsened (1.23/1.19→1.40/1.49), now carrying −7..−17% byte wins over zstd; our own level-9 row beats both bands on the two axes. A ladder-tuning question, not a matcher-core one.
 3. **text.balanced speed x1.41 ST** (improved from 1.47) — the residual cold-start DUBT head per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](../todo.md)).
-4. **Streaming decode on compressible shapes**: json x1.20-1.39, skewed x1.10-1.31, text x1.07-1.21 — the fused-loop serial chain remains (todo 2).
+4. **Streaming decode on compressible shapes**: json x1.20-1.39, skewed x1.10-1.31, text x1.07-1.21 — the fused-loop serial chain remains (closed as a measured op-volume floor, [dec-gap](dec-gap.md)).
 5. **json.fastest x1.43 ST / x1.15 mt8** — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.02 is near closed.
 6. **Best-tier core**: json x1.37, skewed x2.13 (memory-latency tree walk; floor in [todo](../todo.md)). Caps the json.best stream ST cell (x1.37).
 7. **json opt/ultra x1.10-1.12, skewed opt/ultra x1.02-1.08** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](../todo.md)).

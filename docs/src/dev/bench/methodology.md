@@ -55,6 +55,6 @@ Deleted one-off tools (all covered): bench_compare / bench_encode (matrix `dec-s
 - MT encoding uses "cold thread pool per call" on both sides (zstd has no per-call equivalent API; the warm-pool column is listed for reference only).
 - MT decode has no public libzstd API; it is a dimension unique to us (solo scalability table).
 
-## Matrix coverage gaps (to fill later)
+## Matrix coverage gaps
 
-Dictionary encode/decode, streaming encoding with a pledged known size, MT scalability on >32MB inputs, zstd CLI multi-file, how our MT decode performs on our own MT-encoded output (restart density is controllable; higher theoretical ceiling), and the **full-matrix re-run** after the tangled-chain fix + opt parser + ratio preservation.
+The matrix covers no dictionary cells — dict A/Bs run on the systemd fixture (recipe and gates in [encoding](../perf/encoding.md)), not through `matrix`/`ratio`.
