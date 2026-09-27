@@ -1,115 +1,116 @@
-# Perf vs zstd crate · current snapshot (2026-09-19)
+# Perf vs zstd crate · current snapshot (2026-09-27)
 
-> Release pass at `e0b6078b`, 2026-09-19, one machine, one corpus, same flags. Provenance, raw tables and per-chunk commands: [matrix.md](matrix.md), including the full 1-22 numeric ladder (T7) and the small-payload table (T8). The 67 commits since the 09-18/09-19 passes were correctness/review fixes plus two decoder-stream staging commits (`read_to_end` probe growth, `write::Decoder` bounded cursor) — corpus encoder outputs are byte-identical (the ratio sweep reproduces +8.67% exactly), so speed moved only where those commits touch and the dll rows are new. **dll100 (100 MB of real system ELF binaries, `bench/gen_big.sh`) is promoted to a formal shape**: full six-tier encode, four-level decode and an MT-decode scaling row now sit in the shape axes. Comparison target: zstd crate / libzstd 1.5.7 (zstdmt); the ladder pairs fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19. Caveats: ±10% noise between runs; per-side budget 1s (500 ms on the full ladder and small); interleaved medians, spreads in the raw tables.
+> Release pass at `8c22a660`, 2026-09-27, one machine, one corpus, same flags. Provenance, raw tables and per-chunk commands: [matrix.md](matrix.md), including the full 1-22 numeric ladder (T7) and the small-payload table (T8). The 108 commits since the 09-19 pass are the R14-R26 LDM/far-class campaign (preSplit, gap-parse LDM consumers on the fast/dfast/chain rows, far-class screens including the small/mid-size band, MT/stream LDM captures, parallel LDM split scan, bulk-mt state pooling, stream-mt finish-tail publication, small-frame entropy tails) plus one decoder commit (fused bit reads in `decode_step`). Encoder outputs moved for the first time since the 09-16 corpus — zeros bulk-st cells −3 B, text.ultra −20 B, chain-ladder rows up to −17% bytes, dll transformed — so the ratio geo-mean ticked to +8.69% and several speed bands restructured: text chain rows ~2× faster, json 10-12 sharply faster, MT balanced rows +17-26%, dll fastest/fast at parity-or-better speed with double-digit-to-half size wins, while small-payload level 9 flipped from ahead to behind (T8), json/skewed MT decode dropped beyond noise, and the fast rows pay a screen tax on random/zeros. Comparison target: zstd crate / libzstd 1.5.7 (zstdmt); the ladder pairs fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19. Caveats: ±10% noise between runs; per-side budget 1s (500 ms on the full ladder and small); interleaved medians, spreads in the raw tables.
 
 ## Headline
 
-- **Decode ST bulk**: we win 17/18 cells (x 0.21-0.89); skewed.zst9 the lone parity (1.01). Absolute 650-12452 MiB/s ours; dll 1144-1527 MiB/s. json zst9/zst19 bulk ticked up to 0.71/0.60 (was 0.73/0.62).
-- **Decode ST streaming** (core-vs-core): zstd still wins every compressible shape but the staging commits narrowed the text column — json x1.19-1.37, skewed x1.10-1.32, **text x1.04-1.22 (was 1.09-1.24)**, dll x1.30-1.37; we win random (x0.80) and hold zeros (1.00).
-- **Encode ST**: json fastest/fast x1.43/1.04, **balanced ahead at x0.86 carrying +21% density**, best/opt/ultra x1.40/1.10/1.11 at ratio parity or denser (json.opt 9 B ahead of zstd-17). text: fastest/fast x0.74/0.52 (we win); best/opt/ultra ahead x0.92/0.60/0.69; balanced x1.47 (was 1.51), still +1.65% denser than zstd-9. skewed: low tiers ahead or parity (fast x1.07 near-tie, best x2.12, opt/ultra x1.05/1.09). random/zeros: we win at every tier (up to 300× on incompressible high tiers). **dll (new axis)**: fastest x1.36 (+1.8% size), fast x1.06 (−2.2%), balanced x1.49 at −8.4% size, and the first-measured best/opt/ultra x1.39/1.10/1.19 at −12.8/−10.3/−10.5% size — double-digit density wins from balanced up.
-- **Encode MT**: json.fastest.mt8 x1.18 the one remaining clean zstd mt win (noisy 0.92-1.57; mt16 ours x0.34); every other cell ahead except text.balanced x1.48 (was 1.51-1.54). Our cold-pool mt16 json.fast (3402) still beats zstd's warm-pool reference (1636).
-- **Streaming encode ST**: json.fast ahead (x0.94); json.fastest x1.31; best-tier bounded by the core (json/text.best x1.46/1.40).
-- **Streaming encode MT8**: all json cells ahead (x0.56/0.19/0.34/0.73/0.42/0.53); text fastest/fast/best/opt/ultra ahead (x0.52/0.28/0.68/0.59/0.68); text.balanced x1.52 the last stream-mt cell behind.
-- **Decode MT** (our exclusive dimension, libzstd has none): **dll100.zst3 mt16 = 1.82× our ST = 1.30× the zstd stream reference** — the strongest scaling row, on the real-binary payload; json.zst3 mt16 = 1.57× ST = 1.17× ref; skewed 1.09-1.21× ST but below the ref; text flat 0.97-0.98×; random 0.98× ST = 1.07× ref.
-- **Ratio sweep**: geo-mean **+8.67%** denser over 120 cells (bulk-st +1.42%), outputs byte-identical to 09-18. Remaining losing cells: json.fast mt −0.12..−0.14%, skewed.opt −0.06..−0.07%, plus −0.00..−0.04% near-ties on skewed.fast/fastest/ultra and text.ultra mt.
-- **Full 1-22 ladder** (release gate, both sides at the same numeric level): structure unchanged from 09-18 — wins or ties at the ladder ends and on random/zeros throughout; the holes are json 5-8 (x1.19-1.62) and 10-12 (x1.82-2.87, the chain-family rows; our level-9 row beats them on both axes) and skewed 13-16 speed (x1.25-2.58 at ratio parity). Full tables in [matrix.md](matrix.md) T7.
+- **Decode ST bulk**: we win 17/18 cells (x 0.21-0.88); skewed.zst9 the lone loss (x1.03). Absolute 635-12458 MiB/s ours; dll 1156-1533 MiB/s. All cells within ±0.05 of 09-19; dll bulk zst3/9/19 improved to 0.86/0.81/0.85.
+- **Decode ST streaming** (core-vs-core): zstd still wins every compressible shape — json x1.20-1.39, text x1.07-1.21 (zst3/9/19 back at 1.07 from 1.04), skewed x1.10-1.31, dll x1.24-1.34 (tightened from 1.30-1.37); we win random (x0.80) and hold zeros (1.00).
+- **Encode ST**: json fastest/fast x1.43/1.02, **balanced ahead at x0.86 carrying +21% density**, best/opt/ultra x1.37/1.10/1.12 at ratio parity or denser (json.opt 9 B ahead of zstd-17). text: fastest/fast x0.77/0.53 (we win); balanced x1.41 (was 1.47) at +1.65% density; best improved to x0.84 (was 0.92); opt/ultra ahead x0.60/0.68. skewed: fastest/balanced far ahead (x0.43/0.042), fast a near-tie (x1.06), best/opt/ultra behind at ratio parity (x2.13/1.02/1.08). random/zeros: we win at every tier (up to 300× on incompressible high tiers), but the fast rows pay a screen tax (random fastest/fast −8%, zeros −16% ours; x0.91/0.85 and 0.31/0.21). **dll (rewritten by the LDM campaign)**: fastest speed parity x1.01 at **−49.6% size vs zstd-1** (r 4.35 vs 2.19), fast ahead x0.95 at −31.7%, balanced x1.43 at −13.0%, best x1.38 at −12.8%, opt x1.16 at −16.2%, ultra x1.19 at −16.5%.
+- **Encode MT**: json.fastest.mt8 x1.15 the one remaining clean zstd mt win; every other cell ahead — the balanced rows gained 17-26% ours (json.balanced 0.61→0.56/0.50, text.balanced x1.48→1.23/1.21, skewed.balanced 0.17→0.15). Our cold-pool mt16 json.fast (3371) still beats zstd's warm-pool reference (1643).
+- **Streaming encode ST**: json.fast ahead (x0.94); json.fastest x1.30; text.best improved to x0.81 (was 1.40, ours 495→849); text.fastest/fast regressed on our side (x0.33/0.98, was 0.25/0.79 — the unpledged-stream far-class screen cost) but stay wins.
+- **Streaming encode MT8**: every json cell ahead (x0.58/0.18/0.31/0.67/0.42/0.53); text fastest/fast/best/opt/ultra ahead (x0.56/0.28/0.43/0.57/0.67); **text.balanced closed to x1.06** (was 1.52, ours 663→931) — no stream-mt cell loses by more than 6%.
+- **Decode MT** (our exclusive dimension, libzstd has none): **dll100.zst3 mt16 = 1.79× our ST = 1.28× the zstd stream reference** — still the strongest scaling row, on the real-binary payload; random 0.98× ST = 1.07× ref; **json regressed to 1.40× ST = 1.04× ref** (was 1.57×/1.17×, mt2 now below ST) and skewed sits below the ref — beyond-noise movements on our piece-parallel path this pass (candidate: the fused bit-read decoder commit); text flat 0.98×.
+- **Ratio sweep**: geo-mean **+8.69% denser** over 120 cells (bulk-st +1.48%, was +1.42) — outputs no longer byte-identical (zeros bulk −3 B/cell, text.ultra −20 B). Losing cells unchanged from 09-19: json.fast mt −0.12..−0.14%, skewed.opt −0.06..−0.07%, plus −0.00..−0.04% near-ties on skewed.fast/fastest/ultra and text.ultra mt.
+- **Full 1-22 ladder** (release gate, both sides at the same numeric level): the text chain rows flipped to wins (l5-8 x0.42-0.61, l10-12 x0.38-0.62) at −2..−5% bytes; json 10-12 narrowed to x1.63-1.65 (was 1.82-2.87); the remaining holes are json 5-8 (x1.40-1.61, now carrying −7..−17% byte wins), json 10-12, text l9 (x1.41) and skewed 13-16 speed (x1.27-2.53 at ratio parity). Wins or ties everywhere else including the whole 19-22 band (except json.l19 x1.11). Full tables in [matrix.md](matrix.md) T7.
+- **Small payloads**: the level-9 band **flipped from ahead (x0.54-0.90) to behind (x1.07-2.78)**, worst at 64K (json x2.04, text x2.78); level 1 regressed at 1K-4K and text-64K (to x1.49-1.77); level 3 holds near parity. Full table in [matrix.md](matrix.md) T8.
 
 ## Decode ST (MiB/s of raw; x = ours_time/zstd_time, <1 = we faster)
 
 | file | bulk ours | bulk zstd | bulk x | stream ours | stream zstd | stream x |
 |---|---:|---:|---:|---:|---:|---:|
-| json.zst1 | 1731 | 1277 | 0.74 | 1728 | 2189 | 1.27 |
-| json.zst3 | 1438 | 1144 | 0.80 | 1373 | 1875 | 1.37 |
-| json.zst9 | 1724 | 1231 | 0.71 | 1640 | 2143 | 1.31 |
-| json.zst19 | 2166 | 1293 | 0.60 | 2194 | 2606 | 1.19 |
-| text.zst1 | 5971 | 2258 | 0.38 | 6236 | 7590 | 1.22 |
-| text.zst3 | 8760 | 2515 | 0.29 | 10434 | 11123 | 1.07 |
-| text.zst9 | 9364 | 2544 | 0.27 | 11599 | 12109 | 1.04 |
-| text.zst19 | 9382 | 2519 | 0.27 | 11559 | 12150 | 1.05 |
-| skewed.zst1 | 2310 | 1536 | 0.67 | 2590 | 2847 | 1.10 |
-| skewed.zst3 | 1246 | 1061 | 0.85 | 1256 | 1534 | 1.22 |
-| skewed.zst9 | 650 | 660 | 1.01 | 603 | 793 | 1.32 |
-| skewed.zst19 | 2203 | 1491 | 0.68 | 2432 | 2695 | 1.11 |
-| random.zst3 | 9010 | 2368 | 0.26 | 11138 | 8933 | 0.80 |
-| zeros.zst3 | 12452 | 2635 | 0.21 | 12898 | 12901 | 1.00 |
-| dll100.zst1 | 1144 | 1023 | 0.89 | 1159 | 1510 | 1.30 |
-| dll100.zst3 | 1226 | 1094 | 0.89 | 1247 | 1708 | 1.37 |
-| dll100.zst9 | 1527 | 1247 | 0.82 | 1539 | 2084 | 1.35 |
-| dll100.zst19 | 1322 | 1134 | 0.86 | 1343 | 1803 | 1.34 |
+| json.zst1 | 1743 | 1285 | 0.74 | 1751 | 2196 | 1.25 |
+| json.zst3 | 1431 | 1159 | 0.81 | 1402 | 1874 | 1.34 |
+| json.zst9 | 1690 | 1251 | 0.74 | 1549 | 2146 | 1.39 |
+| json.zst19 | 2178 | 1289 | 0.59 | 2192 | 2623 | 1.20 |
+| text.zst1 | 6023 | 2276 | 0.38 | 6278 | 7579 | 1.21 |
+| text.zst3 | 8834 | 2522 | 0.29 | 10138 | 11083 | 1.09 |
+| text.zst9 | 9514 | 2565 | 0.27 | 11295 | 12110 | 1.07 |
+| text.zst19 | 9595 | 2554 | 0.27 | 11343 | 12159 | 1.07 |
+| skewed.zst1 | 2314 | 1543 | 0.67 | 2594 | 2849 | 1.10 |
+| skewed.zst3 | 1250 | 1057 | 0.85 | 1267 | 1535 | 1.21 |
+| skewed.zst9 | 635 | 657 | 1.03 | 608 | 795 | 1.31 |
+| skewed.zst19 | 2190 | 1484 | 0.68 | 2368 | 2704 | 1.14 |
+| random.zst3 | 8950 | 2316 | 0.26 | 11115 | 8871 | 0.80 |
+| zeros.zst3 | 12458 | 2630 | 0.21 | 12845 | 12879 | 1.00 |
+| dll100.zst1 | 1156 | 1017 | 0.88 | 1179 | 1463 | 1.24 |
+| dll100.zst3 | 1235 | 1065 | 0.86 | 1273 | 1710 | 1.34 |
+| dll100.zst9 | 1533 | 1237 | 0.81 | 1568 | 2081 | 1.33 |
+| dll100.zst19 | 1332 | 1131 | 0.85 | 1376 | 1820 | 1.32 |
 
 ## Encode ST bulk (checksums off; x = ours_time/zstd_time; pairs 1/3/9/13/17/19)
 
 | level | shape | ours MiB/s | ours ratio | zstd MiB/s | zstd ratio | x |
 |---|---|---:|---:|---:|---:|---:|
-| fastest | json | 600 | 6.39 | 858 | 6.11 | 1.43 |
-| fastest | text | 14212 | 309.22 | 10455 | 308.94 | 0.74 |
-| fastest | skewed | 2962 | 2.00 | 1274 | 2.00 | 0.43 |
-| fastest | random | 2623 | 1.00 | 2214 | 1.00 | 0.84 |
-| fastest | zeros | 50683 | 32483 | 13363 | 32171 | 0.26 |
-| fastest | dll | 392 | 2.15 | 530 | 2.19 | 1.36 |
-| fast | json | 458 | 5.30 | 477 | 5.29 | 1.04 |
-| fast | text | 14085 | 333.02 | 7275 | 332.90 | 0.52 |
-| fast | skewed | 210 | 1.92 | 224 | 1.92 | 1.07 |
-| fast | random | 2597 | 1.00 | 2068 | 1.00 | 0.80 |
-| fast | zeros | 50425 | 32483 | 8730 | 32171 | 0.17 |
-| fast | dll | 411 | 3.47 | 434 | 3.40 | 1.06 |
-| balanced | json | 142 | 7.20 | 122 | 5.95 | 0.86 |
-| balanced | text | 1178 | 384.64 | 1734 | 378.41 | 1.47 |
-| balanced | skewed | 1860 | 2.00 | 75 | 1.84 | 0.040 |
-| balanced | random | 2305 | 1.00 | 1600 | 1.00 | 0.69 |
-| balanced | zeros | 31840 | 32483 | 1752 | 32202 | 0.054 |
-| balanced | dll | 101 | 5.05 | 151 | 4.62 | 1.49 |
-| best | json | 27 | 6.26 | 37 | 6.10 | 1.40 |
-| best | text | 824 | 386.39 | 742 | 385.90 | 0.92 |
-| best | skewed | 6 | 1.84 | 14 | 1.84 | 2.12 |
-| best | random | 2377 | 1.00 | 264 | 1.00 | 0.11 |
-| best | zeros | 42266 | 32483 | 836 | 32171 | 0.020 |
-| best | dll | 28 | 5.35 | 39 | 4.67 | 1.39 |
+| fastest | json | 599 | 6.39 | 859 | 6.11 | 1.43 |
+| fastest | text | 13696 | 309.23 | 10520 | 308.94 | 0.77 |
+| fastest | skewed | 2937 | 2.00 | 1272 | 2.00 | 0.43 |
+| fastest | random | 2411 | 1.00 | 2192 | 1.00 | 0.91 |
+| fastest | zeros | 42562 | 32577 | 13273 | 32171 | 0.31 |
+| fastest | dll | 531 | 4.35 | 538 | 2.19 | 1.01 |
+| fast | json | 465 | 5.30 | 475 | 5.29 | 1.02 |
+| fast | text | 13667 | 333.03 | 7249 | 332.90 | 0.53 |
+| fast | skewed | 213 | 1.92 | 225 | 1.92 | 1.06 |
+| fast | random | 2405 | 1.00 | 2051 | 1.00 | 0.85 |
+| fast | zeros | 42294 | 32577 | 8700 | 32171 | 0.21 |
+| fast | dll | 451 | 4.97 | 430 | 3.40 | 0.95 |
+| balanced | json | 141 | 7.20 | 121 | 5.95 | 0.86 |
+| balanced | text | 1225 | 384.66 | 1730 | 378.41 | 1.41 |
+| balanced | skewed | 1746 | 2.00 | 74 | 1.84 | 0.042 |
+| balanced | random | 2297 | 1.00 | 1593 | 1.00 | 0.69 |
+| balanced | zeros | 31370 | 32577 | 1752 | 32202 | 0.056 |
+| balanced | dll | 106 | 5.31 | 152 | 4.62 | 1.43 |
+| best | json | 27 | 6.26 | 37 | 6.10 | 1.37 |
+| best | text | 865 | 386.42 | 724 | 385.90 | 0.84 |
+| best | skewed | 7 | 1.84 | 14 | 1.84 | 2.13 |
+| best | random | 2362 | 1.00 | 262 | 1.00 | 0.11 |
+| best | zeros | 42662 | 32577 | 836 | 32171 | 0.020 |
+| best | dll | 29 | 5.35 | 40 | 4.67 | 1.38 |
 | opt | json | 6 | 7.49 | 7 | 7.49 | 1.10 |
-| opt | text | 773 | 410.18 | 463 | 410.11 | 0.60 |
-| opt | skewed | 3 | 2.00 | 3 | 2.00 | 1.05 |
-| opt | random | 2393 | 1.00 | 12 | 1.00 | 0.005 |
-| opt | zeros | 40881 | 32483 | 943 | 32202 | 0.022 |
-| opt | dll | 13 | 5.64 | 14 | 5.06 | 1.10 |
-| ultra | json | 3 | 7.42 | 3 | 7.42 | 1.11 |
-| ultra | text | 393 | 414.04 | 272 | 413.98 | 0.69 |
-| ultra | skewed | 2 | 2.00 | 2 | 2.00 | 1.09 |
-| ultra | random | 2390 | 1.00 | 8 | 1.00 | 0.003 |
-| ultra | zeros | 39985 | 32483 | 675 | 32202 | 0.017 |
-| ultra | dll | 8 | 5.89 | 9 | 5.28 | 1.19 |
+| opt | text | 776 | 410.23 | 461 | 410.11 | 0.60 |
+| opt | skewed | 3 | 2.00 | 3 | 2.00 | 1.02 |
+| opt | random | 2382 | 1.00 | 12 | 1.00 | 0.005 |
+| opt | zeros | 40893 | 32577 | 942 | 32202 | 0.023 |
+| opt | dll | 12 | 6.04 | 14 | 5.06 | 1.16 |
+| ultra | json | 3 | 7.42 | 3 | 7.42 | 1.12 |
+| ultra | text | 394 | 414.12 | 269 | 413.98 | 0.68 |
+| ultra | skewed | 2 | 2.00 | 2 | 2.00 | 1.08 |
+| ultra | random | 2408 | 1.00 | 8 | 1.00 | 0.003 |
+| ultra | zeros | 39180 | 32577 | 681 | 32202 | 0.017 |
+| ultra | dll | 8 | 6.32 | 9 | 5.28 | 1.19 |
 
-Ratio verdict: denser or at parity on json and text at every level (json.opt 9 B ahead); skewed wins everywhere except near-ties; random/zeros tie or win; dll denser from fast up, double digits from balanced up. Checksum on/off (ours): json.fast 1.03, text.fast 0.84.
+Ratio verdict: denser or at parity on json and text at every level (json.opt 9 B ahead); skewed wins everywhere except near-ties; random/zeros tie or win; dll denser at every tier — −49.6% bytes at fastest, −31.7% at fast, double digits from balanced up. Checksum on/off (ours): json.fast 1.00, text.fast 0.86.
 
 ## Encode MT bulk (1 pass; cold pool per call both sides; MiB/s)
 
 | cell | ours mt8 | zstd mt8 | x8 | ours mt16 | zstd mt16 | x16 | ratio ours mt16 | ratio zstd mt16 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| json.fastest | 3702 | 4332 | 1.18 | 5346 | 1824 | 0.34 | 6.34 | 6.11 |
-| json.fast | 2605 | 1069 | 0.41 | 3402 | 1054 | 0.31 | 5.30 | 5.31 |
-| json.balanced | 337 | 204 | 0.61 | 331 | 202 | 0.61 | 7.19 | 5.95 |
-| text.fastest | 22185 | 11496 | 0.52 | 20199 | 2328 | 0.11 | 309.08 | 39.78 |
-| text.fast | 12782 | 2319 | 0.18 | 11759 | 2258 | 0.19 | 332.94 | 189.16 |
-| text.balanced | 855 | 1259 | 1.48 | 856 | 1260 | 1.48 | 384.59 | 378.30 |
-| skewed.fastest | 4302 | 3310 | 0.77 | 3657 | 1601 | 0.44 | 2.00 | 2.00 |
-| skewed.fast | 1302 | 645 | 0.50 | 1664 | 647 | 0.39 | 1.92 | 1.92 |
-| skewed.balanced | 699 | 122 | 0.18 | 697 | 122 | 0.17 | 2.00 | 1.84 |
+| json.fastest | 3706 | 4217 | 1.15 | 5281 | 1822 | 0.35 | 6.34 | 6.11 |
+| json.fast | 2581 | 1055 | 0.41 | 3371 | 1044 | 0.31 | 5.30 | 5.31 |
+| json.balanced | 368 | 207 | 0.56 | 418 | 206 | 0.50 | 7.19 | 5.95 |
+| text.fastest | 20696 | 11166 | 0.54 | 18706 | 2280 | 0.12 | 309.08 | 39.78 |
+| text.fast | 12596 | 2295 | 0.18 | 12026 | 2189 | 0.18 | 332.94 | 189.16 |
+| text.balanced | 1032 | 1264 | 1.23 | 1046 | 1247 | 1.21 | 384.59 | 378.30 |
+| skewed.fastest | 4348 | 3278 | 0.76 | 3687 | 1587 | 0.43 | 2.00 | 2.00 |
+| skewed.fast | 1281 | 649 | 0.51 | 1660 | 647 | 0.39 | 1.92 | 1.92 |
+| skewed.balanced | 831 | 123 | 0.15 | 813 | 122 | 0.15 | 2.00 | 1.84 |
 
 ## Streaming encode (64KiB pulls; json/text; interleaved medians)
 
 | cell | ST ours | ST zstd | ST x | MT8 ours | MT8 zstd | MT8 x |
 |---|---:|---:|---:|---:|---:|---:|
-| json.fastest | 596 | 780 | 1.31 | 3193 | 1893 | 0.56 |
-| json.fast | 473 | 443 | 0.94 | 2201 | 410 | 0.19 |
-| json.balanced | — | — | — | 332 | 114 | 0.34 |
-| json.best | 24 | 36 | 1.46 | 71 | 51 | 0.73 |
+| json.fastest | 594 | 772 | 1.30 | 3182 | 1899 | 0.58 |
+| json.fast | 464 | 439 | 0.94 | 2279 | 402 | 0.18 |
+| json.balanced | — | — | — | 370 | 116 | 0.31 |
+| json.best | 26 | 35 | 1.37 | 79 | 53 | 0.67 |
 | json.opt | — | — | — | 16 | 7 | 0.42 |
 | json.ultra | — | — | — | 6 | 3 | 0.53 |
-| text.fastest | 7243 | 1775 | 0.25 | 7800 | 4070 | 0.52 |
-| text.fast | 6943 | 5456 | 0.79 | 6185 | 1713 | 0.28 |
-| text.balanced | — | — | — | 663 | 1004 | 1.52 |
-| text.best | 495 | 691 | 1.40 | 526 | 357 | 0.68 |
-| text.opt | — | — | — | 647 | 378 | 0.59 |
-| text.ultra | — | — | — | 353 | 239 | 0.68 |
+| text.fastest | 5240 | 1739 | 0.33 | 7456 | 4154 | 0.56 |
+| text.fast | 5118 | 5013 | 0.98 | 5908 | 1603 | 0.28 |
+| text.balanced | — | — | — | 931 | 981 | 1.06 |
+| text.best | 849 | 686 | 0.81 | 856 | 368 | 0.43 |
+| text.opt | — | — | — | 674 | 380 | 0.57 |
+| text.ultra | — | — | — | 367 | 241 | 0.67 |
 
 Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). Stream/ceiling ratios in [matrix.md](matrix.md) T5.
 
@@ -117,27 +118,29 @@ Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB
 
 | file | ours ST | mt2 | mt4 | mt8 | mt16 | zstd ST stream ref |
 |---|---:|---:|---:|---:|---:|---:|
-| json.zst3 | 1402 | 1585 | 2014 | 2160 | 2199 | 1884 |
-| text.zst3 | 11188 | 10885 | 10866 | 10918 | 10921 | 11183 |
-| skewed.zst9 | 613 | 739 | 725 | 667 | 682 | 795 |
-| random.zst3 | 9749 | 9532 | 9561 | 9567 | 9560 | 8977 |
-| dll100.zst3 | 1220 | 1774 | 2004 | 2192 | 2217 | 1708 |
+| json.zst3 | 1401 | 1271 | 1734 | 1999 | 1957 | 1887 |
+| text.zst3 | 11110 | 10973 | 10966 | 10994 | 10941 | 11151 |
+| skewed.zst9 | 605 | 636 | 638 | 609 | 592 | 791 |
+| random.zst3 | 9732 | 9533 | 9565 | 9567 | 9546 | 8951 |
+| dll100.zst3 | 1225 | 1520 | 1988 | 2101 | 2194 | 1710 |
 
-dll100 measured via `files --threads` (see [matrix.md](matrix.md) T2) — the restart-point decode scales best on the large real-binary payload.
+dll100 measured via `files --threads` (see [matrix.md](matrix.md) T2) — the restart-point decode scales best on the large real-binary payload. json/skewed dropped vs 09-19 (json mt16 2199→1957) while their ST and zstd-ref cells held — a real movement on our piece-parallel path.
 
-## Compression-ratio sweep (`zstdx-bench ratio`, 2026-09-19)
+## Compression-ratio sweep (`zstdx-bench ratio`, 2026-09-27)
 
-Geo-mean Δ over 120 cells **+8.67%**; per mode bulk-st +1.42% / bulk-mt +11.08% / stream-st +11.43% / stream-mt +11.11%; per shape json +4.41%, text +40.36%, skewed +1.41%, random ±0, zeros +1.99%. Outputs byte-identical to the 09-18 sweep (the intervening commits moved no corpus cell's bytes). Losing cells (complete): json.fast mt −0.12..−0.14%, text.ultra mt −0.04%, skewed.opt −0.06..−0.07%, skewed.ultra −0.04%, skewed.fast mt −0.01..−0.03%, skewed.fastest −0.00%. Details in [matrix.md](matrix.md) T6.
+Geo-mean Δ over 120 cells **+8.69%**; per mode bulk-st +1.48% / bulk-mt +11.08% / stream-st +11.43% / stream-mt +11.11%; per shape json +4.41%, text +40.36%, skewed +1.41%, random ±0, zeros +2.06%. Outputs are not byte-identical to 09-19 (zeros bulk-st −3 B/cell, text.ultra −20 B; the tier-axis cells otherwise reproduce) — first byte movement since the 09-16 corpus. Losing cells (complete): json.fast mt −0.12..−0.14%, text.ultra mt −0.02%, skewed.opt −0.06..−0.07%, skewed.ultra −0.04%, skewed.fast mt −0.01..−0.03%, skewed.fastest −0.00%. Details in [matrix.md](matrix.md) T6.
 
 ## Top open deficits (from this run, x = ours/zstd wall time)
 
-1. **text.balanced speed x1.47 ST / x1.48 mt / x1.52 stream-mt8** — the residual cold-start DUBT head per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](../todo.md)).
-2. **Streaming decode on compressible shapes**: json x1.19-1.37, skewed x1.10-1.32, text x1.04-1.22 — narrowed by the staging commits; the fused-loop serial chain remains (todo 2).
-3. **json.fastest x1.43 ST / x1.18 mt8** — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.04 is near closed.
-4. **Best-tier core**: json x1.40, skewed x2.12 (memory-latency tree walk; floor in [todo](../todo.md)). Caps the two stream ST cells (json/text.best x1.46/1.40).
-5. **json opt/ultra x1.10-1.11, skewed.ultra x1.09** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](../todo.md)).
-6. **json chain rows 5-8 and 10-12** (full-ladder T7): x1.19-1.62 and x1.82-2.87, the weakest speed band — the deep-chain rows lose to libzstd's chain on both axes while our own level-9 row beats them; a ladder-tuning question, not a matcher-core one.
-7. **MT decode**: text flat ~0.98×, skewed below the zstd stream ref — decoder-side piece-parallel stage B to spend the ramp guarantee (todo 1's open half). json (1.17× ref) and dll (1.30× ref) scale well.
-8. **dll100 low-tier encode** (full tier rows now in the tables above; floor in [todo](../todo.md)): fastest x1.36, fast x1.06, balanced x1.49 at −8.4% size. Differentially attributed 2026-09-20 vs libzstd 1.5.7 ([enc-dll-gap](enc-dll-gap.md)): fastest is a 1.28× instruction gap (scan loop +414 M Ir, `insert_covered` +425 M, literals huff stream +187 M of the 823 M whole-encode gap), fast 1.09× all in the dfast scan loop, balanced runs 0.97× libzstd's instructions — the tier is latency-bound on the chain chase against libzstd's row matcher, and only a row-based candidate storage attacks it. The one emit-side gap (huff stream, 11.1 vs 7.2 Ir/literal) was closed the same day (whole-element discipline + repaired BMI2 dispatch, dll l1 −4.0% Ir); the rest is matcher-side. High tiers x1.10-1.39 at −10..−13% size.
-9. **Small band 64K-1M** fastest x~1.36-1.48 (this run: json-64K/1M x1.41/1.36, text x1.41/1.48; level 3 near parity 0.96-1.31; level 9 ahead 0.54-0.90 except the 1M cells x1.04-1.06) (todo 4).
-10. **Ratio residues**: json.fast mt −0.12..−0.14%, skewed.opt −0.07% (near-tie), dictionary small-payload +3% parse-side (todo 6).
+1. **Small-payload level 9** (todo 4): the whole 1K-1M band flipped from ahead (x0.54-0.90 on 09-19) to behind — json x1.39/1.40/2.04/1.07, text x1.65/1.45/2.78/1.08, worst at 64K. Level 1 also slid at 1K-4K and text-64K (to x1.49-1.77). Suspects: the R14 small-frame entropy tails and the R20 mid-band pre-header far-class screen (per-call costs on exactly this band).
+2. **json chain rows 5-8 and 10-12** (full-ladder T7): x1.40-1.61 and x1.63-1.65 — 10-12 improved from 1.82-2.87 but 5-6 worsened (1.23/1.19→1.40/1.49), now carrying −7..−17% byte wins over zstd; our own level-9 row beats both bands on the two axes. A ladder-tuning question, not a matcher-core one.
+3. **text.balanced speed x1.41 ST** (improved from 1.47) — the residual cold-start DUBT head per-frame cost; ratio +1.65% denser than zstd-9 (floor in [todo](../todo.md)).
+4. **Streaming decode on compressible shapes**: json x1.20-1.39, skewed x1.10-1.31, text x1.07-1.21 — the fused-loop serial chain remains (todo 2).
+5. **json.fastest x1.43 ST / x1.15 mt8** — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.02 is near closed.
+6. **Best-tier core**: json x1.37, skewed x2.13 (memory-latency tree walk; floor in [todo](../todo.md)). Caps the json.best stream ST cell (x1.37).
+7. **json opt/ultra x1.10-1.12, skewed opt/ultra x1.02-1.08** — per-node codegen + event-volume residue at ratio parity or denser (floor in [todo](../todo.md)).
+8. **MT decode regression** (todo 1): json mt16 fell to 1.40× ST = 1.04× ref (was 1.57×/1.17×; mt2 now 0.91× ST) and skewed mt sits below the zstd stream ref, while dll (1.79×/1.28×) and random hold — the movement is specific to our piece-parallel path on those shapes; the single fused bit-read decoder commit in the range is the candidate.
+9. **dll100 balanced x1.43 at −13.0% size** (floor in [todo](../todo.md), differential attribution in [enc-dll-gap](enc-dll-gap.md)); fastest/fast are now speed parity-or-ahead carrying −49.6/−31.7% size — the remaining gap is the balanced chain chase.
+10. **text ST stream fastest/fast**: ours −28/−26% vs 09-19 (7243→5240, 6943→5118) — the unpledged-stream far-class screen (R23); still wins at x0.33/0.98.
+11. **Fast-row screen tax on compressible-flat data**: random fastest/fast ours −8%, zeros fastest/fast −16% (x0.91/0.85, 0.31/0.21 — still wins); skewed chain rows −12..−42% (x≤0.06). The far-class screens cost even when they find nothing.
+12. **Ratio residues**: json.fast mt −0.12..−0.14%, skewed.opt −0.07% (near-tie), dictionary small-payload parse-side (todo 6).
