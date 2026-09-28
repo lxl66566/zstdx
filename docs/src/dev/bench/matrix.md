@@ -134,14 +134,14 @@ The balanced MT rows gained 17-26% on our side: text.balanced x1.48→1.23/1.21,
 | json.best | 26 | 35 | 1.37 | 79 | 53 | 0.67 |
 | json.opt | — | — | — | 16 | 7 | 0.42 |
 | json.ultra | — | — | — | 6 | 3 | 0.53 |
-| text.fastest | 5240 | 1739 | 0.33 | 7456 | 4154 | 0.56 |
-| text.fast | 5118 | 5013 | 0.98 | 5908 | 1603 | 0.28 |
+| text.fastest | 6851 | 1739 | 0.25 | 7456 | 4154 | 0.56 |
+| text.fast | 6571 | 5211 | 0.79 | 5908 | 1603 | 0.28 |
 | text.balanced | — | — | — | 931 | 981 | 1.06 |
 | text.best | 849 | 686 | 0.81 | 856 | 368 | 0.43 |
 | text.opt | — | — | — | 674 | 380 | 0.57 |
 | text.ultra | — | — | — | 367 | 241 | 0.67 |
 
-Stream-mt8 vs own ceilings: json 84/86/99/96/123/120%, text 34/40/88/84/113/106%. Ceilings (solo refs, this run): json 3813/2661/374/82/13/5, text 21866/14941/1052/1021/598/345. The text ceilings jumped with the MT gains (balanced 853→1052, best 477→1021, opt 422→598, ultra 241→345); text.balanced stream-mt8 closed to x1.06 (was 1.52) and text.best ST stream to x0.81 (was 1.40, ours 495→849). The two ST losses that grew: text.fastest/fast stream regressed on our side (7243→5240, 6943→5118; x0.25→0.33 and 0.79→0.98) — the unpledged-stream far-class screen cost; both remain wins. text.opt/ultra stream-mt8 still beat their printed bulk-mt8 ceilings.
+Stream-mt8 vs own ceilings: json 84/86/99/96/123/120%, text 34/40/88/84/113/106%. Ceilings (solo refs, this run): json 3813/2661/374/82/13/5, text 21866/14941/1052/1021/598/345. The text ceilings jumped with the MT gains (balanced 853→1052, best 477→1021, opt 422→598, ultra 241→345); text.balanced stream-mt8 closed to x1.06 (was 1.52) and text.best ST stream to x0.81 (was 1.40, ours 495→849). The two text ST fast rows carry fresh standalone medians: the pass table read 5240/5118 (x0.33/0.98, a claimed −26..−28% vs 09-19) — re-measured after the pass in fresh processes (two clean runs, spreads ±0.003/±0.011, zstd sides at the pass's own level), the cells land at 6851/6571 (x0.25/0.79): the pass readings were a mid-run transient (a sibling load burst collapses this cell's ours side ~7× harder than zstd's — reproduced deliberately), and the real movement vs 09-19 (7243/6943) is ~−5%, the R23 unpledged-stream screen's documented sampling tax; both remain wins. text.opt/ultra stream-mt8 still beat their printed bulk-mt8 ceilings.
 
 ## T6 compression-ratio sweep (`zstdx-bench ratio`)
 
