@@ -283,6 +283,14 @@ pub struct MatchGeneratorDriver {
     /// inside `apply_level`, so entry points set it before `reset` or
     /// re-apply through [`Matcher::consider_reach_probe`].
     reach_choice: ReachChoice,
+    /// The small-src 9/10 row verdict (R27): every frame starts at the
+    /// [`SmallSrcRow::Btlazy`] default (R8's bytes), and the first
+    /// matching entry's head sample may flip it to the stock row (see
+    /// [`Self::resolve_small_src_row`]).
+    small_src_row: SmallSrcRow,
+    /// The pending head verdict, armed by [`Self::apply_level`] when the
+    /// swap engaged; taken by the frame's first matching entry.
+    small_src_pending: Option<Level>,
     /// LDM arming context (see [`LdmArming`]); applied inside
     /// [`Self::apply_level`]'s size gate, so entry points set it before
     /// `reset`.
@@ -718,6 +726,8 @@ impl MatchGeneratorDriver {
             seed_offset: 0,
             seed_hits: 0,
             seed_budget: 0,
+            small_src_row: SmallSrcRow::Btlazy,
+            small_src_pending: None,
             slice_size,
             ramp: RampGate::OFF,
             chain_filled: u64::MAX,
@@ -782,6 +792,8 @@ impl MatchGeneratorDriver {
             seed_offset: 0,
             seed_hits: 0,
             seed_budget: 0,
+            small_src_row: SmallSrcRow::Btlazy,
+            small_src_pending: None,
             slice_size: 0,
             ramp: RampGate::OFF,
             chain_filled: u64::MAX,
@@ -941,7 +953,7 @@ impl MatchGeneratorDriver {
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let mut params = params_for(level, self.shape);
+        let mut params = params_for_row(level, self.shape, self.small_src_row);
         // The frame's reach probe result: only the row's stock reach is
         // replaceable, never a shape-clamped one.
         if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
@@ -1062,6 +1074,55 @@ impl MatchGeneratorDriver {
             },
             (false, _) => None,
         };
+        // R27: the swap's engagement arms the head verdict — resolved at
+        // the frame's first matching entry, where the head sits in the
+        // window. The stock row clears it, so the flip's own re-apply
+        // stays a single pass.
+        self.small_src_pending = (self.small_src_row == SmallSrcRow::Btlazy
+            && self.params.small_src
+            && matches!(level.as_i32(), 9 | 10))
+        .then_some(level);
+    }
+
+    /// Re-derive the per-frame state that keys on the active strategy
+    /// (the deferred DUBT-stale clear, the btlazy cold-head step phase,
+    /// the DUBT head lifecycle). Shared by `reset` and the small-src row
+    /// flip, which re-derives the strategy before the frame's first
+    /// block parses.
+    fn strategy_phase_reset(&mut self) {
+        self.dubt_stale = matches!(self.params.strategy, Strategy::BtLazy(_));
+        self.bt_step = if matches!(self.params.strategy, Strategy::BtLazy(_)) {
+            BtStepPhase::Armed
+        } else {
+            BtStepPhase::Off
+        };
+        self.dubt_head = if self.head_eligible() {
+            HeadPhase::Armed
+        } else {
+            HeadPhase::Off
+        };
+    }
+
+    /// Resolve the pending small-src 9/10 row verdict from the frame's
+    /// head (R27): the band's frames are a single block, so the first
+    /// matching entry holds the whole head in its window. A narrow
+    /// sampled alphabet keeps the level's own row — the swap's density
+    /// rides the wide-alphabet repeat classes (text, dll; see
+    /// [`SmallSrcRow`]'s calibration), while the low-alphabet shapes pay
+    /// its per-position cost for at most noise-level size. Dictionary
+    /// frames never resolve here (their window head is dictionary
+    /// content, not the frame's own; `load_dictionary` cancels the
+    /// pending verdict and they keep the swap).
+    fn resolve_small_src_row(&mut self) {
+        if let Some(level) = self.small_src_pending.take() {
+            let head = window_slice(&self.win, self.ext.as_ref());
+            let span = head.len().min(SMALL_SRC_HEAD_SPAN);
+            if span > 0 && !small_src_btlazy_head(&head[..span]) {
+                self.small_src_row = SmallSrcRow::Stock;
+                self.apply_level(level);
+                self.strategy_phase_reset();
+            }
+        }
     }
 
     /// Point the window at caller-owned memory: `data` holds the bytes at
@@ -1090,6 +1151,10 @@ impl MatchGeneratorDriver {
     /// scan time.
     pub fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
         debug_assert!(self.ext.is_none() && self.win.is_empty() && self.pos == 0);
+        // The pending small-src row verdict dies here: the window head a
+        // resolution would sample is dictionary content, not the frame's
+        // own, so dictionary frames keep R8's swap row at 9/10.
+        self.small_src_pending = None;
         let dict_len = content.len() as u64;
         let keep = content.len().min(self.params.window);
         let content = &content[content.len() - keep..];
@@ -2094,6 +2159,10 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn reset(&mut self, level: Level) {
+        // Every frame starts at the small-src row default (R8's swap): the
+        // head verdict is per-frame state, resolved at the first matching
+        // entry (see `resolve_small_src_row`).
+        self.small_src_row = SmallSrcRow::Btlazy;
         self.apply_level(level);
         // Stale opt-table entries from previous frames decode below the
         // window floor once the origin advances past them (read before the
@@ -2117,12 +2186,7 @@ impl Matcher for MatchGeneratorDriver {
         self.block_end = 0;
         self.anchor = 0;
         self.block_start = 0;
-        self.dubt_stale = matches!(self.params.strategy, Strategy::BtLazy(_));
-        self.bt_step = if matches!(self.params.strategy, Strategy::BtLazy(_)) {
-            BtStepPhase::Armed
-        } else {
-            BtStepPhase::Off
-        };
+        self.strategy_phase_reset();
         self.miss_count = 0;
         self.covered_fill = CoveredFill::Dense;
         self.scan_density = ScanDensity::Plain;
@@ -2138,11 +2202,6 @@ impl Matcher for MatchGeneratorDriver {
         self.next_update = 0;
         self.gap_start = u64::MAX;
         self.gate_hold = false;
-        self.dubt_head = if self.head_eligible() {
-            HeadPhase::Armed
-        } else {
-            HeadPhase::Off
-        };
         if let Some(ldm) = &mut self.ldm {
             ldm.restart(0);
         }
@@ -2230,6 +2289,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        self.resolve_small_src_row();
         let mut literals = Vec::new();
         let mut seqs: Vec<SeqWord> = Vec::new();
         self.start_matching_codes(&mut literals, &mut seqs);
@@ -2261,6 +2321,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        self.resolve_small_src_row();
         if self.head_block() {
             // The head parses through the btlazy2 driver; its bytes stay
             // LDM-indexed so later chain blocks can match far into them.
@@ -2674,6 +2735,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn skip_matching(&mut self) {
+        self.resolve_small_src_row();
         // Only called for RLE blocks so far: every 5-byte window in a
         // uniform run hashes to the same slot, so indexing each byte just
         // rewrites one table entry. The first position covers that slot;
@@ -3003,7 +3065,8 @@ use hash::*;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
-    SmallDictRow, Strategy, ldm_min_window, params_for, sampled_distinct, small_dict_row,
+    SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy, ldm_min_window, params_for,
+    params_for_row, sampled_distinct, small_dict_row, small_src_btlazy_head,
 };
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
