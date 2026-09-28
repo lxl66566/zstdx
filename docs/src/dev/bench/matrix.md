@@ -213,11 +213,11 @@ The 09-19 ratio table no longer reproduces: the LDM campaign densified every jso
 
 | level | shape | 1K | 4K | 64K | 1024K |
 |---|---|---:|---:|---:|---:|
-| 1 | json | 1.23 | 1.39 | 1.40 | 1.35 |
-| 1 | text | 1.63 | 1.60 | 1.77 | 1.49 |
-| 3 | json | 1.29 | 1.13 | 0.98 | 1.17 |
-| 3 | text | 1.39 | 1.10 | 1.06 | 1.05 |
-| 9 | json | 1.39 | 1.40 | 2.04 | 1.07 |
-| 9 | text | 1.65 | 1.45 | 2.78 | 1.08 |
+| 1 | json | 1.21 | 1.35 | 1.38 | 1.34 |
+| 1 | text | 1.65 | 1.51 | 1.66 | 1.48 |
+| 3 | json | 1.29 | 1.13 | 0.98 | 1.16 |
+| 3 | text | 1.37 | 1.08 | 1.11 | 1.05 |
+| 9 | json | 1.13 | 0.95 | 0.64 | 1.09 |
+| 9 | text | 1.73 | 1.48 | 2.78 | 1.08 |
 
-The 09-19 picture inverted at level 9: the tier was ahead through 1K-64K (x0.54-0.90) and is now behind everywhere (x1.07-2.78, worst at 64K; json-64K re-run standalone reproduces x2.030). Level 1 also regressed at 1K/4K on both shapes and at text-64K (1.30-1.41→1.49-1.77) while json 64K/1M held (1.40/1.35); level 3 stays near parity (0.98-1.29) with mild drift on text 1K/64K. Attribution candidates: the R14 small-frame entropy tails and the R20 mid-band pre-header far-class screen — per-call costs landing exactly on this band.
+The 09-19 picture inverted at level 9: the tier was ahead through 1K-64K (x0.54-0.90) and the 09-27 pass found it behind everywhere (x1.07-2.78, worst at 64K; json-64K re-run standalone reproduced x2.030). Bisect (2026-09-28) pinned the flip on R8's small-src btlazy swap alone (`f0eb106f`: json-64K l9 184→54 MiB/s, zstd's 111 flat) — the R14/R20 suspects were falsified (the R20 screen arms only at 32-64 MiB; the R14 entropy tails measure ±1 B on the stock row). R27 content-gated the swap on an 8 KiB head verdict (`sampled_distinct`, bar 48): json (38-39 distinct) and skewed (16) keep the stock chain/row rows — json l9 now x1.13/0.95/0.64/1.09, skewed-64K l9 41→2063 MiB/s at −188 B — while text (66-79), dll32 (108-213) and random keep the swap and its ratio (text-64K l9 14808 B, −0.9% vs zstd-9; dll32-64K −557 B). Level 1's 09-27 slide (1K/4K both shapes, text-64K; the R14 tiny dense bars plus the fast row's small-src dense bars) and level 3 (0.98-1.29) are unchanged this round — the accepted trades.

@@ -636,7 +636,45 @@ pub(crate) const SMALL_SRC_MAX: u64 = 128 * 1024;
 /// known smaller length still clamps a forced window). Raw-block frames
 /// keep the row untouched (their declared window never affects bytes, and
 /// staying shape-independent keeps outputs stable).
+/// The small-src band's row choice for levels 9/10 (R27): R8's swap
+/// bought text/dll-class density at a per-position cost the shapes the
+/// stock row already served could not pay back (json-64K l9: -89 B for
+/// 184->54 MiB/s; skewed-64K: +188 B and 41->4411 MiB/s the other way),
+/// so the frame's head decides which row it gets.
+#[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
+pub(crate) enum SmallSrcRow {
+    /// R8's `btlazy(17, sLog 5)` swap row — the default: every pure
+    /// `(level, shape)` query (headers, strip geometry) and every frame
+    /// whose head never reaches a matching entry keeps R8's bytes.
+    #[default]
+    Btlazy,
+    /// The level's own row (9: the DUBT-head chain, 10: the row matcher).
+    Stock,
+}
+
+/// Head sample the row verdict reads: `sampled_distinct`'s stride keeps
+/// it at ~2048 samples whatever the span, a fixed few-microsecond cost
+/// on the band's single-block frames.
+pub(crate) const SMALL_SRC_HEAD_SPAN: usize = 8 * 1024;
+
+/// The swap's sampled-alphabet bar: json reads 38-39 distinct and skewed
+/// 16 below it, text 66-79, dll32 108-213 and random 251-256 above
+/// (corpus heads at 1K-128K, both levels — the swap's size wins sit
+/// exactly on the wide-alphabet side: text -130..-1596 B, dll32
+/// -53..-3389 B, while skewed loses +5..+792 B).
+const SMALL_SRC_SWAP_SYMS: u32 = 48;
+
+/// Whether a frame head's sampled alphabet clears the btlazy swap's bar
+/// (see [`SmallSrcRow`]). A pure function of the head bytes.
+pub(crate) fn small_src_btlazy_head(head: &[u8]) -> bool {
+    sampled_distinct(head, 0, head.len()) >= SMALL_SRC_SWAP_SYMS
+}
+
 pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
+    params_for_row(level, shape, SmallSrcRow::Btlazy)
+}
+
+pub(super) fn params_for_row(level: Level, shape: InputShape, row: SmallSrcRow) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
         p.window = 1usize << wl.clamp(10, 27);
@@ -647,8 +685,11 @@ pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
     // chain's newest-first selection accepts nearer-shorter candidates
     // where the tiny window leaves the tree's full coverage cheap, and
     // the DUBT parse measured strictly smaller on every class (text 16
-    // KiB -282 B vs the chain, json -107, skewed +9).
-    if p.small_src && matches!(level.as_i32(), 9 | 10) {
+    // KiB -282 B vs the chain, json -107, skewed +9). R27 made the swap
+    // a head verdict (`row`): the 64K-128K band pays the row's
+    // per-position cost at 2-4x for none of that size on the
+    // low-alphabet classes (see [`SmallSrcRow`]).
+    if row == SmallSrcRow::Btlazy && p.small_src && matches!(level.as_i32(), 9 | 10) {
         let mut p = adjust_params(btlazy(17, 1 << 17, bt_knobs(5, 16)), shape.len);
         // The replacement row's constructor defaults the flag to
         // false; the frame IS small — the downstream small-src gates
