@@ -231,11 +231,56 @@ fn window_fp(win: &[u8]) -> u64 {
 
 /// Strided distinct-byte count, the incompressibility gate's sampling
 /// idiom: an eighth of the bytes reads a 128-symbol alphabet to ~110, a
-/// 256-symbol one to ~248.
+/// 256-symbol one to ~248. The count is capped at [`LDM_SYMS_MIN`] (the
+/// only consumer compares against that bar) and the scan is two-stage:
+/// it stops the moment the bar is met (distinct only grows), and a head
+/// whose first [`STAGE1_SAMPLES`] samples are single-symbol-dominated
+/// rejects without reading the rest — the strided walk is otherwise a
+/// fixed ~512K-iteration cost on every flat head a 40 GB/s row would
+/// otherwise spend microseconds on.
+
+/// Strided samples the two-stage scan counts per byte before its RLE
+/// verdict: 512 samples read 4 KiB of the head, where an RLE opening is
+/// fully visible while every class that must reach the full scan (json
+/// ~110 distinct, text/random ~248) shows its mix within the first few
+/// dozen.
+const STAGE1_SAMPLES: usize = 512;
+
+/// Top-byte share of the first stage above which the head is
+/// single-symbol-dominated and rejects early (`top * 100 >=
+/// STAGE1_SAMPLES * STAGE1_RLE_PCT`, 507/512 at the default). The only
+/// heads whose verdict can move versus the full scan are RLE openings
+/// whose whole head still reads >= [`LDM_SYMS_MIN`] distinct strided
+/// bytes — a source opening with >= 4 KiB of one byte and then turning
+/// wide-alphabet far-class; it stays stock (a missed arming, never a
+/// broken one).
+const STAGE1_RLE_PCT: u32 = 99;
 fn strided_distinct(head: &[u8]) -> u32 {
     let mut seen = [false; 256];
     let mut n = 0u32;
-    for &b in head.iter().step_by(8) {
+    // Stage 1 keeps per-byte counts so the RLE verdict can read the top
+    // share; the full scan drops back to the seen-bitset body.
+    let mut counts = [0u16; 256];
+    let mut top = 0u16;
+    let mut samples = 0u32;
+    for &b in head.iter().step_by(8).take(STAGE1_SAMPLES) {
+        let b = b as usize;
+        counts[b] += 1;
+        top = top.max(counts[b]);
+        samples += 1;
+        let seen = &mut seen[b];
+        if !*seen {
+            *seen = true;
+            n += 1;
+            if n >= LDM_SYMS_MIN {
+                return LDM_SYMS_MIN;
+            }
+        }
+    }
+    if u32::from(top) * 100 >= samples * STAGE1_RLE_PCT {
+        return 0;
+    }
+    for &b in head.iter().step_by(8).skip(samples as usize) {
         let seen = &mut seen[b as usize];
         if !*seen {
             *seen = true;
@@ -243,6 +288,52 @@ fn strided_distinct(head: &[u8]) -> u32 {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bar cap fires without walking the rest: a wide-alphabet head
+    /// reports `LDM_SYMS_MIN` however long it is.
+    #[test]
+    fn wide_head_caps_at_the_bar() {
+        let mut head = [0u8; 64 * 1024];
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = mix64(i as u64) as u8;
+        }
+        assert_eq!(strided_distinct(&head), LDM_SYMS_MIN);
+    }
+
+    /// A single-symbol-dominated opening rejects in the first stage
+    /// without reading the rest — the zeros-class head the 09-27 pass
+    /// measured paying the whole walk.
+    #[test]
+    fn rle_head_rejects_in_stage_one() {
+        assert_eq!(strided_distinct(&[0u8; 64 * 1024]), 0);
+    }
+
+    /// The documented miss-class: an RLE opening whose head turns
+    /// wide-alphabet past the first stage still rejects — a missed
+    /// arming, never a broken one.
+    #[test]
+    fn rle_opening_then_wide_rejects() {
+        let mut head = vec![7u8; STAGE1_SAMPLES * 8];
+        head.extend((0u16..256).map(|v| v as u8).cycle().take(2048));
+        assert_eq!(strided_distinct(&head), 0);
+    }
+
+    /// Below the stage boundary the scan covers the whole head and
+    /// reports the plain strided count (i*31%256 at stride 8: eight
+    /// distinct samples).
+    #[test]
+    fn short_head_counts_every_sample() {
+        let mut head = [0u8; 64];
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = (i * 31 % 256) as u8;
+        }
+        assert_eq!(strided_distinct(&head), 8);
+    }
 }
 
 /// Insert `fp` into the open-addressed table; `true` when an equal
