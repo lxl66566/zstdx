@@ -3,6 +3,7 @@
 //! resolves through the parent module.
 
 use super::*;
+use crate::encoding::hugepage::HugeBuf;
 
 impl MatchGeneratorDriver {
     /// Bridge into the optimal parser (levels Opt/Ultra): hands over
@@ -154,8 +155,8 @@ impl MatchGeneratorDriver {
             // deferred clear), so the ring keeps its pooled content.
             self.dubt_table.fill(0);
         } else {
-            self.dubt_table = alloc::vec![0u32; 1 << HEAD_HASH_LOG];
-            self.dubt_bt = alloc::vec![0u32; 2 << HEAD_KNOBS.bt_log];
+            self.dubt_table = HugeBuf::zeroed(1 << HEAD_HASH_LOG);
+            self.dubt_bt = HugeBuf::zeroed(2 << HEAD_KNOBS.bt_log);
         }
         if self.lazy_scratch.is_none() {
             self.lazy_scratch = Some(LazyScratch::new());
