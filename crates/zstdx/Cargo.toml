@@ -22,6 +22,12 @@ alloc = { package = "rustc-std-workspace-alloc", version = "1.0.0", optional = t
 # stable interface of this crate.
 core  = { package = "rustc-std-workspace-core", version = "1.0.0", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Hugepage-backed mappings for the matcher's multi-MiB buffers
+# (see src/encoding/hugepage.rs); no_std-compatible FFI, Linux-only
+# because MADV_HUGEPAGE is.
+libc = { version = "0.2", default-features = false }
+
 [dev-dependencies]
 # Reference implementation for the in-tree XXH64's tests
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"] }

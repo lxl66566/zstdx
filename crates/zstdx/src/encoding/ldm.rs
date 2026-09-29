@@ -23,7 +23,10 @@
 
 use alloc::vec::Vec;
 
-use super::match_generator::{extend_match, pack_pos};
+use super::{
+    hugepage::HugeBuf,
+    match_generator::{extend_match, pack_pos},
+};
 
 /// Shortest split-window match that can become a candidate (C's
 /// `LDM_MIN_MATCH_LENGTH` for the lazy strategies).
@@ -565,7 +568,7 @@ pub(crate) struct LdmSeq {
 /// needs. Shared with the streaming core's shared prefix fill.
 #[cfg(feature = "std")]
 pub(super) struct LdmSnapshot {
-    table: Vec<u64>,
+    table: HugeBuf<u64>,
     bucket_offsets: Vec<u8>,
     rolling: u64,
     fed: u64,
@@ -592,7 +595,7 @@ impl LdmSnapshot {
 pub(super) struct LdmState {
     /// Packed bucket entries: low 32 bits the biased position, high 32 the
     /// checksum. `ENTS_PER_BUCKET` entries per bucket, round-robin.
-    table: Vec<u64>,
+    table: HugeBuf<u64>,
     /// Insert cursor per bucket.
     bucket_offsets: Vec<u8>,
     /// Gear rolling hash, valid exactly up to `fed`.
@@ -624,7 +627,7 @@ impl LdmState {
             .clamp(BUCKET_SIZE_LOG + 3, 20);
         let buckets = 1usize << (hash_log - BUCKET_SIZE_LOG);
         Self {
-            table: alloc::vec![0u64; buckets * ENTS_PER_BUCKET],
+            table: HugeBuf::zeroed(buckets * ENTS_PER_BUCKET),
             bucket_offsets: alloc::vec![0u8; buckets],
             rolling: !(u32::MAX as u64),
             stop_mask: ((1u64 << HASH_RATE_LOG) - 1) << (MIN_MATCH_LENGTH as u32 - HASH_RATE_LOG),

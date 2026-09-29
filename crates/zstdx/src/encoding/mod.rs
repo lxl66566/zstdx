@@ -14,6 +14,7 @@ pub(crate) mod dictionary;
 pub(crate) mod dubt;
 pub(crate) mod far_screen;
 pub(crate) mod frame_header;
+pub(crate) mod hugepage;
 pub(crate) mod ldm;
 pub(crate) mod match_generator;
 #[cfg(feature = "std")]

@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use super::{
     Matcher, SeqWord, Sequence,
     btlazy::{LazyScratch, LazyStep},
+    hugepage::HugeBuf,
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
     reach_probe::{KEEP_REACH, ProbeStats, ReachChoice, SHRINK_REACH},
@@ -102,8 +103,9 @@ pub struct MatchGeneratorDriver {
     /// Contiguous history: `win[0]` is absolute position `win_base`.
     /// Capacity holds two windows plus one block, so compaction (which keeps
     /// MAX_WINDOW) runs at ~1x data volume amortized; blocks are read
-    /// directly into the spare tail.
-    win: Vec<u8>,
+    /// directly into the spare tail. Hugepage-backed once a far window
+    /// grows it past [`HugeBuf`]'s threshold.
+    win: HugeBuf<u8>,
     /// Direct-window mode: the window points into caller-owned memory
     /// instead of `win` (see [`MatchGeneratorDriver::adopt_window`]).
     ext: Option<ExtWindow>,
@@ -121,7 +123,8 @@ pub struct MatchGeneratorDriver {
     /// [`Strategy`]), u32 entries (see [`pack_pos`]). One buffer keeps a
     /// single base pointer live in the scan loops: the second table's
     /// accesses are displacements off it instead of a second hot pointer.
-    tables: Vec<u32>,
+    /// Hugepage-backed past [`HugeBuf`]'s threshold.
+    tables: HugeBuf<u32>,
     /// Length of the head table inside `tables` (== `tables.len()` when
     /// the strategy has no second table).
     second: usize,
@@ -138,10 +141,10 @@ pub struct MatchGeneratorDriver {
     row_heads: Vec<u8>,
     /// Head hash table for the opt strategies, u32 origin-biased entries
     /// (see [`super::opt`]).
-    opt_table: Vec<u32>,
+    opt_table: HugeBuf<u32>,
     /// The opt strategies' binary-tree ring: two u32 link slots per ring
     /// position; empty outside opt.
-    bt: Vec<u32>,
+    bt: HugeBuf<u32>,
     /// Single-probe 3-byte table for the opt strategies with `min_match == 3`
     /// (libzstd's hashTable3); empty otherwise.
     hash3: Vec<u32>,
@@ -149,10 +152,10 @@ pub struct MatchGeneratorDriver {
     /// position entries (see [`super::dubt`]), like libzstd's btlazy2
     /// tables. The random-access working set is window-sized, so entry
     /// width dominates its cache/TLB behavior.
-    dubt_table: Vec<u32>,
+    dubt_table: HugeBuf<u32>,
     /// The DUBT finder's two-slot tree ring for the btlazy2 strategy, u32
     /// entries like `dubt_table`; empty outside btlazy2.
-    dubt_bt: Vec<u32>,
+    dubt_bt: HugeBuf<u32>,
     /// Content-tag table of the incompressibility gate (see
     /// [`Matcher::skip_if_incompressible`]): slot = high hash bits of a
     /// sampled 8-byte window, entry = its low 32 bits. Entries are
@@ -419,7 +422,7 @@ const HEAD_ORIGIN_CAP: u64 = 1 << 30;
 pub(crate) struct StripSnapshot {
     /// The fused head+chain buffer; the split matches the capturing
     /// driver's `second`.
-    tables: Vec<u32>,
+    tables: HugeBuf<u32>,
     second: usize,
     ldm: Option<LdmSnapshot>,
     /// The builder's head coordinate origin: the adopted entries resolve
@@ -672,21 +675,21 @@ impl MatchGeneratorDriver {
         // after another MAX_WINDOW of input means the copy_within runs at
         // ~1x data volume instead of once per block.
         Self {
-            win: Vec::with_capacity(2 * MAX_WINDOW + slice_size),
+            win: HugeBuf::with_capacity(2 * MAX_WINDOW + slice_size),
             ext: None,
             win_base: 0,
             pos: 0,
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: alloc::vec![0u32; 1usize << HASH_LOG],
+            tables: HugeBuf::zeroed(1usize << HASH_LOG),
             second: 1usize << HASH_LOG,
             row_heads: Vec::new(),
-            opt_table: Vec::new(),
-            bt: Vec::new(),
+            opt_table: HugeBuf::new(),
+            bt: HugeBuf::new(),
             hash3: Vec::new(),
-            dubt_table: Vec::new(),
-            dubt_bt: Vec::new(),
+            dubt_table: HugeBuf::new(),
+            dubt_bt: HugeBuf::new(),
             probe: Vec::new(),
             gate_hold: false,
             opt_state: OptState::new(),
@@ -739,21 +742,21 @@ impl MatchGeneratorDriver {
     /// [`Matcher::block_tail`].
     pub fn new_direct() -> Self {
         Self {
-            win: Vec::new(),
+            win: HugeBuf::new(),
             ext: None,
             win_base: 0,
             pos: 0,
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: alloc::vec![0u32; 1usize << HASH_LOG],
+            tables: HugeBuf::zeroed(1usize << HASH_LOG),
             second: 1usize << HASH_LOG,
             row_heads: Vec::new(),
-            opt_table: Vec::new(),
-            bt: Vec::new(),
+            opt_table: HugeBuf::new(),
+            bt: HugeBuf::new(),
             hash3: Vec::new(),
-            dubt_table: Vec::new(),
-            dubt_bt: Vec::new(),
+            dubt_table: HugeBuf::new(),
+            dubt_bt: HugeBuf::new(),
             probe: Vec::new(),
             gate_hold: false,
             opt_state: OptState::new(),
@@ -847,7 +850,7 @@ impl MatchGeneratorDriver {
         match params.strategy {
             Strategy::Fast => {
                 if !heads_kept {
-                    self.tables = alloc::vec![0u32; heads_len];
+                    self.tables = HugeBuf::zeroed(heads_len);
                     self.second = heads_len;
                 } else if self.tables.len() != heads_len {
                     self.tables.truncate(heads_len);
@@ -859,9 +862,9 @@ impl MatchGeneratorDriver {
                     // both kept
                 } else if heads_kept {
                     self.tables.truncate(heads_len);
-                    self.tables.resize(total, 0);
+                    self.tables.resize_zeroed(total);
                 } else {
-                    self.tables = alloc::vec![0u32; total];
+                    self.tables = HugeBuf::zeroed(total);
                     self.second = heads_len;
                 }
             },
@@ -871,9 +874,9 @@ impl MatchGeneratorDriver {
                     // both kept
                 } else if heads_kept {
                     self.tables.truncate(heads_len);
-                    self.tables.resize(total, 0);
+                    self.tables.resize_zeroed(total);
                 } else {
-                    self.tables = alloc::vec![0u32; total];
+                    self.tables = HugeBuf::zeroed(total);
                     self.second = heads_len;
                 }
             },
@@ -890,23 +893,24 @@ impl MatchGeneratorDriver {
                 let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
                     && self.row_heads.len() == rows;
                 if !rows_kept {
-                    self.tables = alloc::vec![0u32; heads_len];
+                    self.tables = HugeBuf::zeroed(heads_len);
                     self.second = heads_len;
                     self.row_heads = alloc::vec![0u8; rows];
                 } else if self.tables.len() != heads_len {
                     self.tables.truncate(heads_len);
-                    self.tables.resize(heads_len, 0);
+                    self.tables.resize_zeroed(heads_len);
                     self.row_heads.truncate(rows);
                     self.row_heads.resize(rows, 0);
                 }
             },
             Strategy::Opt(knobs) => {
                 if self.opt_table.len() != 1usize << params.hash_log {
-                    self.opt_table = alloc::vec![EMPTY; 1usize << params.hash_log];
+                    // EMPTY is the zero bit pattern (hugepage::BufElem).
+                    self.opt_table = HugeBuf::zeroed(1usize << params.hash_log);
                 }
                 // The tree ring: two link slots per ring position.
                 if self.bt.len() != 2usize << knobs.bt_log {
-                    self.bt = alloc::vec![EMPTY; 2usize << knobs.bt_log];
+                    self.bt = HugeBuf::zeroed(2usize << knobs.bt_log);
                 }
                 let want_h3 = usize::from(knobs.hash3_log > 0) << knobs.hash3_log;
                 if self.hash3.len() != want_h3 {
@@ -916,31 +920,31 @@ impl MatchGeneratorDriver {
                         Vec::new()
                     };
                 }
-                self.tables = Vec::new();
+                self.tables = HugeBuf::new();
                 self.second = 0;
             },
             Strategy::BtLazy(knobs) => {
                 if self.dubt_table.len() != 1usize << params.hash_log {
-                    self.dubt_table = alloc::vec![0u32; 1usize << params.hash_log];
+                    self.dubt_table = HugeBuf::zeroed(1usize << params.hash_log);
                 }
                 if self.dubt_bt.len() != 2usize << knobs.bt_log {
-                    self.dubt_bt = alloc::vec![0u32; 2usize << knobs.bt_log];
+                    self.dubt_bt = HugeBuf::zeroed(2usize << knobs.bt_log);
                 }
-                self.opt_table = Vec::new();
-                self.bt = Vec::new();
+                self.opt_table = HugeBuf::new();
+                self.bt = HugeBuf::new();
                 self.hash3 = Vec::new();
-                self.tables = Vec::new();
+                self.tables = HugeBuf::new();
                 self.second = 0;
             },
         }
         if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
-            self.opt_table = Vec::new();
-            self.bt = Vec::new();
+            self.opt_table = HugeBuf::new();
+            self.bt = HugeBuf::new();
             self.hash3 = Vec::new();
         }
         if !matches!(params.strategy, Strategy::BtLazy(_)) {
-            self.dubt_table = Vec::new();
-            self.dubt_bt = Vec::new();
+            self.dubt_table = HugeBuf::new();
+            self.dubt_bt = HugeBuf::new();
         }
         if matches!(params.strategy, Strategy::Opt(_)) && self.opt_scratch.is_none() {
             self.opt_scratch = Some(OptScratch::new());
