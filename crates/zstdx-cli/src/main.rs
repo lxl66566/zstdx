@@ -1,5 +1,7 @@
 extern crate zstdx;
+mod list;
 mod progress;
+mod train;
 
 use std::{
     ffi::OsString,
@@ -49,6 +51,11 @@ enum Mode {
     Decompress,
     /// Decompress to nowhere: integrity check only.
     Test,
+    /// Inspect .zst files: frame counts, sizes, checksums, dictIDs --
+    /// header parsing only, no decoding (`-l/--list`).
+    List,
+    /// Build a dictionary from sample files (`--train`).
+    Train,
 }
 
 /// Byte multiplier of a size flag suffix, mirroring zstd's
@@ -157,6 +164,65 @@ struct Cli {
     /// Test the integrity of compressed files without writing output
     #[arg(short = 't', long, conflicts_with_all = ["compress", "output", "rm"])]
     test: bool,
+
+    /// Print information about Zstandard-compressed files (frame counts,
+    /// sizes, ratio, checksum, dictID) without decompressing them
+    #[arg(
+        short = 'l',
+        long,
+        conflicts_with_all = ["compress", "decompress", "test", "train", "output"]
+    )]
+    list: bool,
+
+    /// Create a dictionary from a training set of files (writes `-o FILE`,
+    /// default `dictionary`)
+    #[arg(long, conflicts_with_all = ["compress", "decompress", "test", "list"])]
+    train: bool,
+
+    /// Limit the trained dictionary to # bytes (--train only; suffixes
+    /// K/M/G accepted)
+    #[arg(long, value_name = "#", value_parser = parse_size)]
+    maxdict: Option<u64>,
+
+    // Rejected --train knobs: kept parseable so the diagnostic is a clear
+    // "unsupported" error instead of clap's unknown-argument text.
+    /// Not supported: the trainer derives the dictionary ID from its
+    /// content (deterministic; zstd's --dictID forcing has no equivalent)
+    #[arg(long = "dictID", value_name = "#", hide = true)]
+    dict_id: Option<u32>,
+
+    /// Not supported: the in-tree trainer is the only algorithm
+    #[arg(
+        long = "train-cover",
+        value_name = "PARAMS",
+        hide = true,
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true
+    )]
+    train_cover: Option<String>,
+
+    /// Not supported: the in-tree trainer is the only algorithm
+    #[arg(
+        long = "train-fastcover",
+        value_name = "PARAMS",
+        hide = true,
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true
+    )]
+    train_fastcover: Option<String>,
+
+    /// Not supported: the in-tree trainer is the only algorithm
+    #[arg(
+        long = "train-legacy",
+        value_name = "PARAMS",
+        hide = true,
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true
+    )]
+    train_legacy: Option<String>,
 
     /// Write to stdout instead of a file
     #[arg(short = 'c', long)]
@@ -320,7 +386,11 @@ fn main() -> ExitCode {
 
 /// Returns false when any input failed to process.
 fn run(cli: &Cli) -> bool {
-    let mode = if cli.test {
+    let mode = if cli.train {
+        Mode::Train
+    } else if cli.list {
+        Mode::List
+    } else if cli.test {
         Mode::Test
     } else if cli.decompress {
         Mode::Decompress
@@ -333,6 +403,32 @@ fn run(cli: &Cli) -> bool {
     if cli.sparse || cli.no_sparse {
         eprintln!("{PREFIX}--sparse/--no-sparse are not supported: output is always dense");
         return false;
+    }
+    if cli.dict_id.is_some() {
+        eprintln!(
+            "{PREFIX}--dictID is not supported: the trainer derives the dictionary ID from its \
+             content"
+        );
+        return false;
+    }
+    if cli.train_cover.is_some() || cli.train_fastcover.is_some() || cli.train_legacy.is_some() {
+        eprintln!(
+            "{PREFIX}--train-cover/--train-fastcover/--train-legacy are not supported: the \
+             in-tree trainer is the only algorithm"
+        );
+        return false;
+    }
+    if cli.maxdict.is_some() && mode != Mode::Train {
+        eprintln!("{PREFIX}--maxdict only applies with --train");
+        return false;
+    }
+
+    // The inspection and training modes are self-contained: they gather
+    // their own inputs and never reach the (de)compression machinery.
+    match mode {
+        Mode::List => return list::run(cli),
+        Mode::Train => return train::run(cli),
+        Mode::Compress | Mode::Decompress | Mode::Test => {},
     }
     if (cli.check || cli.no_check) && mode != Mode::Compress {
         eprintln!(
@@ -605,7 +701,10 @@ fn process(
 
     let written = match mode {
         Mode::Compress => compress(reader, &output, settings, source_size, dict)?,
+        // List and train are dispatched before per-input processing and
+        // never reach this point.
         Mode::Decompress | Mode::Test => decompress(reader, &output, settings, dict)?,
+        Mode::List | Mode::Train => unreachable!("dispatched in run"),
     };
 
     if cli.quiet == 0 {
@@ -628,6 +727,7 @@ fn process(
                 fmt_size(written as f64)
             ),
             Mode::Test => info!("{} tested ok", fmt_size(written as f64)),
+            Mode::List | Mode::Train => unreachable!("dispatched in run"),
         }
     }
 
@@ -646,7 +746,8 @@ fn process(
 fn default_output_name(input: &Path, mode: Mode) -> AnyResult<PathBuf> {
     match mode {
         Mode::Compress => Ok(add_extension(input, ZSTD_SUFFIX)),
-        Mode::Decompress | Mode::Test => {
+        // List and train never reach name derivation (dispatched earlier).
+        Mode::Decompress | Mode::Test | Mode::List | Mode::Train => {
             let name = input
                 .to_str()
                 .and_then(|s| s.strip_suffix(ZSTD_SUFFIX))
@@ -1184,5 +1285,43 @@ mod tests {
         // smaller ones are rejected there; here only the parse matters.
         assert!(Cli::try_parse_from(["zstdx", "--long=31"]).is_ok());
         assert!(Cli::try_parse_from(["zstdx", "--long=9"]).is_ok());
+    }
+
+    /// The list/train surface parses with zstd's spellings, and the mode
+    /// flags conflict with each other and the (de)compression modes.
+    #[test]
+    fn list_train_flags_parse() {
+        let cli =
+            Cli::try_parse_from(["zstdx", "--train", "-r", "samples", "--maxdict=16K"]).unwrap();
+        assert!(cli.train);
+        assert_eq!(cli.maxdict, Some(16 << 10));
+
+        let cli = Cli::try_parse_from(["zstdx", "-l", "a.zst"]).unwrap();
+        assert!(cli.list);
+        let cli = Cli::try_parse_from(["zstdx", "--list", "a.zst"]).unwrap();
+        assert!(cli.list);
+
+        // the rejected --train knobs still parse (rejection happens in
+        // run, with the reason)
+        assert!(Cli::try_parse_from(["zstdx", "--train", "--train-cover", "s"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "--train", "--train-cover=k=48,d=8", "s"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "--train", "--dictID=5", "s"]).is_ok());
+        // a value without `=` is a positional file: the flag itself still
+        // carries the empty default and is rejected in run
+        let cli = Cli::try_parse_from(["zstdx", "--train", "--train-legacy", "s"]).unwrap();
+        assert_eq!(cli.train_legacy.as_deref(), Some(""));
+        assert_eq!(cli.files, [PathBuf::from("s")]);
+
+        for bad in [
+            vec!["zstdx", "-l", "-d", "a.zst"],
+            vec!["zstdx", "-l", "-t", "a.zst"],
+            vec!["zstdx", "-l", "--train"],
+            vec!["zstdx", "--train", "-d", "a.zst"],
+        ] {
+            assert!(
+                Cli::try_parse_from(bad.as_slice()).is_err(),
+                "{bad:?} must conflict"
+            );
+        }
     }
 }

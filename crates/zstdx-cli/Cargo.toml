@@ -15,6 +15,11 @@ categories   = ["command-line-utilities", "compression"]
 name = "zstdx"
 path = "src/main.rs"
 
+[features]
+# Dictionary training (`zstdx --train`); off by default so the default CLI
+# build carries no trainer code, and the flag explains itself when missing.
+dict_builder = ["zstdx/dict_builder"]
+
 [dependencies]
 # Used for the command line binary only
 clap               = { version = "4.5.46", features = ["derive"] }
