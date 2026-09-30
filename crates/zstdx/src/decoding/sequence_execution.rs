@@ -119,8 +119,9 @@ pub(crate) fn execute_decoded_flat(
     // the detection cache makes this dispatch cheap relative to a block.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if std::is_x86_feature_detected!("bmi2") {
-            // SAFETY: bmi2 was just detected at runtime
+        if super::simd_tier::bmi2() {
+            // SAFETY: simd_tier::bmi2() ran the runtime detection (or a forced
+            // tier asserted it), so the BMI2 instantiation is executable
             return unsafe {
                 execute_decoded_flat_bmi2(
                     dec,

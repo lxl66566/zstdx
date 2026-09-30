@@ -22,8 +22,9 @@ pub fn decode_sequences(
     // detection cache makes this dispatch cheap relative to a whole block.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if std::is_x86_feature_detected!("bmi2") {
-            // SAFETY: bmi2 was just detected at runtime
+        if super::simd_tier::bmi2() {
+            // SAFETY: simd_tier::bmi2() ran the runtime detection (or a forced
+            // tier asserted it), so the BMI2 instantiation is executable
             return unsafe { decode_sequences_impl_bmi2(section, source, scratch, target) };
         }
     }
@@ -54,8 +55,9 @@ pub(crate) fn decode_sequences_into(
     // BMI2: as above.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if std::is_x86_feature_detected!("bmi2") {
-            // SAFETY: bmi2 was just detected at runtime
+        if super::simd_tier::bmi2() {
+            // SAFETY: simd_tier::bmi2() ran the runtime detection (or a forced
+            // tier asserted it), so the BMI2 instantiation is executable
             return unsafe { decode_sequences_into_impl_bmi2(section, source, scratch, target) };
         }
     }

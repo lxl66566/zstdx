@@ -33,3 +33,5 @@ mod ringbuffer;
 pub(crate) mod scratch;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+mod simd_tier;
