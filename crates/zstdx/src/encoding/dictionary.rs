@@ -32,6 +32,17 @@ pub(crate) struct EncDictionary {
     of: Option<FSETable>,
 }
 
+// The entropy tables would dominate any Debug output; the identity of a
+// dictionary is its id and content.
+impl core::fmt::Debug for EncDictionary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EncDictionary")
+            .field("id", &self.id)
+            .field("content_bytes", &self.content.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl EncDictionary {
     /// A raw-content dictionary: pure match history, no id, no entropy
     /// tables (libzstd's `ZSTD_dct_rawContent` load).
@@ -144,4 +155,34 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
         4 => SeqCostMode::Greedy,
         _ => SeqCostMode::Exact,
     };
+}
+
+/// A parsed dictionary shared across any number of compressions: the parse
+/// (content split plus the encoder-side entropy-table digest) runs once, at
+/// [Self::parse], and every frame built from it re-seeds its own matcher
+/// from the shared tables — the per-frame content load into a fresh matcher
+/// is intrinsic to the frame model, exactly as libzstd's CDict reuses the
+/// digested dictionary but still re-arms the frame from it.
+#[derive(Clone)]
+pub struct EncoderDictionary {
+    inner: alloc::sync::Arc<EncDictionary>,
+}
+
+impl EncoderDictionary {
+    /// Parse once, reuse for every compression (see [EncoderOptions]'s
+    /// [EncoderOptions::parsed_dictionary] builder).
+    pub fn parse(raw: &[u8]) -> Result<Self, Error> {
+        Ok(Self {
+            inner: alloc::sync::Arc::new(EncDictionary::parse(raw)?),
+        })
+    }
+
+    /// The dictID frames built from this dictionary declare (see [EncDictionary::header_id]).
+    pub fn header_id(&self) -> Option<u32> {
+        self.inner.header_id()
+    }
+
+    pub(crate) fn shared(&self) -> alloc::sync::Arc<EncDictionary> {
+        alloc::sync::Arc::clone(&self.inner)
+    }
 }

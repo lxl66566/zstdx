@@ -9,11 +9,18 @@
 //! consume skippable frames and roll into the next frame, so concatenated
 //! streams decode transparently; the return value is 0 exactly when a frame
 //! completed and everything decoded from it has been flushed.
+//!
+//! The context dictionary is one parsed instance shared with every decoder
+//! built from the context (and with `DDict` handles): a `usingDict` call
+//! parses into the slot, `loadDictionary` does the same, and each stream
+//! re-arm hands the `FrameDecoder` a clone of the share.
+
+use std::sync::Arc;
 
 use zstdx::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::{
-    ZSTD_inBuffer, ZSTD_outBuffer,
+    ZSTD_ResetDirective, ZSTD_inBuffer, ZSTD_outBuffer,
     error::{self, DecodeSite, ErrorCode},
 };
 
@@ -27,13 +34,16 @@ const COMPACT_LIMIT: usize = 512 * 1024;
 /// Input handed to the decoder per pump step.
 const FEED_CHUNK: usize = 128 * 1024;
 
+/// A parsed decoding dictionary shared between the context, its streams and
+/// any `ZSTD_DDict` handle.
+pub type SharedDict = Arc<zstdx::decoding::Dictionary>;
+
 /// The sticky decode parameters of a context (libzstd defaults).
 #[derive(Clone, Default)]
 pub struct Settings {
     /// `ZSTD_d_windowLogMax` (bytes are `1 << log`); the engine clamps to
     /// the format maximum.
     pub window_log_max: Option<u32>,
-    pub dict: Option<Vec<u8>>,
 }
 
 impl Settings {
@@ -54,8 +64,10 @@ impl Settings {
 }
 
 /// One-shot decompression of `src` into `dst`; returns the written length.
+/// `dict` is the dictionary for this call (None decodes plain).
 pub fn decompress_oneshot(
     settings: &Settings,
+    dict: Option<&SharedDict>,
     src: &[u8],
     dst: &mut [u8],
 ) -> Result<usize, ErrorCode> {
@@ -63,8 +75,8 @@ pub fn decompress_oneshot(
     if let Some(log) = settings.window_log_max {
         options = options.max_window_size(1 << log);
     }
-    if let Some(dict) = &settings.dict {
-        options = options.dictionary(dict);
+    if let Some(dict) = dict {
+        options = options.parsed_dictionary(Arc::clone(dict));
     }
     zstdx::bulk::decompress_to_buffer_with(src, dst, &options)
         .map_err(|e| error::decode(&e, DecodeSite::OneShot))
@@ -93,15 +105,15 @@ struct DStream {
 }
 
 impl DStream {
-    fn new(settings: &Settings) -> Result<Self, ErrorCode> {
+    fn new(settings: &Settings, dict: Option<&SharedDict>) -> Result<Self, ErrorCode> {
         let mut inner = FrameDecoder::new();
         if let Some(log) = settings.window_log_max {
             inner.set_max_window_size(1_u64 << log);
         }
-        if let Some(dict) = &settings.dict {
-            let dict = zstdx::decoding::Dictionary::load(dict)
-                .map_err(|_| ErrorCode::DictionaryCorrupted)?;
-            inner.add_dict(dict).map_err(|_| ErrorCode::Generic)?;
+        if let Some(dict) = dict {
+            inner
+                .add_shared_dict(Arc::clone(dict))
+                .map_err(|_| ErrorCode::Generic)?;
         }
         Ok(Self {
             inner,
@@ -137,6 +149,14 @@ impl DStream {
             self.sink.clear();
             self.delivered = 0;
         }
+    }
+
+    /// Whether the stream sits on a frame boundary with nothing staged or
+    /// pending: the state a parameters reset requires.
+    fn at_boundary(&self) -> bool {
+        self.start == self.input.len()
+            && self.sink.len() == self.delivered
+            && (!self.inited || self.inner.is_finished())
     }
 
     /// Decode as much staged input as the block granularity allows.
@@ -241,6 +261,14 @@ impl DStream {
                 Err(crate::frame::ParseError::Malformed) => {
                     return Err(ErrorCode::PrefixUnknown);
                 },
+                // Frame-head constraints the walker can judge on its own;
+                // libzstd's streaming decode reports the same codes.
+                Err(crate::frame::ParseError::ReservedBit) => {
+                    return Err(ErrorCode::FrameParameterUnsupported);
+                },
+                Err(crate::frame::ParseError::WindowTooLarge) => {
+                    return Err(ErrorCode::FrameParameterWindowTooLarge);
+                },
             }
         }
     }
@@ -249,6 +277,10 @@ impl DStream {
 /// The `ZSTD_DCtx` object.
 pub struct DCtx {
     pub settings: Settings,
+    /// The context dictionary, parsed once and shared with every stream
+    /// (set by `usingDict` — sticky until `initDStream` per the legacy
+    /// contract — or `loadDictionary`; cleared by a parameters reset).
+    pub dict: Option<SharedDict>,
     stream: Option<DStream>,
     /// Sticky first error (libzstd calls a failed stream undefined; this
     /// layer replays the code until a reset).
@@ -259,16 +291,64 @@ impl DCtx {
     pub fn new() -> Self {
         Self {
             settings: Settings::default(),
+            dict: None,
             stream: None,
             sticky: None,
         }
+    }
+
+    /// `ZSTD_DCtx_loadDictionary`: rejected mid-frame; a null or empty
+    /// dictionary clears the slot. The parse is eager (the dictionary is
+    /// digested once), so an unloadable dictionary fails here — libzstd
+    /// digests eagerly on the decode side too.
+    pub fn load_dictionary(&mut self, dict: Option<&[u8]>) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.dict = match dict {
+            Some(bytes) => Some(Arc::new(
+                zstdx::decoding::Dictionary::load(bytes)
+                    .map_err(|_| ErrorCode::DictionaryCorrupted)?,
+            )),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// `ZSTD_DCtx_reset`: session resets never fail; parameter resets fail
+    /// unless the stream sits on a frame boundary. Unknown directive values
+    /// are no-ops returning success, as libzstd's fall-through.
+    pub fn reset(&mut self, directive: ZSTD_ResetDirective) -> Result<(), ErrorCode> {
+        match directive {
+            ZSTD_ResetDirective::SessionOnly => self.reset_session(),
+            ZSTD_ResetDirective::Parameters => self.reset_parameters()?,
+            ZSTD_ResetDirective::SessionAndParameters => {
+                self.reset_session();
+                self.reset_parameters()?;
+            },
+        }
+        Ok(())
+    }
+
+    fn reset_session(&mut self) {
+        self.stream = None;
+        self.sticky = None;
+    }
+
+    fn reset_parameters(&mut self) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.settings = Settings::default();
+        self.dict = None;
+        Ok(())
     }
 
     /// `ZSTD_initDStream`: session reset (per the legacy doc contract the
     /// dictionary reference is cleared; parameters survive).
     pub fn init_stream(&mut self) {
         self.stream = None;
-        self.settings.dict = None;
+        self.dict = None;
         self.sticky = None;
     }
 
@@ -283,7 +363,8 @@ impl DCtx {
             return Err(sticky);
         }
         if self.stream.is_none() {
-            match DStream::new(&self.settings) {
+            let dict = self.dict.as_ref();
+            match DStream::new(&self.settings, dict) {
                 Ok(stream) => self.stream = Some(stream),
                 Err(e) => {
                     self.sticky = Some(e);

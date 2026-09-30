@@ -31,6 +31,7 @@ pub mod job_trace;
 mod levels;
 use alloc::vec::Vec;
 
+pub use dictionary::EncoderDictionary;
 pub(crate) use frame_compressor::compress_slice_with_dictionary;
 pub use frame_compressor::{
     FrameCompressor, compress_slice_opts, compress_slice_shaped, compress_slice_to_vec,

@@ -23,6 +23,11 @@ gcc "${cc_common[@]}" "$root/crates/zstdx-ffi/tests/harness.c" -o "$work/self" \
 gcc "${cc_common[@]}" "$root/crates/zstdx-ffi/tests/harness.c" -o "$work/ref" \
     "$ref/lib/libzstd.a" -lpthread -lm
 
+# The same self-tests against the reference library: the suite doubles as
+# a parity check, so expectations that drift from libzstd fail here first.
+echo "== self-tests (reference libzstd.a) =="
+"$work/ref" || { echo "reference self-tests failed: harness expectations drifted"; exit 1; }
+
 echo "== self-tests (zstdx libzstd.so) =="
 LD_LIBRARY_PATH="$root/target/release" "$work/self"
 

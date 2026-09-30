@@ -42,6 +42,21 @@ pub fn compress_with(
     source: &[u8],
     options: &crate::EncoderOptions,
 ) -> Result<alloc::vec::Vec<u8>> {
+    let parsed = options.parsed_dictionary.as_ref().map(|dict| {
+        crate::encoding::compress_slice_with_dictionary(
+            source,
+            options.level,
+            options.checksum,
+            crate::InputShape {
+                len: Some(source.len() as u64),
+                window_log: options.input_shape.window_log,
+            },
+            dict,
+        )
+    });
+    if let Some(compressed) = parsed {
+        return Ok(compressed);
+    }
     if let Some(raw) = &options.dictionary {
         let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
         let shape = crate::InputShape {
@@ -139,6 +154,13 @@ pub fn decompress_to_buffer_with(
         return crate::decoding::mt::decode_all_mt(source, destination, options.threads, max)
             .map_err(Into::into);
     }
+    if let Some(dict) = &options.parsed_dictionary {
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .add_shared_dict(alloc::sync::Arc::clone(dict))
+            .map_err(crate::Error::Frame)?;
+        return decoder.decode_all(source, destination).map_err(Into::into);
+    }
     if let Some(raw) = &options.dictionary {
         let dict = crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?;
         let mut decoder = FrameDecoder::new();
@@ -167,6 +189,20 @@ pub fn decompress_with(
         match crate::decoding::mt::decode_to_vec_mt(source, &mut out, options.threads, max) {
             Ok(()) => return Ok(out),
             Err(e) => return Err(e.into()),
+        }
+    }
+    let shared = options.parsed_dictionary.clone();
+    if let Some(dict) = shared {
+        let mut decoder = FrameDecoder::new();
+        decoder.add_shared_dict(dict).map_err(crate::Error::Frame)?;
+        let mut capacity = capacity.max(64 * 1024);
+        loop {
+            let mut out = alloc::vec::Vec::with_capacity(capacity);
+            match decoder.decode_all_to_vec(source, &mut out) {
+                Ok(()) => return Ok(out),
+                Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     if let Some(raw) = &options.dictionary {

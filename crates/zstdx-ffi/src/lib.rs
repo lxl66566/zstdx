@@ -14,14 +14,16 @@
 
 mod cctx;
 mod dctx;
+mod dict;
 mod error;
 mod frame;
 mod simple;
 
 use core::ffi::c_void;
 
-pub use error::{ErrorCode, MAX_CODE};
 // The C symbols live at the crate root, as on the C side.
+pub use dict::*;
+pub use error::{ErrorCode, MAX_CODE};
 pub use simple::*;
 
 /// Opaque context handles: zero-sized Rust stand-ins for the C structs; the
@@ -34,6 +36,66 @@ pub struct ZSTD_CCtx {
 pub struct ZSTD_DCtx {
     _opaque: [u8; 0],
 }
+
+/// Opaque dictionary handles: `dict::CDict` (a parsed dictionary plus the
+/// level decided at creation) and `dict::DDict` (a parsed decoding
+/// dictionary shared with every decoder built from it).
+#[repr(C)]
+pub struct ZSTD_CDict {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
+pub struct ZSTD_DDict {
+    _opaque: [u8; 0],
+}
+
+/// `ZSTD_ResetDirective`. Values outside the enum reach libzstd's reset
+/// entries as no-ops (its two `if`s fall through and return 0); this layer
+/// mirrors that instead of erroring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+#[repr(i32)]
+pub enum ZSTD_ResetDirective {
+    SessionOnly = 1,
+    Parameters = 2,
+    SessionAndParameters = 3,
+}
+
+impl ZSTD_ResetDirective {
+    /// The directive for a raw C value, `None` for anything else.
+    #[must_use]
+    pub fn from_raw(raw: core::ffi::c_int) -> Option<Self> {
+        match raw {
+            1 => Some(Self::SessionOnly),
+            2 => Some(Self::Parameters),
+            3 => Some(Self::SessionAndParameters),
+            _ => None,
+        }
+    }
+}
+
+/// `ZSTD_FrameHeader` (the `ZSTD_STATIC_LINKING_ONLY` surface).
+#[repr(C)]
+pub struct ZSTD_FrameHeader {
+    /// `ZSTD_CONTENTSIZE_UNKNOWN` when the frame declares none.
+    pub frame_content_size: u64,
+    pub window_size: u64,
+    pub block_size_max: core::ffi::c_uint,
+    /// `ZSTD_frame` (0) or `ZSTD_skippableFrame` (1).
+    pub frame_type: core::ffi::c_int,
+    pub header_size: core::ffi::c_uint,
+    /// For skippable frames the magic variant 0..=15.
+    pub dict_id: core::ffi::c_uint,
+    pub checksum_flag: core::ffi::c_uint,
+    pub _reserved1: core::ffi::c_uint,
+    pub _reserved2: core::ffi::c_uint,
+}
+
+/// `ZSTD_FrameType_e` values (the C names are the ABI).
+#[allow(non_upper_case_globals)]
+pub const ZSTD_frame: core::ffi::c_int = 0;
+#[allow(non_upper_case_globals)]
+pub const ZSTD_skippableFrame: core::ffi::c_int = 1;
 
 // libzstd naming is the ABI contract; the crate keeps it verbatim.
 #[allow(non_camel_case_types)]
@@ -214,7 +276,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
     }
     let ctx = unsafe { cctx_mut(cctx) };
     match ctx.set_parameter(param, value) {
-        Ok(()) => 0,
+        // The reference setters return the applied value on success.
+        Ok(applied) => applied,
         Err(e) => ret(e),
     }
 }
@@ -230,6 +293,109 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
     }
     let ctx = unsafe { dctx_mut(dctx) };
     match ctx.settings.set_parameter(param, value) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setPledgedSrcSize(
+    cctx: *mut ZSTD_CCtx,
+    pledged_src_size: u64,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    match unsafe { cctx_mut(cctx) }.set_pledged(pledged_src_size) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: core::ffi::c_int) -> usize {
+    let Some(directive) = ZSTD_ResetDirective::from_raw(reset) else {
+        // libzstd's fall-through: an unknown directive resets nothing and
+        // still reports success.
+        return 0;
+    };
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    match unsafe { cctx_mut(cctx) }.reset(directive) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_reset(dctx: *mut ZSTD_DCtx, reset: core::ffi::c_int) -> usize {
+    let Some(directive) = ZSTD_ResetDirective::from_raw(reset) else {
+        return 0;
+    };
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    match unsafe { dctx_mut(dctx) }.reset(directive) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_compress2(
+    cctx: *mut ZSTD_CCtx,
+    dst: *mut c_void,
+    dst_capacity: usize,
+    src: *const c_void,
+    src_size: usize,
+) -> usize {
+    let src = match unsafe { as_slice(src, src_size) } {
+        Ok(src) => src,
+        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    };
+    let dst = match unsafe { as_dst(dst, dst_capacity) } {
+        Some(dst) => dst,
+        None => return ret(ErrorCode::DstBufferNull),
+    };
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // Sticky settings and the loaded dictionary; always a fresh frame with
+    // the source size pledged (libzstd's single-round override).
+    match unsafe { cctx_mut(cctx) }.compress2(src, dst) {
+        Ok(written) => written,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary(
+    cctx: *mut ZSTD_CCtx,
+    dict: *const c_void,
+    dict_size: usize,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(dict, dict_size) };
+    match unsafe { cctx_mut(cctx) }.load_dictionary(bytes) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary(
+    dctx: *mut ZSTD_DCtx,
+    dict: *const c_void,
+    dict_size: usize,
+) -> usize {
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(dict, dict_size) };
+    match unsafe { dctx_mut(dctx) }.load_dictionary(bytes) {
         Ok(()) => 0,
         Err(e) => ret(e),
     }
@@ -255,10 +421,10 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let ctx = unsafe { cctx_mut(cctx) };
-    let mut settings = ctx.settings.clone();
-    settings.level = compression_level;
-    match cctx::compress_oneshot(&settings, src, dst) {
+    // One-shot variants run on fresh level-only settings: zstd.h reserves
+    // the sticky parameters for compress2 and the streaming entries.
+    let settings = cctx::Settings::one_shot(compression_level);
+    match cctx::compress_oneshot(&settings, None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
     }
@@ -284,19 +450,10 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
         return ret(ErrorCode::Generic);
     }
     let ctx = unsafe { dctx_mut(dctx) };
-    match dctx::decompress_oneshot(&ctx.settings, src, dst) {
-        Ok(written) if !src.is_empty() => written,
-        Ok(_) => 0,
+    match dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst) {
+        Ok(written) => written,
         Err(e) => ret(e),
     }
-}
-
-/// libzstd treats a null or sub-8-byte dictionary as "no dictionary".
-unsafe fn dict_bytes(dict: *const c_void, size: usize) -> Option<&'static [u8]> {
-    if dict.is_null() || size < 8 {
-        return None;
-    }
-    unsafe { as_slice(dict, size).ok() }
 }
 
 #[unsafe(no_mangle)]
@@ -321,13 +478,28 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let ctx = unsafe { cctx_mut(cctx) };
-    let mut settings = ctx.settings.clone();
-    settings.level = compression_level;
-    settings.dict = unsafe { dict_bytes(dict, dict_size) }.map(<[u8]>::to_vec);
-    match cctx::compress_oneshot(&settings, src, dst) {
+    // Fresh level-only settings, like compressCCtx; the dictionary is this
+    // call's alone and does not linger on the context.
+    let settings = cctx::Settings::one_shot(compression_level);
+    let parsed = parse_cdict_bytes(unsafe { dict_bytes(dict, dict_size) });
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(e) => return ret(e),
+    };
+    match cctx::compress_oneshot(&settings, parsed.as_ref(), src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
+    }
+}
+
+/// Parse dictionary bytes for a one-shot call; null or sub-8-byte
+/// dictionaries mean "no dictionary" (libzstd's rule).
+fn parse_cdict_bytes(bytes: Option<&[u8]>) -> Result<Option<zstdx::EncoderDictionary>, ErrorCode> {
+    match bytes {
+        Some(bytes) => zstdx::EncoderDictionary::parse(bytes)
+            .map(Some)
+            .map_err(|_| ErrorCode::DictionaryCorrupted),
+        None => Ok(None),
     }
 }
 
@@ -355,8 +527,15 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     let ctx = unsafe { dctx_mut(dctx) };
     // The dictionary is loaded into the context (libzstd's usingDict leaves
     // it loaded for the following calls) and survives until initDStream.
-    ctx.settings.dict = unsafe { dict_bytes(dict, dict_size) }.map(<[u8]>::to_vec);
-    match dctx::decompress_oneshot(&ctx.settings, src, dst) {
+    // Parsed once: the slot is shared with the streams that follow.
+    ctx.dict = match unsafe { dict_bytes(dict, dict_size) } {
+        Some(bytes) => match zstdx::decoding::Dictionary::load(bytes) {
+            Ok(parsed) => Some(std::sync::Arc::new(parsed)),
+            Err(_) => return ret(ErrorCode::DictionaryCorrupted),
+        },
+        None => None,
+    };
+    match dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
     }

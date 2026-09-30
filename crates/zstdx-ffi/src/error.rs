@@ -182,10 +182,8 @@ pub fn code(code: ErrorCode) -> usize {
     usize::wrapping_neg(code as u64 as usize)
 }
 
-/// Which entry point is mapping a decode failure: the one-shot and the
-/// streaming path disagree on a few codes (libzstd reports a non-frame input
-/// as `srcSize_wrong` from `ZSTD_decompress` but `prefix_unknown` from
-/// `ZSTD_decompressStream`).
+/// Which entry point is mapping a decode failure (kept for the entries
+/// whose codes still differ between the paths).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DecodeSite {
     OneShot,
@@ -207,10 +205,11 @@ pub fn decode(error: &zstdx::Error, site: DecodeSite) -> ErrorCode {
 pub fn frame(error: &zstdx::decoding::errors::FrameDecoderError, site: DecodeSite) -> ErrorCode {
     use zstdx::decoding::errors::{FrameDecoderError as Fde, ReadFrameHeaderError};
     match error {
-        Fde::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => match site {
-            // libzstd one-shot reports a non-frame buffer as a size error.
-            DecodeSite::OneShot => ErrorCode::SrcSizeWrong,
-            DecodeSite::Stream => ErrorCode::PrefixUnknown,
+        Fde::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
+            // The reference reports prefix_unknown on both paths (its
+            // srcSize_wrong remap needs a completed frame in front).
+            let _ = site;
+            ErrorCode::PrefixUnknown
         },
         Fde::ReadFrameHeaderError(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
         Fde::ReadFrameHeaderError(_) => ErrorCode::CorruptionDetected,

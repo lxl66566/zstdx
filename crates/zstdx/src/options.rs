@@ -64,6 +64,10 @@ pub struct EncoderOptions {
     /// the options). Multithreaded paths fall back to single-threaded with
     /// a dictionary attached.
     pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
+    /// An already-parsed dictionary (see [`Self::parsed_dictionary`]);
+    /// supersedes the raw bytes when both are set.
+    pub(crate) parsed_dictionary:
+        Option<alloc::sync::Arc<crate::encoding::dictionary::EncDictionary>>,
 }
 
 impl EncoderOptions {
@@ -78,6 +82,7 @@ impl EncoderOptions {
                 window_log: None,
             },
             dictionary: None,
+            parsed_dictionary: None,
         }
     }
 
@@ -87,6 +92,16 @@ impl EncoderOptions {
     /// frame header. Invalid dictionaries fail when the encoder is built.
     pub fn dictionary(mut self, dict: &[u8]) -> Self {
         self.dictionary = Some(dict.to_vec());
+        self
+    }
+
+    /// Attach an already-parsed dictionary
+    /// ([`EncoderDictionary`][crate::EncoderDictionary]) so building an
+    /// encoder skips the per-compression parse. Supersedes any raw
+    /// [`Self::dictionary`] bytes; invalid dictionaries already failed at
+    /// the parse.
+    pub fn parsed_dictionary(mut self, dict: &crate::EncoderDictionary) -> Self {
+        self.parsed_dictionary = Some(dict.shared());
         self
     }
 
@@ -135,6 +150,9 @@ impl EncoderOptions {
 pub struct DecoderOptions {
     pub(crate) max_window_size: Option<u64>,
     pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
+    /// An already-parsed dictionary (see [`Self::parsed_dictionary`]);
+    /// supersedes the raw bytes when both are set.
+    pub(crate) parsed_dictionary: Option<alloc::sync::Arc<crate::decoding::Dictionary>>,
     pub(crate) threads: u32,
 }
 
@@ -143,6 +161,7 @@ impl DecoderOptions {
         Self {
             max_window_size: None,
             dictionary: None,
+            parsed_dictionary: None,
             threads: 0,
         }
     }
@@ -158,6 +177,17 @@ impl DecoderOptions {
     /// Attach a zstd dictionary for decoding.
     pub fn dictionary(mut self, dict: &[u8]) -> Self {
         self.dictionary = Some(dict.to_vec());
+        self
+    }
+
+    /// Attach an already-parsed dictionary so taking the options skips the
+    /// per-decompression parse (the dictionary is shared, not copied).
+    /// Supersedes any raw [`Self::dictionary`] bytes.
+    pub fn parsed_dictionary(
+        mut self,
+        dict: alloc::sync::Arc<crate::decoding::Dictionary>,
+    ) -> Self {
+        self.parsed_dictionary = Some(dict);
         self
     }
 
