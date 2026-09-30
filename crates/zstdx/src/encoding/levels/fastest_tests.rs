@@ -400,3 +400,67 @@ fn xorshift(len: usize) -> Vec<u8> {
     data.truncate(len);
     data
 }
+
+/// The row band's attempts diet (R33): narrow-alphabet heads take the
+/// halved candidate budget at the lazy rows — including the level-10
+/// small-src flip, whose stock row is the row matcher — and every frame
+/// must roundtrip through both decoders whatever the verdict.
+#[cfg(feature = "std")]
+#[test]
+fn row_band_attempts_diet_roundtrips() {
+    let narrow = narrow_repeats(96 * 1024 + 17);
+    for level in [5i32, 7, 10, 12] {
+        let level = Level::from_zstd(level);
+        let bulk = compress_to_vec(narrow.as_slice(), level);
+        assert_eq!(
+            crate::bulk::decompress(bulk.as_slice(), narrow.len()).unwrap(),
+            narrow
+        );
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(bulk.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, narrow);
+        // The unpledged stream resolves the same head verdict and must
+        // roundtrip identically (its frames may differ in form, not
+        // meaning).
+        let mut sink = Vec::new();
+        {
+            let mut enc = crate::stream::write::Encoder::with_options(
+                &mut sink,
+                crate::EncoderOptions::new(level),
+            )
+            .unwrap();
+            for piece in narrow.chunks(64 * 1024) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        assert_eq!(
+            crate::bulk::decompress(sink.as_slice(), narrow.len()).unwrap(),
+            narrow
+        );
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(sink.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, narrow);
+    }
+}
+
+/// Narrow-alphabet payload with dense near-repeats (the attempts diet's
+/// target class): 24 symbols, repeated 16-byte words.
+fn narrow_repeats(len: usize) -> Vec<u8> {
+    let words = [
+        &b"key:value pair, "[..],
+        &b"list[0]=item; "[..],
+        &b"{\"id\": 42, "[..],
+        &b"true, null, "[..],
+    ];
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        data.extend_from_slice(words[(state as usize) % words.len()]);
+    }
+    data.truncate(len);
+    data
+}

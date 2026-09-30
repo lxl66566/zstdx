@@ -13,7 +13,7 @@ Full 1-22 ladder (one parameter row per numeric level, modeled on libzstd's `cle
 |---|---|---|---|---|
 | Uncompressed (0) | 0 | raw block | — | |
 | Fastest (1) | 1 | fast (hash5 single-probe table) | 768 KiB | row 2: fast H16/W20 |
-| Fast (3) | 3 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | row 4: dfast H18/C18; rows 5-12: chain family (greedy→lazy→lazy2 via lazy_depth, min_match 5, depths half libzstd's 1<<S — our per-probe walk is dearer; W21→W22, H19→H23) |
+| Fast (3) | 3 | dfast (hash8+hash5 dual-table single-probe) | 2 MiB | row 4: dfast H18/C18; rows 5-12: tagged row matcher (libzstd's own rows, attempts at parity; a narrow-head verdict cuts the budget — R33, json x1.19-1.29 at −4.8..−16.4% bytes) |
 | Balanced (9) | 9 | hash chain + lazy2 | 4 MiB | H21 / C20 (aliased beyond 1MiB, like libzstd cLog<wLog) / depth 8 |
 | Best (13) | 13 | btlazy2 over the DUBT tree | 64 MiB | rows 13-15 (libzstd btlazy2 territory, C's exact S4/5/6 ladder); W22 / H22-23; O(1) fill + search-time batch sort (`dubt.rs`, 2026-09-14) |
 | Opt (17) | 17 | btopt (full port) | 8 MiB | rows 16-17; W23 / H22 / C22 (L17 row, ring capped below libzstd's C23: json −19.6% time for +0.16% dll) |
