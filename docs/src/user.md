@@ -191,8 +191,14 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 
 - Default output names: `FILE.zst` when compressing, the name without the `.zst` suffix when decompressing; inputs are kept unless `--rm`.
 - Levels: `-1`..`-19` (default 3), `--fast[=N]` for negative levels, `--ultra` unlocks 20–22.
-- `-T N` sets worker threads (`-T0` = all cores); `-D DICT` (de)compresses against a dictionary.
-- `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity.
+- `-T N` sets worker threads (`-T0` = all cores, `--single-thread` = `-T1`); `-D DICT` (de)compresses against a dictionary.
+- `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity, `--[no-]progress` overrides the auto progress-bar rule (interactive stderr, known size), `--ignore-errors` keeps per-input failures out of the exit code.
+- `--long[=N]` forces the window log (default 27, the engine's maximum; 10-27; a known source size still shrinks the window to the source like zstd). Unlike zstd, `--long` alone does not switch the long-distance matcher on: the engine arms LDM by level row once the effective window reaches 32 MiB.
+- `--[no-]check` toggles the frame checksum (default on); both are compression-only — decoding always validates a present checksum, and the flags are rejected in decode modes instead of ignored.
+- `--stream-size=N` pledges the exact stdin size (a mismatch fails, like zstd); `--size-hint=N` sizes the encoder row for an approximate stdin size without any header promise. Both are stdin-only and rejected for file inputs, whose sizes are already pledged.
+- `-M N` / `--memory=N` bounds decode memory by capping the frame window (zstd's syntax: bare bytes or `K`/`M`/`G` suffixes). Values below 1K reject every frame and are refused, as in zstd; compression rejects the flag (zstd silently ignores it there).
+- `--filelist LIST` (alias `--file`) reads the input list from LIST, one path per line; `-` reads the list itself from stdin.
+- `--sparse`/`--no-sparse` are rejected with an explicit unsupported error: output is always dense (sparse decode-to-seek is not implemented).
 - A failed (de)compression to a file removes the partial output it created, mirroring zstd.
 - Overwrite prompts are read from the controlling terminal (/dev/tty), never from piped stdin; without a terminal, existing outputs are refused unless `-f` is given.
 - A progress bar shows only on an interactive stderr; it never pollutes pipes.
@@ -201,6 +207,8 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 zstdx trace.log                          # → trace.log.zst, level 3
 zstdx -19 -o data.zst data.csv
 zstdx -D api.dict -9 req.json            # dictionary-compressed
+zstdx --long=26 -T0 archive.tar          # 64 MiB window, all cores
+zstdx -d -M 128M out.zst                 # decode within a memory cap
 zstdx -d out.zst                         # → out
 zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
 ```

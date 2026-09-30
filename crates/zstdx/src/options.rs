@@ -24,7 +24,10 @@ use crate::Level;
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct InputShape {
     /// Whole-frame byte length, when known: the window and tables downsize
-    /// to the source (libzstd's `ZSTD_adjustCParams`).
+    /// to the source (libzstd's `ZSTD_adjustCParams`). The streaming
+    /// encoders treat it as a non-binding hint when no
+    /// [`pledged_size`][EncoderOptions::pledged_size] is set (libzstd's
+    /// `srcSizeHint`): it sizes the row, never the header promise.
     pub len: Option<u64>,
     /// Forced window log (clamped to 10..=27), overriding the level's row
     /// before the length adjustment (a known smaller length still clamps
