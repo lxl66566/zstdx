@@ -400,6 +400,365 @@ done:
 
 /* DCtx reset + the metadata size entries. */
 
+/* Deterministic incompressible bytes (dictionary tests need content the
+ * pattern generator cannot accidentally reproduce). */
+static unsigned char *gen_random(size_t n) {
+    unsigned char *buf = malloc(n ? n : 1);
+    for (size_t i = 0; i < n; i++) {
+        rnd(); /* churn */
+        buf[i] = (unsigned char)(rng_state >> 32);
+    }
+    return buf;
+}
+
+/* Reset family + compress2: sticky parameters, session/parameter resets,
+ * pledged sizes on chunked and single-round streams. */
+static void test_reset_compress2(void) {
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    size_t n = 200000;
+    unsigned char *src = gen_input(n);
+    size_t cap = ZSTD_compressBound(n);
+    unsigned char *cmp = malloc(cap);
+    unsigned char *out = malloc(n + 1);
+
+    /* compress2 with sticky parameters: checksum flag lands in the frame. */
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 9) == 9, "level param");
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1) == 1, "checksum param");
+    size_t c = ZSTD_compress2(cctx, cmp, cap, src, n);
+    CHECK(!ZSTD_isError(c), "compress2: %s", ZSTD_getErrorName(c));
+    CHECK(ZSTD_getFrameContentSize(cmp, c) == n, "compress2 fcs");
+    {
+        ZSTD_FrameHeader zfh;
+        memset(&zfh, 0, sizeof(zfh));
+        CHECK(ZSTD_getFrameHeader(&zfh, cmp, c) == 0, "getFrameHeader");
+        CHECK(zfh.checksumFlag == 1, "checksum flag in frame");
+        CHECK(zfh.frameContentSize == n, "zfh fcs");
+        CHECK(zfh.frameType == ZSTD_frame, "zfh type");
+    }
+
+    /* Session reset keeps parameters: the next frame still checksums. */
+    CHECK(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only) == 0, "session reset");
+    size_t c2 = ZSTD_compress2(cctx, cmp, cap, src, n / 2);
+    CHECK(!ZSTD_isError(c2), "compress2 after reset: %s", ZSTD_getErrorName(c2));
+    CHECK(ZSTD_getFrameHeader(NULL, cmp, 0) != 0, "null zfh rejected");
+    {
+        ZSTD_FrameHeader zfh;
+        memset(&zfh, 0, sizeof(zfh));
+        CHECK(ZSTD_getFrameHeader(&zfh, cmp, c2) == 0, "getHeader 2");
+        CHECK(zfh.checksumFlag == 1, "checksum survives session reset");
+    }
+
+    /* Parameters reset mid-frame fails; the combined form always works. */
+    {
+        ZSTD_CCtx *c3 = ZSTD_createCCtx();
+        ZSTD_inBuffer in = {src, 8192, 0};
+        unsigned char ob[256];
+        ZSTD_outBuffer outb = {ob, sizeof(ob), 0};
+        ZSTD_compressStream2(c3, &outb, &in, ZSTD_e_continue);
+        size_t r = ZSTD_CCtx_reset(c3, ZSTD_reset_parameters);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+              "params reset mid-frame: %s", ZSTD_getErrorName(r));
+        CHECK(ZSTD_CCtx_reset(c3, ZSTD_reset_session_and_parameters) == 0, "combined reset");
+        /* Unknown directive values are no-ops, as in libzstd. */
+        CHECK(ZSTD_CCtx_reset(c3, (ZSTD_ResetDirective)7) == 0, "bogus directive");
+        ZSTD_freeCCtx(c3);
+    }
+
+    /* Pledged size on a chunked stream: declared, then consumed. */
+    CHECK(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters) == 0, "full reset");
+    CHECK(ZSTD_CCtx_setPledgedSrcSize(cctx, 100000) == 0, "pledge");
+    {
+        ZSTD_CCtx *cs = ZSTD_createCStream();
+        CHECK(ZSTD_CCtx_setPledgedSrcSize(cs, 100000) == 0, "pledge cs");
+        unsigned char *frame = malloc(ZSTD_compressBound(100000) + 64);
+        size_t produced = 0, fed = 0;
+        for (;;) {
+            size_t take = 100000 - fed < 16384 ? 100000 - fed : 16384;
+            ZSTD_inBuffer in = {src + fed, take, 0};
+            fed += take;
+            ZSTD_EndDirective end = fed == 100000 ? ZSTD_e_end : ZSTD_e_continue;
+            for (;;) {
+                ZSTD_outBuffer out = {frame + produced, 4096, 0};
+                size_t r = ZSTD_compressStream2(cs, &out, &in, end);
+                CHECK(!ZSTD_isError(r), "pledged stream: %s", ZSTD_getErrorName(r));
+                produced += out.pos;
+                if (in.pos == in.size && (end == ZSTD_e_continue || r == 0)) break;
+            }
+            if (end == ZSTD_e_end) break;
+        }
+        CHECK(ZSTD_getFrameContentSize(frame, produced) == 100000, "pledged fcs declared");
+        size_t d = ZSTD_decompress(out, n, frame, produced);
+        CHECK(!ZSTD_isError(d) && d == 100000 && memcmp(out, src, 100000) == 0, "pledged roundtrip");
+        /* A new frame on the same context: the pledge is gone. */
+        produced = 0; fed = 0;
+        for (;;) {
+            size_t take = 100000 - fed < 16384 ? 100000 - fed : 16384;
+            ZSTD_inBuffer in = {src + fed, take, 0};
+            fed += take;
+            ZSTD_EndDirective end = fed == 100000 ? ZSTD_e_end : ZSTD_e_continue;
+            for (;;) {
+                ZSTD_outBuffer out = {frame + produced, 4096, 0};
+                size_t r = ZSTD_compressStream2(cs, &out, &in, end);
+                CHECK(!ZSTD_isError(r), "second stream: %s", ZSTD_getErrorName(r));
+                produced += out.pos;
+                if (in.pos == in.size && (end == ZSTD_e_continue || r == 0)) break;
+            }
+            if (end == ZSTD_e_end) break;
+        }
+        CHECK(ZSTD_getFrameContentSize(frame, produced) == ZSTD_CONTENTSIZE_UNKNOWN,
+              "pledge consumed");
+        /* UNKNOWN explicitly means no pledge. */
+        CHECK(ZSTD_CCtx_reset(cs, ZSTD_reset_session_only) == 0, "cs reset");
+        CHECK(ZSTD_CCtx_setPledgedSrcSize(cs, ZSTD_CONTENTSIZE_UNKNOWN) == 0, "pledge unknown");
+        /* Setting a pledge mid-frame is stage_wrong. */
+        {
+            ZSTD_inBuffer in = {src, 8192, 0};
+            unsigned char ob[256];
+            ZSTD_outBuffer outb = {ob, sizeof(ob), 0};
+            ZSTD_compressStream2(cs, &outb, &in, ZSTD_e_continue);
+            size_t r = ZSTD_CCtx_setPledgedSrcSize(cs, 5);
+            CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+                  "pledge mid-frame: %s", ZSTD_getErrorName(r));
+        }
+        free(frame);
+        ZSTD_freeCStream(cs);
+    }
+
+    /* A single-round e_end stream declares its size (the auto-pledge). */
+    {
+        ZSTD_CCtx *cs = ZSTD_createCStream();
+        ZSTD_inBuffer in = {src, 4096, 0};
+        unsigned char *frame = malloc(ZSTD_compressBound(4096));
+        ZSTD_outBuffer out = {frame, ZSTD_compressBound(4096), 0};
+        size_t r;
+        do {
+            out.pos = 0;
+            r = ZSTD_compressStream2(cs, &out, &in, ZSTD_e_end);
+            CHECK(!ZSTD_isError(r), "single round: %s", ZSTD_getErrorName(r));
+        } while (r != 0);
+        CHECK(ZSTD_getFrameContentSize(frame, out.pos) == 4096, "single-round fcs");
+        free(frame);
+        ZSTD_freeCStream(cs);
+    }
+
+    ZSTD_freeCCtx(cctx);
+    free(src);
+    free(cmp);
+    free(out);
+}
+
+/* CDict/DDict objects, loadDictionary, and the getDictID family. */
+static void test_dicts(void) {
+    /* A dictionary of incompressible content; the payload ends with its
+     * tail so frames genuinely reference the dictionary. */
+    unsigned char *dict = gen_random(8192);
+    size_t payload_len = 1000 + 4096;
+    unsigned char *payload = malloc(payload_len);
+    memcpy(payload, gen_random(1000), 1000);
+    memcpy(payload + 1000, dict + 4096, 4096);
+
+    size_t cap = ZSTD_compressBound(payload_len);
+    unsigned char *cmp = malloc(cap);
+    unsigned char *cmp2 = malloc(cap);
+    unsigned char *out = malloc(payload_len + 1);
+
+    /* getDictID_fromDict: raw content and handcrafted formatted heads. */
+    CHECK(ZSTD_getDictID_fromDict(dict, 8192) == 0, "raw dict id 0");
+    CHECK(ZSTD_getDictID_fromDict(dict, 4) == 0, "short dict id 0");
+    CHECK(ZSTD_getDictID_fromDict(NULL, 0) == 0, "null dict id 0");
+    {
+        unsigned char crafted[64];
+        memset(crafted, 0, sizeof(crafted));
+        crafted[0] = 0x37; crafted[1] = 0xA4; crafted[2] = 0x30; crafted[3] = 0xEC;
+        crafted[7] = 0x5A; /* id 0x5A000000, little endian */
+        CHECK(ZSTD_getDictID_fromDict(crafted, sizeof(crafted)) == 0x5A000000u, "crafted id");
+    }
+
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+
+    /* CDict: level from the handle, byte-identical to usingDict. */
+    ZSTD_CDict *cdict = ZSTD_createCDict(dict, 8192, 7);
+    CHECK(cdict != NULL, "createCDict");
+    CHECK(ZSTD_getDictID_fromCDict(cdict) == 0, "cdict raw id");
+    size_t c = ZSTD_compress_usingCDict(cctx, cmp, cap, payload, payload_len, cdict);
+    CHECK(!ZSTD_isError(c), "usingCDict: %s", ZSTD_getErrorName(c));
+    CHECK(ZSTD_getFrameContentSize(cmp, c) == payload_len, "usingCDict fcs");
+    size_t c2 = ZSTD_compress_usingDict(cctx, cmp2, cap, payload, payload_len, dict, 8192, 7);
+    CHECK(!ZSTD_isError(c2), "usingDict: %s", ZSTD_getErrorName(c2));
+    CHECK(c == c2 && memcmp(cmp, cmp2, c) == 0, "usingCDict == usingDict");
+    /* Reuse: a second job through the same handle. */
+    size_t c3 = ZSTD_compress_usingCDict(cctx, cmp2, cap, payload, payload_len - 16, cdict);
+    CHECK(!ZSTD_isError(c3), "cdict reuse: %s", ZSTD_getErrorName(c3));
+    /* NULL cdict is dictionary_wrong. */
+    size_t r = ZSTD_compress_usingCDict(cctx, cmp2, cap, payload, 100, NULL);
+    CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_dictionary_wrong,
+          "usingCDict NULL: %s", ZSTD_getErrorName(r));
+    /* Empty CDict: level-only handle. */
+    ZSTD_CDict *empty = ZSTD_createCDict(NULL, 0, 3);
+    CHECK(empty != NULL, "createCDict empty");
+    r = ZSTD_compress_usingCDict(cctx, cmp2, cap, payload, 1000, empty);
+    CHECK(!ZSTD_isError(r), "usingCDict empty: %s", ZSTD_getErrorName(r));
+    CHECK(ZSTD_freeCDict(cdict) == 0 && ZSTD_freeCDict(empty) == 0, "freeCDict");
+    CHECK(ZSTD_freeCDict(NULL) == 0, "freeCDict null");
+
+    /* The frame needs its dictionary: plain decode fails. */
+    r = ZSTD_decompressDCtx(dctx, out, payload_len + 1, cmp, c);
+    CHECK(ZSTD_isError(r), "plain decode of dict frame must fail");
+    /* DDict decodes it. */
+    ZSTD_DDict *ddict = ZSTD_createDDict(dict, 8192);
+    CHECK(ddict != NULL, "createDDict");
+    CHECK(ZSTD_getDictID_fromDDict(ddict) == 0, "ddict raw id");
+    size_t d = ZSTD_decompress_usingDDict(dctx, out, payload_len + 1, cmp, c, ddict);
+    CHECK(!ZSTD_isError(d) && d == payload_len && memcmp(out, payload, payload_len) == 0,
+          "decompress_usingDDict: %s", ZSTD_getErrorName(d));
+    /* bytes form: identical outcome. */
+    size_t d2 = ZSTD_decompress_usingDict(dctx, out, payload_len + 1, cmp, c, dict, 8192);
+    CHECK(!ZSTD_isError(d2) && d2 == payload_len, "decompress_usingDict");
+    CHECK(ZSTD_freeDDict(ddict) == 0 && ZSTD_freeDDict(NULL) == 0, "freeDDict");
+
+    /* loadDictionary: compression and decode through the context slot. */
+    CHECK(ZSTD_CCtx_loadDictionary(cctx, dict, 8192) == 0, "cctx loadDictionary");
+    /* Mid-frame load is stage_wrong. */
+    {
+        ZSTD_CCtx *cm = ZSTD_createCCtx();
+        ZSTD_inBuffer in = {payload, 8192, 0};
+        unsigned char ob[256];
+        ZSTD_outBuffer outb = {ob, sizeof(ob), 0};
+        ZSTD_compressStream2(cm, &outb, &in, ZSTD_e_continue);
+        r = ZSTD_CCtx_loadDictionary(cm, dict, 8192);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+              "loadDictionary mid-frame: %s", ZSTD_getErrorName(r));
+        ZSTD_freeCCtx(cm);
+    }
+    size_t cl = ZSTD_compress2(cctx, cmp, cap, payload, payload_len);
+    CHECK(!ZSTD_isError(cl), "compress2 with loaded dict: %s", ZSTD_getErrorName(cl));
+    CHECK(cl < ZSTD_compress(cctx ? cmp2 : cmp2, cap, payload, payload_len, 7),
+          "loaded dictionary must help this payload");
+    CHECK(ZSTD_DCtx_loadDictionary(dctx, dict, 8192) == 0, "dctx loadDictionary");
+    size_t dl = ZSTD_decompressDCtx(dctx, out, payload_len + 1, cmp, cl);
+    CHECK(!ZSTD_isError(dl) && dl == payload_len, "decompressDCtx with loaded dict");
+    /* A parameters reset drops the dictionary. */
+    CHECK(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters) == 0, "reset drops dict");
+    size_t cn = ZSTD_compress2(cctx, cmp, cap, payload, payload_len);
+    CHECK(!ZSTD_isError(cn), "compress2 after reset");
+    CHECK(cn > cl, "dictionary survived the parameters reset");
+    /* initDStream clears the decode-side dictionary (legacy contract). */
+    CHECK(ZSTD_initDStream(dctx) > 0, "initDStream");
+    r = ZSTD_decompressDCtx(dctx, out, payload_len + 1, cmp, cl);
+    CHECK(ZSTD_isError(r), "dict frame must fail after initDStream");
+    /* NULL dictionary returns to no-dictionary mode. */
+    CHECK(ZSTD_DCtx_loadDictionary(dctx, NULL, 0) == 0, "null loadDictionary");
+
+    /* getDictID_fromFrame: no dictID in these frames (raw dict). */
+    CHECK(ZSTD_getDictID_fromFrame(cmp, cn) == 0, "fromFrame raw");
+    CHECK(ZSTD_getDictID_fromFrame(cmp, 3) == 0, "fromFrame short");
+
+    ZSTD_freeCCtx(cctx);
+    ZSTD_freeDCtx(dctx);
+    free(dict);
+    free(payload);
+    free(cmp);
+    free(cmp2);
+    free(out);
+}
+
+/* DCtx reset + the metadata size entries. */
+static void test_dctx_reset_and_metadata(void) {
+    size_t n = 30000;
+    unsigned char *src = gen_input(n);
+    size_t cap = ZSTD_compressBound(n);
+    unsigned char *cmp = malloc(cap);
+    unsigned char *out = malloc(n + 1);
+    size_t c = ZSTD_compress(cmp, cap, src, n, 3);
+
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    /* Parameters reset mid-decode is stage_wrong; session reset then works. */
+    {
+        ZSTD_inBuffer in = {cmp, c, 0};
+        ZSTD_outBuffer outb = {out, 100, 0};
+        CHECK(ZSTD_initDStream(dctx) > 0, "initDStream");
+        ZSTD_decompressStream(dctx, &outb, &in);
+        size_t r = ZSTD_DCtx_reset(dctx, ZSTD_reset_parameters);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+              "dctx params reset mid-frame: %s", ZSTD_getErrorName(r));
+        CHECK(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only) == 0, "dctx session reset");
+        CHECK(ZSTD_DCtx_reset(dctx, ZSTD_reset_parameters) == 0, "dctx params reset");
+        CHECK(ZSTD_DCtx_reset(dctx, (ZSTD_ResetDirective)42) == 0, "dctx bogus directive");
+    }
+
+    /* The obsolete getDecompressedSize blend. */
+    CHECK(ZSTD_getDecompressedSize(cmp, c) == n, "getDecompressedSize known");
+    {
+        unsigned char empty[64];
+        size_t en = ZSTD_compress(empty, 64, src, 0, 3);
+        CHECK(ZSTD_getDecompressedSize(empty, en) == 0, "getDecompressedSize empty");
+    }
+
+    /* findDecompressedSize: single, series with skippable, junk, unknown. */
+    CHECK(ZSTD_findDecompressedSize(cmp, c) == n, "find one");
+    {
+        unsigned char skip[12] = {0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4};
+        unsigned char *series = malloc(c + 12);
+        memcpy(series, cmp, c);
+        memcpy(series + c, skip, 12);
+        CHECK(ZSTD_findDecompressedSize(series, c + 12) == n, "find series+skip");
+        CHECK(ZSTD_getFrameContentSize(skip, 12) == 0, "skippable fcs 0");
+        CHECK(ZSTD_getDecompressedSize(skip, 12) == 0, "skippable getDecompressedSize");
+        series[c] = 1; series[c + 1] = 2; /* trailing junk below prefix len */
+        CHECK(ZSTD_findDecompressedSize(series, c + 2) == ZSTD_CONTENTSIZE_ERROR, "find junk");
+        free(series);
+        /* getFrameHeader on the skippable frame. */
+        {
+            ZSTD_FrameHeader zfh;
+            memset(&zfh, 0, sizeof(zfh));
+            CHECK(ZSTD_getFrameHeader(&zfh, skip, 12) == 0, "skippable header");
+            CHECK(zfh.frameType == ZSTD_skippableFrame, "skippable type");
+            CHECK(zfh.frameContentSize == 4, "skippable zfh fcs");
+            CHECK(zfh.headerSize == 8, "skippable zfh headerSize");
+            CHECK(zfh.dictID == 0, "skippable variant");
+        }
+    }
+    CHECK(ZSTD_findDecompressedSize(cmp, 0) == 0, "find empty input");
+
+    /* frameHeaderSize: descriptor arithmetic, parity on skippables. */
+    {
+        size_t h = ZSTD_frameHeaderSize(cmp, c);
+        CHECK(!ZSTD_isError(h) && h >= 5 && h <= 18, "frameHeaderSize zstd");
+        ZSTD_FrameHeader zfh;
+        memset(&zfh, 0, sizeof(zfh));
+        CHECK(ZSTD_getFrameHeader(&zfh, cmp, c) == 0, "getFrameHeader zstd");
+        CHECK(zfh.headerSize == h, "headerSize agrees");
+        CHECK(zfh.windowSize >= n / 2, "window at least content"); /* single-segment or wide */
+        CHECK(zfh.blockSizeMax == (zfh.windowSize < 131072 ? zfh.windowSize : 131072),
+              "blockSizeMax = min(window, 128K)");
+        unsigned char skip4[12] = {0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4};
+        CHECK(ZSTD_frameHeaderSize(skip4, 12) == 6, "frameHeaderSize skippable (size byte 4)");
+        CHECK(ZSTD_isError(ZSTD_frameHeaderSize(cmp, 4)), "frameHeaderSize short");
+        CHECK(ZSTD_getErrorCode(ZSTD_frameHeaderSize(cmp, 4)) == ZSTD_error_srcSize_wrong,
+              "frameHeaderSize short code");
+    }
+
+    /* getFrameHeader: short inputs want the prefix, garbage is an error. */
+    {
+        ZSTD_FrameHeader zfh;
+        memset(&zfh, 0, sizeof(zfh));
+        CHECK(ZSTD_getFrameHeader(&zfh, cmp, 0) == 5, "empty wants 5");
+        CHECK(ZSTD_getFrameHeader(&zfh, cmp, 3) == 5, "short wants 5");
+        unsigned char half[3] = {0x28, 0xB5, 0x2F};
+        CHECK(ZSTD_getFrameHeader(&zfh, half, 3) == 5, "magic prefix wants 5");
+        unsigned char bad[3] = {1, 2, 3};
+        size_t r = ZSTD_getFrameHeader(&zfh, bad, 3);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_prefix_unknown,
+              "bad prefix: %s", ZSTD_getErrorName(r));
+    }
+
+    ZSTD_freeDCtx(dctx);
+    free(src);
+    free(cmp);
+    free(out);
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "produce") == 0)
         return produce(argv[2], argv[3], 3, 0);
@@ -414,6 +773,9 @@ int main(int argc, char **argv) {
     test_errors();
     test_contexts();
     test_streaming();
+    test_reset_compress2();
+    test_dicts();
+    test_dctx_reset_and_metadata();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;
 }

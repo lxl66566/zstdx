@@ -10,6 +10,10 @@ use crate::{
 };
 
 /// Mirrors `ZSTD_VERSION_NUMBER` of the libzstd API this layer implements.
+/// Dictionary magic (little-endian `0xEC30A437`), the formatting
+/// `zstd --train` writes and `ZSTD_getDictID_fromDict` keys on.
+const DICT_MAGIC: [u8; 4] = [0x37, 0xa4, 0x30, 0xec];
+
 pub const VERSION_NUMBER: u32 = 1 * 100 * 100 + 6 * 100;
 pub const VERSION_MAJOR: u32 = 1;
 pub const VERSION_MINOR: u32 = 6;
@@ -142,7 +146,7 @@ pub unsafe extern "C" fn ZSTD_compress(
     };
     let mut settings = CSettings::default();
     settings.level = compression_level;
-    match crate::cctx::compress_oneshot(&settings, src, dst) {
+    match crate::cctx::compress_oneshot(&settings, None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
     }
@@ -163,7 +167,7 @@ pub unsafe extern "C" fn ZSTD_decompress(
         Some(dst) => dst,
         None => return ret(ErrorCode::DstBufferNull),
     };
-    match crate::dctx::decompress_oneshot(&DSettings::default(), src, dst) {
+    match crate::dctx::decompress_oneshot(&DSettings::default(), None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
     }
@@ -199,6 +203,142 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getDecompressedSize(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> u64 {
+    // The obsolete blend: known-and-nonempty keeps its value, everything
+    // else (unknown, error, empty, skippable) collapses to 0.
+    let fcs = unsafe { ZSTD_getFrameContentSize(src, src_size) };
+    if fcs >= CONTENTSIZE_ERROR {
+        0
+    } else {
+        fcs
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_findDecompressedSize(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> u64 {
+    let src = match unsafe { crate::as_slice(src, src_size) } {
+        Ok(src) => src,
+        Err(_) => return CONTENTSIZE_ERROR,
+    };
+    match crate::frame::find_decompressed_size(src) {
+        Ok(Some(total)) => total,
+        // A frame without a declared size makes the whole series unknown.
+        Ok(None) => CONTENTSIZE_UNKNOWN,
+        Err(()) => CONTENTSIZE_ERROR,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_frameHeaderSize(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> usize {
+    let src = match unsafe { crate::as_slice(src, src_size) } {
+        Ok(src) => src,
+        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    };
+    if src.len() < crate::frame::HEADER_PREFIX {
+        return ret(ErrorCode::SrcSizeWrong);
+    }
+    // libzstd's entry is pure arithmetic on the descriptor byte — no magic
+    // validation (verified against the reference library: a skippable
+    // frame is measured through its own size field's first byte).
+    crate::frame::header_size_formula(src[4])
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getFrameHeader(
+    zfh_ptr: *mut crate::ZSTD_FrameHeader,
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> usize {
+    if zfh_ptr.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let src = match unsafe { crate::as_slice(src, src_size) } {
+        Ok(src) => src,
+        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    };
+    let zfh = unsafe { &mut *zfh_ptr };
+    let unknown = CONTENTSIZE_UNKNOWN;
+    *zfh = crate::ZSTD_FrameHeader {
+        frame_content_size: unknown,
+        window_size: 0,
+        block_size_max: 0,
+        frame_type: crate::ZSTD_frame,
+        header_size: 0,
+        dict_id: 0,
+        checksum_flag: 0,
+        _reserved1: 0,
+        _reserved2: 0,
+    };
+    match crate::frame::parse_full_header(src) {
+        Ok(crate::frame::HeaderParse::Complete(header)) => {
+            zfh.frame_content_size = header.content_size.unwrap_or(unknown);
+            zfh.window_size = header.window_size;
+            zfh.block_size_max = header.block_size_max as core::ffi::c_uint;
+            zfh.frame_type = match header.frame_type {
+                crate::frame::FrameType::Zstd => crate::ZSTD_frame,
+                crate::frame::FrameType::Skippable => crate::ZSTD_skippableFrame,
+            };
+            zfh.header_size = header.header_size as core::ffi::c_uint;
+            zfh.dict_id = header.dict_id;
+            zfh.checksum_flag = u32::from(header.checksum);
+            0
+        },
+        // A valid prefix: the total size the parser wants.
+        Ok(crate::frame::HeaderParse::Wanted(wanted)) => wanted,
+        Err(crate::frame::ParseError::NeedMore) => crate::frame::HEADER_PREFIX,
+        Err(crate::frame::ParseError::BadMagic) => ret(ErrorCode::PrefixUnknown),
+        Err(crate::frame::ParseError::ReservedBit) => ret(ErrorCode::FrameParameterUnsupported),
+        Err(crate::frame::ParseError::WindowTooLarge) => {
+            ret(ErrorCode::FrameParameterWindowTooLarge)
+        },
+        Err(crate::frame::ParseError::Malformed) => ret(ErrorCode::CorruptionDetected),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getDictID_fromDict(
+    dict: *const core::ffi::c_void,
+    dict_size: usize,
+) -> core::ffi::c_uint {
+    // The reference reads the four bytes behind the dictionary magic with
+    // no validity judgment of the tables that follow.
+    let Some(bytes) = (unsafe { crate::dict::dict_bytes(dict, dict_size) }) else {
+        return 0;
+    };
+    if bytes[..4] != DICT_MAGIC {
+        return 0;
+    }
+    u32::from_le_bytes(bytes[4..8].try_into().expect("8 bytes checked"))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getDictID_fromFrame(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> core::ffi::c_uint {
+    let src = match unsafe { crate::as_slice(src, src_size) } {
+        Ok(src) => src,
+        Err(_) => return 0,
+    };
+    match crate::frame::parse_full_header(src) {
+        // The reference returns the skippable magic variant for skippable
+        // frames (it reads the same struct field); incomplete or invalid
+        // heads report 0.
+        Ok(crate::frame::HeaderParse::Complete(header)) => header.dict_id,
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(
     src: *const core::ffi::c_void,
     src_size: usize,
@@ -212,6 +352,10 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(
         Err(crate::frame::ParseError::BadMagic) => ret(ErrorCode::PrefixUnknown),
         Err(crate::frame::ParseError::NeedMore) => ret(ErrorCode::SrcSizeWrong),
         Err(crate::frame::ParseError::Malformed) => ret(ErrorCode::CorruptionDetected),
+        Err(crate::frame::ParseError::ReservedBit) => ret(ErrorCode::FrameParameterUnsupported),
+        Err(crate::frame::ParseError::WindowTooLarge) => {
+            ret(ErrorCode::FrameParameterWindowTooLarge)
+        },
     }
 }
 

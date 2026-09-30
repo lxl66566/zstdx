@@ -6,11 +6,19 @@
 //! staging `Vec` (the only public path that pledges the content size into
 //! the frame header, as libzstd does by default), and the streaming entries
 //! reuse the same encoder across calls with a delivered-cursor sink.
+//!
+//! libzstd's parameter model splits in two: the sticky parameters (level,
+//! window, frame flags, workers) apply to `compress2` and the streaming
+//! entries only — the one-shot variants (`compressCCtx`, `usingDict`,
+//! `usingCDict`) run on fresh level-only settings, as `zstd.h` documents.
+//! The dictionary loaded through `loadDictionary` and the pledged size set
+//! through `setPledgedSrcSize` are session state: they apply to the frames
+//! that follow and drop on a parameters reset.
 
 use std::io::Write as _;
 
 use crate::{
-    ZSTD_EndDirective, ZSTD_cParameter, ZSTD_inBuffer, ZSTD_outBuffer,
+    ZSTD_EndDirective, ZSTD_ResetDirective, ZSTD_cParameter, ZSTD_inBuffer, ZSTD_outBuffer,
     error::{self, ErrorCode},
 };
 
@@ -31,7 +39,6 @@ pub struct Settings {
     pub checksum: bool,
     pub content_size: bool,
     pub workers: u32,
-    pub dict: Option<Vec<u8>>,
 }
 
 impl Default for Settings {
@@ -44,12 +51,21 @@ impl Default for Settings {
             // ...but does write the content size whenever known.
             content_size: true,
             workers: 0,
-            dict: None,
         }
     }
 }
 
 impl Settings {
+    /// Fresh settings for the one-shot variants: the level argument and
+    /// libzstd's frame defaults, nothing sticky.
+    #[must_use]
+    pub fn one_shot(level: i32) -> Self {
+        Self {
+            level,
+            ..Self::default()
+        }
+    }
+
     /// The zstdx level for the raw FFI value: 0 selects the libzstd default
     /// (3); out-of-range values clamp (negatives to 1 — zstdx models no
     /// accelerated levels — and >22 to 22).
@@ -72,9 +88,6 @@ impl Settings {
         if let Some(window_log) = self.window_log {
             options =
                 options.with_input_shape(zstdx::InputShape::default().with_window_log(window_log));
-        }
-        if let Some(dict) = &self.dict {
-            options = options.dictionary(dict);
         }
         options
     }
@@ -134,17 +147,31 @@ impl Settings {
     }
 }
 
+/// The context's loaded dictionary, parsed once so every following frame
+/// skips the digest. A dictionary that fails to parse is retained as a
+/// pending error: libzstd digests lazily too, so the failure surfaces when
+/// the next frame starts, not at the load call.
+pub enum LoadedDict {
+    Parsed(zstdx::EncoderDictionary),
+    Invalid,
+}
+
 /// One-shot compression of `src` into `dst`; returns the written length.
+/// `dict` overrides the settings' dictionary for this call only.
 pub fn compress_oneshot(
     settings: &Settings,
+    dict: Option<&zstdx::EncoderDictionary>,
     src: &[u8],
     dst: &mut [u8],
 ) -> Result<usize, ErrorCode> {
     let pledged = Some(src.len() as u64);
+    let mut options = settings.encoder_options(pledged);
+    if let Some(dict) = dict {
+        options = options.parsed_dictionary(dict);
+    }
     let sink = Vec::with_capacity(crate::compress_bound(src.len()));
     let mut encoder =
-        zstdx::stream::write::Encoder::with_options(sink, settings.encoder_options(pledged))
-            .map_err(|e| map_encode(&e))?;
+        zstdx::stream::write::Encoder::with_options(sink, options).map_err(|e| map_encode(&e))?;
     encoder.write_all(src).map_err(|e| map_io(&e))?;
     encoder.do_finish().map_err(|e| map_encode(&e))?;
     copy_out(encoder.get_ref(), dst)
@@ -186,12 +213,17 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(settings: &Settings, pledged: Option<u64>) -> Result<Self, ErrorCode> {
-        let encoder = zstdx::stream::write::Encoder::with_options(
-            Vec::new(),
-            settings.encoder_options(pledged),
-        )
-        .map_err(|e| map_encode(&e))?;
+    fn new(
+        settings: &Settings,
+        dict: Option<&zstdx::EncoderDictionary>,
+        pledged: Option<u64>,
+    ) -> Result<Self, ErrorCode> {
+        let mut options = settings.encoder_options(pledged);
+        if let Some(dict) = dict {
+            options = options.parsed_dictionary(dict);
+        }
+        let encoder = zstdx::stream::write::Encoder::with_options(Vec::new(), options)
+            .map_err(|e| map_encode(&e))?;
         Ok(Self {
             encoder,
             delivered: 0,
@@ -222,9 +254,15 @@ impl StreamState {
 /// The `ZSTD_CCtx` object.
 pub struct CCtx {
     pub settings: Settings,
+    /// Session dictionary (`loadDictionary`; sticky until a parameters
+    /// reset or `initCStream`'s legacy clear).
+    dict: Option<LoadedDict>,
+    /// `ZSTD_CCtx_setPledgedSrcSize`: applies to the next frame only and is
+    /// consumed when that frame completes.
+    pledged: Option<u64>,
     stream: Option<StreamState>,
     /// libzstd leaves a failed context in an undefined state; this layer
-    /// keeps replaying the first error until a reset (initCStream).
+    /// keeps replaying the first error until a reset.
     sticky: Option<ErrorCode>,
 }
 
@@ -232,8 +270,20 @@ impl CCtx {
     pub fn new() -> Self {
         Self {
             settings: Settings::default(),
+            dict: None,
+            pledged: None,
             stream: None,
             sticky: None,
+        }
+    }
+
+    /// The loaded dictionary, or the pending parse error to surface at the
+    /// next frame.
+    fn dict(&self) -> Result<Option<&zstdx::EncoderDictionary>, ErrorCode> {
+        match &self.dict {
+            Some(LoadedDict::Parsed(dict)) => Ok(Some(dict)),
+            Some(LoadedDict::Invalid) => Err(ErrorCode::DictionaryCorrupted),
+            None => Ok(None),
         }
     }
 
@@ -247,13 +297,84 @@ impl CCtx {
         self.settings.set_parameter(param, value)
     }
 
+    /// `ZSTD_CCtx_setPledgedSrcSize`: rejected mid-frame; the pledge (any
+    /// value but `ZSTD_CONTENTSIZE_UNKNOWN`) applies to the next frame.
+    pub fn set_pledged(&mut self, size: u64) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.pledged = (size != u64::MAX).then_some(size);
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_loadDictionary`: rejected mid-frame; a null or empty
+    /// dictionary clears the slot.
+    pub fn load_dictionary(&mut self, dict: Option<&[u8]>) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.dict = match dict {
+            Some(bytes) => match zstdx::EncoderDictionary::parse(bytes) {
+                Ok(parsed) => Some(LoadedDict::Parsed(parsed)),
+                // Retained: the error surfaces when a frame tries to use it.
+                Err(_) => Some(LoadedDict::Invalid),
+            },
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_reset`: session resets never fail; parameter resets fail
+    /// mid-frame (after a session reset in the combined form they cannot).
+    /// Unknown directive values are no-ops returning success, as libzstd's
+    /// fall-through.
+    pub fn reset(&mut self, directive: ZSTD_ResetDirective) -> Result<(), ErrorCode> {
+        match directive {
+            ZSTD_ResetDirective::SessionOnly => self.reset_session(),
+            ZSTD_ResetDirective::Parameters => self.reset_parameters()?,
+            ZSTD_ResetDirective::SessionAndParameters => {
+                self.reset_session();
+                self.reset_parameters()?;
+            },
+        }
+        Ok(())
+    }
+
+    /// Drop the open frame and the error state; parameters and dictionary
+    /// survive (libzstd's session reset contract).
+    fn reset_session(&mut self) {
+        self.stream = None;
+        self.sticky = None;
+        self.pledged = None;
+    }
+
+    fn reset_parameters(&mut self) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.settings = Settings::default();
+        self.dict = None;
+        Ok(())
+    }
+
     /// `ZSTD_initCStream`: session reset (the legacy doc contract also
     /// clears the dictionary) plus the level.
     pub fn init_stream(&mut self, level: i32) {
         self.settings.level = level;
-        self.settings.dict = None;
+        self.dict = None;
         self.stream = None;
         self.sticky = None;
+        self.pledged = None;
+    }
+
+    /// `ZSTD_compress2`: sticky settings and the loaded dictionary, always
+    /// a fresh frame with the source size pledged (the single-round
+    /// override in libzstd's init).
+    pub fn compress2(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, ErrorCode> {
+        self.reset_session();
+        let dict = self.dict()?;
+        let settings = self.settings.clone();
+        compress_oneshot(&settings, dict, src, dst)
     }
 
     /// `ZSTD_compressStream2` core; the return is the bytes-left-to-flush
@@ -271,6 +392,8 @@ impl CCtx {
         // ZSTD_compressStream2 does not require an explicit reset.
         if self.stream.as_ref().is_some_and(|s| s.finished) {
             self.stream = None;
+            // The pledge (if any) was consumed by the finished frame.
+            self.pledged = None;
         }
         if self.stream.is_none() && mode == ZSTD_EndDirective::Continue && input.pos == input.size {
             // Nothing to stage and nothing to flush: a no-op call, avoiding
@@ -280,15 +403,15 @@ impl CCtx {
             return Ok(0);
         }
         if self.stream.is_none() {
-            // libzstd overrides any pledge with the input size whenever the
-            // frame opens on an e_end call (its "single round" rule) — the
-            // same rule that makes ZSTD_compress2's content size automatic.
+            // libzstd overrides the pledge with the input size whenever the
+            // frame opens on an e_end call (its "single round" rule).
             let pledged = if mode == ZSTD_EndDirective::End {
                 Some((input.size - input.pos) as u64)
             } else {
-                None
+                self.pledged
             };
-            match StreamState::new(&self.settings, pledged) {
+            let dict = self.dict()?;
+            match StreamState::new(&self.settings, dict, pledged) {
                 Ok(state) => self.stream = Some(state),
                 Err(e) => {
                     self.sticky = Some(e);
