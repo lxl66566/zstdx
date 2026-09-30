@@ -1,0 +1,27 @@
+[package]
+name    = "zstdx-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description  = "libzstd-compatible C ABI (drop-in `libzstd`) over the zstdx codec"
+homepage     = "https://github.com/lxl66566/zstdx"
+repository   = "https://github.com/lxl66566/zstdx"
+license      = "MIT"
+keywords     = ["compression", "zstandard", "zstd", "ffi", "bindings"]
+categories   = ["compression", "external-ffi-bindings"]
+
+# The cdylib/staticlib artifacts are named `libzstd.so` / `libzstd.a`, so a
+# build is directly deployable as a drop-in libzstd (see tests/run-c.sh for
+# the soname copy step). The rlib target exists so the crate's own tests can
+# link the same symbols they export.
+[lib]
+name        = "zstd"
+crate-type  = ["cdylib", "staticlib", "rlib"]
+path        = "src/lib.rs"
+
+[dependencies]
+# hash brings the xxh64 frame checksum (encode + verified decode)
+zstdx = { path = "../zstdx", default-features = false, features = ["std", "hash"] }
+
+[lints]
+workspace = true
