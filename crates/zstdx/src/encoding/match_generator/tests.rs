@@ -991,3 +991,68 @@ fn gate_probe_empty_strip_on_warm_table() {
     assert!(!d.probe.is_empty());
     d.prefill_job_strip(&[], 0);
 }
+
+/// The x86-64 `extend_match` runs a hand-written two-copy loop entered
+/// through a computed stub (the never-straddle-a-64B-line fix, R32); the
+/// portable body is the semantic reference. Differential over planted
+/// match/mismatch shapes: a planted equal run with the mismatch placed at
+/// every byte offset of the first two u64s (the tzcnt arithmetic),
+/// (the byte tail), and `i` flush against the window end.
+#[test]
+fn extend_match_asm_matches_portable() {
+    use super::hash::{extend_match, extend_match_portable};
+    if cfg!(not(target_arch = "x86_64")) {
+        return;
+    }
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // Half random noise, half a repeated 97-byte motif: matches of every
+    // length mod 8 appear, ending both in mismatches and at the window end.
+    let motif: Vec<u8> = (0..97).map(|_| (rand() & 0xff) as u8).collect();
+    let mut win: Vec<u8> = (0..4096).map(|_| (rand() & 0xff) as u8).collect();
+    while win.len() < 32 * 1024 {
+        win.extend_from_slice(&motif);
+    }
+    win.truncate(32 * 1024);
+    let mut cases: Vec<(usize, usize)> = Vec::new();
+    for _ in 0..4000 {
+        let i = (rand() as usize) % (win.len() - 8);
+        let j = (rand() as usize) % (i + 1);
+        cases.push((i, j));
+    }
+    // Deterministic edges: every mismatch offset inside the first two u64s
+    // of a planted repeat, exact-limit pairs, and every short-limit tail
+    // length.
+    {
+        let i = 8192 + 40;
+        let j = i - 32;
+        for t in 0..32 {
+            win[j + t] = win[i + t]; // plant a guaranteed-equal run at (i, j)
+        }
+        for k in 0..16 {
+            win[j + k] ^= 0x80; // mismatch exactly at offset k
+            assert_eq!(
+                extend_match(&win, i, j),
+                extend_match_portable(&win, i, j),
+                "extend_match({i}, {j}) with a planted mismatch at offset {k}"
+            );
+            win[j + k] ^= 0x80;
+        }
+    }
+    for tail in 0..17 {
+        let i = win.len() - tail;
+        cases.push((i, 4096));
+    }
+    for (i, j) in cases {
+        assert_eq!(
+            extend_match(&win, i, j),
+            extend_match_portable(&win, i, j),
+            "extend_match({i}, {j})"
+        );
+    }
+}
