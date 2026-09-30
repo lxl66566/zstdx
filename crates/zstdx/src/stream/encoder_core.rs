@@ -298,9 +298,14 @@ impl FrameEncoderCoreSt {
         // one's header without a screen (the mid-band fast rows) and a
         // ProbeKeep residue would ride the wrong strip policy.
         self.state.matcher.set_ldm_arming(LdmArming::Frame);
+        // `InputShape::len` is a non-binding size hint: it sizes the row
+        // when no pledge exists (libzstd's `srcSizeHint`). The pledge
+        // stays the only hard contract — header promise, finish check,
+        // single-segment form are all pledged-keyed below.
+        let len = options.pledged_size.or(options.input_shape.len);
         let dict_id = if let Some(dict) = dict {
             let mut shape = crate::InputShape {
-                len: options.pledged_size,
+                len,
                 window_log: options.input_shape.window_log,
             };
             // libzstd clamps the window by src + dict.
@@ -314,7 +319,7 @@ impl FrameEncoderCoreSt {
             dict.header_id()
         } else {
             let shape = crate::InputShape {
-                len: options.pledged_size,
+                len,
                 window_log: options.input_shape.window_log,
             };
             self.state.matcher.set_input_shape(shape);
@@ -334,12 +339,12 @@ impl FrameEncoderCoreSt {
         // the screen's span cancels it back to stock in write/finish.
         let probe_pending = dict_id.is_none()
             && reach_probe::eligible(options.level, crate::InputShape {
-                len: options.pledged_size,
+                len,
                 window_log: options.input_shape.window_log,
             });
         let screen_pending = dict_id.is_none()
             && fast_row_screen_pending(options.level, crate::InputShape {
-                len: options.pledged_size,
+                len,
                 window_log: options.input_shape.window_log,
             });
         // libzstd's frame-header shape: a pledged size the window already

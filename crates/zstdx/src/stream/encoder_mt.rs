@@ -873,8 +873,12 @@ impl MtEncoderCore {
         let checksum = options.checksum && cfg!(feature = "hash");
         // The pledge is the frame's authoritative length; the forced window
         // log rides along so the jobs' tables and the header window agree.
+        // `InputShape::len` acts as a non-binding hint when unpledged (the
+        // ST core does the same): it sizes the window/overlap, while the
+        // job grid and probe gates below stay pledge-keyed — a hinted
+        // stream must keep growing its jobs like any open-ended one.
         let shape = crate::InputShape {
-            len: options.pledged_size,
+            len: options.pledged_size.or(options.input_shape.len),
             window_log: options.input_shape.window_log,
         };
         let window = MatchGeneratorDriver::window_for_level(options.level, shape);
