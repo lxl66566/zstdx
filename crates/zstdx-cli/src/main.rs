@@ -14,7 +14,7 @@ use progress::{ProgressMonitor, fmt_size};
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
-use zstdx::{DecoderOptions, EncoderOptions, Level};
+use zstdx::{DecoderOptions, EncoderOptions, InputShape, Level};
 
 /// Suffix added on compression and required (or stripped) on decompression.
 const ZSTD_SUFFIX: &str = ".zst";
@@ -22,8 +22,24 @@ const ZSTD_SUFFIX: &str = ".zst";
 const DEFAULT_LEVEL: i32 = 3;
 /// libzstd's CLI caps levels here unless `--ultra` is passed.
 const MAX_LEVEL_WITHOUT_ULTRA: i32 = 19;
+/// Lowest window log the frame format can express (`--long` lower bound,
+/// mirroring libzstd's `ZSTD_WINDOWLOG_ABSOLUTEMIN`).
+const MIN_WINDOW_LOG: u32 = 10;
+/// Highest window log the engine implements. libzstd allows up to 30 on
+/// 64-bit targets; `--long` above this warns and clamps.
+const MAX_WINDOW_LOG: u32 = 27;
+/// Smallest window a frame may request, in bytes: `-M` values below it
+/// reject every frame (libzstd's out-of-bound parameter error).
+const MIN_WINDOW_BYTES: u64 = 1 << MIN_WINDOW_LOG;
 /// Message prefix, mirroring zstd's `zstd: ...` diagnostics.
 const PREFIX: &str = "zstdx: ";
+
+/// Version line printed by `-V/--version`: crate version plus the compat
+/// note (the argument surface mirrors zstd 1.5.7's, in subset).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (zstd v1.5.7-compatible argument surface; RFC 8878 frames)"
+);
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -35,11 +51,90 @@ enum Mode {
     Test,
 }
 
+/// Byte multiplier of a size flag suffix, mirroring zstd's
+/// `readU32FromChar` (binary multipliers, uppercase suffixes only).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SizeUnit {
+    Bytes,
+    Kilo,
+    Mega,
+    Giga,
+}
+
+impl SizeUnit {
+    /// The suffix as written after the digits; `B` alone is not a unit
+    /// zstd accepts, so neither do we.
+    fn parse(suffix: &str) -> Option<Self> {
+        match suffix {
+            "" => Some(Self::Bytes),
+            "K" | "KB" | "KiB" => Some(Self::Kilo),
+            "M" | "MB" | "MiB" => Some(Self::Mega),
+            "G" | "GB" | "GiB" => Some(Self::Giga),
+            _ => None,
+        }
+    }
+
+    const fn multiplier(self) -> u64 {
+        match self {
+            Self::Bytes => 1,
+            Self::Kilo => 1 << 10,
+            Self::Mega => 1 << 20,
+            Self::Giga => 1 << 30,
+        }
+    }
+}
+
+/// Parse `<digits>[K|M|G][i][B]` into a byte count (zstd's size syntax).
+fn parse_size(text: &str) -> Result<u64, String> {
+    // A manual byte scan, not str::split_once: on this repo's nightly
+    // (1.100.0-nightly 8925ea358) split_once with a char-closure pattern
+    // splits one char late ("128M" -> ("128", "")), while the byte
+    // position is exact for any UTF-8 tail (digits are ASCII, and the
+    // first non-digit byte of a multibyte char starts that char).
+    let split = text
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, suffix) = text.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("expected a size like 512K or 64M, got {text:?}"));
+    }
+    let unit = SizeUnit::parse(suffix)
+        .ok_or_else(|| format!("unknown size suffix {suffix:?} in {text:?}"))?;
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("size out of range: {text:?}"))?;
+    value
+        .checked_mul(unit.multiplier())
+        .ok_or_else(|| format!("size out of range: {text:?}"))
+}
+
+/// Validated, mode-scoped knobs for one invocation, derived once in `run`.
+/// Every accepted flag lands in a field here; flags the engine cannot
+/// honor are rejected in `run` instead, never silently dropped.
+#[derive(Debug)]
+struct Settings {
+    level: i32,
+    threads: u32,
+    /// Whether frames carry a content checksum (--no-check clears it).
+    checksum: bool,
+    /// Forced window log (--long).
+    window_log: Option<u32>,
+    /// Hard stdin size pledge (--stream-size); file inputs pledge their
+    /// metadata size instead.
+    stream_size: Option<u64>,
+    /// Non-binding stdin size hint (--size-hint): sizes the encoder row
+    /// without a header promise.
+    size_hint: Option<u64>,
+    /// Decode window bound (-M), the dominant decode memory allocation.
+    max_window: Option<u64>,
+}
+
 // Boolean flags mirror zstd's CLI switches one-to-one.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 #[command(
-    version,
+    version = VERSION,
     about = "Compress or decompress files in the Zstandard format",
     long_about = "zstdx is a zstd-compatible command line for the pure-Rust zstdx engine: `zstdx \
                   file` writes file.zst, `zstdx -d file.zst` restores file, and with no FILES (or \
@@ -121,6 +216,82 @@ struct Cli {
     /// --train`)
     #[arg(short = 'D', long, value_name = "DICT")]
     dict: Option<PathBuf>,
+
+    /// Enable long-distance matching by forcing the window log to N
+    /// (default 27, the maximum; 10-27). A known source size still shrinks
+    /// the window to the source, as zstd does
+    ///
+    /// Note: unlike zstd, this flag alone does not force the long-distance
+    /// matcher on -- the engine arms LDM by level row once the effective
+    /// window reaches 32 MiB
+    #[arg(
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "27",
+        require_equals = true,
+        conflicts_with_all = ["decompress", "test"]
+    )]
+    long: Option<u32>,
+
+    /// Write a frame content checksum (the default)
+    #[arg(long, conflicts_with = "no_check")]
+    check: bool,
+
+    /// Omit the frame content checksum. Compression only: decoding always
+    /// validates a present checksum
+    #[arg(long)]
+    no_check: bool,
+
+    /// Pledge the exact byte size of the stdin stream (mismatching input
+    /// fails, mirroring zstd); stdin only
+    #[arg(long, value_name = "N", value_parser = parse_size, conflicts_with = "size_hint")]
+    stream_size: Option<u64>,
+
+    /// Size encoder tables for a stdin stream of approximately N bytes, a
+    /// non-binding hint (no frame header promise); stdin only
+    #[arg(long, value_name = "N", value_parser = parse_size)]
+    size_hint: Option<u64>,
+
+    /// Bound decode memory: frames whose window exceeds N bytes fail to
+    /// decode (suffixes K/M/G accepted); decode modes only
+    #[arg(short = 'M', long, value_name = "N", value_parser = parse_size)]
+    memory: Option<u64>,
+
+    /// Read the list of input files from LIST, one per line; a LIST of `-`
+    /// reads the list itself from stdin
+    #[arg(long, alias = "file", value_name = "LIST")]
+    filelist: Option<PathBuf>,
+
+    /// Force the progress bar on (it still needs a known input size, so
+    /// stdin streams show none)
+    #[arg(long, conflicts_with = "no_progress")]
+    progress: bool,
+
+    /// Hide the progress bar
+    #[arg(long)]
+    no_progress: bool,
+
+    /// Compress on the calling thread; equivalent to -T1 here, whose
+    /// in-line form already shares nothing with other encoders
+    #[arg(long, conflicts_with = "threads")]
+    single_thread: bool,
+
+    /// Per-input failures (e.g. one unreadable file under -r) are reported
+    /// but do not affect the exit code
+    #[arg(long)]
+    ignore_errors: bool,
+
+    // Rejected flags: parsing them keeps the diagnostic a clear
+    // "unsupported" error instead of clap's generic unknown-argument text.
+    /// Not supported: output is always written dense (sparse TODO: decode
+    /// the zero-run blocks into seeks)
+    #[arg(long, hide = true)]
+    sparse: bool,
+
+    /// Not supported: output is always written dense (see --sparse)
+    #[arg(long, hide = true, conflicts_with = "sparse")]
+    no_sparse: bool,
 }
 
 /// One input to process: either stdin or a file on disk.
@@ -157,7 +328,49 @@ fn run(cli: &Cli) -> bool {
         Mode::Compress
     };
 
-    let threads = if cli.threads == 0 {
+    // Flags whose meaning the engine cannot honor are rejected up front:
+    // every accepted flag changes behavior below, none is a silent no-op.
+    if cli.sparse || cli.no_sparse {
+        eprintln!("{PREFIX}--sparse/--no-sparse are not supported: output is always dense");
+        return false;
+    }
+    if (cli.check || cli.no_check) && mode != Mode::Compress {
+        eprintln!(
+            "{PREFIX}--check/--no-check affect compression only: decoding always validates a \
+             present checksum"
+        );
+        return false;
+    }
+    if cli.memory.is_some() && mode == Mode::Compress {
+        eprintln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
+        return false;
+    }
+    if cli.memory.is_some_and(|limit| limit < MIN_WINDOW_BYTES) {
+        eprintln!(
+            "{PREFIX}-M values below {MIN_WINDOW_BYTES} reject every frame (the format's minimum \
+             window); use at least 1K"
+        );
+        return false;
+    }
+    let window_log = match cli.long {
+        None => None,
+        Some(log) if log < MIN_WINDOW_LOG => {
+            eprintln!("{PREFIX}--long: window log must be at least {MIN_WINDOW_LOG} (got {log})");
+            return false;
+        },
+        Some(log) if log > MAX_WINDOW_LOG => {
+            eprintln!(
+                "{PREFIX}Warning: --long={log} above the engine's maximum {MAX_WINDOW_LOG}, \
+                 reduced to {MAX_WINDOW_LOG}"
+            );
+            Some(MAX_WINDOW_LOG)
+        },
+        log => log,
+    };
+
+    let threads = if cli.single_thread || cli.threads == 1 {
+        1
+    } else if cli.threads == 0 {
         std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
     } else {
         cli.threads
@@ -186,20 +399,56 @@ fn run(cli: &Cli) -> bool {
         None => None,
     };
 
+    let filelist = match &cli.filelist {
+        Some(path) => match read_filelist(path) {
+            Ok(list) => list,
+            Err(err) => {
+                eprintln!("{PREFIX}{}: {err}", path.display());
+                return false;
+            },
+        },
+        None => Vec::new(),
+    };
+
     let mut inputs = Vec::new();
     let mut ok = true;
-    if cli.files.is_empty() {
+    if cli.files.is_empty() && filelist.is_empty() {
         inputs.push(Input::Stdin);
     } else {
-        for file in &cli.files {
+        for file in cli.files.iter().chain(&filelist) {
             collect_input(file, cli.recursive, &mut inputs, &mut ok);
         }
+    }
+
+    // Size flags shape the stdin stream's encoder row; a file input already
+    // carries its exact size as the pledge, so honoring a second, looser
+    // number would silently do nothing (zstd ignores it there).
+    let stdin_stream = matches!(inputs.as_slice(), [Input::Stdin]);
+    if cli.stream_size.is_some() && !stdin_stream {
+        eprintln!("{PREFIX}--stream-size only applies to stdin input");
+        return false;
+    }
+    if cli.size_hint.is_some() && !stdin_stream {
+        eprintln!(
+            "{PREFIX}--size-hint only applies to stdin input (file sizes are pledged exactly)"
+        );
+        return false;
     }
 
     if cli.output.is_some() && inputs.len() > 1 {
         eprintln!("{PREFIX}-o/--output cannot be used with multiple input files");
         return false;
     }
+
+    let settings = Settings {
+        level,
+        threads,
+        checksum: !cli.no_check,
+        window_log,
+        stream_size: cli.stream_size,
+        size_hint: cli.size_hint,
+        max_window: cli.memory,
+    };
 
     let stdout_output =
         cli.stdout || cli.output.is_none() && inputs.iter().any(|i| matches!(i, Input::Stdin));
@@ -208,7 +457,7 @@ fn run(cli: &Cli) -> bool {
     }
 
     for input in &inputs {
-        if let Err(err) = process(input, cli, mode, level, threads, dict.as_deref()) {
+        if let Err(err) = process(input, cli, mode, &settings, dict.as_deref()) {
             if cli.quiet < 2 {
                 let name = match input {
                     Input::Stdin => "stdin".to_string(),
@@ -216,10 +465,30 @@ fn run(cli: &Cli) -> bool {
                 };
                 eprintln!("{PREFIX}{name}: {err}");
             }
-            ok = false;
+            // --ignore-errors keeps per-input failures out of the exit code.
+            if !cli.ignore_errors {
+                ok = false;
+            }
         }
     }
     ok
+}
+
+/// Read `--filelist`: one path per line, blank lines skipped.
+fn read_filelist(path: &Path) -> AnyResult<Vec<PathBuf>> {
+    let reader: Box<dyn BufRead> = if path.as_os_str() == "-" {
+        Box::new(io::stdin().lock())
+    } else {
+        Box::new(BufReader::new(File::open(path)?))
+    };
+    let mut paths = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if !line.is_empty() {
+            paths.push(PathBuf::from(line));
+        }
+    }
+    Ok(paths)
 }
 
 /// Gather the file list, expanding directories when `recursive` is set.
@@ -258,13 +527,29 @@ fn collect_input(path: &Path, recursive: bool, inputs: &mut Vec<Input>, ok: &mut
     inputs.push(Input::File(path.to_path_buf()));
 }
 
+/// Whether the progress bar may draw for one input. `--[no-]progress`
+/// overrides the auto rule (interactive stderr, not quiet, no stdout
+/// output); every form still needs a known input size, so stdin streams
+/// never show a bar.
+fn progress_visible(cli: &Cli, sized: bool, stdout_output: bool, interactive: bool) -> bool {
+    if !sized {
+        return false;
+    }
+    if cli.no_progress {
+        return false;
+    }
+    if cli.progress {
+        return true;
+    }
+    cli.quiet == 0 && interactive && !stdout_output
+}
+
 /// Process a single input; errors are reported by the caller.
 fn process(
     input: &Input,
     cli: &Cli,
     mode: Mode,
-    level: i32,
-    threads: u32,
+    settings: &Settings,
     dict: Option<&[u8]>,
 ) -> AnyResult<()> {
     let output = match mode {
@@ -306,10 +591,12 @@ fn process(
     }
 
     let (reader, source_size) = open_input(input)?;
-    let show_progress = source_size > 0
-        && !matches!(output, Output::Stdout)
-        && cli.quiet == 0
-        && io::stderr().is_terminal();
+    let show_progress = progress_visible(
+        cli,
+        source_size > 0,
+        matches!(output, Output::Stdout),
+        io::stderr().is_terminal(),
+    );
     let reader: Box<dyn Read> = if show_progress {
         Box::new(ProgressMonitor::new(reader, source_size, true))
     } else {
@@ -317,8 +604,8 @@ fn process(
     };
 
     let written = match mode {
-        Mode::Compress => compress(reader, &output, level, threads, source_size, dict)?,
-        Mode::Decompress | Mode::Test => decompress(reader, &output, threads, dict)?,
+        Mode::Compress => compress(reader, &output, settings, source_size, dict)?,
+        Mode::Decompress | Mode::Test => decompress(reader, &output, settings, dict)?,
     };
 
     if cli.quiet == 0 {
@@ -413,18 +700,32 @@ fn open_input(input: &Input) -> AnyResult<(Box<dyn Read>, usize)> {
 fn compress(
     mut reader: Box<dyn Read>,
     output: &Output,
-    level: i32,
-    threads: u32,
+    settings: &Settings,
     source_size: usize,
     dict: Option<&[u8]>,
 ) -> AnyResult<u64> {
-    let mut options = EncoderOptions::new(Level::from_zstd(level));
-    if source_size > 0 {
-        options = options.pledged_size(Some(source_size as u64));
+    let mut options =
+        EncoderOptions::new(Level::from_zstd(settings.level)).checksum(settings.checksum);
+    // A file input pledges its metadata size; a stdin stream pledges
+    // --stream-size or nothing.
+    let pledged = settings
+        .stream_size
+        .or((source_size > 0).then_some(source_size as u64));
+    options = options.pledged_size(pledged);
+    // --long forces the window, --size-hint sizes the row; a known pledge
+    // still shrinks the window to the source inside the engine, as zstd
+    // does.
+    let mut shape = InputShape::default();
+    if let Some(log) = settings.window_log {
+        shape = shape.with_window_log(log);
     }
+    if let Some(hint) = settings.size_hint {
+        shape = shape.with_len(hint);
+    }
+    options = options.with_input_shape(shape);
     // 0/1 worker runs on the calling thread; more engages the job pool.
-    if threads > 1 {
-        options = options.workers(threads);
+    if settings.threads > 1 {
+        options = options.workers(settings.threads);
     }
     if let Some(dict) = dict {
         options = options.dictionary(dict);
@@ -462,12 +763,15 @@ fn compress(
 fn decompress(
     reader: Box<dyn Read>,
     output: &Output,
-    threads: u32,
+    settings: &Settings,
     dict: Option<&[u8]>,
 ) -> AnyResult<u64> {
     let mut options = DecoderOptions::new();
-    if threads > 1 {
-        options = options.threads(threads);
+    if settings.threads > 1 {
+        options = options.threads(settings.threads);
+    }
+    if let Some(max) = settings.max_window {
+        options = options.max_window_size(max);
     }
     if let Some(dict) = dict {
         options = options.dictionary(dict);
@@ -543,7 +847,7 @@ fn remove_partial_output(output: &Output) {
 }
 
 fn init_logging(cli: &Cli) {
-    let to_stdout = cli.stdout || cli.files.is_empty();
+    let to_stdout = cli.stdout || cli.files.is_empty() && cli.filelist.is_none();
     let effective_quiet = cli.quiet + u8::from(to_stdout && cli.verbose == 0);
     let filter = match (effective_quiet, cli.verbose) {
         (2.., _) => tracing::level_filters::LevelFilter::ERROR,
@@ -617,10 +921,12 @@ mod tests {
         path::PathBuf,
     };
 
+    use clap::Parser as _;
     use zstdx::Level;
 
     use crate::{
-        Mode, Output, add_extension, compress, decompress, default_output_name, normalize_args,
+        Cli, Mode, Output, Settings, add_extension, compress, decompress, default_output_name,
+        normalize_args, parse_size, progress_visible,
     };
 
     /// A per-test temp path, pre-cleaned so reruns start from nothing.
@@ -628,6 +934,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("zstdx-cli-{}-{tag}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// A `--`-less default CLI for the pure decision functions.
+    fn plain_cli() -> Cli {
+        Cli::try_parse_from(["zstdx"]).unwrap()
     }
 
     /// A valid multi-block frame.
@@ -649,7 +960,15 @@ mod tests {
         let result = decompress(
             Box::new(Cursor::new(compressed)),
             &Output::File(out.clone()),
-            1,
+            &Settings {
+                level: 3,
+                threads: 1,
+                checksum: true,
+                window_log: None,
+                stream_size: None,
+                size_hint: None,
+                max_window: None,
+            },
             None,
         );
         assert!(result.is_err());
@@ -664,8 +983,15 @@ mod tests {
         let result = compress(
             Box::new(&b"payload"[..]),
             &Output::File(out.clone()),
-            3,
-            1,
+            &Settings {
+                level: 3,
+                threads: 1,
+                checksum: true,
+                window_log: None,
+                stream_size: None,
+                size_hint: None,
+                max_window: None,
+            },
             0,
             Some(&[0x37, 0xa4, 0x30, 0xec]),
         );
@@ -682,8 +1008,15 @@ mod tests {
         let written = compress(
             Box::new(Cursor::new(data.clone())),
             &Output::Sink,
-            3,
-            1,
+            &Settings {
+                level: 3,
+                threads: 1,
+                checksum: true,
+                window_log: None,
+                stream_size: None,
+                size_hint: None,
+                max_window: None,
+            },
             data.len(),
             None,
         )
@@ -779,5 +1112,77 @@ mod tests {
         assert_eq!(normalize(&["-"]), ["-"]);
         assert_eq!(normalize(&["-12a"]), ["-12a"]);
         assert_eq!(normalize(&["12"]), ["12"]);
+    }
+
+    /// zstd's size syntax: bare digits are bytes, K/M/G are binary
+    /// multipliers, i and B are optional decorations.
+    #[test]
+    fn sizes_parse_with_suffixes() {
+        assert_eq!(parse_size("1000000").unwrap(), 1_000_000);
+        assert_eq!(parse_size("1K").unwrap(), 1 << 10);
+        assert_eq!(parse_size("512KB").unwrap(), 512 << 10);
+        assert_eq!(parse_size("64MiB").unwrap(), 64 << 20);
+        assert_eq!(parse_size("1G").unwrap(), 1 << 30);
+        assert_eq!(parse_size("0").unwrap(), 0);
+        for bad in ["", "K", "1Q", "1 KiB", "1B", "-5"] {
+            assert!(parse_size(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    /// The auto rule needs a known size, an interactive stderr and no
+    /// stdout output; --[no-]progress overrides it either way.
+    #[test]
+    fn progress_visibility_matrix() {
+        let mut cli = plain_cli();
+        assert!(progress_visible(&cli, true, false, true));
+        assert!(!progress_visible(&cli, false, false, true), "unknown size");
+        assert!(!progress_visible(&cli, true, false, false), "piped stderr");
+        assert!(!progress_visible(&cli, true, true, true), "stdout output");
+
+        cli.quiet = 1;
+        assert!(!progress_visible(&cli, true, false, true), "quiet");
+        cli.progress = true;
+        assert!(progress_visible(&cli, true, true, false), "--progress wins");
+        assert!(
+            !progress_visible(&cli, false, true, false),
+            "still needs size"
+        );
+        cli.no_progress = true;
+        assert!(!progress_visible(&cli, true, false, true), "--no-progress");
+    }
+
+    /// The new flags must parse with their zstd spellings, including the
+    /// `--file` alias of `--filelist`.
+    #[test]
+    fn parity_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "zstdx",
+            "--long=20",
+            "--no-check",
+            "--size-hint=4K",
+            "--single-thread",
+            "--no-progress",
+            "--ignore-errors",
+            "--file",
+            "list.txt",
+        ])
+        .unwrap();
+        assert_eq!(cli.long, Some(20));
+        assert!(cli.no_check);
+        assert_eq!(cli.size_hint, Some(4096));
+        assert!(cli.single_thread);
+        assert!(cli.no_progress);
+        assert!(cli.ignore_errors);
+        assert_eq!(cli.filelist, Some(PathBuf::from("list.txt")));
+
+        let cli = Cli::try_parse_from(["zstdx", "--long"]).unwrap();
+        assert_eq!(cli.long, Some(27), "bare --long defaults to 27");
+        let cli = Cli::try_parse_from(["zstdx", "-t", "-M", "512K"]).unwrap();
+        assert_eq!(cli.memory, Some(512 << 10));
+
+        // --long stops at the engine's ceiling: larger values clamp in run,
+        // smaller ones are rejected there; here only the parse matters.
+        assert!(Cli::try_parse_from(["zstdx", "--long=31"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "--long=9"]).is_ok());
     }
 }
