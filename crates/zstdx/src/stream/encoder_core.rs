@@ -747,6 +747,11 @@ impl FrameEncoderCore {
     // Fallible only for an invalid dictionary (no_std + workers > 1 keeps
     // its Unsupported error; a dictionary forces the single-threaded core).
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
+        if let Some(dict) = &options.parsed_dictionary {
+            return Ok(Self::Single(StCore::new(
+                FrameEncoderCoreSt::new_with_dictionary(options, Some(dict)),
+            )));
+        }
         if let Some(raw) = &options.dictionary {
             let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
             return Ok(Self::Single(StCore::new(

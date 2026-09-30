@@ -86,7 +86,7 @@ pub const DEFAULT_MAX_WINDOW_SIZE: u64 = 1024 * 1024 * 128;
 /// ```
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    dicts: BTreeMap<u32, Dictionary>,
+    dicts: BTreeMap<u32, alloc::sync::Arc<Dictionary>>,
     max_window_size: u64,
     /// Bytes consumed from the source while hunting the next frame start
     /// ([frame_source]); kept across calls so a transient read error there
@@ -325,6 +325,17 @@ impl FrameDecoder {
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the
     /// appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
+        self.dicts.insert(dict.id, alloc::sync::Arc::new(dict));
+        Ok(())
+    }
+
+    /// [`Self::add_dict`] for an already-parsed dictionary shared with the
+    /// caller: repeated decoders reuse one parse instead of re-reading the
+    /// raw bytes per stream (the FFI layer's DDict).
+    pub fn add_shared_dict(
+        &mut self,
+        dict: alloc::sync::Arc<Dictionary>,
+    ) -> Result<(), FrameDecoderError> {
         self.dicts.insert(dict.id, dict);
         Ok(())
     }

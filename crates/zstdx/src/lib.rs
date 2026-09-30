@@ -65,6 +65,7 @@ pub use bulk::{compress, decompress};
 #[cfg(feature = "std")]
 #[doc(hidden)]
 pub use decoding::mt_pieces::{piece_engagements, set_piece_decode_for_tests};
+pub use encoding::EncoderDictionary;
 #[cfg(feature = "std")]
 #[doc(hidden)]
 pub use encoding::set_mt_ramp_depth_for_tests;
