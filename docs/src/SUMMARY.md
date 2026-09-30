@@ -25,6 +25,7 @@
 ## Upstream Comparison
 
 - [zstdx vs. official zstd](dev/comparison.md)
+- [C FFI (libzstd compatibility layer)](dev/ffi.md)
 
 ## Performance Optimization
 
