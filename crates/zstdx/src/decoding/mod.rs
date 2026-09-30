@@ -19,7 +19,9 @@ pub(crate) mod block_decoder;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
 pub(crate) mod flat_buffer;
-pub(crate) mod frame;
+/// Raw frame-header parsing (`read_frame_header`), public for callers that
+/// inspect frames without decoding them (the CLI's `--list`).
+pub mod frame;
 pub(crate) mod frame_source;
 pub(crate) mod literals_section_decoder;
 #[cfg(feature = "std")]
