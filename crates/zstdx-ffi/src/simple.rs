@@ -190,7 +190,10 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(
         Ok(crate::frame::Header::Zstd(header)) => {
             header.content_size.unwrap_or(CONTENTSIZE_UNKNOWN)
         },
-        // Skippable frames carry no content size declaration.
+        // A complete skippable frame reports 0 (verified against the
+        // reference library); a truncated one is an error, like any other
+        // unreadable head.
+        Ok(crate::frame::Header::Skippable { .. }) => 0,
         _ => CONTENTSIZE_ERROR,
     }
 }

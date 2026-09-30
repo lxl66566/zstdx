@@ -79,34 +79,47 @@ impl Settings {
         options
     }
 
-    /// Validate and apply one `ZSTD_CCtx_setParameter` pair.
-    pub fn set_parameter(&mut self, param: ZSTD_cParameter, value: i32) -> Result<(), ErrorCode> {
+    /// Validate and apply one `ZSTD_CCtx_setParameter` pair. The return is
+    /// the applied value, as in the reference tree: levels and flags clamp
+    /// into range, windowLog validates 0 (default) or 10..=31, and only
+    /// genuinely out-of-range requests error.
+    pub fn set_parameter(
+        &mut self,
+        param: ZSTD_cParameter,
+        value: i32,
+    ) -> Result<usize, ErrorCode> {
         match param {
             ZSTD_cParameter::CompressionLevel => {
-                if !(-(131_072)..=22).contains(&value) {
-                    return Err(ErrorCode::ParameterOutOfBound);
-                }
-                self.level = value;
+                // Reference range: 0 selects the default (and returns it),
+                // other values clamp to [minCLevel, maxCLevel].
+                let applied = if value == 0 {
+                    DEFAULT_CLEVEL
+                } else {
+                    value.clamp(-131_072, 22)
+                };
+                self.level = applied;
+                // Negative levels exist in the settings but cannot ride a
+                // size_t return; the reference answers 0 for them.
+                Ok(applied.max(0) as usize)
             },
             ZSTD_cParameter::WindowLog => {
                 // 0 means "level default"; the engine clamps to its own
                 // 10..=27 window range.
-                if value != 0 && !(10..=30).contains(&value) {
+                if value != 0 && !(10..=31).contains(&value) {
                     return Err(ErrorCode::ParameterOutOfBound);
                 }
                 self.window_log =
                     (value != 0).then_some(u32::try_from(value).expect("bounds checked"));
+                Ok(value.max(0) as usize)
             },
             ZSTD_cParameter::ChecksumFlag | ZSTD_cParameter::ContentSizeFlag => {
-                if !matches!(value, 0 | 1) {
-                    return Err(ErrorCode::ParameterOutOfBound);
-                }
-                let flag = value == 1;
+                let flag = value != 0;
                 match param {
                     ZSTD_cParameter::ChecksumFlag => self.checksum = flag,
                     ZSTD_cParameter::ContentSizeFlag => self.content_size = flag,
                     _ => unreachable!("narrowed above"),
                 }
+                Ok(usize::from(flag))
             },
             ZSTD_cParameter::NbWorkers => {
                 if !(0..=256).contains(&value) {
@@ -115,9 +128,9 @@ impl Settings {
                 // zstdx engages its job paths from 2 workers; a dictionary
                 // rides the single-threaded core (documented engine limit).
                 self.workers = u32::try_from(value).expect("bounds checked");
+                Ok(value.max(0) as usize)
             },
         }
-        Ok(())
     }
 }
 
@@ -173,10 +186,12 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(settings: &Settings) -> Result<Self, ErrorCode> {
-        let encoder =
-            zstdx::stream::write::Encoder::with_options(Vec::new(), settings.encoder_options(None))
-                .map_err(|e| map_encode(&e))?;
+    fn new(settings: &Settings, pledged: Option<u64>) -> Result<Self, ErrorCode> {
+        let encoder = zstdx::stream::write::Encoder::with_options(
+            Vec::new(),
+            settings.encoder_options(pledged),
+        )
+        .map_err(|e| map_encode(&e))?;
         Ok(Self {
             encoder,
             delivered: 0,
@@ -224,7 +239,7 @@ impl CCtx {
 
     /// `ZSTD_CCtx_setParameter`: parameters are rejected mid-frame, as in
     /// libzstd.
-    pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<(), ErrorCode> {
+    pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<usize, ErrorCode> {
         if self.stream.as_ref().is_some_and(|s| !s.finished) {
             return Err(ErrorCode::StageWrong);
         }
@@ -265,7 +280,15 @@ impl CCtx {
             return Ok(0);
         }
         if self.stream.is_none() {
-            match StreamState::new(&self.settings) {
+            // libzstd overrides any pledge with the input size whenever the
+            // frame opens on an e_end call (its "single round" rule) — the
+            // same rule that makes ZSTD_compress2's content size automatic.
+            let pledged = if mode == ZSTD_EndDirective::End {
+                Some((input.size - input.pos) as u64)
+            } else {
+                None
+            };
+            match StreamState::new(&self.settings, pledged) {
                 Ok(state) => self.stream = Some(state),
                 Err(e) => {
                     self.sticky = Some(e);

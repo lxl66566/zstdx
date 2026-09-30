@@ -62,16 +62,22 @@ fn shapes() -> Vec<Vec<u8>> {
     ]
 }
 
+/// setParameter returns the applied value on success (the reference
+/// contract); 0 means "the value cannot be represented" (negative levels).
+fn set_param(cctx: *mut zstd::ZSTD_CCtx, param: c_int, value: c_int) -> usize {
+    let r = unsafe { zstd::ZSTD_CCtx_setParameter(cctx, param, value) };
+    assert!(!is_error(r));
+    r
+}
+
 fn cctx_with(level: c_int, checksum: c_int) -> *mut zstd::ZSTD_CCtx {
     let cctx = zstd::ZSTD_createCCtx();
     assert!(!cctx.is_null());
     if level != 0 {
-        assert_eq!(0, unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, level) });
+        assert_eq!(level as usize, set_param(cctx, 100, level));
     }
     if checksum != 0 {
-        assert_eq!(0, unsafe {
-            zstd::ZSTD_CCtx_setParameter(cctx, 201, checksum)
-        });
+        assert_eq!(1, set_param(cctx, 201, checksum));
     }
     cctx
 }
@@ -203,12 +209,13 @@ fn one_shot_error_paths() {
     assert!(is_error(code));
     assert_eq!(error_code(code), zstd::ErrorCode::SrcSizeWrong as u32);
 
-    // Bad magic.
+    // Bad magic: prefix_unknown (the reference's srcSize_wrong remap needs
+    // a completed frame in front of the garbage).
     let mut garbage = frame.to_vec();
     garbage[0] ^= 0xff;
     let code = decompress(&mut dst, &garbage);
     assert!(is_error(code));
-    assert_eq!(error_code(code), zstd::ErrorCode::SrcSizeWrong as u32);
+    assert_eq!(error_code(code), zstd::ErrorCode::PrefixUnknown as u32);
 
     // Tiny destination.
     let mut tiny = [0u8; 3];
@@ -265,9 +272,14 @@ fn metadata_entries() {
     let truncated = unsafe { zstd::ZSTD_findFrameCompressedSize(dst.as_ptr().cast(), n - 1) };
     assert!(is_error(truncated));
 
-    // A streaming-made frame without a pledged size reports UNKNOWN.
-    let unpledged = stream_compress(&input, 9, 128 * 1024, 128 * 1024);
-    let fcs = unsafe { zstd::ZSTD_getFrameContentSize(unpledged.as_ptr().cast(), unpledged.len()) };
+    // A frame whose opening call is a single-round e_end pledges the input
+    // size (libzstd's auto-override); a chunked stream still carries none.
+    let single_round = stream_compress(&input, 9, 128 * 1024, 128 * 1024);
+    let fcs =
+        unsafe { zstd::ZSTD_getFrameContentSize(single_round.as_ptr().cast(), single_round.len()) };
+    assert_eq!(fcs, input.len() as u64);
+    let chunked = stream_compress(&input, 9, 32 * 1024, 128 * 1024);
+    let fcs = unsafe { zstd::ZSTD_getFrameContentSize(chunked.as_ptr().cast(), chunked.len()) };
     assert_eq!(fcs, zstd::CONTENTSIZE_UNKNOWN);
 }
 
@@ -467,8 +479,9 @@ fn context_one_shot_and_parameter_bounds() {
         )
     };
     assert!(!is_error(n));
-    // The checksum flag adds exactly the four-byte trailer over the same
-    // encoding.
+    // zstd.h: sticky parameters do not apply to the one-shot variants, so
+    // the checksum flag set above must not change compressCCtx's output
+    // (the reference library produces identical bytes).
     let cctx2 = cctx_with(0, 0);
     let mut dst2 = vec![0u8; compress_bound(input.len())];
     let m = unsafe {
@@ -481,11 +494,18 @@ fn context_one_shot_and_parameter_bounds() {
             9,
         )
     };
-    assert_eq!(n, m + 4, "checksum adds exactly the trailer");
+    assert!(!is_error(m));
+    assert_eq!(n, m, "compressCCtx ignores the sticky checksum flag");
 
-    // setParameter bounds checking.
+    // setParameter: levels clamp into the reference range, unknown
+    // parameters stay unsupported, and flags clamp to 0/1.
+    assert_eq!(22, set_param(cctx, 100, 1_000_000));
+    assert_eq!(22, set_param(cctx, 100, 22));
+    assert_eq!(3, set_param(cctx, 100, 0));
+    assert_eq!(0, set_param(cctx, 100, -131_072));
+    assert_eq!(1, set_param(cctx, 201, 2));
     assert_eq!(
-        error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 1_000_000) }),
+        error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 101, 99) }),
         zstd::ErrorCode::ParameterOutOfBound as u32
     );
     assert_eq!(
@@ -566,7 +586,7 @@ fn window_log_and_nb_workers_parameters() {
     let mut plain = vec![0u8; input.len()];
 
     let cctx = cctx_with(0, 0);
-    assert_eq!(0, unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 101, 14) });
+    assert_eq!(14, set_param(cctx, 101, 14));
     let n = unsafe {
         zstd::ZSTD_compressCCtx(
             cctx,
@@ -584,7 +604,7 @@ fn window_log_and_nb_workers_parameters() {
 
     // nbWorkers accepts sane values; MT rides the engine's job paths.
     let cctx = cctx_with(0, 0);
-    assert_eq!(0, unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 400, 4) });
+    assert_eq!(4, set_param(cctx, 400, 4));
     let n = unsafe {
         zstd::ZSTD_compressCCtx(
             cctx,

@@ -214,7 +214,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
     }
     let ctx = unsafe { cctx_mut(cctx) };
     match ctx.set_parameter(param, value) {
-        Ok(()) => 0,
+        // The reference setters return the applied value on success.
+        Ok(applied) => applied,
         Err(e) => ret(e),
     }
 }
@@ -255,8 +256,9 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let ctx = unsafe { cctx_mut(cctx) };
-    let mut settings = ctx.settings.clone();
+    // One-shot variants run on fresh level-only settings: zstd.h reserves
+    // the sticky parameters for compress2 and the streaming entries.
+    let mut settings = cctx::Settings::default();
     settings.level = compression_level;
     match cctx::compress_oneshot(&settings, src, dst) {
         Ok(written) => written,
@@ -321,8 +323,9 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let ctx = unsafe { cctx_mut(cctx) };
-    let mut settings = ctx.settings.clone();
+    // Fresh level-only settings, like compressCCtx; the dictionary is this
+    // call's alone and does not linger on the context.
+    let mut settings = cctx::Settings::default();
     settings.level = compression_level;
     settings.dict = unsafe { dict_bytes(dict, dict_size) }.map(<[u8]>::to_vec);
     match cctx::compress_oneshot(&settings, src, dst) {
