@@ -278,10 +278,16 @@ fn sampled_distinct(win: &[u8], samples: usize) -> u32 {
 /// block: the compare runs per 64 bytes with an early return.
 pub(super) fn strip_is_uniform(win: &[u8]) -> bool {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if win.len() >= 64 && std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: the feature was just detected; every load reads a full
-        // 64-byte block inside `win`.
-        return unsafe { strip_is_uniform_avx512(win) };
+    {
+        use crate::common::simd::{self, SimdTier};
+        if win.len() >= 64
+            && simd::allows(SimdTier::Avx512)
+            && std::is_x86_feature_detected!("avx512f")
+        {
+            // SAFETY: the feature was just detected; every load reads a
+            // full 64-byte block inside `win`.
+            return unsafe { strip_is_uniform_avx512(win) };
+        }
     }
     let Some(&v0) = win.first() else { return true };
     win.iter().all(|&b| b == v0)
@@ -314,10 +320,16 @@ unsafe fn strip_is_uniform_avx512(win: &[u8]) -> bool {
 /// to run first: a matching u64's low half is the u32 at the same index.
 pub(super) fn seed_scan(data: &[u8], last: usize, a8: u64) -> Option<usize> {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if last >= SEED_SCAN_MIN && std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: the feature was just detected; every load stays inside
-        // data (see the bound derivation in the callee).
-        return unsafe { seed_scan_avx512(data, last, a8) };
+    {
+        use crate::common::simd::{self, SimdTier};
+        if last >= SEED_SCAN_MIN
+            && simd::allows(SimdTier::Avx512)
+            && std::is_x86_feature_detected!("avx512f")
+        {
+            // SAFETY: the feature was just detected; every load stays
+            // inside data (see the bound derivation in the callee).
+            return unsafe { seed_scan_avx512(data, last, a8) };
+        }
     }
     let mut u = last;
     while u > 0 {

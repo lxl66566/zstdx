@@ -1188,7 +1188,9 @@ pub(super) fn entropy_log2(x: f64) -> f64 {
 pub(super) fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
+        use crate::common::simd::{self, SimdTier};
         if literals.len() >= 64
+            && simd::allows(SimdTier::Avx512)
             && std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
             && std::is_x86_feature_detected!("popcnt")

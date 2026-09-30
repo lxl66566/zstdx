@@ -458,10 +458,12 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 // byte-permutes instead of per-symbol LUT loads.
                 #[cfg(all(target_arch = "x86_64", feature = "std"))]
                 {
+                    use crate::common::simd::{self, SimdTier};
                     const CHUNK: usize = 64;
                     let full = groups / 4;
                     let simd_stop = n - full * CHUNK;
                     if full > 0
+                        && simd::allows(SimdTier::Avx512)
                         && std::is_x86_feature_detected!("avx512bw")
                         && std::is_x86_feature_detected!("avx512vbmi")
                     {

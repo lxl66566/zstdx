@@ -800,11 +800,17 @@ impl DfastEmit<'_> {
 /// cache-warm for the probes that follow the clear.
 pub(super) fn clear_table(t: &mut [u32]) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if t.len() >= NT_CLEAR_MIN && std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: the feature was just detected; the stores stay inside t
-        // and the fence retires them before any read.
-        unsafe { clear_table_avx512(t) };
-        return;
+    {
+        use crate::common::simd::{self, SimdTier};
+        if t.len() >= NT_CLEAR_MIN
+            && simd::allows(SimdTier::Avx512)
+            && std::is_x86_feature_detected!("avx512f")
+        {
+            // SAFETY: the feature was just detected; the stores stay
+            // inside t and the fence retires them before any read.
+            unsafe { clear_table_avx512(t) };
+            return;
+        }
     }
     t.fill(0);
 }

@@ -51,6 +51,7 @@ Deleted one-off tools (all covered): bench_compare / bench_encode (matrix `dec-s
 
 - **xslow = our time ÷ zstd time**, >1 = we are slower; speeds are always MiB/s of raw.
 - zstd's bulk(slice) decode API is a slow wrapper (per-block re-entry); its real speed lives on the streaming path — **the streaming column is the real gap**; the bulk column is only an API-convention reference.
+- **`ZSTDX_SIMD_FORCE=auto|avx512|avx2|scalar`** clamps every runtime-dispatched encode kernel to a narrower tier (`common::simd`, parsed once per process; unset clamps nothing) — the honest way to measure the intermediate SIMD tiers on this AVX-512 box, and the env the dump differential gate re-runs under per tier. BMI2-only sites sit outside the clamp (no vector width to tier; every AVX2-era CPU carries them).
 - The encode side runs with frame checksums disabled on both sides (our xxh64 overhead measured separately: json.Fast on/off = 1.036); final numbers after the sidecar offload include checksums — mind the convention when comparing.
 - MT encoding uses "cold thread pool per call" on both sides (zstd has no per-call equivalent API; the warm-pool column is listed for reference only).
 - MT decode has no public libzstd API; it is a dimension unique to us (solo scalability table).
