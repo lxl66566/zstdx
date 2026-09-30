@@ -294,6 +294,15 @@ pub struct MatchGeneratorDriver {
     /// The pending head verdict, armed by [`Self::apply_level`] when the
     /// swap engaged; taken by the frame's first matching entry.
     small_src_pending: Option<Level>,
+    /// The row band's attempts verdict (rows 5-12, see [`RowAttempts`]):
+    /// every frame starts at [`RowAttempts::Stock`], and the first
+    /// matching entry's head sample may flip it to
+    /// [`RowAttempts::Light`] (see [`Self::resolve_row_attempts`]).
+    row_attempts: RowAttempts,
+    /// The pending attempts verdict, armed by [`Self::apply_level`] when
+    /// the level's strategy is a row row; taken by the frame's first
+    /// matching entry.
+    row_attempts_pending: Option<Level>,
     /// LDM arming context (see [`LdmArming`]); applied inside
     /// [`Self::apply_level`]'s size gate, so entry points set it before
     /// `reset`.
@@ -731,6 +740,8 @@ impl MatchGeneratorDriver {
             seed_budget: 0,
             small_src_row: SmallSrcRow::Btlazy,
             small_src_pending: None,
+            row_attempts: RowAttempts::Stock,
+            row_attempts_pending: None,
             slice_size,
             ramp: RampGate::OFF,
             chain_filled: u64::MAX,
@@ -797,6 +808,8 @@ impl MatchGeneratorDriver {
             seed_budget: 0,
             small_src_row: SmallSrcRow::Btlazy,
             small_src_pending: None,
+            row_attempts: RowAttempts::Stock,
+            row_attempts_pending: None,
             slice_size: 0,
             ramp: RampGate::OFF,
             chain_filled: u64::MAX,
@@ -957,7 +970,7 @@ impl MatchGeneratorDriver {
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let mut params = params_for_row(level, self.shape, self.small_src_row);
+        let mut params = params_for_row(level, self.shape, self.small_src_row, self.row_attempts);
         // The frame's reach probe result: only the row's stock reach is
         // replaceable, never a shape-clamped one.
         if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
@@ -1086,6 +1099,14 @@ impl MatchGeneratorDriver {
             && self.params.small_src
             && matches!(level.as_i32(), 9 | 10))
         .then_some(level);
+        // A row-band level arms the attempts verdict — resolved at the
+        // frame's first matching entry, where the head sits in the window
+        // (the small-src verdict's discipline). Stock-only arming keeps a
+        // resolved Light frame from re-arming across the re-applies (the
+        // reach probe's flips).
+        self.row_attempts_pending = (self.row_attempts == RowAttempts::Stock
+            && matches!(self.params.strategy, Strategy::Row(_)))
+        .then_some(level);
     }
 
     /// Re-derive the per-frame state that keys on the active strategy
@@ -1125,6 +1146,30 @@ impl MatchGeneratorDriver {
                 self.small_src_row = SmallSrcRow::Stock;
                 self.apply_level(level);
                 self.strategy_phase_reset();
+                // The stock row at level 10 is the row matcher: the flip's
+                // re-apply armed the attempts verdict, and the same head
+                // sample decides it now (the frame is already inside its
+                // first matching entry).
+                self.resolve_row_attempts();
+            }
+        }
+    }
+
+    /// Resolve the pending row-band attempts verdict from the frame's
+    /// head (see [`RowAttempts`]): a narrow sampled alphabet takes the
+    /// reduced candidate budget for the frame. Like
+    /// [`Self::resolve_small_src_row`], this runs at the frame's first
+    /// matching entry, where the head sits in the window; dictionary
+    /// frames never resolve (the head a resolution would sample is
+    /// dictionary content — `load_dictionary` cancels the pending
+    /// verdict).
+    fn resolve_row_attempts(&mut self) {
+        if let Some(level) = self.row_attempts_pending.take() {
+            let head = window_slice(&self.win, self.ext.as_ref());
+            let span = head.len().min(ROW_ATTEMPTS_HEAD_SPAN);
+            if span > 0 && row_attempts_light(&head[..span]) {
+                self.row_attempts = RowAttempts::Light;
+                self.apply_level(level);
             }
         }
     }
@@ -1157,8 +1202,10 @@ impl MatchGeneratorDriver {
         debug_assert!(self.ext.is_none() && self.win.is_empty() && self.pos == 0);
         // The pending small-src row verdict dies here: the window head a
         // resolution would sample is dictionary content, not the frame's
-        // own, so dictionary frames keep R8's swap row at 9/10.
+        // own, so dictionary frames keep R8's swap row at 9/10. The
+        // pending attempts verdict dies with it, for the same reason.
         self.small_src_pending = None;
+        self.row_attempts_pending = None;
         let dict_len = content.len() as u64;
         let keep = content.len().min(self.params.window);
         let content = &content[content.len() - keep..];
@@ -2167,6 +2214,9 @@ impl Matcher for MatchGeneratorDriver {
         // head verdict is per-frame state, resolved at the first matching
         // entry (see `resolve_small_src_row`).
         self.small_src_row = SmallSrcRow::Btlazy;
+        // Every frame starts at the stock attempts: the verdict is
+        // per-frame state, resolved at the first matching entry.
+        self.row_attempts = RowAttempts::Stock;
         self.apply_level(level);
         // Stale opt-table entries from previous frames decode below the
         // window floor once the origin advances past them (read before the
@@ -2294,6 +2344,7 @@ impl Matcher for MatchGeneratorDriver {
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.resolve_small_src_row();
+        self.resolve_row_attempts();
         let mut literals = Vec::new();
         let mut seqs: Vec<SeqWord> = Vec::new();
         self.start_matching_codes(&mut literals, &mut seqs);
@@ -2326,6 +2377,7 @@ impl Matcher for MatchGeneratorDriver {
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         self.resolve_small_src_row();
+        self.resolve_row_attempts();
         if self.head_block() {
             // The head parses through the btlazy2 driver; its bytes stay
             // LDM-indexed so later chain blocks can match far into them.
@@ -2740,6 +2792,7 @@ impl Matcher for MatchGeneratorDriver {
 
     fn skip_matching(&mut self) {
         self.resolve_small_src_row();
+        self.resolve_row_attempts();
         // Only called for RLE blocks so far: every 5-byte window in a
         // uniform run hashes to the same slot, so indexing each byte just
         // rewrites one table entry. The first position covers that slot;
@@ -3069,8 +3122,9 @@ use hash::*;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
-    SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy, ldm_min_window, params_for,
-    params_for_row, sampled_distinct, small_dict_row, small_src_btlazy_head,
+    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy,
+    ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
+    small_dict_row, small_src_btlazy_head,
 };
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]

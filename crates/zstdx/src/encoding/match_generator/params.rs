@@ -670,11 +670,74 @@ pub(crate) fn small_src_btlazy_head(head: &[u8]) -> bool {
     sampled_distinct(head, 0, head.len()) >= SMALL_SRC_SWAP_SYMS
 }
 
-pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
-    params_for_row(level, shape, SmallSrcRow::Btlazy)
+/// The row band's per-frame attempts diet (rows 5-12): the tagged row
+/// matcher's per-search candidate budget, decided by the frame head's
+/// sampled alphabet. At libzstd-parity attempts the band's json cells sit
+/// x1.4-1.7 behind libzstd while carrying 8-20% density leads — json's
+/// dense near-repeats make every one of the 8-63 attempts a real
+/// candidate, so the attempts ARE the search volume — while the blanket
+/// cut costs text/dll-class frames ratio they do not have to spare (the
+/// halving calibrations measured +0.9-1.6% text size at rows 5-8 and
+/// +0.5% at 10-12). A narrow sampled alphabet is the separating
+/// evidence (the small-src swap's own calibration numbers): json-class
+/// frames take [`RowAttempts::Light`] and spend their own cushion,
+/// every wide-alphabet frame keeps the stock bytes exactly.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) enum RowAttempts {
+    /// The ladder's stock rows at libzstd-parity attempts — the default
+    /// of every frame and of every pure `(level, shape)` query
+    /// (headers, strip geometry).
+    #[default]
+    Stock,
+    /// The reduced candidate budget for narrow-alphabet frame heads
+    /// (see [`row_light_search_depth`]).
+    Light,
 }
 
-pub(super) fn params_for_row(level: Level, shape: InputShape, row: SmallSrcRow) -> LevelParams {
+/// Head sample the attempts verdict reads (see [`RowAttempts`]): the
+/// same span the small-src row verdict samples.
+pub(crate) const ROW_ATTEMPTS_HEAD_SPAN: usize = 8 * 1024;
+
+/// The attempts diet's sampled-alphabet bar (see [`RowAttempts`]): json
+/// heads read 38-39 distinct and skewed 16 below it, text 66-79, dll
+/// 108-213 and random 251-256 above (the small-src swap's corpus
+/// calibration, measured on heads at 1K-128K).
+const ROW_ATTEMPTS_LIGHT_SYMS: u32 = 48;
+
+/// Whether a frame head's sampled alphabet takes [`RowAttempts::Light`]
+/// (see [`RowAttempts`]). A pure function of the head bytes.
+pub(crate) fn row_attempts_light(head: &[u8]) -> bool {
+    sampled_distinct(head, 0, head.len()) < ROW_ATTEMPTS_LIGHT_SYMS
+}
+
+/// The Light candidate budget per row-band level (see [`RowAttempts`]):
+/// 2/3/5/8 at rows 5-8 and 12/32/32 at rows 10-12, calibrated against
+/// the stock 8/8/16/16 and 32/64/64 — json -13..-23% time per halving
+/// (the greedy row converts worst per step, lazy2 best), spent against
+/// the band's 4.8-16% json density lead: l5 lands at -4.8% bytes vs
+/// zstd-5 and x1.29, l8-l12 at -16% and x1.19-1.25.
+fn row_light_search_depth(level: i32) -> Option<u32> {
+    match level {
+        5 => Some(2),
+        6 => Some(3),
+        7 => Some(5),
+        8 => Some(8),
+        10 => Some(12),
+        11 | 12 => Some(32),
+        _ => None,
+    }
+}
+
+pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
+    params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock)
+}
+
+pub(super) fn params_for_row(
+    level: Level,
+    shape: InputShape,
+    row: SmallSrcRow,
+    attempts: RowAttempts,
+) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
         p.window = 1usize << wl.clamp(10, 27);
@@ -704,6 +767,15 @@ pub(super) fn params_for_row(level: Level, shape: InputShape, row: SmallSrcRow) 
     // shorter matches its tiny window makes common.
     if p.small_src && matches!(p.strategy, Strategy::Row(_)) {
         p.min_match = 4;
+    }
+    // The row band's attempts diet (see [`RowAttempts`]): a resolved
+    // Light verdict takes the reduced candidate budget. Pure queries
+    // never resolve a verdict, so headers and strip geometry keep the
+    // stock row.
+    if attempts == RowAttempts::Light
+        && let Some(depth) = row_light_search_depth(level.as_i32())
+    {
+        p.search_depth = depth;
     }
     if level == Level::Uncompressed {
         p

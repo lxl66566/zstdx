@@ -1056,3 +1056,78 @@ fn extend_match_asm_matches_portable() {
         );
     }
 }
+
+/// The row band's attempts verdict (R33): a narrow-alphabet frame head
+/// halves the row matcher's candidate budget (json-class heads read
+/// 38-39 sampled distinct against the bar of 48), a wide head keeps the
+/// stock attempts — the verdict resolves once per frame at the first
+/// matching entry, from the head bytes alone, and both classes must
+/// reconstruct their input.
+#[test]
+fn row_attempts_verdict_tracks_head_alphabet() {
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // A 24-symbol alphabet with repeated words: dense near-repeats (the
+    // class the diet targets) and a head sample far under the bar.
+    let words = [
+        &b"key:value pair, "[..],
+        &b"list[0]=item; "[..],
+        &b"{\"id\": 42, "[..],
+        &b"true, null, "[..],
+    ];
+    let mut narrow = Vec::with_capacity(256 * 1024);
+    while narrow.len() < 256 * 1024 {
+        narrow.extend_from_slice(words[(rand() as usize) % words.len()]);
+    }
+    let wide: Vec<u8> = (0..256 * 1024).map(|_| (rand() & 0xff) as u8).collect();
+    for (data, light) in [(&narrow, true), (&wide, false)] {
+        let mut driver = MatchGeneratorDriver::new_direct();
+        driver.reset(crate::Level::from_zstd(7));
+        driver.adopt_window(data, 0);
+        driver.set_block(0, data.len() as u64);
+        let mut reconstructed = Vec::new();
+        let mut rep = [1u32, 4, 8];
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                reconstructed.extend_from_slice(literals);
+                let actual = crate::decoding::sequence_execution::do_offset_history(
+                    offset as u32,
+                    literals.len() as u32,
+                    &mut rep,
+                );
+                let from = reconstructed.len() - actual as usize;
+                for i in 0..match_len {
+                    let b = reconstructed[from + i];
+                    reconstructed.push(b);
+                }
+            },
+        });
+        assert_eq!(&reconstructed, data, "row parse must reconstruct");
+        // Row 7's Light budget (2/3/5/8 at rows 5-8): 5 against the
+        // stock 16.
+        assert_eq!(
+            driver.params.search_depth,
+            if light {
+                5
+            } else {
+                16
+            },
+            "attempts verdict for a {} head",
+            if light {
+                "narrow"
+            } else {
+                "wide"
+            }
+        );
+    }
+}
