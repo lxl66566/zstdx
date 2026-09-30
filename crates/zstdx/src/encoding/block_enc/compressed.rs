@@ -105,6 +105,8 @@ pub(crate) struct DictEntropy {
     /// above), set by the dictionary load. `Stock` keeps every no-dict
     /// frame's output byte-identical.
     pub cost_mode: SeqCostMode,
+    /// Literals stream layout policy for the frame (see [`LitStreams`]).
+    pub lit_streams: LitStreams,
 }
 
 /// Sequence-table selection semantics for one frame, mirroring which arm
@@ -137,6 +139,41 @@ pub(crate) enum SeqCostMode {
 /// the residue lives in.
 const EXACT_ARM_MAX_LEN: u64 = 128 * 1024;
 
+/// Largest frame that takes the one-stream literals layout (see
+/// [`LitStreams`]): above it a frame's blocks routinely carry more
+/// literals than the 3-byte header's 10-bit fields hold, so the stock
+/// layout stays; below it the whole frame is one decode unit.
+const SMALL_FRAME_LITERALS_MAX: u64 = 64 * 1024;
+
+/// Literals stream layout for a frame's Huffman literals sections. The
+/// four-stream form exists for decoder parallelism and costs a six-byte
+/// jumptable plus three extra stream tails per section; `SmallFrame`
+/// drops it for the one-stream form wherever the 3-byte header regime
+/// holds (both size fields 10-bit) — the layout libzstd's superblock
+/// gives its small blocks (`ZSTD_compressSubBlock_literal`'s
+/// `lhSize == 3` arm). A frame this small decodes as one unit, so the
+/// parallelism buys nothing there.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LitStreams {
+    #[default]
+    Stock,
+    SmallFrame,
+}
+
+impl LitStreams {
+    /// The layout a frame with a known source length takes. Unpledged
+    /// streams stay `Stock`: the layout must not depend on write
+    /// chunking, and the pinned stream-equals-bulk fixtures (128 KiB
+    /// shapes, unpledged) require the gate to stay off where an
+    /// unpledged stream cannot know it would have qualified.
+    pub(crate) fn for_frame(known_len: Option<u64>) -> Self {
+        match known_len {
+            Some(len) if len <= SMALL_FRAME_LITERALS_MAX => Self::SmallFrame,
+            _ => Self::Stock,
+        }
+    }
+}
+
 impl SeqCostMode {
     /// The selection arm a no-dict frame's level takes, mirroring
     /// `ZSTD_selectEncodingType`'s strategy split: this ladder's rows 6+
@@ -161,6 +198,7 @@ impl DictEntropy {
         ml: true,
         of: true,
         cost_mode: SeqCostMode::Stock,
+        lit_streams: LitStreams::Stock,
     };
 
     /// A plain (no-dict) frame's entropy state: nothing seeded, the
@@ -168,6 +206,7 @@ impl DictEntropy {
     pub(crate) fn plain(level: crate::Level, known_len: Option<u64>) -> Self {
         Self {
             cost_mode: SeqCostMode::for_plain_level(level, known_len),
+            lit_streams: LitStreams::for_frame(known_len),
             ..Self::default()
         }
     }
@@ -278,6 +317,7 @@ pub(crate) fn encode_staged_block<M: Matcher>(
             literals,
             last_huff_table,
             dict_entropy.huff,
+            dict_entropy.lit_streams,
             &mut writer,
             literals_gate_hold,
             fse,
@@ -1390,6 +1430,7 @@ fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     dict_seeded: bool,
+    lit_streams: LitStreams,
     writer: &mut BitWriter<&mut Vec<u8>>,
     gate_hold: &mut bool,
     fse: &mut FseBuildScratch,
@@ -1482,22 +1523,32 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
-    // libzstd's ZSTD_compressLiterals: one stream below 256 literals (the
-    // four-stream jumptable never pays for itself there); a
-    // dictionary-seeded stream additionally takes the single-stream form
-    // below 1 KiB whatever the table outcome (libzstd's `repeat_valid &&
-    // lhSize == 3` — the flag exists only while the frame still carries
-    // dictionary statistics). The literals header keeps the stream count
-    // and size format in one field.
-    let (size_format, size_bits) = match literals.len() {
-        0..256 => (0b00u8, 10),
-        _ if dict_seeded && literals.len() < 1024 => (0b00u8, 10),
-        256..1024 => (0b01, 10),
-        1024..16384 => (0b10, 14),
-        16384..262144 => (0b11, 18),
-        _ => unimplemented!("too many literals"),
+    // Stream layout, mirroring libzstd: `ZSTD_compressLiterals` takes one
+    // stream below 256 literals (the jumptable never pays there) and below
+    // 1 KiB while the frame still carries dictionary statistics
+    // (`repeat_valid && lhSize == 3`); a small frame (see [`LitStreams`])
+    // takes the one-stream form over the whole 3-byte-header regime —
+    // libzstd's superblock literals layout. Both size fields are 10 bits
+    // there, and the encoded-vs-raw compare below keeps only sections
+    // smaller than the literals themselves, so the fields always hold.
+    // The one-stream body is never larger than the four-stream one over
+    // the same table (identical per-symbol codes; the quarters only add
+    // jumptable and tails), so on an armed frame the choice is unconditional.
+    let single_stream = match literals.len() {
+        0..256 => true,
+        256..1024 => dict_seeded || lit_streams == LitStreams::SmallFrame,
+        _ => false,
     };
-    let single_stream = size_format == 0;
+    let (size_format, size_bits) = if single_stream {
+        (0b00u8, 10)
+    } else {
+        match literals.len() {
+            256..1024 => (0b01, 10),
+            1024..16384 => (0b10, 14),
+            16384..262144 => (0b11, 18),
+            _ => unimplemented!("too many literals"),
+        }
+    };
 
     writer.write_bits(size_format, 2);
     writer.write_bits(literals.len() as u32, size_bits);

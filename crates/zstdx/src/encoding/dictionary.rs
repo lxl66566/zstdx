@@ -9,7 +9,7 @@ use crate::{
     Error, InputShape, Level,
     decoding::{Dictionary, dictionary::MAGIC_NUM},
     encoding::{
-        block_enc::compressed::{DictEntropy, SeqCostMode},
+        block_enc::compressed::{DictEntropy, LitStreams, SeqCostMode},
         frame_compressor::CompressState,
     },
     fse::fse_encoder::{FSETable, build_table_from_probabilities},
@@ -133,6 +133,9 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     // `ZSTD_selectEncodingType` the frame's strategy takes. Levels 5+ are
     // the lazy family or above in both of libzstd's cParams tables, so
     // dictionary frames there run the exact three-way cost comparison;
+    // The superblock literals layout keys on the frame's known length
+    // like every plain frame (dict content included in `shape.len`).
+    state.dict_entropy.lit_streams = LitStreams::for_frame(shape.len);
     // level 4 is greedy's tighter heuristic bar. Fast rows (1-3) keep the
     // stock heuristic. Sticky per frame (survives the seeding flags
     // clearing above); no-dict frames never see it.
