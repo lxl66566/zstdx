@@ -20,8 +20,9 @@
 use alloc::vec::Vec;
 
 use super::compressed::{
-    BlockOutcome, BlockScratch, BlockTables, DictEntropy, FseTableMode, PrevTable, StagedBlock,
-    encode_staged_block, entropy_log2, histogram_literals, repeat_bit_cost, select_from_counts,
+    BlockOutcome, BlockScratch, BlockTables, DictEntropy, FseTableMode, LitStreams, PrevTable,
+    StagedBlock, encode_staged_block, entropy_log2, histogram_literals, repeat_bit_cost,
+    select_from_counts,
 };
 use crate::{
     bit_io::BitWriter,
@@ -640,7 +641,8 @@ impl Estimator<'_> {
             None => desc + new_cost,
         };
         table.recycle_aligned(self.huff);
-        let single_stream = n < 256 || (self.dict.huff && n < 1024);
+        let single_stream = n < 256
+            || n < 1024 && (self.dict.huff || self.dict.lit_streams == LitStreams::SmallFrame);
         let header = if n < 1024 {
             2
         } else {

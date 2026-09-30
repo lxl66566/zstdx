@@ -193,6 +193,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
+    use crate::EncoderOptions;
 
     fn shapes() -> Vec<Vec<u8>> {
         let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
@@ -265,6 +266,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The superblock literals layout (`LitStreams`): a frame small enough
+    /// to decode as one unit emits its Huffman literals sections as one
+    /// stream (the four-stream form's jumptable plus extra tails never pay
+    /// there), while an unpledged stream over the same bytes keeps the
+    /// stock four-stream sections — its output must not depend on write
+    /// chunking, so it cannot arm on a length it does not know. Both forms
+    /// must roundtrip.
+    #[test]
+    fn small_frame_literals_take_one_stream() {
+        // json-ish records: repetitive enough that a small frame's literal
+        // run lands in [256, 1024) — the flip window between the stock
+        // <256 single-stream rule and the 10-bit size-field ceiling.
+        let mut payload = Vec::new();
+        for i in 0..64u32 {
+            // decimal digits without std formatting
+            let digits = [(b'0' + (i / 10) as u8), b'0' + (i % 10) as u8];
+            let n = if i < 10 {
+                &digits[1..]
+            } else {
+                &digits[..]
+            };
+            payload.extend_from_slice(b"{\"id\":");
+            payload.extend_from_slice(&n);
+            payload.extend_from_slice(b",\"name\":\"record-");
+            payload.extend_from_slice(&n);
+            payload.extend_from_slice(b"\",\"value\":");
+            payload.extend_from_slice(&n);
+            payload.extend_from_slice(b"83,\"tags\":[\"a\",\"b\"]}\n");
+        }
+        let opts = EncoderOptions::new(Level::Balanced).checksum(false);
+        let small = compress_with(&payload, &opts).unwrap();
+
+        // Unpledged stream over the same bytes: the stock layout.
+        let mut sink = Vec::new();
+        {
+            let mut enc = crate::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
+            use crate::io::Write;
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let sections = |frame: &[u8]| -> Vec<(u32, u8)> {
+            // (regenerated_size, num_streams) of every Huffman literals
+            // section: a tiny frame walker — header, then per-block.
+            let mut out = Vec::new();
+            let fhd = frame[4];
+            let mut o = 5usize;
+            if fhd & 0x20 == 0 {
+                o += 1; // window descriptor
+            }
+            let fcsf = fhd >> 6;
+            if fcsf > 0 || fhd & 0x20 != 0 {
+                o += match fcsf {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    _ => 8,
+                };
+            }
+            loop {
+                let h = u32::from_le_bytes([frame[o], frame[o + 1], frame[o + 2], 0]);
+                o += 3;
+                let (last, bt, size) = (h & 1 != 0, (h >> 1) & 3, (h >> 3) as usize);
+                if bt == 2 {
+                    let mut ls = crate::blocks::literals_section::LiteralsSection::new();
+                    ls.parse_from_header(&frame[o..o + 5]).unwrap();
+                    if matches!(
+                        ls.ls_type,
+                        crate::blocks::literals_section::LiteralsSectionType::Compressed
+                    ) {
+                        out.push((ls.regenerated_size, ls.num_streams.unwrap()));
+                    }
+                }
+                o += match bt {
+                    1 => 1, // RLE content is a single byte
+                    _ => size,
+                };
+                if last {
+                    return out;
+                }
+            }
+        };
+
+        let small_secs = sections(&small);
+        assert!(
+            small_secs
+                .iter()
+                .any(|&(regen, _)| (256..1024).contains(&regen)),
+            "fixture must reach the flip window: {small_secs:?}"
+        );
+        for &(regen, streams) in &small_secs {
+            assert_eq!(
+                streams, 1,
+                "small frame section with {regen} literals must be one stream"
+            );
+        }
+        // The stock side keeps four streams over the flip window (sections
+        // below 256 stay single there).
+        for &(regen, streams) in &sections(&sink) {
+            if (256..1024).contains(&regen) {
+                assert_eq!(streams, 4, "unpledged stream section with {regen} literals");
+            }
+        }
+
+        assert_eq!(decompress(&small, payload.len()).unwrap(), payload);
+        assert_eq!(decompress(&sink, payload.len()).unwrap(), payload);
     }
 
     #[test]
