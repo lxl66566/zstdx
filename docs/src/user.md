@@ -177,7 +177,7 @@ if let Some(rest) = dec.collect() {
 | -------------- | ------- | ------------------------------------------- |
 | `std`          | ✓       | `std::io` traits, threads, `compat`         |
 | `hash`         | ✓       | XXH64 frame checksums (write + verify)      |
-| `dict_builder` | —       | dictionary training (`zstdx::dict`)         |
+| `dict_builder` | —       | dictionary training (`zstdx::dict`; `zstdx-cli` passes it through for `zstdx --train`) |
 | `fuzz_exports` | —       | internal: exposes `fse`/`huff0` for fuzzing |
 
 `seq_dump` and `job_trace` are internal instrumentation features for the bench tooling, not a stable interface.
@@ -198,6 +198,8 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 - `--stream-size=N` pledges the exact stdin size (a mismatch fails, like zstd); `--size-hint=N` sizes the encoder row for an approximate stdin size without any header promise. Both are stdin-only and rejected for file inputs, whose sizes are already pledged.
 - `-M N` / `--memory=N` bounds decode memory by capping the frame window (zstd's syntax: bare bytes or `K`/`M`/`G` suffixes). Values below 1K reject every frame and are refused, as in zstd; compression rejects the flag (zstd silently ignores it there).
 - `--filelist LIST` (alias `--file`) reads the input list from LIST, one path per line; `-` reads the list itself from stdin.
+- `-l`/`--list` prints frame information (frames/skips counts, compressed and decompressed sizes, ratio, checksum, dictID) without decompressing — headers are parsed and block headers walked only. The column layout, `-v` field block, `-vv` raw byte counts, grouped totals, and error categories (not-zstd/truncated/frame error) match zstd 1.5.7 byte for byte; stdin is refused. `-l` conflicts with the (de)compression modes and `-o`.
+- `--train` builds a dictionary from sample files (plain file list, `-r` for directories, no stdin) through the `dict_builder` feature: `-o` sets the output (default `dictionary`), `--maxdict=#` caps its size (zstd suffix syntax, default 112640, floor 256). The output is a formatted dictionary (magic + dictID + entropy tables) usable by zstd itself. Built without the feature, the flag fails with a clear error. `--dictID` and `--train-cover`/`--train-fastcover`/`--train-legacy` are rejected loudly: the trainer derives the dictID from content and implements one algorithm.
 - `--sparse`/`--no-sparse` are rejected with an explicit unsupported error: output is always dense (sparse decode-to-seek is not implemented).
 - A failed (de)compression to a file removes the partial output it created, mirroring zstd.
 - Overwrite prompts are read from the controlling terminal (/dev/tty), never from piped stdin; without a terminal, existing outputs are refused unless `-f` is given.
@@ -211,6 +213,9 @@ zstdx --long=26 -T0 archive.tar          # 64 MiB window, all cores
 zstdx -d -M 128M out.zst                 # decode within a memory cap
 zstdx -d out.zst                         # → out
 zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
+zstdx -l -v archive.tar.zst              # frame info without decompressing
+zstdx --train -r logs/ --maxdict=64K -o logs.dict
+zstdx -D logs.dict -9 app.log             # trained-dictionary compression
 ```
 
 ## Current limitations
