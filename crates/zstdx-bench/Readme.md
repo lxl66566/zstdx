@@ -79,11 +79,19 @@ The full 1-22 ladder is extremely heavy: never run it during daily
 iteration — run it once before a release. Combine with `--shape`/`--level`/
 `--budget-ms` to narrow smoke passes.
 
+`--pull <size>` (comma-separated, bytes with optional k/m suffix, default
+`64k`) loops the streaming cells over several reader pull sizes: the
+`dec-st` streaming cells and the `enc-stream` ST cells (all six ladder
+tiers) report one cell per size; the 64 KiB cell keeps its unsuffixed name,
+others get `.4k`/`.1m`-style suffixes. The `enc-stream` MT section always
+runs at 64 KiB.
+
 `--file <path>` (repeatable) appends payload files outside the corpus: a
 `.zst*` file adds `dec-st` cells (verified against the raw counterpart
-found next to it — stem or `<stem>.raw`), any other file adds `enc-st`
-cells as raw input. Other sections reject `--file`. See "Large payloads"
-below for the 100 MB+ recipe.
+found next to it — stem or `<stem>.raw`), any other file adds raw-input
+cells to `enc-st` and to both `enc-stream` sections (ST and MT). Other
+sections reject `--file`. See "Large payloads" below for the 100 MB+
+recipe.
 
 ### Large payloads (100 MB+)
 

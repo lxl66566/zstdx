@@ -53,15 +53,19 @@ Without `std` the crate builds as `no_std` + `alloc`; bulk, streaming and the lo
 
 ## Performance
 
-Benchmarked against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MB real-binary payload (dll, concatenated system ELF binaries via [gen_big.sh](bench/gen_big.sh)); single-threaded unless noted, checksums off, every cell roundtrip-verified, ±10% run-to-run noise. Full tables — MT encode, streaming encode, small payloads, the numeric 1-22 ladder and every raw number: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md).
+Benchmarked against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MB real-binary payload (dll, concatenated system ELF binaries via [gen_big.sh](bench/gen_big.sh)); single-threaded unless noted, checksums off, every cell roundtrip-verified, ±10% run-to-run noise. The figures use the **streaming** paths — what `Read`/`Write` users actually run; full tables incl. bulk: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md).
 
-![Encode: throughput vs compression ratio, zstdx vs libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/master/assets/encode-pareto.svg)
+![Streaming encode: throughput vs compression ratio, zstdx vs libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/master/assets/encode-pareto.svg)
 
-At equal ratio zstdx stays on or above the libzstd curve: on json, everything libzstd compresses between ratio 6.2 and 7.4 runs below 40 MiB/s while zstdx holds 142 MiB/s at ratio 7.2; on the dll payload it is 8–13% smaller than libzstd from level 9 up. Multi-threaded bulk encode keeps the same pattern; the one libzstd win is json at level 1.
+At matched numeric levels zstdx is denser at **every** streaming-encode level on every payload — +4.7% bytes on json at the fastest tier, +20% on json balanced (ratio 7.13 vs 5.95), −13..−17% on the dll payload from balanced up, −49.6% at its fastest tier at speed parity. Speed: zstdx leads the working tiers — fast on every payload, fastest on text at 3.2×, best/opt/ultra on text — while the cells it trails (json fastest/balanced/best, text balanced, dll balanced/best/opt/ultra) all carry 1.7–20% byte wins; json best/ultra hold ratio parity-or-denser at somewhat less speed, everything else sits on or above the libzstd frontier. On unknown-size text streams libzstd's fastest tier emits a 1.84 MB frame (ratio 18.3) vs our 108 KB (ratio 309) — 16.9× denser *and* 3.2× faster (the isolated gray point in the log-x panel). Reader pull sizes 4 KiB–1 MiB were swept for every cell: speedups stay within 5% of the 64 KiB value.
 
-![Decode speedup over libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/master/assets/decode-speedup.svg)
+![Streaming encode, 8 workers vs libzstd at 8 workers](https://raw.githubusercontent.com/lxl66566/zstdx/master/assets/encode-stream-mt.svg)
 
-Bulk decode wins every cell, up to 4.7×. Streaming decode — the path `Read`/`Write` users hit — is the honest gap: libzstd holds a 1.04–1.37× edge on compressible shapes while we win incompressible data; and our multi-threaded decoder (libzstd has none) reaches 1.17× (json) and 1.30× (dll100) of libzstd's streaming decode at 16 workers. Compression-ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels.
+With 8-worker multithreaded streaming (64 KiB pulls), zstdx stays ahead of libzstd on json at every tier (1.6–5.7×) and on text at every tier (1.0–3.4×). On the dll payload it leads at fast and opt but trails at fastest, balanced, ultra and sharply at best (0.07×) — those cells also run at 46–93% of zstdx's own bulk-mt throughput, so the streaming-MT path on that payload has recorded headroom in the bench docs.
+
+![Streaming decode speedup over libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/master/assets/decode-speedup.svg)
+
+Streaming decode — the honest gap — wins incompressible data (random 1.2–1.3×, zeros at parity) and trails on compressible shapes (dots left of the parity line; libzstd's edge is 1.04–1.36×), and the pull-size bands show it barely moves from 4 KiB to 1 MiB reads. Bulk decode, for contrast, wins 17/18 cells up to 4.8×. Our 16-worker multi-threaded decoder (diamonds) reaches ×1.18 (json) / ×1.31 (dll100) of libzstd's single-threaded streaming decode. Compression-ratio geo-mean over the full sweep (5 shapes × 6 levels × bulk/stream × ST/MT): **+8.7% denser than libzstd** at matched numeric levels.
 
 Full per-level tables (1-22), methodology and noise caveats: [snapshot.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/master/docs/src/dev/bench/matrix.md).
 

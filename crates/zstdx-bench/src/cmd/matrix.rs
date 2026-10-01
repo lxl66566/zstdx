@@ -10,9 +10,10 @@
 //! timed.
 //!
 //! Sections and verdicts:
-//! - `dec-st` interleaves both sides' bulk and streaming (64 KiB) decoders over the zst1/zst3/zst9
-//!   corpus variants plus the optional .zst19 trio. The streaming rows carry the real comparison:
-//!   the zstd crate's bulk API is a slow per-chunk wrapper.
+//! - `dec-st` interleaves both sides' bulk and streaming decoders over the zst1/zst3/zst9 corpus
+//!   variants plus the optional .zst19 trio; the streaming cells loop over the selected pull sizes
+//!   (`--pull`, default 64 KiB). The streaming rows carry the real comparison: the zstd crate's
+//!   bulk API is a slow per-chunk wrapper.
 //! - `dec-mt` scales our parallel decoder (`DecoderOptions::threads`) solo; libzstd exposes no
 //!   multithreaded decode, so the zstd column is its single-threaded streaming speed as a reference
 //!   line.
@@ -22,9 +23,11 @@
 //!   both sides at the same number — extremely heavy, a release-gate pass, never daily iteration.
 //! - `enc-mt` interleaves both sides at equal worker counts with fresh contexts per call (the zstd
 //!   crate has no per-call pool API; a warm reused context is reported once as a reference line).
-//! - `enc-stream` compares the streaming encoders with 64 KiB pulls: single-threaded zstdx vs zstd
-//!   interleaved, then multithreaded (`--mt-workers`, default 8) zstdx vs zstd interleaved, each
-//!   followed by our bulk mt path over the same bytes as the ceiling reference.
+//! - `enc-stream` compares the streaming encoders: single-threaded zstdx vs zstd interleaved over
+//!   the selected pull sizes (`--pull`, default 64 KiB; all six ladder tiers), then multithreaded
+//!   (`--mt-workers`, default 8) zstdx vs zstd interleaved at 64 KiB, each followed by our bulk mt
+//!   path over the same bytes as the ceiling reference. Raw `--file` payloads (e.g.
+//!   `bench/big/dll100.raw`) join the ST section.
 
 use std::{
     fs,
@@ -102,13 +105,31 @@ pub struct Args {
     pub full_ladder: bool,
     /// Extra payload files outside the corpus (repeatable): a `.zst*` file
     /// adds dec-st cells (verified against the raw counterpart found next
-    /// to it), any other file adds enc-st cells as raw input. See
-    /// `bench/gen_big.sh` for the 100 MB+ recipe.
+    /// to it), any other file adds raw-input cells to enc-st and enc-stream.
+    /// See `bench/gen_big.sh` for the 100 MB+ recipe.
     #[arg(long)]
     pub file: Vec<PathBuf>,
+    /// Pull sizes for the streaming sections, comma-separated (bytes, with
+    /// optional k/m suffix): dec-st's streaming cells and enc-stream's ST
+    /// cells loop over these; the default is the historical 64 KiB.
+    #[arg(long, value_delimiter = ',', value_parser = parse_pull, default_value = "64k")]
+    pub pull: Vec<usize>,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
+}
+
+/// `--pull` entry: bytes with an optional k/m suffix (64k, 1m, 262144).
+fn parse_pull(s: &str) -> Result<usize, String> {
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1024usize),
+        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1),
+    };
+    digits
+        .parse::<usize>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("invalid pull size `{s}`: expected bytes with optional k/m suffix"))
 }
 
 /// Report name padded past `AbReport::print`'s name column so the numeric
@@ -179,8 +200,8 @@ fn validate_levels(args: &Args) {
     }
 }
 
-/// `--file` payloads only run in the dec-st (`.zst*`) and enc-st (raw)
-/// sections; catch mismatches before any measurement starts.
+/// `--file` payloads only run in the dec-st (`.zst*`), enc-st and
+/// enc-stream (raw) sections; catch mismatches before any measurement starts.
 fn validate_files(args: &Args) {
     if args.file.is_empty() {
         return;
@@ -188,7 +209,10 @@ fn validate_files(args: &Args) {
     for p in &args.file {
         assert!(p.is_file(), "--file {}: not a file", p.display());
         let dec_section = matches!(args.mode, MatrixMode::All | MatrixMode::DecSt);
-        let enc_section = matches!(args.mode, MatrixMode::All | MatrixMode::EncSt);
+        let raw_section = matches!(
+            args.mode,
+            MatrixMode::All | MatrixMode::EncSt | MatrixMode::EncStream
+        );
         if is_zst_payload(p) {
             assert!(
                 dec_section,
@@ -197,8 +221,8 @@ fn validate_files(args: &Args) {
             );
         } else {
             assert!(
-                enc_section,
-                "--file {}: raw payloads run in --mode enc-st",
+                raw_section,
+                "--file {}: raw payloads run in --mode enc-st/enc-stream",
                 p.display()
             );
         }
@@ -207,8 +231,29 @@ fn validate_files(args: &Args) {
 
 // ---------- decode, single-thread, bulk vs streaming ----------
 
+/// Report-name tag for a streaming pull size; the historical 64 KiB stays
+/// unsuffixed so default runs keep their documented cell names.
+fn pull_tag(pull: usize) -> String {
+    if pull >= 1024 * 1024 && pull % (1024 * 1024) == 0 {
+        format!("{}m", pull / (1024 * 1024))
+    } else if pull >= 1024 && pull % 1024 == 0 {
+        format!("{}k", pull / 1024)
+    } else {
+        pull.to_string()
+    }
+}
+
+fn stream_cell_name(cell: &str, pull: usize) -> String {
+    if pull == 64 * 1024 {
+        cell.to_owned()
+    } else {
+        format!("{cell}.{}", pull_tag(pull))
+    }
+}
+
 /// Bulk + streaming decode A/B cells for one frame, verified against `raw`.
-fn dec_st_cells(ab: &Ab, comp: &[u8], raw: &[u8], name: &str) {
+/// The streaming cells loop over the selected pull sizes.
+fn dec_st_cells(ab: &Ab, args: &Args, comp: &[u8], raw: &[u8], name: &str) {
     let bytes = raw.len() as u64;
     gate_ruz_dec(comp, raw, name);
     gate_zstd_dec(comp, raw, name);
@@ -227,36 +272,41 @@ fn dec_st_cells(ab: &Ab, comp: &[u8], raw: &[u8], name: &str) {
     )
     .print(&pad(&format!("{name}.bulk")), bytes);
 
-    // streaming path, 64 KiB reads
-    ab.measure(
-        || {
-            let mut dec = StreamingDecoder::new(comp).unwrap();
-            let mut sink = vec![0u8; 64 * 1024];
-            let mut total = 0usize;
-            loop {
-                let n = dec.read(&mut sink).unwrap();
-                if n == 0 {
-                    break;
+    // streaming path, one cell per pull size
+    for &pull in &args.pull {
+        ab.measure(
+            || {
+                let mut dec = StreamingDecoder::new(comp).unwrap();
+                let mut sink = vec![0u8; pull];
+                let mut total = 0usize;
+                loop {
+                    let n = dec.read(&mut sink).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
                 }
-                total += n;
-            }
-            assert_eq!(total, raw.len());
-        },
-        || {
-            let mut dec = zstd::stream::read::Decoder::new(comp).unwrap();
-            let mut sink = vec![0u8; 64 * 1024];
-            let mut total = 0usize;
-            loop {
-                let n = dec.read(&mut sink).unwrap();
-                if n == 0 {
-                    break;
+                assert_eq!(total, raw.len());
+            },
+            || {
+                let mut dec = zstd::stream::read::Decoder::new(comp).unwrap();
+                let mut sink = vec![0u8; pull];
+                let mut total = 0usize;
+                loop {
+                    let n = dec.read(&mut sink).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
                 }
-                total += n;
-            }
-            assert_eq!(total, raw.len());
-        },
-    )
-    .print(&pad(&format!("{name}.stream")), bytes);
+                assert_eq!(total, raw.len());
+            },
+        )
+        .print(
+            &pad(&stream_cell_name(&format!("{name}.stream"), pull)),
+            bytes,
+        );
+    }
 }
 
 /// A `--file` payload is a decode input when its extension starts with
@@ -279,7 +329,7 @@ fn t1_dec_st(ab: &Ab, args: &Args) {
             continue;
         }
         let (comp, raw) = load(f);
-        dec_st_cells(ab, &comp, &raw, f);
+        dec_st_cells(ab, args, &comp, &raw, f);
     }
     for path in args.file.iter().filter(|p| is_zst_payload(p)) {
         let raw_path = raw_counterpart(path).unwrap_or_else(|| {
@@ -291,7 +341,7 @@ fn t1_dec_st(ab: &Ab, args: &Args) {
         let comp = fs::read(path).unwrap();
         let raw = fs::read(&raw_path).unwrap();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap();
-        dec_st_cells(ab, &comp, &raw, name);
+        dec_st_cells(ab, args, &comp, &raw, name);
     }
 }
 
@@ -573,19 +623,44 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
 
 // ---------- encode, streaming ----------
 
+/// Streaming payloads: the two corpus shapes plus any raw `--file` entries
+/// (e.g. `bench/big/dll100.raw`). Raw files join the ST section only.
+fn t5_payloads(args: &Args) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = [Shape::Json, Shape::Text]
+        .into_iter()
+        .filter(|s| want(&args.shape, s))
+        .map(|s| (s.raw_name().to_owned(), load_raw(s)))
+        .collect();
+    for path in args.file.iter().filter(|p| !is_zst_payload(p)) {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        v.push((stem.to_owned(), fs::read(path).unwrap()));
+    }
+    v
+}
+
+fn pull_list(args: &Args) -> String {
+    if args.pull == [64 * 1024] {
+        "64 KiB pulls".to_owned()
+    } else {
+        format!(
+            "pulls {}",
+            args.pull
+                .iter()
+                .map(|&p| pull_tag(p))
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    }
+}
+
 fn t5_enc_stream(ab: &Ab, args: &Args) {
-    println!("== T5 encode streaming ST, checksums off (interleaved A/B; 64 KiB pulls) ==");
-    for shape in [Shape::Json, Shape::Text] {
-        if !want(&args.shape, &shape) {
-            continue;
-        }
-        let raw = load_raw(shape);
+    println!(
+        "== T5 encode streaming ST, checksums off (interleaved A/B; {}) ==",
+        pull_list(args)
+    );
+    for (name, raw) in t5_payloads(args) {
         let bytes = raw.len() as u64;
-        for (label, level, z) in ladder_axis(args, &[
-            LevelName::Fastest,
-            LevelName::Fast,
-            LevelName::Best,
-        ]) {
+        for (label, level, z) in ladder_axis(args, &LADDER) {
             // gate: both sides' streaming outputs must roundtrip to the raw input
             let mut comp = Vec::new();
             let mut enc = zstdx::stream::read::Encoder::with_options(
@@ -602,50 +677,52 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             zenc.finish();
             assert_roundtrip(&zcomp, &raw, &label);
             println!(
-                "sizes {}.{label}.stream  ruz {}   zstd {}",
-                shape.raw_name(),
+                "sizes {name}.{label}.stream  ruz {}   zstd {}",
                 comp.len(),
                 zcomp.len()
             );
 
-            ab.measure(
-                || {
-                    let mut enc = zstdx::stream::read::Encoder::with_options(
-                        &raw[..],
-                        EncoderOptions::new(level).checksum(false),
-                    )
-                    .unwrap();
-                    let mut sink = vec![0u8; 64 * 1024];
-                    loop {
-                        if enc.read(&mut sink).unwrap() == 0 {
-                            break;
+            // one cell per pull size
+            for &pull in &args.pull {
+                ab.measure(
+                    || {
+                        let mut enc = zstdx::stream::read::Encoder::with_options(
+                            &raw[..],
+                            EncoderOptions::new(level).checksum(false),
+                        )
+                        .unwrap();
+                        let mut sink = vec![0u8; pull];
+                        loop {
+                            if enc.read(&mut sink).unwrap() == 0 {
+                                break;
+                            }
                         }
-                    }
-                    enc.finish().unwrap();
-                },
-                || {
-                    let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
-                    let mut sink = vec![0u8; 64 * 1024];
-                    loop {
-                        if enc.read(&mut sink).unwrap() == 0 {
-                            break;
+                        enc.finish().unwrap();
+                    },
+                    || {
+                        let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
+                        let mut sink = vec![0u8; pull];
+                        loop {
+                            if enc.read(&mut sink).unwrap() == 0 {
+                                break;
+                            }
                         }
-                    }
-                    enc.finish();
-                },
-            )
-            .print(&pad(&format!("{}.{label}.stream", shape.raw_name())), bytes);
+                        enc.finish();
+                    },
+                )
+                .print(
+                    &pad(&stream_cell_name(&format!("{name}.{label}.stream"), pull)),
+                    bytes,
+                );
+            }
         }
     }
 
-    // multithreaded streaming, both sides
+    // multithreaded streaming, both sides (always the default 64 KiB pull;
+    // --pull applies to the ST section)
     let mt = args.mt_workers;
     println!("== T5b encode streaming MT({mt}), checksums off (interleaved A/B; 64 KiB pulls) ==");
-    for shape in [Shape::Json, Shape::Text] {
-        if !want(&args.shape, &shape) {
-            continue;
-        }
-        let raw = load_raw(shape);
+    for (name, raw) in t5_payloads(args) {
         let bytes = raw.len() as u64;
         for (label, level, z) in ladder_axis(args, &[
             LevelName::Fastest,
@@ -676,7 +753,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             assert_roundtrip(&zcomp, &raw, &label);
             println!(
                 "sizes {}.{label}.stream-mt{mt}  ruz {}   zstd {}",
-                shape.raw_name(),
+                name,
                 comp.len(),
                 zcomp.len()
             );
@@ -708,10 +785,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                     enc.finish();
                 },
             )
-            .print(
-                &pad(&format!("{}.{label}.stream-mt{mt}", shape.raw_name())),
-                bytes,
-            );
+            .print(&pad(&format!("{}.{label}.stream-mt{mt}", name)), bytes);
         }
 
         // ceiling reference: our bulk mt path over the same bytes (the
@@ -739,7 +813,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                 "{:<32}{:>8.0}  (zstdx {}.{label} bulk mt{mt} ceiling)",
                 "ref",
                 stats.mibs(bytes),
-                shape.raw_name()
+                name
             );
         }
     }
