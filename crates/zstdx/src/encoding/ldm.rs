@@ -521,8 +521,9 @@ fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
 fn checksum_mask(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
+        use crate::common::simd::{self, SimdTier};
         // SAFETY: guarded by the feature check; reads exactly the bucket.
-        if std::is_x86_feature_detected!("avx512f") {
+        if simd::allows(SimdTier::Avx512) && std::is_x86_feature_detected!("avx512f") {
             return unsafe { checksum_mask_avx512(entries, checksum) };
         }
     }

@@ -458,13 +458,20 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 // byte-permutes instead of per-symbol LUT loads.
                 #[cfg(all(target_arch = "x86_64", feature = "std"))]
                 {
+                    use crate::common::simd::{self, SimdTier};
                     const CHUNK: usize = 64;
                     let full = groups / 4;
                     let simd_stop = n - full * CHUNK;
-                    if full > 0
+                    // `!wide_ok` below keeps the corner the AVX-512 kernel
+                    // cannot take (groups 2-3, under its 64-symbol chunk) on
+                    // the scalar tail of wide hardware: the AVX2 kernel's
+                    // fixed 256-entry slot scan costs more than those few
+                    // groups pack scalar (skewed default-path +0.19% Ir
+                    // measured without the gate).
+                    let wide_ok = simd::allows(SimdTier::Avx512)
                         && std::is_x86_feature_detected!("avx512bw")
-                        && std::is_x86_feature_detected!("avx512vbmi")
-                    {
+                        && std::is_x86_feature_detected!("avx512vbmi");
+                    if full > 0 && wide_ok {
                         let mut tab = [0u8; 256];
                         for (b, t) in tab.iter_mut().enumerate() {
                             *t = lut(b as u8);
@@ -474,6 +481,38 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                         // 64-byte loads inside data.
                         p = uniform4_pack_avx512(data, simd_stop, n, p, &tab);
                         i = simd_stop;
+                    } else if groups >= 2
+                        && !wide_ok
+                        && simd::allows(SimdTier::Avx2)
+                        && std::is_x86_feature_detected!("avx2")
+                    {
+                        // A uniform 4-bit code table admits at most sixteen
+                        // live symbols (Kraft: one codeword per present
+                        // symbol, 2^4 codewords), and `packed` is zero
+                        // exactly on the absent ones — so the slot list a
+                        // 256-entry byte LUT cannot be permuted through on
+                        // AVX2 is derivable by one scan of it.
+                        let mut slots = [(0u8, 0u8); 16];
+                        let mut nslots = 0usize;
+                        for (b, &e) in packed.iter().enumerate() {
+                            if e != 0 {
+                                if nslots == 16 {
+                                    nslots += 1;
+                                    break;
+                                }
+                                slots[nslots] = (b as u8, lut(b as u8));
+                                nslots += 1;
+                            }
+                        }
+                        let full = groups / 2;
+                        let simd_stop = n - full * 32;
+                        if nslots <= 16 {
+                            // SAFETY: the feature was just detected; the
+                            // reserve covers all stores; i >= simd_stop + 31
+                            // keeps the 32-byte loads inside data.
+                            p = uniform4_pack_avx2(data, simd_stop, n, p, &slots, nslots);
+                            i = simd_stop;
+                        }
                     }
                 }
                 while i > bulk_end {
@@ -616,11 +655,171 @@ unsafe fn uniform4_pack_avx512(
     }
 }
 
+/// AVX2 form of [`uniform4_pack_avx512`]: 32-symbol chunks. `slots` is the
+/// live `(symbol, 4-bit code)` list (`packed`'s nonzero entries, at most
+/// sixteen — see the dispatch site). The per-byte LUT runs as one
+/// equality-select pass per slot (`vpcmpeqb` + `vblendvb`) — a 256-entry
+/// byte LUT has no AVX2 permute counterpart. One lane swap of the loaded
+/// codes puts chunk bytes 16..31 (the first group's source) in lane 0
+/// and bytes 0..15 in lane 1; lane-local shuffles then fold the codes
+/// into reversed nibble pairs — output byte `j` of 16 holds
+/// `code(data[i + 31 - 2j]) | code(data[i + 30 - 2j]) << 4`, exactly the
+/// scalar tail's order — leaving each lane's low qword in output
+/// order, so one unpack folds the lane pair into the 16 stored bytes.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn uniform4_pack_avx2(
+    data: &[u8],
+    stop: usize,
+    end: usize,
+    mut dst: *mut u8,
+    slots: &[(u8, u8); 16],
+    nslots: usize,
+) -> *mut u8 {
+    unsafe {
+        use core::arch::x86_64::*;
+        // Per-lane shuffle indices taking every other code byte in
+        // descending chunk order; the zeroed upper halves of each lane are
+        // placeholders whose shuffle results are never stored (the unpack
+        // keeps only each lane's low qword). SAFETY: construction reads
+        // only the local arrays.
+        let odd = {
+            let mut idx = [0u8; 32];
+            for half in 0..2 {
+                for j in 0..8 {
+                    idx[half * 16 + j] = (15 - 2 * j) as u8;
+                }
+            }
+            _mm256_loadu_si256(idx.as_ptr().cast())
+        };
+        let even = {
+            let mut idx = [0u8; 32];
+            for half in 0..2 {
+                for j in 0..8 {
+                    idx[half * 16 + j] = (14 - 2 * j) as u8;
+                }
+            }
+            _mm256_loadu_si256(idx.as_ptr().cast())
+        };
+        let mut i = end;
+        while i > stop {
+            i -= 32;
+            // SAFETY: i >= stop keeps this 32-byte load inside data.
+            let v = _mm256_loadu_si256(data.as_ptr().add(i).cast());
+            // The load's lane 0 carries chunk bytes 0..15 but must feed
+            // output bytes 8..16, and vice versa; the shuffles below are
+            // lane-local and cannot cross, so swap the load once here.
+            // SAFETY: immediate lane selector.
+            let v = _mm256_permute2x128_si256(v, v, 0x01);
+            let mut acc = _mm256_setzero_si256();
+            for k in 0..nslots {
+                let (sym, code) = slots[k];
+                let eq = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(sym as i8));
+                acc = _mm256_blendv_epi8(acc, _mm256_set1_epi8(code as i8), eq);
+            }
+            // SAFETY: vpshufb indices are < 16 in both lanes; the unset
+            // upper halves shuffle byte 0 of each lane and are never
+            // stored.
+            let lo = _mm256_shuffle_epi8(acc, odd);
+            let hi = _mm256_shuffle_epi8(acc, even);
+            // Four-bit codes stay inside the low nibble, so the 16-bit
+            // shifts cannot bleed between neighboring byte pairs.
+            let pairs = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
+            // SAFETY: the dispatch site reserved pos + total + 16 bytes;
+            // the unpack stores exactly the 16 semantic output bytes
+            // (each lane's shuffled low qword).
+            _mm_storeu_si128(
+                dst.cast(),
+                _mm_unpacklo_epi64(
+                    _mm256_castsi256_si128(pairs),
+                    _mm256_extracti128_si256(pairs, 1),
+                ),
+            );
+            dst = dst.add(16);
+        }
+        dst
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
     use super::BitWriter;
+
+    /// The AVX2 uniform-4 pack against the scalar group loop over
+    /// randomized data and slot sets (both are also exercised end-to-end
+    /// by the tier-forced dump differential gate).
+    #[test]
+    fn uniform4_pack_avx2_matches_scalar() {
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if std::is_x86_feature_detected!("avx2") {
+            let mut state = 0x1234_5678_9abc_def0u64;
+            let mut rng = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for round in 0..64 {
+                let nslots = 1 + (rng() % 16) as usize;
+                let mut syms: alloc::vec::Vec<u8> = (0..=255u8).collect();
+                for k in (0..nslots).rev() {
+                    let j = (rng() as usize) % (k + 1);
+                    syms.swap(k, j);
+                }
+                let mut packed = [0u16; 256];
+                let mut slots = [(0u8, 0u8); 16];
+                for k in 0..nslots {
+                    let code = if round % 3 == 0 {
+                        k as u8
+                    } else {
+                        (rng() % 16) as u8
+                    };
+                    packed[syms[k] as usize] = ((code as u16) << 4) | 4;
+                    slots[k] = (syms[k], code);
+                }
+                let lut = |b: u8| (packed[b as usize] >> 4) as u8;
+                let len = 32 * (1 + (rng() as usize) % 9) + (rng() as usize) % 32;
+                let data: alloc::vec::Vec<u8> = (0..len)
+                    .map(|_| syms[(rng() as usize >> 8) % nslots])
+                    .collect();
+                // Scalar reference: the write_uniform4_bulk group loop.
+                let groups = len / 16;
+                let bulk_end = len - groups * 16;
+                let mut scalar = vec![0u8; groups * 8 + 16];
+                let mut o = 0usize;
+                let mut i = len;
+                while i > bulk_end {
+                    for k in 0..8 {
+                        scalar[o + k] = lut(data[i - 1 - 2 * k]) | lut(data[i - 2 - 2 * k]) << 4;
+                    }
+                    o += 8;
+                    i -= 16;
+                }
+                // Both pack the topmost full*32 symbols; the SIMD writes
+                // its chunks in the same top-down byte order as the scalar
+                // groups, so the prefixes must match exactly.
+                let full = groups / 2;
+                let simd_stop = len - full * 32;
+                let mut simd = vec![0u8; groups * 8 + 16];
+                // SAFETY: avx2 detected above; the buffer covers every
+                // store (groups * 8 bytes of output plus slack).
+                let q = unsafe {
+                    super::uniform4_pack_avx2(
+                        &data,
+                        simd_stop,
+                        len,
+                        simd.as_mut_ptr(),
+                        &slots,
+                        nslots,
+                    )
+                };
+                assert_eq!(q as usize - simd.as_ptr() as usize, full * 16);
+                assert_eq!(&simd[..full * 16], &scalar[..full * 16]);
+            }
+        }
+    }
 
     #[test]
     fn from_existing() {

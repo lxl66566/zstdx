@@ -33,3 +33,9 @@ pub const fn max_block_output(window_size: usize) -> usize {
         MAX_BLOCK_SIZE as usize
     }
 }
+
+/// Runtime SIMD tier clamp (`ZSTDX_SIMD_FORCE`): the dev override that
+/// lowers runtime kernel dispatch to a narrower tier for honest
+/// measurement on wider hardware.
+#[cfg(feature = "std")]
+pub(crate) mod simd;

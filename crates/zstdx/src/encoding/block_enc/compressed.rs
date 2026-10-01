@@ -1188,14 +1188,25 @@ pub(super) fn entropy_log2(x: f64) -> f64 {
 pub(super) fn histogram_literals(literals: &[u8], counts: &mut [usize; 256]) -> usize {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if literals.len() >= 64
+        use crate::common::simd::{self, SimdTier};
+        let wide_ok = simd::allows(SimdTier::Avx512)
             && std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
-            && std::is_x86_feature_detected!("popcnt")
-        {
+            && std::is_x86_feature_detected!("popcnt");
+        let avx2_ok = !wide_ok
+            && simd::allows(SimdTier::Avx2)
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("popcnt");
+        if literals.len() >= 64 && wide_ok {
             // SAFETY: the features were just detected; every access stays
             // inside `literals` (the loop guards i + 64 <= len).
             if let Some(max) = unsafe { histogram_small_alpha_avx512(literals, counts) } {
+                return max;
+            }
+        } else if literals.len() >= 64 && avx2_ok {
+            // SAFETY: same bound discipline; the kernel leaves `counts`
+            // untouched on a too-wide alphabet.
+            if let Some(max) = unsafe { histogram_small_alpha_avx2(literals, counts) } {
                 return max;
             }
         }
@@ -1337,6 +1348,88 @@ unsafe fn histogram_small_alpha_avx512(
             }
             let slot = slots[..nslots].iter().position(|&s| s == b).unwrap();
             acc[slot] += 1;
+        }
+        let mut max_symbol = 0usize;
+        for s in 0..nslots {
+            counts[slots[s] as usize] = acc[s] as usize;
+            max_symbol = max_symbol.max(slots[s] as usize);
+        }
+        Some(max_symbol)
+    }
+}
+
+/// AVX2 histogram for at-most-16-symbol alphabets: the steady state runs
+/// `nslots` per-slot `vpcmpeqb` + mask popcounts over two 32-byte vectors
+/// per step; the per-slot counts commit only when their sum is exactly
+/// 64 (slots are distinct, so each byte matches at most one — a
+/// shortfall proves a byte no slot owns), otherwise the chunk absorbs
+/// scalar and grows the slot set — the AVX-512 kernel's permute-LUT
+/// novel-byte test replaced by the compare sum itself. Published counts
+/// are exact, so the block encode is byte-identical to the scalar path.
+// SAFETY: caller checks the features.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn histogram_small_alpha_avx2(literals: &[u8], counts: &mut [usize; 256]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let mut slots = [0u8; 16];
+    let mut nslots = 0usize;
+    let mut acc = [0u32; 16];
+    let mut i = 0usize;
+    unsafe {
+        while i + 64 <= literals.len() {
+            // SAFETY: the loop guard bounds both 32-byte loads.
+            let a = _mm256_loadu_si256(literals.as_ptr().add(i).cast());
+            let b = _mm256_loadu_si256(literals.as_ptr().add(i + 32).cast());
+            // Per-slot counts stage in `step` and commit only when the
+            // coverage sum proves every byte owned: a failed check means
+            // a novel byte, and the scalar absorb below recounts the
+            // whole chunk — committing the vector counts too would
+            // double them.
+            let mut step = [0u32; 16];
+            let mut covered = 0u32;
+            for s in 0..nslots {
+                let sym = _mm256_set1_epi8(slots[s] as i8);
+                let n = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, sym)).count_ones()
+                    + _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, sym)).count_ones();
+                step[s] = n;
+                covered += n;
+            }
+            if covered == 64 {
+                for s in 0..nslots {
+                    acc[s] += step[s];
+                }
+            } else {
+                // Absorb by hand, growing the slot set from novel bytes;
+                // a seventeenth distinct symbol aborts with `None`.
+                for j in 0..64 {
+                    let byte = literals[i + j];
+                    match slots[..nslots].iter().position(|&s| s == byte) {
+                        Some(slot) => acc[slot] += 1,
+                        None => {
+                            if nslots == 16 {
+                                return None;
+                            }
+                            slots[nslots] = byte;
+                            acc[nslots] = 1;
+                            nslots += 1;
+                        },
+                    }
+                }
+            }
+            i += 64;
+        }
+        for &byte in &literals[i..] {
+            match slots[..nslots].iter().position(|&s| s == byte) {
+                Some(slot) => acc[slot] += 1,
+                None => {
+                    if nslots == 16 {
+                        return None;
+                    }
+                    slots[nslots] = byte;
+                    acc[nslots] = 1;
+                    nslots += 1;
+                },
+            }
         }
         let mut max_symbol = 0usize;
         for s in 0..nslots {
@@ -1583,6 +1676,89 @@ fn compress_literals(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
+    use super::histogram_literals;
+
+    /// AVX2 small-alphabet histogram against the scalar 4-lane pass.
+    #[test]
+    fn histogram_small_alpha_avx2_matches_scalar() {
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("popcnt") {
+            let mut state = 0x00ff_1e2d_3c4b_5a69u64;
+            let mut rng = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for round in 0..64 {
+                let width = 1 + rng() as usize % 24;
+                let len = match round % 4 {
+                    0 => 64,
+                    1 => 64 + (rng() as usize) % 64,
+                    2 => 256,
+                    _ => 4096,
+                };
+                let data: Vec<u8> = (0..len)
+                    .map(|_| ((rng() as usize >> 9) % width) as u8)
+                    .collect();
+                let mut scalar = [0usize; 256];
+                let max_scalar = {
+                    let mut m = histogram_literals_scalar(&data, &mut scalar);
+                    while scalar[m] == 0 {
+                        m -= 1;
+                    }
+                    m
+                };
+                let mut simd = [0usize; 256];
+                // SAFETY: avx2 + popcnt detected above.
+                let max = unsafe { super::histogram_small_alpha_avx2(&data, &mut simd) };
+                // The bail predicate is the PRESENT distinct count, not the
+                // generator width: a width>16 draw may still land <=16
+                // distinct symbols, and then the kernel must answer Some.
+                let distinct = {
+                    let mut seen = [false; 256];
+                    for &b in &data {
+                        seen[b as usize] = true;
+                    }
+                    seen.iter().filter(|&&s| s).count()
+                };
+                if distinct <= 16 {
+                    let max = max.expect("alphabet fits");
+                    for (s, (&a, &b)) in simd.iter().zip(scalar.iter()).enumerate() {
+                        assert_eq!(a, b, "count of symbol {s}");
+                    }
+                    assert_eq!(max, max_scalar);
+                } else {
+                    assert_eq!(max, None);
+                    assert!(simd.iter().all(|&c| c == 0), "counts untouched on bail");
+                }
+            }
+        }
+    }
+
+    /// The four-lane scalar body of `histogram_literals` as the reference.
+    fn histogram_literals_scalar(literals: &[u8], counts: &mut [usize; 256]) -> usize {
+        let mut c0 = [0usize; 256];
+        let mut c1 = [0usize; 256];
+        let mut c2 = [0usize; 256];
+        let mut c3 = [0usize; 256];
+        let (chunks, remainder) = literals.as_chunks::<4>();
+        for chunk in chunks {
+            c0[chunk[0] as usize] += 1;
+            c1[chunk[1] as usize] += 1;
+            c2[chunk[2] as usize] += 1;
+            c3[chunk[3] as usize] += 1;
+        }
+        for &b in remainder {
+            c0[b as usize] += 1;
+        }
+        for i in 0..256 {
+            counts[i] = c0[i] + c1[i] + c2[i] + c3[i];
+        }
+        255
+    }
     use super::*;
     use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table};
 
