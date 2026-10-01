@@ -13,6 +13,7 @@ outside the library so dev-only dependencies never leak into it.
   both sides alternate round by round and the per-round **ratio** is the
   primary verdict (robust to clock drift). Per-side time budget:
   `--budget-ms` (default 500 ms), or the `BENCH_BUDGET_MS` env var.
+- `ZSTDX_DEC_SIMD_TIER=scalar|bmi2` (library env override, unset = runtime detect; an invalid value panics) forces the decode SIMD tier — running the decode subcommands (`files`/`mtcheck`/`corrupt`/`prof dec`) under it gates the forced tiers on any machine.
 - Deterministic, instruction-count based benchmarks (valgrind) live in the
   sibling crate [`zstdx-gungraun`](../zstdx-gungraun/README.md).
 
