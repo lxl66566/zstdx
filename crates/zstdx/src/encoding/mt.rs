@@ -315,18 +315,17 @@ pub fn compress_slice_mt(
                         Some(PrefixPlan::SelfFill { .. }) => JobSpfOwned::None,
                         Some(plan) if start as u64 > plan_med(plan) => match plan {
                             PrefixPlan::Whole { med: _, share } => {
-                                match wait_prefix_build(share, &ready, &poison) {
-                                    Some((upto, snap)) => {
-                                        JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
-                                    },
-                                    None => {
-                                        // Poisoned while waiting: release the
-                                        // slot so the ordered assembly drains
-                                        // before the panic resumes.
-                                        *slots[id].lock().unwrap() = Some(Vec::new());
-                                        ready.notify_all();
-                                        break;
-                                    },
+                                if let Some((upto, snap)) =
+                                    wait_prefix_build(share, &ready, &poison)
+                                {
+                                    JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
+                                } else {
+                                    // Poisoned while waiting: release the
+                                    // slot so the ordered assembly drains
+                                    // before the panic resumes.
+                                    *slots[id].lock().unwrap() = Some(Vec::new());
+                                    ready.notify_all();
+                                    break;
                                 }
                             },
                             PrefixPlan::Windowed(w) => {
@@ -803,9 +802,7 @@ fn capture_grid(
     // long job's parse-indexed history (matched interiors skipped) would
     // keep (dll100 at 4 MiB jobs: +0.97 MB over st; at 13.1 MiB: +12 KB).
     let n_jobs = len.div_ceil(job_size as u64) as usize;
-    let prefix_last = (1..n_jobs)
-        .filter(|&i| (i * job_size) as u64 <= window)
-        .last()?;
+    let prefix_last = (1..n_jobs).rfind(|&i| (i * job_size) as u64 <= window)?;
     ((prefix_last * job_size) as u64 >= SPF_MIN_PREFIX).then_some(job_size)
 }
 
@@ -1148,7 +1145,7 @@ mod tests {
 
     use super::{
         capture_grid, compress_slice_mt, donation_arming, job_size_for, plan_prefix_ldm,
-        reach_probe, take_slice_state,
+        take_slice_state,
     };
     use crate::{
         Level,
@@ -1287,7 +1284,7 @@ mod tests {
             shape.len.unwrap().div_ceil(job_size as u64) as usize,
             None,
         );
-        assert_eq!(plan.is_some(), false);
+        assert!(plan.is_none());
         assert_eq!(donation_arming(plan.is_some()), LdmArming::Job);
     }
 
@@ -1823,7 +1820,7 @@ mod tests {
             let mut state = take_slice_state(
                 level,
                 crate::InputShape::default(),
-                reach_probe::ReachChoice::Keep,
+                ReachChoice::Keep,
                 LdmArming::Frame,
             );
             let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1852,7 +1849,7 @@ mod tests {
         let mut state = take_slice_state(
             Level::Balanced,
             crate::InputShape::default(),
-            reach_probe::ReachChoice::Keep,
+            ReachChoice::Keep,
             LdmArming::Frame,
         );
         state.matcher.arm_ramp(1 << 20, 1 << 20);

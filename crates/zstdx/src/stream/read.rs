@@ -45,7 +45,7 @@ impl<R: Read> Encoder<R> {
     // options are consumed builder data; by value keeps the chaining API
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(source: R, options: EncoderOptions) -> Result<Self> {
-        Self::try_with_options(source, options).map_err(|(_, err)| err)
+        Self::try_with_options(source, &options).map_err(|(_, err)| err)
     }
 
     /// Like [`Encoder::with_options`], but hands the source back when the
@@ -53,9 +53,9 @@ impl<R: Read> Encoder<R> {
     /// same shape as the write encoder's `try_with_options`).
     pub(crate) fn try_with_options(
         source: R,
-        options: EncoderOptions,
+        options: &EncoderOptions,
     ) -> Result<Self, (R, crate::Error)> {
-        match FrameEncoderCore::new(&options) {
+        match FrameEncoderCore::new(options) {
             Ok(core) => Ok(Self {
                 source: Some(source),
                 core,
@@ -162,7 +162,7 @@ impl<R: Read> Decoder<R> {
     // options are consumed builder data; by value keeps the chaining API
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(source: R, options: DecoderOptions) -> Result<Self> {
-        Self::try_with_options(source, options).map_err(|(_, err)| err)
+        Self::try_with_options(source, &options).map_err(|(_, err)| err)
     }
 
     /// Like [`Decoder::with_options`], but hands the source back when
@@ -174,7 +174,7 @@ impl<R: Read> Decoder<R> {
     /// wherever the source then stands.
     pub(crate) fn try_with_options(
         mut source: R,
-        options: DecoderOptions,
+        options: &DecoderOptions,
     ) -> Result<Self, (R, crate::Error)> {
         let mut decoder = FrameDecoder::new();
         if let Some(max) = options.max_window_size {

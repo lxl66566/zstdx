@@ -255,10 +255,7 @@ impl DStream {
                     return Ok(true);
                 },
                 Err(crate::frame::ParseError::NeedMore) => return Ok(false),
-                Err(crate::frame::ParseError::BadMagic) => {
-                    return Err(ErrorCode::PrefixUnknown);
-                },
-                Err(crate::frame::ParseError::Malformed) => {
+                Err(crate::frame::ParseError::BadMagic | crate::frame::ParseError::Malformed) => {
                     return Err(ErrorCode::PrefixUnknown);
                 },
                 // Frame-head constraints the walker can judge on its own;

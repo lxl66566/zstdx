@@ -1403,32 +1403,30 @@ unsafe fn histogram_small_alpha_avx2(literals: &[u8], counts: &mut [usize; 256])
                 // a seventeenth distinct symbol aborts with `None`.
                 for j in 0..64 {
                     let byte = literals[i + j];
-                    match slots[..nslots].iter().position(|&s| s == byte) {
-                        Some(slot) => acc[slot] += 1,
-                        None => {
-                            if nslots == 16 {
-                                return None;
-                            }
-                            slots[nslots] = byte;
-                            acc[nslots] = 1;
-                            nslots += 1;
-                        },
+                    if let Some(slot) = slots[..nslots].iter().position(|&s| s == byte) {
+                        acc[slot] += 1;
+                    } else {
+                        if nslots == 16 {
+                            return None;
+                        }
+                        slots[nslots] = byte;
+                        acc[nslots] = 1;
+                        nslots += 1;
                     }
                 }
             }
             i += 64;
         }
         for &byte in &literals[i..] {
-            match slots[..nslots].iter().position(|&s| s == byte) {
-                Some(slot) => acc[slot] += 1,
-                None => {
-                    if nslots == 16 {
-                        return None;
-                    }
-                    slots[nslots] = byte;
-                    acc[nslots] = 1;
-                    nslots += 1;
-                },
+            if let Some(slot) = slots[..nslots].iter().position(|&s| s == byte) {
+                acc[slot] += 1;
+            } else {
+                if nslots == 16 {
+                    return None;
+                }
+                slots[nslots] = byte;
+                acc[nslots] = 1;
+                nslots += 1;
             }
         }
         let mut max_symbol = 0usize;
@@ -1678,8 +1676,6 @@ fn compress_literals(
 mod tests {
     use alloc::vec::Vec;
 
-    use super::histogram_literals;
-
     /// AVX2 small-alphabet histogram against the scalar 4-lane pass.
     #[test]
     fn histogram_small_alpha_avx2_matches_scalar() {
@@ -1713,7 +1709,7 @@ mod tests {
                 };
                 let mut simd = [0usize; 256];
                 // SAFETY: avx2 + popcnt detected above.
-                let max = unsafe { super::histogram_small_alpha_avx2(&data, &mut simd) };
+                let max = unsafe { histogram_small_alpha_avx2(&data, &mut simd) };
                 // The bail predicate is the PRESENT distinct count, not the
                 // generator width: a width>16 draw may still land <=16
                 // distinct symbols, and then the kernel must answer Some.
@@ -1907,7 +1903,8 @@ mod tests {
     #[test]
     fn uncovered_histogram_never_selects_predefined() {
         // (default table, codes below/above the coverage bound, max_log)
-        let cases: [(fn() -> FSETable, u8, u8, u8); 3] = [
+        type Case = (fn() -> FSETable, u8, u8, u8);
+        let cases: [Case; 3] = [
             (default_of_table, 28, 29, 8),
             (default_ll_table, 35, 36, 9),
             (default_ml_table, 52, 53, 9),
@@ -1954,7 +1951,7 @@ mod tests {
         let of_default = default_of_table();
         let mut symbols = alloc::vec![29u8, 28];
         symbols.extend(core::iter::repeat_n(29, 4));
-        let mut counts = counts_from(&symbols);
+        let counts = counts_from(&symbols);
         let mode = normalization_fallback(
             &of_default,
             false,

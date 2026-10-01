@@ -712,8 +712,7 @@ unsafe fn uniform4_pack_avx2(
             // SAFETY: immediate lane selector.
             let v = _mm256_permute2x128_si256(v, v, 0x01);
             let mut acc = _mm256_setzero_si256();
-            for k in 0..nslots {
-                let (sym, code) = slots[k];
+            for &(sym, code) in &slots[..nslots] {
                 let eq = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(sym as i8));
                 acc = _mm256_blendv_epi8(acc, _mm256_set1_epi8(code as i8), eq);
             }
@@ -763,7 +762,7 @@ mod tests {
             };
             for round in 0..64 {
                 let nslots = 1 + (rng() % 16) as usize;
-                let mut syms: alloc::vec::Vec<u8> = (0..=255u8).collect();
+                let mut syms: vec::Vec<u8> = (0..=255u8).collect();
                 for k in (0..nslots).rev() {
                     let j = (rng() as usize) % (k + 1);
                     syms.swap(k, j);
@@ -781,7 +780,7 @@ mod tests {
                 }
                 let lut = |b: u8| (packed[b as usize] >> 4) as u8;
                 let len = 32 * (1 + (rng() as usize) % 9) + (rng() as usize) % 32;
-                let data: alloc::vec::Vec<u8> = (0..len)
+                let data: vec::Vec<u8> = (0..len)
                     .map(|_| syms[(rng() as usize >> 8) % nslots])
                     .collect();
                 // Scalar reference: the write_uniform4_bulk group loop.

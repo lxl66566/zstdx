@@ -909,7 +909,9 @@ impl MtEncoderCore {
         // both bands stage before anything posts; the probe never runs on
         // these rows (strategy-exclusive), so the two stagings never hold
         // the same frame.
-        let fast_capture = if !probe_pending {
+        let fast_capture = if probe_pending {
+            FastCapture::Stock
+        } else {
             match options.pledged_size {
                 Some(_) => {
                     if far_screen::mt_capture_window(options.level, shape, &[]).is_some() {
@@ -930,8 +932,6 @@ impl MtEncoderCore {
                 },
                 None => FastCapture::Stock,
             }
-        } else {
-            FastCapture::Stock
         };
         let initial_job = match grid {
             JobGrid::Fixed(size) => size,
@@ -1639,7 +1639,14 @@ impl MtEncoderCore {
             size = (size * 2).min(cap);
             edge = edge.saturating_add(CAPTURE_BAND_JOBS * size);
         }
-        (size, (size < cap).then_some(edge).unwrap_or(u64::MAX))
+        (
+            size,
+            if size < cap {
+                edge
+            } else {
+                u64::MAX
+            },
+        )
     }
 
     /// The Growing grid's job-size ceiling: `post_due` stages a whole epoch
@@ -2701,7 +2708,7 @@ mod tests {
                 .workers(4)
                 .pledged_size(Some(10)),
         );
-        match core.write(&vec![b'x'; 20]) {
+        match core.write(&[b'x'; 20]) {
             Err(crate::Error::PledgedSizeMismatch {
                 pledged: 10,
                 actual: 20,
@@ -2711,7 +2718,7 @@ mod tests {
         assert!(!core.is_finished());
         assert_eq!(core.pending_output(), 0);
         // Exactly-pledged input must still succeed through finish.
-        core.write(&vec![b'x'; 10]).unwrap();
+        core.write(&[b'x'; 10]).unwrap();
         core.finish().unwrap();
 
         // Under-run: detected at finish.
@@ -2720,7 +2727,7 @@ mod tests {
                 .workers(4)
                 .pledged_size(Some(100)),
         );
-        core.write(&vec![b'x'; 20]).unwrap();
+        core.write(&[b'x'; 20]).unwrap();
         match core.finish() {
             Err(crate::Error::PledgedSizeMismatch {
                 pledged: 100,
@@ -2742,7 +2749,7 @@ mod tests {
         // Fastest with 4 workers: the first epoch is exactly 4 MiB.
         let data = textish(4 * mib);
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-        core.write(&data);
+        core.write(&data).unwrap();
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -2750,7 +2757,7 @@ mod tests {
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
 
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-        core.write(&data);
+        core.write(&data).unwrap();
         core.flush_block();
         assert!(core.pending_output() > 0);
         core.finish().unwrap();
@@ -2795,7 +2802,7 @@ mod tests {
     fn write_output_to_preserves_tail_on_error() {
         let data = textish(4 * 1024 * 1024);
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-        core.write(&data);
+        core.write(&data).unwrap();
         core.flush_block();
         assert!(core.pending_output() > 0);
         let mut flaky = ScriptedWriter {
@@ -2829,7 +2836,7 @@ mod tests {
         let mut reference = None;
         for _ in 0..4 {
             let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
-            core.write(&data);
+            core.write(&data).unwrap();
             core.finish().unwrap();
             match &reference {
                 Some(bytes) => assert_eq!(&core.output, bytes, "sequential reuse"),
@@ -2844,7 +2851,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..4 {
                     let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
-                    core.write(&data);
+                    core.write(&data).unwrap();
                     core.finish().unwrap();
                     assert_eq!(core.output, reference, "concurrent lease {t}");
                 }
@@ -2863,12 +2870,12 @@ mod tests {
         let data = textish(9 * 1024 * 1024);
         for _ in 0..4 {
             let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-            core.write(&data);
+            core.write(&data).unwrap();
             // Drop here: the first epoch's jobs are posted, later bytes
             // are not.
         }
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-        core.write(&data);
+        core.write(&data).unwrap();
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -2886,7 +2893,7 @@ mod tests {
         for chunk in [1024 * 1024, 300 * 1024, usize::MAX] {
             let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
             for piece in data.chunks(chunk) {
-                core.write(piece);
+                core.write(piece).unwrap();
             }
             core.finish().unwrap();
             let mut out = vec![0u8; data.len()];
@@ -2909,13 +2916,13 @@ mod tests {
     fn huge_single_write_bounds_reserve() {
         let len = BUF_CAP_MAX + BUF_CAP_MAX / 4;
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
-        core.write(&vec![0u8; len]);
+        core.write(&vec![0u8; len]).unwrap();
         let cap = core.buf.capacity();
         assert!(
             cap <= BUF_CAP_MAX + PUMP_STEP_MAX + 64 * 1024,
             "single huge write grew the reserve to {cap}"
         );
-        core.finish();
+        core.finish().unwrap();
         let output = core.output.clone();
         drop(core);
         let mut out = vec![1u8; len];
@@ -2938,7 +2945,7 @@ mod tests {
         let job = Arc::new(Job {
             level: Level::Fastest,
             choice: ReachChoice::Keep,
-            shape: crate::InputShape {
+            shape: InputShape {
                 len: None,
                 window_log: None,
             },
@@ -3002,7 +3009,7 @@ mod tests {
         let job = Arc::new(Job {
             level: Level::Fastest,
             choice: ReachChoice::Keep,
-            shape: crate::InputShape {
+            shape: InputShape {
                 len: None,
                 window_log: None,
             },
@@ -3279,7 +3286,9 @@ mod tests {
                 "huge pledge reserved {} at construction ({level:?})",
                 core.buf.capacity()
             );
-            core.finish();
+            // The 16 GiB pledge is never met: finish fails, deliberately
+            // unchecked — only the reserve sizes are under test here.
+            let _ = core.finish();
             assert!(
                 core.buf.capacity() <= BUF_CAP_MAX,
                 "huge pledge reserved {} at the probe settle ({level:?})",

@@ -338,7 +338,7 @@ fn transient_materialize_error_is_retryable() {
         pos: usize,
         failed: bool,
     }
-    impl std::io::Read for FlakySource {
+    impl Read for FlakySource {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if !self.failed {
                 self.failed = true;

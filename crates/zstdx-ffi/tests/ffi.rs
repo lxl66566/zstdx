@@ -30,16 +30,16 @@ fn decompress(dst: &mut [u8], src: &[u8]) -> usize {
 }
 
 fn is_error(code: usize) -> bool {
-    unsafe { zstd::ZSTD_isError(code) != 0 }
+    zstd::ZSTD_isError(code) != 0
 }
 
 fn error_code(code: usize) -> u32 {
-    unsafe { zstd::ZSTD_getErrorCode(code) }
+    zstd::ZSTD_getErrorCode(code)
 }
 
 fn error_name(code: usize) -> String {
     let name = zstd::ZSTD_getErrorName(code);
-    unsafe { core::ffi::CStr::from_ptr(name as *const c_char) }
+    unsafe { core::ffi::CStr::from_ptr(name.cast::<c_char>()) }
         .to_string_lossy()
         .into_owned()
 }
@@ -120,7 +120,7 @@ fn stream_compress(input: &[u8], level: c_int, in_size: usize, out_size: usize) 
                 size: out_buf.len(),
                 pos: 0,
             };
-            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &mut zout, &mut zin, end) };
+            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, end) };
             assert!(!is_error(r), "compressStream2 failed");
             produced.extend_from_slice(&out_buf[..zout.pos]);
             if zin.pos == zin.size && (end == 0 || r == 0) {
@@ -162,7 +162,7 @@ fn stream_compress_ctx(cctx: *mut zstd::ZSTD_CCtx, input: &[u8], chunk: usize) -
                 size: out_buf.len(),
                 pos: 0,
             };
-            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &mut zob, &mut zib, 2) };
+            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zob, &raw mut zib, 2) };
             assert!(!is_error(r));
             produced.extend_from_slice(&out_buf[..zob.pos]);
             if r == 0 {
@@ -190,7 +190,7 @@ fn stream_compress_ctx(cctx: *mut zstd::ZSTD_CCtx, input: &[u8], chunk: usize) -
                 size: out_buf.len(),
                 pos: 0,
             };
-            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &mut zob, &mut zib, end) };
+            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zob, &raw mut zib, end) };
             assert!(!is_error(r));
             produced.extend_from_slice(&out_buf[..zob.pos]);
             if zib.pos == zib.size && (end == 0 || r == 0) {
@@ -203,22 +203,22 @@ fn stream_compress_ctx(cctx: *mut zstd::ZSTD_CCtx, input: &[u8], chunk: usize) -
 
 #[test]
 fn version_surface() {
-    assert_eq!(unsafe { zstd::ZSTD_versionNumber() }, 10_600);
+    assert_eq!(zstd::ZSTD_versionNumber(), 10_600);
     assert_eq!(error_name_or_empty(), "1.6.0");
-    assert_eq!(unsafe { zstd::ZSTD_versionMajor() }, 1);
-    assert_eq!(unsafe { zstd::ZSTD_versionMinor() }, 6);
-    assert_eq!(unsafe { zstd::ZSTD_versionRelease() }, 0);
-    assert_eq!(unsafe { zstd::ZSTD_maxCLevel() }, 22);
-    assert_eq!(unsafe { zstd::ZSTD_minCLevel() }, -131_072);
-    assert_eq!(unsafe { zstd::ZSTD_defaultCLevel() }, 3);
-    assert_eq!(unsafe { zstd::ZSTD_compressBound(0) }, 64);
-    assert_eq!(unsafe { zstd::ZSTD_compressBound(1) }, 64);
-    assert_eq!(unsafe { zstd::ZSTD_compressBound(131_072) }, 131_584);
+    assert_eq!(zstd::ZSTD_versionMajor(), 1);
+    assert_eq!(zstd::ZSTD_versionMinor(), 6);
+    assert_eq!(zstd::ZSTD_versionRelease(), 0);
+    assert_eq!(zstd::ZSTD_maxCLevel(), 22);
+    assert_eq!(zstd::ZSTD_minCLevel(), -131_072);
+    assert_eq!(zstd::ZSTD_defaultCLevel(), 3);
+    assert_eq!(zstd::ZSTD_compressBound(0), 64);
+    assert_eq!(zstd::ZSTD_compressBound(1), 64);
+    assert_eq!(zstd::ZSTD_compressBound(131_072), 131_584);
 }
 
 fn error_name_or_empty() -> String {
     let v = zstd::ZSTD_versionString();
-    unsafe { core::ffi::CStr::from_ptr(v as *const c_char) }
+    unsafe { core::ffi::CStr::from_ptr(v.cast::<c_char>()) }
         .to_string_lossy()
         .into_owned()
 }
@@ -269,7 +269,7 @@ fn one_shot_error_paths() {
 
     // Bad magic: prefix_unknown (the reference's srcSize_wrong remap needs
     // a completed frame in front of the garbage).
-    let mut garbage = frame.to_vec();
+    let mut garbage = frame.clone();
     garbage[0] ^= 0xff;
     let code = decompress(&mut dst, &garbage);
     assert!(is_error(code));
@@ -378,7 +378,7 @@ fn flush_returns_zero_only_when_drained() {
             size: out_buf.len(),
             pos: 0,
         };
-        let r = unsafe { zstd::ZSTD_compressStream(cctx, &mut zout, &mut zin) };
+        let r = unsafe { zstd::ZSTD_compressStream(cctx, &raw mut zout, &raw mut zin) };
         assert!(!is_error(r));
         if zin.pos == zin.size {
             break;
@@ -394,7 +394,7 @@ fn flush_returns_zero_only_when_drained() {
             size: out_buf.len(),
             pos: 0,
         };
-        pending = unsafe { zstd::ZSTD_flushStream(cctx, &mut zout) };
+        pending = unsafe { zstd::ZSTD_flushStream(cctx, &raw mut zout) };
         assert!(!is_error(pending));
         flushes += 1;
         assert!(flushes < 10_000, "flush never drained");
@@ -407,7 +407,7 @@ fn flush_returns_zero_only_when_drained() {
             size: out_buf.len(),
             pos: 0,
         };
-        pending = unsafe { zstd::ZSTD_endStream(cctx, &mut zout) };
+        pending = unsafe { zstd::ZSTD_endStream(cctx, &raw mut zout) };
         assert!(!is_error(pending));
     }
     unsafe { zstd::ZSTD_freeCCtx(cctx) };
@@ -448,7 +448,7 @@ fn stream_decode_multiframe_and_boundaries() {
                 size: out.len(),
                 pos: 0,
             };
-            let r = unsafe { zstd::ZSTD_decompressStream(dctx, &mut zout, &mut zin) };
+            let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
             assert!(!is_error(r), "decode stream failed: {}", error_name(r));
             decoded.extend_from_slice(&out[..zout.pos]);
             if r == 0 {
@@ -494,7 +494,7 @@ fn stream_decode_error_and_wait_paths() {
         size: out.len(),
         pos: 0,
     };
-    let r = unsafe { zstd::ZSTD_decompressStream(dctx, &mut zout, &mut zin) };
+    let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
     assert!(!is_error(r));
     assert!(r > 0);
     // The single truncated block decodes nothing; the hint asks for input.
@@ -511,11 +511,11 @@ fn stream_decode_error_and_wait_paths() {
         size: garbage.len(),
         pos: 0,
     };
-    let r = unsafe { zstd::ZSTD_decompressStream(dctx, &mut zout, &mut zin) };
+    let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
     assert!(is_error(r));
     assert_eq!(error_code(r), zstd::ErrorCode::PrefixUnknown as u32);
     // The failed context keeps reporting an error until reset.
-    let r2 = unsafe { zstd::ZSTD_decompressStream(dctx, &mut zout, &mut zin) };
+    let r2 = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
     assert!(is_error(r2));
     unsafe { zstd::ZSTD_freeDStream(dctx) };
 }
@@ -582,7 +582,7 @@ fn context_one_shot_and_parameter_bounds() {
         size: streaming.len(),
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut zout, &mut zin, 0) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, 0) };
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 5) }),
         zstd::ErrorCode::StageWrong as u32
@@ -696,7 +696,7 @@ fn raw_dict() -> Vec<u8> {
     // A raw-content dictionary cut from the same pattern family as the
     // payload (a formatted dictionary, when present in the tree, is used by
     // the dictID tests below).
-    (0..8192u32).map(|i| (b'a' + (i % 23) as u8)).collect()
+    (0..8192u32).map(|i| b'a' + (i % 23) as u8).collect()
 }
 
 fn formatted_dict() -> Option<Vec<u8>> {
@@ -712,7 +712,7 @@ fn reset_round_trips_on_reused_cctx() {
     let a: Vec<u8> = (0..100_000u32)
         .map(|i| {
             if i % 7 < 5 {
-                (b'a' + (i % 23) as u8)
+                b'a' + (i % 23) as u8
             } else {
                 (i >> 3) as u8 ^ 0x5a
             }
@@ -794,7 +794,7 @@ fn reset_round_trips_on_reused_cctx() {
         size: small.len(),
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut zout, &mut zin, 0) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, 0) };
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_CCtx_reset(cctx, 2) }),
         zstd::ErrorCode::StageWrong as u32
@@ -834,10 +834,10 @@ fn compress2_honors_sticky_params_and_loaded_dict() {
         header_size: 0,
         dict_id: 0,
         checksum_flag: 0,
-        _reserved1: 0,
-        _reserved2: 0,
+        reserved1: 0,
+        reserved2: 0,
     };
-    let r = unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, dst.as_ptr().cast(), n) };
+    let r = unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, dst.as_ptr().cast(), n) };
     assert_eq!(r, 0);
     assert_eq!(zfh.frame_content_size, payload.len() as u64);
     assert_eq!(zfh.checksum_flag, 1);
@@ -975,7 +975,7 @@ fn pledged_size_on_streaming_frames() {
         size: small.len(),
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx2, &mut zout, &mut zin, 0) };
+    unsafe { zstd::ZSTD_compressStream2(cctx2, &raw mut zout, &raw mut zin, 0) };
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_CCtx_setPledgedSrcSize(cctx2, 5) }),
         zstd::ErrorCode::StageWrong as u32
@@ -1183,7 +1183,7 @@ fn load_dictionary_stage_and_stickiness() {
         size: small.len(),
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut zout, &mut zin, 0) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, 0) };
     assert_eq!(
         error_code(unsafe {
             zstd::ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr().cast(), dict.len())
@@ -1218,7 +1218,8 @@ fn load_dictionary_stage_and_stickiness() {
                 } else {
                     0
                 };
-                let r = unsafe { zstd::ZSTD_compressStream2(cctx, &mut zob, &mut zib, end) };
+                let r =
+                    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zob, &raw mut zib, end) };
                 assert!(!is_error(r));
                 produced.extend_from_slice(&buf[..zob.pos]);
                 if zib.pos == zib.size && (end == 0 || r == 0) {
@@ -1287,7 +1288,7 @@ fn dctx_reset_directives() {
         pos: 0,
     };
     unsafe { zstd::ZSTD_initDStream(dctx) };
-    unsafe { zstd::ZSTD_decompressStream(dctx, &mut zout, &mut zin) };
+    unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_DCtx_reset(dctx, 2) }),
         zstd::ErrorCode::StageWrong as u32
@@ -1353,7 +1354,7 @@ fn metadata_size_entries() {
     // frameHeaderSize: the descriptor arithmetic, srcSize_wrong below 5.
     let r = unsafe { zstd::ZSTD_frameHeaderSize(dst.as_ptr().cast(), n) };
     assert!(!is_error(r));
-    assert!(r >= 5 && r <= 18);
+    assert!((5..=18).contains(&r));
     let mut zfh = zstd::ZSTD_FrameHeader {
         frame_content_size: 0,
         window_size: 0,
@@ -1362,27 +1363,27 @@ fn metadata_size_entries() {
         header_size: 0,
         dict_id: 0,
         checksum_flag: 0,
-        _reserved1: 0,
-        _reserved2: 0,
+        reserved1: 0,
+        reserved2: 0,
     };
-    let g = unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, dst.as_ptr().cast(), n) };
+    let g = unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, dst.as_ptr().cast(), n) };
     assert_eq!(g, 0);
     assert_eq!(zfh.header_size as usize, r);
     // Short inputs ask for the prefix; garbage is prefix_unknown.
     assert_eq!(
-        unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, dst.as_ptr().cast(), 0) },
+        unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, dst.as_ptr().cast(), 0) },
         5
     );
     assert_eq!(
-        unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, dst.as_ptr().cast(), 3) },
+        unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, dst.as_ptr().cast(), 3) },
         5
     );
     let garbage = [9u8, 9, 9];
     assert!(is_error(unsafe {
-        zstd::ZSTD_getFrameHeader(&mut zfh, garbage.as_ptr().cast(), 3)
+        zstd::ZSTD_getFrameHeader(&raw mut zfh, garbage.as_ptr().cast(), 3)
     }));
     assert_eq!(
-        error_code(unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, garbage.as_ptr().cast(), 3) }),
+        error_code(unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, garbage.as_ptr().cast(), 3) }),
         zstd::ErrorCode::PrefixUnknown as u32
     );
 
@@ -1396,7 +1397,7 @@ fn metadata_size_entries() {
         0
     );
     let sh = unsafe { zstd::ZSTD_frameHeaderSize(skip.as_ptr().cast(), skip.len()) };
-    let g = unsafe { zstd::ZSTD_getFrameHeader(&mut zfh, skip.as_ptr().cast(), skip.len()) };
+    let g = unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, skip.as_ptr().cast(), skip.len()) };
     assert_eq!(g, 0);
     assert_eq!(zfh.frame_type, 1);
     assert_eq!(zfh.frame_content_size, 3);
@@ -1441,7 +1442,7 @@ fn formatted_dict_ids_flow_into_headers() {
         let mut files: Vec<_> = std::fs::read_dir("../zstdx/dict_tests/files")
             .map(|entries| {
                 entries
-                    .filter_map(|e| e.ok())
+                    .filter_map(Result::ok)
                     .map(|e| e.path())
                     .collect::<Vec<_>>()
             })
@@ -1521,10 +1522,10 @@ fn free_accepts_null() {
 
 #[test]
 fn stream_sizes() {
-    assert_eq!(unsafe { zstd::ZSTD_CStreamInSize() }, 128 * 1024);
-    assert_eq!(unsafe { zstd::ZSTD_CStreamOutSize() }, 131_591);
-    assert_eq!(unsafe { zstd::ZSTD_DStreamInSize() }, 131_075);
-    assert_eq!(unsafe { zstd::ZSTD_DStreamOutSize() }, 128 * 1024);
+    assert_eq!(zstd::ZSTD_CStreamInSize(), 128 * 1024);
+    assert_eq!(zstd::ZSTD_CStreamOutSize(), 131_591);
+    assert_eq!(zstd::ZSTD_DStreamInSize(), 131_075);
+    assert_eq!(zstd::ZSTD_DStreamOutSize(), 128 * 1024);
     let cstream = zstd::ZSTD_createCStream();
     assert!(!cstream.is_null());
     assert_eq!(0, unsafe { zstd::ZSTD_initCStream(cstream, 3) });

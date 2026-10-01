@@ -39,7 +39,7 @@ impl<W: io::Write> EncoderState<W> {
     fn materialize(&mut self) -> io::Result<&mut crate::stream::write::Encoder<W>> {
         if self.encoder.is_none() {
             let writer = self.writer.take().expect("writer kept until start");
-            match crate::stream::write::Encoder::try_with_options(writer, self.options.clone()) {
+            match crate::stream::write::Encoder::try_with_options(writer, &self.options) {
                 Ok(encoder) => self.encoder = Some(encoder),
                 // Put the writer back so get_mut/finish still work after a
                 // failed start.
@@ -443,16 +443,14 @@ pub mod read {
                 let source = self.source.take().expect("source kept until start");
                 // On failure the source goes back before the error leaves,
                 // mirroring the read decoder's materialize.
-                let encoder = match crate::stream::read::Encoder::try_with_options(
-                    source,
-                    self.options.clone(),
-                ) {
-                    Ok(encoder) => encoder,
-                    Err((source, err)) => {
-                        self.source = Some(source);
-                        return Err(io::Error::from(err));
-                    },
-                };
+                let encoder =
+                    match crate::stream::read::Encoder::try_with_options(source, &self.options) {
+                        Ok(encoder) => encoder,
+                        Err((source, err)) => {
+                            self.source = Some(source);
+                            return Err(io::Error::from(err));
+                        },
+                    };
                 self.inner = Some(encoder);
             }
             Ok(self.inner.as_mut().unwrap())
@@ -552,16 +550,14 @@ pub mod read {
                 // finish stay usable, and a retry re-runs the construction.
                 // Bytes a failed first-frame parse already consumed from the
                 // source are not replayed.
-                let decoder = match crate::stream::read::Decoder::try_with_options(
-                    source,
-                    self.options.clone(),
-                ) {
-                    Ok(decoder) => decoder,
-                    Err((source, err)) => {
-                        self.source = Some(source);
-                        return Err(io::Error::from(err));
-                    },
-                };
+                let decoder =
+                    match crate::stream::read::Decoder::try_with_options(source, &self.options) {
+                        Ok(decoder) => decoder,
+                        Err((source, err)) => {
+                            self.source = Some(source);
+                            return Err(io::Error::from(err));
+                        },
+                    };
                 let decoder = if self.single_frame {
                     decoder.single_frame()
                 } else {

@@ -880,11 +880,9 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
     let (search_log, hash_log) = match level {
         11 | 12 => (4, 14),
         13 => (5, 14),
-        14 => (6, 15),
-        15 => (7, 15),
+        14 | 17 => (6, 15),
+        15 | 18 => (7, 15),
         16 => (5, 15),
-        17 => (6, 15),
-        18 => (7, 15),
         19 | 20 => (8, 15),
         21 => (9, 15),
         22 => (10, 15),

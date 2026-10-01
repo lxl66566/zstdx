@@ -107,8 +107,6 @@ impl ErrorCode {
 
     /// Invert a libzstd `size_t` return into its code: `no_error` when the
     /// value is not in the error range, and gap values (the enum has none)
-    /// collapse to `no_error` as well.: `no_error` when the
-    /// value is not in the error range, and gap values (the enum has none)
     /// collapse to `no_error` as well.
     #[must_use]
     pub fn from_raw(raw: usize) -> Self {
@@ -117,7 +115,6 @@ impl ErrorCode {
         }
         let value = (raw as isize).wrapping_neg() as u32;
         match value {
-            0 => Self::NoError,
             1 => Self::Generic,
             10 => Self::PrefixUnknown,
             12 => Self::VersionUnsupported,
@@ -211,24 +208,26 @@ pub fn frame(error: &zstdx::decoding::errors::FrameDecoderError, site: DecodeSit
             let _ = site;
             ErrorCode::PrefixUnknown
         },
-        Fde::ReadFrameHeaderError(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
-        Fde::ReadFrameHeaderError(_) => ErrorCode::CorruptionDetected,
-        Fde::FrameHeaderError(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
-        Fde::FrameHeaderError(_) => ErrorCode::CorruptionDetected,
+        Fde::ReadFrameHeaderError(_)
+        | Fde::FrameHeaderError(_)
+        | Fde::FailedToReadBlockHeader(_)
+        | Fde::FailedToReadBlockBody(_)
+        | Fde::FailedToReadChecksum(_)
+            if is_truncated(error) =>
+        {
+            ErrorCode::SrcSizeWrong
+        },
         Fde::WindowSizeTooBig { .. } => ErrorCode::FrameParameterWindowTooLarge,
         Fde::DictionaryDecodeError(_) => ErrorCode::DictionaryCorrupted,
-        Fde::FailedToReadBlockHeader(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
-        Fde::FailedToReadBlockHeader(_) => ErrorCode::CorruptionDetected,
-        Fde::FailedToReadBlockBody(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
-        Fde::FailedToReadBlockBody(_) => ErrorCode::CorruptionDetected,
-        Fde::FailedToReadChecksum(_) if is_truncated(error) => ErrorCode::SrcSizeWrong,
-        Fde::FailedToReadChecksum(_) => ErrorCode::ChecksumWrong,
-        Fde::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
+        Fde::FailedToReadChecksum(_) | Fde::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
         Fde::ContentSizeMismatch { .. } => ErrorCode::SrcSizeWrong,
         Fde::NotYetInitialized | Fde::FailedToInitialize(_) => ErrorCode::StageWrong,
         Fde::FailedToDrainDecodebuffer(_) | Fde::FailedToSkipFrame => ErrorCode::Generic,
         Fde::TargetTooSmall => ErrorCode::DstSizeTooSmall,
         Fde::DictNotProvided { .. } => ErrorCode::DictionaryWrong,
+        // Every remaining shape — malformed heads, block headers and block
+        // bodies, undecodable streams — is corruption, like libzstd's
+        // corruption_detected catch-all.
         _ => ErrorCode::CorruptionDetected,
     }
 }
@@ -249,11 +248,9 @@ fn common(error: &zstdx::Error) -> ErrorCode {
         zstdx::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             ErrorCode::SrcSizeWrong
         },
-        zstdx::Error::Io(_) => ErrorCode::Generic,
-        zstdx::Error::Parameter(_) => ErrorCode::StageWrong,
-        zstdx::Error::UnreadOutput { .. } => ErrorCode::StageWrong,
+        zstdx::Error::Parameter(_) | zstdx::Error::UnreadOutput { .. } => ErrorCode::StageWrong,
         // Non-exhaustive upstream enum; the decode/encode entry points have
-        // already claimed their own variants.
+        // already claimed their own variants (other Io errors land here too).
         _ => ErrorCode::Generic,
     }
 }
@@ -264,10 +261,10 @@ fn common(error: &zstdx::Error) -> ErrorCode {
 fn is_truncated(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(error);
     while let Some(e) = source {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::UnexpectedEof {
-                return true;
-            }
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::UnexpectedEof
+        {
+            return true;
         }
         source = e.source();
     }

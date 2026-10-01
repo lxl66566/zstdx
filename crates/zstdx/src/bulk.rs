@@ -229,7 +229,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
-    use crate::EncoderOptions;
+    use crate::{EncoderOptions, io::Write as _};
 
     fn shapes() -> Vec<Vec<u8>> {
         let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
@@ -292,7 +292,7 @@ mod tests {
         mixed.extend((0..130 * 1024).map(|i| (i % 61) as u8));
         mixed.extend((0..64 * 1024).map(|_| (rand() & 0xff) as u8));
         for level in [Level::Fastest, Level::Fast, Level::Balanced, Level::Best] {
-            let opts = crate::EncoderOptions::new(level).checksum(false);
+            let opts = EncoderOptions::new(level).checksum(false);
             let first = compress_with(&mixed, &opts).unwrap();
             for _ in 0..3 {
                 assert_eq!(
@@ -326,11 +326,11 @@ mod tests {
                 &digits[..]
             };
             payload.extend_from_slice(b"{\"id\":");
-            payload.extend_from_slice(&n);
+            payload.extend_from_slice(n);
             payload.extend_from_slice(b",\"name\":\"record-");
-            payload.extend_from_slice(&n);
+            payload.extend_from_slice(n);
             payload.extend_from_slice(b"\",\"value\":");
-            payload.extend_from_slice(&n);
+            payload.extend_from_slice(n);
             payload.extend_from_slice(b"83,\"tags\":[\"a\",\"b\"]}\n");
         }
         let opts = EncoderOptions::new(Level::Balanced).checksum(false);
@@ -340,7 +340,6 @@ mod tests {
         let mut sink = Vec::new();
         {
             let mut enc = crate::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
-            use crate::io::Write;
             enc.write_all(&payload).unwrap();
             enc.finish().unwrap();
         }
@@ -479,7 +478,7 @@ mod tests {
             .collect();
         let input: Vec<u8> = (0..16).flat_map(|_| unit.iter().copied()).collect();
         let wide = compress(&input, Level::Ultra);
-        let opts = crate::EncoderOptions::new(Level::Ultra)
+        let opts = EncoderOptions::new(Level::Ultra)
             .with_input_shape(crate::InputShape::default().with_window_log(15));
         let narrow = compress_with(&input, &opts).unwrap();
         assert!(

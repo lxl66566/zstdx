@@ -241,7 +241,7 @@ fn window_fp(win: &[u8]) -> u64 {
 /// reading the rest — the strided walk is otherwise a fixed
 /// ~512K-iteration cost on every flat head a 40 GB/s row would
 /// otherwise spend microseconds on.
-
+///
 /// Prefix the RLE probe reads: 4 KiB covers an RLE opening fully while
 /// every class that must reach the full scan (json ~110 distinct,
 /// text/random ~248) shows its mix within the first few dozen bytes.
@@ -281,52 +281,6 @@ fn strided_distinct(head: &[u8]) -> u32 {
         }
     }
     n
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The bar cap fires without walking the rest: a wide-alphabet head
-    /// reports `LDM_SYMS_MIN` however long it is.
-    #[test]
-    fn wide_head_caps_at_the_bar() {
-        let mut head = [0u8; 64 * 1024];
-        for (i, b) in head.iter_mut().enumerate() {
-            *b = mix64(i as u64) as u8;
-        }
-        assert_eq!(strided_distinct(&head), LDM_SYMS_MIN);
-    }
-
-    /// A single-symbol-dominated opening rejects in the first stage
-    /// without reading the rest — the zeros-class head the 09-27 pass
-    /// measured paying the whole walk.
-    #[test]
-    fn rle_head_rejects_in_stage_one() {
-        assert_eq!(strided_distinct(&[0u8; 64 * 1024]), 0);
-    }
-
-    /// The documented miss-class: an RLE opening whose head turns
-    /// wide-alphabet past the first stage still rejects — a missed
-    /// arming, never a broken one.
-    #[test]
-    fn rle_opening_then_wide_rejects() {
-        let mut head = vec![7u8; STAGE1_BYTES];
-        head.extend((0u16..256).map(|v| v as u8).cycle().take(2048));
-        assert_eq!(strided_distinct(&head), 0);
-    }
-
-    /// Below the stage boundary the scan covers the whole head and
-    /// reports the plain strided count (i*31%256 at stride 8: eight
-    /// distinct samples).
-    #[test]
-    fn short_head_counts_every_sample() {
-        let mut head = [0u8; 64];
-        for (i, b) in head.iter_mut().enumerate() {
-            *b = (i * 31 % 256) as u8;
-        }
-        assert_eq!(strided_distinct(&head), 8);
-    }
 }
 
 /// Insert `fp` into the open-addressed table; `true` when an equal
@@ -406,4 +360,50 @@ pub(crate) fn screen(head: &[u8]) -> FarHead {
         }
     }
     FarHead::Sparse
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bar cap fires without walking the rest: a wide-alphabet head
+    /// reports `LDM_SYMS_MIN` however long it is.
+    #[test]
+    fn wide_head_caps_at_the_bar() {
+        let mut head = vec![0u8; 64 * 1024];
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = mix64(i as u64) as u8;
+        }
+        assert_eq!(strided_distinct(&head), LDM_SYMS_MIN);
+    }
+
+    /// A single-symbol-dominated opening rejects in the first stage
+    /// without reading the rest — the zeros-class head the 09-27 pass
+    /// measured paying the whole walk.
+    #[test]
+    fn rle_head_rejects_in_stage_one() {
+        assert_eq!(strided_distinct(&vec![0u8; 64 * 1024]), 0);
+    }
+
+    /// The documented miss-class: an RLE opening whose head turns
+    /// wide-alphabet past the first stage still rejects — a missed
+    /// arming, never a broken one.
+    #[test]
+    fn rle_opening_then_wide_rejects() {
+        let mut head = vec![7u8; STAGE1_BYTES];
+        head.extend((0u16..256).map(|v| v as u8).cycle().take(2048));
+        assert_eq!(strided_distinct(&head), 0);
+    }
+
+    /// Below the stage boundary the scan covers the whole head and
+    /// reports the plain strided count (i*31%256 at stride 8: eight
+    /// distinct samples).
+    #[test]
+    fn short_head_counts_every_sample() {
+        let mut head = [0u8; 64];
+        for (i, b) in head.iter_mut().enumerate() {
+            *b = (i * 31 % 256) as u8;
+        }
+        assert_eq!(strided_distinct(&head), 8);
+    }
 }

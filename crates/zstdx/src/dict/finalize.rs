@@ -92,16 +92,6 @@ pub fn finalize_dictionary_ex(
 
 /// The serialized dictionary header: magic, content-hash id, entropy
 /// tables, repcodes.
-fn serialize_header(
-    content: &[u8],
-    samples: &[&[u8]],
-    capacity: usize,
-    fse: &mut FseBuildScratch,
-    huff: &mut HuffScratch,
-) -> Option<Vec<u8>> {
-    serialize_header_ex(content, samples, capacity, STATS_LEVEL, fse, huff)
-}
-
 fn serialize_header_ex(
     content: &[u8],
     samples: &[&[u8]],
@@ -185,10 +175,6 @@ impl EntropyStats {
 
 /// Parse every sample's first block against the content as raw match
 /// history and count the emitted literals and code triples.
-fn collect_stats(content: &[u8], samples: &[&[u8]]) -> EntropyStats {
-    collect_stats_ex(content, samples, STATS_LEVEL)
-}
-
 fn collect_stats_ex(content: &[u8], samples: &[&[u8]], stats_level: i32) -> EntropyStats {
     let level = Level::from_zstd(stats_level);
     // C sizes the stats parse's cParams once from the average sample size

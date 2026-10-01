@@ -24,7 +24,7 @@ use std::{
 pub use cover::DmerHash;
 use cover::KMerTable;
 pub use finalize::finalize_dictionary;
-use finalize::{STATS_LEVEL, finalize_dictionary_ex};
+use finalize::finalize_dictionary_ex;
 
 use crate::{EncoderOptions, Level};
 
@@ -273,7 +273,7 @@ impl TrainingSet {
             train_body,
             &self.lens[..self.train_end],
             config.cross_sample_kmers,
-            config.hash.into(),
+            config.hash,
         );
         let candidates: Vec<usize> = if test_samples.is_empty() {
             vec![K_DEFAULT]
@@ -432,7 +432,7 @@ pub fn finalize_content_with_samples<W: Write>(
             StatsSet::All => set.all_samples(),
         }
     } else {
-        samples.iter().copied().collect()
+        samples.to_vec()
     };
     let dict = match stats_level {
         Some(level) => finalize_dictionary_ex(content, &stats_samples, dict_size, level),
@@ -596,7 +596,7 @@ fn train_config_variants_are_deterministic() {
             for hash in [DmerHash::Exact, DmerHash::LibzstdBuckets] {
                 for cross in [true, false] {
                     let config = TrainConfig {
-                        k_grid: k_grid.clone(),
+                        k_grid,
                         metric,
                         hash,
                         cross_sample_kmers: cross,

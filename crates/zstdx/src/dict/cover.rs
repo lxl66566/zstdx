@@ -25,7 +25,7 @@ pub enum DmerHash {
 
 impl DmerHash {
     #[inline]
-    fn key(&self, body: &[u8], pos: usize) -> u64 {
+    fn key(self, body: &[u8], pos: usize) -> u64 {
         let kmer = u64::from_le_bytes(body[pos..pos + K].try_into().unwrap());
         match self {
             Self::Exact => kmer.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29),
@@ -107,6 +107,7 @@ impl KMerTable {
 
     /// Total counted k-mer occurrences (test observable: the within-sample
     /// filter must drop only boundary-spanning positions).
+    #[cfg(test)]
     pub(super) fn total_counts(&self) -> u64 {
         self.counts.values().map(|&c| c as u64).sum()
     }
@@ -177,8 +178,8 @@ impl KMerTable {
 }
 
 /// Aperiodic filler bytes (a small xorshift stream).
+#[cfg(test)]
 fn noise(seed: u64, len: usize) -> Vec<u8> {
-    use std::vec::Vec;
     let mut state = seed | 1;
     (0..len)
         .map(|_| {
@@ -240,7 +241,7 @@ fn cross_sample_kmers_go_uncounted() {
     let lens = [a.len(), b.len(), a.len(), b.len()];
     for hash in [DmerHash::Exact, DmerHash::LibzstdBuckets] {
         let mut stopped = KMerTable::build(&body, &lens, false, hash);
-        let mut crossed = KMerTable::build(&body, &lens, true, hash);
+        let crossed = KMerTable::build(&body, &lens, true, hash);
         assert!(stopped.total_counts() < crossed.total_counts());
 
         let seg = stopped.select_segment(&body, 0, body.len() + 1 - K, 256);

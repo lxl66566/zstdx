@@ -627,6 +627,9 @@ fn collect_input(path: &Path, recursive: bool, inputs: &mut Vec<Input>, ok: &mut
 /// overrides the auto rule (interactive stderr, not quiet, no stdout
 /// output); every form still needs a known input size, so stdin streams
 /// never show a bar.
+// Three independent CLI-state facts; a bundling struct would just relay
+// them one-to-one from the (also bool-flagged) call sites.
+#[allow(clippy::fn_params_excessive_bools)]
 fn progress_visible(cli: &Cli, sized: bool, stdout_output: bool, interactive: bool) -> bool {
     if !sized {
         return false;
@@ -836,22 +839,19 @@ fn compress(
     // The whole write phase runs in a closure so the output handles are
     // dropped before the partial output is removed on failure.
     let written: AnyResult<u64> = (|| {
-        match out_file {
-            Some(file) => {
-                let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
-                io::copy(&mut reader, &mut encoder)?;
-                encoder.finish()?;
-                Ok(file.metadata()?.len())
-            },
+        if let Some(file) = out_file {
+            let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
+            io::copy(&mut reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(file.metadata()?.len())
+        } else {
             // stdout and the test-mode sink have no file to stat; count the
             // bytes pushed through the writer instead
-            None => {
-                let mut out = CountingWriter::new(writer);
-                let mut encoder = zstdx::stream::write::Encoder::with_options(&mut out, options)?;
-                io::copy(&mut reader, &mut encoder)?;
-                encoder.finish()?;
-                Ok(out.count)
-            },
+            let mut out = CountingWriter::new(writer);
+            let mut encoder = zstdx::stream::write::Encoder::with_options(&mut out, options)?;
+            io::copy(&mut reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(out.count)
         }
     })();
     if written.is_err() {

@@ -678,6 +678,7 @@ pub(crate) fn compress_job_blocks(
 /// every above-boundary job takes it — see `windowed_ldm_prefill` for
 /// what that costs past the window bar).
 #[cfg(feature = "std")]
+#[derive(Clone, Copy)]
 pub(crate) enum JobSpf<'a> {
     None,
     Whole(&'a StripSnapshot),
@@ -694,7 +695,10 @@ pub(crate) enum JobSpf<'a> {
 /// prefill indexes — `overlap` itself stays the job's window (the
 /// windowed band adopts the whole window while prefilling only the
 /// chain's reach tail into the dense tables).
+// Job-level entry: the distinct per-job knobs stay flat arguments (a
+// bundling struct would just mirror them one-to-one at every call site).
 #[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_job_blocks_inner(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],

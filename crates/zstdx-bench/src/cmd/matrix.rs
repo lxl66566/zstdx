@@ -122,8 +122,8 @@ pub struct Args {
 /// `--pull` entry: bytes with an optional k/m suffix (64k, 1m, 262144).
 fn parse_pull(s: &str) -> Result<usize, String> {
     let (digits, mult) = match s.as_bytes().last() {
-        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1024usize),
-        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024 * 1024),
         _ => (s, 1),
     };
     digits
@@ -234,9 +234,9 @@ fn validate_files(args: &Args) {
 /// Report-name tag for a streaming pull size; the historical 64 KiB stays
 /// unsuffixed so default runs keep their documented cell names.
 fn pull_tag(pull: usize) -> String {
-    if pull >= 1024 * 1024 && pull % (1024 * 1024) == 0 {
+    if pull >= 1024 * 1024 && pull.is_multiple_of(1024 * 1024) {
         format!("{}m", pull / (1024 * 1024))
-    } else if pull >= 1024 && pull % 1024 == 0 {
+    } else if pull >= 1024 && pull.is_multiple_of(1024) {
         format!("{}k", pull / 1024)
     } else {
         pull.to_string()
@@ -785,7 +785,7 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                     enc.finish();
                 },
             )
-            .print(&pad(&format!("{}.{label}.stream-mt{mt}", name)), bytes);
+            .print(&pad(&format!("{name}.{label}.stream-mt{mt}")), bytes);
         }
 
         // ceiling reference: our bulk mt path over the same bytes (the

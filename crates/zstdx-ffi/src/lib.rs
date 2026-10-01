@@ -87,8 +87,8 @@ pub struct ZSTD_FrameHeader {
     /// For skippable frames the magic variant 0..=15.
     pub dict_id: core::ffi::c_uint,
     pub checksum_flag: core::ffi::c_uint,
-    pub _reserved1: core::ffi::c_uint,
-    pub _reserved2: core::ffi::c_uint,
+    pub reserved1: core::ffi::c_uint,
+    pub reserved2: core::ffi::c_uint,
 }
 
 /// `ZSTD_FrameType_e` values (the C names are the ABI).
@@ -121,7 +121,7 @@ impl ZSTD_inBuffer {
         if len == 0 {
             return &[];
         }
-        unsafe { core::slice::from_raw_parts((self.src as *const u8).add(pos), len) }
+        unsafe { core::slice::from_raw_parts(self.src.cast::<u8>().add(pos), len) }
     }
 }
 
@@ -223,7 +223,7 @@ pub unsafe fn as_slice(ptr: *const c_void, len: usize) -> Result<&'static [u8], 
     if ptr.is_null() {
         return Err(ErrorCode::SrcBufferWrong);
     }
-    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+    Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) })
 }
 
 /// Write side of [`as_slice`]: null plus positive capacity is
@@ -239,7 +239,7 @@ pub unsafe fn as_dst(ptr: *mut c_void, len: usize) -> Option<&'static mut [u8]> 
     if ptr.is_null() {
         return None;
     }
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) })
 }
 
 /// Output slice of an out-buffer.
@@ -250,7 +250,7 @@ pub unsafe fn as_mut_slice(ptr: *mut c_void, len: usize) -> &'static mut [u8] {
     if len == 0 || ptr.is_null() {
         return &mut [];
     }
-    unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) }
+    unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,13 +350,11 @@ pub unsafe extern "C" fn ZSTD_compress2(
     src: *const c_void,
     src_size: usize,
 ) -> usize {
-    let src = match unsafe { as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -410,13 +408,11 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     src_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
-    let src = match unsafe { as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -438,13 +434,11 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     src: *const c_void,
     src_size: usize,
 ) -> usize {
-    let src = match unsafe { as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -467,13 +461,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     dict_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
-    let src = match unsafe { as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -513,13 +505,11 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     dict: *const c_void,
     dict_size: usize,
 ) -> usize {
-    let src = match unsafe { as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -633,7 +623,7 @@ pub unsafe extern "C" fn ZSTD_flushStream(
         size: 0,
         pos: 0,
     };
-    unsafe { ZSTD_compressStream2(zcs, output, &mut empty, ZSTD_EndDirective::Flush as i32) }
+    unsafe { ZSTD_compressStream2(zcs, output, &raw mut empty, ZSTD_EndDirective::Flush as i32) }
 }
 
 /// `ZSTD_compressStream2(, emptyInput, ZSTD_e_end)`.
@@ -650,7 +640,7 @@ pub unsafe extern "C" fn ZSTD_endStream(
         size: 0,
         pos: 0,
     };
-    unsafe { ZSTD_compressStream2(zcs, output, &mut empty, ZSTD_EndDirective::End as i32) }
+    unsafe { ZSTD_compressStream2(zcs, output, &raw mut empty, ZSTD_EndDirective::End as i32) }
 }
 
 // ---------------------------------------------------------------------------

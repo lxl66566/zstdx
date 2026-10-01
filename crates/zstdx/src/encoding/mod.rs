@@ -179,12 +179,8 @@ mod tests {
                 },
             }
         }
-        for level in [
-            crate::Level::Fastest,
-            crate::Level::Fast,
-            crate::Level::Balanced,
-        ] {
-            let sliced = super::compress_slice_to_vec(&input, level);
+        for level in [Level::Fastest, Level::Fast, Level::Balanced] {
+            let sliced = compress_slice_to_vec(&input, level);
             let read_streamed = super::compress_to_vec_shaped(
                 input.as_slice(),
                 level,

@@ -85,6 +85,9 @@ enum BlockTail {
     Closed,
 }
 
+// Five independent per-frame flags, each with its own write path; folding
+// them into enums would obscure those paths for no checked invariant.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct FrameEncoderCoreSt {
     state: CompressState<MatchGeneratorDriver>,
     hasher: StreamChecksum,

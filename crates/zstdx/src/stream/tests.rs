@@ -1206,7 +1206,6 @@ mod mt {
     /// >= 48 distinct bytes).
     #[cfg(feature = "std")]
     fn words(len: usize) -> Vec<u8> {
-        use std::format;
         const WORDS: [&[u8]; 13] = [
             b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
             b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",

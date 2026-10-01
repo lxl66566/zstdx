@@ -14,11 +14,14 @@ use crate::{Cli, PREFIX};
 use crate::{Input, collect_input, read_filelist};
 
 /// zstd's `g_defaultDictName`: the output when `-o` is absent.
+#[cfg(feature = "dict_builder")]
 const DEFAULT_DICT_NAME: &str = "dictionary";
 /// zstd's `g_defaultMaxDictSize` (110K).
+#[cfg(feature = "dict_builder")]
 const DEFAULT_MAX_DICT: u64 = 112_640;
 /// ZDICT's minimum dictionary capacity (`dictBufferCapacity must be at
 /// least 256`).
+#[cfg(feature = "dict_builder")]
 const MIN_DICT: u64 = 256;
 
 /// Entry point: train on the sample files and write the dictionary.
@@ -30,7 +33,7 @@ pub fn run(cli: &Cli) -> bool {
     {
         let _ = cli;
         eprintln!("{PREFIX}training mode not available (built without the dict_builder feature)");
-        return false;
+        false
     }
     #[cfg(feature = "dict_builder")]
     train_with_builder(cli)

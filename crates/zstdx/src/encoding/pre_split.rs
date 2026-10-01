@@ -319,9 +319,7 @@ fn split_by_chunks(block: &[u8], rate: usize, hash_log: u32) -> usize {
             return pos;
         }
         merge_events(&mut past, &new, hash_log);
-        if penalty > 0 {
-            penalty -= 1;
-        }
+        penalty = penalty.saturating_sub(1);
         pos += CHUNK;
     }
     block.len()

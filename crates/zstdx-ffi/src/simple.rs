@@ -14,7 +14,7 @@ use crate::{
 /// `zstd --train` writes and `ZSTD_getDictID_fromDict` keys on.
 const DICT_MAGIC: [u8; 4] = [0x37, 0xa4, 0x30, 0xec];
 
-pub const VERSION_NUMBER: u32 = 1 * 100 * 100 + 6 * 100;
+pub const VERSION_NUMBER: u32 = 100 * 100 + 6 * 100;
 pub const VERSION_MAJOR: u32 = 1;
 pub const VERSION_MINOR: u32 = 6;
 pub const VERSION_RELEASE: u32 = 0;
@@ -136,16 +136,16 @@ pub unsafe extern "C" fn ZSTD_compress(
     src_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { crate::as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
-    let mut settings = CSettings::default();
-    settings.level = compression_level;
+    let settings = CSettings {
+        level: compression_level,
+        ..CSettings::default()
+    };
     match crate::cctx::compress_oneshot(&settings, None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
@@ -159,13 +159,11 @@ pub unsafe extern "C" fn ZSTD_decompress(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { crate::as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     match crate::dctx::decompress_oneshot(&DSettings::default(), None, src, dst) {
         Ok(written) => written,
@@ -186,9 +184,8 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> u64 {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return CONTENTSIZE_ERROR,
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return CONTENTSIZE_ERROR;
     };
     match crate::frame::parse_header(src) {
         Ok(crate::frame::Header::Zstd(header)) => {
@@ -222,9 +219,8 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> u64 {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return CONTENTSIZE_ERROR,
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return CONTENTSIZE_ERROR;
     };
     match crate::frame::find_decompressed_size(src) {
         Ok(Some(total)) => total,
@@ -239,9 +235,8 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
     if src.len() < crate::frame::HEADER_PREFIX {
         return ret(ErrorCode::SrcSizeWrong);
@@ -261,9 +256,8 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
     if zfh_ptr.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
     let zfh = unsafe { &mut *zfh_ptr };
     let unknown = CONTENTSIZE_UNKNOWN;
@@ -275,8 +269,8 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
         header_size: 0,
         dict_id: 0,
         checksum_flag: 0,
-        _reserved1: 0,
-        _reserved2: 0,
+        reserved1: 0,
+        reserved2: 0,
     };
     match crate::frame::parse_full_header(src) {
         Ok(crate::frame::HeaderParse::Complete(header)) => {
@@ -325,9 +319,8 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromFrame(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> core::ffi::c_uint {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return 0,
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return 0;
     };
     match crate::frame::parse_full_header(src) {
         // The reference returns the skippable magic variant for skippable
@@ -343,9 +336,8 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
     match crate::frame::frame_compressed_size(src) {
         Ok(size) => size,
@@ -366,9 +358,8 @@ pub unsafe extern "C" fn ZSTD_isFrame(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> core::ffi::c_uint {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return 0,
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return 0;
     };
     if src.len() < 4 {
         return 0;

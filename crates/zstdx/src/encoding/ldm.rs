@@ -328,8 +328,10 @@ fn gear4_portable(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
 /// x86-64 `gear4`: forces the re-associated schedule (LEA per checkpoint,
 /// `shl`+add for the x16 group step, loads hoisted off the chain). The
 /// portable `gear4` above is semantically identical but compiles back into
-/// the one-byte serial chain.
+/// the one-byte serial chain. Idle since `gear_run`'s whole-loop asm took
+/// over the scan; kept as the tuned per-group fallback.
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline(always)]
 fn gear4_asm(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
     debug_assert!(w.len() >= 4);
@@ -379,6 +381,7 @@ fn gear4_asm(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline(always)]
 fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
     gear4_asm(w, h)
@@ -1178,7 +1181,9 @@ struct SplitHit {
 /// `[start, stop)` from `entry`, returning the lane's splits with their
 /// fingerprints, in position order. `start == stop` (a rounding-exact
 /// lane) returns empty.
+// Scan-loop arguments stay flat: they feed the register-passed hot path.
 #[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
 fn scan_lane(
     win: &[u8],
     win_base: u64,
@@ -1235,12 +1240,12 @@ fn prefetch_hit(table: &[u64], offsets: &[u8], hash: usize) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::x86_64::_mm_prefetch(
-            offsets.as_ptr().add(hash) as *const i8,
+            offsets.as_ptr().add(hash).cast::<i8>(),
             core::arch::x86_64::_MM_HINT_T0,
         );
         let base = table.as_ptr().add(hash * ENTS_PER_BUCKET);
-        core::arch::x86_64::_mm_prefetch(base as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        core::arch::x86_64::_mm_prefetch(base.add(8) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        core::arch::x86_64::_mm_prefetch(base.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
+        core::arch::x86_64::_mm_prefetch(base.add(8).cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (table, offsets, hash);
@@ -1518,7 +1523,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn parallel_fill_matches_serial() {
-        for seed in [0x0ddb_a11, 0x5eed_5eed] {
+        for seed in [0x00dd_ba11, 0x5eed_5eed] {
             let mut data = rand_bytes(1 << 19, seed);
             // Data-dependent trigger density straddling the lane cuts: a
             // low-entropy stripe every 64 bytes plus the random body.

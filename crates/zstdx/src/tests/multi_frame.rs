@@ -414,9 +414,8 @@ fn staging_does_not_leak_across_streams() {
         let mut sink = [0u8; 7];
         loop {
             match s1.read(&mut sink) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break, // Err: the injected WouldBlock — abandon stream 1
                 Ok(n) => out.extend_from_slice(&sink[..n]),
-                Err(_) => break, // the injected WouldBlock: abandon stream 1
             }
         }
         assert_eq!(out, b"aaaa");

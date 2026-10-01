@@ -74,7 +74,11 @@ pub unsafe extern "C" fn ZSTD_freeCDict(cdict: *mut ZSTD_CDict) -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getDictID_fromCDict(cdict: *const ZSTD_CDict) -> core::ffi::c_uint {
     match unsafe { cdict_ref(cdict) } {
-        Some(cdict) => cdict.dict.as_ref().and_then(|d| d.header_id()).unwrap_or(0),
+        Some(cdict) => cdict
+            .dict
+            .as_ref()
+            .and_then(zstdx::EncoderDictionary::header_id)
+            .unwrap_or(0),
         None => 0,
     }
 }
@@ -88,13 +92,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
     src_size: usize,
     cdict: *const ZSTD_CDict,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { crate::as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     let Some(cdict) = (unsafe { cdict_ref(cdict) }) else {
         // libzstd's usingCDict_internal rejects the NULL handle outright.
@@ -140,8 +142,8 @@ pub unsafe extern "C" fn ZSTD_freeDDict(ddict: *mut ZSTD_DDict) -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getDictID_fromDDict(ddict: *const ZSTD_DDict) -> core::ffi::c_uint {
     match unsafe { ddict_ref(ddict) } {
-        Some(ddict) => (ddict.dict.id != 0).then_some(ddict.dict.id).unwrap_or(0),
-        None => 0,
+        Some(ddict) if ddict.dict.id != 0 => ddict.dict.id,
+        _ => 0,
     }
 }
 
@@ -154,13 +156,11 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     src_size: usize,
     ddict: *const ZSTD_DDict,
 ) -> usize {
-    let src = match unsafe { crate::as_slice(src, src_size) } {
-        Ok(src) => src,
-        Err(_) => return ret(ErrorCode::SrcBufferWrong),
+    let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return ret(ErrorCode::SrcBufferWrong);
     };
-    let dst = match unsafe { crate::as_dst(dst, dst_capacity) } {
-        Some(dst) => dst,
-        None => return ret(ErrorCode::DstBufferNull),
+    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
+        return ret(ErrorCode::DstBufferNull);
     };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);

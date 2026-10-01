@@ -393,14 +393,18 @@ mod tests {
         let frame = compress_default();
         let header = match parse_header(&frame).unwrap() {
             Header::Zstd(h) => h,
-            other => panic!("unexpected {other:?}"),
+            other @ Header::Skippable { .. } => {
+                panic!("unexpected {other:?}")
+            },
         };
         assert_eq!(header.content_size, Some(7));
-        assert_eq!(header.checksum, true);
+        assert!(header.checksum);
         assert_eq!(frame_compressed_size(&frame).unwrap(), frame.len());
         let full = match parse_full_header(&frame).unwrap() {
             HeaderParse::Complete(h) => h,
-            other => panic!("unexpected {other:?}"),
+            other @ HeaderParse::Wanted(_) => {
+                panic!("unexpected {other:?}")
+            },
         };
         assert_eq!(full.frame_type, FrameType::Zstd);
         // 7-byte single-segment frame: window == FCS == block max.
@@ -420,7 +424,9 @@ mod tests {
         assert_eq!(frame_compressed_size(&skip).unwrap(), 12);
         let full = match parse_full_header(&skip).unwrap() {
             HeaderParse::Complete(h) => h,
-            other => panic!("unexpected {other:?}"),
+            other @ HeaderParse::Wanted(_) => {
+                panic!("unexpected {other:?}")
+            },
         };
         assert_eq!(full.frame_type, FrameType::Skippable);
         assert_eq!(full.content_size, Some(4));
@@ -450,7 +456,7 @@ mod tests {
         for cut in 1..frame.len() {
             match frame_compressed_size(&frame[..cut]) {
                 Ok(n) => assert_eq!(n, cut, "only the exact prefix can satisfy the walk"),
-                Err(ParseError::NeedMore) | Err(ParseError::Malformed) => {},
+                Err(ParseError::NeedMore | ParseError::Malformed) => {},
                 Err(e) => panic!("unexpected {e:?}"),
             }
         }
@@ -462,7 +468,9 @@ mod tests {
         let frame = compress_default();
         let header = match parse_header(&frame).unwrap() {
             Header::Zstd(h) => h,
-            other => panic!("unexpected {other:?}"),
+            other @ Header::Skippable { .. } => {
+                panic!("unexpected {other:?}")
+            },
         };
         assert_eq!(header_size_formula(frame[4]), header.header_len);
         // A windowed frame (pledge off, streaming shape): 4+1+1.

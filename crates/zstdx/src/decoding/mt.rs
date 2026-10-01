@@ -1439,7 +1439,7 @@ mod tests {
         let mut sink = Vec::new();
         let mut enc = crate::stream::write::Encoder::with_options(
             &mut sink,
-            crate::EncoderOptions::new(Level::Fastest).pledged_size(Some(data.len() as u64)),
+            EncoderOptions::new(Level::Fastest).pledged_size(Some(data.len() as u64)),
         )
         .unwrap();
         enc.write_all(data).unwrap();
@@ -1656,13 +1656,14 @@ mod tests {
         expect.extend_from_slice(&[0x30, 0x31, 0x32, 0x33, 0x33, 0x33, 0x33]);
         expect.extend(std::iter::repeat_n(0x02, 7));
 
+        let pad = vec![0xaa; 128 * 1024];
         let mut frame = Vec::new();
         frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
         frame.push(0xa0); // 4-byte frame content size + single segment
         frame.extend_from_slice(&(expect.len() as u32).to_le_bytes());
         push_block(&mut frame, false, 2, &block_a);
         for _ in 0..4 {
-            push_block(&mut frame, false, 0, &[0xaa; 128 * 1024]);
+            push_block(&mut frame, false, 0, &pad);
         }
         push_block(&mut frame, false, 2, &block_b);
         push_block(&mut frame, true, 2, &block_c);
