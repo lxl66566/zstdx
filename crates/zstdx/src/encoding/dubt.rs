@@ -46,7 +46,9 @@
 //! compares, never falsify a match — every candidate's bytes are verified
 //! before use.
 
-use super::opt::{Match, OPT_NUM, count_from, hash3_at, hash4_at, hash5_at, read4};
+use super::opt::{
+    Match, OPT_NUM, count_from, count_from_long, hash3_at, hash4_at, hash5_at, read4,
+};
 
 /// Offset price class (`highbit32(offBase)`); ~free for repcodes and for
 /// "no candidate".
@@ -121,7 +123,11 @@ fn unpack_pos(v: u32, pos: u64) -> u64 {
 /// its constants fold at compile time, the constprop libzstd gets for free
 /// from its `_noDict_5` template instantiations. All live rows hash 5; the
 /// 4-instantiation is the small-frame wide-alphabet row, 3 the ultra rows.
-pub(crate) struct DubtFinder<'a, 'b, const MLS: usize> {
+/// `LONG` selects the compare form (see [`count_from_long`]): the mt job
+/// machinery instantiates `true` (the per-job re-sorted shallow trees pay
+/// multi-KiB twin compares), the frame-continuous rows `false` (their
+/// compares are prefix-bounded short and keep the stock scalar loop).
+pub(crate) struct DubtFinder<'a, 'b, const MLS: usize, const LONG: bool = false> {
     pub(crate) win: &'a [u8],
     pub(crate) win_base: u64,
     pub(crate) block_end_idx: usize,
@@ -136,7 +142,17 @@ pub(crate) struct DubtFinder<'a, 'b, const MLS: usize> {
     pub(crate) next_update: &'b mut u64,
 }
 
-impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
+impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
+    /// The compare proper, in the instantiation's form.
+    #[inline(always)]
+    fn count(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+        if LONG {
+            count_from_long(win, idx, cand, start, limit)
+        } else {
+            count_from(win, idx, cand, start, limit)
+        }
+    }
+
     /// Lowest absolute position usable as a candidate when scanning `pos`.
     #[inline]
     fn cand_floor(&self, pos: u64) -> u64 {
@@ -205,7 +221,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
                 nb -= 1;
                 let cidx = (cand - self.win_base) as usize;
                 let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, curr_idx, cidx, ml, self.block_end_idx);
+                ml = Self::count(self.win, curr_idx, cidx, ml, self.block_end_idx);
                 // An equal tail cannot order the candidate; stop to keep
                 // the tree consistent.
                 if curr_idx + ml >= self.block_end_idx {
@@ -284,7 +300,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
                 };
                 if hit {
                     let rep_len =
-                        count_from(self.win, idx, cand, self.min_match, self.block_end_idx);
+                        Self::count(self.win, idx, cand, self.min_match, self.block_end_idx);
                     if rep_len > best_len {
                         found.rep = Match {
                             off: rep_code - ll0 + 1,
@@ -393,7 +409,7 @@ impl<const MLS: usize> DubtFinder<'_, '_, MLS> {
                 nb -= 1;
                 let cidx = (cand_abs - self.win_base) as usize;
                 let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+                ml = Self::count(self.win, idx, cidx, ml, self.block_end_idx);
                 let at_end = idx + ml >= self.block_end_idx;
                 if ml > best_len {
                     if cand_abs + ml as u64 > match_end {

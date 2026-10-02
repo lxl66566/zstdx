@@ -483,6 +483,175 @@ pub(crate) fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limi
     len
 }
 
+/// [`count_from`]'s long-compare form: same pure function, but a compare
+/// still running at 64 B switches to a SIMD kernel (one masked byte
+/// compare per 64/32 B step instead of the scalar u64 loop). Selected by
+/// the caller's const `LONG` instantiation — the mt jobs' shallow,
+/// per-job re-sorted trees pay multi-KiB twin compares the deep ST tree
+/// avoids (see docs/src/dev/perf/matchers.md), so only their finders
+/// monomorphize this form and the ST rows keep the exact stock loop.
+#[inline(always)]
+pub(crate) fn count_from_long(
+    win: &[u8],
+    idx: usize,
+    cand: usize,
+    start: usize,
+    limit: usize,
+) -> usize {
+    debug_assert!(cand <= idx && idx <= limit);
+    let room = limit - idx;
+    // Two phases so the kernel switch costs nothing per compared byte:
+    // phase one is exactly the plain scalar loop, just capped at the 64 B
+    // switch point; only a compare still running there pays the (cold,
+    // once-per-process resolved) kernel call.
+    let switch_at = start + 64;
+    let stop1 = switch_at.min(room);
+    let mut len = start;
+    // SAFETY: same bounds as `count_from`.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 8 <= stop1 {
+            let a = base.add(idx + len).cast::<u64>().read_unaligned();
+            let b = base.add(cand + len).cast::<u64>().read_unaligned();
+            if a != b {
+                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+            }
+            len += 8;
+        }
+    }
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if len >= switch_at && len + 64 <= room {
+        return count_from_kernel(win, idx, cand, len, limit);
+    }
+    // The scalar remainder: u64 steps to the limit, then the byte tail.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 8 <= room {
+            let a = base.add(idx + len).cast::<u64>().read_unaligned();
+            let b = base.add(cand + len).cast::<u64>().read_unaligned();
+            if a != b {
+                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+            }
+            len += 8;
+        }
+    }
+    while len < room && win[idx + len] == win[cand + len] {
+        len += 1;
+    }
+    len
+}
+
+/// The kernel dispatch, outlined and cold so the dispatching body stays
+/// exactly the scalar loop plus one gate. Not actually cold on the
+/// long-compare rows (the mt jobs' twin compares call it per candidate),
+/// where one extra call per multi-KiB compare is noise.
+#[cold]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn count_from_kernel(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+    use crate::common::simd::{self, SimdTier};
+    type Kernel = fn(&[u8], usize, usize, usize, usize) -> usize;
+    // The kernel choice is a pure function of the CPU and the env clamp:
+    // resolved once per process, then one indirect call.
+    static KERNEL: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+    let kernel = *KERNEL.get_or_init(|| {
+        if simd::allows(SimdTier::Avx512) && std::is_x86_feature_detected!("avx512bw") {
+            |win, idx, cand, start, limit| {
+                // SAFETY: avx512bw detected at selection.
+                unsafe { count_from_avx512(win, idx, cand, start, limit) }
+            }
+        } else if simd::allows(SimdTier::Avx2) && std::is_x86_feature_detected!("avx2") {
+            |win, idx, cand, start, limit| {
+                // SAFETY: avx2 detected at selection.
+                unsafe { count_from_avx2(win, idx, cand, start, limit) }
+            }
+        } else {
+            count_from_scalar
+        }
+    });
+    kernel(win, idx, cand, start, limit)
+}
+
+/// 64-byte step of [`count_from`]: one masked byte compare per step.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512bw")]
+unsafe fn count_from_avx512(
+    win: &[u8],
+    idx: usize,
+    cand: usize,
+    start: usize,
+    limit: usize,
+) -> usize {
+    use core::arch::x86_64::{_mm512_cmpneq_epi8_mask, _mm512_loadu_si512};
+    let mut len = start;
+    // SAFETY: the 64-byte reads stay inside [.., limit) like the scalar
+    // loop's u64 reads; cand <= idx bounds the candidate side.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 64 <= limit - idx {
+            let a = _mm512_loadu_si512(base.add(idx + len).cast());
+            let b = _mm512_loadu_si512(base.add(cand + len).cast());
+            let neq = _mm512_cmpneq_epi8_mask(a, b);
+            if neq != 0 {
+                return len + neq.trailing_zeros() as usize;
+            }
+            len += 64;
+        }
+    }
+    count_from_scalar(win, idx, cand, len, limit)
+}
+
+/// 32-byte step of [`count_from`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn count_from_avx2(
+    win: &[u8],
+    idx: usize,
+    cand: usize,
+    start: usize,
+    limit: usize,
+) -> usize {
+    use core::arch::x86_64::{_mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let mut len = start;
+    // SAFETY: same bounds as the scalar loop, 32-byte steps.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 32 <= limit - idx {
+            let a = _mm256_loadu_si256(base.add(idx + len).cast());
+            let b = _mm256_loadu_si256(base.add(cand + len).cast());
+            let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            if eq != u32::MAX {
+                return len + (!eq).trailing_zeros() as usize;
+            }
+            len += 32;
+        }
+    }
+    count_from_scalar(win, idx, cand, len, limit)
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn count_from_scalar(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+    let mut len = start;
+    // SAFETY: the u64 reads stay inside [.., limit) which is at or before
+    // the window end; cand <= idx bounds the candidate side.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 8 <= limit - idx {
+            let a = base.add(idx + len).cast::<u64>().read_unaligned();
+            let b = base.add(cand + len).cast::<u64>().read_unaligned();
+            if a == b {
+                len += 8;
+            } else {
+                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+            }
+        }
+    }
+    while len < limit - idx && win[idx + len] == win[cand + len] {
+        len += 1;
+    }
+    len
+}
+
 /// Binary-tree match finder plus the per-block constants (`ZSTD_insertBt1` /
 /// `ZSTD_insertBtAndGetAllMatches`).
 pub(crate) struct Finder<'a, 'b> {

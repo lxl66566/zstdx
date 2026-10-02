@@ -39,11 +39,18 @@ impl MatchGeneratorDriver {
             unreachable!("btlazy scratch allocated by apply_level")
         };
         let lit_lens = self.lit_lens;
+        // Long-compare form for the job machinery only: the per-job
+        // re-sorted shallow trees re-pay multi-KiB twin compares that the
+        // frame-continuous rows' deep tree avoids (see [`DubtFinder`]'s
+        // `LONG`). Keyed on the LDM arming context, which already splits
+        // jobs from frames.
+        let long_compare = !matches!(self.ldm_arming, LdmArming::Frame | LdmArming::FrameScreened);
         // Disjoint field borrows: the window (win/ext) against the tables.
         let ldm_won = crate::encoding::btlazy::run_block_lazy(
             &knobs,
             tree_mls,
             step,
+            long_compare,
             win,
             self.win_base,
             self.block_start,

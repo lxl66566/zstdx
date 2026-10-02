@@ -18,7 +18,7 @@ use super::{
     dubt::{DubtFinder, Found, lazy_price, scale_value},
     ldm::LdmSeq,
     match_generator::{HASH_READ, MIN_MATCH, push_seq_packed},
-    opt::{Match, OptKnobs, count_from, read4},
+    opt::{Match, OptKnobs, count_from, count_from_long, read4},
 };
 
 /// Displaced-literal value scale of one scan position: the sum of the
@@ -39,7 +39,7 @@ fn lit_scale(win: &[u8], idx: usize, lit_clamp: &[i32; 256]) -> i32 {
 /// extension. `None` when the offset does not resolve or the bytes differ.
 /// The caller guarantees 4 readable bytes at `p`.
 #[inline]
-fn rep_probe(
+fn rep_probe<const LONG: bool>(
     win: &[u8],
     win_base: u64,
     block_end_idx: usize,
@@ -55,7 +55,12 @@ fn rep_probe(
     if read4(win, cand) != read4(win, pidx) {
         return None;
     }
-    Some(count_from(win, pidx, cand, MIN_MATCH, block_end_idx))
+    let len = if LONG {
+        count_from_long(win, pidx, cand, MIN_MATCH, block_end_idx)
+    } else {
+        count_from(win, pidx, cand, MIN_MATCH, block_end_idx)
+    };
+    Some(len)
 }
 
 /// Per-block scratch anchor for the pooled matcher state. The fused
@@ -109,6 +114,7 @@ pub(crate) fn run_block_lazy(
     knobs: &OptKnobs,
     tree_mls: usize,
     step: LazyStep,
+    long_compare: bool,
     win: &[u8],
     win_base: u64,
     block_start: u64,
@@ -129,8 +135,8 @@ pub(crate) fn run_block_lazy(
     let table_log = table.len().trailing_zeros();
     let bt_mask = bt.len() / 2 - 1;
     macro_rules! go {
-        ($m:literal) => {{
-            let mut finder = DubtFinder {
+        ($m:literal, $l:literal) => {{
+            let mut finder: DubtFinder<'_, '_, $m, $l> = DubtFinder {
                 win,
                 win_base,
                 block_end_idx,
@@ -144,7 +150,7 @@ pub(crate) fn run_block_lazy(
                 min_match: knobs.min_match as usize,
                 sufficient_len: knobs.sufficient_len as usize,
             };
-            block_lazy_segments::<$m>(
+            block_lazy_segments::<$m, $l>(
                 step,
                 &mut finder,
                 lit_lens,
@@ -165,19 +171,24 @@ pub(crate) fn run_block_lazy(
     // default is the row's searchLength). The const parameter monomorphizes
     // the block loop per width — the hash selection and its constants fold,
     // the constprop libzstd gets from its `ZSTD_BtFindBestMatch_noDict_5`
-    // template instantiations.
-    match tree_mls {
-        3 => go!(3),
-        4 => go!(4),
-        _ => go!(5),
+    // template instantiations. `long_compare` monomorphizes the compare
+    // form (see [`DubtFinder`]'s `LONG`).
+    match (tree_mls, long_compare) {
+        (3, false) => go!(3, false),
+        (3, true) => go!(3, true),
+        (4, false) => go!(4, false),
+        (4, true) => go!(4, true),
+        (_, false) => go!(5, false),
+        (_, true) => go!(5, true),
     }
 }
 
-/// The block loop proper, monomorphized over the tree hash width.
+/// The block loop proper, monomorphized over the tree hash width and the
+/// compare form.
 #[allow(clippy::too_many_arguments)]
-fn block_lazy_segments<const MLS: usize>(
+fn block_lazy_segments<const MLS: usize, const LONG: bool>(
     step: LazyStep,
-    finder: &mut DubtFinder<'_, '_, MLS>,
+    finder: &mut DubtFinder<'_, '_, MLS, LONG>,
     lit_lens: &[u8; 256],
     ldm_seqs: &[LdmSeq],
     block_start: u64,
@@ -257,7 +268,7 @@ fn block_lazy_segments<const MLS: usize>(
                 } else {
                     pos
                 };
-                if let Some(ml) = rep_probe(win, win_base, end_idx, probe, rep[0]) {
+                if let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0]) {
                     let v =
                         scale_value(lit_scale(win, (probe - win_base) as usize, &lit_clamp), ml);
                     // An empty incumbent (no tree candidate) prices 0 — the
@@ -380,7 +391,7 @@ fn block_lazy_segments<const MLS: usize>(
             // Immediate offset-2 chain (libzstd's rep_offset2 loop): ll0
             // repcode sequences alternating rep0/rep1 by construction.
             while *rep_pending == 0 && end - pos >= MIN_MATCH as u64 {
-                let Some(ml2) = rep_probe(win, win_base, end_idx, pos, rep[1]) else {
+                let Some(ml2) = rep_probe::<LONG>(win, win_base, end_idx, pos, rep[1]) else {
                     break;
                 };
                 let pidx = (pos - win_base) as usize;

@@ -139,6 +139,8 @@ json.fastest.mt8 x1.23 (spread 1.03-1.57) remains the one clean zstd mt win — 
 
 **dll100 joined the streaming-MT section (2026-10-02)** — T5b now iterates the same payload list as ST, so raw `--file` payloads get MT cells. First measurement, stream-mt8 vs libzstd-mt8: ahead only at fast (537/437, x0.81) and opt (26/25, x0.96); trailing fastest 585/2051 (x3.56), balanced 157/180 (x1.15), ultra 15/18 (x1.22) and best 6/83 (**x14.27**). Against our own bulk-mt8 ceilings (1073/950/169/13/36/22 MiB/s) the dll stream cells run 46-93% — the same stream-vs-ceiling class as text's fast rows (40-43%, recorded above) — but the libzstd-MT losses are new: its dll stream-mt is genuinely strong (fastest 2051 MiB/s ≈ 4× its own ST stream). json/text MT cells re-measured in the same run reproduce the recorded table within spread. Investigation opened as [todo](../todo.md) 17.
 
+**Same-day follow-up (2026-10-02, `count_from_long` landed)**: the best cell's x14.27 was a matcher long-compare collapse, not scheduling (attribution in [mt-stream](../perf/mt-stream.md)); with the SIMD compare the cell reads **best 15-16/83 (x5.4)**, the bulk-mt8 best ceiling 13 → 29 MiB/s, all other cells unchanged, every cell's output byte-identical. [todo](../todo.md) 17.
+
 ## T6 compression-ratio sweep (`zstdx-bench ratio`)
 
 Full matrix 5 shapes x 6 levels x {bulk,stream} x {st,mt4}, one deterministic pass per cell, checksums off; Δ% = ours/zstd ratio − 1, geo-mean. Wall 110 s. Every cell roundtrip-gated. **Outputs are byte-identical to the 09-28 sweep** (and therefore to 09-27): R33's diet moves only ladder rows outside the tier set, R34-R36 touch no encoder output on this corpus — the sweep re-confirms it cell for cell.
