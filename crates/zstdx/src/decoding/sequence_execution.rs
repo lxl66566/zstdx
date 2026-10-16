@@ -286,7 +286,10 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
     let mut lit = lit_base;
 
     while rem != 0 {
-        let seq = decode_step(
+        // FUSED read: this loop owns no cursor state beyond the decode
+        // state itself, so it hosts the fused read body's wider live set
+        // (see `decode_step`).
+        let seq = decode_step::<true>(
             tbl,
             src_ptr,
             &mut ip,
@@ -701,6 +704,16 @@ fn copy_wrapped_match(
 /// masking the (garbage) index, whose loaded value the selects then
 /// discard.
 pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+    // Real offsets (the 87-100% share on json/dll/skewed) need no slot
+    // machinery: a constant 3-move rotation, off the select chain the
+    // repcode domain keeps.
+    if offset_value > 3 {
+        let actual = offset_value - 3;
+        scratch[2] = scratch[1];
+        scratch[1] = scratch[0];
+        scratch[0] = actual;
+        return actual;
+    }
     let idx = offset_value
         .wrapping_sub(1)
         .wrapping_add((lit_len == 0) as u32);
