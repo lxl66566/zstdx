@@ -640,6 +640,50 @@ fn test_decode_all() {
     assert_eq!(output, original);
 }
 
+/// The bulk one-shot honors a pledged size exactly as the streaming core
+/// does: the declaration lands in the frame header (a source the row's
+/// window covers takes the single-segment form), an absent pledge leaves
+/// the header undeclaring, and a disagreeing pledge fails with the same
+/// error the stream raises at finish.
+#[test]
+fn bulk_pledged_size_declares_and_validates() {
+    let mut data = alloc::vec![0u8; 300 * 1024];
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for b in &mut data {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *b = (state >> 33) as u8 & 0xf;
+    }
+    let opts =
+        crate::EncoderOptions::new(crate::Level::Fastest).pledged_size(Some(data.len() as u64));
+    let frame = crate::bulk::compress_with(&data, &opts).unwrap();
+    let (declared, _) = multi_frame::locate_fcs(&frame);
+    assert_eq!(declared, data.len() as u64);
+    assert_eq!(crate::bulk::decompress(&frame, data.len()).unwrap(), data);
+
+    // No pledge: the header declares nothing (no FCS field, no
+    // single-segment flag).
+    let plain =
+        crate::bulk::compress_with(&data, &crate::EncoderOptions::new(crate::Level::Fastest))
+            .unwrap();
+    assert_eq!(plain[4] >> 6, 0);
+    assert_eq!((plain[4] >> 5) & 1, 0);
+
+    // A disagreeing pledge is rejected outright, not silently dropped.
+    let wrong =
+        crate::EncoderOptions::new(crate::Level::Fastest).pledged_size(Some(data.len() as u64 + 1));
+    match crate::bulk::compress_with(&data, &wrong) {
+        Err(crate::Error::PledgedSizeMismatch { pledged, actual }) => {
+            assert_eq!(
+                (pledged, actual),
+                (data.len() as u64 + 1, data.len() as u64)
+            );
+        },
+        other => panic!("expected PledgedSizeMismatch, got {other:?}"),
+    }
+}
+
 /// Plaintext that `test_fixtures/window_128mib.zst` and
 /// `test_fixtures/window_256mib.zst` decode to. The 128mib window fixture was
 /// produced with `zstd --long=27` (a 128 MiB window descriptor) from this exact

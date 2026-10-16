@@ -100,8 +100,7 @@ impl FrameHeader {
         // `Frame_Content_Size_flag`:
         // The Frame_Content_Size_flag specifies if
         // the Frame_Content_Size field is provided within the header.
-        // TODO: The Frame_Content_Size field isn't set at all, we should prefer to include it
-        // always. If the `Single_Segment_flag` is set and this value is zero,
+        // If the `Single_Segment_flag` is set and this value is zero,
         // the size of the FCS field is 1 byte.
         // Otherwise, the FCS field is omitted.
         // | Value | Size of field (Bytes)

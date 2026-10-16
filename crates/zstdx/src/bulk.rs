@@ -29,7 +29,13 @@ pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
 /// multithreaded job path on std builds (single-threaded when a dictionary
 /// is attached), the checksum flag decides whether the frame carries a
 /// content checksum, and an attached dictionary is parsed here — an invalid
-/// dictionary is the one fallible case.
+/// dictionary is the one fallible case. A
+/// [`pledged_size`][crate::EncoderOptions::pledged_size] lands in the frame
+/// header exactly as it does on the streaming encoders (byte-identical
+/// frames for the same options); a pledge that disagrees with `source`'s
+/// length fails with
+/// [`Error::PledgedSizeMismatch`][crate::Error::PledgedSizeMismatch], the
+/// same contract the streaming core enforces at finish.
 ///
 /// ```rust
 /// let data = b"the quick brown fox jumps over the lazy dog";
@@ -42,6 +48,15 @@ pub fn compress_with(
     source: &[u8],
     options: &crate::EncoderOptions,
 ) -> Result<alloc::vec::Vec<u8>> {
+    if let Some(pledged) = options.pledged_size
+        && pledged != source.len() as u64
+    {
+        return Err(crate::Error::PledgedSizeMismatch {
+            pledged,
+            actual: source.len() as u64,
+        });
+    }
+    let declared = options.pledged_size;
     let parsed = options.parsed_dictionary.as_ref().map(|dict| {
         crate::encoding::compress_slice_with_dictionary(
             source,
@@ -52,6 +67,7 @@ pub fn compress_with(
                 window_log: options.input_shape.window_log,
             },
             dict,
+            declared,
         )
     });
     if let Some(compressed) = parsed {
@@ -69,6 +85,7 @@ pub fn compress_with(
             options.checksum,
             shape,
             &dict,
+            declared,
         ));
     }
     #[cfg(feature = "std")]
@@ -79,9 +96,10 @@ pub fn compress_with(
             options.checksum,
             options.workers,
             options.input_shape.window_log,
+            declared,
         ));
     }
-    Ok(crate::encoding::compress_slice_shaped(
+    Ok(crate::encoding::compress_slice_shaped_declared(
         source,
         options.level,
         options.checksum,
@@ -89,6 +107,7 @@ pub fn compress_with(
             len: None,
             window_log: options.input_shape.window_log,
         },
+        declared,
     ))
 }
 

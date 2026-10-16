@@ -28,7 +28,7 @@ Known-length sources resize their row (libzstd's `ZSTD_adjustCParams` port: wind
 <!-- prettier-ignore -->
 | Capability | Status |
 |---|---|
-| slice/bulk codec | ✅ zero-copy encoding + state pools (thread-local for ST, cross-thread shared with the stream leases for MT jobs — R25); decoding writes directly into the flat output |
+| slice/bulk codec | ✅ zero-copy encoding + state pools (thread-local for ST, cross-thread shared with the stream leases for MT jobs — R25); decoding writes directly into the flat output; `compress_with` declares a `pledged_size` in the frame header (validated, byte-identical to the pledged stream — 2026-10-16, the FFI one-shots ride it) |
 | streaming codec (read/write Encoder, Decoder) | ✅ streaming output byte-identical to bulk when no flush |
 | MT encoding | ✅ bulk (overlap jobs) + streaming (bursts); workers>1; no_std reports Unsupported |
 | MT decoding | ✅ segment-parallel (stage A pool + serial stage B) plus piece-parallel stage B on ramp frames (`decoding/mt_pieces.rs`, env-paired with the encoder ramp and engaged by measured validation — json.lvl3 mt8 3.2× serial-B at +0.00% size; see [mt-stream](perf/mt-stream.md)); plain frames: json 1.60× ST at mt16 (= 1.18× the zstd stream reference), dll100 1.83×/1.31×, skewed 1.19× (0.95× ref — the shape's band wanders), text flat 0.98× — remaining floors in todo 1 |

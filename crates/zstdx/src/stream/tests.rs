@@ -871,8 +871,14 @@ mod mt {
         let data = textish(7 * 1024 * 1024 + 999);
         for workers in [2u32, 4] {
             for checksum in [true, false] {
-                let bulk_mt =
-                    encoding::mt::compress_slice_mt(&data, Level::Fastest, checksum, workers, None);
+                let bulk_mt = encoding::mt::compress_slice_mt(
+                    &data,
+                    Level::Fastest,
+                    checksum,
+                    workers,
+                    None,
+                    None,
+                );
                 let streamed = encode_write(
                     &data,
                     1024 * 1024,
@@ -890,7 +896,7 @@ mod mt {
         // into two jobs at the opt strip's 4 MiB floor).
         let deep = textish(4 * 1024 * 1024 + 512 * 1024);
         for level in [Level::Opt, Level::Ultra] {
-            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None);
+            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None, None);
             let streamed =
                 encode_write(&deep, 1024 * 1024, level, 4, false, Some(deep.len() as u64));
             assert_eq!(streamed, bulk_mt, "{level:?}");
@@ -899,7 +905,7 @@ mod mt {
         // probe shares the bulk strip, job floor and reach, so a pledged
         // stream stays byte-identical to bulk mt there too.
         let near = jsonish(9 * 1024 * 1024 + 123 * 1024);
-        let bulk_mt = encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None);
+        let bulk_mt = encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None, None);
         let streamed = encode_write(
             &near,
             1024 * 1024,
@@ -911,7 +917,98 @@ mod mt {
         assert_eq!(streamed, bulk_mt);
     }
 
-    /// The pledged mid-size capture (see `MtEncoderCore::engage_midsize_capture`):
+    /// A stream written exactly to its pledge and the bulk slice entry with
+    /// the size declared produce byte-identical frames — the equivalence the
+    /// FFI one-shot rides. Covers both header forms (single-segment below
+    /// the row's window, windowed above), checksum on/off, a forced window
+    /// log, the reach-probe row and a dictionary frame.
+    #[test]
+    fn pledged_stream_matches_declared_bulk_st() {
+        let single_segment = |frame: &[u8]| (frame[4] >> 5) & 1 == 1;
+        // Small sources take the single-segment form on both entries.
+        for len in [300usize, 200 * 1024] {
+            let data = textish(len);
+            for checksum in [true, false] {
+                let streamed = encode_write(
+                    &data,
+                    64 * 1024,
+                    Level::Fastest,
+                    0,
+                    checksum,
+                    Some(data.len() as u64),
+                );
+                let bulk = encoding::compress_slice_shaped_declared(
+                    &data,
+                    Level::Fastest,
+                    checksum,
+                    crate::InputShape::default(),
+                    Some(data.len() as u64),
+                );
+                assert_eq!(streamed, bulk, "len {len} checksum {checksum}");
+                assert!(
+                    single_segment(&streamed),
+                    "len {len} must be single-segment"
+                );
+            }
+        }
+        // Past the row's window the frames stay windowed; balanced rides the
+        // reach probe's donated path, fastest the far-class screen band.
+        let data = jsonish(9 * 1024 * 1024 + 123 * 1024);
+        for level in [Level::Fastest, Level::Balanced] {
+            let streamed =
+                encode_write(&data, 1024 * 1024, level, 0, false, Some(data.len() as u64));
+            let bulk = encoding::compress_slice_shaped_declared(
+                &data,
+                level,
+                false,
+                crate::InputShape::default(),
+                Some(data.len() as u64),
+            );
+            assert_eq!(streamed, bulk, "{level:?}");
+            assert_ne!(streamed[4] >> 6, 0, "{level:?} must declare the size");
+        }
+        // A forced window log rides both entries through InputShape.
+        let data = textish(3 * 1024 * 1024 + 5);
+        for window_log in [18u32, 22] {
+            let shape = crate::InputShape::default().with_window_log(window_log);
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Fast)
+                    .with_input_shape(shape)
+                    .checksum(false)
+                    .pledged_size(Some(data.len() as u64)),
+            )
+            .unwrap();
+            for piece in data.chunks(1024 * 1024) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            let bulk = encoding::compress_slice_shaped_declared(
+                &data,
+                Level::Fast,
+                false,
+                shape,
+                Some(data.len() as u64),
+            );
+            assert_eq!(sink, bulk, "window log {window_log}");
+        }
+        // Dictionary frames keep the windowed header and declare there too.
+        if let Ok(dict) = std::fs::read("./dict_tests/dictionary") {
+            let data = textish(128 * 1024);
+            let opts = || {
+                EncoderOptions::new(Level::Fastest)
+                    .dictionary(&dict)
+                    .pledged_size(Some(data.len() as u64))
+            };
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts()).unwrap();
+            enc.write_all(&data).unwrap();
+            enc.finish().unwrap();
+            let bulk = bulk::compress_with(&data, &opts()).unwrap();
+            assert_eq!(sink, bulk);
+        }
+    }
     /// a keep-class frame whose clamped window lands in the bulk capture's
     /// class must share the bulk grid, strips and JobPrefix arming, so the
     /// pledged stream is byte-identical to bulk mt — without it the clamped
@@ -952,8 +1049,14 @@ mod mt {
         }
         let st = encoding::compress_slice_to_vec(&data, Level::Balanced);
         for (workers, checksum) in [(4u32, true), (4, false), (8, true)] {
-            let bulk_mt =
-                encoding::mt::compress_slice_mt(&data, Level::Balanced, checksum, workers, None);
+            let bulk_mt = encoding::mt::compress_slice_mt(
+                &data,
+                Level::Balanced,
+                checksum,
+                workers,
+                None,
+                None,
+            );
             let streamed = encode_write(
                 &data,
                 1024 * 1024,
@@ -1000,7 +1103,7 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None);
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1081,7 +1184,7 @@ mod mt {
         let a = flushed(1024 * 1024);
         assert_eq!(a, flushed(128 * 1024), "flush-cancelled determinism");
         assert_both_decoders(&a, &data, "flush-cancelled mid-band");
-        let armed = encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None);
+        let armed = encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None, None);
         assert!(
             a.len() > armed.len() + armed.len() / 2,
             "the flush-cancelled frame must pay the stock parse: {} vs armed {}",
@@ -1133,7 +1236,7 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None);
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1148,7 +1251,7 @@ mod mt {
             assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} fullband stream"));
             let again = encode_write(&data, MIB, level, 8, true, Some(data.len() as u64));
             assert_eq!(again, bulk_mt4, "{level:?}: run-to-run determinism");
-            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None);
+            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None, None);
             assert!(
                 bulk_mt4.len() <= st.len() + st.len() / 20,
                 "{level:?}: the far class must survive the self-fill: stream-mt {} vs armed st {}",

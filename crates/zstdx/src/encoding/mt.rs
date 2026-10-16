@@ -102,12 +102,19 @@ pub fn mt_job_size_for(
 /// [`super::compress_slice_to_vec` modulo the checksum flag`) when the input
 /// is too small, only one worker is requested, the level stores raw blocks,
 /// or the process has a single usable core.
+///
+/// `declared` is the caller's header content-size declaration: the fallback
+/// slice frame carries it as given, while the job path defaults an absent
+/// declaration to the input size (the whole input is known here, so the
+/// decoders preallocate exactly and the parallel decode path can partition
+/// up front — the fallback's smaller frames never profit from it).
 pub fn compress_slice_mt(
     src: &[u8],
     level: Level,
     checksum: bool,
     workers: u32,
     window_log: Option<u32>,
+    declared: Option<u64>,
 ) -> Vec<u8> {
     let checksum = checksum && cfg!(feature = "hash");
     if workers < 2
@@ -115,10 +122,16 @@ pub fn compress_slice_mt(
         || level == Level::Uncompressed
         || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
     {
-        return super::compress_slice_shaped(src, level, checksum, crate::InputShape {
-            len: None,
-            window_log,
-        });
+        return super::compress_slice_shaped_declared(
+            src,
+            level,
+            checksum,
+            crate::InputShape {
+                len: None,
+                window_log,
+            },
+            declared,
+        );
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
@@ -268,9 +281,9 @@ pub fn compress_slice_mt(
     let block_overhead = 3 * (src.len() / MAX_BLOCK_SIZE as usize + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     FrameHeader {
-        // The whole input is known here, so pledge it: decoders preallocate
-        // exactly and the parallel decode path can partition up front.
-        frame_content_size: Some(src.len() as u64),
+        // An absent declaration defaults to the input size here (see the
+        // function docs); a present one is the caller's exact contract.
+        frame_content_size: declared.or(Some(src.len() as u64)),
         single_segment: false,
         content_checksum: checksum,
         dictionary_id: None,
@@ -1189,19 +1202,19 @@ mod tests {
         for (i, b) in tail.iter().enumerate() {
             src[(2 << 20) + i] = *b;
         }
-        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
         // Second call rides pooled states from the first.
-        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
         assert_eq!(one, two);
         // Mixed worker counts share one pool.
-        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None);
-        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None, None);
+        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
         assert_eq!(one, w4);
         assert_eq!(one, again8);
         // A different level between two balanced calls: the pool must
         // reconfigure without residue.
-        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None);
-        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None);
+        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None, None);
+        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
         assert_eq!(one, mixed);
         // And the frame still roundtrips.
         let mut back = vec![0u8; src.len()];
@@ -1327,8 +1340,8 @@ mod tests {
         // 32 MiB at two workers grids 8 MiB jobs, so job zero holds the
         // head copy plus ~3.25 MiB of copy two; the capture engages (the
         // head above).
-        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None);
-        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None);
+        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None, None);
+        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None, None);
         for (name, frame) in [("st", &st), ("mt", &mt)] {
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
@@ -1386,9 +1399,9 @@ mod tests {
         }
         let random = lcg(data.len());
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None, None);
             for (name, frame) in [("st", &st), ("mt4", &mt4)] {
                 let mut out = vec![0u8; data.len()];
                 let mut decoder = FrameDecoder::new();
@@ -1414,7 +1427,7 @@ mod tests {
                 mt4.len(),
                 st.len()
             );
-            let stock_random = compress_slice_mt(&random, level, true, 4, None);
+            let stock_random = compress_slice_mt(&random, level, true, 4, None, None);
             assert!(
                 mt4.len() * 2 < stock_random.len(),
                 "{level:?}: armed {} vs random {}",
@@ -1425,7 +1438,7 @@ mod tests {
             // window — the same header bytes a below-band random source
             // carries (the FCS tail differs; the prefix compared here does
             // not).
-            let below_band = compress_slice_mt(&random[..15 * mib], level, true, 4, None);
+            let below_band = compress_slice_mt(&random[..15 * mib], level, true, 4, None, None);
             assert_eq!(
                 &stock_random[..6],
                 &below_band[..6],
@@ -1500,9 +1513,9 @@ mod tests {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None, None);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder
@@ -1515,7 +1528,7 @@ mod tests {
             assert_eq!(mt4, mt8, "{level:?}: mt4 != mt8");
             assert_eq!(
                 mt8,
-                compress_slice_mt(&data, level, true, 8, None),
+                compress_slice_mt(&data, level, true, 8, None, None),
                 "{level:?}: run-to-run determinism"
             );
             assert!(
@@ -1560,7 +1573,7 @@ mod tests {
             for workers in [2u32, 4] {
                 for checksum in [true, false] {
                     let compressed =
-                        compress_slice_mt(&data, Level::Fastest, checksum, workers, None);
+                        compress_slice_mt(&data, Level::Fastest, checksum, workers, None, None);
                     // our decoder, exact-size output slice
                     let mut out = vec![0u8; data.len()];
                     let mut decoder = FrameDecoder::new();
@@ -1584,8 +1597,8 @@ mod tests {
     #[test]
     fn mt_output_is_deterministic() {
         let data = textish(3 * 1024 * 1024);
-        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None);
-        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None);
+        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None, None);
+        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None, None);
         assert_eq!(a, b);
     }
 
@@ -1594,8 +1607,8 @@ mod tests {
     #[test]
     fn mt_ratio_stays_close_to_single_thread() {
         let data = textish(6 * 1024 * 1024);
-        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None);
+        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None, None);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None);
         assert!(
             mt.len() <= st.len() + st.len() / 50,
             "single {} vs multi {}",
@@ -1610,7 +1623,7 @@ mod tests {
     fn mt_chain_levels_roundtrip() {
         let data = textish(5 * 1024 * 1024);
         for level in [Level::Fast, Level::Balanced] {
-            let compressed = compress_slice_mt(&data, level, true, 4, None);
+            let compressed = compress_slice_mt(&data, level, true, 4, None, None);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&compressed, &mut out).unwrap();
@@ -1634,8 +1647,8 @@ mod tests {
         let unit = textish(300 * 1024);
         let data: Vec<u8> = (0..24).flat_map(|_| unit.iter().copied()).collect();
         for level in [Level::Fastest, Level::Fast, Level::Balanced] {
-            let st = compress_slice_mt(&data, level, true, 1, None);
-            let mt = compress_slice_mt(&data, level, true, 4, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None);
+            let mt = compress_slice_mt(&data, level, true, 4, None, None);
             assert!(
                 mt.len() <= st.len() + st.len() / 50,
                 "{level:?}: periodic data must match across jobs, mt {} vs st {}",
@@ -1689,9 +1702,9 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None);
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None);
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder
@@ -1714,7 +1727,7 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None)
+            compress_slice_mt(&data, Level::Balanced, true, 4, None, None)
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -1763,9 +1776,9 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None);
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None);
         // Roundtrip through both decoders.
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -1789,7 +1802,7 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None)
+            compress_slice_mt(&data, Level::Balanced, true, 4, None, None)
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -1804,7 +1817,7 @@ mod tests {
     #[test]
     fn small_inputs_fall_back_identically() {
         let data = textish(64 * 1024);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None);
         let st = crate::encoding::compress_slice_to_vec(&data, Level::Fastest);
         assert_eq!(mt, st);
     }

@@ -290,6 +290,22 @@ pub fn compress_slice_shaped(
     checksum: bool,
     shape: crate::InputShape,
 ) -> Vec<u8> {
+    compress_slice_shaped_declared(src, level, checksum, shape, None)
+}
+
+/// [`compress_slice_shaped`] with the frame content size `declared` in the
+/// header. The declaration takes the streaming core's exact header shape —
+/// the single-segment form whenever the row's window already covers the
+/// size, the windowed form (dictionary frames, sizes past the window)
+/// otherwise — so a stream pledged to the same size and this entry produce
+/// byte-identical frames. `None` leaves the header undeclaring.
+pub(crate) fn compress_slice_shaped_declared(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+    declared: Option<u64>,
+) -> Vec<u8> {
     let mut shape = shape;
     shape.len = Some(src.len() as u64);
     // The fast rows' mid-size band arms on the pre-header far-class
@@ -308,14 +324,14 @@ pub fn compress_slice_shaped(
         // frame's own blocks through the full pipeline, and only a Shrink
         // verdict restarts the frame (see `compress_with_state_donated`).
         let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
-        let output = compress_with_state_donated(&mut state, src, level, checksum, shape);
+        let output = compress_with_state_donated(&mut state, src, level, checksum, shape, declared);
         return_slice_state(state);
         return output;
     }
     // The frame's head decides its chain reach (see reach_probe).
     let choice = reach_probe::probe_reach_choice(src, level, shape);
     let mut state = take_slice_state(level, shape, choice, ldm);
-    let output = compress_with_state(&mut state, src, level, checksum);
+    let output = compress_with_state(&mut state, src, level, checksum, declared);
     return_slice_state(state);
     output
 }
@@ -325,6 +341,7 @@ fn compress_with_state(
     src: &[u8],
     level: Level,
     checksum: bool,
+    declared: Option<u64>,
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
     // Worst case (every block raw) is the input size plus block headers;
@@ -334,12 +351,16 @@ fn compress_with_state(
     let block_size = state.matcher.block_size();
     let block_overhead = 3 * (src.len() / header_floor(level, block_size) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    let window = state.matcher.window_size();
     let header = FrameHeader {
-        frame_content_size: None,
-        single_segment: false,
+        frame_content_size: declared,
+        // libzstd's frame-header shape (the streaming core's `configure`): a
+        // declared size the window already covers drops the window
+        // descriptor for the single-segment form.
+        single_segment: declared.is_some_and(|n| n <= window),
         content_checksum: checksum && cfg!(feature = "hash"),
         dictionary_id: None,
-        window_size: Some(state.matcher.window_size()),
+        window_size: Some(window),
     };
     header.serialize(&mut output);
     let max_window = state.matcher.window_size();
@@ -456,17 +477,19 @@ fn compress_with_state_donated(
     level: Level,
     checksum: bool,
     shape: crate::InputShape,
+    declared: Option<u64>,
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
     let block_size = state.matcher.block_size();
     let block_overhead = 3 * (src.len() / header_floor(level, block_size) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    let window = state.matcher.window_size();
     let header = FrameHeader {
-        frame_content_size: None,
-        single_segment: false,
+        frame_content_size: declared,
+        single_segment: declared.is_some_and(|n| n <= window),
         content_checksum: checksum && cfg!(feature = "hash"),
         dictionary_id: None,
-        window_size: Some(state.matcher.window_size()),
+        window_size: Some(window),
     };
     header.serialize(&mut output);
     let max_window = state.matcher.window_size();
@@ -520,12 +543,13 @@ fn compress_with_state_donated(
         state.matcher.restart_shrunk(level);
         hasher = SliceChecksum::new(src.len(), checksum);
         output.clear();
+        let window = state.matcher.window_size();
         let header = FrameHeader {
-            frame_content_size: None,
-            single_segment: false,
+            frame_content_size: declared,
+            single_segment: declared.is_some_and(|n| n <= window),
             content_checksum: checksum && cfg!(feature = "hash"),
             dictionary_id: None,
-            window_size: Some(state.matcher.window_size()),
+            window_size: Some(window),
         };
         header.serialize(&mut output);
         emit_slice_blocks(
@@ -569,19 +593,23 @@ fn compress_with_state_donated(
 /// but through the owned-window matcher (the dictionary cannot join the
 /// borrowed zero-copy window, so blocks stage through the matcher's own
 /// buffer), with the dictionary's id in the header. `state` must have been
-/// reset through [`super::dictionary::reset_with_dictionary`].
+/// reset through [`super::dictionary::reset_with_dictionary`]. A declared
+/// content size lands in the header, but the frame stays windowed (the
+/// dictionary's history reaches past the content, as the streaming core
+/// keeps it).
 pub(crate) fn compress_with_state_dictionary(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
     dict_id: Option<u32>,
     checksum: bool,
+    declared: Option<u64>,
 ) -> Vec<u8> {
     let mut hasher = SliceChecksum::new(src.len(), checksum);
     let block_size = state.matcher.block_size();
     let block_overhead = 3 * (src.len() / block_size.min(pre_split::SPLIT_MIN) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
     let header = FrameHeader {
-        frame_content_size: None,
+        frame_content_size: declared,
         single_segment: false,
         content_checksum: checksum && cfg!(feature = "hash"),
         dictionary_id: dict_id,
@@ -619,22 +647,24 @@ pub(crate) fn compress_with_state_dictionary(
     output
 }
 
-/// [`compress_slice_shaped`] with a parsed dictionary: dictionary content
-/// as match history, its entropy tables seeding the first blocks, its id
-/// in the header. Runs single-threaded through the owned-window matcher.
+/// [`compress_slice_shaped_declared`] with a parsed dictionary: dictionary
+/// content as match history, its entropy tables seeding the first blocks,
+/// its id in the header. Runs single-threaded through the owned-window
+/// matcher.
 pub(crate) fn compress_slice_with_dictionary(
     src: &[u8],
     level: Level,
     checksum: bool,
     shape: crate::InputShape,
     dict: &super::dictionary::EncDictionary,
+    declared: Option<u64>,
 ) -> Vec<u8> {
     let mut shape = shape;
     let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
     shape.len = Some(len);
     let mut state = new_owned_state();
     super::dictionary::reset_with_dictionary(&mut state, dict, level, shape);
-    compress_with_state_dictionary(&mut state, src, dict.header_id(), checksum)
+    compress_with_state_dictionary(&mut state, src, dict.header_id(), checksum, declared)
 }
 
 /// Compress the blocks of one multithreaded job into `output`: no frame

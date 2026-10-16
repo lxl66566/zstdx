@@ -2,10 +2,10 @@
 //! and the streaming-encode state behind `ZSTD_compressStream2`.
 //!
 //! The context owns zstdx-side state objects and never touches codec
-//! internals: one-shot compression rides a streaming encoder core over a
-//! staging `Vec` (the only public path that pledges the content size into
-//! the frame header, as libzstd does by default), and the streaming entries
-//! reuse the same encoder across calls with a delivered-cursor sink.
+//! internals: one-shot compression rides the zero-copy bulk slice core with
+//! the source size declared (the streaming entries' byte-identical frame
+//! without the input staging), and the streaming entries reuse one encoder
+//! across calls with a delivered-cursor sink.
 //!
 //! libzstd's parameter model splits in two: the sticky parameters (level,
 //! window, frame flags, workers) apply to `compress2` and the streaming
@@ -158,6 +158,14 @@ pub enum LoadedDict {
 
 /// One-shot compression of `src` into `dst`; returns the written length.
 /// `dict` overrides the settings' dictionary for this call only.
+///
+/// Rides the zero-copy bulk slice core (the borrowed matcher window and
+/// straight-to-buffer blocks) with the source size declared — byte-identical
+/// to the streaming core over the same options, without its input staging.
+/// The one cell the slice core cannot express: the multithreaded slice path
+/// always declares its content size (the decoder's piece-partition policy),
+/// so `nbWorkers >= 2` with the content-size flag off keeps the streaming
+/// core, which honors the flag.
 pub fn compress_oneshot(
     settings: &Settings,
     dict: Option<&zstdx::EncoderDictionary>,
@@ -169,12 +177,16 @@ pub fn compress_oneshot(
     if let Some(dict) = dict {
         options = options.parsed_dictionary(dict);
     }
-    let sink = Vec::with_capacity(crate::compress_bound(src.len()));
-    let mut encoder =
-        zstdx::stream::write::Encoder::with_options(sink, options).map_err(|e| map_encode(&e))?;
-    encoder.write_all(src).map_err(|e| map_io(&e))?;
-    encoder.do_finish().map_err(|e| map_encode(&e))?;
-    copy_out(encoder.get_ref(), dst)
+    if settings.workers >= 2 && !settings.content_size {
+        let sink = Vec::with_capacity(crate::compress_bound(src.len()));
+        let mut encoder = zstdx::stream::write::Encoder::with_options(sink, options)
+            .map_err(|e| map_encode(&e))?;
+        encoder.write_all(src).map_err(|e| map_io(&e))?;
+        encoder.do_finish().map_err(|e| map_encode(&e))?;
+        return copy_out(encoder.get_ref(), dst);
+    }
+    let compressed = zstdx::bulk::compress_with(src, &options).map_err(|e| map_encode(&e))?;
+    copy_out(&compressed, dst)
 }
 
 /// Move a finished frame into the caller's buffer.
