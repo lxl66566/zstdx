@@ -426,6 +426,102 @@ fn pos_entry_roundtrip_across_cycles() {
     assert_eq!(unpack_pos(0, 1 << 40), None);
 }
 
+/// Collect one scan's sequence stream as (ll, offset, ml) triples over a
+/// borrowed window placed at absolute offset `base`: `hist` bytes of
+/// history prefilled, the rest scanned as one block.
+fn scan_triples_at_base(
+    level: crate::Level,
+    data: &[u8],
+    hist: usize,
+    base: u64,
+) -> Vec<(u32, u32, u32)> {
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(level);
+    driver.prefill_window(&data[..hist], base);
+    driver.adopt_window(data, base);
+    driver.set_block(base + hist as u64, base + data.len() as u64);
+    let mut seqs = Vec::new();
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { .. } => {},
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => seqs.push((literals.len() as u32, offset as u32, match_len as u32)),
+    });
+    seqs
+}
+
+/// The fast/dfast coordinate epoch (`fast_shift`) must make the scan
+/// translation-invariant: the same window driven at an absolute base past
+/// 2^33 emits the same sequence stream as at base 0. Without the rebase
+/// the packed entries truncate at 2^32 and the resolve rejects every hash
+/// candidate (the >4-GiB-stream defect), collapsing the base-2^33 run to
+/// literal-only output — the payload below keeps every match short and
+/// seedless (a mutation every 16 bytes) so only the hash tables can carry
+/// it.
+#[test]
+fn fast_dfast_epoch_translational_invariance() {
+    // A 512 KiB payload of 64 KiB tiles, each copy mutated every 16
+    // bytes: dense short hash matches at one-tile distance, no run long
+    // enough for the strip seed (48 bytes) or a repcode chain.
+    let mut x = 0x243f_6a88_85a3_08d3u64;
+    let mut tile = alloc::vec![0u8; 64 * 1024];
+    for b in &mut tile {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    let mut data = Vec::with_capacity(512 * 1024);
+    data.extend_from_slice(&tile);
+    for t in 1..8 {
+        data.extend_from_slice(&tile);
+        let start = data.len() - tile.len();
+        for i in (0..tile.len()).step_by(16) {
+            data[start + i] ^= t + 1;
+        }
+    }
+    let hist = 256 * 1024;
+    for level in [crate::Level::Fastest, crate::Level::Fast] {
+        let at_zero = scan_triples_at_base(level, &data, hist, 0);
+        assert!(
+            at_zero.iter().any(|&(_, _, ml)| ml >= 5),
+            "{level:?}: the payload must produce real hash matches"
+        );
+        let at_giant = scan_triples_at_base(level, &data, hist, (1 << 33) + 12345);
+        assert_eq!(at_zero, at_giant, "{level:?}: sequence stream at 2^33");
+    }
+}
+
+/// [`fast_epoch_advance`]'s floor choice: the streaming shape (window
+/// base tracks the scan) re-anchors at the window base, the borrowed
+/// full-input shape (window base stuck at 0) at `pos - FAST_EPOCH_SPAN`,
+/// and both stay at or below the scan position.
+#[test]
+fn fast_epoch_advance_floor_choice() {
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(crate::Level::Fastest);
+    driver.fast_shift = 0;
+    driver.pos = super::FAST_EPOCH_SPAN + 5;
+    driver.win_base = 1 << 20;
+    driver.fast_epoch_advance();
+    assert_eq!(
+        driver.fast_shift,
+        1 << 20,
+        "streaming floor is the window base"
+    );
+    driver.pos = (1 << 33) + 7;
+    driver.win_base = 0;
+    driver.fast_epoch_advance();
+    assert_eq!(
+        driver.fast_shift,
+        (1 << 33) + 7 - super::FAST_EPOCH_SPAN,
+        "borrowed floor rides the scan"
+    );
+    assert!(driver.fast_shift <= driver.pos);
+}
+
 /// The seed scan must return exactly the nearest qualifying position a
 /// naive byte-wise walk would find, on every path: the AVX-512 block
 /// walk (residue classes mod 8, block boundaries, the anchor's trivial

@@ -32,9 +32,24 @@ impl MatchGeneratorDriver {
         // Hot state lives in locals for the whole loop: the emit helpers
         // used to take `&mut self`, which forced a reload of every cursor
         // from memory after each match.
-        let win = window_slice(&self.win, self.ext.as_ref());
-        let win_base = self.win_base;
-        let block_end = self.block_end;
+        //
+        // Coordinate epoch (see `fast_shift` on the driver): the whole
+        // body below is coordinate-pure — every window index derives
+        // from `pos - win_base` and every table entry from the same
+        // rebased positions — so running the block in `abs - shift`
+        // coordinates leaves the loop's arithmetic untouched while
+        // keeping the packed entries inside their 4-GiB truncation
+        // horizon at any stream size. The shift only moves at table
+        // clears, so the folded constants agree with the entries already
+        // in the table. When the shift passes the window base (a
+        // borrowed full-input window past the epoch span), the window
+        // itself is sliced forward to keep indexing non-negative.
+        let shift = self.fast_shift;
+        debug_assert!(self.pos >= shift && self.anchor >= shift && self.block_end >= shift);
+        let off = shift.saturating_sub(self.win_base) as usize;
+        let win = &window_slice(&self.win, self.ext.as_ref())[off..];
+        let win_base = self.win_base.saturating_sub(shift);
+        let block_end = self.block_end - shift;
         // saturating: tiny first blocks never reach an emit, so the bound is
         // never consulted when win.len() < HASH_READ.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
@@ -72,8 +87,8 @@ impl MatchGeneratorDriver {
         // Armed frames keep the stock scan domain through `chain_reach`
         // (the widened window is the far domain); stock frames have none.
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
-        let mut pos = self.pos;
-        let mut anchor = self.anchor;
+        let mut pos = self.pos - shift;
+        let mut anchor = self.anchor - shift;
         let mut miss_count = self.miss_count;
         let mut rep = self.rep;
         let mut rep_pending = self.rep_pending;
@@ -99,8 +114,9 @@ impl MatchGeneratorDriver {
         let mut ldm_i = 0usize;
         let mut ldm_won = false;
 
-        // Resolve a table entry to a window index. The truncated absolute
-        // position is rebuilt as a *distance* from the scanning position:
+        // Resolve a table entry to a window index. The truncated
+        // (epoch-rebased, see `fast_shift`) position is rebuilt as a
+        // *distance* from the scanning position:
         // `dist = pos - (entry - 1)` wraps to a huge u64 for both the empty
         // sentinel (dist = pos + 1 > reach) and candidates from the previous
         // 4 GiB cycle, so the window-range check `dist <= reach` (reach =
@@ -111,14 +127,13 @@ impl MatchGeneratorDriver {
         // predictable branch instead of a three-way check per probe
         // (libzstd's selectAddr trick).
         //
-        // Known regime cost: the zero-extended entry subtraction keeps
-        // dist >= pos + 1 - 2^32, which exceeds every window reach once pos
-        // passes 2^32 + max_window — from there on all hash candidates
-        // stay rejected for the rest of the frame (repcodes and the miss
-        // ramp keep the output valid; ratio degrades toward rep-only).
-        // The u32 wrap-domain resolve admits in-window candidates at any
-        // stream size but costs hot-path instructions here — measured out
-        // four ways, see the negative notes before retrying.
+        // The zero-extended entry subtraction keeps dist >= pos + 1 - 2^32,
+        // so a live in-window candidate needs the epoch span to hold (see
+        // `FAST_EPOCH_SPAN`) — the coordinate rebase above supplies that at
+        // any stream size without touching this arithmetic. The u32
+        // wrap-domain resolve that would admit in-window candidates in raw
+        // absolute coordinates costs hot-path instructions here — measured
+        // out four ways, see the negative notes before retrying.
         //
         // SAFETY: none needed — the select keeps the index inside the
         // window either way.
@@ -157,7 +172,12 @@ impl MatchGeneratorDriver {
         // instantiation) costs 3% fewer instructions but regressed
         // text.fastest wall by 7% — the third macro instantiation displaces
         // the hot blocks; do not retry without a code-layout story.
-        let ramp = self.ramp;
+        // The ramp's absolute band rides the same rebase (its comparisons
+        // sit against rebased candidates); OFF gates stay OFF under the
+        // shift, and the depth is a distance.
+        let mut ramp = self.ramp;
+        ramp.start = ramp.start.saturating_sub(shift);
+        ramp.end = ramp.end.saturating_sub(shift);
         // Small-input policy bars, compile-time per instantiation (a
         // runtime-variable bar in this loop cost text-16K fastest -22%
         // wall — the compare and the shift must fold): the stock bars
@@ -579,7 +599,7 @@ impl MatchGeneratorDriver {
         // like blocks — the seeded state is the scan's, not a segment's.
         'segments: loop {
             let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
-                end = s.split;
+                end = s.split - shift;
                 Some(*s)
             } else {
                 end = block_end;
@@ -605,7 +625,7 @@ impl MatchGeneratorDriver {
                 break 'segments;
             };
             ldm_i += 1;
-            debug_assert_eq!(seq.split, end);
+            debug_assert_eq!(seq.split - shift, end);
             // The 4-byte guard only defends a stale candidate (generate
             // verified the whole span at fill time); a failure drops it and
             // re-opens the split as gap bytes of the next segment, the
@@ -651,7 +671,7 @@ impl MatchGeneratorDriver {
             // the next candidate's split; a chain that covers a split drops
             // that candidate (the coverage rule — its span is emitted
             // content).
-            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split);
+            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split - shift);
             let mut cursor = anchor;
             if rep_pending == 0 {
                 cursor = emit.rep1_chain::<RAMPED>(win, None, anchor, bound, &mut rep, ramp);
@@ -674,8 +694,10 @@ impl MatchGeneratorDriver {
         // A zero-sequence block stages nothing: its literals are exactly the
         // block, which the caller reads through get_last_space() instead of
         // paying a whole-block copy into and out of the scratch buffer.
-        self.pos = block_end;
-        self.anchor = block_end;
+        // The save-backs run in true coordinates (the field is unchanged by
+        // the scan; the local block_end is rebased).
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
         self.miss_count = miss_count;
         self.rep = rep;
         self.rep_pending = rep_pending;

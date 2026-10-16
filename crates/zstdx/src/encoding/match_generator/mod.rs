@@ -213,6 +213,19 @@ pub struct MatchGeneratorDriver {
     /// cannot carry a 32-bit shift, and their table sizes make the clear
     /// cheap).
     head_origin: u64,
+    /// Coordinate-rebasing shift of the fast/dfast tables' packed
+    /// positions (see [`Self::fast_epoch_advance`]): every entry those
+    /// tables hold was written at `abs - fast_shift`, and the scans run
+    /// in the same rebased coordinates, so the u64 resolve's truncated-
+    /// entry rebuild stays exact at any stream size (the entries' 4-GiB
+    /// truncation horizon rides the shift instead of the frame origin).
+    /// Plain strip/dictionary fills restart it at the fill's own base
+    /// (the tables were just cleared); the windowed capture band and
+    /// mid-frame streaming advance it — with a clear — once
+    /// `pos - fast_shift` passes [`FAST_EPOCH_SPAN`]. The
+    /// chain/row/tree strategies never touch it; their own regimes are
+    /// documented separately.
+    fast_shift: u64,
     /// High-water mark of the positions this state has written into the
     /// chain heads since the last origin advance, stashed at each reset
     /// (before the cursor zeroes; `max` because the pooled bulk path
@@ -418,6 +431,15 @@ pub(crate) const SPF_SEG: u64 = 1024 * 1024;
 /// would pass this bar — once per ~1 GiB of cumulative positions on one
 /// pooled state, keeping frames below 3 GiB on exact semantics.
 const HEAD_ORIGIN_CAP: u64 = 1 << 30;
+
+/// Span of one fast/dfast position epoch (`fast_shift`): the rebased
+/// coordinates of a live entry and a scanning position must stay within
+/// 2^32 of each other, and every strategy on these tables caps its
+/// match window far below the half-span headroom this leaves (the
+/// widest armed reach is 4 MiB). Advancing past it is one table clear
+/// per ~2 GiB of frame, so the epoch never costs a reachable candidate
+/// (entries older than the clear are already beyond every reach).
+pub(super) const FAST_EPOCH_SPAN: u64 = 1 << 31;
 
 /// Captured strip-fill state of a [`MatchGeneratorDriver`] (the streaming
 /// core's shared prefix fill): the chain row's head/chain grid tables plus
@@ -709,6 +731,7 @@ impl MatchGeneratorDriver {
             // Epoch 0 is the never-valid state of a zeroed table.
             opt_origin: 0,
             head_origin: 0,
+            fast_shift: 0,
             strip_mark: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
@@ -777,6 +800,7 @@ impl MatchGeneratorDriver {
             gap_start: u64::MAX,
             opt_origin: 0,
             head_origin: 0,
+            fast_shift: 0,
             strip_mark: 0,
             miss_count: 0,
             covered_fill: CoveredFill::Dense,
@@ -1815,6 +1839,20 @@ impl MatchGeneratorDriver {
             clear_table(&mut self.tables[..self.second]);
             #[cfg(feature = "job_trace")]
             super::job_trace::add_clear(trace_clear);
+            // The clear restarts the fast/dfast tables' coordinate epoch
+            // at the fill's base — except the windowed capture band
+            // (`Defer`): its jobs adopt a window reaching below the
+            // strip base, so no fill-time floor is slice-free there and
+            // the scan-side epoch trigger re-anchors instead (first
+            // block past the span, at the adopted window floor). Plain
+            // strips cover their job's whole adopt window
+            // (`chain_overlap == overlap`), the dictionary grid carries
+            // base 0, and empty frame-start strips keep 0.
+            if matches!(self.params.strategy, Strategy::Fast | Strategy::Dfast(_))
+                && ldm_fill == LdmStripFill::Ingest
+            {
+                self.fast_shift = base;
+            }
         }
         // The row heads choose slots, so they carry the same per-job
         // determinism contract as the head table (a stale head would make
@@ -1893,7 +1931,9 @@ impl MatchGeneratorDriver {
             Strategy::Fast => {
                 // Sparse grid, oldest-to-newest, newest-wins per slot — the
                 // single-strategy table has no chain to walk, so a buried
-                // twin is unreachable (see PREFILL_STRIDE).
+                // twin is unreachable (see PREFILL_STRIDE). Positions ride
+                // the epoch shift set above the strategy arms.
+                let shift = self.fast_shift;
                 let table = &mut self.tables[..self.second];
                 let log = self.params.hash_log;
                 match grid {
@@ -1905,7 +1945,7 @@ impl MatchGeneratorDriver {
                         let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
                         let mut idx = last.saturating_sub(retain);
                         while idx < last {
-                            insert_at(data, table, idx, base + idx as u64, log);
+                            insert_at(data, table, idx, base + idx as u64 - shift, log);
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -1917,8 +1957,8 @@ impl MatchGeneratorDriver {
                         // retention cap would drop dictionary-head entries.
                         let mut idx = 0;
                         while idx < last {
-                            insert_at(data, table, idx, base + idx as u64, log);
-                            backfill_empty(table, data, base, idx, log, last);
+                            insert_at(data, table, idx, base + idx as u64 - shift, log);
+                            backfill_empty(table, data, base - shift, idx, log, last);
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -1926,6 +1966,7 @@ impl MatchGeneratorDriver {
                 self.acquire_seed(data, last);
             },
             Strategy::Dfast(small_log) => {
+                let shift = self.fast_shift;
                 let long_log = self.params.hash_log;
                 // The short table keys 4-byte windows on dictionary frames
                 // (the scan's `MM4` row; see `dict_row`).
@@ -1935,7 +1976,7 @@ impl MatchGeneratorDriver {
                 while idx < last {
                     // SAFETY: both hashes are masked to their tables' sizes.
                     unsafe {
-                        let entry = pack_pos(base + idx as u64);
+                        let entry = pack_pos(base + idx as u64 - shift);
                         *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_width(data, idx, small_log, width)) =
                             entry;
@@ -1952,19 +1993,19 @@ impl MatchGeneratorDriver {
                                 idx + 1,
                                 small_log,
                                 width,
-                            )) = pack_pos(base + idx as u64 + 1);
+                            )) = pack_pos(base + idx as u64 + 1 - shift);
                             *small.get_unchecked_mut(hash_at_width(
                                 data,
                                 idx + 2,
                                 small_log,
                                 width,
-                            )) = pack_pos(base + idx as u64 + 2);
+                            )) = pack_pos(base + idx as u64 + 2 - shift);
                         }
                     }
                     if grid == FillGrid::Dictionary {
                         // The long table takes the empty-slot backfill
                         // (libzstd's fillDoubleHashTableForCDict).
-                        backfill8_empty(long, data, base, idx, long_log, last);
+                        backfill8_empty(long, data, base - shift, idx, long_log, last);
                     }
                     idx += PREFILL_STRIDE;
                 }
@@ -2240,6 +2281,10 @@ impl Matcher for MatchGeneratorDriver {
         self.block_end = 0;
         self.anchor = 0;
         self.block_start = 0;
+        // Frame positions restart at zero; the fast/dfast tables' residue
+        // stays in the documented don't-clear semantics, re-read against
+        // the fresh frame's unshifted coordinates.
+        self.fast_shift = 0;
         self.strategy_phase_reset();
         self.miss_count = 0;
         self.covered_fill = CoveredFill::Dense;
@@ -2392,6 +2437,14 @@ impl Matcher for MatchGeneratorDriver {
             return;
         }
         if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
+            // Fast/dfast epoch rollover first, so the gap fill below and
+            // the scan write the same rebased coordinates the cleared
+            // tables restart in.
+            if matches!(self.params.strategy, Strategy::Fast | Strategy::Dfast(_))
+                && self.pos - self.fast_shift > FAST_EPOCH_SPAN
+            {
+                self.fast_epoch_advance();
+            }
             self.catch_up_insertions();
             // The reopened gap is now table content (the helper filled it
             // up to its HASH_READ tail margin); the dictionary rows'
@@ -2833,7 +2886,7 @@ impl Matcher for MatchGeneratorDriver {
                     let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
                     // SAFETY: both hashes masked to their tables' sizes.
                     unsafe {
-                        let entry = pack_pos(self.block_start);
+                        let entry = pack_pos(self.block_start - self.fast_shift);
                         *self.tables.get_unchecked_mut(hl) = entry;
                         *self.tables.get_unchecked_mut(self.second + hs) = entry;
                     }
@@ -2843,7 +2896,7 @@ impl Matcher for MatchGeneratorDriver {
                         win,
                         &mut self.tables[..self.second],
                         idx,
-                        self.block_start,
+                        self.block_start - self.fast_shift,
                         self.params.hash_log,
                     );
                 },
@@ -2994,6 +3047,24 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Roll the fast/dfast tables into a fresh coordinate epoch (see
+    /// `fast_shift`): clear both tables and restart the shift at the
+    /// window floor — or at `pos - FAST_EPOCH_SPAN` when the window
+    /// itself spans past that (a borrowed full-input window on a >2-GiB
+    /// bulk encode, where the floor must move with the scan). Either
+    /// choice keeps the shift at or below every position the cleared
+    /// tables will hold and within one span of the scan, which is all the
+    /// truncated-entry resolve needs; the cleared entries are all beyond
+    /// every strategy's match reach, so the rollover costs no candidate.
+    fn fast_epoch_advance(&mut self) {
+        debug_assert!(matches!(
+            self.params.strategy,
+            Strategy::Fast | Strategy::Dfast(_)
+        ));
+        clear_table(&mut self.tables);
+        self.fast_shift = self.win_base.max(self.pos - FAST_EPOCH_SPAN);
+    }
+
     /// Dense catch-up fill for the table strategies: the positions an
     /// incompressibility-gated block skipped ([`Matcher::skip_if_incompressible`])
     /// become searchable again before the next scan reads the tables. Gated
@@ -3030,6 +3101,9 @@ impl MatchGeneratorDriver {
         let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
         let win = window_slice(&self.win, self.ext.as_ref());
         let mut idx = (from - win_base) as usize;
+        // The fast/dfast inserts ride their tables' coordinate epoch
+        // (`fast_shift`; zero on chain/row states, which never set it).
+        let shift = self.fast_shift;
         match self.params.strategy {
             Strategy::Fast => {
                 let log = self.params.hash_log;
@@ -3038,7 +3112,7 @@ impl MatchGeneratorDriver {
                         win,
                         &mut self.tables[..self.second],
                         idx,
-                        win_base + idx as u64,
+                        win_base + idx as u64 - shift,
                         log,
                     );
                     idx += 1;
@@ -3052,7 +3126,7 @@ impl MatchGeneratorDriver {
                     // SAFETY: both hashes are masked to their tables' sizes
                     // (same pair as the dfast prefill).
                     unsafe {
-                        let entry = pack_pos(win_base + idx as u64);
+                        let entry = pack_pos(win_base + idx as u64 - shift);
                         *long.get_unchecked_mut(hash8_at_log(win, idx, long_log)) = entry;
                         *small.get_unchecked_mut(hash_at_width(win, idx, small_log, width)) = entry;
                     }

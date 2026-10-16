@@ -35,7 +35,17 @@ impl MatchGeneratorDriver {
         literals: &mut Vec<u8>,
         seqs: &mut Vec<SeqWord>,
     ) {
-        let win = window_slice(&self.win, self.ext.as_ref());
+        // Coordinate epoch (see `fast_shift` on the driver, and the fast
+        // loop's entry note): the body below derives every absolute from
+        // the `win_base` local, so rebasing it — plus slicing the window
+        // forward when the shift passed the window base — runs the whole
+        // block in `abs - shift` coordinates with the loop arithmetic
+        // untouched, keeping the packed entries inside their 4-GiB
+        // truncation horizon at any stream size.
+        let shift = self.fast_shift;
+        debug_assert!(self.pos >= shift && self.anchor >= shift && self.block_end >= shift);
+        let off = shift.saturating_sub(self.win_base) as usize;
+        let win = &window_slice(&self.win, self.ext.as_ref())[off..];
         // Known rows instantiate with their logs as constants (the hash
         // shifts fold to immediates and the two shift registers free up);
         // clamped-window shapes pass [`RUNTIME_LOG`] for both.
@@ -49,9 +59,13 @@ impl MatchGeneratorDriver {
         } else {
             SMALL_LOG
         };
-        let win_base = self.win_base;
-        let ramp = self.ramp;
-        let block_end = self.block_end;
+        let win_base = self.win_base.saturating_sub(shift);
+        // The ramp's absolute band rides the same rebase; OFF gates stay
+        // OFF under the shift, and the depth is a distance.
+        let mut ramp = self.ramp;
+        ramp.start = ramp.start.saturating_sub(shift);
+        ramp.end = ramp.end.saturating_sub(shift);
+        let block_end = self.block_end - shift;
         let block_len = (block_end - win_base) as usize;
         // Probing hashes 8 bytes, so the last probeable window index; the
         // insert bound coincides with it (the window ends at the block), so
@@ -68,8 +82,11 @@ impl MatchGeneratorDriver {
         let mut seed_offset = self.seed_offset;
         let mut seed_hits = self.seed_hits;
         let mut seed_budget = self.seed_budget;
-        let mut anchor_idx = (self.anchor - win_base) as usize;
-        let mut ip_idx = (self.pos - win_base) as usize;
+        // Scan cursors in the rebased domain (the fields are true
+        // coordinates; `win_base` above is already rebased, so the shift
+        // comes out of the fields' side of the difference).
+        let mut anchor_idx = (self.anchor - shift - win_base) as usize;
+        let mut ip_idx = (self.pos - shift - win_base) as usize;
         // The scan's own table writes go through raw pointers: routing them
         // through the emit context's slice fields kept the pointers,
         // log shifts and tag stack-resident (a re-load per access, the
@@ -428,7 +445,7 @@ impl MatchGeneratorDriver {
         // blocks — the seeded state is the scan's, not a segment's.
         'segments: loop {
             let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
-                let e = s.split;
+                let e = s.split - shift;
                 seg_end = (e - win_base) as usize;
                 Some(*s)
             } else {
@@ -453,7 +470,7 @@ impl MatchGeneratorDriver {
                 break 'segments;
             };
             ldm_i += 1;
-            debug_assert_eq!(seq.split, win_base + seg_end as u64);
+            debug_assert_eq!(seq.split - shift, win_base + seg_end as u64);
             // The 4-byte guard only defends a stale candidate (generate
             // verified the whole span at fill time); a failure drops it and
             // re-opens the split as gap bytes of the next segment, the
@@ -504,14 +521,15 @@ impl MatchGeneratorDriver {
             // bounded at the next candidate's split; a chain that covers a
             // split drops that candidate (the coverage rule — its span is
             // emitted content).
-            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split);
+            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split - shift);
             let mut cursor = anchor_idx;
             if rep_pending == 0 {
                 let bound_limit = ((bound - win_base) as usize).saturating_sub(HASH_READ);
                 cursor =
                     emit.rep_chain::<RAMPED, true>(win, anchor_idx, bound_limit, &mut rep, ramp);
             }
-            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < win_base + cursor as u64 {
+            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split - shift < win_base + cursor as u64
+            {
                 ldm_i += 1;
             }
             if cursor >= block_len {
