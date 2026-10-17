@@ -134,7 +134,9 @@ impl HuffmanTable {
     }
 
     /// Completely empty the table then repopulate as a replica
-    /// of `other`.
+    /// of `other`. `bit_ranks` and `rank_indexes` stay empty: both are
+    /// fill scratch rebuilt at the top of every table fill from `bits`
+    /// (`build_table_from_weights`), never read between fills.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.decode.extend_from_slice(&other.decode);
@@ -142,7 +144,6 @@ impl HuffmanTable {
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.bits.extend_from_slice(&other.bits);
-        self.rank_indexes.extend_from_slice(&other.rank_indexes);
         self.x2.extend_from_slice(&other.x2);
         self.fse_table.reinit_from(&other.fse_table);
     }

@@ -115,7 +115,12 @@ impl FSETable {
         self.symbol_info = other.symbol_info;
     }
 
-    /// Empty the table and clear all internal state.
+    /// Empty the table and clear all internal state. `symbol_info` is
+    /// left as-is on purpose: it is fill scratch whose live symbol range
+    /// (zero-probability slots back to `DEFAULT`) is rewritten by every
+    /// `build_decoding_table` before any read, so a stale tail is never
+    /// observed and clearing 256 slots here would tax the per-block
+    /// rebuild.
     pub fn reset(&mut self) {
         self.symbol_counter.clear();
         self.symbol_probabilities.clear();
