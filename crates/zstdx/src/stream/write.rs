@@ -363,6 +363,21 @@ impl<W: Write> Decoder<W> {
         let last = b0 & 1 == 1;
         let block_type = (b0 >> 1) & 0b11;
         let size = ((b0 >> 3) as usize) | ((b1 as usize) << 5) | ((b2 as usize) << 13);
+        // The format's block maximum, the read side's
+        // `BlockSizeError::BlockSizeTooLarge`: without it a corrupt
+        // 21-bit size claim makes the pump stage bytes that never arrive
+        // instead of erroring.
+        if size > crate::common::MAX_BLOCK_SIZE as usize {
+            return Err(crate::Error::Frame(
+                FrameDecoderError::FailedToReadBlockHeader(
+                    crate::decoding::errors::BlockHeaderReadError::BlockSizeError(
+                        crate::decoding::errors::BlockSizeError::BlockSizeTooLarge {
+                            size: size as u32,
+                        },
+                    ),
+                ),
+            ));
+        }
         let body = match block_type {
             0 | 2 => size, // Raw / Compressed carry `size` content bytes
             1 => 1,        // RLE encodes a single byte

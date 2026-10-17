@@ -598,6 +598,35 @@ fn write_decoder_is_transparent_over_frames() {
     assert_eq!(sink, plain);
 }
 
+/// A block header claiming more than the format's 128 KiB maximum must
+/// error the write-shaped decoder at the header, not stage megabytes of
+/// body bytes that never arrive — the same input errors `BlockSizeTooLarge`
+/// on every read path.
+#[test]
+fn oversized_block_claim_errors_write_decoder() {
+    let compressed = bulk::compress(b"payload", Level::Fastest);
+    let mut corrupt = compressed.clone();
+    // Locate the first block header behind the frame header, then rewrite
+    // its 21-bit size field to 128 KiB + 1, keeping type and last-block
+    // bits.
+    let mut probe = compressed.as_slice();
+    crate::decoding::frame::read_frame_header(&mut probe).unwrap();
+    let header_len = compressed.len() - probe.len();
+    corrupt[header_len] = (corrupt[header_len] & 0x07) | (1 << 3);
+    corrupt[header_len + 1] = 0;
+    corrupt[header_len + 2] = 16;
+    let mut sink = Vec::new();
+    let mut dec = write::Decoder::new(&mut sink).unwrap();
+    let err = dec.write_all(&corrupt).unwrap_err();
+    let text = alloc::format!("{err}");
+    assert!(
+        text.contains("Blocksize was bigger"),
+        "unexpected error: {text}"
+    );
+    assert!(bulk::decompress(&corrupt, b"payload".len()).is_err());
+    assert!(crate::stream::decode_all(corrupt.as_slice()).is_err());
+}
+
 #[test]
 fn one_liner_functions_roundtrip() {
     let data: Vec<u8> = (0..150 * 1024).map(|i| (i * 31 % 251) as u8).collect();
