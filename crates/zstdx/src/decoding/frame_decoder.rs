@@ -732,6 +732,11 @@ impl FrameDecoder {
                 },
                 BlockType::RLE => {
                     let size = block_header.decompressed_size as usize;
+                    // Bounds before the byte read, the Raw arm's order, so
+                    // both arms consume the same input on error paths.
+                    if written + size > out.len() {
+                        return Err(err::TargetTooSmall);
+                    }
                     let mut buf = [0u8; 1];
                     source.read_exact(&mut buf[..]).map_err(|e| {
                         err::FailedToReadBlockBody(
@@ -741,9 +746,6 @@ impl FrameDecoder {
                             },
                         )
                     })?;
-                    if written + size > out.len() {
-                        return Err(err::TargetTooSmall);
-                    }
                     out[written..written + size].fill(buf[0]);
                     state.bytes_read_counter += 1;
                     written += size;
