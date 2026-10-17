@@ -436,6 +436,71 @@ fn probe_driver() -> Box<MatchGeneratorDriver> {
 #[cfg(not(feature = "std"))]
 fn return_probe_driver(_driver: Box<MatchGeneratorDriver>) {}
 
+/// Measure a donated probe's shrink side while `keep_side` runs the keep
+/// donation on the calling thread: a scope thread parses the shrink span
+/// concurrently, so the probe costs its longer side instead of the sum of
+/// both parses (jobdecomp put the serial probe at 45-72% of the balanced
+/// bulk-mt walls — every worker idles through it).
+///
+/// The concurrent shrink cannot know the keep cost, so it parses the full
+/// span with no landslide abort cap — the cap only shortens a measurement
+/// whose verdict is already decided (see [`parse_cost_with`]), so
+/// `decide_donated` reaches the same verdict from the full cost. The
+/// shrink rides the calling thread's pooled probe driver, moved across and
+/// back (the driver is `Send` by the same raw-window discipline the mt
+/// jobs use), so the pool's warmth stays on the steady thread.
+#[cfg(feature = "std")]
+pub(crate) fn measure_shrink_concurrent(
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+    keep_side: impl FnOnce() -> f64,
+) -> (f64, f64) {
+    let driver = probe_driver();
+    let (keep, shrink, driver) = std::thread::scope(|scope| {
+        let measurer = scope.spawn(move || {
+            let mut driver = driver;
+            let cost = parse_cost_with(
+                &mut driver,
+                head,
+                level,
+                shape,
+                ReachChoice::Shrink,
+                ProbeFeedback::Approx,
+                None,
+            );
+            (cost, driver)
+        });
+        let keep = keep_side();
+        let (shrink, driver) = measurer.join().unwrap();
+        (keep, shrink, driver)
+    });
+    return_probe_driver(driver);
+    (keep, shrink)
+}
+
+/// Single-threaded fallback: the keep donation first, then the shrink
+/// measurement on the same thread under the landslide abort cap (the one
+/// efficiency a second thread buys is hiddenness, and there is none).
+#[cfg(not(feature = "std"))]
+pub(crate) fn measure_shrink_concurrent(
+    head: &[u8],
+    level: Level,
+    shape: InputShape,
+    keep_side: impl FnOnce() -> f64,
+) -> (f64, f64) {
+    let keep = keep_side();
+    let shrink = parse_cost(
+        head,
+        level,
+        shape,
+        ReachChoice::Shrink,
+        ProbeFeedback::Approx,
+        Some(keep * KEEP_LANDSLIDE),
+    );
+    (keep, shrink)
+}
+
 /// [`parse_cost`] on a caller-supplied pooled driver: a donation running
 /// on an ephemeral pool worker cannot warm the thread-local driver, so it
 /// carries its own across encoders (see `mt::donate_span`).

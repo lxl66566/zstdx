@@ -527,10 +527,10 @@ fn donation_arming(capture_engages: bool) -> LdmArming {
 /// parse's true cost only when the span parses as that job would. `head`
 /// is the frame's first [`reach_probe::PROBE_SPAN`] bytes. Returns the
 /// measured keep cost and the encoded span; the caller takes the verdict
-/// (the shrink side measures separately — bulk serially on the calling
-/// thread, the stream core on a second pool worker) and disposes of the
-/// state (a Shrink verdict's returns to its pool, a Keep's becomes job
-/// zero's continuation state).
+/// (the shrink side measures separately — every donation entry runs it on
+/// another thread under the keep parse, see `measure_shrink_concurrent`)
+/// and disposes of the state (a Shrink verdict's returns to its pool, a
+/// Keep's becomes job zero's continuation state).
 pub(crate) fn donate_keep_span(
     state: &mut CompressState<MatchGeneratorDriver>,
     head: &[u8],
@@ -588,22 +588,13 @@ fn donate_job_zero_prefix(
     Vec<u8>,
 ) {
     let mut state = take_pooled_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
-    let (keep, output) = donate_keep_span(
-        &mut state,
-        &src[..reach_probe::PROBE_SPAN],
-        level,
-        shape,
-        ldm,
-    );
-    let shrink = reach_probe::parse_cost(
-        &src[..reach_probe::PROBE_SPAN],
-        level,
-        shape,
-        reach_probe::ReachChoice::Shrink,
-        reach_probe::ProbeFeedback::Approx,
-        // Same landslide abort as the bulk-ST path.
-        Some(keep * reach_probe::KEEP_LANDSLIDE),
-    );
+    let head = &src[..reach_probe::PROBE_SPAN];
+    let mut output = Vec::new();
+    let (keep, shrink) = reach_probe::measure_shrink_concurrent(head, level, shape, || {
+        let (keep_cost, span) = donate_keep_span(&mut state, head, level, shape, ldm);
+        output = span;
+        keep_cost
+    });
     let choice = reach_probe::decide_donated(keep, shrink, src, level, shape);
     (choice, state, output)
 }

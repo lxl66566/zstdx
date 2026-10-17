@@ -499,30 +499,31 @@ fn compress_with_state_donated(
     // eligibility gate keeps the frame far above it either way.
     let span = reach_probe::PROBE_SPAN;
 
-    state.matcher.begin_probe_stats();
-    emit_slice_blocks(
-        state,
-        src,
-        level,
-        &mut output,
-        &mut hasher,
-        max_window,
-        0,
-        span.min(src.len()),
-    );
-    let keep = state
-        .matcher
-        .take_probe_cost()
-        .expect("donation began the stats");
-    let shrink = reach_probe::parse_cost(
+    // The shrink measurement overlaps the keep donation's span blocks (see
+    // `measure_shrink_concurrent`): the caller parses the frame's own first
+    // span while a scope thread measures the shrunk alternative, so only a
+    // Shrink verdict's restart re-pays any parse time.
+    let (keep, shrink) = reach_probe::measure_shrink_concurrent(
         &src[..reach_probe::PROBE_SPAN],
         level,
         shape,
-        reach_probe::ReachChoice::Shrink,
-        reach_probe::ProbeFeedback::Approx,
-        // The verdict keeps outright once the shrink cost reaches the
-        // landslide bound (text-class frames cross it a few blocks in).
-        Some(keep * reach_probe::KEEP_LANDSLIDE),
+        || {
+            state.matcher.begin_probe_stats();
+            emit_slice_blocks(
+                state,
+                src,
+                level,
+                &mut output,
+                &mut hasher,
+                max_window,
+                0,
+                span.min(src.len()),
+            );
+            state
+                .matcher
+                .take_probe_cost()
+                .expect("donation began the stats")
+        },
     );
     if reach_probe::decide_donated(keep, shrink, src, level, shape)
         == reach_probe::ReachChoice::Shrink
