@@ -2998,14 +2998,16 @@ impl MatchGeneratorDriver {
     /// past the far-history horizon counts quiet, and [`LDM_QUIET`]
     /// consecutive quiet blocks latch the generator off. Quiet counts only
     /// where a beyond-reach twin could exist at all — the frame's first
-    /// `window` bytes have no content far enough back.
+    /// `window` bytes have no content far enough back — and stops once the
+    /// latch is on (a canary revival is the only event that needs the
+    /// counter again, and it resets it).
     fn ldm_note_block(&mut self, won: bool) {
         if self.ldm.is_none() {
             return;
         }
         if won {
             self.ldm_quiet = 0;
-        } else if self.block_end - self.win_base > self.params.window as u64 {
+        } else if !self.ldm_dead && self.block_end - self.win_base > self.params.window as u64 {
             self.ldm_quiet += 1;
             if self.ldm_quiet >= LDM_QUIET {
                 self.ldm_dead = true;
