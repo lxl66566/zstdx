@@ -437,8 +437,11 @@ fn scan_triples_at_base(
 ) -> Vec<(u32, u32, u32)> {
     let mut driver = MatchGeneratorDriver::new_direct();
     driver.reset(level);
-    driver.prefill_window(&data[..hist], base);
+    // Window before strip fill, mirroring the real strip flows (the
+    // window already sits at or below the strip base when a fill runs —
+    // the fill-side epoch roll floors there).
     driver.adopt_window(data, base);
+    driver.prefill_window(&data[..hist], base);
     driver.set_block(base + hist as u64, base + data.len() as u64);
     let mut seqs = Vec::new();
     driver.start_matching(|seq| match seq {
@@ -452,16 +455,16 @@ fn scan_triples_at_base(
     seqs
 }
 
-/// The fast/dfast coordinate epoch (`fast_shift`) must make the scan
-/// translation-invariant: the same window driven at an absolute base past
-/// 2^33 emits the same sequence stream as at base 0. Without the rebase
-/// the packed entries truncate at 2^32 and the resolve rejects every hash
-/// candidate (the >4-GiB-stream defect), collapsing the base-2^33 run to
-/// literal-only output — the payload below keeps every match short and
-/// seedless (a mutation every 16 bytes) so only the hash tables can carry
-/// it.
+/// The coordinate epochs (`fast_shift`; the chain's `head_origin`) must
+/// make every table strategy's scan translation-invariant: the same
+/// window driven at an absolute base past 2^33 emits the same sequence
+/// stream as at base 0. Without the rebase the packed entries truncate at
+/// 2^32 and the resolve rejects every hash candidate (the >4-GiB-stream
+/// defect), collapsing the base-2^33 run to literal-only output — the
+/// payload below keeps every match short and seedless (a mutation every
+/// 16 bytes) so only the hash tables can carry it.
 #[test]
-fn fast_dfast_epoch_translational_invariance() {
+fn epoch_translational_invariance() {
     // A 512 KiB payload of 64 KiB tiles, each copy mutated every 16
     // bytes: dense short hash matches at one-tile distance, no run long
     // enough for the strip seed (48 bytes) or a repcode chain.
@@ -483,7 +486,11 @@ fn fast_dfast_epoch_translational_invariance() {
         }
     }
     let hist = 256 * 1024;
-    for level in [crate::Level::Fastest, crate::Level::Fast] {
+    for level in [
+        crate::Level::Fastest,
+        crate::Level::Fast,
+        crate::Level::Balanced,
+    ] {
         let at_zero = scan_triples_at_base(level, &data, hist, 0);
         assert!(
             at_zero.iter().any(|&(_, _, ml)| ml >= 5),
@@ -492,6 +499,33 @@ fn fast_dfast_epoch_translational_invariance() {
         let at_giant = scan_triples_at_base(level, &data, hist, (1 << 33) + 12345);
         assert_eq!(at_zero, at_giant, "{level:?}: sequence stream at 2^33");
     }
+}
+
+/// The chain heads' coordinate epoch ([`MatchGeneratorDriver::chain_epoch_roll`]):
+/// a rolled origin is a wrapped negative that resolves floor-relative
+/// entries exactly, keeps the empty sentinel beyond reach, and is squared
+/// away by `reset` (fresh frame positions would resolve below the negated
+/// floor of the ended frame).
+#[test]
+fn chain_epoch_roll_resolves_floor_relative() {
+    let floor = 1u64 << 33;
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(crate::Level::Balanced);
+    driver.chain_epoch_roll(floor);
+    assert_eq!(driver.head_origin, floor.wrapping_neg());
+    // Live entry at `floor + 5`, resolved at `floor + 9`: distance 4
+    // through the wrapped-negative origin, exactly as at base 0.
+    let entry = super::tables::pack_head(floor + 5, driver.head_origin);
+    let q = (floor + 9).wrapping_add(driver.head_origin).wrapping_add(1);
+    assert_eq!(q.wrapping_sub(entry as u64), 4);
+    // The empty sentinel maps above any window reach (reach here: 8).
+    let sentinel = q.wrapping_sub(0);
+    assert!(sentinel.wrapping_sub(1) >= 8);
+    // reset clears a rolled epoch; the residue it drops only exists past
+    // the roll bar, where it is beyond every reach.
+    driver.reset(crate::Level::Balanced);
+    assert_eq!(driver.head_origin, 0);
+    assert!(driver.tables.iter().all(|&e| e == 0));
 }
 
 /// [`fast_epoch_advance`]'s floor choice: the streaming shape (window

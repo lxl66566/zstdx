@@ -212,6 +212,15 @@ pub struct MatchGeneratorDriver {
     /// their per-job clears stand (the row's 24-bit packed positions
     /// cannot carry a 32-bit shift, and their table sizes make the clear
     /// cheap).
+    ///
+    /// The origin doubles as the epoch coordinate of the entry packing:
+    /// the u64-domain resolve needs a live entry's `pos + origin + 1`
+    /// below 2^32, so once that value approaches the bar the epoch rolls
+    /// ([`Self::chain_epoch_roll`]) — the head table is cleared (every
+    /// survivor is beyond every reach) and the origin restarts at a
+    /// negated floor, so live entries store floor-relative positions and
+    /// the resolve stays exact at any stream size. A rolled origin is a
+    /// wrapped negative; every arithmetic on the field is wrapping.
     head_origin: u64,
     /// Coordinate-rebasing shift of the fast/dfast tables' packed
     /// positions (see [`Self::fast_epoch_advance`]): every entry those
@@ -425,12 +434,14 @@ pub(crate) const SPF_MIN_PREFIX: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "std")]
 pub(crate) const SPF_SEG: u64 = 1024 * 1024;
 
-/// Ceiling for the chain heads' coordinate origin (`head_origin`): the
-/// u64-domain entry resolve needs `pos + origin + 1 < 2^32` for live
-/// entries, so the advance degrades into a real clear once the origin
-/// would pass this bar — once per ~1 GiB of cumulative positions on one
-/// pooled state, keeping frames below 3 GiB on exact semantics.
-const HEAD_ORIGIN_CAP: u64 = 1 << 30;
+/// Roll bar for the chain heads' coordinate epoch (`head_origin`): the
+/// u64-domain entry resolve needs a live entry's `pos + origin + 1` below
+/// 2^32, so once the entry value a scan or strip fill would write
+/// approaches the bar, the epoch rolls (clear + floor-relative restart;
+/// see [`MatchGeneratorDriver::chain_epoch_roll`]). The half-GiB margin
+/// below 2^32 covers the block extent, window and strip-fill slack that
+/// can pass between the per-block trigger checks.
+const CHAIN_EPOCH_ROLL: i64 = (1 << 32) - (1 << 29);
 
 /// Span of one fast/dfast position epoch (`fast_shift`): the rebased
 /// coordinates of a live entry and a scanning position must stay within
@@ -1811,26 +1822,26 @@ impl MatchGeneratorDriver {
         };
         if matches!(self.params.strategy, Strategy::Chain(_)) && grid == FillGrid::Strip {
             // The chain row's head invalidation is the coordinate-origin
-            // advance (see `head_origin`), not the clear: `strip_mark`
-            // covers every position this state has written since the last
-            // advance, so every stale entry rebuilds as a beyond-reach
-            // distance — exactly the clear's semantics, at O(1) cost
-            // instead of an 8 MiB NT clear per job. The resolve runs in
-            // the u64 domain, where the empty sentinel dies by arithmetic
-            // (`q >= pos+1 > reach`) — that needs a live entry's
-            // `pos + origin + 1` below 2^32, so the origin stays capped:
-            // once it would pass [`HEAD_ORIGIN_CAP`] the advance becomes a
-            // real clear and the origin restarts (one clear per ~1 GiB of
-            // cumulative positions on a pooled state, amortized to noise
-            // against the per-job clear it replaced; frames past 3 GiB
-            // degrade exactly where today's u32 positions already wrap).
+            // advance (see `head_origin`): `strip_mark` covers every
+            // position this state has written since the last advance, so
+            // every stale entry rebuilds as a beyond-reach distance —
+            // exactly the clear's semantics, at O(1) cost instead of an
+            // 8 MiB NT clear per job. The resolve needs a live entry's
+            // `pos + origin + 1` below 2^32, so when the advance would
+            // drive this fill's entries against that horizon — or below
+            // zero, against a still-negated rolled origin — the epoch
+            // rolls instead (`chain_epoch_roll`): the clear subsumes the
+            // advance's invalidation and the origin restarts at the
+            // fill's floor, keeping entries exact at any stream size.
             // Dictionary loads keep the clear below: the dtlm backfills
             // read the empty sentinel off the slots themselves.
-            if self.head_origin + self.strip_mark + 1 > HEAD_ORIGIN_CAP {
-                clear_table(&mut self.tables[..self.second]);
-                self.head_origin = 0;
+            let advanced = self.head_origin as i64 + (self.strip_mark + 1) as i64;
+            if advanced + (base + data.len() as u64) as i64 >= CHAIN_EPOCH_ROLL
+                || (advanced + base as i64) < 0
+            {
+                self.chain_epoch_roll(base.min(self.win_base));
             } else {
-                self.head_origin += self.strip_mark + 1;
+                self.head_origin = self.head_origin.wrapping_add(self.strip_mark + 1);
             }
             self.strip_mark = 0;
         } else {
@@ -2271,6 +2282,16 @@ impl Matcher for MatchGeneratorDriver {
         // (see `strip_mark`): the next strip prefill advances `head_origin`
         // past it.
         self.strip_mark = self.strip_mark.max(self.pos);
+        // A rolled chain epoch leaves the origin at a negated floor of the
+        // ended frame, and fresh frame positions would resolve below it.
+        // That regime only arises past the roll bar — where the residue is
+        // beyond every reach anyway — so the epoch restarts outright;
+        // un-rolled origins keep the don't-clear residue semantics
+        // bit-exact.
+        if matches!(self.params.strategy, Strategy::Chain(_)) && (self.head_origin as i64) < 0 {
+            clear_table(&mut self.tables[..self.second]);
+            self.head_origin = 0;
+        }
         self.ext = None;
         self.win.clear();
         self.win_base = 0;
@@ -2441,11 +2462,19 @@ impl Matcher for MatchGeneratorDriver {
         if !matches!(self.params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
             // Fast/dfast epoch rollover first, so the gap fill below and
             // the scan write the same rebased coordinates the cleared
-            // tables restart in.
+            // tables restart in. The chain heads' epoch rollover rides the
+            // same spot for the same reason; strips already roll at their
+            // fill, so this trigger only covers the scan-side span (single
+            // frames on streaming and borrowed bulk windows).
             if matches!(self.params.strategy, Strategy::Fast | Strategy::Dfast(_))
                 && self.pos - self.fast_shift > FAST_EPOCH_SPAN
             {
                 self.fast_epoch_advance();
+            }
+            if matches!(self.params.strategy, Strategy::Chain(_))
+                && (self.pos.wrapping_add(self.head_origin) as i64) >= CHAIN_EPOCH_ROLL
+            {
+                self.chain_epoch_roll(self.win_base);
             }
             self.catch_up_insertions();
             // The reopened gap is now table content (the helper filled it
@@ -3067,6 +3096,22 @@ impl MatchGeneratorDriver {
         ));
         clear_table(&mut self.tables);
         self.fast_shift = self.win_base.max(self.pos - FAST_EPOCH_SPAN);
+    }
+
+    /// Roll the chain heads into a fresh coordinate epoch (see
+    /// `head_origin`): clear the head table and restart the origin at the
+    /// negated `floor`, so every position written afterwards packs as
+    /// `pos - floor + 1` — window-relative at the scan's floor,
+    /// strip-relative at a fill's — keeping the u64-domain resolve exact
+    /// at any stream size. The cleared entries sit GiBs beyond every
+    /// strategy's reach (the roll bar towers over any window), so the
+    /// rollover costs no candidate; the floor is at or below every
+    /// position the scans and fills can still write, which also keeps the
+    /// empty sentinel's `q > reach` rejection exact.
+    fn chain_epoch_roll(&mut self, floor: u64) {
+        debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
+        clear_table(&mut self.tables[..self.second]);
+        self.head_origin = floor.wrapping_neg();
     }
 
     /// Dense catch-up fill for the table strategies: the positions an

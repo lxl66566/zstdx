@@ -102,7 +102,13 @@ fn giant_stream_size_mt(level: Level) -> usize {
 #[test]
 #[ignore = "multi-GiB runtime; run explicitly for the epoch paths"]
 fn giant_stream_keeps_matching_past_4gib() {
-    for level in [Level::Fastest, Level::Fast] {
+    // Fastest/Fast ride fast_shift's fill-time rebase; Balanced rides the
+    // chain heads' origin epoch (the scan-side roll carries the ST cells
+    // past 4 GiB — without it the chain collapses to 2.8 GB on this
+    // payload). The mt cells slice buffer-relative job coordinates (the
+    // sliding grid), so they never enter the regime: they pin the strip
+    // path's parity with the ST bytes instead.
+    for level in [Level::Fastest, Level::Fast, Level::Balanced] {
         COUNTING.store(0, Ordering::Relaxed);
         let out = giant_stream_size(level);
         // The fixed regime replays every token as a ~16-byte match at a
@@ -114,10 +120,12 @@ fn giant_stream_keeps_matching_past_4gib() {
             "{level:?}: {out} bytes for 6 GiB of token replay"
         );
     }
-    COUNTING.store(0, Ordering::Relaxed);
-    let out = giant_stream_size_mt(Level::Fastest);
-    assert!(
-        out < 2 * 1024 * 1024 * 1024,
-        "mt Fastest: {out} bytes for 6 GiB of token replay"
-    );
+    for level in [Level::Fastest, Level::Balanced] {
+        COUNTING.store(0, Ordering::Relaxed);
+        let out = giant_stream_size_mt(level);
+        assert!(
+            out < 2 * 1024 * 1024 * 1024,
+            "mt {level:?}: {out} bytes for 6 GiB of token replay"
+        );
+    }
 }
