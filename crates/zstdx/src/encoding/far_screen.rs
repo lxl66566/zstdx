@@ -22,10 +22,11 @@
 
 use alloc::vec;
 
+// `mt_capture_window`'s geometry constants (that entry is mt-only).
+#[cfg(feature = "std")]
+use super::match_generator::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, fast_row_far_class};
 use super::{
-    match_generator::{
-        LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming, fast_row_far_class,
-    },
+    match_generator::{LDM_SYMS_MIN, LdmArming},
     util::is_uniform,
 };
 
@@ -86,6 +87,7 @@ pub(crate) fn frame_arming(head: &[u8]) -> LdmArming {
 /// window from their own row parameters, and a rejected or below-band
 /// fast row keeps the stock per-job parse. Deterministic in the input and
 /// level alone, so the grid and the frame bytes stay worker-independent.
+#[cfg(feature = "std")]
 pub(crate) fn mt_capture_window(
     level: crate::Level,
     shape: crate::InputShape,

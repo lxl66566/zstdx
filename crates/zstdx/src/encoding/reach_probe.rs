@@ -442,8 +442,10 @@ std::thread_local! {
 /// block loop mirrors the bulk slice path exactly (per-block adopted
 /// window, uniform/RLE skip and the incompressibility gate, head and LDM
 /// riding the row's own machinery), so the two parses differ in nothing but
-/// the reach. The donating entry points call this for the shrink side only
-/// — their keep cost comes off the frame's own blocks (see `ProbeStats`).
+/// the reach. The std entry points measure on explicit drivers
+/// (`parse_cost_with`); this thread-local wrapper serves the no_std
+/// fallbacks only.
+#[cfg(not(feature = "std"))]
 pub(crate) fn parse_cost(
     head: &[u8],
     level: Level,

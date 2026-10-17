@@ -210,13 +210,13 @@ pub(crate) fn push_state_pool(state: alloc::boxed::Box<CompressState<MatchGenera
 /// call (the bulk path's `thread::scope` jobs): the cross-thread pool
 /// above, falling back to a fresh state, reset for a fresh frame at
 /// `level` exactly like [`take_slice_state`].
+#[cfg(feature = "std")]
 pub(crate) fn take_pooled_slice_state(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
-    #[cfg(feature = "std")]
     if let Some(mut s) = pop_state_pool() {
         reset_slice_state(&mut s, level, shape, choice, ldm);
         return s;
@@ -227,13 +227,11 @@ pub(crate) fn take_pooled_slice_state(
 }
 
 /// Return a state taken by [`take_pooled_slice_state`].
+#[cfg(feature = "std")]
 pub(crate) fn return_pooled_slice_state(
     state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
 ) {
-    #[cfg(feature = "std")]
     push_state_pool(state);
-    #[cfg(not(feature = "std"))]
-    drop(state);
 }
 
 /// Take the per-thread pooled slice state, reset for a fresh frame at

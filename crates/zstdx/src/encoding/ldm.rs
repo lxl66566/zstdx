@@ -1155,6 +1155,7 @@ fn record_split(splits: &mut [u64; BATCH_SIZE], count: &mut usize, split: u64) -
 /// below it. Exact wherever at least 64 bytes have been fed since the
 /// last (re)arm — the state's dependence on anything older shifts out —
 /// which is every interior position of a parallel fill's span.
+#[cfg(feature = "std")]
 fn gear_entry(win: &[u8], win_base: u64, pos: u64) -> u64 {
     let bytes =
         &win[(pos - MIN_MATCH_LENGTH as u64 - win_base) as usize..(pos - win_base) as usize];
