@@ -452,6 +452,18 @@ pub trait Matcher {
     fn block_splitting_enabled(&self) -> bool {
         false
     }
+    /// Resolve the pending small-src row verdict (R27) if this frame
+    /// carries one, then report whether it kept the level's stock row:
+    /// the exact seq-selection arm's exemption condition (on the stock
+    /// row the arm's measured size delta is ±1 B against ~5% wall, json
+    /// l9 1K/4K). Calling this at the block encoder's per-block entry is
+    /// verdict-identical to the first matching entry's own resolution —
+    /// both sample the same window head — so the early resolution never
+    /// changes parse bytes. The default carries no verdict and never
+    /// exempts.
+    fn kept_stock_small_src_row(&mut self) -> bool {
+        false
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]

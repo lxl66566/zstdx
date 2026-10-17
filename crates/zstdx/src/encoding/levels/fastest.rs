@@ -6,7 +6,7 @@ use crate::{
         Matcher,
         block_enc::{
             compress_block,
-            compressed::{BlockOutcome, PrevTable},
+            compressed::{BlockOutcome, PrevTable, SeqCostMode},
             split,
         },
         block_header::BlockHeader,
@@ -78,6 +78,18 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         // is known, saving the per-block staging copy of the whole content.
         let start = output.len();
         output.extend_from_slice(&[0u8; 3]);
+        // The exact seq-selection arm rides the R27 stock-row verdict: on
+        // the narrow-alphabet classes the arm buys ±1 B for ~5% wall (json
+        // l9 1K/4K), so a frame whose verdict kept the level's stock row
+        // takes the heuristic instead. Resolving here sees the same window
+        // head the first parse would sample one call later — the arm's
+        // ≤128-KiB band is a single block — so the early resolution is
+        // verdict-identical and never changes parse bytes.
+        if state.dict_entropy.cost_mode == SeqCostMode::Exact
+            && state.matcher.kept_stock_small_src_row()
+        {
+            state.dict_entropy.cost_mode = SeqCostMode::Stock;
+        }
         let dict_entropy = state.dict_entropy;
         // The opt rows with a >=2^17 window split blocks at entropy shifts
         // (libzstd's post-parse block splitter); every other row takes the

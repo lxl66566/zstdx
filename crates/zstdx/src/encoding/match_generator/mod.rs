@@ -2351,6 +2351,11 @@ impl Matcher for MatchGeneratorDriver {
         matches!(self.params.strategy, Strategy::Opt(_)) && self.params.window >= (1 << 17)
     }
 
+    fn kept_stock_small_src_row(&mut self) -> bool {
+        self.resolve_small_src_row();
+        self.small_src_row == SmallSrcRow::Stock
+    }
+
     fn block_tail(&mut self) -> &mut [u8] {
         debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
         if self.win.len() + self.slice_size > self.win.capacity() {
