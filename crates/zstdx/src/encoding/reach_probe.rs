@@ -364,25 +364,70 @@ pub(crate) fn probe_staged(head: &[u8], level: Level, shape: InputShape) -> Reac
         return ReachChoice::Keep;
     }
     let head = &head[..PROBE_SPAN];
-    let keep = parse_cost(
-        head,
-        level,
-        shape,
-        ReachChoice::Keep,
-        ProbeFeedback::Flat,
-        None,
-    );
-    // The plain verdict keeps at any shrink cost above `keep`, so the
-    // shrink parse aborts once its lower bound crosses it.
-    let shrink = parse_cost(
-        head,
-        level,
-        shape,
-        ReachChoice::Shrink,
-        ProbeFeedback::Flat,
-        Some(keep),
-    );
-    decide(keep, shrink)
+    // The two measurement parses run concurrently (the donation entries'
+    // R40 shape): the shrink on a scope thread under the keep parse, so
+    // the probe costs its longer side instead of the sum. The concurrent
+    // shrink cannot know the keep cost, so it parses the full span with
+    // no abort cap — the plain verdict keeps at any shrink cost above
+    // `keep`, so the cap only shortened a measurement whose verdict was
+    // already decided. The ephemeral scope thread has no warm thread-local
+    // driver, so the shrink rides the process-global donation kit.
+    #[cfg(feature = "std")]
+    {
+        let mut driver = probe_driver();
+        let (keep, shrink, driver) = std::thread::scope(|scope| {
+            let measurer = scope.spawn(move || {
+                let mut kit = super::mt::take_donation_probe();
+                let cost = parse_cost_with(
+                    &mut kit,
+                    head,
+                    level,
+                    shape,
+                    ReachChoice::Shrink,
+                    ProbeFeedback::Flat,
+                    None,
+                );
+                super::mt::return_donation_probe(kit);
+                cost
+            });
+            let keep = parse_cost_with(
+                &mut driver,
+                head,
+                level,
+                shape,
+                ReachChoice::Keep,
+                ProbeFeedback::Flat,
+                None,
+            );
+            let shrink = measurer.join().unwrap();
+            (keep, shrink, driver)
+        });
+        return_probe_driver(driver);
+        decide(keep, shrink)
+    }
+    // Single-threaded fallback: the keep measurement first, then the
+    // shrink under the keep-cost abort cap (the verdict keeps at any
+    // shrink cost above `keep`).
+    #[cfg(not(feature = "std"))]
+    {
+        let keep = parse_cost(
+            head,
+            level,
+            shape,
+            ReachChoice::Keep,
+            ProbeFeedback::Flat,
+            None,
+        );
+        let shrink = parse_cost(
+            head,
+            level,
+            shape,
+            ReachChoice::Shrink,
+            ProbeFeedback::Flat,
+            Some(keep),
+        );
+        decide(keep, shrink)
+    }
 }
 
 #[cfg(feature = "std")]
