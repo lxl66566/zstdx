@@ -18,6 +18,8 @@ use crate::{
 pub enum FrameDescriptorError {
     #[error("Invalid Frame_Content_Size_Flag; Is: {got}, Should be one of: 0, 1, 2, 3")]
     InvalidFrameContentSizeFlag { got: u8 },
+    #[error("Reserved bit set in frame descriptor; Is: {got:#04x}, Should be: 0")]
+    ReservedBitSet { got: u8 },
 }
 
 #[derive(Debug, thiserror::Error)]

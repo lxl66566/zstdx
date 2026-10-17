@@ -108,19 +108,20 @@ fn two_frames_decode_completely() {
 fn fuzzer_found_two_frame_input() {
     // crash-b5593b58b45a98a3e4d44fb3c94ab6b545a3b7c6: two tiny frames (RLE
     // blocks emitting 4x0x38 and 5x0x04); the streaming path used to stop
-    // after the first. The second frame's declared Frame_Content_Size is 5,
-    // matching its RLE block (the originally fuzzed 0x39 declared 57 and is
-    // now the content_size_mismatch case below).
+    // after the first. The second frame's FHD 0x38 sets the reserved bit —
+    // rejected with libzstd parity ("unsupported frame parameter") since
+    // header strictness converged, so the whole stream errors on both paths
+    // after the first frame's bytes; the first frame alone still decodes.
     let input = [
         0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x23, 0x00, 0x00, 0x38, //
         0x28, 0xb5, 0x2f, 0xfd, 0x38, 0x05, 0x2b, 0x00, 0x00, 0x04,
     ];
-    expect_consistent(&input);
-    let out = flat_decode(&input).unwrap();
-    assert_eq!(out, [0x38, 0x38, 0x38, 0x38, 0x04, 0x04, 0x04, 0x04, 0x04]);
-    // No reference cross-check: this frame sets reserved frame-descriptor
-    // bits (FHD 0x38), which libzstd rejects ("unsupported frame parameter")
-    // while zstdx currently tolerates; only the internal paths must agree.
+    #[cfg(feature = "std")]
+    expect_reference_error(&input);
+    #[cfg(not(feature = "std"))]
+    expect_consistent_error(&input);
+    expect_consistent(&input[..10]);
+    assert_eq!(flat_decode(&input[..10]).unwrap(), [0x38, 0x38, 0x38, 0x38]);
 }
 
 /// A frame whose header declares a Frame_Content_Size its blocks do not
@@ -128,15 +129,18 @@ fn fuzzer_found_two_frame_input() {
 /// shape as a size error at the frame tail).
 #[test]
 fn content_size_mismatch_is_an_error() {
-    // The original b5593b58 second frame: single-segment, 1-byte FCS field
-    // declaring 57 bytes, one RLE block producing 5.
+    // The original b5593b58 second frame declared 57 bytes over a 5-byte
+    // RLE body, but its FHD 0x38 also sets the reserved bit — rejected at
+    // the header with libzstd parity, so the size-mismatch class below is
+    // carried by the patched pledged frames instead.
     let input = [
         0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x23, 0x00, 0x00, 0x38, //
         0x28, 0xb5, 0x2f, 0xfd, 0x38, 0x39, 0x2b, 0x00, 0x00, 0x04,
     ];
-    expect_content_size_error(&input);
     #[cfg(feature = "std")]
-    assert!(zstd::decode_all(&input[..]).is_err(), "reference rejects");
+    expect_reference_error(&input);
+    #[cfg(not(feature = "std"))]
+    expect_consistent_error(&input);
 
     // A real frame with its declared FCS patched one byte beyond the actual
     // content must fail the same way (the encoder itself cannot emit this;

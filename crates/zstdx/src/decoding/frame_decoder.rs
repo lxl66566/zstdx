@@ -1223,4 +1223,31 @@ mod tests {
         assert!(dec.is_finished());
         assert!(dec.collect().unwrap().is_empty());
     }
+
+    /// The FHD reserved bit (bit 3) is rejected with libzstd parity, while
+    /// the spec's Unused_bit (bit 4) stays accepted — a compliant decoder
+    /// shall not interpret it.
+    #[test]
+    fn fhd_reserved_bit_is_rejected() {
+        use std::io::Cursor;
+
+        let mut reserved = plain_frame();
+        reserved[4] |= 0x08;
+        let err = FrameDecoder::new()
+            .reset(&mut Cursor::new(reserved))
+            .unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("ReservedBitSet"),
+            "got: {err}"
+        );
+
+        let mut unused = plain_frame();
+        unused[4] |= 0x10;
+        let mut dec = FrameDecoder::new();
+        let mut src = Cursor::new(unused);
+        dec.reset(&mut src).unwrap();
+        dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+            .unwrap();
+        assert!(dec.is_finished());
+    }
 }

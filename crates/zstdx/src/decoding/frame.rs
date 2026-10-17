@@ -37,6 +37,17 @@ pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFram
         .map_err(err::FrameDescriptorReadError)?;
     let desc = FrameDescriptor(buf[0]);
 
+    // The reserved bit (bit 3) must be zero; libzstd rejects it as
+    // "unsupported frame parameter" and the format lets a future feature
+    // hide behind it, so a set bit cannot be decoded transparently. Bit 4
+    // is the spec's Unused_bit — a compliant decoder shall not interpret
+    // it — and stays accepted.
+    if desc.reserved_flag() {
+        return Err(err::InvalidFrameDescriptor(
+            FrameDescriptorError::ReservedBitSet { got: desc.0 },
+        ));
+    }
+
     bytes_read += 1;
 
     let mut frame_header = FrameHeader {
