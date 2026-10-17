@@ -294,6 +294,32 @@ fn dictionary_decoding_interop() {
     assert_eq!(out, content);
 }
 
+/// Both bulk struct paths honor a dictionary attached at construction:
+/// `decompress` (the growing-Vec path) must decode through the same
+/// decompressor as `decompress_to_buffer`, not a fresh contextless one.
+#[test]
+fn bulk_decompressor_applies_dictionary() {
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+    let mut compressor = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    let compressed = compressor.compress(&content).unwrap();
+
+    let mut dec = compat::bulk::Decompressor::with_dictionary(&dict).unwrap();
+    assert_eq!(dec.decompress(&compressed, 0).unwrap(), content);
+    let mut out = vec![0u8; content.len()];
+    let written = dec.decompress_to_buffer(&compressed, &mut out).unwrap();
+    assert_eq!(&out[..written], &content);
+
+    // Without the dictionary the frame is undecodable (matches into the
+    // dictionary's history have no referent).
+    assert!(
+        compat::bulk::Decompressor::new()
+            .unwrap()
+            .decompress(&compressed, 0)
+            .is_err()
+    );
+}
+
 /// A failed materialize must hand the writer back instead of dropping it:
 /// `get_mut` and `get_ref` stay usable afterwards.
 #[test]

@@ -51,7 +51,8 @@ pub struct Args {
     /// Print the sweep's chosen parameters
     #[arg(short, long)]
     pub verbose: bool,
-    /// Stats-parse level for --format-content (default 3, C's default)
+    /// Stats-parse level for --format-content (default: the library's
+    /// STATS_LEVEL, 4; C pins 3)
     #[arg(long)]
     pub stats_level: Option<i32>,
     /// Stats sample set for --format-content: train split or all samples

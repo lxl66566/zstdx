@@ -742,12 +742,6 @@ impl MatchGeneratorDriver {
             // past `start + ml`; its own emissions land on fresh hashes
             // either way, and the scan's top-of-loop prefetch takes over
             // from the next step.
-            // Prefetch the post-match scan position's rows before the
-            // emit: the top-of-loop pipelining only covers
-            // scan-consecutive positions, and every emission breaks that
-            // chain. The emit's literal copy and covered fill give the
-            // load its shadow (the repcode continuation may extend past
-            // it; its own emissions hash fresh either way).
             let next = win_base + (start + ml) as u64;
             if block_end.saturating_sub(next) > hash_read {
                 let hn = row_hash_at(win, start + ml, hash_log, ROW_LOG, width);

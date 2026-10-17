@@ -2187,9 +2187,6 @@ impl Matcher for MatchGeneratorDriver {
         self.shape = shape;
     }
 
-    /// Decide the frame's reach from its first bytes (see
-    /// `super::reach_probe`). Called before any block of the frame is
-    /// matched; no-op for heads below the probe span.
     /// Start accumulating a reach-probe cost off this driver's real parses
     /// (donation mode; see `probe_stats`). No effect on the parse.
     fn begin_probe_stats(&mut self) {

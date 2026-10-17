@@ -139,8 +139,8 @@ fn roundtrip() {
     }
 
     #[cfg(feature = "std")]
-    if std::fs::exists("fuzz/artifacts/huff0").unwrap_or(false) {
-        for file in std::fs::read_dir("fuzz/artifacts/huff0").unwrap() {
+    if std::fs::exists("../zstdx-fuzz/artifacts/huff0").unwrap_or(false) {
+        for file in std::fs::read_dir("../zstdx-fuzz/artifacts/huff0").unwrap() {
             if file.as_ref().unwrap().file_type().unwrap().is_file() {
                 let data = std::fs::read(file.unwrap().path()).unwrap();
                 round_trip(&data);

@@ -612,11 +612,15 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
         opt(22, 1 << 26, knobs(7, 256, 3, 23, true)),
         1 << 23,
     )),
-    // 20-22: libzstd widens to W25-27 with C25-27/H23-25. Our u64-tagged
-    // opt tables would cost 2-8x libzstd's u32 memory there, so the ring
-    // caps at 24 and the hash stays at 22 (H23 measured 0.06-0.13% sparser
-    // on json — pure dilution); windows widen to W24-26, the reach
-    // dll-class data needs. Beyond-window distance classes are LDM's job.
+    // 20-22: libzstd widens to W25-27 with C25-27/H23-25. The ring caps
+    // at 24 and the hash stays at 22: the ring carries TWO u32 link slots
+    // per position (libzstd's chainTable one), so libzstd's own C27/H25
+    // geometry would land near 640 MiB per encoder — and these tables
+    // ride every MT worker's pooled state — where the caps hold the row
+    // at ~144 MiB (H23 measured 0.06-0.13% sparser on json — pure
+    // dilution); windows widen to W24-26, the reach dll-class data needs.
+    // These rows carry no LDM: the ladder's beyond-window far classes
+    // belong to the W26+LDM rows 16-19.
     opt(22, 1 << 24, knobs(7, 256, 3, 23, true)),
     opt(22, 1 << 25, knobs(7, 512, 3, 24, true)),
     opt(22, 1 << 26, knobs(8, 999, 3, 24, true)),

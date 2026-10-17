@@ -1435,8 +1435,8 @@ mod tests {
             zstd::stream::copy_decode(data, &mut output)?;
             Ok(output)
         }
-        if std::fs::exists("fuzz/artifacts/interop").unwrap_or(false) {
-            for file in std::fs::read_dir("fuzz/artifacts/interop").unwrap() {
+        if std::fs::exists("../zstdx-fuzz/artifacts/interop").unwrap_or(false) {
+            for file in std::fs::read_dir("../zstdx-fuzz/artifacts/interop").unwrap() {
                 if file.as_ref().unwrap().file_type().unwrap().is_file() {
                     let data = std::fs::read(file.unwrap().path()).unwrap();
                     let data = data.as_slice();

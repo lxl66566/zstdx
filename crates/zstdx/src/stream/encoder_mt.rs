@@ -1940,7 +1940,7 @@ impl MtEncoderCore {
         // opt/btlazy rows fill different tables), and a prefix strip
         // large enough to pay for the machinery. The strategy gate plus
         // the threshold admit exactly the whole-window chain rows: every
-        // other row's stream strip is its search domain (<= 8 MiB). A
+        // other row's stream strip is its search domain (<= 8 MiB).
         // A far-dead frame skips the build (its strips cap at the row's
         // reach — no nesting, nothing to share); the segment loop below
         // resolves a still-pending screen as soon as the probe machinery

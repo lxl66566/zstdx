@@ -54,7 +54,9 @@ impl Decompressor {
     /// Creates a new decompressor bound to a dictionary.
     pub fn with_dictionary(dictionary: &[u8]) -> io::Result<Self> {
         let mut inner = crate::decoding::FrameDecoder::new();
-        let dict = crate::decoding::Dictionary::decode_dict(dictionary)
+        // `load` (not `decode_dict`): headerless raw content is a valid
+        // dictionary here, as on every other decode entry point.
+        let dict = crate::decoding::Dictionary::load(dictionary)
             .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?;
         inner
             .add_dict(dict)
@@ -63,8 +65,18 @@ impl Decompressor {
     }
 
     /// Decompresses into the Vec, growing it if the capacity is too small.
+    /// Decodes through this decompressor, so a dictionary attached at
+    /// construction applies (the zstd crate's semantics).
     pub fn decompress(&mut self, source: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
-        crate::bulk::decompress(source, capacity).map_err(io::Error::from)
+        let mut capacity = capacity.max(64 * 1024);
+        loop {
+            let mut out = Vec::with_capacity(capacity);
+            match self.inner.decode_all_to_vec(source, &mut out) {
+                Ok(()) => return Ok(out),
+                Err(crate::decoding::errors::FrameDecoderError::TargetTooSmall) => capacity *= 2,
+                Err(e) => return Err(io::Error::from(crate::Error::Frame(e))),
+            }
+        }
     }
 
     /// Decompresses into the caller's buffer, returning the decoded length.

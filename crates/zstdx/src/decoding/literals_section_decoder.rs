@@ -124,22 +124,33 @@ fn decompress_literals(
             && stream_bounds.iter().all(|&(s, e)| e - s >= 8)
             && scratch.table.max_num_bits >= 1
         {
-            if scratch.table.x2_table().is_empty() {
-                decompress_4streams_interleaved(
-                    &scratch.table,
-                    source,
-                    &stream_bounds,
-                    total_out,
-                    target,
-                )?;
+            // The interleave plus `finish_streams` write every byte of the
+            // output region before anything can read it, and the literals
+            // buffer is per-block scratch (cleared before the next section
+            // is decoded into it; truncated back below on error), so the
+            // region is published uninitialized: `resize(.., 0)` would
+            // memset a full literals section on every block for nothing.
+            let out_start = target.len();
+            target.reserve(total_out);
+            // SAFETY: the spare capacity was reserved above; the whole
+            // region is written on success and the length is restored on
+            // the error paths. clippy::uninit_vec flags exactly the pattern
+            // chosen here: the interleave plus `finish_streams` fully
+            // overwrite the region before anything can read it, so the
+            // memset a zeroing `resize` would pay is pure waste.
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                target.set_len(out_start + total_out);
+            };
+            let out = &mut target[out_start..];
+            let res = if scratch.table.x2_table().is_empty() {
+                decompress_4streams_interleaved(&scratch.table, source, &stream_bounds, out)
             } else {
-                decompress_4streams_interleaved_x2(
-                    &scratch.table,
-                    source,
-                    &stream_bounds,
-                    total_out,
-                    target,
-                )?;
+                decompress_4streams_interleaved_x2(&scratch.table, source, &stream_bounds, out)
+            };
+            if let Err(e) = res {
+                target.truncate(out_start);
+                return Err(e);
             }
         } else {
             // Slow path: same per-stream segment contract as the fast path
@@ -239,16 +250,15 @@ fn decompress_literals(
 /// bound is precomputed from the minimum of output/5 and input/7 iterations.
 ///
 /// `region` holds the four streams back to back; `stream_bounds` are the (start, end)
-/// offsets into `region`. The output is written into `target`, which is resized to
-/// hold exactly `total_out` bytes. Every stream must decode exactly its quarter of
-/// the output, as guaranteed by the format.
+/// offsets into `region`. The output is written into `out` (exactly the section's
+/// regenerated size; every byte is written on success). Every stream must decode
+/// exactly its quarter of the output, as guaranteed by the format.
 #[allow(clippy::too_many_lines)]
 fn decompress_4streams_interleaved(
     table: &HuffmanTable,
     region: &[u8],
     stream_bounds: &[(usize, usize); 4],
-    total_out: usize,
-    target: &mut Vec<u8>,
+    out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 
@@ -259,6 +269,7 @@ fn decompress_4streams_interleaved(
     debug_assert_eq!(packed.len(), 1 << tl);
 
     // per-stream output segments: stream k ends at (k+1) * segment, stream 4 at total_out
+    let total_out = out.len();
     let segment = total_out.div_ceil(4);
     let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
@@ -283,9 +294,6 @@ fn decompress_4streams_interleaved(
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
 
-    let out_start = target.len();
-    target.resize(out_start + total_out, 0);
-    let out = &mut target[out_start..];
     // stream k starts writing at k * segment (stream 4 takes the remainder)
     let out_base = out.as_mut_ptr();
     let mut op = [
@@ -489,14 +497,14 @@ fn select_x2_table(dst_size: usize, c_src_size: usize) -> bool {
 /// preceding a lookup advance by at most 8, so a lookup starting within an
 /// iteration never starts at `seg_end - 1` and cannot spill into the next
 /// stream's territory. The final byte of each stream is written by the scalar
-/// finish loop.
+/// finish loop. `out` holds exactly the section's regenerated size; every byte
+/// is written on success.
 #[allow(clippy::too_many_lines)]
 fn decompress_4streams_interleaved_x2(
     table: &HuffmanTable,
     region: &[u8],
     stream_bounds: &[(usize, usize); 4],
-    total_out: usize,
-    target: &mut Vec<u8>,
+    out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 
@@ -504,6 +512,7 @@ fn decompress_4streams_interleaved_x2(
     debug_assert_eq!(dt.len(), 1 << 11);
 
     // per-stream output segments: stream k ends at (k+1) * segment, stream 4 at total_out
+    let total_out = out.len();
     let segment = total_out.div_ceil(4);
     let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
@@ -528,9 +537,6 @@ fn decompress_4streams_interleaved_x2(
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
 
-    let out_start = target.len();
-    target.resize(out_start + total_out, 0);
-    let out = &mut target[out_start..];
     let out_base = out.as_mut_ptr();
     let mut op = [
         out_base,

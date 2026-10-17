@@ -221,7 +221,7 @@ zstdx -D logs.dict -9 app.log             # trained-dictionary compression
 ## Current limitations
 
 - Encoder speed is split by tier and corpus shape (ahead on several tiers, behind on the json fastest scan core and the best-tier tree core); bulk decode is ahead across the board. Measured numbers in [Current Status](dev/status.md).
-- No superblock or C FFI.
+- Dictionary encode is single-threaded (MT falls back to ST), and dictionaries ride only the match-history/entropy-seed path — no dict-specialized matcher templates.
 
 [`Level::from_zstd(i32)`]: https://docs.rs/zstdx/latest/zstdx/level/struct.Level.html#method.from_zstd
 [`stream::encode_all`]: https://docs.rs/zstdx/latest/zstdx/stream/fn.encode_all.html

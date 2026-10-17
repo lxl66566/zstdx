@@ -50,8 +50,6 @@ impl<'t> FSEDecoder<'t> {
         let base_line = self.state.base_line;
         let new_state = base_line + add as u32;
         self.state = self.table.decode[new_state as usize];
-
-        // println!("Update: {}, {} -> {}", base_line, add,  self.state);
     }
 }
 
@@ -287,7 +285,6 @@ impl FSETable {
             } else {
                 unchecked_value
             };
-            // println!("{}, {}, {}", self.symbol_probablilities.len(), unchecked_value, value);
 
             let prob = (value as i32) - 1;
 

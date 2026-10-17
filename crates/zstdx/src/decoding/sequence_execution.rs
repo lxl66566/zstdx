@@ -689,20 +689,22 @@ fn copy_wrapped_match(
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are
 /// needed before you get a functional number.
 ///
-/// The repcode domain (`offset_value <= 3`) is handled ZSTD_decodeSequence
-/// style: the code plus the literal-length-0 flag forms a slot index
-/// (`code - 1 + ll0`), where slot 3 — code 3 with no literals — is the
-/// `rep0 - 1` pseudo-slot, folded onto `scratch[0]` with a conditional
-/// subtract after the shared load. The same slot picks the history
-/// rotation: 0 keeps everything (code 1 with literals), anything else —
-/// including real offsets, whose slot is always >= 3 — rotates all three.
+/// Real offsets (`offset_value > 3`, the 87-100% share on json/dll/skewed)
+/// take a constant 3-move rotation and return immediately (R38): they need
+/// no slot machinery, and the fast-path branch sits on the offset class,
+/// which predicts. The repcode domain (`offset_value <= 3`) keeps the
+/// ZSTD_decodeSequence-style select form: the code plus the
+/// literal-length-0 flag forms a slot index (`code - 1 + ll0`), where
+/// slot 3 — code 3 with no literals — is the `rep0 - 1` pseudo-slot,
+/// folded onto `scratch[0]` with a conditional subtract after the shared
+/// load. The same slot picks the history rotation: 0 keeps everything
+/// (code 1 with literals), anything else rotates all three.
 ///
-/// Entirely select-based, no data-dependent branches: repcodes flip too
-/// often on structured input for the `<= 3` test and the rotation match to
-/// predict, and both sat among the largest branch-miss clusters of the
-/// fused decode loop. The slot load stays in bounds for non-repcodes by
-/// masking the (garbage) index, whose loaded value the selects then
-/// discard.
+/// The repcode domain stays entirely select-based: repcodes flip too often
+/// on structured input for the rotation match to predict, and it sat among
+/// the largest branch-miss clusters of the fused decode loop before the
+/// select rewrite. The slot load stays in bounds by masking the (garbage)
+/// index, whose loaded value the selects then discard.
 pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     // Real offsets (the 87-100% share on json/dll/skewed) need no slot
     // machinery: a constant 3-move rotation, off the select chain the
@@ -735,9 +737,9 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     };
 
     // Rotation as selects: slot 0 keeps everything, slot 1 swaps the two
-    // most recent codes (slot 2 untouched), anything else — including real
-    // offsets, whose slot is always >= 3 — rotates all three. Ordered so
-    // every read sees the pre-update values.
+    // most recent codes (slot 2 untouched), anything else rotates all
+    // three. Ordered so every read sees the pre-update values. Real offsets
+    // never reach here (the fast path above returned).
     let keep = idx == 0;
     let rotate_all = idx >= 2;
     scratch[2] = if rotate_all {
