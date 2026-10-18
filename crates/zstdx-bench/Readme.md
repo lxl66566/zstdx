@@ -200,13 +200,29 @@ one code path. `prof dec <file.zst> [iters]`, `prof enc <zstd-level> <iters>
 cargo run --release -p zstdx-bench -- prof enc 3 20 bench/corpus/text.raw
 ```
 
+### `dictmt` — dictionary multithreading wall A/B
+
+Times the dictionary ST slice entry against the mt job path (the frame's
+first job seeded from the dictionary) per worker count on one raw input,
+interleaved round by round; prints the deterministic size table first
+(dict-st, dict-mt with the job-split delta, plain-frame references) and
+keeps a plain st-vs-mt cell as the no-regression sanity gate. Every timed
+cell roundtrips through our decoder with the dictionary before timing.
+`--dict` takes a formatted dictionary (`zstdx-bench train --formatted`).
+
+```bash
+cargo run --release -p zstdx-bench -- dictmt bench/corpus/json.raw \
+    --dict bench/dict-json --level fastest,fast,balanced,best --workers 4,8
+```
+
 ### `dump` — byte-exact output snapshots
 
 Compresses every corpus `.raw` into a directory so two builds can be
 compared byte for byte: `dump <dir>` per build, then `cmp -r dir_a dir_b`.
 The regression gate for optimizations that must not change the encoder's
 output at all. `--all-levels` covers the whole ladder (files tagged
-`.l1/.l3/.l6/.l12/.l16/.l19`).
+`.l1/.l3/.l6/.l12/.l16/.l19`); `--workers N` routes the compression
+through the multithreaded job path so the gate covers mt bytes too.
 
 ```bash
 cargo run --release -p zstdx-bench -- dump /tmp/dump-a

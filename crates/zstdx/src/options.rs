@@ -61,8 +61,8 @@ pub struct EncoderOptions {
     pub(crate) workers: u32,
     pub(crate) input_shape: InputShape,
     /// Raw zstd dictionary for compression (parsed when an encoder takes
-    /// the options). Multithreaded paths fall back to single-threaded with
-    /// a dictionary attached.
+    /// the options). Multithreaded paths seed the frame's first job from
+    /// it (see the encoding mt module).
     pub(crate) dictionary: Option<alloc::vec::Vec<u8>>,
     /// An already-parsed dictionary (see [`Self::parsed_dictionary`]);
     /// supersedes the raw bytes when both are set.
@@ -133,8 +133,9 @@ impl EncoderOptions {
     /// Number of worker threads for compression. `0` (the default) compresses
     /// on the calling thread. More than one worker engages the multithreaded
     /// job paths on std builds — both [`bulk::compress_with`][crate::bulk::compress_with]
-    /// and the streaming encoders — falling back to the single-threaded core
-    /// for raw-block levels and single-core processes. Without std the
+    /// and the streaming encoders, dictionary attached or not (a dictionary
+    /// seeds the frame's first job) — falling back to the single-threaded
+    /// core for raw-block levels and single-core processes. Without std the
     /// streaming encoders reject it with
     /// [`Error::Unsupported`][crate::Error::Unsupported].
     pub const fn workers(mut self, workers: u32) -> Self {

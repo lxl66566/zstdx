@@ -17,6 +17,10 @@ pub struct Args {
     /// Dump every ladder level instead of Fastest only
     #[arg(long)]
     pub all_levels: bool,
+    /// Compress through the multithreaded job path at this worker count
+    /// (default: the single-threaded slice path)
+    #[arg(long)]
+    pub workers: Option<u32>,
 }
 
 pub fn run(args: &Args) {
@@ -40,7 +44,15 @@ pub fn run(args: &Args) {
     for name in &names {
         let raw = fs::read(corpus_dir().join(name)).unwrap();
         for (level, z) in &levels {
-            let comp = zstdx::encoding::compress_slice_to_vec(&raw[..], level.pair().0);
+            let comp = match args.workers {
+                None => zstdx::encoding::compress_slice_to_vec(&raw[..], level.pair().0),
+                Some(w) => {
+                    let opts = zstdx::EncoderOptions::new(level.pair().0)
+                        .checksum(false)
+                        .workers(w);
+                    zstdx::bulk::compress_with(&raw[..], &opts).unwrap()
+                },
+            };
             let suffix = if args.all_levels {
                 format!(".l{z}")
             } else {

@@ -690,7 +690,7 @@ mod mt {
 
     /// Text-like data: repeating vocabulary with variation, so matches,
     /// repcodes and entropy coding all engage across job boundaries.
-    fn textish(len: usize) -> Vec<u8> {
+    pub(super) fn textish(len: usize) -> Vec<u8> {
         let words: [&[u8]; 13] = [
             b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ",
             b"lorem ", b"ipsum ", b"dolor ", b"sit ", b"amet ",
@@ -907,6 +907,7 @@ mod mt {
                     workers,
                     None,
                     None,
+                    None,
                 );
                 let streamed = encode_write(
                     &data,
@@ -925,7 +926,7 @@ mod mt {
         // into two jobs at the opt strip's 4 MiB floor).
         let deep = textish(4 * 1024 * 1024 + 512 * 1024);
         for level in [Level::Opt, Level::Ultra] {
-            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None, None);
+            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None, None, None);
             let streamed =
                 encode_write(&deep, 1024 * 1024, level, 4, false, Some(deep.len() as u64));
             assert_eq!(streamed, bulk_mt, "{level:?}");
@@ -934,7 +935,8 @@ mod mt {
         // probe shares the bulk strip, job floor and reach, so a pledged
         // stream stays byte-identical to bulk mt there too.
         let near = jsonish(9 * 1024 * 1024 + 123 * 1024);
-        let bulk_mt = encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None, None);
+        let bulk_mt =
+            encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None, None, None);
         let streamed = encode_write(
             &near,
             1024 * 1024,
@@ -1085,6 +1087,7 @@ mod mt {
                 workers,
                 None,
                 None,
+                None,
             );
             let streamed = encode_write(
                 &data,
@@ -1132,7 +1135,7 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None, None);
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1213,7 +1216,8 @@ mod mt {
         let a = flushed(1024 * 1024);
         assert_eq!(a, flushed(128 * 1024), "flush-cancelled determinism");
         assert_both_decoders(&a, &data, "flush-cancelled mid-band");
-        let armed = encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None, None);
+        let armed =
+            encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None, None, None);
         assert!(
             a.len() > armed.len() + armed.len() / 2,
             "the flush-cancelled frame must pay the stock parse: {} vs armed {}",
@@ -1265,7 +1269,7 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None, None);
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1280,7 +1284,7 @@ mod mt {
             assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} fullband stream"));
             let again = encode_write(&data, MIB, level, 8, true, Some(data.len() as u64));
             assert_eq!(again, bulk_mt4, "{level:?}: run-to-run determinism");
-            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None, None);
+            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None, None, None);
             assert!(
                 bulk_mt4.len() <= st.len() + st.len() / 20,
                 "{level:?}: the far class must survive the self-fill: stream-mt {} vs armed st {}",
@@ -1573,4 +1577,107 @@ fn reach_probe_stream_roundtrips() {
     write_in_chunks(&data[1024 * 1024..], 512 * 1024, &mut enc);
     enc.finish().unwrap();
     assert_eq!(bulk::decompress(&sink, len).unwrap(), data);
+}
+
+/// Multithreaded dictionary streaming: job zero seeds from the dictionary
+/// on the burst path (both grids), the frames decode through our decoder
+/// and libzstd with the same dictionary, and a pledged dict stream is
+/// byte-identical to the bulk dict frame at the same worker count (the
+/// same parity the plain mt frames keep).
+#[cfg(feature = "std")]
+mod mt_dict {
+    use super::*;
+    use crate::io::Read as _;
+
+    fn dict_fixture() -> Option<(Vec<u8>, Vec<u8>)> {
+        let raw = std::fs::read("./dict_tests/dictionary").ok()?;
+        let content = encoding::dictionary::EncDictionary::parse(&raw)
+            .ok()?
+            .content;
+        let mut data = content.clone();
+        data.extend_from_slice(&content);
+        data.extend(mt::textish((2 << 20) + 100 * 1024 - data.len()));
+        Some((raw, data))
+    }
+
+    fn decode_with_dict(frame: &[u8], dict: &[u8]) -> Vec<u8> {
+        let mut decoder =
+            read::Decoder::with_options(frame, crate::DecoderOptions::new().dictionary(dict))
+                .unwrap();
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn roundtrips_and_interops() {
+        let Some((raw, data)) = dict_fixture() else {
+            return;
+        };
+        for workers in [2u32, 4, 8] {
+            for (level, chunk) in [(Level::Fastest, 64 * 1024), (Level::Balanced, 300 * 1024)] {
+                let mut sink = Vec::new();
+                let mut enc = write::Encoder::with_options(
+                    &mut sink,
+                    EncoderOptions::new(level)
+                        .workers(workers)
+                        .dictionary(&raw)
+                        .pledged_size(Some(data.len() as u64)),
+                )
+                .unwrap();
+                for piece in data.chunks(chunk) {
+                    enc.write_all(piece).unwrap();
+                }
+                enc.finish().unwrap();
+                assert_eq!(decode_with_dict(&sink, &raw), data, "{level:?} w{workers}");
+                let mut zd = zstd::bulk::Decompressor::with_dictionary(&raw).unwrap();
+                assert_eq!(
+                    zd.decompress(&sink, data.len()).unwrap(),
+                    data,
+                    "{level:?} w{workers} libzstd"
+                );
+            }
+        }
+        // Unpledged (the growing grid), odd write sizes: chunking must not
+        // move the bytes either.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for (sink, chunk) in [(&mut a, 777 * 103), (&mut b, 3 << 20)] {
+            let mut enc = write::Encoder::with_options(
+                sink,
+                EncoderOptions::new(Level::Fast).workers(4).dictionary(&raw),
+            )
+            .unwrap();
+            for piece in data.chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        assert_eq!(a, b);
+        assert_eq!(decode_with_dict(&a, &raw), data);
+    }
+
+    #[test]
+    fn pledged_stream_matches_bulk_dict_mt() {
+        let Some((raw, data)) = dict_fixture() else {
+            return;
+        };
+        for (workers, checksum) in [(2u32, true), (4, false)] {
+            let opts = || {
+                EncoderOptions::new(Level::Balanced)
+                    .workers(workers)
+                    .checksum(checksum)
+                    .dictionary(&raw)
+                    .pledged_size(Some(data.len() as u64))
+            };
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts()).unwrap();
+            for piece in data.chunks(1024 * 1024) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            let bulk = bulk::compress_with(&data, &opts()).unwrap();
+            assert_eq!(sink, bulk, "workers {workers} checksum {checksum}");
+        }
+    }
 }

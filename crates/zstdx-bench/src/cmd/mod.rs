@@ -1,4 +1,5 @@
 pub mod corrupt;
+pub mod dictmt;
 pub mod dump;
 pub mod emitframe;
 pub mod files;

@@ -67,6 +67,9 @@ enum Command {
     /// Train a raw-content dictionary with the in-tree trainer, or extract
     /// the content section of a formatted dict.
     Train(cmd::train::Args),
+    /// Dictionary multithreading wall A/B: dict st vs dict mt (job zero
+    /// seeded from the dictionary) plus plain-frame sanity cells.
+    Dictmt(cmd::dictmt::Args),
 }
 
 fn main() {
@@ -85,5 +88,6 @@ fn main() {
         Command::Piecepipe(args) => cmd::piecepipe::run(&args),
         Command::Prefill(args) => cmd::prefill::run(&args),
         Command::Train(args) => cmd::train::run(&args),
+        Command::Dictmt(args) => cmd::dictmt::run(&args),
     }
 }

@@ -747,20 +747,19 @@ pub(crate) enum FrameEncoderCore {
 }
 
 impl FrameEncoderCore {
-    // Fallible only for an invalid dictionary (no_std + workers > 1 keeps
-    // its Unsupported error; a dictionary forces the single-threaded core).
+    // Fallible only for an invalid dictionary.
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
-        if let Some(dict) = &options.parsed_dictionary {
-            return Ok(Self::Single(StCore::new(
-                FrameEncoderCoreSt::new_with_dictionary(options, Some(dict)),
-            )));
-        }
-        if let Some(raw) = &options.dictionary {
-            let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
-            return Ok(Self::Single(StCore::new(
-                FrameEncoderCoreSt::new_with_dictionary(options, Some(&dict)),
-            )));
-        }
+        // The dictionary resolves once (the parsed form shares, the raw
+        // bytes parse fallibly here) and routes every arm below: the
+        // multithreaded core seeds the frame's first job from it, the
+        // single-threaded core the frame itself.
+        let dict = match (&options.parsed_dictionary, &options.dictionary) {
+            (parsed, _) if parsed.is_some() => parsed.clone(),
+            (_, Some(raw)) => Some(alloc::sync::Arc::new(
+                crate::encoding::dictionary::EncDictionary::parse(raw)?,
+            )),
+            (_, None) => None,
+        };
         if options.workers > 1 {
             // Same engagement conditions as the bulk mt path: raw-block
             // levels and single-core processes run the single-threaded core
@@ -769,14 +768,34 @@ impl FrameEncoderCore {
             if options.level != Level::Uncompressed
                 && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2)
             {
-                return Ok(Self::Mt(super::encoder_mt::MtEncoderCore::new(options)));
+                return Ok(Self::Mt(match dict {
+                    Some(dict) => {
+                        super::encoder_mt::MtEncoderCore::new_with_dictionary(options, Some(dict))
+                    },
+                    None => super::encoder_mt::MtEncoderCore::new(options),
+                }));
             }
             #[cfg(feature = "std")]
-            return Ok(Self::Single(StCore::new(FrameEncoderCoreSt::new(options))));
+            {
+                if let Some(dict) = &dict {
+                    return Ok(Self::Single(StCore::new(
+                        FrameEncoderCoreSt::new_with_dictionary(options, Some(dict)),
+                    )));
+                }
+                return Ok(Self::Single(StCore::new(FrameEncoderCoreSt::new(options))));
+            }
             #[cfg(not(feature = "std"))]
-            return Err(Error::Unsupported {
-                feature: crate::Feature::Multithread,
-            });
+            {
+                let _ = dict;
+                return Err(Error::Unsupported {
+                    feature: crate::Feature::Multithread,
+                });
+            }
+        }
+        if let Some(dict) = &dict {
+            return Ok(Self::Single(StCore::new(
+                FrameEncoderCoreSt::new_with_dictionary(options, Some(dict)),
+            )));
         }
         Ok(Self::Single(StCore::new(FrameEncoderCoreSt::new(options))))
     }
