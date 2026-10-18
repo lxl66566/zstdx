@@ -13,7 +13,9 @@
 //!   including the prepared [`dict::EncoderDictionary`]/[`dict::DecoderDictionary`] forms; the
 //!   trainers live in [`dict`] behind the `dict_builder` feature.
 //! - `zstd_safe` (and the `stream::{raw,zio}` layer around it) has no equivalent; the native
-//!   low-level API is [`crate::encoding`]/[`crate::decoding`].
+//!   low-level API is [`crate::encoding`]/[`crate::decoding`]. The context wrappers therefore take
+//!   no `'a` lifetime, and `with_context`/`with_writer`/`with_encoder`/`with_ref_prefix`/
+//!   `set_parameter`/`context_mut` have no counterpart.
 //! - `bulk::Decompressor::decompress` treats `capacity` as a growing hint, where the zstd crate
 //!   errors when the content exceeds it; [`bulk::Decompressor::upper_bound`] always answers
 //!   (upstream needs the `experimental` feature).
@@ -32,7 +34,7 @@ mod tests;
 // The zstd crate re-exports these at its root: `zstd::Encoder` is the
 // write-side encoder, `zstd::Decoder` the read-side decoder.
 #[doc(no_inline)]
-pub use stream::{decode_all, encode_all, read::Decoder, write::AutoFinishEncoder, write::Encoder};
+pub use stream::{decode_all, encode_all, read::Decoder, write::Encoder};
 
 use crate::Level;
 

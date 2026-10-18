@@ -255,6 +255,8 @@ impl<W: Write> Decoder<W> {
         if let Some(dict) = &options.dictionary {
             let dict = crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
             inner.add_dict(dict)?;
+        } else if let Some(dict) = &options.parsed_dictionary {
+            inner.add_shared_dict(dict.clone())?;
         }
         Ok(Self {
             writer,

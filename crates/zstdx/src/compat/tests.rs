@@ -663,3 +663,258 @@ fn dict_trainers_and_roundtrip() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The write encoder's parameter surface: `window_log` and
+/// `include_contentsize` before the first write (rejected after), with
+/// the zstd crate's `test_flush` shape (flush mid-stream, then finish).
+#[test]
+fn stream_write_encoder_parameters() {
+    let data = payload();
+
+    // window_log still round-trips (clamped by the format's 10..=27)
+    let mut sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(&mut sink, 3).unwrap();
+    enc.window_log(10).unwrap();
+    enc.write_all(&data).unwrap();
+    assert!(enc.window_log(12).is_err());
+    enc.finish().unwrap();
+    assert_eq!(compat::bulk::decompress(&sink, data.len()).unwrap(), data);
+
+    // include_contentsize(false): the pledge sizes the frame but the
+    // header carries no content-size field
+    let mut sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(&mut sink, 3).unwrap();
+    enc.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+    enc.include_contentsize(false).unwrap();
+    enc.write_all(&data).unwrap();
+    assert!(enc.include_contentsize(true).is_err());
+    enc.finish().unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&sink).unwrap(),
+        None,
+        "the header must not declare the content size"
+    );
+    assert_eq!(compat::bulk::decompress(&sink, 0).unwrap(), data);
+
+    // include_contentsize(true) (the default): the pledge is written
+    let mut sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(&mut sink, 3).unwrap();
+    enc.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+    enc.write_all(&data).unwrap();
+    enc.finish().unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&sink)
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(data.len())
+    );
+
+    // the zstd crate's test_flush shape: flush mid-stream, finish, decode
+    let sink = Vec::new();
+    let mut enc = compat::stream::write::Encoder::new(sink, 19).unwrap();
+    enc.write_all(b"hello").unwrap();
+    enc.flush().unwrap();
+    let sink = enc.finish().unwrap();
+    assert_eq!(
+        compat::stream::decode_all(sink.as_slice()).unwrap(),
+        b"hello"
+    );
+}
+
+/// The read encoder gains the same parameter setters as the write side,
+/// plus the dictionary and buffer constructors.
+#[test]
+fn stream_read_encoder_parameters() {
+    let data = payload();
+
+    // with_dictionary / with_buffer
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let mut enc =
+        compat::stream::read::Encoder::with_dictionary(data.as_slice(), 3, &dict).unwrap();
+    let mut compressed = Vec::new();
+    enc.read_to_end(&mut compressed).unwrap();
+    enc.finish().unwrap();
+    let mut dec =
+        compat::stream::read::Decoder::with_dictionary(compressed.as_slice(), &dict).unwrap();
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+
+    let mut enc = compat::stream::read::Encoder::with_buffer(data.as_slice(), 3).unwrap();
+    // parameters before the first read; rejected after it started
+    enc.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+    enc.include_checksum(false).unwrap();
+    enc.window_log(10).unwrap();
+    enc.include_contentsize(false).unwrap();
+    let mut compressed = Vec::new();
+    enc.read_to_end(&mut compressed).unwrap();
+    assert!(enc.set_pledged_src_size(None).is_err());
+    assert!(enc.include_checksum(true).is_err());
+    assert!(enc.window_log(20).is_err());
+    assert!(enc.include_contentsize(true).is_err());
+    enc.finish().unwrap();
+    // the pledge did not reach the header (contentsize off), but the
+    // stream still enforced nothing and round-trips
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&compressed).unwrap(),
+        None
+    );
+    assert_eq!(compat::bulk::decompress(&compressed, 0).unwrap(), data);
+}
+
+/// A writer that counts flushes, for the auto-flush semantics test.
+struct CountingFlush<'a> {
+    sink: &'a mut Vec<u8>,
+    count: &'a std::cell::Cell<usize>,
+}
+
+impl Write for CountingFlush<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sink.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.count.set(self.count.get() + 1);
+        Ok(())
+    }
+}
+
+/// `AutoFlushDecoder` follows the zstd crate's semantics: writes buffer,
+/// the wrapper's drop performs the flush and reports it to `on_flush`.
+#[test]
+fn stream_write_decoder_auto_flush_on_drop() {
+    let data = payload();
+    let compressed = compat::bulk::compress(&data, 3).unwrap();
+    let mut sink = Vec::new();
+    let flushes = std::cell::Cell::new(0usize);
+    let callback_ran = std::cell::Cell::new(false);
+    {
+        let mut counting = CountingFlush {
+            sink: &mut sink,
+            count: &flushes,
+        };
+        {
+            let mut dec = compat::stream::write::Decoder::new(&mut counting)
+                .unwrap()
+                .on_flush(|res| {
+                    res.unwrap();
+                    callback_ran.set(true);
+                });
+            dec.write_all(&compressed).unwrap();
+            assert_eq!(flushes.get(), 0, "writes buffer; the flush comes at drop");
+        }
+        assert_eq!(flushes.get(), 1);
+    }
+    assert!(callback_ran.get());
+    assert_eq!(sink, data);
+
+    // plain auto_flush flushes at drop too, and into_inner hands the
+    // decoder back without a flush
+    let flushes = std::cell::Cell::new(0usize);
+    let mut sink = Vec::new();
+    {
+        let mut counting = CountingFlush {
+            sink: &mut sink,
+            count: &flushes,
+        };
+        let mut dec = compat::stream::write::Decoder::new(&mut counting)
+            .unwrap()
+            .auto_flush();
+        dec.write_all(&compressed).unwrap();
+        let mut dec = dec.into_inner();
+        assert_eq!(flushes.get(), 0);
+        dec.flush().unwrap();
+        assert_eq!(flushes.get(), 1);
+    }
+    assert_eq!(sink, data);
+}
+
+/// Prepared dictionaries on the stream types: compression runs at the
+/// dictionary's level, decode attaches the shared parse, and an invalid
+/// prepared dictionary is refused where each side validates.
+#[test]
+fn stream_prepared_dictionaries() {
+    use crate::decoding::dictionary::MAGIC_NUM;
+
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+    let encoder_dict = compat::dict::EncoderDictionary::copy(&dict, 3);
+    let decoder_dict = compat::dict::DecoderDictionary::copy(&dict);
+
+    // write encoder -> read decoder through prepared dictionaries
+    let mut compressed = Vec::new();
+    let mut enc =
+        compat::stream::write::Encoder::with_prepared_dictionary(&mut compressed, &encoder_dict)
+            .unwrap();
+    enc.write_all(&content).unwrap();
+    enc.finish().unwrap();
+    let mut dec = compat::stream::read::Decoder::with_prepared_dictionary(
+        compressed.as_slice(),
+        &decoder_dict,
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+
+    // the read encoder takes one too, and the write decoder decodes through it
+    let mut enc =
+        compat::stream::read::Encoder::with_prepared_dictionary(content.as_slice(), &encoder_dict)
+            .unwrap();
+    let mut round = Vec::new();
+    enc.read_to_end(&mut round).unwrap();
+    enc.finish().unwrap();
+    let mut out = Vec::new();
+    {
+        let mut dec =
+            compat::stream::write::Decoder::with_prepared_dictionary(&mut out, &decoder_dict)
+                .unwrap();
+        dec.write_all(&round).unwrap();
+        dec.flush().unwrap();
+    }
+    assert_eq!(out, content);
+
+    // invalid prepared dictionaries: refused at the stream constructors
+    // (the parse replays there), on every side
+    let bad_enc = compat::dict::EncoderDictionary::copy(&MAGIC_NUM, 3);
+    let bad_dec = compat::dict::DecoderDictionary::copy(&MAGIC_NUM);
+    assert!(
+        compat::stream::write::Encoder::with_prepared_dictionary(Vec::new(), &bad_enc).is_err()
+    );
+    assert!(
+        compat::stream::read::Encoder::with_prepared_dictionary(content.as_slice(), &bad_enc)
+            .is_err()
+    );
+    assert!(
+        compat::stream::read::Decoder::with_prepared_dictionary(content.as_slice(), &bad_dec)
+            .is_err()
+    );
+    assert!(
+        compat::stream::write::Decoder::with_prepared_dictionary(Vec::new(), &bad_dec).is_err()
+    );
+}
+
+/// The re-exports mirror the zstd crate's: `compat::Encoder` is the write
+/// encoder, `compat::Decoder` the read decoder, both also visible at
+/// `compat::stream::` together with `AutoFinishEncoder`.
+#[test]
+fn reexport_shape_matches_zstd() {
+    let mut sink = Vec::new();
+    let mut enc: compat::Encoder<&mut Vec<u8>> = compat::Encoder::new(&mut sink, 1).unwrap();
+    enc.write_all(b"payload").unwrap();
+    let _ = enc.finish().unwrap();
+    let mut dec: compat::Decoder<&[u8]> = compat::Decoder::new(sink.as_slice()).unwrap();
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"payload");
+
+    let mut sink = Vec::new();
+    let _: compat::stream::Encoder<&mut Vec<u8>> =
+        compat::stream::Encoder::new(&mut sink, 1).unwrap();
+    let _: compat::stream::Decoder<&[u8]> = compat::stream::Decoder::new(sink.as_slice()).unwrap();
+    let _: compat::stream::AutoFinishEncoder<&mut Vec<u8>> =
+        compat::stream::write::Encoder::new(&mut sink, 1)
+            .unwrap()
+            .auto_finish();
+}
