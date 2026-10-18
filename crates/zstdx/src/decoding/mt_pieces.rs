@@ -101,13 +101,19 @@ fn enabled() -> bool {
 
 /// Whether `plan` should route to the piece executor: the env gate plus a
 /// single pledged frame in the staging bounds. Returns the pledged size.
-pub(super) fn gate(plan: &ScanPlan) -> Option<u64> {
+///
+/// The range check runs on `usize::try_from(fcs)`: a plain `as` cast would
+/// let a >4-GiB pledge wrap into the regime on 32-bit targets and tile
+/// pieces over the truncated size, silently dropping the pledge
+/// divergence (the same contract hole the R49 verdict gate closed for
+/// 64-bit).
+pub(super) fn gate(plan: &ScanPlan) -> Option<usize> {
     if !enabled() {
         return None;
     }
-    let fcs = plan.pledged_single?;
+    let fcs = usize::try_from(plan.pledged_single?).ok()?;
     (MIN_PIECE_FRAME..=MAX_PIECE_FRAME)
-        .contains(&(fcs as usize))
+        .contains(&fcs)
         .then_some(fcs)
 }
 
@@ -743,10 +749,9 @@ pub(super) fn decode_pieces(
     input: &[u8],
     workers: u32,
     plan: &ScanPlan,
-    fcs: u64,
+    fcs: usize,
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
 ) -> Result<usize, FrameDecoderError> {
-    let fcs = fcs as usize;
     let n_segments = plan.segments.len();
     let threads = (workers as usize).min(n_segments);
 
