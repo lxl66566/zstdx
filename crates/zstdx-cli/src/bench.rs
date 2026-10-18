@@ -709,12 +709,17 @@ struct TimedFnState {
 
 impl TimedFnState {
     fn new(seconds: u64) -> Self {
-        // zstd's `!total_ms` guard: a zero budget still measures one round.
+        // zstd's `!total_ms` guard: a zero budget still measures one round,
+        // and its `run_ms > total_ms` clamp folds the round budget into
+        // the phase budget: `-i0` reports its first measured round instead
+        // of growing one to the half-second floor (the reference finishes
+        // such runs in milliseconds).
         let total_ms = seconds.saturating_mul(1000).max(1);
+        let total_ns = total_ms as u128 * 1_000_000;
         Self {
             time_spent_ns: 0,
-            time_budget_ns: total_ms as u128 * 1_000_000,
-            run_budget_ns: RUN_BUDGET.as_nanos(),
+            time_budget_ns: total_ns,
+            run_budget_ns: RUN_BUDGET.as_nanos().min(total_ns),
             nb_loops: 1,
         }
     }
@@ -1254,9 +1259,43 @@ mod tests {
     }
 
     /// The timed scheduler reports the fastest round and completes once the
-    /// budget is spent (mirrors BMK_benchTimedFn's shape).
+    /// budget is spent (mirrors BMK_benchTimedFn's shape): a round below
+    /// the reporting floor is re-measured with a larger loop count.
     #[test]
     fn timed_fn_reports_fastest_and_completes() {
+        struct Spin {
+            calls: u32,
+        }
+        impl BenchPass for Spin {
+            fn run(&mut self) -> Result<u64, String> {
+                self.calls += 1;
+                let spin = Instant::now();
+                while spin.elapsed() < Duration::from_millis(60) {}
+                Ok(42)
+            }
+        }
+        let mut state = TimedFnState::new(1);
+        let mut pass = Spin { calls: 0 };
+        let (ns_per_run, sum) = bench_timed_fn(&mut state, &mut pass).unwrap();
+        assert_eq!(sum, 42);
+        assert!(ns_per_run > 0.0);
+        assert!(
+            state.completed(),
+            "a 1-second budget is spent once a floor-clearing round lands"
+        );
+        assert!(
+            pass.calls >= 2,
+            "the loop must re-measure with a larger count"
+        );
+    }
+
+    /// The `-i0` clamp (`run_ms > total_ms` in zstd's reset): the round
+    /// budget folds into the phase budget, so the first measured round —
+    /// already above it — reports instead of growing to the half-second
+    /// floor. The reference finishes `zstd -b1 -i0` in milliseconds; the
+    /// unclamped port spun both phases up to the floor first.
+    #[test]
+    fn zero_budget_reports_the_first_round() {
         struct Spin {
             calls: u32,
         }
@@ -1273,14 +1312,8 @@ mod tests {
         let (ns_per_run, sum) = bench_timed_fn(&mut state, &mut pass).unwrap();
         assert_eq!(sum, 42);
         assert!(ns_per_run > 0.0);
-        assert!(
-            state.completed(),
-            "a 0-second budget is spent after one round"
-        );
-        assert!(
-            pass.calls >= 2,
-            "the loop must re-measure with a larger count"
-        );
+        assert_eq!(pass.calls, 1, "a 60 ms round must clear the 1 ms floor");
+        assert!(state.completed(), "the zero budget is spent after it");
     }
 
     /// Display helpers: zstd's digit rules.
