@@ -185,6 +185,8 @@ impl<R: Read> Decoder<R> {
                 let dict =
                     crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
                 decoder.add_dict(dict)?;
+            } else if let Some(dict) = &options.parsed_dictionary {
+                decoder.add_shared_dict(dict.clone())?;
             }
             Self::init_first_frame(&mut source, &mut decoder)
         };

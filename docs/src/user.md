@@ -77,7 +77,9 @@ let compressed = compat::bulk::compress(data, 3)?;
 let original = compat::bulk::decompress(&compressed, 0)?;
 ```
 
-`compat::stream` provides `Encoder`/`Decoder` and `copy_encode`/`copy_decode`. Not covered: `zstd_safe` and trained-dict generation via `zstd::dict` (use `zstdx::dict`).
+`compat::stream` provides `Encoder`/`Decoder` (also re-exported at `compat::` like the zstd crate does) and `copy_encode`/`copy_decode`; `compat::dict` provides prepared `EncoderDictionary`/`DecoderDictionary` (one shared parse per handle) and, with the `dict_builder` feature, the `from_samples`/`from_continuous`/`from_sample_iterator`/`from_files` trainers. The bulk paths declare the frame content size like libzstd's one-shot compressor; `upper_bound` answers `ZSTD_getFrameContentSize` semantics.
+
+Not covered: everything resting on `zstd_safe` (`stream::{raw,zio}`, `with_context`, `set_parameter`, `context_mut`, `CDict`/`DDict` re-exports) and the experimental items (`include_magicbytes`, by-reference `dict::*::new`). Known deviations: `compression_level_range` is 1..=22 (no accelerated levels); `read::{Encoder,Decoder}` take `R: Read` directly (no `BufReader` wrapper, so `get_ref`/`finish` expose `R`); `bulk::Decompressor::decompress` treats `capacity` as a growing hint where the zstd crate errors; a prepared dictionary that fails to parse replays the error at use instead of panicking; `include_dictid`/`long_distance_matching`/`set_target_cblock_size`/`with_ref_prefix` have no engine knob yet (dev/todo.md 18).
 
 The streaming types materialize their native backend on the first read/write. A failed start hands the wrapped reader/writer back (`get_mut`/`finish` stay usable, a retry re-runs the start); bytes the native read decoder's eager first-frame parse already consumed before failing are not replayed, so a retried start keeps reading from wherever the source stands.
 

@@ -6,7 +6,10 @@ use std::{
     vec::Vec,
 };
 
-use super::map_level;
+use super::{
+    dict::{DecoderDictionary, EncoderDictionary},
+    map_level,
+};
 use crate::{DecoderOptions, EncoderOptions};
 
 /// Common state of the compat encoders: options are collected until the
@@ -14,6 +17,9 @@ use crate::{DecoderOptions, EncoderOptions};
 struct EncoderState<W: io::Write> {
     writer: Option<W>,
     options: EncoderOptions,
+    /// libzstd's ContentSizeFlag: when false, a pledged size still sizes
+    /// the frame but never reaches the header.
+    contentsize_flag: bool,
     encoder: Option<crate::stream::write::Encoder<W>>,
 }
 
@@ -22,6 +28,7 @@ impl<W: io::Write> EncoderState<W> {
         Self {
             writer: Some(writer),
             options: EncoderOptions::new(map_level(level)),
+            contentsize_flag: true,
             encoder: None,
         }
     }
@@ -39,7 +46,18 @@ impl<W: io::Write> EncoderState<W> {
     fn materialize(&mut self) -> io::Result<&mut crate::stream::write::Encoder<W>> {
         if self.encoder.is_none() {
             let writer = self.writer.take().expect("writer kept until start");
-            match crate::stream::write::Encoder::try_with_options(writer, &self.options) {
+            // ContentSizeFlag=false: the pledge degrades to a sizing hint
+            // (`input_shape.len`) and leaves the header without the field.
+            let mut options = self.options.clone();
+            if !self.contentsize_flag
+                && let Some(len) = options.pledged_size
+            {
+                options.pledged_size = None;
+                let mut shape = options.input_shape;
+                shape.len = Some(len);
+                options = options.with_input_shape(shape);
+            }
+            match crate::stream::write::Encoder::try_with_options(writer, &options) {
                 Ok(encoder) => self.encoder = Some(encoder),
                 // Put the writer back so get_mut/finish still work after a
                 // failed start.
@@ -103,6 +121,17 @@ pub mod write {
             Ok(Self { state })
         }
 
+        /// Creates an encoder bound to an already-prepared dictionary
+        /// (its parse is shared); the dictionary's level is used.
+        pub fn with_prepared_dictionary(
+            writer: W,
+            dictionary: &EncoderDictionary,
+        ) -> io::Result<Self> {
+            let mut state = EncoderState::new(writer, dictionary.compression_level());
+            state.options = dictionary.apply(state.options)?;
+            Ok(Self { state })
+        }
+
         /// Sets the pledged source size (written into the frame header; a
         /// stream writing a different size fails at finish); fails once
         /// streaming started.
@@ -117,6 +146,23 @@ pub mod write {
         pub fn include_checksum(&mut self, include: bool) -> io::Result<()> {
             self.state.set_started()?;
             self.state.options.checksum = include && cfg!(feature = "hash");
+            Ok(())
+        }
+
+        /// Includes or excludes the content size in the frame header
+        /// (default on). With it off, a pledged source size still sizes the
+        /// frame but is not written; fails once streaming started.
+        pub fn include_contentsize(&mut self, include: bool) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.contentsize_flag = include;
+            Ok(())
+        }
+
+        /// Sets the maximum back-reference distance as `2^log_distance`
+        /// (clamped to the format's 10..=27); fails once streaming started.
+        pub fn window_log(&mut self, log_distance: u32) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.options.input_shape.window_log = Some(log_distance);
             Ok(())
         }
 
@@ -271,6 +317,23 @@ pub mod write {
             })
         }
 
+        /// Creates a decoder bound to an already-prepared dictionary
+        /// (its parse is shared). An invalid prepared dictionary is
+        /// refused here, the decode side's attach point.
+        pub fn with_prepared_dictionary(
+            writer: W,
+            dictionary: &DecoderDictionary,
+        ) -> io::Result<Self> {
+            let dict = dictionary.shared()?;
+            Ok(Self {
+                decoder: crate::stream::write::Decoder::with_options(
+                    writer,
+                    DecoderOptions::new().parsed_dictionary(dict),
+                )
+                .map_err(io::Error::from)?,
+            })
+        }
+
         /// Sets the maximum window log distance (log2 of bytes); applies to
         /// frames not yet decoded.
         pub fn window_log_max(&mut self, log: u32) -> io::Result<()> {
@@ -279,10 +342,22 @@ pub mod write {
                 .map_err(io::Error::from)
         }
 
-        /// Returns a wrapper that flushes the writer after each write.
+        /// Returns a wrapper that flushes the stream on drop.
         pub fn auto_flush(self) -> AutoFlushDecoder<W> {
             AutoFlushDecoder {
                 decoder: Some(self),
+                on_flush: None,
+            }
+        }
+
+        /// Returns a decoder that flushes the stream on drop.
+        ///
+        /// Calls the given callback with the result of the implicit flush.
+        /// It runs during drop, so it must not panic.
+        pub fn on_flush<F: FnMut(io::Result<()>)>(self, f: F) -> AutoFlushDecoder<W, F> {
+            AutoFlushDecoder {
+                decoder: Some(self),
+                on_flush: Some(f),
             }
         }
 
@@ -317,12 +392,15 @@ pub mod write {
         }
     }
 
-    /// A decoder that flushes its writer after each write.
-    pub struct AutoFlushDecoder<W: io::Write> {
+    /// A decoder that flushes the stream on drop (the zstd crate's
+    /// semantics: writes buffer, the wrapper's drop performs the flush).
+    pub struct AutoFlushDecoder<W: io::Write, F: FnMut(io::Result<()>) = fn(io::Result<()>)> {
+        // Wrapped in an Option to take it during drop.
         decoder: Option<Decoder<W>>,
+        on_flush: Option<F>,
     }
 
-    impl<W: io::Write> AutoFlushDecoder<W> {
+    impl<W: io::Write, F: FnMut(io::Result<()>)> AutoFlushDecoder<W, F> {
         /// Acquires a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             self.decoder.as_ref().unwrap().get_ref()
@@ -339,17 +417,24 @@ pub mod write {
         }
     }
 
-    impl<W: io::Write> io::Write for AutoFlushDecoder<W> {
+    impl<W: io::Write, F: FnMut(io::Result<()>)> io::Write for AutoFlushDecoder<W, F> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let res = self.decoder.as_mut().unwrap().write(buf);
-            if res.is_ok() {
-                self.decoder.as_mut().unwrap().flush()?;
-            }
-            res
+            self.decoder.as_mut().unwrap().write(buf)
         }
 
         fn flush(&mut self) -> io::Result<()> {
             self.decoder.as_mut().unwrap().flush()
+        }
+    }
+
+    impl<W: io::Write, F: FnMut(io::Result<()>)> Drop for AutoFlushDecoder<W, F> {
+        fn drop(&mut self) {
+            if let Some(mut decoder) = self.decoder.take() {
+                let result = io::Write::flush(&mut decoder);
+                if let Some(f) = self.on_flush.as_mut() {
+                    f(result);
+                }
+            }
         }
     }
 }
@@ -367,6 +452,9 @@ pub mod read {
     pub struct Encoder<R: io::Read> {
         source: Option<R>,
         options: EncoderOptions,
+        /// libzstd's ContentSizeFlag: when false, a pledged size still
+        /// sizes the frame but never reaches the header.
+        contentsize_flag: bool,
         inner: Option<crate::stream::read::Encoder<R>>,
     }
 
@@ -378,8 +466,76 @@ pub mod read {
             Ok(Self {
                 source: Some(source),
                 options: EncoderOptions::new(map_level(level)),
+                contentsize_flag: true,
                 inner: None,
             })
+        }
+
+        /// Creates a new encoder around a `BufRead` (this porting layer
+        /// reads through its own buffering, so the input is taken as-is).
+        pub fn with_buffer(source: R, level: i32) -> io::Result<Self> {
+            Self::new(source, level)
+        }
+
+        /// Creates an encoder bound to a dictionary.
+        pub fn with_dictionary(source: R, level: i32, dictionary: &[u8]) -> io::Result<Self> {
+            Ok(Self {
+                source: Some(source),
+                options: EncoderOptions::new(map_level(level)).dictionary(dictionary),
+                contentsize_flag: true,
+                inner: None,
+            })
+        }
+
+        /// Creates an encoder bound to an already-prepared dictionary
+        /// (its parse is shared); the dictionary's level is used.
+        pub fn with_prepared_dictionary(
+            source: R,
+            dictionary: &EncoderDictionary,
+        ) -> io::Result<Self> {
+            let options = dictionary.apply(EncoderOptions::new(map_level(
+                dictionary.compression_level(),
+            )))?;
+            Ok(Self {
+                source: Some(source),
+                options,
+                contentsize_flag: true,
+                inner: None,
+            })
+        }
+
+        /// Sets the pledged source size (written into the frame header; a
+        /// stream writing a different size fails at finish); fails once
+        /// streaming started.
+        pub fn set_pledged_src_size(&mut self, size: Option<u64>) -> io::Result<()> {
+            self.not_started()?;
+            self.options.pledged_size = size;
+            Ok(())
+        }
+
+        /// Includes or excludes the frame checksum (default on); fails
+        /// once streaming started.
+        pub fn include_checksum(&mut self, include: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.options.checksum = include && cfg!(feature = "hash");
+            Ok(())
+        }
+
+        /// Includes or excludes the content size in the frame header
+        /// (default on). With it off, a pledged source size still sizes
+        /// the frame but is not written; fails once streaming started.
+        pub fn include_contentsize(&mut self, include: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.contentsize_flag = include;
+            Ok(())
+        }
+
+        /// Sets the maximum back-reference distance as `2^log_distance`
+        /// (clamped to the format's 10..=27); fails once streaming started.
+        pub fn window_log(&mut self, log_distance: u32) -> io::Result<()> {
+            self.not_started()?;
+            self.options.input_shape.window_log = Some(log_distance);
+            Ok(())
         }
 
         /// Enables multithreaded compression: `workers > 1` engages the
@@ -389,13 +545,19 @@ pub mod read {
         /// Fails once streaming started, like the write-side parameter
         /// setters.
         pub fn multithread(&mut self, workers: u32) -> io::Result<()> {
-            if self.inner.is_some() {
-                return Err(io::Error::other(crate::Error::Parameter(
-                    crate::ParameterError::AlreadyStreaming,
-                )));
-            }
+            self.not_started()?;
             self.options.workers = workers;
             Ok(())
+        }
+
+        fn not_started(&self) -> io::Result<()> {
+            if self.inner.is_some() {
+                Err(io::Error::other(crate::Error::Parameter(
+                    crate::ParameterError::AlreadyStreaming,
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         /// Recommended size of read batches: one full block.
@@ -443,16 +605,28 @@ pub mod read {
         fn materialize(&mut self) -> io::Result<&mut crate::stream::read::Encoder<R>> {
             if self.inner.is_none() {
                 let source = self.source.take().expect("source kept until start");
+                // ContentSizeFlag=false: the pledge degrades to a sizing
+                // hint (`input_shape.len`) and leaves the header without
+                // the field.
+                let mut options = self.options.clone();
+                if !self.contentsize_flag
+                    && let Some(len) = options.pledged_size
+                {
+                    options.pledged_size = None;
+                    let mut shape = options.input_shape;
+                    shape.len = Some(len);
+                    options = options.with_input_shape(shape);
+                }
                 // On failure the source goes back before the error leaves,
                 // mirroring the read decoder's materialize.
-                let encoder =
-                    match crate::stream::read::Encoder::try_with_options(source, &self.options) {
-                        Ok(encoder) => encoder,
-                        Err((source, err)) => {
-                            self.source = Some(source);
-                            return Err(io::Error::from(err));
-                        },
-                    };
+                let encoder = match crate::stream::read::Encoder::try_with_options(source, &options)
+                {
+                    Ok(encoder) => encoder,
+                    Err((source, err)) => {
+                        self.source = Some(source);
+                        return Err(io::Error::from(err));
+                    },
+                };
                 self.inner = Some(encoder);
             }
             Ok(self.inner.as_mut().unwrap())
@@ -490,6 +664,27 @@ pub mod read {
             Ok(Self {
                 source: Some(source),
                 options: DecoderOptions::new().dictionary(dictionary),
+                inner: None,
+                single_frame: false,
+            })
+        }
+
+        /// Creates a new decoder around a `BufRead` (this porting layer
+        /// reads through its own buffering, so the input is taken as-is).
+        pub fn with_buffer(source: R) -> io::Result<Self> {
+            Self::new(source)
+        }
+
+        /// Creates a new decoder bound to an already-prepared dictionary
+        /// (its parse is shared).
+        pub fn with_prepared_dictionary(
+            source: R,
+            dictionary: &DecoderDictionary,
+        ) -> io::Result<Self> {
+            let dict = dictionary.shared()?;
+            Ok(Self {
+                source: Some(source),
+                options: DecoderOptions::new().parsed_dictionary(dict),
                 inner: None,
                 single_frame: false,
             })
@@ -577,6 +772,12 @@ pub mod read {
         }
     }
 }
+
+// The zstd crate re-exports these at `zstd::stream::` as well: the
+// write-side encoder, the read-side decoder and its auto-finishing
+// wrapper.
+#[doc(no_inline)]
+pub use self::{read::Decoder, write::AutoFinishEncoder, write::Encoder};
 
 /// Compresses everything `source` provides into a Vec.
 pub fn encode_all<R: io::Read>(source: R, level: i32) -> io::Result<Vec<u8>> {
