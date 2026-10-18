@@ -311,8 +311,13 @@ impl FrameEncoderCoreSt {
                 len,
                 window_log: options.input_shape.window_log,
             };
-            // libzstd clamps the window by src + dict.
-            shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+            // libzstd clamps the window by src + dict — only for a known
+            // content size; an open-ended stream keeps
+            // CONTENTSIZE_UNKNOWN, so `ZSTD_adjustCParams_internal` skips
+            // its window clamp and the frame keeps the row's full window
+            // (the mt core folds the same way). Folding `unwrap_or(0)`
+            // here clamped such streams to a dict-sized window.
+            shape.len = len.map(|len| len + dict.content.len() as u64);
             crate::encoding::dictionary::reset_with_dictionary(
                 &mut self.state,
                 dict,

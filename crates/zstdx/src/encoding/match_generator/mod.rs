@@ -411,6 +411,16 @@ use super::ldm::LdmSnapshot;
 /// <= 16 KiB clevels table boundary, keyed on the payload alone on the
 /// loadDictionary route — see `load_dictionary`).
 const SMALL_DICT_PAYLOAD_MAX: u64 = 16 * 1024;
+/// Span ceiling for the dict-row parse semantics (payload + dict, the
+/// shape's `len` — see `load_dictionary`): libzstd keys its small-input
+/// clevels tables by rSize = srcSize + dictSize on the loadDictionary
+/// route (`ZSTD_getCParamRowSize`), and above its largest boundary
+/// (256 KB) every row is stock — the large table's lazy rows are
+/// searchLength 5 with stock search budgets, no dict adjustments. A
+/// frame whose known span passes the ceiling disarms the dict-row
+/// width/accept-bar semantics the same way (the x8 chain walk budget
+/// stays armed at every dict span — see `load_dictionary`).
+const DICT_ROW_SPAN_MAX: u64 = 256 * 1024;
 /// Hash log of the <= 16 KiB table's chain rows, R12 geometry: the table's
 /// H14 dilutes 4-byte candidate classes once the dictionary's content and
 /// the payload share one table (~20 KiB of positions over 16 KiB of
@@ -1277,13 +1287,37 @@ impl MatchGeneratorDriver {
         // hashes 8 there whatever the row. Dict frames are not a hot path
         // (1.4 ms/file on the fixture at -5/-9 either way); no-dict params
         // and widths stay put (byte-identical no-dict output).
-        if matches!(
-            self.params.strategy,
-            Strategy::Chain(_) | Strategy::Dfast(_) | Strategy::Row(_)
-        ) {
+        // R50 span test: the width-4 dict-row semantics are tuned for the
+        // small-payload regime (the fixture grid's <= 16 KiB payloads,
+        // where the parse lives inside the dict's dense twin field) and
+        // dilute a large homogeneous frame — 32 MiB json paid +2.1/+17.7%
+        // vs plain-ST at fast/balanced (dict-ST 6,472,761 vs 6,336,107 at
+        // -3, 5,486,229 vs 4,661,011 at -9): the 4-byte candidate classes
+        // bury the far twins a large frame parses for, and every accepted
+        // ml-4 match fragments the sequence stream. Above
+        // DICT_ROW_SPAN_MAX (payload + dict, `self.shape.len` — libzstd's
+        // own rSize key and 256 KB table boundary, above which its rows
+        // are all stock) the width disarms: width-5 hashing, stock
+        // min_match, miss ramp and offset-pays gate. The x8 chain walk
+        // budget stays armed at every dict span — with the stock width the
+        // deep walk converts on large frames too (32 MiB dict-ST -9:
+        // json 4,697,443 -> 4,589,941, text 61,797 -> 59,827; it was the
+        // width that made it lose here). An unknown span stays armed —
+        // libzstd's unpledged dict stream resolves its table from the
+        // dict's own size (`ZSTD_getCParamRowSize`'s unknown arm wraps to
+        // dictSize + 499, a small table), and both our streaming cores
+        // keep the unknown-length row there.
+        let dict_rows_armed = self.shape.len.is_none_or(|span| span <= DICT_ROW_SPAN_MAX);
+        if dict_rows_armed
+            && matches!(
+                self.params.strategy,
+                Strategy::Chain(_) | Strategy::Dfast(_) | Strategy::Row(_)
+            )
+        {
             self.dict_row = true;
         }
-        if matches!(self.params.strategy, Strategy::Chain(_) | Strategy::Row(_)) {
+        if dict_rows_armed && matches!(self.params.strategy, Strategy::Chain(_) | Strategy::Row(_))
+        {
             self.params.min_match = MIN_MATCH as u32;
         }
         if matches!(self.params.strategy, Strategy::Chain(_)) {
