@@ -1,4 +1,5 @@
 extern crate zstdx;
+mod adapt;
 mod bench;
 mod list;
 mod patch;
@@ -125,6 +126,8 @@ fn parse_size(text: &str) -> Result<u64, String> {
 struct Settings {
     level: i32,
     threads: u32,
+    /// --adapt bounds: dynamic per-chunk level walking (None: off).
+    adapt: Option<adapt::AdaptRange>,
     /// Whether frames carry a content checksum (--no-check clears it).
     checksum: bool,
     /// Forced window log (--long).
@@ -332,6 +335,23 @@ struct Cli {
     )]
     long: Option<u32>,
 
+    /// Dynamically adapt the compression level to I/O conditions
+    /// (compression only): `min=`/`max=` bounds, comma-separated, either
+    /// order, at least one (default 1-22, the engine's range; zstd's
+    /// negative rungs do not exist here). The input compresses as
+    /// independent 8 MiB chunk frames and a level step applies to every
+    /// later chunk; `-T` workers apply within each chunk
+    #[arg(
+        long,
+        value_name = "PARAMS",
+        num_args = 0..=1,
+        default_missing_value = "min=1,max=22",
+        require_equals = true,
+        value_parser = adapt::parse_range,
+        conflicts_with_all = ["decompress", "test"]
+    )]
+    adapt: Option<adapt::AdaptRange>,
+
     /// Write a frame content checksum (the default)
     #[arg(long, conflicts_with = "no_check")]
     check: bool,
@@ -531,6 +551,17 @@ fn run(cli: &Cli) -> bool {
         level = MAX_LEVEL_WITHOUT_ULTRA;
     }
 
+    // --adapt clamps the starting level into its bounds (zstdcli.c applies
+    // the same two clamps after the ultra reduction).
+    if let Some(range) = &cli.adapt {
+        if range.min > level {
+            level = range.min;
+        }
+        if range.max < level {
+            level = range.max;
+        }
+    }
+
     // --patch-from loads its reference through the same raw-dictionary
     // path as -D (the flags conflict, so at most one is set).
     let dict = match cli.dict.as_ref().or(cli.patch_from.as_ref()) {
@@ -573,6 +604,13 @@ fn run(cli: &Cli) -> bool {
         eprintln!("{PREFIX}--stream-size only applies to stdin input");
         return false;
     }
+    if cli.adapt.is_some() && (cli.stream_size.is_some() || cli.size_hint.is_some()) {
+        eprintln!(
+            "{PREFIX}--stream-size/--size-hint cannot combine with --adapt: chunk frames pledge \
+             their own sizes exactly"
+        );
+        return false;
+    }
     if cli.size_hint.is_some() && !stdin_stream {
         eprintln!(
             "{PREFIX}--size-hint only applies to stdin input (file sizes are pledged exactly)"
@@ -601,6 +639,7 @@ fn run(cli: &Cli) -> bool {
     let settings = Settings {
         level,
         threads,
+        adapt: cli.adapt,
         checksum: !cli.no_check,
         window_log: patch_window_log.or(window_log),
         stream_size: cli.stream_size,
@@ -870,6 +909,9 @@ fn compress(
     source_size: usize,
     dict: Option<&[u8]>,
 ) -> AnyResult<u64> {
+    if settings.adapt.is_some() {
+        return adapt::compress(reader, output, settings, dict);
+    }
     let mut options =
         EncoderOptions::new(Level::from_zstd(settings.level)).checksum(settings.checksum);
     // A file input pledges its metadata size; a stdin stream pledges
@@ -1158,6 +1200,7 @@ mod tests {
                 stream_size: None,
                 size_hint: None,
                 max_window: None,
+                adapt: None,
             },
             None,
         );
@@ -1181,6 +1224,7 @@ mod tests {
                 stream_size: None,
                 size_hint: None,
                 max_window: None,
+                adapt: None,
             },
             0,
             Some(&[0x37, 0xa4, 0x30, 0xec]),
@@ -1206,6 +1250,7 @@ mod tests {
                 stream_size: None,
                 size_hint: None,
                 max_window: None,
+                adapt: None,
             },
             data.len(),
             None,
@@ -1378,6 +1423,22 @@ mod tests {
         // smaller ones are rejected there; here only the parse matters.
         assert!(Cli::try_parse_from(["zstdx", "--long=31"]).is_ok());
         assert!(Cli::try_parse_from(["zstdx", "--long=9"]).is_ok());
+    }
+
+    /// --adapt parses with zstd's spellings: bare, either key alone, both
+    /// keys in either order; malformed values and the decode modes reject.
+    #[test]
+    fn adapt_flags_parse() {
+        use crate::adapt::AdaptRange;
+        let cli = Cli::try_parse_from(["zstdx", "--adapt"]).unwrap();
+        assert_eq!(cli.adapt, Some(AdaptRange { min: 1, max: 22 }));
+        let cli = Cli::try_parse_from(["zstdx", "--adapt=max=9"]).unwrap();
+        assert_eq!(cli.adapt, Some(AdaptRange { min: 1, max: 9 }));
+        let cli = Cli::try_parse_from(["zstdx", "--adapt=max=19,min=3"]).unwrap();
+        assert_eq!(cli.adapt, Some(AdaptRange { min: 3, max: 19 }));
+        assert!(Cli::try_parse_from(["zstdx", "--adapt=x"]).is_err());
+        assert!(Cli::try_parse_from(["zstdx", "--adapt=min=9,max=2"]).is_err());
+        assert!(Cli::try_parse_from(["zstdx", "--adapt", "-d", "f.zst"]).is_err());
     }
 
     /// The list/train surface parses with zstd's spellings, and the mode

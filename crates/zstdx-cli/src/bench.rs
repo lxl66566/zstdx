@@ -229,6 +229,8 @@ fn rejected_flag(cli: &Cli) -> Option<String> {
         )
     } else if cli.memory.is_some() {
         ("-M/--memory", "benchmark mode bounds no windows")
+    } else if cli.adapt.is_some() {
+        ("--adapt", "benchmark mode drives its own levels")
     } else if cli.stream_size.is_some() || cli.size_hint.is_some() {
         (
             "--stream-size/--size-hint",
