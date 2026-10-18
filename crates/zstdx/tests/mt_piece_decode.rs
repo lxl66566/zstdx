@@ -400,3 +400,76 @@ fn pledged_fcs_mismatch_errors_through_serial_fallback() {
     set_mt_ramp_depth_for_tests(u64::MAX);
     set_piece_decode_for_tests(false);
 }
+
+/// Handcrafted frame whose staged prefix hits the pledge exactly while the
+/// frame keeps producing output: 16 raw 128-KiB blocks (2 MiB = the
+/// pledge), then ~50k compressed restart blocks (7 bytes out each). The
+/// head stages in microseconds (raw staging only records body ranges), so
+/// the prefix [0, 2 MiB) is cut and validated - raw blocks carry no
+/// sequences, no piece reads below its start - and a winner can settle
+/// long before the tail's single big final segment finishes its ~50k
+/// section decodes. The verdict must stay unconsumable until staging
+/// completes: taking the pieces then would silently drop the tail and
+/// return Ok(pledge) where every other path reports the Frame_Content_Size
+/// mismatch. The head-to-tail staging ratio (~us vs ~ms) pins the race
+/// pre-fix; post-fix the outcome is timing-independent.
+#[test]
+fn overlong_frame_after_early_winner_errors() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(true);
+
+    let block = [0xaau8; 128 * 1024];
+    let mut push_raw = |frame: &mut Vec<u8>, last: bool| {
+        let raw = ((block.len() as u32) << 3) | u32::from(last);
+        frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+        frame.extend_from_slice(&block);
+    };
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&0xfd2fb528u32.to_le_bytes());
+    frame.push(0x80); // FCS flag 2 (4-byte field), no single segment/checksum/dict
+    frame.push(0x38); // window log 17 (128 KiB): full-size raw blocks are legal
+    frame.extend_from_slice(&(2 * 1024 * 1024u32).to_le_bytes());
+    for _ in 0..16 {
+        push_raw(&mut frame, false);
+    }
+    // Restart blocks: raw literals + one RLE-mode sequence (explicit FSE
+    // tables, no Huffman rebuild) - the restart points past the frame
+    // start, so the scan cuts segments around them and the bulk of them
+    // lands in one big slowly-staged final segment.
+    let restart = [
+        0x20u8, 0x30, 0x31, 0x32, 0x33, // raw literals section, 4 bytes
+        0x01, 0x54, 0x04, 0x00, 0x00, 0x01, // 1 sequence, all-RLE FSE modes
+    ];
+    let tail_blocks = 50_000;
+    for i in 0..tail_blocks {
+        let raw = ((restart.len() as u32) << 3) | (2 << 1) | u32::from(i + 1 == tail_blocks);
+        frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+        frame.extend_from_slice(&restart);
+    }
+
+    // Sequential baseline: the lie is reported (decode_all_to_vec needs the
+    // geometric retry to fit the actual ~2.35 MiB output first).
+    let mut capacity = 1 << 20;
+    let err = loop {
+        let mut seq_out = Vec::with_capacity(capacity);
+        match FrameDecoder::new().decode_all_to_vec(&frame, &mut seq_out) {
+            Ok(()) => panic!("sequential decoder accepted the overlong frame"),
+            Err(zstdx::decoding::errors::FrameDecoderError::TargetTooSmall) => capacity *= 2,
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        err.to_string().contains("Frame_Content_Size mismatch"),
+        "{err}"
+    );
+
+    let err =
+        bulk::decompress_with(&frame, 1 << 20, &DecoderOptions::new().threads(8)).unwrap_err();
+    assert!(
+        err.to_string().contains("Frame_Content_Size mismatch"),
+        "{err}"
+    );
+    set_piece_decode_for_tests(false);
+}
+
