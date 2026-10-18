@@ -30,8 +30,9 @@ use super::{
     checksum::SliceChecksum,
     compress_fastest, far_screen,
     frame_compressor::{
-        CompressState, JobSpf, compress_job_blocks_inner, new_slice_state, reset_slice_state,
-        return_pooled_slice_state, return_slice_state, take_pooled_slice_state, take_slice_state,
+        CompressState, JobSpf, compress_job_blocks_inner, new_owned_state, new_slice_state,
+        reset_slice_state, return_pooled_slice_state, return_slice_state, take_pooled_slice_state,
+        take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
@@ -115,6 +116,7 @@ pub fn compress_slice_mt(
     workers: u32,
     window_log: Option<u32>,
     declared: Option<u64>,
+    dict: Option<&super::dictionary::EncDictionary>,
 ) -> Vec<u8> {
     let checksum = checksum && cfg!(feature = "hash");
     if workers < 2
@@ -122,16 +124,7 @@ pub fn compress_slice_mt(
         || level == Level::Uncompressed
         || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
     {
-        return super::compress_slice_shaped_declared(
-            src,
-            level,
-            checksum,
-            crate::InputShape {
-                len: None,
-                window_log,
-            },
-            declared,
-        );
+        return st_fallback(src, level, checksum, window_log, declared, dict);
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
@@ -149,11 +142,18 @@ pub fn compress_slice_mt(
     // decouple the two (a wide frame window for far reach, a narrow strip):
     // a full-window strip would scale the job floor with the LDM reach and
     // starve parallelism.
-    let window = MatchGeneratorDriver::window_for_level(level, shape);
+    let window = header_window(level, shape, src.len() as u64, window_log, dict);
     // The fast rows' far-class capture window (R21): resolved from the
     // same head sample the frame-continuous entries screen — None for
     // every chain row (strategy-checked before any screen work runs).
-    let fast_window = far_screen::mt_capture_window(level, shape, src);
+    // Dictionary frames keep the stock grid (their job zero runs the
+    // dictionary path below, which the capture classes' donation and
+    // shared-fill schedules do not model).
+    let fast_window = if dict.is_none() {
+        far_screen::mt_capture_window(level, shape, src)
+    } else {
+        None
+    };
     // The frame's head decides its chain reach (see reach_probe), and with
     // it the strip: a shrunk search domain shrinks the strip to match.
     // Eligible frames donate the probe's keep side into job zero (see
@@ -172,7 +172,8 @@ pub fn compress_slice_mt(
     let mut keep_plan = None;
     let choice;
     let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
-    if reach_probe::eligible(level, shape)
+    if dict.is_none()
+        && reach_probe::eligible(level, shape)
         && job_size_for(
             src.len() as u64,
             workers.max(2),
@@ -224,6 +225,11 @@ pub fn compress_slice_mt(
             return_pooled_slice_state(state);
             keep_plan = None;
         }
+    } else if dict.is_some() {
+        // Dictionary frames keep the stock reach, like every ST
+        // dictionary entry (the probe samples a head the dictionary
+        // would have to seed).
+        choice = reach_probe::ReachChoice::Keep;
     } else {
         choice = reach_probe::probe_reach_choice(src, level, shape);
     }
@@ -241,7 +247,7 @@ pub fn compress_slice_mt(
     // the window would floor jobs at 32 MiB and starve parallelism — and
     // the shared prefix fill bounds the per-job prefix fill's redundancy:
     // one build to the median boundary, tail jobs above it adopt.
-    let spf: Option<PrefixPlan> = if choice == reach_probe::ReachChoice::Keep {
+    let spf: Option<PrefixPlan> = if dict.is_none() && choice == reach_probe::ReachChoice::Keep {
         // A kept frame's capture is exactly the plan the donation gate
         // computed (the same pure inputs at Keep); a non-donated frame
         // plans from its final schedule.
@@ -286,7 +292,7 @@ pub fn compress_slice_mt(
         frame_content_size: declared.or(Some(src.len() as u64)),
         single_segment: false,
         content_checksum: checksum,
-        dictionary_id: None,
+        dictionary_id: dict.and_then(super::dictionary::EncDictionary::header_id),
         window_size: Some(window),
     }
     .serialize(&mut output);
@@ -364,6 +370,21 @@ pub fn compress_slice_mt(
                     // history is still the format default [1, 4, 8]; the gate
                     // is job.start > 0 (applied inside the state preparation).
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if id == 0
+                            && let Some(dict) = dict
+                        {
+                            // Job zero is the frame's only dictionary-seeded
+                            // job (see `run_dict_job_zero`); the donation arm
+                            // below never runs on a dictionary frame.
+                            return run_dict_job_zero(
+                                src,
+                                start..end,
+                                end == src.len(),
+                                level,
+                                shape,
+                                dict,
+                            );
+                        }
                         if id == 0
                             && let Some((mut dstate, prefix)) = donation.lock().unwrap().take()
                         {
@@ -477,6 +498,64 @@ pub fn compress_slice_mt(
         output.extend_from_slice(&(hash.finish() as u32).to_le_bytes());
     }
     output
+}
+
+/// The frame header's window: the plain row window, or — on a dictionary
+/// frame — the src+dict fold the ST dictionary entries clamp by (libzstd's
+/// `ZSTD_dictAndWindowLog`); jobs after the first keep the plain shape,
+/// their history being the strip, not the dictionary.
+fn header_window(
+    level: Level,
+    shape: crate::InputShape,
+    src_len: u64,
+    window_log: Option<u32>,
+    dict: Option<&super::dictionary::EncDictionary>,
+) -> u64 {
+    match dict {
+        Some(dict) => MatchGeneratorDriver::window_for_level(level, crate::InputShape {
+            len: Some(src_len + dict.content.len() as u64),
+            window_log,
+        }),
+        None => MatchGeneratorDriver::window_for_level(level, shape),
+    }
+}
+
+/// The single-threaded fallback for `compress_slice_mt`'s engagement gate
+/// (small inputs, one worker, raw-block level, single-core processes): the
+/// plain shaped slice entry, or — with a dictionary — its owned-window
+/// dictionary twin (the same entry `bulk::compress_with` routes
+/// single-worker dictionary calls through).
+fn st_fallback(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    window_log: Option<u32>,
+    declared: Option<u64>,
+    dict: Option<&super::dictionary::EncDictionary>,
+) -> Vec<u8> {
+    if let Some(dict) = dict {
+        return super::compress_slice_with_dictionary(
+            src,
+            level,
+            checksum,
+            crate::InputShape {
+                len: Some(src.len() as u64),
+                window_log,
+            },
+            dict,
+            declared,
+        );
+    }
+    super::compress_slice_shaped_declared(
+        src,
+        level,
+        checksum,
+        crate::InputShape {
+            len: None,
+            window_log,
+        },
+        declared,
+    )
 }
 
 /// Deep-offset ramp depth for gated jobs (decode-parallelism experiment):
@@ -653,6 +732,98 @@ pub(crate) fn take_donation_probe() -> alloc::boxed::Box<MatchGeneratorDriver> {
 #[cfg(feature = "std")]
 pub(crate) fn return_donation_probe(probe: alloc::boxed::Box<MatchGeneratorDriver>) {
     donation_kit().lock().unwrap().1 = Some(probe);
+}
+
+/// Pooled owned-window states for dictionary job zero (see
+/// `run_dict_job_zero`): the job pools are direct-driver states (borrowed
+/// windows), which cannot stage blocks through `block_tail` — the
+/// dictionary's owned window needs its own. The kit outlives encoders
+/// like the donation kit (the streaming pool workers are ephemeral, and
+/// the bulk path's scope threads die with the call, so neither can keep
+/// a thread-local warm). Dictionary state cannot reach a plain frame's
+/// bytes: only `run_dict_job_zero` takes from this pool, and every
+/// taker passes through `reset_with_dictionary` (fresh entropy tables,
+/// matcher reset), exactly the reset discipline the plain pools run
+/// under.
+#[cfg(feature = "std")]
+static DICT_KIT: std::sync::OnceLock<
+    Mutex<Vec<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>>,
+> = std::sync::OnceLock::new();
+#[cfg(feature = "std")]
+const DICT_KIT_DEPTH: usize = 4;
+
+/// Take an owned-window state from the kit (a fresh one when cold).
+#[cfg(feature = "std")]
+fn take_dict_state() -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    match DICT_KIT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .pop()
+    {
+        Some(state) => state,
+        None => alloc::boxed::Box::new(new_owned_state()),
+    }
+}
+
+/// Return a dictionary state to the kit; at depth the state drops.
+#[cfg(feature = "std")]
+fn return_dict_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
+    let kit = DICT_KIT.get_or_init(|| Mutex::new(Vec::new()));
+    let mut kit = kit.lock().unwrap();
+    if kit.len() < DICT_KIT_DEPTH {
+        kit.push(state);
+    }
+}
+
+/// Run the frame's first job seeded from `dict`: the dictionary content is
+/// the job's match history and its tables the entropy seed, loaded exactly
+/// as the ST dictionary entries load them (`reset_with_dictionary` — same
+/// window fold, dictionary fill grid, repcode history and table-seeding
+/// flags), so job zero's blocks parse like a single-threaded dictionary
+/// frame's opening blocks. The job's blocks stage through the matcher's
+/// owned window — the one window model a borrowed-strip job cannot join
+/// (the dictionary precedes the source in history, and a borrowed window
+/// is a single contiguous caller slice). Jobs after the first keep the
+/// stock strip model, mirroring libzstd's zstdmt (the CDict seeds only
+/// job zero; later jobs run under forceMaxWindow with repcodes gated).
+/// `shape` is the frame's plain declared shape — the dictionary fold
+/// inside applies the same `len + dict_content` clamp the ST entries use.
+pub(crate) fn run_dict_job_zero(
+    src: &[u8],
+    job: Range<usize>,
+    is_last_job: bool,
+    level: Level,
+    shape: crate::InputShape,
+    dict: &super::dictionary::EncDictionary,
+) -> Vec<u8> {
+    let mut state = take_dict_state();
+    // The stock job context pair (the plain jobs' `reset_slice_state`
+    // order): dictionary frames keep the full reach, and the LDM runs the
+    // per-job model — the table restarts at the job, the dictionary
+    // content included in its ingest.
+    state
+        .matcher
+        .set_reach_choice(reach_probe::ReachChoice::Keep);
+    state.matcher.set_ldm_arming(LdmArming::Job);
+    let dict_shape = crate::InputShape {
+        len: shape.len.map(|len| len + dict.content.len() as u64),
+        window_log: shape.window_log,
+    };
+    super::dictionary::reset_with_dictionary(&mut state, dict, level, dict_shape);
+    let floor = state.matcher.block_size().min(super::pre_split::SPLIT_MIN);
+    let mut output = Vec::with_capacity(job.len() + 3 * (job.len() / floor + 1) + 8);
+    let mut hasher = SliceChecksum::new(0, false);
+    super::frame_compressor::compress_dict_span_blocks(
+        &mut state,
+        src,
+        job,
+        is_last_job,
+        &mut output,
+        &mut hasher,
+    );
+    return_dict_state(state);
+    output
 }
 
 /// The shared prefix fill's published build: the boundary the snapshot
@@ -1193,19 +1364,19 @@ mod tests {
         for (i, b) in tail.iter().enumerate() {
             src[(2 << 20) + i] = *b;
         }
-        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
+        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
         // Second call rides pooled states from the first.
-        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
+        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
         assert_eq!(one, two);
         // Mixed worker counts share one pool.
-        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None, None);
-        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
+        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None, None, None);
+        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
         assert_eq!(one, w4);
         assert_eq!(one, again8);
         // A different level between two balanced calls: the pool must
         // reconfigure without residue.
-        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None, None);
-        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None, None);
+        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None, None, None);
+        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
         assert_eq!(one, mixed);
         // And the frame still roundtrips.
         let mut back = vec![0u8; src.len()];
@@ -1331,8 +1502,8 @@ mod tests {
         // 32 MiB at two workers grids 8 MiB jobs, so job zero holds the
         // head copy plus ~3.25 MiB of copy two; the capture engages (the
         // head above).
-        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None, None);
-        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None, None);
+        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None, None, None);
+        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None, None, None);
         for (name, frame) in [("st", &st), ("mt", &mt)] {
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
@@ -1390,9 +1561,9 @@ mod tests {
         }
         let random = lcg(data.len());
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None, None, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None, None, None);
             for (name, frame) in [("st", &st), ("mt4", &mt4)] {
                 let mut out = vec![0u8; data.len()];
                 let mut decoder = FrameDecoder::new();
@@ -1418,7 +1589,7 @@ mod tests {
                 mt4.len(),
                 st.len()
             );
-            let stock_random = compress_slice_mt(&random, level, true, 4, None, None);
+            let stock_random = compress_slice_mt(&random, level, true, 4, None, None, None);
             assert!(
                 mt4.len() * 2 < stock_random.len(),
                 "{level:?}: armed {} vs random {}",
@@ -1429,7 +1600,8 @@ mod tests {
             // window — the same header bytes a below-band random source
             // carries (the FCS tail differs; the prefix compared here does
             // not).
-            let below_band = compress_slice_mt(&random[..15 * mib], level, true, 4, None, None);
+            let below_band =
+                compress_slice_mt(&random[..15 * mib], level, true, 4, None, None, None);
             assert_eq!(
                 &stock_random[..6],
                 &below_band[..6],
@@ -1504,9 +1676,9 @@ mod tests {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
+            let mt4 = compress_slice_mt(&data, level, true, 4, None, None, None);
+            let mt8 = compress_slice_mt(&data, level, true, 8, None, None, None);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder
@@ -1519,7 +1691,7 @@ mod tests {
             assert_eq!(mt4, mt8, "{level:?}: mt4 != mt8");
             assert_eq!(
                 mt8,
-                compress_slice_mt(&data, level, true, 8, None, None),
+                compress_slice_mt(&data, level, true, 8, None, None, None),
                 "{level:?}: run-to-run determinism"
             );
             assert!(
@@ -1563,8 +1735,15 @@ mod tests {
         for (name, data) in shapes() {
             for workers in [2u32, 4] {
                 for checksum in [true, false] {
-                    let compressed =
-                        compress_slice_mt(&data, Level::Fastest, checksum, workers, None, None);
+                    let compressed = compress_slice_mt(
+                        &data,
+                        Level::Fastest,
+                        checksum,
+                        workers,
+                        None,
+                        None,
+                        None,
+                    );
                     // our decoder, exact-size output slice
                     let mut out = vec![0u8; data.len()];
                     let mut decoder = FrameDecoder::new();
@@ -1588,8 +1767,8 @@ mod tests {
     #[test]
     fn mt_output_is_deterministic() {
         let data = textish(3 * 1024 * 1024);
-        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None, None);
-        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None, None);
+        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None, None, None);
+        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None, None, None);
         assert_eq!(a, b);
     }
 
@@ -1598,8 +1777,8 @@ mod tests {
     #[test]
     fn mt_ratio_stays_close_to_single_thread() {
         let data = textish(6 * 1024 * 1024);
-        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None, None);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None);
+        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None, None, None);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None, None);
         assert!(
             mt.len() <= st.len() + st.len() / 50,
             "single {} vs multi {}",
@@ -1614,7 +1793,7 @@ mod tests {
     fn mt_chain_levels_roundtrip() {
         let data = textish(5 * 1024 * 1024);
         for level in [Level::Fast, Level::Balanced] {
-            let compressed = compress_slice_mt(&data, level, true, 4, None, None);
+            let compressed = compress_slice_mt(&data, level, true, 4, None, None, None);
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&compressed, &mut out).unwrap();
@@ -1638,8 +1817,8 @@ mod tests {
         let unit = textish(300 * 1024);
         let data: Vec<u8> = (0..24).flat_map(|_| unit.iter().copied()).collect();
         for level in [Level::Fastest, Level::Fast, Level::Balanced] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None);
-            let mt = compress_slice_mt(&data, level, true, 4, None, None);
+            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
+            let mt = compress_slice_mt(&data, level, true, 4, None, None, None);
             assert!(
                 mt.len() <= st.len() + st.len() / 50,
                 "{level:?}: periodic data must match across jobs, mt {} vs st {}",
@@ -1693,9 +1872,9 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None);
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None, None);
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder
@@ -1718,7 +1897,7 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None, None)
+            compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None)
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -1767,9 +1946,9 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None);
+        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None, None);
+        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None);
+        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None, None);
         // Roundtrip through both decoders.
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -1793,7 +1972,7 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None, None)
+            compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None)
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -1808,7 +1987,7 @@ mod tests {
     #[test]
     fn small_inputs_fall_back_identically() {
         let data = textish(64 * 1024);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None);
+        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None, None);
         let st = crate::encoding::compress_slice_to_vec(&data, Level::Fastest);
         assert_eq!(mt, st);
     }
@@ -1857,5 +2036,128 @@ mod tests {
             LdmArming::Frame,
         );
         state.matcher.arm_ramp(1 << 20, 1 << 20);
+    }
+
+    /// The dictionary fixture for the multithreaded tests: the checked-in
+    /// formatted dictionary, with a source whose opening span (job zero's
+    /// own range at the worker counts under test) repeats the dictionary
+    /// content so the dictionary actually carries matches there.
+    fn dict_mt_fixture() -> Option<(Vec<u8>, Vec<u8>)> {
+        let raw = std::fs::read("./dict_tests/dictionary").ok()?;
+        let content = crate::encoding::dictionary::EncDictionary::parse(&raw)
+            .ok()?
+            .content;
+        let mut data = content.clone();
+        data.extend_from_slice(&content);
+        // The rest stays text-shaped (real entropy work in the jobs after
+        // the first, which never see the dictionary).
+        data.extend(textish((2 << 20) + 100 * 1024 - data.len()));
+        Some((raw, data))
+    }
+
+    /// Dictionary frames on the mt path: job zero seeds from the
+    /// dictionary (match history, entropy tables, repcodes — the same
+    /// `reset_with_dictionary` machinery the ST entries run), later jobs
+    /// keep the stock strip model, and the assembled frame roundtrips
+    /// through our decoder and libzstd with the same dictionary.
+    #[test]
+    fn dict_bulk_mt_roundtrips_and_interops() {
+        let Some((raw, data)) = dict_mt_fixture() else {
+            return;
+        };
+        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
+        let dec_opts = || crate::DecoderOptions::new().dictionary(&raw);
+        for level in [Level::Fastest, Level::Fast, Level::Balanced, Level::Best] {
+            for workers in [2u32, 4, 8] {
+                let frame = compress_slice_mt(
+                    &data,
+                    level,
+                    true,
+                    workers,
+                    None,
+                    Some(data.len() as u64),
+                    Some(&dict),
+                );
+                // ours, both decode entries
+                let back = crate::bulk::decompress_with(&frame, 0, &dec_opts()).unwrap();
+                assert_eq!(back, data, "{level:?} w{workers}");
+                // libzstd with the same dictionary
+                let mut zd = zstd::bulk::Decompressor::with_dictionary(&raw).unwrap();
+                let out = zd.decompress(&frame, data.len()).unwrap();
+                assert_eq!(out, data, "{level:?} w{workers} libzstd");
+                // the header declares the dictionary's id: a decoder
+                // without it refuses the frame (the dictID check)
+                assert!(
+                    crate::bulk::decompress_with(&frame, 0, &crate::DecoderOptions::new()).is_err()
+                );
+            }
+        }
+    }
+
+    /// libzstd's own mt dictionary frames must decode through our decoder
+    /// (the interop direction the CLI's `-D -T` route rides).
+    #[test]
+    fn libzstd_mt_dict_frames_decode() {
+        use std::io::Write as _;
+
+        let Some((raw, data)) = dict_mt_fixture() else {
+            return;
+        };
+        let mut enc = zstd::stream::write::Encoder::with_dictionary(Vec::new(), 3, &raw).unwrap();
+        enc.multithread(4).unwrap();
+        for piece in data.chunks(300 * 1024) {
+            enc.write_all(piece).unwrap();
+        }
+        let zframe = enc.finish().unwrap();
+        let back = crate::bulk::decompress_with(
+            &zframe,
+            0,
+            &crate::DecoderOptions::new().dictionary(&raw),
+        )
+        .unwrap();
+        assert_eq!(back, data);
+    }
+
+    /// Dictionary state cannot reach a later plain frame's bytes: the
+    /// dictionary job's owned-window state lives in its own kit pool
+    /// (only `run_dict_job_zero` takes from it, through the full
+    /// `reset_with_dictionary`), and the plain jobs' direct-driver pool
+    /// is a different population — a dict frame between two plain mt
+    /// frames must not move the second one's bytes.
+    #[test]
+    fn dict_mt_leaves_plain_mt_bytes_untouched() {
+        let mut src = pattern_head(3 << 20);
+        let tail = pattern_head(1 << 20);
+        for (i, b) in tail.iter().enumerate() {
+            src[(2 << 20) + i] = *b;
+        }
+        let plain = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let Some((raw, data)) = dict_mt_fixture() else {
+            return;
+        };
+        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
+        let _between = compress_slice_mt(&data, Level::Balanced, false, 8, None, None, Some(&dict));
+        let after = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        assert_eq!(plain, after);
+    }
+
+    /// Job zero's dictionary seeding must pay: on a source whose whole
+    /// dictionary-relevant span sits inside job zero, the dict frame is
+    /// strictly denser than the plain mt frame over the same bytes (the
+    /// jobs after the first are identical by construction).
+    #[test]
+    fn dict_mt_beats_plain_mt_on_dict_relevant_source() {
+        let Some((raw, data)) = dict_mt_fixture() else {
+            return;
+        };
+        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
+        let plain = compress_slice_mt(&data, Level::Balanced, false, 4, None, None, None);
+        let with = compress_slice_mt(&data, Level::Balanced, false, 4, None, None, Some(&dict));
+        assert!(
+            with.len() < plain.len(),
+            "dict mt {} must beat plain mt {}",
+            with.len(),
+            plain.len()
+        );
     }
 }

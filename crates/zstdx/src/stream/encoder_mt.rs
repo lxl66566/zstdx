@@ -342,6 +342,11 @@ struct Job {
     /// every job so the frame's jobs and its header agree.
     choice: ReachChoice,
     shape: crate::InputShape,
+    /// The frame's dictionary, carried by the frame's first job alone:
+    /// that job seeds from it (see `encoding::mt::run_dict_job_zero`),
+    /// every later job keeps the stock strip model. `None` on every
+    /// non-dictionary frame and every job after the first.
+    dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
     /// The donation tasks' owned copy of the frame's first
     /// [`reach_probe::PROBE_SPAN`] bytes, shared between the two: owned,
     /// not borrowed, so neither holds a buffer view — donations do not
@@ -667,7 +672,20 @@ fn run_claimed_job(
             // this job's whole lifetime (see FrozenSrc).
             let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
             let spf = spf.lock().unwrap().clone();
-            let bytes = if let Some(don) = donation.lock().unwrap().take() {
+            let bytes = if let Some(dict) = &job.dict {
+                // The frame's dictionary job: job zero (the only carrier —
+                // see `post_job`), seeded and staged through the
+                // owned-window runner; the pooled lease state stays cold.
+                debug_assert_eq!(*first, 0, "a dictionary job starts the frame");
+                crate::encoding::mt::run_dict_job_zero(
+                    src,
+                    *first..*len,
+                    *last_frame_block,
+                    job.level,
+                    job.shape,
+                    dict,
+                )
+            } else if let Some(don) = donation.lock().unwrap().take() {
                 // The donated continuation: job zero's state already carries
                 // its reset, strip prefill and parsed span — the
                 // continuation emits from where the donation stopped. The
@@ -830,6 +848,9 @@ pub(crate) struct MtEncoderCore {
     /// The frame's reach decision, handed to every job (see
     /// [`reach_probe`]).
     choice: ReachChoice,
+    /// The frame's dictionary (see [`Job`]'s `dict`): seeds the frame's
+    /// first job and its header's dictID/window; `None` on plain frames.
+    dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
     /// The frame's declared shape (length = the pledge, plus the forced
     /// window log); shared by every job so tables and the header agree.
     shape: crate::InputShape,
@@ -869,7 +890,19 @@ pub(crate) struct MtEncoderCore {
 }
 
 impl MtEncoderCore {
+    /// The plain-frame constructor (tests and the streaming router's
+    /// no-dictionary arm).
     pub(crate) fn new(options: &EncoderOptions) -> Self {
+        Self::new_with_dictionary(options, None)
+    }
+
+    /// Build the core; a `dict` seeds the frame's first job and its
+    /// header (dictID, the src+dict window fold) from the dictionary —
+    /// `None` builds a plain frame.
+    pub(crate) fn new_with_dictionary(
+        options: &EncoderOptions,
+        dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
+    ) -> Self {
         let checksum = options.checksum && cfg!(feature = "hash");
         // The pledge is the frame's authoritative length; the forced window
         // log rides along so the jobs' tables and the header window agree.
@@ -881,7 +914,19 @@ impl MtEncoderCore {
             len: options.pledged_size.or(options.input_shape.len),
             window_log: options.input_shape.window_log,
         };
-        let window = MatchGeneratorDriver::window_for_level(options.level, shape);
+        // libzstd clamps the dictionary window by payload + dict content
+        // (the ST dictionary entries do the same fold); the jobs' own
+        // shape stays plain — their history is the strip, not the
+        // dictionary.
+        let window = match &dict {
+            Some(dict) => {
+                MatchGeneratorDriver::window_for_level(options.level, crate::InputShape {
+                    len: shape.len.map(|len| len + dict.content.len() as u64),
+                    window_log: shape.window_log,
+                })
+            },
+            None => MatchGeneratorDriver::window_for_level(options.level, shape),
+        };
         // The job history rides the level's stream overlap rule (see
         // `stream_overlap_for`): the whole window where cross-job history
         // carries a far class, the search domain where the LDM restarts
@@ -898,10 +943,16 @@ impl MtEncoderCore {
         // its schedule until the probe's head is staged. A pledge clears
         // the probe's size gate here; an open-ended stream gates at
         // PROBE_MIN_FRAME streamed bytes (see the module docs).
-        let probe_pending = match options.pledged_size {
-            Some(_) => reach_probe::eligible(options.level, shape),
-            None => MatchGeneratorDriver::reach_probe_eligible(options.level, shape),
-        };
+        // Dictionary frames keep the stock reach and no screens, exactly
+        // like the ST dictionary core (the probe samples a head the
+        // dictionary would have to seed; the fast rows' capture classes
+        // model a borrowed-strip job zero the dictionary path does not
+        // run).
+        let probe_pending = dict.is_none()
+            && match options.pledged_size {
+                Some(_) => reach_probe::eligible(options.level, shape),
+                None => MatchGeneratorDriver::reach_probe_eligible(options.level, shape),
+            };
         // The fast rows' capture staging (see [`FastCapture`]): pledged
         // only — the arming keys on the declared length, which is the
         // pledge. The full band's window arms on geometry alone, but the
@@ -909,7 +960,7 @@ impl MtEncoderCore {
         // both bands stage before anything posts; the probe never runs on
         // these rows (strategy-exclusive), so the two stagings never hold
         // the same frame.
-        let fast_capture = if probe_pending {
+        let fast_capture = if probe_pending || dict.is_some() {
             FastCapture::Stock
         } else {
             match options.pledged_size {
@@ -943,7 +994,7 @@ impl MtEncoderCore {
             frame_content_size: options.pledged_size,
             single_segment: false,
             content_checksum: checksum,
-            dictionary_id: None,
+            dictionary_id: dict.as_ref().and_then(|d| d.header_id()),
             window_size: Some(window),
         };
         let mut serialized = Vec::with_capacity(18);
@@ -977,13 +1028,22 @@ impl MtEncoderCore {
             grid,
             overlap,
             job_ldm: LdmArming::Job,
-            far_class: FarClass::Pending,
+            // A dictionary frame never screens: the ST dictionary core
+            // keeps the stock strip too, and the bulk dictionary path has
+            // no FarDead band — a pledged dict stream stays byte-identical
+            // to the bulk dict frame (same grid, same strips).
+            far_class: if dict.is_some() {
+                FarClass::Alive
+            } else {
+                FarClass::Pending
+            },
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             probe_wait: None,
             donation: None,
             fast_capture,
             choice: ReachChoice::Keep,
+            dict,
 
             shape,
             hasher: if checksum {
@@ -1282,6 +1342,7 @@ impl MtEncoderCore {
         let keep = Arc::new(Job {
             level: self.level,
             choice: ReachChoice::Keep,
+            dict: None,
             shape: self.shape,
             head: Some(head.clone()),
             kind: JobKind::DonateKeep {
@@ -1293,6 +1354,7 @@ impl MtEncoderCore {
         let shrink = Arc::new(Job {
             level: self.level,
             choice: ReachChoice::Keep,
+            dict: None,
             shape: self.shape,
             head: Some(head),
             kind: JobKind::DonateShrink {
@@ -1949,6 +2011,7 @@ impl MtEncoderCore {
             || self.job_start != 0
             || self.buf_base != 0
             || self.choice == ReachChoice::Shrink
+            || self.dict.is_some()
             || matches!(self.far_class, FarClass::Dead)
             || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
         {
@@ -2131,6 +2194,24 @@ impl MtEncoderCore {
         let first = (self.job_start - strip_lo) as usize;
         self.hash_to(hi);
         let last_len = (bounds[1] - bounds[0]) as usize;
+        if self.job_start == 0
+            && let Some(dict) = &self.dict
+        {
+            // The dictionary frame's job zero on the pool-less inline path
+            // (a single short job): the seeded runner needs no lease
+            // state — it stages through its own owned-window kit state.
+            let bytes = crate::encoding::mt::run_dict_job_zero(
+                &self.buf[..(hi - self.buf_base) as usize],
+                first..first + last_len,
+                last_frame_block,
+                self.level,
+                self.shape,
+                dict,
+            );
+            self.output.extend_from_slice(&bytes);
+            self.job_start = hi;
+            return;
+        }
         let mut state = take_pooled_state();
         // The engaged fast capture's SelfFill split applies to the inline
         // tail job exactly as to a posted one (belt: an engaged frame has
@@ -2219,6 +2300,7 @@ impl MtEncoderCore {
             level: self.level,
             choice: self.choice,
             shape: self.shape,
+            dict: (start == 0).then(|| self.dict.clone()).flatten(),
             head: None,
             kind: JobKind::Encode {
                 src: FrozenSrc { ptr },
@@ -2949,6 +3031,7 @@ mod tests {
                 len: None,
                 window_log: None,
             },
+            dict: None,
             head: None,
             kind: JobKind::Encode {
                 // The job never runs; the view only needs a stable address
@@ -3013,6 +3096,7 @@ mod tests {
                 len: None,
                 window_log: None,
             },
+            dict: None,
             head: None,
             kind: JobKind::Encode {
                 src: FrozenSrc {

@@ -615,22 +615,7 @@ pub(crate) fn compress_with_state_dictionary(
         window_size: Some(state.matcher.window_size()),
     };
     header.serialize(&mut output);
-    let mut cursor = 0usize;
-    while cursor < src.len() {
-        let window_end = (cursor + block_size).min(src.len());
-        let decided = state
-            .split
-            .block_size(&src[cursor..window_end], state.matcher.pre_split_level());
-        let block = &src[cursor..cursor + decided];
-        let last_block = cursor + decided >= src.len();
-        let tail = state.matcher.block_tail();
-        tail[..block.len()].copy_from_slice(block);
-        state.matcher.commit_block(block.len());
-        let before = output.len();
-        compress_fastest(state, last_block, &mut output, &mut hasher);
-        state.split.note_block(block.len(), output.len() - before);
-        cursor += decided;
-    }
+    compress_dict_span_blocks(state, src, 0..src.len(), true, &mut output, &mut hasher);
     if src.is_empty() {
         let header = BlockHeader {
             last_block: true,
@@ -644,6 +629,41 @@ pub(crate) fn compress_with_state_dictionary(
         output.extend_from_slice(&hasher.finish32().to_le_bytes());
     }
     output
+}
+
+/// The dictionary frame's block loop over `span` of `src`: blocks stage
+/// through the matcher's owned window (`block_tail` — the dictionary
+/// cannot join a borrowed one), pre-split decides the sizes, and the
+/// span's final block takes the frame's last-block flag when
+/// `last_frame_block` says the span ends the frame. Shared by the ST
+/// slice entry (one span, the whole source) and the multithreaded
+/// paths' dictionary job zero (its job is the frame's first — see
+/// `mt::run_dict_job_zero`).
+pub(crate) fn compress_dict_span_blocks(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    src: &[u8],
+    span: core::ops::Range<usize>,
+    last_frame_block: bool,
+    output: &mut Vec<u8>,
+    hasher: &mut SliceChecksum,
+) {
+    let block_size = state.matcher.block_size();
+    let mut cursor = span.start;
+    while cursor < span.end {
+        let window_end = (cursor + block_size).min(span.end);
+        let decided = state
+            .split
+            .block_size(&src[cursor..window_end], state.matcher.pre_split_level());
+        let block = &src[cursor..cursor + decided];
+        let last_block = last_frame_block && cursor + decided >= span.end;
+        let tail = state.matcher.block_tail();
+        tail[..block.len()].copy_from_slice(block);
+        state.matcher.commit_block(block.len());
+        let before = output.len();
+        compress_fastest(state, last_block, output, hasher);
+        state.split.note_block(decided, output.len() - before);
+        cursor += decided;
+    }
 }
 
 /// [`compress_slice_shaped_declared`] with a parsed dictionary: dictionary

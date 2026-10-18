@@ -26,8 +26,10 @@ pub fn compress(source: &[u8], level: Level) -> alloc::vec::Vec<u8> {
 }
 
 /// [`compress`] with a full option set: more than one worker engages the
-/// multithreaded job path on std builds (single-threaded when a dictionary
-/// is attached), the checksum flag decides whether the frame carries a
+/// multithreaded job path on std builds (a dictionary seeds the frame's
+/// first job from its content and entropy tables — see
+/// [`crate::encoding`]'s mt module), the checksum flag decides whether the
+/// frame carries a
 /// content checksum, and an attached dictionary is parsed here — an invalid
 /// dictionary is the one fallible case. A
 /// [`pledged_size`][crate::EncoderOptions::pledged_size] lands in the frame
@@ -57,8 +59,31 @@ pub fn compress_with(
         });
     }
     let declared = options.pledged_size;
-    let parsed = options.parsed_dictionary.as_ref().map(|dict| {
-        crate::encoding::compress_slice_with_dictionary(
+    // The dictionary resolves once (the parsed form shares, the raw bytes
+    // parse fallibly here) and routes below: more than one worker seeds
+    // job zero from it on the multithreaded path, anything else runs the
+    // single-threaded dictionary slice entry.
+    let dict = match (&options.parsed_dictionary, &options.dictionary) {
+        (parsed, _) if parsed.is_some() => parsed.clone(),
+        (_, Some(raw)) => Some(alloc::sync::Arc::new(
+            crate::encoding::dictionary::EncDictionary::parse(raw)?,
+        )),
+        (_, None) => None,
+    };
+    if let Some(dict) = &dict {
+        #[cfg(feature = "std")]
+        if options.workers > 1 {
+            return Ok(crate::encoding::mt::compress_slice_mt(
+                source,
+                options.level,
+                options.checksum,
+                options.workers,
+                options.input_shape.window_log,
+                declared,
+                Some(dict),
+            ));
+        }
+        return Ok(crate::encoding::compress_slice_with_dictionary(
             source,
             options.level,
             options.checksum,
@@ -67,24 +92,6 @@ pub fn compress_with(
                 window_log: options.input_shape.window_log,
             },
             dict,
-            declared,
-        )
-    });
-    if let Some(compressed) = parsed {
-        return Ok(compressed);
-    }
-    if let Some(raw) = &options.dictionary {
-        let dict = crate::encoding::dictionary::EncDictionary::parse(raw)?;
-        let shape = crate::InputShape {
-            len: Some(source.len() as u64),
-            window_log: options.input_shape.window_log,
-        };
-        return Ok(crate::encoding::compress_slice_with_dictionary(
-            source,
-            options.level,
-            options.checksum,
-            shape,
-            &dict,
             declared,
         ));
     }
@@ -97,6 +104,7 @@ pub fn compress_with(
             options.workers,
             options.input_shape.window_log,
             declared,
+            None,
         ));
     }
     Ok(crate::encoding::compress_slice_shaped_declared(

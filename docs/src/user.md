@@ -117,7 +117,7 @@ let dopts = zstdx::DecoderOptions::new().threads(4);   // parallel decode
 let original = bulk::decompress_with(&compressed, 0, &dopts)?;
 ```
 
-- `workers(n > 1)` works for bulk and the native streaming encoders. Falls back to single-threaded for raw-block levels, on single-core machines, or when a dictionary is attached. Without `std`: [`Error::Unsupported`].
+- `workers(n > 1)` works for bulk and the native streaming encoders, dictionary attached or not (a dictionary seeds the frame's first job). Falls back to single-threaded for raw-block levels and on single-core machines. Without `std`: [`Error::Unsupported`].
 - `threads(n > 1)` needs frames with restart points (this crate's MT encoder or libzstd `-T` output); other frames decode sequentially.
 - `InputShape::default().with_window_log(n)` forces the encoder window (clamped to 10..=27), e.g. to bound decoder memory; `.with_len(n)` feeds a known input size so window and tables shrink to the source. A pledged size wins for the length when both are set.
 - `DecoderOptions::max_window_size(n)` rejects frames whose window exceeds `n` bytes (default cap: 128 MiB) — use it on untrusted input.
