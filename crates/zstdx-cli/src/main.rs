@@ -1531,5 +1531,6 @@ mod tests {
         std::fs::write(&path, vec![7u8; 64 * 1024]).unwrap();
         let cli = Cli::try_parse_from(["zstdx", "-b1", "-i0", path.to_str().unwrap()]).unwrap();
         assert!(crate::bench::run(&cli), "the smoke benchmark must succeed");
+        let _ = std::fs::remove_file(&path);
     }
 }
