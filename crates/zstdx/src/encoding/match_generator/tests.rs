@@ -1261,3 +1261,50 @@ fn row_attempts_verdict_tracks_head_alphabet() {
         );
     }
 }
+
+/// The R50 span key (payload + dict, `shape.len`; unknown keyed by the
+/// dict's own size like libzstd's `dictSize + 499` wrap) rules every
+/// dict-row knob: the <= 16 KiB small-payload row swap must not re-arm
+/// the width-4 semantics once the span passes the 256 KiB ceiling, and an
+/// unknown span with a dict past the ceiling stays stock too (libzstd's
+/// rSize key runs its large table there whatever the payload alone).
+#[test]
+fn dict_row_span_key_rules_the_small_payload_swap() {
+    let level = crate::Level::from_zstd(5);
+    let load = |dict: &[u8], len: Option<u64>| {
+        let mut driver = MatchGeneratorDriver::new_direct();
+        driver.set_input_shape(crate::InputShape {
+            len,
+            window_log: None,
+        });
+        driver.reset(level);
+        driver.load_dictionary(dict, [1, 4, 8], level);
+        driver
+    };
+    // Armed regression: a small span keeps the small-table row with the
+    // width-4 semantics on.
+    let small: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let armed = load(&small, Some(small.len() as u64 + 4 * 1024));
+    assert!(armed.dict_row, "a 20 KiB span arms the dict row");
+    assert_eq!(armed.params.min_match, 4);
+
+    // Small payload, dict past the ceiling: the swap must stay off.
+    let big: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let disarmed = load(&big, Some(big.len() as u64 + 8 * 1024));
+    assert!(!disarmed.dict_row, "a 308 KiB span disarms the dict row");
+    assert_eq!(disarmed.params.min_match, 5, "stock accept bar");
+
+    // Unknown span: armed through the dict's own size while small, stock
+    // past the ceiling (the 300 KiB dict wraps libzstd's rSize key above
+    // its largest table boundary).
+    let unknown_big = load(&big, None);
+    assert!(
+        !unknown_big.dict_row,
+        "a 300 KiB dict disarms the unknown span"
+    );
+    let unknown_small = load(&small, None);
+    assert!(
+        unknown_small.dict_row,
+        "a 16 KiB dict keeps the unknown span armed"
+    );
+}

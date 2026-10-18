@@ -1302,12 +1302,16 @@ impl MatchGeneratorDriver {
         // budget stays armed at every dict span — with the stock width the
         // deep walk converts on large frames too (32 MiB dict-ST -9:
         // json 4,697,443 -> 4,589,941, text 61,797 -> 59,827; it was the
-        // width that made it lose here). An unknown span stays armed —
-        // libzstd's unpledged dict stream resolves its table from the
-        // dict's own size (`ZSTD_getCParamRowSize`'s unknown arm wraps to
-        // dictSize + 499, a small table), and both our streaming cores
-        // keep the unknown-length row there.
-        let dict_rows_armed = self.shape.len.is_none_or(|span| span <= DICT_ROW_SPAN_MAX);
+        // width that made it lose here). An unknown span keys the same
+        // ceiling by the dict's own size — libzstd's unpledged dict stream
+        // resolves its table from `ZSTD_getCParamRowSize`'s unknown arm,
+        // which wraps CONTENTSIZE_UNKNOWN + dictSize + 500 to
+        // dictSize + 499, so a dict past the ceiling runs its large table
+        // there too (R53; both our streaming cores keep the span `None`).
+        let dict_rows_armed = match self.shape.len {
+            Some(span) => span <= DICT_ROW_SPAN_MAX,
+            None => dict_len + 499 <= DICT_ROW_SPAN_MAX,
+        };
         if dict_rows_armed
             && matches!(
                 self.params.strategy,
@@ -1339,10 +1343,18 @@ impl MatchGeneratorDriver {
         // The frame window keeps its shape-clamped size (>= libzstd's
         // W14): the swap targets the strategy class and table geometry,
         // not the reach. Unknown payload sizes (unpledged streams) keep
-        // the large-table row, like libzstd's CONTENTSIZE_UNKNOWN.
+        // the large-table row, like libzstd's CONTENTSIZE_UNKNOWN. The
+        // swap is a fixture-tuned deviation keyed on the payload alone —
+        // libzstd's rSize counts the dict too (verified on the 1.5.7
+        // reference: a 100 KiB dict + 4 KiB payload runs the <= 128 KiB
+        // table's dfast row) — and it holds only inside the armed span:
+        // above `DICT_ROW_SPAN_MAX` libzstd runs stock rows whatever the
+        // payload, and a huge dict leaves the <= 16 KiB geometry dilute
+        // (H14 tables over ~20x their content; R53).
         let payload = self.shape.len.map(|n| n.saturating_sub(dict_len));
         if let Some(payload) = payload
             && payload <= SMALL_DICT_PAYLOAD_MAX
+            && dict_rows_armed
         {
             match small_dict_row(level.as_i32(), self.params.window, self.shape) {
                 // Chain depths are tuned past libzstd's 1<<S
