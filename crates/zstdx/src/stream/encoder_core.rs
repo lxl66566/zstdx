@@ -752,7 +752,8 @@ pub(crate) enum FrameEncoderCore {
 }
 
 impl FrameEncoderCore {
-    // Fallible only for an invalid dictionary.
+    // Fallible for an invalid dictionary, and — without std — for any
+    // worker count above one (no core can serve it there).
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
         // The dictionary resolves once (the parsed form shares, the raw
         // bytes parse fallibly here) and routes every arm below: the
