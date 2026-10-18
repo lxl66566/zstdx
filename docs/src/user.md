@@ -200,6 +200,7 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 - `--filelist LIST` (alias `--file`) reads the input list from LIST, one path per line; `-` reads the list itself from stdin.
 - `-l`/`--list` prints frame information (frames/skips counts, compressed and decompressed sizes, ratio, checksum, dictID) without decompressing — headers are parsed and block headers walked only. The column layout, `-v` field block, `-vv` raw byte counts, grouped totals, and error categories (not-zstd/truncated/frame error) match zstd 1.5.7 byte for byte; stdin is refused. `-l` conflicts with the (de)compression modes and `-o`.
 - `--train` builds a dictionary from sample files (plain file list, `-r` for directories, no stdin) through the `dict_builder` feature: `-o` sets the output (default `dictionary`), `--maxdict=#` caps its size (zstd suffix syntax, default 112640, floor 256). The output is a formatted dictionary (magic + dictID + entropy tables) usable by zstd itself. Built without the feature, the flag fails with a clear error. `--dictID` and `--train-cover`/`--train-fastcover`/`--train-legacy` are rejected loudly: the trainer derives the dictID from content and implements one algorithm.
+- `-b#` benchmarks files at compression level # (default 3), a port of zstd 1.5.7's `benchzstd` down to the result-line formats: whole files load into memory, `-B#`/`--split=#` cuts them into independent chunks, each level spends `-i#` seconds per phase (default 3) and reports the fastest measured round, `-e#` extends to a level range, `-T#` multithreads the benchmarked compression, and `-d` (`-bd`) selects the decode-only benchmark. With no FILES a synthetic 10 MB "Lorem ipsum" corpus runs, byte-identical to zstd's generator. Results and `\r` progress go to stdout; `-q` prints the one-line-per-level summary instead. Benchmark frames carry no checksum (the library default, unlike normal CLI compression), and level 0 is the engine's raw-store level 0, not libzstd's default row.
 - `--sparse`/`--no-sparse` are rejected with an explicit unsupported error: output is always dense (sparse decode-to-seek is not implemented).
 - A failed (de)compression to a file removes the partial output it created, mirroring zstd.
 - Overwrite prompts are read from the controlling terminal (/dev/tty), never from piped stdin; without a terminal, existing outputs are refused unless `-f` is given.
@@ -215,6 +216,8 @@ zstdx -d out.zst                         # → out
 zstdx -T0 -c big.bin | ssh host 'zstd -d > big.bin'
 zstdx -l -v archive.tar.zst              # frame info without decompressing
 zstdx --train -r logs/ --maxdict=64K -o logs.dict
+zstdx -b1 -e3 -i5 trace.log             # zstd-style benchmark, levels 1-3
+zstdx -bd -i5 trace.log.zst             # decode-only benchmark
 zstdx -D logs.dict -9 app.log             # trained-dictionary compression
 ```
 
