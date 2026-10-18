@@ -5,19 +5,34 @@
 //! Swap `zstd::` for `zstdx::compat::` and most code compiles unchanged.
 //! Known differences, all forced by what this crate implements today:
 //!
-//! - Numeric levels map exactly through [`Level::from_zstd`][crate::Level::from_zstd].
+//! - Numeric levels map exactly through [`Level::from_zstd`][crate::Level::from_zstd];
+//!   `compression_level_range` answers 1..=22 (no accelerated levels), and a level of 0 selects the
+//!   default (3).
 //! - `multithread(n)` with `n > 1` runs the native multithreaded streaming encoder; it must be set
-//!   before the stream starts. Dictionary-taking constructors are supported (single-threaded).
-//! - `zstd_safe` and `zstd::dict` (trained dictionaries) have no equivalent; the native low-level
-//!   API is [`crate::encoding`]/[`crate::decoding`].
+//!   before the stream starts. Dictionary-taking constructors are supported (single-threaded),
+//!   including the prepared [`dict::EncoderDictionary`]/[`dict::DecoderDictionary`] forms; the
+//!   trainers live in [`dict`] behind the `dict_builder` feature.
+//! - `zstd_safe` (and the `stream::{raw,zio}` layer around it) has no equivalent; the native
+//!   low-level API is [`crate::encoding`]/[`crate::decoding`].
+//! - `bulk::Decompressor::decompress` treats `capacity` as a growing hint, where the zstd crate
+//!   errors when the content exceeds it; [`bulk::Decompressor::upper_bound`] always answers
+//!   (upstream needs the `experimental` feature).
+//! - `stream::read::{Encoder,Decoder}` take `R: Read` directly instead of wrapping it in a
+//!   `BufReader`, so `get_ref`/`get_mut`/`finish` expose `R`, not `BufReader<R>`.
 //!
 //! [`zstd` crate]: https://docs.rs/zstd/0.13
 
 pub mod bulk;
+pub mod dict;
 pub mod stream;
 
 #[cfg(test)]
 mod tests;
+
+// The zstd crate re-exports these at its root: `zstd::Encoder` is the
+// write-side encoder, `zstd::Decoder` the read-side decoder.
+#[doc(no_inline)]
+pub use stream::{decode_all, encode_all, read::Decoder, write::AutoFinishEncoder, write::Encoder};
 
 use crate::Level;
 

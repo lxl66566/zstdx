@@ -50,10 +50,151 @@ fn bulk_structs() {
     );
     compressor.set_compression_level(1).unwrap();
     assert_eq!(compressor.compress(&data).unwrap(), compressed);
+    // bulk frames carry the content size (see bulk_content_size_parity);
+    // streaming-shaped ones do not (checked in upper_bound_parity below)
     assert_eq!(
         compat::bulk::Decompressor::upper_bound(&compressed),
-        None // frames from this crate carry no content size: unknown
+        Some(data.len())
     );
+}
+
+/// The zstd crate's own `has_content_size` test: bulk functions include
+/// the content size by default. Empty input declares an empty frame.
+#[test]
+fn bulk_content_size_parity() {
+    let data = payload();
+    let compressed = compat::bulk::compress(&data, 3).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&compressed)
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(data.len())
+    );
+    // same for the struct path (which compress_to_buffer routes through)
+    let mut compressor = compat::bulk::Compressor::new(3).unwrap();
+    let mut buffer = vec![0u8; data.len() + 1024];
+    let written = compressor.compress_to_buffer(&data, &mut buffer).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&buffer[..written])
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(data.len())
+    );
+    // empty input: a declared zero-size frame, not an unknown size
+    let empty = compat::bulk::compress(&[], 3).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&empty)
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(0)
+    );
+    assert_eq!(
+        compat::bulk::decompress(&empty, 0).unwrap(),
+        Vec::<u8>::new()
+    );
+}
+
+/// The zstd crate's dictionary lifecycle on `bulk::Compressor`:
+/// `set_compression_level` clears a registered dictionary,
+/// `set_dictionary(level, dict)` re-registers one at a new level, and an
+/// empty slice detaches it.
+#[test]
+fn bulk_compressor_dictionary_lifecycle() {
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+
+    let mut compressor = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    let with_dict = compressor.compress(&content).unwrap();
+    // changing the level drops the dictionary: the frame decodes bare
+    compressor.set_compression_level(1).unwrap();
+    let bare = compressor.compress(&content).unwrap();
+    assert_eq!(
+        compat::bulk::decompress(&bare, content.len()).unwrap(),
+        content
+    );
+    assert_ne!(bare, with_dict);
+    // re-registering at the same level reproduces the frame (the level
+    // changes how the content compresses, dictionary or not)
+    compressor.set_dictionary(3, &dict).unwrap();
+    let again = compressor.compress(&content).unwrap();
+    assert_eq!(again, with_dict);
+    assert!(
+        compat::bulk::Decompressor::new()
+            .unwrap()
+            .decompress(&again, 0)
+            .is_err()
+    );
+    // an empty dictionary detaches (a bare frame at the current level)
+    compressor.set_dictionary(5, &[]).unwrap();
+    let mut at_five = compat::bulk::Compressor::new(5).unwrap();
+    assert_eq!(
+        compressor.compress(&content).unwrap(),
+        at_five.compress(&content).unwrap()
+    );
+}
+
+/// Prepared dictionaries through the whole compat surface: the parse is
+/// shared, compression runs at the dictionary's level, and a dictionary
+/// that failed to parse replays the failure at first use (libzstd's
+/// behavior, since `copy` is infallible there too).
+#[test]
+fn bulk_prepared_dictionaries() {
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+
+    let encoder_dict = compat::dict::EncoderDictionary::copy(&dict, 3);
+    let mut compressor = compat::bulk::Compressor::with_prepared_dictionary(&encoder_dict).unwrap();
+    let compressed = compressor.compress(&content).unwrap();
+    // the prepared dictionary's frames still declare the content size
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&compressed)
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(content.len())
+    );
+
+    let decoder_dict = compat::dict::DecoderDictionary::copy(&dict);
+    let mut decompressor =
+        compat::bulk::Decompressor::with_prepared_dictionary(&decoder_dict).unwrap();
+    assert_eq!(decompressor.decompress(&compressed, 0).unwrap(), content);
+    // set_dictionary / set_prepared_dictionary swap dictionaries mid-life
+    let mut plain = compat::bulk::Decompressor::new().unwrap();
+    plain.set_prepared_dictionary(&decoder_dict).unwrap();
+    assert_eq!(plain.decompress(&compressed, 0).unwrap(), content);
+    plain.set_dictionary(&dict).unwrap();
+    assert_eq!(plain.decompress(&compressed, 0).unwrap(), content);
+    // and a prepared encoder dictionary attaches the same way
+    let mut re = compat::bulk::Compressor::new(1).unwrap();
+    re.set_prepared_dictionary(&encoder_dict).unwrap();
+    assert_eq!(re.compress(&content).unwrap(), compressed);
+}
+
+/// A dictionary that does not parse still constructs (the zstd crate's
+/// `copy` is infallible too — its `CDict`/`DDict` creation panics there,
+/// this port replays the failure as an error instead). The encoder side
+/// surfaces it at the first compression, like its byte-dictionary path;
+/// the decoder side, which validates at attach, refuses it at the
+/// constructor.
+#[test]
+fn prepared_dictionaries_replay_parse_errors() {
+    use crate::decoding::dictionary::MAGIC_NUM;
+    let encoder_dict = compat::dict::EncoderDictionary::copy(&MAGIC_NUM, 3);
+    let mut compressor = compat::bulk::Compressor::with_prepared_dictionary(&encoder_dict).unwrap();
+    let first = compressor.compress(b"payload").unwrap_err();
+    // deterministic replay on the next call
+    assert_eq!(
+        format!("{}", compressor.compress(b"payload").unwrap_err()),
+        format!("{first}")
+    );
+
+    let decoder_dict = compat::dict::DecoderDictionary::copy(&MAGIC_NUM);
+    assert!(compat::bulk::Decompressor::with_prepared_dictionary(&decoder_dict).is_err());
+    let mut plain = compat::bulk::Decompressor::new().unwrap();
+    assert!(plain.set_prepared_dictionary(&decoder_dict).is_err());
+    // the decompressor stays usable after a refused attach
+    let data = payload();
+    let compressed = compat::bulk::compress(&data, 3).unwrap();
+    assert_eq!(plain.decompress(&compressed, 0).unwrap(), data);
 }
 
 #[test]
@@ -401,7 +542,9 @@ fn transient_materialize_error_is_retryable() {
 fn upper_bound_parity_with_get_frame_content_size() {
     let data = payload();
     let frames: Vec<Vec<u8>> = vec![
-        // no FCS field (our streaming-shaped one-shot)
+        // no FCS field (streaming shape, unpledged)
+        compat::stream::encode_all(data.as_slice(), 3).unwrap(),
+        // FCS declared (the bulk paths pledge it, as libzstd's one-shot does)
         compat::bulk::compress(&data, 3).unwrap(),
         // FCS declared (libzstd's one-shot always does)
         zstd::bulk::compress(&data, 3).unwrap(),
@@ -426,4 +569,97 @@ fn upper_bound_parity_with_get_frame_content_size() {
             frame.len()
         );
     }
+}
+
+/// The compat trainers mirror `zstd::dict`: the continuous/sample-list/
+/// sample-iterator entry points agree with each other, mismatched sizes
+/// error with the exact upstream message, and a trained dictionary
+/// round-trips through the compat stream shapes (`io::copy` through an
+/// auto-finishing dictionary encoder, decode through a dictionary decoder)
+/// the way the zstd crate's own `test_dict_training` does.
+#[cfg(feature = "dict_builder")]
+#[test]
+fn dict_trainers_and_roundtrip() {
+    let samples: Vec<Vec<u8>> = (0..64u32)
+        .map(|i| {
+            format!(
+                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"\
+                 ]}}\n",
+                i % 7
+            )
+            .into_bytes()
+        })
+        .collect();
+    let from_list = compat::dict::from_samples(&samples, 8 * 1024).unwrap();
+
+    // the continuous form over the same data trains the same dictionary
+    let mut data = Vec::new();
+    let mut sizes = Vec::new();
+    for sample in &samples {
+        data.extend_from_slice(sample);
+        sizes.push(sample.len());
+    }
+    assert_eq!(
+        compat::dict::from_continuous(&data, &sizes, 8 * 1024).unwrap(),
+        from_list
+    );
+    // ... and the sample-iterator form feeds the continuous form
+    let cursors = samples.iter().map(|s| Ok(std::io::Cursor::new(s.clone())));
+    assert_eq!(
+        compat::dict::from_sample_iterator(cursors, 8 * 1024).unwrap(),
+        from_list
+    );
+    // mismatched sizes error with the zstd crate's exact message
+    let err =
+        compat::dict::from_continuous(&data, &sizes[..sizes.len() - 1], 8 * 1024).unwrap_err();
+    assert_eq!(format!("{err}"), "sample sizes don't add up");
+    // read errors propagate out of the sample iterator
+    let failing = [Err::<std::io::Cursor<&[u8]>, _>(std::io::Error::other(
+        "boom",
+    ))];
+    assert_eq!(
+        format!(
+            "{}",
+            compat::dict::from_sample_iterator(failing, 8 * 1024).unwrap_err()
+        ),
+        "boom"
+    );
+
+    // the trained dictionary round-trips through the stream shapes with
+    // io::copy, exactly as the zstd crate's own training test does
+    let content =
+        b"{\"user\":\"user_5\",\"event\":\"click\",\"score\":3,\"tags\":[\"a\",\"b\"]}".repeat(64);
+    let mut buffer = Vec::new();
+    {
+        let mut encoder =
+            compat::stream::write::Encoder::with_dictionary(&mut buffer, 1, &from_list)
+                .unwrap()
+                .auto_finish();
+        std::io::copy(&mut content.as_slice(), &mut encoder).unwrap();
+    }
+    let mut result = Vec::new();
+    {
+        let mut decoder =
+            compat::stream::read::Decoder::with_dictionary(buffer.as_slice(), &from_list).unwrap();
+        decoder.read_to_end(&mut result).unwrap();
+    }
+    assert_eq!(result, content);
+
+    // from_files: each file one sample, agreeing with from_samples
+    let dir = std::env::temp_dir().join("zstdx-r52-dict-train");
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<std::path::PathBuf> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, sample)| {
+            let path = dir.join(format!("sample-{i}"));
+            std::fs::write(&path, sample).unwrap();
+            path
+        })
+        .collect();
+    assert_eq!(
+        compat::dict::from_files(&paths, 8 * 1024).unwrap(),
+        from_list
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

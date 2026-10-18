@@ -2,27 +2,25 @@
 
 use std::{io, vec::Vec};
 
-use super::map_level;
+use super::{
+    dict::{DecoderDictionary, EncoderDictionary},
+    map_level,
+};
 use crate::decoding::frame::read_frame_header;
 
 /// Compresses a single block of data to a Vec.
+///
+/// Like the `zstd` crate's bulk functions, the frame header declares the
+/// content size.
 pub fn compress(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
-    Ok(crate::bulk::compress(data, map_level(level)))
+    Compressor::new(level)?.compress(data)
 }
 
 /// Compresses a single block of data to a writable buffer.
 ///
 /// Fails if the buffer does not have enough space for the compressed frame.
 pub fn compress_to_buffer(data: &[u8], destination: &mut [u8], level: i32) -> io::Result<usize> {
-    let compressed = crate::bulk::compress(data, map_level(level));
-    if destination.len() < compressed.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "destination buffer too small for the compressed frame",
-        ));
-    }
-    destination[..compressed.len()].copy_from_slice(&compressed);
-    Ok(compressed.len())
+    Compressor::new(level)?.compress_to_buffer(data, destination)
 }
 
 /// Decompresses a frame to the given Vec capacity; the buffer grows if the
@@ -64,6 +62,39 @@ impl Decompressor {
         Ok(Self { inner })
     }
 
+    /// Creates a new decompressor using an existing prepared
+    /// [`DecoderDictionary`].
+    pub fn with_prepared_dictionary(dictionary: &DecoderDictionary) -> io::Result<Self> {
+        let mut inner = crate::decoding::FrameDecoder::new();
+        let dict = dictionary.shared()?;
+        inner
+            .add_shared_dict(dict)
+            .map_err(|e| io::Error::from(crate::Error::Frame(e)))?;
+        Ok(Self { inner })
+    }
+
+    /// Changes the dictionary used by this decompressor (an empty slice
+    /// detaches it). Affects future decompressions; dictionaries attached
+    /// earlier stay available to the frames that want them.
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> io::Result<()> {
+        // `load` (not `decode_dict`): headerless raw content is a valid
+        // dictionary here, as on every other decode entry point.
+        let dict = crate::decoding::Dictionary::load(dictionary)
+            .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?;
+        self.inner
+            .add_dict(dict)
+            .map_err(|e| io::Error::from(crate::Error::Frame(e)))
+    }
+
+    /// Changes the dictionary used by this decompressor to a prepared
+    /// [`DecoderDictionary`].
+    pub fn set_prepared_dictionary(&mut self, dictionary: &DecoderDictionary) -> io::Result<()> {
+        let dict = dictionary.shared()?;
+        self.inner
+            .add_shared_dict(dict)
+            .map_err(|e| io::Error::from(crate::Error::Frame(e)))
+    }
+
     /// Decompresses into the Vec, growing it if the capacity is too small.
     /// Decodes through this decompressor, so a dictionary attached at
     /// construction applies (the zstd crate's semantics).
@@ -94,6 +125,9 @@ impl Decompressor {
     /// `ZSTD_getFrameContentSize` semantics: a header without the FCS
     /// field is an unknown size (`None`), not a bogus zero; a complete
     /// skippable frame is `Some(0)`; an unreadable head is `None`.
+    ///
+    /// The `zstd` crate only answers this with its `experimental` feature
+    /// (`zstd_safe::decompress_bound`); this porting layer always can.
     pub fn upper_bound(data: &[u8]) -> Option<usize> {
         match read_frame_header(data) {
             // A complete skippable frame carries no content; a truncated
@@ -119,49 +153,103 @@ impl Default for Decompressor {
     }
 }
 
+/// The dictionary attached to a [`Compressor`]: raw bytes at the context's
+/// level, or a prepared dictionary compressing at its own level.
+#[derive(Debug)]
+enum Attachment {
+    None,
+    Raw(Vec<u8>),
+    Prepared(EncoderDictionary),
+}
+
 /// An encoder that can be used to compress multiple frames, mirroring
 /// `zstd::bulk::Compressor`.
 #[derive(Debug)]
 pub struct Compressor {
     level: i32,
-    dict: Option<Vec<u8>>,
+    dict: Attachment,
 }
 
 impl Compressor {
     /// Creates a new compressor.
     pub fn new(level: i32) -> io::Result<Self> {
-        Ok(Self { level, dict: None })
-    }
-
-    /// Creates a compressor bound to a dictionary.
-    pub fn with_dictionary(level: i32, dictionary: &[u8]) -> io::Result<Self> {
         Ok(Self {
             level,
-            dict: Some(dictionary.to_vec()),
+            dict: Attachment::None,
         })
     }
 
-    /// Changes the level used by subsequent `compress` calls.
+    /// Creates a new compressor, using the given dictionary.
+    ///
+    /// Note that using a dictionary means that decompression will need to
+    /// use the same dictionary.
+    pub fn with_dictionary(level: i32, dictionary: &[u8]) -> io::Result<Self> {
+        let mut compressor = Self::new(level)?;
+        compressor.set_dictionary(level, dictionary)?;
+        Ok(compressor)
+    }
+
+    /// Creates a new compressor using an existing prepared
+    /// [`EncoderDictionary`]; the compression level is the one the
+    /// dictionary was created with.
+    ///
+    /// Note that using a dictionary means that decompression will need to
+    /// use the same dictionary.
+    pub fn with_prepared_dictionary(dictionary: &EncoderDictionary) -> io::Result<Self> {
+        Ok(Self {
+            level: dictionary.compression_level(),
+            dict: Attachment::Prepared(dictionary.clone()),
+        })
+    }
+
+    /// Changes the compression level used by this compressor.
+    ///
+    /// *This will clear any dictionary previously registered* (the zstd
+    /// crate's semantics: pass the dictionary back through
+    /// [`Self::set_dictionary`] to keep it).
     pub fn set_compression_level(&mut self, level: i32) -> io::Result<()> {
+        self.set_dictionary(level, &[])
+    }
+
+    /// Changes the dictionary and compression level used by this
+    /// compressor (an empty slice detaches the dictionary). Affects future
+    /// compression jobs.
+    ///
+    /// Note that using a dictionary means that decompression will need to
+    /// use the same dictionary.
+    pub fn set_dictionary(&mut self, level: i32, dictionary: &[u8]) -> io::Result<()> {
         self.level = level;
+        self.dict = if dictionary.is_empty() {
+            Attachment::None
+        } else {
+            Attachment::Raw(dictionary.to_vec())
+        };
         Ok(())
     }
 
-    /// Sets a dictionary for subsequent compression (an empty slice
-    /// detaches it).
-    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> io::Result<()> {
-        self.dict = (!dictionary.is_empty()).then(|| dictionary.to_vec());
+    /// Changes the dictionary used by this compressor to a prepared
+    /// [`EncoderDictionary`]; the level the dictionary was created with is
+    /// used. Affects future compression jobs.
+    ///
+    /// Note that using a dictionary means that decompression will need to
+    /// use the same dictionary.
+    pub fn set_prepared_dictionary(&mut self, dictionary: &EncoderDictionary) -> io::Result<()> {
+        self.dict = Attachment::Prepared(dictionary.clone());
         Ok(())
     }
 
-    /// Compresses a single block of data.
+    /// Compresses a single block of data. The frame header declares the
+    /// content size, as libzstd's one-shot compressor does.
     pub fn compress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        self.compress_inner(data).map(|(v, _)| v)
+        // We could allocate exactly compress_bound(len); the native path
+        // already sizes its output, and the Vec is handed back as produced.
+        let options = self.options(data.len() as u64)?;
+        crate::bulk::compress_with(data, &options).map_err(io::Error::from)
     }
 
     /// Compresses a single block into the caller's buffer.
     pub fn compress_to_buffer(&mut self, data: &[u8], destination: &mut [u8]) -> io::Result<usize> {
-        let (compressed, _) = self.compress_inner(data)?;
+        let compressed = self.compress(data)?;
         if destination.len() < compressed.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -172,14 +260,26 @@ impl Compressor {
         Ok(compressed.len())
     }
 
-    fn compress_inner(&mut self, data: &[u8]) -> io::Result<(Vec<u8>, i32)> {
-        let level = self.level;
+    /// The options for one compression job: the effective level (a prepared
+    /// dictionary carries its own) and the content-size pledge the `zstd`
+    /// crate's bulk frames are written with.
+    fn options(&self, len: u64) -> io::Result<crate::EncoderOptions> {
+        let level = match &self.dict {
+            Attachment::Prepared(dict) => dict.compression_level(),
+            _ => self.level,
+        };
+        let options = crate::EncoderOptions::new(map_level(level)).pledged_size(Some(len));
         match &self.dict {
-            Some(dict) => {
-                let opts = crate::EncoderOptions::new(map_level(level)).dictionary(dict);
-                Ok((crate::bulk::compress_with(data, &opts)?, level))
-            },
-            None => Ok((crate::bulk::compress(data, map_level(level)), level)),
+            Attachment::None => Ok(options),
+            Attachment::Raw(dict) => Ok(options.dictionary(dict)),
+            Attachment::Prepared(dict) => dict.apply(options),
         }
     }
+}
+
+#[test]
+fn contexts_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    assert_send(Compressor::new(0));
+    assert_send(Decompressor::new());
 }
