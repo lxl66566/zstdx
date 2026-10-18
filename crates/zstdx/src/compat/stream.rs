@@ -166,6 +166,17 @@ pub mod write {
             Ok(())
         }
 
+        /// Enables or disables storing of the dict id (default on). With it
+        /// off the dictionary still applies — content, entropy tables,
+        /// repcodes — but the frame header carries no Dictionary_ID, so
+        /// decoders need the dictionary explicitly and decoding with a
+        /// wrong one is undefined; fails once streaming started.
+        pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.options.include_dictid = include;
+            Ok(())
+        }
+
         /// Enables multithreaded compression: `workers > 1` engages the
         /// native multithreaded streaming core (raw-block levels and
         /// single-core processes fall back to the single-threaded core, as
@@ -535,6 +546,17 @@ pub mod read {
         pub fn window_log(&mut self, log_distance: u32) -> io::Result<()> {
             self.not_started()?;
             self.options.input_shape.window_log = Some(log_distance);
+            Ok(())
+        }
+
+        /// Enables or disables storing of the dict id (default on). With it
+        /// off the dictionary still applies — content, entropy tables,
+        /// repcodes — but the frame header carries no Dictionary_ID, so
+        /// decoders need the dictionary explicitly and decoding with a
+        /// wrong one is undefined; fails once streaming started.
+        pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.options.include_dictid = include;
             Ok(())
         }
 

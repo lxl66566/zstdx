@@ -873,6 +873,110 @@ fn test_max_window_size_clamped_to_format_maximum() {
     assert_eq!(decoder.max_window_size(), MAX_WINDOW_SIZE);
 }
 
+/// `EncoderOptions::include_dictid(false)` suppresses the frame header's
+/// Dictionary_ID while the dictionary stays fully in effect (libzstd's
+/// `ZSTD_c_dictIDFlag = 0`): header inspection on both engines' frames,
+/// roundtrips with the dictionary attached, and interop in both
+/// directions. (R55)
+#[test]
+fn include_dictid_suppresses_the_header_field() {
+    extern crate std;
+    use alloc::{format, vec::Vec};
+    use std::io::Write as _;
+
+    let samples: Vec<Vec<u8>> = (0..96u32)
+        .map(|i| {
+            format!(
+                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"\
+                 ]}}\n",
+                i % 7
+            )
+            .into_bytes()
+        })
+        .collect();
+    // a real trained dictionary, so the id is nonzero; skipped when the
+    // training backend is unavailable
+    let Ok(dict) = zstd::dict::from_samples(&samples, 8 * 1024) else {
+        return;
+    };
+    let content = b"{\"user\":\"user_5\",\"event\":\"click\",\"score\":3,\"tags\":[\"a\",\"b\"]}\n"
+        .repeat(96);
+
+    // bulk: the header field follows the flag, and only that field
+    let stamped = crate::bulk::compress_with(
+        &content,
+        &crate::EncoderOptions::new(crate::Level::Fast).dictionary(&dict),
+    )
+    .unwrap();
+    let bare = crate::bulk::compress_with(
+        &content,
+        &crate::EncoderOptions::new(crate::Level::Fast)
+            .dictionary(&dict)
+            .include_dictid(false),
+    )
+    .unwrap();
+    assert!(zstd::zstd_safe::get_dict_id_from_frame(&stamped).is_some());
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&bare), None);
+    // our own header parse agrees: no dictionary_id field at all
+    let (header, _) = crate::decoding::frame::read_frame_header(&*bare).unwrap();
+    assert_eq!(header.dictionary_id(), None);
+    // the suppressed frame is smaller: only the id field left out
+    assert!(bare.len() < stamped.len());
+
+    // the dictionary still applies on both engines
+    let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
+    let roundtrip = crate::bulk::decompress_with(&bare, content.len(), &dec_opts).unwrap();
+    assert_eq!(roundtrip, content);
+    let mut zdec = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+    let mut zout = alloc::vec![0u8; content.len()];
+    let n = zdec.decompress_to_buffer(&bare, &mut zout).unwrap();
+    assert_eq!(&zout[..n], &content[..]);
+
+    // reverse direction: libzstd's own dictID-less dict frame decodes here
+    let mut zenc = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    zenc.include_dictid(false).unwrap();
+    let zbare = zenc.compress(&content).unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&zbare), None);
+    let zroundtrip = crate::bulk::decompress_with(&zbare, content.len(), &dec_opts).unwrap();
+    assert_eq!(zroundtrip, content);
+
+    // streaming core: same suppression, same roundtrip
+    let stream_bare = {
+        let mut encoder = crate::stream::write::Encoder::with_options(
+            Vec::new(),
+            crate::EncoderOptions::new(crate::Level::Fast)
+                .dictionary(&dict)
+                .include_dictid(false),
+        )
+        .unwrap();
+        encoder.write_all(&content).unwrap();
+        encoder.finish().unwrap()
+    };
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&stream_bare), None);
+    let stream_roundtrip =
+        crate::bulk::decompress_with(&stream_bare, content.len(), &dec_opts).unwrap();
+    assert_eq!(stream_roundtrip, content);
+
+    // multithreaded stream core: the suppression holds there too (on
+    // single-core machines the ST core runs and passes identically)
+    let mt_bare = {
+        let mut encoder = crate::stream::write::Encoder::with_options(
+            Vec::new(),
+            crate::EncoderOptions::new(crate::Level::Fast)
+                .dictionary(&dict)
+                .include_dictid(false)
+                .workers(2)
+                .pledged_size(Some(content.len() as u64)),
+        )
+        .unwrap();
+        encoder.write_all(&content).unwrap();
+        encoder.finish().unwrap()
+    };
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&mt_bare), None);
+    let mt_roundtrip = crate::bulk::decompress_with(&mt_bare, content.len(), &dec_opts).unwrap();
+    assert_eq!(mt_roundtrip, content);
+}
+
 pub mod bit_reader;
 pub mod block_output_cap;
 pub mod decode_corpus;

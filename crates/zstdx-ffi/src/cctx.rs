@@ -39,6 +39,8 @@ pub struct Settings {
     pub checksum: bool,
     pub content_size: bool,
     pub workers: u32,
+    /// ZSTD_c_dictIDFlag (libzstd default: on).
+    pub dict_id_flag: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +53,7 @@ impl Default for Settings {
             // ...but does write the content size whenever known.
             content_size: true,
             workers: 0,
+            dict_id_flag: true,
         }
     }
 }
@@ -83,6 +86,7 @@ impl Settings {
     fn encoder_options(&self, pledged: Option<u64>) -> zstdx::EncoderOptions {
         let mut options = zstdx::EncoderOptions::new(self.level())
             .checksum(self.checksum)
+            .include_dictid(self.dict_id_flag)
             .pledged_size(self.content_size.then_some(pledged).flatten())
             .workers(self.workers);
         if let Some(window_log) = self.window_log {
@@ -125,12 +129,14 @@ impl Settings {
                     (value != 0).then_some(u32::try_from(value).expect("bounds checked"));
                 Ok(value.max(0) as usize)
             },
-            ZSTD_cParameter::ChecksumFlag | ZSTD_cParameter::ContentSizeFlag => {
+            ZSTD_cParameter::ChecksumFlag
+            | ZSTD_cParameter::ContentSizeFlag
+            | ZSTD_cParameter::DictIDFlag => {
                 let flag = value != 0;
                 match param {
                     ZSTD_cParameter::ChecksumFlag => self.checksum = flag,
                     ZSTD_cParameter::ContentSizeFlag => self.content_size = flag,
-                    _ => unreachable!("narrowed above"),
+                    _ => self.dict_id_flag = flag,
                 }
                 Ok(usize::from(flag))
             },

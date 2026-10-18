@@ -329,6 +329,23 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// Attach a dictionary the way the options-based decode entries do:
+    /// under its own id for frames that declare it, and under the null id
+    /// as the history for dictionary-id-less frames — libzstd applies a
+    /// loaded dictionary to every frame regardless of the header field,
+    /// so a suppressed-id encode ([`crate::EncoderOptions::include_dictid`])
+    /// decodes once the dictionary is handed to the decoder. Repeated
+    /// calls keep earlier ids addressable while the null-id entry tracks
+    /// the latest dictionary.
+    pub fn add_options_dict(
+        &mut self,
+        dict: alloc::sync::Arc<Dictionary>,
+    ) -> Result<(), FrameDecoderError> {
+        self.dicts.insert(0, alloc::sync::Arc::clone(&dict));
+        self.dicts.insert(dict.id, dict);
+        Ok(())
+    }
+
     /// [`Self::add_dict`] for an already-parsed dictionary shared with the
     /// caller: repeated decoders reuse one parse instead of re-reading the
     /// raw bytes per stream (the FFI layer's DDict).

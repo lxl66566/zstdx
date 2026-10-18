@@ -562,6 +562,9 @@ fn context_one_shot_and_parameter_bounds() {
     assert_eq!(3, set_param(cctx, 100, 0));
     assert_eq!(0, set_param(cctx, 100, -131_072));
     assert_eq!(1, set_param(cctx, 201, 2));
+    // dictIDFlag: applied-value contract like the other flags.
+    assert_eq!(0, set_param(cctx, 202, 0));
+    assert_eq!(1, set_param(cctx, 202, 1));
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 101, 99) }),
         zstd::ErrorCode::ParameterOutOfBound as u32

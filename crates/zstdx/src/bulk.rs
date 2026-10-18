@@ -71,8 +71,14 @@ pub fn compress_with(
         (_, None) => None,
     };
     if let Some(dict) = &dict {
+        // The header stamp: `include_dictid(false)` suppresses it, and the
+        // mt slice entry cannot express that — such frames run the
+        // single-threaded dictionary entry instead (an MT engagement
+        // demotion like the small-input one, recorded in the compat
+        // deviations).
+        let dict_id = options.include_dictid.then(|| dict.header_id()).flatten();
         #[cfg(feature = "std")]
-        if options.workers > 1 {
+        if options.workers > 1 && options.include_dictid {
             return Ok(crate::encoding::mt::compress_slice_mt(
                 source,
                 options.level,
@@ -83,7 +89,7 @@ pub fn compress_with(
                 Some(dict),
             ));
         }
-        return Ok(crate::encoding::compress_slice_with_dictionary(
+        return Ok(crate::encoding::compress_slice_with_dictionary_id(
             source,
             options.level,
             options.checksum,
@@ -93,6 +99,7 @@ pub fn compress_with(
             },
             dict,
             declared,
+            dict_id,
         ));
     }
     #[cfg(feature = "std")]
@@ -184,14 +191,18 @@ pub fn decompress_to_buffer_with(
     if let Some(dict) = &options.parsed_dictionary {
         let mut decoder = FrameDecoder::new();
         decoder
-            .add_shared_dict(alloc::sync::Arc::clone(dict))
+            .add_options_dict(alloc::sync::Arc::clone(dict))
             .map_err(crate::Error::Frame)?;
         return decoder.decode_all(source, destination).map_err(Into::into);
     }
     if let Some(raw) = &options.dictionary {
-        let dict = crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?;
+        let dict = alloc::sync::Arc::new(
+            crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?,
+        );
         let mut decoder = FrameDecoder::new();
-        decoder.add_dict(dict).map_err(crate::Error::Frame)?;
+        decoder
+            .add_options_dict(dict)
+            .map_err(crate::Error::Frame)?;
         return decoder.decode_all(source, destination).map_err(Into::into);
     }
     #[cfg(not(feature = "std"))]
@@ -221,7 +232,9 @@ pub fn decompress_with(
     let shared = options.parsed_dictionary.clone();
     if let Some(dict) = shared {
         let mut decoder = FrameDecoder::new();
-        decoder.add_shared_dict(dict).map_err(crate::Error::Frame)?;
+        decoder
+            .add_options_dict(dict)
+            .map_err(crate::Error::Frame)?;
         let mut capacity = capacity.max(64 * 1024);
         loop {
             let mut out = alloc::vec::Vec::with_capacity(capacity);
@@ -233,9 +246,13 @@ pub fn decompress_with(
         }
     }
     if let Some(raw) = &options.dictionary {
-        let dict = crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?;
+        let dict = alloc::sync::Arc::new(
+            crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?,
+        );
         let mut decoder = FrameDecoder::new();
-        decoder.add_dict(dict).map_err(crate::Error::Frame)?;
+        decoder
+            .add_options_dict(dict)
+            .map_err(crate::Error::Frame)?;
         let mut capacity = capacity.max(64 * 1024);
         loop {
             let mut out = alloc::vec::Vec::with_capacity(capacity);

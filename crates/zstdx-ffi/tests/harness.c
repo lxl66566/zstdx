@@ -131,6 +131,8 @@ static void test_contexts(void) {
      * contract since zstd 1.6). */
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 9) == 9, "level param");
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1) == 1, "checksum param");
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 1) == 1, "dictID param");
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 0) == 0, "dictID off");
     CHECK(ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 2)) ||
           ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 2) == 2, "workers param");
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 18) == 18, "window param");

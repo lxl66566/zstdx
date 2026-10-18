@@ -182,11 +182,12 @@ impl<R: Read> Decoder<R> {
         }
         let mut build = || -> Result<()> {
             if let Some(dict) = &options.dictionary {
-                let dict =
-                    crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?;
-                decoder.add_dict(dict)?;
+                let dict = alloc::sync::Arc::new(
+                    crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?,
+                );
+                decoder.add_options_dict(dict)?;
             } else if let Some(dict) = &options.parsed_dictionary {
-                decoder.add_shared_dict(dict.clone())?;
+                decoder.add_options_dict(dict.clone())?;
             }
             Self::init_first_frame(&mut source, &mut decoder)
         };

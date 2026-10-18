@@ -57,6 +57,9 @@ impl InputShape {
 pub struct EncoderOptions {
     pub(crate) level: Level,
     pub(crate) checksum: bool,
+    /// libzstd's `ZSTD_c_dictIDFlag`: stamp the dictionary id into the
+    /// frame header (see [`Self::include_dictid`]).
+    pub(crate) include_dictid: bool,
     pub(crate) pledged_size: Option<u64>,
     pub(crate) workers: u32,
     pub(crate) input_shape: InputShape,
@@ -75,6 +78,7 @@ impl EncoderOptions {
         Self {
             level,
             checksum: cfg!(feature = "hash"),
+            include_dictid: true,
             pledged_size: None,
             workers: 0,
             input_shape: InputShape {
@@ -117,6 +121,18 @@ impl EncoderOptions {
     /// without it — the flag is inert when the feature is disabled).
     pub const fn checksum(mut self, enabled: bool) -> Self {
         self.checksum = enabled;
+        self
+    }
+
+    /// Declare the dictionary id in the frame header (default: on).
+    /// Turning it off keeps the dictionary fully in effect — content as
+    /// match history, entropy tables, repcodes — but omits the
+    /// Dictionary_ID field (libzstd's `ZSTD_c_dictIDFlag = 0`): decoders
+    /// then need the dictionary passed explicitly, and decoding with a
+    /// wrong one is undefined. Without a dictionary the flag changes
+    /// nothing.
+    pub const fn include_dictid(mut self, include: bool) -> Self {
+        self.include_dictid = include;
         self
     }
 

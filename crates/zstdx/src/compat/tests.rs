@@ -918,3 +918,74 @@ fn reexport_shape_matches_zstd() {
             .unwrap()
             .auto_finish();
 }
+
+/// `include_dictid` across the compat surface: the flag lands in the
+/// frame header (no Dictionary_ID), the dictionary still applies, and the
+/// zstd crate's own suppressed frames decode through the compat layer.
+/// (R55)
+#[test]
+fn include_dictid_parity() {
+    let samples: Vec<Vec<u8>> = (0..96u32)
+        .map(|i| {
+            format!(
+                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"\
+                 ]}}\n",
+                i % 7
+            )
+            .into_bytes()
+        })
+        .collect();
+    let Ok(dict) = zstd::dict::from_samples(&samples, 8 * 1024) else {
+        return;
+    };
+    let content = b"{\"user\":\"user_5\",\"event\":\"click\",\"score\":3,\"tags\":[\"a\",\"b\"]}\n"
+        .repeat(96);
+
+    // write-side stream encoder: parameter before the first write
+    let mut encoder =
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &dict).unwrap();
+    encoder.include_dictid(false).unwrap();
+    encoder.write_all(&content).unwrap();
+    let bare = encoder.finish().unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&bare), None);
+    // the setter refuses once streaming started
+    let mut encoder =
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &dict).unwrap();
+    encoder.write_all(&content).unwrap();
+    assert!(encoder.include_dictid(false).is_err());
+
+    // read-side stream encoder
+    let mut rencoder =
+        compat::stream::read::Encoder::with_dictionary(content.as_slice(), 3, &dict).unwrap();
+    rencoder.include_dictid(false).unwrap();
+    let mut rbare = Vec::new();
+    rencoder.read_to_end(&mut rbare).unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&rbare), None);
+
+    // bulk compressor: the flag survives a dictionary re-register
+    let mut compressor = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    compressor.include_dictid(false).unwrap();
+    compressor.set_dictionary(5, &dict).unwrap();
+    let cbare = compressor.compress(&content).unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&cbare), None);
+
+    // every suppressed frame still needs the dictionary to decode, and
+    // decodes through the compat layer with it
+    for frame in [&bare, &rbare, &cbare] {
+        let mut decoder =
+            compat::stream::read::Decoder::with_dictionary(frame.as_slice(), &dict).unwrap();
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+        assert_eq!(out, content);
+    }
+
+    // libzstd's suppressed frames decode through the compat layer
+    let mut zenc = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    zenc.include_dictid(false).unwrap();
+    let zbare = zenc.compress(&content).unwrap();
+    let mut decoder =
+        compat::stream::read::Decoder::with_dictionary(zbare.as_slice(), &dict).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+}

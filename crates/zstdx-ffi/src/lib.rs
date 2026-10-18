@@ -144,6 +144,7 @@ pub enum ZSTD_cParameter {
     WindowLog = 101,
     ContentSizeFlag = 200,
     ChecksumFlag = 201,
+    DictIDFlag = 202,
     NbWorkers = 400,
 }
 
@@ -154,6 +155,7 @@ impl ZSTD_cParameter {
             101 => Some(Self::WindowLog),
             200 => Some(Self::ContentSizeFlag),
             201 => Some(Self::ChecksumFlag),
+            202 => Some(Self::DictIDFlag),
             400 => Some(Self::NbWorkers),
             _ => None,
         }

@@ -324,7 +324,9 @@ impl FrameEncoderCoreSt {
                 options.level,
                 shape,
             );
-            dict.header_id()
+            // libzstd's dictIDFlag: the dictionary stays fully in effect,
+            // only the header field is suppressed.
+            options.include_dictid.then(|| dict.header_id()).flatten()
         } else {
             let shape = crate::InputShape {
                 len,
@@ -345,12 +347,12 @@ impl FrameEncoderCoreSt {
         // unpledged one (no length to band-check — the screen's verdict is
         // the evidence) both stage here; a stream ending or flushing below
         // the screen's span cancels it back to stock in write/finish.
-        let probe_pending = dict_id.is_none()
+        let probe_pending = dict.is_none()
             && reach_probe::eligible(options.level, crate::InputShape {
                 len,
                 window_log: options.input_shape.window_log,
             });
-        let screen_pending = dict_id.is_none()
+        let screen_pending = dict.is_none()
             && fast_row_screen_pending(options.level, crate::InputShape {
                 len,
                 window_log: options.input_shape.window_log,
@@ -360,7 +362,7 @@ impl FrameEncoderCoreSt {
         // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=
         // pledgedSrcSize`). Dictionary frames keep the windowed form.
         let window = self.state.matcher.window_size();
-        let single_segment = dict_id.is_none() && options.pledged_size.is_some_and(|n| n <= window);
+        let single_segment = dict.is_none() && options.pledged_size.is_some_and(|n| n <= window);
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
             single_segment,

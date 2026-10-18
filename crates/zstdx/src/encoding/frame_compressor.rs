@@ -678,12 +678,35 @@ pub(crate) fn compress_slice_with_dictionary(
     dict: &super::dictionary::EncDictionary,
     declared: Option<u64>,
 ) -> Vec<u8> {
+    compress_slice_with_dictionary_id(
+        src,
+        level,
+        checksum,
+        shape,
+        dict,
+        declared,
+        dict.header_id(),
+    )
+}
+
+/// [`compress_slice_with_dictionary`] with the header id resolved by the
+/// caller: `dict_id = None` is the suppressed form (the dictionary still
+/// applies, libzstd's dictIDFlag = 0), not just an id-0 dictionary.
+pub(crate) fn compress_slice_with_dictionary_id(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+    dict: &super::dictionary::EncDictionary,
+    declared: Option<u64>,
+    dict_id: Option<u32>,
+) -> Vec<u8> {
     let mut shape = shape;
     let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
     shape.len = Some(len);
     let mut state = new_owned_state();
     super::dictionary::reset_with_dictionary(&mut state, dict, level, shape);
-    compress_with_state_dictionary(&mut state, src, dict.header_id(), checksum, declared)
+    compress_with_state_dictionary(&mut state, src, dict_id, checksum, declared)
 }
 
 /// Compress the blocks of one multithreaded job into `output`: no frame
