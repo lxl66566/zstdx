@@ -12,7 +12,7 @@ const SKIPPABLE_MIN: u32 = 0x184d_2a50;
 const SKIPPABLE_MAX: u32 = 0x184d_2a5f;
 /// Format block-content maximum; the block header's 21-bit size field may
 /// declare more, which is malformed.
-const MAX_BLOCK_CONTENT: usize = 128 * 1024;
+pub(crate) const MAX_BLOCK_CONTENT: usize = 128 * 1024;
 /// `ZSTD_FRAMEHEADERSIZE_PREFIX` (zstd1): the least input the header-size
 /// arithmetic and the early magic check need.
 pub const HEADER_PREFIX: usize = 5;

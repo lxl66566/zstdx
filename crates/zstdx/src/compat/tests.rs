@@ -52,7 +52,7 @@ fn bulk_structs() {
     assert_eq!(compressor.compress(&data).unwrap(), compressed);
     assert_eq!(
         compat::bulk::Decompressor::upper_bound(&compressed),
-        Some(0) // frames from this crate carry no content size
+        None // frames from this crate carry no content size: unknown
     );
 }
 
@@ -391,4 +391,39 @@ fn transient_materialize_error_is_retryable() {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).unwrap();
     assert_eq!(out, data);
+}
+
+/// `upper_bound` must mirror `ZSTD_getFrameContentSize` (through
+/// `zstd_safe`): a header-declared size as `Some`, a header without the
+/// FCS field as `None` — unknown, not a bogus zero — a complete skippable
+/// frame as `Some(0)`, and unreadable heads as `None`.
+#[test]
+fn upper_bound_parity_with_get_frame_content_size() {
+    let data = payload();
+    let frames: Vec<Vec<u8>> = vec![
+        // no FCS field (our streaming-shaped one-shot)
+        compat::bulk::compress(&data, 3).unwrap(),
+        // FCS declared (libzstd's one-shot always does)
+        zstd::bulk::compress(&data, 3).unwrap(),
+        // a complete skippable frame (4 content bytes)
+        [0x50u8, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4].to_vec(),
+        // a truncated skippable head
+        [0x50u8, 0x2a, 0x4d, 0x18, 4, 0, 0].to_vec(),
+        // a truncated zstd head past the magic
+        compat::bulk::compress(&data, 3).unwrap()[..6].to_vec(),
+        // not a frame at all
+        b"junk junk junk".to_vec(),
+    ];
+    for frame in &frames {
+        let reference = zstd::zstd_safe::get_frame_content_size(frame)
+            .ok()
+            .flatten()
+            .and_then(|size| usize::try_from(size).ok());
+        assert_eq!(
+            compat::bulk::Decompressor::upper_bound(frame),
+            reference,
+            "upper_bound diverged from the reference on {} bytes",
+            frame.len()
+        );
+    }
 }

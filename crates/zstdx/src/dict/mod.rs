@@ -59,6 +59,8 @@ pub enum KGrid {
     LibzstdCli,
     /// One forced segment size (experiments; keeps the holdout split, so
     /// unlike C's forced `--train-fastcover=k=` path there is no leak).
+    /// Follows the grid viability rule: a `k` below the dmer floor or
+    /// past the dictionary/training body trains nothing.
     Fixed(usize),
 }
 
@@ -66,15 +68,17 @@ impl KGrid {
     fn candidates(&self, dict_size: usize, train_len: usize) -> Vec<usize> {
         const COMPACT: [usize; 9] = [200, 300, 400, 500, 650, 800, 1024, 1400, 2000];
         const CLI: [usize; 5] = [50, 537, 1024, 1511, 2000];
-        let grid: &[usize] = match self {
-            Self::Compact => &COMPACT,
-            Self::LibzstdCli => &CLI,
-            Self::Fixed(k) => return vec![*k],
+        // The viability rule every grid follows, `Fixed` included: a
+        // segment size must fit the dictionary and the training body, and
+        // must clear the dmer floor (`build_dict` and `select_segment`
+        // subtract K from these lengths — a k past either underflows).
+        let viable = |k: usize| K <= k && k <= dict_size && k <= train_len;
+        let grid: Vec<usize> = match self {
+            Self::Compact => COMPACT.to_vec(),
+            Self::LibzstdCli => CLI.to_vec(),
+            Self::Fixed(k) => vec![*k],
         };
-        grid.iter()
-            .copied()
-            .filter(|&k| k <= dict_size && k <= train_len)
-            .collect()
+        grid.into_iter().filter(|&k| viable(k)).collect()
     }
 }
 
@@ -472,7 +476,13 @@ fn shuffle<T>(items: &mut [T]) {
 /// dictionary from the back, strongest content last, until the budget is
 /// spent or the content runs out.
 fn build_dict(table: &mut KMerTable, train_body: &[u8], k: usize, dict_size: usize) -> Vec<u8> {
-    let positions = train_body.len() + 1 - K;
+    // Below one k-mer position there is nothing to select (the candidate
+    // filter already narrows k to the training body's length; this covers
+    // the unfiltered default-K path).
+    let positions = (train_body.len() + 1).saturating_sub(K);
+    if positions == 0 {
+        return Vec::new();
+    }
     let mut num_epochs = (dict_size / k).max(1);
     let mut epoch_size = positions / num_epochs;
     let min_epoch_size = k * 10;
@@ -697,4 +707,56 @@ fn formatted_dict_interops_both_ways() {
     let mut reference = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
     let libzstd = reference.decompress(&frame, payload.len()).unwrap();
     assert_eq!(libzstd, payload);
+}
+
+/// A forced segment size outside the viable band (below the 8-byte dmer
+/// floor, or past the training split) must be filtered like the swept
+/// grids, not underflow the epoch geometry: `build_dict`'s `positions`
+/// and `select_segment`'s window width both subtract `K` from lengths a
+/// forced `k` can exceed.
+#[test]
+fn fixed_k_grid_survives_degenerate_geometry() {
+    // Sixteen bytes across eight samples (the trainable floor): whichever
+    // six land in the shuffled train split, it can hold as few as six
+    // bytes — below K - 1. Cover every arrangement of which samples are
+    // the two 5-byte ones.
+    for mask in 0u8..=0xff {
+        if mask.count_ones() != 2 {
+            continue;
+        }
+        let samples: Vec<Vec<u8>> = (0..8)
+            .map(|i| vec![b'a' + i as u8; usize::from(mask >> i & 1 == 1) * 4 + 1])
+            .collect();
+        let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+        let config = TrainConfig {
+            k_grid: KGrid::Fixed(1024),
+            ..TrainConfig::default()
+        };
+        let outcome = train_raw(&refs, 4096, &config);
+        assert!(outcome.dict.is_empty());
+        assert_eq!(outcome.k, 0);
+        assert_eq!(outcome.k, 0);
+    }
+
+    // k below the dmer floor on a healthy corpus: filtered, not a
+    // sub-K window width.
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for i in 0..16u8 {
+        let mut sample = Vec::new();
+        for _ in 0..4 {
+            sample.extend_from_slice(b"[Unit]\nDescription=shared boilerplate block\n");
+            for j in 0..24u32 {
+                sample.push((i as u32 * 131 + j * 17) as u8);
+            }
+        }
+        samples.push(sample);
+    }
+    let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
+    let config = TrainConfig {
+        k_grid: KGrid::Fixed(4),
+        ..TrainConfig::default()
+    };
+    let outcome = train_raw(&refs, 4096, &config);
+    assert!(outcome.dict.is_empty());
+    assert_eq!(outcome.k, 0);
 }
