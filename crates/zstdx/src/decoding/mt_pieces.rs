@@ -101,13 +101,19 @@ fn enabled() -> bool {
 
 /// Whether `plan` should route to the piece executor: the env gate plus a
 /// single pledged frame in the staging bounds. Returns the pledged size.
-pub(super) fn gate(plan: &ScanPlan) -> Option<u64> {
+///
+/// The range check runs on `usize::try_from(fcs)`: a plain `as` cast would
+/// let a >4-GiB pledge wrap into the regime on 32-bit targets and tile
+/// pieces over the truncated size, silently dropping the pledge
+/// divergence (the same contract hole the R49 verdict gate closed for
+/// 64-bit).
+pub(super) fn gate(plan: &ScanPlan) -> Option<usize> {
     if !enabled() {
         return None;
     }
-    let fcs = plan.pledged_single?;
+    let fcs = usize::try_from(plan.pledged_single?).ok()?;
     (MIN_PIECE_FRAME..=MAX_PIECE_FRAME)
-        .contains(&(fcs as usize))
+        .contains(&fcs)
         .then_some(fcs)
 }
 
@@ -371,7 +377,11 @@ impl Driver {
         if complete && self.staged_pos != self.fcs {
             // Corrupt pledge: no grid can tile the output, so every grid
             // dies and the serial fallback below verifies the frame's
-            // declared size (verify_frame_content_sizes).
+            // declared size (verify_frame_content_sizes). A winner settled
+            // against the partial prefix (staged output == fcs at settle
+            // time, more output staged behind it) is withdrawn with the
+            // grids - consuming it would silently drop the divergence.
+            self.winner = None;
             self.grids.iter_mut().for_each(|g| g.alive = false);
             return false;
         }
@@ -739,10 +749,9 @@ pub(super) fn decode_pieces(
     input: &[u8],
     workers: u32,
     plan: &ScanPlan,
-    fcs: u64,
+    fcs: usize,
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
 ) -> Result<usize, FrameDecoderError> {
-    let fcs = fcs as usize;
     let n_segments = plan.segments.len();
     let threads = (workers as usize).min(n_segments);
 
@@ -813,9 +822,17 @@ pub(super) fn decode_pieces(
             let mut scratch = SegmentScratch::new();
             let mut d = driver.lock().unwrap();
             loop {
-                let ready = d.winner.is_some()
-                    || d.aborting
-                    || (d.staged_count == n_segments && (d.all_dead || d.stage_failed));
+                // The verdict is consumable only once staging completed: a
+                // winner can settle while the contiguous staged prefix
+                // equals the pledge and trailing segments are still staging
+                // (their output would push it past the pledge, which the
+                // complete-refresh kill above must still be able to
+                // withdraw). Taking the pieces earlier also let late
+                // refreshes re-cut a grid whose pieces were already
+                // consumed.
+                let ready = d.aborting
+                    || (d.staged_count == n_segments
+                        && (d.winner.is_some() || d.all_dead || d.stage_failed));
                 if ready {
                     break;
                 }

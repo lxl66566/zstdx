@@ -400,3 +400,122 @@ fn pledged_fcs_mismatch_errors_through_serial_fallback() {
     set_mt_ramp_depth_for_tests(u64::MAX);
     set_piece_decode_for_tests(false);
 }
+
+/// Handcrafted frame whose staged prefix hits the pledge exactly while the
+/// frame keeps producing output: 16 raw 128-KiB blocks (2 MiB = the
+/// pledge), then ~50k compressed restart blocks (7 bytes out each). The
+/// head stages in microseconds (raw staging only records body ranges), so
+/// the prefix [0, 2 MiB) is cut and validated - raw blocks carry no
+/// sequences, no piece reads below its start - and a winner can settle
+/// long before the tail's single big final segment finishes its ~50k
+/// section decodes. The verdict must stay unconsumable until staging
+/// completes: taking the pieces then would silently drop the tail and
+/// return Ok(pledge) where every other path reports the Frame_Content_Size
+/// mismatch. The head-to-tail staging ratio (~us vs ~ms) pins the race
+/// pre-fix; post-fix the outcome is timing-independent.
+#[test]
+fn overlong_frame_after_early_winner_errors() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(true);
+
+    let block = vec![0xaau8; 128 * 1024];
+    let push_raw = |frame: &mut Vec<u8>, last: bool| {
+        let raw = ((block.len() as u32) << 3) | u32::from(last);
+        frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+        frame.extend_from_slice(&block);
+    };
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&0xfd2fb528u32.to_le_bytes());
+    frame.push(0x80); // FCS flag 2 (4-byte field), no single segment/checksum/dict
+    frame.push(0x38); // window log 17 (128 KiB): full-size raw blocks are legal
+    frame.extend_from_slice(&(2 * 1024 * 1024u32).to_le_bytes());
+    for _ in 0..16 {
+        push_raw(&mut frame, false);
+    }
+    // Restart blocks: raw literals + one RLE-mode sequence (explicit FSE
+    // tables, no Huffman rebuild) - the restart points past the frame
+    // start, so the scan cuts segments around them and the bulk of them
+    // lands in one big slowly-staged final segment.
+    let restart = [
+        0x20u8, 0x30, 0x31, 0x32, 0x33, // raw literals section, 4 bytes
+        0x01, 0x54, 0x04, 0x00, 0x00, 0x01, // 1 sequence, all-RLE FSE modes
+    ];
+    let tail_blocks = 50_000;
+    for i in 0..tail_blocks {
+        let raw = ((restart.len() as u32) << 3) | (2 << 1) | u32::from(i + 1 == tail_blocks);
+        frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+        frame.extend_from_slice(&restart);
+    }
+
+    // Sequential baseline: the lie is reported (decode_all_to_vec needs the
+    // geometric retry to fit the actual ~2.35 MiB output first).
+    let mut capacity = 1 << 20;
+    let err = loop {
+        let mut seq_out = Vec::with_capacity(capacity);
+        match FrameDecoder::new().decode_all_to_vec(&frame, &mut seq_out) {
+            Ok(()) => panic!("sequential decoder accepted the overlong frame"),
+            Err(zstdx::decoding::errors::FrameDecoderError::TargetTooSmall) => capacity *= 2,
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        err.to_string().contains("Frame_Content_Size mismatch"),
+        "{err}"
+    );
+
+    let err =
+        bulk::decompress_with(&frame, 1 << 20, &DecoderOptions::new().threads(8)).unwrap_err();
+    assert!(
+        err.to_string().contains("Frame_Content_Size mismatch"),
+        "{err}"
+    );
+    set_piece_decode_for_tests(false);
+}
+
+/// Seeded corruption smoke: pseudo-random mutations over a ramp frame and
+/// a plain MT frame must never panic or hang through either parallel entry
+/// point; decode errors and checksum mismatches are both acceptable
+/// verdicts (the fuzz target decode_mt covers the same property with
+/// byte-exact sequential parity; this pins it in the test suite).
+#[test]
+fn mutation_smoke_no_panics() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    let data = records(4 * 1024 * 1024);
+    let ramp = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Fastest)
+            .workers(4)
+            .checksum(true),
+    )
+    .unwrap();
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    let plain = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Balanced)
+            .workers(2)
+            .checksum(true),
+    )
+    .unwrap();
+
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = |modulus: u64| -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) % modulus
+    };
+    for _ in 0..256 {
+        for frame in [&ramp, &plain] {
+            let mut c = frame.clone();
+            for _ in 0..=next(8) {
+                let pos = next(c.len() as u64) as usize;
+                c[pos] ^= 1 + next(255) as u8;
+            }
+            let _ = bulk::decompress_with(&c, 1 << 20, &DecoderOptions::new().threads(4));
+            let mut appended = Vec::new();
+            let _ = zstdx::decoding::mt_decode_to_vec_for_tests(&c, &mut appended, 4, MAX_WINDOW);
+        }
+    }
+    set_piece_decode_for_tests(false);
+}
