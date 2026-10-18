@@ -82,7 +82,10 @@ impl KMerTable {
         cross_sample: bool,
         hash: DmerHash,
     ) -> Self {
-        let positions = body.len() + 1 - K;
+        // A training body shorter than K-1 carries no k-mers (a degenerate
+        // train split of a "trainable" whole body: eight 2-byte samples
+        // can shuffle six of themselves to the front).
+        let positions = (body.len() + 1).saturating_sub(K);
         let stride = (positions / MAX_TABLE_ENTRIES).max(1);
         debug_assert!(sample_lens.iter().sum::<usize>() <= body.len());
         let ends = sample_ends(sample_lens);
