@@ -87,8 +87,9 @@ pub mod write {
     }
 
     impl<W: io::Write> Encoder<W> {
-        /// Creates a new encoder. A level of 0 or any negative/positive
-        /// value compresses with the fast strategy.
+        /// Creates a new encoder. A level of 0 selects the default (3);
+        /// other values map through `Level::from_zstd` (negatives clamp
+        /// to 1 — zstdx models no accelerated levels).
         pub fn new(writer: W, level: i32) -> io::Result<Self> {
             Ok(Self {
                 state: EncoderState::new(writer, level),
@@ -370,8 +371,9 @@ pub mod read {
     }
 
     impl<R: io::Read> Encoder<R> {
-        /// Creates a new encoder. A level of 0 or any negative/positive
-        /// value compresses with the fast strategy.
+        /// Creates a new encoder. A level of 0 selects the default (3);
+        /// other values map through `Level::from_zstd` (negatives clamp
+        /// to 1 — zstdx models no accelerated levels).
         pub fn new(source: R, level: i32) -> io::Result<Self> {
             Ok(Self {
                 source: Some(source),

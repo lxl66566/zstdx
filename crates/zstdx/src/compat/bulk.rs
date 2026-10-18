@@ -90,11 +90,26 @@ impl Decompressor {
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))
     }
 
-    /// Frame content size from the leading frame header, when present.
+    /// Frame content size from the leading frame header, with
+    /// `ZSTD_getFrameContentSize` semantics: a header without the FCS
+    /// field is an unknown size (`None`), not a bogus zero; a complete
+    /// skippable frame is `Some(0)`; an unreadable head is `None`.
     pub fn upper_bound(data: &[u8]) -> Option<usize> {
-        read_frame_header(data)
-            .ok()
-            .map(|(header, _)| header.frame_content_size() as usize)
+        match read_frame_header(data) {
+            // A complete skippable frame carries no content; a truncated
+            // one is unreadable (both the reference's answers).
+            Err(crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. })
+                if data.len() >= 8 + length as usize =>
+            {
+                Some(0)
+            },
+            Ok((header, _)) if header.descriptor.declares_content_size() => {
+                usize::try_from(header.frame_content_size()).ok()
+            },
+            // No FCS field (unknown size), a truncated skippable head, or
+            // an unreadable head.
+            _ => None,
+        }
     }
 }
 
