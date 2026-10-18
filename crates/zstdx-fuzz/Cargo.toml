@@ -20,6 +20,10 @@ name = "decode_dict"
 path = "fuzz_targets/decode_dict.rs"
 
 [[bin]]
+name = "decode_mt"
+path = "fuzz_targets/decode_mt.rs"
+
+[[bin]]
 name = "encode"
 path = "fuzz_targets/encode.rs"
 
