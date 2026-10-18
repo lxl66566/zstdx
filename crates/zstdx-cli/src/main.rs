@@ -1,6 +1,7 @@
 extern crate zstdx;
 mod bench;
 mod list;
+mod patch;
 mod progress;
 mod train;
 
@@ -307,6 +308,13 @@ struct Cli {
     #[arg(short = 'D', long, value_name = "DICT")]
     dict: Option<PathBuf>,
 
+    /// Compress/decompress as a diff against REF: compression treats REF
+    /// as match history (a raw-content dictionary, no dictID in the
+    /// frame), decompression needs the same REF. One input only, and
+    /// stdin compression requires --stream-size; implies --ultra
+    #[arg(long, value_name = "REF", conflicts_with_all = ["dict", "list", "train"])]
+    patch_from: Option<PathBuf>,
+
     /// Enable long-distance matching by forcing the window log to N
     /// (default 27, the maximum; 10-27). A known source size still shrinks
     /// the window to the source, as zstd does
@@ -510,7 +518,12 @@ fn run(cli: &Cli) -> bool {
         || cli.level.unwrap_or(DEFAULT_LEVEL),
         |acceleration| -acceleration,
     );
-    if mode == Mode::Compress && level > MAX_LEVEL_WITHOUT_ULTRA && !cli.ultra {
+    // --patch-from implies --ultra (zstdcli.c sets it with the flag).
+    if mode == Mode::Compress
+        && level > MAX_LEVEL_WITHOUT_ULTRA
+        && !cli.ultra
+        && cli.patch_from.is_none()
+    {
         eprintln!(
             "{PREFIX}Warning: compression level higher than max, reduced to \
              {MAX_LEVEL_WITHOUT_ULTRA} (use --ultra to allow 20-22)"
@@ -518,7 +531,9 @@ fn run(cli: &Cli) -> bool {
         level = MAX_LEVEL_WITHOUT_ULTRA;
     }
 
-    let dict = match &cli.dict {
+    // --patch-from loads its reference through the same raw-dictionary
+    // path as -D (the flags conflict, so at most one is set).
+    let dict = match cli.dict.as_ref().or(cli.patch_from.as_ref()) {
         Some(path) => match fs::read(path) {
             Ok(bytes) => Some(bytes),
             Err(err) => {
@@ -570,14 +585,27 @@ fn run(cli: &Cli) -> bool {
         return false;
     }
 
+    // --patch-from derives its own window (overriding --long) and decode
+    // bound; the reference's exact rules live in patch.rs.
+    let (patch_window_log, patch_max_window) = match &cli.patch_from {
+        Some(_) => match patch::adjust(cli, mode, &inputs, dict.as_deref()) {
+            Ok(adjustments) => (adjustments.window_log, adjustments.max_window),
+            Err(msg) => {
+                eprintln!("{PREFIX}{msg}");
+                return false;
+            },
+        },
+        None => (None, None),
+    };
+
     let settings = Settings {
         level,
         threads,
         checksum: !cli.no_check,
-        window_log,
+        window_log: patch_window_log.or(window_log),
         stream_size: cli.stream_size,
         size_hint: cli.size_hint,
-        max_window: cli.memory,
+        max_window: patch_max_window.or(cli.memory),
     };
 
     let stdout_output =

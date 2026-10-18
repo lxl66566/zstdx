@@ -192,6 +192,7 @@ Compression is the default, `-d` decompresses, and with no FILES (or `-`) data s
 - Default output names: `FILE.zst` when compressing, the name without the `.zst` suffix when decompressing; inputs are kept unless `--rm`.
 - Levels: `-1`..`-19` (default 3), `--fast[=N]` for negative levels, `--ultra` unlocks 20–22.
 - `-T N` sets worker threads (`-T0` = all cores, `--single-thread` = `-T1`); `-D DICT` (de)compresses against a dictionary.
+- `--patch-from=REF` switches to diff mode: compression treats REF as match history (a raw-content dictionary — REF needs no dictionary header, and no dictID lands in the frame) and sizes the window from the source like zstd: the next power of two above it, clamped to 10-27 with a warning (`--long`'s value is ignored, as in zstd). Decompression (`-d --patch-from=REF`) applies the patch with the same REF, raising `-M`'s bound to cover it. One input only, stdin compression requires `--stream-size`, and the flag implies `--ultra`. Frames interoperate with zstd's `--patch-from` in both directions.
 - `-c` writes to stdout, `-o FILE` sets the output (single input only), `-k` keeps inputs (default), `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, `-q`/`-v` adjust verbosity, `--[no-]progress` overrides the auto progress-bar rule (interactive stderr, known size), `--ignore-errors` keeps per-input failures out of the exit code.
 - `--long[=N]` forces the window log (default 27, the engine's maximum; 10-27; a known source size still shrinks the window to the source like zstd). Unlike zstd, `--long` alone does not switch the long-distance matcher on: the engine arms LDM by level row once the effective window reaches 32 MiB.
 - `--[no-]check` toggles the frame checksum (default on); both are compression-only — decoding always validates a present checksum, and the flags are rejected in decode modes instead of ignored.
@@ -219,6 +220,8 @@ zstdx --train -r logs/ --maxdict=64K -o logs.dict
 zstdx -b1 -e3 -i5 trace.log             # zstd-style benchmark, levels 1-3
 zstdx -bd -i5 trace.log.zst             # decode-only benchmark
 zstdx -D logs.dict -9 app.log             # trained-dictionary compression
+zstdx --patch-from=v1.tar -19 v2.tar      # diff-style: v2 compressed against v1
+zstdx -d --patch-from=v1.tar v2.tar.zst   # apply the patch
 ```
 
 ## Current limitations
