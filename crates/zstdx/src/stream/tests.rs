@@ -1040,6 +1040,7 @@ mod mt {
             assert_eq!(sink, bulk);
         }
     }
+
     /// a keep-class frame whose clamped window lands in the bulk capture's
     /// class must share the bulk grid, strips and JobPrefix arming, so the
     /// pledged stream is byte-identical to bulk mt — without it the clamped
@@ -1577,6 +1578,77 @@ fn reach_probe_stream_roundtrips() {
     write_in_chunks(&data[1024 * 1024..], 512 * 1024, &mut enc);
     enc.finish().unwrap();
     assert_eq!(bulk::decompress(&sink, len).unwrap(), data);
+}
+
+/// Single-threaded streaming dictionary shape (R50): the unpledged dict
+/// stream keeps the unknown-length row like libzstd's CONTENTSIZE_UNKNOWN
+/// (see the test).
+#[cfg(feature = "std")]
+mod st_dict {
+    use super::*;
+
+    /// An unpledged dictionary stream keeps the unknown-length shape
+    /// (libzstd's CONTENTSIZE_UNKNOWN — the mt core folds the same way):
+    /// the src+dict window clamp must not engage, so a payload spanning
+    /// far past the dictionary keeps the row's full window. The old
+    /// `unwrap_or(0) + dict_len` fold clamped such streams to a
+    /// dict-sized window, blinding the parse to any repeat beyond it.
+    #[test]
+    fn unpledged_dict_stream_keeps_full_window() {
+        use crate::io::Read as _;
+
+        let Ok(raw) = std::fs::read("./dict_tests/dictionary") else {
+            return;
+        };
+        // A 256 KiB unit, a 256 KiB gap, the unit's twin (a 512 KiB match
+        // distance — far past the ~51 KiB dictionary, well inside the best
+        // row's 4 MiB tree domain), then a fresh tail.
+        let unit = mt::textish(256 * 1024);
+        let mut data = unit.clone();
+        data.extend(mt::textish(256 * 1024));
+        data.extend_from_slice(&unit);
+        data.extend(mt::textish(64 * 1024));
+        // Best (btlazy2): the tree row never arms the dict-row knobs, so the
+        // frame isolates the window shape — the folded form clamps the tree's
+        // search domain to the dict size and loses the repeat outright.
+        let unpledged = |data: &[u8]| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Best).dictionary(&raw),
+            )
+            .unwrap();
+            write_in_chunks(data, 100 * 1024, &mut enc);
+            enc.finish().unwrap();
+            sink
+        };
+        let frame = unpledged(&data);
+        let mut decoder = read::Decoder::with_options(
+            frame.as_slice(),
+            crate::DecoderOptions::new().dictionary(&raw),
+        )
+        .unwrap();
+        let mut back = Vec::new();
+        decoder.read_to_end(&mut back).unwrap();
+        assert_eq!(back, data);
+        let mut zd = zstd::bulk::Decompressor::with_dictionary(&raw).unwrap();
+        assert_eq!(zd.decompress(&frame, data.len()).unwrap(), data);
+        // The full-window verdict: replace the twin with its reversal (same
+        // vocabulary and entropy, no positional twin) and the frame must grow
+        // by roughly the twin's compressed size — a dict-clamped window
+        // cannot see the 512 KiB repeat, so both variants would compress the
+        // tail identically.
+        let mut blinded = data.clone();
+        let reversed: Vec<u8> = unit.iter().rev().copied().collect();
+        blinded[512 * 1024..768 * 1024].copy_from_slice(&reversed);
+        let control = unpledged(&blinded);
+        assert!(
+            frame.len() + 16 * 1024 < control.len(),
+            "repeat frame {} vs control {}",
+            frame.len(),
+            control.len()
+        );
+    }
 }
 
 /// Multithreaded dictionary streaming: job zero seeds from the dictionary
