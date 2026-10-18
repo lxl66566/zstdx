@@ -473,3 +473,49 @@ fn overlong_frame_after_early_winner_errors() {
     set_piece_decode_for_tests(false);
 }
 
+/// Seeded corruption smoke: pseudo-random mutations over a ramp frame and
+/// a plain MT frame must never panic or hang through either parallel entry
+/// point; decode errors and checksum mismatches are both acceptable
+/// verdicts (the fuzz target decode_mt covers the same property with
+/// byte-exact sequential parity; this pins it in the test suite).
+#[test]
+fn mutation_smoke_no_panics() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    let data = records(4 * 1024 * 1024);
+    let ramp = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Fastest)
+            .workers(4)
+            .checksum(true),
+    )
+    .unwrap();
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    let plain = bulk::compress_with(
+        &data,
+        &EncoderOptions::new(Level::Balanced)
+            .workers(2)
+            .checksum(true),
+    )
+    .unwrap();
+
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = |modulus: u64| -> u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) % modulus
+    };
+    for _ in 0..256 {
+        for frame in [&ramp, &plain] {
+            let mut c = frame.clone();
+            for _ in 0..1 + next(8) {
+                let pos = next(c.len() as u64) as usize;
+                c[pos] ^= 1 + next(255) as u8;
+            }
+            let _ = bulk::decompress_with(&c, 1 << 20, &DecoderOptions::new().threads(4));
+            let mut appended = Vec::new();
+            let _ = zstdx::decoding::mt_decode_to_vec_for_tests(&c, &mut appended, 4, MAX_WINDOW);
+        }
+    }
+    set_piece_decode_for_tests(false);
+}
