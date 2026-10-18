@@ -1535,3 +1535,61 @@ fn stream_sizes() {
     assert!(unsafe { zstd::ZSTD_initDStream(dstream) } > 0);
     assert_eq!(0, unsafe { zstd::ZSTD_freeDStream(dstream) });
 }
+
+/// A block header claiming more than the format's 128 KiB maximum must
+/// error the streaming decoder at the header, not stage megabytes of body
+/// bytes that never arrive while the caller waits on a positive hint —
+/// the write-shaped decoder's hardening, on its FFI twin.
+#[test]
+fn stream_decode_oversized_block_claim_errors() {
+    let input = b"payload payload payload";
+    let frame = stream_compress(input, 3, 128 * 1024, 128 * 1024);
+    let mut corrupt = frame.clone();
+    // Rewrite the first block header's 21-bit size field to 128 KiB + 1,
+    // keeping type and last-block bits (the write-shaped test's recipe).
+    // Walk the frame header (descriptor arithmetic, the stream_compress
+    // shape: no dict id, FCS when declared).
+    let fhd = frame[4];
+    let mut header_len = 5usize;
+    if fhd & 0x20 == 0 {
+        header_len += 1; // window descriptor
+    }
+    let fcsf = fhd >> 6;
+    if fcsf > 0 || fhd & 0x20 != 0 {
+        header_len += [1usize, 2, 4, 8][fcsf as usize];
+    }
+    corrupt[header_len] = (corrupt[header_len] & 0x07) | (1 << 3);
+    corrupt[header_len + 1] = 0;
+    corrupt[header_len + 2] = 16;
+
+    // One-shot decode of the same bytes errors corruption on every path.
+    let mut out = vec![0u8; 4096];
+    let r = decompress(&mut out, &corrupt);
+    assert!(is_error(r));
+    assert_eq!(error_code(r), 20); // corruption_detected
+
+    let dctx = dctx_with(0);
+    unsafe { zstd::ZSTD_initDStream(dctx) };
+    let mut zin = zstd::ZSTD_inBuffer {
+        src: corrupt.as_ptr().cast(),
+        size: corrupt.len(),
+        pos: 0,
+    };
+    let mut zout = zstd::ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
+    assert!(
+        is_error(r),
+        "oversized block claim must error, got hint {r}"
+    );
+    assert_eq!(error_code(r), 20); // corruption_detected
+    assert_eq!(
+        zin.pos,
+        corrupt.len(),
+        "the claim is rejected at the header"
+    );
+    unsafe { zstd::ZSTD_freeDStream(dctx) };
+}

@@ -211,6 +211,13 @@ impl DStream {
         let last = b0 & 1 == 1;
         let block_type = (b0 >> 1) & 3;
         let size = (usize::from(b0) >> 3) | (usize::from(b1) << 5) | (usize::from(b2) << 13);
+        // The format's block maximum, the write-shaped decoder's twin
+        // check: without it a corrupt 21-bit size claim makes the stream
+        // stage up to 2 MiB of body bytes that never arrive instead of
+        // erroring (the core would reject the block only once staged).
+        if size > crate::frame::MAX_BLOCK_CONTENT {
+            return Err(ErrorCode::CorruptionDetected);
+        }
         let body = match block_type {
             0 | 2 => size, // Raw / Compressed carry `size` content bytes
             1 => 1,        // RLE encodes a single byte
