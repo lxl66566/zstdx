@@ -1,4 +1,5 @@
 extern crate zstdx;
+mod bench;
 mod list;
 mod progress;
 mod train;
@@ -178,6 +179,29 @@ struct Cli {
     /// default `dictionary`)
     #[arg(long, conflicts_with_all = ["compress", "decompress", "test", "list"])]
     train: bool,
+
+    /// Benchmark files at compression level # (default 3); with `-d`,
+    /// benchmark decompression only; with no FILES, a synthetic corpus
+    #[arg(
+        short = 'b',
+        value_name = "#",
+        conflicts_with_all = ["compress", "test", "list", "train", "output"]
+    )]
+    bench: Option<i32>,
+
+    /// Benchmark all levels up to #; the starting level is `-b#` (bench
+    /// only)
+    #[arg(short = 'e', value_name = "#")]
+    bench_end: Option<i32>,
+
+    /// Minimum evaluation time of # seconds per phase (bench only)
+    #[arg(short = 'i', value_name = "#")]
+    bench_seconds: Option<u64>,
+
+    /// Cut the input into independent blocks of size # (bench only;
+    /// zstd's --split)
+    #[arg(short = 'B', long = "split", value_name = "#", value_parser = parse_size)]
+    block_size: Option<u64>,
 
     /// Limit the trained dictionary to # bytes (--train only; suffixes
     /// K/M/G accepted)
@@ -421,6 +445,16 @@ fn run(cli: &Cli) -> bool {
     if cli.maxdict.is_some() && mode != Mode::Train {
         eprintln!("{PREFIX}--maxdict only applies with --train");
         return false;
+    }
+
+    // Benchmark mode is self-contained: it gathers its own inputs and
+    // rejects the flags it cannot honor (its own orphan knobs included).
+    if cli.bench.is_some()
+        || cli.bench_end.is_some()
+        || cli.bench_seconds.is_some()
+        || cli.block_size.is_some()
+    {
+        return bench::run(cli);
     }
 
     // The inspection and training modes are self-contained: they gather
@@ -985,6 +1019,33 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Vec<OsString> {
             normalized.push(arg);
             continue;
         }
+        // A bare -b carries zstd's default benchmark level; attaching it
+        // here keeps the next argument free to be a file.
+        if arg == "-b" {
+            normalized.push(OsString::from("-b3"));
+            continue;
+        }
+        // zstd's bundled decode-only benchmark cluster (`-bd`, `-b3d`): the
+        // digits after b are the level (3 when absent), the d switches the
+        // benchmark to decompression, and a trailing level is decorative
+        // there (the decode benchmark runs at 0).
+        if let Some(text) = arg.to_str()
+            && let Some(rest) = text.strip_prefix("-b")
+            && let Some(digits) = rest.strip_suffix('d').or_else(|| {
+                rest.strip_suffix(|c: char| c.is_ascii_digit())
+                    .and_then(|r| r.strip_suffix('d'))
+            })
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            let level = if digits.is_empty() {
+                "3"
+            } else {
+                digits
+            };
+            normalized.push(OsString::from(format!("-b{level}")));
+            normalized.push(OsString::from("-d"));
+            continue;
+        }
         // strip_prefix keeps the slicing boundary-safe: an argument starting
         // with a multibyte character (a non-ASCII path) must pass through
         // instead of panicking on a mid-character slice.
@@ -1209,6 +1270,10 @@ mod tests {
         assert_eq!(normalize(&["-0"]), ["--level=0"]);
         assert_eq!(normalize(&["-1"]), ["--level=1"]);
         assert_eq!(normalize(&["-123"]), ["--level=123"]);
+        // the benchmark cluster: -bd / -b3d / -bd5 all decode-bench
+        assert_eq!(normalize(&["-bd"]), ["-b3", "-d"]);
+        assert_eq!(normalize(&["-b3d"]), ["-b3", "-d"]);
+        assert_eq!(normalize(&["-bd5"]), ["-b3", "-d"]);
         // bare dash, a non-digit tail and a plain number stay untouched
         assert_eq!(normalize(&["-"]), ["-"]);
         assert_eq!(normalize(&["-12a"]), ["-12a"]);
@@ -1323,5 +1388,59 @@ mod tests {
                 "{bad:?} must conflict"
             );
         }
+    }
+
+    /// The benchmark surface parses with zstd's spellings, and `-d` turns
+    /// it into the decode-only benchmark instead of a conflict.
+    #[test]
+    fn bench_flags_parse() {
+        let cli = Cli::try_parse_from(["zstdx", "-b3", "file"]).unwrap();
+        assert_eq!(cli.bench, Some(3));
+        let cli = Cli::try_parse_from(["zstdx", "-b1", "-e5", "-i0", "file"]).unwrap();
+        assert_eq!(cli.bench, Some(1));
+        assert_eq!(cli.bench_end, Some(5));
+        assert_eq!(cli.bench_seconds, Some(0));
+        let cli = Cli::try_parse_from(["zstdx", "-b1", "-B", "64K", "file"]).unwrap();
+        assert_eq!(cli.block_size, Some(64 << 10));
+        let cli = Cli::try_parse_from(["zstdx", "-b1", "--split=1M", "file"]).unwrap();
+        assert_eq!(cli.block_size, Some(1 << 20));
+        let cli = Cli::try_parse_from(["zstdx", "-b3", "-d", "f.zst"]).unwrap();
+        assert!(cli.decompress && cli.bench.is_some());
+
+        for bad in [
+            vec!["zstdx", "-b3", "-t", "f"],
+            vec!["zstdx", "-b3", "-l", "f"],
+            vec!["zstdx", "-b3", "--train", "f"],
+            vec!["zstdx", "-b3", "-z", "f"],
+            vec!["zstdx", "-b3", "-o", "out", "f"],
+        ] {
+            assert!(
+                Cli::try_parse_from(bad.as_slice()).is_err(),
+                "{bad:?} must conflict"
+            );
+        }
+    }
+
+    /// A bare -b carries the default level so the next argument stays a file.
+    #[test]
+    fn bare_bench_flag_defaults_level() {
+        let args = [
+            OsString::from("zstdx"),
+            OsString::from("-b"),
+            OsString::from("file"),
+        ];
+        let cli = Cli::parse_from(normalize_args(args));
+        assert_eq!(cli.bench, Some(3));
+        assert_eq!(cli.files, [PathBuf::from("file")]);
+    }
+
+    /// The benchmark mode runs end to end on a tiny file with a zero-second
+    /// budget (the per-round timing minimum still applies) and succeeds.
+    #[test]
+    fn bench_smoke_run() {
+        let path = temp_path("bench-smoke");
+        std::fs::write(&path, vec![7u8; 64 * 1024]).unwrap();
+        let cli = Cli::try_parse_from(["zstdx", "-b1", "-i0", path.to_str().unwrap()]).unwrap();
+        assert!(crate::bench::run(&cli), "the smoke benchmark must succeed");
     }
 }
