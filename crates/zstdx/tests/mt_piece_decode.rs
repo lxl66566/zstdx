@@ -419,8 +419,8 @@ fn overlong_frame_after_early_winner_errors() {
     set_mt_ramp_depth_for_tests(u64::MAX);
     set_piece_decode_for_tests(true);
 
-    let block = [0xaau8; 128 * 1024];
-    let mut push_raw = |frame: &mut Vec<u8>, last: bool| {
+    let block = vec![0xaau8; 128 * 1024];
+    let push_raw = |frame: &mut Vec<u8>, last: bool| {
         let raw = ((block.len() as u32) << 3) | u32::from(last);
         frame.extend_from_slice(&raw.to_le_bytes()[..3]);
         frame.extend_from_slice(&block);
@@ -508,7 +508,7 @@ fn mutation_smoke_no_panics() {
     for _ in 0..256 {
         for frame in [&ramp, &plain] {
             let mut c = frame.clone();
-            for _ in 0..1 + next(8) {
+            for _ in 0..=next(8) {
                 let pos = next(c.len() as u64) as usize;
                 c[pos] ^= 1 + next(255) as u8;
             }
