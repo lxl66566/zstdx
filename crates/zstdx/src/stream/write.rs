@@ -296,7 +296,8 @@ impl<W: Write> Decoder<W> {
     }
 
     /// Wrap this decoder so the underlying writer is flushed after every
-    /// write.
+    /// write. (The compat layer's same-named wrapper follows the `zstd`
+    /// crate instead: writes buffer and the drop performs the flush.)
     pub fn auto_flush(self) -> AutoFlushDecoder<W> {
         AutoFlushDecoder { decoder: self }
     }

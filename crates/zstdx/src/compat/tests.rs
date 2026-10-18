@@ -918,3 +918,102 @@ fn reexport_shape_matches_zstd() {
             .unwrap()
             .auto_finish();
 }
+
+/// Seeded corruption smoke over the prepared-dictionary decode surface
+/// (R53): pseudo-random mutations and truncations of a dict frame walk the
+/// bulk struct, the read decoder, and the write decoder in both its flush
+/// shapes (explicit, and the auto-flush wrapper's drop flush). Every
+/// outcome must be an `io::Result`, never a panic; a surviving decode is
+/// allowed (a mutation can land in an undecoded region), but whatever a
+/// truncated prefix decodes to must be a prefix of the true payload.
+#[test]
+fn prepared_dict_corruption_smoke() {
+    let Ok(dict_raw) = std::fs::read("./dict_tests/dictionary") else {
+        return;
+    };
+    let encoder_dict = compat::dict::EncoderDictionary::copy(&dict_raw, 3);
+    let decoder_dict = compat::dict::DecoderDictionary::copy(&dict_raw);
+
+    let content = b"[Unit]\nDescription=shared boilerplate block\n".repeat(256);
+    let frame = {
+        let mut compressor =
+            compat::bulk::Compressor::with_prepared_dictionary(&encoder_dict).unwrap();
+        compressor.compress(&content).unwrap()
+    };
+    // the frame really is dictionary-bound (a bare decode refuses it)
+    assert!(
+        compat::bulk::Decompressor::new()
+            .unwrap()
+            .decompress(&frame, 0)
+            .is_err()
+    );
+
+    let bulk_decode = |corrupt: &[u8]| {
+        compat::bulk::Decompressor::with_prepared_dictionary(&decoder_dict)
+            .unwrap()
+            .decompress(corrupt, 1)
+    };
+    let read_decode = |corrupt: &[u8]| {
+        compat::stream::read::Decoder::with_prepared_dictionary(corrupt, &decoder_dict)
+            .unwrap()
+            .read_to_end(&mut Vec::new())
+    };
+    let write_decode = |corrupt: &[u8]| -> std::io::Result<()> {
+        let mut sink = Vec::new();
+        let mut dec =
+            compat::stream::write::Decoder::with_prepared_dictionary(&mut sink, &decoder_dict)
+                .unwrap();
+        dec.write_all(corrupt)?;
+        Write::flush(&mut dec)?;
+        Ok(())
+    };
+    let drop_flush_decode = |corrupt: &[u8]| -> std::io::Result<()> {
+        let mut sink = Vec::new();
+        {
+            let mut dec =
+                compat::stream::write::Decoder::with_prepared_dictionary(&mut sink, &decoder_dict)
+                    .unwrap()
+                    .auto_flush();
+            dec.write_all(corrupt)?;
+        } // the drop performs the flush
+        Ok(())
+    };
+
+    let mut s = 0x0123_4567_89ab_cdefu64;
+    let mut rand = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for round in 0..96u64 {
+        let mut corrupt = frame.clone();
+        // 1-4 byte flips, seeded
+        for _ in 0..=(round % 4) {
+            let at = (rand() as usize) % corrupt.len();
+            corrupt[at] ^= (rand() >> 32) as u8 | 1;
+        }
+        let _ = bulk_decode(&corrupt);
+        let _ = read_decode(&corrupt);
+        let _ = write_decode(&corrupt);
+        let _ = drop_flush_decode(&corrupt);
+
+        // a truncated prefix: a surviving bulk decode must be a prefix of
+        // the payload, never longer than it
+        let cut = (rand() as usize) % corrupt.len();
+        if let Ok(out) = bulk_decode(&corrupt[..cut]) {
+            assert!(out.len() <= content.len());
+            assert_eq!(&out[..], &content[..out.len()]);
+        }
+    }
+
+    // edge dictionaries through the prepared surface: an empty raw dict
+    // constructs, compresses and decodes like a bare frame
+    let empty_dict = compat::dict::EncoderDictionary::copy(&[], 3);
+    let empty_dec_dict = compat::dict::DecoderDictionary::copy(&[]);
+    let mut compressor = compat::bulk::Compressor::with_prepared_dictionary(&empty_dict).unwrap();
+    let one = compressor.compress(b"x").unwrap();
+    let mut decoder =
+        compat::bulk::Decompressor::with_prepared_dictionary(&empty_dec_dict).unwrap();
+    assert_eq!(decoder.decompress(&one, 0).unwrap(), b"x");
+}

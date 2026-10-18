@@ -73,9 +73,11 @@ impl Decompressor {
         Ok(Self { inner })
     }
 
-    /// Changes the dictionary used by this decompressor (an empty slice
-    /// detaches it). Affects future decompressions; dictionaries attached
-    /// earlier stay available to the frames that want them.
+    /// Changes the dictionary used by this decompressor. Affects future
+    /// decompressions; dictionaries attached earlier stay available to the
+    /// frames that want them (this crate keys dictionaries by id, where
+    /// the zstd crate's context holds one — an empty slice detaches a raw
+    /// id-less dictionary, named ones stay reachable by their id).
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> io::Result<()> {
         // `load` (not `decode_dict`): headerless raw content is a valid
         // dictionary here, as on every other decode entry point.
