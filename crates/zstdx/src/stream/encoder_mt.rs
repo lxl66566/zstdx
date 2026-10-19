@@ -839,6 +839,13 @@ pub(crate) struct MtEncoderCore {
     /// Whether the reach probe's decision (see [`reach_probe`]) is still
     /// pending: no job posts until the head is staged and decided.
     probe_pending: bool,
+    /// Whether a pledged dictionary frame's mid-size capture engagement
+    /// (see [`Self::settle_dict_capture`]) is still pending: the
+    /// engagement's head-block evidence has not staged yet, so the frame
+    /// holds the stock grid until it does (or cancels at a short
+    /// flush/finish, the never-taken-verdict rule the probe's staging
+    /// shares).
+    dict_capture_pending: bool,
     /// The posted donation tasks whose verdict has not been consumed yet
     /// (see `post_donation`/`resolve_probe`): the keep and shrink sides.
     probe_wait: Option<(Arc<Job>, Arc<Job>)>,
@@ -890,6 +897,24 @@ pub(crate) struct MtEncoderCore {
 }
 
 impl MtEncoderCore {
+    /// The frame header's window: the plain row window, or — on a
+    /// dictionary frame — the src+dict fold the ST dictionary entries
+    /// clamp by (libzstd's `ZSTD_dictAndWindowLog`; the jobs' own shape
+    /// stays plain — their history is the strip, not the dictionary).
+    fn header_window(
+        level: Level,
+        shape: crate::InputShape,
+        dict: Option<&crate::encoding::dictionary::EncDictionary>,
+    ) -> u64 {
+        match dict {
+            Some(dict) => MatchGeneratorDriver::window_for_level(level, crate::InputShape {
+                len: shape.len.map(|len| len + dict.content.len() as u64),
+                window_log: shape.window_log,
+            }),
+            None => MatchGeneratorDriver::window_for_level(level, shape),
+        }
+    }
+
     /// The plain-frame constructor (tests and the streaming router's
     /// no-dictionary arm).
     pub(crate) fn new(options: &EncoderOptions) -> Self {
@@ -914,19 +939,7 @@ impl MtEncoderCore {
             len: options.pledged_size.or(options.input_shape.len),
             window_log: options.input_shape.window_log,
         };
-        // libzstd clamps the dictionary window by payload + dict content
-        // (the ST dictionary entries do the same fold); the jobs' own
-        // shape stays plain — their history is the strip, not the
-        // dictionary.
-        let window = match &dict {
-            Some(dict) => {
-                MatchGeneratorDriver::window_for_level(options.level, crate::InputShape {
-                    len: shape.len.map(|len| len + dict.content.len() as u64),
-                    window_log: shape.window_log,
-                })
-            },
-            None => MatchGeneratorDriver::window_for_level(options.level, shape),
-        };
+        let window = Self::header_window(options.level, shape, dict.as_deref());
         // The job history rides the level's stream overlap rule (see
         // `stream_overlap_for`): the whole window where cross-job history
         // carries a far class, the search domain where the LDM restarts
@@ -943,11 +956,11 @@ impl MtEncoderCore {
         // its schedule until the probe's head is staged. A pledge clears
         // the probe's size gate here; an open-ended stream gates at
         // PROBE_MIN_FRAME streamed bytes (see the module docs).
-        // Dictionary frames keep the stock reach and no screens, exactly
-        // like the ST dictionary core (the probe samples a head the
-        // dictionary would have to seed; the fast rows' capture classes
-        // model a borrowed-strip job zero the dictionary path does not
-        // run).
+        // Dictionary frames keep the stock reach, exactly like the ST
+        // dictionary core: the probe's shrink arm (W12) cannot host the
+        // dictionary's history — the seed sits at distances up to the
+        // dict content length, which a shrunk window makes illegal
+        // frame-wide (see negative/dict.md).
         let probe_pending = dict.is_none()
             && match options.pledged_size {
                 Some(_) => reach_probe::eligible(options.level, shape),
@@ -959,8 +972,11 @@ impl MtEncoderCore {
         // capture grid's collision screen still reads the first block, so
         // both bands stage before anything posts; the probe never runs on
         // these rows (strategy-exclusive), so the two stagings never hold
-        // the same frame.
-        let fast_capture = if probe_pending || dict.is_some() {
+        // the same frame. Dictionary frames stage the same way (R54): the
+        // verdict is a pure function of the source sample the jobs>0
+        // strips borrow, so the capture stays byte-safe with the seed
+        // confined to job zero's owned window.
+        let fast_capture = if probe_pending {
             FastCapture::Stock
         } else {
             match options.pledged_size {
@@ -1012,6 +1028,8 @@ impl MtEncoderCore {
         } else {
             initial_reserve(options.workers, initial_job, overlap)
         };
+        // Computed before the struct literal moves `grid`.
+        let dict_capture_pending = dict.is_some() && matches!(grid, JobGrid::Fixed(_));
         let (mut buf, mut init_len) = take_pooled_buf(want);
         if buf.capacity() < want {
             buf.reserve_exact(want - buf.len());
@@ -1028,17 +1046,19 @@ impl MtEncoderCore {
             grid,
             overlap,
             job_ldm: LdmArming::Job,
-            // A dictionary frame never screens: the ST dictionary core
-            // keeps the stock strip too, and the bulk dictionary path has
-            // no FarDead band — a pledged dict stream stays byte-identical
-            // to the bulk dict frame (same grid, same strips).
-            far_class: if dict.is_some() {
-                FarClass::Alive
-            } else {
-                FarClass::Pending
-            },
+            // Dictionary frames screen too (R54): the verdict is a pure
+            // buffer function, and the strips it caps borrow source bytes
+            // only — the seed never enters the screens' inputs. On the
+            // verdict class the cap is byte-exact by the FarClass
+            // argument (the LDM candidates never won there), so the dict
+            // stream keeps matching the bulk dict frame's reach strips.
+            far_class: FarClass::Pending,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
+            // Pledged dictionary frames alone: the open-ended twin keeps
+            // the growing grid (the plain frames' stance — no mid-size
+            // capture without a declared length).
+            dict_capture_pending,
             probe_wait: None,
             donation: None,
             fast_capture,
@@ -1396,6 +1416,30 @@ impl MtEncoderCore {
         }
     }
 
+    /// Settle a pledged dictionary frame's mid-size capture engagement
+    /// (R54): the plain frames engage inside the probe's Keep resolution,
+    /// which dictionary frames never run — their choice is the forced
+    /// Keep, so the engagement needs only its own evidence (the head
+    /// block the bulk planner's screen reads), staged before any job can
+    /// post (the fixed grid's first job end is a whole job size away).
+    /// The engagement itself is the plain [`Self::engage_midsize_capture`]:
+    /// the pinned bulk capture lattice plus [`LdmArming::JobPrefix`] for
+    /// the jobs>0 strips — pure source functions, the seed confined to
+    /// job zero's owned window — so a pledged dict stream stays
+    /// byte-identical to the bulk dict frame on the armed band. A
+    /// flush/finish below the staging span cancels to the stock grid (the
+    /// never-taken-verdict rule, `settle_probe`'s own).
+    fn settle_dict_capture(&mut self) {
+        if !self.dict_capture_pending {
+            return;
+        }
+        self.dict_capture_pending = false;
+        if self.pos < MAX_BLOCK_SIZE as u64 || self.buf_base != 0 {
+            return;
+        }
+        self.engage_midsize_capture();
+    }
+
     /// Consume the donation's verdict: a shrunk frame re-grids from offset
     /// zero with the shrunk history strip and the job floor it implies
     /// (job zero parses undonated, from a pooled state), a kept frame parks
@@ -1566,13 +1610,20 @@ impl MtEncoderCore {
         // it left (the staging gate held every emit): the bulk mt form —
         // windowed, W26 — with the FCS exactly when a pledge declared it,
         // so an armed pledged stream and the bulk frame agree byte for
-        // byte, and an armed open stream carries the ST armed form.
+        // byte, and an armed open stream carries the ST armed form. A
+        // dictionary frame keeps its dictID and folds the declared window
+        // with the construction-time src+dict clamp (the far window
+        // exceeds every plain fast-row window, so plain bytes never move).
         let header = FrameHeader {
             frame_content_size: self.shape.len,
             single_segment: false,
             content_checksum: self.checksum,
-            dictionary_id: None,
-            window_size: Some(window),
+            dictionary_id: self.dict.as_ref().and_then(|d| d.header_id()),
+            window_size: Some(window.max(Self::header_window(
+                self.level,
+                self.shape,
+                self.dict.as_deref(),
+            ))),
         };
         self.header.clear();
         header.serialize(&mut self.header);
@@ -1795,6 +1846,7 @@ impl MtEncoderCore {
             }
             self.resolve_fast_capture();
         }
+        self.settle_dict_capture();
         loop {
             // A verdict that already landed is consumed for free here (the
             // finish path then never waits on it); a pending one is only
@@ -1932,6 +1984,10 @@ impl MtEncoderCore {
         self.settle_probe(last_frame_block);
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_fin_settle(settle_t0);
+        // The dictionary capture's staging settles the same way (a belt:
+        // post_ready settles at the write that crosses the span, so this
+        // arm only serves a flush/finish arriving first).
+        self.settle_dict_capture();
         if spf.is_some() && self.choice == ReachChoice::Shrink {
             // The shrunk re-grid's strips are not the prefixes the build
             // filled; drop the plan unused.
@@ -2007,11 +2063,14 @@ impl MtEncoderCore {
         // reach — no nesting, nothing to share); the segment loop below
         // resolves a still-pending screen as soon as the probe machinery
         // settles, retiring the build before any segment runs.
+        // Dictionary frames build too (R54): the build fills source
+        // prefixes through a pooled strip state, and the tail jobs' strips
+        // borrow source bytes only — the dict seed never enters the build
+        // or the adoption, so the shared schedule stays byte-invariant.
         if !matches!(self.grid, JobGrid::Growing)
             || self.job_start != 0
             || self.buf_base != 0
             || self.choice == ReachChoice::Shrink
-            || self.dict.is_some()
             || matches!(self.far_class, FarClass::Dead)
             || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
         {
