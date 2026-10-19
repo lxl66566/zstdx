@@ -146,14 +146,13 @@ pub fn compress_slice_mt(
     // The fast rows' far-class capture window (R21): resolved from the
     // same head sample the frame-continuous entries screen — None for
     // every chain row (strategy-checked before any screen work runs).
-    // Dictionary frames keep the stock grid (their job zero runs the
-    // dictionary path below, which the capture classes' donation and
-    // shared-fill schedules do not model).
-    let fast_window = if dict.is_none() {
-        far_screen::mt_capture_window(level, shape, src)
-    } else {
-        None
-    };
+    // Dictionary frames screen the same sample (R54): the verdict is a
+    // pure function of the source bytes the jobs>0 strips borrow, so the
+    // capture stays byte-safe with the dict seed confined to job zero's
+    // owned window (which the donation and shared-fill schedules never
+    // touch — job zero runs the dictionary path below on the armed grid
+    // like on the stock one).
+    let fast_window = far_screen::mt_capture_window(level, shape, src);
     // The frame's head decides its chain reach (see reach_probe), and with
     // it the strip: a shrunk search domain shrinks the strip to match.
     // Eligible frames donate the probe's keep side into job zero (see
@@ -247,10 +246,15 @@ pub fn compress_slice_mt(
     // the window would floor jobs at 32 MiB and starve parallelism — and
     // the shared prefix fill bounds the per-job prefix fill's redundancy:
     // one build to the median boundary, tail jobs above it adopt.
-    let spf: Option<PrefixPlan> = if dict.is_none() && choice == reach_probe::ReachChoice::Keep {
+    // Dictionary frames join the class (R54): their choice is the forced
+    // Keep below, and every schedule input the plan reads is a plain
+    // source function — job zero keeps the dictionary path, the tail jobs
+    // arm exactly as a plain frame's do.
+    let spf: Option<PrefixPlan> = if choice == reach_probe::ReachChoice::Keep {
         // A kept frame's capture is exactly the plan the donation gate
         // computed (the same pure inputs at Keep); a non-donated frame
-        // plans from its final schedule.
+        // (and every dictionary frame — no probe runs) plans from its
+        // final schedule.
         keep_plan
             .take()
             .or_else(|| plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs, fast_window))
@@ -262,19 +266,28 @@ pub fn compress_slice_mt(
     // frame probe-eligible, so the gate passed and the plan was computed
     // there). The fast rows' capture (`fast_window`) never donates — the
     // rows are not probe subjects, and their grid is pinned the same way.
-    debug_assert!(spf.is_none() || donation_prefix || fast_window.is_some());
-    // A captured fast row declares and runs the far window its screen or
-    // geometry armed (the chain rows' capture window is already their own
-    // row window, so `window` moves only on the fast rows).
-    let window = match (&spf, fast_window) {
-        (Some(_), Some(far)) => far,
+    // A dictionary frame never donates either (no probe runs): its job
+    // zero is the dictionary seed, which the capture classes never touch.
+    debug_assert!(spf.is_none() || donation_prefix || fast_window.is_some() || dict.is_some());
+    // The capture's strip window: the plan's own band — the chain rows'
+    // clamped row window or the fast rows' screened far window — never
+    // the header fold (a dictionary fold can exceed the plain row window
+    // across a pow2 boundary; the strips borrow source bytes either way,
+    // and the streaming core's capture strips use the plain window, so
+    // the two paths stay byte-identical). A captured fast row declares
+    // the far window its screen or geometry armed, folded with the
+    // dictionary window so dict-distance matches stay inside the declared
+    // domain (plain frames: `far` already exceeds the row window, a
+    // no-op).
+    let capture_window = spf
+        .is_some()
+        .then(|| MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window))
+        .flatten();
+    let window = match capture_window {
+        Some(w) if fast_window.is_some() => w.max(window),
         _ => window,
     };
-    let job_overlap = if spf.is_some() {
-        window as usize
-    } else {
-        overlap
-    };
+    let job_overlap = capture_window.map_or(overlap, |w| w as usize);
     let job_ldm = if spf.is_some() {
         LdmArming::JobPrefix
     } else {

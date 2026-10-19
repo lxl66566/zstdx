@@ -1729,6 +1729,187 @@ mod mt_dict {
         assert_eq!(decode_with_dict(&a, &raw), data);
     }
 
+    /// Far-class payload (dll-shaped, R54's capture fixture): a 512 KiB
+    /// head drawn from a pool of 96 random 64-byte blocks — the 8-gram
+    /// repeats pass the capture head screen (whose odd stride defeats any
+    /// single-period tiling) and the dense 64-byte twins clear the far
+    /// screen's cheap-rejection bar — then 3 MiB random units tiled: the
+    /// unit period sits past the fast rows' stock window (the far class
+    /// the W26 widening pays for) and inside the chain reach, with an
+    /// 8-byte motif every 2 KiB keeping blocks matchable for the
+    /// incompressibility gate.
+    fn far_class_payload(len: usize) -> Vec<u8> {
+        const MIB: usize = 1024 * 1024;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut blocks = Vec::new();
+        for _ in 0..96 {
+            blocks.push((0..64).map(|_| (rand() & 0xff) as u8).collect::<Vec<u8>>());
+        }
+        let mut unit: Vec<u8> = (0..3 * MIB).map(|_| (rand() & 0xff) as u8).collect();
+        let word: [u8; 8] = core::array::from_fn(|_| (rand() & 0xff) as u8);
+        let mut i = 0;
+        while i + 64 <= unit.len() {
+            for k in 0..8 {
+                unit[i + k * 8..i + k * 8 + 8].copy_from_slice(&word);
+            }
+            i += 2048;
+        }
+        let mut data = Vec::with_capacity(len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while data.len() < 512 * 1024 {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.extend_from_slice(&blocks[(pick >> 33) as usize % 96]);
+        }
+        while data.len() < len {
+            let take = unit.len().min(len - data.len());
+            data.extend_from_slice(&unit[..take]);
+        }
+        data
+    }
+
+    fn dict_stream(data: &[u8], chunk: usize, opts: &EncoderOptions) -> Vec<u8> {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(&mut sink, opts.clone()).unwrap();
+        for piece in data.chunks(chunk) {
+            enc.write_all(piece).unwrap();
+        }
+        enc.finish().unwrap();
+        sink
+    }
+
+    /// The capture classes on dictionary frames (R54): a far-class payload
+    /// with a dictionary arms the chain rows' mid-size capture and the
+    /// fast rows' screened capture exactly as a plain frame does — the
+    /// schedules are pure functions of the source bytes the jobs>0 strips
+    /// borrow, the dict seed staying inside job zero's owned window. The
+    /// armed frame must be worker-count-independent (the pinned grids),
+    /// a pledged dict stream must stay byte-identical to the bulk dict
+    /// frame on the armed bands, and every cell roundtrips through both
+    /// decoders with the dictionary.
+    #[test]
+    fn dict_mt_capture_classes() {
+        let Some((raw, _)) = dict_fixture() else {
+            return;
+        };
+        let data = far_class_payload(32 * 1024 * 1024);
+        for level in [Level::Balanced, Level::Fast] {
+            let bulk_of = |workers: u32| {
+                bulk::compress_with(
+                    &data,
+                    &EncoderOptions::new(level).workers(workers).dictionary(&raw),
+                )
+                .unwrap()
+            };
+            let mt4 = bulk_of(4);
+            assert_eq!(mt4, bulk_of(8), "{level:?}: the pinned capture grid");
+            assert_eq!(mt4, bulk_of(16), "{level:?}: the pinned capture grid");
+            // The far class survived the job split. The fast row is where
+            // the widening pays outright: the 3 MiB-period twins sit past
+            // its stock window, so the ST dict frame carries them not at
+            // all — an armed mt frame must beat it by the units' whole
+            // cost (a silently un-armed mt would sit at the ST size plus
+            // job boundaries). The chain row's ST twin already carries
+            // the far class frame-continuously through its own LDM, so
+            // the capture's contract there is the job-split parity: mt
+            // stays inside the ordinary boundary cost of st.
+            let st =
+                bulk::compress_with(&data, &EncoderOptions::new(level).dictionary(&raw)).unwrap();
+            if level == Level::Fast {
+                assert!(
+                    mt4.len() < st.len() * 3 / 4,
+                    "{level:?}: armed mt {} vs stock-window st {}",
+                    mt4.len(),
+                    st.len()
+                );
+            } else {
+                assert!(
+                    mt4.len() <= st.len() + st.len() / 50,
+                    "{level:?}: armed mt {} vs st {}",
+                    mt4.len(),
+                    st.len()
+                );
+            }
+            // Pledged stream parity on the armed band.
+            for workers in [2u32, 4, 8] {
+                let stream = dict_stream(
+                    &data,
+                    1024 * 1024,
+                    &EncoderOptions::new(level)
+                        .workers(workers)
+                        .dictionary(&raw)
+                        .pledged_size(Some(data.len() as u64)),
+                );
+                assert_eq!(
+                    stream, mt4,
+                    "{level:?} w{workers}: pledged stream vs bulk on the armed band"
+                );
+            }
+            assert_eq!(decode_with_dict(&mt4, &raw), data, "{level:?}");
+            let mut zd = zstd::bulk::Decompressor::with_dictionary(&raw).unwrap();
+            assert_eq!(
+                zd.decompress(&mt4, data.len()).unwrap(),
+                data,
+                "{level:?} libzstd"
+            );
+        }
+    }
+
+    /// The unpledged dict stream on the armed classes stays a pure function
+    /// of the input (the open fast-row capture's lattice and the growing
+    /// grid's finish tail share the strip-fill schedule), and a far-dead
+    /// dict payload (random — both far screens reject) keeps the same
+    /// property with the screens armed.
+    #[test]
+    fn dict_stream_capture_write_independent() {
+        let Some((raw, _)) = dict_fixture() else {
+            return;
+        };
+        let cells: [(&str, Level, Vec<u8>); 3] = [
+            ("far/fast", Level::Fast, far_class_payload(32 * 1024 * 1024)),
+            (
+                "far/balanced",
+                Level::Balanced,
+                far_class_payload(32 * 1024 * 1024),
+            ),
+            ("dead/balanced", Level::Balanced, {
+                let mut state = 0x0db1_a5eed_u64;
+                (0..32 * 1024 * 1024)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state & 0xff) as u8
+                    })
+                    .collect()
+            }),
+        ];
+        for (name, level, data) in cells {
+            let reference = dict_stream(
+                &data,
+                usize::MAX,
+                &EncoderOptions::new(level).workers(4).dictionary(&raw),
+            );
+            for chunk in [64 * 1024, 333 * 1024, 3 * 1024 * 1024] {
+                assert_eq!(
+                    dict_stream(
+                        &data,
+                        chunk,
+                        &EncoderOptions::new(level).workers(4).dictionary(&raw),
+                    ),
+                    reference,
+                    "{name}: chunk {chunk}"
+                );
+            }
+            assert_eq!(decode_with_dict(&reference, &raw), data, "{name}");
+        }
+    }
+
     #[test]
     fn pledged_stream_matches_bulk_dict_mt() {
         let Some((raw, data)) = dict_fixture() else {
