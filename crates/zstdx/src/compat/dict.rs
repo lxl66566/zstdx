@@ -10,7 +10,9 @@
 //! The trainers exist under the `dict_builder` feature and delegate to
 //! [`crate::dict`].
 
-use std::{io, path, sync::Arc, vec::Vec};
+use std::{io, sync::Arc};
+#[cfg(feature = "dict_builder")]
+use std::{path, vec::Vec};
 
 use crate::{decoding, encoding};
 

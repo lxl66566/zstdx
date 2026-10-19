@@ -167,14 +167,18 @@ pub fn decompress_to_buffer(source: &[u8], destination: &mut [u8]) -> Result<usi
 /// [`decompress_to_buffer`] with a full option set: more than one decode
 /// thread engages the parallel decoder on std builds (see
 /// [`DecoderOptions::threads`][crate::DecoderOptions::threads]); an
-/// attached dictionary is parsed here and used by the sequential decoder.
+/// attached dictionary (raw or parsed) is used by the sequential decoder.
 pub fn decompress_to_buffer_with(
     source: &[u8],
     destination: &mut [u8],
     options: &crate::DecoderOptions,
 ) -> Result<usize> {
+    // Either dictionary form keeps the decode sequential: the parallel
+    // decoder plans over the raw frame bytes alone and its fallback
+    // builds a fresh frame decoder, so a dictionary it never saw would
+    // be silently dropped.
     #[cfg(feature = "std")]
-    if options.threads > 1 && options.dictionary.is_none() {
+    if options.threads > 1 && options.dictionary.is_none() && options.parsed_dictionary.is_none() {
         let max = options
             .max_window_size
             .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
@@ -208,7 +212,7 @@ pub fn decompress_with(
     options: &crate::DecoderOptions,
 ) -> Result<alloc::vec::Vec<u8>> {
     #[cfg(feature = "std")]
-    if options.threads > 1 && options.dictionary.is_none() {
+    if options.threads > 1 && options.dictionary.is_none() && options.parsed_dictionary.is_none() {
         let max = options
             .max_window_size
             .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
@@ -532,5 +536,36 @@ mod tests {
         // and we decode libzstd's frames
         let zstd_made = zstd::bulk::compress(&input, 3).unwrap();
         assert_eq!(decompress(&zstd_made, 0).unwrap(), input);
+    }
+
+    /// A prepared dictionary must steer the decode off the parallel fast
+    /// path exactly like a raw one (R53): the parallel decoder's
+    /// sequential fallback builds a fresh frame decoder, so a dictionary
+    /// it never saw would be silently dropped and the frame's dictID
+    /// would fail to resolve.
+    #[cfg(feature = "std")]
+    #[test]
+    fn threads_with_prepared_dictionary_decode() {
+        let Ok(raw) = std::fs::read("./dict_tests/dictionary") else {
+            return;
+        };
+        let payload: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(2048);
+        let parsed = crate::EncoderDictionary::parse(&raw).unwrap();
+        let frame = compress_with(
+            &payload,
+            &EncoderOptions::new(Level::Balanced).parsed_dictionary(&parsed),
+        )
+        .unwrap();
+        let dict = alloc::sync::Arc::new(crate::decoding::Dictionary::load(&raw).unwrap());
+        for threads in [1, 4] {
+            let options = crate::DecoderOptions::new()
+                .parsed_dictionary(alloc::sync::Arc::clone(&dict))
+                .threads(threads);
+            let out = decompress_with(&frame, 0, &options).unwrap();
+            assert_eq!(out, payload, "threads {threads}");
+            let mut buffer = vec![0u8; payload.len()];
+            let written = decompress_to_buffer_with(&frame, &mut buffer, &options).unwrap();
+            assert_eq!(&buffer[..written], &payload[..], "threads {threads}");
+        }
     }
 }
