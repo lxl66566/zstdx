@@ -121,6 +121,16 @@ pub mod write {
             Ok(Self { state })
         }
 
+        /// Creates an encoder using a reference prefix: the prefix bytes
+        /// are match history for the first frame (libzstd's
+        /// `ZSTD_c_refPrefix`, which loads the content raw — no entropy
+        /// tables, no dictionary id, format-default repcodes). The
+        /// engine's raw-dictionary path is exactly that load, so this is
+        /// the dictionary constructor under the prefix name.
+        pub fn with_ref_prefix(writer: W, level: i32, prefix: &[u8]) -> io::Result<Self> {
+            Self::with_dictionary(writer, level, prefix)
+        }
+
         /// Creates an encoder bound to an already-prepared dictionary
         /// (its parse is shared); the dictionary's level is used.
         pub fn with_prepared_dictionary(
@@ -163,6 +173,33 @@ pub mod write {
         pub fn window_log(&mut self, log_distance: u32) -> io::Result<()> {
             self.state.set_started()?;
             self.state.options.input_shape.window_log = Some(log_distance);
+            Ok(())
+        }
+
+        /// Enables or disables storing of the dict id (default on). With it
+        /// off the dictionary still applies — content, entropy tables,
+        /// repcodes — but the frame header carries no Dictionary_ID, so
+        /// decoders need the dictionary explicitly and decoding with a
+        /// wrong one is undefined; fails once streaming started.
+        pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.options.include_dictid = include;
+            Ok(())
+        }
+
+        /// Enables or disables long-distance matching. `true` forces the
+        /// far-match source on and, with no [`Self::window_log`] set,
+        /// raises the window to 27 as libzstd does; `false` restores the
+        /// automatic per-level arming — the zstd crate's bool maps onto
+        /// libzstd's auto value there, not an explicit disable. Fails
+        /// once streaming started.
+        pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.options.long_distance_matching = if enable {
+                crate::LdmMode::Enable
+            } else {
+                crate::LdmMode::Auto
+            };
             Ok(())
         }
 
@@ -538,6 +575,33 @@ pub mod read {
             Ok(())
         }
 
+        /// Enables or disables storing of the dict id (default on). With it
+        /// off the dictionary still applies — content, entropy tables,
+        /// repcodes — but the frame header carries no Dictionary_ID, so
+        /// decoders need the dictionary explicitly and decoding with a
+        /// wrong one is undefined; fails once streaming started.
+        pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.options.include_dictid = include;
+            Ok(())
+        }
+
+        /// Enables or disables long-distance matching. `true` forces the
+        /// far-match source on and, with no [`Self::window_log`] set,
+        /// raises the window to 27 as libzstd does; `false` restores the
+        /// automatic per-level arming — the zstd crate's bool maps onto
+        /// libzstd's auto value there, not an explicit disable. Fails
+        /// once streaming started.
+        pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.options.long_distance_matching = if enable {
+                crate::LdmMode::Enable
+            } else {
+                crate::LdmMode::Auto
+            };
+            Ok(())
+        }
+
         /// Enables multithreaded compression: `workers > 1` engages the
         /// native multithreaded streaming core (raw-block levels and
         /// single-core processes fall back to the single-threaded core, as
@@ -667,6 +731,15 @@ pub mod read {
                 inner: None,
                 single_frame: false,
             })
+        }
+
+        /// Creates a new decoder using a reference prefix: the same raw
+        /// content the encoder saw (libzstd's `ZSTD_d_refPrefix` — the
+        /// bytes load as a raw-content dictionary under the null id and
+        /// serve as history for the frame, whose header carries no
+        /// dictionary id to check against).
+        pub fn with_ref_prefix(source: R, prefix: &[u8]) -> io::Result<Self> {
+            Self::with_dictionary(source, prefix)
         }
 
         /// Creates a new decoder around a `BufRead` (this porting layer

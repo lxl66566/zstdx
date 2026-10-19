@@ -54,10 +54,12 @@ impl Decompressor {
         let mut inner = crate::decoding::FrameDecoder::new();
         // `load` (not `decode_dict`): headerless raw content is a valid
         // dictionary here, as on every other decode entry point.
-        let dict = crate::decoding::Dictionary::load(dictionary)
-            .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?;
+        let dict = alloc::sync::Arc::new(
+            crate::decoding::Dictionary::load(dictionary)
+                .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?,
+        );
         inner
-            .add_dict(dict)
+            .add_options_dict(dict)
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))?;
         Ok(Self { inner })
     }
@@ -68,7 +70,7 @@ impl Decompressor {
         let mut inner = crate::decoding::FrameDecoder::new();
         let dict = dictionary.shared()?;
         inner
-            .add_shared_dict(dict)
+            .add_options_dict(dict)
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))?;
         Ok(Self { inner })
     }
@@ -81,10 +83,12 @@ impl Decompressor {
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> io::Result<()> {
         // `load` (not `decode_dict`): headerless raw content is a valid
         // dictionary here, as on every other decode entry point.
-        let dict = crate::decoding::Dictionary::load(dictionary)
-            .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?;
+        let dict = alloc::sync::Arc::new(
+            crate::decoding::Dictionary::load(dictionary)
+                .map_err(|e| io::Error::from(crate::Error::Dictionary(e)))?,
+        );
         self.inner
-            .add_dict(dict)
+            .add_options_dict(dict)
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))
     }
 
@@ -93,7 +97,7 @@ impl Decompressor {
     pub fn set_prepared_dictionary(&mut self, dictionary: &DecoderDictionary) -> io::Result<()> {
         let dict = dictionary.shared()?;
         self.inner
-            .add_shared_dict(dict)
+            .add_options_dict(dict)
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))
     }
 
@@ -170,6 +174,12 @@ enum Attachment {
 pub struct Compressor {
     level: i32,
     dict: Attachment,
+    /// libzstd's dictIDFlag, a context parameter that outlives dictionary
+    /// changes (unlike the dictionary itself).
+    include_dictid: bool,
+    /// Explicit long-distance-matching switch (the zstd crate's bool maps
+    /// true to force-enable, false to libzstd's auto value).
+    long_distance_matching: crate::LdmMode,
 }
 
 impl Compressor {
@@ -178,6 +188,8 @@ impl Compressor {
         Ok(Self {
             level,
             dict: Attachment::None,
+            include_dictid: true,
+            long_distance_matching: crate::LdmMode::Auto,
         })
     }
 
@@ -201,6 +213,8 @@ impl Compressor {
         Ok(Self {
             level: dictionary.compression_level(),
             dict: Attachment::Prepared(dictionary.clone()),
+            include_dictid: true,
+            long_distance_matching: crate::LdmMode::Auto,
         })
     }
 
@@ -240,6 +254,32 @@ impl Compressor {
         Ok(())
     }
 
+    /// Enables or disables storing of the dict id (default on). With it
+    /// off the dictionary still applies — content, entropy tables,
+    /// repcodes — but the frame header carries no Dictionary_ID, so
+    /// decoders need the dictionary explicitly and decoding with a wrong
+    /// one is undefined. Affects future compression jobs; survives
+    /// dictionary changes, like any context parameter.
+    pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
+        self.include_dictid = include;
+        Ok(())
+    }
+
+    /// Enables or disables long-distance matching. `true` forces the
+    /// far-match source on and, with no `window_log` set, raises the
+    /// window to 27 as libzstd does; `false` restores the automatic
+    /// per-level arming — the zstd crate's bool maps onto libzstd's auto
+    /// value there, not an explicit disable. Affects future compression
+    /// jobs.
+    pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+        self.long_distance_matching = if enable {
+            crate::LdmMode::Enable
+        } else {
+            crate::LdmMode::Auto
+        };
+        Ok(())
+    }
+
     /// Compresses a single block of data. The frame header declares the
     /// content size, as libzstd's one-shot compressor does.
     pub fn compress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
@@ -270,7 +310,9 @@ impl Compressor {
             Attachment::Prepared(dict) => dict.compression_level(),
             _ => self.level,
         };
-        let options = crate::EncoderOptions::new(map_level(level)).pledged_size(Some(len));
+        let mut options = crate::EncoderOptions::new(map_level(level)).pledged_size(Some(len));
+        options.include_dictid = self.include_dictid;
+        options.long_distance_matching = self.long_distance_matching;
         match &self.dict {
             Attachment::None => Ok(options),
             Attachment::Raw(dict) => Ok(options.dictionary(dict)),

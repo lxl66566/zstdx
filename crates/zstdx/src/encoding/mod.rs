@@ -35,7 +35,9 @@ pub use dictionary::EncoderDictionary;
 pub use frame_compressor::{
     FrameCompressor, compress_slice_opts, compress_slice_shaped, compress_slice_to_vec,
 };
+#[cfg(feature = "std")]
 pub(crate) use frame_compressor::{compress_slice_shaped_declared, compress_slice_with_dictionary};
+pub(crate) use frame_compressor::{compress_slice_shaped_ldm, compress_slice_with_dictionary_id};
 pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
 #[cfg(feature = "std")]
@@ -380,6 +382,10 @@ pub trait Matcher {
     /// and/or a forced window log overriding the level's row. Per frame —
     /// implementations must not carry it across resets.
     fn set_input_shape(&mut self, _shape: crate::InputShape) {}
+    /// Declare the frame's explicit LDM switch before [`Matcher::reset`]
+    /// (the reset's size gate reads it). Per frame; the default keeps the
+    /// matcher's own arming policy.
+    fn set_ldm_mode(&mut self, _mode: crate::LdmMode) {}
     /// Decide the frame's chain reach from its first bytes (the built-in
     /// matcher's shape-adaptive row-9 probe, see
     /// `match_generator::reach_probe`): called once per frame, before the

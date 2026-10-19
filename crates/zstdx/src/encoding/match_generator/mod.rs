@@ -329,6 +329,13 @@ pub struct MatchGeneratorDriver {
     /// [`Self::apply_level`]'s size gate, so entry points set it before
     /// `reset`.
     ldm_arming: LdmArming,
+    /// Explicit LDM switch (see [`crate::LdmMode`]): `Auto` leaves the
+    /// arming policy to [`Self::ldm_arming`] and the row; `Enable`/`Disable`
+    /// force the size gate and stand the fast rows' window widening down.
+    /// Entry points re-declare it before `reset`; every state take
+    /// (`reset_slice_state`) restores `Auto`, so pooled drivers carry no
+    /// residue into paths that never set it (the mt jobs).
+    ldm_mode: crate::LdmMode,
     /// Cold-start DUBT head lifecycle (see [`HeadPhase`]).
     dubt_head: HeadPhase,
     /// Cold-head probe-step phase for the btlazy2 rows (see
@@ -684,6 +691,15 @@ impl MatchGeneratorDriver {
         self.ldm_arming = arming;
     }
 
+    /// Declare the frame's explicit LDM switch (see [`crate::LdmMode`])
+    /// before `reset` — the reset's `apply_level` reads it. Unlike the
+    /// arming context this is per-frame intent: pooled states restore
+    /// `Auto` at every take, so single-threaded entry points set it fresh
+    /// each frame.
+    pub(crate) fn set_ldm_mode(&mut self, mode: crate::LdmMode) {
+        self.ldm_mode = mode;
+    }
+
     /// Largest block the frame may carry: the format caps blocks at the
     /// declared window (RFC 8878: Block_Maximum_Size = min(window, 128K)),
     /// so a forced or downsized window below 128 KiB shrinks the blocks.
@@ -763,6 +779,7 @@ impl MatchGeneratorDriver {
             small_wide_key: (0, 0),
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
+            ldm_mode: crate::LdmMode::Auto,
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
             probe_stats: None,
@@ -832,6 +849,7 @@ impl MatchGeneratorDriver {
             small_wide_key: (0, 0),
             reach_choice: ReachChoice::Keep,
             ldm_arming: LdmArming::Frame,
+            ldm_mode: crate::LdmMode::Auto,
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
             probe_stats: None,
@@ -1043,37 +1061,78 @@ impl MatchGeneratorDriver {
         // geometry engages — see `far_screen::mt_capture_window`) parses
         // with the far window its frame declared; chain rows take nothing
         // here (their capture window is the row's own).
+        // The explicit LDM switch (R55): Auto keeps the row's policy;
+        // Disable disarms the split pass everywhere (the fast rows'
+        // widening below exists to feed it, so it stands down too);
+        // Enable forces the row's LDM capability on and lifts the size
+        // gate's bar below. The tagged Row strategies (rows 5-8, 10-12)
+        // have no LDM candidate feed in their parse — Enable is inert
+        // there (the one fidelity note, see the compat deviations).
+        match self.ldm_mode {
+            crate::LdmMode::Auto => {},
+            crate::LdmMode::Disable => params.ldm = false,
+            crate::LdmMode::Enable => params.ldm = true,
+        }
         let declared = |bar: u64| matches!(self.shape.len, Some(n) if n >= bar);
         // The screened bar minus the length: the screen's accept is the
         // evidence, so an open-ended frame (declared length `None`, the
         // unpledged stream entry) passes it too.
         let screened = |bar: u64| !matches!(self.shape.len, Some(n) if n < bar);
-        if params.ldm
-            && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
-            && params.window < LDM_FULL_WINDOW
-            && match self.ldm_arming {
-                LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
-                LdmArming::FrameScreened => screened(LDM_MIDSIZE_WINDOW as u64),
-                // The screened form, not the declared one: the unpledged
-                // stream's engaged capture jobs (R24) carry `JobPrefix`
-                // with no declared length — the screen that armed the
-                // frame is the evidence, exactly the FrameScreened rule.
-                // Every other JobPrefix site holds a declared length, so
-                // the two predicates agree there.
-                #[cfg(feature = "std")]
-                LdmArming::JobPrefix => screened(LDM_MIDSIZE_WINDOW as u64),
-                _ => false,
+        if params.ldm && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_)) {
+            match self.ldm_mode {
+                // R55: explicit enable — the resolved window (the enable
+                // default of 27 or the user's forced one) plays the far
+                // window and the scan domain stays the stock row window:
+                // the same split the auto arm below makes on the screen's
+                // evidence, with the user's word in its place. Without the
+                // split the scan domain would cover the whole raised
+                // window and the LDM consumer's beyond-reach filter would
+                // drop every candidate (they are the dense tables' own
+                // class there).
+                crate::LdmMode::Enable => {
+                    let stock = params_for_row(
+                        level,
+                        InputShape {
+                            len: self.shape.len,
+                            window_log: None,
+                        },
+                        self.small_src_row,
+                        self.row_attempts,
+                    )
+                    .window
+                    .next_power_of_two();
+                    if stock < params.window {
+                        params.chain_reach = Some(stock);
+                    }
+                },
+                crate::LdmMode::Auto
+                    if params.window < LDM_FULL_WINDOW
+                        && match self.ldm_arming {
+                            LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
+                            LdmArming::FrameScreened => screened(LDM_MIDSIZE_WINDOW as u64),
+                            // The screened form, not the declared one: the unpledged
+                            // stream's engaged capture jobs (R24) carry `JobPrefix`
+                            // with no declared length — the screen that armed the
+                            // frame is the evidence, exactly the FrameScreened rule.
+                            // Every other JobPrefix site holds a declared length, so
+                            // the two predicates agree there.
+                            #[cfg(feature = "std")]
+                            LdmArming::JobPrefix => screened(LDM_MIDSIZE_WINDOW as u64),
+                            _ => false,
+                        } =>
+                {
+                    // The preserved scan domain is the stock window as a power of
+                    // two: a declared length at or past the row's window rounds it
+                    // there (`adjust_params`), and an open-length frame that armed
+                    // staged at least the screen's 4 MiB span, so the same rounding
+                    // is the length a pledged twin would have declared — without it
+                    // the Fastest row's 768 KiB domain would parse the 768 KiB-1 MiB
+                    // offset band differently than every armed pledged frame.
+                    params.chain_reach = Some(params.window.next_power_of_two());
+                    params.window = LDM_FULL_WINDOW;
+                },
+                _ => {},
             }
-        {
-            // The preserved scan domain is the stock window as a power of
-            // two: a declared length at or past the row's window rounds it
-            // there (`adjust_params`), and an open-length frame that armed
-            // staged at least the screen's 4 MiB span, so the same rounding
-            // is the length a pledged twin would have declared — without it
-            // the Fastest row's 768 KiB domain would parse the 768 KiB-1 MiB
-            // offset band differently than every armed pledged frame.
-            params.chain_reach = Some(params.window.next_power_of_two());
-            params.window = LDM_FULL_WINDOW;
         }
         // The reach change alone must not re-derive anything: the tables'
         // sizes are reach-independent, and the reach flips twice per probe
@@ -1120,7 +1179,15 @@ impl MatchGeneratorDriver {
                     | Strategy::Opt(_)
                     | Strategy::BtLazy(_)
             )
-            && ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar);
+            && match self.ldm_mode {
+                // Explicit enable: armed at whatever window the source
+                // clamp left, as libzstd keeps LDM on below its auto bar
+                // once the flag is set. A Shrink verdict still withholds
+                // the far domain (the probe measured near-locality from a
+                // parse without LDM; the override does not revisit it).
+                crate::LdmMode::Enable => true,
+                _ => ldm_min_window(self.ldm_arming).is_some_and(|bar| params.window >= bar),
+            };
         let ldm_sized = self
             .ldm
             .as_ref()
@@ -2242,6 +2309,10 @@ impl Matcher for MatchGeneratorDriver {
 
     fn set_input_shape(&mut self, shape: InputShape) {
         self.shape = shape;
+    }
+
+    fn set_ldm_mode(&mut self, mode: crate::LdmMode) {
+        self.ldm_mode = mode;
     }
 
     /// Start accumulating a reach-probe cost off this driver's real parses

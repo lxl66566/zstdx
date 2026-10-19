@@ -1017,3 +1017,222 @@ fn prepared_dict_corruption_smoke() {
         compat::bulk::Decompressor::with_prepared_dictionary(&empty_dec_dict).unwrap();
     assert_eq!(decoder.decompress(&one, 0).unwrap(), b"x");
 }
+
+/// `include_dictid` across the compat surface: the flag lands in the
+/// frame header (no Dictionary_ID), the dictionary still applies, and the
+/// zstd crate's own suppressed frames decode through the compat layer.
+/// (R55)
+#[test]
+fn include_dictid_parity() {
+    let samples: Vec<Vec<u8>> = (0..96u32)
+        .map(|i| {
+            format!(
+                "{{\"user\":\"user_{i}\",\"event\":\"click\",\"score\":{},\"tags\":[\"a\",\"b\"\
+                 ]}}\n",
+                i % 7
+            )
+            .into_bytes()
+        })
+        .collect();
+    let Ok(dict) = zstd::dict::from_samples(&samples, 8 * 1024) else {
+        return;
+    };
+    let content = b"{\"user\":\"user_5\",\"event\":\"click\",\"score\":3,\"tags\":[\"a\",\"b\"]}\n"
+        .repeat(96);
+
+    // write-side stream encoder: parameter before the first write
+    let mut encoder =
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &dict).unwrap();
+    encoder.include_dictid(false).unwrap();
+    encoder.write_all(&content).unwrap();
+    let bare = encoder.finish().unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&bare), None);
+    // the setter refuses once streaming started
+    let mut encoder =
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &dict).unwrap();
+    encoder.write_all(&content).unwrap();
+    assert!(encoder.include_dictid(false).is_err());
+
+    // read-side stream encoder
+    let mut rencoder =
+        compat::stream::read::Encoder::with_dictionary(content.as_slice(), 3, &dict).unwrap();
+    rencoder.include_dictid(false).unwrap();
+    let mut rbare = Vec::new();
+    rencoder.read_to_end(&mut rbare).unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&rbare), None);
+
+    // bulk compressor: the flag survives a dictionary re-register
+    let mut compressor = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    compressor.include_dictid(false).unwrap();
+    compressor.set_dictionary(5, &dict).unwrap();
+    let cbare = compressor.compress(&content).unwrap();
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&cbare), None);
+
+    // every suppressed frame still needs the dictionary to decode, and
+    // decodes through the compat layer with it
+    for frame in [&bare, &rbare, &cbare] {
+        let mut decoder =
+            compat::stream::read::Decoder::with_dictionary(frame.as_slice(), &dict).unwrap();
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+        assert_eq!(out, content);
+    }
+
+    // libzstd's suppressed frames decode through the compat layer
+    let mut zenc = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    zenc.include_dictid(false).unwrap();
+    let zbare = zenc.compress(&content).unwrap();
+    let mut decoder =
+        compat::stream::read::Decoder::with_dictionary(zbare.as_slice(), &dict).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+}
+
+/// `long_distance_matching` across the compat surface (R55): the upstream
+/// bool maps true to force-enable (with libzstd's window-27 default when
+/// no window was set) and false back to auto — it cannot express an
+/// explicit disable. Both engines' frames decode on either side.
+#[test]
+fn long_distance_matching_parity() {
+    use std::io::Read as _;
+
+    // 4 MiB of a 1 MiB tile: repeats beyond the stock fast window.
+    let tile: Vec<u8> = {
+        let mut tile = vec![0u8; 1 << 20];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &mut tile {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 33) as u8;
+        }
+        tile
+    };
+    let mut data = tile.clone();
+    data.extend_from_slice(&tile);
+    data.extend_from_slice(&tile);
+    data.extend_from_slice(&tile);
+
+    // write-side stream encoder: enable before the first write
+    let mut encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.long_distance_matching(true).unwrap();
+    encoder.write_all(&data).unwrap();
+    let enabled = encoder.finish().unwrap();
+    // false restores the auto default: byte-identical to a fresh encoder
+    let mut auto_encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    auto_encoder.write_all(&data).unwrap();
+    let auto = auto_encoder.finish().unwrap();
+    let mut off_encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    off_encoder.long_distance_matching(true).unwrap();
+    off_encoder.long_distance_matching(false).unwrap();
+    off_encoder.write_all(&data).unwrap();
+    assert_eq!(off_encoder.finish().unwrap(), auto);
+    assert!(enabled.len() < auto.len());
+    // the parameter refuses once streaming started
+    let mut started = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    started.write_all(&data).unwrap();
+    assert!(started.long_distance_matching(true).is_err());
+
+    // read-side stream encoder and the bulk compressor agree with it
+    let mut rencoder = compat::stream::read::Encoder::new(data.as_slice(), 1).unwrap();
+    rencoder.long_distance_matching(true).unwrap();
+    let mut renabled = Vec::new();
+    rencoder.read_to_end(&mut renabled).unwrap();
+    assert_eq!(renabled, enabled);
+    let mut compressor = compat::bulk::Compressor::new(1).unwrap();
+    compressor.long_distance_matching(true).unwrap();
+    // The bulk compressor pledges the content size (its frames carry the
+    // field; the unpledged stream frames above do not), so the equality
+    // target is the pledged zstdx entry with the same switch, not the
+    // stream frame.
+    let pledged = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Enable)
+            .pledged_size(Some(data.len() as u64)),
+    )
+    .unwrap();
+    assert_eq!(compressor.compress(&data).unwrap(), pledged);
+    assert_eq!(crate::bulk::decompress(&pledged, data.len()).unwrap(), data);
+
+    // both engines decode both engines' frames
+    assert_eq!(
+        compat::stream::decode_all(enabled.as_slice()).unwrap(),
+        data
+    );
+    let mut zenc = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    zenc.long_distance_matching(true).unwrap();
+    zenc.write_all(&data).unwrap();
+    let zenabled = zenc.finish().unwrap();
+    assert!(zenabled.len() < auto.len(), "libzstd LDM must engage too");
+    let mut zauto = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    zauto.write_all(&data).unwrap();
+    let zauto_frame = zauto.finish().unwrap();
+    assert_eq!(
+        compat::stream::decode_all(zauto_frame.as_slice()).unwrap(),
+        data
+    );
+    assert_eq!(
+        zstd::stream::decode_all(enabled.as_slice()).unwrap(),
+        data,
+        "libzstd decodes the compat layer's LDM-enabled frame"
+    );
+}
+
+/// `with_ref_prefix` across the compat surface (R55): the prefix is raw
+/// content history on both sides — the engine's raw-dictionary load — so
+/// a prefixed frame carries no dictionary id, decodes only with the
+/// prefix, and interops with libzstd's refPrefix in both directions.
+#[test]
+fn ref_prefix_parity() {
+    use std::io::Read as _;
+
+    // A prefix of records and a payload sharing its head records.
+    let records = |from: usize, to: usize| -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in from..to {
+            out.extend_from_slice(
+                format!("record-{i:05}: frame match distance window\n").as_bytes(),
+            );
+        }
+        out
+    };
+    let prefix = records(0, 4096);
+    let content = records(0, 8192);
+
+    // encode with the prefix: smaller than without it (the shared head is
+    // history), and the frame header carries no dictionary id.
+    let mut encoder =
+        compat::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, &prefix).unwrap();
+    encoder.write_all(&content).unwrap();
+    let prefixed = encoder.finish().unwrap();
+    let mut plain = compat::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    plain.write_all(&content).unwrap();
+    let unprefixed = plain.finish().unwrap();
+    assert!(prefixed.len() < unprefixed.len());
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&prefixed), None);
+
+    // decode through the compat layer's own ref-prefix decoder
+    let mut decoder =
+        compat::stream::read::Decoder::with_ref_prefix(prefixed.as_slice(), &prefix).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+
+    // interop: libzstd's refPrefix entries both ways
+    let mut zdec =
+        zstd::stream::read::Decoder::with_ref_prefix(prefixed.as_slice(), &prefix).unwrap();
+    let mut zout = Vec::new();
+    zdec.read_to_end(&mut zout).unwrap();
+    assert_eq!(zout, content);
+    let mut zenc = zstd::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, &prefix).unwrap();
+    zenc.write_all(&content).unwrap();
+    let zprefixed = zenc.finish().unwrap();
+    assert!(zprefixed.len() < unprefixed.len());
+    let mut decoder =
+        compat::stream::read::Decoder::with_ref_prefix(zprefixed.as_slice(), &prefix).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+}

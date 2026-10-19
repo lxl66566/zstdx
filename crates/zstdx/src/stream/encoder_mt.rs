@@ -937,7 +937,11 @@ impl MtEncoderCore {
         // stream must keep growing its jobs like any open-ended one.
         let shape = crate::InputShape {
             len: options.pledged_size.or(options.input_shape.len),
-            window_log: options.input_shape.window_log,
+            // The LDM switch's window interplay: an explicit enable with
+            // no forced window raises it to 27 (libzstd's
+            // ZSTD_LDM_DEFAULT_WINDOW_LOG); the per-job LDM arming below
+            // stays on the job model (see the compat deviations).
+            window_log: options.ldm_window_log(),
         };
         let window = Self::header_window(options.level, shape, dict.as_deref());
         // The job history rides the level's stream overlap rule (see
@@ -1010,7 +1014,12 @@ impl MtEncoderCore {
             frame_content_size: options.pledged_size,
             single_segment: false,
             content_checksum: checksum,
-            dictionary_id: dict.as_ref().and_then(|d| d.header_id()),
+            // libzstd's dictIDFlag: the dictionary still seeds job zero,
+            // only the header field is suppressed.
+            dictionary_id: options
+                .include_dictid
+                .then(|| dict.as_ref().and_then(|d| d.header_id()))
+                .flatten(),
             window_size: Some(window),
         };
         let mut serialized = Vec::with_capacity(18);

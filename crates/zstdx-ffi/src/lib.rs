@@ -142,8 +142,10 @@ pub struct ZSTD_outBuffer {
 pub enum ZSTD_cParameter {
     CompressionLevel = 100,
     WindowLog = 101,
+    EnableLongDistanceMatching = 160,
     ContentSizeFlag = 200,
     ChecksumFlag = 201,
+    DictIDFlag = 202,
     NbWorkers = 400,
 }
 
@@ -152,8 +154,10 @@ impl ZSTD_cParameter {
         match raw {
             100 => Some(Self::CompressionLevel),
             101 => Some(Self::WindowLog),
+            160 => Some(Self::EnableLongDistanceMatching),
             200 => Some(Self::ContentSizeFlag),
             201 => Some(Self::ChecksumFlag),
+            202 => Some(Self::DictIDFlag),
             400 => Some(Self::NbWorkers),
             _ => None,
         }

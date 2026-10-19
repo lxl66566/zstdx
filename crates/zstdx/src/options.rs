@@ -49,6 +49,33 @@ impl InputShape {
     }
 }
 
+/// Explicit long-distance-matching switch, libzstd's
+/// `ZSTD_c_enableLongDistanceMatching` tri-state. `Auto` keeps this
+/// engine's per-row arming (window thresholds plus the far-class
+/// screens); `Enable` forces the gear-hash long-distance candidate
+/// source on at whatever window the source clamp left, `Disable` forces
+/// it off.
+///
+/// `Enable` interacts with the window exactly as libzstd: with no forced
+/// [`window_log`][InputShape::window_log] it raises the window to 27
+/// (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before the source-length clamp; a
+/// forced window log wins.
+///
+/// ```rust
+/// use zstdx::{EncoderOptions, LdmMode, Level};
+/// let opts = EncoderOptions::new(Level::Fast).long_distance_matching(LdmMode::Enable);
+/// ```
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub enum LdmMode {
+    /// Per-row auto arming: the engine's window thresholds and screens.
+    #[default]
+    Auto,
+    /// LDM on regardless of the thresholds.
+    Enable,
+    /// LDM off regardless of the thresholds.
+    Disable,
+}
+
 /// Parameters of an encoder, applied when the encoder is constructed.
 ///
 /// The default matches the crate's one-shot paths: checksum on (when the
@@ -57,6 +84,11 @@ impl InputShape {
 pub struct EncoderOptions {
     pub(crate) level: Level,
     pub(crate) checksum: bool,
+    /// libzstd's `ZSTD_c_dictIDFlag`: stamp the dictionary id into the
+    /// frame header (see [`Self::include_dictid`]).
+    pub(crate) include_dictid: bool,
+    /// Explicit LDM switch (see [`LdmMode`], [`Self::long_distance_matching`]).
+    pub(crate) long_distance_matching: LdmMode,
     pub(crate) pledged_size: Option<u64>,
     pub(crate) workers: u32,
     pub(crate) input_shape: InputShape,
@@ -75,6 +107,8 @@ impl EncoderOptions {
         Self {
             level,
             checksum: cfg!(feature = "hash"),
+            include_dictid: true,
+            long_distance_matching: LdmMode::Auto,
             pledged_size: None,
             workers: 0,
             input_shape: InputShape {
@@ -120,6 +154,27 @@ impl EncoderOptions {
         self
     }
 
+    /// Declare the dictionary id in the frame header (default: on).
+    /// Turning it off keeps the dictionary fully in effect — content as
+    /// match history, entropy tables, repcodes — but omits the
+    /// Dictionary_ID field (libzstd's `ZSTD_c_dictIDFlag = 0`): decoders
+    /// then need the dictionary passed explicitly, and decoding with a
+    /// wrong one is undefined. Without a dictionary the flag changes
+    /// nothing.
+    pub const fn include_dictid(mut self, include: bool) -> Self {
+        self.include_dictid = include;
+        self
+    }
+
+    /// Explicit long-distance-matching override (default
+    /// [`LdmMode::Auto`], the per-row window-threshold arming). See
+    /// [`LdmMode`] for the semantics and the window interplay under
+    /// `Enable`.
+    pub const fn long_distance_matching(mut self, mode: LdmMode) -> Self {
+        self.long_distance_matching = mode;
+        self
+    }
+
     /// Pledge the total input size so it can be written into the frame
     /// header, letting decoders preallocate exactly. The pledge is a hard
     /// contract: finishing a stream that wrote a different byte count fails
@@ -128,6 +183,18 @@ impl EncoderOptions {
     pub const fn pledged_size(mut self, size: Option<u64>) -> Self {
         self.pledged_size = size;
         self
+    }
+
+    /// The effective window log: a forced
+    /// [`window_log`][InputShape::window_log] wins; an explicit LDM enable
+    /// with none raises it to 27 (libzstd's `ZSTD_LDM_DEFAULT_WINDOW_LOG`)
+    /// ahead of the source-length clamp, so the far candidates have a
+    /// window to land in.
+    pub(crate) fn ldm_window_log(&self) -> Option<u32> {
+        match (self.long_distance_matching, self.input_shape.window_log) {
+            (LdmMode::Enable, None) => Some(27),
+            (_, log) => log,
+        }
     }
 
     /// Number of worker threads for compression. `0` (the default) compresses
