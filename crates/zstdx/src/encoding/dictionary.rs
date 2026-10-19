@@ -122,6 +122,19 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
     level: Level,
     shape: InputShape,
 ) {
+    reset_with_dictionary_mode(state, dict, level, shape, crate::LdmMode::Auto);
+}
+
+/// [`reset_with_dictionary`] with the frame's explicit LDM switch declared
+/// before the reset (the reset's size gate reads it).
+pub(crate) fn reset_with_dictionary_mode<M: crate::encoding::Matcher>(
+    state: &mut CompressState<M>,
+    dict: &EncDictionary,
+    level: Level,
+    shape: InputShape,
+    ldm: crate::LdmMode,
+) {
+    state.matcher.set_ldm_mode(ldm);
     state.matcher.set_input_shape(shape);
     state.matcher.reset(level);
     state

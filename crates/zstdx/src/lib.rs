@@ -71,7 +71,7 @@ pub use encoding::EncoderDictionary;
 pub use encoding::set_mt_ramp_depth_for_tests;
 pub use error::{Error, Feature, ParameterError, Result};
 pub use level::Level;
-pub use options::{DecoderOptions, EncoderOptions, InputShape};
+pub use options::{DecoderOptions, EncoderOptions, InputShape, LdmMode};
 
 pub(crate) mod blocks;
 

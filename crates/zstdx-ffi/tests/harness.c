@@ -133,6 +133,7 @@ static void test_contexts(void) {
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1) == 1, "checksum param");
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 1) == 1, "dictID param");
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 0) == 0, "dictID off");
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1) == 1, "ldm param");
     CHECK(ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 2)) ||
           ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 2) == 2, "workers param");
     CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 18) == 18, "window param");

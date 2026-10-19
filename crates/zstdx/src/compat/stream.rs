@@ -177,6 +177,22 @@ pub mod write {
             Ok(())
         }
 
+        /// Enables or disables long-distance matching. `true` forces the
+        /// far-match source on and, with no [`Self::window_log`] set,
+        /// raises the window to 27 as libzstd does; `false` restores the
+        /// automatic per-level arming — the zstd crate's bool maps onto
+        /// libzstd's auto value there, not an explicit disable. Fails
+        /// once streaming started.
+        pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+            self.state.set_started()?;
+            self.state.options.long_distance_matching = if enable {
+                crate::LdmMode::Enable
+            } else {
+                crate::LdmMode::Auto
+            };
+            Ok(())
+        }
+
         /// Enables multithreaded compression: `workers > 1` engages the
         /// native multithreaded streaming core (raw-block levels and
         /// single-core processes fall back to the single-threaded core, as
@@ -557,6 +573,22 @@ pub mod read {
         pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
             self.not_started()?;
             self.options.include_dictid = include;
+            Ok(())
+        }
+
+        /// Enables or disables long-distance matching. `true` forces the
+        /// far-match source on and, with no [`Self::window_log`] set,
+        /// raises the window to 27 as libzstd does; `false` restores the
+        /// automatic per-level arming — the zstd crate's bool maps onto
+        /// libzstd's auto value there, not an explicit disable. Fails
+        /// once streaming started.
+        pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+            self.not_started()?;
+            self.options.long_distance_matching = if enable {
+                crate::LdmMode::Enable
+            } else {
+                crate::LdmMode::Auto
+            };
             Ok(())
         }
 

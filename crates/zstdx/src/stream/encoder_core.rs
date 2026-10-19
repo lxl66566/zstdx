@@ -306,11 +306,14 @@ impl FrameEncoderCoreSt {
         // stays the only hard contract — header promise, finish check,
         // single-segment form are all pledged-keyed below.
         let len = options.pledged_size.or(options.input_shape.len);
+        // The LDM switch's window interplay (see `EncoderOptions::
+        // long_distance_matching`): an explicit enable with no forced
+        // window raises it to 27 before the length clamp, as libzstd's
+        // ZSTD_LDM_DEFAULT_WINDOW_LOG.
+        let window_log = options.ldm_window_log();
+        let ldm_mode = options.long_distance_matching;
         let dict_id = if let Some(dict) = dict {
-            let mut shape = crate::InputShape {
-                len,
-                window_log: options.input_shape.window_log,
-            };
+            let mut shape = crate::InputShape { len, window_log };
             // libzstd clamps the window by src + dict — only for a known
             // content size; an open-ended stream keeps
             // CONTENTSIZE_UNKNOWN, so `ZSTD_adjustCParams_internal` skips
@@ -318,20 +321,19 @@ impl FrameEncoderCoreSt {
             // (the mt core folds the same way). Folding `unwrap_or(0)`
             // here clamped such streams to a dict-sized window.
             shape.len = len.map(|len| len + dict.content.len() as u64);
-            crate::encoding::dictionary::reset_with_dictionary(
+            crate::encoding::dictionary::reset_with_dictionary_mode(
                 &mut self.state,
                 dict,
                 options.level,
                 shape,
+                ldm_mode,
             );
             // libzstd's dictIDFlag: the dictionary stays fully in effect,
             // only the header field is suppressed.
             options.include_dictid.then(|| dict.header_id()).flatten()
         } else {
-            let shape = crate::InputShape {
-                len,
-                window_log: options.input_shape.window_log,
-            };
+            let shape = crate::InputShape { len, window_log };
+            self.state.matcher.set_ldm_mode(ldm_mode);
             self.state.matcher.set_input_shape(shape);
             self.state.matcher.reset(options.level);
             self.state.dict_entropy.cost_mode =
@@ -348,15 +350,9 @@ impl FrameEncoderCoreSt {
         // the evidence) both stage here; a stream ending or flushing below
         // the screen's span cancels it back to stock in write/finish.
         let probe_pending = dict.is_none()
-            && reach_probe::eligible(options.level, crate::InputShape {
-                len,
-                window_log: options.input_shape.window_log,
-            });
+            && reach_probe::eligible(options.level, crate::InputShape { len, window_log });
         let screen_pending = dict.is_none()
-            && fast_row_screen_pending(options.level, crate::InputShape {
-                len,
-                window_log: options.input_shape.window_log,
-            });
+            && fast_row_screen_pending(options.level, crate::InputShape { len, window_log });
         // libzstd's frame-header shape: a pledged size the window already
         // covers drops the window descriptor for the single-segment form
         // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=

@@ -134,7 +134,10 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
 /// `shape` carries what the caller declared about the input (length,
 /// forced window; see [`Matcher::set_input_shape`]); `ldm` is the driver's
 /// LDM arming context (frame-continuous callers pass [`LdmArming::Frame`],
-/// multithreaded jobs [`LdmArming::Job`]).
+/// multithreaded jobs [`LdmArming::Job`]). The explicit LDM switch resets
+/// to [`crate::LdmMode::Auto`] here — every state take (the mt jobs'
+/// included) passes through, so pooled drivers carry no residue from a
+/// single-threaded frame that set one.
 pub(crate) fn reset_slice_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     level: Level,
@@ -142,6 +145,20 @@ pub(crate) fn reset_slice_state(
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
 ) {
+    reset_slice_state_mode(state, level, shape, choice, ldm, crate::LdmMode::Auto);
+}
+
+/// [`reset_slice_state`] with the frame's explicit LDM switch: declared
+/// ahead of the reset, whose size gate reads it.
+pub(crate) fn reset_slice_state_mode(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
+    mode: crate::LdmMode,
+) {
+    state.matcher.set_ldm_mode(mode);
     state.matcher.set_input_shape(shape);
     state.matcher.set_reach_choice(choice);
     state.matcher.set_ldm_arming(ldm);
@@ -236,19 +253,32 @@ pub(crate) fn return_pooled_slice_state(
 
 /// Take the per-thread pooled slice state, reset for a fresh frame at
 /// `level`. Fresh states are built (and reset) when the pool is empty.
+#[cfg(feature = "std")]
 pub(crate) fn take_slice_state(
     level: Level,
     shape: crate::InputShape,
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
 ) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    take_slice_state_ldm(level, shape, choice, ldm, crate::LdmMode::Auto)
+}
+
+/// [`take_slice_state`] with the frame's explicit LDM switch applied ahead
+/// of the reset (the stock take clears it to Auto).
+pub(crate) fn take_slice_state_ldm(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    ldm: LdmArming,
+    mode: crate::LdmMode,
+) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
     #[cfg(feature = "std")]
     if let Some(mut s) = SLICE_STATE.with(|p| p.borrow_mut().take()) {
-        reset_slice_state(&mut s, level, shape, choice, ldm);
+        reset_slice_state_mode(&mut s, level, shape, choice, ldm, mode);
         return s;
     }
     let mut fresh = alloc::boxed::Box::new(new_slice_state());
-    reset_slice_state(&mut fresh, level, shape, choice, ldm);
+    reset_slice_state_mode(&mut fresh, level, shape, choice, ldm, mode);
     fresh
 }
 
@@ -288,7 +318,7 @@ pub fn compress_slice_shaped(
     checksum: bool,
     shape: crate::InputShape,
 ) -> Vec<u8> {
-    compress_slice_shaped_declared(src, level, checksum, shape, None)
+    compress_slice_shaped_ldm(src, level, checksum, shape, crate::LdmMode::Auto, None)
 }
 
 /// [`compress_slice_shaped`] with the frame content size `declared` in the
@@ -297,11 +327,26 @@ pub fn compress_slice_shaped(
 /// size, the windowed form (dictionary frames, sizes past the window)
 /// otherwise — so a stream pledged to the same size and this entry produce
 /// byte-identical frames. `None` leaves the header undeclaring.
+#[cfg(feature = "std")]
 pub(crate) fn compress_slice_shaped_declared(
     src: &[u8],
     level: Level,
     checksum: bool,
     shape: crate::InputShape,
+    declared: Option<u64>,
+) -> Vec<u8> {
+    compress_slice_shaped_ldm(src, level, checksum, shape, crate::LdmMode::Auto, declared)
+}
+
+/// [`compress_slice_shaped_declared`] with the frame's explicit LDM
+/// switch (see [`crate::LdmMode`]); the resets below read it at their
+/// size gates.
+pub(crate) fn compress_slice_shaped_ldm(
+    src: &[u8],
+    level: Level,
+    checksum: bool,
+    shape: crate::InputShape,
+    ldm_mode: crate::LdmMode,
     declared: Option<u64>,
 ) -> Vec<u8> {
     let mut shape = shape;
@@ -321,14 +366,15 @@ pub(crate) fn compress_slice_shaped_declared(
         // The probe's keep side donates: the first span blocks run as the
         // frame's own blocks through the full pipeline, and only a Shrink
         // verdict restarts the frame (see `compress_with_state_donated`).
-        let mut state = take_slice_state(level, shape, reach_probe::ReachChoice::Keep, ldm);
+        let mut state =
+            take_slice_state_ldm(level, shape, reach_probe::ReachChoice::Keep, ldm, ldm_mode);
         let output = compress_with_state_donated(&mut state, src, level, checksum, shape, declared);
         return_slice_state(state);
         return output;
     }
     // The frame's head decides its chain reach (see reach_probe).
     let choice = reach_probe::probe_reach_choice(src, level, shape);
-    let mut state = take_slice_state(level, shape, choice, ldm);
+    let mut state = take_slice_state_ldm(level, shape, choice, ldm, ldm_mode);
     let output = compress_with_state(&mut state, src, level, checksum, declared);
     return_slice_state(state);
     output
@@ -670,6 +716,7 @@ pub(crate) fn compress_dict_span_blocks(
 /// content as match history, its entropy tables seeding the first blocks,
 /// its id in the header. Runs single-threaded through the owned-window
 /// matcher.
+#[cfg(feature = "std")]
 pub(crate) fn compress_slice_with_dictionary(
     src: &[u8],
     level: Level,
@@ -686,6 +733,7 @@ pub(crate) fn compress_slice_with_dictionary(
         dict,
         declared,
         dict.header_id(),
+        crate::LdmMode::Auto,
     )
 }
 
@@ -700,12 +748,13 @@ pub(crate) fn compress_slice_with_dictionary_id(
     dict: &super::dictionary::EncDictionary,
     declared: Option<u64>,
     dict_id: Option<u32>,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut shape = shape;
     let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
     shape.len = Some(len);
     let mut state = new_owned_state();
-    super::dictionary::reset_with_dictionary(&mut state, dict, level, shape);
+    super::dictionary::reset_with_dictionary_mode(&mut state, dict, level, shape, ldm_mode);
     compress_with_state_dictionary(&mut state, src, dict_id, checksum, declared)
 }
 

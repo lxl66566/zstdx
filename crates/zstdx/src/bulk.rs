@@ -77,6 +77,13 @@ pub fn compress_with(
         // demotion like the small-input one, recorded in the compat
         // deviations).
         let dict_id = options.include_dictid.then(|| dict.header_id()).flatten();
+        // The LDM switch's window interplay (libzstd's
+        // ZSTD_LDM_DEFAULT_WINDOW_LOG): the multithreaded path consumes
+        // the raised window through its own forced-window plumbing; its
+        // per-job LDM arming follows the job model (see the compat
+        // deviations), so only the window half of an explicit switch
+        // reaches it.
+        let window_log = options.ldm_window_log();
         #[cfg(feature = "std")]
         if options.workers > 1 && options.include_dictid {
             return Ok(crate::encoding::mt::compress_slice_mt(
@@ -84,7 +91,7 @@ pub fn compress_with(
                 options.level,
                 options.checksum,
                 options.workers,
-                options.input_shape.window_log,
+                window_log,
                 declared,
                 Some(dict),
             ));
@@ -95,11 +102,12 @@ pub fn compress_with(
             options.checksum,
             crate::InputShape {
                 len: Some(source.len() as u64),
-                window_log: options.input_shape.window_log,
+                window_log,
             },
             dict,
             declared,
             dict_id,
+            options.long_distance_matching,
         ));
     }
     #[cfg(feature = "std")]
@@ -109,19 +117,20 @@ pub fn compress_with(
             options.level,
             options.checksum,
             options.workers,
-            options.input_shape.window_log,
+            options.ldm_window_log(),
             declared,
             None,
         ));
     }
-    Ok(crate::encoding::compress_slice_shaped_declared(
+    Ok(crate::encoding::compress_slice_shaped_ldm(
         source,
         options.level,
         options.checksum,
         crate::InputShape {
             len: None,
-            window_log: options.input_shape.window_log,
+            window_log: options.ldm_window_log(),
         },
+        options.long_distance_matching,
         declared,
     ))
 }

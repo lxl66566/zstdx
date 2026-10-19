@@ -912,7 +912,11 @@ impl MtEncoderCore {
         // stream must keep growing its jobs like any open-ended one.
         let shape = crate::InputShape {
             len: options.pledged_size.or(options.input_shape.len),
-            window_log: options.input_shape.window_log,
+            // The LDM switch's window interplay: an explicit enable with
+            // no forced window raises it to 27 (libzstd's
+            // ZSTD_LDM_DEFAULT_WINDOW_LOG); the per-job LDM arming below
+            // stays on the job model (see the compat deviations).
+            window_log: options.ldm_window_log(),
         };
         // libzstd clamps the dictionary window by payload + dict content
         // (the ST dictionary entries do the same fold); the jobs' own

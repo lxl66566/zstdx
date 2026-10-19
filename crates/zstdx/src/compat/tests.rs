@@ -989,3 +989,94 @@ fn include_dictid_parity() {
     decoder.read_to_end(&mut out).unwrap();
     assert_eq!(out, content);
 }
+
+/// `long_distance_matching` across the compat surface (R55): the upstream
+/// bool maps true to force-enable (with libzstd's window-27 default when
+/// no window was set) and false back to auto — it cannot express an
+/// explicit disable. Both engines' frames decode on either side.
+#[test]
+fn long_distance_matching_parity() {
+    use std::io::Read as _;
+
+    // 4 MiB of a 1 MiB tile: repeats beyond the stock fast window.
+    let tile: Vec<u8> = {
+        let mut tile = vec![0u8; 1 << 20];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &mut tile {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 33) as u8;
+        }
+        tile
+    };
+    let mut data = tile.clone();
+    data.extend_from_slice(&tile);
+    data.extend_from_slice(&tile);
+    data.extend_from_slice(&tile);
+
+    // write-side stream encoder: enable before the first write
+    let mut encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.long_distance_matching(true).unwrap();
+    encoder.write_all(&data).unwrap();
+    let enabled = encoder.finish().unwrap();
+    // false restores the auto default: byte-identical to a fresh encoder
+    let mut auto_encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    auto_encoder.write_all(&data).unwrap();
+    let auto = auto_encoder.finish().unwrap();
+    let mut off_encoder = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    off_encoder.long_distance_matching(true).unwrap();
+    off_encoder.long_distance_matching(false).unwrap();
+    off_encoder.write_all(&data).unwrap();
+    assert_eq!(off_encoder.finish().unwrap(), auto);
+    assert!(enabled.len() < auto.len());
+    // the parameter refuses once streaming started
+    let mut started = compat::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    started.write_all(&data).unwrap();
+    assert!(started.long_distance_matching(true).is_err());
+
+    // read-side stream encoder and the bulk compressor agree with it
+    let mut rencoder = compat::stream::read::Encoder::new(data.as_slice(), 1).unwrap();
+    rencoder.long_distance_matching(true).unwrap();
+    let mut renabled = Vec::new();
+    rencoder.read_to_end(&mut renabled).unwrap();
+    assert_eq!(renabled, enabled);
+    let mut compressor = compat::bulk::Compressor::new(1).unwrap();
+    compressor.long_distance_matching(true).unwrap();
+    // The bulk compressor pledges the content size (its frames carry the
+    // field; the unpledged stream frames above do not), so the equality
+    // target is the pledged zstdx entry with the same switch, not the
+    // stream frame.
+    let pledged = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Enable)
+            .pledged_size(Some(data.len() as u64)),
+    )
+    .unwrap();
+    assert_eq!(compressor.compress(&data).unwrap(), pledged);
+    assert_eq!(crate::bulk::decompress(&pledged, data.len()).unwrap(), data);
+
+    // both engines decode both engines' frames
+    assert_eq!(
+        compat::stream::decode_all(enabled.as_slice()).unwrap(),
+        data
+    );
+    let mut zenc = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    zenc.long_distance_matching(true).unwrap();
+    zenc.write_all(&data).unwrap();
+    let zenabled = zenc.finish().unwrap();
+    assert!(zenabled.len() < auto.len(), "libzstd LDM must engage too");
+    let mut zauto = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    zauto.write_all(&data).unwrap();
+    let zauto_frame = zauto.finish().unwrap();
+    assert_eq!(
+        compat::stream::decode_all(zauto_frame.as_slice()).unwrap(),
+        data
+    );
+    assert_eq!(
+        zstd::stream::decode_all(enabled.as_slice()).unwrap(),
+        data,
+        "libzstd decodes the compat layer's LDM-enabled frame"
+    );
+}

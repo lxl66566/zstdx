@@ -977,6 +977,175 @@ fn include_dictid_suppresses_the_header_field() {
     assert_eq!(mt_roundtrip, content);
 }
 
+/// A far-class tile (R55): a seeded 2 MiB stream of records — a short
+/// word plus the generator's raw 8 bytes. The words keep every block
+/// parsing (raw blocks never reach the LDM indexer below the full
+/// window), the raw bytes keep the alphabet past the mid-size gate's
+/// [`LDM_SYMS_MIN`](crate::encoding) floor, and the sequence is globally
+/// unique, so the only beyond-window matches are the tile copies.
+#[cfg(test)]
+fn ldm_text_tile() -> Vec<u8> {
+    const WORDS: [&[u8]; 12] = [
+        b"frame",
+        b"match",
+        b"distance",
+        b"window",
+        b"encode",
+        b"stream",
+        b"prefix",
+        b"check",
+        b"level",
+        b"table",
+        b"block",
+        b"hash",
+    ];
+    let mut tile = Vec::with_capacity(2 << 20);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    while tile.len() < 2 << 20 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        tile.extend_from_slice(WORDS[(state >> 33) as usize % WORDS.len()]);
+        tile.extend_from_slice(&state.to_le_bytes());
+        tile.push(b' ');
+    }
+    tile
+}
+
+/// `EncoderOptions::long_distance_matching` (R55): `Enable` forces the
+/// far-match source on below every auto bar and raises the window to 27
+/// when none is forced (a forced window wins), `Disable` forces it off,
+/// and `Auto` (the default) leaves every default frame byte-identical.
+#[test]
+fn long_distance_matching_override() {
+    // 6 MiB of a 2 MiB text tile: repeats sit at 2-4 MiB distances, past
+    // the Fastest row's 1 MiB stock window and inside the raised one.
+    let tile = ldm_text_tile();
+    let mut data = tile.clone();
+    data.extend_from_slice(&tile);
+    data.extend_from_slice(&tile);
+
+    let auto =
+        crate::bulk::compress_with(&data, &crate::EncoderOptions::new(crate::Level::Fastest))
+            .unwrap();
+    let enabled = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Enable),
+    )
+    .unwrap();
+    // The far repeats are unreachable at the stock window and land in the
+    // raised one: strictly smaller, different bytes, same content back.
+    assert!(
+        enabled.len() < auto.len(),
+        "enable must reach the far repeats ({} vs {})",
+        enabled.len(),
+        auto.len()
+    );
+    assert_ne!(enabled, auto);
+    assert_eq!(crate::bulk::decompress(&enabled, data.len()).unwrap(), data);
+    // libzstd decodes the frame (plain interop: the wire form is ordinary)
+    assert_eq!(
+        zstd::decode_all(enabled.as_slice()).unwrap(),
+        data,
+        "libzstd decodes the LDM-enabled frame"
+    );
+    // The raised window lands in the header: the source clamp leaves 2^23.
+    let (header, _) = crate::decoding::frame::read_frame_header(&*enabled).unwrap();
+    assert_eq!(header.window_size().unwrap(), 1 << 23);
+
+    // A forced window wins over the enable default: the header carries
+    // 2^18, and at that window the far repeats stay out of reach (the
+    // frame still roundtrips — the override never breaks the form).
+    let forced = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Enable)
+            .with_input_shape(crate::InputShape::default().with_window_log(18)),
+    )
+    .unwrap();
+    let (forced_header, _) = crate::decoding::frame::read_frame_header(&*forced).unwrap();
+    assert_eq!(forced_header.window_size().unwrap(), 1 << 18);
+    assert_eq!(crate::bulk::decompress(&forced, data.len()).unwrap(), data);
+
+    // Disable where auto is disarmed anyway (6 MiB is far under the 64 MiB
+    // auto bar): byte-identical to the default — the override never arms
+    // anything on its own.
+    let disabled = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Disable),
+    )
+    .unwrap();
+    assert_eq!(disabled, auto);
+
+    // Streaming core: the same override engages there too. The frame
+    // shape differs from the pledged bulk one (no content size, the
+    // unclamped 2^27 window), so the evidence is its own auto twin.
+    let stream = |mode: crate::LdmMode| {
+        use std::io::Write as _;
+        let mut encoder = crate::stream::write::Encoder::with_options(
+            Vec::new(),
+            crate::EncoderOptions::new(crate::Level::Fastest).long_distance_matching(mode),
+        )
+        .unwrap();
+        encoder.write_all(&data).unwrap();
+        encoder.finish().unwrap()
+    };
+    let stream_enabled = stream(crate::LdmMode::Enable);
+    let stream_auto = stream(crate::LdmMode::Auto);
+    assert!(stream_enabled.len() < stream_auto.len());
+    assert_eq!(
+        crate::stream::decode_all(stream_enabled.as_slice()).unwrap(),
+        data
+    );
+}
+
+/// The Disable override where the auto policy arms: a 64 MiB far-class
+/// source (the Frame arming bar), whose fast row auto-arms on geometry —
+/// Disable must stand the split pass down and keep the stock window.
+#[test]
+fn long_distance_matching_disable_overrides_auto_arming() {
+    // Exactly 2^26: the Frame bar is `declared >= LDM_FULL_WINDOW`, and
+    // the stock window the clamp leaves (1 MiB) sits far below it.
+    let tile = ldm_text_tile();
+    let mut data = Vec::with_capacity(64 << 20);
+    for _ in 0..32 {
+        data.extend_from_slice(&tile);
+    }
+
+    let auto =
+        crate::bulk::compress_with(&data, &crate::EncoderOptions::new(crate::Level::Fastest))
+            .unwrap();
+    let disabled = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::Fastest)
+            .long_distance_matching(crate::LdmMode::Disable),
+    )
+    .unwrap();
+    assert_ne!(disabled, auto, "auto arms on this far-class source");
+    assert!(
+        disabled.len() > auto.len(),
+        "the disarmed parse cannot reach the far repeats ({} vs {})",
+        disabled.len(),
+        auto.len()
+    );
+    // The disarmed frame keeps the stock window; the auto one widened.
+    let (auto_header, _) = crate::decoding::frame::read_frame_header(&*auto).unwrap();
+    let (off_header, _) = crate::decoding::frame::read_frame_header(&*disabled).unwrap();
+    assert_eq!(auto_header.window_size().unwrap(), 1 << 26);
+    assert_eq!(off_header.window_size().unwrap(), 1 << 20);
+    assert_eq!(
+        crate::bulk::decompress(&disabled, data.len()).unwrap(),
+        data
+    );
+    assert_eq!(
+        crate::bulk::decompress(&auto, data.len()).unwrap(),
+        data,
+        "the auto-armed far frame stays legal"
+    );
+}
+
 pub mod bit_reader;
 pub mod block_output_cap;
 pub mod decode_corpus;

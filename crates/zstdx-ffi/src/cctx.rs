@@ -41,6 +41,9 @@ pub struct Settings {
     pub workers: u32,
     /// ZSTD_c_dictIDFlag (libzstd default: on).
     pub dict_id_flag: bool,
+    /// ZSTD_c_enableLongDistanceMatching: 0 auto / 1 enable / 2 disable,
+    /// libzstd's `ZSTD_ParamSwitch_e` (default: auto).
+    pub ldm: zstdx::LdmMode,
 }
 
 impl Default for Settings {
@@ -54,6 +57,7 @@ impl Default for Settings {
             content_size: true,
             workers: 0,
             dict_id_flag: true,
+            ldm: zstdx::LdmMode::Auto,
         }
     }
 }
@@ -87,6 +91,7 @@ impl Settings {
         let mut options = zstdx::EncoderOptions::new(self.level())
             .checksum(self.checksum)
             .include_dictid(self.dict_id_flag)
+            .long_distance_matching(self.ldm)
             .pledged_size(self.content_size.then_some(pledged).flatten())
             .workers(self.workers);
         if let Some(window_log) = self.window_log {
@@ -128,6 +133,20 @@ impl Settings {
                 self.window_log =
                     (value != 0).then_some(u32::try_from(value).expect("bounds checked"));
                 Ok(value.max(0) as usize)
+            },
+            ZSTD_cParameter::EnableLongDistanceMatching => {
+                // ZSTD_ParamSwitch_e: 0 auto, 1 enable, 2 disable (the
+                // reference's bounds are [ps_auto, ps_disable]); the
+                // applied enum value comes back.
+                if !(0..=2).contains(&value) {
+                    return Err(ErrorCode::ParameterOutOfBound);
+                }
+                self.ldm = match value {
+                    1 => zstdx::LdmMode::Enable,
+                    2 => zstdx::LdmMode::Disable,
+                    _ => zstdx::LdmMode::Auto,
+                };
+                Ok(value as usize)
             },
             ZSTD_cParameter::ChecksumFlag
             | ZSTD_cParameter::ContentSizeFlag

@@ -175,6 +175,9 @@ pub struct Compressor {
     /// libzstd's dictIDFlag, a context parameter that outlives dictionary
     /// changes (unlike the dictionary itself).
     include_dictid: bool,
+    /// Explicit long-distance-matching switch (the zstd crate's bool maps
+    /// true to force-enable, false to libzstd's auto value).
+    long_distance_matching: crate::LdmMode,
 }
 
 impl Compressor {
@@ -184,6 +187,7 @@ impl Compressor {
             level,
             dict: Attachment::None,
             include_dictid: true,
+            long_distance_matching: crate::LdmMode::Auto,
         })
     }
 
@@ -208,6 +212,7 @@ impl Compressor {
             level: dictionary.compression_level(),
             dict: Attachment::Prepared(dictionary.clone()),
             include_dictid: true,
+            long_distance_matching: crate::LdmMode::Auto,
         })
     }
 
@@ -258,6 +263,21 @@ impl Compressor {
         Ok(())
     }
 
+    /// Enables or disables long-distance matching. `true` forces the
+    /// far-match source on and, with no `window_log` set, raises the
+    /// window to 27 as libzstd does; `false` restores the automatic
+    /// per-level arming — the zstd crate's bool maps onto libzstd's auto
+    /// value there, not an explicit disable. Affects future compression
+    /// jobs.
+    pub fn long_distance_matching(&mut self, enable: bool) -> io::Result<()> {
+        self.long_distance_matching = if enable {
+            crate::LdmMode::Enable
+        } else {
+            crate::LdmMode::Auto
+        };
+        Ok(())
+    }
+
     /// Compresses a single block of data. The frame header declares the
     /// content size, as libzstd's one-shot compressor does.
     pub fn compress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
@@ -290,6 +310,7 @@ impl Compressor {
         };
         let mut options = crate::EncoderOptions::new(map_level(level)).pledged_size(Some(len));
         options.include_dictid = self.include_dictid;
+        options.long_distance_matching = self.long_distance_matching;
         match &self.dict {
             Attachment::None => Ok(options),
             Attachment::Raw(dict) => Ok(options.dictionary(dict)),
