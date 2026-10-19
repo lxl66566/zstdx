@@ -1080,3 +1080,60 @@ fn long_distance_matching_parity() {
         "libzstd decodes the compat layer's LDM-enabled frame"
     );
 }
+
+/// `with_ref_prefix` across the compat surface (R55): the prefix is raw
+/// content history on both sides — the engine's raw-dictionary load — so
+/// a prefixed frame carries no dictionary id, decodes only with the
+/// prefix, and interops with libzstd's refPrefix in both directions.
+#[test]
+fn ref_prefix_parity() {
+    use std::io::Read as _;
+
+    // A prefix of records and a payload sharing its head records.
+    let records = |from: usize, to: usize| -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in from..to {
+            out.extend_from_slice(
+                format!("record-{i:05}: frame match distance window\n").as_bytes(),
+            );
+        }
+        out
+    };
+    let prefix = records(0, 4096);
+    let content = records(0, 8192);
+
+    // encode with the prefix: smaller than without it (the shared head is
+    // history), and the frame header carries no dictionary id.
+    let mut encoder =
+        compat::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, &prefix).unwrap();
+    encoder.write_all(&content).unwrap();
+    let prefixed = encoder.finish().unwrap();
+    let mut plain = compat::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    plain.write_all(&content).unwrap();
+    let unprefixed = plain.finish().unwrap();
+    assert!(prefixed.len() < unprefixed.len());
+    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&prefixed), None);
+
+    // decode through the compat layer's own ref-prefix decoder
+    let mut decoder =
+        compat::stream::read::Decoder::with_ref_prefix(prefixed.as_slice(), &prefix).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+
+    // interop: libzstd's refPrefix entries both ways
+    let mut zdec =
+        zstd::stream::read::Decoder::with_ref_prefix(prefixed.as_slice(), &prefix).unwrap();
+    let mut zout = Vec::new();
+    zdec.read_to_end(&mut zout).unwrap();
+    assert_eq!(zout, content);
+    let mut zenc = zstd::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, &prefix).unwrap();
+    zenc.write_all(&content).unwrap();
+    let zprefixed = zenc.finish().unwrap();
+    assert!(zprefixed.len() < unprefixed.len());
+    let mut decoder =
+        compat::stream::read::Decoder::with_ref_prefix(zprefixed.as_slice(), &prefix).unwrap();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, content);
+}

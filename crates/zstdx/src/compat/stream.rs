@@ -121,6 +121,16 @@ pub mod write {
             Ok(Self { state })
         }
 
+        /// Creates an encoder using a reference prefix: the prefix bytes
+        /// are match history for the first frame (libzstd's
+        /// `ZSTD_c_refPrefix`, which loads the content raw — no entropy
+        /// tables, no dictionary id, format-default repcodes). The
+        /// engine's raw-dictionary path is exactly that load, so this is
+        /// the dictionary constructor under the prefix name.
+        pub fn with_ref_prefix(writer: W, level: i32, prefix: &[u8]) -> io::Result<Self> {
+            Self::with_dictionary(writer, level, prefix)
+        }
+
         /// Creates an encoder bound to an already-prepared dictionary
         /// (its parse is shared); the dictionary's level is used.
         pub fn with_prepared_dictionary(
@@ -721,6 +731,15 @@ pub mod read {
                 inner: None,
                 single_frame: false,
             })
+        }
+
+        /// Creates a new decoder using a reference prefix: the same raw
+        /// content the encoder saw (libzstd's `ZSTD_d_refPrefix` — the
+        /// bytes load as a raw-content dictionary under the null id and
+        /// serve as history for the frame, whose header carries no
+        /// dictionary id to check against).
+        pub fn with_ref_prefix(source: R, prefix: &[u8]) -> io::Result<Self> {
+            Self::with_dictionary(source, prefix)
         }
 
         /// Creates a new decoder around a `BufRead` (this porting layer
