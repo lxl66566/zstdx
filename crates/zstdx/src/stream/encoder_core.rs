@@ -136,10 +136,6 @@ pub(crate) struct FrameEncoderCoreSt {
     out_read: usize,
     blocks: u64,
     finished: bool,
-    /// Whether the core was configured from a dictionary: dict-loaded
-    /// table residue must never enter [`ST_CORE_POOL`] (see
-    /// [`FrameEncoderCoreSt::reinit`]).
-    from_dict: bool,
 }
 
 // Pooled single-threaded cores, one deep per thread (std only). A fresh
@@ -148,9 +144,11 @@ pub(crate) struct FrameEncoderCoreSt {
 // owned window, LDM state), measured at ~16K page faults against a
 // ~40 ms bulk encode of the same bytes on the bench machine; the mt
 // streaming core pools the same class of buffers for the same reason
-// (see the accumulate-buffer pool). Plain frames only: a dictionary
-// frame's re-init would have to retire table residue the bulk pools
-// never exercise, so dict cores stay one-shot.
+// (see the accumulate-buffer pool). Dictionary cores pool too: their
+// re-seeding runs through the state's single-entry seed image cache
+// (`dictionary::seed_with_cache`), so a same-dict re-arm is an exact
+// restore and any other key a full re-seed that retires the residue
+// itself (the same machinery `FrameCompressor`'s reuse runs under).
 #[cfg(feature = "std")]
 std::thread_local! {
     static ST_CORE_POOL: core::cell::RefCell<Option<alloc::boxed::Box<FrameEncoderCoreSt>>> =
@@ -196,9 +194,7 @@ impl core::ops::DerefMut for StCore {
 impl Drop for StCore {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
-        if let Some(core) = self.0.take()
-            && !core.from_dict
-        {
+        if let Some(core) = self.0.take() {
             return_pooled_st_core(core);
         }
     }
@@ -213,13 +209,11 @@ impl FrameEncoderCoreSt {
     /// dictionary.
     pub(crate) fn new_with_dictionary(
         options: &EncoderOptions,
-        dict: Option<&crate::encoding::dictionary::EncDictionary>,
+        dict: Option<&alloc::sync::Arc<crate::encoding::dictionary::EncDictionary>>,
     ) -> Self {
         #[cfg(feature = "std")]
-        if dict.is_none()
-            && let Some(mut core) = take_pooled_st_core()
-        {
-            core.reinit(options);
+        if let Some(mut core) = take_pooled_st_core() {
+            core.reinit(options, dict);
             return *core;
         }
         // Owned-window driver like FrameCompressor::new: the streaming core
@@ -233,6 +227,8 @@ impl FrameEncoderCoreSt {
                 fse_tables: FseTables::new(),
                 scratch: BlockScratch::default(),
                 split: pre_split::FrameSavings::new(),
+                #[cfg(feature = "std")]
+                seed_cache: None,
             },
             hasher: StreamChecksum::Off,
             level: options.level,
@@ -250,7 +246,6 @@ impl FrameEncoderCoreSt {
             out_read: 0,
             blocks: 0,
             finished: false,
-            from_dict: dict.is_some(),
         };
         core.configure(options, dict);
         core
@@ -263,7 +258,11 @@ impl FrameEncoderCoreSt {
     /// byte-verify arbitration, the DUBT deferred clear), the same
     /// contract the bulk pools run under.
     #[cfg(feature = "std")]
-    fn reinit(&mut self, options: &EncoderOptions) {
+    fn reinit(
+        &mut self,
+        options: &EncoderOptions,
+        dict: Option<&alloc::sync::Arc<crate::encoding::dictionary::EncDictionary>>,
+    ) {
         self.state.dict_entropy = DictEntropy::default();
         if let Some(table) = self.state.last_huff_table.take() {
             table.recycle_aligned(&mut self.state.scratch.huff);
@@ -282,7 +281,7 @@ impl FrameEncoderCoreSt {
         if let Some(table) = self.state.fse_tables.of_previous.take() {
             table.recycle(fse);
         }
-        self.configure(options, None);
+        self.configure(options, dict);
     }
 
     /// Derive the frame-level state from the options, shared by fresh
@@ -292,7 +291,7 @@ impl FrameEncoderCoreSt {
     fn configure(
         &mut self,
         options: &EncoderOptions,
-        dict: Option<&crate::encoding::dictionary::EncDictionary>,
+        dict: Option<&alloc::sync::Arc<crate::encoding::dictionary::EncDictionary>>,
     ) {
         // The arming context survives resets by contract (the pooled
         // matcher carries it across frames; `set_ldm_arming`'s doc), so
@@ -321,6 +320,15 @@ impl FrameEncoderCoreSt {
             // (the mt core folds the same way). Folding `unwrap_or(0)`
             // here clamped such streams to a dict-sized window.
             shape.len = len.map(|len| len + dict.content.len() as u64);
+            #[cfg(feature = "std")]
+            crate::encoding::dictionary::seed_with_cache(
+                &mut self.state,
+                dict,
+                options.level,
+                shape,
+                ldm_mode,
+            );
+            #[cfg(not(feature = "std"))]
             crate::encoding::dictionary::reset_with_dictionary_mode(
                 &mut self.state,
                 dict,
@@ -399,7 +407,6 @@ impl FrameEncoderCoreSt {
         self.out_read = 0;
         self.blocks = 0;
         self.finished = false;
-        self.from_dict = dict.is_some();
     }
 
     /// Stage input for the frame. Fails with

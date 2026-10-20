@@ -510,6 +510,101 @@ pub(crate) struct LdmPrefixSnapshot {
     pub(crate) upto: u64,
 }
 
+/// Captured post-seed state of a [`MatchGeneratorDriver`] for the
+/// dictionary re-seed image cache (see `super::dictionary`): everything a
+/// `reset` + `load_dictionary` pair leaves behind, in the canonical form a
+/// FRESH driver holds after the same seeding (the capture sites
+/// canonicalize the few lazy caches first -- see
+/// [`MatchGeneratorDriver::canonicalize_for_seed_capture`]). Restore is a
+/// full overwrite of the same set, in place, so a restored driver parses
+/// exactly like a freshly seeded one.
+///
+/// Deliberately NOT captured, each with its neutrality argument:
+/// - `opt_table`, `bt`, `hash3` (opt rows): seeding never writes them (the tree fill is lazy from
+///   `next_update`), so their image would be pure zeros -- a restore-copy the re-seed itself never
+///   pays. Residue instead retires through the O(1) coordinate advance restore re-runs (`opt_origin
+///   += pos + 1`, reset's own move), the same invalidation pooled plain opt frames already run
+///   under; `hash3` shares the origin arithmetic (`pack`/`resolve`), so it retires with it.
+/// - `dubt_table`, `dubt_bt` (btlazy2): the deferred `dubt_stale` clear (a captured scalar) zeroes
+///   the heads before the first search and the ring is unreachable behind zeroed heads.
+/// - the chain ring beyond the dictionary's positions: those slots keep the previous frame's links
+///   (a fresh state holds zeros there), but a chain walk only ever reads the link slot of an
+///   INSERTED position -- every insert writes its own slot first -- and the dict fill rebuilds
+///   every head, so stale slots are unreachable state.
+/// - `opt_scratch`, `lazy_scratch`: per-block DP/candidate scratch, written before read.
+/// - `probe_stats`, `small_wide`/`small_wide_key`: restored to the fresh form (`None`); the
+///   verdicts are recomputed lazily over identical bytes.
+/// - `ldm_seqs`: restored empty (regenerated per block).
+/// - `ldm_parked`: parking only; its content is stale-cleared before any read when `apply_level`
+///   swaps it in.
+/// - `win` beyond `pos`: never read below `pos`; `ext`: `None` after seeding. `slice_size`/`win`
+///   capacity: the image is only ever restored into the very state it was captured on (the cache
+///   slot rides the state), so allocation identity is preserved by construction.
+// The bool set mirrors the driver's own sticky-flag family (see its
+// `struct_excessive_bools` note): independent latches with distinct
+// clear points, not one state machine.
+#[cfg(feature = "std")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DriverSeedImage {
+    /// Seeded window content, `win[..pos]` at capture time.
+    win: Vec<u8>,
+    /// The fused head/second/row table (`tables[..]`) with its `second`
+    /// split; empty for the opt/btlazy rows (their seeding writes none of
+    /// it -- see the type doc).
+    tables: Vec<u32>,
+    second: usize,
+    row_heads: Vec<u8>,
+    probe: Vec<u32>,
+    /// Active LDM state after the dict fill, `None` when the row left LDM
+    /// disarmed; `ldm_stale` marks the fill-skipped form (a restart with
+    /// the clear deferred -- table content dead).
+    ldm: Option<LdmSnapshot>,
+    ldm_stale: bool,
+    /// Whether restore takes the opt-family `opt_origin` special path
+    /// (residue advance instead of the captured value).
+    opt_family: bool,
+    // Scalar block, restored verbatim.
+    win_base: u64,
+    pos: u64,
+    block_end: u64,
+    anchor: u64,
+    block_start: u64,
+    next_update: u64,
+    gap_start: u64,
+    opt_origin: u64,
+    head_origin: u64,
+    fast_shift: u64,
+    miss_count: usize,
+    covered_fill: CoveredFill,
+    scan_density: ScanDensity,
+    params: LevelParams,
+    rep: [u32; 3],
+    rep_pending: u8,
+    lit_lens: [u8; 256],
+    seed_offset: u32,
+    seed_hits: u8,
+    seed_budget: u32,
+    shape: InputShape,
+    reach_choice: ReachChoice,
+    small_src_row: SmallSrcRow,
+    row_attempts: RowAttempts,
+    ldm_arming: LdmArming,
+    ldm_mode: crate::LdmMode,
+    dubt_head: HeadPhase,
+    bt_step: BtStepPhase,
+    dubt_stale: bool,
+    ldm_quiet: u8,
+    ldm_dead: bool,
+    ldm_canary: u8,
+    ldm_checked: bool,
+    strip_parse: bool,
+    dict_row: bool,
+    gate_hold: bool,
+    ramp: RampGate,
+    chain_filled: u64,
+    opt_state: OptState,
+}
+
 /// Resolve the active window (owned or borrowed). A free function so callers
 /// can split-borrow `win`/`ext` against `&mut table`.
 fn window_slice<'a>(win: &'a [u8], ext: Option<&'a ExtWindow>) -> &'a [u8] {
@@ -2286,6 +2381,266 @@ impl MatchGeneratorDriver {
         #[cfg(feature = "job_trace")]
         super::job_trace::add_seed_scan(trace_seed);
     }
+
+    /// Canonicalize the lazy per-frame caches to the fresh-driver form
+    /// ahead of a seed-image capture (see [`DriverSeedImage`]): the probe
+    /// accumulator is dropped (donation is the only thing that begins
+    /// one), the small-band alphabet screen is invalidated (its window
+    /// key would match the restored buffer pointer-for-pointer, silently
+    /// reusing a verdict the capture-time frame computed), and the opt
+    /// price statistics return to the all-zero fresh form
+    /// (`rescale_freqs` re-seeds identically from a zero
+    /// `lit_length_sum` either way, so this is output-neutral for the
+    /// capturing frame too).
+    #[cfg(feature = "std")]
+    pub(crate) fn canonicalize_for_seed_capture(&mut self) {
+        self.probe_stats = None;
+        self.small_wide = None;
+        self.small_wide_key = (0, 0);
+        self.opt_state = OptState::new();
+    }
+
+    /// Capture the post-seed image (see [`DriverSeedImage`]); call after
+    /// `reset` + `load_dictionary` with
+    /// [`Self::canonicalize_for_seed_capture`] applied.
+    #[cfg(feature = "std")]
+    pub(crate) fn capture_seed_image(&self) -> DriverSeedImage {
+        let ldm_stale = self.ldm.as_ref().is_some_and(LdmState::is_stale);
+        DriverSeedImage {
+            win: self.win.to_vec(),
+            tables: self.tables.to_vec(),
+            second: self.second,
+            row_heads: self.row_heads.clone(),
+            probe: self.probe.clone(),
+            ldm: match (&self.ldm, ldm_stale) {
+                (Some(ldm), false) => Some(ldm.snapshot()),
+                _ => None,
+            },
+            ldm_stale,
+            opt_family: matches!(self.params.strategy, Strategy::Opt(_)),
+            win_base: self.win_base,
+            pos: self.pos,
+            block_end: self.block_end,
+            anchor: self.anchor,
+            block_start: self.block_start,
+            next_update: self.next_update,
+            gap_start: self.gap_start,
+            opt_origin: self.opt_origin,
+            head_origin: self.head_origin,
+            fast_shift: self.fast_shift,
+            miss_count: self.miss_count,
+            covered_fill: self.covered_fill,
+            scan_density: self.scan_density,
+            params: self.params,
+            rep: self.rep,
+            rep_pending: self.rep_pending,
+            lit_lens: self.lit_lens,
+            seed_offset: self.seed_offset,
+            seed_hits: self.seed_hits,
+            seed_budget: self.seed_budget,
+            shape: self.shape,
+            reach_choice: self.reach_choice,
+            small_src_row: self.small_src_row,
+            row_attempts: self.row_attempts,
+            ldm_arming: self.ldm_arming,
+            ldm_mode: self.ldm_mode,
+            dubt_head: self.dubt_head,
+            bt_step: self.bt_step,
+            dubt_stale: self.dubt_stale,
+            ldm_quiet: self.ldm_quiet,
+            ldm_dead: self.ldm_dead,
+            ldm_canary: self.ldm_canary,
+            ldm_checked: self.ldm_checked,
+            strip_parse: self.strip_parse,
+            dict_row: self.dict_row,
+            gate_hold: self.gate_hold,
+            ramp: self.ramp,
+            chain_filled: self.chain_filled,
+            opt_state: self.opt_state.clone(),
+        }
+    }
+
+    /// The uncaptured table families' bookkeeping, mirroring
+    /// `resize_tables`'s family arms: the opt rows' `opt_table`/`bt`/
+    /// `hash3` and the btlazy rows' `dubt_table`/`dubt_bt` (plus their
+    /// scratch) exist exactly at the image's geometry, and every other
+    /// family's buffers are empty. A same-key hit finds this already in
+    /// place (the capturing state ran `resize_tables` itself); the
+    /// length checks cover a key-displacing frame that flipped the
+    /// family in between.
+    #[cfg(feature = "std")]
+    fn ensure_family_buffers(&mut self, params: &LevelParams) {
+        match params.strategy {
+            Strategy::Opt(knobs) => {
+                if self.opt_table.len() != 1usize << params.hash_log {
+                    self.opt_table = HugeBuf::zeroed(1usize << params.hash_log);
+                }
+                if self.bt.len() != 2usize << knobs.bt_log {
+                    self.bt = HugeBuf::zeroed(2usize << knobs.bt_log);
+                }
+                let want_h3 = usize::from(knobs.hash3_log > 0) << knobs.hash3_log;
+                if self.hash3.len() != want_h3 {
+                    self.hash3 = if knobs.hash3_log > 0 {
+                        alloc::vec![EMPTY; 1usize << knobs.hash3_log]
+                    } else {
+                        Vec::new()
+                    };
+                }
+                self.dubt_table = HugeBuf::new();
+                self.dubt_bt = HugeBuf::new();
+                if self.opt_scratch.is_none() {
+                    self.opt_scratch = Some(OptScratch::new());
+                }
+            },
+            Strategy::BtLazy(knobs) => {
+                if self.dubt_table.len() != 1usize << params.hash_log {
+                    self.dubt_table = HugeBuf::zeroed(1usize << params.hash_log);
+                }
+                if self.dubt_bt.len() != 2usize << knobs.bt_log {
+                    self.dubt_bt = HugeBuf::zeroed(2usize << knobs.bt_log);
+                }
+                self.opt_table = HugeBuf::new();
+                self.bt = HugeBuf::new();
+                self.hash3 = Vec::new();
+                if self.lazy_scratch.is_none() {
+                    self.lazy_scratch = Some(LazyScratch::new());
+                }
+            },
+            _ => {
+                self.opt_table = HugeBuf::new();
+                self.bt = HugeBuf::new();
+                self.hash3 = Vec::new();
+                self.dubt_table = HugeBuf::new();
+                self.dubt_bt = HugeBuf::new();
+            },
+        }
+    }
+
+    /// Restore a captured seed image in place (see [`DriverSeedImage`]):
+    /// the full overwrite of everything seeding wrote, so the driver
+    /// parses exactly like the freshly seeded one it was captured from.
+    #[cfg(feature = "std")]
+    pub(crate) fn restore_seed_image(&mut self, image: &DriverSeedImage) {
+        self.ensure_family_buffers(&image.params);
+        // Two scalars are computed against the CURRENT residue (the same
+        // moves `reset` itself runs) before the cursor overwrite below
+        // replaces `pos`: the opt rows' coordinate origin (the image's
+        // value pairs with the uncaptured table bytes, so the residue
+        // invalidation replaces it) and the chain heads' write high-water
+        // (reset's stash — the coverage invariant wants the state's own
+        // history, and a superset high-water only over-advances a future
+        // origin, the safe direction).
+        let opt_origin = if image.opt_family {
+            self.opt_origin.wrapping_add(self.pos + 1)
+        } else {
+            image.opt_origin
+        };
+        let strip_mark = self.strip_mark.max(self.pos);
+        // Buffers: length-checked in-place copies. A same-key hit on the
+        // capturing state always matches lengths; the reallocation branch
+        // is the never-taken safety net.
+        self.win.clear();
+        self.win.extend_from_slice(&image.win);
+        if self.tables.len() != image.tables.len() {
+            self.tables = HugeBuf::zeroed(image.tables.len());
+        }
+        if !image.tables.is_empty() {
+            self.tables.copy_from_slice(&image.tables);
+        }
+        if self.row_heads.len() == image.row_heads.len() {
+            self.row_heads.copy_from_slice(&image.row_heads);
+        } else {
+            self.row_heads.clone_from(&image.row_heads);
+        }
+        if self.probe.len() == image.probe.len() {
+            self.probe.copy_from_slice(&image.probe);
+        } else {
+            self.probe.clone_from(&image.probe);
+        }
+        // LDM: adopt the captured fill state; the stale (fill-skipped)
+        // form is a plain deferred restart; a captured `None` disarms the
+        // live state (parked rather than dropped when a spot is free).
+        match (&image.ldm, image.ldm_stale) {
+            (Some(snap), false) => {
+                if self
+                    .ldm
+                    .as_ref()
+                    .is_none_or(|l| l.window() != image.params.window as u64)
+                {
+                    self.ldm = Some(LdmState::new(
+                        (image.params.window as u64).ilog2(),
+                        image.params.window as u64,
+                    ));
+                }
+                self.ldm.as_mut().unwrap().restore(snap);
+            },
+            (None, false) => {
+                if let Some(live) = self.ldm.take() {
+                    self.ldm_parked = self.ldm_parked.take().or(Some(live));
+                }
+            },
+            (_, true) => {
+                if self.ldm.is_none() {
+                    self.ldm = Some(LdmState::new(
+                        (image.params.window as u64).ilog2(),
+                        image.params.window as u64,
+                    ));
+                }
+                self.ldm.as_mut().unwrap().restart(0);
+            },
+        }
+        // Scalars.
+        self.win_base = image.win_base;
+        self.pos = image.pos;
+        self.block_end = image.block_end;
+        self.anchor = image.anchor;
+        self.block_start = image.block_start;
+        self.second = image.second;
+        self.next_update = image.next_update;
+        self.gap_start = image.gap_start;
+        self.opt_origin = opt_origin;
+        self.head_origin = image.head_origin;
+        self.fast_shift = image.fast_shift;
+        self.strip_mark = strip_mark;
+        self.miss_count = image.miss_count;
+        self.covered_fill = image.covered_fill;
+        self.scan_density = image.scan_density;
+        self.params = image.params;
+        self.rep = image.rep;
+        self.rep_pending = image.rep_pending;
+        self.lit_lens = image.lit_lens;
+        self.seed_offset = image.seed_offset;
+        self.seed_hits = image.seed_hits;
+        self.seed_budget = image.seed_budget;
+        self.shape = image.shape;
+        self.reach_choice = image.reach_choice;
+        self.small_src_row = image.small_src_row;
+        self.row_attempts = image.row_attempts;
+        self.ldm_arming = image.ldm_arming;
+        self.ldm_mode = image.ldm_mode;
+        self.dubt_head = image.dubt_head;
+        self.bt_step = image.bt_step;
+        self.dubt_stale = image.dubt_stale;
+        self.ldm_quiet = image.ldm_quiet;
+        self.ldm_dead = image.ldm_dead;
+        self.ldm_canary = image.ldm_canary;
+        self.ldm_checked = image.ldm_checked;
+        self.strip_parse = image.strip_parse;
+        self.dict_row = image.dict_row;
+        self.gate_hold = image.gate_hold;
+        self.ramp = image.ramp;
+        self.chain_filled = image.chain_filled;
+        self.opt_state = image.opt_state.clone();
+        // Canonical fresh forms for the deliberately-uncaptured fields
+        // (see [`DriverSeedImage`]'s doc).
+        self.ext = None;
+        self.probe_stats = None;
+        self.small_wide = None;
+        self.small_wide_key = (0, 0);
+        self.ldm_seqs.clear();
+        self.small_src_pending = None;
+        self.row_attempts_pending = None;
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -2373,6 +2728,30 @@ impl Matcher for MatchGeneratorDriver {
     /// trait view.
     fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
         self.load_dictionary(content, rep, level);
+    }
+
+    #[cfg(feature = "std")]
+    fn force_dict_frame_inputs(&mut self) {
+        // The deterministic dict-frame inputs (see `dictionary::seed_with_cache`):
+        // dictionary frames keep the stock reach and the frame-continuous
+        // arming context whatever the pooled state's residue holds.
+        self.set_reach_choice(ReachChoice::Keep);
+        self.set_ldm_arming(LdmArming::Frame);
+    }
+
+    #[cfg(feature = "std")]
+    fn canonicalize_for_seed_capture(&mut self) {
+        MatchGeneratorDriver::canonicalize_for_seed_capture(self);
+    }
+
+    #[cfg(feature = "std")]
+    fn capture_seed_image(&self) -> Option<DriverSeedImage> {
+        Some(MatchGeneratorDriver::capture_seed_image(self))
+    }
+
+    #[cfg(feature = "std")]
+    fn restore_seed_image(&mut self, image: &DriverSeedImage) {
+        MatchGeneratorDriver::restore_seed_image(self, image);
     }
 
     fn reset(&mut self, level: Level) {
@@ -3402,6 +3781,108 @@ pub(crate) fn fast_row_screen_pending(level: Level, shape: InputShape) -> bool {
             Some(n) => (LDM_MIDSIZE_WINDOW as u64..LDM_FULL_WINDOW as u64).contains(&n),
         }
 }
+/// Whether two seeded drivers hold the same REACHABLE state: the seed
+/// image cache's exactness gate (compare a freshly seeded driver with one
+/// restored into pooled residue). Every captured field is compared; the
+/// deliberately-uncaptured pieces follow their neutrality contracts from
+/// [`DriverSeedImage`]'s doc — the opt/bt/hash3/dubt tables by length
+/// only, the chain ring beyond the dictionary's written slots (stale
+/// links there are unreachable: a walk only reads slots of inserted
+/// positions), `ldm_parked` and the scratch buffers not at all.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriver) -> bool {
+    let scalars = a.win_base == b.win_base
+        && a.pos == b.pos
+        && a.block_end == b.block_end
+        && a.anchor == b.anchor
+        && a.block_start == b.block_start
+        && a.next_update == b.next_update
+        && a.gap_start == b.gap_start
+        && a.head_origin == b.head_origin
+        && a.fast_shift == b.fast_shift
+        && a.miss_count == b.miss_count
+        && a.covered_fill == b.covered_fill
+        && a.scan_density == b.scan_density
+        && a.params == b.params
+        && a.rep == b.rep
+        && a.rep_pending == b.rep_pending
+        && a.lit_lens == b.lit_lens
+        && a.seed_offset == b.seed_offset
+        && a.seed_hits == b.seed_hits
+        && a.seed_budget == b.seed_budget
+        && a.shape == b.shape
+        && a.reach_choice == b.reach_choice
+        && a.small_src_row == b.small_src_row
+        && a.row_attempts == b.row_attempts
+        && a.ldm_arming == b.ldm_arming
+        && a.ldm_mode == b.ldm_mode
+        && a.dubt_head == b.dubt_head
+        && a.bt_step == b.bt_step
+        && a.dubt_stale == b.dubt_stale
+        && a.ldm_quiet == b.ldm_quiet
+        && a.ldm_dead == b.ldm_dead
+        && a.ldm_canary == b.ldm_canary
+        && a.ldm_checked == b.ldm_checked
+        && a.strip_parse == b.strip_parse
+        && a.dict_row == b.dict_row
+        && a.gate_hold == b.gate_hold
+        && a.ramp == b.ramp
+        && a.chain_filled == b.chain_filled
+        && a.opt_state == b.opt_state
+        && a.second == b.second
+        && a.ext.is_none()
+        && b.ext.is_none()
+        && a.probe_stats.is_none()
+        && b.probe_stats.is_none()
+        && a.small_src_pending.is_none()
+        && b.small_src_pending.is_none()
+        && a.row_attempts_pending.is_none()
+        && b.row_attempts_pending.is_none()
+        && a.small_wide.is_none()
+        && b.small_wide.is_none()
+        && a.ldm_seqs.is_empty()
+        && b.ldm_seqs.is_empty();
+    // Coordinate origins: both are restored against the state's own
+    // residue (reset's own moves), not replayed from the capture. The
+    // opt-family origin is equivalent when it retires every position the
+    // state has written; outside the opt family `opt_table` is empty, so
+    // the value is inert. `strip_mark` (restored as reset's stash) is
+    // consumed only by strip prefills, which these single-threaded
+    // states never run; a superset high-water only over-advances a
+    // future origin — the safe direction — so coverage subsumption is
+    // the equivalence.
+    let opt = matches!(a.params.strategy, Strategy::Opt(_));
+    let origins = (!opt || b.opt_origin > b.pos)
+        && b.opt_origin >= a.opt_origin
+        && b.strip_mark >= a.strip_mark;
+    // Head tables: fully cleared and refilled at seeding. The chain ring
+    // is position-keyed: only the dictionary's own slots are written
+    // (a fresh state holds zeros in the rest; residue there is
+    // unreachable).
+    let tables = a.tables[..a.second] == b.tables[..b.second] && {
+        let (ring_a, ring_b) = (&a.tables[a.second..], &b.tables[b.second..]);
+        let written = (a.pos as usize).min(ring_a.len());
+        ring_a.len() == ring_b.len() && ring_a[..written] == ring_b[..written]
+    };
+    let buffers = window_slice(&a.win, None) == window_slice(&b.win, None)
+        && a.row_heads == b.row_heads
+        && a.probe == b.probe
+        && a.opt_table.len() == b.opt_table.len()
+        && a.bt.len() == b.bt.len()
+        && a.hash3.len() == b.hash3.len()
+        && a.dubt_table.len() == b.dubt_table.len()
+        && a.dubt_bt.len() == b.dubt_bt.len();
+    let ldm = match (&a.ldm, &b.ldm) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            LdmState::is_stale(x) == LdmState::is_stale(y)
+                && (LdmState::is_stale(x) || x.snapshot().same_as(&y.snapshot()))
+        },
+        _ => false,
+    };
+    scalars && origins && tables && buffers && ldm
+}
+
 use parse_row::{row_hash_at, row_insert, row_insert_fill};
 use price::*;
 use tables::*;

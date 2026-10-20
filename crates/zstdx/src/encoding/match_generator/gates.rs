@@ -45,7 +45,7 @@ pub(super) const SEED_SCAN_MIN: usize = 128;
 /// by its shallowest crossing read, wherever that read sits in the piece.
 /// All-zero disables the gate; the hot-path check folds to two
 /// comparisons.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RampGate {
     /// Absolute job start; sources below it are cross-boundary reads.
     pub(super) start: u64,

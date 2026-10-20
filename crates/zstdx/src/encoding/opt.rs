@@ -220,6 +220,7 @@ pub(crate) struct OptKnobs {
 
 /// Price statistics persisting across blocks; a zero `lit_length_sum` means
 /// "first block" and re-seeds (`ZSTD_rescaleFreqs`).
+#[derive(Clone, PartialEq)]
 pub(crate) struct OptState {
     lit_freq: [u32; 256],
     lit_length_freq: [u32; 36],

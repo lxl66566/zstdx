@@ -506,3 +506,371 @@ fn dict_frame_content_size_is_enforced() {
     }
     println!("dict frame FCS check at {} bytes", data.len());
 }
+
+/// Fixtures for the seed-image cache gates: the formatted dictionary plus
+/// three payload shapes (4 KiB json-ish, 64 KiB text, 4 KiB of dict-twin
+/// repeats) and a raw-content dictionary.
+#[cfg(all(test, feature = "std"))]
+struct SeedCacheFixtures {
+    formatted: alloc::vec::Vec<u8>,
+    raw: alloc::vec::Vec<u8>,
+    payloads: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+}
+
+#[cfg(all(test, feature = "std"))]
+fn seed_cache_fixtures() -> Option<SeedCacheFixtures> {
+    extern crate std;
+    use alloc::{vec, vec::Vec};
+    use std::fs;
+    let formatted = fs::read("./dict_tests/dictionary").ok()?;
+    let mut text = Vec::new();
+    for entry in super::fixture_entries("./dict_tests/files")?
+        .into_iter()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("service") {
+            text.extend_from_slice(&fs::read(path).unwrap());
+            if text.len() >= 64 * 1024 {
+                break;
+            }
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let mut json = alloc::string::String::new();
+    for i in 0..128 {
+        use core::fmt::Write as _;
+        core::write!(
+            json,
+            "{{\"unit\":{},\"state\":\"active\",\"path\":\"/system slice {}\",\"score\":{}}}",
+            i,
+            i % 7,
+            i * 31
+        )
+        .unwrap();
+    }
+    // Repeats of dictionary content: the shape the dictionary exists for.
+    let twins = formatted[formatted.len() - 4096..].to_vec();
+    let raw = formatted[64..64 + 48 * 1024].to_vec();
+    Some(SeedCacheFixtures {
+        formatted,
+        raw,
+        payloads: vec![json.into_bytes(), text, twins],
+    })
+}
+
+/// The uncached fresh-seed reference for a (dict, level, payload): the
+/// mt-fallback slice entry builds a fresh owned state per call.
+#[cfg(all(test, feature = "std"))]
+fn seed_cache_fresh_frame(
+    dict: &crate::EncoderDictionary,
+    level: crate::Level,
+    payload: &[u8],
+) -> alloc::vec::Vec<u8> {
+    let shared = dict.shared();
+    crate::encoding::compress_slice_with_dictionary(
+        payload,
+        level,
+        false,
+        crate::InputShape {
+            len: Some(payload.len() as u64),
+            window_log: None,
+        },
+        &shared,
+        None,
+    )
+}
+
+/// The seed-image cache's output contract: a frame seeded from a restored
+/// image is byte-identical to one seeded fresh, across the level ladder,
+/// both dictionary kinds, and cache misses that must not hit (level and
+/// dictionary changes interleaved between hits).
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_cache_byte_identity() {
+    let Some(f) = seed_cache_fixtures() else {
+        return;
+    };
+    let dicts = [&f.formatted[..], &f.raw[..]];
+    for level in [1i32, 3, 9, 13, 19] {
+        for (di, &dict) in dicts.iter().enumerate() {
+            let parsed = crate::EncoderDictionary::parse(dict).unwrap();
+            let level = crate::Level::from_zstd(level);
+            let cached = |payload: &[u8]| -> alloc::vec::Vec<u8> {
+                let options = crate::EncoderOptions::new(level)
+                    .checksum(false)
+                    .parsed_dictionary(&parsed);
+                crate::bulk::compress_with(payload, &options).unwrap()
+            };
+            let other_level = crate::Level::from_zstd(if level.as_i32() == 1 {
+                19
+            } else {
+                1
+            });
+            let other_options = crate::EncoderOptions::new(other_level)
+                .checksum(false)
+                .parsed_dictionary(&parsed);
+            let other_dict_options = crate::EncoderOptions::new(level)
+                .checksum(false)
+                .parsed_dictionary(&crate::EncoderDictionary::parse(&f.raw).unwrap());
+
+            for payload in &f.payloads {
+                // Capture (pool cold on this thread for the key, or left
+                // by an earlier iteration with another key).
+                let first = cached(payload);
+                assert_eq!(
+                    first,
+                    seed_cache_fresh_frame(&parsed, level, payload),
+                    "capture frame (dict {di}, L{})",
+                    level.as_i32()
+                );
+                // Hit: same key again, pool warm from the frame above.
+                assert_eq!(
+                    cached(payload),
+                    seed_cache_fresh_frame(&parsed, level, payload),
+                    "restore frame (dict {di}, L{})",
+                    level.as_i32()
+                );
+                // A different payload under the same key: different
+                // shape (its own key), must equal its own fresh frame
+                // whether it hit or missed.
+                let short = &payload[..payload.len() / 2];
+                assert_eq!(
+                    cached(short),
+                    seed_cache_fresh_frame(&parsed, level, short),
+                    "half-size frame (dict {di}, L{})",
+                    level.as_i32()
+                );
+                // Interleaved misses: another level, another dictionary,
+                // then the original key again (the slot was displaced, so
+                // this re-seeds and re-captures).
+                crate::bulk::compress_with(payload, &other_options).unwrap();
+                crate::bulk::compress_with(payload, &other_dict_options).unwrap();
+                assert_eq!(
+                    cached(payload),
+                    seed_cache_fresh_frame(&parsed, level, payload),
+                    "post-miss frame (dict {di}, L{})",
+                    level.as_i32()
+                );
+            }
+        }
+    }
+}
+
+/// The cache's `FrameCompressor` reuse path: multi-frame reuse through the
+/// per-instance slot produces the fresh-seed bytes at every frame, with
+/// key-displacing frames interleaved.
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_cache_frame_compressor_reuse() {
+    let Some(f) = seed_cache_fixtures() else {
+        return;
+    };
+    let sources: alloc::vec::Vec<&[u8]> =
+        f.payloads.iter().map(alloc::vec::Vec::as_slice).collect();
+    for level in [crate::Level::from_zstd(3), crate::Level::from_zstd(19)] {
+        let parsed = crate::EncoderDictionary::parse(&f.formatted).unwrap();
+        // A fresh compressor per frame is the fresh-seed reference (the
+        // same frame shape the reuse path emits, checksum and all).
+        let fresh_frame = |src: &[u8]| {
+            let mut fresh = crate::encoding::FrameCompressor::new(level);
+            fresh.set_parsed_dictionary(&parsed);
+            fresh.set_source(src);
+            let mut out = alloc::vec::Vec::new();
+            fresh.set_drain(&mut out);
+            fresh.compress();
+            out
+        };
+        let mut enc = crate::encoding::FrameCompressor::new(level);
+        enc.set_parsed_dictionary(&parsed);
+        for src in &sources {
+            enc.set_source(*src);
+            enc.set_drain(alloc::vec::Vec::new());
+            enc.compress();
+            let reused = enc.set_drain(alloc::vec::Vec::new()).unwrap();
+            assert_eq!(reused, fresh_frame(src), "reuse L{}", level.as_i32());
+        }
+        // Displace the key (a raw dictionary), then come back: the next
+        // frame re-seeds and still matches.
+        enc.set_dictionary(&f.raw[..1024]);
+        enc.set_source(sources[0]);
+        enc.set_drain(alloc::vec::Vec::new());
+        enc.compress();
+        let _ = enc.set_drain(alloc::vec::Vec::new()).unwrap();
+        enc.set_parsed_dictionary(&parsed);
+        enc.set_source(sources[0]);
+        enc.set_drain(alloc::vec::Vec::new());
+        enc.compress();
+        let back = enc.set_drain(alloc::vec::Vec::new()).unwrap();
+        assert_eq!(
+            back,
+            fresh_frame(sources[0]),
+            "post-displacement L{}",
+            level.as_i32()
+        );
+    }
+}
+
+/// The cache's stream-core path: encoders materializing from the pooled
+/// core (dict cores pool now, see `ST_CORE_POOL`) restore the seeded
+/// image and produce the fresh-core bytes.
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_cache_stream_core() {
+    let Some(f) = seed_cache_fixtures() else {
+        return;
+    };
+    let parsed = crate::EncoderDictionary::parse(&f.formatted).unwrap();
+    let encode = |payload: &[u8], level: crate::Level| -> alloc::vec::Vec<u8> {
+        let mut sink = alloc::vec::Vec::new();
+        let mut enc = crate::stream::write::Encoder::with_options(
+            &mut sink,
+            crate::EncoderOptions::new(level)
+                .checksum(false)
+                .parsed_dictionary(&parsed),
+        )
+        .unwrap();
+        crate::io::Write::write_all(&mut enc, payload).unwrap();
+        enc.finish().unwrap();
+        sink
+    };
+    for level in [crate::Level::from_zstd(3), crate::Level::from_zstd(13)] {
+        // First encoder on this thread: fresh core (capture). Later ones:
+        // pooled cores (restores). A plain encoder and an other-level
+        // dict encoder ride the same pool in between — the plain one
+        // re-seeds through its own path, the other-level one displaces
+        // the dict image.
+        let first = encode(&f.payloads[0], level);
+        let second = encode(&f.payloads[1], level);
+        let third = encode(&f.payloads[0], level);
+        let _plain = {
+            let mut sink = alloc::vec::Vec::new();
+            let mut enc = crate::stream::write::Encoder::with_options(
+                &mut sink,
+                crate::EncoderOptions::new(crate::Level::from_zstd(1)),
+            )
+            .unwrap();
+            crate::io::Write::write_all(&mut enc, b"plain interlude").unwrap();
+            enc.finish().unwrap();
+            sink
+        };
+        let fourth = encode(&f.payloads[1], level);
+        let _ = encode(&f.payloads[0], crate::Level::from_zstd(9));
+        let fifth = encode(&f.payloads[0], level);
+        assert_eq!(third, first, "restored stream core L{}", level.as_i32());
+        assert_eq!(
+            fifth,
+            first,
+            "post-displacement stream core L{}",
+            level.as_i32()
+        );
+        assert_eq!(
+            fourth,
+            second,
+            "second payload stream core L{}",
+            level.as_i32()
+        );
+        // And the frames decode with the dictionary.
+        let mut dec = crate::decoding::FrameDecoder::new();
+        dec.add_dict(crate::decoding::Dictionary::decode_dict(&f.formatted).unwrap())
+            .unwrap();
+        for (frame, want) in [(&first, &f.payloads[0]), (&second, &f.payloads[1])] {
+            let mut input = frame.as_slice();
+            dec.reset(&mut input).unwrap();
+            dec.decode_blocks(&mut input, crate::decoding::BlockDecodingStrategy::All)
+                .unwrap();
+            assert_eq!(dec.collect().unwrap(), *want);
+        }
+    }
+}
+
+/// The restore leaves the driver exactly in the freshly seeded state
+/// (modulo the documented unreachable/neutralized residue) and the
+/// entropy side with the dictionary tables: the construction-level twin
+/// of the byte-identity gates.
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_state_equality() {
+    use crate::encoding::frame_compressor::{CompressState, new_owned_state};
+    let Some(f) = seed_cache_fixtures() else {
+        return;
+    };
+    for level in [1i32, 3, 9, 13, 19] {
+        let level = crate::Level::from_zstd(level);
+        let dict = alloc::sync::Arc::new(
+            crate::encoding::dictionary::EncDictionary::parse(&f.formatted).unwrap(),
+        );
+        let shape = crate::InputShape {
+            len: Some(f.payloads[0].len() as u64 + dict.content.len() as u64),
+            window_log: None,
+        };
+        // Fresh seeding, canonicalized like a capture would.
+        let mut fresh: CompressState<crate::encoding::match_generator::MatchGeneratorDriver> =
+            new_owned_state();
+        crate::encoding::dictionary::reset_with_dictionary_mode(
+            &mut fresh,
+            &dict,
+            level,
+            shape,
+            crate::LdmMode::Auto,
+        );
+        fresh.matcher.canonicalize_for_seed_capture();
+        // Pooled seeding: capture, run a frame to dirty the state,
+        // displace the key with another level, dirty again, then a key
+        // hit restores.
+        let mut pooled = new_owned_state();
+        crate::encoding::dictionary::seed_with_cache(
+            &mut pooled,
+            &dict,
+            level,
+            shape,
+            crate::LdmMode::Auto,
+        );
+        let _ = crate::encoding::frame_compressor::compress_with_state_dictionary(
+            &mut pooled,
+            &f.payloads[1],
+            dict.header_id(),
+            false,
+            None,
+        );
+        crate::encoding::dictionary::seed_with_cache(
+            &mut pooled,
+            &dict,
+            crate::Level::from_zstd(level.as_i32() % 19 + 1),
+            shape,
+            crate::LdmMode::Auto,
+        );
+        let _ = crate::encoding::frame_compressor::compress_with_state_dictionary(
+            &mut pooled,
+            &f.payloads[2],
+            dict.header_id(),
+            false,
+            None,
+        );
+        crate::encoding::dictionary::seed_with_cache(
+            &mut pooled,
+            &dict,
+            level,
+            shape,
+            crate::LdmMode::Auto,
+        );
+        assert!(
+            crate::encoding::match_generator::same_seeded_state(&fresh.matcher, &pooled.matcher),
+            "driver state diverges at L{}",
+            level.as_i32()
+        );
+        assert_eq!(
+            fresh.last_huff_table.is_some(),
+            pooled.last_huff_table.is_some()
+        );
+        assert_eq!(
+            fresh.fse_tables.ll_previous.is_some(),
+            pooled.fse_tables.ll_previous.is_some()
+        );
+        assert_eq!(fresh.dict_entropy.huff, pooled.dict_entropy.huff);
+        assert_eq!(fresh.dict_entropy.ll, pooled.dict_entropy.ll);
+        assert_eq!(fresh.dict_entropy.cost_mode, pooled.dict_entropy.cost_mode);
+    }
+}

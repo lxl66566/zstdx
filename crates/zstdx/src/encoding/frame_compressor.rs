@@ -95,6 +95,13 @@ pub(crate) struct CompressState<M: Matcher> {
     /// The pre-split gate's savings accumulator (see `pre_split`): reset
     /// with the rest of the frame state, carried across a donated span.
     pub(crate) split: pre_split::FrameSavings,
+    /// Single-entry dictionary seed image cache (see
+    /// `super::dictionary::seed_with_cache`): rides the state, so the
+    /// image only ever restores into the state it was captured on and no
+    /// locking is involved on the thread-local pools. Single-threaded
+    /// dictionary paths only; the mt jobs never populate it.
+    #[cfg(feature = "std")]
+    pub(crate) seed_cache: Option<alloc::boxed::Box<super::dictionary::SeedCache>>,
 }
 
 // Per-thread pool for the slice entry point: the hash table, the three
@@ -108,6 +115,41 @@ std::thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
+// Per-thread pool for the single-threaded dictionary slice entry: the
+// owned-window state (dict content stages through `block_tail`) plus its
+// single-entry seed image. Pooling keeps the level's table set allocated
+// across calls (the opt rows' ~100 MiB first-touch cost dwarfs a small
+// payload) and the image cache turns the per-call re-seed into a restore;
+// the plain slice pool above cannot serve this path (its matcher owns no
+// window). Same reentrancy contract as `SLICE_STATE`.
+#[cfg(feature = "std")]
+std::thread_local! {
+    static DICT_STATE: core::cell::RefCell<Option<alloc::boxed::Box<CompressState<MatchGeneratorDriver>>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Take the per-thread pooled dictionary state, seeded for `dict` through
+/// the image cache (a miss seeds fully and captures).
+#[cfg(feature = "std")]
+fn take_dict_state(
+    dict: &alloc::sync::Arc<super::dictionary::EncDictionary>,
+    level: Level,
+    shape: crate::InputShape,
+    ldm: crate::LdmMode,
+) -> alloc::boxed::Box<CompressState<MatchGeneratorDriver>> {
+    let mut state = DICT_STATE
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or_else(|| alloc::boxed::Box::new(new_owned_state()));
+    super::dictionary::seed_with_cache(&mut state, dict, level, shape, ldm);
+    state
+}
+
+/// Return a state taken by [`take_dict_state`].
+#[cfg(feature = "std")]
+fn return_dict_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>) {
+    DICT_STATE.with(|p| *p.borrow_mut() = Some(state));
+}
+
 pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
     CompressState {
         matcher: MatchGeneratorDriver::new_direct(),
@@ -116,6 +158,8 @@ pub(crate) fn new_slice_state() -> CompressState<MatchGeneratorDriver> {
         dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
         split: pre_split::FrameSavings::new(),
+        #[cfg(feature = "std")]
+        seed_cache: None,
     }
 }
 
@@ -130,6 +174,8 @@ pub(crate) fn new_owned_state() -> CompressState<MatchGeneratorDriver> {
         dict_entropy: DictEntropy::default(),
         scratch: super::block_enc::compressed::BlockScratch::default(),
         split: pre_split::FrameSavings::new(),
+        #[cfg(feature = "std")]
+        seed_cache: None,
     }
 }
 
@@ -720,6 +766,9 @@ pub(crate) fn compress_dict_span_blocks(
 /// content as match history, its entropy tables seeding the first blocks,
 /// its id in the header. Runs single-threaded through the owned-window
 /// matcher.
+/// The mt module's single-threaded fallback keeps the plain per-call
+/// seeding: its caller hands a bare reference (no `Arc` identity for the
+/// cache key), and the fallback is a cold demotion path.
 #[cfg(feature = "std")]
 pub(crate) fn compress_slice_with_dictionary(
     src: &[u8],
@@ -729,16 +778,18 @@ pub(crate) fn compress_slice_with_dictionary(
     dict: &super::dictionary::EncDictionary,
     declared: Option<u64>,
 ) -> Vec<u8> {
-    compress_slice_with_dictionary_id(
-        src,
-        level,
-        checksum,
-        shape,
+    let mut shape = shape;
+    let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
+    shape.len = Some(len);
+    let mut state = new_owned_state();
+    super::dictionary::reset_with_dictionary_mode(
+        &mut state,
         dict,
-        declared,
-        dict.header_id(),
+        level,
+        shape,
         crate::LdmMode::Auto,
-    )
+    );
+    compress_with_state_dictionary(&mut state, src, dict.header_id(), checksum, declared)
 }
 
 /// [`compress_slice_with_dictionary`] with the header id resolved by the
@@ -749,7 +800,7 @@ pub(crate) fn compress_slice_with_dictionary_id(
     level: Level,
     checksum: bool,
     shape: crate::InputShape,
-    dict: &super::dictionary::EncDictionary,
+    dict: &alloc::sync::Arc<super::dictionary::EncDictionary>,
     declared: Option<u64>,
     dict_id: Option<u32>,
     ldm_mode: crate::LdmMode,
@@ -757,9 +808,22 @@ pub(crate) fn compress_slice_with_dictionary_id(
     let mut shape = shape;
     let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
     shape.len = Some(len);
-    let mut state = new_owned_state();
-    super::dictionary::reset_with_dictionary_mode(&mut state, dict, level, shape, ldm_mode);
-    compress_with_state_dictionary(&mut state, src, dict_id, checksum, declared)
+    // The pooled, image-cached seeding (std); without std there is no
+    // pool to keep an image warm in, so every call seeds a fresh state.
+    #[cfg(feature = "std")]
+    let output = {
+        let mut state = take_dict_state(dict, level, shape, ldm_mode);
+        let output = compress_with_state_dictionary(&mut state, src, dict_id, checksum, declared);
+        return_dict_state(state);
+        output
+    };
+    #[cfg(not(feature = "std"))]
+    let output = {
+        let mut state = new_owned_state();
+        super::dictionary::reset_with_dictionary_mode(&mut state, dict, level, shape, ldm_mode);
+        compress_with_state_dictionary(&mut state, src, dict_id, checksum, declared)
+    };
+    output
 }
 
 /// Compress the blocks of one multithreaded job into `output`: no frame
@@ -940,6 +1004,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 fse_tables: FseTables::new(),
                 scratch: super::block_enc::compressed::BlockScratch::default(),
                 split: pre_split::FrameSavings::new(),
+                #[cfg(feature = "std")]
+                seed_cache: None,
             },
             hasher: FrameHasher::new(),
         }
@@ -959,6 +1025,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 fse_tables: FseTables::new(),
                 scratch: super::block_enc::compressed::BlockScratch::default(),
                 split: pre_split::FrameSavings::new(),
+                #[cfg(feature = "std")]
+                seed_cache: None,
             },
             compression_level,
             input_shape: crate::InputShape::default(),
@@ -1048,6 +1116,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         if let Some(dict) = dict.as_ref() {
             let mut shape = self.input_shape;
             shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+            #[cfg(feature = "std")]
+            super::dictionary::seed_with_cache(
+                &mut self.state,
+                dict,
+                self.compression_level,
+                shape,
+                crate::LdmMode::Auto,
+            );
+            #[cfg(not(feature = "std"))]
             super::dictionary::reset_with_dictionary(
                 &mut self.state,
                 dict,

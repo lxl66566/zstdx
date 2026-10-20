@@ -405,6 +405,24 @@ pub trait Matcher {
         None
     }
     fn restart_shrunk(&mut self, _level: Level) {}
+    /// Dictionary seed-image cache hooks (std only; see
+    /// `dictionary::seed_with_cache`): the built-in driver captures and
+    /// restores whole post-seed images so a repeated dictionary frame
+    /// re-arms by restore; foreign matchers keep the plain per-frame
+    /// re-seed (capture returns `None`, so no image is ever stored and
+    /// the restore hook cannot fire).
+    #[cfg(feature = "std")]
+    fn force_dict_frame_inputs(&mut self) {}
+    #[cfg(feature = "std")]
+    fn canonicalize_for_seed_capture(&mut self) {}
+    #[cfg(feature = "std")]
+    fn capture_seed_image(&self) -> Option<match_generator::DriverSeedImage> {
+        None
+    }
+    #[cfg(feature = "std")]
+    fn restore_seed_image(&mut self, _image: &match_generator::DriverSeedImage) {
+        panic!("a matcher that captures no seed image holds none to restore");
+    }
     /// Load dictionary content as the frame's match history after
     /// [`Matcher::reset`], before the first block (owned-window
     /// implementations only; the default drops it, and the encoder still
