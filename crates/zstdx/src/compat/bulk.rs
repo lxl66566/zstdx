@@ -164,7 +164,14 @@ impl Default for Decompressor {
 #[derive(Debug)]
 enum Attachment {
     None,
+    /// Raw bytes from `set_dictionary`/`with_dictionary`, not yet parsed.
     Raw(Vec<u8>),
+    /// The cached parse of formerly-raw bytes (resolved at the first
+    /// compression after the attachment was set): the shared dictionary on
+    /// success, the raw bytes back on failure so the error replays at
+    /// every later compression (the error type is not `Clone`). Any
+    /// re-set of the attachment discards the cache wholesale.
+    RawParsed(Result<alloc::sync::Arc<crate::encoding::dictionary::EncDictionary>, Vec<u8>>),
     Prepared(EncoderDictionary),
 }
 
@@ -304,8 +311,23 @@ impl Compressor {
 
     /// The options for one compression job: the effective level (a prepared
     /// dictionary carries its own) and the content-size pledge the `zstd`
-    /// crate's bulk frames are written with.
-    fn options(&self, len: u64) -> io::Result<crate::EncoderOptions> {
+    /// crate's bulk frames are written with. A raw attachment resolves its
+    /// parse here, lazily: the parse ran at every compress call before, so
+    /// an invalid dictionary errors at the first compress call (not at
+    /// `set_dictionary`), and the outcome caches for every later call.
+    fn options(&mut self, len: u64) -> io::Result<crate::EncoderOptions> {
+        if matches!(self.dict, Attachment::Raw(_)) {
+            let Attachment::Raw(raw) = core::mem::replace(&mut self.dict, Attachment::None) else {
+                unreachable!("guarded by matches!");
+            };
+            self.dict = match crate::EncoderDictionary::parse(&raw) {
+                Ok(parsed) => Attachment::RawParsed(Ok(parsed.shared())),
+                Err(e) => {
+                    self.dict = Attachment::RawParsed(Err(raw));
+                    return Err(io::Error::from(e));
+                },
+            };
+        }
         let level = match &self.dict {
             Attachment::Prepared(dict) => dict.compression_level(),
             _ => self.level,
@@ -315,7 +337,18 @@ impl Compressor {
         options.long_distance_matching = self.long_distance_matching;
         match &self.dict {
             Attachment::None => Ok(options),
-            Attachment::Raw(dict) => Ok(options.dictionary(dict)),
+            Attachment::Raw(_) => unreachable!("resolved above"),
+            Attachment::RawParsed(Ok(dict)) => {
+                options.parsed_dictionary = Some(alloc::sync::Arc::clone(dict));
+                Ok(options)
+            },
+            // Replay: the same bytes already failed this exact parse.
+            Attachment::RawParsed(Err(raw)) => Err(io::Error::from(
+                match crate::EncoderDictionary::parse(raw) {
+                    Ok(_) => unreachable!("a failed dictionary parse fails again"),
+                    Err(e) => e,
+                },
+            )),
             Attachment::Prepared(dict) => dict.apply(options),
         }
     }

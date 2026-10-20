@@ -349,6 +349,93 @@ fn test_dict_encoding() {
     std::println!("dict sizes: ours <= libzstd in {ours_smaller}, behind in {theirs_smaller}");
 }
 
+/// `FrameCompressor::set_parsed_dictionary` shares one parse across
+/// frames: multi-frame reuse on a single compressor produces the exact
+/// bytes the raw `set_dictionary` form (one fresh compressor per frame,
+/// parse per frame) produces, and the two attach forms displace each
+/// other.
+#[test]
+fn frame_compressor_parsed_dictionary_multi_frame() {
+    extern crate std;
+    use alloc::vec::Vec;
+    use std::fs;
+
+    let Some(entries) = super::fixture_entries("./dict_tests/files") else {
+        return;
+    };
+    let dict: Vec<u8> = fs::read("./dict_tests/dictionary").unwrap();
+    let mut files: Vec<_> = entries
+        .into_iter()
+        .filter_map(|f| {
+            let p = f.ok()?.path();
+            (p.extension()?.to_str()? == "service").then_some(p)
+        })
+        .collect();
+    files.sort();
+    let sources: Vec<Vec<u8>> = files
+        .into_iter()
+        .take(3)
+        .map(|p| fs::read(p).unwrap())
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+
+    // Parsed form: one compressor, many frames, one shared parse.
+    let parsed = crate::EncoderDictionary::parse(&dict).unwrap();
+    let mut enc = crate::encoding::FrameCompressor::new(crate::Level::Fast);
+    enc.set_parsed_dictionary(&parsed);
+    let mut parsed_frames = Vec::new();
+    for src in &sources {
+        enc.set_source(src.as_slice());
+        enc.set_drain(Vec::new());
+        enc.compress();
+        let frame = enc.set_drain(Vec::new()).expect("drain was just set");
+        parsed_frames.push(frame);
+    }
+    assert!(parsed_frames.iter().all(|f| !f.is_empty()));
+
+    // Raw form: a fresh compressor per frame parses its own dictionary and
+    // must land on the same bytes.
+    for (src, parsed_frame) in sources.iter().zip(&parsed_frames) {
+        let mut raw = crate::encoding::FrameCompressor::new(crate::Level::Fast);
+        raw.set_dictionary(&dict);
+        raw.set_source(src.as_slice());
+        let mut out = Vec::new();
+        raw.set_drain(&mut out);
+        raw.compress();
+        assert_eq!(&out, parsed_frame, "raw and parsed forms disagree");
+    }
+
+    // The attach forms displace each other: parsed after raw, raw after
+    // parsed.
+    let src = sources[0].as_slice();
+    enc.set_dictionary(&dict);
+    enc.set_source(src);
+    enc.set_drain(Vec::new());
+    enc.compress();
+    let raw_again = enc.set_drain(Vec::new()).unwrap();
+    assert_eq!(raw_again, parsed_frames[0]);
+    enc.set_parsed_dictionary(&parsed);
+    enc.set_source(src);
+    enc.set_drain(Vec::new());
+    enc.compress();
+    let parsed_again = enc.set_drain(Vec::new()).unwrap();
+    assert_eq!(parsed_again, parsed_frames[0]);
+
+    // and every frame roundtrips through the dictionary decoder
+    let mut dec = crate::decoding::FrameDecoder::new();
+    dec.add_dict(crate::decoding::Dictionary::decode_dict(&dict).unwrap())
+        .unwrap();
+    for (src, frame) in sources.iter().zip(&parsed_frames) {
+        let mut input = frame.as_slice();
+        dec.reset(&mut input).unwrap();
+        dec.decode_blocks(&mut input, crate::decoding::BlockDecodingStrategy::All)
+            .unwrap();
+        assert_eq!(dec.collect().unwrap(), *src);
+    }
+}
+
 /// The ring decode path (dictionary frames) enforces the declared
 /// Frame_Content_Size against its own output count: a pledged dict stream
 /// decodes clean, and corrupting only the header's FCS field rejects the

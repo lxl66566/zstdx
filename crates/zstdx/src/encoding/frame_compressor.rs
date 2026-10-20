@@ -52,6 +52,10 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     /// model panics on IO already — use the option-carrying entry points
     /// for recoverable errors).
     dictionary: Option<Vec<u8>>,
+    /// Parsed dictionary (see [`Self::set_parsed_dictionary`]): shared
+    /// across frames, so multi-frame reuse skips the per-frame parse of
+    /// the raw form above.
+    parsed_dictionary: Option<alloc::sync::Arc<super::dictionary::EncDictionary>>,
     state: CompressState<M>,
     hasher: FrameHasher,
 }
@@ -928,6 +932,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compression_level,
             input_shape: crate::InputShape::default(),
             dictionary: None,
+            parsed_dictionary: None,
             state: CompressState {
                 dict_entropy: DictEntropy::default(),
                 matcher: MatchGeneratorDriver::new(1024 * 128),
@@ -958,6 +963,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             input_shape: crate::InputShape::default(),
             dictionary: None,
+            parsed_dictionary: None,
             hasher: FrameHasher::new(),
         }
     }
@@ -986,9 +992,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
     /// Attach a raw zstd dictionary for compression (content as match
     /// history, entropy tables seeded, id in the frame header). Must be set
-    /// before `compress`; re-declared per frame.
+    /// before `compress`; re-declared per frame. The bytes parse at every
+    /// [`Self::compress`]; pass the dictionary through
+    /// [`crate::EncoderDictionary::parse`] and [`Self::set_parsed_dictionary`]
+    /// instead when reusing the compressor across frames.
     pub fn set_dictionary(&mut self, dict: &[u8]) {
+        self.parsed_dictionary = None;
         self.dictionary = Some(dict.to_vec());
+    }
+
+    /// Attach an already-parsed dictionary (see [`crate::EncoderDictionary`])
+    /// for compression: the parse is shared across frames, unlike the raw
+    /// form of [`Self::set_dictionary`]. Must be set before `compress`;
+    /// replaces a raw dictionary set earlier (and vice versa). A parsed
+    /// dictionary cannot fail, so the raw form's compress-time panic never
+    /// fires on this path.
+    pub fn set_parsed_dictionary(&mut self, dict: &crate::EncoderDictionary) {
+        self.dictionary = None;
+        self.parsed_dictionary = Some(dict.shared());
     }
 
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to
@@ -1005,21 +1026,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor; a dictionary
         // (validated here — see `set_dictionary`'s panic contract) rides
-        // along as match history and seeded entropy state.
-        let dict = self
-            .dictionary
-            .as_deref()
-            .map(super::dictionary::EncDictionary::parse)
-            .map(|d| d.expect("valid dictionary"));
+        // along as match history and seeded entropy state. The parsed form
+        // shares one parse across frames; the raw form parses per frame.
+        let dict: Option<alloc::sync::Arc<super::dictionary::EncDictionary>> =
+            match self.parsed_dictionary.clone() {
+                Some(parsed) => Some(parsed),
+                None => self.dictionary.as_deref().map(|raw| {
+                    alloc::sync::Arc::new(
+                        super::dictionary::EncDictionary::parse(raw).expect("valid dictionary"),
+                    )
+                }),
+            };
         let dict_id = dict
-            .as_ref()
+            .as_deref()
             .and_then(super::dictionary::EncDictionary::header_id);
         // No frame inherits the previous one's reach choice (see
         // reach_probe): an empty head resets it to the stock reach.
         self.state
             .matcher
             .consider_reach_probe(&[], self.compression_level);
-        if let Some(ref dict) = dict {
+        if let Some(dict) = dict.as_ref() {
             let mut shape = self.input_shape;
             shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
             super::dictionary::reset_with_dictionary(
