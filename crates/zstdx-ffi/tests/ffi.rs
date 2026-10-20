@@ -708,6 +708,36 @@ fn window_log_and_nb_workers_parameters() {
     unsafe { zstd::ZSTD_freeDCtx(dctx) };
 }
 
+#[test]
+fn ldm_switch_with_workers() {
+    // ZSTD_c_enableLongDistanceMatching (160: 0 auto / 1 enable / 2
+    // disable) rides the multithreaded dispatch together with nbWorkers
+    // (R57): every switch value must produce a legal frame on the job
+    // path (the input clears the 2 MiB MT gate).
+    let input: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 61) as u8).collect();
+    let mut dst = vec![0u8; compress_bound(input.len())];
+    let mut plain = vec![0u8; input.len()];
+    for ldm in [0, 1, 2] {
+        let cctx = cctx_with(0, 0);
+        assert_eq!(ldm as usize, set_param(cctx, 160, ldm));
+        assert_eq!(4, set_param(cctx, 400, 4));
+        let n = unsafe {
+            zstd::ZSTD_compressCCtx(
+                cctx,
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                input.as_ptr().cast(),
+                input.len(),
+                3,
+            )
+        };
+        assert!(!is_error(n));
+        assert_eq!(decompress(&mut plain, &dst[..n]), input.len());
+        assert_eq!(&plain, &input, "ldm {ldm}");
+        unsafe { zstd::ZSTD_freeCCtx(cctx) };
+    }
+}
+
 fn raw_dict() -> Vec<u8> {
     // A raw-content dictionary cut from the same pattern family as the
     // payload (a formatted dictionary, when present in the tree, is used by

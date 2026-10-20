@@ -61,10 +61,13 @@ impl InputShape {
 /// (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before the source-length clamp; a
 /// forced window log wins.
 ///
-/// Multithreaded frames (`workers` > 1) consume only the window half:
-/// the jobs keep the job-model LDM arming, so `Disable` does not stand
-/// the cross-job captures down and `Enable` does not force them below
-/// their own bars (a recorded deviation).
+/// On multithreaded frames (`workers` > 1) the bulk path carries the
+/// switch into every job: `Disable` stands the cross-job captures down
+/// and disarms LDM everywhere (the dictionary seed included), `Enable`
+/// forces the far source on per job at the raised window (the fast-row
+/// screen capture stands down under it — its grid cannot honor the strip
+/// the raised window widens). The streaming core's multithreaded path
+/// still consumes only the window half.
 ///
 /// ```rust
 /// use zstdx::{EncoderOptions, LdmMode, Level};

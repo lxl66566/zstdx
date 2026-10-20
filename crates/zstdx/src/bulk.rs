@@ -79,10 +79,9 @@ pub fn compress_with(
         let dict_id = options.include_dictid.then(|| dict.header_id()).flatten();
         // The LDM switch's window interplay (libzstd's
         // ZSTD_LDM_DEFAULT_WINDOW_LOG): the multithreaded path consumes
-        // the raised window through its own forced-window plumbing; its
-        // per-job LDM arming follows the job model (see the compat
-        // deviations), so only the window half of an explicit switch
-        // reaches it.
+        // the raised window through its own forced-window plumbing and
+        // carries the switch itself into every job (Disable stands the
+        // capture classes down, Enable forces the far source per job).
         let window_log = options.ldm_window_log();
         #[cfg(feature = "std")]
         if options.workers > 1 && options.include_dictid {
@@ -94,6 +93,7 @@ pub fn compress_with(
                 window_log,
                 declared,
                 Some(dict),
+                options.long_distance_matching,
             ));
         }
         return Ok(crate::encoding::compress_slice_with_dictionary_id(
@@ -120,6 +120,7 @@ pub fn compress_with(
             options.ldm_window_log(),
             declared,
             None,
+            options.long_distance_matching,
         ));
     }
     Ok(crate::encoding::compress_slice_shaped_ldm(
