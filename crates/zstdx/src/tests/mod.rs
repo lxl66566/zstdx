@@ -1146,6 +1146,38 @@ fn long_distance_matching_disable_overrides_auto_arming() {
     );
 }
 
+/// The LDM override stays legal on every strategy family (R56): Enable
+/// on the tagged rows is inert by design (no LDM candidate feed) and on
+/// the btlazy2/opt rows arms the far source below every auto bar — each
+/// family must still emit frames this engine and libzstd decode.
+#[test]
+fn ldm_override_roundtrips_every_family() {
+    let data = ldm_text_tile();
+    for level in [
+        crate::Level::from_zstd(7), // tagged Row strategy: Enable is inert
+        crate::Level::Best,         // btlazy2
+        crate::Level::Opt,          // opt-family tree search
+    ] {
+        for mode in [crate::LdmMode::Enable, crate::LdmMode::Disable] {
+            let frame = crate::bulk::compress_with(
+                &data,
+                &crate::EncoderOptions::new(level).long_distance_matching(mode),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::bulk::decompress(&frame, data.len()).unwrap(),
+                data,
+                "{level:?}/{mode:?}"
+            );
+            assert_eq!(
+                zstd::decode_all(frame.as_slice()).unwrap(),
+                data,
+                "{level:?}/{mode:?}: libzstd decodes"
+            );
+        }
+    }
+}
+
 pub mod bit_reader;
 pub mod block_output_cap;
 pub mod decode_corpus;
