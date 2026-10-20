@@ -9,6 +9,7 @@ use crate::{
     Error, InputShape, Level,
     decoding::{Dictionary, dictionary::MAGIC_NUM},
     encoding::{
+        Matcher,
         block_enc::compressed::{DictEntropy, LitStreams, SeqCostMode},
         frame_compressor::CompressState,
     },
@@ -116,7 +117,7 @@ impl EncDictionary {
 /// exactly like between-block reuse; the dictID in the header makes that
 /// legal). The length in `shape` must already include the dictionary
 /// content (libzstd clamps the window by src+dict).
-pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
+pub(crate) fn reset_with_dictionary<M: Matcher>(
     state: &mut CompressState<M>,
     dict: &EncDictionary,
     level: Level,
@@ -127,7 +128,7 @@ pub(crate) fn reset_with_dictionary<M: crate::encoding::Matcher>(
 
 /// [`reset_with_dictionary`] with the frame's explicit LDM switch declared
 /// before the reset (the reset's size gate reads it).
-pub(crate) fn reset_with_dictionary_mode<M: crate::encoding::Matcher>(
+pub(crate) fn reset_with_dictionary_mode<M: Matcher>(
     state: &mut CompressState<M>,
     dict: &EncDictionary,
     level: Level,
@@ -170,12 +171,122 @@ pub(crate) fn reset_with_dictionary_mode<M: crate::encoding::Matcher>(
     };
 }
 
+/// Single-entry dictionary seed image cache, riding a pooled
+/// [`CompressState`] (see `seed_with_cache`): after a state is seeded for
+/// `(dictionary, level, shape, ldm mode)`, the image of everything the
+/// seeding wrote is captured; a later seeding with the same key restores
+/// the image instead of re-running `reset_with_dictionary` — the
+/// single-threaded counterpart of libzstd's CDict attach economics (digest
+/// once, re-arm near-free), minus its shared match state (each pooled
+/// state carries its own image, so no locking is involved: the slot is
+/// only touched while the owning thread holds the state).
+///
+/// The key is collision-proof by construction: the dictionary enters as
+/// `Arc` target identity and the image holds its own `Arc` clone, so the
+/// address cannot be recycled by a different dictionary while the image
+/// lives; level, shape and LDM mode are the remaining inputs the seeding
+/// reads (`reset` + `load_dictionary` derive every table size, row swap
+/// and gate from them; the reach choice and LDM arming context are forced
+/// to the deterministic dict-frame values at every `seed_with_cache`
+/// call, so they need no key slot). Restores are exact by construction:
+/// the image is the full overwrite of everything seeding wrote (see
+/// `match_generator::DriverSeedImage` for the deliberate exceptions and
+/// their neutrality arguments).
+#[cfg(feature = "std")]
+pub(crate) struct SeedCache {
+    /// Pins the key's address (see the type doc).
+    dict: alloc::sync::Arc<EncDictionary>,
+    level: Level,
+    shape: InputShape,
+    ldm: crate::LdmMode,
+    driver: super::match_generator::DriverSeedImage,
+    last_huff_table: Option<HuffmanTable>,
+    ll_previous: Option<FSETable>,
+    ml_previous: Option<FSETable>,
+    of_previous: Option<FSETable>,
+    dict_entropy: DictEntropy,
+}
+
+#[cfg(feature = "std")]
+impl SeedCache {
+    fn matches(
+        &self,
+        dict: &alloc::sync::Arc<EncDictionary>,
+        level: Level,
+        shape: InputShape,
+        ldm: crate::LdmMode,
+    ) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.dict, dict)
+            && self.level == level
+            && self.shape == shape
+            && self.ldm == ldm
+    }
+
+    fn restore_into<M: Matcher>(&self, state: &mut CompressState<M>) {
+        state.matcher.restore_seed_image(&self.driver);
+        state.last_huff_table.clone_from(&self.last_huff_table);
+        state.fse_tables.ll_previous.clone_from(&self.ll_previous);
+        state.fse_tables.ml_previous.clone_from(&self.ml_previous);
+        state.fse_tables.of_previous.clone_from(&self.of_previous);
+        state.dict_entropy = self.dict_entropy;
+        state.split = super::pre_split::FrameSavings::new();
+    }
+}
+
+/// Seed `state` for a dictionary frame through its single-entry image
+/// cache: a key hit restores the captured post-seed image, a miss runs
+/// the full seeding (see [`reset_with_dictionary_mode`]) and captures an
+/// image when the matcher provides one (the built-in driver). The reach
+/// choice and LDM arming context are forced to the dict-frame determinism
+/// first (the fresh-state values every dict entry point implies today),
+/// so the key needs no slot for them.
+#[cfg(feature = "std")]
+pub(crate) fn seed_with_cache<M: Matcher>(
+    state: &mut CompressState<M>,
+    dict: &alloc::sync::Arc<EncDictionary>,
+    level: Level,
+    shape: InputShape,
+    ldm: crate::LdmMode,
+) {
+    state.matcher.set_ldm_mode(ldm);
+    state.matcher.force_dict_frame_inputs();
+    // The slot is taken out for the restore: the image lives inside the
+    // state it restores, so the borrow must not overlap.
+    let parked = state.seed_cache.take();
+    if let Some(cache) = parked
+        .as_ref()
+        .filter(|c| c.matches(dict, level, shape, ldm))
+    {
+        cache.restore_into(state);
+        state.seed_cache = parked;
+        return;
+    }
+    reset_with_dictionary_mode(state, dict, level, shape, ldm);
+    state.matcher.canonicalize_for_seed_capture();
+    if let Some(driver) = state.matcher.capture_seed_image() {
+        state.seed_cache = Some(alloc::boxed::Box::new(SeedCache {
+            driver,
+            last_huff_table: state.last_huff_table.clone(),
+            ll_previous: state.fse_tables.ll_previous.clone(),
+            ml_previous: state.fse_tables.ml_previous.clone(),
+            of_previous: state.fse_tables.of_previous.clone(),
+            dict_entropy: state.dict_entropy,
+            dict: alloc::sync::Arc::clone(dict),
+            level,
+            shape,
+            ldm,
+        }));
+    }
+}
+
 /// A parsed dictionary shared across any number of compressions: the parse
 /// (content split plus the encoder-side entropy-table digest) runs once, at
 /// [Self::parse], and every frame built from it re-seeds its own matcher
 /// from the shared tables — the per-frame content load into a fresh matcher
-/// is intrinsic to the frame model, exactly as libzstd's CDict reuses the
-/// digested dictionary but still re-arms the frame from it.
+/// pays the frame model's re-arm, exactly as libzstd's CDict reuses the
+/// digested dictionary but still re-arms the frame from it; the
+/// single-threaded entry points cache the re-arm itself as a seed image
+/// (see [`seed_with_cache`]).
 #[derive(Clone)]
 pub struct EncoderDictionary {
     inner: alloc::sync::Arc<EncDictionary>,

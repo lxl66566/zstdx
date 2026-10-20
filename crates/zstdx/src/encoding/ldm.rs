@@ -669,6 +669,14 @@ impl LdmState {
         self.window
     }
 
+    /// Whether the deferred restart clear is still pending (table content
+    /// dead until the first touch); the seed-image cache captures the
+    /// distinction.
+    #[cfg(feature = "std")]
+    pub(super) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
     #[cfg(feature = "std")]
     /// Capture the fill state for [`Self::restore`]: exactly the parts a
     /// prefix-fill continuation needs (`window`/`stop_mask`/`hash_mask`

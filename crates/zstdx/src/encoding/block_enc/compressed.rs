@@ -111,7 +111,7 @@ pub(crate) struct DictEntropy {
 
 /// Sequence-table selection semantics for one frame, mirroring which arm
 /// of libzstd's `ZSTD_selectEncodingType` the frame's strategy takes.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) enum SeqCostMode {
     /// The fast-strategy heuristic (dynamic-table threshold at mult 9)
     /// plus the repeat cost check — the stock behavior of every no-dict
