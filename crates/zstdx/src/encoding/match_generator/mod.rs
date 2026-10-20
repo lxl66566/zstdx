@@ -530,8 +530,10 @@ pub(crate) struct LdmPrefixSnapshot {
 /// dictionary content beyond the stock search domain, btlazy rows on
 /// small-src shapes) capture whatever the seeding left: pooled residue,
 /// which the frame retires exactly as R57 did -- the opt entries through
-/// the coordinate origin restored with them (the pair is consistent), the
-/// DUBT ring behind heads the deferred `dubt_stale` clear zeroes.
+/// the coordinate origin advance the restore re-runs over the live
+/// residue (`opt_origin += pos + 1`, reset's own move; the captured value
+/// would rewind below the entries written since the capture), the DUBT
+/// ring behind heads the deferred `dubt_stale` clear zeroes.
 ///
 /// Deliberately NOT captured, each with its neutrality argument:
 /// - the chain ring beyond the dictionary's positions: those slots keep the previous frame's links
@@ -2673,15 +2675,27 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     pub(crate) fn restore_seed_image(&mut self, image: &DriverSeedImage) {
         self.ensure_family_buffers(&image.params);
-        // One scalar is computed against the CURRENT residue (reset's own
-        // stash): the chain heads' write high-water (the coverage
-        // invariant wants the state's own history, and a superset
-        // high-water only over-advances a future origin, the safe
-        // direction). The opt rows' coordinate origin rides the image
-        // verbatim: it pairs with the captured table bytes (filled or
-        // residue alike), so the restored pair is exactly the captured
-        // state's.
+        // Two scalars are computed against the CURRENT residue (the same
+        // moves `reset` itself runs) before the scalar block below
+        // overwrites `pos`: the chain heads' write high-water (the
+        // coverage invariant wants the state's own history, and a
+        // superset high-water only over-advances a future origin, the
+        // safe direction), and -- on the opt family's SKIP shapes only --
+        // the opt coordinate origin: the image carries no tree bytes
+        // there, so the live tables' residue must retire through the
+        // reset move (advance past every position the state has
+        // written); restoring the captured value would rewind the
+        // origin below entries the frames since the capture wrote,
+        // leaving them live as candidates at shifted positions. The
+        // filled shapes restore the captured (canonical zero) origin: it
+        // pairs with the wholesale-copied table bytes.
         let strip_mark = self.strip_mark.max(self.pos);
+        let opt_origin =
+            if matches!(image.params.strategy, Strategy::Opt(_)) && image.opt_table.is_empty() {
+                self.opt_origin.wrapping_add(self.pos + 1)
+            } else {
+                image.opt_origin
+            };
         // Buffers: length-checked in-place copies. A same-key hit on the
         // capturing state always matches lengths; the reallocation branch
         // is the never-taken safety net.
@@ -2780,7 +2794,7 @@ impl MatchGeneratorDriver {
         self.second = image.second;
         self.next_update = image.next_update;
         self.gap_start = image.gap_start;
-        self.opt_origin = image.opt_origin;
+        self.opt_origin = opt_origin;
         self.head_origin = image.head_origin;
         self.fast_shift = image.fast_shift;
         self.strip_mark = strip_mark;
