@@ -111,8 +111,12 @@ impl DStream {
             inner.set_max_window_size(1_u64 << log);
         }
         if let Some(dict) = dict {
+            // The options-based registration rule: under the dictionary's
+            // own id and the null id — libzstd applies a ref'd dictionary
+            // to every frame regardless of the header's dictID field, so a
+            // dictIDFlag-suppressed frame decodes with it attached.
             inner
-                .add_shared_dict(Arc::clone(dict))
+                .add_options_dict(Arc::clone(dict))
                 .map_err(|_| ErrorCode::Generic)?;
         }
         Ok(Self {

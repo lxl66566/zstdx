@@ -1609,3 +1609,98 @@ fn stream_decode_oversized_block_claim_errors() {
     );
     unsafe { zstd::ZSTD_freeDStream(dctx) };
 }
+
+/// A dictIDFlag-suppressed frame decodes on the streaming path with the
+/// formatted dictionary loaded (R56): libzstd applies a loaded dictionary
+/// to every frame regardless of the header's dictID field, so the stream
+/// decoder must register it under the null id too, not only its own.
+#[test]
+fn suppressed_dictid_stream_decodes_with_loaded_dict() {
+    let Some(dict) = formatted_dict() else {
+        return;
+    };
+    let payload: Vec<u8> = {
+        let mut files: Vec<_> = std::fs::read_dir("../zstdx/dict_tests/files")
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        files.sort();
+        match files.first() {
+            Some(path) => std::fs::read(path).unwrap_or_else(|_| dict[..dict.len() / 2].to_vec()),
+            None => dict[..dict.len() / 2].to_vec(),
+        }
+    };
+
+    // Compress with the dictionary and dictIDFlag = 0, streaming.
+    let cctx = zstd::ZSTD_createCCtx();
+    assert_eq!(0, set_param(cctx, 202, 0));
+    assert!(!is_error(unsafe {
+        zstd::ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr().cast(), dict.len())
+    }));
+    let mut produced = Vec::new();
+    {
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: payload.as_ptr().cast(),
+            size: payload.len(),
+            pos: 0,
+        };
+        let mut chunk = vec![0u8; 128 * 1024];
+        loop {
+            let mut zout = zstd::ZSTD_outBuffer {
+                dst: chunk.as_mut_ptr().cast(),
+                size: chunk.len(),
+                pos: 0,
+            };
+            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, 2) };
+            assert!(!is_error(r), "{}", error_name(r));
+            produced.extend_from_slice(&chunk[..zout.pos]);
+            if r == 0 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        unsafe { zstd::ZSTD_getDictID_fromFrame(produced.as_ptr().cast(), produced.len()) },
+        0,
+        "the flag must suppress the header field"
+    );
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+
+    // Streaming decode with the dictionary loaded: the frame carries no
+    // dictID, so the dictionary applies through its null-id registration.
+    // initDStream first — the legacy contract clears any dictionary
+    // reference on it (ZSTD_DCtx_refDDict(zds, NULL)).
+    let dctx = zstd::ZSTD_createDCtx();
+    assert!(unsafe { zstd::ZSTD_initDStream(dctx) } > 0);
+    assert!(!is_error(unsafe {
+        zstd::ZSTD_DCtx_loadDictionary(dctx, dict.as_ptr().cast(), dict.len())
+    }));
+    let mut decoded = Vec::with_capacity(payload.len());
+    {
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: produced.as_ptr().cast(),
+            size: produced.len(),
+            pos: 0,
+        };
+        let mut chunk = vec![0u8; 128 * 1024];
+        loop {
+            let mut zout = zstd::ZSTD_outBuffer {
+                dst: chunk.as_mut_ptr().cast(),
+                size: chunk.len(),
+                pos: 0,
+            };
+            let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
+            assert!(!is_error(r), "decode stream failed: {}", error_name(r));
+            decoded.extend_from_slice(&chunk[..zout.pos]);
+            if r == 0 {
+                break;
+            }
+        }
+    }
+    assert_eq!(decoded, payload);
+    unsafe { zstd::ZSTD_freeDStream(dctx) };
+}
