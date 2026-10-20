@@ -31,8 +31,8 @@ use super::{
     compress_fastest, far_screen,
     frame_compressor::{
         CompressState, JobSpf, compress_job_blocks_inner, new_owned_state, new_slice_state,
-        reset_slice_state, return_pooled_slice_state, return_slice_state, take_pooled_slice_state,
-        take_slice_state,
+        reset_slice_state_mode, return_pooled_slice_state, return_slice_state,
+        take_pooled_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
     match_generator::{
@@ -93,8 +93,17 @@ pub fn mt_job_size_for(
     // encoder actually runs. `head` is the whole input (the screen clamps
     // its own span).
     let fast_window = far_screen::mt_capture_window(level, shape, head);
-    capture_grid(len, level, shape, choice, head, fast_window)
-        .unwrap_or_else(|| job_size_for(len, workers.max(2), overlap))
+    // The analysis tools model the stock (Auto) frame.
+    capture_grid(
+        len,
+        level,
+        shape,
+        choice,
+        head,
+        fast_window,
+        crate::LdmMode::Auto,
+    )
+    .unwrap_or_else(|| job_size_for(len, workers.max(2), overlap))
 }
 
 /// Compress `src` into one frame using up to `workers` threads.
@@ -109,6 +118,14 @@ pub fn mt_job_size_for(
 /// declaration to the input size (the whole input is known here, so the
 /// decoders preallocate exactly and the parallel decode path can partition
 /// up front — the fallback's smaller frames never profit from it).
+///
+/// `ldm_mode` is the frame's explicit LDM switch (see [`crate::LdmMode`]),
+/// carried into every job and the fallback alike: `Auto` keeps the job
+/// model's own arming exactly; `Disable` stands the whole capture lattice
+/// down (no far screen, no pinned grid, no shared prefix fill, no header
+/// window raise) and disarms LDM in every job including the dictionary
+/// seed; `Enable` rides the window the caller raised and forces the far
+/// source on in every job, the capture classes keeping their own bars.
 pub fn compress_slice_mt(
     src: &[u8],
     level: Level,
@@ -117,6 +134,7 @@ pub fn compress_slice_mt(
     window_log: Option<u32>,
     declared: Option<u64>,
     dict: Option<&super::dictionary::EncDictionary>,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let checksum = checksum && cfg!(feature = "hash");
     if workers < 2
@@ -124,7 +142,7 @@ pub fn compress_slice_mt(
         || level == Level::Uncompressed
         || std::thread::available_parallelism().map_or(true, |n| n.get() < 2)
     {
-        return st_fallback(src, level, checksum, window_log, declared, dict);
+        return st_fallback(src, level, checksum, window_log, declared, dict, ldm_mode);
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
@@ -151,8 +169,16 @@ pub fn compress_slice_mt(
     // capture stays byte-safe with the dict seed confined to job zero's
     // owned window (which the donation and shared-fill schedules never
     // touch — job zero runs the dictionary path below on the armed grid
-    // like on the stock one).
-    let fast_window = far_screen::mt_capture_window(level, shape, src);
+    // like on the stock one). The screen runs under Auto only: Disable
+    // stands the far class down outright, and Enable's per-job forcing
+    // already carries the far source at the raised window — whose widened
+    // fast-row strip (the mid-size band) is past the capture grid's
+    // ceiling, a schedule the SelfFill lattice cannot grid anyway.
+    let fast_window = if ldm_mode == crate::LdmMode::Auto {
+        far_screen::mt_capture_window(level, shape, src)
+    } else {
+        None
+    };
     // The frame's head decides its chain reach (see reach_probe), and with
     // it the strip: a shrunk search domain shrinks the strip to match.
     // Eligible frames donate the probe's keep side into job zero (see
@@ -196,6 +222,7 @@ pub fn compress_slice_mt(
             reach_probe::ReachChoice::Keep,
             head,
             fast_window,
+            ldm_mode,
         )
         .unwrap_or_else(|| job_size_for(src.len() as u64, workers.max(2), keep_strip));
         keep_plan = plan_prefix_ldm(
@@ -206,12 +233,18 @@ pub fn compress_slice_mt(
             keep_job_size,
             src.len().div_ceil(keep_job_size),
             fast_window,
+            ldm_mode,
         );
         donation_prefix = keep_plan.is_some();
         #[cfg(feature = "job_trace")]
         let trace_probe = std::time::Instant::now();
-        let (donated_choice, state, prefix) =
-            donate_job_zero_prefix(src, level, shape, donation_arming(donation_prefix));
+        let (donated_choice, state, prefix) = donate_job_zero_prefix(
+            src,
+            level,
+            shape,
+            donation_arming(donation_prefix),
+            ldm_mode,
+        );
         #[cfg(feature = "job_trace")]
         super::job_trace::add_probe(trace_probe);
         choice = donated_choice;
@@ -234,8 +267,16 @@ pub fn compress_slice_mt(
     }
     let donation = Mutex::new(donation);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
-    let job_size = capture_grid(src.len() as u64, level, shape, choice, head, fast_window)
-        .unwrap_or_else(|| job_size_for(src.len() as u64, workers, overlap));
+    let job_size = capture_grid(
+        src.len() as u64,
+        level,
+        shape,
+        choice,
+        head,
+        fast_window,
+        ldm_mode,
+    )
+    .unwrap_or_else(|| job_size_for(src.len() as u64, workers, overlap));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -255,9 +296,18 @@ pub fn compress_slice_mt(
         // computed (the same pure inputs at Keep); a non-donated frame
         // (and every dictionary frame — no probe runs) plans from its
         // final schedule.
-        keep_plan
-            .take()
-            .or_else(|| plan_prefix_ldm(src, level, shape, choice, job_size, n_jobs, fast_window))
+        keep_plan.take().or_else(|| {
+            plan_prefix_ldm(
+                src,
+                level,
+                shape,
+                choice,
+                job_size,
+                n_jobs,
+                fast_window,
+                ldm_mode,
+            )
+        })
     } else {
         None
     };
@@ -396,6 +446,7 @@ pub fn compress_slice_mt(
                                 level,
                                 shape,
                                 dict,
+                                ldm_mode,
                             );
                         }
                         if id == 0
@@ -428,6 +479,7 @@ pub fn compress_slice_mt(
                             choice,
                             job_ldm,
                             snapshot.job_spf(),
+                            ldm_mode,
                         )
                     }));
                     match attempt {
@@ -459,7 +511,7 @@ pub fn compress_slice_mt(
             // spans cannot see.
             match plan {
                 PrefixPlan::Whole { med, share } => {
-                    let build = build_prefix_snapshot(src, level, shape, *med)
+                    let build = build_prefix_snapshot(src, level, shape, *med, ldm_mode)
                         .map(|(upto, snapshot)| PrefixBuild { upto, snapshot });
                     *share.lock().unwrap() = build;
                 },
@@ -468,7 +520,9 @@ pub fn compress_slice_mt(
                 // step so each adopting job's own remainder fill stays
                 // bounded wherever the build has reached when the job's
                 // worker picks it up.
-                PrefixPlan::Windowed(w) => build_ldm_prefix_chain(src, level, shape, w, &ready),
+                PrefixPlan::Windowed(w) => {
+                    build_ldm_prefix_chain(src, level, shape, w, &ready, ldm_mode)
+                },
                 PrefixPlan::SelfFill { .. } => {},
             }
             ready.notify_all();
@@ -537,7 +591,9 @@ fn header_window(
 /// (small inputs, one worker, raw-block level, single-core processes): the
 /// plain shaped slice entry, or — with a dictionary — its owned-window
 /// dictionary twin (the same entry `bulk::compress_with` routes
-/// single-worker dictionary calls through).
+/// single-worker dictionary calls through). The frame's explicit LDM
+/// switch rides along, so the fallback's bytes are the ST entry's for the
+/// same mode whatever worker count engaged the gate.
 fn st_fallback(
     src: &[u8],
     level: Level,
@@ -545,9 +601,37 @@ fn st_fallback(
     window_log: Option<u32>,
     declared: Option<u64>,
     dict: Option<&super::dictionary::EncDictionary>,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
+    if ldm_mode == crate::LdmMode::Auto {
+        // The stock entries verbatim: Auto's fallback bytes are exactly
+        // the pre-switch fallback's, whatever engaged the gate.
+        if let Some(dict) = dict {
+            return super::compress_slice_with_dictionary(
+                src,
+                level,
+                checksum,
+                crate::InputShape {
+                    len: Some(src.len() as u64),
+                    window_log,
+                },
+                dict,
+                declared,
+            );
+        }
+        return super::compress_slice_shaped_declared(
+            src,
+            level,
+            checksum,
+            crate::InputShape {
+                len: None,
+                window_log,
+            },
+            declared,
+        );
+    }
     if let Some(dict) = dict {
-        return super::compress_slice_with_dictionary(
+        return super::compress_slice_with_dictionary_id(
             src,
             level,
             checksum,
@@ -557,9 +641,11 @@ fn st_fallback(
             },
             dict,
             declared,
+            dict.header_id(),
+            ldm_mode,
         );
     }
-    super::compress_slice_shaped_declared(
+    super::compress_slice_shaped_ldm(
         src,
         level,
         checksum,
@@ -567,6 +653,7 @@ fn st_fallback(
             len: None,
             window_log,
         },
+        ldm_mode,
         declared,
     )
 }
@@ -629,9 +716,17 @@ pub(crate) fn donate_keep_span(
     level: Level,
     shape: crate::InputShape,
     ldm: LdmArming,
+    ldm_mode: crate::LdmMode,
 ) -> (f64, Vec<u8>) {
     debug_assert_eq!(head.len(), reach_probe::PROBE_SPAN);
-    reset_slice_state(state, level, shape, reach_probe::ReachChoice::Keep, ldm);
+    reset_slice_state_mode(
+        state,
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        ldm,
+        ldm_mode,
+    );
     state.matcher.prefill_job_strip(&head[..0], 0);
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
@@ -674,6 +769,7 @@ fn donate_job_zero_prefix(
     level: Level,
     shape: crate::InputShape,
     ldm: LdmArming,
+    ldm_mode: crate::LdmMode,
 ) -> (
     reach_probe::ReachChoice,
     alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
@@ -683,7 +779,7 @@ fn donate_job_zero_prefix(
     let head = &src[..reach_probe::PROBE_SPAN];
     let mut output = Vec::new();
     let (keep, shrink) = reach_probe::measure_shrink_concurrent(head, level, shape, || {
-        let (keep_cost, span) = donate_keep_span(&mut state, head, level, shape, ldm);
+        let (keep_cost, span) = donate_keep_span(&mut state, head, level, shape, ldm, ldm_mode);
         output = span;
         keep_cost
     });
@@ -809,12 +905,14 @@ pub(crate) fn run_dict_job_zero(
     level: Level,
     shape: crate::InputShape,
     dict: &super::dictionary::EncDictionary,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut state = take_dict_state();
     // The stock job context pair (the plain jobs' `reset_slice_state`
     // order): dictionary frames keep the full reach, and the LDM runs the
     // per-job model — the table restarts at the job, the dictionary
-    // content included in its ingest.
+    // content included in its ingest. The frame's explicit switch rides
+    // the reset below (Disable disarms the dictionary job's LDM too).
     state
         .matcher
         .set_reach_choice(reach_probe::ReachChoice::Keep);
@@ -823,7 +921,7 @@ pub(crate) fn run_dict_job_zero(
         len: shape.len.map(|len| len + dict.content.len() as u64),
         window_log: shape.window_log,
     };
-    super::dictionary::reset_with_dictionary(&mut state, dict, level, dict_shape);
+    super::dictionary::reset_with_dictionary_mode(&mut state, dict, level, dict_shape, ldm_mode);
     let floor = state.matcher.block_size().min(super::pre_split::SPLIT_MIN);
     let mut output = Vec::with_capacity(job.len() + 3 * (job.len() / floor + 1) + 8);
     let mut hasher = SliceChecksum::new(0, false);
@@ -932,7 +1030,11 @@ impl JobSpfOwned {
 /// reach of `reach` (see `capture_grid`): shared by the bulk planner and
 /// the pledged stream's re-grid so the two run the same lattice.
 pub(crate) fn capture_job_size(len: u64, reach: usize) -> usize {
-    let floor = MIN_JOB_SIZE.max(reach);
+    // The reach floor stays under the ceiling: a forced (or LDM-raised)
+    // window on a fast row widens the strip past the cap, and the clamp
+    // would panic on floor > cap — such sources grid at the cap with
+    // strips deeper than one job's span (legal, just less balanced).
+    let floor = MIN_JOB_SIZE.max(reach).min(CAPTURE_JOB_CAP as usize);
     len.div_ceil(8).clamp(floor as u64, CAPTURE_JOB_CAP) as usize
 }
 
@@ -962,7 +1064,8 @@ fn capture_head_parses(
 /// one the encoder runs, and it is independent of the worker count (the
 /// frame bytes cannot depend on how many workers pick the jobs up).
 /// `fast_window` is the fast rows' pre-screened capture window
-/// (`far_screen::mt_capture_window`; `None` for every other class).
+/// (`far_screen::mt_capture_window`; `None` for every other class); an
+/// explicit `Disable` makes every class return `None`.
 fn capture_grid(
     len: u64,
     level: Level,
@@ -970,7 +1073,13 @@ fn capture_grid(
     choice: reach_probe::ReachChoice,
     head: &[u8],
     fast_window: Option<u64>,
+    ldm_mode: crate::LdmMode,
 ) -> Option<usize> {
+    // An explicit Disable stands the lattice down: no pinned grid, so the
+    // worker-scaled job formula takes over.
+    if ldm_mode == crate::LdmMode::Disable {
+        return None;
+    }
     let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
     let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
     if !capture_head_parses(shape, fast_window, head) {
@@ -1008,7 +1117,16 @@ pub(crate) fn fast_capture_schedule(
     head: &[u8],
     window: u64,
 ) -> Option<(usize, u64)> {
-    let job_size = capture_grid(len, level, shape, choice, head, Some(window))?;
+    // Auto: the stream core carries no explicit switch (its bytes pin).
+    let job_size = capture_grid(
+        len,
+        level,
+        shape,
+        choice,
+        head,
+        Some(window),
+        crate::LdmMode::Auto,
+    )?;
     let n_jobs = len.div_ceil(job_size as u64) as usize;
     // Non-empty by `capture_grid`'s own prefix_last gate; the median is
     // the same balance point `plan_prefix_ldm` splits its schedule at.
@@ -1028,7 +1146,7 @@ pub(crate) fn fast_capture_schedule(
 /// fill. Deterministic in the input and level alone (the grid is pinned,
 /// see `capture_grid`). `fast_window` is the fast rows' pre-screened
 /// capture window (`far_screen::mt_capture_window`; `None` for every
-/// other class).
+/// other class); an explicit `Disable` returns `None`.
 fn plan_prefix_ldm(
     src: &[u8],
     level: Level,
@@ -1037,16 +1155,27 @@ fn plan_prefix_ldm(
     job_size: usize,
     n_jobs: usize,
     fast_window: Option<u64>,
+    ldm_mode: crate::LdmMode,
 ) -> Option<PrefixPlan> {
+    // An explicit Disable stands the lattice down (see `capture_grid`).
+    if ldm_mode == crate::LdmMode::Disable {
+        return None;
+    }
     let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
     let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
     if !capture_head_parses(shape, fast_window, head) {
         return None;
     }
     debug_assert_eq!(
-        shape
-            .len
-            .and_then(|len| capture_grid(len, level, shape, choice, head, fast_window)),
+        shape.len.and_then(|len| capture_grid(
+            len,
+            level,
+            shape,
+            choice,
+            head,
+            fast_window,
+            ldm_mode
+        )),
         Some(job_size),
         "the caller pinned the capture grid"
     );
@@ -1106,12 +1235,25 @@ fn build_prefix_snapshot(
     level: Level,
     shape: crate::InputShape,
     med: u64,
+    ldm_mode: crate::LdmMode,
 ) -> Option<(u64, Arc<StripSnapshot>)> {
     let mut state = take_slice_state(
         level,
         shape,
         reach_probe::ReachChoice::Keep,
         LdmArming::JobPrefix,
+    );
+    // The take reset clears the switch to Auto; re-reset with the frame's
+    // so the build parses exactly as the adopting jobs do (identical under
+    // Auto, and Enable's capture rows arm LDM either way — Disable never
+    // reaches a build).
+    reset_slice_state_mode(
+        &mut state,
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        LdmArming::JobPrefix,
+        ldm_mode,
     );
     // The stock prefill's clears and LDM restart, then the fill itself in
     // segments whose slack past `med` stays bounded — the loop cannot run
@@ -1193,12 +1335,25 @@ fn build_ldm_prefix_chain(
     shape: crate::InputShape,
     plan: &WindowPlan,
     ready: &Condvar,
+    ldm_mode: crate::LdmMode,
 ) {
     let mut state = take_slice_state(
         level,
         shape,
         reach_probe::ReachChoice::Keep,
         LdmArming::JobPrefix,
+    );
+    // The take reset clears the switch to Auto; re-reset with the frame's
+    // so the build parses exactly as the adopting jobs do (identical under
+    // Auto, and Enable's capture rows arm LDM either way — Disable never
+    // reaches a build).
+    reset_slice_state_mode(
+        &mut state,
+        level,
+        shape,
+        reach_probe::ReachChoice::Keep,
+        LdmArming::JobPrefix,
+        ldm_mode,
     );
     // The stock prefill's LDM restart (fresh at 0, entry floor 0) — the
     // chain tables stay untouched: this build only feeds the LDM state.
@@ -1236,8 +1391,9 @@ pub(crate) fn prepare_job_state(
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
     job_start: u64,
+    ldm_mode: crate::LdmMode,
 ) {
-    reset_slice_state(state, level, shape, choice, ldm);
+    reset_slice_state_mode(state, level, shape, choice, ldm, ldm_mode);
     if job_start > 0 {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -1268,10 +1424,11 @@ pub(crate) fn run_job_with(
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
     spf: JobSpf<'_>,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
-    prepare_job_state(state, level, shape, choice, ldm, job.start as u64);
+    prepare_job_state(state, level, shape, choice, ldm, job.start as u64, ldm_mode);
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
     // The windowed band's chain tables cover the reach tail; every other
@@ -1309,6 +1466,7 @@ pub(crate) fn run_job(
     choice: reach_probe::ReachChoice,
     ldm: LdmArming,
     spf: JobSpf<'_>,
+    ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut state = take_pooled_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
@@ -1322,6 +1480,7 @@ pub(crate) fn run_job(
         choice,
         ldm,
         spf,
+        ldm_mode,
     );
     return_pooled_slice_state(state);
     output
@@ -1377,19 +1536,73 @@ mod tests {
         for (i, b) in tail.iter().enumerate() {
             src[(2 << 20) + i] = *b;
         }
-        let one = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let one = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         // Second call rides pooled states from the first.
-        let two = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let two = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert_eq!(one, two);
         // Mixed worker counts share one pool.
-        let w4 = compress_slice_mt(&src, Level::Balanced, false, 4, None, None, None);
-        let again8 = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let w4 = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let again8 = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert_eq!(one, w4);
         assert_eq!(one, again8);
         // A different level between two balanced calls: the pool must
         // reconfigure without residue.
-        let _other = compress_slice_mt(&src, Level::Fast, false, 8, None, None, None);
-        let mixed = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let _other = compress_slice_mt(
+            &src,
+            Level::Fast,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mixed = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert_eq!(one, mixed);
         // And the frame still roundtrips.
         let mut back = vec![0u8; src.len()];
@@ -1427,8 +1640,16 @@ mod tests {
                 MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
                     as usize;
             // The planner pins the capture grid (see `compress_slice_mt`).
-            let job_size = capture_grid(len, Level::Balanced, shape, ReachChoice::Keep, &src, None)
-                .unwrap_or_else(|| job_size_for(len, workers.max(2), strip));
+            let job_size = capture_grid(
+                len,
+                Level::Balanced,
+                shape,
+                ReachChoice::Keep,
+                &src,
+                None,
+                crate::LdmMode::Auto,
+            )
+            .unwrap_or_else(|| job_size_for(len, workers.max(2), strip));
             let n_jobs = len.div_ceil(job_size as u64) as usize;
             let plan = plan_prefix_ldm(
                 &src,
@@ -1438,6 +1659,7 @@ mod tests {
                 job_size,
                 n_jobs,
                 None,
+                crate::LdmMode::Auto,
             );
             assert_eq!(
                 plan.is_some(),
@@ -1471,6 +1693,7 @@ mod tests {
             job_size,
             shape.len.unwrap().div_ceil(job_size as u64) as usize,
             None,
+            crate::LdmMode::Auto,
         );
         assert!(plan.is_none());
         assert_eq!(donation_arming(plan.is_some()), LdmArming::Job);
@@ -1515,8 +1738,26 @@ mod tests {
         // 32 MiB at two workers grids 8 MiB jobs, so job zero holds the
         // head copy plus ~3.25 MiB of copy two; the capture engages (the
         // head above).
-        let st = compress_slice_mt(&data, Level::from_zstd(9), true, 1, None, None, None);
-        let mt = compress_slice_mt(&data, Level::from_zstd(9), true, 2, None, None, None);
+        let st = compress_slice_mt(
+            &data,
+            Level::from_zstd(9),
+            true,
+            1,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt = compress_slice_mt(
+            &data,
+            Level::from_zstd(9),
+            true,
+            2,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         for (name, frame) in [("st", &st), ("mt", &mt)] {
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
@@ -1574,9 +1815,36 @@ mod tests {
         }
         let random = lcg(data.len());
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None, None, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None, None, None);
+            let st = compress_slice_mt(
+                &data,
+                level,
+                true,
+                1,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let mt4 = compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let mt8 = compress_slice_mt(
+                &data,
+                level,
+                true,
+                8,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             for (name, frame) in [("st", &st), ("mt4", &mt4)] {
                 let mut out = vec![0u8; data.len()];
                 let mut decoder = FrameDecoder::new();
@@ -1602,7 +1870,16 @@ mod tests {
                 mt4.len(),
                 st.len()
             );
-            let stock_random = compress_slice_mt(&random, level, true, 4, None, None, None);
+            let stock_random = compress_slice_mt(
+                &random,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             assert!(
                 mt4.len() * 2 < stock_random.len(),
                 "{level:?}: armed {} vs random {}",
@@ -1613,8 +1890,16 @@ mod tests {
             // window — the same header bytes a below-band random source
             // carries (the FCS tail differs; the prefix compared here does
             // not).
-            let below_band =
-                compress_slice_mt(&random[..15 * mib], level, true, 4, None, None, None);
+            let below_band = compress_slice_mt(
+                &random[..15 * mib],
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             assert_eq!(
                 &stock_random[..6],
                 &below_band[..6],
@@ -1649,6 +1934,7 @@ mod tests {
                     ReachChoice::Keep,
                     head,
                     fast_window,
+                    crate::LdmMode::Auto,
                 );
                 assert_eq!(grid.is_some(), name == "parses", "{level:?} {name}");
             }
@@ -1689,9 +1975,36 @@ mod tests {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
-            let mt4 = compress_slice_mt(&data, level, true, 4, None, None, None);
-            let mt8 = compress_slice_mt(&data, level, true, 8, None, None, None);
+            let st = compress_slice_mt(
+                &data,
+                level,
+                true,
+                1,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let mt4 = compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let mt8 = compress_slice_mt(
+                &data,
+                level,
+                true,
+                8,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder
@@ -1704,7 +2017,16 @@ mod tests {
             assert_eq!(mt4, mt8, "{level:?}: mt4 != mt8");
             assert_eq!(
                 mt8,
-                compress_slice_mt(&data, level, true, 8, None, None, None),
+                compress_slice_mt(
+                    &data,
+                    level,
+                    true,
+                    8,
+                    None,
+                    None,
+                    None,
+                    crate::LdmMode::Auto
+                ),
                 "{level:?}: run-to-run determinism"
             );
             assert!(
@@ -1756,6 +2078,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        crate::LdmMode::Auto,
                     );
                     // our decoder, exact-size output slice
                     let mut out = vec![0u8; data.len()];
@@ -1780,8 +2103,26 @@ mod tests {
     #[test]
     fn mt_output_is_deterministic() {
         let data = textish(3 * 1024 * 1024);
-        let a = compress_slice_mt(&data, Level::Fastest, true, 3, None, None, None);
-        let b = compress_slice_mt(&data, Level::Fastest, true, 3, None, None, None);
+        let a = compress_slice_mt(
+            &data,
+            Level::Fastest,
+            true,
+            3,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let b = compress_slice_mt(
+            &data,
+            Level::Fastest,
+            true,
+            3,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert_eq!(a, b);
     }
 
@@ -1790,8 +2131,26 @@ mod tests {
     #[test]
     fn mt_ratio_stays_close_to_single_thread() {
         let data = textish(6 * 1024 * 1024);
-        let st = compress_slice_mt(&data, Level::Fastest, true, 1, None, None, None);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None, None);
+        let st = compress_slice_mt(
+            &data,
+            Level::Fastest,
+            true,
+            1,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt = compress_slice_mt(
+            &data,
+            Level::Fastest,
+            true,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert!(
             mt.len() <= st.len() + st.len() / 50,
             "single {} vs multi {}",
@@ -1806,7 +2165,16 @@ mod tests {
     fn mt_chain_levels_roundtrip() {
         let data = textish(5 * 1024 * 1024);
         for level in [Level::Fast, Level::Balanced] {
-            let compressed = compress_slice_mt(&data, level, true, 4, None, None, None);
+            let compressed = compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
             let n = decoder.decode_all(&compressed, &mut out).unwrap();
@@ -1830,8 +2198,26 @@ mod tests {
         let unit = textish(300 * 1024);
         let data: Vec<u8> = (0..24).flat_map(|_| unit.iter().copied()).collect();
         for level in [Level::Fastest, Level::Fast, Level::Balanced] {
-            let st = compress_slice_mt(&data, level, true, 1, None, None, None);
-            let mt = compress_slice_mt(&data, level, true, 4, None, None, None);
+            let st = compress_slice_mt(
+                &data,
+                level,
+                true,
+                1,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let mt = compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             assert!(
                 mt.len() <= st.len() + st.len() / 50,
                 "{level:?}: periodic data must match across jobs, mt {} vs st {}",
@@ -1885,9 +2271,36 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None, None);
+        let st = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            1,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt4 = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt8 = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
         let n = decoder
@@ -1910,7 +2323,16 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None)
+            compress_slice_mt(
+                &data,
+                Level::Balanced,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto
+            )
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -1959,9 +2381,36 @@ mod tests {
                 });
             }
         }
-        let st = compress_slice_mt(&data, Level::Balanced, true, 1, None, None, None);
-        let mt4 = compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None);
-        let mt8 = compress_slice_mt(&data, Level::Balanced, true, 8, None, None, None);
+        let st = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            1,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt4 = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let mt8 = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         // Roundtrip through both decoders.
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
@@ -1985,7 +2434,16 @@ mod tests {
         }
         assert_eq!(
             mt4,
-            compress_slice_mt(&data, Level::Balanced, true, 4, None, None, None)
+            compress_slice_mt(
+                &data,
+                Level::Balanced,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto
+            )
         );
         assert!(
             mt4.len() <= st.len() + st.len() / 50,
@@ -2000,7 +2458,16 @@ mod tests {
     #[test]
     fn small_inputs_fall_back_identically() {
         let data = textish(64 * 1024);
-        let mt = compress_slice_mt(&data, Level::Fastest, true, 4, None, None, None);
+        let mt = compress_slice_mt(
+            &data,
+            Level::Fastest,
+            true,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         let st = crate::encoding::compress_slice_to_vec(&data, Level::Fastest);
         assert_eq!(mt, st);
     }
@@ -2090,6 +2557,7 @@ mod tests {
                     None,
                     Some(data.len() as u64),
                     Some(&dict),
+                    crate::LdmMode::Auto,
                 );
                 // ours, both decode entries
                 let back = crate::bulk::decompress_with(&frame, 0, &dec_opts()).unwrap();
@@ -2144,13 +2612,40 @@ mod tests {
         for (i, b) in tail.iter().enumerate() {
             src[(2 << 20) + i] = *b;
         }
-        let plain = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let plain = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         let Some((raw, data)) = dict_mt_fixture() else {
             return;
         };
         let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
-        let _between = compress_slice_mt(&data, Level::Balanced, false, 8, None, None, Some(&dict));
-        let after = compress_slice_mt(&src, Level::Balanced, false, 8, None, None, None);
+        let _between = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            Some(&dict),
+            crate::LdmMode::Auto,
+        );
+        let after = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert_eq!(plain, after);
     }
 
@@ -2164,8 +2659,26 @@ mod tests {
             return;
         };
         let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
-        let plain = compress_slice_mt(&data, Level::Balanced, false, 4, None, None, None);
-        let with = compress_slice_mt(&data, Level::Balanced, false, 4, None, None, Some(&dict));
+        let plain = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            false,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let with = compress_slice_mt(
+            &data,
+            Level::Balanced,
+            false,
+            4,
+            None,
+            None,
+            Some(&dict),
+            crate::LdmMode::Auto,
+        );
         assert!(
             with.len() < plain.len(),
             "dict mt {} must beat plain mt {}",

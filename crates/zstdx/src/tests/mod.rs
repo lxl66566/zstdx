@@ -1156,6 +1156,243 @@ fn long_distance_matching_disable_overrides_auto_arming() {
     );
 }
 
+/// A far-class multithreaded fixture (32 MiB): the far screen's cheap
+/// reject gate wants twins inside the first MiB, so the source opens with
+/// a 768 KiB-period pair (near-field evidence) ahead of a 2 MiB-period
+/// body whose repeats sit past the fast rows' stock window (768 KiB,
+/// rounded to 1 MiB by the length clamp) and inside the far domain the
+/// capture raises the frame to.
+#[cfg(all(test, feature = "std"))]
+fn far_class_mt_source() -> Vec<u8> {
+    let tile = ldm_text_tile();
+    let head = tile[..768 * 1024].to_vec();
+    let mut data = Vec::with_capacity(32 << 20);
+    data.extend_from_slice(&head);
+    data.extend_from_slice(&head);
+    while data.len() < 32 << 20 {
+        data.extend_from_slice(&tile);
+    }
+    data.truncate(32 << 20);
+    data
+}
+
+/// The explicit LDM switch survives the MT engagement gate's fallback
+/// (R57): below `MIN_MT_INPUT` every worker count runs the ST entry, so
+/// the same mode must produce the same bytes at workers 0, 1 and 4 —
+/// plain and dictionary frames alike (the pre-fix fallback dropped the
+/// mode, so `Enable` produced different bytes at 0 vs 4).
+#[cfg(feature = "std")]
+#[test]
+fn ldm_mode_mt_fallback_keeps_the_mode() {
+    let tile = ldm_text_tile();
+    let data = tile[..(1536 * 1024)].to_vec();
+    let dict = std::fs::read("./dict_tests/dictionary").ok();
+    for mode in [
+        crate::LdmMode::Auto,
+        crate::LdmMode::Enable,
+        crate::LdmMode::Disable,
+    ] {
+        let frame = |workers: u32, dict: Option<&[u8]>| {
+            let mut opts = crate::EncoderOptions::new(crate::Level::Fastest)
+                .long_distance_matching(mode)
+                .workers(workers);
+            if let Some(dict) = dict {
+                opts = opts.dictionary(dict);
+            }
+            crate::bulk::compress_with(&data, &opts).unwrap()
+        };
+        for dict in [None, dict.as_deref()] {
+            let zero = frame(0, dict);
+            assert_eq!(frame(1, dict), zero, "{mode:?}: one worker is the ST entry");
+            assert_eq!(
+                frame(4, dict),
+                zero,
+                "{mode:?}: the small-input fallback must keep the mode"
+            );
+            let mut back = vec![0u8; data.len()];
+            let mut dopts = crate::DecoderOptions::new();
+            if let Some(dict) = dict {
+                dopts = dopts.dictionary(dict);
+            }
+            let written = crate::bulk::decompress_to_buffer_with(&zero, &mut back, &dopts).unwrap();
+            assert_eq!(&back[..written], &data[..], "{mode:?} roundtrip");
+        }
+    }
+}
+
+/// `Disable` stands the whole capture lattice down on true-MT frames
+/// (R57): the fast-row far screen never arms, the grid keeps the
+/// worker-scaled formula's stock window, and no job runs LDM — while
+/// `Auto` arms the mid-size capture (pinned grid, far window) and
+/// `Enable` rides the raised window with the lattice at its own bars
+/// (the screen accepts this head, so its capture engages there too — a
+/// sanctioned divergence from the ST enable, whose header stays at the
+/// clamped 2^25).
+#[cfg(feature = "std")]
+#[test]
+fn ldm_mode_mt_disable_stands_the_capture_down() {
+    let data = far_class_mt_source();
+    let frame = |mode: crate::LdmMode, workers: u32| {
+        crate::bulk::compress_with(
+            &data,
+            &crate::EncoderOptions::new(crate::Level::Fastest)
+                .long_distance_matching(mode)
+                .workers(workers),
+        )
+        .unwrap()
+    };
+    let window = |f: &[u8]| {
+        crate::decoding::frame::read_frame_header(f)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    };
+
+    // Auto: the screen accepts, the capture pins the grid (worker-count
+    // invariant bytes) and raises the header window to the far domain.
+    let auto4 = frame(crate::LdmMode::Auto, 4);
+    assert_eq!(
+        auto4,
+        frame(crate::LdmMode::Auto, 2),
+        "the pinned grid holds"
+    );
+    assert_eq!(window(&auto4), 1 << 26);
+
+    // Disable: no screen, no pinned grid, no far window — the stock row
+    // window (768 KiB rounded to 1 MiB by the length clamp) and the far
+    // repeats left on the table.
+    let dis4 = frame(crate::LdmMode::Disable, 4);
+    assert_eq!(window(&dis4), 1 << 20);
+    assert!(
+        dis4.len() > auto4.len(),
+        "the disarmed parse cannot reach the far repeats ({} vs {})",
+        dis4.len(),
+        auto4.len()
+    );
+    assert_eq!(crate::bulk::decompress(&dis4, data.len()).unwrap(), data);
+    assert_eq!(
+        zstd::decode_all(dis4.as_slice()).unwrap(),
+        data,
+        "libzstd decodes the disarmed mt frame"
+    );
+
+    // Enable: the raised window (27 clamped to the 32 MiB source: 2^25)
+    // plus per-job forcing. The fast-row capture stands down under an
+    // explicit enable (its grid cannot honor the raised strip), so the
+    // header keeps the clamped window and the strip floors the grid at
+    // one whole-source job — worker-invariant by construction.
+    let en4 = frame(crate::LdmMode::Enable, 4);
+    assert_eq!(en4, frame(crate::LdmMode::Enable, 2));
+    assert_eq!(window(&en4), 1 << 25);
+    assert!(en4.len() < dis4.len(), "enable must reach the far repeats");
+    assert_eq!(crate::bulk::decompress(&en4, data.len()).unwrap(), data);
+}
+
+/// The full band (len >= 64 MiB): Auto's capture arms on geometry alone
+/// (pinned grid, far window); Disable keeps the stock window; Enable's
+/// clamped window is the far domain itself, so the fast-row class stands
+/// down (its window must sit below the far domain) and the per-job
+/// forcing runs on the worker-scaled grid — legal and deterministic,
+/// byte-parity across worker counts not owed there.
+#[cfg(feature = "std")]
+#[test]
+fn ldm_mode_mt_full_band() {
+    let tile = ldm_text_tile();
+    let mut data = Vec::with_capacity(64 << 20);
+    for _ in 0..32 {
+        data.extend_from_slice(&tile);
+    }
+    let frame = |mode: crate::LdmMode, workers: u32| {
+        crate::bulk::compress_with(
+            &data,
+            &crate::EncoderOptions::new(crate::Level::Fastest)
+                .long_distance_matching(mode)
+                .workers(workers),
+        )
+        .unwrap()
+    };
+    let window = |f: &[u8]| {
+        crate::decoding::frame::read_frame_header(f)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    };
+
+    let auto4 = frame(crate::LdmMode::Auto, 4);
+    assert_eq!(
+        auto4,
+        frame(crate::LdmMode::Auto, 2),
+        "the pinned grid holds"
+    );
+    assert_eq!(window(&auto4), 1 << 26);
+
+    let dis4 = frame(crate::LdmMode::Disable, 4);
+    assert_eq!(window(&dis4), 1 << 20);
+    assert!(dis4.len() > auto4.len());
+    assert_eq!(crate::bulk::decompress(&dis4, data.len()).unwrap(), data);
+
+    // Enable: window 27 stays (the source clamp rounds up at exact powers
+    // of two: ceil-log2(2^26) = 27), the fast-row class is off at that
+    // window, every job forces the far source on; the run must be
+    // deterministic (pooled states carry no mode residue).
+    let en4 = frame(crate::LdmMode::Enable, 4);
+    assert_eq!(en4, frame(crate::LdmMode::Enable, 4));
+    assert_eq!(window(&en4), 1 << 27);
+    assert!(en4.len() < dis4.len());
+    assert_eq!(crate::bulk::decompress(&en4, data.len()).unwrap(), data);
+}
+
+/// Dictionary frames join the capture classes (R54), so `Disable` must
+/// stand them down there too: the dict+far-class frame keeps its stock
+/// fold window and the stock grid, while `Auto` arms the screen capture
+/// exactly as a plain frame's.
+#[cfg(feature = "std")]
+#[test]
+fn ldm_mode_mt_dict_capture_disable() {
+    let Ok(raw) = std::fs::read("./dict_tests/dictionary") else {
+        return;
+    };
+    let data = far_class_mt_source();
+    let dict = crate::EncoderDictionary::parse(&raw).unwrap();
+    let frame = |mode: crate::LdmMode| {
+        crate::bulk::compress_with(
+            &data,
+            &crate::EncoderOptions::new(crate::Level::Fastest)
+                .long_distance_matching(mode)
+                .workers(4)
+                .parsed_dictionary(&dict),
+        )
+        .unwrap()
+    };
+    let window = |f: &[u8]| {
+        crate::decoding::frame::read_frame_header(f)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    };
+
+    let auto = frame(crate::LdmMode::Auto);
+    let dis = frame(crate::LdmMode::Disable);
+    // The lattice armed on the dict frame (far window header, the dict id
+    // stamped) and stood down under Disable (stock fold window).
+    assert_eq!(window(&auto), 1 << 26);
+    assert_eq!(window(&dis), 1 << 20);
+    assert!(dis.len() > auto.len());
+    // Both roundtrip through the dictionary.
+    let options = crate::DecoderOptions::new().dictionary(&raw);
+    assert_eq!(
+        crate::bulk::decompress_with(&auto, 0, &options).unwrap(),
+        data
+    );
+    assert_eq!(
+        crate::bulk::decompress_with(&dis, 0, &options).unwrap(),
+        data
+    );
+}
+
 /// The LDM override stays legal on every strategy family (R56): Enable
 /// on the tagged rows is inert by design (no LDM candidate feed) and on
 /// the btlazy2/opt rows arms the far source below every auto bar — each

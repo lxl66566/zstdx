@@ -677,6 +677,7 @@ fn run_claimed_job(
                 // see `post_job`), seeded and staged through the
                 // owned-window runner; the pooled lease state stays cold.
                 debug_assert_eq!(*first, 0, "a dictionary job starts the frame");
+                // The stream core carries no explicit switch (Auto).
                 crate::encoding::mt::run_dict_job_zero(
                     src,
                     *first..*len,
@@ -684,6 +685,7 @@ fn run_claimed_job(
                     job.level,
                     job.shape,
                     dict,
+                    crate::LdmMode::Auto,
                 )
             } else if let Some(don) = donation.lock().unwrap().take() {
                 // The donated continuation: job zero's state already carries
@@ -719,6 +721,7 @@ fn run_claimed_job(
                             job.choice,
                             *ldm,
                             *first as u64,
+                            crate::LdmMode::Auto,
                         );
                         compress_job_blocks_inner(
                             state,
@@ -750,6 +753,7 @@ fn run_claimed_job(
                             JobSpfStream::Windowed => JobSpf::Windowed(None),
                             _ => JobSpf::None,
                         },
+                        crate::LdmMode::Auto,
                     ),
                 }
             };
@@ -763,8 +767,14 @@ fn run_claimed_job(
             // workers carry no warm tables, so the donation's state
             // round-trips a process-global pool instead.
             let mut st = crate::encoding::mt::take_donation_state();
-            let (keep_bits, prefix) =
-                donate_keep_span(&mut st, head, job.level, job.shape, *arming);
+            let (keep_bits, prefix) = donate_keep_span(
+                &mut st,
+                head,
+                job.level,
+                job.shape,
+                *arming,
+                crate::LdmMode::Auto,
+            );
             *outcome.lock().unwrap() = Some(KeepOutcome {
                 keep_bits,
                 arming: *arming,
@@ -2286,6 +2296,7 @@ impl MtEncoderCore {
                 self.level,
                 self.shape,
                 dict,
+                crate::LdmMode::Auto,
             );
             self.output.extend_from_slice(&bytes);
             self.job_start = hi;
@@ -2310,6 +2321,7 @@ impl MtEncoderCore {
             self.choice,
             self.job_ldm,
             spf,
+            crate::LdmMode::Auto,
         );
         return_pooled_state(state);
         self.output.extend_from_slice(&bytes);

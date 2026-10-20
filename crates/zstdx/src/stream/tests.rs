@@ -908,6 +908,7 @@ mod mt {
                     None,
                     None,
                     None,
+                    crate::LdmMode::Auto,
                 );
                 let streamed = encode_write(
                     &data,
@@ -926,7 +927,16 @@ mod mt {
         // into two jobs at the opt strip's 4 MiB floor).
         let deep = textish(4 * 1024 * 1024 + 512 * 1024);
         for level in [Level::Opt, Level::Ultra] {
-            let bulk_mt = encoding::mt::compress_slice_mt(&deep, level, false, 4, None, None, None);
+            let bulk_mt = encoding::mt::compress_slice_mt(
+                &deep,
+                level,
+                false,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             let streamed =
                 encode_write(&deep, 1024 * 1024, level, 4, false, Some(deep.len() as u64));
             assert_eq!(streamed, bulk_mt, "{level:?}");
@@ -935,8 +945,16 @@ mod mt {
         // probe shares the bulk strip, job floor and reach, so a pledged
         // stream stays byte-identical to bulk mt there too.
         let near = jsonish(9 * 1024 * 1024 + 123 * 1024);
-        let bulk_mt =
-            encoding::mt::compress_slice_mt(&near, Level::Balanced, false, 4, None, None, None);
+        let bulk_mt = encoding::mt::compress_slice_mt(
+            &near,
+            Level::Balanced,
+            false,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         let streamed = encode_write(
             &near,
             1024 * 1024,
@@ -1089,6 +1107,7 @@ mod mt {
                 None,
                 None,
                 None,
+                crate::LdmMode::Auto,
             );
             let streamed = encode_write(
                 &data,
@@ -1136,7 +1155,16 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1217,8 +1245,16 @@ mod mt {
         let a = flushed(1024 * 1024);
         assert_eq!(a, flushed(128 * 1024), "flush-cancelled determinism");
         assert_both_decoders(&a, &data, "flush-cancelled mid-band");
-        let armed =
-            encoding::mt::compress_slice_mt(&data, Level::Fastest, false, 4, None, None, None);
+        let armed = encoding::mt::compress_slice_mt(
+            &data,
+            Level::Fastest,
+            false,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
         assert!(
             a.len() > armed.len() + armed.len() / 2,
             "the flush-cancelled frame must pay the stock parse: {} vs armed {}",
@@ -1270,7 +1306,16 @@ mod mt {
             }
         }
         for level in [Level::Fastest, Level::Fast] {
-            let bulk_mt4 = encoding::mt::compress_slice_mt(&data, level, true, 4, None, None, None);
+            let bulk_mt4 = encoding::mt::compress_slice_mt(
+                &data,
+                level,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             for workers in [4u32, 8] {
                 let streamed = encode_write(
                     &data,
@@ -1285,7 +1330,16 @@ mod mt {
             assert_both_decoders(&bulk_mt4, &data, &format!("{level:?} fullband stream"));
             let again = encode_write(&data, MIB, level, 8, true, Some(data.len() as u64));
             assert_eq!(again, bulk_mt4, "{level:?}: run-to-run determinism");
-            let st = encoding::mt::compress_slice_mt(&data, level, true, 1, None, None, None);
+            let st = encoding::mt::compress_slice_mt(
+                &data,
+                level,
+                true,
+                1,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
             assert!(
                 bulk_mt4.len() <= st.len() + st.len() / 20,
                 "{level:?}: the far class must survive the self-fill: stream-mt {} vs armed st {}",
