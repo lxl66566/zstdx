@@ -153,6 +153,8 @@ zstdx::dict::create_formatted_dict_from_samples(&[&s1, &s2], &mut dict, 110 * 10
 
 Training is deterministic for a given sample set. Dictionaries should stay small relative to typical payloads — they pay off on short inputs.
 
+Parse reuse: `EncoderDictionary::parse` runs the dictionary parse once for any number of compressions (`EncoderOptions::parsed_dictionary`). The compat `bulk::Compressor` caches the parse of a raw-attached dictionary the same way after its first use, and `FrameCompressor::set_parsed_dictionary` shares one parse across frames; re-attaching a dictionary (or changing a compat compressor's level, which detaches it) parses afresh.
+
 ## Bounded-memory decoding (low-level `FrameDecoder`)
 
 For untrusted or huge frames: decode in batches, drain bytes that are no longer needed as match history, repeat. Memory stays at roughly window size + batch size regardless of frame size.

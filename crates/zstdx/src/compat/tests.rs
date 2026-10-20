@@ -133,6 +133,71 @@ fn bulk_compressor_dictionary_lifecycle() {
     );
 }
 
+/// The raw-dictionary attachment parses lazily, once per attachment: the
+/// first compression resolves the parse and every later call reuses it
+/// (the CDict-role hoist), so repeated calls and the prepared-handle path
+/// produce byte-identical frames — a pure caching change. Re-setting the
+/// dictionary (or the level, which detaches it) invalidates the cache.
+#[test]
+fn bulk_raw_dictionary_parses_once_and_caches() {
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+
+    let mut raw = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    let first = raw.compress(&content).unwrap();
+    // repeated calls: identical bytes (the cached parse is invisible)
+    assert_eq!(raw.compress(&content).unwrap(), first);
+    assert_eq!(raw.compress(&content).unwrap(), first);
+    // and identical to the prepared-handle path on the same bytes/level
+    let prepared = compat::dict::EncoderDictionary::copy(&dict, 3);
+    let mut via_prepared = compat::bulk::Compressor::with_prepared_dictionary(&prepared).unwrap();
+    assert_eq!(via_prepared.compress(&content).unwrap(), first);
+
+    // a level change detaches (the cache dies with the attachment): the
+    // bare frame at the new level matches a fresh context's
+    raw.set_compression_level(1).unwrap();
+    let mut plain = compat::bulk::Compressor::new(1).unwrap();
+    assert_eq!(
+        raw.compress(&content).unwrap(),
+        plain.compress(&content).unwrap()
+    );
+
+    // re-registering the dictionary parses afresh and reproduces the frame
+    raw.set_dictionary(3, &dict).unwrap();
+    assert_eq!(raw.compress(&content).unwrap(), first);
+    // a different dictionary re-registers cleanly over the cache
+    let other = dict.iter().copied().rev().collect::<Vec<u8>>();
+    raw.set_dictionary(3, &other).unwrap();
+    let swapped = raw.compress(&content).unwrap();
+    let mut fresh = compat::bulk::Compressor::with_dictionary(3, &other).unwrap();
+    assert_eq!(swapped, fresh.compress(&content).unwrap());
+    assert_ne!(swapped, first);
+}
+
+/// An invalid raw dictionary errors at the first compression (not at
+/// attachment), keeps erroring deterministically on every later call, and
+/// a valid re-set recovers — exactly the pre-cache timing, replayed from
+/// the cached failure.
+#[test]
+fn bulk_raw_dictionary_invalid_errors_at_first_compress() {
+    use crate::decoding::dictionary::MAGIC_NUM;
+    let mut compressor = compat::bulk::Compressor::new(3).unwrap();
+    compressor.set_dictionary(3, &MAGIC_NUM).unwrap();
+    let first = compressor.compress(b"payload").unwrap_err();
+    // deterministic replay on the next calls
+    assert_eq!(
+        format!("{}", compressor.compress(b"payload").unwrap_err()),
+        format!("{first}")
+    );
+    assert!(compressor.compress(b"payload").is_err());
+    // a valid re-set invalidates the cached failure
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    compressor.set_dictionary(3, &dict).unwrap();
+    let frame = compressor.compress(b"payload").unwrap();
+    let mut fresh = compat::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    assert_eq!(frame, fresh.compress(b"payload").unwrap());
+}
+
 /// Prepared dictionaries through the whole compat surface: the parse is
 /// shared, compression runs at the dictionary's level, and a dictionary
 /// that failed to parse replays the failure at first use (libzstd's
