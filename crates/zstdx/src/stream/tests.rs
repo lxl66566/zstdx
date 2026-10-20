@@ -749,6 +749,62 @@ mod mt {
         assert_eq!(decoded, data, "{label}");
     }
 
+    /// The mid-band far-class fixture (this module's capture subject: the
+    /// near-field head twins clear the screen's cheap-reject bar, the
+    /// 3 MiB unit copies carry the paying far class) plus a same-size
+    /// random twin (the screen-rejecting never-arms control).
+    fn midband_fixture_with_random_twin() -> (Vec<u8>, Vec<u8>) {
+        let mib = 1024 * 1024;
+        let head = lcg(256 * 1024);
+        let unit = lcg(3 * mib);
+        let mut data = Vec::with_capacity(4 * head.len() + 11 * unit.len());
+        for (src, copies) in [(&head, 4u32), (&unit, 11u32)] {
+            for copy in 0..copies {
+                for (i, &b) in src.iter().enumerate() {
+                    data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                        b ^ 0x5a
+                    } else {
+                        b
+                    });
+                }
+            }
+        }
+        let random = lcg(data.len());
+        (data, random)
+    }
+
+    /// A write-side stream frame under an explicit LDM mode: pledged or
+    /// open (`pledged = false`), with an optional input shape.
+    fn stream_frame(
+        data: &[u8],
+        level: Level,
+        mode: crate::LdmMode,
+        workers: u32,
+        pledged: bool,
+        shape: Option<crate::InputShape>,
+    ) -> Vec<u8> {
+        let mut opts = EncoderOptions::new(level)
+            .long_distance_matching(mode)
+            .workers(workers)
+            .pledged_size(pledged.then_some(data.len() as u64));
+        if let Some(shape) = shape {
+            opts = opts.with_input_shape(shape);
+        }
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(&mut sink, opts).unwrap();
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+        sink
+    }
+
+    fn frame_header_window(frame: &[u8]) -> u64 {
+        crate::decoding::frame::read_frame_header(frame)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    }
+
     #[test]
     fn roundtrip_both_decoders() {
         for (name, data) in shapes() {
@@ -1261,6 +1317,216 @@ mod mt {
             a.len(),
             armed.len()
         );
+    }
+
+    /// The mid-band far-class fixture — `Auto`'s fast-row capture
+    /// subject — run per explicit LDM mode on the pledged stream-MT core
+    /// (the R58 port of the R57 bulk dispatch). `Disable` stands every
+    /// stream capture down: no far screen, no pinned grid, the stock row
+    /// window, LDM off in every job — and it never arms anything on its
+    /// own (on the screen-rejecting random twin, where `Auto` keeps the
+    /// stock window, the bytes are `Auto`'s exactly). The fast rows'
+    /// stock strips equal the bulk dispatch's and the grid formula is
+    /// shared, so the frame is byte-identical to the bulk `Disable`
+    /// dispatch's. `Enable` rides the raised window (27 clamped by the
+    /// pledge to 2^26) with the fast-row capture off and per-job forcing
+    /// on: the raised strip floors the grid at one whole-source job —
+    /// worker-invariant by construction — and the one-job shape is the
+    /// bulk `Enable` dispatch's own, byte-identical there too.
+    #[test]
+    fn ldm_mode_stream_mt_tri_state_midband() {
+        let (data, random) = midband_fixture_with_random_twin();
+        let stream = |data: &[u8], mode: crate::LdmMode, workers: u32| {
+            stream_frame(data, Level::Fastest, mode, workers, true, None)
+        };
+        let bulk = |mode: crate::LdmMode| {
+            bulk::compress_with(
+                &data,
+                &EncoderOptions::new(Level::Fastest)
+                    .long_distance_matching(mode)
+                    .workers(4),
+            )
+            .unwrap()
+        };
+
+        // Auto arms the capture (the far window header; the midband test
+        // above holds its bulk byte-parity).
+        let auto = stream(&data, crate::LdmMode::Auto, 4);
+        assert_eq!(frame_header_window(&auto), 1 << 26);
+
+        // Disable: no screen, no pinned grid, no far window — the stock
+        // row window, the far repeats left on the table, and the frame is
+        // the bulk Disable dispatch's exactly.
+        let dis = stream(&data, crate::LdmMode::Disable, 4);
+        assert_eq!(frame_header_window(&dis), 1 << 20);
+        assert!(
+            dis.len() > auto.len(),
+            "the disarmed parse cannot reach the far repeats ({} vs {})",
+            dis.len(),
+            auto.len()
+        );
+        assert_both_decoders(&dis, &data, "Disable mid-band stream");
+        assert_eq!(
+            dis,
+            bulk(crate::LdmMode::Disable),
+            "fast-row Disable parity"
+        );
+
+        // The override never arms anything on its own: where Auto stays
+        // stock (the random twin fails the screen), Disable is
+        // byte-identical to it.
+        assert_eq!(
+            stream(&random, crate::LdmMode::Disable, 4),
+            stream(&random, crate::LdmMode::Auto, 4),
+            "Disable must be a no-op where nothing arms"
+        );
+
+        // Enable: the raised window with per-job forcing, the fast-row
+        // capture off. The raised strip floors the grid at one
+        // whole-source job, so the bytes cannot move with the worker
+        // count, and the shape matches the bulk Enable dispatch.
+        let en = stream(&data, crate::LdmMode::Enable, 4);
+        assert_eq!(en, stream(&data, crate::LdmMode::Enable, 2));
+        assert_eq!(frame_header_window(&en), 1 << 26);
+        assert!(en.len() < dis.len(), "enable must reach the far repeats");
+        assert_eq!(en, bulk(crate::LdmMode::Enable), "fast-row Enable parity");
+        assert_both_decoders(&en, &data, "Enable mid-band stream");
+    }
+
+    /// The unpledged twins of the tri-state (no bulk twin exists — the
+    /// dispatch is one-shot): `Auto`'s open capture arms on the verdict
+    /// alone (R24); `Disable` keeps the stock window with every capture
+    /// stood down; `Enable` declares the unclamped raised window before
+    /// any content exists — the open stream's header decides pre-content,
+    /// the sanctioned divergence (the ST unpledged entry's own shape) —
+    /// and the open capture never arms under it (the screen is off).
+    #[test]
+    fn ldm_mode_stream_mt_unpledged_tri_state() {
+        let (data, random) = midband_fixture_with_random_twin();
+        let open = |data: &[u8], mode: crate::LdmMode| {
+            stream_frame(data, Level::Fastest, mode, 4, false, None)
+        };
+
+        let auto = open(&data, crate::LdmMode::Auto);
+        assert_eq!(
+            frame_header_window(&auto),
+            1 << 26,
+            "the open capture armed"
+        );
+
+        let dis = open(&data, crate::LdmMode::Disable);
+        assert_eq!(frame_header_window(&dis), 1 << 20);
+        assert!(dis.len() > auto.len());
+        assert_both_decoders(&dis, &data, "Disable open stream");
+
+        let en = open(&data, crate::LdmMode::Enable);
+        assert_eq!(
+            frame_header_window(&en),
+            1 << 27,
+            "the unclamped raised window"
+        );
+        assert!(en.len() < dis.len(), "enable must reach the far repeats");
+        assert_both_decoders(&en, &data, "Enable open stream");
+
+        assert_eq!(
+            open(&random, crate::LdmMode::Disable),
+            open(&random, crate::LdmMode::Auto),
+            "Disable must be a no-op where nothing arms"
+        );
+    }
+
+    /// The raised-window shape on the stream capture planning (R58, the
+    /// stream-side analog of the bulk `capture_job_size` clamp fix): a
+    /// forced `with_window_log(25)` on a fast row widens the strip (the
+    /// fast rows' strip IS the window) past the capture grid's 16 MiB
+    /// ceiling — the [32, 64) MiB far-class band reaches
+    /// `fast_capture_schedule` with a reach above the cap, which the
+    /// pre-fix floor clamp turned into a panic. The floor is now capped
+    /// at the ceiling (the R57 fix in `encoding::mt`, shared by this
+    /// path), and an explicit `Enable` stands the capture down with the
+    /// raised strip flooring the grid at one whole-source job instead.
+    /// Every shape must complete and decode.
+    #[test]
+    fn ldm_mode_stream_mt_raised_window_capture_grid() {
+        let (data, _) = midband_fixture_with_random_twin();
+        let raised = crate::InputShape::default().with_window_log(25);
+
+        // Auto + the forced window: the screen accepts, the capture arms
+        // past the forced window (a window descriptor is a maximum) onto
+        // the pinned lattice — the widened reach is exactly the shape the
+        // clamp fix guards.
+        let auto = stream_frame(
+            &data,
+            Level::Fastest,
+            crate::LdmMode::Auto,
+            4,
+            true,
+            Some(raised),
+        );
+        assert_eq!(frame_header_window(&auto), 1 << 26);
+        assert_both_decoders(&auto, &data, "raised-window armed stream");
+
+        // Enable + the forced window: the capture stands down; the 32 MiB
+        // strip floors the grid at one whole-source job.
+        let en = stream_frame(
+            &data,
+            Level::Fastest,
+            crate::LdmMode::Enable,
+            4,
+            true,
+            Some(raised),
+        );
+        assert_eq!(frame_header_window(&en), 1 << 25);
+        assert_both_decoders(&en, &data, "raised-window enabled stream");
+
+        // The unpledged Enable twin: the growing grid under the raised
+        // strip, with the header at the forced 2^25 (no declared length
+        // exists to clamp it).
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .long_distance_matching(crate::LdmMode::Enable)
+                .with_input_shape(raised)
+                .workers(4),
+        )
+        .unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(frame_header_window(&sink), 1 << 25);
+        assert_both_decoders(&sink, &data, "raised-window open enabled stream");
+    }
+
+    /// The chain-row subject (the reach probe's: the donated keep side,
+    /// the far-class screens, the whole-window strip) under the explicit
+    /// modes. Below every capture band the jobs parse with LDM off under
+    /// `Auto` and `Disable` alike, and the far-dead strip cap is
+    /// byte-exact by the FarClass argument — so `Disable` is
+    /// byte-identical to `Auto` here too (the donation arms `Job` under
+    /// it, the verdict and grid follow, nothing engages). `Enable`
+    /// forces the far source on in every job at the raised window
+    /// (27 clamped by the pledge) — a different, smaller parse that must
+    /// stay deterministic and decode.
+    #[test]
+    fn ldm_mode_stream_mt_chain_row_probe() {
+        let data = textish(9 * 1024 * 1024 + 123 * 1024);
+        let stream =
+            |mode: crate::LdmMode| stream_frame(&data, Level::Balanced, mode, 4, true, None);
+
+        let auto = stream(crate::LdmMode::Auto);
+        let dis = stream(crate::LdmMode::Disable);
+        assert_eq!(dis, auto, "Disable is a no-op below every band");
+        assert_both_decoders(&dis, &data, "Disable chain-row stream");
+
+        let en = stream(crate::LdmMode::Enable);
+        assert_eq!(en, stream(crate::LdmMode::Enable), "deterministic");
+        assert_eq!(
+            frame_header_window(&en),
+            1 << 24,
+            "27 clamped by the pledge"
+        );
+        assert!(en.len() <= auto.len(), "forcing cannot lose the far class");
+        assert_both_decoders(&en, &data, "Enable chain-row stream");
     }
 
     /// The fast rows' full-band stream capture (>= LDM_FULL_WINDOW
