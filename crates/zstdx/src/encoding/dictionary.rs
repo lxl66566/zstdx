@@ -117,6 +117,7 @@ impl EncDictionary {
 /// exactly like between-block reuse; the dictID in the header makes that
 /// legal). The length in `shape` must already include the dictionary
 /// content (libzstd clamps the window by src+dict).
+#[cfg(any(not(feature = "std"), feature = "dict_builder"))]
 pub(crate) fn reset_with_dictionary<M: Matcher>(
     state: &mut CompressState<M>,
     dict: &EncDictionary,

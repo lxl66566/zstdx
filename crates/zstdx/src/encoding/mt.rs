@@ -133,7 +133,7 @@ pub fn compress_slice_mt(
     workers: u32,
     window_log: Option<u32>,
     declared: Option<u64>,
-    dict: Option<&super::dictionary::EncDictionary>,
+    dict: Option<&Arc<super::dictionary::EncDictionary>>,
     ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let checksum = checksum && cfg!(feature = "hash");
@@ -160,7 +160,13 @@ pub fn compress_slice_mt(
     // decouple the two (a wide frame window for far reach, a narrow strip):
     // a full-window strip would scale the job floor with the LDM reach and
     // starve parallelism.
-    let window = header_window(level, shape, src.len() as u64, window_log, dict);
+    let window = header_window(
+        level,
+        shape,
+        src.len() as u64,
+        window_log,
+        dict.map(|v| &**v),
+    );
     // The fast rows' far-class capture window (R21): resolved from the
     // same head sample the frame-continuous entries screen — None for
     // every chain row (strategy-checked before any screen work runs).
@@ -355,7 +361,7 @@ pub fn compress_slice_mt(
         frame_content_size: declared.or(Some(src.len() as u64)),
         single_segment: false,
         content_checksum: checksum,
-        dictionary_id: dict.and_then(super::dictionary::EncDictionary::header_id),
+        dictionary_id: dict.map(|d| d.header_id()).flatten(),
         window_size: Some(window),
     }
     .serialize(&mut output);
@@ -600,7 +606,7 @@ fn st_fallback(
     checksum: bool,
     window_log: Option<u32>,
     declared: Option<u64>,
-    dict: Option<&super::dictionary::EncDictionary>,
+    dict: Option<&Arc<super::dictionary::EncDictionary>>,
     ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     if ldm_mode == crate::LdmMode::Auto {
@@ -2545,7 +2551,8 @@ mod tests {
         let Some((raw, data)) = dict_mt_fixture() else {
             return;
         };
-        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
+        let dict =
+            alloc::sync::Arc::new(crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap());
         let dec_opts = || crate::DecoderOptions::new().dictionary(&raw);
         for level in [Level::Fastest, Level::Fast, Level::Balanced, Level::Best] {
             for workers in [2u32, 4, 8] {
@@ -2625,7 +2632,8 @@ mod tests {
         let Some((raw, data)) = dict_mt_fixture() else {
             return;
         };
-        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
+        let dict =
+            alloc::sync::Arc::new(crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap());
         let _between = compress_slice_mt(
             &data,
             Level::Balanced,
@@ -2658,7 +2666,6 @@ mod tests {
         let Some((raw, data)) = dict_mt_fixture() else {
             return;
         };
-        let dict = crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap();
         let plain = compress_slice_mt(
             &data,
             Level::Balanced,
@@ -2669,6 +2676,8 @@ mod tests {
             None,
             crate::LdmMode::Auto,
         );
+        let dict =
+            alloc::sync::Arc::new(crate::encoding::dictionary::EncDictionary::parse(&raw).unwrap());
         let with = compress_slice_mt(
             &data,
             Level::Balanced,
