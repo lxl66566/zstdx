@@ -64,6 +64,28 @@
 //! deterministic across worker counts, write chunkings and run-to-run. A
 //! stream that ends or flushes inside the staging span keeps the stock
 //! fast-row schedule.
+//!
+//! The frame's explicit LDM switch (see [`crate::LdmMode`], the R58
+//! stream-side port of the R57 bulk dispatch) rides every state the core
+//! runs — each posted job, the probe's donated span, the dictionary seed
+//! job and the finish tail's shared-prefix build. `Auto` reads as the
+//! pre-switch hardcoded Auto, so the stock stream bytes pin exactly.
+//! `Disable` stands the stream captures down — the fast-row capture
+//! staging, the dictionary mid-size engagement, the finish tail's shared
+//! prefix fill and the far-class screens (the frame starts far-dead: the
+//! strip's only beyond-reach reader is LDM, off in every job, so the
+//! reach cap is free and the screens never run) — with every job parsing
+//! `params.ldm = false`. `Enable` keeps the window half (the 27 raise
+//! rides the shape from the options) and forces the far source on per
+//! job; the fast-row screen capture stands down under it exactly as the
+//! bulk dispatch's does, while the chain rows' mid-size capture keeps
+//! its own stock bars and the far-class screens keep running (their
+//! verdicts are content-pure). Sanctioned divergences from the bulk
+//! modes: an open-ended stream has no length to band-check, so `Enable`
+//! declares the unclamped raised window before any content exists (the
+//! ST unpledged entry's own shape), and the chain rows' whole-window
+//! strip schedule keeps its pre-existing bulk divergence on the
+//! full-window band.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -92,7 +114,9 @@ use crate::{
         block_header::BlockHeader,
         checksum::{BlockChecksum as _, FrameHasher},
         far_screen,
-        frame_compressor::{CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state},
+        frame_compressor::{
+            CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state_mode,
+        },
         frame_header::FrameHeader,
         match_generator::{
             LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG,
@@ -342,6 +366,12 @@ struct Job {
     /// every job so the frame's jobs and its header agree.
     choice: ReachChoice,
     shape: crate::InputShape,
+    /// The frame's explicit LDM switch (see [`crate::LdmMode`]), shared by
+    /// every job so the frame's parse states agree: `Auto` keeps the job
+    /// model's own arming exactly, `Disable` parses with the LDM split
+    /// pass off (the captures stood down before any post), `Enable`
+    /// forces the far source on at the window the options raised.
+    ldm_mode: crate::LdmMode,
     /// The frame's dictionary, carried by the frame's first job alone:
     /// that job seeds from it (see `encoding::mt::run_dict_job_zero`),
     /// every later job keeps the stock strip model. `None` on every
@@ -677,7 +707,6 @@ fn run_claimed_job(
                 // see `post_job`), seeded and staged through the
                 // owned-window runner; the pooled lease state stays cold.
                 debug_assert_eq!(*first, 0, "a dictionary job starts the frame");
-                // The stream core carries no explicit switch (Auto).
                 crate::encoding::mt::run_dict_job_zero(
                     src,
                     *first..*len,
@@ -685,7 +714,7 @@ fn run_claimed_job(
                     job.level,
                     job.shape,
                     dict,
-                    crate::LdmMode::Auto,
+                    job.ldm_mode,
                 )
             } else if let Some(don) = donation.lock().unwrap().take() {
                 // The donated continuation: job zero's state already carries
@@ -721,7 +750,7 @@ fn run_claimed_job(
                             job.choice,
                             *ldm,
                             *first as u64,
-                            crate::LdmMode::Auto,
+                            job.ldm_mode,
                         );
                         compress_job_blocks_inner(
                             state,
@@ -753,7 +782,7 @@ fn run_claimed_job(
                             JobSpfStream::Windowed => JobSpf::Windowed(None),
                             _ => JobSpf::None,
                         },
-                        crate::LdmMode::Auto,
+                        job.ldm_mode,
                     ),
                 }
             };
@@ -767,14 +796,8 @@ fn run_claimed_job(
             // workers carry no warm tables, so the donation's state
             // round-trips a process-global pool instead.
             let mut st = crate::encoding::mt::take_donation_state();
-            let (keep_bits, prefix) = donate_keep_span(
-                &mut st,
-                head,
-                job.level,
-                job.shape,
-                *arming,
-                crate::LdmMode::Auto,
-            );
+            let (keep_bits, prefix) =
+                donate_keep_span(&mut st, head, job.level, job.shape, *arming, job.ldm_mode);
             *outcome.lock().unwrap() = Some(KeepOutcome {
                 keep_bits,
                 arming: *arming,
@@ -820,6 +843,20 @@ pub(crate) struct MtEncoderCore {
     level: Level,
     checksum: bool,
     workers: u32,
+    /// The frame's explicit LDM switch (see [`crate::LdmMode`]), threaded
+    /// into every job, donation and shared-prefix build the frame runs.
+    /// `Auto` reads as the pre-switch hardcoded Auto (the stream bytes
+    /// pin); `Disable` stands the stream captures down — the far screens
+    /// (the frame starts far-dead: the strip's only beyond-reach reader is
+    /// LDM, off in every job), the fast-row capture staging, the
+    /// dictionary mid-size engagement and the finish tail's shared prefix
+    /// fill — while every job parses with `params.ldm = false`;
+    /// `Enable` keeps the window half (the 27 raise already rides the
+    /// shape) and forces the far source on per job, the fast-row screen
+    /// capture standing down under it exactly as the bulk dispatch's does
+    /// (its grid cannot honor the strip the raised window widens), the
+    /// chain rows' mid-size capture keeping its own stock bars.
+    ldm_mode: crate::LdmMode,
     /// Absolute job schedule: job boundaries derive from absolute stream
     /// offsets alone (see [`JobGrid`]), so the frame bytes never depend on
     /// how the input is written. A flush re-grids by advancing job_start
@@ -944,6 +981,7 @@ impl MtEncoderCore {
         dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
     ) -> Self {
         let checksum = options.checksum && cfg!(feature = "hash");
+        let ldm_mode = options.long_distance_matching;
         // The pledge is the frame's authoritative length; the forced window
         // log rides along so the jobs' tables and the header window agree.
         // `InputShape::len` acts as a non-binding hint when unpledged (the
@@ -995,7 +1033,14 @@ impl MtEncoderCore {
         // verdict is a pure function of the source sample the jobs>0
         // strips borrow, so the capture stays byte-safe with the seed
         // confined to job zero's owned window.
-        let fast_capture = if probe_pending {
+        // An explicit switch stands the fast-row capture down: `Disable`
+        // arms nothing anywhere, and `Enable`'s per-job forcing already
+        // carries the far reach at the raised window — the bulk dispatch's
+        // own stance (its `fast_window` screens under Auto only; the
+        // raised window widens the fast rows' strip past the capture
+        // grid's 16 MiB ceiling in the [32, 64) MiB band, a schedule the
+        // SelfFill lattice cannot grid).
+        let fast_capture = if probe_pending || ldm_mode != crate::LdmMode::Auto {
             FastCapture::Stock
         } else {
             match options.pledged_size {
@@ -1055,8 +1100,12 @@ impl MtEncoderCore {
         } else {
             initial_reserve(options.workers, initial_job, overlap)
         };
-        // Computed before the struct literal moves `grid`.
-        let dict_capture_pending = dict.is_some() && matches!(grid, JobGrid::Fixed(_));
+        // Computed before the struct literal moves `grid`. An explicit
+        // Disable stands the dictionary mid-size engagement down with every
+        // other capture (the R54 classes under an explicit off).
+        let dict_capture_pending = dict.is_some()
+            && matches!(grid, JobGrid::Fixed(_))
+            && ldm_mode != crate::LdmMode::Disable;
         let (mut buf, mut init_len) = take_pooled_buf(want);
         if buf.capacity() < want {
             buf.reserve_exact(want - buf.len());
@@ -1073,13 +1122,22 @@ impl MtEncoderCore {
             grid,
             overlap,
             job_ldm: LdmArming::Job,
+            ldm_mode,
             // Dictionary frames screen too (R54): the verdict is a pure
             // buffer function, and the strips it caps borrow source bytes
             // only — the seed never enters the screens' inputs. On the
             // verdict class the cap is byte-exact by the FarClass
             // argument (the LDM candidates never won there), so the dict
             // stream keeps matching the bulk dict frame's reach strips.
-            far_class: FarClass::Pending,
+            // An explicit Disable starts the frame far-dead: the strip's
+            // only beyond-reach reader is LDM, off in every job under the
+            // mode, so the cap is free (byte-exact by the FarClass
+            // argument) and the screens themselves never run.
+            far_class: if ldm_mode == crate::LdmMode::Disable {
+                FarClass::Dead
+            } else {
+                FarClass::Pending
+            },
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             // Pledged dictionary frames alone: the open-ended twin keeps
@@ -1382,7 +1440,9 @@ impl MtEncoderCore {
         // otherwise. A Job-armed span in the capture's window band would
         // parse without LDM (the clamped window sits below the `Job` bar)
         // and job zero's bytes would diverge from the undonated schedule.
-        let arming = if midsize_capture_window(self.level, self.shape, &head).is_some() {
+        let arming = if self.ldm_mode != crate::LdmMode::Disable
+            && midsize_capture_window(self.level, self.shape, &head).is_some()
+        {
             LdmArming::JobPrefix
         } else {
             LdmArming::Job
@@ -1392,6 +1452,7 @@ impl MtEncoderCore {
             choice: ReachChoice::Keep,
             dict: None,
             shape: self.shape,
+            ldm_mode: self.ldm_mode,
             head: Some(head.clone()),
             kind: JobKind::DonateKeep {
                 arming,
@@ -1404,6 +1465,7 @@ impl MtEncoderCore {
             choice: ReachChoice::Keep,
             dict: None,
             shape: self.shape,
+            ldm_mode: self.ldm_mode,
             head: Some(head),
             kind: JobKind::DonateShrink {
                 outcome: Mutex::new(None),
@@ -1554,6 +1616,11 @@ impl MtEncoderCore {
     /// job zero would.
     fn engage_midsize_capture(&mut self) {
         if !matches!(self.grid, JobGrid::Fixed(_)) {
+            return;
+        }
+        // An explicit Disable stands the capture lattice down (the bulk
+        // dispatch's own stance): the stock grid and `Job` arming stay.
+        if self.ldm_mode == crate::LdmMode::Disable {
             return;
         }
         let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
@@ -2103,6 +2170,11 @@ impl MtEncoderCore {
             || self.choice == ReachChoice::Shrink
             || matches!(self.far_class, FarClass::Dead)
             || !MatchGeneratorDriver::spf_strip_fill(self.level, self.shape)
+            // An explicit Disable stands the shared fill down (the
+            // far-dead start above already short-circuits it; the term
+            // keeps the stance explicit against a future far-class
+            // re-keying).
+            || self.ldm_mode == crate::LdmMode::Disable
         {
             return None;
         }
@@ -2135,12 +2207,17 @@ impl MtEncoderCore {
         let med = starts[starts.len() / 2];
         let s_max = *starts.last().unwrap();
         let mut state = take_pooled_state();
-        reset_slice_state(
+        // The pooled take clears the switch to Auto; re-reset with the
+        // frame's so the build parses exactly as the adopting jobs do
+        // (identical under Auto; Enable's strip fills arm the split pass
+        // like the jobs they serve; Disable never reaches a build).
+        reset_slice_state_mode(
             &mut state,
             self.level,
             self.shape,
             ReachChoice::Keep,
             LdmArming::Job,
+            self.ldm_mode,
         );
         // The clears of a stock prefill, then the fill itself segmented at
         // LDM batch-freeze points (the exact boundaries — see
@@ -2296,7 +2373,7 @@ impl MtEncoderCore {
                 self.level,
                 self.shape,
                 dict,
-                crate::LdmMode::Auto,
+                self.ldm_mode,
             );
             self.output.extend_from_slice(&bytes);
             self.job_start = hi;
@@ -2321,7 +2398,7 @@ impl MtEncoderCore {
             self.choice,
             self.job_ldm,
             spf,
-            crate::LdmMode::Auto,
+            self.ldm_mode,
         );
         return_pooled_state(state);
         self.output.extend_from_slice(&bytes);
@@ -2391,6 +2468,7 @@ impl MtEncoderCore {
             level: self.level,
             choice: self.choice,
             shape: self.shape,
+            ldm_mode: self.ldm_mode,
             dict: (start == 0).then(|| self.dict.clone()).flatten(),
             head: None,
             kind: JobKind::Encode {
@@ -3123,6 +3201,7 @@ mod tests {
                 window_log: None,
             },
             dict: None,
+            ldm_mode: crate::LdmMode::Auto,
             head: None,
             kind: JobKind::Encode {
                 // The job never runs; the view only needs a stable address
@@ -3188,6 +3267,7 @@ mod tests {
                 window_log: None,
             },
             dict: None,
+            ldm_mode: crate::LdmMode::Auto,
             head: None,
             kind: JobKind::Encode {
                 src: FrozenSrc {
