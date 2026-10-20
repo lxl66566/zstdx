@@ -415,6 +415,11 @@ pub trait Matcher {
     fn force_dict_frame_inputs(&mut self) {}
     #[cfg(feature = "std")]
     fn canonicalize_for_seed_capture(&mut self) {}
+    /// Eagerly fill the tree families' tables over the seeded dictionary
+    /// ahead of [`Matcher::capture_seed_image`] (the R58 tree-hoist; see
+    /// the driver's method for the byte-neutrality contract).
+    #[cfg(feature = "std")]
+    fn seed_fill_dictionary_tree(&mut self) {}
     #[cfg(feature = "std")]
     fn capture_seed_image(&self) -> Option<match_generator::DriverSeedImage> {
         None

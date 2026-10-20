@@ -594,7 +594,7 @@ fn dict_seed_image_cache_byte_identity() {
         return;
     };
     let dicts = [&f.formatted[..], &f.raw[..]];
-    for level in [1i32, 3, 9, 13, 19] {
+    for level in [1i32, 3, 9, 13, 15, 19] {
         for (di, &dict) in dicts.iter().enumerate() {
             let parsed = crate::EncoderDictionary::parse(dict).unwrap();
             let level = crate::Level::from_zstd(level);
@@ -736,7 +736,11 @@ fn dict_seed_image_cache_stream_core() {
         enc.finish().unwrap();
         sink
     };
-    for level in [crate::Level::from_zstd(3), crate::Level::from_zstd(13)] {
+    for level in [
+        crate::Level::from_zstd(3),
+        crate::Level::from_zstd(13),
+        crate::Level::from_zstd(19),
+    ] {
         // First encoder on this thread: fresh core (capture). Later ones:
         // pooled cores (restores). A plain encoder and an other-level
         // dict encoder ride the same pool in between — the plain one
@@ -797,7 +801,7 @@ fn dict_seed_image_state_equality() {
     let Some(f) = seed_cache_fixtures() else {
         return;
     };
-    for level in [1i32, 3, 9, 13, 19] {
+    for level in [1i32, 3, 9, 13, 15, 19] {
         let level = crate::Level::from_zstd(level);
         let dict = alloc::sync::Arc::new(
             crate::encoding::dictionary::EncDictionary::parse(&f.formatted).unwrap(),
@@ -817,6 +821,9 @@ fn dict_seed_image_state_equality() {
             crate::LdmMode::Auto,
         );
         fresh.matcher.canonicalize_for_seed_capture();
+        // The eager tree fill mirrors the capture path's seeding order
+        // (canonicalize, fill, capture).
+        fresh.matcher.seed_fill_dictionary_tree();
         // Pooled seeding: capture, run a frame to dirty the state,
         // displace the key with another level, dirty again, then a key
         // hit restores.
