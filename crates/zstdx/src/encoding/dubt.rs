@@ -466,6 +466,30 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
 /// as `&mut` slices (noalias): stores through either no longer alias the
 /// locals holding the bases, so both stay pinned in registers across the
 /// loop instead of reloading off the frame per position.
+/// The dictionary seed-time fill (the R58 seed-image entry): [`fill_range`]
+/// over `[0, target)` at the row's tree hash width -- the same three stores
+/// per position the lazy `fill_to` at the first searching block writes,
+/// independent of any block boundary by construction, so hoisting it is
+/// byte-neutral. `table` must already be cleared (the deferred clear, run
+/// eagerly by the caller) so the fill-time chain links name positions of
+/// this fill alone.
+#[cfg(feature = "std")]
+pub(crate) fn fill_dict_range(
+    mls: usize,
+    win: &[u8],
+    table: &mut [u32],
+    bt: &mut [u32],
+    target: usize,
+) {
+    let table_log = table.len().trailing_zeros();
+    let bt_mask = bt.len() / 2 - 1;
+    match mls {
+        3 => fill_range::<3>(win, table, bt, 0, table_log, bt_mask, 0, target),
+        4 => fill_range::<4>(win, table, bt, 0, table_log, bt_mask, 0, target),
+        _ => fill_range::<5>(win, table, bt, 0, table_log, bt_mask, 0, target),
+    }
+}
+
 #[inline]
 fn fill_range<const MLS: usize>(
     win: &[u8],

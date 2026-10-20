@@ -519,14 +519,21 @@ pub(crate) struct LdmPrefixSnapshot {
 /// full overwrite of the same set, in place, so a restored driver parses
 /// exactly like a freshly seeded one.
 ///
+/// The tree families' tables (`opt_table`/`bt`/`hash3`, `dubt_table`/
+/// `dubt_bt`) ARE captured since R58: the seeding eagerly fills them over
+/// the dictionary content (see
+/// [`MatchGeneratorDriver::seed_fill_dictionary_tree`]) after
+/// canonicalizing them (and the opt coordinate origin) to zero, so the
+/// captured bytes are a pure function of the cache key and a restore
+/// replaces the first searching block's random-access tree fill with one
+/// sequential copy. The skip shapes that keep the lazy fill (opt rows with
+/// dictionary content beyond the stock search domain, btlazy rows on
+/// small-src shapes) capture whatever the seeding left: pooled residue,
+/// which the frame retires exactly as R57 did -- the opt entries through
+/// the coordinate origin restored with them (the pair is consistent), the
+/// DUBT ring behind heads the deferred `dubt_stale` clear zeroes.
+///
 /// Deliberately NOT captured, each with its neutrality argument:
-/// - `opt_table`, `bt`, `hash3` (opt rows): seeding never writes them (the tree fill is lazy from
-///   `next_update`), so their image would be pure zeros -- a restore-copy the re-seed itself never
-///   pays. Residue instead retires through the O(1) coordinate advance restore re-runs (`opt_origin
-///   += pos + 1`, reset's own move), the same invalidation pooled plain opt frames already run
-///   under; `hash3` shares the origin arithmetic (`pack`/`resolve`), so it retires with it.
-/// - `dubt_table`, `dubt_bt` (btlazy2): the deferred `dubt_stale` clear (a captured scalar) zeroes
-///   the heads before the first search and the ring is unreachable behind zeroed heads.
 /// - the chain ring beyond the dictionary's positions: those slots keep the previous frame's links
 ///   (a fresh state holds zeros there), but a chain walk only ever reads the link slot of an
 ///   INSERTED position -- every insert writes its own slot first -- and the dict fill rebuilds
@@ -555,14 +562,19 @@ pub struct DriverSeedImage {
     second: usize,
     row_heads: Vec<u8>,
     probe: Vec<u32>,
+    /// The opt family's filled tree tables (see the type doc); empty
+    /// outside the family or on the lazy-fill skip shapes.
+    opt_table: Vec<u32>,
+    bt: Vec<u32>,
+    hash3: Vec<u32>,
+    /// The btlazy family's filled tables, same contract.
+    dubt_table: Vec<u32>,
+    dubt_bt: Vec<u32>,
     /// Active LDM state after the dict fill, `None` when the row left LDM
     /// disarmed; `ldm_stale` marks the fill-skipped form (a restart with
     /// the clear deferred -- table content dead).
     ldm: Option<LdmSnapshot>,
     ldm_stale: bool,
-    /// Whether restore takes the opt-family `opt_origin` special path
-    /// (residue advance instead of the captured value).
-    opt_family: bool,
     // Scalar block, restored verbatim.
     win_base: u64,
     pos: u64,
@@ -2400,24 +2412,163 @@ impl MatchGeneratorDriver {
         self.opt_state = OptState::new();
     }
 
+    /// Whether the eager dictionary tree fill applies to this seeded
+    /// state (see [`Self::seed_fill_dictionary_tree`]'s skip notes): the
+    /// capture and the exactness gate key off the same predicate.
+    #[cfg(feature = "std")]
+    pub(crate) fn dict_tree_filled(&self) -> bool {
+        match self.params.strategy {
+            Strategy::Opt(_) => {
+                self.pos <= self.params.chain_reach.unwrap_or(self.params.window) as u64
+            },
+            Strategy::BtLazy(_) => !self.params.small_src,
+            _ => false,
+        }
+    }
+
+    /// Eagerly fill the tree families' tables over the seeded dictionary
+    /// content, ahead of the seed-image capture (R58): the opt rows'
+    /// `update_tree` -- with the ultra rows' frame-start statistics parse
+    /// replayed first, so the frame skips its own -- and the btlazy rows'
+    /// DUBT fill (the reset's deferred heads clear run here). The image
+    /// then captures the FILLED tree and a restore replaces the first
+    /// searching block's random-access fill with one sequential copy.
+    ///
+    /// Byte-neutral against the lazy fill by construction (the exact
+    /// arguments in `opt::seed_dict_tree` and `dubt::fill_dict_range`):
+    /// the opt fill's count caps are `min(keep, idx + OPT_NUM)`, equal to
+    /// the frame's `min(keep + first_block_len, idx + OPT_NUM)` for every
+    /// position below the `keep - OPT_NUM` bound the eager fill stops at,
+    /// so the first block's `update_tree` completes only the tail with the
+    /// true frame caps over the same prefix tree; the DUBT fill is
+    /// block-boundary-independent. The tables are canonicalized to zero
+    /// first (and the opt coordinate origin to 0 -- zeroed tables carry no
+    /// residue to invalidate, and `resolve`/the DUBT range checks read a
+    /// zero entry as dead whatever the origin), so the captured image is a
+    /// pure function of the cache key: no pooled residue, no
+    /// history-dependent origin bias.
+    ///
+    /// Skipped -- keeping the lazy fill and the R58-pre image semantics of
+    /// uncaptured (residue) tree tables -- where inputs only the frame can
+    /// know would change the content: opt rows whose dictionary content
+    /// reaches past the stock search domain (the frame's LDM alphabet gate
+    /// parks LDM at the first block, moving the fill floor between the
+    /// stock reach and the LDM-widened window), and btlazy rows on
+    /// small-src shapes (the tree hash width is screened over
+    /// dictionary+block, the block unknowable here).
+    #[cfg(feature = "std")]
+    pub(crate) fn seed_fill_dictionary_tree(&mut self) {
+        debug_assert!(self.ext.is_none() && self.win_base == 0 && self.next_update == 0);
+        let keep = self.pos as usize;
+        match self.params.strategy {
+            Strategy::Opt(knobs) => {
+                let reach = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+                if keep as u64 > reach {
+                    return;
+                }
+                // EMPTY is the zero bit pattern for all three tables.
+                self.opt_table.fill(0);
+                self.bt.fill(0);
+                self.hash3.fill(0);
+                self.opt_origin = 0;
+                let mut max_window = reach;
+                if self.ldm.is_some() {
+                    max_window = max_window.max(self.params.window as u64);
+                }
+                let win = window_slice(&self.win, self.ext.as_ref());
+                let Some(scratch) = self.opt_scratch.as_mut() else {
+                    unreachable!("opt scratch allocated by apply_level")
+                };
+                let mut rep = self.rep;
+                let mut rep_pending = self.rep_pending;
+                super::opt::seed_dict_tree(
+                    &knobs,
+                    win,
+                    max_window,
+                    self.opt_origin,
+                    &mut self.opt_table,
+                    &mut self.bt,
+                    &mut self.hash3,
+                    &mut self.next_update,
+                    &mut self.opt_state,
+                    scratch,
+                    &mut rep,
+                    &mut rep_pending,
+                );
+                self.rep = rep;
+                self.rep_pending = rep_pending;
+            },
+            Strategy::BtLazy(knobs) => {
+                if self.params.small_src {
+                    return;
+                }
+                self.dubt_table.fill(0);
+                self.dubt_bt.fill(0);
+                self.dubt_stale = false;
+                let target = keep.saturating_sub(HASH_READ);
+                if target > 0 {
+                    let win = window_slice(&self.win, self.ext.as_ref());
+                    super::dubt::fill_dict_range(
+                        knobs.mls as usize,
+                        win,
+                        &mut self.dubt_table,
+                        &mut self.dubt_bt,
+                        target,
+                    );
+                    self.next_update = target as u64;
+                }
+            },
+            _ => {},
+        }
+    }
+
     /// Capture the post-seed image (see [`DriverSeedImage`]); call after
     /// `reset` + `load_dictionary` with
-    /// [`Self::canonicalize_for_seed_capture`] applied.
+    /// [`Self::canonicalize_for_seed_capture`] and
+    /// [`Self::seed_fill_dictionary_tree`] applied.
     #[cfg(feature = "std")]
     pub(crate) fn capture_seed_image(&self) -> DriverSeedImage {
         let ldm_stale = self.ldm.as_ref().is_some_and(LdmState::is_stale);
+        let filled = self.dict_tree_filled();
         DriverSeedImage {
             win: self.win.to_vec(),
             tables: self.tables.to_vec(),
             second: self.second,
             row_heads: self.row_heads.clone(),
             probe: self.probe.clone(),
+            // The skip shapes capture no tree bytes: their live content is
+            // pooled residue the frame retires (R57 semantics), so an
+            // image-sized copy per restore would be pure waste.
+            opt_table: if filled {
+                self.opt_table.to_vec()
+            } else {
+                Vec::new()
+            },
+            bt: if filled {
+                self.bt.to_vec()
+            } else {
+                Vec::new()
+            },
+            hash3: if filled {
+                self.hash3.clone()
+            } else {
+                Vec::new()
+            },
+            dubt_table: if filled {
+                self.dubt_table.to_vec()
+            } else {
+                Vec::new()
+            },
+            dubt_bt: if filled {
+                self.dubt_bt.to_vec()
+            } else {
+                Vec::new()
+            },
             ldm: match (&self.ldm, ldm_stale) {
                 (Some(ldm), false) => Some(ldm.snapshot()),
                 _ => None,
             },
             ldm_stale,
-            opt_family: matches!(self.params.strategy, Strategy::Opt(_)),
             win_base: self.win_base,
             pos: self.pos,
             block_end: self.block_end,
@@ -2522,19 +2673,14 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     pub(crate) fn restore_seed_image(&mut self, image: &DriverSeedImage) {
         self.ensure_family_buffers(&image.params);
-        // Two scalars are computed against the CURRENT residue (the same
-        // moves `reset` itself runs) before the cursor overwrite below
-        // replaces `pos`: the opt rows' coordinate origin (the image's
-        // value pairs with the uncaptured table bytes, so the residue
-        // invalidation replaces it) and the chain heads' write high-water
-        // (reset's stash — the coverage invariant wants the state's own
-        // history, and a superset high-water only over-advances a future
-        // origin, the safe direction).
-        let opt_origin = if image.opt_family {
-            self.opt_origin.wrapping_add(self.pos + 1)
-        } else {
-            image.opt_origin
-        };
+        // One scalar is computed against the CURRENT residue (reset's own
+        // stash): the chain heads' write high-water (the coverage
+        // invariant wants the state's own history, and a superset
+        // high-water only over-advances a future origin, the safe
+        // direction). The opt rows' coordinate origin rides the image
+        // verbatim: it pairs with the captured table bytes (filled or
+        // residue alike), so the restored pair is exactly the captured
+        // state's.
         let strip_mark = self.strip_mark.max(self.pos);
         // Buffers: length-checked in-place copies. A same-key hit on the
         // capturing state always matches lengths; the reallocation branch
@@ -2556,6 +2702,42 @@ impl MatchGeneratorDriver {
             self.probe.copy_from_slice(&image.probe);
         } else {
             self.probe.clone_from(&image.probe);
+        }
+        // Tree families: a filled image overwrites the tables wholesale
+        // (length-checked in-place copies; a same-key hit on the capturing
+        // state matches lengths, `ensure_family_buffers` covered a
+        // family-flip frame in between). An EMPTY image field is the skip
+        // shapes' marker: the live buffers keep their geometry and residue,
+        // exactly R57's uncaptured semantics.
+        if !image.opt_table.is_empty() {
+            if self.opt_table.len() != image.opt_table.len() {
+                self.opt_table = HugeBuf::zeroed(image.opt_table.len());
+            }
+            self.opt_table.copy_from_slice(&image.opt_table);
+        }
+        if !image.bt.is_empty() {
+            if self.bt.len() != image.bt.len() {
+                self.bt = HugeBuf::zeroed(image.bt.len());
+            }
+            self.bt.copy_from_slice(&image.bt);
+        }
+        if !image.hash3.is_empty() {
+            if self.hash3.len() != image.hash3.len() {
+                self.hash3 = alloc::vec![0u32; image.hash3.len()];
+            }
+            self.hash3.copy_from_slice(&image.hash3);
+        }
+        if !image.dubt_table.is_empty() {
+            if self.dubt_table.len() != image.dubt_table.len() {
+                self.dubt_table = HugeBuf::zeroed(image.dubt_table.len());
+            }
+            self.dubt_table.copy_from_slice(&image.dubt_table);
+        }
+        if !image.dubt_bt.is_empty() {
+            if self.dubt_bt.len() != image.dubt_bt.len() {
+                self.dubt_bt = HugeBuf::zeroed(image.dubt_bt.len());
+            }
+            self.dubt_bt.copy_from_slice(&image.dubt_bt);
         }
         // LDM: adopt the captured fill state; the stale (fill-skipped)
         // form is a plain deferred restart; a captured `None` disarms the
@@ -2598,7 +2780,7 @@ impl MatchGeneratorDriver {
         self.second = image.second;
         self.next_update = image.next_update;
         self.gap_start = image.gap_start;
-        self.opt_origin = opt_origin;
+        self.opt_origin = image.opt_origin;
         self.head_origin = image.head_origin;
         self.fast_shift = image.fast_shift;
         self.strip_mark = strip_mark;
@@ -2742,6 +2924,11 @@ impl Matcher for MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn canonicalize_for_seed_capture(&mut self) {
         MatchGeneratorDriver::canonicalize_for_seed_capture(self);
+    }
+
+    #[cfg(feature = "std")]
+    fn seed_fill_dictionary_tree(&mut self) {
+        MatchGeneratorDriver::seed_fill_dictionary_tree(self);
     }
 
     #[cfg(feature = "std")]
@@ -3784,11 +3971,12 @@ pub(crate) fn fast_row_screen_pending(level: Level, shape: InputShape) -> bool {
 /// Whether two seeded drivers hold the same REACHABLE state: the seed
 /// image cache's exactness gate (compare a freshly seeded driver with one
 /// restored into pooled residue). Every captured field is compared; the
-/// deliberately-uncaptured pieces follow their neutrality contracts from
-/// [`DriverSeedImage`]'s doc — the opt/bt/hash3/dubt tables by length
-/// only, the chain ring beyond the dictionary's written slots (stale
-/// links there are unreachable: a walk only reads slots of inserted
-/// positions), `ldm_parked` and the scratch buffers not at all.
+/// uncaptured pieces follow their neutrality contracts from
+/// [`DriverSeedImage`]'s doc — the tree tables fully on the eager-fill
+/// shapes and by length only on the skip shapes, the chain ring beyond
+/// the dictionary's written slots (stale links there are unreachable: a
+/// walk only reads slots of inserted positions), `ldm_parked` and the
+/// scratch buffers not at all.
 #[cfg(all(test, feature = "std"))]
 pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriver) -> bool {
     let scalars = a.win_base == b.win_base
@@ -3842,19 +4030,25 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && b.small_wide.is_none()
         && a.ldm_seqs.is_empty()
         && b.ldm_seqs.is_empty();
-    // Coordinate origins: both are restored against the state's own
-    // residue (reset's own moves), not replayed from the capture. The
-    // opt-family origin is equivalent when it retires every position the
-    // state has written; outside the opt family `opt_table` is empty, so
-    // the value is inert. `strip_mark` (restored as reset's stash) is
-    // consumed only by strip prefills, which these single-threaded
-    // states never run; a superset high-water only over-advances a
-    // future origin — the safe direction — so coverage subsumption is
-    // the equivalence.
+    // Coordinate origins. The eager-fill shapes canonicalized the opt
+    // origin to 0 (zeroed tables carry no residue to invalidate), so the
+    // restored value is the captured one and equality is the equivalence.
+    // The skip shapes keep R57's reasoning: the origin is restored against
+    // the state's own residue (reset's own moves), not replayed from the
+    // capture; the opt-family value is equivalent when it retires every
+    // position the state has written, and outside the opt family
+    // `opt_table` is empty so the value is inert. `strip_mark` (restored
+    // as reset's stash) is consumed only by strip prefills, which these
+    // single-threaded states never run; a superset high-water only
+    // over-advances a future origin — the safe direction — so coverage
+    // subsumption is the equivalence.
+    let tree_canonical = a.dict_tree_filled();
     let opt = matches!(a.params.strategy, Strategy::Opt(_));
-    let origins = (!opt || b.opt_origin > b.pos)
-        && b.opt_origin >= a.opt_origin
-        && b.strip_mark >= a.strip_mark;
+    let origins = if tree_canonical {
+        a.opt_origin == b.opt_origin
+    } else {
+        (!opt || b.opt_origin > b.pos) && b.opt_origin >= a.opt_origin
+    } && b.strip_mark >= a.strip_mark;
     // Head tables: fully cleared and refilled at seeding. The chain ring
     // is position-keyed: only the dictionary's own slots are written
     // (a fresh state holds zeros in the rest; residue there is
@@ -3864,14 +4058,27 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         let written = (a.pos as usize).min(ring_a.len());
         ring_a.len() == ring_b.len() && ring_a[..written] == ring_b[..written]
     };
+    // Tree tables: full equality on the eager-fill shapes (the seeding
+    // canonicalized them to zero before filling, so every slot -- written
+    // by the fill or not -- is a function of the key alone); length-only
+    // on the skip shapes (residue rides the neutrality contracts).
+    let tree_tables = if tree_canonical {
+        a.opt_table == b.opt_table
+            && a.bt == b.bt
+            && a.hash3 == b.hash3
+            && a.dubt_table == b.dubt_table
+            && a.dubt_bt == b.dubt_bt
+    } else {
+        a.opt_table.len() == b.opt_table.len()
+            && a.bt.len() == b.bt.len()
+            && a.hash3.len() == b.hash3.len()
+            && a.dubt_table.len() == b.dubt_table.len()
+            && a.dubt_bt.len() == b.dubt_bt.len()
+    };
     let buffers = window_slice(&a.win, None) == window_slice(&b.win, None)
         && a.row_heads == b.row_heads
         && a.probe == b.probe
-        && a.opt_table.len() == b.opt_table.len()
-        && a.bt.len() == b.bt.len()
-        && a.hash3.len() == b.hash3.len()
-        && a.dubt_table.len() == b.dubt_table.len()
-        && a.dubt_bt.len() == b.dubt_bt.len();
+        && tree_tables;
     let ldm = match (&a.ldm, &b.ldm) {
         (None, None) => true,
         (Some(x), Some(y)) => {

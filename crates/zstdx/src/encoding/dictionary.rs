@@ -264,6 +264,11 @@ pub(crate) fn seed_with_cache<M: Matcher>(
     }
     reset_with_dictionary_mode(state, dict, level, shape, ldm);
     state.matcher.canonicalize_for_seed_capture();
+    // The eager tree fill runs after the canonicalization (the ultra rows'
+    // replayed statistics parse shapes the fresh-form price state the
+    // image then captures) and before the capture (the image holds the
+    // filled tree; see the driver's method).
+    state.matcher.seed_fill_dictionary_tree();
     if let Some(driver) = state.matcher.capture_seed_image() {
         state.seed_cache = Some(alloc::boxed::Box::new(SeedCache {
             driver,

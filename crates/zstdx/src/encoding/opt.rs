@@ -1161,6 +1161,118 @@ pub(crate) fn run_block<const ULTRA: bool>(
     won
 }
 
+/// The dictionary seed-time tree machinery for the opt rows (the R58
+/// seed-image fill; `win` is the freshly seeded window -- dictionary
+/// content alone, `win.len() == pos`, `win_base == 0`, `next_update == 0`,
+/// tables already canonicalized to zero): replay the ultra rows'
+/// frame-start statistics parse over the dictionary content exactly as the
+/// first block's `initStats` seed would run it on a dictionary frame (the
+/// re-based `else`-branch span with a throwaway emission, no origin
+/// advance, cursor rewound to the window base), then thread the fill
+/// prefix `[0, len - OPT_NUM)`.
+///
+/// Byte-exactness vs the lazy frame fill (the seed image's restore contract):
+/// - The replay shapes `state` the same way (so the frame's own seed parse, gated on a zero
+///   `lit_length_sum`, is skipped) and leaves the tree in the seed parse's post-threading form; the
+///   prefix re-fill then re-inserts `[0, len - OPT_NUM)` in the same order and with the same
+///   per-position count caps (`min(win.len(), idx + OPT_NUM)` equals the frame's `min(win.len() +
+///   first_block_len, idx + OPT_NUM)` for every `idx` below the bound), leaving the first block's
+///   `update_tree` only the tail `[len - OPT_NUM, len)` to fill with the true frame caps over the
+///   same prefix tree.
+/// - Non-ultra rows skip the replay (their frame flow has none): the eager prefix fill starts from
+///   the canonical zero tables, which thread exactly like the residue the lazy fill starts from on
+///   a pooled state (stale entries resolve to `None` and end the walk, zero entries are `EMPTY` and
+///   end the walk).
+/// - The known corner: a first block of <= `PREDEF_THRESHOLD` bytes skips the frame's seed parse in
+///   the lazy flow while the eager replay has already shaped `state`; such frames parse differently
+///   (still valid, just a different legal parse).
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_dict_tree(
+    knobs: &OptKnobs,
+    win: &[u8],
+    max_window: u64,
+    origin: u64,
+    table: &mut [u32],
+    bt: &mut [u32],
+    hash3: &mut [u32],
+    next_update: &mut u64,
+    state: &mut OptState,
+    scratch: &mut OptScratch,
+    rep: &mut [u32; 3],
+    rep_pending: &mut u8,
+) {
+    let keep = win.len() as u64;
+    debug_assert_eq!(*next_update, 0);
+    if knobs.ultra && keep - seed_start_of(keep) > PREDEF_THRESHOLD as u64 {
+        let seed_start = seed_start_of(keep);
+        let saved_rep = *rep;
+        let saved_pending = *rep_pending;
+        // Re-base the window slice to the span (the empty-window frame
+        // start; identical to the plain case when `keep <= SEED_SPAN`).
+        let seed_win = &win[seed_start as usize..];
+        let mut literals = Vec::new();
+        let mut seqs = Vec::new();
+        run_once::<true>(
+            knobs,
+            seed_win,
+            seed_start,
+            seed_start,
+            keep,
+            max_window,
+            &[],
+            origin,
+            table,
+            bt,
+            hash3,
+            next_update,
+            state,
+            scratch,
+            rep,
+            rep_pending,
+            &mut literals,
+            &mut seqs,
+        );
+        *rep = saved_rep;
+        *rep_pending = saved_pending;
+        // The isolated seed left its span threaded and the cursor advanced;
+        // rewind it so the fill prefix below re-inserts the span (the head
+        // rejects the duplicate position -- run_block's own rewind).
+        *next_update = 0;
+    }
+    let table_log = table.len().trailing_zeros();
+    let bt_mask = bt.len() / 2 - 1;
+    let mut finder = Finder {
+        win,
+        win_base: 0,
+        // The window end is the count cap: `min(keep, idx + OPT_NUM)`
+        // matches the frame caps below the fill bound (see the doc).
+        block_end_idx: win.len(),
+        origin,
+        max_window,
+        table,
+        table_log,
+        bt,
+        bt_mask,
+        hash3,
+        hash3_log: knobs.hash3_log,
+        min_match: knobs.min_match as usize,
+        mls: knobs.mls as usize,
+        nb_compares: 1usize << knobs.search_log,
+        insert_compares: 1usize << knobs.insert_log,
+        sufficient_len: knobs.sufficient_len as usize,
+        next_update,
+    };
+    finder.update_tree(win.len().saturating_sub(OPT_NUM));
+}
+
+/// The ultra seed parse's span start for a dictionary of `keep` bytes
+/// (`run_block`'s `block_start.saturating_sub(SEED_SPAN).max(win_base)`
+/// with `win_base == 0`).
+fn seed_start_of(keep: u64) -> u64 {
+    keep.saturating_sub(SEED_SPAN)
+}
+
 /// The caller guarantees the tables match the knobs' logs, the window covers
 /// `[win_base, block_end]`, and `bt.len() >= 2`.
 #[allow(clippy::too_many_arguments)]
