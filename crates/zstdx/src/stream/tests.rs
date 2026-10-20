@@ -1910,6 +1910,37 @@ mod mt_dict {
         }
     }
 
+    /// The capture engagement's header re-serialization must keep a
+    /// suppressed dict id suppressed (R56): the armed fast-row header is
+    /// the frame's own header — `include_dictid(false)` holds on the
+    /// engagement path, not only the construction-time one.
+    #[test]
+    fn dict_mt_capture_keeps_suppressed_dictid() {
+        let Some((raw, _)) = dict_fixture() else {
+            return;
+        };
+        let data = far_class_payload(32 * 1024 * 1024);
+        // The engaged band and fixture of `dict_mt_capture_classes`'s Fast
+        // cell, with the header id suppressed: the frame must carry no
+        // Dictionary_ID (the bulk entry demotes to ST here; the stream MT
+        // core is the suppressed dict frame's only mt form).
+        let stream = dict_stream(
+            &data,
+            1024 * 1024,
+            &EncoderOptions::new(Level::Fast)
+                .workers(4)
+                .dictionary(&raw)
+                .pledged_size(Some(data.len() as u64))
+                .include_dictid(false),
+        );
+        assert_eq!(
+            zstd::zstd_safe::get_dict_id_from_frame(&stream),
+            None,
+            "the engaged header re-stamped the suppressed dict id"
+        );
+        assert_eq!(decode_with_dict(&stream, &raw), data);
+    }
+
     #[test]
     fn pledged_stream_matches_bulk_dict_mt() {
         let Some((raw, data)) = dict_fixture() else {

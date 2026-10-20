@@ -882,7 +882,11 @@ fn test_max_window_size_clamped_to_format_maximum() {
 fn include_dictid_suppresses_the_header_field() {
     extern crate std;
     use alloc::{format, vec::Vec};
-    use std::io::Write as _;
+
+    // The crate's own io trait: std::io::Write is the wrong trait under
+    // --no-default-features (the encoder implements crate::io::Write,
+    // which the std feature re-exports from std::io).
+    use crate::io::Write as _;
 
     let samples: Vec<Vec<u8>> = (0..96u32)
         .map(|i| {
@@ -957,8 +961,10 @@ fn include_dictid_suppresses_the_header_field() {
         crate::bulk::decompress_with(&stream_bare, content.len(), &dec_opts).unwrap();
     assert_eq!(stream_roundtrip, content);
 
-    // multithreaded stream core: the suppression holds there too (on
-    // single-core machines the ST core runs and passes identically)
+    // Multithreaded stream core: the suppression holds there too (on
+    // single-core machines the ST core runs and passes identically); the
+    // no-std build has no workers at all.
+    #[cfg(feature = "std")]
     let mt_bare = {
         let mut encoder = crate::stream::write::Encoder::with_options(
             Vec::new(),
@@ -972,9 +978,13 @@ fn include_dictid_suppresses_the_header_field() {
         encoder.write_all(&content).unwrap();
         encoder.finish().unwrap()
     };
-    assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&mt_bare), None);
-    let mt_roundtrip = crate::bulk::decompress_with(&mt_bare, content.len(), &dec_opts).unwrap();
-    assert_eq!(mt_roundtrip, content);
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&mt_bare), None);
+        let mt_roundtrip =
+            crate::bulk::decompress_with(&mt_bare, content.len(), &dec_opts).unwrap();
+        assert_eq!(mt_roundtrip, content);
+    }
 }
 
 /// A far-class tile (R55): a seeded 2 MiB stream of records — a short
@@ -1083,7 +1093,7 @@ fn long_distance_matching_override() {
     // shape differs from the pledged bulk one (no content size, the
     // unclamped 2^27 window), so the evidence is its own auto twin.
     let stream = |mode: crate::LdmMode| {
-        use std::io::Write as _;
+        use crate::io::Write as _;
         let mut encoder = crate::stream::write::Encoder::with_options(
             Vec::new(),
             crate::EncoderOptions::new(crate::Level::Fastest).long_distance_matching(mode),
@@ -1144,6 +1154,38 @@ fn long_distance_matching_disable_overrides_auto_arming() {
         data,
         "the auto-armed far frame stays legal"
     );
+}
+
+/// The LDM override stays legal on every strategy family (R56): Enable
+/// on the tagged rows is inert by design (no LDM candidate feed) and on
+/// the btlazy2/opt rows arms the far source below every auto bar — each
+/// family must still emit frames this engine and libzstd decode.
+#[test]
+fn ldm_override_roundtrips_every_family() {
+    let data = ldm_text_tile();
+    for level in [
+        crate::Level::from_zstd(7), // tagged Row strategy: Enable is inert
+        crate::Level::Best,         // btlazy2
+        crate::Level::Opt,          // opt-family tree search
+    ] {
+        for mode in [crate::LdmMode::Enable, crate::LdmMode::Disable] {
+            let frame = crate::bulk::compress_with(
+                &data,
+                &crate::EncoderOptions::new(level).long_distance_matching(mode),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::bulk::decompress(&frame, data.len()).unwrap(),
+                data,
+                "{level:?}/{mode:?}"
+            );
+            assert_eq!(
+                zstd::decode_all(frame.as_slice()).unwrap(),
+                data,
+                "{level:?}/{mode:?}: libzstd decodes"
+            );
+        }
+    }
 }
 
 pub mod bit_reader;

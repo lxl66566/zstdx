@@ -858,6 +858,11 @@ pub(crate) struct MtEncoderCore {
     /// The frame's dictionary (see [`Job`]'s `dict`): seeds the frame's
     /// first job and its header's dictID/window; `None` on plain frames.
     dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
+    /// The header's Dictionary_ID, resolved once at construction
+    /// (`include_dictid(false)` suppresses it): every header
+    /// (re-)serialization — the capture engagement's included — stamps
+    /// this value, never a fresh read off the dictionary.
+    header_dict_id: Option<u32>,
     /// The frame's declared shape (length = the pledge, plus the forced
     /// window log); shared by every job so tables and the header agree.
     shape: crate::InputShape,
@@ -1010,16 +1015,19 @@ impl MtEncoderCore {
             // Engaged mid-stream only; the band base is its floor.
             JobGrid::Capture => far_screen::SCREEN_SPAN,
         };
+        // libzstd's dictIDFlag: the dictionary still seeds job zero,
+        // only the header field is suppressed. Resolved once here — the
+        // engagement path's re-serialization reuses it (a fresh read off
+        // the dictionary would re-stamp a suppressed id).
+        let header_dict_id = options
+            .include_dictid
+            .then(|| dict.as_ref().and_then(|d| d.header_id()))
+            .flatten();
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
             single_segment: false,
             content_checksum: checksum,
-            // libzstd's dictIDFlag: the dictionary still seeds job zero,
-            // only the header field is suppressed.
-            dictionary_id: options
-                .include_dictid
-                .then(|| dict.as_ref().and_then(|d| d.header_id()))
-                .flatten(),
+            dictionary_id: header_dict_id,
             window_size: Some(window),
         };
         let mut serialized = Vec::with_capacity(18);
@@ -1073,6 +1081,7 @@ impl MtEncoderCore {
             fast_capture,
             choice: ReachChoice::Keep,
             dict,
+            header_dict_id,
 
             shape,
             hasher: if checksum {
@@ -1620,14 +1629,16 @@ impl MtEncoderCore {
         // windowed, W26 — with the FCS exactly when a pledge declared it,
         // so an armed pledged stream and the bulk frame agree byte for
         // byte, and an armed open stream carries the ST armed form. A
-        // dictionary frame keeps its dictID and folds the declared window
-        // with the construction-time src+dict clamp (the far window
-        // exceeds every plain fast-row window, so plain bytes never move).
+        // dictionary frame keeps its header dictID — the construction-time
+        // resolution (a suppressed id stays suppressed) — and folds the
+        // declared window with the construction-time src+dict clamp (the
+        // far window exceeds every plain fast-row window, so plain bytes
+        // never move).
         let header = FrameHeader {
             frame_content_size: self.shape.len,
             single_segment: false,
             content_checksum: self.checksum,
-            dictionary_id: self.dict.as_ref().and_then(|d| d.header_id()),
+            dictionary_id: self.header_dict_id,
             window_size: Some(window.max(Self::header_window(
                 self.level,
                 self.shape,

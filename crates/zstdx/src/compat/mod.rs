@@ -9,13 +9,14 @@
 //!   `compression_level_range` answers 1..=22 (no accelerated levels), and a level of 0 selects the
 //!   default (3).
 //! - `multithread(n)` with `n > 1` runs the native multithreaded streaming encoder; it must be set
-//!   before the stream starts. Dictionary-taking constructors are supported (single-threaded),
-//!   including the prepared [`dict::EncoderDictionary`]/[`dict::DecoderDictionary`] forms; the
-//!   trainers live in [`dict`] behind the `dict_builder` feature.
+//!   before the stream starts. Dictionary-taking constructors are supported (a dictionary seeds the
+//!   frame's first job under `multithread` too), including the prepared
+//!   [`dict::EncoderDictionary`]/[`dict::DecoderDictionary`] forms; the trainers live in [`dict`]
+//!   behind the `dict_builder` feature.
 //! - `zstd_safe` (and the `stream::{raw,zio}` layer around it) has no equivalent; the native
 //!   low-level API is [`crate::encoding`]/[`crate::decoding`]. The context wrappers therefore take
-//!   no `'a` lifetime, and `with_context`/`with_writer`/`with_encoder`/`with_ref_prefix`/
-//!   `set_parameter`/`context_mut` have no counterpart.
+//!   no `'a` lifetime, and `with_context`/`with_writer`/`with_encoder`/`set_parameter`/
+//!   `context_mut` have no counterpart.
 //! - `bulk::Decompressor::decompress` treats `capacity` as a growing hint, where the zstd crate
 //!   errors when the content exceeds it; [`bulk::Decompressor::upper_bound`] always answers
 //!   (upstream needs the `experimental` feature).

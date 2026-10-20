@@ -61,6 +61,11 @@ impl InputShape {
 /// (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before the source-length clamp; a
 /// forced window log wins.
 ///
+/// Multithreaded frames (`workers` > 1) consume only the window half:
+/// the jobs keep the job-model LDM arming, so `Disable` does not stand
+/// the cross-job captures down and `Enable` does not force them below
+/// their own bars (a recorded deviation).
+///
 /// ```rust
 /// use zstdx::{EncoderOptions, LdmMode, Level};
 /// let opts = EncoderOptions::new(Level::Fast).long_distance_matching(LdmMode::Enable);
