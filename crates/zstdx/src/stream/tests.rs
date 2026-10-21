@@ -1223,6 +1223,36 @@ mod mt {
         }
     }
 
+    /// An absurd pledge on a fast row must not stall `write` behind a
+    /// pledge-proportional schedule walk: the first staged band resolves
+    /// the capture schedule in window-bounded time, the writes return,
+    /// and finish reports the (genuinely promised) mismatch — before the
+    /// closed-form fix the first `write` walked n_jobs = u64::MAX / 16 MiB
+    /// candidates, so this test hanging is the regression signal.
+    #[test]
+    fn absurd_pledge_fast_row_write_returns_bounded() {
+        // Head twins (the capture's collision screen must pass so the
+        // schedule actually runs) followed by stream bytes.
+        let head = lcg(128 * 1024);
+        let mut band = head.clone();
+        band.extend_from_slice(&head);
+        band.extend_from_slice(&textish(2 * 1024 * 1024 - band.len()));
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .pledged_size(Some(u64::MAX)),
+        )
+        .unwrap();
+        enc.write_all(&band).unwrap();
+        enc.write_all(&band).unwrap();
+        match enc.finish() {
+            Err(crate::Error::PledgedSizeMismatch { .. }) => {},
+            other => panic!("absurd pledge: got {other:?}"),
+        }
+    }
+
     /// A mid-band hint (unpledged `input_shape(len)` — compat's
     /// ContentSizeFlag=false degradation of a pledge lands exactly here)
     /// must stream like any open frame: the armed capture takes the

@@ -1837,8 +1837,10 @@ impl MtEncoderCore {
     /// untouched tail costs address space only, and past it the wrap
     /// recycle stands as before.
     fn reserve_decided(&mut self) {
+        // `saturating_add`: a u64::MAX-class pledge (compat's absurd
+        // declarations) must not wrap the reserve to a near-zero want.
         let want = match (&self.grid, self.pledged) {
-            (JobGrid::Fixed(_), Some(n)) => (n + 64 * 1024) as usize,
+            (JobGrid::Fixed(_), Some(n)) => n.saturating_add(64 * 1024) as usize,
             _ => BUF_CAP_MAX,
         }
         .min(BUF_CAP_MAX);
