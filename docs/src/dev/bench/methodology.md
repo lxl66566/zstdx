@@ -26,7 +26,7 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 | `small` | 1KiB-1MiB small loads; `--size`/`--impl` pin a single size and a single impl (for profiler targeting) |
 | `files` | Decoding timing for arbitrary .zst files (budget-based; automatically finds the `.raw`/bare-stem reference for verification via any `zst*` suffix) |
 | `prof` | Single-side profiling loops: `prof dec <f> [n]` / `prof enc <lvl> <n> <f...>` / `prof enc-stream <lvl> <n> <f>`; `RUZ_CKSUM` env toggles the checksum path |
-| `dump` | Corpus byte snapshots, a deterministic regression probe: dump one directory per build and `diff -r`; `--all-levels` covers all 6 levels (tags l1/l3/l6/l12/l16/l19) |
+| `dump` | Corpus byte snapshots, a deterministic regression probe: dump one directory per build and `diff -r`; `--all-levels` covers all 6 levels (tags l1/l3/l6/l12/l16/l19); `--stream` swaps in the streaming cores — the one-command stream differential gate (see the note below) |
 | `corrupt` | Random-corruption smoke test (0 panics), covering streaming + flat paths |
 | `mtcheck` | MT decode cross-check against the zstd CLI (`--workers` selects the level) |
 | `seqstats` | Sequence statistics and entropy lower bound |
@@ -35,6 +35,8 @@ A standalone crate (`cargo run --release -p zstdx-bench -- <subcommand>`); bench
 Common harness (`src/common.rs` in the crate): per-round interleaving, warmup, time budget (`--budget-ms`, default 500ms/side; equivalent to the old BENCH_BUDGET_MS env, which still works), median/mad statistics. The crate's README documents every subcommand's usage.
 
 Ratio-bench workflow note: run `ratio` after every encoder-touching change; it is single-pass and parallel (~1 min full sweep), and its output is fully deterministic — `diff` two captures to attribute size changes. For changes that must not alter output at all, `dump` + `cmp -r` remains the byte-exact gate.
+
+Stream differential gate: `dump <dir> --all-levels --stream` per build, then `diff -r` — 120 frames (5 shapes × 6 levels × {.stream open, .stream-pledged, .stream-mt<W> open, .stream-mt<W>-pledged}), every frame roundtrip+interop-gated in-tool. Use this instead of scratch emitframe loops for stream-path changes. Sanctioned divergences vs the bulk dump (by design, details in the bench Readme): unpledged-mt rides the Growing grid keyed on `--workers` (never diff across worker counts); pledged-mt differs only on the Balanced row (skewed/text l9 — the reach probe's stream/bulk verdict split); pledged-st differs by the 4-byte FCS header field; the open cells have no byte-equal bulk counterpart.
 
 Deleted one-off tools (all covered): bench_compare / bench_encode (matrix `dec-st`/`enc-st` + filters), bench_corpus (files), ab_fast / ab_mt (matrix + filters), compression_ratio (small), stream_cmp (small-block streaming reads for fuzz decode), criterion decode_all (files).
 
