@@ -490,8 +490,13 @@ std::thread_local! {
     static BUF_POOL: core::cell::RefCell<Vec<Vec<u8>>> =
         const { core::cell::RefCell::new(Vec::new()) };
 }
-// Largest buffer retained per thread (a 32 MiB stream peaks at ~35 MiB).
-const BUF_POOL_KEEP_MAX: usize = 64 * 1024 * 1024;
+// Largest buffer retained per thread. The full cap: a decided open stream
+// now reserves it (see `reserve_decided`), and dropping the returned
+// buffer would re-fault the whole first-touch cost every following
+// stream — exactly the bimodality this pool exists to remove. Buffers
+// only reach the cap on threads that ran a cap-scale stream, so the
+// parked set stays bounded by what was live anyway (depth 2).
+const BUF_POOL_KEEP_MAX: usize = BUF_CAP_MAX;
 // Buffers retained per thread (a second one covers size-mismatched pairs).
 const BUF_POOL_DEPTH: usize = 2;
 
@@ -1796,17 +1801,26 @@ impl MtEncoderCore {
         }
     }
 
-    /// Re-reserve the accumulate buffer for the decided schedule's working
-    /// scale, under the same cap as the initial reserve (see
-    /// `initial_reserve`) — a huge pledge's grid must not reserve
-    /// workers x job_size here either.
+    /// Re-reserve the accumulate buffer for the decided schedule. Growth
+    /// mid-stream is not free capacity: `make_space` may only grow at full
+    /// quiescence (a realloc relocates the allocation under the resolved
+    /// views incomplete jobs hold), so an undersized reserve turns the
+    /// stream into buffer-sized waves — the pump parks behind the
+    /// in-flight jobs' slowest straggler at every growth point and the
+    /// not-yet-postable tail idles the workers after it (dll100
+    /// stream-mt8 fastest: the engaged 96 MiB reserve stalled the pump
+    /// 100 of 176 ms and left the last 16 MiB job running alone; the deep
+    /// rows' Growing reserve serialized whole epochs the same way). A
+    /// pledged stream reserves its exact extent (the whole stream fits,
+    /// zero recycle points); an open stream reserves the cap — the
+    /// untouched tail costs address space only, and past it the wrap
+    /// recycle stands as before.
     fn reserve_decided(&mut self) {
-        let initial_job = match self.grid {
-            JobGrid::Fixed(size) => size,
-            JobGrid::Growing => MIN_JOB_SIZE.max(self.overlap),
-            JobGrid::Capture => far_screen::SCREEN_SPAN,
-        };
-        let want = initial_reserve(self.workers, initial_job, self.overlap);
+        let want = match (&self.grid, self.shape.len) {
+            (JobGrid::Fixed(_), Some(n)) => (n + 64 * 1024) as usize,
+            _ => BUF_CAP_MAX,
+        }
+        .min(BUF_CAP_MAX);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
             self.buf.reserve_exact(target - self.buf.len());
