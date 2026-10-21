@@ -452,6 +452,7 @@ pub fn compress_slice_mt(
                                 level,
                                 shape,
                                 dict,
+                                job_ldm,
                                 ldm_mode,
                             );
                         }
@@ -902,8 +903,25 @@ fn return_dict_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver
 /// is a single contiguous caller slice). Jobs after the first keep the
 /// stock strip model, mirroring libzstd's zstdmt (the CDict seeds only
 /// job zero; later jobs run under forceMaxWindow with repcodes gated).
+/// The dictionary job's LDM arming from the frame's job arming (see
+/// `run_dict_job_zero`): the per-job model, except the frame-wide disarm
+/// — a far-dead stream frame's `LdmArming::FarDead` disarms the
+/// dictionary job's LDM like every other job's. The capture flips'
+/// `JobPrefix` is about borrowed strips the owned-window dictionary job
+/// never runs, so the per-job model stands there (the R54 contract: the
+/// dictionary job zero keeps its parse on the armed bands, bulk and
+/// stream alike).
+fn dict_job_arming(job_ldm: LdmArming) -> LdmArming {
+    match job_ldm {
+        LdmArming::FarDead => LdmArming::FarDead,
+        _ => LdmArming::Job,
+    }
+}
+
 /// `shape` is the frame's plain declared shape — the dictionary fold
 /// inside applies the same `len + dict_content` clamp the ST entries use.
+/// `job_ldm` is the frame's job arming (the context its other jobs run
+/// under), folded by `dict_job_arming`.
 pub(crate) fn run_dict_job_zero(
     src: &[u8],
     job: Range<usize>,
@@ -911,6 +929,7 @@ pub(crate) fn run_dict_job_zero(
     level: Level,
     shape: crate::InputShape,
     dict: &super::dictionary::EncDictionary,
+    job_ldm: LdmArming,
     ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut state = take_dict_state();
@@ -922,7 +941,7 @@ pub(crate) fn run_dict_job_zero(
     state
         .matcher
         .set_reach_choice(reach_probe::ReachChoice::Keep);
-    state.matcher.set_ldm_arming(LdmArming::Job);
+    state.matcher.set_ldm_arming(dict_job_arming(job_ldm));
     let dict_shape = crate::InputShape {
         len: shape.len.map(|len| len + dict.content.len() as u64),
         window_log: shape.window_log,
@@ -1044,15 +1063,14 @@ pub(crate) fn capture_job_size(len: u64, reach: usize) -> usize {
     len.div_ceil(8).clamp(floor as u64, CAPTURE_JOB_CAP) as usize
 }
 
-/// The capture classes' head engagement screen, shared by `capture_grid`
-/// and `plan_prefix_ldm`: the chain rows and the fast rows' full band keep
-/// the near-repeat collision screen (`ldm_head_parses`) — what keeps a
-/// max-entropy head (random) or a low-alphabet one (json-class) out of
-/// the capture's per-job LDM machinery — while the fast rows' mid band
-/// carries the far screen's own verdict (the content-aligned twin count
-/// that armed the window in `far_screen::mt_capture_window`, strictly
-/// stronger evidence than the collision this checks for). `head_block` is
-/// the frame's first block.
+/// The capture classes' head engagement screen (see `capture_band`): the
+/// chain rows and the fast rows' full band keep the near-repeat collision
+/// screen (`ldm_head_parses`) — what keeps a max-entropy head (random) or
+/// a low-alphabet one (json-class) out of the capture's per-job LDM
+/// machinery — while the fast rows' mid band carries the far screen's own
+/// verdict (the content-aligned twin count that armed the window in
+/// `far_screen::mt_capture_window`, strictly stronger evidence than the
+/// collision this checks for). `head_block` is the frame's first block.
 fn capture_head_parses(
     shape: crate::InputShape,
     fast_window: Option<u64>,
@@ -1064,14 +1082,73 @@ fn capture_head_parses(
     ldm_head_parses(head_block)
 }
 
-/// The capture grid's job size when the frame's class engages the shared
-/// prefix fill (see `plan_prefix_ldm`): pinned at the reach floor — the
-/// same gates as the plan, so the grid the plan was laid out on is the
-/// one the encoder runs, and it is independent of the worker count (the
-/// frame bytes cannot depend on how many workers pick the jobs up).
-/// `fast_window` is the fast rows' pre-screened capture window
-/// (`far_screen::mt_capture_window`; `None` for every other class); an
-/// explicit `Disable` makes every class return `None`.
+/// The capture lattice's engagement band for one frame (see
+/// `capture_band`): the window's class, which picks the schedule.
+pub(crate) enum CaptureBand {
+    /// The chain rows' clamped row window inside
+    /// `[LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW)`: every job's window strip
+    /// is a frame prefix — one whole-strip snapshot to the median
+    /// boundary (`PrefixPlan::Whole`).
+    MidSize { window: u64 },
+    /// The chain rows' window at `LDM_FULL_WINDOW` and beyond: jobs keep
+    /// their chain strip at the reach, LDM history rides the shared
+    /// build's snapshot chain (`PrefixPlan::Windowed`).
+    Windowed { window: u64 },
+    /// The fast rows' pre-screened far window: the no-build schedule
+    /// (`PrefixPlan::SelfFill`) — above-median jobs cold-fill their own
+    /// window span, nothing is ever shared.
+    Fast { window: u64 },
+}
+
+impl CaptureBand {
+    /// The capture window the band runs at.
+    fn window(&self) -> u64 {
+        match self {
+            Self::MidSize { window } | Self::Windowed { window } | Self::Fast { window } => *window,
+        }
+    }
+}
+
+/// The capture lattice's engagement over a frame's schedule inputs — the
+/// one canonical predicate every capture decision reads: the bulk
+/// planner's grid and plan (`capture_grid`, `plan_prefix_ldm`) and the
+/// stream core's capture flips (the pledged mid-size engagement and the
+/// fast rows' schedule, see `encoder_mt`), so the two paths' classes
+/// cannot drift. An explicit `Disable` stands the lattice down; the
+/// class's window resolves (the chain rows' clamped row window under
+/// `prefix_ldm_window`, else the fast rows' pre-screened `fast_window` —
+/// the rows are strategy-disjoint, the `or` never papers over a class
+/// conflict); the head screen (`capture_head_parses` over the frame's
+/// first block) accepts. `fast_window` is the fast rows' pre-screened
+/// capture window (`far_screen::mt_capture_window`; `None` for every
+/// other class).
+pub(crate) fn capture_band(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    head: &[u8],
+    fast_window: Option<u64>,
+    ldm_mode: crate::LdmMode,
+) -> Option<CaptureBand> {
+    if ldm_mode == crate::LdmMode::Disable {
+        return None;
+    }
+    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
+    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
+    if !capture_head_parses(shape, fast_window, head) {
+        return None;
+    }
+    Some(match (fast_window.is_some(), window) {
+        // The band is a function of the window alone (the rows are
+        // strategy-disjoint, so a `fast_window` implies the far window).
+        (true, window) => CaptureBand::Fast { window },
+        (false, window) if MatchGeneratorDriver::windowed_ldm_capture(window) => {
+            CaptureBand::Windowed { window }
+        },
+        (false, window) => CaptureBand::MidSize { window },
+    })
+}
+
 /// The last job index in `1..n_jobs` whose start `(i * job_size)` sits
 /// inside `window` — the tail of the prefix jobs (whole-frame-prefix
 /// strips). The predicate is monotone in `i`, so the closed form replaces
@@ -1087,6 +1164,14 @@ fn prefix_last_job(n_jobs: u64, job_size: u64, window: u64) -> Option<u64> {
     (n_jobs > 1 && last >= 1).then(|| last.min(n_jobs - 1))
 }
 
+/// The capture grid's job size when the frame's class engages the shared
+/// prefix fill (see `plan_prefix_ldm`): pinned at the reach floor — the
+/// same gates as the plan, so the grid the plan was laid out on is the
+/// one the encoder runs, and it is independent of the worker count (the
+/// frame bytes cannot depend on how many workers pick the jobs up).
+/// The engagement itself is the canonical `capture_band`; an explicit
+/// `Disable` stands the lattice down there: no pinned grid, so the
+/// worker-scaled job formula takes over.
 fn capture_grid(
     len: u64,
     level: Level,
@@ -1096,16 +1181,7 @@ fn capture_grid(
     fast_window: Option<u64>,
     ldm_mode: crate::LdmMode,
 ) -> Option<usize> {
-    // An explicit Disable stands the lattice down: no pinned grid, so the
-    // worker-scaled job formula takes over.
-    if ldm_mode == crate::LdmMode::Disable {
-        return None;
-    }
-    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
-    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
-    if !capture_head_parses(shape, fast_window, head) {
-        return None;
-    }
+    let window = capture_band(level, shape, choice, head, fast_window, ldm_mode)?.window();
     let job_size = capture_job_size(
         len,
         MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize,
@@ -1135,7 +1211,10 @@ fn capture_grid(
 /// the [`PrefixPlan::SelfFill`] median boundary, shared by the bulk
 /// planner and the pledged stream port (see `encoder_mt`) so the two run
 /// the same lattice and the same above/below-median split. `head` is the
-/// frame's first block (the collision screen's span, clamped inside).
+/// frame's first block (the collision screen's span, clamped inside);
+/// `ldm_mode` is the frame's own switch — the engagement predicates
+/// (`capture_band` under the hood) stand down under `Disable`, so the
+/// schedule never leans on the stream constructor's staging gate for it.
 pub(crate) fn fast_capture_schedule(
     len: u64,
     level: Level,
@@ -1143,17 +1222,9 @@ pub(crate) fn fast_capture_schedule(
     choice: reach_probe::ReachChoice,
     head: &[u8],
     window: u64,
+    ldm_mode: crate::LdmMode,
 ) -> Option<(usize, u64)> {
-    // Auto: the stream core carries no explicit switch (its bytes pin).
-    let job_size = capture_grid(
-        len,
-        level,
-        shape,
-        choice,
-        head,
-        Some(window),
-        crate::LdmMode::Auto,
-    )?;
+    let job_size = capture_grid(len, level, shape, choice, head, Some(window), ldm_mode)?;
     // Non-empty by `capture_grid`'s own prefix_last gate (the grid just
     // resolved on the same window); the prefix jobs are the contiguous
     // 1..=last range, so the median boundary — the same balance point
@@ -1181,28 +1252,23 @@ fn plan_prefix_ldm(
     fast_window: Option<u64>,
     ldm_mode: crate::LdmMode,
 ) -> Option<PrefixPlan> {
-    // An explicit Disable stands the lattice down (see `capture_grid`).
-    if ldm_mode == crate::LdmMode::Disable {
-        return None;
-    }
-    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window)?;
-    let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
-    if !capture_head_parses(shape, fast_window, head) {
-        return None;
-    }
+    // The canonical engagement (see `capture_band`; the band picks the
+    // schedule below, the window the grid gates read).
+    let band = capture_band(level, shape, choice, src, fast_window, ldm_mode)?;
     debug_assert_eq!(
         shape.len.and_then(|len| capture_grid(
             len,
             level,
             shape,
             choice,
-            head,
+            src,
             fast_window,
             ldm_mode
         )),
         Some(job_size),
         "the caller pinned the capture grid"
     );
+    let window = band.window();
     // Tail jobs whose window strip is a whole frame prefix: the source
     // sits inside the clamped window in the mid-size band, but the bound
     // stays explicit — a mid-stream strip keeps the stock fill either way.
@@ -1218,10 +1284,10 @@ fn plan_prefix_ldm(
     // `PrefixPlan::SelfFill`): their encode cannot hide a serial build, so
     // the engagement conditions above stay the only gates and every
     // above-boundary job owns its fill.
-    if fast_window.is_some() {
+    if let CaptureBand::Fast { .. } = band {
         return Some(PrefixPlan::SelfFill { med });
     }
-    if MatchGeneratorDriver::windowed_ldm_capture(window) {
+    if let CaptureBand::Windowed { .. } = band {
         // The last adopting job's start: the build needs to reach it (its
         // own remainder fill then covers the rest), and no further.
         let stop = ((n_jobs - 1) * job_size) as u64;
@@ -1512,8 +1578,9 @@ mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::{
-        capture_grid, compress_slice_mt, donation_arming, fast_capture_schedule, job_size_for,
-        plan_prefix_ldm, prefix_last_job, take_slice_state,
+        CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
+        dict_job_arming, donation_arming, fast_capture_schedule, job_size_for, plan_prefix_ldm,
+        prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
@@ -1979,6 +2046,46 @@ mod tests {
         }
     }
 
+    /// The dictionary job's arming fold: only the frame-wide disarm
+    /// reaches the owned-window dictionary job — every other context
+    /// (stock `Job`, the capture bands' `JobPrefix`) keeps the per-job
+    /// LDM model, the R54 band contract.
+    #[test]
+    fn dict_job_arming_honors_only_the_frame_disarm() {
+        assert_eq!(dict_job_arming(LdmArming::Job), LdmArming::Job);
+        assert_eq!(dict_job_arming(LdmArming::JobPrefix), LdmArming::Job);
+        assert_eq!(dict_job_arming(LdmArming::FarDead), LdmArming::FarDead);
+    }
+
+    /// `capture_job_size`'s forced-window arm: a reach (the widened strip
+    /// a raised window leaves on a fast row — R57's clamp-panic class)
+    /// past the 16 MiB cap floors the grid at the cap instead of
+    /// panicking on floor > cap — strips deeper than one job's span are
+    /// legal, just less balanced — and the in-band arms stay pinned.
+    #[test]
+    fn capture_job_size_clamps_a_reach_past_the_cap() {
+        let mib = 1024 * 1024u64;
+        let cap = CAPTURE_JOB_CAP;
+        // Above the cap the floor IS the cap, whatever the length: one
+        // 16 MiB grid, never a panic.
+        for reach in [cap as usize + 1, 2 * cap as usize, 1 << 30] {
+            for len in [1, 1024, 8 * mib, 128 * mib, 1 << 40] {
+                assert_eq!(capture_job_size(len, reach), cap as usize);
+            }
+        }
+        // At the cap exactly the same: the min() is inclusive.
+        assert_eq!(capture_job_size(1 << 40, cap as usize), cap as usize);
+        // In-band: below the reach the floor rules, above it len/8, and
+        // the small-job floor stands when the reach is small.
+        assert_eq!(
+            capture_job_size(64 * mib, 4 * mib as usize),
+            8 * mib as usize
+        );
+        assert_eq!(capture_job_size(128 * mib, mib as usize), 16 * mib as usize);
+        assert_eq!(capture_job_size(mib, MIN_JOB_SIZE), MIN_JOB_SIZE);
+        assert_eq!(capture_job_size(1, 1), MIN_JOB_SIZE);
+    }
+
     /// A declared length of u64 scale (a genuine absurd pledge, or compat's
     /// ContentSizeFlag=false twin of one) must resolve the capture schedule
     /// instantly: the walks the closed form replaced iterated
@@ -2016,9 +2123,25 @@ mod tests {
                     shape,
                     ReachChoice::Keep,
                     &head,
-                    window.unwrap()
+                    window.unwrap(),
+                    crate::LdmMode::Auto
                 ),
                 Some((16 * 1024 * 1024, 48 * 1024 * 1024)),
+                "{level:?}"
+            );
+            // The frame's own switch stands the schedule down: the
+            // predicate must not lean on the caller's staging gates.
+            assert_eq!(
+                fast_capture_schedule(
+                    u64::MAX,
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    &head,
+                    window.unwrap(),
+                    crate::LdmMode::Disable
+                ),
+                None,
                 "{level:?}"
             );
         }
