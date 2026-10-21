@@ -1115,7 +1115,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .consider_reach_probe(&[], self.compression_level);
         if let Some(dict) = dict.as_ref() {
             let mut shape = self.input_shape;
-            shape.len = Some(shape.len.unwrap_or(0) + dict.content.len() as u64);
+            // libzstd clamps the window by src + dict only for a known
+            // content size; an unpledged source keeps the unknown length
+            // (the stream core's own fold rule — a dict-sized span here
+            // clamped the window to the dictionary while the source still
+            // streams arbitrary input past it).
+            shape.len = shape.len.map(|len| len + dict.content.len() as u64);
             #[cfg(feature = "std")]
             super::dictionary::seed_with_cache(
                 &mut self.state,

@@ -991,3 +991,31 @@ fn dict_seed_image_opt_skip_shape_retires_residue() {
     );
     assert_eq!(restored, fresh_frame, "skip-shape restored frame bytes");
 }
+
+/// An unpledged `FrameCompressor` dictionary frame feeds arbitrary-length
+/// input through a stream-shaped reader; folding the unknown length into a
+/// dict-sized span clamped the window to the dictionary and the frame
+/// landed past the block-size bound (`min(window, 128 KiB)`) — rejected by
+/// every decoder.
+#[test]
+fn unpledged_frame_compressor_dict_keeps_full_window() {
+    use alloc::vec::Vec;
+
+    let dict: Vec<u8> = (0..4 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut src = Vec::with_capacity(256 * 1024);
+    while src.len() < 256 * 1024 {
+        for i in 0..977u32 {
+            src.push((i % 253) as u8);
+        }
+    }
+    let mut enc = crate::encoding::FrameCompressor::new(crate::Level::Fast);
+    enc.set_dictionary(&dict);
+    enc.set_source(src.as_slice());
+    let mut frame = Vec::new();
+    enc.set_drain(&mut frame);
+    enc.compress();
+    let dec = crate::DecoderOptions::new().dictionary(&dict);
+    let back = crate::bulk::decompress_with(&frame, 0, &dec)
+        .expect("the unpledged dict frame must decode");
+    assert_eq!(&back[..], &src[..]);
+}
