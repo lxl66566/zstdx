@@ -124,8 +124,8 @@ use crate::{
             StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
-            CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_job_size, donate_keep_span,
-            fast_capture_schedule, job_size_for, prepare_job_state, run_job_with,
+            CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, capture_band, capture_job_size,
+            donate_keep_span, fast_capture_schedule, job_size_for, prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -330,32 +330,43 @@ impl Clone for JobSpfStream {
 }
 
 /// The pledged mid-size capture's engagement (see
-/// [`MtEncoderCore::engage_midsize_capture`]): the pledge itself, the
-/// source-clamped window class and the head screen over the frame's first
-/// block. Shared verbatim by the capture flip and the donation's arming
-/// (see `post_donation`) — the capture's jobs and a donated job zero must
-/// arm alike, and both sites read the same decision off the same head
-/// bytes (nothing posts or wraps before the verdict resolves, so the
-/// buffer's head is still the frame's).
-fn midsize_capture_window(level: Level, shape: crate::InputShape, head: &[u8]) -> Option<u64> {
+/// [`MtEncoderCore::engage_midsize_capture`]): the canonical capture
+/// predicate (`mt::capture_band` — the same classes the bulk dispatch
+/// runs, so the paths cannot drift) filtered to the mid-size band the
+/// stream core ports, plus the declared length the engagement needs (the
+/// pledge keys the fixed grid the capture re-grids). Shared verbatim by
+/// the capture flip and the donation's arming (see `post_donation`) —
+/// the capture's jobs and a donated job zero must arm alike, and both
+/// sites read the same decision off the same head bytes (nothing posts
+/// or wraps before the verdict resolves, so the buffer's head is still
+/// the frame's). The band filter keeps the stream at the mid-size class:
+/// the full-window band runs windowed jobs on the bulk side (chain
+/// tables over the reach tail, LDM through the shared build's snapshot
+/// ring) while the stream core keeps its whole-window strip schedule
+/// there — a pledged W26 stream grids its stock 64 MiB jobs with LDM
+/// armed at the `Job` bar (the window equals it), carrying the far class
+/// already; the two paths' bytes diverge on that band either way (the
+/// pre-existing divergence, recorded in dev/perf/mt-stream). The fast
+/// rows never reach here (`capture_band` resolves their window only via
+/// `fast_window`, which this call never carries): their both-bands
+/// capture is [`FastCapture`], which ports the R22 no-build schedule.
+/// The engagement deliberately stops at the window decision: the bulk
+/// grid's prefix-tail gate (`prefix_last_job` inside `capture_grid`)
+/// stays a grid concern — the pledged re-grid below pins
+/// `capture_job_size` directly, and the one-job W25 edge where the two
+/// disagree keeps the pre-existing pledged-vs-bulk divergence (recorded
+/// above), not a new one.
+fn midsize_capture_window(
+    level: Level,
+    shape: crate::InputShape,
+    head: &[u8],
+    ldm_mode: crate::LdmMode,
+) -> Option<u64> {
     shape.len?;
-    let window = MatchGeneratorDriver::prefix_ldm_window(level, shape, ReachChoice::Keep)?;
-    // The pledged stream's capture stays at the mid-size band: the
-    // full-window band runs windowed jobs on the bulk side (chain tables
-    // over the reach tail, LDM through the shared build's snapshot ring)
-    // and the stream core keeps its whole-window strip schedule there —
-    // a pledged W26 stream grids its stock 64 MiB jobs with LDM armed at
-    // the `Job` bar (the window equals it), carrying the far class
-    // already; the two paths' bytes diverge on that band either way (the
-    // pre-existing divergence, now recorded in dev/perf/mt-stream). The
-    // fast rows never reach here (`prefix_ldm_window` is chain-row
-    // only): their both-bands capture is [`FastCapture`], which ports
-    // the R22 no-build schedule instead of this whole-strip snapshot.
-    if MatchGeneratorDriver::windowed_ldm_capture(window) {
-        return None;
+    match capture_band(level, shape, ReachChoice::Keep, head, None, ldm_mode) {
+        Some(CaptureBand::MidSize { window }) => Some(window),
+        _ => None,
     }
-    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
-    ldm_head_parses(head).then_some(window)
 }
 
 /// One posted job: the frozen source view (see the recycling rules in
@@ -1466,8 +1477,7 @@ impl MtEncoderCore {
         // clamped window sits below the `Job` bar) and job zero's bytes
         // would diverge from the undonated schedule.
         let arming = if matches!(self.grid, JobGrid::Fixed(_))
-            && self.ldm_mode != crate::LdmMode::Disable
-            && midsize_capture_window(self.level, self.shape, &head).is_some()
+            && midsize_capture_window(self.level, self.shape, &head, self.ldm_mode).is_some()
         {
             LdmArming::JobPrefix
         } else {
@@ -1644,13 +1654,12 @@ impl MtEncoderCore {
         if !matches!(self.grid, JobGrid::Fixed(_)) {
             return;
         }
-        // An explicit Disable stands the capture lattice down (the bulk
-        // dispatch's own stance): the stock grid and `Job` arming stay.
-        if self.ldm_mode == crate::LdmMode::Disable {
-            return;
-        }
+        // An explicit Disable stands the capture lattice down inside the
+        // canonical predicate (the bulk dispatch's own stance): the stock
+        // grid and `Job` arming stay.
         let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
-        let Some(window) = midsize_capture_window(self.level, self.shape, head) else {
+        let Some(window) = midsize_capture_window(self.level, self.shape, head, self.ldm_mode)
+        else {
             return;
         };
         debug_assert_eq!(
@@ -1709,9 +1718,15 @@ impl MtEncoderCore {
         let (grid, med) = match self.pledged {
             Some(n) => {
                 let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
-                let Some((job_size, med)) =
-                    fast_capture_schedule(n, self.level, self.shape, self.choice, head, window)
-                else {
+                let Some((job_size, med)) = fast_capture_schedule(
+                    n,
+                    self.level,
+                    self.shape,
+                    self.choice,
+                    head,
+                    window,
+                    self.ldm_mode,
+                ) else {
                     return;
                 };
                 (JobGrid::Fixed(job_size), med)
@@ -2870,34 +2885,53 @@ mod tests {
         };
         // Row 9's source-clamped window is W25: the capture's window.
         assert_eq!(
-            midsize_capture_window(Level::Balanced, band, &head),
+            midsize_capture_window(Level::Balanced, band, &head, crate::LdmMode::Auto),
             Some(1 << 25)
+        );
+        // The frame's explicit switch rides the canonical predicate: an
+        // armed Disable stands the lattice down, the caller's own gate or
+        // not.
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, band, &head, crate::LdmMode::Disable),
+            None
         );
         // Above the band (window W26) the `Job` bar holds: no capture.
         let above = InputShape {
             len: Some(64 * mib),
             window_log: None,
         };
-        assert_eq!(midsize_capture_window(Level::Balanced, above, &head), None);
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, above, &head, crate::LdmMode::Auto),
+            None
+        );
         // Below it there are no prefix strips worth sharing.
         let below = InputShape {
             len: Some(8 * mib),
             window_log: None,
         };
-        assert_eq!(midsize_capture_window(Level::Balanced, below, &head), None);
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, below, &head, crate::LdmMode::Auto),
+            None
+        );
         // An open-ended stream never flips (a Growing grid has no capture).
         let open = InputShape::default();
-        assert_eq!(midsize_capture_window(Level::Balanced, open, &head), None);
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, open, &head, crate::LdmMode::Auto),
+            None
+        );
         // A uniform head fails the capture's head screen.
         let zeros = vec![0u8; MAX_BLOCK_SIZE as usize];
-        assert_eq!(midsize_capture_window(Level::Balanced, band, &zeros), None);
+        assert_eq!(
+            midsize_capture_window(Level::Balanced, band, &zeros, crate::LdmMode::Auto),
+            None
+        );
         // Not the LDM chain row: no capture at any size.
         assert_eq!(
-            midsize_capture_window(Level::from_zstd(10), band, &head),
+            midsize_capture_window(Level::from_zstd(10), band, &head, crate::LdmMode::Auto),
             None
         );
         assert_eq!(
-            midsize_capture_window(Level::from_zstd(13), band, &head),
+            midsize_capture_window(Level::from_zstd(13), band, &head, crate::LdmMode::Auto),
             None
         );
     }
