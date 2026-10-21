@@ -1072,6 +1072,21 @@ fn capture_head_parses(
 /// `fast_window` is the fast rows' pre-screened capture window
 /// (`far_screen::mt_capture_window`; `None` for every other class); an
 /// explicit `Disable` makes every class return `None`.
+/// The last job index in `1..n_jobs` whose start `(i * job_size)` sits
+/// inside `window` — the tail of the prefix jobs (whole-frame-prefix
+/// strips). The predicate is monotone in `i`, so the closed form replaces
+/// a literal scan over `1..n_jobs`: a scan's cost is pledge-scaled when
+/// `n_jobs` derives from a declared length (a fast row carrying a
+/// u64::MAX-class pledge walked ~2^60 candidates before the first staged
+/// band resolved, stalling `write` for minutes), while the answer never
+/// depends on entries past `window / job_size`.
+fn prefix_last_job(n_jobs: u64, job_size: u64, window: u64) -> Option<u64> {
+    let last = window / job_size;
+    // The empty scan (n_jobs <= 1) has no candidate; the clamp below can
+    // otherwise floor a single-job frame onto the out-of-range index 0.
+    (n_jobs > 1 && last >= 1).then(|| last.min(n_jobs - 1))
+}
+
 fn capture_grid(
     len: u64,
     level: Level,
@@ -1104,9 +1119,15 @@ fn capture_grid(
     // floods the 16-deep LDM buckets and evicts older unique twins that a
     // long job's parse-indexed history (matched interiors skipped) would
     // keep (dll100 at 4 MiB jobs: +0.97 MB over st; at 13.1 MiB: +12 KB).
-    let n_jobs = len.div_ceil(job_size as u64) as usize;
-    let prefix_last = (1..n_jobs).rfind(|&i| (i * job_size) as u64 <= window)?;
-    ((prefix_last * job_size) as u64 >= SPF_MIN_PREFIX).then_some(job_size)
+    let prefix_last = prefix_last_job(len.div_ceil(job_size as u64), job_size as u64, window)?;
+    // The SPF bar is implied on every lattice that reaches here: the
+    // window is at least LDM_MIDSIZE_WINDOW (2^25) — the fast rows pin
+    // LDM_FULL_WINDOW — the job size sits in [len/8, 2^24], and the src
+    // clamp keeps len >= window/2, so a window-bound tail clears
+    // 2^25 - 2^24 bytes and a job-count-clamped one clears
+    // len - 2^24 > 8 MiB either way.
+    debug_assert!(prefix_last * job_size as u64 >= SPF_MIN_PREFIX);
+    Some(job_size)
 }
 
 /// The fast rows' capture schedule for a window the frame's own evidence
@@ -1133,16 +1154,13 @@ pub(crate) fn fast_capture_schedule(
         Some(window),
         crate::LdmMode::Auto,
     )?;
-    let n_jobs = len.div_ceil(job_size as u64) as usize;
-    // Non-empty by `capture_grid`'s own prefix_last gate; the median is
-    // the same balance point `plan_prefix_ldm` splits its schedule at.
-    let prefix_jobs: Vec<usize> = (1..n_jobs)
-        .filter(|&i| (i * job_size) as u64 <= window)
-        .collect();
-    Some((
-        job_size,
-        (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64,
-    ))
+    // Non-empty by `capture_grid`'s own prefix_last gate (the grid just
+    // resolved on the same window); the prefix jobs are the contiguous
+    // 1..=last range, so the median boundary — the same balance point
+    // `plan_prefix_ldm` splits its schedule at — is job `last / 2 + 1`.
+    let last = prefix_last_job(len.div_ceil(job_size as u64), job_size as u64, window)
+        .expect("non-empty by the capture grid's own gate");
+    Some((job_size, (last / 2 + 1) * job_size as u64))
 }
 
 /// Whether the bulk path runs a frame on prefix-strip LDM jobs (the LDM
@@ -1188,17 +1206,14 @@ fn plan_prefix_ldm(
     // Tail jobs whose window strip is a whole frame prefix: the source
     // sits inside the clamped window in the mid-size band, but the bound
     // stays explicit — a mid-stream strip keeps the stock fill either way.
-    let prefix_jobs: Vec<usize> = (1..n_jobs)
-        .filter(|&i| (i * job_size) as u64 <= window)
-        .collect();
-    let s_max = (*prefix_jobs.last()? * job_size) as u64;
-    if s_max < SPF_MIN_PREFIX {
-        return None;
-    }
-    // The median prefix boundary balances the sequential build against the
-    // adopters' parallel remainder fills (the same balance point the
-    // streaming core's finish tail picks).
-    let med = (prefix_jobs[prefix_jobs.len() / 2] * job_size) as u64;
+    // The contiguous 1..=last range's median boundary balances the
+    // sequential build against the adopters' parallel remainder fills
+    // (the same balance point the streaming core's finish tail picks);
+    // the SPF bar above the last prefix is implied by the lattice bounds
+    // (see `capture_grid`).
+    let last = prefix_last_job(n_jobs as u64, job_size as u64, window)?;
+    debug_assert!(last * job_size as u64 >= SPF_MIN_PREFIX);
+    let med = (last / 2 + 1) * job_size as u64;
     // The fast rows' capture runs the no-build schedule (see
     // `PrefixPlan::SelfFill`): their encode cannot hide a serial build, so
     // the engagement conditions above stay the only gates and every
@@ -1497,8 +1512,8 @@ mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::{
-        capture_grid, compress_slice_mt, donation_arming, job_size_for, plan_prefix_ldm,
-        take_slice_state,
+        capture_grid, compress_slice_mt, donation_arming, fast_capture_schedule, job_size_for,
+        plan_prefix_ldm, prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
@@ -1917,6 +1932,98 @@ mod tests {
     /// The fast rows' full-band capture engages on geometry (no screen may
     /// run there), gated by the same head engagement screen the chain rows
     /// use — a max-entropy head keeps the per-job stock parse.
+    /// The prefix-job tail's closed form (`prefix_last_job`) must equal
+    /// the literal scans it replaced — `capture_grid`'s reverse walk and
+    /// the contiguous filter's median — over a sweep of bounded
+    /// len/job_size/window triples covering the empty, window-clamped and
+    /// job-count-clamped arms.
+    #[test]
+    fn prefix_last_job_closed_form_matches_the_scan() {
+        let mib = 1024 * 1024u64;
+        for len in [
+            512 * 1024,
+            mib,
+            5 * mib,
+            17 * mib,
+            33 * mib,
+            100 * mib,
+            1024 * mib,
+        ] {
+            for job_size in [512 * 1024, mib, 3 * mib, 8 * mib, 16 * mib] {
+                for window in [
+                    512 * 1024,
+                    2 * mib,
+                    8 * mib,
+                    17 * mib,
+                    32 * mib,
+                    33 * mib,
+                    64 * mib,
+                ] {
+                    let n_jobs = len.div_ceil(job_size);
+                    let naive_last = (1..n_jobs).rfind(|&i| i * job_size <= window);
+                    assert_eq!(
+                        prefix_last_job(n_jobs, job_size, window),
+                        naive_last,
+                        "len {len} job_size {job_size} window {window}"
+                    );
+                    let Some(last) = naive_last else { continue };
+                    // The old schedule's median: the contiguous prefix
+                    // list's 0-based last/2 entry.
+                    let naive_med = (1..n_jobs)
+                        .filter(|&i| i * job_size <= window)
+                        .nth((last / 2) as usize)
+                        .map(|i| i * job_size);
+                    assert_eq!(Some((last / 2 + 1) * job_size), naive_med);
+                }
+            }
+        }
+    }
+
+    /// A declared length of u64 scale (a genuine absurd pledge, or compat's
+    /// ContentSizeFlag=false twin of one) must resolve the capture schedule
+    /// instantly: the walks the closed form replaced iterated
+    /// n_jobs = len / 16 MiB candidates — minutes at u64::MAX — so this
+    /// test hanging is the regression signal.
+    #[test]
+    fn capture_schedule_survives_absurd_declared_lens() {
+        let head = pattern_head(MAX_BLOCK_SIZE as usize);
+        let shape = crate::InputShape {
+            len: Some(u64::MAX),
+            window_log: None,
+        };
+        for level in [Level::Fastest, Level::Fast] {
+            let window = super::far_screen::mt_capture_window(level, shape, &head);
+            assert_eq!(window, Some(LDM_FULL_WINDOW as u64), "{level:?}");
+            // The pinned lattice: 16 MiB jobs, the prefix tail at the
+            // window bound (job 4), the median at job 3.
+            assert_eq!(
+                capture_grid(
+                    u64::MAX,
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    &head,
+                    window,
+                    crate::LdmMode::Auto
+                ),
+                Some(16 * 1024 * 1024),
+                "{level:?}"
+            );
+            assert_eq!(
+                fast_capture_schedule(
+                    u64::MAX,
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    &head,
+                    window.unwrap()
+                ),
+                Some((16 * 1024 * 1024, 48 * 1024 * 1024)),
+                "{level:?}"
+            );
+        }
+    }
+
     #[test]
     fn fast_row_fullband_capture_engages_on_geometry() {
         let parses = pattern_head(MAX_BLOCK_SIZE as usize);

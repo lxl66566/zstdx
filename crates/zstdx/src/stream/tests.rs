@@ -190,7 +190,47 @@ fn pledged_size_mismatch_fails_write_and_finish() {
     }
 }
 
-/// The read-side encoder surfaces the same contract: a source that ends
+/// `input_shape(len)` is a non-binding size hint (libzstd's srcSizeHint,
+/// the ST core's rule), never a hard content contract: a stream may run
+/// past it at any worker count. The mt core once keyed its
+/// PledgedSizeMismatch gates on the shape length, so the very options
+/// that streamed cleanly at workers(1) errored at workers(4) the moment
+/// the fed total crossed the hint — while a genuine pledge keeps the
+/// contract above at every count.
+#[test]
+fn input_shape_len_is_a_hint_not_a_pledge() {
+    let data = vec![b'h'; 300 * 1024];
+    #[cfg(feature = "std")]
+    let workers = [1u32, 4];
+    #[cfg(not(feature = "std"))]
+    let workers = [1u32];
+    for w in workers {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(w)
+                .with_input_shape(crate::InputShape {
+                    len: Some(64 * 1024),
+                    window_log: None,
+                }),
+        )
+        .unwrap();
+        // One write straight past the hint, then finish over the actual
+        // total: both must pass, and the hint never reaches the header.
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(bulk::decompress(&sink, 0).unwrap(), data, "workers {w}");
+        #[cfg(feature = "std")]
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&sink).unwrap(),
+            None,
+            "workers {w}: a hint never serializes an FCS field"
+        );
+    }
+}
+
+/// A read-side encoder surfaces the same contract: a source that ends
 /// short of the pledge errors on the read hitting EOF (the core finishes
 /// there), and finish() keeps reporting the failure afterwards.
 #[test]
@@ -1181,6 +1221,64 @@ mod mt {
                 st.len()
             );
         }
+    }
+
+    /// An absurd pledge on a fast row must not stall `write` behind a
+    /// pledge-proportional schedule walk: the first staged band resolves
+    /// the capture schedule in window-bounded time, the writes return,
+    /// and finish reports the (genuinely promised) mismatch — before the
+    /// closed-form fix the first `write` walked n_jobs = u64::MAX / 16 MiB
+    /// candidates, so this test hanging is the regression signal.
+    #[test]
+    fn absurd_pledge_fast_row_write_returns_bounded() {
+        // Head twins (the capture's collision screen must pass so the
+        // schedule actually runs) followed by stream bytes.
+        let head = lcg(128 * 1024);
+        let mut band = head.clone();
+        band.extend_from_slice(&head);
+        band.extend_from_slice(&textish(2 * 1024 * 1024 - band.len()));
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .pledged_size(Some(u64::MAX)),
+        )
+        .unwrap();
+        enc.write_all(&band).unwrap();
+        enc.write_all(&band).unwrap();
+        match enc.finish() {
+            Err(crate::Error::PledgedSizeMismatch { .. }) => {},
+            other => panic!("absurd pledge: got {other:?}"),
+        }
+    }
+
+    /// A mid-band hint (unpledged `input_shape(len)` — compat's
+    /// ContentSizeFlag=false degradation of a pledge lands exactly here)
+    /// must stream like any open frame: the armed capture takes the
+    /// open-length lattice and the header stays FCS-less, and the stream
+    /// may end short of the hint — the mt core once treated the hint as
+    /// a hard pledge, so this very stream errored at finish.
+    #[test]
+    fn fast_row_midband_hint_streams_like_open() {
+        let (data, _) = midband_fixture_with_random_twin();
+        let frame = stream_frame(
+            &data,
+            Level::Fastest,
+            crate::LdmMode::Auto,
+            4,
+            false,
+            Some(crate::InputShape {
+                len: Some(40 * 1024 * 1024),
+                window_log: None,
+            }),
+        );
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            None,
+            "a hint never serializes an FCS field"
+        );
+        assert_both_decoders(&frame, &data, "mid-band hinted open stream");
     }
 
     /// The fast rows' far-class capture on the pledged stream (the R23
