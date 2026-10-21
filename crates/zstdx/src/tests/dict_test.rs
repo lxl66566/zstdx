@@ -881,3 +881,113 @@ fn dict_seed_image_state_equality() {
         assert_eq!(fresh.dict_entropy.cost_mode, pooled.dict_entropy.cost_mode);
     }
 }
+
+/// Deterministic non-uniform filler (LCG): uniform content would collapse
+/// the gate probe and the parses to their O(1) forms and never write the
+/// tree tables this gate needs dirty.
+#[cfg(all(test, feature = "std"))]
+fn lcg_bytes(len: usize, seed: u64) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let mut x = seed;
+    while out.len() < len {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.extend_from_slice(&x.to_le_bytes()[..7]);
+    }
+    out.truncate(len);
+    out
+}
+
+/// The opt-family skip shape (dictionary content past the row's stock
+/// search domain; L16's 4 MiB reach under a 5 MiB dictionary): the eager
+/// tree fill cannot apply, so the image carries no tree bytes and a
+/// restore must retire the live tables' residue the way a re-seed's
+/// reset does — the opt coordinate origin's advance past every written
+/// position — instead of rewinding it to the captured value, which
+/// leaves the frames that ran since the capture alive as candidates
+/// (their entries resolve at shifted positions inside the new window).
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_opt_skip_shape_retires_residue() {
+    use crate::encoding::frame_compressor::{CompressState, new_owned_state};
+
+    let dict = alloc::sync::Arc::new(crate::encoding::dictionary::EncDictionary::raw_content(
+        &lcg_bytes(5 << 20, 0x243f_6a88),
+    ));
+    let payload = lcg_bytes(64 << 10, 0x1319_8a2e);
+    let level = crate::Level::from_zstd(16);
+    let shape = crate::InputShape {
+        len: Some(payload.len() as u64 + dict.content.len() as u64),
+        window_log: None,
+    };
+    // The fresh reference: seed, canonicalize, skip fill (the shape's
+    // `dict_tree_filled` is false — the dictionary outruns the reach).
+    let mut fresh: CompressState<crate::encoding::match_generator::MatchGeneratorDriver> =
+        new_owned_state();
+    crate::encoding::dictionary::reset_with_dictionary_mode(
+        &mut fresh,
+        &dict,
+        level,
+        shape,
+        crate::LdmMode::Auto,
+    );
+    fresh.matcher.canonicalize_for_seed_capture();
+    fresh.matcher.seed_fill_dictionary_tree();
+    assert!(
+        !fresh.matcher.dict_tree_filled(),
+        "the fixture must engage the skip shape"
+    );
+    // Pooled: capture, run a frame (its parse writes the tree tables at
+    // the captured origin), then the same key again — a hit.
+    let mut pooled = new_owned_state();
+    crate::encoding::dictionary::seed_with_cache(
+        &mut pooled,
+        &dict,
+        level,
+        shape,
+        crate::LdmMode::Auto,
+    );
+    let _ = crate::encoding::frame_compressor::compress_with_state_dictionary(
+        &mut pooled,
+        &payload,
+        dict.header_id(),
+        false,
+        None,
+    );
+    crate::encoding::dictionary::seed_with_cache(
+        &mut pooled,
+        &dict,
+        level,
+        shape,
+        crate::LdmMode::Auto,
+    );
+    assert!(
+        crate::encoding::match_generator::same_seeded_state(&fresh.matcher, &pooled.matcher),
+        "the skip-shape restore must retire the live tree residue"
+    );
+    // And the restored frame parses like a fresh-seeded one.
+    let restored = crate::encoding::frame_compressor::compress_with_state_dictionary(
+        &mut pooled,
+        &payload,
+        dict.header_id(),
+        false,
+        None,
+    );
+    let mut virgin = new_owned_state();
+    crate::encoding::dictionary::reset_with_dictionary_mode(
+        &mut virgin,
+        &dict,
+        level,
+        shape,
+        crate::LdmMode::Auto,
+    );
+    let fresh_frame = crate::encoding::frame_compressor::compress_with_state_dictionary(
+        &mut virgin,
+        &payload,
+        dict.header_id(),
+        false,
+        None,
+    );
+    assert_eq!(restored, fresh_frame, "skip-shape restored frame bytes");
+}
