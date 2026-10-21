@@ -43,6 +43,14 @@ path = "fuzz_targets/huff0.rs"
 name = "fse"
 path = "fuzz_targets/fse.rs"
 
+[[bin]]
+name = "dict_pooled"
+path = "fuzz_targets/dict_pooled.rs"
+
+[[bin]]
+name = "ldm_mt_parity"
+path = "fuzz_targets/ldm_mt_parity.rs"
+
 [dependencies]
 libfuzzer-sys = "0.4"
 # reference implementation for the interop targets; same binding the
