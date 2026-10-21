@@ -452,6 +452,7 @@ pub fn compress_slice_mt(
                                 level,
                                 shape,
                                 dict,
+                                job_ldm,
                                 ldm_mode,
                             );
                         }
@@ -902,8 +903,25 @@ fn return_dict_state(state: alloc::boxed::Box<CompressState<MatchGeneratorDriver
 /// is a single contiguous caller slice). Jobs after the first keep the
 /// stock strip model, mirroring libzstd's zstdmt (the CDict seeds only
 /// job zero; later jobs run under forceMaxWindow with repcodes gated).
+/// The dictionary job's LDM arming from the frame's job arming (see
+/// `run_dict_job_zero`): the per-job model, except the frame-wide disarm
+/// — a far-dead stream frame's `LdmArming::FarDead` disarms the
+/// dictionary job's LDM like every other job's. The capture flips'
+/// `JobPrefix` is about borrowed strips the owned-window dictionary job
+/// never runs, so the per-job model stands there (the R54 contract: the
+/// dictionary job zero keeps its parse on the armed bands, bulk and
+/// stream alike).
+fn dict_job_arming(job_ldm: LdmArming) -> LdmArming {
+    match job_ldm {
+        LdmArming::FarDead => LdmArming::FarDead,
+        _ => LdmArming::Job,
+    }
+}
+
 /// `shape` is the frame's plain declared shape — the dictionary fold
 /// inside applies the same `len + dict_content` clamp the ST entries use.
+/// `job_ldm` is the frame's job arming (the context its other jobs run
+/// under), folded by `dict_job_arming`.
 pub(crate) fn run_dict_job_zero(
     src: &[u8],
     job: Range<usize>,
@@ -911,6 +929,7 @@ pub(crate) fn run_dict_job_zero(
     level: Level,
     shape: crate::InputShape,
     dict: &super::dictionary::EncDictionary,
+    job_ldm: LdmArming,
     ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut state = take_dict_state();
@@ -922,7 +941,7 @@ pub(crate) fn run_dict_job_zero(
     state
         .matcher
         .set_reach_choice(reach_probe::ReachChoice::Keep);
-    state.matcher.set_ldm_arming(LdmArming::Job);
+    state.matcher.set_ldm_arming(dict_job_arming(job_ldm));
     let dict_shape = crate::InputShape {
         len: shape.len.map(|len| len + dict.content.len() as u64),
         window_log: shape.window_log,
@@ -1559,8 +1578,8 @@ mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::{
-        capture_grid, compress_slice_mt, donation_arming, fast_capture_schedule, job_size_for,
-        plan_prefix_ldm, prefix_last_job, take_slice_state,
+        capture_grid, compress_slice_mt, dict_job_arming, donation_arming, fast_capture_schedule,
+        job_size_for, plan_prefix_ldm, prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
@@ -2024,6 +2043,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The dictionary job's arming fold: only the frame-wide disarm
+    /// reaches the owned-window dictionary job — every other context
+    /// (stock `Job`, the capture bands' `JobPrefix`) keeps the per-job
+    /// LDM model, the R54 band contract.
+    #[test]
+    fn dict_job_arming_honors_only_the_frame_disarm() {
+        assert_eq!(dict_job_arming(LdmArming::Job), LdmArming::Job);
+        assert_eq!(dict_job_arming(LdmArming::JobPrefix), LdmArming::Job);
+        assert_eq!(dict_job_arming(LdmArming::FarDead), LdmArming::FarDead);
     }
 
     /// A declared length of u64 scale (a genuine absurd pledge, or compat's

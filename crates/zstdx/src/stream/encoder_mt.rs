@@ -731,6 +731,7 @@ fn run_claimed_job(
                     job.level,
                     job.shape,
                     dict,
+                    *ldm,
                     job.ldm_mode,
                 )
             } else if let Some(don) = donation.lock().unwrap().take() {
@@ -2425,6 +2426,7 @@ impl MtEncoderCore {
                 self.level,
                 self.shape,
                 dict,
+                self.job_ldm,
                 self.ldm_mode,
             );
             self.output.extend_from_slice(&bytes);
