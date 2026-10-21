@@ -428,6 +428,16 @@ pub trait Matcher {
     fn restore_seed_image(&mut self, _image: &match_generator::DriverSeedImage) {
         panic!("a matcher that captures no seed image holds none to restore");
     }
+    /// Whether a just-run dictionary seeding's own resolutions equal the
+    /// seed key derived for the same inputs (see
+    /// `match_generator::dict_seed_key`): the drift gate
+    /// `dictionary::seed_with_cache` debug-asserts at every capture. The
+    /// default opts foreign matchers out -- they keep the plain re-seed and
+    /// never populate the cache.
+    #[cfg(feature = "std")]
+    fn seed_key_mirror_ok(&self, _key: &match_generator::DictSeedKey) -> bool {
+        true
+    }
     /// Load dictionary content as the frame's match history after
     /// [`Matcher::reset`], before the first block (owned-window
     /// implementations only; the default drops it, and the encoder still

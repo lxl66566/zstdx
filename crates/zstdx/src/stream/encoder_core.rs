@@ -146,7 +146,8 @@ pub(crate) struct FrameEncoderCoreSt {
 // streaming core pools the same class of buffers for the same reason
 // (see the accumulate-buffer pool). Dictionary cores pool too: their
 // re-seeding runs through the state's single-entry seed image cache
-// (`dictionary::seed_with_cache`), so a same-dict re-arm is an exact
+// (`dictionary::seed_with_cache`), so a same-key re-arm (dictionary,
+// level, LDM mode and the shape's seeding projection) is an exact
 // restore and any other key a full re-seed that retires the residue
 // itself (the same machinery `FrameCompressor`'s reuse runs under).
 #[cfg(feature = "std")]

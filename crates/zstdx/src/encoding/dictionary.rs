@@ -174,7 +174,7 @@ pub(crate) fn reset_with_dictionary_mode<M: Matcher>(
 
 /// Single-entry dictionary seed image cache, riding a pooled
 /// [`CompressState`] (see `seed_with_cache`): after a state is seeded for
-/// `(dictionary, level, shape, ldm mode)`, the image of everything the
+/// `(dictionary, level, seed key, ldm mode)`, the image of everything the
 /// seeding wrote is captured; a later seeding with the same key restores
 /// the image instead of re-running `reset_with_dictionary` — the
 /// single-threaded counterpart of libzstd's CDict attach economics (digest
@@ -185,12 +185,14 @@ pub(crate) fn reset_with_dictionary_mode<M: Matcher>(
 /// The key is collision-proof by construction: the dictionary enters as
 /// `Arc` target identity and the image holds its own `Arc` clone, so the
 /// address cannot be recycled by a different dictionary while the image
-/// lives; level, shape and LDM mode are the remaining inputs the seeding
-/// reads (`reset` + `load_dictionary` derive every table size, row swap
-/// and gate from them; the reach choice and LDM arming context are forced
-/// to the deterministic dict-frame values at every `seed_with_cache`
-/// call, so they need no key slot). Restores are exact by construction:
-/// the image is the full overwrite of everything seeding wrote (see
+/// lives; level and LDM mode are explicit slots, and the shape enters as
+/// `match_generator::dict_seed_key`'s projection — the seeding's own
+/// resolutions (every table size, row swap, span class and literals-stream
+/// class the shape's length feeds), so two payload sizes inside one
+/// projection class share the image (a repeated-dictionary workload with
+/// varying record sizes stays on the hit path) while any decision-flipping
+/// size change misses. Restores are exact by construction: the image is
+/// the full overwrite of everything seeding wrote (see
 /// `match_generator::DriverSeedImage` for the deliberate exceptions and
 /// their neutrality arguments).
 #[cfg(feature = "std")]
@@ -198,7 +200,7 @@ pub(crate) struct SeedCache {
     /// Pins the key's address (see the type doc).
     dict: alloc::sync::Arc<EncDictionary>,
     level: Level,
-    shape: InputShape,
+    shape_key: super::match_generator::DictSeedKey,
     ldm: crate::LdmMode,
     driver: super::match_generator::DriverSeedImage,
     last_huff_table: Option<HuffmanTable>,
@@ -214,12 +216,12 @@ impl SeedCache {
         &self,
         dict: &alloc::sync::Arc<EncDictionary>,
         level: Level,
-        shape: InputShape,
+        shape_key: &super::match_generator::DictSeedKey,
         ldm: crate::LdmMode,
     ) -> bool {
         alloc::sync::Arc::ptr_eq(&self.dict, dict)
             && self.level == level
-            && self.shape == shape
+            && self.shape_key == *shape_key
             && self.ldm == ldm
     }
 
@@ -251,18 +253,29 @@ pub(crate) fn seed_with_cache<M: Matcher>(
 ) {
     state.matcher.set_ldm_mode(ldm);
     state.matcher.force_dict_frame_inputs();
+    let shape_key =
+        super::match_generator::dict_seed_key(level, shape, ldm, dict.content.len() as u64);
     // The slot is taken out for the restore: the image lives inside the
     // state it restores, so the borrow must not overlap.
     let parked = state.seed_cache.take();
     if let Some(cache) = parked
         .as_ref()
-        .filter(|c| c.matches(dict, level, shape, ldm))
+        .filter(|c| c.matches(dict, level, &shape_key, ldm))
     {
         cache.restore_into(state);
+        // The image carries no shape (its shape-derived content is the key
+        // just proven equal); every live consumer -- the reach probe's
+        // mid-frame re-entry included -- must see this call's shape.
+        state.matcher.set_input_shape(shape);
         state.seed_cache = parked;
         return;
     }
     reset_with_dictionary_mode(state, dict, level, shape, ldm);
+    debug_assert!(
+        state.matcher.seed_key_mirror_ok(&shape_key)
+            && state.dict_entropy.lit_streams == shape_key.lit_streams(),
+        "dict_seed_key diverged from the seeding's own resolutions"
+    );
     state.matcher.canonicalize_for_seed_capture();
     // The eager tree fill runs after the canonicalization (the ultra rows'
     // replayed statistics parse shapes the fresh-form price state the
@@ -279,7 +292,7 @@ pub(crate) fn seed_with_cache<M: Matcher>(
             dict_entropy: state.dict_entropy,
             dict: alloc::sync::Arc::clone(dict),
             level,
-            shape,
+            shape_key,
             ldm,
         }));
     }

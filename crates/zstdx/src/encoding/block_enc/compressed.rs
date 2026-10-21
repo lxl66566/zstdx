@@ -153,7 +153,7 @@ const SMALL_FRAME_LITERALS_MAX: u64 = 64 * 1024;
 /// gives its small blocks (`ZSTD_compressSubBlock_literal`'s
 /// `lhSize == 3` arm). A frame this small decodes as one unit, so the
 /// parallelism buys nothing there.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) enum LitStreams {
     #[default]
     Stock,

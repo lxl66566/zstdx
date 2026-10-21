@@ -633,9 +633,9 @@ fn dict_seed_image_cache_byte_identity() {
                     "restore frame (dict {di}, L{})",
                     level.as_i32()
                 );
-                // A different payload under the same key: different
-                // shape (its own key), must equal its own fresh frame
-                // whether it hit or missed.
+                // A different payload length: its own seed key, which may
+                // project onto this one (same class) or not; either way the
+                // frame must equal its own fresh frame.
                 let short = &payload[..payload.len() / 2];
                 assert_eq!(
                     cached(short),
@@ -990,6 +990,253 @@ fn dict_seed_image_opt_skip_shape_retires_residue() {
         None,
     );
     assert_eq!(restored, fresh_frame, "skip-shape restored frame bytes");
+}
+
+/// `dict_seed_key`'s no-drift gate: across the threshold ladder the key
+/// derived from the inputs equals what a real seeding resolved on the
+/// driver plus the entropy side's literals-stream class. Any new length
+/// read added to the seeding without a key slot lands here first.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn dict_seed_key_mirror_sweep() {
+    use crate::encoding::frame_compressor::{CompressState, new_owned_state};
+
+    // The decisions under test read the content's length, not its bytes;
+    // a small dictionary keeps the sweep's seedings cheap.
+    let dict = alloc::sync::Arc::new(crate::encoding::dictionary::EncDictionary::raw_content(
+        &lcg_bytes(4096, 0x5dee_ce6d),
+    ));
+    let dict_len = dict.content.len() as u64;
+    // Span (payload + dict) thresholds the resolution reads: the window
+    // clamp at every power of two, the literals-stream flip at 64 KiB, the
+    // small-src flag at 128 KiB, the dict-row ceiling at 256 KiB, the LDM
+    // full-window bar — each probed from both sides.
+    let mut spans: alloc::vec::Vec<u64> = alloc::vec![0, 1, 8, 9, 100, 4096];
+    for bar in [64 * 1024, 128 * 1024, 256 * 1024, 1 << 25, 1 << 26] {
+        spans.extend_from_slice(&[bar - 1, bar, bar + 1]);
+    }
+    for k in 12..27u32 {
+        let p = 1u64 << k;
+        spans.extend_from_slice(&[p - 1, p, p + 1]);
+    }
+    spans.sort_unstable();
+    spans.dedup();
+
+    let levels = [1i32, 3, 4, 5, 8, 9, 10, 11, 12, 13, 16, 19, 22];
+    let combos = [
+        (None, crate::LdmMode::Auto),
+        (None, crate::LdmMode::Enable),
+        (None, crate::LdmMode::Disable),
+        (Some(17u32), crate::LdmMode::Auto),
+        (Some(27u32), crate::LdmMode::Auto),
+        (Some(27u32), crate::LdmMode::Enable),
+    ];
+    for &raw in &levels {
+        let level = crate::Level::from_zstd(raw);
+        for &(window_log, ldm) in &combos {
+            for &span in &spans {
+                let shape = crate::InputShape {
+                    len: Some(span),
+                    window_log,
+                };
+                let key =
+                    crate::encoding::match_generator::dict_seed_key(level, shape, ldm, dict_len);
+                let mut state: CompressState<
+                    crate::encoding::match_generator::MatchGeneratorDriver,
+                > = new_owned_state();
+                crate::encoding::dictionary::reset_with_dictionary_mode(
+                    &mut state, &dict, level, shape, ldm,
+                );
+                assert!(
+                    state.matcher.seed_key_mirror_ok(&key),
+                    "resolutions diverged at L{raw} span {span} wl {window_log:?} {ldm:?}"
+                );
+                assert_eq!(
+                    state.dict_entropy.lit_streams,
+                    key.lit_streams(),
+                    "lit_streams diverged at L{raw} span {span} wl {window_log:?}"
+                );
+            }
+            // The unpledged arm: the dict-row ceiling keys on the
+            // dictionary's own size there.
+            let shape = crate::InputShape {
+                len: None,
+                window_log,
+            };
+            let key = crate::encoding::match_generator::dict_seed_key(level, shape, ldm, dict_len);
+            let mut state: CompressState<crate::encoding::match_generator::MatchGeneratorDriver> =
+                new_owned_state();
+            crate::encoding::dictionary::reset_with_dictionary_mode(
+                &mut state, &dict, level, shape, ldm,
+            );
+            assert!(
+                state.matcher.seed_key_mirror_ok(&key),
+                "unpledged resolutions diverged at L{raw} wl {window_log:?} {ldm:?}"
+            );
+        }
+    }
+}
+
+/// The projection classes the key actually carves: lengths inside one
+/// class share it, decision-flipping lengths do not.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn dict_seed_key_len_classes() {
+    use crate::encoding::match_generator::dict_seed_key;
+
+    let dict_len = 110_240u64;
+    let key = |payload: u64| {
+        dict_seed_key(
+            crate::Level::from_zstd(5),
+            crate::InputShape {
+                len: Some(dict_len + payload),
+                window_log: None,
+            },
+            crate::LdmMode::Auto,
+            dict_len,
+        )
+    };
+    // One class: the small-record band over the same dictionary (the
+    // window bucket, the small-payload swap arm and the span classes all
+    // agree inside it).
+    assert_eq!(key(4096), key(5000));
+    assert_eq!(key(4096), key(16 * 1024));
+    // The small-dict row swap's payload ceiling, the window clamp's
+    // span bucket (ceil-log2 flips between 2^k and 2^k + 1), the
+    // dict-row span ceiling: each flips a decision and with it the key.
+    assert_ne!(key(16 * 1024), key(16 * 1024 + 1));
+    let span_pow2 = (1u64 << 18) - dict_len;
+    assert_ne!(key(span_pow2), key(span_pow2 + 1));
+    let row_span = 256 * 1024 - dict_len;
+    assert_ne!(key(row_span), key(row_span + 1));
+}
+
+/// A capture at one payload length restores for a different length in the
+/// same projection class: the cache slot survives (the seeding took the
+/// restore path, no re-seed), the state equals a fresh seeding at the new
+/// length, and the frame parses like a fresh-seeded one.
+#[cfg(feature = "std")]
+#[test]
+fn dict_seed_image_len_class_restore() {
+    use crate::encoding::frame_compressor::{CompressState, new_owned_state};
+
+    let Some(f) = seed_cache_fixtures() else {
+        return;
+    };
+    let dict = alloc::sync::Arc::new(
+        crate::encoding::dictionary::EncDictionary::parse(&f.formatted).unwrap(),
+    );
+    let dict_len = dict.content.len() as u64;
+    // Two payload sizes in one class: the json payload and a 37-byte
+    // shorter cut of it, both under every bar the resolution reads.
+    let a = &f.payloads[0];
+    let b = &a[..a.len() - 37];
+    let shape_of = |p: &[u8]| crate::InputShape {
+        len: Some(p.len() as u64 + dict_len),
+        window_log: None,
+    };
+    for level in [1i32, 9, 13, 19] {
+        let level = crate::Level::from_zstd(level);
+        assert_eq!(
+            crate::encoding::match_generator::dict_seed_key(
+                level,
+                shape_of(a),
+                crate::LdmMode::Auto,
+                dict_len
+            ),
+            crate::encoding::match_generator::dict_seed_key(
+                level,
+                shape_of(b),
+                crate::LdmMode::Auto,
+                dict_len
+            ),
+            "fixture lengths must land in one class at L{}",
+            level.as_i32()
+        );
+        // Fresh reference at the shorter length.
+        let mut fresh: CompressState<crate::encoding::match_generator::MatchGeneratorDriver> =
+            new_owned_state();
+        crate::encoding::dictionary::reset_with_dictionary_mode(
+            &mut fresh,
+            &dict,
+            level,
+            shape_of(b),
+            crate::LdmMode::Auto,
+        );
+        fresh.matcher.canonicalize_for_seed_capture();
+        fresh.matcher.seed_fill_dictionary_tree();
+        // Pooled: capture at the longer length, dirty the state with a
+        // frame, then seed the shorter length — a same-class restore.
+        let mut pooled = new_owned_state();
+        crate::encoding::dictionary::seed_with_cache(
+            &mut pooled,
+            &dict,
+            level,
+            shape_of(a),
+            crate::LdmMode::Auto,
+        );
+        let slot = pooled
+            .seed_cache
+            .as_ref()
+            .map(|c| core::ptr::from_ref(&**c))
+            .expect("capture");
+        let _ = crate::encoding::frame_compressor::compress_with_state_dictionary(
+            &mut pooled,
+            a,
+            dict.header_id(),
+            false,
+            None,
+        );
+        crate::encoding::dictionary::seed_with_cache(
+            &mut pooled,
+            &dict,
+            level,
+            shape_of(b),
+            crate::LdmMode::Auto,
+        );
+        assert_eq!(
+            pooled
+                .seed_cache
+                .as_ref()
+                .map(|c| core::ptr::from_ref(&**c)),
+            Some(slot),
+            "a same-class length must take the restore path at L{}",
+            level.as_i32()
+        );
+        assert!(
+            crate::encoding::match_generator::same_seeded_state(&fresh.matcher, &pooled.matcher),
+            "restored state diverges at L{}",
+            level.as_i32()
+        );
+        let restored = crate::encoding::frame_compressor::compress_with_state_dictionary(
+            &mut pooled,
+            b,
+            dict.header_id(),
+            false,
+            None,
+        );
+        let mut virgin = new_owned_state();
+        crate::encoding::dictionary::reset_with_dictionary_mode(
+            &mut virgin,
+            &dict,
+            level,
+            shape_of(b),
+            crate::LdmMode::Auto,
+        );
+        let fresh_frame = crate::encoding::frame_compressor::compress_with_state_dictionary(
+            &mut virgin,
+            b,
+            dict.header_id(),
+            false,
+            None,
+        );
+        assert_eq!(
+            restored,
+            fresh_frame,
+            "same-class frame bytes at L{}",
+            level.as_i32()
+        );
+    }
 }
 
 /// An unpledged `FrameCompressor` dictionary frame feeds arbitrary-length

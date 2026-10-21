@@ -19,6 +19,8 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "std")]
+use super::block_enc::compressed::LitStreams;
 use super::{
     Matcher, SeqWord, Sequence,
     btlazy::{LazyScratch, LazyStep},
@@ -536,6 +538,10 @@ pub(crate) struct LdmPrefixSnapshot {
 /// ring behind heads the deferred `dubt_stale` clear zeroes.
 ///
 /// Deliberately NOT captured, each with its neutrality argument:
+/// - `shape`: the seeding's every shape-derived decision is the cache key's `DictSeedKey` half, so
+///   the image carries no shape of its own; the restore leaves the live shape in place and
+///   `seed_with_cache` sets the current call's around it (mid-frame shape readers -- the reach
+///   probe's re-entry -- must see this call's shape, not the capturing call's).
 /// - the chain ring beyond the dictionary's positions: those slots keep the previous frame's links
 ///   (a fresh state holds zeros there), but a chain walk only ever reads the link slot of an
 ///   INSERTED position -- every insert writes its own slot first -- and the dict fill rebuilds
@@ -598,7 +604,6 @@ pub struct DriverSeedImage {
     seed_offset: u32,
     seed_hits: u8,
     seed_budget: u32,
-    shape: InputShape,
     reach_choice: ReachChoice,
     small_src_row: SmallSrcRow,
     row_attempts: RowAttempts,
@@ -617,6 +622,140 @@ pub struct DriverSeedImage {
     ramp: RampGate,
     chain_filled: u64,
     opt_state: OptState,
+}
+
+/// The dictionary seeding's shape-derived decisions: the shape half of the
+/// seed-image cache's key (`dictionary::SeedCache`). [`dict_seed_key`]
+/// resolves `(level, shape, LDM mode, dict length)` through the same
+/// arithmetic `apply_level` and `load_dictionary` run, so two shapes with
+/// equal keys seed byte-identical state whatever their exact lengths —
+/// every length read in the seeding funnels through the resolved table
+/// geometry (the clamp and the LDM length bars), the dict-row span classes,
+/// the small-dict row swap and the literals-stream class held here. The
+/// image restores none of the shape itself: the live call's shape is set
+/// around the restore, and its seeding-relevant content is exactly this
+/// key.
+#[cfg(feature = "std")]
+#[derive(Clone, PartialEq)]
+pub struct DictSeedKey {
+    params: LevelParams,
+    dict_row: bool,
+    lit_streams: LitStreams,
+}
+
+#[cfg(feature = "std")]
+impl DictSeedKey {
+    pub(crate) fn lit_streams(&self) -> LitStreams {
+        self.lit_streams
+    }
+}
+
+// Diagnostics-only: the params half is opaque (`LevelParams` carries no
+// Debug; a class-flip assertion failure names its payload pair, which is
+// the input that matters).
+#[cfg(feature = "std")]
+impl core::fmt::Debug for DictSeedKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DictSeedKey")
+            .field("dict_row", &self.dict_row)
+            .field("lit_streams", &self.lit_streams)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resolve [`DictSeedKey`] for a dictionary seeding's inputs. Pure — the
+/// matcher's own state never enters (the seeding's remaining inputs are
+/// forced to the dict-frame determinism at every
+/// `dictionary::seed_with_cache` call: the stock row verdicts, the Keep
+/// reach, the Frame arming context). [`MatchGeneratorDriver::
+/// seed_key_mirror_ok`] pins this arithmetic to what the real seeding left
+/// on the driver, debug-asserted at every capture and swept in the tests.
+#[cfg(feature = "std")]
+pub(crate) fn dict_seed_key(
+    level: Level,
+    shape: InputShape,
+    ldm: crate::LdmMode,
+    dict_len: u64,
+) -> DictSeedKey {
+    // `apply_level`'s resolution: the stock verdicts resolve the row, the
+    // Keep reach takes no shrink replacement, and the LDM switch runs its
+    // fast/dfast window split under the length bars.
+    let mut params = params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock);
+    match ldm {
+        crate::LdmMode::Auto => {},
+        crate::LdmMode::Disable => params.ldm = false,
+        crate::LdmMode::Enable => params.ldm = true,
+    }
+    if params.ldm && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_)) {
+        match ldm {
+            crate::LdmMode::Enable => {
+                let stock = params_for_row(
+                    level,
+                    InputShape {
+                        len: shape.len,
+                        window_log: None,
+                    },
+                    SmallSrcRow::Btlazy,
+                    RowAttempts::Stock,
+                )
+                .window
+                .next_power_of_two();
+                if stock < params.window {
+                    params.chain_reach = Some(stock);
+                }
+            },
+            crate::LdmMode::Auto
+                if params.window < LDM_FULL_WINDOW
+                    && matches!(shape.len, Some(n) if n >= LDM_FULL_WINDOW as u64) =>
+            {
+                params.chain_reach = Some(params.window.next_power_of_two());
+                params.window = LDM_FULL_WINDOW;
+            },
+            _ => {},
+        }
+    }
+    // `load_dictionary`'s row semantics, in its order: the span classes
+    // arm the dict-row knobs (the x8 chain-walk budget runs at every span,
+    // the width keys on the armed one), then the small-payload row swap
+    // replaces the geometry wholesale.
+    let dict_rows_armed = match shape.len {
+        Some(span) => span <= DICT_ROW_SPAN_MAX,
+        None => dict_len + 499 <= DICT_ROW_SPAN_MAX,
+    };
+    let mut dict_row = dict_rows_armed
+        && matches!(
+            params.strategy,
+            Strategy::Chain(_) | Strategy::Dfast(_) | Strategy::Row(_)
+        );
+    if dict_rows_armed && matches!(params.strategy, Strategy::Chain(_) | Strategy::Row(_)) {
+        params.min_match = MIN_MATCH as u32;
+    }
+    if matches!(params.strategy, Strategy::Chain(_)) {
+        params.search_depth *= 8;
+    }
+    let payload = shape.len.map(|n| n.saturating_sub(dict_len));
+    if let Some(payload) = payload
+        && payload <= SMALL_DICT_PAYLOAD_MAX
+        && dict_rows_armed
+    {
+        match small_dict_row(level.as_i32(), params.window, shape) {
+            Some(SmallDictRow::Chain { depth, lazy }) => {
+                params.hash_log = SMALL_DICT_HASH_LOG;
+                params.strategy = Strategy::Chain(SMALL_DICT_CHAIN_LOG);
+                params.search_depth = depth;
+                params.lazy_depth = lazy;
+                params.min_match = MIN_MATCH as u32;
+                dict_row = true;
+            },
+            Some(SmallDictRow::Opt(row)) => params = row,
+            None => {},
+        }
+    }
+    DictSeedKey {
+        params,
+        dict_row,
+        lit_streams: LitStreams::for_frame(shape.len),
+    }
 }
 
 /// Resolve the active window (owned or borrowed). A free function so callers
@@ -2407,6 +2546,16 @@ impl MatchGeneratorDriver {
     /// `lit_length_sum` either way, so this is output-neutral for the
     /// capturing frame too).
     #[cfg(feature = "std")]
+    /// Whether the driver's post-seeding resolutions equal [`dict_seed_key`]'s
+    /// for the same inputs — the drift gate for the key's mirror of
+    /// `apply_level` + `load_dictionary` (debug-asserted at every capture in
+    /// `dictionary::seed_with_cache`, swept across the threshold ladder in
+    /// the tests).
+    #[cfg(feature = "std")]
+    pub(crate) fn seed_key_mirror_ok(&self, key: &DictSeedKey) -> bool {
+        self.params == key.params && self.dict_row == key.dict_row
+    }
+
     pub(crate) fn canonicalize_for_seed_capture(&mut self) {
         self.probe_stats = None;
         self.small_wide = None;
@@ -2591,7 +2740,6 @@ impl MatchGeneratorDriver {
             seed_offset: self.seed_offset,
             seed_hits: self.seed_hits,
             seed_budget: self.seed_budget,
-            shape: self.shape,
             reach_choice: self.reach_choice,
             small_src_row: self.small_src_row,
             row_attempts: self.row_attempts,
@@ -2672,6 +2820,8 @@ impl MatchGeneratorDriver {
     /// Restore a captured seed image in place (see [`DriverSeedImage`]):
     /// the full overwrite of everything seeding wrote, so the driver
     /// parses exactly like the freshly seeded one it was captured from.
+    /// The stored `shape` is the caller's business (see the type doc): the
+    /// restore never touches it.
     #[cfg(feature = "std")]
     pub(crate) fn restore_seed_image(&mut self, image: &DriverSeedImage) {
         self.ensure_family_buffers(&image.params);
@@ -2808,7 +2958,6 @@ impl MatchGeneratorDriver {
         self.seed_offset = image.seed_offset;
         self.seed_hits = image.seed_hits;
         self.seed_budget = image.seed_budget;
-        self.shape = image.shape;
         self.reach_choice = image.reach_choice;
         self.small_src_row = image.small_src_row;
         self.row_attempts = image.row_attempts;
@@ -2953,6 +3102,11 @@ impl Matcher for MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn restore_seed_image(&mut self, image: &DriverSeedImage) {
         MatchGeneratorDriver::restore_seed_image(self, image);
+    }
+
+    #[cfg(feature = "std")]
+    fn seed_key_mirror_ok(&self, key: &DictSeedKey) -> bool {
+        MatchGeneratorDriver::seed_key_mirror_ok(self, key)
     }
 
     fn reset(&mut self, level: Level) {

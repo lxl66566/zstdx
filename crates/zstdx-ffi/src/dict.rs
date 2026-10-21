@@ -1,9 +1,10 @@
 //! The digested-dictionary objects: `ZSTD_CDict`/`ZSTD_DDict` hold the
 //! parsed dictionary state once so repeated jobs skip re-prep, plus the
-//! `getDictID` accessors. The engine re-seeds a fresh matcher/decoder per
-//! frame from the shared tables (intrinsic to its frame model — libzstd
-//! additionally caches the filled match state inside its CDict); the
-//! parse-and-digest half is what the handles amortize, honestly.
+//! `getDictID` accessors. Compression through the handle rides the
+//! pooled single-threaded dict state, whose seed-image cache restores the
+//! filled match state across calls with the same seeding key (dictionary,
+//! level, LDM mode and the payload size's seeding projection) — the
+//! CDict attach economics; a key change re-seeds fully.
 
 use std::sync::Arc;
 
