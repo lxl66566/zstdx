@@ -1578,8 +1578,9 @@ mod tests {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::{
-        capture_grid, compress_slice_mt, dict_job_arming, donation_arming, fast_capture_schedule,
-        job_size_for, plan_prefix_ldm, prefix_last_job, take_slice_state,
+        CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
+        dict_job_arming, donation_arming, fast_capture_schedule, job_size_for, plan_prefix_ldm,
+        prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
@@ -2054,6 +2055,35 @@ mod tests {
         assert_eq!(dict_job_arming(LdmArming::Job), LdmArming::Job);
         assert_eq!(dict_job_arming(LdmArming::JobPrefix), LdmArming::Job);
         assert_eq!(dict_job_arming(LdmArming::FarDead), LdmArming::FarDead);
+    }
+
+    /// `capture_job_size`'s forced-window arm: a reach (the widened strip
+    /// a raised window leaves on a fast row — R57's clamp-panic class)
+    /// past the 16 MiB cap floors the grid at the cap instead of
+    /// panicking on floor > cap — strips deeper than one job's span are
+    /// legal, just less balanced — and the in-band arms stay pinned.
+    #[test]
+    fn capture_job_size_clamps_a_reach_past_the_cap() {
+        let mib = 1024 * 1024u64;
+        let cap = CAPTURE_JOB_CAP;
+        // Above the cap the floor IS the cap, whatever the length: one
+        // 16 MiB grid, never a panic.
+        for reach in [cap as usize + 1, 2 * cap as usize, 1 << 30] {
+            for len in [1, 1024, 8 * mib, 128 * mib, 1 << 40] {
+                assert_eq!(capture_job_size(len, reach), cap as usize);
+            }
+        }
+        // At the cap exactly the same: the min() is inclusive.
+        assert_eq!(capture_job_size(1 << 40, cap as usize), cap as usize);
+        // In-band: below the reach the floor rules, above it len/8, and
+        // the small-job floor stands when the reach is small.
+        assert_eq!(
+            capture_job_size(64 * mib, 4 * mib as usize),
+            8 * mib as usize
+        );
+        assert_eq!(capture_job_size(128 * mib, mib as usize), 16 * mib as usize);
+        assert_eq!(capture_job_size(mib, MIN_JOB_SIZE), MIN_JOB_SIZE);
+        assert_eq!(capture_job_size(1, 1), MIN_JOB_SIZE);
     }
 
     /// A declared length of u64 scale (a genuine absurd pledge, or compat's

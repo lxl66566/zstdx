@@ -3020,6 +3020,81 @@ mod tests {
         assert!(core.overlap as u64 + 8 * cap <= BUF_CAP_MAX as u64);
     }
 
+    /// The finish tail's shared prefix fill pins its adoption schedule:
+    /// the build's freeze points are content-pure (one serial segmented
+    /// fill), and `SpfPlan::pick` is a pure function of the plan and the
+    /// job start, so every tail job's adopted snapshot is fixed by the
+    /// input alone at a given worker count. What cannot be pinned is
+    /// cross-worker byte equality: the growing grid's job bounds key on
+    /// `burst_jobs`, so which starts exist — and with them which freeze
+    /// serves each — is worker-keyed by construction; the r8/r19
+    /// invariance (an adoption at any freeze at or below the start is
+    /// bit-identical to the stock fill) is what keeps that scheduling
+    /// freedom out of the bytes.
+    #[test]
+    fn spf_finish_tail_adoption_is_pinned() {
+        let data = spfish(16 * 1024 * 1024);
+        let mib = 1024 * 1024u64;
+        let mut reference: Option<(Vec<u64>, Vec<u8>)> = None;
+        for _ in 0..2 {
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Balanced).workers(4));
+            core.write(&data).unwrap();
+            // The growing grid's first epoch spans far past this stream:
+            // nothing posted, the finish tail owns every job and the
+            // build's eligibility holds.
+            assert_eq!(core.job_start, 0);
+            let plan = core
+                .build_spf(core.pos)
+                .expect("the dll-class finish tail builds");
+            let keys: Vec<u64> = plan.snapshots.iter().map(|(u, _)| *u).collect();
+            // Plan invariants: strictly ascending publishes (the fill's
+            // order), the first strictly past zero (nothing adopts an
+            // empty prefix), the prefix domain bounded at the strip
+            // window — mid-stream strips never adopt.
+            assert!(keys.windows(2).all(|w| w[0] < w[1]));
+            assert!(keys.first().is_some_and(|&u| u > 0));
+            assert_eq!(plan.prefix_end, core.overlap as u64);
+            // The last publish cannot pass the last prefix job's start
+            // (the terminal snapshot rule) and must serve it.
+            let bounds = core.build_bounds(core.pos);
+            let starts: Vec<u64> = bounds[..bounds.len() - 1].to_vec();
+            assert!(keys.last().is_some_and(|&u| u <= *starts.last().unwrap()));
+            // Every job's adopted freeze is the newest publish at or
+            // below its start, checked by snapshot identity — including
+            // job zero, which adopts nothing.
+            for &start in &starts {
+                let adopted = plan.pick(start);
+                let n = keys.partition_point(|&u| u <= start);
+                assert_eq!(adopted.is_some(), n > 0, "start {start}");
+                if let Some(snap) = adopted {
+                    assert!(
+                        Arc::ptr_eq(&snap, &plan.snapshots[n - 1].1),
+                        "start {start}"
+                    );
+                }
+            }
+            // A start past the prefix domain (a mid-stream strip) never
+            // adopts even when a freeze sits at or below it.
+            assert!(plan.pick(plan.prefix_end + mib).is_none());
+            // Run-to-run: identical freeze points and identical frames —
+            // the whole finish (build + adoptions + remainder fills) is
+            // deterministic in the input.
+            core.finish().unwrap();
+            match &reference {
+                Some((prev_keys, prev_frame)) => {
+                    assert_eq!(&keys, prev_keys);
+                    assert_eq!(&core.output, prev_frame);
+                },
+                None => reference = Some((keys, core.output.clone())),
+            }
+            let (_, frame) = reference.as_ref().unwrap();
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(frame, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+        }
+    }
+
     /// The pledged-size contract on the mt core itself: a write pushing the
     /// fed total past the pledge fails that write itself (libzstd's
     /// srcSize_wrong at the first overrun); an under-run still slips past
@@ -3427,6 +3502,27 @@ mod tests {
         out.extend_from_slice(&base);
         out.truncate(len);
         out
+    }
+
+    /// A chain-row fixture the spf build serves (see
+    /// `spf_finish_tail_adoption_is_pinned`): the dll-class body keeps the
+    /// far-repeat veto alive (the whole first half repeats at the
+    /// half-stream distance), under a head the engagement screen parses —
+    /// the screen's stride over the 2 MiB probe span is odd (1025), so
+    /// `dllish`'s doubled-fragment lags (multiples of 64 KiB) never align
+    /// with the sampling grid; a 1025-periodic 4 KiB prefix puts a strided
+    /// collision in the first few samples instead.
+    fn spfish(len: usize) -> Vec<u8> {
+        let mut data = dllish(len);
+        for (i, b) in (0..1025u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .cycle()
+            .take(4096)
+            .enumerate()
+        {
+            data[i] = b;
+        }
+        data
     }
 
     /// The declared window log off a serialized frame header (magic + FHD
