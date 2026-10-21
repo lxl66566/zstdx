@@ -37,8 +37,9 @@
 //! pledge clears the probe's size gate at construction, so the head stages
 //! at [`reach_probe::PROBE_SPAN`]; an open-ended stream cannot know its
 //! length, so the decision waits for [`reach_probe::PROBE_MIN_FRAME`]
-//! streamed bytes. A stream that ends or flushes before the gate keeps the
-//! stock reach.
+//! streamed bytes (a size hint of that bar or more stages early, the ST
+//! entry's own eligibility — see `probe_gate`). A stream that ends or
+//! flushes before the gate keeps the stock reach.
 //!
 //! The chain rows' whole-window strip carries exactly one reader beyond
 //! the row's search domain: LDM's far class (the chain walk rejects
@@ -915,9 +916,16 @@ pub(crate) struct MtEncoderCore {
     /// (re-)serialization — the capture engagement's included — stamps
     /// this value, never a fresh read off the dictionary.
     header_dict_id: Option<u32>,
-    /// The frame's declared shape (length = the pledge, plus the forced
-    /// window log); shared by every job so tables and the header agree.
+    /// The frame's declared shape (length = the pledge or the non-binding
+    /// hint, plus the forced window log); shared by every job so tables
+    /// and the header agree.
     shape: crate::InputShape,
+    /// The pledged content size, verbatim from the options (the ST core's
+    /// own split): `InputShape::len` is a sizing hint only — every hard
+    /// contract (the write/read/finish mismatch gates, the header FCS,
+    /// the probe's size gate, the fixed grid's final-job hold) reads this
+    /// field, never the shape length.
+    pledged: Option<u64>,
     hasher: StreamChecksum,
     header: Vec<u8>,
     /// [strip of already-encoded history for the next job's matches] followed
@@ -991,8 +999,9 @@ impl MtEncoderCore {
         // log rides along so the jobs' tables and the header window agree.
         // `InputShape::len` acts as a non-binding hint when unpledged (the
         // ST core does the same): it sizes the window/overlap, while the
-        // job grid and probe gates below stay pledge-keyed — a hinted
-        // stream must keep growing its jobs like any open-ended one.
+        // job grid, the probe's size gate and the mismatch gates below
+        // stay pledge-keyed — a hinted stream must keep growing its jobs
+        // like any open-ended one and may stream past the hint freely.
         let shape = crate::InputShape {
             len: options.pledged_size.or(options.input_shape.len),
             // The LDM switch's window interplay: an explicit enable with
@@ -1157,6 +1166,7 @@ impl MtEncoderCore {
             header_dict_id,
 
             shape,
+            pledged: options.pledged_size,
             hasher: if checksum {
                 StreamChecksum::On(FrameHasher::new())
             } else {
@@ -1196,7 +1206,7 @@ impl MtEncoderCore {
     /// error surfaces from the offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
-        if let Some(pledged) = self.shape.len
+        if let Some(pledged) = self.pledged
             && self.pos + data.len() as u64 > pledged
         {
             return Err(crate::Error::PledgedSizeMismatch {
@@ -1276,7 +1286,7 @@ impl MtEncoderCore {
                 self.pos += n as u64;
                 // Same contract as write: a fed total past the pledge fails
                 // the read that carried it, not only the EOF finish.
-                if let Some(pledged) = self.shape.len
+                if let Some(pledged) = self.pledged
                     && self.pos > pledged
                 {
                     return Err(crate::Error::PledgedSizeMismatch {
@@ -1305,7 +1315,7 @@ impl MtEncoderCore {
         }
         // `pos` is live from the writes themselves, so the check fires
         // before the drain below could discover it.
-        if let Some(pledged) = self.shape.len
+        if let Some(pledged) = self.pledged
             && pledged != self.pos
         {
             return Err(crate::Error::PledgedSizeMismatch {
@@ -1401,11 +1411,19 @@ impl MtEncoderCore {
 
     /// The probe decision's staging gate (see [`reach_probe`]): a pledged
     /// frame stages its head at [`reach_probe::PROBE_SPAN`] (the pledge
-    /// already cleared the probe's size gate), an open-ended stream must
-    /// stream [`reach_probe::PROBE_MIN_FRAME`] bytes before the probe's
-    /// fixed cost amortizes.
+    /// already cleared the probe's size gate), a hinted stream clears the
+    /// size gate the ST entry's way (`reach_probe::eligible`: only a hint
+    /// of [`reach_probe::PROBE_MIN_FRAME`] or more — smaller hints never
+    /// arm the probe), and a hint-less open stream must stream
+    /// [`reach_probe::PROBE_MIN_FRAME`] bytes before the probe's fixed
+    /// cost amortizes.
     fn probe_gate(&self) -> u64 {
-        if self.shape.len.is_some() {
+        if self.pledged.is_some()
+            || self
+                .shape
+                .len
+                .is_some_and(|n| n >= reach_probe::PROBE_MIN_FRAME)
+        {
             reach_probe::PROBE_SPAN as u64
         } else {
             reach_probe::PROBE_MIN_FRAME
@@ -1440,12 +1458,15 @@ impl MtEncoderCore {
         let done = || core::sync::atomic::AtomicBool::new(false);
         // The donated span must parse exactly as the kept frame's job zero
         // would: the mid-size capture's arming when the capture engages
-        // (the same predicate `engage_midsize_capture` flips the jobs with,
-        // evaluated on the same head bytes), the stock job arming
-        // otherwise. A Job-armed span in the capture's window band would
-        // parse without LDM (the clamped window sits below the `Job` bar)
-        // and job zero's bytes would diverge from the undonated schedule.
-        let arming = if self.ldm_mode != crate::LdmMode::Disable
+        // (the same gates and predicate `engage_midsize_capture` flips the
+        // jobs with — the fixed-grid gate included, so an open-ended
+        // frame (hint or not) donates a Job-armed span — evaluated on the
+        // same head bytes), the stock job arming otherwise. A Job-armed
+        // span in the capture's window band would parse without LDM (the
+        // clamped window sits below the `Job` bar) and job zero's bytes
+        // would diverge from the undonated schedule.
+        let arming = if matches!(self.grid, JobGrid::Fixed(_))
+            && self.ldm_mode != crate::LdmMode::Disable
             && midsize_capture_window(self.level, self.shape, &head).is_some()
         {
             LdmArming::JobPrefix
@@ -1582,7 +1603,7 @@ impl MtEncoderCore {
             crate::encoding::mt::return_donation_state(keep.donation.state);
             self.overlap = reach_probe::SHRINK_REACH;
             if let JobGrid::Fixed(_) = self.grid {
-                let n = self.shape.len.expect("the gate saw a pledge");
+                let n = self.pledged.expect("the gate saw a pledge");
                 self.grid = JobGrid::Fixed(job_size_for(n, self.workers, self.overlap));
             }
         } else {
@@ -1641,7 +1662,7 @@ impl MtEncoderCore {
         // worker-independent, so the pledged stream re-grids onto the
         // same lattice the bulk path runs and the two stay byte-identical
         // at every worker count.
-        let n = self.shape.len.expect("the capture gate checked the pledge");
+        let n = self.pledged.expect("the capture gate checked the pledge");
         self.grid = JobGrid::Fixed(capture_job_size(n, reach as usize));
         self.job_ldm = LdmArming::JobPrefix;
     }
@@ -1685,7 +1706,7 @@ impl MtEncoderCore {
         let Some(window) = window else {
             return;
         };
-        let (grid, med) = match self.shape.len {
+        let (grid, med) = match self.pledged {
             Some(n) => {
                 let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
                 let Some((job_size, med)) =
@@ -1717,7 +1738,7 @@ impl MtEncoderCore {
         // far window exceeds every plain fast-row window, so plain bytes
         // never move).
         let header = FrameHeader {
-            frame_content_size: self.shape.len,
+            frame_content_size: self.pledged,
             single_segment: false,
             content_checksum: self.checksum,
             dictionary_id: self.header_dict_id,
@@ -1816,7 +1837,7 @@ impl MtEncoderCore {
     /// untouched tail costs address space only, and past it the wrap
     /// recycle stands as before.
     fn reserve_decided(&mut self) {
-        let want = match (&self.grid, self.shape.len) {
+        let want = match (&self.grid, self.pledged) {
             (JobGrid::Fixed(_), Some(n)) => (n + 64 * 1024) as usize,
             _ => BUF_CAP_MAX,
         }
@@ -2001,7 +2022,7 @@ impl MtEncoderCore {
                 if self.pos < end {
                     return false;
                 }
-                if let Some(n) = self.shape.len
+                if let Some(n) = self.pledged
                     && end >= n
                     && self.pos <= n
                 {
