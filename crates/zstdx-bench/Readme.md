@@ -218,15 +218,37 @@ cargo run --release -p zstdx-bench -- dictmt bench/corpus/json.raw \
 ### `dump` — byte-exact output snapshots
 
 Compresses every corpus `.raw` into a directory so two builds can be
-compared byte for byte: `dump <dir>` per build, then `cmp -r dir_a dir_b`.
+compared byte for byte: `dump <dir>` per build, then `diff -r dir_a dir_b`.
 The regression gate for optimizations that must not change the encoder's
 output at all. `--all-levels` covers the whole ladder (files tagged
 `.l1/.l3/.l6/.l12/.l16/.l19`); `--workers N` routes the compression
-through the multithreaded job path so the gate covers mt bytes too.
+through the multithreaded job path so the gate covers mt bytes too. Every
+emitted frame is roundtrip-gated through both in-process decoders and the
+libzstd CLI before it lands.
+
+`--stream` swaps the bulk encoders for the streaming cores: the read-side
+incremental core driven as `matrix --mode enc-stream` drives it (one
+`read_to_end`, no flush), emitting every shape × level as the
+{st, mt} × {pledged, open} grid — `<shape>.raw.stream[.lN].zst`,
+`.stream-pledged`, `.stream-mt<W>`, `.stream-mt<W>-pledged`, the mt cells
+at `--workers` (default 4). One command is then the stream differential
+gate: `dump --stream --all-levels <dir>` per build, `diff -r` the dirs.
+Deterministic run to run, mt cells included (no wall-clock or thread
+timing in the bytes); the unpledged mt cells ride the Growing grid, which
+is keyed on the worker count by design — never diff them across
+`--workers` values. Bulk anchors on the full corpus grid: pledged-mt is
+byte-identical to the `--workers` bulk dump except the Balanced row
+(skewed/text l9, the reach probe's stream/bulk verdict split, −3.5 KB/
+−12 B); pledged-st matches the bulk dump modulo the 4-byte declared-size
+header field except json l13 (stream −721.9 KB, the better side); the
+open cells have no byte-equal bulk counterpart (undeclared header, the
+length-keyed bulk rows, and the probe-less ST stream cores all diverge by
+design).
 
 ```bash
 cargo run --release -p zstdx-bench -- dump /tmp/dump-a
 cargo run --release -p zstdx-bench -- dump /tmp/dump-a --all-levels
+cargo run --release -p zstdx-bench -- dump /tmp/dump-a --all-levels --stream
 ```
 
 ### `corrupt` — corruption smoke test
