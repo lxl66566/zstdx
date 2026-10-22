@@ -864,7 +864,7 @@ fn test_max_window_size_clamped_to_format_maximum() {
 
     let mut decoder = FrameDecoder::new();
 
-    // A value below the format maximum is kept verbatim.
+    // A value at or below the format maximum is kept verbatim.
     decoder.set_max_window_size(2 * 1024 * 1024 * 1024);
     assert_eq!(decoder.max_window_size(), 2 * 1024 * 1024 * 1024);
 
@@ -1433,6 +1433,7 @@ pub mod dict_test;
 pub mod encode_corpus;
 pub mod fuzz_regressions;
 pub mod multi_frame;
+pub mod parity;
 
 #[cfg(feature = "std")]
 #[test]

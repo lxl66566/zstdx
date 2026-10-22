@@ -145,7 +145,9 @@ impl FrameHeader {
             let window_size = window_base + window_add;
 
             if window_size >= MIN_WINDOW_SIZE {
-                if window_size < MAX_WINDOW_SIZE {
+                // inclusive: a window of exactly 2^31 is the largest any
+                // libzstd configuration accepts (windowLog 31, mantissa 0)
+                if window_size <= MAX_WINDOW_SIZE {
                     Ok(window_size)
                 } else {
                     Err(FrameHeaderError::WindowTooBig { got: window_size })

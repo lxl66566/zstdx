@@ -1553,8 +1553,9 @@ mod tests {
         let p = probe_restart(&treeless);
         assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Reuse, true));
 
-        // Any Repeat FSE stream carries state across.
-        let repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x01, 0xff];
+        // Any Repeat FSE stream carries state across (modes 0xFC: all three
+        // Repeat, reserved bits zero).
+        let repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x01, 0xfc];
         let p = probe_restart(&repeat);
         assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Rebuild, false));
 

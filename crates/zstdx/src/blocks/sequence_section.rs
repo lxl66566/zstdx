@@ -86,6 +86,16 @@ pub enum ModeType {
 }
 
 impl CompressionModes {
+    /// Parse the Symbol_Compression_Modes byte. Its low 2 bits are reserved
+    /// and must be zero (RFC 8878 3.1.1.3.1.2); libzstd rejects a set
+    /// reserved field as corruption, and so does this parser.
+    pub fn parse(byte: u8) -> Result<Self, SequencesHeaderParseError> {
+        if byte & 0b11 != 0 {
+            return Err(SequencesHeaderParseError::ReservedBitsSet { got: byte });
+        }
+        Ok(CompressionModes(byte))
+    }
+
     /// Deserialize a two bit mode value into a [ModeType]
     pub fn decode_mode(m: u8) -> ModeType {
         match m {
@@ -151,7 +161,7 @@ impl SequencesHeader {
                     });
                 }
                 self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes(source[1]));
+                self.modes = Some(CompressionModes::parse(source[1])?);
                 bytes_read += 2;
             },
             128..=254 => {
@@ -170,7 +180,7 @@ impl SequencesHeader {
                             got: source.len(),
                         });
                     }
-                    self.modes = Some(CompressionModes(source[2]));
+                    self.modes = Some(CompressionModes::parse(source[2])?);
                     bytes_read += 1;
                 }
             },
@@ -182,7 +192,7 @@ impl SequencesHeader {
                     });
                 }
                 self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7f00;
-                self.modes = Some(CompressionModes(source[3]));
+                self.modes = Some(CompressionModes::parse(source[3])?);
                 bytes_read += 4;
             },
         }
@@ -262,7 +272,7 @@ mod tests {
     }
 
     /// The mode byte packs LL/OF/ML as 2-bit fields high to low; the low two
-    /// bits are reserved and must not affect the parsed modes.
+    /// bits are reserved and must not affect the mode accessors.
     #[test]
     fn compression_mode_bit_packing() {
         for byte in [0xe4, 0xe5] {
@@ -275,5 +285,26 @@ mod tests {
         assert!(matches!(modes.ll_mode(), ModeType::Predefined));
         assert!(matches!(modes.of_mode(), ModeType::Predefined));
         assert!(matches!(modes.ml_mode(), ModeType::Predefined));
+    }
+
+    /// RFC 8878 3.1.1.3.1.2: the low two bits of the mode byte are a
+    /// reserved field that must be zero. libzstd rejects a set field as
+    /// corruption (`ZSTD_decodeSeqHeaders`' `*ip & 3` gate); the header
+    /// parser must too — it silently decoded such frames before (R65).
+    #[test]
+    fn reserved_bits_in_mode_byte_are_rejected() {
+        use super::SequencesHeaderParseError;
+        for byte in [0x01u8, 0x02, 0x03, 0xe5, 0xff] {
+            let mut header = SequencesHeader::new();
+            let err = header.parse_from_header(&[0x05, byte]).unwrap_err();
+            assert!(
+                matches!(err, SequencesHeaderParseError::ReservedBitsSet { got } if got == byte),
+                "byte {byte:#04x}"
+            );
+        }
+        // all-zero reserved field parses
+        let mut header = SequencesHeader::new();
+        header.parse_from_header(&[0x05, 0x00]).unwrap();
+        assert_eq!(header.num_sequences, 5);
     }
 }
