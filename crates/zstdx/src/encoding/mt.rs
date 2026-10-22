@@ -185,92 +185,23 @@ pub fn compress_slice_mt(
     } else {
         None
     };
-    // The frame's head decides its chain reach (see reach_probe), and with
-    // it the strip: a shrunk search domain shrinks the strip to match.
-    // Eligible frames donate the probe's keep side into job zero (see
-    // `donate_job_zero_prefix`): the first span blocks run as job zero's
-    // own blocks on the calling thread through the job machinery, so only
-    // a Shrink verdict pays a re-parse. The keep grid must leave job zero
-    // work beyond the span for the continuation to take over.
-    let mut donation = None;
-    // Whether the donated state arms with the capture's arming
-    // (see `donation_arming`): the pairing invariant below checks the
-    // capture the frame finally runs against it.
-    let mut donation_prefix = false;
-    // The capture plan a Keep verdict would run, computed before the
-    // donation so the donated span can arm for it; reused as the frame's
-    // plan when the verdict keeps.
-    let mut keep_plan = None;
-    let choice;
     let head = &src[..src.len().min(MAX_BLOCK_SIZE as usize)];
-    if dict.is_none()
-        && reach_probe::eligible(level, shape)
-        && job_size_for(
-            src.len() as u64,
-            workers.max(2),
-            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
-                as usize,
-        ) >= reach_probe::PROBE_SPAN
-    {
-        let keep_strip =
-            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
-                as usize;
-        // Capture frames pin the job grid at the reach floor instead of
-        // the worker-scaled formula: the grid (and with it the frame
-        // bytes) stays identical at every worker count, and the floor
-        // already dominates the formula wherever the mid-size band
-        // engaged before (a 32 MiB capture source grids 4 MiB jobs at
-        // any worker count).
-        let keep_job_size = capture_grid(
-            src.len() as u64,
-            level,
-            shape,
-            reach_probe::ReachChoice::Keep,
-            head,
-            fast_window,
-            ldm_mode,
-        )
-        .unwrap_or_else(|| job_size_for(src.len() as u64, workers.max(2), keep_strip));
-        keep_plan = plan_prefix_ldm(
-            src,
-            level,
-            shape,
-            reach_probe::ReachChoice::Keep,
-            keep_job_size,
-            src.len().div_ceil(keep_job_size),
-            fast_window,
-            ldm_mode,
-        );
-        donation_prefix = keep_plan.is_some();
-        #[cfg(feature = "job_trace")]
-        let trace_probe = std::time::Instant::now();
-        let (donated_choice, state, prefix) = donate_job_zero_prefix(
-            src,
-            level,
-            shape,
-            donation_arming(donation_prefix),
-            ldm_mode,
-        );
-        #[cfg(feature = "job_trace")]
-        super::job_trace::add_probe(trace_probe);
-        choice = donated_choice;
-        if choice == reach_probe::ReachChoice::Keep {
-            donation = Some((state, prefix));
-        } else {
-            // The shrink verdict discards the donation (and the plan: the
-            // shrunk strips are not the prefixes it filled); job zero
-            // parses from its own pooled state like an undonated frame.
-            return_pooled_slice_state(state);
-            keep_plan = None;
-        }
-    } else if dict.is_some() {
-        // Dictionary frames keep the stock reach, like every ST
-        // dictionary entry (the probe samples a head the dictionary
-        // would have to seed).
-        choice = reach_probe::ReachChoice::Keep;
-    } else {
-        choice = reach_probe::probe_reach_choice(src, level, shape);
-    }
+    let ReachGate {
+        choice,
+        donation,
+        mut keep_plan,
+        donation_prefix,
+    } = resolve_reach_gate(
+        src,
+        level,
+        shape,
+        workers,
+        head,
+        fast_window,
+        dict,
+        ldm_mode,
+    );
+
     let donation = Mutex::new(donation);
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     let job_size = capture_grid(
@@ -361,7 +292,7 @@ pub fn compress_slice_mt(
         frame_content_size: declared.or(Some(src.len() as u64)),
         single_segment: false,
         content_checksum: checksum,
-        dictionary_id: dict.map(|d| d.header_id()).flatten(),
+        dictionary_id: dict.and_then(|d| d.header_id()),
         window_size: Some(window),
     }
     .serialize(&mut output);
@@ -528,7 +459,7 @@ pub fn compress_slice_mt(
                 // bounded wherever the build has reached when the job's
                 // worker picks it up.
                 PrefixPlan::Windowed(w) => {
-                    build_ldm_prefix_chain(src, level, shape, w, &ready, ldm_mode)
+                    build_ldm_prefix_chain(src, level, shape, w, &ready, ldm_mode);
                 },
                 PrefixPlan::SelfFill { .. } => {},
             }
@@ -572,6 +503,124 @@ pub fn compress_slice_mt(
         output.extend_from_slice(&(hash.finish() as u32).to_le_bytes());
     }
     output
+}
+
+/// The reach-probe gate's outcome: the verdict, the donated job-zero
+/// state and its emitted prefix span (a Keep verdict only), the Keep
+/// capture plan the donation armed for, and whether that arming paired.
+struct ReachGate {
+    choice: reach_probe::ReachChoice,
+    donation: Option<(
+        alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+        Vec<u8>,
+    )>,
+    keep_plan: Option<PrefixPlan>,
+    donation_prefix: bool,
+}
+
+/// Resolve the frame's reach verdict and the job-zero donation it arms:
+/// The frame's head decides its chain reach (see reach_probe), and with
+/// it the strip: a shrunk search domain shrinks the strip to match.
+/// Eligible frames donate the probe's keep side into job zero (see
+/// `donate_job_zero_prefix`): the first span blocks run as job zero's
+/// own blocks on the calling thread through the job machinery, so only
+/// a Shrink verdict pays a re-parse. The keep grid must leave job zero
+/// work beyond the span for the continuation to take over.
+fn resolve_reach_gate(
+    src: &[u8],
+    level: Level,
+    shape: crate::InputShape,
+    workers: u32,
+    head: &[u8],
+    fast_window: Option<u64>,
+    dict: Option<&Arc<super::dictionary::EncDictionary>>,
+    ldm_mode: crate::LdmMode,
+) -> ReachGate {
+    let mut donation = None;
+    // Whether the donated state arms with the capture's arming
+    // (see `donation_arming`): the pairing invariant in
+    // `compress_slice_mt` checks the capture the frame finally runs
+    // against it.
+    let mut donation_prefix = false;
+    // The capture plan a Keep verdict would run, computed before the
+    // donation so the donated span can arm for it; reused as the frame's
+    // plan when the verdict keeps.
+    let mut keep_plan = None;
+    let choice;
+    if dict.is_none()
+        && reach_probe::eligible(level, shape)
+        && job_size_for(
+            src.len() as u64,
+            workers.max(2),
+            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
+                as usize,
+        ) >= reach_probe::PROBE_SPAN
+    {
+        let keep_strip =
+            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
+                as usize;
+        // Capture frames pin the job grid at the reach floor instead of
+        // the worker-scaled formula: the grid (and with it the frame
+        // bytes) stays identical at every worker count, and the floor
+        // already dominates the formula wherever the mid-size band
+        // engaged before (a 32 MiB capture source grids 4 MiB jobs at
+        // any worker count).
+        let keep_job_size = capture_grid(
+            src.len() as u64,
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            head,
+            fast_window,
+            ldm_mode,
+        )
+        .unwrap_or_else(|| job_size_for(src.len() as u64, workers.max(2), keep_strip));
+        keep_plan = plan_prefix_ldm(
+            src,
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            keep_job_size,
+            src.len().div_ceil(keep_job_size),
+            fast_window,
+            ldm_mode,
+        );
+        donation_prefix = keep_plan.is_some();
+        #[cfg(feature = "job_trace")]
+        let trace_probe = std::time::Instant::now();
+        let (donated_choice, state, prefix) = donate_job_zero_prefix(
+            src,
+            level,
+            shape,
+            donation_arming(donation_prefix),
+            ldm_mode,
+        );
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_probe(trace_probe);
+        choice = donated_choice;
+        if choice == reach_probe::ReachChoice::Keep {
+            donation = Some((state, prefix));
+        } else {
+            // The shrink verdict discards the donation (and the plan: the
+            // shrunk strips are not the prefixes it filled); job zero
+            // parses from its own pooled state like an undonated frame.
+            return_pooled_slice_state(state);
+            keep_plan = None;
+        }
+    } else if dict.is_some() {
+        // Dictionary frames keep the stock reach, like every ST
+        // dictionary entry (the probe samples a head the dictionary
+        // would have to seed).
+        choice = reach_probe::ReachChoice::Keep;
+    } else {
+        choice = reach_probe::probe_reach_choice(src, level, shape);
+    }
+    ReachGate {
+        choice,
+        donation,
+        keep_plan,
+        donation_prefix,
+    }
 }
 
 /// The frame header's window: the plain row window, or — on a dictionary
