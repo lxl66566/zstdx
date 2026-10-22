@@ -1,6 +1,13 @@
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::{bit_io::BitWriter, encoding::seq_codes::SEQ_CODE_SPACE};
+use crate::{
+    bit_io::BitWriter,
+    blocks::sequence_section::{
+        LL_DEFAULT_ACC_LOG, LL_DEFAULT_DISTRIBUTION, ML_DEFAULT_ACC_LOG, ML_DEFAULT_DISTRIBUTION,
+        OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
+    },
+    encoding::seq_codes::SEQ_CODE_SPACE,
+};
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
     pub(super) table: FSETable,
@@ -1149,39 +1156,16 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
-const ML_DIST: &[i32] = &[
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
-];
-
-const LL_DIST: &[i32] = &[
-    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-    -1, -1, -1, -1,
-];
-
-const OF_DIST: &[i32] = &[
-    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
-];
-
-// Predefined-table coverage (see `select_from_counts`): the highest
-// encodable code is each distribution's last index. The LL/ML defaults
-// cover their whole wire code spaces (35/52); the OF default stops at 28
-// (libzstd's DefaultMaxOff) although the OF wire space reaches 31, so
-// offset codes 29-31 always force a dynamic table.
-const _: () = assert!(LL_DIST.len() == 36);
-const _: () = assert!(ML_DIST.len() == 53);
-const _: () = assert!(OF_DIST.len() == 29);
-
 pub(crate) fn default_ml_table() -> FSETable {
-    build_table_from_probabilities(ML_DIST, 6)
+    build_table_from_probabilities(&ML_DEFAULT_DISTRIBUTION, ML_DEFAULT_ACC_LOG)
 }
 
 pub(crate) fn default_ll_table() -> FSETable {
-    build_table_from_probabilities(LL_DIST, 6)
+    build_table_from_probabilities(&LL_DEFAULT_DISTRIBUTION, LL_DEFAULT_ACC_LOG)
 }
 
 pub(crate) fn default_of_table() -> FSETable {
-    build_table_from_probabilities(OF_DIST, 5)
+    build_table_from_probabilities(&OF_DEFAULT_DISTRIBUTION, OF_DEFAULT_ACC_LOG)
 }
 
 #[cfg(test)]
