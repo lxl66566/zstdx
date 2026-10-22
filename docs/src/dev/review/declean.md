@@ -32,3 +32,15 @@ Removed from `decoding/block_decoder.rs`:
 - `DecodeBlockContentError::{DecoderStateIsFailed, ExpectedHeaderOfPreviousBlock}` — their only construction sites were the removed match; the enum is `#[non_exhaustive]`, so removal is compatible.
 
 `BlockDecoder` now holds only `header_buffer`. Invariant relied on: header-then-body ordering is structural at every call site (fresh decoder per frame, read/decode pairs inside one loop). Behavior identical for every in-tree path; the flat path was already stateless, and the removed match sat at the once-per-block entry of the ring path, not in any symbol loop.
+
+## Task 3 — LiteralsSection::parse_from_header (todo 20c)
+
+**Verdict: done.**
+
+`parse_from_header` read the 2-bit type and 2-bit size_format through a `BitReader` but then re-derived every field with raw byte arithmetic (`raw[0] >> 3` etc.); the reader's only real contribution was the empty-input error. Now plain byte arithmetic: `let Some(&first) = raw.first() else` (empty input returns the identical `GetBitsError::NotEnoughRemainingBits { requested: 2, remaining: 0 }` the 2-bit type read produced), `section_type(first)`, `(first >> 2) & 3`. The `BitReader` import is gone from the module.
+
+Field arithmetic, error classes and the check ordering (truncation rejected before any multi-byte field read) are unchanged; R64's header tests (`raw_rle_header_forms`, `compressed_header_forms`, `header_bytes_needed_matches_parse`, `short_header_is_an_error`) stay green, with the empty-input case now pinned to the exact variant.
+
+## Test results
+
+Full workspace `cargo test` (debug) green after each commit; final `--release` and `-p zstdx --no-default-features` runs in the round log below. `cargo clippy -p zstdx` zero warnings (`--all-targets` still shows one pre-existing `items_after_statements` in R64's `reserved_and_oversized_are_rejected` test, untouched here).

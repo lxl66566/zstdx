@@ -1,6 +1,6 @@
 //! Utilities and representations for the first half of a block, the literals section.
 //! It contains data that is then copied from by the sequences section.
-use crate::{bit_io::BitReader, decoding::errors::LiteralsSectionParseError};
+use crate::{bit_io::GetBitsError, decoding::errors::LiteralsSectionParseError};
 
 /// A compressed block consists of two sections, a literals section, and a sequences section.
 ///
@@ -116,13 +116,24 @@ impl LiteralsSection {
     }
 
     /// Parse the header into `self`, and returns the number of bytes read.
+    ///
+    /// Every field is a contiguous little-endian bit slice of the first 1-5
+    /// bytes, so plain byte arithmetic covers the whole header; only the
+    /// empty-input rejection needs a hand-rolled error.
     pub fn parse_from_header(&mut self, raw: &[u8]) -> Result<u8, LiteralsSectionParseError> {
-        let mut br: BitReader<'_> = BitReader::new(raw);
-        let block_type = br.get_bits(2)? as u8;
-        self.ls_type = Self::section_type(block_type)?;
-        let size_format = br.get_bits(2)? as u8;
+        // An empty header produces the same error the 2-bit type read did.
+        let Some(&first) = raw.first() else {
+            return Err(LiteralsSectionParseError::GetBitsError(
+                GetBitsError::NotEnoughRemainingBits {
+                    requested: 2,
+                    remaining: 0,
+                },
+            ));
+        };
+        self.ls_type = Self::section_type(first)?;
+        let size_format = (first >> 2) & 0x3;
 
-        let byte_needed = Self::header_bytes_needed(raw[0])?;
+        let byte_needed = Self::header_bytes_needed(first)?;
         if raw.len() < byte_needed as usize {
             return Err(LiteralsSectionParseError::NotEnoughBytes {
                 have: raw.len(),
@@ -240,7 +251,7 @@ impl LiteralsSection {
 #[cfg(test)]
 mod tests {
     use super::{LiteralsSection, LiteralsSectionType};
-    use crate::decoding::errors::LiteralsSectionParseError;
+    use crate::{bit_io::GetBitsError, decoding::errors::LiteralsSectionParseError};
 
     fn parse(bytes: &[u8]) -> (u32, Option<u32>, Option<u8>, LiteralsSectionType, u8) {
         let mut section = LiteralsSection::new();
@@ -384,8 +395,16 @@ mod tests {
                 other => panic!("expected NotEnoughBytes for {bytes:?}, got {other:?}"),
             }
         }
-        // empty input fails in the bit reader before the length check
+        // empty input: the exact error the 2-bit type read produced
         let mut section = LiteralsSection::new();
-        assert!(section.parse_from_header(&[]).is_err());
+        assert!(matches!(
+            section.parse_from_header(&[]),
+            Err(LiteralsSectionParseError::GetBitsError(
+                GetBitsError::NotEnoughRemainingBits {
+                    requested: 2,
+                    remaining: 0
+                }
+            ))
+        ));
     }
 }
