@@ -241,20 +241,11 @@ impl HuffmanTable {
 
             bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
 
-            // skip the 0 padding at the end of the last byte of the bit stream and throw away
-            // the first 1 found
-            let mut skipped_bits = 0;
-            loop {
-                let val = br.get_bits(1);
-                skipped_bits += 1;
-                if val == 1 || skipped_bits > 8 {
-                    break;
-                }
-            }
-            if skipped_bits > 8 {
-                // if more than 7 bits are 0, this is not the correct end of the bitstream.
-                // Either a bug or corrupted data
-                return Err(err::ExtraPadding { skipped_bits });
+            // The bitstream must end (in reading order: start) with padding
+            // zeros and a single 1 marker; more than 7 zeros means the
+            // stream is corrupt.
+            if !br.skip_padding_marker() {
+                return Err(err::ExtraPadding { skipped_bits: 9 });
             }
 
             dec1.init_state(&mut br)?;

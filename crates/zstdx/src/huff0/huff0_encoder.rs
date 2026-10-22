@@ -50,7 +50,11 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// The four-stream form without a table description: the caller appended
     /// the description (byte-aligned) beforehand or chose the treeless form.
     pub(crate) fn encode4x_only(&mut self, data: &[u8]) {
-        assert!(data.len() >= 4);
+        // The quarter split needs three non-degenerate segments plus at
+        // least one byte for the fourth stream's end marker (the caller's
+        // one-vs-four gate only ever passes >= 256, but the slicing below
+        // panics below 6).
+        assert!(data.len() >= 6);
 
         // Split data in 4 equally sized parts (the last one might be a bit smaller than the rest)
         let split_size = data.len().div_ceil(4);

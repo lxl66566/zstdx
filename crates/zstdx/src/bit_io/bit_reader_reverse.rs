@@ -149,6 +149,19 @@ impl<'s> BitReaderReversed<'s> {
         self.peek_bits(n)
     }
 
+    /// Skip the padding zeros and the final `1` marker at the start of a
+    /// reversed bitstream (the end of the forward stream). Returns false
+    /// when no marker sits within the first 8 bits, i.e. the stream does
+    /// not end in a valid end mark.
+    pub fn skip_padding_marker(&mut self) -> bool {
+        for _ in 0..8 {
+            if self.get_bits(1) == 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Consume `n` bits from the source.
     #[inline(always)]
     pub fn consume(&mut self, n: u8) {
@@ -175,5 +188,17 @@ mod test {
         // All zeroes filled in
         assert_eq!(br.get_bits(4), 0b0000);
         assert_eq!(br.bits_remaining(), -7);
+    }
+
+    #[test]
+    fn padding_marker_skips_zeros_then_one() {
+        // Three padding zeros, the 1 marker, then payload bits 010.
+        let data = [0b1111_1111, 0b0001_0100];
+        let mut br = super::BitReaderReversed::new(&data);
+        assert!(br.skip_padding_marker());
+        assert_eq!(br.get_bits(3), 0b010);
+        // Eight zeros carry no marker: not a valid stream end.
+        let mut br = super::BitReaderReversed::new(&[0x00, 0x00]);
+        assert!(!br.skip_padding_marker());
     }
 }

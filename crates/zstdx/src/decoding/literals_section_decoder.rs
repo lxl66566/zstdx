@@ -165,20 +165,8 @@ fn decompress_literals(
                 let stream = &source[start..end];
                 let mut decoder = HuffmanDecoder::new(&scratch.table);
                 let mut br = BitReaderReversed::new(stream);
-                // skip the 0 padding at the end of the last byte of the bit stream and throw away
-                // the first 1 found
-                let mut skipped_bits = 0;
-                loop {
-                    let val = br.get_bits(1);
-                    skipped_bits += 1;
-                    if val == 1 || skipped_bits > 8 {
-                        break;
-                    }
-                }
-                if skipped_bits > 8 {
-                    // if more than 7 bits are 0, this is not the correct end of the bitstream.
-                    // Either a bug or corrupted data
-                    return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
+                if !br.skip_padding_marker() {
+                    return Err(DecompressLiteralsError::ExtraPadding { skipped_bits: 9 });
                 }
                 decoder.init_state(&mut br);
 
@@ -210,18 +198,8 @@ fn decompress_literals(
         assert_eq!(num_streams, 1);
         let mut decoder = HuffmanDecoder::new(&scratch.table);
         let mut br = BitReaderReversed::new(source);
-        let mut skipped_bits = 0;
-        loop {
-            let val = br.get_bits(1);
-            skipped_bits += 1;
-            if val == 1 || skipped_bits > 8 {
-                break;
-            }
-        }
-        if skipped_bits > 8 {
-            // if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug
-            // or corrupted data
-            return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
+        if !br.skip_padding_marker() {
+            return Err(DecompressLiteralsError::ExtraPadding { skipped_bits: 9 });
         }
         decoder.init_state(&mut br);
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
