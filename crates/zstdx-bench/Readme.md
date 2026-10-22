@@ -270,6 +270,42 @@ Decodes every `.zst*` file in a directory with several worker counts
 cargo run --release -p zstdx-bench -- mtcheck bench/corpus
 ```
 
+### `parity` — decode-parity differential vs the zstd CLI
+
+Institutionalized R65 craft+mutate differential (todo 21b/21c; design and
+sweep history in `docs/src/dev/review/diffbench.md`): a deterministic
+corpus — 24 real frames (our encoder over 4 payload families x levels
+1/3/19, checksum on/off) plus the handcrafted shapes of
+`zstdx::parity` (the same bytes the lib tests pin) — mutated by an
+exhaustive truncation ladder, rotating single-byte XOR flips, OR scans
+(`|=` on the 18 header bytes with 4 masks, and `|= 0x03` at every
+position — the class that found the modes-byte reserved-bits hole XOR
+misses) and strided deletes/inserts. Every case is decoded by zstdx
+(serial arm plus `--mt` arms) and by `zstd -dcq` (one CLI spawn per
+case, the reference by design); accept/reject and output bytes are
+compared. Any zstdx panic or verdict/output divergence exits nonzero, so
+the mode can gate. The one documented CLI-vs-one-shot asymmetry
+(window-violating offsets; R65 parity.md finding 7) is adjudicated by
+libzstd's own one-shot `ZSTD_decompress` and reported as
+`oneshot-asymmetry`, not a failure. A full sweep is multi-core work:
+wrap it in `flock /root/programs/fork/zstd-bench.lock`.
+
+```bash
+cargo run --release -p zstdx-bench -- parity                 # full sweep (~38k cases)
+cargo run --release -p zstdx-bench -- parity --cases 2000     # deterministic stride sample
+cargo run --release -p zstdx-bench -- parity --mt 2,4,8       # more MT arms
+cargo run --release -p zstdx-bench -- parity --dict bench/dict-json
+```
+
+Flags: `--seed` reseeds the payload RNG, `--cases N` stride-samples to an
+approximate budget (clean replays always kept), `--dict <path>` attaches
+the dictionary to both decoders and encodes the real seeds with it (the
+dict-frame sweep itself is todo 21a), `--mt` selects the worker-count
+arms (default `4`; with `--dict` they run the sequential dictionary
+path), `--dump <dir>` writes every divergent case's bytes for offline
+replay, and `--decode <file>` prints one file's verdicts (zstdx, libzstd
+one-shot, CLI) for replaying a dumped case.
+
 ### `seqstats` — matcher sequence statistics
 
 Sequence statistics and entropy lower bound of our matcher on one corpus

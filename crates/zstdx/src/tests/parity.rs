@@ -14,6 +14,9 @@ use crate::decoding::{
         SequencesHeaderParseError,
     },
 };
+// The handcrafted shapes live in the shared parity module so the bench
+// differential replays the exact bytes these tests pin.
+use crate::parity::{BlockWireType, one_sequence_frame, push_block};
 
 fn decode(data: &[u8]) -> Result<Vec<u8>, FrameDecoderError> {
     let mut decoder = FrameDecoder::new();
@@ -21,36 +24,6 @@ fn decode(data: &[u8]) -> Result<Vec<u8>, FrameDecoderError> {
     decoder
         .decode_all(data, &mut out)
         .map(|n| out[..n].to_vec())
-}
-
-fn push_block(out: &mut Vec<u8>, last: bool, btype: u32, content: &[u8]) {
-    let hdr = ((content.len() as u32) << 3) | (btype << 1) | u32::from(last);
-    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
-    out.extend_from_slice(content);
-}
-
-/// A minimal valid frame with one Compressed block: Raw literals "ababababab"
-/// (header 0x50 = 10 << 3), one sequence with all three FSE streams in RLE
-/// mode (LL code 9 → ll 9, OF code 0 → rep0 = offset 1, ML code 2 → ml 5)
-/// and a bare end-marker bitstream (every read is zero-width). Output:
-/// "ababababa" + "aaaaa" (offset-1 match off the just-written 'a') + the
-/// trailing literal 'b' = 15 bytes.
-fn one_sequence_frame(modes_byte: u8) -> Vec<u8> {
-    let mut block = Vec::new();
-    block.push(0x50); // Raw literals, regenerated size 10
-    block.extend_from_slice(b"ababababab");
-    block.push(0x01); // nbSeq = 1
-    block.push(modes_byte);
-    block.push(9); // LL RLE code 9: ll = 9, 0 add bits
-    block.push(0); // OF RLE code 0: offset value 1 (rep0), 0 add bits
-    block.push(2); // ML RLE code 2: ml = 5, 0 add bits
-    block.push(0x01); // bitstream: end marker only
-    let mut frame = Vec::new();
-    frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
-    frame.push(0x00); // FHD: nothing declared
-    frame.push(0x00); // window descriptor: 1 KiB
-    push_block(&mut frame, true, 2, &block);
-    frame
 }
 
 /// RFC 8878 3.1.1.3.1.2: the Symbol_Compression_Modes byte's low two bits
@@ -90,7 +63,7 @@ fn single_segment_zero_fcs_empty_frame_is_accepted() {
     frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
     frame.push(0x20); // single segment, FCS field size 1
     frame.push(0x00); // FCS = 0
-    push_block(&mut frame, true, 0, b""); // empty last Raw block
+    push_block(&mut frame, true, BlockWireType::Raw, b""); // empty last Raw block
     let out = decode(&frame).expect("empty single-segment frame decodes");
     assert!(out.is_empty());
 }
@@ -179,4 +152,59 @@ fn absolute_window_ceiling_is_two_gibibytes() {
             crate::decoding::errors::FrameHeaderError::WindowTooBig { .. }
         )
     ));
+}
+
+/// R66 literals tail parity 1/3: the reference's x86_64 fast decode
+/// (4-stream literals, every stream >= 8 bytes) validates by output
+/// length, not by exact bit consumption (`HUF_decompress4X1_.._fast` has
+/// no `BIT_endOfDStream`). Stream 1 of this frame carries only 4 of its
+/// 10 codes; the tail must keep decoding rotations of the frozen floor
+/// window (the 8 bytes at the jump table) until the segment is full, and
+/// the frame is ACCEPTED with that garbage visible in the output. zstdx
+/// used to apply the fallback body's strict tail here and rejected.
+#[test]
+fn four_stream_literals_underflow_is_accepted_with_reference_garbage() {
+    let frame = crate::parity::four_stream_underflow_frame();
+    let out = decode(&frame).expect("under-running 4-stream literals decode");
+    // streams 0/2/3: the full code list; stream 1: 4 codes then the
+    // zero-rotation fill.
+    let full: [u8; 10] = [1, 2, 3, 1, 1, 2, 3, 1, 2, 2];
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&full);
+    expected.extend_from_slice(&full[..4]);
+    expected.extend_from_slice(&[0u8; 6]);
+    expected.extend_from_slice(&full);
+    expected.extend_from_slice(&full);
+    assert_eq!(out, expected);
+}
+
+/// R66 literals tail parity 2/3: a tight single stream (every bit
+/// consumed) decodes on the count-driven 1X path.
+#[test]
+fn single_stream_tight_literals_are_accepted() {
+    let frame = crate::parity::single_stream_frame(false);
+    let out = decode(&frame).expect("tight single-stream literals decode");
+    assert_eq!(out, [1, 2, 3, 1, 1, 2, 3, 1, 2, 2]);
+}
+
+/// R66 literals tail parity 3/3: the same codes with 11 leftover zero
+/// bits are rejected — the 1X path is count-driven then gated by the
+/// exact-consumption check (`BIT_endOfDStream`), and zstdx used to skip
+/// that gate entirely (bits-driven loop, count check only), accepting
+/// frames libzstd rejects.
+#[test]
+fn single_stream_leftover_bits_are_rejected() {
+    let frame = crate::parity::single_stream_frame(true);
+    let err = decode(&frame).expect_err("leftover bits must be rejected");
+    assert!(
+        matches!(
+            err,
+            FrameDecoderError::FailedToReadBlockBody(
+                DecodeBlockContentError::DecompressBlockError(
+                    DecompressBlockError::DecompressLiteralsError(_),
+                ),
+            )
+        ),
+        "got {err:?}"
+    );
 }

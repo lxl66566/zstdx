@@ -70,6 +70,11 @@ enum Command {
     /// Dictionary multithreading wall A/B: dict st vs dict mt (job zero
     /// seeded from the dictionary) plus plain-frame sanity cells.
     Dictmt(cmd::dictmt::Args),
+    /// Decode-parity differential vs the zstd CLI: deterministic
+    /// craft+mutate corpus replayed through zstdx (serial/MT) and
+    /// `zstd -dcq`, accept/reject and output compared per case; nonzero
+    /// exit on divergence.
+    Parity(cmd::parity::Args),
 }
 
 fn main() {
@@ -89,5 +94,6 @@ fn main() {
         Command::Prefill(args) => cmd::prefill::run(&args),
         Command::Train(args) => cmd::train::run(&args),
         Command::Dictmt(args) => cmd::dictmt::run(&args),
+        Command::Parity(args) => cmd::parity::run(&args),
     }
 }

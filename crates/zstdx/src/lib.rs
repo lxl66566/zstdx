@@ -82,6 +82,8 @@ pub(crate) mod xxh64;
 pub mod fse;
 #[cfg(feature = "fuzz_exports")]
 pub mod huff0;
+#[cfg(any(test, feature = "fuzz_exports"))]
+pub mod parity;
 
 #[cfg(not(feature = "fuzz_exports"))]
 pub(crate) mod fse;

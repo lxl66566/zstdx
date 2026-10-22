@@ -64,6 +64,7 @@ fn decompress_literals(
         LiteralsSectionType::Compressed => {
             // read Huffman tree description
             bytes_read += scratch.table.build_decoder(source)?;
+
             // pick the decoding table shape for this block's literals,
             // mirroring libzstd's HUF_selectDecoder cost model
             if select_x2_table(section.regenerated_size as usize, compressed_size) {
@@ -96,11 +97,11 @@ fn decompress_literals(
         let jump2 = jump1 + source[2] as usize + ((source[3] as usize) << 8);
         let jump3 = jump2 + source[4] as usize + ((source[5] as usize) << 8);
         bytes_read += 6;
-        let source = &source[6..];
+        let streams = &source[6..];
 
-        if source.len() < jump3 {
+        if streams.len() < jump3 {
             return Err(err::MissingBytesForLiterals {
-                got: source.len(),
+                got: streams.len(),
                 needed: jump3,
             });
         }
@@ -110,11 +111,16 @@ fn decompress_literals(
         // `segment` bytes (the last stream the remainder).
         let total_out = section.regenerated_size as usize;
         let segment = total_out.div_ceil(4);
+        // The region handed to the fast path includes the 6 jump-table
+        // bytes: the reference's per-stream tail reader floors at
+        // `ilowest` (the jump table start), and an exhausted tail decodes
+        // rotations of the 8 bytes there, so the floor window must be
+        // byte-identical to the reference's.
         let stream_bounds = [
-            (0, jump1),
-            (jump1, jump2),
-            (jump2, jump3),
-            (jump3, source.len()),
+            (6, 6 + jump1),
+            (6 + jump1, 6 + jump2),
+            (6 + jump2, 6 + jump3),
+            (6 + jump3, source.len()),
         ];
         let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
@@ -162,6 +168,8 @@ fn decompress_literals(
             let mut seg_start = 0;
             for (&(start, end), &seg_end) in stream_bounds.iter().zip(seg_end.iter()) {
                 let seg_len = seg_end - seg_start;
+                // stream_bounds carry the +6 jump-table offset of the fast
+                // region; this source still holds the jump table.
                 let stream = &source[start..end];
                 let mut decoder = HuffmanDecoder::new(&scratch.table);
                 let mut br = BitReaderReversed::new(stream);
@@ -192,7 +200,7 @@ fn decompress_literals(
             }
         }
 
-        bytes_read += source.len() as u32;
+        bytes_read += streams.len() as u32;
     } else {
         // just decode the one stream
         assert_eq!(num_streams, 1);
@@ -202,8 +210,19 @@ fn decompress_literals(
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits: 9 });
         }
         decoder.init_state(&mut br);
-        while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
+        // Count-driven like the reference's 1X body (`HUF_decodeStreamX1`
+        // fills to dstEnd, the zero-padding reader making overshoots
+        // defined), then the exact-consumption gate that is
+        // `BIT_endOfDStream`.
+        let tl = scratch.table.max_num_bits as isize;
+        for _ in 0..section.regenerated_size {
             target.push(decoder.decode_and_advance(&mut br));
+        }
+        if br.bits_remaining() != -tl {
+            return Err(DecompressLiteralsError::BitstreamReadMismatch {
+                read_til: br.bits_remaining(),
+                expected: -tl,
+            });
         }
         bytes_read += source.len() as u32;
     }
@@ -238,8 +257,6 @@ fn decompress_4streams_interleaved(
     stream_bounds: &[(usize, usize); 4],
     out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
-    use DecompressLiteralsError as err;
-
     let tl = table.max_num_bits; // 1..=11
     debug_assert!((1..=11).contains(&tl));
     let shift = 64 - tl as u32;
@@ -316,12 +333,11 @@ fn decompress_4streams_interleaved(
         if iters == 0 {
             break;
         }
-        // A stream crossing below its predecessor indicates corruption
+        // A stream crossing below its predecessor ends the interleaved
+        // loop (`goto _out` in the reference): the per-stream window
+        // bound in `finish_streams` is the corruption gate, not this.
         if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
-            return Err(err::BitstreamReadMismatch {
-                read_til: 0,
-                expected: -(tl as isize),
-            });
+            break;
         }
         let olimit = unsafe { op[3].add(iters * 5) };
 
@@ -388,10 +404,14 @@ fn finish_streams(
     use DecompressLiteralsError as err;
 
     let tl = table.max_num_bits as isize;
+    let packed = table.packed_table();
+    let shift = 64 - table.max_num_bits as u32;
+    debug_assert_eq!(packed.len(), 1 << table.max_num_bits);
     for s in 0..4 {
-        let (start, end) = stream_bounds[s];
-        // The window may reach at most 8 bytes below the stream start (bytes already
-        // consumed); anything lower means the stream over-consumed => corruption
+        let start = stream_bounds[s].0;
+        // The handoff bounds (the reference's `HUF_initRemainingDStream`
+        // gates): the window may sit at most 8 bytes below the stream
+        // start, and the loop may not have written past its segment.
         if ip[s] + 8 < start {
             return Err(err::BitstreamReadMismatch {
                 read_til: 0,
@@ -404,27 +424,66 @@ fn finish_streams(
                 expected: seg_end[s],
             });
         }
-        // Hand the window state back to a regular bit reader. The slice may start up
-        // to 8 bytes below the stream (those foreign bytes are already consumed);
-        // account for them when checking the remaining bits.
-        let ext = start.saturating_sub(8);
-        let foreign = (8 * (start - ext)) as isize;
-        let slice = &region[ext..end];
-        let ctz = bits[s].trailing_zeros() as u8;
-        let mut br = BitReaderReversed::from_parts(slice, ip[s] - ext, ctz, 0);
 
-        let mut decoder = HuffmanDecoder::new(table);
-        decoder.init_state(&mut br);
+        // Scalar tail as an exact mirror of the reference's
+        // `HUF_decodeStreamX1` on a `BIT_DStream` over the whole region
+        // (`start` = the jump table, the reference's `ilowest` floor).
+        // Verdict parity alone is not enough: an exhausted tail decodes
+        // rotations of the frozen floor window and the reference ACCEPTS
+        // that output, so the garbage bytes themselves must match.
+        let read64 = |p: usize| u64::from_le_bytes(region[p..][..8].try_into().unwrap());
+        let mut ptr = ip[s];
+        let mut consumed = bits[s].trailing_zeros();
+        let mut window = read64(ptr);
         let mut o = op[s];
-        while o < seg_end[s] && br.bits_remaining() - foreign > -tl {
-            out[o] = decoder.decode_and_advance(&mut br);
-            o += 1;
+
+        // Four-symbol batches under reload protection:
+        // `while ((BIT_reloadDStream() == unfinished) & (p < pEnd-3))`.
+        // The reload sits in the loop CONDITION in the reference, so it
+        // also runs on the iteration that exits — and the short-tail
+        // `else` branch reloads once too. Entering the unguarded phase
+        // without that final refresh could leave `consumed >= 64`, and
+        // the rotation mask below would read the wrong bits.
+        loop {
+            let want = (consumed >> 3) as usize;
+            let unfinished = if consumed > 64 {
+                false // overflow
+            } else if ptr >= 8 {
+                ptr -= want;
+                consumed &= 7;
+                window = read64(ptr);
+                true
+            } else if ptr > 0 {
+                let clamped = want > ptr;
+                let nb = want.min(ptr);
+                ptr -= nb;
+                consumed -= 8 * nb as u32;
+                window = read64(ptr);
+                !clamped
+            } else {
+                false // endOfBuffer at the floor
+            };
+            if !unfinished || o + 3 >= seg_end[s] {
+                break;
+            }
+            for _ in 0..4 {
+                // `BIT_lookBitsFast` in release mode masks the shift at
+                // 63 bits, so past-64 consumption keeps rotating the
+                // (possibly frozen) window exactly like the reference.
+                let entry = packed[((window << (consumed & 63)) >> shift) as usize];
+                out[o] = (entry >> 8) as u8;
+                o += 1;
+                consumed += u32::from(entry & 0x3f);
+            }
         }
-        if o != seg_end[s] || br.bits_remaining() - foreign != -tl {
-            return Err(err::BitstreamReadMismatch {
-                read_til: br.bits_remaining() - foreign,
-                expected: -tl,
-            });
+        // Unguarded tail: the window is frozen at the reload floor and
+        // every remaining symbol is a rotation lookup (`while (p < pEnd)`
+        // with no reload in the reference).
+        while o < seg_end[s] {
+            let entry = packed[((window << (consumed & 63)) >> shift) as usize];
+            out[o] = (entry >> 8) as u8;
+            o += 1;
+            consumed += u32::from(entry & 0x3f);
         }
     }
 
