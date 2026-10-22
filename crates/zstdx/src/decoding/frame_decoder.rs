@@ -19,13 +19,15 @@ use crate::{
 
 /// The default maximum window size, in bytes, that a [FrameDecoder] accepts.
 ///
-/// Defaults to 128mb to bound allocation for malformed or hostile frames. The
-/// spec permits far larger windows, so raise the limit with
-/// [FrameDecoder::set_max_window_size] for input you trust.
+/// Equals libzstd's `ZSTD_MAXWINDOWSIZE_DEFAULT` ((1<<27)+1): frames needing
+/// at most 128 MiB + 1 byte of window decode, larger ones are rejected with
+/// [FrameDecoderError::WindowSizeTooBig]. The spec permits far larger
+/// windows, so raise the limit with [FrameDecoder::set_max_window_size] for
+/// input you trust.
 ///
 /// See [ZSTD_d_maxWindowLog](https://github.com/facebook/zstd/wiki/Using-libzstd-in-a-memory-constrained-environment#zstd_d_maxwindowlog)
 /// for compatibility concerns.
-pub const DEFAULT_MAX_WINDOW_SIZE: u64 = 1024 * 1024 * 128;
+pub const DEFAULT_MAX_WINDOW_SIZE: u64 = (1 << 27) + 1;
 
 /// Low level Zstandard decoder that can be used to decompress frames with fine control over when
 /// and how many bytes are decoded.
@@ -257,11 +259,12 @@ impl FrameDecoder {
     /// declaring a larger window are rejected with
     /// [FrameDecoderError::WindowSizeTooBig].
     ///
-    /// The default ([DEFAULT_MAX_WINDOW_SIZE], 128 MiB) bounds allocation for
+    /// The default ([DEFAULT_MAX_WINDOW_SIZE]) bounds allocation for
     /// untrusted input. Raising it reintroduces that large-allocation risk, so
     /// only do so for sources you trust. Mirrors `ZSTD_d_windowLogMax` in libzstd.
     ///
-    /// Clamped to the spec's maximum window size.
+    /// Clamped to [crate::common::MAX_WINDOW_SIZE], the absolute ceiling no
+    /// libzstd configuration exceeds.
     pub fn set_max_window_size(&mut self, max_window_size: u64) {
         self.max_window_size = max_window_size.min(crate::common::MAX_WINDOW_SIZE);
     }

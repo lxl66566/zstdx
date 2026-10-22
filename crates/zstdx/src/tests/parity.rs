@@ -109,3 +109,74 @@ fn trailing_garbage_is_rejected() {
             | FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_))
     ));
 }
+
+/// A single-segment frame declaring Frame_Content_Size = 2^27+1: its window
+/// (= FCS) is exactly libzstd's `ZSTD_MAXWINDOWSIZE_DEFAULT`, so the default
+/// decode limit accepts it (libzstd: `windowSize > maxWindowSize` is false).
+/// zstdx rejected this one window value before (limit 2^27, strict `>`).
+/// One byte more is rejected by both. The frames are header-only; the pin is
+/// that the failure is NOT the window check.
+#[test]
+fn default_window_limit_is_exactly_libzstds() {
+    fn frame(fcs: u64) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+        f.push(0xe0); // single segment, FCS field size 8
+        f.extend_from_slice(&fcs.to_le_bytes());
+        f
+    }
+    let err = decode(&frame((1 << 27) + 1)).expect_err("no blocks present");
+    assert!(
+        !matches!(err, FrameDecoderError::WindowSizeTooBig { .. }),
+        "2^27+1 must pass the default window check: {err:?}"
+    );
+    let err = decode(&frame((1 << 27) + 2)).expect_err("over the limit");
+    assert!(matches!(
+        err,
+        FrameDecoderError::WindowSizeTooBig { requested, max }
+            if requested == (1 << 27) + 2 && max == crate::decoding::DEFAULT_MAX_WINDOW_SIZE
+    ));
+}
+
+/// The absolute window ceiling: no libzstd configuration decodes a window
+/// above 2^31 (`ZSTD_WINDOWLOG_MAX` = 31 on 64-bit; `ZSTD_d_windowLogMax`
+/// cannot be raised further). A windowLog-31/mantissa-0 frame (= 2^31) is
+/// the largest accepted; mantissa >= 1 is rejected even with the limit
+/// raised to the clamp. Pinned at header level (header-only frames).
+#[test]
+fn absolute_window_ceiling_is_two_gibibytes() {
+    fn frame(window_descriptor: u8) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+        f.push(0x00); // no single segment, no FCS
+        f.push(window_descriptor);
+        f
+    }
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(u64::MAX); // clamps to MAX_WINDOW_SIZE
+    let mut out = vec![0u8; 8];
+    // windowLog 31, mantissa 0 -> exactly 2^31: accepted window
+    let err = decoder
+        .decode_all(&frame((31 - 10) << 3), &mut out)
+        .expect_err("no blocks present");
+    assert!(
+        !matches!(
+            err,
+            FrameDecoderError::WindowSizeTooBig { .. }
+                | FrameDecoderError::FrameHeaderError(
+                    crate::decoding::errors::FrameHeaderError::WindowTooBig { .. }
+                )
+        ),
+        "2^31 must be the accepted ceiling: {err:?}"
+    );
+    // windowLog 31, mantissa 1 -> 2^31 + 2^28: rejected at header level
+    let err = decoder
+        .decode_all(&frame(((31 - 10) << 3) | 1), &mut out)
+        .expect_err("over the absolute ceiling");
+    assert!(matches!(
+        err,
+        FrameDecoderError::FrameHeaderError(
+            crate::decoding::errors::FrameHeaderError::WindowTooBig { .. }
+        )
+    ));
+}

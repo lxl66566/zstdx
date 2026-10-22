@@ -10,8 +10,12 @@ pub const MAGIC_NUM: u32 = 0xfd2f_b528;
 pub const MIN_WINDOW_SIZE: u64 = 1024;
 /// Window size refers to the minimum amount of memory needed to decode any given frame.
 ///
-/// The maximum window size allowed by the spec is 3.75TB
-pub const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
+/// The wire format can express windows up to 3.75 TB (windowLog 41), but no
+/// libzstd build decodes beyond `ZSTD_WINDOWLOG_MAX` (31 on 64-bit): the
+/// header parse rejects a larger log outright and `ZSTD_d_windowLogMax`
+/// cannot be raised above it, so no reference tool ever accepts a window
+/// over 2^31. Align with that absolute ceiling.
+pub const MAX_WINDOW_SIZE: u64 = 1 << 31;
 
 // --- BLOCKS ---
 /// While the spec limits block size to 128KB, the implementation uses
