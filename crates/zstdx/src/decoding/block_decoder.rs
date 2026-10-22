@@ -455,3 +455,63 @@ impl BlockDecoder {
             | (u32::from(self.header_buffer[2]) << 13)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::new;
+    use crate::{
+        blocks::block::BlockType,
+        decoding::errors::{BlockHeaderReadError, BlockSizeError},
+    };
+
+    fn read(bytes: &[u8]) -> Result<(crate::blocks::block::BlockHeader, u8), BlockHeaderReadError> {
+        new().read_block_header(bytes)
+    }
+
+    /// RFC 8878 3.1.1: 3-byte header packing the last-block bit, the 2-bit
+    /// type and the 21-bit block size, little-endian, plus the per-type
+    /// meaning of the size for Raw (stored and output size), RLE (output
+    /// repetitions, one stored byte) and Compressed (stored size only).
+    #[test]
+    fn header_field_layout() {
+        let (h, n) = read(&[0x01, 0x00, 0x00]).unwrap();
+        assert!(h.last_block);
+        assert_eq!(h.block_type, BlockType::Raw);
+        assert_eq!((h.content_size, h.decompressed_size, n), (0, 0, 3));
+
+        let (h, _) = read(&[0x28, 0x00, 0x00]).unwrap();
+        assert_eq!(h.block_type, BlockType::Raw);
+        assert_eq!((h.content_size, h.decompressed_size), (5, 5));
+
+        let (h, _) = read(&[0x2a, 0x00, 0x00]).unwrap();
+        assert_eq!(h.block_type, BlockType::RLE);
+        assert_eq!((h.content_size, h.decompressed_size), (1, 5));
+
+        // max block size must pass: 128 KiB, high bits in byte 2
+        let (h, _) = read(&[0x04, 0x00, 0x10]).unwrap();
+        assert_eq!(h.block_type, BlockType::Compressed);
+        assert_eq!((h.content_size, h.decompressed_size), (128 * 1024, 0));
+    }
+
+    /// Reserved block types and sizes over the 128 KiB block maximum are
+    /// rejected at header-parse time.
+    #[test]
+    fn reserved_and_oversized_are_rejected() {
+        assert!(matches!(
+            read(&[0x06, 0x00, 0x00]),
+            Err(BlockHeaderReadError::FoundReservedBlock)
+        ));
+        const OVER: u32 = 128 * 1024 + 1;
+        assert!(matches!(
+            read(&[0x08, 0x00, 0x10]),
+            Err(BlockHeaderReadError::BlockSizeError(
+                BlockSizeError::BlockSizeTooLarge { size: OVER }
+            ))
+        ));
+    }
+
+    #[test]
+    fn truncated_header_is_a_read_error() {
+        assert!(read(&[0x01, 0x00]).is_err());
+    }
+}

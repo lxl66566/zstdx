@@ -29,6 +29,7 @@ pub struct LiteralsSection {
 }
 
 /// The way which a literal section is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiteralsSectionType {
     /// Literals are stored uncompressed.
     Raw,
@@ -233,5 +234,158 @@ impl LiteralsSection {
             3 => Ok(LiteralsSectionType::Treeless),
             other => Err(LiteralsSectionParseError::IllegalLiteralSectionType { got: other }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LiteralsSection, LiteralsSectionType};
+    use crate::decoding::errors::LiteralsSectionParseError;
+
+    fn parse(bytes: &[u8]) -> (u32, Option<u32>, Option<u8>, LiteralsSectionType, u8) {
+        let mut section = LiteralsSection::new();
+        let read = section.parse_from_header(bytes).unwrap();
+        (
+            section.regenerated_size,
+            section.compressed_size,
+            section.num_streams,
+            section.ls_type,
+            read,
+        )
+    }
+
+    /// RFC 8878 3.1.1.1.2: Raw/RLE size_format discriminates with its first
+    /// bit only, so the 5-bit form covers "sf" values 0 and 2 alike (bit 3
+    /// belongs to the size there); 1 -> 12 bits, 3 -> 20 bits, little-endian.
+    #[test]
+    fn raw_rle_header_forms() {
+        // 1 byte, 5-bit regen; the two bytes make sf read 0 and 2
+        assert_eq!(
+            (31, None, None, LiteralsSectionType::Raw, 1),
+            parse(&[0xf8])
+        );
+        assert_eq!(
+            (10, None, None, LiteralsSectionType::Raw, 1),
+            parse(&[0x50])
+        );
+        assert_eq!((7, None, None, LiteralsSectionType::RLE, 1), parse(&[0x39]));
+        // 2 bytes, 12-bit regen
+        assert_eq!(
+            (0xabc, None, None, LiteralsSectionType::Raw, 2),
+            parse(&[0xc4, 0xab])
+        );
+        assert_eq!(
+            (0x123, None, None, LiteralsSectionType::RLE, 2),
+            parse(&[0x35, 0x12])
+        );
+        // 3 bytes, 20-bit regen
+        assert_eq!(
+            (0x3210a, None, None, LiteralsSectionType::Raw, 3),
+            parse(&[0xac, 0x10, 0x32])
+        );
+    }
+
+    /// Compressed/Treeless headers: sf 0/1 -> 3 bytes and 10-bit sizes (1 vs
+    /// 4 streams), sf 2 -> 4 bytes and 14 bits, sf 3 -> 5 bytes and 18 bits.
+    #[test]
+    fn compressed_header_forms() {
+        assert_eq!(
+            (
+                0x3ab,
+                Some(0x2cd),
+                Some(1),
+                LiteralsSectionType::Compressed,
+                3
+            ),
+            parse(&[0xb2, 0x7a, 0xb3])
+        );
+        assert_eq!(
+            (
+                0x3ab,
+                Some(0x2cd),
+                Some(4),
+                LiteralsSectionType::Compressed,
+                3
+            ),
+            parse(&[0xb6, 0x7a, 0xb3])
+        );
+        assert_eq!(
+            (
+                0x2abc,
+                Some(0x1555),
+                Some(4),
+                LiteralsSectionType::Compressed,
+                4
+            ),
+            parse(&[0xca, 0xab, 0x56, 0x55])
+        );
+        assert_eq!(
+            (
+                0x3210a,
+                Some(0x2fedb),
+                Some(4),
+                LiteralsSectionType::Compressed,
+                5
+            ),
+            parse(&[0xae, 0x10, 0xf2, 0xb6, 0xbf])
+        );
+        // treeless: same packing with the type bits set to 3
+        assert_eq!(
+            (
+                0x3ab,
+                Some(0x2cd),
+                Some(1),
+                LiteralsSectionType::Treeless,
+                3
+            ),
+            parse(&[0xb3, 0x7a, 0xb3])
+        );
+    }
+
+    /// The standalone length oracle must agree with the parser on every form.
+    #[test]
+    fn header_bytes_needed_matches_parse() {
+        for (first, want) in [
+            (0xf8u8, 1u8),
+            (0x50, 1),
+            (0x39, 1),
+            (0xc4, 2),
+            (0xac, 3),
+            (0xb2, 3),
+            (0xb6, 3),
+            (0xca, 4),
+            (0xae, 5),
+        ] {
+            assert_eq!(
+                LiteralsSection::header_bytes_needed(first).unwrap(),
+                want,
+                "{first:#04x}"
+            );
+        }
+    }
+
+    /// Headers truncated mid-field are a typed error, not a panic or a
+    /// partial parse.
+    #[test]
+    fn short_header_is_an_error() {
+        let cases: [(&[u8], u8); 5] = [
+            (&[0xc4], 2),
+            (&[0xac, 0x10], 3),
+            (&[0xb2, 0x7a], 3),
+            (&[0xca, 0xab, 0x56], 4),
+            (&[0xae, 0x10, 0xf2, 0xb6], 5),
+        ];
+        for (bytes, need) in cases {
+            let mut section = LiteralsSection::new();
+            match section.parse_from_header(bytes) {
+                Err(LiteralsSectionParseError::NotEnoughBytes { have, need: n }) => {
+                    assert_eq!((have, n), (bytes.len(), need));
+                },
+                other => panic!("expected NotEnoughBytes for {bytes:?}, got {other:?}"),
+            }
+        }
+        // empty input fails in the bit reader before the length check
+        let mut section = LiteralsSection::new();
+        assert!(section.parse_from_header(&[]).is_err());
     }
 }
