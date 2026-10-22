@@ -113,7 +113,16 @@ impl HuffmanTable {
             bit_ranks: Vec::with_capacity(11),
             rank_indexes: Vec::with_capacity(11),
             x2: Vec::new(),
-            fse_table: FSETable::new(255),
+            // The weight alphabet is 0..=11, not the u8 range: libzstd sizes
+            // HUF_readStats' FSE workspace at
+            // FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX - 1), so a
+            // weights NCount whose max symbol exceeds 11 fails its workspace
+            // check (tableLog_tooLarge) before any weight is decoded — even
+            // for a declared symbol the bitstream never emits. Capping here
+            // rejects that class at the table read; every libzstd-accepted
+            // weights header passes that check, so it declares at most
+            // symbol 11 and nothing valid regresses.
+            fse_table: FSETable::new(11),
         }
     }
 
@@ -751,6 +760,64 @@ mod tests {
         match t.build_decoder(&src) {
             Err(HuffmanTableError::TooManyWeights { got }) => assert_eq!(got, 256),
             other => panic!("expected TooManyWeights(256), got {other:?}"),
+        }
+    }
+
+    /// Like [`fse_table`] but the NCount additionally declares the weight
+    /// symbol `declared` (probability 1) that the encoded weight list never
+    /// emits — the shape that probes the alphabet cap independent of the
+    /// decoded weight set.
+    fn fse_table_with_declared(weights: &[u8], declared: usize) -> Vec<u8> {
+        use crate::{bit_io::BitWriter, fse::fse_encoder};
+
+        // 64 slots at accuracy log 6: 40/20/3 for the emitted weights 0/1/2
+        // plus 1 for the declared-but-never-emitted symbol.
+        let mut norm = [0i32; 14];
+        norm[0] = 40;
+        norm[1] = 20;
+        norm[2] = 3;
+        norm[declared] = 1;
+        let mut fse = fse_encoder::FseBuildScratch::default();
+        let table = fse_encoder::build_table_from_probabilities_into(&norm, 6, &mut fse);
+        let mut body = Vec::new();
+        {
+            let mut bits = BitWriter::from(&mut body);
+            let mut encoder = fse_encoder::FSEEncoder::new(table, &mut bits);
+            encoder.encode_interleaved(weights);
+            encoder.finish(&mut fse);
+            bits.flush();
+        }
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(body.len() as u8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The weight-alphabet NCount is capped at symbol 11 (HUF_TABLELOG_MAX-1):
+    /// libzstd's FSE workspace sizing in HUF_readStats rejects anything above
+    /// at the table read — even when the symbol is never emitted, a shape no
+    /// Kraft/tablelog bound on the decoded weights can reject. Verified
+    /// against libzstd v1.5.7: declared 11 parses, 12+ returns tableLog_tooLarge.
+    #[test]
+    fn weight_fse_alphabet_cap() {
+        use crate::decoding::errors::FSETableError;
+
+        let weights: Vec<u8> = core::iter::repeat_n(1, 251)
+            .chain(core::iter::repeat_n(2, 2))
+            .collect();
+        // Boundary: symbol 11 declared but never emitted still parses.
+        let src = fse_table_with_declared(&weights, 11);
+        let mut t = HuffmanTable::new();
+        assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
+        assert_eq!(t.weights(), &weights[..]);
+        // One past the cap: rejected at the NCount read.
+        let src = fse_table_with_declared(&weights, 12);
+        let mut t = HuffmanTable::new();
+        match t.build_decoder(&src) {
+            Err(HuffmanTableError::FSETableError(FSETableError::TooManySymbols { got })) => {
+                assert_eq!(got, 13);
+            },
+            other => panic!("expected TooManySymbols(13), got {other:?}"),
         }
     }
 }

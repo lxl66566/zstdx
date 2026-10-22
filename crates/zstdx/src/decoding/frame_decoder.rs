@@ -470,8 +470,12 @@ impl FrameDecoder {
                 block_header.decompressed_size
             );
 
-            let bytes_read_in_block_body = block_dec
-                .decode_block_content(&block_header, &mut state.decoder_scratch, &mut source)
+            let bytes_read_in_block_body =
+                decoding::block_decoder::BlockDecoder::decode_block_content(
+                    &block_header,
+                    &mut state.decoder_scratch,
+                    &mut source,
+                )
                 .map_err(err::FailedToReadBlockBody)?;
             state.bytes_read_counter += bytes_read_in_block_body;
 
@@ -1028,8 +1032,8 @@ impl FrameDecoder {
                         }
                         state.bytes_read_counter += u64::from(block_header_size);
 
-                        let bytes_read_in_block_body = block_dec
-                            .decode_block_content(
+                        let bytes_read_in_block_body =
+                            decoding::block_decoder::BlockDecoder::decode_block_content(
                                 &block_header,
                                 &mut state.decoder_scratch,
                                 &mut mt_source,

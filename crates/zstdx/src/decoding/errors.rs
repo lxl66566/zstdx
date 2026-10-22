@@ -140,13 +140,6 @@ pub enum DecompressBlockError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeBlockContentError {
-    #[error("Can't decode next block if failed along the way. Results will be nonsense")]
-    DecoderStateIsFailed,
-    #[error(
-        "Can't decode next block body, while expecting to decode the header of the previous \
-         block. Results will be nonsense"
-    )]
-    ExpectedHeaderOfPreviousBlock,
     #[error("Error while reading bytes for {step}: {source}")]
     ReadError { step: BlockType, source: Error },
     #[error("{0:?}")]
