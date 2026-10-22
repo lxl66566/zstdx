@@ -150,6 +150,8 @@ impl Xxh64 {
         input: &[u8],
         hash_from: usize,
     ) {
+        debug_assert!(hash_from <= input.len());
+        debug_assert!(hash_from == input.len() || hash_from.is_multiple_of(32));
         // The [0, hash_from) prefix was counted when the fused scan
         // absorbed it; only the resumed range adds to the length.
         self.total += (input.len() - hash_from) as u64;
