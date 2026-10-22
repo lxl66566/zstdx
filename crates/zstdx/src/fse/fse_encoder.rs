@@ -1,6 +1,14 @@
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::{bit_io::BitWriter, encoding::seq_codes::SEQ_CODE_SPACE};
+use super::ACC_LOG_OFFSET;
+use crate::{
+    bit_io::BitWriter,
+    blocks::sequence_section::{
+        LL_DEFAULT_ACC_LOG, LL_DEFAULT_DISTRIBUTION, ML_DEFAULT_ACC_LOG, ML_DEFAULT_DISTRIBUTION,
+        OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
+    },
+    encoding::seq_codes::SEQ_CODE_SPACE,
+};
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
     pub(super) table: FSETable,
@@ -386,6 +394,11 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
     acc_log: u8,
     writer: &mut BitWriter<V>,
 ) {
+    // The serializable range: below ACC_LOG_OFFSET the nibble would
+    // underflow (an RLE table's acc_log of 0 must take the raw-byte wire
+    // mode, never this serializer), and the builder's transition packing
+    // caps accuracy at 2^12 states.
+    debug_assert!((ACC_LOG_OFFSET..=12).contains(&acc_log));
     let table_size = 1usize << acc_log;
     let nsym = probs.len();
 
@@ -425,8 +438,12 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
     // The writer may enter with up to 63 pending bits; one conditional
     // flush establishes the nb <= 47 invariant every add below relies on.
     flush!();
-    acc |= u64::from(acc_log - 5) << nb;
+    acc |= u64::from(acc_log - ACC_LOG_OFFSET) << nb;
     nb += 4;
+    // Re-establish the nb <= 47 invariant before the first symbol: the
+    // header can push nb to 51, and a 13-bit first symbol (acc_log 12)
+    // would reach 64, overflowing the flush's `acc >>` shift below.
+    flush!();
 
     let mut remaining = table_size + 1;
     let mut threshold = table_size;
@@ -1149,39 +1166,16 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
-const ML_DIST: &[i32] = &[
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
-];
-
-const LL_DIST: &[i32] = &[
-    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-    -1, -1, -1, -1,
-];
-
-const OF_DIST: &[i32] = &[
-    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
-];
-
-// Predefined-table coverage (see `select_from_counts`): the highest
-// encodable code is each distribution's last index. The LL/ML defaults
-// cover their whole wire code spaces (35/52); the OF default stops at 28
-// (libzstd's DefaultMaxOff) although the OF wire space reaches 31, so
-// offset codes 29-31 always force a dynamic table.
-const _: () = assert!(LL_DIST.len() == 36);
-const _: () = assert!(ML_DIST.len() == 53);
-const _: () = assert!(OF_DIST.len() == 29);
-
 pub(crate) fn default_ml_table() -> FSETable {
-    build_table_from_probabilities(ML_DIST, 6)
+    build_table_from_probabilities(&ML_DEFAULT_DISTRIBUTION, ML_DEFAULT_ACC_LOG)
 }
 
 pub(crate) fn default_ll_table() -> FSETable {
-    build_table_from_probabilities(LL_DIST, 6)
+    build_table_from_probabilities(&LL_DEFAULT_DISTRIBUTION, LL_DEFAULT_ACC_LOG)
 }
 
 pub(crate) fn default_of_table() -> FSETable {
-    build_table_from_probabilities(OF_DIST, 5)
+    build_table_from_probabilities(&OF_DEFAULT_DISTRIBUTION, OF_DEFAULT_ACC_LOG)
 }
 
 #[cfg(test)]

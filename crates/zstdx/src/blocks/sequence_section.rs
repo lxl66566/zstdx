@@ -7,6 +7,29 @@ pub(crate) const MAX_LITERAL_LENGTH_CODE: u8 = 35;
 pub(crate) const MAX_MATCH_LENGTH_CODE: u8 = 52;
 pub(crate) const MAX_OFFSET_CODE: u8 = 31;
 
+// The predefined ("default") FSE distributions, pinned by RFC 8878
+// (https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md).
+// Single source for the encoder's and decoder's predefined-table builds so
+// the two sides cannot drift apart. The highest encodable code is each
+// distribution's last index: the LL/ML defaults cover their whole wire code
+// spaces (35/52); the OF default stops at 28 (libzstd's DefaultMaxOff)
+// although the OF wire space reaches 31, so offset codes 29-31 always force
+// a dynamic table.
+pub(crate) const LL_DEFAULT_DISTRIBUTION: [i32; 36] = [
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1,
+];
+pub(crate) const LL_DEFAULT_ACC_LOG: u8 = 6;
+pub(crate) const ML_DEFAULT_DISTRIBUTION: [i32; 53] = [
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
+];
+pub(crate) const ML_DEFAULT_ACC_LOG: u8 = 6;
+pub(crate) const OF_DEFAULT_DISTRIBUTION: [i32; 29] = [
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
+];
+pub(crate) const OF_DEFAULT_ACC_LOG: u8 = 5;
+
 pub struct SequencesHeader {
     pub num_sequences: u32,
     pub modes: Option<CompressionModes>,

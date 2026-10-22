@@ -6,7 +6,11 @@ use super::{
     scratch::FSEScratch,
 };
 use crate::{
-    blocks::sequence_section::{MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE},
+    blocks::sequence_section::{
+        LL_DEFAULT_ACC_LOG, LL_DEFAULT_DISTRIBUTION, MAX_LITERAL_LENGTH_CODE,
+        MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE, ML_DEFAULT_ACC_LOG, ML_DEFAULT_DISTRIBUTION,
+        OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
+    },
     decoding::errors::DecodeSequenceError,
     fse::FSETable,
 };
@@ -875,10 +879,9 @@ fn maybe_update_fse_tables(
             // The predefined table is immutable; only (re)build it when the
             // scratch table currently holds something else.
             if !scratch.ll_predefined {
-                scratch.literal_lengths.build_from_probabilities(
-                    LL_DEFAULT_ACC_LOG,
-                    &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
-                )?;
+                scratch
+                    .literal_lengths
+                    .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LL_DEFAULT_DISTRIBUTION)?;
                 scratch.ll_predefined = true;
                 scratch.ll_seq_valid = false;
             }
@@ -924,7 +927,7 @@ fn maybe_update_fse_tables(
             if !scratch.of_predefined {
                 scratch
                     .offsets
-                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
+                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OF_DEFAULT_DISTRIBUTION)?;
                 scratch.of_predefined = true;
                 scratch.of_seq_valid = false;
             }
@@ -968,10 +971,9 @@ fn maybe_update_fse_tables(
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
             if !scratch.ml_predefined {
-                scratch.match_lengths.build_from_probabilities(
-                    ML_DEFAULT_ACC_LOG,
-                    &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
-                )?;
+                scratch
+                    .match_lengths
+                    .build_from_probabilities(ML_DEFAULT_ACC_LOG, &ML_DEFAULT_DISTRIBUTION)?;
                 scratch.ml_predefined = true;
                 scratch.ml_seq_valid = false;
             }
@@ -987,43 +989,11 @@ fn maybe_update_fse_tables(
     Ok(bytes_read)
 }
 
-// The default Literal Length decoding table uses an accuracy logarithm of 6 bits.
-const LL_DEFAULT_ACC_LOG: u8 = 6;
-/// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
-/// table is generated using a predefined distribution table.
-///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals-length
-const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
-    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-    -1, -1, -1, -1,
-];
-
-// The default Match Length decoding table uses an accuracy logarithm of 6 bits.
-const ML_DEFAULT_ACC_LOG: u8 = 6;
-/// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
-/// table is generated using a predefined distribution table.
-///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
-const MATCH_LENGTH_DEFAULT_DISTRIBUTION: [i32; 53] = [
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
-];
-
-// The default Match Length decoding table uses an accuracy logarithm of 5 bits.
-const OF_DEFAULT_ACC_LOG: u8 = 5;
-/// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
-/// table is generated using a predefined distribution table.
-///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
-const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
-    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
-];
-
 #[test]
 fn test_ll_default() {
     let mut table = FSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
-        .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
+        .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LL_DEFAULT_DISTRIBUTION)
         .unwrap();
 
     #[cfg(feature = "std")]

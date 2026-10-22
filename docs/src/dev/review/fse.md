@@ -1,5 +1,37 @@
 # R64 review — FSE core
 
-Scope: `crates/zstdx/src/fse/` (decoder, encoder, table transforms).
+Scope: `crates/zstdx/src/fse/` (fse_decoder.rs, fse_encoder.rs, mod.rs, 1978 lines) plus call-site contracts (decoding/sequence_section_decoder.rs table modes & packed layout, huff0 weight FSE path, dict finalize NCount writes). Reference: libzstd at `/root/programs/fork/zstd` (FSE_readNCount/FSE_buildDTable in entropy_common.c/fse_decompress.c; FSE_writeNCount/normalizeCount/normalizeM2/optimalTableLog/buildCTable/compress_usingCTable in fse_compress.c), RFC 8878.
 
-(in progress)
+Baseline before changes: debug/release/no-default-features `cargo test` all green.
+
+## Exactness audit vs libzstd (verified line-by-line, no action)
+
+- `read_probabilities` ≡ `FSE_readNCount_body`: value/threshold/max algebra identical (proved `bits_to_read == nbBits` via C's invariant `threshold <= remaining < 2*threshold`; short/mid/long branches and `return_bits(1)` match; zero-run 2-bit markers incl. C's ctz fast path equivalent; `remaining` bounded so `counter <= sum` always — `value <= remaining` on all three branches). Error-class differences only (C breaks on `charnum > maxSV` inside the loop and reports corruption/maxSymbolValue_tooSmall; this port keeps reading to the sum or input exhaustion → TooManySymbols/GetBitsError). Work is input-bounded (every iteration consumes >= 1 bit or advances the counter).
+- `build_decoding_table` ≡ `FSE_buildDTable`: -1 symbols at the top via `highThreshold`, positive spread `position = (position+step) & mask` skipping the -1 region, per-occurrence baseline/num_bits identical. Proved the `SymbolSpreadInfo` formulas equal C's `newState = (nextState << nbBits) - tableSize` per occurrence k: double `base_d + k*2*sw == (p+k)*2*sw - ts` for k < R-p, single `(k-num_double)*sw == (p+k-R)*sw`. Pinned by `soa_matches_reference` + `tables_equal`.
+- `encode_interleaved` ≡ `FSE_compress_usingCTable` wire-for-wire, including the parity-dependent init swap (C inits C2←last for even srcSize, C1←last for odd + extra join step) and the mod-4 join; final state write order matches (the data[1]-chain state first, data[0]-chain last = read first by the decoder). Verified by trace on even/odd/mod-4 cases. Single-state `encode` matches the FSE encode semantics (pinned by round_trip).
+- `normalize_count`/`normalize_m2` ≡ `FSE_normalizeCount`/`FSE_normalizeM2` including RTB_TABLE, the `-stillToDistribute >= norm[largest]>>1` corner, `total==0` and all-poor paths. C's in-loop `count[s]==total` RLE early-return is unreachable here: both callers gate RLE (`most_frequent == nb_seq`) before normalizing. Missing C tableLog validation is caller-guaranteed (optimal_table_log clamps to >= 5).
+- `optimal_table_log`/`min_table_log` ≡ C (the wrap of `highbit(src_size-1)-2` reproduced; C's final clamp is FSE_MAX_TABLELOG=12, not maxTableLog, matching the Rust `clamp(5, 12)`).
+- `write_ncount` ≡ `FSE_writeNCount`: threshold/max/value/bits accounting and zero-run marker order identical; bound `4+15*nsym)/8+16` proven safe (worst 13 bits/live symbol, 2 bits/zero; stores stay inside reserve).
+- All unsafe audited: `write_ncount` raw-ptr stores (reserve covers pos+8; no realloc between ptr derivation and set_hot_state; aliasing sound), `build_table_body` region splits (offsets 0/2048/3072/3584 in a `tab_len = 448 + ceil(ts/2)` u64 buffer, disjoint, u64-aligned), spread run stores (ts+8 slack), `tab_parts`/`state_table`/`probs`/`start` slices. No UB found. Contracts that callers must uphold are documented at each site (dead-symbol tt entries are stale pooled data; `step` on a dead symbol stays in-bounds by the dead fill).
+- Call-site contracts: seq table modes (RLE via `pack_rle_entry` self-transition, predefined rebuild gating, max_log 9/9/8 per RFC), `LL_CODES`/`ML_CODES`/`OF_CODES` sized to the MAX_* codes so `pack_seq_table`'s `codes[sym]` is bounds-safe; huff0 weights `build_decoder(.., 6)` = RFC weight max log; dict finalize writes NCount with logs >= 5.
+
+## Findings
+
+1. **BUG (fixed, 5061157)** — decoder rejected valid NCount streams. The final symbol serialized in the short form ends its read one bit past the last byte; libzstd's zero-padded read window accepts (net consumption <= stream), the Rust bounds check errored before the branch could `return_bits(1)`. Reachable in production (any encoder, incl. libzstd's own writeNCount, can emit it; found by a random distribution within 44 cases). Fix: `BitReader::get_bits_zero_padded` with slack 1 + a post-branch truncation guard (a read that keeps the padding bit is truncated). Decoder-only, no encoder bytes affected.
+2. **Latent bug (fixed, c0ce8bc)** — `write_ncount` accumulator: entering with 47 pending bits + 4 header bits = 51, and a 13-bit first symbol (acc_log 12) reached nb=64 → `acc >> 64` overflow in flush (panic debug / silent wrap release). Unreachable with current callers (acc_log <= 9); fixed with a post-header flush!() — bit-sequence-preserving, byte-neutral (round-trip + byte-identity suites green).
+3. **Latent landmine (fixed, c0ce8bc)** — `write_ncount`'s `acc_log - 5` underflows for acc_log < 5; `rle_table` builds acc_log-0 tables (legitimately never serialized — RLE writes a raw byte) but nothing guarded the serializer. Now: shared `ACC_LOG_OFFSET` (hoisted to fse/mod.rs, used by both codec halves) + `debug_assert!((ACC_LOG_OFFSET..=12).contains(&acc_log))`.
+4. **Duplication (fixed, 8d8541f)** — predefined distributions existed twice (encoder `LL/ML/OF_DIST`, decoder `*_DEFAULT_DISTRIBUTION`) with no test pinning equality; drift would break predefined-mode interop silently. Consolidated into `blocks::sequence_section` next to MAX_*_CODE; also fixed the copy-pasted "match-length" doc on the OF distribution. Byte-neutral.
+5. **Dead code (accepted)** — `ProbabilityCounterMismatch` is unreachable (loop only exits with counter == sum; values bounded by remaining). Kept as defense-in-depth: it is the analog of C's post-loop `remaining != 1` check, which IS reachable in C via its in-loop maxSV break; if the bound proof regresses, the error prevents `build_decoding_table` walking an over-subscribed spread (which would underflow `negative_idx`). Documented at the site.
+6. **Test gap (fixed, 5061157)** — the NCount serialize/parse pair had no direct property gate (round_trip only covered legacy-normalized positive distributions; never -1 weights or long zero runs). Added `ncount_roundtrip` (300 cases, acc 5..=12, -1 weights, interior runs past 24 → packed 0xFFFF markers, trailing dead symbols, byte-count equality, decode-table identity vs `build_from_probabilities`) + pinned lookahead/truncation cases. `Entry` gained `PartialEq, Eq` for the comparison.
+7. **Accepted (huff0 module's call)** — the weight FSE table is `FSETable::new(255)`; libzstd caps the weight alphabet at HUF_TABLELOG_MAX (12) inside FSE_readNCount. The Rust rejects oversized symbols later at `build_table_from_weights` (`WeightBiggerThanMaxNumBits`) — same net accept/reject on every input, different error class/timing. Left for the huff0 owner.
+8. **Accepted (minor)** — mod.rs `round_trip`'s `data.len() < 2` early return is subsumed by the later `< 64` check (test-only, harmless).
+
+## Commits
+
+- 8d8541f fse: share the predefined sequence distributions between encoder and decoder
+- c0ce8bc fse: harden write_ncount's accumulator invariant
+- 5061157 fse: accept the NCount final short-form one-bit lookahead
+
+## Tests
+
+Full `cargo test` (debug), `--release`, `--no-default-features`: green before and after each change (368 lib tests incl. the 3 new ones).
