@@ -346,7 +346,9 @@ impl Xxh64 {
                 .wrapping_add(v3.rotate_left(18));
             merge_round(merge_round(merge_round(merge_round(acc, v0), v1), v2), v3)
         } else {
-            PRIME5
+            // Short inputs never ran a round, so v[2] still holds the seed;
+            // the reference starts this branch at `seed + PRIME5`.
+            self.v[2].wrapping_add(PRIME5)
         };
         h = h.wrapping_add(self.total);
 
@@ -397,6 +399,22 @@ mod tests {
         let mut h = Xxh64::new(0);
         h.write(&[0]);
         assert_eq!(h.finish(), reference.finish());
+    }
+
+    /// The short-input finalize starts at `v[2] + PRIME5` in the reference
+    /// (`v[2]` still holds the seed there); bare PRIME5 would drop it.
+    #[test]
+    fn nonzero_seed_short_inputs_match_twox() {
+        let data: Vec<u8> = (0..40u8).collect();
+        for seed in [1u64, 0xdead_beef_cafe_f00d] {
+            for len in [0usize, 1, 3, 31] {
+                let mut reference = twox_hash::XxHash64::with_seed(seed);
+                reference.write(&data[..len]);
+                let mut h = Xxh64::new(seed);
+                h.write(&data[..len]);
+                assert_eq!(h.finish(), reference.finish(), "seed {seed:#x} len {len}");
+            }
+        }
     }
 
     /// Match twox-hash byte for byte across sizes and streaming splits: the
