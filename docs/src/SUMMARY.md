@@ -32,6 +32,8 @@
 - [R64 · FSE core](dev/review/fse.md)
 - [R64 · Huff0 + bit I/O](dev/review/huff0.md)
 - [R64 · Blocks + xxh64](dev/review/blocks.md)
+- [R65 · Decode error-path parity](dev/review/parity.md)
+- [R65 · Decode cleanups](dev/review/declean.md)
 
 ## Performance Optimization
 
