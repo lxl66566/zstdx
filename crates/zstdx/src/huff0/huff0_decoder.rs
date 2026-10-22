@@ -241,20 +241,11 @@ impl HuffmanTable {
 
             bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
 
-            // skip the 0 padding at the end of the last byte of the bit stream and throw away
-            // the first 1 found
-            let mut skipped_bits = 0;
-            loop {
-                let val = br.get_bits(1);
-                skipped_bits += 1;
-                if val == 1 || skipped_bits > 8 {
-                    break;
-                }
-            }
-            if skipped_bits > 8 {
-                // if more than 7 bits are 0, this is not the correct end of the bitstream.
-                // Either a bug or corrupted data
-                return Err(err::ExtraPadding { skipped_bits });
+            // The bitstream must end (in reading order: start) with padding
+            // zeros and a single 1 marker; more than 7 zeros means the
+            // stream is corrupt.
+            if !br.skip_padding_marker() {
+                return Err(err::ExtraPadding { skipped_bits: 9 });
             }
 
             dec1.init_state(&mut br)?;
@@ -290,6 +281,14 @@ impl HuffmanTable {
                         got: self.weights.len(),
                     });
                 }
+            }
+            // The two exhaustion breaks above skip the in-loop bound, and the
+            // inferred last weight would push a 257th symbol past the u8
+            // alphabet (aliasing symbol 256 onto 0 in the table fill).
+            if self.weights.len() > 255 {
+                return Err(err::TooManyWeights {
+                    got: self.weights.len(),
+                });
             }
         } else {
             // If the header byte is greater than or equal to 128,
@@ -350,10 +349,12 @@ impl HuffmanTable {
         self.bits.resize(self.weights.len() + 1, 0);
 
         let mut weight_sum: u32 = 0;
+        let mut weight_one_count = 0usize;
         for w in &self.weights {
             if *w > MAX_MAX_NUM_BITS {
                 return Err(err::WeightBiggerThanMaxNumBits { got: *w });
             }
+            weight_one_count += usize::from(*w == 1);
             weight_sum += if *w > 0 {
                 1_u32 << (*w - 1)
             } else {
@@ -374,6 +375,18 @@ impl HuffmanTable {
         }
 
         let last_weight = highest_bit_set(left_over) as u8;
+
+        // libzstd's tree-validity check (HUF_readStats): the maximum-weight
+        // class (weight 1, inferred last weight included) must hold an even
+        // count of at least two symbols. Complete-but-non-canonical weight
+        // sets (e.g. raw [2, 2] with the inferred 3) parse Kraft-exact yet
+        // cannot come from a real Huffman tree, so libzstd rejects them.
+        // (The odd half is already implied by the leftover power-of-two
+        // check; it stays for structural parity with the reference.)
+        let rank_one = weight_one_count + usize::from(last_weight == 1);
+        if rank_one < 2 || rank_one % 2 == 1 {
+            return Err(err::InvalidWeightOneCount { got: rank_one });
+        }
 
         for symbol in 0..self.weights.len() {
             let bits = if self.weights[symbol] > 0 {
@@ -622,4 +635,122 @@ pub struct Entry {
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raw (4-bit) weight description: header 128 + count, then the nibbles
+    /// (high first), the trailing low nibble of an odd count is padding.
+    fn raw_table(weights: &[u8]) -> Vec<u8> {
+        let mut out = vec![127 + weights.len() as u8];
+        for pair in weights.chunks(2) {
+            let lo = if pair.len() == 2 {
+                pair[1]
+            } else {
+                0
+            };
+            out.push((pair[0] << 4) | lo);
+        }
+        out
+    }
+
+    #[test]
+    fn rejects_weight_sets_without_rank_one_symbols() {
+        // [2, 2] closes Kraft-exact with the inferred weight 3, but an empty
+        // maximum-weight class cannot come from a real Huffman tree
+        // (libzstd's rankStats[1] < 2 check).
+        let mut t = HuffmanTable::new();
+        match t.build_decoder(&raw_table(&[2, 2])) {
+            Err(HuffmanTableError::InvalidWeightOneCount { got: 0 }) => {},
+            other => panic!("expected InvalidWeightOneCount(0), got {other:?}"),
+        }
+        // [3] has the same shape one weight class up.
+        let mut t = HuffmanTable::new();
+        match t.build_decoder(&raw_table(&[3])) {
+            Err(HuffmanTableError::InvalidWeightOneCount { got: 0 }) => {},
+            other => panic!("expected InvalidWeightOneCount(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_canonical_weight_sets() {
+        // [2, 1]: the inferred weight 1 closes an even weight-1 pair.
+        let mut t = HuffmanTable::new();
+        let src = raw_table(&[2, 1]);
+        assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
+        assert_eq!(t.max_num_bits, 2);
+        // [1, 1, 1, 1]: four 3-bit codes plus the inferred 1-bit code.
+        let mut t = HuffmanTable::new();
+        let src = raw_table(&[1, 1, 1, 1]);
+        assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
+        assert_eq!(t.max_num_bits, 3);
+        // A single written weight is the two-symbol minimum (header 128).
+        let mut t = HuffmanTable::new();
+        let src = raw_table(&[1]);
+        assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
+        assert_eq!(t.max_num_bits, 1);
+    }
+
+    /// FSE-compressed weights description (the same pipeline
+    /// `write_table_desc` produces) for hand-chosen weight lists.
+    fn fse_table(weights: &[u8]) -> Vec<u8> {
+        use crate::{bit_io::BitWriter, fse::fse_encoder};
+
+        let mut counts = [0u32; 12];
+        let mut max_w = 0usize;
+        for &w in weights {
+            counts[w as usize] += 1;
+            max_w = max_w.max(w as usize);
+        }
+        let n = weights.len();
+        let table_log = fse_encoder::optimal_table_log(6, n, max_w);
+        let mut norm = [0i32; 12];
+        assert!(fse_encoder::normalize_count(
+            &mut norm, table_log, &counts, n, max_w, false
+        ));
+        let mut fse = fse_encoder::FseBuildScratch::default();
+        let table =
+            fse_encoder::build_table_from_probabilities_into(&norm[..=max_w], table_log, &mut fse);
+        let mut body = Vec::new();
+        {
+            let mut bits = BitWriter::from(&mut body);
+            let mut encoder = fse_encoder::FSEEncoder::new(table, &mut bits);
+            encoder.encode_interleaved(weights);
+            encoder.finish(&mut fse);
+            bits.flush();
+        }
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(body.len() as u8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn fse_weights_decode_count_bound() {
+        // 251 ones + 2 twos: sum 255, leftover 1, rank-1 count 252 — the
+        // maximum legal written-weight count (255 with the inferred one).
+        let weights: Vec<u8> = core::iter::repeat_n(1, 251)
+            .chain(core::iter::repeat_n(2, 2))
+            .collect();
+        let src = fse_table(&weights);
+        let mut t = HuffmanTable::new();
+        assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
+        assert_eq!(t.weights(), &weights[..]);
+        assert_eq!(t.max_num_bits, 8);
+
+        // One more weight exceeds the u8 alphabet once the last symbol is
+        // inferred; the count bound must reject it on every exit path of
+        // the interleaved decode loop.
+        let weights: Vec<u8> = core::iter::repeat_n(1, 252)
+            .chain(core::iter::repeat_n(2, 4))
+            .collect();
+        let src = fse_table(&weights);
+        let mut t = HuffmanTable::new();
+        match t.build_decoder(&src) {
+            Err(HuffmanTableError::TooManyWeights { got }) => assert_eq!(got, 256),
+            other => panic!("expected TooManyWeights(256), got {other:?}"),
+        }
+    }
 }

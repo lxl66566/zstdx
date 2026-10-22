@@ -34,17 +34,7 @@ pub fn round_trip(data: &[u8]) {
     let mut decoder = HuffmanDecoder::new(&decoder_table);
 
     let mut br = BitReaderReversed::new(&encoded[table_bytes as usize..]);
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    // if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or
-    // corrupted data
-    assert!(skipped_bits <= 8, "Corrupted end marker");
+    assert!(br.skip_padding_marker(), "Corrupted end marker");
 
     decoder.init_state(&mut br);
     let mut decoded = Vec::new();
@@ -85,15 +75,7 @@ pub fn round_trip_x2(data: &[u8]) {
     }
 
     let mut br = BitReaderReversed::new(&encoded[table_bytes as usize..]);
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    assert!(skipped_bits <= 8, "Corrupted end marker");
+    assert!(br.skip_padding_marker(), "Corrupted end marker");
 
     let mut decoded = Vec::new();
     while decoded.len() < data.len() {
