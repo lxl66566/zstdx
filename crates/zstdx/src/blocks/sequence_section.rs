@@ -190,3 +190,90 @@ impl SequencesHeader {
         Ok(bytes_read)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CompressionModes, ModeType, SequencesHeader};
+
+    /// RFC 8878 3.1.1.3.1.1 Number_of_Sequences forms, including the
+    /// zero-count forms that omit the Symbol_Compression_Modes byte.
+    #[test]
+    fn number_of_sequences_forms() {
+        let mut header = SequencesHeader::new();
+        header.parse_from_header(&[0x00]).unwrap();
+        assert_eq!((header.num_sequences, header.modes.is_none()), (0, true));
+
+        header = SequencesHeader::new();
+        header.parse_from_header(&[0x05, 0xe4]).unwrap();
+        assert_eq!((header.num_sequences, header.modes.is_some()), (5, true));
+
+        // the two-byte form decoding to zero also omits the mode byte
+        header = SequencesHeader::new();
+        header.parse_from_header(&[0x80, 0x00]).unwrap();
+        assert_eq!((header.num_sequences, header.modes.is_none()), (0, true));
+
+        header = SequencesHeader::new();
+        header.parse_from_header(&[0x80, 0x05, 0xe4]).unwrap();
+        assert_eq!(header.num_sequences, 5);
+
+        header = SequencesHeader::new();
+        header.parse_from_header(&[0xfe, 0xff, 0xe4]).unwrap();
+        assert_eq!(header.num_sequences, 0x7eff);
+
+        header = SequencesHeader::new();
+        header.parse_from_header(&[0xff, 0x00, 0x01, 0xe4]).unwrap();
+        assert_eq!(header.num_sequences, 0x8000);
+    }
+
+    /// Bytes consumed per form; the caller advances its cursor by this.
+    #[test]
+    fn bytes_read_per_form() {
+        let cases: [(&[u8], u8); 6] = [
+            (&[0x00], 1),
+            (&[0x05, 0xe4], 2),
+            (&[0x80, 0x00], 2),
+            (&[0x80, 0x05, 0xe4], 3),
+            (&[0xfe, 0xff, 0xe4], 3),
+            (&[0xff, 0x00, 0x01, 0xe4], 4),
+        ];
+        for (bytes, want) in cases {
+            let mut header = SequencesHeader::new();
+            assert_eq!(header.parse_from_header(bytes).unwrap(), want, "{bytes:?}");
+        }
+    }
+
+    /// Every form truncated right before a byte it needs is a typed error.
+    #[test]
+    fn short_header_is_an_error() {
+        for bytes in [
+            &[0x05][..],
+            &[0x80][..],
+            &[0x80, 0x01][..],
+            &[0xff][..],
+            &[0xff, 0x00, 0x01][..],
+            &[][..],
+        ] {
+            let mut header = SequencesHeader::new();
+            assert!(
+                header.parse_from_header(bytes).is_err(),
+                "expected error for {bytes:?}"
+            );
+        }
+    }
+
+    /// The mode byte packs LL/OF/ML as 2-bit fields high to low; the low two
+    /// bits are reserved and must not affect the parsed modes.
+    #[test]
+    fn compression_mode_bit_packing() {
+        for byte in [0xe4, 0xe5] {
+            let modes = CompressionModes(byte);
+            assert!(matches!(modes.ll_mode(), ModeType::Repeat));
+            assert!(matches!(modes.of_mode(), ModeType::FSECompressed));
+            assert!(matches!(modes.ml_mode(), ModeType::RLE));
+        }
+        let modes = CompressionModes(0x00);
+        assert!(matches!(modes.ll_mode(), ModeType::Predefined));
+        assert!(matches!(modes.of_mode(), ModeType::Predefined));
+        assert!(matches!(modes.ml_mode(), ModeType::Predefined));
+    }
+}

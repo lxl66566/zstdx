@@ -10,7 +10,7 @@ pub struct BlockHeader {
     /// Influences the meaning of `block_size`.
     pub block_type: BlockType,
     /// - For `Raw` blocks, this is the size of the block's content in bytes.
-    /// - For `RLE` blocks, there will be a single byte follwing the header, repeated `block_size`
+    /// - For `RLE` blocks, there will be a single byte following the header, repeated `block_size`
     ///   times.
     /// - For `Compressed` blocks, this is the length of the compressed data.
     ///
@@ -31,6 +31,9 @@ impl BlockHeader {
     /// that reserve the header before the block content's size is known and
     /// patch it in place afterwards.
     pub fn serialize_into(self, prefix: &mut [u8; 3]) {
+        // The wire field is 21 bits; a larger size would silently wrap into
+        // the discarded 4th byte and corrupt the frame.
+        debug_assert!(self.block_size < 1 << 21);
         let encoded_block_type = match self.block_type {
             BlockType::Raw => 0,
             BlockType::RLE => 1,
