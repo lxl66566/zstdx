@@ -1,5 +1,6 @@
 use alloc::{boxed::Box, vec::Vec};
 
+use super::ACC_LOG_OFFSET;
 use crate::{
     bit_io::BitWriter,
     blocks::sequence_section::{
@@ -393,6 +394,11 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
     acc_log: u8,
     writer: &mut BitWriter<V>,
 ) {
+    // The serializable range: below ACC_LOG_OFFSET the nibble would
+    // underflow (an RLE table's acc_log of 0 must take the raw-byte wire
+    // mode, never this serializer), and the builder's transition packing
+    // caps accuracy at 2^12 states.
+    debug_assert!((ACC_LOG_OFFSET..=12).contains(&acc_log));
     let table_size = 1usize << acc_log;
     let nsym = probs.len();
 
@@ -432,8 +438,12 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
     // The writer may enter with up to 63 pending bits; one conditional
     // flush establishes the nb <= 47 invariant every add below relies on.
     flush!();
-    acc |= u64::from(acc_log - 5) << nb;
+    acc |= u64::from(acc_log - ACC_LOG_OFFSET) << nb;
     nb += 4;
+    // Re-establish the nb <= 47 invariant before the first symbol: the
+    // header can push nb to 51, and a 13-bit first symbol (acc_log 12)
+    // would reach 64, overflowing the flush's `acc >>` shift below.
+    flush!();
 
     let mut remaining = table_size + 1;
     let mut threshold = table_size;

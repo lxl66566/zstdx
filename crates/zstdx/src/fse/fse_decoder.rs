@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use super::ACC_LOG_OFFSET;
 use crate::{
     bit_io::{BitReader, BitReaderReversed},
     decoding::errors::{FSEDecoderError, FSETableError},
@@ -350,10 +351,6 @@ pub struct Entry {
     /// The byte that should be put in the decode output when encountering this state.
     pub symbol: u8,
 }
-
-/// This value is added to the first 4 bits of the stream to determine the
-/// `Accuracy_Log`
-const ACC_LOG_OFFSET: u8 = 5;
 
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);

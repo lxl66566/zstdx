@@ -18,6 +18,10 @@ pub use fse_decoder::*;
 
 pub mod fse_encoder;
 
+/// Offset added to the 4-bit accuracy-log nibble of an NCount stream: the
+/// format's minimum FSE table log (libzstd's FSE_MIN_TABLELOG).
+pub(crate) const ACC_LOG_OFFSET: u8 = 5;
+
 #[test]
 fn tables_equal() {
     let probs = &[0, 0, -1, 3, 2, 2, (1 << 6) - 8];
