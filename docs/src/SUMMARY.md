@@ -34,6 +34,8 @@
 - [R64 · Blocks + xxh64](dev/review/blocks.md)
 - [R65 · Decode error-path parity](dev/review/parity.md)
 - [R65 · Decode cleanups](dev/review/declean.md)
+- [R66 · Parity bench mode](dev/review/diffbench.md)
+- [R66 · Dictionary parity](dev/review/dictparity.md)
 
 ## Performance Optimization
 
