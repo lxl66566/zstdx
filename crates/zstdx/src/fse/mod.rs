@@ -22,6 +22,17 @@ pub mod fse_encoder;
 /// format's minimum FSE table log (libzstd's FSE_MIN_TABLELOG).
 pub(crate) const ACC_LOG_OFFSET: u8 = 5;
 
+/// Serialize one normalized distribution as a wire NCount stream (the fuzz
+/// targets' counterpart of the internal `write_ncount`; `probs` must sum to
+/// `1 << acc_log`, counting a -1 entry as one state, and acc_log must be in
+/// `ACC_LOG_OFFSET..=12`).
+#[cfg(feature = "fuzz_exports")]
+pub fn serialize_ncount(probs: &[i32], acc_log: u8) -> alloc::vec::Vec<u8> {
+    let mut writer = crate::bit_io::BitWriter::new();
+    fse_encoder::write_ncount(probs, acc_log, &mut writer);
+    writer.dump()
+}
+
 #[test]
 fn tables_equal() {
     let probs = &[0, 0, -1, 3, 2, 2, (1 << 6) - 8];
