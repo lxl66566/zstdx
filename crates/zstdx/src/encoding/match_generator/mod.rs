@@ -1282,9 +1282,22 @@ impl MatchGeneratorDriver {
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
         let mut params = params_for_row(level, self.shape, self.small_src_row, self.row_attempts);
-        // The frame's reach probe result: only the row's stock reach is
-        // replaceable, never a shape-clamped one.
-        if self.reach_choice == ReachChoice::Shrink && params.chain_reach == Some(KEEP_REACH) {
+        // The frame's reach probe result: only a probe-subject row's
+        // stock reach is replaceable — never a shape-clamped one, and
+        // never a row that merely shares the KEEP_REACH value: the
+        // btlazy rows 13-15 and opt row 16 ride `chain_reach` as their
+        // tree search domain at exactly KEEP_REACH without being probe
+        // subjects (see `reach_probe_eligible`). The value check alone
+        // let a pooled driver's Shrink verdict from an earlier row-9
+        // frame collapse a later Best-tier frame's 4 MiB domain to
+        // SHRINK_REACH — the single-threaded stream cores never
+        // re-declare the choice, so the bytes depended on what the
+        // pooled core compressed before (R63's dump --stream gate:
+        // json 32 MiB, -721,873 B).
+        if self.reach_choice == ReachChoice::Shrink
+            && params.chain_reach == Some(KEEP_REACH)
+            && matches!(params.strategy, Strategy::Chain(_))
+        {
             params.chain_reach = Some(SHRINK_REACH);
         }
         // Fast/dfast LDM arming (R19): the row's stock window (768 KiB-2 MiB)
