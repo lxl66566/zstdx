@@ -25,42 +25,23 @@ use crate::{
 
 pub struct BlockDecoder {
     header_buffer: [u8; 3],
-    internal_state: DecoderState,
-}
-
-enum DecoderState {
-    ReadyToDecodeNextHeader,
-    ReadyToDecodeNextBody,
-    #[allow(dead_code)]
-    Failed, /* TODO put "self.internal_state = DecoderState::Failed;" everywhere an
-             * unresolvable error occurs */
 }
 
 /// Create a new [BlockDecoder].
 pub fn new() -> BlockDecoder {
     BlockDecoder {
-        internal_state: DecoderState::ReadyToDecodeNextHeader,
         header_buffer: [0u8; 3],
     }
 }
 
 impl BlockDecoder {
     pub fn decode_block_content(
-        &mut self,
         header: &BlockHeader,
         workspace: &mut DecoderScratch, /* reuse this as often as possible. Not only if the
                                          * trees are reused but also reuse the allocations when
                                          * building new trees */
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
-        match self.internal_state {
-            DecoderState::ReadyToDecodeNextBody => { /* Happy :) */ },
-            DecoderState::Failed => return Err(DecodeBlockContentError::DecoderStateIsFailed),
-            DecoderState::ReadyToDecodeNextHeader => {
-                return Err(DecodeBlockContentError::ExpectedHeaderOfPreviousBlock)
-            },
-        }
-
         let block_type = header.block_type;
         // Raw/RLE blocks declare their output in the header: bounded to
         // MAX_BLOCK_SIZE there, but a frame with a small window must keep
@@ -85,8 +66,6 @@ impl BlockDecoder {
                     .buffer
                     .extend_and_fill(buf[0], header.decompressed_size as usize);
 
-                self.internal_state = DecoderState::ReadyToDecodeNextHeader;
-
                 Ok(1)
             },
             BlockType::Raw => {
@@ -98,7 +77,6 @@ impl BlockDecoder {
                         source: err,
                     })?;
 
-                self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))
             },
 
@@ -111,8 +89,6 @@ impl BlockDecoder {
 
             BlockType::Compressed => {
                 Self::decompress_block(header, workspace, source)?;
-
-                self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.content_size))
             },
         }
@@ -396,9 +372,6 @@ impl BlockDecoder {
 
         let last_block = self.is_last();
 
-        self.reset_buffer();
-        self.internal_state = DecoderState::ReadyToDecodeNextBody;
-
         // just return 3. Blockheaders always take 3 bytes
         Ok((
             BlockHeader {
@@ -409,12 +382,6 @@ impl BlockDecoder {
             },
             3,
         ))
-    }
-
-    fn reset_buffer(&mut self) {
-        self.header_buffer[0] = 0;
-        self.header_buffer[1] = 0;
-        self.header_buffer[2] = 0;
     }
 
     fn is_last(&self) -> bool {

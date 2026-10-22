@@ -20,3 +20,15 @@ Change: `HuffmanTable::new` builds its weight `FSETable` at `FSETable::new(11)` 
 No-valid-stream-regression proof: every libzstd-accepted weights header passes the workspace check, hence declares maxSV ≤ 11, hence still parses under the cap; the flipped inputs are exactly the maxSV ≥ 12 headers, all of which libzstd rejects. Note the cap also makes weight value 12 unreachable via the FSE form — matching libzstd, where the same workspace check precludes it (the raw 4-bit form still carries weight-12 values, and its existing build-time checks are untouched).
 
 Tests: `weight_fse_alphabet_cap` (declared-never-emitted 11 parses with exact weight round-trip; 12 → `TooManySymbols(13)`), via the new `fse_table_with_declared` helper. R64's `fse_weights_decode_count_bound` (255 legal weights) stays green — its NCount maxSV is 2.
+
+## Task 2 — vestigial BlockDecoder state machine (todo 20c)
+
+**Verdict: done.**
+
+Removed from `decoding/block_decoder.rs`:
+
+- `enum DecoderState` + the `internal_state` field and its transition writes. `Failed` was never set (its TODO admitted the intent was never carried out); `ExpectedHeaderOfPreviousBlock` was unreachable in-tree: every `decode_block_content` call site (the ring loop and the MT fallback in `frame_decoder.rs`) constructs a fresh decoder and goes through `read_block_header` first, and `decompress_block_flat` (the flat/MT paths) never consulted the state at all.
+- `reset_buffer()` (3-byte zeroing of `header_buffer` after every header) — dead: `read_block_header` fully overwrites the buffer via `read_exact` before `is_last`/`block_type`/`block_content_size` read any of it.
+- `DecodeBlockContentError::{DecoderStateIsFailed, ExpectedHeaderOfPreviousBlock}` — their only construction sites were the removed match; the enum is `#[non_exhaustive]`, so removal is compatible.
+
+`BlockDecoder` now holds only `header_buffer`. Invariant relied on: header-then-body ordering is structural at every call site (fresh decoder per frame, read/decode pairs inside one loop). Behavior identical for every in-tree path; the flat path was already stateless, and the removed match sat at the once-per-block entry of the ring path, not in any symbol loop.
