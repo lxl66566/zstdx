@@ -151,3 +151,166 @@ pub fn round_trip(data: &[u8]) {
 
     assert_eq!(br.bits_remaining(), 0);
 }
+
+#[cfg(test)]
+mod ncount_tests {
+    use super::{ACC_LOG_OFFSET, FSETable, fse_encoder::write_ncount};
+    use crate::bit_io::BitWriter;
+
+    /// `write_ncount`'s description must be read back by `read_probabilities`
+    /// exactly: the same distribution (up to the last live symbol; trailing
+    /// zeros are not serialized), the same accuracy log, a byte count equal to
+    /// the written bytes, and the identical decoding table a direct
+    /// `build_from_probabilities` produces. Pins the zero-run marker path —
+    /// runs past 24 exercise the packed 0xFFFF marker form — and the -1
+    /// low-probability wire form against the decoder, across the full
+    /// serializable accuracy range.
+    #[test]
+    fn ncount_roundtrip() {
+        let mut seed = 0x9e3779b9_7f4a7c15u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300u32 {
+            let acc_log = ACC_LOG_OFFSET + (rand() % 8) as u8;
+            let table_size = 1u64 << acc_log;
+            let nsym = 2 + (rand() % 62) as usize;
+            let mut probs = alloc::vec![0i32; nsym];
+
+            // Every 5th case plants an interior dead run past 24 symbols so
+            // the serializer takes its packed 0xFFFF marker form. The run
+            // stays clear of the last symbol.
+            let (run_start, run_end) = if case % 5 == 0 {
+                let run = 25 + (rand() % 10) as usize;
+                let start = 1 + (rand() % ((nsym / 2).max(1) as u64)) as usize;
+                let end = (start + run).min(nsym - 1);
+                (Some(start), end)
+            } else {
+                (None, 0)
+            };
+
+            // Assign single states (or -1 wire forms) while the state budget
+            // lasts; everything else stays dead.
+            let mut budget = table_size;
+            let mut has_positive = false;
+            for (idx, prob) in probs.iter_mut().enumerate() {
+                if run_start.is_some_and(|s| idx >= s && idx < run_end) {
+                    continue;
+                }
+                let r = rand();
+                if budget <= 1 || r % 4 == 0 {
+                    continue; // dead symbol
+                }
+                budget -= 1;
+                if r % 9 == 0 && budget > 1 {
+                    *prob = -1;
+                } else {
+                    *prob = 1;
+                    has_positive = true;
+                }
+            }
+            let in_run = |i: usize| run_start.is_some_and(|s| i >= s && i < run_end);
+            if !has_positive {
+                // The pour below needs a positive sink. Promoting a dead
+                // slot costs one of the >= 1 states the assignment loop
+                // left over; if every live slot is a -1, promote one of
+                // those instead (same single-state cost, no extra budget).
+                if let Some(i) = (0..nsym).find(|&i| probs[i] == 0 && !in_run(i)) {
+                    budget -= 1;
+                    probs[i] = 1;
+                } else {
+                    let i = (0..nsym).find(|&i| probs[i] == -1).unwrap();
+                    probs[i] = 1;
+                }
+            }
+
+            // Pour the remaining states onto the live positives in random
+            // chunks so the sum lands exactly on 1 << acc_log.
+            while budget > 0 {
+                let idx = (rand() as usize) % nsym;
+                if probs[idx] > 0 {
+                    let add = 1 + rand() % budget;
+                    probs[idx] += add as i32;
+                    budget -= add;
+                }
+            }
+            // -1 costs one state; positives cost their weight.
+            let sum: i32 = probs
+                .iter()
+                .map(|&p| {
+                    if p == -1 {
+                        1
+                    } else {
+                        p
+                    }
+                })
+                .sum();
+            assert_eq!(sum as u64, table_size, "case {case} generator");
+
+            let mut writer = BitWriter::new();
+            write_ncount(&probs, acc_log, &mut writer);
+            let bytes = writer.dump();
+
+            let mut decoded = FSETable::new(255);
+            let used = match decoded.build_decoder(&bytes, 12) {
+                Ok(u) => u,
+                Err(e) => {
+                    panic!("case {case} acc {acc_log} probs {probs:?}: {e:?}");
+                },
+            };
+            assert_eq!(used, bytes.len(), "case {case} consumed bytes");
+            assert_eq!(decoded.accuracy_log, acc_log, "case {case} acc_log");
+
+            // Trailing dead symbols are not serialized: compare through the
+            // last live one, then pin both paths to the same decoding table.
+            let last = probs.iter().rposition(|&p| p != 0).unwrap();
+            let mut reference = FSETable::new(255);
+            reference
+                .build_from_probabilities(acc_log, &probs[..=last])
+                .unwrap();
+            assert_eq!(
+                decoded.decode, reference.decode,
+                "case {case} decode table probs {probs:?}"
+            );
+        }
+    }
+
+    /// The final symbol's short form legally ends its read one bit past the
+    /// last byte of the description; libzstd's zero-padded read window
+    /// accepts it, so this decoder must too. Pins the exact distribution
+    /// that first exposed the off-by-one rejection.
+    #[test]
+    fn ncount_final_short_form_lookahead() {
+        // acc_log 10, table 1024: the trailing -1 serializes to a single
+        // short-form bit landing on the last bit of the 14th byte.
+        let probs: &[i32] = &[-1, 0, 1, -1, 1, 70, 0, 1, 1, 888, 59, -1];
+        let mut writer = BitWriter::new();
+        write_ncount(probs, 10, &mut writer);
+        let bytes = writer.dump();
+        assert_eq!(bytes.len(), 14);
+        let mut table = FSETable::new(255);
+        let used = table.build_decoder(&bytes, 12).unwrap();
+        assert_eq!(used, 14);
+        assert_eq!(table.accuracy_log, 10);
+    }
+
+    /// A description truncated beyond the one-bit lookahead must be
+    /// rejected, not zero-padded through.
+    #[test]
+    fn ncount_truncated() {
+        let probs: &[i32] = &[-1, 0, 1, -1, 1, 70, 0, 1, 1, 888, 59, -1];
+        let mut writer = BitWriter::new();
+        write_ncount(probs, 10, &mut writer);
+        let bytes = writer.dump();
+        for cut in [11, 12, 13] {
+            let mut table = FSETable::new(255);
+            assert!(
+                table.build_decoder(&bytes[..cut], 12).is_err(),
+                "cut {cut} must be rejected"
+            );
+        }
+    }
+}

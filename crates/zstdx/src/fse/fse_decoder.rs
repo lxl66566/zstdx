@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use super::ACC_LOG_OFFSET;
 use crate::{
-    bit_io::{BitReader, BitReaderReversed},
+    bit_io::{BitReader, BitReaderReversed, GetBitsError},
     decoding::errors::{FSEDecoderError, FSETableError},
 };
 
@@ -277,7 +277,11 @@ impl FSETable {
             let max_remaining_value = probability_sum - probability_counter + 1;
             let bits_to_read = highest_bit_set(max_remaining_value);
 
-            let unchecked_value = br.get_bits(bits_to_read as usize)? as u32;
+            // The final symbol may legally be serialized in the short form,
+            // its read looking one bit past the end of the stream before the
+            // branch below unreads that bit (libzstd's reader zero-pads its
+            // read window the same way), so tolerate a one-bit shortfall.
+            let unchecked_value = br.get_bits_zero_padded(bits_to_read as usize, 1)? as u32;
 
             let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
             let mask = (1 << (bits_to_read - 1)) - 1;
@@ -291,6 +295,18 @@ impl FSETable {
             } else {
                 unchecked_value
             };
+
+            // Only the short form's returned lookahead may touch the zero
+            // padding; if the index is still past the end here, a long-form
+            // or mid-form read consumed padding bits: a truncated stream.
+            if br.bits_read() > source.len() * 8 {
+                return Err(FSETableError::GetBitsError(
+                    GetBitsError::NotEnoughRemainingBits {
+                        requested: bits_to_read as usize,
+                        remaining: bits_to_read as usize - 1,
+                    },
+                ));
+            }
 
             let prob = (value as i32) - 1;
 
@@ -317,6 +333,12 @@ impl FSETable {
             }
         }
 
+        // Unreachable in practice: the loop above only exits once the
+        // counter reaches the sum (every read value is bounded by the
+        // remaining mass), so this only fires if that bound regresses. It
+        // mirrors libzstd's post-loop `remaining != 1` corruption check,
+        // which is reachable in C because its loop breaks on the symbol
+        // cap while this port keeps reading instead.
         if probability_counter != probability_sum {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_counter,
@@ -341,7 +363,7 @@ impl FSETable {
 }
 
 /// A single entry in an FSE table.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// This value is used as an offset value, and it is added
     /// to a value read from the stream to determine the next state value.

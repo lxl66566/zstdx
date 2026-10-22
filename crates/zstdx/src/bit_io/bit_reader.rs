@@ -88,6 +88,36 @@ impl<'s> BitReader<'s> {
 
         Ok(value)
     }
+
+    /// Read `n` bits, tolerating up to `slack` missing bits past the end of
+    /// the source by serving them as zeros: the index moves past the end by
+    /// the served count, and a `return_bits` of exactly that count restores
+    /// it, so a short-form read-then-unread pair stays within `bits_read`'s
+    /// source bounds. This mirrors libzstd's zero-padded NCount read window,
+    /// where the final symbol's short form legally looks one bit past the
+    /// last byte. Errors when more than `slack` bits would be missing.
+    pub fn get_bits_zero_padded(&mut self, n: usize, slack: usize) -> Result<u64, GetBitsError> {
+        let total = self.source.len() * 8;
+        if self.idx >= total {
+            return Err(GetBitsError::NotEnoughRemainingBits {
+                requested: n,
+                remaining: 0,
+            });
+        }
+        let remaining = total - self.idx;
+        if remaining >= n {
+            return self.get_bits(n);
+        }
+        if n - remaining > slack {
+            return Err(GetBitsError::NotEnoughRemainingBits {
+                requested: n,
+                remaining,
+            });
+        }
+        let value = self.get_bits(remaining)?;
+        self.idx += n - remaining;
+        Ok(value)
+    }
 }
 
 #[derive(Debug)]
