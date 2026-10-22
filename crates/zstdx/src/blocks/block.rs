@@ -22,21 +22,23 @@ impl core::fmt::Display for BlockType {
             BlockType::Compressed => write!(f, "Compressed"),
             BlockType::Raw => write!(f, "Raw"),
             BlockType::RLE => write!(f, "RLE"),
-            BlockType::Reserved => write!(f, "Reserverd"),
+            BlockType::Reserved => write!(f, "Reserved"),
         }
     }
 }
 
-/// A representation of a single block header. As well as containing a frame header,
-/// each Zstandard frame contains one or more blocks.
+/// A representation of a single block header. Each Zstandard frame contains
+/// one or more blocks, each introduced by such a header.
 pub struct BlockHeader {
     /// Whether this block is the last block in the frame.
     /// It may be followed by an optional `Content_Checksum` if it is.
     pub last_block: bool,
     pub block_type: BlockType,
-    /// The size of the decompressed data. If the block type
-    /// is [BlockType::Reserved] or [BlockType::Compressed],
-    /// this value is set to zero and should not be referenced.
+    /// The number of decompressed bytes the block produces. For [BlockType::Raw]
+    /// this equals `content_size`, for [BlockType::RLE] it is the repetition
+    /// count. For [BlockType::Reserved] and [BlockType::Compressed] it is set to
+    /// zero and should not be referenced (a compressed block's output size is
+    /// only known after decoding).
     pub decompressed_size: u32,
     /// The size of the block. If the block is [BlockType::RLE],
     /// this value will be 1.

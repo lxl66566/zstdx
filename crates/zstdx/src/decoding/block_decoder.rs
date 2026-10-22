@@ -374,14 +374,6 @@ impl BlockDecoder {
         &mut self,
         mut r: impl Read,
     ) -> Result<(BlockHeader, u8), BlockHeaderReadError> {
-        // match self.internal_state {
-        //    DecoderState::ReadyToDecodeNextHeader => {/* Happy :) */},
-        //    DecoderState::Failed => return Err(format!("Cant decode next block if failed along the
-        // way. Results will be nonsense")),    DecoderState::ReadyToDecodeNextBody =>
-        // return Err(format!("Cant decode next block header, while expecting to decode the body of
-        // the previous block. Results will be nonsense")),
-        //}
-
         r.read_exact(&mut self.header_buffer[0..3])?;
 
         let btype = self.block_type()?;
