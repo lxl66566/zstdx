@@ -163,8 +163,12 @@ pub(crate) fn write_table_desc(
                 let fse_len = scratch.desc_fse.len();
                 // libzstd's FSE-vs-raw gate in HUF_writeCTable_wksp. The raw
                 // form's header cannot count past 128 weights, so wider
-                // alphabets keep the FSE form unconditionally.
-                if fse_len > 1 && (fse_len < n / 2 || n > 128) {
+                // alphabets keep the FSE form unconditionally. fse_len < 128
+                // keeps the header byte below the raw-form range (128): a
+                // Kraft-valid table's weight stream tops out at ~1.9
+                // bits/symbol plus the table description, so a longer form
+                // means an invariant broke.
+                if fse_len > 1 && fse_len < 128 && (fse_len < n / 2 || n > 128) {
                     desc.push(fse_len as u8);
                     desc.extend_from_slice(&scratch.desc_fse);
                     return;
@@ -202,8 +206,11 @@ pub(crate) fn write_table_desc(
             }
         }
     }
-    debug_assert!(n <= 128);
     // Raw 4-bit weights; the header counts the stored (non-last) weights.
+    // Reaching here with n > 128 would wrap the header byte into the FSE
+    // range and emit a corrupt description (unreachable per the entropy
+    // bound above).
+    assert!(n <= 128, "raw weight form cannot address {n} weights");
     desc.push(n as u8 + 127);
     let (pairs, remainder) = weights.as_chunks::<2>();
     for pair in pairs {
@@ -1137,4 +1144,45 @@ mod optimal_literal_log_tests {
         // total 2781: maxBitsSrc 10, minBits 8
         assert_eq!(optimal_literal_log(&counts), 10);
     }
+}
+
+#[test]
+fn wide_alphabet_table_desc_stays_fse_addressable() {
+    // Near-maximum weight-stream entropy over a Kraft-exact multiset
+    // (mass 2048 over 234 symbols: the class counts are the entropy
+    // optimum up to rounding), shuffled deterministically so the stream
+    // does not degenerate into runs. The raw form cannot address more
+    // than 128 weights, so the description must take the FSE form and its
+    // header byte must stay below 128.
+    let class_counts = [42usize, 53, 47, 40, 31, 16, 4, 1];
+    let mut weights: Vec<usize> = Vec::new();
+    for (w_minus_1, &count) in class_counts.iter().enumerate() {
+        weights.extend(core::iter::repeat_n(w_minus_1 + 1, count));
+    }
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for k in (1..weights.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        weights.swap(k, (state as usize) % (k + 1));
+    }
+
+    let table = HuffmanTable::build_from_weights(&weights);
+    let mut fse = fse_encoder::FseBuildScratch::default();
+    let mut huff = HuffScratch::default();
+    write_table_desc(&table, &mut fse, &mut huff);
+    let desc = &huff.desc;
+    assert!(
+        desc[0] < 128 && desc.len() > 1,
+        "wide alphabet must use the FSE form, got header {}",
+        desc[0]
+    );
+
+    // The description must parse back into the same weights.
+    let mut decoded = crate::huff0::HuffmanTable::new();
+    assert_eq!(decoded.build_decoder(desc).unwrap(), desc.len() as u32);
+    let mut wire = Vec::new();
+    table.write_weights_into(&mut wire);
+    wire.pop(); // the decoder's weights lack the inferred last symbol
+    assert_eq!(decoded.weights(), &wire[..]);
 }
