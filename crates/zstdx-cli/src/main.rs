@@ -1208,10 +1208,15 @@ mod tests {
         assert!(!out.exists(), "partial output must be removed");
     }
 
-    /// A compress failure (the dictionary magic alone does not parse) after
-    /// the output file was created must not leave the output on disk.
+    /// A compress failure (a magic-prefixed dictionary with broken tables;
+    /// a bare magic is raw content under the auto content type) after the
+    /// output file was created must not leave the output on disk.
     #[test]
     fn failed_compress_removes_partial_output() {
+        let broken = [
+            0x37u8, 0xa4, 0x30, 0xec, 0xde, 0xad, 0xbe, 0xef, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        ];
         let out = temp_path("compress-partial");
         let result = compress(
             Box::new(&b"payload"[..]),
@@ -1227,7 +1232,7 @@ mod tests {
                 adapt: None,
             },
             0,
-            Some(&[0x37, 0xa4, 0x30, 0xec]),
+            Some(&broken),
         );
         assert!(result.is_err());
         assert!(!out.exists(), "empty output must be removed");

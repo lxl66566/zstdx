@@ -55,9 +55,12 @@ impl Dictionary {
     /// Load a dictionary: formatted dictionaries parse their entropy tables;
     /// content without the magic loads as a raw-content dictionary — pure
     /// match history with the format-default repcodes, mirroring libzstd's
-    /// content-only load.
+    /// content-only load. Inputs under 8 bytes are always raw content too:
+    /// libzstd's auto content type never parses a header shorter than the
+    /// magic + id it would need (`ZSTD_loadEntropy_intoDDict` treats
+    /// `dictSize < 8` as pure content even when the magic prefix is present).
     pub fn load(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
-        if raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
+        if raw.len() < 8 || raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
             return Ok(Dictionary {
                 id: 0,
                 fse: FSEScratch::new(),
@@ -194,6 +197,50 @@ fn fixture_dict(reps: [u32; 3], content: &[u8]) -> Vec<u8> {
     }
     raw.extend_from_slice(content);
     raw
+}
+
+#[test]
+fn short_magic_prefixed_dictionary_loads_as_raw_content() {
+    use crate::decoding::errors::DictionaryDecodeError;
+
+    // 4..7 bytes with the magic prefix: no complete header exists, so the
+    // auto load treats them as raw content (id 0, default repcodes, the
+    // magic bytes themselves as history) — libzstd's dictSize < 8 rule.
+    let junk = [0xdeu8, 0xad, 0xbe, 0xef];
+    for len in 0..8usize {
+        let mut raw = MAGIC_NUM.to_vec();
+        let take = len.saturating_sub(4);
+        raw.extend_from_slice(&junk[..take]);
+        let dict = Dictionary::load(&raw).unwrap_or_else(|e| panic!("len {len}: {e:?}"));
+        assert_eq!(dict.id, 0, "len {len}");
+        assert_eq!(dict.dict_content, raw, "len {len}");
+        assert_eq!(dict.offset_hist, [1, 4, 8], "len {len}");
+    }
+
+    // Exactly 8 bytes with the magic DOES enter the formatted path, where
+    // the missing table bytes fail it (libzstd: `dict is too small`).
+    let mut raw = MAGIC_NUM.to_vec();
+    raw.extend_from_slice(&[1, 2, 3, 4]);
+    assert!(matches!(
+        Dictionary::load(&raw),
+        Err(DictionaryDecodeError::HuffmanTableError(_))
+    ));
+}
+
+#[test]
+fn frame_compressed_with_short_magic_dict_decodes() {
+    // A libzstd frame of b"hello dict world!!" compressed with a 4-byte
+    // magic-prefixed dictionary (the CLI accepts it as raw content); the
+    // decode must accept it the same way and reproduce the payload.
+    let dict = [0x37u8, 0xa4, 0x30, 0xec];
+    let frame: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x12, 0x91, 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
+        0x64, 0x69, 0x63, 0x74, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x21, 0x21, 0x72, 0xee, 0x88,
+        0x3f,
+    ];
+    let opts = crate::DecoderOptions::new().dictionary(&dict);
+    let out = crate::bulk::decompress_with(frame, 64, &opts).expect("raw-content dict decode");
+    assert_eq!(out, b"hello dict world!!");
 }
 
 #[test]

@@ -63,7 +63,10 @@ impl EncDictionary {
     /// content (as produced by the in-tree trainer), which loads as pure
     /// match history with the format-default repcodes.
     pub(crate) fn parse(raw: &[u8]) -> Result<Self, Error> {
-        if raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
+        // Under 8 bytes there is no header to parse: libzstd's auto content
+        // type treats such inputs as raw content even with the magic prefix
+        // (same rule as `decoding::Dictionary::load`).
+        if raw.len() < 8 || raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
             return Ok(Self::raw_content(raw));
         }
         let dict = Dictionary::decode_dict(raw)?;
@@ -327,5 +330,24 @@ impl EncoderDictionary {
 
     pub(crate) fn shared(&self) -> alloc::sync::Arc<EncDictionary> {
         alloc::sync::Arc::clone(&self.inner)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::EncDictionary;
+
+    #[test]
+    fn short_magic_prefixed_dict_parses_as_raw_content() {
+        use crate::decoding::dictionary::MAGIC_NUM;
+
+        // Under 8 bytes there is no header to parse: libzstd's auto content
+        // type takes such inputs as raw content even with the magic prefix,
+        // and so does the decode-side load.
+        let mut dict = MAGIC_NUM.to_vec();
+        dict.extend_from_slice(&[0xde, 0xad, 0xbe]);
+        let parsed = EncDictionary::parse(&dict).unwrap();
+        assert_eq!(parsed.id, 0);
+        assert_eq!(parsed.content, dict);
+        assert_eq!(parsed.rep, [1, 4, 8]);
     }
 }

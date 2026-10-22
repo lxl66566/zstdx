@@ -174,15 +174,28 @@ fn bulk_raw_dictionary_parses_once_and_caches() {
     assert_ne!(swapped, first);
 }
 
+/// A magic-prefixed dictionary with a full header but broken table bytes:
+/// the smallest genuinely-invalid dictionary (a bare 4-byte magic is raw
+/// content under the auto content type, as in libzstd).
+fn broken_dict() -> Vec<u8> {
+    use crate::decoding::dictionary::MAGIC_NUM;
+    MAGIC_NUM
+        .iter()
+        .copied()
+        .chain([0xde, 0xad, 0xbe, 0xef])
+        .chain([0x11; 24])
+        .collect()
+}
+
 /// An invalid raw dictionary errors at the first compression (not at
 /// attachment), keeps erroring deterministically on every later call, and
 /// a valid re-set recovers — exactly the pre-cache timing, replayed from
 /// the cached failure.
 #[test]
 fn bulk_raw_dictionary_invalid_errors_at_first_compress() {
-    use crate::decoding::dictionary::MAGIC_NUM;
+    let broken = broken_dict();
     let mut compressor = compat::bulk::Compressor::new(3).unwrap();
-    compressor.set_dictionary(3, &MAGIC_NUM).unwrap();
+    compressor.set_dictionary(3, &broken).unwrap();
     let first = compressor.compress(b"payload").unwrap_err();
     // deterministic replay on the next calls
     assert_eq!(
@@ -242,8 +255,8 @@ fn bulk_prepared_dictionaries() {
 /// constructor.
 #[test]
 fn prepared_dictionaries_replay_parse_errors() {
-    use crate::decoding::dictionary::MAGIC_NUM;
-    let encoder_dict = compat::dict::EncoderDictionary::copy(&MAGIC_NUM, 3);
+    let broken = broken_dict();
+    let encoder_dict = compat::dict::EncoderDictionary::copy(&broken, 3);
     let mut compressor = compat::bulk::Compressor::with_prepared_dictionary(&encoder_dict).unwrap();
     let first = compressor.compress(b"payload").unwrap_err();
     // deterministic replay on the next call
@@ -252,7 +265,7 @@ fn prepared_dictionaries_replay_parse_errors() {
         format!("{first}")
     );
 
-    let decoder_dict = compat::dict::DecoderDictionary::copy(&MAGIC_NUM);
+    let decoder_dict = compat::dict::DecoderDictionary::copy(&broken);
     assert!(compat::bulk::Decompressor::with_prepared_dictionary(&decoder_dict).is_err());
     let mut plain = compat::bulk::Decompressor::new().unwrap();
     assert!(plain.set_prepared_dictionary(&decoder_dict).is_err());
@@ -530,10 +543,9 @@ fn bulk_decompressor_applies_dictionary() {
 /// `get_mut` and `get_ref` stay usable afterwards.
 #[test]
 fn failed_materialize_keeps_writer() {
-    use crate::decoding::dictionary::MAGIC_NUM;
-    // the dictionary magic alone does not parse as a dictionary
+    let broken = broken_dict();
     let mut encoder =
-        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &MAGIC_NUM).unwrap();
+        compat::stream::write::Encoder::with_dictionary(Vec::new(), 3, &broken).unwrap();
     assert!(encoder.write(b"payload").is_err());
     encoder.get_mut().extend_from_slice(b"kept");
     assert_eq!(encoder.get_ref().as_slice(), b"kept");
@@ -547,12 +559,11 @@ fn failed_materialize_keeps_writer() {
 /// missing source) and get_mut/finish stay usable.
 #[test]
 fn failed_materialize_keeps_source() {
-    use crate::decoding::dictionary::MAGIC_NUM;
-    // the dictionary magic alone does not parse as a dictionary, so nothing
-    // is read from the source before the failure
+    let broken = broken_dict();
+    // the dictionary fails at the first frame materialize, before anything
+    // is read from the source
     let mut decoder =
-        compat::stream::read::Decoder::with_dictionary(b"compressed".as_slice(), &MAGIC_NUM)
-            .unwrap();
+        compat::stream::read::Decoder::with_dictionary(b"compressed".as_slice(), &broken).unwrap();
     let mut out = [0u8; 4];
     let first = format!("{:?}", decoder.read(&mut out).unwrap_err());
     assert_eq!(format!("{:?}", decoder.read(&mut out).unwrap_err()), first);
@@ -900,8 +911,6 @@ fn stream_write_decoder_auto_flush_on_drop() {
 /// prepared dictionary is refused where each side validates.
 #[test]
 fn stream_prepared_dictionaries() {
-    use crate::decoding::dictionary::MAGIC_NUM;
-
     let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
     let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
     let encoder_dict = compat::dict::EncoderDictionary::copy(&dict, 3);
@@ -942,8 +951,9 @@ fn stream_prepared_dictionaries() {
 
     // invalid prepared dictionaries: refused at the stream constructors
     // (the parse replays there), on every side
-    let bad_enc = compat::dict::EncoderDictionary::copy(&MAGIC_NUM, 3);
-    let bad_dec = compat::dict::DecoderDictionary::copy(&MAGIC_NUM);
+    let broken = broken_dict();
+    let bad_enc = compat::dict::EncoderDictionary::copy(&broken, 3);
+    let bad_dec = compat::dict::DecoderDictionary::copy(&broken);
     assert!(
         compat::stream::write::Encoder::with_prepared_dictionary(Vec::new(), &bad_enc).is_err()
     );
