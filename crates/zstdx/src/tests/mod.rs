@@ -1433,6 +1433,7 @@ pub mod dict_test;
 pub mod encode_corpus;
 pub mod fuzz_regressions;
 pub mod multi_frame;
+pub mod parity;
 
 #[cfg(feature = "std")]
 #[test]
