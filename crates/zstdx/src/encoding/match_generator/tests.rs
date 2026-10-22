@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use super::{LdmArming, MatchGeneratorDriver, ldm_min_window, pack_pos, unpack_pos};
-use crate::encoding::{Matcher, Sequence};
+use crate::encoding::{Matcher, Sequence, reach_probe::ReachChoice};
 
 /// The 64 KiB unit both LDM far-class tests duplicate.
 const UNIT: usize = 64 * 1024;
@@ -245,6 +245,84 @@ fn reconstructs_after_compaction() {
         data.extend(&[7u8; 63]);
     }
     assert_eq!(match_and_reconstruct(&data, 128 * 1024), data);
+}
+
+/// Parse `data` at `level` with the reach choice pre-declared, collecting
+/// every sequence's (literal count, offset, match length) — the residue
+/// pin's comparison key.
+fn parse_with_choice(
+    data: &[u8],
+    level: crate::Level,
+    choice: ReachChoice,
+) -> Vec<(usize, usize, usize)> {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024);
+    driver.set_input_shape(crate::InputShape {
+        len: Some(data.len() as u64),
+        window_log: None,
+    });
+    driver.set_reach_choice(choice);
+    driver.reset(level);
+    let mut seqs = Vec::new();
+    for block in data.chunks(128 * 1024) {
+        driver.block_tail()[..block.len()].copy_from_slice(block);
+        driver.commit_block(block.len());
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => {
+                if !literals.is_empty() {
+                    seqs.push((literals.len(), 0, 0));
+                }
+            },
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                seqs.push((literals.len(), offset, match_len));
+            },
+        });
+    }
+    seqs
+}
+
+/// A Shrink reach-probe residue must stay inside the probe's subject
+/// row. The choice survives resets by contract (pooled stream cores
+/// never re-declare it), and the Best row's tree search domain sits at
+/// exactly KEEP_REACH like the subject row's stock reach — so the
+/// residue's apply gate must key on the row being a subject, not on the
+/// reach value: a leaked Shrink verdict collapsed the btlazy domain
+/// from 4 MiB to 4 KiB and made the frame's bytes depend on what the
+/// pooled core had compressed before (R63's dump --stream gate, json
+/// 32 MiB, -721,873 B).
+#[test]
+fn shrink_residue_spares_non_subject_rows() {
+    // > 2 MiB so the rows' chain reach survives the source clamp at the
+    // stock 4 MiB (KEEP_REACH), and structured so matches well beyond
+    // SHRINK_REACH exist (records repeated at 100 KiB spacing).
+    let mut data = Vec::with_capacity((2 << 20) + (64 << 10));
+    let record: Vec<u8> = (0..4096u32)
+        .map(|i| (b'0' + (i % 10) as u8, b'a' + (i % 26) as u8))
+        .flat_map(|(d, c)| [d, c, b',', b' '])
+        .collect();
+    while data.len() < 2 << 20 {
+        data.extend_from_slice(&record);
+        data.extend((0..96 * 1024).map(|i| (i % 251) as u8));
+    }
+    // The subject row control first: the residue must apply there.
+    let keep = parse_with_choice(&data, crate::Level::Balanced, ReachChoice::Keep);
+    let shrunk = parse_with_choice(&data, crate::Level::Balanced, ReachChoice::Shrink);
+    assert_ne!(keep, shrunk, "subject row must take the shrink verdict");
+    assert!(
+        keep.iter().any(|&(_, off, _)| off > (1 << 16)),
+        "keep control has no match beyond the shrunk domain; test data too weak"
+    );
+    // The Best row shares the KEEP_REACH value without being a subject:
+    // the residue must not move its parse.
+    let best_keep = parse_with_choice(&data, crate::Level::Best, ReachChoice::Keep);
+    let best_shrunk = parse_with_choice(&data, crate::Level::Best, ReachChoice::Shrink);
+    assert_eq!(
+        best_keep, best_shrunk,
+        "shrink residue leaked into the Best row's tree domain"
+    );
 }
 
 /// Far repeats beyond the chain reach must ride LDM candidates: two
