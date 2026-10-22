@@ -27,6 +27,12 @@
 - [zstdx vs. official zstd](dev/comparison.md)
 - [C FFI (libzstd compatibility layer)](dev/ffi.md)
 
+## Review Rounds
+
+- [R64 · FSE core](dev/review/fse.md)
+- [R64 · Huff0 + bit I/O](dev/review/huff0.md)
+- [R64 · Blocks + xxh64](dev/review/blocks.md)
+
 ## Performance Optimization
 
 - [Decoding Side](dev/perf/decoding.md)
