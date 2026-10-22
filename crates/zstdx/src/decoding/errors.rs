@@ -436,6 +436,11 @@ pub enum HuffmanTableError {
         crate::huff0::MAX_MAX_NUM_BITS
     )]
     MaxBitsTooHigh { got: u8 },
+    #[error(
+        "weight-1 symbol count (inferred last weight included) is {got}; a real Huffman tree \
+         always has an even count of at least two"
+    )]
+    InvalidWeightOneCount { got: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
