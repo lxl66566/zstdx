@@ -38,6 +38,7 @@
 - [R66 · Dictionary parity](dev/review/dictparity.md)
 - [R67 · FFI parity](dev/review/ffiparity.md)
 - [R67 · CLI parity](dev/review/cliparity.md)
+- [R68 · Encoder edges](dev/review/encparity.md)
 
 ## Performance Optimization
 
