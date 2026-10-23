@@ -1429,11 +1429,14 @@ fn run_once<const ULTRA: bool>(
                         opt[cur].litlen = litlen_l;
                         opt[cur].price = price as u32;
                         // btultra: a match ending right here followed by one
-                        // literal can beat the all-literal path.
+                        // literal can beat the all-literal path. C's guard is
+                        // `ip + cur < iend` (the priced literal must be in
+                        // the block); the port's `+1` dropped the boundary
+                        // case where that literal is the block's last byte.
                         if ULTRA
                             && prev_match.litlen == 0
                             && ll_inc_price::<ULTRA>(state, 1) < 0
-                            && pos + cur as u64 + 1 < block_end
+                            && pos + (cur as u64) < block_end
                         {
                             let with1 = prev_match.price as i64
                                 + state.lit_price::<ULTRA>(win[idx_cur]) as i64
