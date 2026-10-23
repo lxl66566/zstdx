@@ -924,6 +924,8 @@ impl MatchGeneratorDriver {
         if seqs.is_empty() {
             // A zero-sequence block's literals are the block itself.
             // Direct field reads: the stats borrow keeps this disjoint.
+            // The window always holds the committed block, so the cursor
+            // pair cannot wrap.
             let start = (self.block_start - self.win_base) as usize;
             let win = window_slice(&self.win, self.ext.as_ref());
             stats.absorb_literals(&win[start..]);
@@ -960,6 +962,10 @@ impl MatchGeneratorDriver {
     /// (owned-window drivers only).
     pub(crate) fn staged_window(&self) -> &[u8] {
         debug_assert!(self.ext.is_none());
+        // Valid only between `block_tail` (which extends the length by
+        // `slice_size`) and the matching `commit_block`; the assert pins
+        // that contract against a wrapped slice start.
+        debug_assert!(self.win.len() >= self.slice_size);
         &self.win[self.win.len() - self.slice_size..]
     }
 
@@ -3274,6 +3280,9 @@ impl Matcher for MatchGeneratorDriver {
 
     fn commit_block(&mut self, read_bytes: usize) {
         debug_assert!(self.ext.is_none(), "commit_block is owned-window only");
+        // Pairs with the `block_tail` call that staged the tail slice; the
+        // assert pins that contract against a wrapped length.
+        debug_assert!(self.win.len() >= self.slice_size);
         let old_len = self.win.len() - self.slice_size;
         // SAFETY: the caller wrote read_bytes bytes into the tail slice
         // handed out by block_tail.
@@ -3341,7 +3350,9 @@ impl Matcher for MatchGeneratorDriver {
             // tables restart in. The chain heads' epoch rollover rides the
             // same spot for the same reason; strips already roll at their
             // fill, so this trigger only covers the scan-side span (single
-            // frames on streaming and borrowed bulk windows).
+            // frames on streaming and borrowed bulk windows). The shift is
+            // only ever set to a value at/below the scan position (0, a
+            // fill base, an epoch floor), so the subtraction cannot wrap.
             if matches!(self.params.strategy, Strategy::Fast | Strategy::Dfast(_))
                 && self.pos - self.fast_shift > FAST_EPOCH_SPAN
             {
@@ -3623,6 +3634,8 @@ impl Matcher for MatchGeneratorDriver {
     #[inline(never)]
     fn skip_if_incompressible(&mut self) -> bool {
         let win = window_slice(&self.win, self.ext.as_ref());
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
         let block = &win[(self.block_start - self.win_base) as usize..];
         let total = block.len();
         if total < GATE_MIN_BLOCK {
@@ -3760,6 +3773,8 @@ impl Matcher for MatchGeneratorDriver {
         // chain. The opt strategies skip even that: their tree fills
         // lazily from `next_update`, which stays at the block start and
         // covers the run on the next block's fill.
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
         let idx = (self.block_start - self.win_base) as usize;
         let win = window_slice(&self.win, self.ext.as_ref());
         if idx + HASH_READ <= win.len() {
@@ -3886,6 +3901,8 @@ impl MatchGeneratorDriver {
         }
         self.ldm_checked = true;
         let win = window_slice(&self.win, self.ext.as_ref());
+        // The window holds the committed block, so the cursor pairs cannot
+        // wrap.
         let start = (self.block_start - self.win_base) as usize;
         let end = (self.block_end - self.win_base) as usize;
         if sampled_distinct(win, start, end) < LDM_SYMS_MIN {
@@ -3912,7 +3929,11 @@ impl MatchGeneratorDriver {
         }
         if won {
             self.ldm_quiet = 0;
-        } else if !self.ldm_dead && self.block_end - self.win_base > self.params.window as u64 {
+        } else if !self.ldm_dead
+            // The window holds the committed block, so the cursor pair
+            // cannot wrap.
+            && self.block_end - self.win_base > self.params.window as u64
+        {
             self.ldm_quiet += 1;
             if self.ldm_quiet >= LDM_QUIET {
                 self.ldm_dead = true;
@@ -3965,6 +3986,8 @@ impl MatchGeneratorDriver {
     /// tables will hold and within one span of the scan, which is all the
     /// truncated-entry resolve needs; the cleared entries are all beyond
     /// every strategy's match reach, so the rollover costs no candidate.
+    /// (The caller's `pos - fast_shift > FAST_EPOCH_SPAN` trigger holds
+    /// `pos` above the span, so the floor subtraction cannot wrap.)
     fn fast_epoch_advance(&mut self) {
         debug_assert!(matches!(
             self.params.strategy,
@@ -4023,8 +4046,12 @@ impl MatchGeneratorDriver {
         // (`last = len - HASH_READ; while idx < last`), so the tables come
         // back scan-equivalent up to that shared conservatism and never
         // past the coverage the window guarantees.
-        let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
+        let to = IdxRange::new(win_base, block_start.max(win_base))
+            .len()
+            .saturating_sub(HASH_READ as u64) as usize;
         let win = window_slice(&self.win, self.ext.as_ref());
+        // `from` is floored at `win_base` above, so the index derivation
+        // cannot wrap.
         let mut idx = (from - win_base) as usize;
         // The fast/dfast inserts ride their tables' coordinate epoch
         // (`fast_shift`; zero on chain/row states, which never set it).
@@ -4110,6 +4137,7 @@ mod parse_fast;
 mod parse_opt;
 mod parse_row;
 mod price;
+mod range;
 mod tables;
 #[cfg(test)]
 mod tests;
@@ -4128,6 +4156,7 @@ use params::{
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
+use range::IdxRange;
 
 /// Whether `level`/`shape` names a fast/dfast LDM row whose stock window
 /// sits below the far domain — the population the pre-header far-class

@@ -398,8 +398,9 @@ impl RowEmit<'_> {
         if from >= end_abs {
             return self.win_base + match_end as u64;
         }
+        let span = IdxRange::new(from, end_abs);
         let mut seg_end = end_abs;
-        if end_abs - from > 384 {
+        if span.len() > 384 {
             seg_end = from + 96;
         }
         let mut p = from;
@@ -434,7 +435,12 @@ impl RowEmit<'_> {
         ramp: RampGate,
     ) -> u64 {
         let mut pos = pos;
-        while block_end - pos >= MIN_MATCH as u64 {
+        // The remaining block span at the cursor. The max-clamp treats a
+        // cursor at/past the bound as empty — the naked `block_end - pos`
+        // wraps huge there and the loop would keep emitting past the block
+        // (the R68 rep-tail class).
+        let mut left = IdxRange::new(pos, block_end.max(pos)).len();
+        while left >= MIN_MATCH as u64 {
             let Some(cand_abs) = pos.checked_sub(rep[1] as u64) else {
                 break;
             };
@@ -451,7 +457,7 @@ impl RowEmit<'_> {
             // byte mid-frame, foreign memory at the frame tail), so
             // compare only the bytes the block holds — extend_match caps
             // the match at the window end either way.
-            let head_matches = if block_end - pos > MIN_MATCH as u64 {
+            let head_matches = if left > MIN_MATCH as u64 {
                 read4(win, cand) == read4(win, pidx)
             } else {
                 win[cand..cand + MIN_MATCH] == win[pidx..pidx + MIN_MATCH]
@@ -469,6 +475,7 @@ impl RowEmit<'_> {
                 row_insert_fill::<ROW_LOG>(self.table, self.heads, h, pos);
             }
             pos = self.emit::<ROW_LOG>(win, pos, pidx, ml, 1, rep);
+            left = IdxRange::new(pos, block_end.max(pos)).len();
         }
         pos
     }
@@ -497,7 +504,7 @@ impl MatchGeneratorDriver {
         let dict_row = self.dict_row;
         let width = ChainHashWidth::of(dict_row);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
-        let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
+        let insert_max = IdxRange::new(win_base, win_base + win.len() as u64).insert_max();
         // SAFETY: the scan's table/tag accesses go through raw pointers
         // (the fast loop's SROA note); derived here, before the emit
         // context below takes its borrow, and never resized during the
@@ -592,6 +599,8 @@ impl MatchGeneratorDriver {
             // never pay). Mirrors the chain loop's twin block.
             let mut seed_hit = false;
             if $gated && seed_offset != 0 {
+                // Wraps huge when the seed offset reaches past pos or below
+                // the window floor; the `ci < idx` compare rejects both.
                 let ci = (pos - seed_offset as u64 - win_base) as usize;
                 // The rep probe may have advanced `pos` one byte past this
                 // iteration's `idx`; a seed offset of exactly one then
@@ -789,7 +798,11 @@ impl MatchGeneratorDriver {
             };
         }
         // Seeded phase: job starts only; each emit re-checks convergence
-        // at the head, and the values only ever wind down.
+        // at the head, and the values only ever wind down. Both bars hold
+        // `pos` inside `[win_base, block_end - HASH_READ]` for the whole
+        // body, so every naked `block_end - pos` / `pos - win_base` /
+        // `anchor - win_base` derivation below is wrap-free by the bar
+        // (pos only grows, from `self.pos >= win_base`).
         'seeded: while (rep_pending != 0 || seed_offset != 0)
             && block_end.saturating_sub(pos) >= hash_read
         {

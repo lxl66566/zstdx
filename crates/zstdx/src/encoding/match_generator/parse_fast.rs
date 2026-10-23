@@ -50,9 +50,10 @@ impl MatchGeneratorDriver {
         let win = &window_slice(&self.win, self.ext.as_ref())[off..];
         let win_base = self.win_base.saturating_sub(shift);
         let block_end = self.block_end - shift;
-        // saturating: tiny first blocks never reach an emit, so the bound is
-        // never consulted when win.len() < HASH_READ.
-        let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
+        // The insert bound over the rebased window span (the helper floors
+        // at the span start; tiny first blocks never reach an emit, so the
+        // bound is never consulted when win.len() < HASH_READ).
+        let insert_max = IdxRange::new(win_base, win_base + win.len() as u64).insert_max();
         // The scan's own table accesses go through a raw pointer: routing
         // them through the emit context's slice field kept the pointer
         // stack-resident (a re-load per access; see the dfast loop's note on
@@ -340,6 +341,9 @@ impl MatchGeneratorDriver {
                     // offset, and after SEED_MATCHES the repcode probes ride it
                     // without further seed help.
                     if $gated && seed_offset != 0 {
+                    // Wraps huge when the seed offset reaches past pos or
+                    // below the window floor; the `ci < idx0` compare
+                    // rejects both.
                     let ci = (pos - seed_offset as u64 - win_base) as usize;
                     // Strictly older than the probed position: the rep
                     // probe's pos-advance can otherwise cancel a seed
@@ -597,6 +601,13 @@ impl MatchGeneratorDriver {
         // every bound retargeted at the segment end (`end`), then the
         // candidate emits wholesale at its split. The phases span segments
         // like blocks — the seeded state is the scan's, not a segment's.
+        // Splits sit at/after the segment's block start, which the entry
+        // debug_assert keeps at/after the shift, so `s.split - shift`
+        // cannot wrap; both bars hold `pos` inside
+        // `[win_base, end - HASH_READ]` for the whole body, so every naked
+        // `end - pos` / `pos - win_base` / `anchor - win_base` derivation
+        // below is wrap-free by the bar (pos only grows, from
+        // `self.pos >= win_base`).
         'segments: loop {
             let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
                 end = s.split - shift;

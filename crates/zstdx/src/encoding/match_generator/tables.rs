@@ -8,6 +8,7 @@ use super::{
     MIN_MATCH, PREFILL_STRIDE,
     gates::{CoveredFill, RampGate},
     hash::{ChainHashWidth, extend_match, hash_at_log, hash_at_width, hash8_at_log, read4},
+    range::IdxRange,
 };
 use crate::{
     decoding::sequence_execution::do_offset_history,
@@ -267,6 +268,9 @@ pub(in crate::encoding) fn push_seq_packed(
     literals: &mut Vec<u8>,
     seqs: &mut Vec<SeqWord>,
 ) -> (u32, usize) {
+    // The anchor lives inside the window and every match starts at or
+    // after it (the scans' construction), so neither cursor subtraction
+    // can wrap.
     let anchor_idx = (anchor - win_base) as usize;
     let ll = (start - anchor_idx) as u32;
     // Most sequences carry only a handful of literals; an out-of-line memcpy
@@ -347,6 +351,7 @@ pub(super) fn insert_covered(
         if p >= end {
             return;
         }
+        let span = IdxRange::new(p, end);
         // Density-gated stride-2 form first, so the dense path below stays
         // instruction-identical on the shapes that never gate (the branch
         // lives in this outlined body, never in the scan loop).
@@ -363,7 +368,7 @@ pub(super) fn insert_covered(
         // Peel the odd tail before the loop: `while p < end` alone unrolls
         // mod 2 behind a per-entry parity guard that mispredicts on every
         // other insert (measured on json.fastest).
-        if (end - p) & 1 == 1 {
+        if span.len() & 1 == 1 {
             put!((p - win_base) as usize, p);
             p += 1;
         }
@@ -377,7 +382,11 @@ pub(super) fn insert_covered(
         // variant): near-duplicate dict twins sit on every phase.
         let end = (win_base + (start + match_len) as u64).min(insert_max);
         let mut p = win_base + start as u64;
-        if p < end && (end - p) & 1 == 1 {
+        // Empty span when the clamp put the end at/below the match start
+        // (the guard above's twin): the clamp keeps the parity peel and
+        // the loop off a wrapped length.
+        let span = IdxRange::new(p, end.max(p));
+        if span.len() & 1 == 1 {
             put!((p - win_base) as usize, p);
             p += 1;
         }
@@ -387,6 +396,7 @@ pub(super) fn insert_covered(
         }
     } else {
         let base = win_base + start as u64;
+        // match_len > 16 on this branch, so the -2 cannot wrap.
         let hi = base + match_len as u64 - 2;
         if hi <= insert_max {
             let lo = base + 2;
@@ -599,7 +609,12 @@ impl TableEmit<'_> {
         ramp: RampGate,
     ) -> u64 {
         let mut pos = pos;
-        while block_end - pos >= MIN_MATCH as u64 {
+        // The remaining block span at the cursor. The max-clamp treats a
+        // cursor at/past the bound as empty — the naked `block_end - pos`
+        // wraps huge there and the loop would keep emitting past the block
+        // (the R68 rep-tail class).
+        let mut left = IdxRange::new(pos, block_end.max(pos)).len();
+        while left >= MIN_MATCH as u64 {
             let Some(cand_abs) = pos.checked_sub(rep[1] as u64) else {
                 break;
             };
@@ -613,7 +628,7 @@ impl TableEmit<'_> {
             let cand = (cand_abs - self.win_base) as usize;
             // With exactly MIN_MATCH bytes of block left, read4's fourth
             // compare byte lies past the window (see `rep1_row`'s twin).
-            let head_matches = if block_end - pos > MIN_MATCH as u64 {
+            let head_matches = if left > MIN_MATCH as u64 {
                 read4(win, cand) == read4(win, pidx)
             } else {
                 win[cand..cand + MIN_MATCH] == win[pidx..pidx + MIN_MATCH]
@@ -626,12 +641,13 @@ impl TableEmit<'_> {
             // scans pass the window end (a no-op — the window buffer ends
             // there), the chain's gap-parse pass a segment end so no
             // chained match may cross a wholesale LDM emission's split.
-            let ml = ml.min((block_end - pos) as usize);
+            let ml = ml.min(left as usize);
             debug_assert!(ml >= MIN_MATCH);
             pos = match chain.as_deref_mut() {
                 Some(chain) => self.emit_linked(win, chain, pos, pidx, ml, rep),
                 None => self.emit(win, pos, pidx, ml, 1, rep),
             };
+            left = IdxRange::new(pos, block_end.max(pos)).len();
         }
         pos
     }
