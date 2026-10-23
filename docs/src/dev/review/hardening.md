@@ -28,7 +28,7 @@ Mechanisms in [pitfalls/encoding](../pitfalls/encoding.md). Fixes are no-ops on 
 
 - Tests: debug 416+12+21 · release 411+12+21 · no-default-features 240 · zstdx-cli 99 · **paranoid 416+12+21** — all green with every wall armed.
 - Dump byte-differential vs the pre-round base: bulk `--all-levels` and stream `--all-levels` grids **byte-identical** (the two MT fixes included — their corner is off the dump lattice, pinned by tests instead).
-- gungraun Ir vs base: fastest json **+0.004%** (flat), balanced json **+0.438%** — decomposed to `HeadTables` accessor placement on the once-per-parse chain path (a semantically identical form of the rep-tail body swung ±3% Ir without executing: register-allocation placement, not algorithmic cost; the landed shape keeps the base loop and clamps post-emit — 68c0d81c). Wall on the memory-bound chain tier expected flat; recovery is todo 24a.
+- gungraun Ir vs base: fastest json **+0.004%** (flat), balanced json **+0.438%** — decomposed to `HeadTables` accessor placement on the once-per-parse chain path (a semantically identical form of the rep-tail body swung ±3% Ir without executing: register-allocation placement, not algorithmic cost; the landed shape keeps the base loop and clamps post-emit — 68c0d81c). Wall A/B closed the residue 2026-10-24: 4x order-swapped interleaved `prof enc 9` json, base median 155.5 vs HEAD 159 MiB/s, every pair favoring HEAD — the memory-bound chain tier never pays it; no recovery spent.
 - Fuzz smokes (ASAN, merged tree): `encode` 15,366 runs / `encode_stream` 4,300 runs, zero findings.
 - Poison overhead: debug suite 54.0→65.2s (walls' fill/assert inside the heavy MT tests); the sweep itself ~1s (966 cells, option bits rotated one per cell). Release unaffected: `nm` on the release rlib shows zero wall symbols.
 
@@ -55,7 +55,7 @@ Mechanisms in [pitfalls/encoding](../pitfalls/encoding.md). Fixes are no-ops on 
 
 ## Follow-ups
 
-Todo 24: balanced-Ir placement recovery; the remaining compile-time menu (cross-domain index newtypes, NonZero distances, `Option<Candidate>` sentinels, enum rep-bases); the unpoisonable carry zone; the `-max_len` >4096 campaign (carried from todo 23b — 23a closed here with `encode_stream`).
+Todo 24: the balanced-Ir placement residue is closed (wall A/B flat-to-positive, above); the remaining compile-time menu (cross-domain index newtypes, NonZero distances, `Option<Candidate>` sentinels, enum rep-bases); the unpoisonable carry zone; the `-max_len` >4096 campaign (carried from todo 23b — 23a closed here with `encode_stream`).
 
 ## Commits
 
