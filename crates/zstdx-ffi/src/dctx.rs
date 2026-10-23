@@ -51,8 +51,10 @@ impl Settings {
     pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<(), ErrorCode> {
         match crate::ZSTD_dParameter::try_from(param)? {
             crate::ZSTD_dParameter::WindowLogMax => {
-                // 0 means the default limit (2^27); the format maximum is 2^41.
-                if value != 0 && !(10..=41).contains(&value) {
+                // 0 means the default limit (2^27); the accepted range is
+                // the reference dParam bound, ZSTD_WINDOWLOG_ABSOLUTEMIN..=
+                // ZSTD_WINDOWLOG_MAX_64 (the format maximum 2^41 stays out).
+                if value != 0 && !(10..=31).contains(&value) {
                     return Err(ErrorCode::ParameterOutOfBound);
                 }
                 self.window_log_max =
@@ -321,6 +323,15 @@ impl DCtx {
             None => None,
         };
         Ok(())
+    }
+
+    /// `ZSTD_DCtx_setParameter`: rejected while a frame is open (the
+    /// reference checks its streamStage before dispatching the value).
+    pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.settings.set_parameter(param, value)
     }
 
     /// `ZSTD_DCtx_reset`: session resets never fail; parameter resets fail

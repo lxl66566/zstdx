@@ -154,6 +154,25 @@ static void test_contexts(void) {
     CHECK(ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_hashLog, 17)) ||
           ZSTD_CCtx_setParameter(cctx, ZSTD_c_hashLog, 17) == 17, "hashLog");
 
+    /* d windowLogMax bounds (R67): {0} + 10..=31, the reference dParam
+     * bound; unknown d params are parameter_unsupported. */
+    {
+        ZSTD_DCtx *d2 = ZSTD_createDCtx();
+        CHECK(ZSTD_DCtx_setParameter(d2, ZSTD_d_windowLogMax, 0) == 0, "dwlm 0");
+        CHECK(ZSTD_DCtx_setParameter(d2, ZSTD_d_windowLogMax, 27) == 0, "dwlm 27");
+        CHECK(ZSTD_DCtx_setParameter(d2, ZSTD_d_windowLogMax, 31) == 0, "dwlm 31");
+        size_t rd = ZSTD_DCtx_setParameter(d2, ZSTD_d_windowLogMax, 32);
+        CHECK(ZSTD_isError(rd) && ZSTD_getErrorCode(rd) == ZSTD_error_parameter_outOfBound,
+              "dwlm 32: %s", ZSTD_getErrorName(rd));
+        rd = ZSTD_DCtx_setParameter(d2, ZSTD_d_windowLogMax, 9);
+        CHECK(ZSTD_isError(rd) && ZSTD_getErrorCode(rd) == ZSTD_error_parameter_outOfBound,
+              "dwlm 9: %s", ZSTD_getErrorName(rd));
+        rd = ZSTD_DCtx_setParameter(d2, 999999, 1);
+        CHECK(ZSTD_isError(rd) && ZSTD_getErrorCode(rd) == ZSTD_error_parameter_unsupported,
+              "dwlm unknown: %s", ZSTD_getErrorName(rd));
+        ZSTD_freeDCtx(d2);
+    }
+
     size_t c = ZSTD_compressCCtx(cctx, cmp, cap, src, n, 9);
     CHECK(!ZSTD_isError(c), "compressCCtx: %s", ZSTD_getErrorName(c));
     size_t d = ZSTD_decompressDCtx(dctx, out, n, cmp, c);
@@ -307,6 +326,38 @@ static void test_streaming(void) {
             if (++guard > 1000000) { CHECK(0, "end never drained"); break; }
         }
         ZSTD_freeCStream(cctx);
+    }
+
+    /* Wild cursors are rejected like the reference (R67): compressStream2
+     * checks output first, input second; decompressStream checks input
+     * first. */
+    {
+        ZSTD_CCtx *cctx = ZSTD_createCStream();
+        ZSTD_initCStream(cctx, 3);
+        unsigned char ob[64];
+        ZSTD_inBuffer in = {src, 64, 65};
+        ZSTD_outBuffer wout = {ob, sizeof(ob), sizeof(ob) + 1};
+        size_t rc1 = ZSTD_compressStream2(cctx, &wout, &in, ZSTD_e_continue);
+        CHECK(ZSTD_isError(rc1) && ZSTD_getErrorCode(rc1) == ZSTD_error_dstSize_tooSmall,
+              "c wild out cursor: %s", ZSTD_getErrorName(rc1));
+        ZSTD_outBuffer ok = {ob, sizeof(ob), 0};
+        size_t rc2 = ZSTD_compressStream2(cctx, &ok, &in, ZSTD_e_continue);
+        CHECK(ZSTD_isError(rc2) && ZSTD_getErrorCode(rc2) == ZSTD_error_srcSize_wrong,
+              "c wild in cursor: %s", ZSTD_getErrorName(rc2));
+        ZSTD_freeCStream(cctx);
+
+        ZSTD_DStream *zds2 = ZSTD_createDStream();
+        ZSTD_initDStream(zds2);
+        ZSTD_outBuffer dwout = {ob, sizeof(ob), sizeof(ob) + 1};
+        ZSTD_inBuffer dwin = {src, 64, 65};
+        size_t rd1 = ZSTD_decompressStream(zds2, &dwout, &dwin);
+        CHECK(ZSTD_isError(rd1) && ZSTD_getErrorCode(rd1) == ZSTD_error_srcSize_wrong,
+              "d wild in cursor: %s", ZSTD_getErrorName(rd1));
+        ZSTD_inBuffer dok = {src, 64, 0};
+        size_t rd2 = ZSTD_decompressStream(zds2, &dwout, &dok);
+        CHECK(ZSTD_isError(rd2) && ZSTD_getErrorCode(rd2) == ZSTD_error_dstSize_tooSmall,
+              "d wild out cursor: %s", ZSTD_getErrorName(rd2));
+        ZSTD_freeDStream(zds2);
     }
 
     free(src);
@@ -473,6 +524,17 @@ static void test_reset_compress2(void) {
         size_t r = ZSTD_CCtx_reset(c3, ZSTD_reset_parameters);
         CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
               "params reset mid-frame: %s", ZSTD_getErrorName(r));
+        /* Level is the reference-authorized mid-frame update (applies to
+         * the next frame here); frame-shape parameters and unknown ids
+         * stay init-stage only. */
+        r = ZSTD_CCtx_setParameter(c3, ZSTD_c_compressionLevel, 5);
+        CHECK(!ZSTD_isError(r) && r == 5, "level mid-frame: %s", ZSTD_getErrorName(r));
+        r = ZSTD_CCtx_setParameter(c3, ZSTD_c_windowLog, 20);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+              "windowLog mid-frame: %s", ZSTD_getErrorName(r));
+        r = ZSTD_CCtx_setParameter(c3, 999999, 1);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_stage_wrong,
+              "unknown mid-frame: %s", ZSTD_getErrorName(r));
         CHECK(ZSTD_CCtx_reset(c3, ZSTD_reset_session_and_parameters) == 0, "combined reset");
         /* Unknown directive values are no-ops, as in libzstd. */
         CHECK(ZSTD_CCtx_reset(c3, (ZSTD_ResetDirective)7) == 0, "bogus directive");

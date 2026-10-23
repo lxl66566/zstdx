@@ -599,8 +599,20 @@ fn context_one_shot_and_parameter_bounds() {
         pos: 0,
     };
     unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, 0) };
+    // The compression level is the reference-authorized mid-frame update
+    // (stored here, applied to the next frame); the frame-shape parameters
+    // and unknown ids stay init-stage only.
     assert_eq!(
-        error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 5) }),
+        unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 5) },
+        5,
+        "level update authorized mid-frame"
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 101, 20) }),
+        zstd::ErrorCode::StageWrong as u32
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 999, 1) }),
         zstd::ErrorCode::StageWrong as u32
     );
     unsafe { zstd::ZSTD_freeCCtx(cctx) };

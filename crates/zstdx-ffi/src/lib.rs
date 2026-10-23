@@ -296,7 +296,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
         return ret(ErrorCode::Generic);
     }
     let ctx = unsafe { dctx_mut(dctx) };
-    match ctx.settings.set_parameter(param, value) {
+    match ctx.set_parameter(param, value) {
         Ok(()) => 0,
         Err(e) => ret(e),
     }
@@ -589,11 +589,15 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     let Ok(mode) = ZSTD_EndDirective::try_from(end_op) else {
         return ret(ErrorCode::ParameterOutOfBound);
     };
-    let ctx = unsafe { cctx_mut(cctx) };
     let (output, input) = unsafe { (&mut *output, &mut *input) };
-    // Keep the contract sane on wild cursors (libzstd asserts pos <= size).
-    output.pos = output.pos.min(output.size);
-    input.pos = input.pos.min(input.size);
+    // Wild cursors are rejected exactly as the reference does, output first.
+    if output.pos > output.size {
+        return ret(ErrorCode::DstSizeTooSmall);
+    }
+    if input.pos > input.size {
+        return ret(ErrorCode::SrcSizeWrong);
+    }
+    let ctx = unsafe { cctx_mut(cctx) };
     match ctx.compress_stream2(output, input, mode) {
         Ok(hint) => hint,
         Err(e) => {
@@ -693,10 +697,15 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
     if zds.is_null() || output.is_null() || input.is_null() {
         return ret(ErrorCode::Generic);
     }
-    let ctx = unsafe { dctx_mut(zds) };
     let (output, input) = unsafe { (&mut *output, &mut *input) };
-    output.pos = output.pos.min(output.size);
-    input.pos = input.pos.min(input.size);
+    // Wild cursors rejected in the reference order: input first, then output.
+    if input.pos > input.size {
+        return ret(ErrorCode::SrcSizeWrong);
+    }
+    if output.pos > output.size {
+        return ret(ErrorCode::DstSizeTooSmall);
+    }
+    let ctx = unsafe { dctx_mut(zds) };
     match ctx.decompress_stream(output, input) {
         Ok(hint) => hint,
         Err(e) => {
