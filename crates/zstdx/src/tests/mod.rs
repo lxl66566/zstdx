@@ -1431,6 +1431,8 @@ pub mod decode_corpus;
 pub mod dict_test;
 #[cfg(feature = "std")]
 pub mod encode_corpus;
+#[cfg(test)]
+pub mod encode_edges;
 pub mod fuzz_regressions;
 pub mod multi_frame;
 pub mod parity;
