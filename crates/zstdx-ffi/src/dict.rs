@@ -158,11 +158,10 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     ddict: *const ZSTD_DDict,
 ) -> usize {
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        return ret(ErrorCode::SrcSizeWrong);
     };
-    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
-        return ret(ErrorCode::DstBufferNull);
-    };
+    // Null dst reads as zero capacity, like ZSTD_decompress.
+    let dst = unsafe { crate::as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }

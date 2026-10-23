@@ -51,8 +51,10 @@ impl Settings {
     pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<(), ErrorCode> {
         match crate::ZSTD_dParameter::try_from(param)? {
             crate::ZSTD_dParameter::WindowLogMax => {
-                // 0 means the default limit (2^27); the format maximum is 2^41.
-                if value != 0 && !(10..=41).contains(&value) {
+                // 0 means the default limit (2^27); the accepted range is
+                // the reference dParam bound, ZSTD_WINDOWLOG_ABSOLUTEMIN..=
+                // ZSTD_WINDOWLOG_MAX_64 (the format maximum 2^41 stays out).
+                if value != 0 && !(10..=31).contains(&value) {
                     return Err(ErrorCode::ParameterOutOfBound);
                 }
                 self.window_log_max =
@@ -78,8 +80,84 @@ pub fn decompress_oneshot(
     if let Some(dict) = dict {
         options = options.parsed_dictionary(Arc::clone(dict));
     }
-    zstdx::bulk::decompress_to_buffer_with(src, dst, &options)
-        .map_err(|e| error::decode(&e, DecodeSite::OneShot))
+    zstdx::bulk::decompress_to_buffer_with(src, dst, &options).map_err(|e| {
+        // Below the prefix size the reference loop never starts (its
+        // startingInputLength gate): any failure with that little input
+        // is the leftover-input srcSize_wrong.
+        if src.len() < crate::frame::HEADER_PREFIX {
+            return ErrorCode::SrcSizeWrong;
+        }
+        if let zstdx::Error::Frame(
+            zstdx::decoding::errors::FrameDecoderError::ReadFrameHeaderError(header_error),
+        ) = &e
+        {
+            use zstdx::decoding::errors::ReadFrameHeaderError as Rhe;
+            match header_error {
+                // The reference one-shot loop judges magic only after its
+                // decompressFrame precondition (a visible header + block
+                // header in the remaining input); shorter garbage tails
+                // are srcSize_wrong, not prefix_unknown.
+                Rhe::BadMagicNumber(_) => return bad_magic_tail_code(src),
+                // A magic read that fails on the tail the frame walk
+                // leaves below the prefix size is the series' leftover
+                // input - the reference loop never starts on it.
+                Rhe::MagicNumberReadError(_)
+                    if frame_series_tail(src).len() < crate::frame::HEADER_PREFIX =>
+                {
+                    return ErrorCode::SrcSizeWrong
+                },
+                _ => {},
+            }
+        }
+        error::decode(&e, DecodeSite::OneShot)
+    })
+}
+
+/// Walk every complete frame of a series (skippable ones included) and
+/// return the tail where the engine stopped, plus whether any real
+/// (non-skippable) frame completed in front of it. A truncated final
+/// frame stays in the tail - it is leftover input, not a boundary.
+fn frame_series_walk(src: &[u8]) -> (&[u8], bool) {
+    let mut pos = 0;
+    let mut real_frame_done = false;
+    while src.len() - pos >= crate::frame::HEADER_PREFIX {
+        let step = match crate::frame::frame_compressed_size(&src[pos..]) {
+            Ok(size) if pos + size <= src.len() => size,
+            _ => break,
+        };
+        real_frame_done |= !matches!(
+            crate::frame::parse_header(&src[pos..]),
+            Ok(crate::frame::Header::Skippable { .. })
+        );
+        pos += step;
+    }
+    (&src[pos..], real_frame_done)
+}
+
+/// The tail the frame-series walk leaves.
+fn frame_series_tail(src: &[u8]) -> &[u8] {
+    frame_series_walk(src).0
+}
+
+/// The reference's answer for a bad-magic failure in the one-shot loop:
+/// the tail is where the engine saw the magic; the reference requires
+/// header size + block header there before believing the garbage is a
+/// frame (srcSize_wrong otherwise). A decoded frame in front of the tail
+/// promotes even a passing tail to srcSize_wrong (the reference's
+/// moreThan1Frame rule); skippable frames skip past the flag and never
+/// promote.
+fn bad_magic_tail_code(src: &[u8]) -> ErrorCode {
+    let (tail, promoted) = frame_series_walk(src);
+    if tail.len() < crate::frame::HEADER_PREFIX {
+        // Below the multi-frame loop threshold: leftover input.
+        return ErrorCode::SrcSizeWrong;
+    }
+    let want = crate::frame::header_size_formula(tail[4]) + 3;
+    if tail.len() < want || promoted {
+        ErrorCode::SrcSizeWrong
+    } else {
+        ErrorCode::PrefixUnknown
+    }
 }
 
 /// Live streaming-decoder state inside a DCtx.
@@ -102,6 +180,10 @@ struct DStream {
     /// (0) requires at least one, so a stream of only skippable frames
     /// never reports completion.
     frames_done: u32,
+    /// Whether the completion answer (0) already went out for the frame
+    /// just finished; the next call then asks for the next frame's
+    /// header, like the reference's between-frames loadHeader shortcut.
+    done_reported: bool,
 }
 
 impl DStream {
@@ -128,6 +210,7 @@ impl DStream {
             sink: Vec::new(),
             delivered: 0,
             frames_done: 0,
+            done_reported: false,
         })
     }
 
@@ -161,6 +244,20 @@ impl DStream {
         self.start == self.input.len()
             && self.sink.len() == self.delivered
             && (!self.inited || self.inner.is_finished())
+    }
+
+    /// The between-frames state: a real frame finished, everything
+    /// decoded from it was flushed, nothing is staged. The completion
+    /// answer (0) is given once; afterwards this is the state the
+    /// reference answers from its loadHeader shortcut, which also sits
+    /// before its no-forward-progress guard.
+    fn idle_done(&self) -> bool {
+        let frame_done = self.inited
+            && self.inner.is_finished()
+            && self.inner.can_collect() == 0
+            && self.start == self.input.len();
+        let boundary_idle = !self.inited && self.frames_done > 0 && self.start == self.input.len();
+        self.sink.len() == self.delivered && (frame_done || boundary_idle)
     }
 
     /// Decode as much staged input as the block granularity allows.
@@ -282,6 +379,15 @@ impl DStream {
     }
 }
 
+/// `ZSTD_NO_FORWARD_PROGRESS_MAX`: consecutive no-progress streaming
+/// calls before the reference refuses.
+const NO_FORWARD_PROGRESS_MAX: u32 = 16;
+
+/// The between-frames suggestion: the reference's loadHeader shortcut
+/// returns max(ZSTD_FRAMEHEADERSIZE_MIN, hSize) - staged + blockHeaderSize
+/// before its no-forward-progress guard; with nothing staged that is 9.
+const NEXT_FRAME_HINT: usize = 6 + 3;
+
 /// The `ZSTD_DCtx` object.
 pub struct DCtx {
     pub settings: Settings,
@@ -293,6 +399,9 @@ pub struct DCtx {
     /// Sticky first error (libzstd calls a failed stream undefined; this
     /// layer replays the code until a reset).
     sticky: Option<ErrorCode>,
+    /// Consecutive streaming calls that moved neither cursor (the
+    /// reference no-forward-progress guard).
+    no_forward: u32,
 }
 
 impl DCtx {
@@ -302,6 +411,7 @@ impl DCtx {
             dict: None,
             stream: None,
             sticky: None,
+            no_forward: 0,
         }
     }
 
@@ -323,6 +433,15 @@ impl DCtx {
         Ok(())
     }
 
+    /// `ZSTD_DCtx_setParameter`: rejected while a frame is open (the
+    /// reference checks its streamStage before dispatching the value).
+    pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.settings.set_parameter(param, value)
+    }
+
     /// `ZSTD_DCtx_reset`: session resets never fail; parameter resets fail
     /// unless the stream sits on a frame boundary. Unknown directive values
     /// are no-ops returning success, as libzstd's fall-through.
@@ -341,6 +460,7 @@ impl DCtx {
     fn reset_session(&mut self) {
         self.stream = None;
         self.sticky = None;
+        self.no_forward = 0;
     }
 
     fn reset_parameters(&mut self) -> Result<(), ErrorCode> {
@@ -353,11 +473,35 @@ impl DCtx {
     }
 
     /// `ZSTD_initDStream`: session reset (per the legacy doc contract the
-    /// dictionary reference is cleared; parameters survive).
+    /// dictionary reference is cleared; parameters survive). The
+    /// no-forward-progress guard restarts too - the reference runs
+    /// ZSTD_decompressBegin under every session reset, and a DStream is
+    /// its DCtx.
     pub fn init_stream(&mut self) {
-        self.stream = None;
+        self.reset_session();
         self.dict = None;
-        self.sticky = None;
+    }
+
+    /// `ZSTD_initDStream_usingDict`: session reset then a dictionary
+    /// load; an unloadable dictionary is the return (the reference
+    /// propagates ZSTD_DCtx_loadDictionary's failure).
+    pub fn init_stream_with_dict(&mut self, dict: Option<&[u8]>) -> Result<(), ErrorCode> {
+        self.reset_session();
+        self.load_dictionary(dict)
+    }
+
+    /// `ZSTD_initDStream_usingDDict`: session reset with the handle's
+    /// parsed dictionary taking the slot directly (no re-parse; a null
+    /// handle clears it).
+    pub fn init_stream_with_ddict(&mut self, dict: Option<&SharedDict>) {
+        self.reset_session();
+        self.dict = dict.cloned();
+    }
+
+    /// `ZSTD_resetDStream`: a bare session reset (the dictionary
+    /// reference survives, unlike ZSTD_initDStream).
+    pub fn init_stream_keep_dict(&mut self) {
+        self.reset_session();
     }
 
     /// `ZSTD_decompressStream` core; the return is the libzstd hint
@@ -370,6 +514,39 @@ impl DCtx {
         if let Some(sticky) = self.sticky {
             return Err(sticky);
         }
+        let (out_start, in_start) = (output.pos, input.pos);
+        let hint = self.decompress_stream_inner(output, input)?;
+        if hint == 0 {
+            // A completed frame restarts the guard, as the reference's
+            // decompressBegin does at every frame boundary.
+            self.no_forward = 0;
+            return Ok(0);
+        }
+        if output.pos == out_start && input.pos == in_start {
+            // The between-frames state returns from before the reference
+            // guard (its loadHeader shortcut); those calls never count.
+            let idle = self.stream.as_ref().is_some_and(|s| s.idle_done());
+            if !idle {
+                self.no_forward += 1;
+                if self.no_forward >= NO_FORWARD_PROGRESS_MAX {
+                    return Err(if output.pos == output.size {
+                        ErrorCode::NoForwardProgressDestFull
+                    } else {
+                        ErrorCode::NoForwardProgressInputEmpty
+                    });
+                }
+            }
+        } else {
+            self.no_forward = 0;
+        }
+        Ok(hint)
+    }
+
+    fn decompress_stream_inner(
+        &mut self,
+        output: &mut ZSTD_outBuffer,
+        input: &mut ZSTD_inBuffer,
+    ) -> Result<usize, ErrorCode> {
         if self.stream.is_none() {
             let dict = self.dict.as_ref();
             match DStream::new(&self.settings, dict) {
@@ -394,6 +571,7 @@ impl DCtx {
                 .extend_from_slice(unsafe { input.slice_at(in_pos, take) });
             in_pos += take;
             input.pos = in_pos;
+            stream.done_reported = false;
             stream.pump()?;
         }
         stream.deliver(out, &mut output.pos);
@@ -402,16 +580,13 @@ impl DCtx {
             // Output the caller's buffer could not fit yet.
             return Ok(stream.sink.len() - stream.delivered);
         }
-        let frame_done = stream.inited
-            && stream.inner.is_finished()
-            && stream.inner.can_collect() == 0
-            && stream.start == stream.input.len();
-        // Past the last frame boundary (skippable frames trailing, or a
-        // frame boundary that emptied the staging) the same completion
-        // holds with no frame in progress.
-        let idle_done =
-            !stream.inited && stream.frames_done > 0 && stream.start == stream.input.len();
-        if frame_done || idle_done {
+        if stream.idle_done() {
+            // The completion answer goes out once per finished frame;
+            // further calls want the next frame's header, like the
+            // reference's between-frames loadHeader shortcut.
+            if core::mem::replace(&mut stream.done_reported, true) {
+                return Ok(NEXT_FRAME_HINT);
+            }
             return Ok(0);
         }
         // More input or output will advance the frame; the hint is the

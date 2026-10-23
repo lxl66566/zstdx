@@ -1,9 +1,10 @@
 //! The simple (context-free) entry points: version constants, one-shot
 //! compression and decompression, error accessors, and frame metadata.
 
-use core::ffi::c_char;
+use core::{ffi::c_char, mem::size_of};
 
 use crate::{
+    ZSTD_FrameHeader,
     cctx::{CCtx, Settings as CSettings},
     dctx::{DCtx, Settings as DSettings},
     error::{self, ErrorCode},
@@ -120,7 +121,14 @@ pub extern "C" fn ZSTD_getErrorName(code: usize) -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_getErrorCode(code: usize) -> core::ffi::c_uint {
-    ErrorCode::from_raw(code) as u32
+    // ERR_getErrorCode answers the raw negated value for any error-range
+    // input; gap values (inside -(maxCode), outside the enum) keep their
+    // number rather than collapsing to no_error.
+    if error::is_error(code) {
+        0usize.wrapping_sub(code) as u32
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,11 +168,14 @@ pub unsafe extern "C" fn ZSTD_decompress(
     src_size: usize,
 ) -> usize {
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        // Below the prefix size the reference loop never derefs the src:
+        // its leftover-input check answers srcSize_wrong.
+        return ret(ErrorCode::SrcSizeWrong);
     };
-    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
-        return ret(ErrorCode::DstBufferNull);
-    };
+    // A null dst behaves as zero capacity on every reference path that
+    // does not crash it: non-empty output answers dstSize_tooSmall, an
+    // empty one succeeds.
+    let dst = unsafe { crate::as_mut_slice(dst, dst_capacity) };
     match crate::dctx::decompress_oneshot(&DSettings::default(), None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
@@ -249,7 +260,7 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getFrameHeader(
-    zfh_ptr: *mut crate::ZSTD_FrameHeader,
+    zfh_ptr: *mut ZSTD_FrameHeader,
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
@@ -257,24 +268,26 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
         return ret(ErrorCode::Generic);
     }
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        // A null src with a positive size hits the reference entry check
+        // (GENERIC, never a deref); size 0 stays on the wants-5 path.
+        return ret(ErrorCode::Generic);
     };
     let zfh = unsafe { &mut *zfh_ptr };
-    let unknown = CONTENTSIZE_UNKNOWN;
-    *zfh = crate::ZSTD_FrameHeader {
-        frame_content_size: unknown,
-        window_size: 0,
-        block_size_max: 0,
-        frame_type: crate::ZSTD_frame,
-        header_size: 0,
-        dict_id: 0,
-        checksum_flag: 0,
-        reserved1: 0,
-        reserved2: 0,
-    };
-    match crate::frame::parse_full_header(src) {
+    let parsed = crate::frame::parse_full_header(src);
+    // The struct-write contract mirrors the reference memset placement:
+    // inputs below the prefix size return before the memset (the struct
+    // keeps the caller bytes), everything past it sees zeros first and
+    // real values only on a complete parse.
+    if src.len() >= crate::frame::HEADER_PREFIX {
+        // The reference memsets the whole struct, tail padding included;
+        // a plain Rust assignment would leave the padding bytes alone.
+        unsafe {
+            core::ptr::write_bytes(zfh_ptr.cast::<u8>(), 0, size_of::<ZSTD_FrameHeader>());
+        }
+    }
+    match parsed {
         Ok(crate::frame::HeaderParse::Complete(header)) => {
-            zfh.frame_content_size = header.content_size.unwrap_or(unknown);
+            zfh.frame_content_size = header.content_size.unwrap_or(CONTENTSIZE_UNKNOWN);
             zfh.window_size = header.window_size;
             zfh.block_size_max = header.block_size_max as core::ffi::c_uint;
             zfh.frame_type = match header.frame_type {

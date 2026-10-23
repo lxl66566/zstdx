@@ -328,7 +328,15 @@ impl CCtx {
     /// libzstd.
     pub fn set_parameter(&mut self, param: i32, value: i32) -> Result<usize, ErrorCode> {
         if self.stream.as_ref().is_some_and(|s| !s.finished) {
-            return Err(ErrorCode::StageWrong);
+            // libzstd authorizes a mid-frame update for the block/level
+            // knobs (ZSTD_isUpdateAuthorized); frame-shape parameters and
+            // unknown ids stay init-stage only. Of the authorized set this
+            // layer implements only the compression level: stored mid-frame,
+            // applied to the next frame (the reference retunes the running
+            // frame's blocks from the next one).
+            if param != ZSTD_cParameter::CompressionLevel as i32 {
+                return Err(ErrorCode::StageWrong);
+            }
         }
         let param = ZSTD_cParameter::try_from(param)?;
         self.settings.set_parameter(param, value)
