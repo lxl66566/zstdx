@@ -2457,6 +2457,15 @@ impl MtEncoderCore {
         let strip_lo = self.job_start.saturating_sub(strip as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (self.job_start - strip_lo) as usize;
+        // The job view starts at the strip head, exactly like a posted
+        // job's frozen view (`post_job` builds its pointer from
+        // `strip_lo`): `first` indexes from `strip_lo`, not `buf_base`, so
+        // slicing the buffer from its base handed the job the wrong
+        // absolute span whenever the strip head sat past the buffer's
+        // head (a mid-stream job start under a window shorter than it —
+        // the inline path's flush-split jobs re-encoded stale bytes).
+        let src_lo = (strip_lo - self.buf_base) as usize;
+        let src_hi = (hi - self.buf_base) as usize;
         self.hash_to(hi);
         let last_len = (bounds[1] - bounds[0]) as usize;
         if self.job_start == 0
@@ -2466,7 +2475,7 @@ impl MtEncoderCore {
             // (a single short job): the seeded runner needs no lease
             // state — it stages through its own owned-window kit state.
             let bytes = crate::encoding::mt::run_dict_job_zero(
-                &self.buf[..(hi - self.buf_base) as usize],
+                &self.buf[src_lo..src_hi],
                 first..first + last_len,
                 last_frame_block,
                 self.level,
@@ -2489,7 +2498,7 @@ impl MtEncoderCore {
         };
         let bytes = run_job_with(
             &mut state,
-            &self.buf[..(hi - self.buf_base) as usize],
+            &self.buf[src_lo..src_hi],
             first..first + last_len,
             strip,
             last_frame_block,
