@@ -257,24 +257,30 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
         return ret(ErrorCode::Generic);
     }
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        // A null src with a positive size hits the reference entry check
+        // (GENERIC, never a deref); size 0 stays on the wants-5 path.
+        return ret(ErrorCode::Generic);
     };
     let zfh = unsafe { &mut *zfh_ptr };
-    let unknown = CONTENTSIZE_UNKNOWN;
-    *zfh = crate::ZSTD_FrameHeader {
-        frame_content_size: unknown,
-        window_size: 0,
-        block_size_max: 0,
-        frame_type: crate::ZSTD_frame,
-        header_size: 0,
-        dict_id: 0,
-        checksum_flag: 0,
-        reserved1: 0,
-        reserved2: 0,
-    };
-    match crate::frame::parse_full_header(src) {
+    let parsed = crate::frame::parse_full_header(src);
+    // The struct-write contract mirrors the reference memset placement:
+    // inputs below the prefix size return before the memset (the struct
+    // keeps the caller bytes), everything past it sees zeros first and
+    // real values only on a complete parse.
+    if src.len() >= crate::frame::HEADER_PREFIX {
+        // The reference memsets the whole struct, tail padding included;
+        // a plain Rust assignment would leave the padding bytes alone.
+        unsafe {
+            core::ptr::write_bytes(
+                zfh_ptr.cast::<u8>(),
+                0,
+                core::mem::size_of::<crate::ZSTD_FrameHeader>(),
+            );
+        }
+    }
+    match parsed {
         Ok(crate::frame::HeaderParse::Complete(header)) => {
-            zfh.frame_content_size = header.content_size.unwrap_or(unknown);
+            zfh.frame_content_size = header.content_size.unwrap_or(CONTENTSIZE_UNKNOWN);
             zfh.window_size = header.window_size;
             zfh.block_size_max = header.block_size_max as core::ffi::c_uint;
             zfh.frame_type = match header.frame_type {

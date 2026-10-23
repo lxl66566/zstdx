@@ -10,6 +10,8 @@ pub const MAGIC: u32 = 0xfd2f_b528;
 /// Skippable-frame magic range (`0x184D2A50..=0x184D2A5F`).
 const SKIPPABLE_MIN: u32 = 0x184d_2a50;
 const SKIPPABLE_MAX: u32 = 0x184d_2a5f;
+/// `ZSTD_MAGIC_SKIPPABLE_MASK`: the low nibble carries the variant.
+const SKIPPABLE_MASK: u32 = 0xffff_fff0;
 /// Format block-content maximum; the block header's 21-bit size field may
 /// declare more, which is malformed.
 pub(crate) const MAX_BLOCK_CONTENT: usize = 128 * 1024;
@@ -188,7 +190,9 @@ pub enum HeaderParse {
 /// magic prefix is validated and 5 is wanted; skippable frames want 8 and
 /// then complete; zstd frames want their full serialized header.
 pub fn parse_full_header(src: &[u8]) -> Result<HeaderParse, ParseError> {
-    if src.len() < 4 {
+    // Below the prefix size libzstd never reads the descriptor: a complete
+    // 4-byte magic (either family) still wants 5, not the family's own size.
+    if src.len() < HEADER_PREFIX {
         // libzstd validates whatever magic bytes it can see before asking
         // for more (a mismatching prefix is an error, not a size request).
         if !src.is_empty() && !magic_prefix_ok(src) {
@@ -249,12 +253,18 @@ pub fn parse_full_header(src: &[u8]) -> Result<HeaderParse, ParseError> {
 }
 
 /// Whether `src` is a prefix of either magic family (libzstd's early check
-/// on short inputs).
+/// on short inputs: the full-magic compare first, then the skippable base
+/// under its variant mask, so any first byte 0x50..=0x5F qualifies).
 fn magic_prefix_ok(src: &[u8]) -> bool {
-    let magic = MAGIC.to_le_bytes();
-    let skip = SKIPPABLE_MIN.to_le_bytes();
     let head = src.len().min(4);
-    src[..head] == magic[..head] || src[..head] == skip[..head]
+    let mut hbuf = MAGIC.to_le_bytes();
+    hbuf[..head].copy_from_slice(&src[..head]);
+    if u32::from_le_bytes(hbuf) == MAGIC {
+        return true;
+    }
+    let mut hbuf = SKIPPABLE_MIN.to_le_bytes();
+    hbuf[..head].copy_from_slice(&src[..head]);
+    u32::from_le_bytes(hbuf) & SKIPPABLE_MASK == SKIPPABLE_MIN
 }
 
 /// RFC 8878 window descriptor: `10 + exponent` plus a 3-bit mantissa

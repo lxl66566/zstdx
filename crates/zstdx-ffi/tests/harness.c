@@ -754,6 +754,46 @@ static void test_dctx_reset_and_metadata(void) {
         size_t r = ZSTD_getFrameHeader(&zfh, bad, 3);
         CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_prefix_unknown,
               "bad prefix: %s", ZSTD_getErrorName(r));
+        /* Any skippable-variant first byte qualifies (masked compare). */
+        unsigned char v1[1] = {0x5F};
+        CHECK(ZSTD_getFrameHeader(&zfh, v1, 1) == 5, "variant byte wants 5");
+    }
+
+    /* getFrameHeader short-input contract (R67): a complete 4-byte magic of
+     * either family still wants 5, never the family own size; the struct
+     * write follows the reference memset placement - untouched below the
+     * prefix size, zeroed whole (tail padding included) from it on. */
+    {
+        ZSTD_FrameHeader zfh;
+        const unsigned char zm[4] = {0x28, 0xB5, 0x2F, 0xFD};
+        const unsigned char sm[4] = {0x50, 0x2A, 0x4D, 0x18};
+        const unsigned char *p;
+        size_t i;
+        memset(&zfh, 0xAA, sizeof(zfh));
+        CHECK(ZSTD_getFrameHeader(&zfh, zm, 4) == 5, "zstd magic wants 5");
+        CHECK(ZSTD_getFrameHeader(&zfh, sm, 4) == 5, "skippable magic wants 5");
+        p = (const unsigned char *)&zfh;
+        for (i = 0; i < sizeof(zfh); i++)
+            if (p[i] != 0xAA) break;
+        CHECK(i == sizeof(zfh), "short input leaves the struct untouched");
+        memset(&zfh, 0xAA, sizeof(zfh));
+        {
+            size_t want = ZSTD_getFrameHeader(&zfh, cmp, 5);
+            CHECK(!ZSTD_isError(want) && want >= 6 && want <= 18,
+                  "incomplete header wants its size: %zu", want);
+        }
+        p = (const unsigned char *)&zfh;
+        for (i = 0; i < sizeof(zfh); i++)
+            if (p[i] != 0) break;
+        CHECK(i == sizeof(zfh), "past-prefix input zeroes the struct");
+        /* null src: size 0 wants 5 (no deref); positive size is GENERIC,
+         * the reference entry check. */
+        CHECK(ZSTD_getFrameHeader(&zfh, NULL, 0) == 5, "null src size 0 wants 5");
+        {
+            size_t rn = ZSTD_getFrameHeader(&zfh, NULL, 4);
+            CHECK(ZSTD_isError(rn) && ZSTD_getErrorCode(rn) == ZSTD_error_GENERIC,
+                  "null src: %s", ZSTD_getErrorName(rn));
+        }
     }
 
     ZSTD_freeDCtx(dctx);
