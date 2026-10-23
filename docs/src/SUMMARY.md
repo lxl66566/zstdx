@@ -40,6 +40,7 @@
 - [R67 · CLI parity](dev/review/cliparity.md)
 - [R68 · Encoder edges](dev/review/encparity.md)
 - [R69 · Encode-path hardening](dev/review/hardening.md)
+- [R70 · Optimal parser](dev/review/opt.md)
 
 ## Performance Optimization
 
