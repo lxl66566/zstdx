@@ -20,6 +20,8 @@ pub(crate) mod match_generator;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
 pub(crate) mod opt;
+#[cfg(debug_assertions)]
+pub(crate) mod poison;
 pub(crate) mod pre_split;
 pub(crate) mod reach_probe;
 pub(crate) mod seq_codes;
