@@ -124,6 +124,9 @@ pub struct TrainOutcome {
     /// Every scored candidate `(k, metric)` in sweep order (empty when the
     /// sweep did not run).
     pub sweep: Vec<(usize, usize)>,
+    /// Dmer count over the training split, fastCover's `ctx.nbDmers`
+    /// (`trainingSamplesSize - MAX(d, 8) + 1`); 0 when nothing was trained.
+    pub dmers: usize,
 }
 
 /// Creates a "raw content" dictionary from every file under `path`
@@ -230,6 +233,15 @@ impl TrainingSet {
         self.body.len() >= 16
     }
 
+    /// Dmer count over the training split, fastCover's `ctx.nbDmers`
+    /// (`trainingSamplesSize - MAX(d, 8) + 1`).
+    fn dmer_count(&self) -> usize {
+        self.lens[..self.train_end]
+            .iter()
+            .sum::<usize>()
+            .saturating_sub(K - 1)
+    }
+
     /// The training split's samples in shuffled order (C's finalize step
     /// uses the whole train split at the default acceleration).
     fn train_samples(&self) -> Vec<&[u8]> {
@@ -321,8 +333,14 @@ impl TrainingSet {
                 dict: Vec::new(),
                 k: 0,
                 sweep,
+                dmers: self.dmer_count(),
             },
-            Some((_, dict, k)) => TrainOutcome { dict, k, sweep },
+            Some((_, dict, k)) => TrainOutcome {
+                dict,
+                k,
+                sweep,
+                dmers: self.dmer_count(),
+            },
         }
     }
 }
@@ -343,6 +361,7 @@ pub fn train_raw(samples: &[&[u8]], dict_size: usize, config: &TrainConfig) -> T
             dict: Vec::new(),
             k: 0,
             sweep: Vec::new(),
+            dmers: 0,
         };
     }
     let set = TrainingSet::build(samples);
@@ -354,10 +373,12 @@ pub fn train_raw(samples: &[&[u8]], dict_size: usize, config: &TrainConfig) -> T
         );
         set.select_content(dict_size, config)
     } else {
+        let dmers = set.dmer_count();
         TrainOutcome {
             dict: set.body,
             k: 0,
             sweep: Vec::new(),
+            dmers,
         }
     }
 }
@@ -385,14 +406,17 @@ pub fn train_formatted(samples: &[&[u8]], dict_size: usize, config: &TrainConfig
             dict: Vec::new(),
             k: 0,
             sweep: Vec::new(),
+            dmers: 0,
         };
     }
     let set = TrainingSet::build(samples);
     if !set.trainable() {
+        let dmers = set.dmer_count();
         return TrainOutcome {
             dict: set.body,
             k: 0,
             sweep: Vec::new(),
+            dmers,
         };
     }
     vprintln!(
@@ -414,6 +438,7 @@ pub fn train_formatted(samples: &[&[u8]], dict_size: usize, config: &TrainConfig
         dict,
         k: content.k,
         sweep: content.sweep,
+        dmers: content.dmers,
     }
 }
 

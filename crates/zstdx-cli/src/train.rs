@@ -7,7 +7,7 @@
 use std::{fs, io::Write, path::PathBuf};
 
 #[cfg(feature = "dict_builder")]
-use zstdx::dict::TrainConfig;
+use zstdx::dict::{TrainConfig, TrainOutcome};
 
 use crate::{Cli, PREFIX};
 #[cfg(feature = "dict_builder")]
@@ -100,11 +100,39 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
         return crate::Exit::Failure;
     }
 
+    let maxdict = cli.maxdict.unwrap_or(DEFAULT_MAX_DICT);
+    // DiB_train's own small-corpus warning, before training runs; the
+    // loading total caps each sample at 128 KiB (dibio's SAMPLESIZE_MAX).
+    let load_total: u64 = samples
+        .iter()
+        .map(|sample| sample.len().min(128 * 1024) as u64)
+        .sum();
+    if cli.quiet == 0 && load_total < maxdict * 8 {
+        eprintln!("!  Warning : data size of samples too small for target dictionary size ");
+        eprintln!("!  Samples should be about 100x larger than target dictionary size ");
+    }
+
     let out: PathBuf = cli
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DICT_NAME));
-    let dict = train_dict(&samples, cli.maxdict.unwrap_or(DEFAULT_MAX_DICT));
+    let outcome = train_dict(&samples, maxdict);
+    // COVER_warnOnSmallCorpus: fewer than 10 dmers per requested dictionary
+    // byte means the corpus cannot fill the capacity (printed at display
+    // level 1: hidden only under -qq).
+    if cli.quiet < 2 {
+        let ratio = outcome.dmers as f64 / maxdict as f64;
+        if ratio < 10.0 {
+            eprintln!(
+                "WARNING: The maximum dictionary size {} is too large compared to the source size \
+                 {}! size(source)/size(dictionary) = {ratio:.6}, but it should be >= 10! This may \
+                 lead to a subpar dictionary! We recommend training on sources at least 10x, and \
+                 preferably 100x the size of the dictionary! ",
+                maxdict, outcome.dmers
+            );
+        }
+    }
+    let dict = outcome.dict;
     let mut file = match fs::File::create(&out) {
         Ok(file) => file,
         Err(err) => {
@@ -132,7 +160,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
 /// entropy tables, content), with the CLI k-grid defaulting to libzstd's
 /// optimizer ladder.
 #[cfg(feature = "dict_builder")]
-fn train_dict(samples: &[Vec<u8>], maxdict: u64) -> Vec<u8> {
+fn train_dict(samples: &[Vec<u8>], maxdict: u64) -> TrainOutcome {
     let refs: Vec<&[u8]> = samples.iter().map(|s| &s[..]).collect();
-    zstdx::dict::train_formatted(&refs, maxdict as usize, &TrainConfig::default()).dict
+    zstdx::dict::train_formatted(&refs, maxdict as usize, &TrainConfig::default())
 }

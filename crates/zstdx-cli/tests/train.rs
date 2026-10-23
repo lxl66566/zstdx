@@ -92,7 +92,7 @@ fn write_samples(dir: &Path, count: usize) -> Vec<Vec<u8>> {
 #[test]
 fn trains_formatted_dictionary() {
     let scratch = Scratch::new("basic");
-    let samples = write_samples(&scratch.path("samples"), 24);
+    write_samples(&scratch.path("samples"), 24);
     let sample_dir = scratch.path("samples");
     let dict = scratch.path("out.dict");
     let out = run(&[
@@ -114,12 +114,48 @@ fn trains_formatted_dictionary() {
         stderr.contains(&format!("Save dictionary of size {} ", bytes.len())),
         "{stderr}"
     );
-    // dibio reports nothing else at default verbosity (no sample-count
-    // line exists on zstd's side)
+    // this corpus is small enough to draw both reference warnings; beyond
+    // those and the Save line nothing leaks (verbose-only trainer traces
+    // stay hidden at default verbosity)
     assert!(
-        !stderr.contains("training on"),
+        !stderr.contains("create_dict"),
         "no non-reference diagnostics: {stderr}"
     );
+}
+
+/// Small corpora draw zstd's small-corpus diagnostics: DiB_train's
+/// level-2 pair before training and COVER_warnOnSmallCorpus's level-1
+/// line during it, byte for byte; -q keeps only the level-1 line and -qq
+/// hides both.
+#[test]
+fn small_corpus_warns_like_zstd() {
+    let scratch = Scratch::new("small-warn");
+    write_samples(&scratch.path("samples"), 8);
+    let samples = scratch.path("samples").display().to_string();
+    let dict = scratch.path("d.dict").display().to_string();
+    let out = run(&["--train", "-r", &samples, "-o", &dict]);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("!  Warning : data size of samples too small for target dictionary size "),
+        "{stderr}"
+    );
+    let cover_line = format!(
+        "WARNING: The maximum dictionary size 112640 is too large compared to the source size "
+    );
+    assert!(stderr.contains(&cover_line), "{stderr}");
+
+    let out = run(&["--train", "-r", &samples, "-o", &dict, "-q"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("!  Warning"), "{stderr}");
+    assert!(
+        stderr.contains("WARNING: The maximum dictionary size"),
+        "{stderr}"
+    );
+
+    let out = run(&["--train", "-r", &samples, "-o", &dict, "-qq"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 /// zstd's default output name is `dictionary` in the working directory.
