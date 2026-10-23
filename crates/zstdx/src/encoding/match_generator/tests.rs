@@ -1402,3 +1402,30 @@ fn dict_row_span_key_rules_the_small_payload_swap() {
         "a 16 KiB dict keeps the unknown span armed"
     );
 }
+
+/// The owned window's poison wall must fire: a byte disturbed past the
+/// staged tail (the ASAN-blind overread footprint — the wall is the only
+/// witness) panics at the next checkpoint with the checkpoint named.
+/// Debug-only with the wall itself (`cargo test --release` compiles none
+/// of it).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "poison margin disturbed")]
+fn win_poison_wall_fires_on_a_past_tail_touch() {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024);
+    let tail = driver.block_tail();
+    tail[..8].copy_from_slice(b"aaaaaaaa");
+    driver.commit_block(8);
+    // Disturb one wall byte through the fill's own widen-write-shrink
+    // dance: the committed length stays untouched, exactly like a scan
+    // overreading past the block end through the slack.
+    let staged_end = driver.win_poison_at;
+    let committed = driver.win.len();
+    let wide = (staged_end + 2).min(driver.win.capacity());
+    // SAFETY: `wide` stays inside the capacity; the restore below shrinks
+    // back to the committed length.
+    unsafe { driver.win.set_len(wide) };
+    driver.win[staged_end + 1] = 0;
+    unsafe { driver.win.set_len(committed) };
+    driver.win_poison_assert("test");
+}

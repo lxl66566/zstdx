@@ -108,6 +108,12 @@ pub struct MatchGeneratorDriver {
     /// directly into the spare tail. Hugepage-backed once a far window
     /// grows it past [`HugeBuf`]'s threshold.
     win: HugeBuf<u8>,
+    /// Debug poison wall over `win`'s slack: the staged length whose
+    /// [`poison::MARGIN`]-wide past-the-end span is walled (see
+    /// [`Self::win_poison_fill`]); `usize::MAX` while no wall is up
+    /// (fresh state, after a clear/reallocation, borrowed windows).
+    #[cfg(debug_assertions)]
+    win_poison_at: usize,
     /// Direct-window mode: the window points into caller-owned memory
     /// instead of `win` (see [`MatchGeneratorDriver::adopt_window`]).
     ext: Option<ExtWindow>,
@@ -989,6 +995,8 @@ impl MatchGeneratorDriver {
         // ~1x data volume instead of once per block.
         Self {
             win: HugeBuf::with_capacity(2 * MAX_WINDOW + slice_size),
+            #[cfg(debug_assertions)]
+            win_poison_at: usize::MAX,
             ext: None,
             win_base: 0,
             pos: 0,
@@ -1059,6 +1067,8 @@ impl MatchGeneratorDriver {
     pub fn new_direct() -> Self {
         Self {
             win: HugeBuf::new(),
+            #[cfg(debug_assertions)]
+            win_poison_at: usize::MAX,
             ext: None,
             win_base: 0,
             pos: 0,
@@ -1416,6 +1426,10 @@ impl MatchGeneratorDriver {
                 let need = 2 * params.window + self.slice_size;
                 if self.win.capacity() < need {
                     self.win.reserve(need - self.win.len());
+                    // A reallocation moves the walled span; the next
+                    // staging re-establishes it.
+                    #[cfg(debug_assertions)]
+                    self.win_poison_drop();
                 }
             }
         }
@@ -1584,6 +1598,10 @@ impl MatchGeneratorDriver {
         let content = &content[content.len() - keep..];
         self.win.clear();
         self.win.extend_from_slice(content);
+        // Borrowed window: no staging happens while ext is set, and the
+        // re-extension above moved the walled span.
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         self.win_base = 0;
         self.pos = keep as u64;
         self.anchor = keep as u64;
@@ -2863,6 +2881,8 @@ impl MatchGeneratorDriver {
         // is the never-taken safety net.
         self.win.clear();
         self.win.extend_from_slice(&image.win);
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         self.tables.restore(&image.tables, image.second);
         if self.row_heads.len() == image.row_heads.len() {
             self.row_heads.copy_from_slice(&image.row_heads);
@@ -3149,6 +3169,10 @@ impl Matcher for MatchGeneratorDriver {
         }
         self.ext = None;
         self.win.clear();
+        // The cleared backing's wall span is stale; the frame's first
+        // staging re-establishes it.
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         self.win_base = 0;
         self.pos = 0;
         self.block_end = 0;
@@ -3231,6 +3255,12 @@ impl Matcher for MatchGeneratorDriver {
 
     fn block_tail(&mut self) -> &mut [u8] {
         debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
+        // Everything since the last staging (the parse, the last-space
+        // reads, the skip probes) read the window; none of it may have
+        // crossed the staged tail. Runs before the compaction below
+        // moves the bytes.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("block_tail entry");
         if self.win.len() + self.slice_size > self.win.capacity() {
             let keep = self.win.len().min(self.params.window);
             let drop = self.win.len() - keep;
@@ -3244,6 +3274,10 @@ impl Matcher for MatchGeneratorDriver {
         // written count to commit_block, which shrinks the length back to
         // exactly that, so the never-written tail bytes are never observed.
         unsafe { self.win.set_len(old + self.slice_size) };
+        // Wall the slack past the staged tail for the staging round and
+        // the parse that follows its commit.
+        #[cfg(debug_assertions)]
+        self.win_poison_fill();
         &mut self.win[old..]
     }
 
@@ -3256,6 +3290,10 @@ impl Matcher for MatchGeneratorDriver {
         // Pairs with the `block_tail` call that staged the tail slice; the
         // assert pins that contract against a wrapped length.
         debug_assert!(self.win.len() >= self.slice_size);
+        // The staged wall must be intact: the caller's tail writes and
+        // the pre-split decision stayed inside the staged tail.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("commit_block");
         let old_len = self.win.len() - self.slice_size;
         // SAFETY: the caller wrote read_bytes bytes into the tail slice
         // handed out by block_tail.
@@ -3302,6 +3340,296 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        self.start_matching_codes_inner(literals, seqs);
+        // The parse read the window up to the block end; the wall past
+        // the staged tail must be intact (the wrapper covers every
+        // return path of the body below).
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("start_matching_codes");
+    }
+
+    // Outlined on purpose: with the body inlined into `compress_fastest`
+    // the block loop's layout shifted and text.fastest lost 7% wall at
+    // +0.4% instructions (pure placement). One cold call per block.
+    #[inline(never)]
+    fn skip_if_incompressible(&mut self) -> bool {
+        let win = window_slice(&self.win, self.ext.as_ref());
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
+        let block = &win[(self.block_start - self.win_base) as usize..];
+        let total = block.len();
+        if total < GATE_MIN_BLOCK {
+            return false;
+        }
+        if self.probe.is_empty() {
+            self.probe.resize(1 << GATE_PROBE_LOG, 0);
+        }
+        let probe = &mut self.probe;
+        // Strided repeat probe: a hit means a colliding 47-bit content hash
+        // exists somewhere in the history sampled so far — near-certainly
+        // the same 8 bytes — so the block may be matchable and must not be
+        // gated. The odd stride avoids period locking against structured
+        // inputs. Any match region of a stride's length or more holds a
+        // sample, so only short sparse matches escape detection — those are
+        // worth under a percent of the block, the price the threshold below
+        // already accepted. A hit exits immediately: any single repeat
+        // keeps the whole block matchable.
+        //
+        // The same pass accumulates a sampled byte bitmap: distinct < 208
+        // (the literals gate's pre-screen bar) rules the entropy bar out
+        // outright, keeping low-alphabet corpora out of the exact histogram
+        // below.
+        let stride = (total >> 11) | 1;
+        let mut bitmap = [0u64; 4];
+        let mut i = 0usize;
+        // Micro-screen checkpoints: a block whose sampled distinct count is
+        // implausibly low for a max-entropy source (uniform bytes expect 57
+        // distinct at 64 samples, 221 at 512) sits far below the entropy
+        // bar — text-like alphabets (~70 symbols) and 16-letter skewed exit
+        // at the first or second checkpoint instead of paying the rest of
+        // the probe pass. Rejecting is always the conservative side, so the
+        // screens cannot mis-gate.
+        let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
+        while i + HASH_READ <= total {
+            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
+            let tag = h as u32;
+            if probe[slot] == tag {
+                self.gate_hold = false;
+                return false;
+            }
+            probe[slot] = tag;
+            let b = h as u8 as usize;
+            bitmap[b >> 6] |= 1 << (b & 63);
+            if i == screen1 {
+                screen1 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
+                    self.gate_hold = false;
+                    return false;
+                }
+            } else if i == screen2 {
+                screen2 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
+                    self.gate_hold = false;
+                    return false;
+                }
+            }
+            i += stride;
+        }
+        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if distinct < 208 {
+            self.gate_hold = false;
+            return false;
+        }
+        // The sticky hold skips the exact pass on steady-state
+        // incompressible runs (see the field's risk model); the first block
+        // of every run always pays it.
+        if !self.gate_hold {
+            // Exact byte histogram (four lanes break the store-forward chain):
+            // the entropy decision must not ride on a sample's noise band —
+            // a block wrongly kept below the bar forces a full scan (plus the
+            // table catch-up fill), hundreds of times the histogram cost.
+            let mut lanes = [[0u32; 256]; 4];
+            let (chunks, remainder) = block.as_chunks::<4>();
+            for chunk in chunks {
+                lanes[0][chunk[0] as usize] += 1;
+                lanes[1][chunk[1] as usize] += 1;
+                lanes[2][chunk[2] as usize] += 1;
+                lanes[3][chunk[3] as usize] += 1;
+            }
+            for &b in remainder {
+                lanes[0][b as usize] += 1;
+            }
+            let total_f = total as f64;
+            let mut entropy_bits = 0.0f64;
+            let mut distinct = 0u32;
+            for (s, &c0) in lanes[0].iter().enumerate() {
+                let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
+                if c > 0 {
+                    distinct += 1;
+                    entropy_bits -=
+                        c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
+                }
+            }
+            // Miller-Madow bias correction, as in the literals entropy gate.
+            let bits_per_byte =
+                entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+            // Well past the literals gate's reject floor: huffman on literals
+            // this dense saves under 0.4% before the table description, and the
+            // probe above already ruled out matches worth more.
+            if bits_per_byte < 7.97 {
+                return false;
+            }
+            self.gate_hold = true;
+        }
+        // Advance the cursors only. The opt strategies' tree fills the
+        // skipped range lazily from `next_update`; the table strategies
+        // open the gap at the block start, and the next scan's
+        // `catch_up_insertions` restores the block as match history before
+        // any probe reads the tables — so a later duplicate of a gated
+        // block still matches.
+        if self.gap_start == u64::MAX {
+            self.gap_start = self.block_start;
+        }
+        // Donation mode: a gated block's cost model is its own bytes as
+        // literals (the frame emits it raw). Runs before the cursor
+        // advance: the block borrow must not straddle the LDM fill call.
+        if let Some(stats) = &mut self.probe_stats {
+            stats.absorb_literals(block);
+        }
+        self.ldm_fill_block(LdmFill::Skipped);
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
+        true
+    }
+
+    fn skip_matching(&mut self) {
+        self.resolve_small_src_row();
+        self.resolve_row_attempts();
+        // Only called for RLE blocks so far: every 5-byte window in a
+        // uniform run hashes to the same slot, so indexing each byte just
+        // rewrites one table entry. The first position covers that slot;
+        // future probes into the run resolve through it or the repcode
+        // chain. The opt strategies skip even that: their tree fills
+        // lazily from `next_update`, which stays at the block start and
+        // covers the run on the next block's fill.
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
+        let idx = (self.block_start - self.win_base) as usize;
+        let win = window_slice(&self.win, self.ext.as_ref());
+        if idx + HASH_READ <= win.len() {
+            match self.params.strategy {
+                Strategy::Opt(_) | Strategy::BtLazy(_) => {},
+                Strategy::Chain(_) => {
+                    // The head hash uses params.hash_log; the pattern's
+                    // payload is the chain-table log (they differ on rows
+                    // whose head table outsizes the chain table).
+                    let h = hash_at_width(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
+                    // SAFETY: h is masked to hash_log bits, the absolute block
+                    // start to the chain size (absolute key; see
+                    // emit_chain's note on the walk side's indexing).
+                    let (heads, chain) = self.tables.split();
+                    let chain_mask = chain.len() - 1;
+                    unsafe {
+                        let head = *heads.get_unchecked(h);
+                        *chain.get_unchecked_mut(self.block_start as usize & chain_mask) = head;
+                        *heads.get_unchecked_mut(h) = pack_head(self.block_start, self.head_origin);
+                    }
+                },
+                Strategy::Dfast(small_log) => {
+                    let hl = hash8_at_log(win, idx, self.params.hash_log);
+                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
+                    // SAFETY: both hashes masked to their tables' sizes.
+                    let (long, small) = self.tables.split();
+                    unsafe {
+                        let entry = pack_pos(self.block_start - self.fast_shift);
+                        *long.get_unchecked_mut(hl) = entry;
+                        *small.get_unchecked_mut(hs) = entry;
+                    }
+                },
+                Strategy::Fast => {
+                    insert_at(
+                        win,
+                        self.tables.heads_mut(),
+                        idx,
+                        self.block_start - self.fast_shift,
+                        self.params.hash_log,
+                    );
+                },
+                Strategy::Row(row_log) => {
+                    // Same single-insert policy as the chain arm: a uniform
+                    // run hashes every position to one row, and the newest
+                    // insert covers it.
+                    let h = row_hash_at(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        row_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
+                    let table = self.tables.buf_mut().as_mut_ptr();
+                    let heads = self.row_heads.as_mut_ptr();
+                    match row_log {
+                        4 => row_insert::<4>(table, heads, h, self.block_start),
+                        5 => row_insert::<5>(table, heads, h, self.block_start),
+                        _ => row_insert::<6>(table, heads, h, self.block_start),
+                    }
+                },
+            }
+        }
+        self.ldm_fill_block(LdmFill::Skipped);
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
+        // The skip's window reads stayed inside the staged tail.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("skip_matching");
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// Debug poison wall over the owned window's staging slack: the
+    /// allocation past the staged tail is the ASAN-blind overread zone
+    /// (the R68 class survived exactly there), and `HugeBuf`'s deref
+    /// stops at the logical length, so the helper widens the length to
+    /// the capacity for the fill and shrinks it back. The wall always
+    /// sits past the STAGED length, never past the committed one: the
+    /// streaming core's carry convention keeps tail bytes past a
+    /// committed block alive into the next staging round (the next fill
+    /// reads in behind them), so only the span no caller may touch —
+    /// beyond the full staged tail — is walled. A full-block commit
+    /// lands the wall directly past the block end, where every parse
+    /// overread crosses it.
+    #[cfg(debug_assertions)]
+    fn win_poison_fill(&mut self) {
+        let len = self.win.len();
+        let wide = len.saturating_add(poison::MARGIN).min(self.win.capacity());
+        if wide > len {
+            // SAFETY: `wide` stays inside the capacity; the fill below
+            // writes the whole span, so no read ever sees it unwritten.
+            unsafe { self.win.set_len(wide) };
+            poison::fill_margin(&mut self.win, len);
+            unsafe { self.win.set_len(len) };
+        }
+        self.win_poison_at = len;
+    }
+
+    /// Assert the wall from the last [`Self::win_poison_fill`] intact;
+    /// `ctx` names this checkpoint so the panic localizes the offender.
+    #[cfg(debug_assertions)]
+    fn win_poison_assert(&mut self, ctx: &str) {
+        let at = self.win_poison_at;
+        if at == usize::MAX {
+            return;
+        }
+        let len = self.win.len();
+        debug_assert!(at >= len, "wall below the logical length");
+        let wide = at.saturating_add(poison::MARGIN).min(self.win.capacity());
+        if wide > at {
+            // SAFETY: `wide` stays inside the capacity, and the span was
+            // written by the fill — a disturbance is exactly what the
+            // check reports.
+            unsafe { self.win.set_len(wide) };
+            poison::assert_margin(&self.win, at, ctx);
+            unsafe { self.win.set_len(len) };
+        }
+    }
+
+    /// Drop the wall: a clear or reallocation moves or frees the walled
+    /// span (the bytes past a copied prefix come back unwritten), so the
+    /// next staging must re-establish it.
+    #[cfg(debug_assertions)]
+    fn win_poison_drop(&mut self) {
+        self.win_poison_at = usize::MAX;
+    }
+
+    /// [`Self::start_matching_codes`]'s body, split so the poison wall
+    /// check above runs on every return path.
+    fn start_matching_codes_inner(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         self.resolve_small_src_row();
         self.resolve_row_attempts();
         if self.head_block() {
@@ -3601,227 +3929,6 @@ impl Matcher for MatchGeneratorDriver {
         self.absorb_probe_stats(literals, seqs);
     }
 
-    // Outlined on purpose: with the body inlined into `compress_fastest`
-    // the block loop's layout shifted and text.fastest lost 7% wall at
-    // +0.4% instructions (pure placement). One cold call per block.
-    #[inline(never)]
-    fn skip_if_incompressible(&mut self) -> bool {
-        let win = window_slice(&self.win, self.ext.as_ref());
-        // The window holds the committed block, so the cursor pair cannot
-        // wrap.
-        let block = &win[(self.block_start - self.win_base) as usize..];
-        let total = block.len();
-        if total < GATE_MIN_BLOCK {
-            return false;
-        }
-        if self.probe.is_empty() {
-            self.probe.resize(1 << GATE_PROBE_LOG, 0);
-        }
-        let probe = &mut self.probe;
-        // Strided repeat probe: a hit means a colliding 47-bit content hash
-        // exists somewhere in the history sampled so far — near-certainly
-        // the same 8 bytes — so the block may be matchable and must not be
-        // gated. The odd stride avoids period locking against structured
-        // inputs. Any match region of a stride's length or more holds a
-        // sample, so only short sparse matches escape detection — those are
-        // worth under a percent of the block, the price the threshold below
-        // already accepted. A hit exits immediately: any single repeat
-        // keeps the whole block matchable.
-        //
-        // The same pass accumulates a sampled byte bitmap: distinct < 208
-        // (the literals gate's pre-screen bar) rules the entropy bar out
-        // outright, keeping low-alphabet corpora out of the exact histogram
-        // below.
-        let stride = (total >> 11) | 1;
-        let mut bitmap = [0u64; 4];
-        let mut i = 0usize;
-        // Micro-screen checkpoints: a block whose sampled distinct count is
-        // implausibly low for a max-entropy source (uniform bytes expect 57
-        // distinct at 64 samples, 221 at 512) sits far below the entropy
-        // bar — text-like alphabets (~70 symbols) and 16-letter skewed exit
-        // at the first or second checkpoint instead of paying the rest of
-        // the probe pass. Rejecting is always the conservative side, so the
-        // screens cannot mis-gate.
-        let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
-        while i + HASH_READ <= total {
-            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
-            let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
-            let tag = h as u32;
-            if probe[slot] == tag {
-                self.gate_hold = false;
-                return false;
-            }
-            probe[slot] = tag;
-            let b = h as u8 as usize;
-            bitmap[b >> 6] |= 1 << (b & 63);
-            if i == screen1 {
-                screen1 = usize::MAX;
-                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
-                    self.gate_hold = false;
-                    return false;
-                }
-            } else if i == screen2 {
-                screen2 = usize::MAX;
-                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
-                    self.gate_hold = false;
-                    return false;
-                }
-            }
-            i += stride;
-        }
-        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
-        if distinct < 208 {
-            self.gate_hold = false;
-            return false;
-        }
-        // The sticky hold skips the exact pass on steady-state
-        // incompressible runs (see the field's risk model); the first block
-        // of every run always pays it.
-        if !self.gate_hold {
-            // Exact byte histogram (four lanes break the store-forward chain):
-            // the entropy decision must not ride on a sample's noise band —
-            // a block wrongly kept below the bar forces a full scan (plus the
-            // table catch-up fill), hundreds of times the histogram cost.
-            let mut lanes = [[0u32; 256]; 4];
-            let (chunks, remainder) = block.as_chunks::<4>();
-            for chunk in chunks {
-                lanes[0][chunk[0] as usize] += 1;
-                lanes[1][chunk[1] as usize] += 1;
-                lanes[2][chunk[2] as usize] += 1;
-                lanes[3][chunk[3] as usize] += 1;
-            }
-            for &b in remainder {
-                lanes[0][b as usize] += 1;
-            }
-            let total_f = total as f64;
-            let mut entropy_bits = 0.0f64;
-            let mut distinct = 0u32;
-            for (s, &c0) in lanes[0].iter().enumerate() {
-                let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
-                if c > 0 {
-                    distinct += 1;
-                    entropy_bits -=
-                        c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
-                }
-            }
-            // Miller-Madow bias correction, as in the literals entropy gate.
-            let bits_per_byte =
-                entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
-            // Well past the literals gate's reject floor: huffman on literals
-            // this dense saves under 0.4% before the table description, and the
-            // probe above already ruled out matches worth more.
-            if bits_per_byte < 7.97 {
-                return false;
-            }
-            self.gate_hold = true;
-        }
-        // Advance the cursors only. The opt strategies' tree fills the
-        // skipped range lazily from `next_update`; the table strategies
-        // open the gap at the block start, and the next scan's
-        // `catch_up_insertions` restores the block as match history before
-        // any probe reads the tables — so a later duplicate of a gated
-        // block still matches.
-        if self.gap_start == u64::MAX {
-            self.gap_start = self.block_start;
-        }
-        // Donation mode: a gated block's cost model is its own bytes as
-        // literals (the frame emits it raw). Runs before the cursor
-        // advance: the block borrow must not straddle the LDM fill call.
-        if let Some(stats) = &mut self.probe_stats {
-            stats.absorb_literals(block);
-        }
-        self.ldm_fill_block(LdmFill::Skipped);
-        self.pos = self.block_end;
-        self.anchor = self.block_end;
-        true
-    }
-
-    fn skip_matching(&mut self) {
-        self.resolve_small_src_row();
-        self.resolve_row_attempts();
-        // Only called for RLE blocks so far: every 5-byte window in a
-        // uniform run hashes to the same slot, so indexing each byte just
-        // rewrites one table entry. The first position covers that slot;
-        // future probes into the run resolve through it or the repcode
-        // chain. The opt strategies skip even that: their tree fills
-        // lazily from `next_update`, which stays at the block start and
-        // covers the run on the next block's fill.
-        // The window holds the committed block, so the cursor pair cannot
-        // wrap.
-        let idx = (self.block_start - self.win_base) as usize;
-        let win = window_slice(&self.win, self.ext.as_ref());
-        if idx + HASH_READ <= win.len() {
-            match self.params.strategy {
-                Strategy::Opt(_) | Strategy::BtLazy(_) => {},
-                Strategy::Chain(_) => {
-                    // The head hash uses params.hash_log; the pattern's
-                    // payload is the chain-table log (they differ on rows
-                    // whose head table outsizes the chain table).
-                    let h = hash_at_width(
-                        win,
-                        idx,
-                        self.params.hash_log,
-                        ChainHashWidth::of(self.dict_row),
-                    );
-                    // SAFETY: h is masked to hash_log bits, the absolute block
-                    // start to the chain size (absolute key; see
-                    // emit_chain's note on the walk side's indexing).
-                    let (heads, chain) = self.tables.split();
-                    let chain_mask = chain.len() - 1;
-                    unsafe {
-                        let head = *heads.get_unchecked(h);
-                        *chain.get_unchecked_mut(self.block_start as usize & chain_mask) = head;
-                        *heads.get_unchecked_mut(h) = pack_head(self.block_start, self.head_origin);
-                    }
-                },
-                Strategy::Dfast(small_log) => {
-                    let hl = hash8_at_log(win, idx, self.params.hash_log);
-                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
-                    // SAFETY: both hashes masked to their tables' sizes.
-                    let (long, small) = self.tables.split();
-                    unsafe {
-                        let entry = pack_pos(self.block_start - self.fast_shift);
-                        *long.get_unchecked_mut(hl) = entry;
-                        *small.get_unchecked_mut(hs) = entry;
-                    }
-                },
-                Strategy::Fast => {
-                    insert_at(
-                        win,
-                        self.tables.heads_mut(),
-                        idx,
-                        self.block_start - self.fast_shift,
-                        self.params.hash_log,
-                    );
-                },
-                Strategy::Row(row_log) => {
-                    // Same single-insert policy as the chain arm: a uniform
-                    // run hashes every position to one row, and the newest
-                    // insert covers it.
-                    let h = row_hash_at(
-                        win,
-                        idx,
-                        self.params.hash_log,
-                        row_log,
-                        ChainHashWidth::of(self.dict_row),
-                    );
-                    let table = self.tables.buf_mut().as_mut_ptr();
-                    let heads = self.row_heads.as_mut_ptr();
-                    match row_log {
-                        4 => row_insert::<4>(table, heads, h, self.block_start),
-                        5 => row_insert::<5>(table, heads, h, self.block_start),
-                        _ => row_insert::<6>(table, heads, h, self.block_start),
-                    }
-                },
-            }
-        }
-        self.ldm_fill_block(LdmFill::Skipped);
-        self.pos = self.block_end;
-        self.anchor = self.block_end;
-    }
-}
-
-impl MatchGeneratorDriver {
     /// LDM-index a block the scan will not parse (incompressibility-gated,
     /// RLE-skipped, or parsed by the DUBT head): the bytes stay matchable
     /// far-distance history for later blocks, and the rolling hash stays
@@ -4129,6 +4236,9 @@ pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmAr
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
 use range::IdxRange;
+
+#[cfg(debug_assertions)]
+use super::poison;
 
 /// Whether `level`/`shape` names a fast/dfast LDM row whose stock window
 /// sits below the far domain — the population the pre-header far-class
