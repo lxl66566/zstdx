@@ -51,6 +51,61 @@ fn shape(kind: &str, len: usize) -> Vec<u8> {
                 data.extend_from_slice(&unit[..unit.len().min(len - data.len())]);
             }
         },
+        // Beyond-window redundancy with no near twin (the todo-26
+        // reproducer classes): `farfrags` spreads a small fragment pool
+        // so every twin sits a few KiB out (past the small forced
+        // windows), `twinhalves` repeats its whole first half a
+        // half-payload later (past a w16 window).
+        "farfrags" => {
+            let mut rng = Rng(0xf00d_f00d_f00d_f00d);
+            let frags: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..40)
+                .map(|_| (0..24).map(|_| rng.byte()).collect())
+                .collect();
+            let mut rng = Rng(0xfeed_face_cafe_babe);
+            let mut rng = Rng(0xfeed_face_cafe_babe);
+            while data.len() < len {
+                let n = 1 + rng.next() as usize % 3;
+                for _ in 0..n {
+                    data.extend_from_slice(&frags[rng.next() as usize % frags.len()]);
+                    let noise = 8 + rng.next() as usize % 40;
+                    for _ in 0..noise {
+                        data.push(rng.byte());
+                    }
+                }
+            }
+            data.truncate(len);
+        },
+        "twinhalves" => {
+            let mut rng = Rng(0x5eed_5eed_5eed_5eed);
+            let frags: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..64)
+                .map(|_| (0..40).map(|_| rng.byte()).collect())
+                .collect();
+            let mut rng = Rng(0x1bad_b002_bad0_dad1);
+            while data.len() < len / 2 {
+                data.extend_from_slice(&frags[rng.next() as usize % frags.len()]);
+                let noise = 20 + rng.next() as usize % 30;
+                for _ in 0..noise {
+                    data.push(rng.byte());
+                }
+            }
+            // The second half replays the first half's span with fresh
+            // noise between: long matches at ~len/2 distance, none nearer.
+            let first = data.clone();
+            let mut i = 0usize;
+            while data.len() < len {
+                let end = (i + 40).min(first.len());
+                data.extend_from_slice(&first[i..end]);
+                i = end;
+                if i >= first.len() {
+                    i = 0;
+                }
+                let noise = 20 + rng.next() as usize % 30;
+                for _ in 0..noise {
+                    data.push(rng.byte());
+                }
+            }
+            data.truncate(len);
+        },
         "run_mix" => {
             // Long uniform runs interleaved with fresh noise: RLE literals,
             // long matches, and entropy tails in one payload.
@@ -285,6 +340,68 @@ fn window_and_ldm_edges() {
         let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level))
             .long_distance_matching(crate::LdmMode::Enable);
         check(&payload, &format!("ldm-forced/{label}/l{level}"), &opts);
+    }
+}
+
+/// Forced windows on UNPLEDGED streams (todo 26): the unknown length
+/// leaves the source clamp out of param resolution, so every row whose
+/// search domain rides `chain_reach` (chain 9, btlazy 13-15, opt 16-19)
+/// scanned past the declared window while the header kept declaring it —
+/// frames the reference rejects (the bulk cells in `option_combos` stay
+/// clamped through their known length, which is exactly why the grid
+/// above never caught it). Both stream cores, no pledge, no length hint,
+/// reference decode on every frame; rows 20-22 (no reach override) ride
+/// along as the control.
+#[cfg(feature = "std")]
+#[test]
+fn forced_window_unpledged_streams() {
+    let shapes = [
+        ("farfrags", shape("farfrags", 300 * 1024)),
+        ("twinhalves", shape("twinhalves", 300 * 1024)),
+    ];
+    for (kind, payload) in &shapes {
+        for window_log in [10u32, 16] {
+            for level in [9i32, 13, 16, 19, 22] {
+                let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level))
+                    .with_input_shape(crate::InputShape::default().with_window_log(window_log));
+                let label = format!("{kind}/w{window_log}/l{level}");
+                // write core: chunked writes, no pledge, no length hint.
+                let mut sink = alloc::vec![];
+                {
+                    use crate::io::Write;
+                    let mut enc =
+                        crate::stream::write::Encoder::with_options(&mut sink, opts.clone())
+                            .unwrap();
+                    for piece in payload.chunks(7_000) {
+                        enc.write_all(piece).unwrap();
+                    }
+                    enc.finish().unwrap();
+                }
+                zstd::stream::decode_all(&sink[..])
+                    .unwrap_or_else(|e| panic!("{label}/write: reference decode failed: {e:?}"));
+                assert_eq!(
+                    crate::stream::decode_all(&sink[..]).unwrap(),
+                    *payload,
+                    "{label}/write: own bytes differ"
+                );
+                // read core: whole-frame pull, no pledge, no length hint.
+                let mut compressed = alloc::vec![];
+                {
+                    use crate::io::Read;
+                    let mut enc =
+                        crate::stream::read::Encoder::with_options(payload.as_slice(), opts)
+                            .unwrap();
+                    enc.read_to_end(&mut compressed).unwrap();
+                }
+                zstd::stream::decode_all(&compressed[..])
+                    .unwrap_or_else(|e| panic!("{label}/read: reference decode failed: {e:?}"));
+                assert_eq!(
+                    crate::stream::decode_all(&compressed[..]).unwrap(),
+                    *payload,
+                    "{label}/read: own bytes differ"
+                );
+            }
+        }
     }
 }
 

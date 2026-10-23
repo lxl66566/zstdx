@@ -865,24 +865,43 @@ pub(super) const fn params_for_row(
     p
 }
 
-/// Downsize a row for a known source length — the window/table half of
+/// Downsize a row for a known source length — the window half of
 /// libzstd's `ZSTD_adjustCParams_internal`: the window clamps to the
-/// source's log (so small inputs never pay large-input reach or memory),
-/// the hash tables to windowLog+1, the chain/ring cycle to windowLog.
-/// `None` (unknown size) keeps the row untouched, like libzstd's
-/// ZSTD_CONTENTSIZE_UNKNOWN.
+/// source's log (so small inputs never pay large-input reach or memory).
+/// `None` (unknown size) skips the window downsize, like libzstd's
+/// ZSTD_CONTENTSIZE_UNKNOWN — but the geometry clamp below still runs:
+/// C bounds every search loop by `ZSTD_getLowestMatchIndex` at the FINAL
+/// windowLog unconditionally (`windowLow = curr - (1 << windowLog)` in
+/// zstd_lazy.c/zstd_opt.c), so a forced window on an unknown-length
+/// stream must shrink the domain too (todo 26: the ring-reach rows
+/// scanned past the declared window and libzstd rejected the frames).
 const fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
-    let n = match src {
-        Some(n) if n > 0 => n,
-        _ => return p,
-    };
-    // srcLog = ceil(log2(max(n, 2^HASHLOG_MIN))), floored at the frame
-    // format's minimum window log.
-    let t = max_u64(n, 1 << 6);
-    let src_log = max_u32(64 - (t - 1).leading_zeros(), 10);
-    // Non-power-of-two windows (the Fastest row's 768 KiB) round up.
-    let wlog = min_u32(64 - (p.window as u64 - 1).leading_zeros(), src_log);
-    p.window = 1usize << wlog;
+    if let Some(n) = src
+        && n > 0
+    {
+        // srcLog = ceil(log2(max(n, 2^HASHLOG_MIN))), floored at the frame
+        // format's minimum window log.
+        let t = max_u64(n, 1 << 6);
+        let src_log = max_u32(64 - (t - 1).leading_zeros(), 10);
+        // Non-power-of-two windows (the Fastest row's 768 KiB) round up.
+        let wlog = min_u32(64 - (p.window as u64 - 1).leading_zeros(), src_log);
+        p.window = 1usize << wlog;
+    }
+    clamp_geometry_to_window(p)
+}
+
+/// The unconditional half of the adjustment: the search domain and every
+/// table log clamp to the row's FINAL window log, whatever declared it
+/// (a source clamp or a forced `window_log`). Mirrors C's relations in
+/// `ZSTD_adjustCParams_internal` (`hashLog > dictAndWindowLog+1` and
+/// `cycleLog > dictAndWindowLog` clamps): our bt ring stores two u32
+/// link slots per position, so its `bt_log` IS the cycle log (C's
+/// `chainLog - btScale`), hence `bt_log <= windowLog`. The stock ladder
+/// rows satisfy every relation by construction (`chain_reach <= window`),
+/// so this only fires under a forced window or a source clamp —
+/// unknown-length stock frames keep their exact bytes.
+const fn clamp_geometry_to_window(mut p: LevelParams) -> LevelParams {
+    let wlog = 64 - (p.window as u64 - 1).leading_zeros();
     p.chain_reach = match p.chain_reach {
         Some(r) => Some(min_usize(r, p.window)),
         None => None,
@@ -986,14 +1005,13 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 ///
 /// The grid is the full cross product the runtime can reach through
 /// `params_for_row`: every level 0..=22, every head-verdict axis
-/// (`SmallSrcRow` × `RowAttempts`), and every source-length cell that
-/// changes the geometry — `Some(1 << src_log)` for src_log 10..=27 (the
-/// exact powers of two, whose `ceil_log2` is the log itself) plus the
-/// unknown-length cell (the untouched ladder row). A forced window log
-/// adds no cell: with a known length it reduces to the
-/// `src_log = min(wlog, src_log)` cell below, and with an unknown length
-/// the length adjustment returns early and the tables keep the pure
-/// ladder row.
+/// (`SmallSrcRow` × `RowAttempts`), every source-length cell that changes
+/// the geometry — `Some(1 << src_log)` for src_log 10..=27 (the exact
+/// powers of two, whose `ceil_log2` is the log itself) plus the
+/// unknown-length cell — and, since todo 26, the forced-window axis
+/// (`None` plus 10..=27): the geometry clamp runs on the unknown length
+/// too, so every (len × window) cell must keep the domain/geometry
+/// relations below.
 ///
 /// Relations proven per cell (a violation fails the build):
 /// - `hash_log` stays within 10..=30, so `1 << hash_log` fits a usize head span on every target;
@@ -1001,7 +1019,11 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 ///   head span; a degenerate row_log at or above hash_log would collapse the rows to one and break
 ///   the scan's row extraction), and its row count is a power of two that exactly partitions the
 ///   head span (`rows * (1 << row_log) == 1 << hash_log`);
-/// - a dfast row keeps its short-table log at or below the head log.
+/// - a dfast row keeps its short-table log at or below the head log;
+/// - the search domain and table geometry sit inside the final window (todo 26): `chain_reach <=
+///   window`, the chain/row/bt logs `<= wlog`, `hash_log <= wlog+1` — the exact relations of
+///   `clamp_geometry_to_window`, so a resolution path that forgets the clamp fails the build
+///   instead of emitting window-violating frames.
 ///
 /// The pair walk then covers the pooled-driver transition the R68 bug #3
 /// class rode: for every pair of row levels at the same cell with equal
@@ -1022,67 +1044,98 @@ const fn prove_ladder_geometry() -> usize {
     let mut variant = 0usize;
     while variant < VARIANTS.len() {
         let (row, attempts) = VARIANTS[variant];
-        let mut src_log = 10u32;
-        while src_log <= 28 {
-            // src_log 28 is the unknown-length cell: `None` keeps the
-            // ladder row untouched, which the length-clamped cells
-            // converge to as the source grows past every table.
-            let shape = if src_log == 28 {
-                InputShape {
-                    len: None,
-                    window_log: None,
-                }
+        // Axis value 0 is the unknown cell (`None`); 10..=27 the known
+        // powers/clamps. Every axis value pairs with every other.
+        let mut w_axis = 0u32;
+        while w_axis <= 18 {
+            let window_log = if w_axis == 0 {
+                None
             } else {
-                InputShape {
-                    len: Some(1u64 << src_log),
-                    window_log: None,
-                }
+                Some(w_axis + 9)
             };
-            // The cell's row-family geometry, for the pair walk below.
-            let mut heads = [0usize; 23];
-            let mut rows = [0usize; 23];
-            let mut row_levels = 0usize;
-            let mut level = 0i32;
-            while level <= 22 {
-                let p = params_for_row(Level::from_zstd(level), shape, row, attempts);
-                assert!(p.hash_log >= 10 && p.hash_log <= 30, "hash_log out of span");
-                match p.strategy {
-                    Strategy::Row(rl) => {
-                        assert!(rl < p.hash_log, "row_log at/above hash_log");
-                        // Every row_log dispatch site instantiates
-                        // 4/5/6 (anything else falls to the 6 arm).
-                        assert!(rl >= 4 && rl <= 6, "row_log outside the instantiated set");
-                        let cell_rows = 1usize << (p.hash_log - rl);
-                        assert!(
-                            cell_rows * (1usize << rl) == 1usize << p.hash_log,
-                            "rows do not partition the head span"
-                        );
-                        assert!(cell_rows.is_power_of_two() && cell_rows >= 2);
-                        heads[row_levels] = 1usize << p.hash_log;
-                        rows[row_levels] = cell_rows;
-                        row_levels += 1;
-                    },
-                    Strategy::Dfast(small) => {
-                        assert!(small <= p.hash_log, "dfast short table above the head");
-                    },
-                    _ => {},
-                }
-                level += 1;
-            }
-            // Pair walk: the rows-kept lockstep transitions.
-            let mut i = 0usize;
-            while i < row_levels {
-                let mut j = i + 1;
-                while j < row_levels {
-                    if rows[i] == rows[j] && heads[i] != heads[j] {
-                        collisions += 1;
-                        assert!(heads[i].is_power_of_two() && heads[j].is_power_of_two());
+            let mut src_axis = 0u32;
+            while src_axis <= 18 {
+                let len = if src_axis == 0 {
+                    None
+                } else {
+                    Some(1u64 << (src_axis + 9))
+                };
+                let shape = InputShape { len, window_log };
+                // The cell's row-family geometry, for the pair walk below.
+                let mut heads = [0usize; 23];
+                let mut rows = [0usize; 23];
+                let mut row_levels = 0usize;
+                let mut level = 0i32;
+                while level <= 22 {
+                    let p = params_for_row(Level::from_zstd(level), shape, row, attempts);
+                    assert!(p.hash_log >= 10 && p.hash_log <= 30, "hash_log out of span");
+                    // The todo-26 domain/geometry relations: everything a
+                    // search can walk sits inside the final window. Level
+                    // 0 opts out (raw blocks never match; the row skips
+                    // the adjustment to stay shape-independent).
+                    let wlog = 64 - (p.window as u64 - 1).leading_zeros();
+                    if level != 0 {
+                        assert!(p.hash_log <= wlog + 1, "hash_log above window+1");
+                        match p.chain_reach {
+                            Some(r) => assert!(r <= p.window, "chain_reach above the window"),
+                            None => {},
+                        }
                     }
-                    j += 1;
+                    match p.strategy {
+                        Strategy::Row(rl) => {
+                            assert!(rl < p.hash_log, "row_log at/above hash_log");
+                            // Every row_log dispatch site instantiates
+                            // 4/5/6 (anything else falls to the 6 arm).
+                            assert!(rl >= 4 && rl <= 6, "row_log outside the instantiated set");
+                            if level != 0 {
+                                assert!(rl <= wlog, "row_log above the window");
+                            }
+                            let cell_rows = 1usize << (p.hash_log - rl);
+                            assert!(
+                                cell_rows * (1usize << rl) == 1usize << p.hash_log,
+                                "rows do not partition the head span"
+                            );
+                            assert!(cell_rows.is_power_of_two() && cell_rows >= 2);
+                            heads[row_levels] = 1usize << p.hash_log;
+                            rows[row_levels] = cell_rows;
+                            row_levels += 1;
+                        },
+                        Strategy::Dfast(small) => {
+                            assert!(small <= p.hash_log, "dfast short table above the head");
+                            if level != 0 {
+                                assert!(small <= wlog + 1, "dfast short table above window+1");
+                            }
+                        },
+                        Strategy::Chain(c) => {
+                            if level != 0 {
+                                assert!(c <= wlog, "chain log above the window");
+                            }
+                        },
+                        Strategy::Opt(knobs) | Strategy::BtLazy(knobs) => {
+                            if level != 0 {
+                                assert!(knobs.bt_log <= wlog, "bt ring above the window");
+                            }
+                        },
+                        Strategy::Fast => {},
+                    }
+                    level += 1;
                 }
-                i += 1;
+                // Pair walk: the rows-kept lockstep transitions.
+                let mut i = 0usize;
+                while i < row_levels {
+                    let mut j = i + 1;
+                    while j < row_levels {
+                        if rows[i] == rows[j] && heads[i] != heads[j] {
+                            collisions += 1;
+                            assert!(heads[i].is_power_of_two() && heads[j].is_power_of_two());
+                        }
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                src_axis += 1;
             }
-            src_log += 1;
+            w_axis += 1;
         }
         variant += 1;
     }
@@ -1096,6 +1149,6 @@ const fn prove_ladder_geometry() -> usize {
 /// precondition: same row count at different hash logs).
 const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
 const _: () = assert!(
-    LADDER_ROW_COLLISIONS == 132,
+    LADDER_ROW_COLLISIONS == 1388,
     "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
 );
