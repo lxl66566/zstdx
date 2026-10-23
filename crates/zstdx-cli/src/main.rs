@@ -14,7 +14,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use progress::{ProgressMonitor, fmt_size};
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -23,6 +23,8 @@ use zstdx::{DecoderOptions, EncoderOptions, InputShape, Level};
 
 /// Suffix added on compression and required (or stripped) on decompression.
 const ZSTD_SUFFIX: &str = ".zst";
+/// Tar-suffix zstd also strips on decompression (`.tzst` maps to `.tar`).
+const TZSTD_SUFFIX: &str = ".tzst";
 /// libzstd's CLI default compression level.
 const DEFAULT_LEVEL: i32 = 3;
 /// libzstd's CLI caps levels here unless `--ultra` is passed.
@@ -33,6 +35,9 @@ const MIN_WINDOW_LOG: u32 = 10;
 /// Highest window log the engine implements. libzstd allows up to 30 on
 /// 64-bit targets; `--long` above this warns and clamps.
 const MAX_WINDOW_LOG: u32 = 27;
+/// libzstd's format-level window log ceiling (`ZSTD_WINDOWLOG_MAX`), which
+/// gates the extra `--long=`/`--memory=` hint line.
+const ZSTD_WINDOWLOG_MAX: u32 = 30;
 /// Smallest window a frame may request, in bytes: `-M` values below it
 /// reject every frame (libzstd's out-of-bound parameter error).
 const MIN_WINDOW_BYTES: u64 = 1 << MIN_WINDOW_LOG;
@@ -47,6 +52,20 @@ const VERSION: &str = concat!(
 );
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// A fully rendered diagnostic: printed verbatim, one line per entry,
+/// instead of the `zstdx: <input>: <message>` wrapper -- for the stderr
+/// lines that mirror zstd's per-site formats byte for byte.
+#[derive(Debug)]
+struct Diagnostic(Vec<String>);
+
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.join("\n"))
+    }
+}
+
+impl std::error::Error for Diagnostic {}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Mode {
@@ -117,6 +136,16 @@ fn parse_size(text: &str) -> Result<u64, String> {
     value
         .checked_mul(unit.multiplier())
         .ok_or_else(|| format!("size out of range: {text:?}"))
+}
+
+/// strerror text of an io error: its Display without the `(os error N)`
+/// suffix, matching the C library strings zstd prints.
+fn strerror(err: &io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    }
 }
 
 /// Validated, mode-scoped knobs for one invocation, derived once in `run`.
@@ -265,7 +294,7 @@ struct Cli {
     keep: bool,
 
     /// Remove input files after successful (de)compression to a file
-    #[arg(long, conflicts_with = "keep")]
+    #[arg(long)]
     rm: bool,
 
     /// Overwrite existing output files without asking, and allow reading
@@ -395,9 +424,9 @@ struct Cli {
     #[arg(long, conflicts_with = "threads")]
     single_thread: bool,
 
-    /// Per-input failures (e.g. one unreadable file under -r) are reported
-    /// but do not affect the exit code
-    #[arg(long)]
+    /// Removed in zstd 1.5.5+ (v1.5.7 rejects it as an incorrect
+    /// parameter); kept parseable so the diagnostic matches zstd's
+    #[arg(long, hide = true)]
     ignore_errors: bool,
 
     // Rejected flags: parsing them keeps the diagnostic a clear
@@ -427,17 +456,58 @@ enum Output {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse_from(normalize_args(std::env::args_os()));
+    let args = match normalize_args(std::env::args_os()) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        },
+    };
+    // zstdcli.c assigns `removeSrcFile` per occurrence of --rm / -k/--keep:
+    // the flag that appears last wins, so `--rm -k` keeps the input.
+    let rm = rm_flag_last_wins(&args);
+    let command = Cli::command();
+    let matches = match command.try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(err) => err.exit(),
+    };
+    let cli = Cli::from_arg_matches(&matches).expect("try_get_matches validated the args");
     init_logging(&cli);
-    if run(&cli) {
+    if run(&cli, rm) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
 }
 
+/// Whether `--rm` or `-k/--keep` appeared last on the command line: clap's
+/// occurrence indices carry default-value entries, so the raw argv is the
+/// reliable witness. Bundled shorts (`-fk`) are clap's domain; a `k` inside
+/// a bundle does not count here (zstdcli.c's char loop does count it).
+fn rm_flag_last_wins(args: &[OsString]) -> bool {
+    let mut rm = false;
+    for arg in args.iter().skip(1) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--rm" {
+            rm = true;
+        } else if arg == "-k" || arg == "--keep" {
+            rm = false;
+        }
+    }
+    rm
+}
+
 /// Returns false when any input failed to process.
-fn run(cli: &Cli) -> bool {
+fn run(cli: &Cli, rm: bool) -> bool {
+    // zstd 1.5.7 removed --ignore-errors (v1.5.5 deprecation turned into
+    // a hard parser rejection, before any mode runs).
+    if cli.ignore_errors {
+        eprintln!("Incorrect parameter: --ignore-errors ");
+        return false;
+    }
+
     let mode = if cli.train {
         Mode::Train
     } else if cli.list {
@@ -544,9 +614,9 @@ fn run(cli: &Cli) -> bool {
         && !cli.ultra
         && cli.patch_from.is_none()
     {
-        eprintln!(
-            "{PREFIX}Warning: compression level higher than max, reduced to \
-             {MAX_LEVEL_WITHOUT_ULTRA} (use --ultra to allow 20-22)"
+        info!(
+            "Warning: compression level higher than max, reduced to {MAX_LEVEL_WITHOUT_ULTRA} \
+             (use --ultra to allow 20-22) "
         );
         level = MAX_LEVEL_WITHOUT_ULTRA;
     }
@@ -568,7 +638,11 @@ fn run(cli: &Cli) -> bool {
         Some(path) => match fs::read(path) {
             Ok(bytes) => Some(bytes),
             Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+                eprintln!(
+                    "{PREFIX}error 31 : Stat failed on dictionary file {}: {} ",
+                    path.display(),
+                    strerror(&err)
+                );
                 return false;
             },
         },
@@ -578,8 +652,8 @@ fn run(cli: &Cli) -> bool {
     let filelist = match &cli.filelist {
         Some(path) => match read_filelist(path) {
             Ok(list) => list,
-            Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+            Err(_) => {
+                eprintln!("{PREFIX}error reading {} ", path.display());
                 return false;
             },
         },
@@ -592,7 +666,13 @@ fn run(cli: &Cli) -> bool {
         inputs.push(Input::Stdin);
     } else {
         for file in cli.files.iter().chain(&filelist) {
-            collect_input(file, cli.recursive, &mut inputs, &mut ok);
+            collect_input(
+                file,
+                cli.recursive,
+                &mut inputs,
+                &mut ok,
+                InputGathering::Stat,
+            );
         }
     }
 
@@ -649,35 +729,36 @@ fn run(cli: &Cli) -> bool {
 
     let stdout_output =
         cli.stdout || cli.output.is_none() && inputs.iter().any(|i| matches!(i, Input::Stdin));
-    if cli.rm && stdout_output {
-        eprintln!("{PREFIX}Note: input files are not removed when output is stdout");
+    if rm && stdout_output {
+        info!("Note: src files are not removed when output is stdout ");
     }
 
     for input in &inputs {
-        if let Err(err) = process(input, cli, mode, &settings, dict.as_deref()) {
+        if let Err(err) = process(input, cli, mode, &settings, dict.as_deref(), rm) {
             if cli.quiet < 2 {
-                let name = match input {
-                    Input::Stdin => "stdin".to_string(),
-                    Input::File(path) => path.display().to_string(),
-                };
-                eprintln!("{PREFIX}{name}: {err}");
+                if let Some(diagnostic) = err.downcast_ref::<Diagnostic>() {
+                    for line in &diagnostic.0 {
+                        eprintln!("{line}");
+                    }
+                } else {
+                    let name = match input {
+                        Input::Stdin => "stdin".to_string(),
+                        Input::File(path) => path.display().to_string(),
+                    };
+                    eprintln!("{PREFIX}{name}: {err}");
+                }
             }
-            // --ignore-errors keeps per-input failures out of the exit code.
-            if !cli.ignore_errors {
-                ok = false;
-            }
+            ok = false;
         }
     }
     ok
 }
 
-/// Read `--filelist`: one path per line, blank lines skipped.
+/// Read `--filelist`: one path per line, blank lines skipped. zstd has no
+/// stdin file-list form: `-` is a literal path there (and fails as
+/// `error reading -`), so it is here too.
 fn read_filelist(path: &Path) -> AnyResult<Vec<PathBuf>> {
-    let reader: Box<dyn BufRead> = if path.as_os_str() == "-" {
-        Box::new(io::stdin().lock())
-    } else {
-        Box::new(BufReader::new(File::open(path)?))
-    };
+    let reader = BufReader::new(File::open(path)?);
     let mut paths = Vec::new();
     for line in reader.lines() {
         let line = line?;
@@ -688,40 +769,100 @@ fn read_filelist(path: &Path) -> AnyResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Whether the metadata is a named pipe, one of zstd's accepted non-regular
+/// input kinds (Unix-only; other platforms have no FIFOs).
+#[cfg(unix)]
+fn is_fifo(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    meta.file_type().is_fifo()
+}
+
+#[cfg(not(unix))]
+fn is_fifo(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// How [`collect_input`] vets each path: the (de)compression modes stat up
+/// front and report unreachable inputs with zstd's collection diagnostics;
+/// the inspector (`-l`) and trainer take raw paths and print their own
+/// per-file errors instead.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum InputGathering {
+    Stat,
+    Raw,
+}
+
 /// Gather the file list, expanding directories when `recursive` is set.
-fn collect_input(path: &Path, recursive: bool, inputs: &mut Vec<Input>, ok: &mut bool) {
+fn collect_input(
+    path: &Path,
+    recursive: bool,
+    inputs: &mut Vec<Input>,
+    ok: &mut bool,
+    gather: InputGathering,
+) {
     if path.as_os_str() == "-" {
         inputs.push(Input::Stdin);
         return;
     }
-    if path.is_dir() {
-        if !recursive {
-            eprintln!("{PREFIX}{}: is a directory -- ignored", path.display());
-            *ok = false;
-            return;
-        }
-        let mut stack = vec![path.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            match fs::read_dir(&dir) {
-                Ok(entries) => {
-                    for entry in entries.filter_map(Result::ok) {
-                        let entry_path = entry.path();
-                        if entry_path.is_dir() {
-                            stack.push(entry_path);
-                        } else {
-                            inputs.push(Input::File(entry_path));
-                        }
-                    }
-                },
-                Err(err) => {
-                    eprintln!("{PREFIX}{}: {err}", dir.display());
-                    *ok = false;
-                },
-            }
+    if gather == InputGathering::Raw {
+        if path.is_dir() && recursive {
+            expand_dir(path, inputs, ok);
+        } else {
+            inputs.push(Input::File(path.to_path_buf()));
         }
         return;
     }
-    inputs.push(Input::File(path.to_path_buf()));
+    match fs::metadata(path) {
+        Err(err) => {
+            eprintln!(
+                "{PREFIX}can't stat {} : {} -- ignored ",
+                path.display(),
+                strerror(&err)
+            );
+            *ok = false;
+        },
+        Ok(meta) if meta.is_dir() => {
+            if !recursive {
+                eprintln!("{PREFIX}{} is a directory -- ignored ", path.display());
+                *ok = false;
+                return;
+            }
+            expand_dir(path, inputs, ok);
+        },
+        // zstd accepts regular files and FIFOs as inputs; anything else
+        // (sockets, devices) is skipped with this diagnostic.
+        Ok(meta) if !meta.is_file() && !is_fifo(&meta) => {
+            eprintln!(
+                "{PREFIX}{} is not a regular file -- ignored ",
+                path.display()
+            );
+            *ok = false;
+        },
+        Ok(_) => inputs.push(Input::File(path.to_path_buf())),
+    }
+}
+
+/// Walk a directory tree, collecting every non-directory entry.
+fn expand_dir(path: &Path, inputs: &mut Vec<Input>, ok: &mut bool) {
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries.filter_map(Result::ok) {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        stack.push(entry_path);
+                    } else {
+                        inputs.push(Input::File(entry_path));
+                    }
+                }
+            },
+            Err(err) => {
+                eprintln!("{PREFIX}{}: {err}", dir.display());
+                *ok = false;
+            },
+        }
+    }
 }
 
 /// Whether the progress bar may draw for one input. `--[no-]progress`
@@ -751,6 +892,7 @@ fn process(
     mode: Mode,
     settings: &Settings,
     dict: Option<&[u8]>,
+    rm: bool,
 ) -> AnyResult<()> {
     let output = match mode {
         Mode::Test => Output::Sink,
@@ -781,7 +923,10 @@ fn process(
     if let (Input::File(in_path), Output::File(out_path)) = (input, &output)
         && in_path == out_path
     {
-        return Err("input and output cannot be the same file".into());
+        return Err(Diagnostic(vec![
+            "{PREFIX}Refusing to open an output file which will overwrite the input file ".into(),
+        ])
+        .into());
     }
     // The overwrite check guards every file output, no matter where the
     // input comes from: piped stdin clobbers an `-o` target just as well as
@@ -807,7 +952,14 @@ fn process(
         Mode::Compress => compress(reader, &output, settings, source_size, dict)?,
         // List and train are dispatched before per-input processing and
         // never reach this point.
-        Mode::Decompress | Mode::Test => decompress(reader, &output, settings, dict)?,
+        Mode::Decompress | Mode::Test => match decompress(reader, &output, settings, dict) {
+            Ok(written) => written,
+            Err(err) => {
+                let mapped = decode_failure_lines(input, source_size, err.as_ref())
+                    .map_or_else(|| err, |lines| Diagnostic(lines).into());
+                return Err(mapped);
+            },
+        },
         Mode::List | Mode::Train => unreachable!("dispatched in run"),
     };
 
@@ -835,8 +987,7 @@ fn process(
         }
     }
 
-    if cli.rm
-        && !cli.keep
+    if rm
         && matches!(output, Output::File(_))
         && let Input::File(path) = input
     {
@@ -845,23 +996,29 @@ fn process(
     Ok(())
 }
 
-/// libzstd's output naming: compress appends `.zst`, decompress requires and
-/// strips it.
+/// libzstd's output naming: compress appends `.zst`, decompress requires
+/// and strips it (or `.tzst`, mapping to `.tar`).
 fn default_output_name(input: &Path, mode: Mode) -> AnyResult<PathBuf> {
     match mode {
         Mode::Compress => Ok(add_extension(input, ZSTD_SUFFIX)),
         // List and train never reach name derivation (dispatched earlier).
         Mode::Decompress | Mode::Test | Mode::List | Mode::Train => {
-            let name = input
-                .to_str()
-                .and_then(|s| s.strip_suffix(ZSTD_SUFFIX))
-                .filter(|s| !s.is_empty());
+            let name = input.to_str().and_then(|s| {
+                s.strip_suffix(ZSTD_SUFFIX)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        s.strip_suffix(TZSTD_SUFFIX)
+                            .map(|stem| format!("{stem}.tar"))
+                    })
+            });
             match name {
-                Some(stripped) => Ok(PathBuf::from(stripped)),
-                None => Err(format!(
-                    "unknown suffix ({ZSTD_SUFFIX} expected). Can't derive the output file name. \
-                     Specify it with -o. Ignoring."
-                )
+                Some(name) => Ok(PathBuf::from(name)),
+                None => Err(Diagnostic(vec![format!(
+                    "{PREFIX}{}: unknown suffix (.zst/.tzst expected). Can't derive the output \
+                     file name. Specify it with -o dstFileName. Ignoring.",
+                    input.display()
+                )])
                 .into()),
             }
         },
@@ -876,18 +1033,153 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
     if cli.force || !path.exists() {
         return Ok(());
     }
-    if let Ok(mut tty) = File::open("/dev/tty").map(BufReader::new) {
-        eprint!(
-            "{PREFIX}{}: already exists; overwrite (y/N)? ",
+    // zstd's displayLevel<=1 path: no interaction is possible, so the file
+    // is declined without a prompt.
+    if cli.quiet >= 1 {
+        return Err(Diagnostic(vec![format!(
+            "{PREFIX}{} already exists; not overwritten  ",
             path.display()
-        );
-        io::stderr().flush()?;
+        )])
+        .into());
+    }
+    // zstd's interactive path: prompt on stderr, answer from the
+    // controlling terminal (never stdin, which carries the payload); a
+    // miss (no terminal, EOF, non-y) declines.
+    eprint!(
+        "{PREFIX}{} already exists; overwrite (y/n) ? ",
+        path.display()
+    );
+    io::stderr().flush()?;
+    if let Ok(mut tty) = File::open("/dev/tty").map(BufReader::new) {
         let mut answer = String::new();
-        if tty.read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes") {
+        if tty.read_line(&mut answer).is_ok() && answer.trim().starts_with(['y', 'Y']) {
             return Ok(());
         }
     }
-    Err(format!("{}: already exists; not overwritten", path.display()).into())
+    eprintln!("Not overwritten  ");
+    Err(Diagnostic(vec![]).into())
+}
+
+/// Render a decode failure as zstd's per-site stderr lines, when the engine
+/// error maps onto one of zstd's categories: the literal-(36) Decoding
+/// error lines (libzstd's error names), premature-end read errors, and the
+/// nothing-read special case for empty sources.
+fn decode_failure_lines(
+    input: &Input,
+    source_size: usize,
+    err: &(dyn std::error::Error + 'static),
+) -> Option<Vec<String>> {
+    use zstdx::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    // Construction failures surface as the bare engine error; read-pump
+    // failures ride inside an io::Error payload.
+    fn as_frame(payload: &zstdx::Error) -> Option<&FrameDecoderError> {
+        match payload {
+            zstdx::Error::Frame(frame) => Some(frame),
+            _ => None,
+        }
+    }
+    let frame = if let Some(error) = err.downcast_ref::<zstdx::Error>() {
+        as_frame(error)?
+    } else {
+        let io_err = err.downcast_ref::<io::Error>()?;
+        as_frame(io_err.get_ref()?.downcast_ref::<zstdx::Error>()?)?
+    };
+    let name = match input {
+        Input::Stdin => "stdin".to_string(),
+        Input::File(path) => path.display().to_string(),
+    };
+    let lines = match frame {
+        FrameDecoderError::ChecksumMismatch { .. } => vec![format!(
+            "{name} : Decoding error (36) : Restored data doesn't match checksum "
+        )],
+        FrameDecoderError::ContentSizeMismatch { .. } => vec![format!(
+            "{name} : Decoding error (36) : Src size is incorrect "
+        )],
+        FrameDecoderError::WindowSizeTooBig { requested, max } => {
+            // FIO_zstdErrorHelp: the sizes line always, then the hint when
+            // the frame's window log fits the format maximum.
+            let mut lines = vec![
+                format!(
+                    "{name} : Decoding error (36) : Frame requires too much memory for decoding "
+                ),
+                format!("{name} : Window size larger than maximum : {requested} > {max} "),
+            ];
+            let log = 63 - requested.leading_zeros() + u32::from(requested & (requested - 1) != 0);
+            if log <= ZSTD_WINDOWLOG_MAX {
+                let mb = (requested >> 20) + u64::from(requested & ((1 << 20) - 1) != 0);
+                lines.push(format!("{name} : Use --long={log} or --memory={mb}MB "));
+            } else {
+                lines.push(format!(
+                    "{name} : Window log larger than ZSTD_WINDOWLOG_MAX={ZSTD_WINDOWLOG_MAX}; not \
+                     supported "
+                ));
+            }
+            lines
+        },
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
+            vec![format!("{PREFIX}{name}: unsupported format ")]
+        },
+        FrameDecoderError::DictNotProvided { .. } | FrameDecoderError::DictionaryDecodeError(_) => {
+            vec![format!(
+                "{name} : Decoding error (36) : Dictionary mismatch "
+            )]
+        },
+        frame if frame_eof(frame) => {
+            // A zero-byte source never read a frame byte: zstd's
+            // "unexpected end of file" (stdin's size is unknown here, so
+            // only file inputs get the distinction).
+            if source_size == 0 && matches!(input, Input::File(_)) {
+                vec![format!("{PREFIX}{name}: unexpected end of file ")]
+            } else {
+                vec![format!("{name} : Read error (39) : premature end ")]
+            }
+        },
+        _ => vec![format!(
+            "{name} : Decoding error (36) : Data corruption detected "
+        )],
+    };
+    Some(lines)
+}
+
+/// Whether the failure is the input running out mid-frame: an io
+/// UnexpectedEof, or a section header claiming more bytes than the
+/// truncated stream still holds (zstd's streamer reports both as a
+/// premature end).
+fn frame_eof(frame: &zstdx::decoding::errors::FrameDecoderError) -> bool {
+    use zstdx::decoding::errors::{
+        BlockHeaderReadError, DecodeBlockContentError, DecompressBlockError, FrameDecoderError,
+        ReadFrameHeaderError,
+    };
+
+    let io_eof = |err: &io::Error| err.kind() == io::ErrorKind::UnexpectedEof;
+    match frame {
+        FrameDecoderError::ReadFrameHeaderError(
+            ReadFrameHeaderError::MagicNumberReadError(err)
+            | ReadFrameHeaderError::FrameDescriptorReadError(err)
+            | ReadFrameHeaderError::WindowDescriptorReadError(err)
+            | ReadFrameHeaderError::DictionaryIdReadError(err)
+            | ReadFrameHeaderError::FrameContentSizeReadError(err),
+        )
+        | FrameDecoderError::FailedToReadChecksum(err)
+        | FrameDecoderError::FailedToDrainDecodebuffer(err) => io_eof(err),
+        FrameDecoderError::FailedToReadBlockHeader(BlockHeaderReadError::ReadError(err)) => {
+            io_eof(err)
+        },
+        FrameDecoderError::FailedToReadBlockBody(
+            DecodeBlockContentError::ReadError { source, .. }
+            | DecodeBlockContentError::DecompressBlockError(
+                DecompressBlockError::BlockContentReadError(source),
+            ),
+        ) => io_eof(source),
+        // Section headers that ran past the end of a truncated stream.
+        FrameDecoderError::FailedToReadBlockBody(
+            DecodeBlockContentError::DecompressBlockError(
+                DecompressBlockError::MalformedSectionHeader { .. },
+            ),
+        ) => true,
+        _ => false,
+    }
 }
 
 fn open_input(input: &Input) -> AnyResult<(Box<dyn Read>, usize)> {
@@ -1073,13 +1365,40 @@ fn init_logging(cli: &Cli) {
         .init();
 }
 
+/// Flags whose value zstd takes as a separate argv entry through its
+/// NEXT_FIELD macro: a following entry starting with `-` (the stdin mark
+/// included) is a hard parse error there, never a value.
+const SEPARATE_VALUE_FLAGS: &[&str] = &[
+    "-b",
+    "-e",
+    "-i",
+    "-B",
+    "--split",
+    "-o",
+    "--output",
+    "-D",
+    "--dict",
+    "-T",
+    "--threads",
+    "-M",
+    "--memory",
+    "--filelist",
+    "--file",
+    "--patch-from",
+    "--stream-size",
+    "--size-hint",
+    "--maxdict",
+];
+
 /// Translate zstd's `-#` level flags (`-1` .. `-19`) into the hidden
-/// `--level` option so clap can parse them. Everything after `--`, and any
+/// `--level` option so clap can parse them, rejecting separated flag values
+/// the way zstd's NEXT_FIELD does. Everything after `--`, and any
 /// non-digit flag, passes through untouched.
-fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Vec<OsString> {
+fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<OsString>, String> {
     let mut normalized = Vec::new();
     let mut literal_args = false;
-    for (index, arg) in args.into_iter().enumerate() {
+    let mut args = args.into_iter().enumerate().peekable();
+    while let Some((index, arg)) = args.next() {
         if index == 0 || literal_args {
             normalized.push(arg);
             continue;
@@ -1088,6 +1407,20 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Vec<OsString> {
             literal_args = true;
             normalized.push(arg);
             continue;
+        }
+        if let Some(text) = arg.to_str()
+            && SEPARATE_VALUE_FLAGS.contains(&text)
+        {
+            match args.peek() {
+                None => return Err("error: missing command argument ".into()),
+                Some((_, next)) => {
+                    if next.to_str().is_some_and(|text| text.starts_with('-')) {
+                        return Err("error: command cannot be separated from its argument by \
+                                    another command "
+                            .into());
+                    }
+                },
+            }
         }
         // A bare -b carries zstd's default benchmark level; attaching it
         // here keeps the next argument free to be a file.
@@ -1129,7 +1462,7 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Vec<OsString> {
             None => normalized.push(arg),
         }
     }
-    normalized
+    Ok(normalized)
 }
 
 /// A temporary utility function that appends a file extension
@@ -1157,8 +1490,9 @@ mod tests {
     use zstdx::Level;
 
     use crate::{
-        Cli, Mode, Output, Settings, add_extension, compress, decompress, default_output_name,
-        normalize_args, parse_size, progress_visible,
+        Cli, Diagnostic, Input, Mode, Output, Settings, add_extension, compress,
+        decode_failure_lines, decompress, default_output_name, normalize_args, parse_size,
+        progress_visible, rm_flag_last_wins,
     };
 
     /// A per-test temp path, pre-cleaned so reruns start from nothing.
@@ -1173,11 +1507,25 @@ mod tests {
         Cli::try_parse_from(["zstdx"]).unwrap()
     }
 
+    /// The default decode settings.
+    fn plain_settings() -> Settings {
+        Settings {
+            level: 3,
+            threads: 1,
+            checksum: true,
+            window_log: None,
+            stream_size: None,
+            size_hint: None,
+            max_window: None,
+            adapt: None,
+        }
+    }
+
     /// A valid multi-block frame.
     fn compressed_payload() -> Vec<u8> {
         let payload = vec![7u8; 300 * 1024];
-        let mut encoder =
-            zstdx::stream::write::Encoder::new(Vec::new(), Level::from_zstd(3)).unwrap();
+        let options = zstdx::EncoderOptions::new(Level::from_zstd(3)).checksum(true);
+        let mut encoder = zstdx::stream::write::Encoder::with_options(Vec::new(), options).unwrap();
         encoder.write_all(&payload).unwrap();
         encoder.finish().unwrap()
     }
@@ -1192,16 +1540,7 @@ mod tests {
         let result = decompress(
             Box::new(Cursor::new(compressed)),
             &Output::File(out.clone()),
-            &Settings {
-                level: 3,
-                threads: 1,
-                checksum: true,
-                window_log: None,
-                stream_size: None,
-                size_hint: None,
-                max_window: None,
-                adapt: None,
-            },
+            &plain_settings(),
             None,
         );
         assert!(result.is_err());
@@ -1221,16 +1560,7 @@ mod tests {
         let result = compress(
             Box::new(&b"payload"[..]),
             &Output::File(out.clone()),
-            &Settings {
-                level: 3,
-                threads: 1,
-                checksum: true,
-                window_log: None,
-                stream_size: None,
-                size_hint: None,
-                max_window: None,
-                adapt: None,
-            },
+            &plain_settings(),
             0,
             Some(&broken),
         );
@@ -1247,16 +1577,7 @@ mod tests {
         let written = compress(
             Box::new(Cursor::new(data.clone())),
             &Output::Sink,
-            &Settings {
-                level: 3,
-                threads: 1,
-                checksum: true,
-                window_log: None,
-                stream_size: None,
-                size_hint: None,
-                max_window: None,
-                adapt: None,
-            },
+            &plain_settings(),
             data.len(),
             None,
         )
@@ -1297,6 +1618,156 @@ mod tests {
         assert!(default_output_name(&PathBuf::from(".zst"), Mode::Decompress).is_err());
     }
 
+    /// `.tzst` decompresses to `.tar`, zstd's tar-suffix rule.
+    #[test]
+    fn tzst_strips_to_tar() {
+        assert_eq!(
+            default_output_name(&PathBuf::from("archive.tzst"), Mode::Decompress).unwrap(),
+            PathBuf::from("archive.tar")
+        );
+        // an empty stem is fine for .tzst: the whole name becomes .tar
+        assert_eq!(
+            default_output_name(&PathBuf::from(".tzst"), Mode::Decompress).unwrap(),
+            PathBuf::from(".tar")
+        );
+    }
+
+    /// The unknown-suffix diagnostic carries zstd's exact text.
+    #[test]
+    fn unknown_suffix_diagnostic_text() {
+        let err = default_output_name(&PathBuf::from("data.bin"), Mode::Decompress).unwrap_err();
+        let diagnostic = err.downcast_ref::<Diagnostic>().unwrap();
+        assert_eq!(diagnostic.0, ["zstdx: data.bin: unknown suffix \
+                                   (.zst/.tzst expected). Can't derive the \
+                                   output file name. Specify it with -o \
+                                   dstFileName. Ignoring."]);
+    }
+
+    #[test]
+    fn rm_keep_last_flag_wins() {
+        let rm_of = |args: &[&str]| {
+            rm_flag_last_wins(
+                &(std::iter::once("zstdx")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()),
+            )
+        };
+        assert!(!rm_of(&["f"]), "default keeps");
+        assert!(rm_of(&["--rm", "f"]));
+        assert!(rm_of(&["-k", "--rm", "f"]), "rm after keep");
+        assert!(!rm_of(&["--rm", "-k", "f"]), "keep after rm");
+        assert!(!rm_of(&["--rm", "--keep", "f"]), "--keep after --rm");
+        // after `--`, flags are files
+        assert!(rm_of(&["--rm", "--", "-k"]));
+    }
+
+    /// Decode failures map onto zstd's stderr lines: the literal-(36)
+    /// Decoding error with libzstd's error name, the window help block,
+    /// premature end, unsupported format, and the empty-source case.
+    #[test]
+    fn decode_failure_lines_match_zstd() {
+        // checksum mismatch: flip the trailing 4-byte frame checksum
+        let mut frame = compressed_payload();
+        let last = frame.len() - 1;
+        frame[last] ^= 0xff;
+        let err = decompress(
+            Box::new(Cursor::new(frame)),
+            &Output::Sink,
+            &plain_settings(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(
+                &Input::File(PathBuf::from("corrupt.zst")),
+                123,
+                err.as_ref()
+            )
+            .unwrap(),
+            ["corrupt.zst : Decoding error (36) : Restored data doesn't match checksum "]
+        );
+
+        // truncation mid-frame: premature end
+        let mut frame = compressed_payload();
+        frame.truncate(frame.len() / 2);
+        let err = decompress(
+            Box::new(Cursor::new(frame)),
+            &Output::Sink,
+            &plain_settings(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(&Input::File(PathBuf::from("trunc.zst")), 500, err.as_ref())
+                .unwrap(),
+            ["trunc.zst : Read error (39) : premature end "]
+        );
+
+        // an empty source never read a frame byte
+        let err = decompress(
+            Box::new(Cursor::new(Vec::new())),
+            &Output::Sink,
+            &plain_settings(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(&Input::File(PathBuf::from("empty.zst")), 0, err.as_ref())
+                .unwrap(),
+            ["zstdx: empty.zst: unexpected end of file "]
+        );
+
+        // bad magic: unsupported format
+        let err = decompress(
+            Box::new(Cursor::new(b"garbage data, not a frame".to_vec())),
+            &Output::Sink,
+            &plain_settings(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(
+                &Input::File(PathBuf::from("badmagic.bin")),
+                21,
+                err.as_ref()
+            )
+            .unwrap(),
+            ["zstdx: badmagic.bin: unsupported format "]
+        );
+    }
+
+    /// A frame whose window exceeds -M renders zstd's three-line help block
+    /// (FIO_zstdErrorHelp), including the rounded-up memory hint.
+    #[test]
+    fn window_too_big_lines_match_zstd() {
+        // magic + FHD(0: no fcs, checksum off, single-segment off) +
+        // window descriptor 0xA0 (log 30) + one empty final raw block
+        let frame = [0x28u8, 0xb5, 0x2f, 0xfd, 0x00, 0xa0, 0x09, 0x00, 0x00, 0x00];
+        let mut settings = plain_settings();
+        settings.max_window = Some(64 << 20);
+        let err = decompress(
+            Box::new(Cursor::new(frame.to_vec())),
+            &Output::Sink,
+            &settings,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(
+                &Input::File(PathBuf::from("w30.zst")),
+                frame.len(),
+                err.as_ref()
+            )
+            .unwrap(),
+            [
+                "w30.zst : Decoding error (36) : Frame requires too much memory for decoding ",
+                "w30.zst : Window size larger than maximum : 1073741824 > 67108864 ",
+                "w30.zst : Use --long=30 or --memory=1024MB ",
+            ]
+        );
+    }
+
     #[test]
     fn digit_flags_become_level() {
         let args = vec![
@@ -1306,7 +1777,7 @@ mod tests {
             OsString::from("--"),
             OsString::from("-3"),
         ];
-        assert_eq!(normalize_args(args), vec![
+        assert_eq!(normalize_args(args).unwrap(), vec![
             OsString::from("zstdx"),
             OsString::from("-d"),
             OsString::from("--level=19"),
@@ -1327,7 +1798,7 @@ mod tests {
             OsString::from("-é3"),
         ];
         // nothing after argv[0] is a digit flag, so everything is unchanged
-        assert_eq!(normalize_args(args.to_vec()), args.to_vec());
+        assert_eq!(normalize_args(args.to_vec()).unwrap(), args.to_vec());
     }
 
     /// Boundary shapes of the `-<digits>` recognition.
@@ -1340,6 +1811,7 @@ mod tests {
                     .map(OsString::from)
                     .collect::<Vec<_>>(),
             )
+            .unwrap()
             .into_iter()
             .skip(1)
             .map(|arg| arg.into_string().unwrap())
@@ -1356,6 +1828,50 @@ mod tests {
         assert_eq!(normalize(&["-"]), ["-"]);
         assert_eq!(normalize(&["-12a"]), ["-12a"]);
         assert_eq!(normalize(&["12"]), ["12"]);
+    }
+
+    /// zstd's NEXT_FIELD: a separated flag value may not start with `-`,
+    /// and a value flag as the last argument is a missing argument.
+    #[test]
+    fn separated_values_reject_dashes() {
+        let normalize = |args: &[&str]| {
+            normalize_args(
+                std::iter::once("zstdx")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|args| args.into_iter().skip(1).collect::<Vec<_>>())
+        };
+        // regular separated values pass
+        assert_eq!(normalize(&["-o", "out.zst", "f"]).unwrap(), [
+            OsString::from("-o"),
+            OsString::from("out.zst"),
+            OsString::from("f")
+        ]);
+        // a dash (or any flag) as the value is zstd's parser error
+        assert_eq!(
+            normalize(&["--filelist", "-"]).unwrap_err(),
+            "error: command cannot be separated from its argument by another command "
+        );
+        assert_eq!(
+            normalize(&["-o", "-f", "f"]).unwrap_err(),
+            "error: command cannot be separated from its argument by another command "
+        );
+        assert_eq!(
+            normalize(&["-T", "-2"]).unwrap_err(),
+            "error: command cannot be separated from its argument by another command "
+        );
+        // the `-b` default rewrite still leaves the file free
+        assert_eq!(normalize(&["-b", "file"]).unwrap(), [
+            OsString::from("-b3"),
+            OsString::from("file")
+        ]);
+        // a trailing value flag is a missing argument
+        assert_eq!(
+            normalize(&["-D"]).unwrap_err(),
+            "error: missing command argument "
+        );
     }
 
     /// zstd's size syntax: bare digits are bytes, K/M/G are binary
@@ -1428,6 +1944,9 @@ mod tests {
         // smaller ones are rejected there; here only the parse matters.
         assert!(Cli::try_parse_from(["zstdx", "--long=31"]).is_ok());
         assert!(Cli::try_parse_from(["zstdx", "--long=9"]).is_ok());
+
+        // --rm and -k coexist: run resolves them by position, like zstd
+        assert!(Cli::try_parse_from(["zstdx", "--rm", "-k", "f"]).is_ok());
     }
 
     /// --adapt parses with zstd's spellings: bare, either key alone, both
@@ -1523,7 +2042,7 @@ mod tests {
             OsString::from("-b"),
             OsString::from("file"),
         ];
-        let cli = Cli::parse_from(normalize_args(args));
+        let cli = Cli::parse_from(normalize_args(args).unwrap());
         assert_eq!(cli.bench, Some(3));
         assert_eq!(cli.files, [PathBuf::from("file")]);
     }

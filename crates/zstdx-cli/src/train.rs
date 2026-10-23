@@ -61,7 +61,13 @@ fn train_with_builder(cli: &Cli) -> bool {
         None => Vec::new(),
     };
     for file in cli.files.iter().chain(&filelist) {
-        collect_input(file, cli.recursive, &mut inputs, &mut ok);
+        collect_input(
+            file,
+            cli.recursive,
+            &mut inputs,
+            &mut ok,
+            crate::InputGathering::Raw,
+        );
     }
     if inputs.iter().any(|i| matches!(i, Input::Stdin)) {
         eprintln!("{PREFIX}--train does not support reading from standard input ");

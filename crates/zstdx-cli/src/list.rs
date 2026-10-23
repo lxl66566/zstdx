@@ -213,7 +213,13 @@ pub fn run(cli: &Cli) -> bool {
     let mut inputs = Vec::new();
     let mut ok = true;
     for file in cli.files.iter().chain(&filelist) {
-        collect_input(file, cli.recursive, &mut inputs, &mut ok);
+        collect_input(
+            file,
+            cli.recursive,
+            &mut inputs,
+            &mut ok,
+            crate::InputGathering::Raw,
+        );
     }
     if no_files || inputs.iter().any(|i| matches!(i, Input::Stdin)) {
         if !io::stdin().is_terminal() {
