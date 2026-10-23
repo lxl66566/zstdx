@@ -39,6 +39,7 @@
 - [R67 · FFI parity](dev/review/ffiparity.md)
 - [R67 · CLI parity](dev/review/cliparity.md)
 - [R68 · Encoder edges](dev/review/encparity.md)
+- [R69 · Encode-path hardening](dev/review/hardening.md)
 
 ## Performance Optimization
 
