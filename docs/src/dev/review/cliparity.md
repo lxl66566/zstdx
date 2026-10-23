@@ -28,20 +28,25 @@ Final differential: cases1 57/57 OK; cases2 50/58 OK, 8 residual divergences (be
 - **progress-flags**: `--progress` at `-q` forces zstd's summary line and its `Read: ... ==> N%` progress drawing (raw \r animations). Our progress runs through indicatif with different bytes; matching zstd's renderer is not worth it.
 - **b-multi-levels / b-blocksize / b-decode**: bench progress redraw differs in one spinner glyph (`|` vs `/`) and number-width spacing — timing-dependent even between two zstd runs.
 - **b-split residual**: after the Incorrect-parameter line zstd prints its full usage block at displayLevel >= 2; our usage text is clap-generated and differs anyway.
-- **pass-through** (found by probing, not in the case sets): `zstd -d -f -c <not-a-frame>` copies the input through and exits 0 (legacy pass-through when force + stdout); zstdx rejects as unsupported format. A mode, not a stderr shape — follow-up below.
+## Closeout (2026-10-23)
 
-## Follow-ups
+All four follow-ups landed or attributed:
 
-- **train-basic stderr**: zstd prints `COVER_warnOnSmallCorpus` (`WARNING: The maximum dictionary size ...`) at displayLevel 1 when dmers/maxDict < 10. Needs the trainer to expose its dmer count (cross-crate API, feature-gated).
-- **Encoder ratio gap**: our level-3 frame of the 316 KiB text corpus is 69575 B vs zstd's 69544 B (+0.045%; --no-check 69571 vs 69540). Invisible to artifact-compare-by-decode, caught by `-l`'s ratio column (4.650 vs 4.652). Engine-side item (level-3 parameter/match-finding parity), not CLI.
-- **Pass-through mode** (above).
-- **unknown header edge**: 1-3-byte *file* inputs now map like zstd; `zstd -q -d -f -c` on them engages pass-through (see above), which we do not implement.
+- **Pass-through landed**: `--pass-through`/`--no-pass-through` flags plus fileio's default (armed when `-f` and the destination is stdout). The decode path is now fileio's frame loop — peek the next magic, discard skippable frames, decode one data frame per `single_frame` decoder chained over the peeked bytes — so every engagement point matches: bad magic, 1-3-byte tails, and trailing garbage after decoded frames copy through and exit 0; the empty source and non-frame input without pass-through still fail with the same lines. Verified by a 20-case differential against the system zstd 1.5.7 (stdout, stderr normalized, exit codes all equal).
+- **The frame loop surfaced a real stream-API bug**: `read::Decoder::single_frame` consulted its flag only after `init_next_frame` had already parsed the next frame's header, so a drained single-frame read left the source 6+ bytes past the frame boundary and the staged bytes died with the decoder (a multi-frame stream decoded its second frame's header into the void and the loop then read garbage as magic). Fixed in `stream/read.rs`; a crate test pins the source position at the next frame's first byte.
+- **Skippable-only streams now exit 0** with empty output like zstd (the old whole-stream decoder errored `unknown header`); a skippable frame truncated mid-content maps to zstd's `Read error (39) : premature end`.
+- **Foreign-format refusals gained**: the gzip/xz/lzma/lz4 magics refuse with fileio's per-format lines (`gzip file cannot be uncompressed (zstd compiled without HAVE_ZLIB) -- ignored` etc., true of this build) before the pass-through arm — matched against the system zstd byte for byte.
+- **train-basic stderr landed**: DiB_train's level-2 small-corpus pair (`!  Warning : data size of samples too small...`, total sample bytes with a 128 KiB per-file cap < 8× maxdict) plus `COVER_warnOnSmallCorpus`'s level-1 line over the trainer's dmer count (`TrainOutcome.dmers`, fastCover's `ctx.nbDmers`; byte-identical to zstd's on a shared corpus, dmers 15545 both sides). `-q` keeps the level-1 line, `-qq` silences both. Still accepted: the `Loading ...`/`Trying N different sets of parameters`/`k=50` progress block (renderer-class).
+- **Encoder ratio gap attributed, not a defect**: a level-3 size sweep (json/text/skewed at 64K-32M plus natural source text at 316K/1M) reads −0.44..+0.21% around parity — the CLI review's +0.045% text cell sits inside the dfast row's recorded near-tie band (json 32 MiB ST +0.18%, the 09-12 ladder's "dfast rows +0.2-0.3%" class), not a new regression. No probe opened.
 
 ## Commits
 
 - f0ddd5b0 cli: align flag semantics and stderr formats with zstd v1.5.7 (rm/keep, ignore-errors, filelist, NEXT_FIELD, stderr shapes, tzst, collect_input Stat/Raw)
 - 75bbb083 cli: zstd exit codes, stdin diagnostics, --train default, unknown-flag and --split rejection
+- 1e3bcb2 stream: single_frame stops at the frame boundary
+- 1bec87f cli: pass-through mode, frame-loop decode, foreign-format refusals
+- b9a1f1a cli,dict: --train small-corpus warnings at zstd parity
 
 ## Tests
 
-`cargo test -p zstdx-cli`: 97 green (43 unit + 54 integration; the train suite is now active in the default build — it was feature-gated to zero before). Pins updated: long9/long28/stream-size exit codes and messages, --split rejection, partial-magic `unknown header`, bench smoke `Exit::Success`, train's dibio-shaped report. `cargo test -p zstdx` (debug): green.
+`cargo test -p zstdx-cli`: 97 green (43 unit + 54 integration; the train suite is now active in the default build — it was feature-gated to zero before). Pins updated: long9/long28/stream-size exit codes and messages, --split rejection, partial-magic `unknown header`, bench smoke `Exit::Success`, train's dibio-shaped report. `cargo test -p zstdx` (debug): green. Closeout adds: the pass-through unit test (copy-through, frame+garbage, skippable positions, truncated skippable, foreign-format lines) and the small-corpus warning test (both lines, `-q`/`-qq` layering); decode walls unchanged (CLI A/B old vs new on json/text/skewed zst3/zst19, within 1 ms) and the `parity --cases 4000` differential stays clean.
