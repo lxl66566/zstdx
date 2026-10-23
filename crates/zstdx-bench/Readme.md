@@ -220,8 +220,8 @@ cargo run --release -p zstdx-bench -- dictmt bench/corpus/json.raw \
 Compresses every corpus `.raw` into a directory so two builds can be
 compared byte for byte: `dump <dir>` per build, then `diff -r dir_a dir_b`.
 The regression gate for optimizations that must not change the encoder's
-output at all. `--all-levels` covers the whole ladder (files tagged
-`.l1/.l3/.l6/.l12/.l16/.l19`); `--workers N` routes the compression
+output at all. `--all-levels` covers the six ladder tiers at their paired
+numbers (files tagged `.l1/.l3/.l9/.l13/.l17/.l19`); `--workers N` routes the compression
 through the multithreaded job path so the gate covers mt bytes too. Every
 emitted frame is roundtrip-gated through both in-process decoders and the
 libzstd CLI before it lands.

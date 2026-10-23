@@ -78,3 +78,24 @@ and pin them with the walker test in
 `crates/zstdx/src/tests/fuzz_regressions.rs` — pooled-state crashes need
 an in-process sequence; a fresh-process artifact replay cannot re-poison
 the pool.
+
+## Campaigns (long wall-time, big payloads)
+
+`smoke.sh` bounds wall time but keeps the libFuzzer default `max_len` (4096).
+The todo-23b shape — payloads past one 128 KiB block, the window-adoption
+edges — needs an explicit campaign:
+
+```bash
+# per target: 8 workers x <secs>, seeds from the real corpus (auto-append
+# grows it), -len_control low so inputs reach max_len early. Takes the
+# bench flock itself (workers eat every core).
+<bin> -jobs=8 -workers=8 -max_total_time=1500 -max_len=300000 \
+  -len_control=20 -rss_limit_mb=2560 -artifact_prefix=<artifacts>/ <corpus>
+```
+
+First pass (2026-10-24, 2 x 25 min over encode + encode_stream): zero
+findings, 50k+ units. Honest limit: evolved inputs carry no beyond-window
+redundancy (pre-campaign seeds are all <=4096 B; coverage-guided mutation
+rarely builds multi-KiB-period structure), so a dict-seeded corpus remains
+the lever for cross-window shapes. After a campaign, re-merge the corpus
+(see above) — this one grew encode 4807->7103, encode_stream 1667->5250.

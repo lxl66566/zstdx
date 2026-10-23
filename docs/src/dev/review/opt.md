@@ -40,6 +40,14 @@ Read bounds at tails (hash/count/byte reads bounded by `idx+HASH_READ ≤ block_
 
 The shared-cursor hoist trap (hash3's fill cursor rides `next_update`; the R58 eager seed moved one without the other) — pitfalls/encoding.md. The gap is unreachable on the current ladder (every hash3 user row has mls==3, so the 22-bit main tree shadows the 17-bit slot — probed byte-identical on natural and adversarial rep-suppressed fixtures), and the prefill that closes it is todo 25b.
 
+## Follow-ups resolved (R71, 2026-10-24)
+
+- row 16 mls 5 and row 22 search_log 9: both falsified with data ([negative](../negative/matchers.md)) — the unlisted tuned-ladder deviations are measured-optimal as they stand.
+- hash3_log clamped to the final window log (`MIN(17, windowLog)`, C zstd_compress.c:2027) — corpus byte-identical, saves the 512 KiB table on forced-small-window opt states.
+- hash3 dict-seed prefill landed: the eager seed now fills the 3-byte table over `[0, keep-OPT_NUM)` (the pitfall below closes in code, output-neutral everywhere).
+- the dead `lit_length_price(MAX_BLOCK_SIZE)` arm carries a debug_assert.
+- The R71 experiments also exposed the forced-window interop bug (unpledged streams at tree rows emit offsets past the declared window; libzstd rejects) — todo 26.
+
 ## Commits
 
 - 7d030838 fix(opt): match C's guard on the ultra match+1-literal recheck
