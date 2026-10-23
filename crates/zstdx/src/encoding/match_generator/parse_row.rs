@@ -510,7 +510,7 @@ impl MatchGeneratorDriver {
         // context below takes its borrow, and never resized during the
         // scan. The emit helpers write through the same pointers at call
         // sites where the loop holds no conflicting borrow.
-        let table_ptr: *mut u32 = self.tables.as_mut_ptr();
+        let table_ptr: *mut u32 = self.tables.buf_mut().as_mut_ptr();
         let heads_ptr: *mut u8 = self.row_heads.as_mut_ptr();
         let mut emit = RowEmit {
             table: table_ptr,

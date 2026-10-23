@@ -61,7 +61,7 @@ impl MatchGeneratorDriver {
         // SAFETY: derived here, before the context below takes its borrow;
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u32 = self.tables[..self.second].as_mut_ptr();
+        let table_ptr: *mut u32 = self.tables.heads_mut().as_mut_ptr();
         // Known rows instantiate with the fastest row's log as a constant
         // (the hash shift folds to an immediate and the shift-count register
         // frees — the same disease the dfast const-log landing treated);
@@ -73,7 +73,7 @@ impl MatchGeneratorDriver {
             HASH_LOG
         };
         let mut emit = TableEmit {
-            table: &mut self.tables[..self.second],
+            table: self.tables.heads_mut(),
             literals,
             seqs,
             win_base,

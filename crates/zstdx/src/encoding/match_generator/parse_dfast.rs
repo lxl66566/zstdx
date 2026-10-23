@@ -50,12 +50,12 @@ impl MatchGeneratorDriver {
         // shifts fold to immediates and the two shift registers free up);
         // clamped-window shapes pass [`RUNTIME_LOG`] for both.
         let long_log = if LONG_LOG == RUNTIME_LOG {
-            self.second.trailing_zeros()
+            self.tables.head_len().trailing_zeros()
         } else {
             LONG_LOG
         };
         let small_log = if SMALL_LOG == RUNTIME_LOG {
-            (self.tables.len() - self.second).trailing_zeros()
+            self.tables.second_len().trailing_zeros()
         } else {
             SMALL_LOG
         };
@@ -100,11 +100,11 @@ impl MatchGeneratorDriver {
         // borrows; both address the same memory, and the loop and the
         // emit helpers never access a slot concurrently.
         let split = if LONG_LOG == RUNTIME_LOG {
-            self.second
+            self.tables.head_len()
         } else {
             1usize << LONG_LOG
         };
-        let (long, small) = self.tables.split_at_mut(split);
+        let (long, small) = self.tables.split_at(split);
         let long_ptr: *mut u32 = long.as_mut_ptr();
         let small_ptr: *mut u32 = small.as_mut_ptr();
         // Dictionary frames hash the short table over 4 bytes (libzstd's

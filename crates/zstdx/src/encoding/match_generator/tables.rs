@@ -1,6 +1,6 @@
 //! Hash-table maintenance and the emit helpers of the fast/dfast/chain
-//! scans: position packing, inserts and backfills, the chain walk, and the
-//! job-start table clear.
+//! scans: the fused head/second table pair, position packing, inserts and
+//! backfills, the chain walk, and the job-start table clear.
 
 use alloc::vec::Vec;
 
@@ -12,8 +12,178 @@ use super::{
 };
 use crate::{
     decoding::sequence_execution::do_offset_history,
-    encoding::{SeqWord, seq_codes::pack_seq},
+    encoding::{SeqWord, hugepage::HugeBuf, seq_codes::pack_seq},
 };
+
+/// The fast/dfast/chain/row strategies' two tables in one allocation —
+/// `buf[..second]` the head hash table, `buf[second..]` the second table
+/// (the dfast short hash or the chain links; the row family runs the whole
+/// buffer as its packed grid, `second == len`), u32 entries (see
+/// [`pack_pos`]). One buffer keeps a single base pointer live in the scan
+/// loops: the second table's accesses are displacements off it instead of
+/// a second hot pointer. Hugepage-backed past [`HugeBuf`]'s threshold.
+///
+/// The split is the struct's invariant (`second <= buf.len()`), and every
+/// geometry change moves both fields together through the resize entries
+/// below — a bare buffer resize leaves a stale span that slices past the
+/// allocation (R68). Content reads and writes go through the span
+/// accessors.
+#[derive(Clone)]
+pub(super) struct HeadTables {
+    buf: HugeBuf<u32>,
+    second: usize,
+}
+
+impl HeadTables {
+    /// Fresh zeroed pair: `heads` head entries plus `total - heads`
+    /// second-table entries.
+    pub(super) fn zeroed(heads: usize, total: usize) -> Self {
+        debug_assert!(heads <= total);
+        Self {
+            buf: HugeBuf::zeroed(total),
+            second: heads,
+        }
+    }
+
+    /// The empty pair (the tree families carry no fused table).
+    pub(super) fn empty() -> Self {
+        Self {
+            buf: HugeBuf::new(),
+            second: 0,
+        }
+    }
+
+    /// Rebuild from scratch: `heads` head entries and `total - heads`
+    /// second-table entries, all zeroed. Any head-size change drops the
+    /// whole buffer (the keep entries below only preserve a matching head
+    /// span).
+    pub(super) fn rebuild(&mut self, heads: usize, total: usize) {
+        debug_assert!(heads <= total);
+        *self = Self::zeroed(heads, total);
+    }
+
+    /// Keep the head span and its entries, rebuild the second table at
+    /// `total` total entries: truncate to the head span, then re-extend
+    /// (resize zeroes only the new tail — the fresh-second-table
+    /// behavior). `total == head_len` drops the second table (the fast
+    /// family's kept-heads truncate).
+    pub(super) fn rebuild_second(&mut self, total: usize) {
+        self.buf.truncate(self.second);
+        self.buf.resize_zeroed(total);
+    }
+
+    /// Re-cut the head span at `heads` on the kept buffer (truncate, or
+    /// zero-extend). The rows-kept lockstep entry: two row levels can
+    /// share a row count at different hash logs (the source-length clamp
+    /// shrinks the head table one log per row_log step), so the span
+    /// resizes while the buffer still names the old length — the split
+    /// moves here, in one place, or a stale larger span would later slice
+    /// past the buffer (R68).
+    pub(super) fn rehead(&mut self, heads: usize) {
+        self.second = heads;
+        self.buf.truncate(heads);
+        self.buf.resize_zeroed(heads);
+    }
+
+    /// Drop the keep-eligibility so the next resize's head-span check
+    /// misses and [`Self::rebuild`] runs: the dictionary row swap's
+    /// foreign-layout guard (a kept dfast/row buffer would seed the chain
+    /// head with `pack_pos` entries where it wants `pack_head`, on
+    /// <= 8 KiB frames where the logs clamp to 14).
+    pub(super) fn force_fresh(&mut self) {
+        self.second = 0;
+    }
+
+    /// Full overwrite from a captured seed image: the buffer takes the
+    /// image's length (reusing the backing at equal length) and content,
+    /// and the split takes the image's value — the pair moves together.
+    #[cfg(feature = "std")]
+    pub(super) fn restore(&mut self, tables: &[u32], second: usize) {
+        debug_assert!(second <= tables.len());
+        if self.buf.len() != tables.len() {
+            self.buf = HugeBuf::zeroed(tables.len());
+        }
+        if !tables.is_empty() {
+            self.buf.copy_from_slice(tables);
+        }
+        self.second = second;
+    }
+
+    /// Total entry count (both spans).
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Head-span length (the split point).
+    #[inline]
+    pub(super) fn head_len(&self) -> usize {
+        self.second
+    }
+
+    /// Second-span length.
+    #[inline]
+    pub(super) fn second_len(&self) -> usize {
+        self.buf.len() - self.second
+    }
+
+    /// The head hash table (read form; the scans take the mut forms, the
+    /// only reader is the test-only state-equivalence check).
+    #[cfg(all(test, feature = "std"))]
+    #[inline]
+    pub(super) fn heads(&self) -> &[u32] {
+        &self.buf[..self.second]
+    }
+
+    #[inline]
+    pub(super) fn heads_mut(&mut self) -> &mut [u32] {
+        &mut self.buf[..self.second]
+    }
+
+    /// The second table.
+    #[inline]
+    pub(super) fn second(&self) -> &[u32] {
+        &self.buf[self.second..]
+    }
+
+    #[inline]
+    pub(super) fn second_mut(&mut self) -> &mut [u32] {
+        &mut self.buf[self.second..]
+    }
+
+    /// Both spans at once, split at the head span.
+    #[inline]
+    pub(super) fn split(&mut self) -> (&mut [u32], &mut [u32]) {
+        self.buf.split_at_mut(self.second)
+    }
+
+    /// Both spans at once, split at `at`, which must coincide with the
+    /// head span: the dfast known-log instantiations pass their
+    /// compile-time head size (equal to the span by the sizing that
+    /// picked the row) so the split point folds to an immediate.
+    #[inline]
+    pub(super) fn split_at(&mut self, at: usize) -> (&mut [u32], &mut [u32]) {
+        debug_assert_eq!(at, self.second);
+        self.buf.split_at_mut(at)
+    }
+
+    /// The whole allocation: contents clears, and the row family's single
+    /// packed table (its strategies hold `head_len == len`).
+    #[inline]
+    pub(super) fn buf(&self) -> &[u32] {
+        &self.buf
+    }
+
+    #[inline]
+    pub(super) fn buf_mut(&mut self) -> &mut [u32] {
+        &mut self.buf
+    }
+}
 
 // The opt strategies' never-valid table entry (see [`super::opt`] for the
 // biased monotone-position form).

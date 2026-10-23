@@ -68,10 +68,26 @@ fn strip_snapshot_adopt_is_exact() {
     let mut adopted = fresh();
     adopted.adopt_strip_snapshot(&snap, &data, 0);
 
-    assert_eq!(stock.tables, adopted.tables, "head grid tables diverge");
-    assert_eq!(stock.second, adopted.second, "chain split diverges");
-    assert_eq!(stock.tables, builder.tables, "builder head grid diverges");
-    assert_eq!(stock.second, builder.second, "chain split diverges");
+    assert_eq!(
+        stock.tables.buf(),
+        adopted.tables.buf(),
+        "head grid tables diverge"
+    );
+    assert_eq!(
+        stock.tables.head_len(),
+        adopted.tables.head_len(),
+        "chain split diverges"
+    );
+    assert_eq!(
+        stock.tables.buf(),
+        builder.tables.buf(),
+        "builder head grid diverges"
+    );
+    assert_eq!(
+        stock.tables.head_len(),
+        builder.tables.head_len(),
+        "chain split diverges"
+    );
     assert_eq!(
         stock.seed_offset, adopted.seed_offset,
         "seed offset diverges"
@@ -603,7 +619,7 @@ fn chain_epoch_roll_resolves_floor_relative() {
     // the roll bar, where it is beyond every reach.
     driver.reset(crate::Level::Balanced);
     assert_eq!(driver.head_origin, 0);
-    assert!(driver.tables.iter().all(|&e| e == 0));
+    assert!(driver.tables.buf().iter().all(|&e| e == 0));
 }
 
 /// [`fast_epoch_advance`]'s floor choice: the streaming shape (window

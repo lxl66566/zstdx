@@ -28,7 +28,7 @@ impl MatchGeneratorDriver {
         seqs: &mut Vec<SeqWord>,
     ) {
         let win = window_slice(&self.win, self.ext.as_ref());
-        let (table_view, chain) = self.tables.split_at_mut(self.second);
+        let (table_view, chain) = self.tables.split();
         let chain_mask = chain.len() - 1;
         let win_base = self.win_base;
         let ramp = self.ramp;

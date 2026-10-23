@@ -119,17 +119,9 @@ pub struct MatchGeneratorDriver {
     anchor: u64,
     /// Absolute start of the last committed block (for `get_last_space`).
     block_start: u64,
-    /// The fast/dfast/chain strategies' two tables in one allocation —
-    /// `tables[..second]` the head hash table, `tables[second..]` the
-    /// second table (the dfast short hash or the chain links; see
-    /// [`Strategy`]), u32 entries (see [`pack_pos`]). One buffer keeps a
-    /// single base pointer live in the scan loops: the second table's
-    /// accesses are displacements off it instead of a second hot pointer.
-    /// Hugepage-backed past [`HugeBuf`]'s threshold.
-    tables: HugeBuf<u32>,
-    /// Length of the head table inside `tables` (== `tables.len()` when
-    /// the strategy has no second table).
-    second: usize,
+    /// The fast/dfast/chain/row strategies' fused head+second table pair
+    /// (see [`HeadTables`]); the tree strategies keep it empty.
+    tables: HeadTables,
     /// The row strategy's per-row insertion heads (one byte per row,
     /// libzstd's `ZSTD_row_nextIndex` state): the byte names the slot the
     /// row's last insert took, the next insert takes its predecessor, so a
@@ -201,7 +193,7 @@ pub struct MatchGeneratorDriver {
     /// retiring all stale entries at read time instead of clearing.
     opt_origin: u64,
     /// Coordinate origin of the chain strategy's head entries (the opt
-    /// tables' scheme applied to `tables[..second]`): each strip prefill —
+    /// tables' scheme applied to the head table): each strip prefill —
     /// every MT job, including job zero's empty strip — advances it past
     /// every position the state has written since the last advance, so
     /// stale entries rebuild as beyond-reach distances at read time and
@@ -481,10 +473,9 @@ pub(super) const FAST_EPOCH_SPAN: u64 = 1 << 31;
 /// the whole strip fill.
 #[cfg(feature = "std")]
 pub(crate) struct StripSnapshot {
-    /// The fused head+chain buffer; the split matches the capturing
-    /// driver's `second`.
-    tables: HugeBuf<u32>,
-    second: usize,
+    /// The fused head+chain buffer with its split (the pair moves as one;
+    /// see [`HeadTables`]).
+    tables: HeadTables,
     ldm: Option<LdmSnapshot>,
     /// The builder's head coordinate origin: the adopted entries resolve
     /// against it, so the adopter must take it with the tables (its own
@@ -906,7 +897,7 @@ impl MatchGeneratorDriver {
     /// residue would otherwise alias as candidates.
     pub(crate) fn clear_parse_tables(&mut self) {
         if !self.tables.is_empty() {
-            clear_table(&mut self.tables);
+            clear_table(self.tables.buf_mut());
         }
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
             self.dubt_table.fill(0);
@@ -1004,8 +995,7 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: HugeBuf::zeroed(1usize << HASH_LOG),
-            second: 1usize << HASH_LOG,
+            tables: HeadTables::zeroed(1usize << HASH_LOG, 1usize << HASH_LOG),
             row_heads: Vec::new(),
             opt_table: HugeBuf::new(),
             bt: HugeBuf::new(),
@@ -1075,8 +1065,7 @@ impl MatchGeneratorDriver {
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: HugeBuf::zeroed(1usize << HASH_LOG),
-            second: 1usize << HASH_LOG,
+            tables: HeadTables::zeroed(1usize << HASH_LOG, 1usize << HASH_LOG),
             row_heads: Vec::new(),
             opt_table: HugeBuf::new(),
             bt: HugeBuf::new(),
@@ -1171,19 +1160,19 @@ impl MatchGeneratorDriver {
     /// either).
     fn resize_tables(&mut self, params: &LevelParams) {
         let heads_len = 1usize << params.hash_log;
-        let heads_kept = self.second == heads_len;
-        // The fused buffer preserves the two-table keep/refresh
-        // semantics exactly: a kept head with a resized second table
-        // truncates and re-extends (resize zeroes only the new tail),
-        // which is today's fresh-second-table behavior; any head-size
-        // change drops the whole buffer like the old two allocations.
+        let heads_kept = self.tables.head_len() == heads_len;
+        // The fused buffer preserves the two-table keep/refresh semantics
+        // exactly through the pair's resize entries: a kept head with a
+        // resized second table truncates and re-extends (resize zeroes
+        // only the new tail), which is today's fresh-second-table
+        // behavior; any head-size change drops the whole buffer like the
+        // old two allocations.
         match params.strategy {
             Strategy::Fast => {
                 if !heads_kept {
-                    self.tables = HugeBuf::zeroed(heads_len);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, heads_len);
                 } else if self.tables.len() != heads_len {
-                    self.tables.truncate(heads_len);
+                    self.tables.rebuild_second(heads_len);
                 }
             },
             Strategy::Dfast(small_log) => {
@@ -1191,11 +1180,9 @@ impl MatchGeneratorDriver {
                 if heads_kept && self.tables.len() == total {
                     // both kept
                 } else if heads_kept {
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(total);
+                    self.tables.rebuild_second(total);
                 } else {
-                    self.tables = HugeBuf::zeroed(total);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, total);
                 }
             },
             Strategy::Chain(chain_log) => {
@@ -1203,11 +1190,9 @@ impl MatchGeneratorDriver {
                 if heads_kept && self.tables.len() == total {
                     // both kept
                 } else if heads_kept {
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(total);
+                    self.tables.rebuild_second(total);
                 } else {
-                    self.tables = HugeBuf::zeroed(total);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, total);
                 }
             },
             Strategy::Row(row_log) => {
@@ -1223,20 +1208,19 @@ impl MatchGeneratorDriver {
                 let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
                     && self.row_heads.len() == rows;
                 if !rows_kept {
-                    self.tables = HugeBuf::zeroed(heads_len);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, heads_len);
                     self.row_heads = alloc::vec![0u8; rows];
                 } else if self.tables.len() != heads_len {
                     // `rows_kept` diverges from `heads_kept` here: two row
                     // levels can share a row count at different hash logs
                     // (the source-length clamp shrinks the head table one
                     // log per row_log step), so this branch resizes the
-                    // head span while `second` still names the old one — a
-                    // stale larger `second` later slices past the buffer
-                    // (the fast family's heads-kept truncate cannot grow).
-                    self.second = heads_len;
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(heads_len);
+                    // head span while the buffer still names the old one —
+                    // the split and the buffer move together inside
+                    // `rehead`, or a stale larger span would later slice
+                    // past the buffer (the fast family's heads-kept
+                    // truncate cannot grow).
+                    self.tables.rehead(heads_len);
                     self.row_heads.truncate(rows);
                     self.row_heads.resize(rows, 0);
                 }
@@ -1258,8 +1242,7 @@ impl MatchGeneratorDriver {
                         Vec::new()
                     };
                 }
-                self.tables = HugeBuf::new();
-                self.second = 0;
+                self.tables = HeadTables::empty();
             },
             Strategy::BtLazy(knobs) => {
                 if self.dubt_table.len() != 1usize << params.hash_log {
@@ -1271,8 +1254,7 @@ impl MatchGeneratorDriver {
                 self.opt_table = HugeBuf::new();
                 self.bt = HugeBuf::new();
                 self.hash3 = Vec::new();
-                self.tables = HugeBuf::new();
-                self.second = 0;
+                self.tables = HeadTables::empty();
             },
         }
         if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
@@ -1290,10 +1272,10 @@ impl MatchGeneratorDriver {
         if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
             self.lazy_scratch = Some(LazyScratch::new());
         }
-        // The head span always fits the buffer: every consumer slices
-        // `tables[..second]` unchecked-by-branch, and a pooled driver carries
-        // the pair across frames.
-        debug_assert!(self.second <= self.tables.len());
+        // The split invariant (`second <= buf.len()`) is [`HeadTables`]'s
+        // own: every geometry change above went through its resize
+        // entries, which move the pair together, so every consumer's
+        // unchecked span slice holds on a pooled driver across frames.
     }
 
     /// Size the search tables for `level` (no-op when unchanged), so pooled
@@ -1721,7 +1703,7 @@ impl MatchGeneratorDriver {
                     // the previous family left (a kept dfast/row buffer
                     // would seed the head with foreign-layout entries on
                     // <= 8 KiB frames, where the logs clamp to 14).
-                    self.second = 0;
+                    self.tables.force_fresh();
                     self.resize_tables(&row);
                     self.params = row;
                 },
@@ -1859,7 +1841,6 @@ impl MatchGeneratorDriver {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
         StripSnapshot {
             tables: self.tables.clone(),
-            second: self.second,
             ldm: self.ldm.as_ref().map(LdmState::snapshot),
             origin: self.head_origin,
             upto,
@@ -1948,7 +1929,7 @@ impl MatchGeneratorDriver {
     pub(crate) fn adopt_strip_snapshot(&mut self, snap: &StripSnapshot, data: &[u8], base: u64) {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
         debug_assert_eq!(self.tables.len(), snap.tables.len());
-        debug_assert_eq!(self.second, snap.second);
+        debug_assert_eq!(self.tables.head_len(), snap.tables.head_len());
         debug_assert!(snap.upto <= base + data.len() as u64);
         self.dubt_head = HeadPhase::Off;
         self.bt_step = BtStepPhase::Off;
@@ -2049,7 +2030,7 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
         let hash_log = self.params.hash_log;
-        let (table, chain) = self.tables.split_at_mut(self.second);
+        let (table, chain) = self.tables.split();
         let chain_mask = chain.len() - 1;
         // The from-scratch loop runs idx = 0, 3, 6, ... while idx < last;
         // a prefix fill to `from` exited at the first aligned idx >=
@@ -2239,7 +2220,7 @@ impl MatchGeneratorDriver {
         } else {
             #[cfg(feature = "job_trace")]
             let trace_clear = std::time::Instant::now();
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             #[cfg(feature = "job_trace")]
             super::job_trace::add_clear(trace_clear);
             // The clear restarts the fast/dfast tables' coordinate epoch
@@ -2273,7 +2254,7 @@ impl MatchGeneratorDriver {
             self.dubt_stale = true;
         }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
-            self.tables[self.second..].fill(0);
+            self.tables.second_mut().fill(0);
         }
         // The strip (grid fill below, or nothing for opt) is the tables'
         // entire content: any gap a previous job left open ends here, and
@@ -2337,7 +2318,7 @@ impl MatchGeneratorDriver {
                 // twin is unreachable (see PREFILL_STRIDE). Positions ride
                 // the epoch shift set above the strategy arms.
                 let shift = self.fast_shift;
-                let table = &mut self.tables[..self.second];
+                let table = self.tables.heads_mut();
                 let log = self.params.hash_log;
                 match grid {
                     FillGrid::Strip => {
@@ -2374,7 +2355,7 @@ impl MatchGeneratorDriver {
                 // The short table keys 4-byte windows on dictionary frames
                 // (the scan's `MM4` row; see `dict_row`).
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split_at_mut(self.second);
+                let (long, small) = self.tables.split();
                 let mut idx = 0;
                 while idx < last {
                     // SAFETY: both hashes are masked to their tables' sizes.
@@ -2419,7 +2400,7 @@ impl MatchGeneratorDriver {
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split_at_mut(self.second);
+                let (table, chain) = self.tables.split();
                 let chain_mask = chain.len() - 1;
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
                 // strip cannot afford a dense fill). Dictionary: every
@@ -2503,7 +2484,7 @@ impl MatchGeneratorDriver {
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.as_mut_ptr();
+                let table = self.tables.buf_mut().as_mut_ptr();
                 let heads = self.row_heads.as_mut_ptr();
                 // Same geometry decision as the chain arm: the strip is a
                 // full window, so it takes the stride grid; dictionary
@@ -2714,8 +2695,8 @@ impl MatchGeneratorDriver {
         let filled = self.dict_tree_filled();
         DriverSeedImage {
             win: self.win.to_vec(),
-            tables: self.tables.to_vec(),
-            second: self.second,
+            tables: self.tables.buf().to_vec(),
+            second: self.tables.head_len(),
             row_heads: self.row_heads.clone(),
             probe: self.probe.clone(),
             // The skip shapes capture no tree bytes: their live content is
@@ -2882,12 +2863,7 @@ impl MatchGeneratorDriver {
         // is the never-taken safety net.
         self.win.clear();
         self.win.extend_from_slice(&image.win);
-        if self.tables.len() != image.tables.len() {
-            self.tables = HugeBuf::zeroed(image.tables.len());
-        }
-        if !image.tables.is_empty() {
-            self.tables.copy_from_slice(&image.tables);
-        }
+        self.tables.restore(&image.tables, image.second);
         if self.row_heads.len() == image.row_heads.len() {
             self.row_heads.copy_from_slice(&image.row_heads);
         } else {
@@ -2972,7 +2948,6 @@ impl MatchGeneratorDriver {
         self.block_end = image.block_end;
         self.anchor = image.anchor;
         self.block_start = image.block_start;
-        self.second = image.second;
         self.next_update = image.next_update;
         self.gap_start = image.gap_start;
         self.opt_origin = opt_origin;
@@ -3070,17 +3045,15 @@ impl Matcher for MatchGeneratorDriver {
         self.set_reach_choice(ReachChoice::Shrink);
         self.reset(level);
         if !self.tables.is_empty() {
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             // Same fresh-state contract for the row heads (see
             // fill_window_grid).
             self.row_heads.fill(0);
         }
-        if !self.tables[self.second..].is_empty()
-            && matches!(self.params.strategy, Strategy::Chain(_))
-        {
+        if !self.tables.second().is_empty() && matches!(self.params.strategy, Strategy::Chain(_)) {
             // The dfast small table doubles as `chain`; its strategies never
             // reach here, but the clear stays strategy-exact regardless.
-            self.tables[self.second..].fill(0);
+            self.tables.second_mut().fill(0);
         }
         self.probe.clear();
     }
@@ -3171,7 +3144,7 @@ impl Matcher for MatchGeneratorDriver {
         // un-rolled origins keep the don't-clear residue semantics
         // bit-exact.
         if matches!(self.params.strategy, Strategy::Chain(_)) && (self.head_origin as i64) < 0 {
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             self.head_origin = 0;
         }
         self.ext = None;
@@ -3518,8 +3491,8 @@ impl Matcher for MatchGeneratorDriver {
                                                         >(literals, seqs);
                             }
                         } else {
-                            let long_log = self.second.trailing_zeros();
-                            let small_log = (self.tables.len() - self.second).trailing_zeros();
+                            let long_log = self.tables.head_len().trailing_zeros();
+                            let small_log = self.tables.second_len().trailing_zeros();
                             match (self.ramp.is_armed(), long_log, small_log) {
                                 (false, 17, 16) => {
                                     self.start_matching_dfast::<false, false, 17, 16, $ldm>(
@@ -3793,30 +3766,29 @@ impl Matcher for MatchGeneratorDriver {
                     // SAFETY: h is masked to hash_log bits, the absolute block
                     // start to the chain size (absolute key; see
                     // emit_chain's note on the walk side's indexing).
+                    let (heads, chain) = self.tables.split();
+                    let chain_mask = chain.len() - 1;
                     unsafe {
-                        let head = *self.tables.get_unchecked(h);
-                        let chain_mask = self.tables.len() - self.second - 1;
-                        *self.tables.get_unchecked_mut(
-                            self.second + (self.block_start as usize & chain_mask),
-                        ) = head;
-                        *self.tables.get_unchecked_mut(h) =
-                            pack_head(self.block_start, self.head_origin);
+                        let head = *heads.get_unchecked(h);
+                        *chain.get_unchecked_mut(self.block_start as usize & chain_mask) = head;
+                        *heads.get_unchecked_mut(h) = pack_head(self.block_start, self.head_origin);
                     }
                 },
                 Strategy::Dfast(small_log) => {
                     let hl = hash8_at_log(win, idx, self.params.hash_log);
                     let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
                     // SAFETY: both hashes masked to their tables' sizes.
+                    let (long, small) = self.tables.split();
                     unsafe {
                         let entry = pack_pos(self.block_start - self.fast_shift);
-                        *self.tables.get_unchecked_mut(hl) = entry;
-                        *self.tables.get_unchecked_mut(self.second + hs) = entry;
+                        *long.get_unchecked_mut(hl) = entry;
+                        *small.get_unchecked_mut(hs) = entry;
                     }
                 },
                 Strategy::Fast => {
                     insert_at(
                         win,
-                        &mut self.tables[..self.second],
+                        self.tables.heads_mut(),
                         idx,
                         self.block_start - self.fast_shift,
                         self.params.hash_log,
@@ -3833,7 +3805,7 @@ impl Matcher for MatchGeneratorDriver {
                         row_log,
                         ChainHashWidth::of(self.dict_row),
                     );
-                    let table = self.tables.as_mut_ptr();
+                    let table = self.tables.buf_mut().as_mut_ptr();
                     let heads = self.row_heads.as_mut_ptr();
                     match row_log {
                         4 => row_insert::<4>(table, heads, h, self.block_start),
@@ -3993,7 +3965,7 @@ impl MatchGeneratorDriver {
             self.params.strategy,
             Strategy::Fast | Strategy::Dfast(_)
         ));
-        clear_table(&mut self.tables);
+        clear_table(self.tables.buf_mut());
         self.fast_shift = self.win_base.max(self.pos - FAST_EPOCH_SPAN);
     }
 
@@ -4009,7 +3981,7 @@ impl MatchGeneratorDriver {
     /// empty sentinel's `q > reach` rejection exact.
     fn chain_epoch_roll(&mut self, floor: u64) {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
-        clear_table(&mut self.tables[..self.second]);
+        clear_table(self.tables.heads_mut());
         self.head_origin = floor.wrapping_neg();
     }
 
@@ -4062,7 +4034,7 @@ impl MatchGeneratorDriver {
                 while idx < to {
                     insert_at(
                         win,
-                        &mut self.tables[..self.second],
+                        self.tables.heads_mut(),
                         idx,
                         win_base + idx as u64 - shift,
                         log,
@@ -4073,7 +4045,7 @@ impl MatchGeneratorDriver {
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split_at_mut(self.second);
+                let (long, small) = self.tables.split();
                 while idx < to {
                     // SAFETY: both hashes are masked to their tables' sizes
                     // (same pair as the dfast prefill).
@@ -4088,7 +4060,7 @@ impl MatchGeneratorDriver {
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split_at_mut(self.second);
+                let (table, chain) = self.tables.split();
                 let chain_mask = chain.len() - 1;
                 let origin = self.head_origin;
                 while idx < to {
@@ -4108,7 +4080,7 @@ impl MatchGeneratorDriver {
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.as_mut_ptr();
+                let table = self.tables.buf_mut().as_mut_ptr();
                 let heads = self.row_heads.as_mut_ptr();
                 while idx < to {
                     let h = row_hash_at(win, idx, hash_log, row_log, width);
@@ -4239,7 +4211,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && a.ramp == b.ramp
         && a.chain_filled == b.chain_filled
         && a.opt_state == b.opt_state
-        && a.second == b.second
+        && a.tables.head_len() == b.tables.head_len()
         && a.ext.is_none()
         && b.ext.is_none()
         && a.probe_stats.is_none()
@@ -4275,8 +4247,8 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
     // is position-keyed: only the dictionary's own slots are written
     // (a fresh state holds zeros in the rest; residue there is
     // unreachable).
-    let tables = a.tables[..a.second] == b.tables[..b.second] && {
-        let (ring_a, ring_b) = (&a.tables[a.second..], &b.tables[b.second..]);
+    let tables = a.tables.heads() == b.tables.heads() && {
+        let (ring_a, ring_b) = (a.tables.second(), b.tables.second());
         let written = (a.pos as usize).min(ring_a.len());
         ring_a.len() == ring_b.len() && ring_a[..written] == ring_b[..written]
     };
