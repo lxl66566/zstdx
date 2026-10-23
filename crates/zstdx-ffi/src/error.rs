@@ -107,7 +107,8 @@ impl ErrorCode {
 
     /// Invert a libzstd `size_t` return into its code: `no_error` when the
     /// value is not in the error range, and gap values (the enum has none)
-    /// collapse to `no_error` as well.
+    /// collapse to `no_error` as well. `ZSTD_getErrorCode` keeps the raw
+    /// number instead (see its entry); this stays the name lookup path.
     #[must_use]
     pub fn from_raw(raw: usize) -> Self {
         if !is_error(raw) {
@@ -167,10 +168,11 @@ pub fn name_raw(raw: usize) -> &'static core::ffi::CStr {
     }
 }
 
-/// `ZSTD_isError`: every value above `-(maxCode)` is an error return.
+/// `ZSTD_isError`: exactly the `ERR_isError` range, strictly above
+/// `-(maxCode)`; the value `-(maxCode)` itself is not an error return.
 #[must_use]
 pub fn is_error(code: usize) -> bool {
-    code >= usize::wrapping_neg(MAX_CODE as usize)
+    code > usize::wrapping_neg(MAX_CODE as usize)
 }
 
 /// Build the libzstd `size_t` return value for `code`.
@@ -277,6 +279,9 @@ mod tests {
 
     #[test]
     fn error_values_match_libzstd_layout() {
+        // -(maxCode) itself sits outside the error range (strict >, as ERR_isError).
+        assert!(!is_error(usize::wrapping_neg(MAX_CODE as usize)));
+        assert!(is_error(usize::wrapping_neg(MAX_CODE as usize) + 1));
         assert_eq!(ErrorCode::Generic as u32, 1);
         assert_eq!(ErrorCode::SrcSizeWrong as u32, 72);
         assert_eq!(code(ErrorCode::SrcSizeWrong), usize::MAX - 71);

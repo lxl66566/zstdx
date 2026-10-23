@@ -120,7 +120,14 @@ pub extern "C" fn ZSTD_getErrorName(code: usize) -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_getErrorCode(code: usize) -> core::ffi::c_uint {
-    ErrorCode::from_raw(code) as u32
+    // ERR_getErrorCode answers the raw negated value for any error-range
+    // input; gap values (inside -(maxCode), outside the enum) keep their
+    // number rather than collapsing to no_error.
+    if error::is_error(code) {
+        0usize.wrapping_sub(code) as u32
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------

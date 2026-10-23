@@ -108,6 +108,18 @@ static void test_errors(void) {
           "tiny dst: %s", ZSTD_getErrorName(r));
     r = ZSTD_compress(NULL, 10, src, 100, 1);
     CHECK(ZSTD_isError(r), "null dst");
+    /* Error fidelity (R67): gap values keep their number through
+     * getErrorCode, -(maxCode) itself is not an error, and both facts
+     * surface through the name table. */
+    CHECK(ZSTD_isError(0) == 0, "isError 0");
+    CHECK(ZSTD_getErrorCode((size_t)-22) == ZSTD_error_checksum_wrong, "code -22");
+    CHECK(ZSTD_getErrorCode((size_t)-11) == 11, "gap code keeps number");
+    CHECK(ZSTD_getErrorCode((size_t)-119) == 119, "gap edge keeps number");
+    CHECK(ZSTD_isError((size_t)-120) == 0, "-(maxCode) not an error");
+    CHECK(strcmp(ZSTD_getErrorName((size_t)-120), "No error detected") == 0,
+          "-(maxCode) name: %s", ZSTD_getErrorName((size_t)-120));
+    CHECK(strcmp(ZSTD_getErrorName((size_t)-11), "Unspecified error code") == 0,
+          "gap name: %s", ZSTD_getErrorName((size_t)-11));
     CHECK(ZSTD_isFrame(NULL, 0) == 0, "isFrame null");
     CHECK(ZSTD_isFrame(cmp, 3) == 0, "isFrame short");
     CHECK(ZSTD_isFrame(cmp, 4) == 1, "isFrame magic");
