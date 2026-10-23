@@ -859,6 +859,23 @@ impl Finder<'_, '_> {
         self.resolve(self.hash3[h], 0, target)
     }
 
+    /// Fill `hash3` over `[win_base, target)` without probing -- the
+    /// dict-seed prefix prefill, mirroring [`Self::update_tree`]'s eager
+    /// range for the 3-byte table (see `seed_dict_tree`).
+    fn prefill_hash3(&mut self, target: usize) {
+        if self.hash3.is_empty() {
+            return;
+        }
+        let mask = self.hash3.len() - 1;
+        // SAFETY: p is a live window position; the hash masks to the table.
+        unsafe {
+            for p in 0..target {
+                let h = hash3_at(self.win, p, self.hash3_log) & mask;
+                *self.hash3.get_unchecked_mut(h) = self.pack(self.win_base + p as u64);
+            }
+        }
+    }
+
     /// Collect every candidate at `idx` whose length strictly improves on the
     /// previous one, repcodes first (`ZSTD_insertBtAndGetAllMatches`).
     /// Returns the match count; `length_to_beat` starts at `min_match`.
@@ -1263,7 +1280,16 @@ pub(crate) fn seed_dict_tree(
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
     };
-    finder.update_tree(win.len().saturating_sub(OPT_NUM));
+    let fill_target = win.len().saturating_sub(OPT_NUM);
+    finder.update_tree(fill_target);
+    // hash3's per-block cursor derives from `next_update`
+    // (`nextToUpdate3 = nextToUpdate`, zstd_opt.c:1098), which the fill
+    // above advanced to `keep - OPT_NUM` -- but the seed parse only wrote
+    // `[seed_start, T_replay)`, so slots below the cursor would read EMPTY
+    // where the lazy dict flow's contiguous fill (cursor 0) holds an
+    // entry. Prefill the same prefix; the rewrite of the replay's span is
+    // idempotent (same positions into the same slots, ascending order).
+    finder.prefill_hash3(fill_target);
 }
 
 /// The ultra seed parse's span start for a dictionary of `keep` bytes
