@@ -465,6 +465,16 @@ struct Cli {
     #[arg(long, hide = true)]
     ignore_errors: bool,
 
+    /// Copy inputs that are not zstd frames through unchanged instead of
+    /// failing (decode modes only; default: on with -f when writing to
+    /// stdout, gzip -df semantics)
+    #[arg(long, conflicts_with = "no_pass_through")]
+    pass_through: bool,
+
+    /// Disable the pass-through default of -f with stdout output
+    #[arg(long)]
+    no_pass_through: bool,
+
     // Rejected flags: parsing them keeps the diagnostic a clear
     // "unsupported" error instead of clap's generic unknown-argument text.
     /// Not supported: output is always written dense (sparse TODO: decode
@@ -481,6 +491,14 @@ struct Cli {
 enum Input {
     Stdin,
     File(PathBuf),
+}
+
+/// zstd's display name for an input source (`stdinmark` for stdin).
+fn input_name(input: &Input) -> String {
+    match input {
+        Input::Stdin => STDIN_NAME.to_string(),
+        Input::File(path) => path.display().to_string(),
+    }
 }
 
 /// Where one input's output goes.
@@ -625,6 +643,10 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     }
     if cli.memory.is_some() && mode == Mode::Compress {
         eprintln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
+        return Exit::Failure;
+    }
+    if (cli.pass_through || cli.no_pass_through) && mode == Mode::Compress {
+        eprintln!("{PREFIX}--pass-through affects decoding only");
         return Exit::Failure;
     }
     if cli.memory.is_some_and(|limit| limit < MIN_WINDOW_BYTES) {
@@ -795,11 +817,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
                         eprintln!("{line}");
                     }
                 } else {
-                    let name = match input {
-                        Input::Stdin => STDIN_NAME.to_string(),
-                        Input::File(path) => path.display().to_string(),
-                    };
-                    eprintln!("{PREFIX}{name}: {err}");
+                    eprintln!("{PREFIX}{}: {err}", input_name(input));
                 }
             }
             // EXM_THROW-class failures decide the exit status even when
@@ -1033,13 +1051,20 @@ fn process(
         },
         // List and train are dispatched before per-input processing and
         // never reach this point.
-        Mode::Decompress | Mode::Test => match decompress(reader, &output, settings, dict) {
-            Ok(written) => written,
-            Err(err) => {
-                let mapped = decode_failure_lines(input, read_bytes.get(), err.as_ref())
-                    .map_or_else(|| err, |lines| Diagnostic::plain(lines).into());
-                return Err(mapped);
-            },
+        Mode::Decompress | Mode::Test => {
+            // fileio's pass-through default: overwrite flag set and the
+            // destination is stdout.
+            let pass_through = cli.pass_through
+                || !cli.no_pass_through && cli.force && matches!(output, Output::Stdout);
+            let name = input_name(input);
+            match decompress(reader, &output, settings, dict, &name, pass_through) {
+                Ok(written) => written,
+                Err(err) => {
+                    let mapped = decode_failure_lines(input, read_bytes.get(), err.as_ref())
+                        .map_or_else(|| err, |lines| Diagnostic::plain(lines).into());
+                    return Err(mapped);
+                },
+            }
         },
         Mode::List | Mode::Train => unreachable!("dispatched in run"),
     };
@@ -1166,10 +1191,7 @@ fn decode_failure_lines(
         let io_err = err.downcast_ref::<io::Error>()?;
         as_frame(io_err.get_ref()?.downcast_ref::<zstdx::Error>()?)?
     };
-    let name = match input {
-        Input::Stdin => STDIN_NAME.to_string(),
-        Input::File(path) => path.display().to_string(),
-    };
+    let name = input_name(input);
     let lines = match frame {
         FrameDecoderError::ChecksumMismatch { .. } => vec![format!(
             "{name} : Decoding error (36) : Restored data doesn't match checksum "
@@ -1264,6 +1286,8 @@ fn frame_eof(frame: &zstdx::decoding::errors::FrameDecoderError) -> bool {
                 DecompressBlockError::MalformedSectionHeader { .. },
             ),
         ) => true,
+        // A skippable frame whose declared content ran past the input.
+        FrameDecoderError::FailedToSkipFrame => true,
         _ => false,
     }
 }
@@ -1381,43 +1405,254 @@ fn compress(
 }
 
 /// Returns the number of bytes written.
+///
+/// The frame loop mirrors fileio's `FIO_decompressFrames`: each iteration
+/// peeks the next magic number, skips skippable frames, and decodes one
+/// data frame. A non-frame remainder is an error -- unless pass-through is
+/// armed, which copies it out verbatim (gzip -df semantics) instead.
 fn decompress(
-    reader: Box<dyn Read>,
+    mut source: Box<dyn Read>,
     output: &Output,
     settings: &Settings,
     dict: Option<&[u8]>,
+    name: &str,
+    pass_through: bool,
 ) -> AnyResult<u64> {
-    let mut options = DecoderOptions::new();
-    if settings.threads > 1 {
-        options = options.threads(settings.threads);
-    }
-    if let Some(max) = settings.max_window {
-        options = options.max_window_size(max);
-    }
-    if let Some(dict) = dict {
-        options = options.dictionary(dict);
-    }
-
-    // Decoder construction precedes output creation: a failure here must
-    // not touch the output path at all.
-    let mut decoder = zstdx::stream::read::Decoder::with_options(reader, options)?;
-    let (mut writer, out_file) = open_output(output)?;
+    let (mut writer, _out_file) = open_output(output)?;
     // The whole write phase runs in a closure so the output handles are
     // dropped before the partial output is removed on failure.
     let written: AnyResult<u64> = (|| {
-        let copied = io::copy(&mut decoder, &mut writer)?;
-        writer.flush()?;
-        match out_file {
-            Some(file) => Ok(file.metadata()?.len()),
-            // stdout and the test-mode sink have no file to stat; the copied
-            // count is the decompressed size either way
-            None => Ok(copied),
+        let mut total = 0u64;
+        let mut read_something = false;
+        loop {
+            let magic = match peek_magic(source.as_mut())? {
+                // fileio's `readSomething` rule: a source that yielded no
+                // byte at all is empty (invalid), a partial magic is an
+                // unchecked header.
+                Peeked::Eof if !read_something => {
+                    return Err(Diagnostic::plain(vec![format!(
+                        "{PREFIX}{name}: unexpected end of file "
+                    )])
+                    .into());
+                },
+                Peeked::Eof => break,
+                Peeked::Short { bytes, len } => {
+                    if pass_through {
+                        total += copy_through(&bytes[..len], source.as_mut(), writer.as_mut())?;
+                        break;
+                    }
+                    return Err(
+                        Diagnostic::plain(vec![format!("{PREFIX}{name}: unknown header ")]).into(),
+                    );
+                },
+                Peeked::Magic(magic) => magic,
+            };
+            read_something = true;
+            if is_skippable(magic) {
+                skip_skippable(source.as_mut())?;
+                continue;
+            }
+            if magic != ZSTD_MAGIC {
+                // fileio checks the foreign-format magics before the
+                // pass-through arm; this build decodes none of them (like
+                // a libzstd-free zstd), so each refuses with its own line.
+                if let Some(format) = foreign_format(magic) {
+                    return Err(Diagnostic::plain(vec![format!(
+                        "{PREFIX}{name}: {} file cannot be uncompressed (zstd compiled without \
+                         HAVE_{}) -- ignored ",
+                        format.name(),
+                        format.missing_lib()
+                    )])
+                    .into());
+                }
+                if pass_through {
+                    total += copy_through(&magic, source.as_mut(), writer.as_mut())?;
+                    break;
+                }
+                return Err(
+                    Diagnostic::plain(vec![format!("{PREFIX}{name}: unsupported format ")]).into(),
+                );
+            }
+            let mut options = DecoderOptions::new();
+            if settings.threads > 1 {
+                options = options.threads(settings.threads);
+            }
+            if let Some(max) = settings.max_window {
+                options = options.max_window_size(max);
+            }
+            if let Some(dict) = dict {
+                options = options.dictionary(dict);
+            }
+            let framed = magic.as_slice().chain(source.as_mut());
+            let mut frame =
+                zstdx::stream::read::Decoder::with_options(framed, options)?.single_frame();
+            total += io::copy(&mut frame, writer.as_mut())?;
         }
+        writer.flush()?;
+        Ok(total)
     })();
     if written.is_err() {
         remove_partial_output(output);
     }
     written
+}
+
+/// A zstd data frame's magic number as serialized (little-endian).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Whether a peeked magic number opens a skippable frame
+/// (0x184D2A50-0x184D2A5F little-endian).
+fn is_skippable(magic: [u8; 4]) -> bool {
+    u32::from_le_bytes(magic) & 0xffff_fff0 == 0x184d_2a50
+}
+
+/// A foreign compressed format fileio recognizes by magic but this build
+/// cannot decode.
+#[derive(Copy, Clone)]
+enum ForeignFormat {
+    Gzip,
+    XzLzma,
+    Lz4,
+}
+
+impl ForeignFormat {
+    /// The name fileio's refusal line prints.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::XzLzma => "xz/lzma",
+            Self::Lz4 => "lz4",
+        }
+    }
+
+    /// The library whose absence the line blames.
+    fn missing_lib(self) -> &'static str {
+        match self {
+            Self::Gzip => "ZLIB",
+            Self::XzLzma => "LZMA",
+            Self::Lz4 => "LZ4",
+        }
+    }
+}
+
+/// Whether a peeked magic opens one of fileio's foreign formats, checked
+/// before pass-through (and before the unsupported-format refusal).
+fn foreign_format(magic: [u8; 4]) -> Option<ForeignFormat> {
+    match magic {
+        [0x1f, 0x8b, ..] => Some(ForeignFormat::Gzip),
+        [0xfd, 0x37, ..] | [0x5d, 0x00, ..] => Some(ForeignFormat::XzLzma),
+        [0x04, 0x22, 0x4d, 0x18] => Some(ForeignFormat::Lz4),
+        _ => None,
+    }
+}
+
+/// What the frame loop's magic peek saw.
+enum Peeked {
+    /// The source ended before its first byte.
+    Eof,
+    /// The source ended mid-magic: `len` of `bytes` (1-3) are valid.
+    Short { bytes: [u8; 4], len: usize },
+    /// Four bytes of magic.
+    Magic([u8; 4]),
+}
+
+/// Fill up to four bytes for the next frame's magic number. Read failures
+/// replay as the decoder's magic-read error so the caller's diagnostics
+/// keep the engine's shape.
+fn peek_magic(source: &mut dyn Read) -> AnyResult<Peeked> {
+    let mut magic = [0u8; 4];
+    let mut filled = 0;
+    while filled < magic.len() {
+        match source.read(&mut magic[filled..]) {
+            Ok(0) => {
+                return Ok(if filled == 0 {
+                    Peeked::Eof
+                } else {
+                    Peeked::Short {
+                        bytes: magic,
+                        len: filled,
+                    }
+                });
+            },
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
+            Err(err) => return Err(magic_read_error(err)),
+        }
+    }
+    Ok(Peeked::Magic(magic))
+}
+
+/// Consume a skippable frame behind its peeked magic: the 4-byte content
+/// size, then the content itself. An exhausted source mid-frame surfaces as
+/// the engine's skip error (zstd's premature end).
+fn skip_skippable(source: &mut dyn Read) -> AnyResult<()> {
+    let mut header = [0u8; 4];
+    if fill(source, &mut header).is_err() {
+        return Err(skip_eof_error());
+    }
+    let mut remaining = u32::from_le_bytes(header) as u64;
+    let mut trash = [0u8; 8 * 1024];
+    while remaining > 0 {
+        let take = (remaining.min(trash.len() as u64)) as usize;
+        if fill(source, &mut trash[..take]).is_err() {
+            return Err(skip_eof_error());
+        }
+        remaining -= take as u64;
+    }
+    Ok(())
+}
+
+/// An input that ran out inside a skippable frame: the engine's skip error,
+/// which the stderr mapping reports as zstd's premature end.
+fn skip_eof_error() -> Box<dyn std::error::Error> {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        zstdx::Error::Frame(zstdx::decoding::errors::FrameDecoderError::FailedToSkipFrame),
+    )
+    .into()
+}
+
+/// Read exactly `buf.len()` bytes; an exhausted source surfaces as the
+/// decoder's magic-read error.
+fn fill(source: &mut dyn Read, buf: &mut [u8]) -> AnyResult<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match source.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(magic_read_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of file",
+                )))
+            },
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
+            Err(err) => return Err(magic_read_error(err)),
+        }
+    }
+    Ok(filled)
+}
+
+/// Wrap a frame-boundary read failure as the decoder's magic-read error, so
+/// the per-site stderr mapping treats it like the engine would.
+fn magic_read_error(err: io::Error) -> Box<dyn std::error::Error> {
+    io::Error::new(
+        err.kind(),
+        zstdx::Error::Frame(
+            zstdx::decoding::errors::FrameDecoderError::ReadFrameHeaderError(
+                zstdx::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(err),
+            ),
+        ),
+    )
+    .into()
+}
+
+/// Copy a pass-through remainder out verbatim: the peeked bytes, then the
+/// rest of the source (`FIO_passThrough`).
+fn copy_through(head: &[u8], source: &mut dyn Read, writer: &mut dyn Write) -> AnyResult<u64> {
+    writer.write_all(head)?;
+    let mut total = io::copy(source, writer)?;
+    total += head.len() as u64;
+    Ok(total)
 }
 
 /// Open the output writer; the `File` is kept alongside so its final size can
@@ -1665,6 +1900,8 @@ mod tests {
             &Output::File(out.clone()),
             &plain_settings(),
             None,
+            "in",
+            false,
         );
         assert!(result.is_err());
         assert!(!out.exists(), "partial output must be removed");
@@ -1799,6 +2036,8 @@ mod tests {
             &Output::Sink,
             &plain_settings(),
             None,
+            "corrupt.zst",
+            false,
         )
         .unwrap_err();
         assert_eq!(
@@ -1819,6 +2058,8 @@ mod tests {
             &Output::Sink,
             &plain_settings(),
             None,
+            "trunc.zst",
+            false,
         )
         .unwrap_err();
         assert_eq!(
@@ -1827,50 +2068,123 @@ mod tests {
             ["trunc.zst : Read error (39) : premature end "]
         );
 
-        // an empty source never read a frame byte
-        let err = decompress(
-            Box::new(Cursor::new(Vec::new())),
-            &Output::Sink,
-            &plain_settings(),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(
-            decode_failure_lines(&Input::File(PathBuf::from("empty.zst")), 0, err.as_ref())
-                .unwrap(),
-            ["zstdx: empty.zst: unexpected end of file "]
-        );
-
-        // 2 bytes read: too few to check magic, zstd's unknown header
-        let err = decompress(
-            Box::new(Cursor::new(b"zz".to_vec())),
-            &Output::Sink,
-            &plain_settings(),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(
-            decode_failure_lines(&Input::File(PathBuf::from("hdr.bin")), 2, err.as_ref()).unwrap(),
-            ["zstdx: hdr.bin: unknown header "]
-        );
-
-        // bad magic: unsupported format
-        let err = decompress(
-            Box::new(Cursor::new(b"garbage data, not a frame".to_vec())),
-            &Output::Sink,
-            &plain_settings(),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(
-            decode_failure_lines(
-                &Input::File(PathBuf::from("badmagic.bin")),
-                21,
-                err.as_ref()
+        // the boundary shapes are decided by the frame loop itself, as
+        // Diagnostics: empty source, partial magic, bad magic
+        let boundary = |bytes: Vec<u8>, name: &str| -> Vec<String> {
+            decompress(
+                Box::new(Cursor::new(bytes)),
+                &Output::Sink,
+                &plain_settings(),
+                None,
+                name,
+                false,
             )
-            .unwrap(),
+            .unwrap_err()
+            .downcast_ref::<Diagnostic>()
+            .unwrap()
+            .lines
+            .clone()
+        };
+        assert_eq!(boundary(Vec::new(), "empty.zst"), ["zstdx: empty.zst: \
+                                                        unexpected end of \
+                                                        file "]);
+        assert_eq!(boundary(b"zz".to_vec(), "hdr.bin"), [
+            "zstdx: hdr.bin: unknown header "
+        ]);
+        assert_eq!(
+            boundary(b"garbage data, not a frame".to_vec(), "badmagic.bin"),
             ["zstdx: badmagic.bin: unsupported format "]
         );
+    }
+
+    /// Pass-through (gzip -df semantics): non-frame input copies through
+    /// verbatim, a frame's trailing garbage copies after the decoded bytes,
+    /// and skippable frames stay transparent in every position.
+    #[test]
+    fn pass_through_copies_non_frames() {
+        let dir = std::env::temp_dir().join("zstdx-cli-pass-through");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("out.bin");
+        let run = |bytes: Vec<u8>, pass_through: bool| -> super::AnyResult<u64> {
+            decompress(
+                Box::new(Cursor::new(bytes)),
+                &Output::File(out_path.clone()),
+                &plain_settings(),
+                None,
+                "in",
+                pass_through,
+            )
+        };
+
+        // plain text: rejected without pass-through, copied with it
+        let plain = b"plain text, no frame".to_vec();
+        let err = run(plain.clone(), false).unwrap_err();
+        assert_eq!(err.downcast_ref::<Diagnostic>().unwrap().lines, [
+            "zstdx: in: unsupported format "
+        ]);
+        let written = run(plain.clone(), true).unwrap();
+        assert_eq!(std::fs::read(&out_path).unwrap(), plain);
+        assert_eq!(written as usize, plain.len());
+
+        // a short (<4 byte) source copies too, an empty one still fails
+        run(b"abc".to_vec(), true).unwrap();
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"abc");
+        assert!(run(Vec::new(), true).is_err());
+
+        // frame + trailing garbage: decoded bytes then the garbage verbatim
+        let frame = compressed_payload();
+        let mut mixed = frame.clone();
+        mixed.extend_from_slice(b"trailing garbage");
+        let written = run(mixed.clone(), true).unwrap();
+        let mut expected = vec![7u8; 300 * 1024];
+        expected.extend_from_slice(b"trailing garbage");
+        assert_eq!(std::fs::read(&out_path).unwrap(), expected);
+        assert_eq!(written as usize, expected.len());
+        // without pass-through the same input is unsupported format
+        assert!(run(mixed, false).is_err());
+
+        // skippable frames stay transparent around a data frame
+        let content = b"SKIP".repeat(6);
+        let skippable = [
+            &0x184d_2a50u32.to_le_bytes()[..],
+            &(content.len() as u32).to_le_bytes()[..],
+            &content[..],
+        ]
+        .concat();
+        let truncated = skippable[..skippable.len() - 2].to_vec();
+        let wrapped = [skippable.clone(), frame, skippable].concat();
+        let written = run(wrapped, false).unwrap();
+        assert_eq!(std::fs::read(&out_path).unwrap(), vec![7u8; 300 * 1024]);
+        assert_eq!(written as usize, 300 * 1024);
+
+        // a skippable frame truncated mid-content is zstd's premature end
+        let err = run(truncated, false).unwrap_err();
+        assert_eq!(
+            decode_failure_lines(&Input::File(PathBuf::from("in")), 9, err.as_ref()).unwrap(),
+            ["in : Read error (39) : premature end "]
+        );
+
+        // foreign formats refuse before pass-through, each with its own line
+        for (magic, line) in [
+            (
+                [0x1fu8, 0x8b, 0x08, 0x00],
+                "gzip file cannot be uncompressed (zstd compiled without HAVE_ZLIB) -- ignored ",
+            ),
+            (
+                [0xfdu8, 0x37, 0x7a, 0x58],
+                "xz/lzma file cannot be uncompressed (zstd compiled without HAVE_LZMA) -- ignored ",
+            ),
+            (
+                [0x04u8, 0x22, 0x4d, 0x18],
+                "lz4 file cannot be uncompressed (zstd compiled without HAVE_LZ4) -- ignored ",
+            ),
+        ] {
+            let err = run(magic.to_vec(), true).unwrap_err();
+            assert_eq!(err.downcast_ref::<Diagnostic>().unwrap().lines, [format!(
+                "zstdx: in: {line}"
+            )]);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A frame whose window exceeds -M renders zstd's three-line help block
@@ -1887,6 +2201,8 @@ mod tests {
             &Output::Sink,
             &settings,
             None,
+            "w30.zst",
+            false,
         )
         .unwrap_err();
         assert_eq!(
