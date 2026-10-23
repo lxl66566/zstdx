@@ -25,27 +25,26 @@ const DEFAULT_MAX_DICT: u64 = 112_640;
 const MIN_DICT: u64 = 256;
 
 /// Entry point: train on the sample files and write the dictionary.
-/// Returns false on any failure.
-pub fn run(cli: &Cli) -> bool {
+pub fn run(cli: &Cli) -> crate::Exit {
     // The gate comes first: a build without the trainer must say so for
     // every --train invocation, not just the ones with usable samples.
     #[cfg(not(feature = "dict_builder"))]
     {
         let _ = cli;
         eprintln!("{PREFIX}training mode not available (built without the dict_builder feature)");
-        false
+        crate::Exit::Failure
     }
     #[cfg(feature = "dict_builder")]
     train_with_builder(cli)
 }
 
 #[cfg(feature = "dict_builder")]
-fn train_with_builder(cli: &Cli) -> bool {
+fn train_with_builder(cli: &Cli) -> crate::Exit {
     if let Some(maxdict) = cli.maxdict
         && maxdict < MIN_DICT
     {
         eprintln!("{PREFIX}--maxdict must be at least {MIN_DICT} bytes");
-        return false;
+        return crate::Exit::Failure;
     }
 
     let mut inputs = Vec::new();
@@ -55,7 +54,7 @@ fn train_with_builder(cli: &Cli) -> bool {
             Ok(list) => list,
             Err(err) => {
                 eprintln!("{PREFIX}{}: {err}", path.display());
-                return false;
+                return crate::Exit::Failure;
             },
         },
         None => Vec::new(),
@@ -71,7 +70,7 @@ fn train_with_builder(cli: &Cli) -> bool {
     }
     if inputs.iter().any(|i| matches!(i, Input::Stdin)) {
         eprintln!("{PREFIX}--train does not support reading from standard input ");
-        return false;
+        return crate::Exit::Failure;
     }
 
     let mut samples = Vec::new();
@@ -83,18 +82,22 @@ fn train_with_builder(cli: &Cli) -> bool {
             Ok(sample) => samples.push(sample),
             Err(err) => {
                 eprintln!("{PREFIX}{}: {err}", path.display());
-                return false;
+                return crate::Exit::Failure;
             },
         }
     }
     let total_bytes: usize = samples.iter().map(Vec::len).sum();
-    // zstd refuses with "Error 14 : nb of samples too low"; our trainer
-    // would happily emit content, but a near-empty sample set (less than
-    // the trainer's 16-byte trainable minimum) is never a useful
-    // dictionary either.
-    if inputs.is_empty() || total_bytes < 16 {
+    // dibio.c refuses under five samples with its own EXM_THROW shape
+    // (dibio's has no zstd: prefix and exits with the number).
+    if samples.len() < 5 {
+        eprintln!("Error 14 : nb of samples too low");
+        return crate::Exit::Error(14);
+    }
+    // Below the trainer's 16-byte trainable minimum the engine itself
+    // cannot produce a dictionary.
+    if total_bytes < 16 {
         eprintln!("{PREFIX}nb of samples too low ");
-        return false;
+        return crate::Exit::Failure;
     }
 
     let out: PathBuf = cli
@@ -106,27 +109,23 @@ fn train_with_builder(cli: &Cli) -> bool {
         Ok(file) => file,
         Err(err) => {
             eprintln!("{PREFIX}{}: {err}", out.display());
-            return false;
+            return crate::Exit::Failure;
         },
     };
     if let Err(err) = file.write_all(&dict).and_then(|()| file.flush()) {
         eprintln!("{PREFIX}{}: {err}", out.display());
-        return false;
+        return crate::Exit::Failure;
     }
-    // zstd overwrites the dictionary target without prompting, and reports
-    // the samples while loading and the result on completion.
-    eprintln!(
-        "training on {} samples, {} bytes, target {} bytes",
-        samples.len(),
-        total_bytes,
-        cli.maxdict.unwrap_or(DEFAULT_MAX_DICT)
-    );
-    eprintln!(
-        "Save dictionary of size {} into file {} ",
-        dict.len(),
-        out.display()
-    );
-    true
+    // dibio.c reports the result at display level 2: visible by default,
+    // hidden under -q.
+    if cli.quiet == 0 {
+        eprintln!(
+            "Save dictionary of size {} into file {} ",
+            dict.len(),
+            out.display()
+        );
+    }
+    crate::Exit::Success
 }
 
 /// The trainer call: `zstd --train`'s formatted shape (magic, dictID,

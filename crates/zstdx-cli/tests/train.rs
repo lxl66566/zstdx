@@ -114,9 +114,11 @@ fn trains_formatted_dictionary() {
         stderr.contains(&format!("Save dictionary of size {} ", bytes.len())),
         "{stderr}"
     );
+    // dibio reports nothing else at default verbosity (no sample-count
+    // line exists on zstd's side)
     assert!(
-        stderr.contains(&format!("{} samples", samples.len())),
-        "{stderr}"
+        !stderr.contains("training on"),
+        "no non-reference diagnostics: {stderr}"
     );
 }
 

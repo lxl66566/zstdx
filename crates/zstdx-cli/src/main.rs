@@ -7,11 +7,13 @@ mod progress;
 mod train;
 
 use std::{
+    cell::Cell,
     ffi::OsString,
     fs::{self, File},
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    rc::Rc,
 };
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
@@ -25,6 +27,9 @@ use zstdx::{DecoderOptions, EncoderOptions, InputShape, Level};
 const ZSTD_SUFFIX: &str = ".zst";
 /// Tar-suffix zstd also strips on decompression (`.tzst` maps to `.tar`).
 const TZSTD_SUFFIX: &str = ".tzst";
+/// zstd's canonical stdin display name (fileio.h `stdinmark`): the literal
+/// text its diagnostics print for `-`.
+const STDIN_NAME: &str = "/*stdin*\\";
 /// libzstd's CLI default compression level.
 const DEFAULT_LEVEL: i32 = 3;
 /// libzstd's CLI caps levels here unless `--ultra` is passed.
@@ -55,17 +60,47 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// A fully rendered diagnostic: printed verbatim, one line per entry,
 /// instead of the `zstdx: <input>: <message>` wrapper -- for the stderr
-/// lines that mirror zstd's per-site formats byte for byte.
+/// lines that mirror zstd's per-site formats byte for byte. `code` is
+/// zstd's numeric exit status (fileio's EXM_THROW exits with the error
+/// number); 0 means a plain failure (exit 1).
 #[derive(Debug)]
-struct Diagnostic(Vec<String>);
+struct Diagnostic {
+    code: u8,
+    lines: Vec<String>,
+}
+
+impl Diagnostic {
+    fn plain(lines: Vec<String>) -> Self {
+        Self { code: 0, lines }
+    }
+}
 
 impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.join("\n"))
+        write!(f, "{}", self.lines.join("\n"))
     }
 }
 
 impl std::error::Error for Diagnostic {}
+
+/// zstd's exit statuses: fileio/dibio's EXM_THROW exits with the error
+/// number (`Error`), every other failure exits 1, success 0.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Exit {
+    Success,
+    Failure,
+    Error(u8),
+}
+
+impl From<bool> for Exit {
+    fn from(ok: bool) -> Self {
+        if ok {
+            Exit::Success
+        } else {
+            Exit::Failure
+        }
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Mode {
@@ -231,9 +266,10 @@ struct Cli {
     #[arg(short = 'i', value_name = "#")]
     bench_seconds: Option<u64>,
 
-    /// Cut the input into independent blocks of size # (bench only;
-    /// zstd's --split)
-    #[arg(short = 'B', long = "split", value_name = "#", value_parser = parse_size)]
+    /// Cut the input into independent blocks of size # (bench only; zstd
+    /// 1.5.7 spells it -B only -- the --split long form is an unknown
+    /// flag there)
+    #[arg(short = 'B', value_name = "#", value_parser = parse_size)]
     block_size: Option<u64>,
 
     /// Limit the trained dictionary to # bytes (--train only; suffixes
@@ -469,14 +505,31 @@ fn main() -> ExitCode {
     let command = Cli::command();
     let matches = match command.try_get_matches_from(args) {
         Ok(matches) => matches,
+        // zstdcli.c's parser: an unknown flag is `Incorrect parameter` and
+        // exit 1, never clap's usage block (the usage text differs from
+        // zstd's either way; zstd prints its own only at -v and up).
+        Err(err) if err.kind() == clap::error::ErrorKind::UnknownArgument => {
+            let arg = err
+                .get(clap::error::ContextKind::InvalidArg)
+                .and_then(|value| match value {
+                    clap::error::ContextValue::String(text) => Some(text.clone()),
+                    clap::error::ContextValue::Strings(list) => list.first().cloned(),
+                    _ => None,
+                });
+            eprintln!(
+                "Incorrect parameter: {} ",
+                arg.as_deref().unwrap_or_default()
+            );
+            return ExitCode::FAILURE;
+        },
         Err(err) => err.exit(),
     };
     let cli = Cli::from_arg_matches(&matches).expect("try_get_matches validated the args");
     init_logging(&cli);
-    if run(&cli, rm) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    match run(&cli, rm) {
+        Exit::Success => ExitCode::SUCCESS,
+        Exit::Failure => ExitCode::FAILURE,
+        Exit::Error(code) => ExitCode::from(code),
     }
 }
 
@@ -499,13 +552,14 @@ fn rm_flag_last_wins(args: &[OsString]) -> bool {
     rm
 }
 
-/// Returns false when any input failed to process.
-fn run(cli: &Cli, rm: bool) -> bool {
+/// The process exit status: `Exit::Error` where zstd's EXM_THROW exits
+/// with the error number, `Exit::Failure` (exit 1) otherwise.
+fn run(cli: &Cli, rm: bool) -> Exit {
     // zstd 1.5.7 removed --ignore-errors (v1.5.5 deprecation turned into
     // a hard parser rejection, before any mode runs).
     if cli.ignore_errors {
         eprintln!("Incorrect parameter: --ignore-errors ");
-        return false;
+        return Exit::Failure;
     }
 
     let mode = if cli.train {
@@ -524,25 +578,25 @@ fn run(cli: &Cli, rm: bool) -> bool {
     // every accepted flag changes behavior below, none is a silent no-op.
     if cli.sparse || cli.no_sparse {
         eprintln!("{PREFIX}--sparse/--no-sparse are not supported: output is always dense");
-        return false;
+        return Exit::Failure;
     }
     if cli.dict_id.is_some() {
         eprintln!(
             "{PREFIX}--dictID is not supported: the trainer derives the dictionary ID from its \
              content"
         );
-        return false;
+        return Exit::Failure;
     }
     if cli.train_cover.is_some() || cli.train_fastcover.is_some() || cli.train_legacy.is_some() {
         eprintln!(
             "{PREFIX}--train-cover/--train-fastcover/--train-legacy are not supported: the \
              in-tree trainer is the only algorithm"
         );
-        return false;
+        return Exit::Failure;
     }
     if cli.maxdict.is_some() && mode != Mode::Train {
         eprintln!("{PREFIX}--maxdict only applies with --train");
-        return false;
+        return Exit::Failure;
     }
 
     // Benchmark mode is self-contained: it gathers its own inputs and
@@ -558,7 +612,7 @@ fn run(cli: &Cli, rm: bool) -> bool {
     // The inspection and training modes are self-contained: they gather
     // their own inputs and never reach the (de)compression machinery.
     match mode {
-        Mode::List => return list::run(cli),
+        Mode::List => return list::run(cli).into(),
         Mode::Train => return train::run(cli),
         Mode::Compress | Mode::Decompress | Mode::Test => {},
     }
@@ -567,32 +621,30 @@ fn run(cli: &Cli, rm: bool) -> bool {
             "{PREFIX}--check/--no-check affect compression only: decoding always validates a \
              present checksum"
         );
-        return false;
+        return Exit::Failure;
     }
     if cli.memory.is_some() && mode == Mode::Compress {
         eprintln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
-        return false;
+        return Exit::Failure;
     }
     if cli.memory.is_some_and(|limit| limit < MIN_WINDOW_BYTES) {
         eprintln!(
             "{PREFIX}-M values below {MIN_WINDOW_BYTES} reject every frame (the format's minimum \
              window); use at least 1K"
         );
-        return false;
+        return Exit::Failure;
     }
     let window_log = match cli.long {
         None => None,
+        // Below the format minimum zstd rejects with the engine parameter
+        // error and its exit code.
         Some(log) if log < MIN_WINDOW_LOG => {
-            eprintln!("{PREFIX}--long: window log must be at least {MIN_WINDOW_LOG} (got {log})");
-            return false;
+            eprintln!("{PREFIX}error 11 : Parameter is out of bound ");
+            return Exit::Error(11);
         },
-        Some(log) if log > MAX_WINDOW_LOG => {
-            eprintln!(
-                "{PREFIX}Warning: --long={log} above the engine's maximum {MAX_WINDOW_LOG}, \
-                 reduced to {MAX_WINDOW_LOG}"
-            );
-            Some(MAX_WINDOW_LOG)
-        },
+        // Above the maximum zstd clamps silently (to its 30); the engine
+        // ceiling here is lower, still clamped silently.
+        Some(log) if log > MAX_WINDOW_LOG => Some(MAX_WINDOW_LOG),
         log => log,
     };
 
@@ -643,7 +695,7 @@ fn run(cli: &Cli, rm: bool) -> bool {
                     path.display(),
                     strerror(&err)
                 );
-                return false;
+                return Exit::Error(31);
             },
         },
         None => None,
@@ -654,7 +706,7 @@ fn run(cli: &Cli, rm: bool) -> bool {
             Ok(list) => list,
             Err(_) => {
                 eprintln!("{PREFIX}error reading {} ", path.display());
-                return false;
+                return Exit::Failure;
             },
         },
         None => Vec::new(),
@@ -682,25 +734,25 @@ fn run(cli: &Cli, rm: bool) -> bool {
     let stdin_stream = matches!(inputs.as_slice(), [Input::Stdin]);
     if cli.stream_size.is_some() && !stdin_stream {
         eprintln!("{PREFIX}--stream-size only applies to stdin input");
-        return false;
+        return Exit::Failure;
     }
     if cli.adapt.is_some() && (cli.stream_size.is_some() || cli.size_hint.is_some()) {
         eprintln!(
             "{PREFIX}--stream-size/--size-hint cannot combine with --adapt: chunk frames pledge \
              their own sizes exactly"
         );
-        return false;
+        return Exit::Failure;
     }
     if cli.size_hint.is_some() && !stdin_stream {
         eprintln!(
             "{PREFIX}--size-hint only applies to stdin input (file sizes are pledged exactly)"
         );
-        return false;
+        return Exit::Failure;
     }
 
     if cli.output.is_some() && inputs.len() > 1 {
         eprintln!("{PREFIX}-o/--output cannot be used with multiple input files");
-        return false;
+        return Exit::Failure;
     }
 
     // --patch-from derives its own window (overriding --long) and decode
@@ -710,7 +762,7 @@ fn run(cli: &Cli, rm: bool) -> bool {
             Ok(adjustments) => (adjustments.window_log, adjustments.max_window),
             Err(msg) => {
                 eprintln!("{PREFIX}{msg}");
-                return false;
+                return Exit::Failure;
             },
         },
         None => (None, None),
@@ -733,25 +785,40 @@ fn run(cli: &Cli, rm: bool) -> bool {
         info!("Note: src files are not removed when output is stdout ");
     }
 
+    let mut exit_code: Option<u8> = None;
     for input in &inputs {
         if let Err(err) = process(input, cli, mode, &settings, dict.as_deref(), rm) {
+            let diagnostic = err.downcast_ref::<Diagnostic>();
             if cli.quiet < 2 {
-                if let Some(diagnostic) = err.downcast_ref::<Diagnostic>() {
-                    for line in &diagnostic.0 {
+                if let Some(diagnostic) = diagnostic {
+                    for line in &diagnostic.lines {
                         eprintln!("{line}");
                     }
                 } else {
                     let name = match input {
-                        Input::Stdin => "stdin".to_string(),
+                        Input::Stdin => STDIN_NAME.to_string(),
                         Input::File(path) => path.display().to_string(),
                     };
                     eprintln!("{PREFIX}{name}: {err}");
                 }
             }
+            // EXM_THROW-class failures decide the exit status even when
+            // their lines are -qq-hidden; the first one wins (zstd exits
+            // at the first).
+            if let Some(code) = diagnostic
+                .map(|diagnostic| diagnostic.code)
+                .filter(|c| *c != 0)
+            {
+                exit_code.get_or_insert(code);
+            }
             ok = false;
         }
     }
-    ok
+    if ok {
+        Exit::Success
+    } else {
+        exit_code.map_or(Exit::Failure, Exit::Error)
+    }
 }
 
 /// Read `--filelist`: one path per line, blank lines skipped. zstd has no
@@ -923,7 +990,7 @@ fn process(
     if let (Input::File(in_path), Output::File(out_path)) = (input, &output)
         && in_path == out_path
     {
-        return Err(Diagnostic(vec![
+        return Err(Diagnostic::plain(vec![
             "{PREFIX}Refusing to open an output file which will overwrite the input file ".into(),
         ])
         .into());
@@ -936,6 +1003,8 @@ fn process(
     }
 
     let (reader, source_size) = open_input(input)?;
+    let read_bytes = Rc::new(Cell::new(0u64));
+    let reader = CountingReader::new(reader, Rc::clone(&read_bytes));
     let show_progress = progress_visible(
         cli,
         source_size > 0,
@@ -949,14 +1018,26 @@ fn process(
     };
 
     let written = match mode {
-        Mode::Compress => compress(reader, &output, settings, source_size, dict)?,
+        Mode::Compress => match compress(reader, &output, settings, source_size, dict) {
+            Ok(written) => written,
+            // A --stream-size pledge the input did not meet is zstd's
+            // parameter-class Src size error (and exit code).
+            Err(err) if pledged_size_mismatch(err.as_ref()) => {
+                return Err(Diagnostic {
+                    code: 11,
+                    lines: vec![format!("{PREFIX}error 11 : Src size is incorrect ")],
+                }
+                .into())
+            },
+            Err(err) => return Err(err),
+        },
         // List and train are dispatched before per-input processing and
         // never reach this point.
         Mode::Decompress | Mode::Test => match decompress(reader, &output, settings, dict) {
             Ok(written) => written,
             Err(err) => {
-                let mapped = decode_failure_lines(input, source_size, err.as_ref())
-                    .map_or_else(|| err, |lines| Diagnostic(lines).into());
+                let mapped = decode_failure_lines(input, read_bytes.get(), err.as_ref())
+                    .map_or_else(|| err, |lines| Diagnostic::plain(lines).into());
                 return Err(mapped);
             },
         },
@@ -1014,7 +1095,7 @@ fn default_output_name(input: &Path, mode: Mode) -> AnyResult<PathBuf> {
             });
             match name {
                 Some(name) => Ok(PathBuf::from(name)),
-                None => Err(Diagnostic(vec![format!(
+                None => Err(Diagnostic::plain(vec![format!(
                     "{PREFIX}{}: unknown suffix (.zst/.tzst expected). Can't derive the output \
                      file name. Specify it with -o dstFileName. Ignoring.",
                     input.display()
@@ -1036,7 +1117,7 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
     // zstd's displayLevel<=1 path: no interaction is possible, so the file
     // is declined without a prompt.
     if cli.quiet >= 1 {
-        return Err(Diagnostic(vec![format!(
+        return Err(Diagnostic::plain(vec![format!(
             "{PREFIX}{} already exists; not overwritten  ",
             path.display()
         )])
@@ -1057,7 +1138,7 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
         }
     }
     eprintln!("Not overwritten  ");
-    Err(Diagnostic(vec![]).into())
+    Err(Diagnostic::plain(vec![]).into())
 }
 
 /// Render a decode failure as zstd's per-site stderr lines, when the engine
@@ -1066,7 +1147,7 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
 /// nothing-read special case for empty sources.
 fn decode_failure_lines(
     input: &Input,
-    source_size: usize,
+    read_bytes: u64,
     err: &(dyn std::error::Error + 'static),
 ) -> Option<Vec<String>> {
     use zstdx::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
@@ -1086,7 +1167,7 @@ fn decode_failure_lines(
         as_frame(io_err.get_ref()?.downcast_ref::<zstdx::Error>()?)?
     };
     let name = match input {
-        Input::Stdin => "stdin".to_string(),
+        Input::Stdin => STDIN_NAME.to_string(),
         Input::File(path) => path.display().to_string(),
     };
     let lines = match frame {
@@ -1125,15 +1206,20 @@ fn decode_failure_lines(
                 "{name} : Decoding error (36) : Dictionary mismatch "
             )]
         },
-        frame if frame_eof(frame) => {
-            // A zero-byte source never read a frame byte: zstd's
-            // "unexpected end of file" (stdin's size is unknown here, so
-            // only file inputs get the distinction).
-            if source_size == 0 && matches!(input, Input::File(_)) {
+        // FIO_decompressDstFile's frame loop: a magic read that hit EOF
+        // never saw a full magic number -- zero bytes is an empty source,
+        // 1-3 bytes cannot even be checked for magic.
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(
+            err,
+        )) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            if read_bytes == 0 {
                 vec![format!("{PREFIX}{name}: unexpected end of file ")]
             } else {
-                vec![format!("{name} : Read error (39) : premature end ")]
+                vec![format!("{PREFIX}{name}: unknown header ")]
             }
+        },
+        frame if frame_eof(frame) => {
+            vec![format!("{name} : Read error (39) : premature end ")]
         },
         _ => vec![format!(
             "{name} : Decoding error (36) : Data corruption detected "
@@ -1180,6 +1266,44 @@ fn frame_eof(frame: &zstdx::decoding::errors::FrameDecoderError) -> bool {
         ) => true,
         _ => false,
     }
+}
+
+/// Input-side byte counter for zstd's `readSomething` rule: whether the
+/// source yielded any byte at all decides the empty-source diagnostics,
+/// and 1-3 bytes mean the magic could not even be checked (stdin has no
+/// stat-able size, so the runtime count is the only witness).
+struct CountingReader<R: Read> {
+    inner: R,
+    count: Rc<Cell<u64>>,
+}
+
+impl<R: Read> CountingReader<R> {
+    fn new(inner: R, count: Rc<Cell<u64>>) -> Self {
+        Self { inner, count }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.count.set(self.count.get() + read as u64);
+        Ok(read)
+    }
+}
+
+/// Whether the failure is the encoder rejecting a --stream-size pledge
+/// the input did not meet (both error-chain shapes: bare and io-wrapped).
+fn pledged_size_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
+    fn is_mismatch(payload: &zstdx::Error) -> bool {
+        matches!(payload, zstdx::Error::PledgedSizeMismatch { .. })
+    }
+    if let Some(error) = err.downcast_ref::<zstdx::Error>() {
+        return is_mismatch(error);
+    }
+    err.downcast_ref::<io::Error>()
+        .and_then(|io_err| io_err.get_ref())
+        .and_then(|payload| payload.downcast_ref::<zstdx::Error>())
+        .is_some_and(is_mismatch)
 }
 
 fn open_input(input: &Input) -> AnyResult<(Box<dyn Read>, usize)> {
@@ -1373,7 +1497,6 @@ const SEPARATE_VALUE_FLAGS: &[&str] = &[
     "-e",
     "-i",
     "-B",
-    "--split",
     "-o",
     "--output",
     "-D",
@@ -1637,10 +1760,10 @@ mod tests {
     fn unknown_suffix_diagnostic_text() {
         let err = default_output_name(&PathBuf::from("data.bin"), Mode::Decompress).unwrap_err();
         let diagnostic = err.downcast_ref::<Diagnostic>().unwrap();
-        assert_eq!(diagnostic.0, ["zstdx: data.bin: unknown suffix \
-                                   (.zst/.tzst expected). Can't derive the \
-                                   output file name. Specify it with -o \
-                                   dstFileName. Ignoring."]);
+        assert_eq!(diagnostic.lines, ["zstdx: data.bin: unknown suffix \
+                                       (.zst/.tzst expected). Can't derive \
+                                       the output file name. Specify it with \
+                                       -o dstFileName. Ignoring."]);
     }
 
     #[test]
@@ -1718,6 +1841,19 @@ mod tests {
             ["zstdx: empty.zst: unexpected end of file "]
         );
 
+        // 2 bytes read: too few to check magic, zstd's unknown header
+        let err = decompress(
+            Box::new(Cursor::new(b"zz".to_vec())),
+            &Output::Sink,
+            &plain_settings(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            decode_failure_lines(&Input::File(PathBuf::from("hdr.bin")), 2, err.as_ref()).unwrap(),
+            ["zstdx: hdr.bin: unknown header "]
+        );
+
         // bad magic: unsupported format
         let err = decompress(
             Box::new(Cursor::new(b"garbage data, not a frame".to_vec())),
@@ -1756,7 +1892,7 @@ mod tests {
         assert_eq!(
             decode_failure_lines(
                 &Input::File(PathBuf::from("w30.zst")),
-                frame.len(),
+                frame.len() as u64,
                 err.as_ref()
             )
             .unwrap(),
@@ -2015,8 +2151,10 @@ mod tests {
         assert_eq!(cli.bench_seconds, Some(0));
         let cli = Cli::try_parse_from(["zstdx", "-b1", "-B", "64K", "file"]).unwrap();
         assert_eq!(cli.block_size, Some(64 << 10));
-        let cli = Cli::try_parse_from(["zstdx", "-b1", "--split=1M", "file"]).unwrap();
+        let cli = Cli::try_parse_from(["zstdx", "-b1", "-B1M", "file"]).unwrap();
         assert_eq!(cli.block_size, Some(1 << 20));
+        // zstd 1.5.7 has no --split long form: an unknown argument.
+        assert!(Cli::try_parse_from(["zstdx", "-b1", "--split=1M", "file"]).is_err());
         let cli = Cli::try_parse_from(["zstdx", "-b3", "-d", "f.zst"]).unwrap();
         assert!(cli.decompress && cli.bench.is_some());
 
@@ -2054,7 +2192,11 @@ mod tests {
         let path = temp_path("bench-smoke");
         std::fs::write(&path, vec![7u8; 64 * 1024]).unwrap();
         let cli = Cli::try_parse_from(["zstdx", "-b1", "-i0", path.to_str().unwrap()]).unwrap();
-        assert!(crate::bench::run(&cli), "the smoke benchmark must succeed");
+        assert_eq!(
+            crate::bench::run(&cli),
+            crate::Exit::Success,
+            "the smoke benchmark must succeed"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -56,16 +56,33 @@ const MAX_DICT: u64 = 64 << 20;
 /// Entry point: validate the flags bench mode cannot honor, then run the
 /// level range over the loaded (or synthetic) corpus. Returns false on any
 /// failure.
-pub fn run(cli: &Cli) -> bool {
+pub fn run(cli: &Cli) -> crate::Exit {
     match bench(cli) {
-        Ok(()) => true,
-        Err(err) => {
+        Ok(()) => crate::Exit::Success,
+        Err(BenchFailure::Load) => {
+            // benchzstd.c's loader failure: bare text, no newline, exit 15.
+            if cli.quiet < 2 {
+                eprint!("Error loading files");
+            }
+            crate::Exit::Error(15)
+        },
+        Err(BenchFailure::Code(code)) => crate::Exit::Error(code),
+        Err(BenchFailure::Message(err)) => {
             if cli.quiet < 2 {
                 eprintln!("{PREFIX}{err}");
             }
-            false
+            crate::Exit::Failure
         },
     }
+}
+
+/// Bench failures: zstd's file-loader error prints bare and exits 15;
+/// EXM_THROW-class errors exit with their number (line already printed);
+/// every other failure goes through the standard prefix and exits 1.
+enum BenchFailure {
+    Load,
+    Code(u8),
+    Message(String),
 }
 
 /// Everything one benchmark invocation is configured with.
@@ -87,12 +104,12 @@ struct Config {
     dict_dec: Option<Arc<Dictionary>>,
 }
 
-fn bench(cli: &Cli) -> Result<(), String> {
+fn bench(cli: &Cli) -> Result<(), BenchFailure> {
     // Bench mode fixes the semantics of every (de)compression knob, so the
     // flags that would silently do nothing are rejected up front, like the
     // other modes reject theirs.
     if let Some(err) = rejected_flag(cli) {
-        return Err(err);
+        return Err(BenchFailure::Message(err));
     }
     let display = 2u8
         .saturating_sub(cli.quiet)
@@ -126,32 +143,34 @@ fn bench(cli: &Cli) -> Result<(), String> {
     };
     let window_log = match cli.long {
         None => None,
+        // Same reference rule as the (de)compression modes: below the
+        // format minimum is the engine parameter error (and exit code);
+        // above the maximum clamps silently.
         Some(log) if log < MIN_WINDOW_LOG => {
-            return Err(format!(
-                "--long: window log must be at least {MIN_WINDOW_LOG} (got {log})"
-            ));
+            eprintln!("{PREFIX}error 11 : Parameter is out of bound ");
+            return Err(BenchFailure::Code(11));
         },
-        Some(log) if log > MAX_WINDOW_LOG => {
-            eprintln!(
-                "{PREFIX}Warning: --long={log} above the engine's maximum {MAX_WINDOW_LOG}, \
-                 reduced to {MAX_WINDOW_LOG}"
-            );
-            Some(MAX_WINDOW_LOG)
-        },
+        Some(log) if log > MAX_WINDOW_LOG => Some(MAX_WINDOW_LOG),
         log => log,
     };
 
     let (dict_enc, dict_dec) = match &cli.dict {
         Some(path) => {
-            let meta = fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
+            let meta = fs::metadata(path)
+                .map_err(|err| BenchFailure::Message(format!("{}: {err}", path.display())))?;
             if meta.len() > MAX_DICT {
-                return Err(format!("dictionary file {} too large", path.display()));
+                return Err(BenchFailure::Message(format!(
+                    "dictionary file {} too large",
+                    path.display()
+                )));
             }
-            let raw = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+            let raw = fs::read(path)
+                .map_err(|err| BenchFailure::Message(format!("{}: {err}", path.display())))?;
             let enc = EncoderDictionary::parse(&raw)
-                .map_err(|err| format!("invalid dictionary: {err}"))?;
+                .map_err(|err| BenchFailure::Message(format!("invalid dictionary: {err}")))?;
             let dec = Arc::new(
-                Dictionary::load(&raw).map_err(|err| format!("invalid dictionary: {err}"))?,
+                Dictionary::load(&raw)
+                    .map_err(|err| BenchFailure::Message(format!("invalid dictionary: {err}")))?,
             );
             (Some(enc), Some(dec))
         },
@@ -194,10 +213,10 @@ fn bench(cli: &Cli) -> Result<(), String> {
         eprintln!("using {threads} threads ");
     }
     if files.is_empty() {
-        return bench_synthetic(&config, start, end);
+        return bench_synthetic(&config, start, end).map_err(BenchFailure::Message);
     }
     let corpus = load_corpus(&files, &config)?;
-    bench_levels(&corpus, &config, start, end)
+    bench_levels(&corpus, &config, start, end).map_err(BenchFailure::Message)
 }
 
 /// The flags bench mode cannot honor: the (de)compression machinery never
@@ -265,19 +284,20 @@ fn rejected_flag(cli: &Cli) -> Option<String> {
 /// Collect the files to bench. Like zstd, an argument that is no loadable
 /// file is fatal ("Error loading files"): stdin and unexpanded directories
 /// qualify; `-r` expands directory arguments.
-fn gather_files(cli: &Cli) -> Result<Vec<PathBuf>, String> {
+fn gather_files(cli: &Cli) -> Result<Vec<PathBuf>, BenchFailure> {
     let filelist = match &cli.filelist {
-        Some(path) => read_filelist(path).map_err(|err| format!("{}: {err}", path.display()))?,
+        Some(path) => read_filelist(path)
+            .map_err(|err| BenchFailure::Message(format!("{}: {err}", path.display())))?,
         None => Vec::new(),
     };
     let mut files = Vec::new();
     for file in cli.files.iter().chain(&filelist) {
         if file.as_os_str() == "-" || !file.is_file() && !file.is_dir() {
-            return Err(format!("Error loading files: {}", file.display()));
+            return Err(BenchFailure::Load);
         }
         if file.is_dir() {
             if !cli.recursive {
-                return Err(format!("Error loading files: {}", file.display()));
+                return Err(BenchFailure::Load);
             }
             let mut stack = vec![file.clone()];
             while let Some(dir) = stack.pop() {
@@ -310,15 +330,14 @@ struct Corpus {
     name: String,
 }
 
-/// Load every file whole (zstd's `BMK_loadFiles`): a failing stat aborts,
-/// the total is capped by the memory probe, and a total of zero data is an
-/// error ("no data to bench").
-fn load_corpus(files: &[PathBuf], config: &Config) -> Result<Corpus, String> {
+/// Load every file whole (zstd's `BMK_loadFiles`): any failing stat/open/
+/// read aborts with the bare loader error (benchzstd prints no file name
+/// and exits 15), the total is capped by the memory probe, and a total of
+/// zero data is an error ("no data to bench").
+fn load_corpus(files: &[PathBuf], config: &Config) -> Result<Corpus, BenchFailure> {
     let mut total: u64 = 0;
     for path in files {
-        let len = fs::metadata(path)
-            .map_err(|_| format!("Error loading files: {}", path.display()))?
-            .len();
+        let len = fs::metadata(path).map_err(|_| BenchFailure::Load)?.len();
         total += len;
     }
     let benched = total.min(find_max_mem(total.saturating_mul(3)) / 3);
@@ -330,24 +349,23 @@ fn load_corpus(files: &[PathBuf], config: &Config) -> Result<Corpus, String> {
     let mut file_sizes = Vec::with_capacity(files.len());
     for path in files {
         let take = fs::metadata(path)
-            .map_err(|_| format!("cannot open file {}", path.display()))?
+            .map_err(|_| BenchFailure::Load)?
             .len()
             .min(benched.saturating_sub(src.len() as u64));
         if config.display >= 2 {
             print_out(&format!("Loading {}...       \r", path.display()));
         }
         if take > 0 {
-            let mut file =
-                fs::File::open(path).map_err(|_| format!("cannot open file {}", path.display()))?;
+            let mut file = fs::File::open(path).map_err(|_| BenchFailure::Load)?;
             let start = src.len();
             src.resize(start + take as usize, 0);
             file.read_exact(&mut src[start..])
-                .map_err(|_| format!("invalid read {}", path.display()))?;
+                .map_err(|_| BenchFailure::Load)?;
         }
         file_sizes.push(take as usize);
     }
     if src.is_empty() {
-        return Err("no data to bench".into());
+        return Err(BenchFailure::Message("no data to bench".into()));
     }
     let name = if files.len() > 1 {
         format!(" {} files", files.len())

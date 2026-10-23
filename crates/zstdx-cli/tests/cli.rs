@@ -314,15 +314,20 @@ fn long_sets_window_log() {
     let (_, frame) = run_piped(&["-q", "--long"], &data);
     assert_eq!(frame[5], 17 << 3, "bare --long: 2^27 window");
 
-    // below the format's minimum: rejected
+    // below the format's minimum: the engine parameter error and its
+    // exit code (zstd rejects the same way)
     let (output, _) = run_piped(&["-q", "--long=9"], &data);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--long"));
+    assert_eq!(output.status.code(), Some(11));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Parameter is out of bound"));
 
-    // above the engine's ceiling: warned and clamped to 27
+    // above the engine's ceiling: clamped silently, like zstd's own clamp
+    // to its 30
     let (output, frame) = run_piped(&["--long=28"], &data);
     assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reduced to 27"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("reduced"),
+        "clamping is silent"
+    );
     assert_eq!(frame[5], 17 << 3);
 
     // a compression option must not ride a decode run
@@ -365,8 +370,15 @@ fn stream_size_pledges_and_enforces() {
     assert_eq!(&frame[5..7], &[0xe8, 0x02], "FCS: 1000 - 256, LE");
 
     let (output, _) = run_piped(&["-q", "--stream-size=1000"], &data);
-    assert!(!output.status.success(), "mismatching input must fail");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pledged"));
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "mismatching input must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Src size is incorrect"),
+        "zstd's parameter-class message"
+    );
 
     let scratch = Scratch::new("stream-size-file");
     let input = scratch.path("data.bin");
