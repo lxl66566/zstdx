@@ -54,6 +54,11 @@ fn margin_span(buf: &[u8], len: usize) -> core::ops::Range<usize> {
 
 #[cfg(test)]
 mod tests {
+    // catch_unwind lives in std; the no-default-features test build links
+    // it through this declaration (the same trick as tests/mod.rs).
+    #[cfg(test)]
+    extern crate std;
+
     use alloc::vec;
 
     use super::*;
