@@ -100,6 +100,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(debug_assertions)]
+use super::encoder_core::vec_poison;
 use super::{
     encoder_core::{StreamChecksum, write_pending_output},
     mt_pool::{
@@ -719,7 +721,8 @@ fn run_claimed_job(
             // this job's whole lifetime (see FrozenSrc).
             let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
             let spf = spf.lock().unwrap().clone();
-            let bytes = if let Some(dict) = &job.dict {
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut bytes = if let Some(dict) = &job.dict {
                 // The frame's dictionary job: job zero (the only carrier —
                 // see `post_job`), seeded and staged through the
                 // owned-window runner; the pooled lease state stays cold.
@@ -740,6 +743,8 @@ fn run_claimed_job(
                 // continuation emits from where the donation stopped. The
                 // state returns to the kit pool afterwards (the worker
                 // builds its own like any undonated job's would).
+                #[cfg(debug_assertions)]
+                vec_poison::assert(&don.prefix, "mt donation prefix");
                 let mut dstate = don.state;
                 let out = compress_job_blocks_inner(
                     &mut dstate,
@@ -804,6 +809,12 @@ fn run_claimed_job(
                     ),
                 }
             };
+            // Arm the job-bytes wall: the assembly checkpoint (the next
+            // post's `assemble_ready`, possibly on another thread) asserts
+            // it, catching any touch of the encoded span's slack across the
+            // post/complete handoff.
+            #[cfg(debug_assertions)]
+            vec_poison::fill(&mut bytes);
             *out.lock().unwrap() = Some(bytes);
         },
         JobKind::DonateKeep {
@@ -814,8 +825,13 @@ fn run_claimed_job(
             // workers carry no warm tables, so the donation's state
             // round-trips a process-global pool instead.
             let mut st = crate::encoding::mt::take_donation_state();
-            let (keep_bits, prefix) =
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let (keep_bits, mut prefix) =
                 donate_keep_span(&mut st, head, job.level, job.shape, *arming, job.ldm_mode);
+            // Same wall as the job bytes: the continuation job that adopts
+            // this donation asserts the prefix's slack at its consumption.
+            #[cfg(debug_assertions)]
+            vec_poison::fill(&mut prefix);
             *outcome.lock().unwrap() = Some(KeepOutcome {
                 keep_bits,
                 arming: *arming,
@@ -1140,7 +1156,7 @@ impl MtEncoderCore {
             // uninitialized.
             init_len = buf.len();
         }
-        Self {
+        let mut core = Self {
             level: options.level,
             checksum,
             workers: options.workers,
@@ -1208,7 +1224,13 @@ impl MtEncoderCore {
             }),
             pool_threads: Vec::new(),
             pending: VecDeque::new(),
-        }
+        };
+        // Arm the output wall from construction (a fresh Vec's spare is
+        // uninitialized); every later re-arm rides the public methods'
+        // exits, exactly like the st core's `configure`.
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut core.output);
+        core
     }
 
     /// Stage input for the frame. Fails with
@@ -1218,6 +1240,8 @@ impl MtEncoderCore {
     /// error surfaces from the offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (write entry)");
         if let Some(pledged) = self.pledged
             && self.pos + data.len() as u64 > pledged
         {
@@ -1245,6 +1269,8 @@ impl MtEncoderCore {
             self.pos += n as u64;
             self.post_ready();
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         Ok(())
     }
 
@@ -1262,6 +1288,8 @@ impl MtEncoderCore {
     #[cfg(feature = "std")]
     pub(crate) fn pump_direct(&mut self, source: &mut impl crate::io::Read) -> crate::Result<()> {
         debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (pump entry)");
         if self.buf.len() == self.buf.capacity() {
             // A positive want keeps the growth arm engaged for the nothing-
             // to-wrap case (an all-live buffer at the cap).
@@ -1310,6 +1338,8 @@ impl MtEncoderCore {
             },
             Err(e) => return Err(e),
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         Ok(())
     }
 
@@ -1325,6 +1355,8 @@ impl MtEncoderCore {
         if self.finished {
             return Ok(());
         }
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (finish entry)");
         // `pos` is live from the writes themselves, so the check fires
         // before the drain below could discover it.
         if let Some(pledged) = self.pledged
@@ -1362,6 +1394,8 @@ impl MtEncoderCore {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_fin(fin_t0);
         Ok(())
@@ -1373,6 +1407,8 @@ impl MtEncoderCore {
     /// data visible early is what a flush is for).
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (flush entry)");
         // A flush promises visibility: every posted job's blocks belong to
         // the output before it returns (encode_jobs drains everything it
         // posts; with nothing new pending, the drain below covers them).
@@ -1382,6 +1418,8 @@ impl MtEncoderCore {
         } else {
             self.drain_all();
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -1400,16 +1438,22 @@ impl MtEncoderCore {
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (drain entry)");
         let res = write_pending_output(&self.output, &mut self.out_read, w);
         if res.is_ok() {
             self.output.clear();
             self.out_read = 0;
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         res
     }
 
     /// Serve encoded bytes without deallocating the output buffer.
     pub(crate) fn split_output(&mut self, buf: &mut [u8]) -> usize {
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (split entry)");
         let pending = &self.output[self.out_read..];
         let n = buf.len().min(pending.len());
         buf[..n].copy_from_slice(&pending[..n]);
@@ -1418,6 +1462,8 @@ impl MtEncoderCore {
             self.output.clear();
             self.out_read = 0;
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         n
     }
 
@@ -2564,6 +2610,11 @@ impl MtEncoderCore {
                     unreachable!("donations never pend assembly")
                 },
             };
+            // The worker armed this span when it published the bytes (see
+            // `run_claimed_job`); the mutex/atomic handoff orders the fill
+            // before this read.
+            #[cfg(debug_assertions)]
+            vec_poison::assert(&bytes, "mt job out (assembly)");
             self.output.extend_from_slice(&bytes);
         }
     }
