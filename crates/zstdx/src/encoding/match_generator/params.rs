@@ -836,11 +836,33 @@ pub(super) const fn params_for_row(
     {
         p.search_depth = depth;
     }
-    if level.as_i32() == 0 {
+    let p = if level.as_i32() == 0 {
         p
     } else {
         adjust_params(p, shape.len)
-    }
+    };
+    // C sizes the opt family's 3-byte table at MIN(17, windowLog)
+    // (zstd_compress.c:2027); `adjust_params` applies that clamp only
+    // under a known length, so a forced window carries it here.
+    let wlog = p.window.trailing_zeros();
+    let p = match p.strategy {
+        Strategy::Opt(mut knobs) => {
+            knobs.hash3_log = min_u32(knobs.hash3_log, wlog);
+            LevelParams {
+                strategy: Strategy::Opt(knobs),
+                ..p
+            }
+        },
+        Strategy::BtLazy(mut knobs) => {
+            knobs.hash3_log = min_u32(knobs.hash3_log, wlog);
+            LevelParams {
+                strategy: Strategy::BtLazy(knobs),
+                ..p
+            }
+        },
+        _ => p,
+    };
+    p
 }
 
 /// Downsize a row for a known source length — the window/table half of
