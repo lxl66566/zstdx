@@ -36,6 +36,8 @@
 - [R65 · Decode cleanups](dev/review/declean.md)
 - [R66 · Parity bench mode](dev/review/diffbench.md)
 - [R66 · Dictionary parity](dev/review/dictparity.md)
+- [R67 · FFI parity](dev/review/ffiparity.md)
+- [R67 · CLI parity](dev/review/cliparity.md)
 
 ## Performance Optimization
 
