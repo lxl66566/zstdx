@@ -1,0 +1,20 @@
+name: paranoid tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paranoid:
+    name: cargo test --profile paranoid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --profile paranoid -p zstdx
+      - run: cargo test --profile paranoid -p zstdx-cli

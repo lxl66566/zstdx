@@ -43,3 +43,11 @@ strip = false
 
 [profile.release]
 codegen-units = 1
+
+# Release codegen with every debug wall on (overflow checks, debug_assert!,
+# the poison margins): catches wrap/overread classes that only manifest
+# under release optimization. Gate/CI-only; never a shipped profile.
+[profile.paranoid]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
