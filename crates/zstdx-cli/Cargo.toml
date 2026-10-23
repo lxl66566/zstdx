@@ -16,8 +16,10 @@ name = "zstdx"
 path = "src/main.rs"
 
 [features]
-# Dictionary training (`zstdx --train`); off by default so the default CLI
-# build carries no trainer code, and the flag explains itself when missing.
+default = ["dict_builder"]
+# Dictionary training (`zstdx --train`), on by default for CLI parity with
+# zstd's built-in trainer; default-features = false drops it and the flag
+# explains itself when missing.
 dict_builder = ["zstdx/dict_builder"]
 
 [dependencies]

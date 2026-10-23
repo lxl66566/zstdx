@@ -91,8 +91,9 @@ fn file_roundtrip_default_names() {
     assert!(compressed.exists());
     assert!(input.exists());
 
-    // Decompression refuses to overwrite the existing input without -f.
-    let output = run(&["-d", compressed.to_str().unwrap()]);
+    // Decompression refuses to overwrite the existing input without -f
+    // (-q: the non-interactive decline message, no prompt).
+    let output = run(&["-q", "-d", compressed.to_str().unwrap()]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already exists"), "{stderr}");
@@ -123,7 +124,7 @@ fn stdin_output_refuses_overwrite() {
     fs::write(&out, b"existing content").unwrap();
 
     // No tty to answer the prompt on, so the existing file must stay.
-    let (output, _) = run_piped(&["-o", out.to_str().unwrap()], b"piped payload");
+    let (output, _) = run_piped(&["-q", "-o", out.to_str().unwrap()], b"piped payload");
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already exists"), "{stderr}");
@@ -313,15 +314,20 @@ fn long_sets_window_log() {
     let (_, frame) = run_piped(&["-q", "--long"], &data);
     assert_eq!(frame[5], 17 << 3, "bare --long: 2^27 window");
 
-    // below the format's minimum: rejected
+    // below the format's minimum: the engine parameter error and its
+    // exit code (zstd rejects the same way)
     let (output, _) = run_piped(&["-q", "--long=9"], &data);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--long"));
+    assert_eq!(output.status.code(), Some(11));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Parameter is out of bound"));
 
-    // above the engine's ceiling: warned and clamped to 27
+    // above the engine's ceiling: clamped silently, like zstd's own clamp
+    // to its 30
     let (output, frame) = run_piped(&["--long=28"], &data);
     assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reduced to 27"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("reduced"),
+        "clamping is silent"
+    );
     assert_eq!(frame[5], 17 << 3);
 
     // a compression option must not ride a decode run
@@ -364,8 +370,15 @@ fn stream_size_pledges_and_enforces() {
     assert_eq!(&frame[5..7], &[0xe8, 0x02], "FCS: 1000 - 256, LE");
 
     let (output, _) = run_piped(&["-q", "--stream-size=1000"], &data);
-    assert!(!output.status.success(), "mismatching input must fail");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pledged"));
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "mismatching input must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Src size is incorrect"),
+        "zstd's parameter-class message"
+    );
 
     let scratch = Scratch::new("stream-size-file");
     let input = scratch.path("data.bin");
@@ -410,7 +423,10 @@ fn memory_caps_decode_window() {
     let (output, _) = run_piped(&["-d", "-q", "-M", "64M"], &big);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("window_size is too big"), "{stderr}");
+    assert!(
+        stderr.contains("Window size larger than maximum"),
+        "{stderr}"
+    );
 
     let (output, out) = run_piped(&["-d", "-q", "-M", "128M"], &big);
     assert!(output.status.success(), "{output:?}");
@@ -428,8 +444,9 @@ fn memory_caps_decode_window() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("bounds decoding"));
 }
 
-/// `--filelist` (alias `--file`) reads the input list from a file, and `-`
-/// reads the list itself from stdin.
+/// `--filelist` (alias `--file`) reads the input list from a file; zstd has
+/// no stdin list form (`-` is zstd's separated-value error, `=-` a literal
+/// missing file).
 #[test]
 fn filelist_reads_input_list() {
     let scratch = Scratch::new("filelist");
@@ -453,28 +470,38 @@ fn filelist_reads_input_list() {
 
     fs::remove_file(scratch.path("a.bin.zst")).unwrap();
     fs::remove_file(scratch.path("b.bin.zst")).unwrap();
-    let mut contents = fs::read(&list).unwrap();
-    contents.push(b'\n');
-    let (output, _) = run_piped(
-        &[
-            "-q",
-            "-f",
-            "--filelist",
-            "-",
-            "-o",
-            scratch.path("out.zst").to_str().unwrap(),
-        ],
-        &contents,
-    );
+    let contents = fs::read(&list).unwrap();
+
+    // `-o` refuses a multiple-input list.
+    let output = run(&[
+        "-q",
+        "-f",
+        "--filelist",
+        list.to_str().unwrap(),
+        "-o",
+        scratch.path("out.zst").to_str().unwrap(),
+    ]);
     assert!(!output.status.success(), "-o refuses multiple inputs");
     assert!(
         !scratch.path("out.zst").exists(),
         "refused run leaves no output"
     );
+
+    // zstd's NEXT_FIELD rejects a dash as a separated value outright.
+    let (output, _) = run_piped(&["-q", "-f", "--filelist", "-"], &contents);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("command cannot be separated from its argument")
+    );
+    // `=-` is a literal (missing) file named `-`.
     let (output, _) = run_piped(&["-q", "-f", "--filelist=-"], &contents);
-    assert!(output.status.success(), "{output:?}");
-    // `--filelist=-` consumes stdin as the list; the listed files compress.
-    assert!(scratch.path("b.bin.zst").exists(), "second entry processed");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error reading -"));
+    assert!(
+        !scratch.path("b.bin.zst").exists(),
+        "no stdin list is consumed"
+    );
 }
 
 /// `--single-thread` is the `-T1` alias; combining it with `-T` is a
@@ -493,17 +520,13 @@ fn single_thread_alias() {
     assert!(!output.status.success());
 }
 
-/// `--ignore-errors` keeps per-input failures out of the exit code; the
-/// failures are still reported.
+/// `--ignore-errors` was removed in zstd 1.5.5+: v1.5.7 rejects it as an
+/// incorrect parameter before any mode runs.
 #[test]
-fn ignore_errors_clears_exit_code() {
+fn ignore_errors_is_rejected() {
     let scratch = Scratch::new("ignore-errors");
     let dir = scratch.path("dir");
     fs::create_dir(&dir).unwrap();
-    let good = dir.join("good");
-    fs::write(&good, payload()).unwrap();
-    assert!(run(&["-q", "-f", good.to_str().unwrap()]).status.success());
-    fs::remove_file(&good).unwrap();
     fs::write(dir.join("bad.zst"), b"not a zstd frame").unwrap();
 
     let output = run(&["-d", "-q", "-r", dir.to_str().unwrap()]);
@@ -511,8 +534,12 @@ fn ignore_errors_clears_exit_code() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("bad.zst"));
 
     let output = run(&["-d", "-q", "-r", "--ignore-errors", dir.to_str().unwrap()]);
-    assert!(output.status.success(), "{output:?}");
-    assert!(dir.join("good").exists(), "the healthy frame still decodes");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Incorrect parameter: --ignore-errors"),
+        "{stderr}"
+    );
 }
 
 /// `--[no-]sparse` parse but fail loudly: the writer always emits dense
