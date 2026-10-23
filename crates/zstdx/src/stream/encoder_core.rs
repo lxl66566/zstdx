@@ -27,6 +27,66 @@ use crate::{
     },
 };
 
+/// Debug poison wall over a `Vec`'s spare capacity — the ASAN-blind zone
+/// past a buffer's logical length but inside its allocation. [`vec_poison::fill`]
+/// arms the first [`vec_poison::WALL`] spare bytes past the current length
+/// at every public method's exit; [`vec_poison::assert`] checks them at the
+/// next entry, before any mutation can legitimately overwrite the slack.
+/// Both sides key the span off the *current* length, so the pair stays
+/// consistent whatever growth or compaction happened between the re-arms.
+/// Shared with the mt core (its `output` runs the same protocol).
+#[cfg(debug_assertions)]
+pub(crate) mod vec_poison {
+    use alloc::vec::Vec;
+
+    use crate::encoding::poison;
+
+    /// Wall width past the logical length: wide enough that any scan
+    /// family's overread (read4/read8/hash windows) crosses it, cheap
+    /// enough to re-arm per streaming call in debug runs.
+    const WALL: usize = 4 * 1024;
+
+    /// Arm the wall over `v`'s spare capacity.
+    pub(crate) fn fill<T>(v: &mut Vec<T>) {
+        let n = span_len(v);
+        if n == 0 {
+            return;
+        }
+        let size = size_of::<T>();
+        let spare = v.spare_capacity_mut();
+        // SAFETY: the span lies inside the Vec's spare capacity; writing
+        // the pattern initializes exactly those bytes, which the Vec never
+        // reads below its own length.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), n * size) };
+        poison::fill(bytes);
+    }
+
+    /// Assert the wall armed by [`fill`] is unchanged. `ctx` names the
+    /// checkpoint so the panic localizes the offending path.
+    pub(crate) fn assert<T>(v: &Vec<T>, ctx: &str) {
+        let (n, len) = (span_len(v), v.len());
+        if n == 0 {
+            return;
+        }
+        let size = size_of::<T>();
+        // SAFETY: every asserted byte was written by the [`fill`] at the
+        // previous exit (the protocol keeps the span unmutated between the
+        // re-arm and this checkpoint), so reading them back is initialized
+        // memory.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(v.as_ptr().add(len).cast::<u8>(), n * size) };
+        poison::assert_intact(bytes, ctx);
+    }
+
+    /// Element count of the walled span at `v`'s current length (the byte
+    /// span stays at or below [`WALL`]; a zero-sized `T` walls nothing).
+    fn span_len<T>(v: &Vec<T>) -> usize {
+        let size = size_of::<T>().max(1);
+        (v.capacity() - v.len()).min(WALL / size)
+    }
+}
+
 /// Checksum backend that can be switched off at runtime: the streaming API
 /// exposes the checksum as an option, so unlike the one-shot paths (which fix
 /// it per feature set) the no-op arm must exist even with `hash` enabled.
@@ -408,6 +468,14 @@ impl FrameEncoderCoreSt {
         self.out_read = 0;
         self.blocks = 0;
         self.finished = false;
+        #[cfg(debug_assertions)]
+        {
+            // Re-arm the staging/output walls: `clear`/`reserve` above moved
+            // both lengths and capacities (a pooled core arrives with a
+            // previous frame's poison at stale offsets).
+            vec_poison::fill(&mut self.staged);
+            vec_poison::fill(&mut self.output);
+        }
     }
 
     /// Stage input for the frame. Fails with
@@ -417,6 +485,11 @@ impl FrameEncoderCoreSt {
     /// offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> Result<()> {
         debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::assert(&self.staged, "st core staged (write entry)");
+            vec_poison::assert(&self.output, "st core output (write entry)");
+        }
         if let Some(pledged) = self.pledged
             && self.pos + data.len() as u64 > pledged
         {
@@ -483,6 +556,11 @@ impl FrameEncoderCoreSt {
                 }
                 self.compact_staged();
             }
+        }
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::fill(&mut self.staged);
+            vec_poison::fill(&mut self.output);
         }
         Ok(())
     }
@@ -553,6 +631,11 @@ impl FrameEncoderCoreSt {
         if self.finished {
             return Ok(());
         }
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::assert(&self.staged, "st core staged (finish entry)");
+            vec_poison::assert(&self.output, "st core output (finish entry)");
+        }
         if let Some(pledged) = self.pledged
             && pledged != self.pos
         {
@@ -601,6 +684,11 @@ impl FrameEncoderCoreSt {
             self.output.extend_from_slice(&checksum.to_le_bytes());
         }
         self.finished = true;
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::fill(&mut self.staged);
+            vec_poison::fill(&mut self.output);
+        }
         Ok(())
     }
 
@@ -608,6 +696,11 @@ impl FrameEncoderCoreSt {
     /// is staged.
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::assert(&self.staged, "st core staged (flush entry)");
+            vec_poison::assert(&self.output, "st core output (flush entry)");
+        }
         // A flush inside the probe's or the screen's staging window cancels
         // it (the stock reach/frame stays) and emits the staged head block
         // by block.
@@ -617,6 +710,11 @@ impl FrameEncoderCoreSt {
             self.encode_block(false);
         }
         self.compact_staged();
+        #[cfg(debug_assertions)]
+        {
+            vec_poison::fill(&mut self.staged);
+            vec_poison::fill(&mut self.output);
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -635,16 +733,22 @@ impl FrameEncoderCoreSt {
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "st core output (drain entry)");
         let res = write_pending_output(&self.output, &mut self.out_read, w);
         if res.is_ok() {
             self.output.clear();
             self.out_read = 0;
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         res
     }
 
     /// Serve encoded bytes without deallocating the output buffer.
     pub(crate) fn split_output(&mut self, buf: &mut [u8]) -> usize {
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "st core output (split entry)");
         let pending = &self.output[self.out_read..];
         let n = buf.len().min(pending.len());
         buf[..n].copy_from_slice(&pending[..n]);
@@ -653,6 +757,8 @@ impl FrameEncoderCoreSt {
             self.output.clear();
             self.out_read = 0;
         }
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut self.output);
         n
     }
 

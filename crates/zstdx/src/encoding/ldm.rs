@@ -39,6 +39,32 @@ const ENTS_PER_BUCKET: usize = 1 << BUCKET_SIZE_LOG;
 /// Splits staged per gear-feed call (C's `LDM_BATCH_SIZE`).
 const BATCH_SIZE: usize = 64;
 
+/// Debug poison margins over the split staging batches: `[count, len)` is
+/// dead slack inside a stack array, invisible to ASAN — an overread past a
+/// batch's count picks up the pattern as a split position (a wild index,
+/// loud downstream) and a write past `record_split`'s bound disturbs the
+/// wall at the next assert. The pattern is the byte twin of
+/// `crate::encoding::poison::PATTERN`.
+#[cfg(debug_assertions)]
+mod batch_poison {
+    const PATTERN: u64 = u64::from_ne_bytes([crate::encoding::poison::PATTERN; 8]);
+
+    /// Poison `[count, buf.len())`.
+    pub(super) fn fill(buf: &mut [u64], count: usize) {
+        for v in &mut buf[count..] {
+            *v = PATTERN;
+        }
+    }
+
+    /// Assert the span poisoned by [`fill`] is unchanged. `ctx` names the
+    /// checkpoint so the panic localizes the offending path.
+    pub(super) fn assert(buf: &[u64], count: usize, ctx: &str) {
+        if let Some(i) = buf[count..].iter().position(|v| *v != PATTERN) {
+            panic!("ldm split-batch poison disturbed at slot {i} past {count} (checkpoint: {ctx})");
+        }
+    }
+}
+
 /// libzstd's `ZSTD_ldm_gearTab`: one random u64 per byte; bit n of the
 /// rolling hash depends on the last n bytes, so the split mask reads the
 /// highest-weight bits of the 64-byte window.
@@ -778,6 +804,9 @@ impl LdmState {
             &mut hash,
             splits,
         );
+        // Re-arm the batch margin past the staged count (see `batch_poison`).
+        #[cfg(debug_assertions)]
+        batch_poison::fill(splits, count);
         self.rolling = hash;
         self.fed = base + n as u64;
         (n, count)
@@ -851,6 +880,8 @@ impl LdmState {
                 let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
                 self.insert(hash, split, checksum);
             }
+            #[cfg(debug_assertions)]
+            batch_poison::assert(&splits, count, "ldm fill batch");
             pos += n as u64;
         }
     }
@@ -975,6 +1006,8 @@ impl LdmState {
                 let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
                 self.insert(hash, split, checksum);
             }
+            #[cfg(debug_assertions)]
+            batch_poison::assert(&splits, count, "ldm fill_to_freeze batch");
             pos += n as u64;
             if count == BATCH_SIZE && pos >= soft {
                 return Some(pos);
@@ -1071,6 +1104,8 @@ impl LdmState {
                     });
                     anchor = match_end;
                     if anchor > fed_end {
+                        #[cfg(debug_assertions)]
+                        batch_poison::assert(&splits, count, "ldm generate batch");
                         // The match overran the fed range (repeating
                         // overlap): index one repetition, skip the rest.
                         self.gear_rearm(win, win_base, anchor);
@@ -1079,6 +1114,8 @@ impl LdmState {
                     }
                 }
             }
+            #[cfg(debug_assertions)]
+            batch_poison::assert(&splits, count, "ldm generate batch");
             pos = fed_end;
         }
     }
@@ -1222,6 +1259,8 @@ fn scan_lane(
             &mut rolling,
             &mut batch,
         );
+        #[cfg(debug_assertions)]
+        batch_poison::fill(&mut batch, count);
         for &split in batch.iter().take(count) {
             let fp = LdmState::split_fp(win, (split - win_base) as usize);
             hits.push(SplitHit {
@@ -1230,6 +1269,8 @@ fn scan_lane(
                 cks: (fp >> 32) as u32,
             });
         }
+        #[cfg(debug_assertions)]
+        batch_poison::assert(&batch, count, "ldm scan_lane batch");
         pos += n as u64;
     }
     hits
