@@ -439,11 +439,10 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     src_size: usize,
 ) -> usize {
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        return ret(ErrorCode::SrcSizeWrong);
     };
-    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
-        return ret(ErrorCode::DstBufferNull);
-    };
+    // Null dst reads as zero capacity, like ZSTD_decompress.
+    let dst = unsafe { as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
@@ -510,11 +509,10 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     dict_size: usize,
 ) -> usize {
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        return ret(ErrorCode::SrcSizeWrong);
     };
-    let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
-        return ret(ErrorCode::DstBufferNull);
-    };
+    // Null dst reads as zero capacity, like ZSTD_decompress.
+    let dst = unsafe { as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
@@ -685,7 +683,50 @@ pub unsafe extern "C" fn ZSTD_initDStream(zds: *mut ZSTD_DStream) -> usize {
         return ret(ErrorCode::Generic);
     }
     unsafe { dctx_mut(zds) }.init_stream();
-    dctx::DSTREAM_IN_SIZE
+    // The reference returns ZSTD_startingInputLength: the prefix size a
+    // first read wants, not the general DStreamInSize.
+    frame::HEADER_PREFIX
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
+    zds: *mut ZSTD_DStream,
+    dict: *const c_void,
+    dict_size: usize,
+) -> usize {
+    if zds.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let dctx = unsafe { dctx_mut(zds) };
+    match dctx.init_stream_with_dict(unsafe { dict_bytes(dict, dict_size) }) {
+        Ok(()) => frame::HEADER_PREFIX,
+        Err(e) => ret(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initDStream_usingDDict(
+    zds: *mut ZSTD_DStream,
+    ddict: *const ZSTD_DDict,
+) -> usize {
+    if zds.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // A null handle clears the slot, as ZSTD_DCtx_refDDict(zds, NULL).
+    let dict = (!ddict.is_null()).then(|| unsafe { &*ddict.cast::<DDict>() });
+    unsafe { dctx_mut(zds) }.init_stream_with_ddict(dict.map(|d| &d.dict));
+    frame::HEADER_PREFIX
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_resetDStream(zds: *mut ZSTD_DStream) -> usize {
+    if zds.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // Session-only: the dictionary reference survives, unlike
+    // ZSTD_initDStream.
+    unsafe { dctx_mut(zds) }.init_stream_keep_dict();
+    frame::HEADER_PREFIX
 }
 
 #[unsafe(no_mangle)]

@@ -424,7 +424,9 @@ fn stream_decode_multiframe_and_boundaries() {
 
     let dctx = dctx_with(0);
     let hint = unsafe { zstd::ZSTD_initDStream(dctx) };
-    assert_eq!(hint, 128 * 1024 + 3);
+    // The reference returns ZSTD_startingInputLength (the header prefix
+    // size), not ZSTD_DStreamInSize.
+    assert_eq!(hint, 5);
     let mut out = vec![0u8; 4096];
     let mut in_chunk = vec![0u8; 1000];
     let mut decoded = Vec::new();
@@ -1745,4 +1747,332 @@ fn suppressed_dictid_stream_decodes_with_loaded_dict() {
     }
     assert_eq!(decoded, payload);
     unsafe { zstd::ZSTD_freeDStream(dctx) };
+}
+
+/// R67 round 2, one-shot bad-magic gating: a garbage tail is believed
+/// (prefix_unknown) only past fhsize + block header (9 with a bare
+/// descriptor, 17 with an 8-byte FCS field); below that it is leftover
+/// input (srcSize_wrong). A decoded frame in front promotes any tail to
+/// srcSize_wrong (the reference's moreThan1Frame rule); a skippable
+/// frame never promotes.
+#[test]
+fn oneshot_bad_magic_gating() {
+    let mut out = vec![0u8; 8192];
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut cmp = vec![0u8; compress_bound(payload.len())];
+    let c = compress(&mut cmp, &payload, 5);
+    assert!(!is_error(c), "{}", error_name(c));
+
+    for descriptor in [0x00u8, 0xc0] {
+        let gate = if descriptor == 0xc0 {
+            14 + 3
+        } else {
+            6 + 3
+        };
+        for len in 0..=gate + 2 {
+            let garbage: Vec<u8> = (0..len)
+                .map(|i| match i {
+                    0 => 0x11,
+                    1 => 0x22,
+                    2 => 0x33,
+                    3 => 0x44,
+                    4 => descriptor,
+                    i => i as u8,
+                })
+                .collect();
+            let frame_tail = [cmp[..c].to_vec(), garbage.clone()].concat();
+            let skip_tail = [
+                [0x50u8, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4].to_vec(),
+                garbage.clone(),
+            ]
+            .concat();
+            let series = [
+                ("gar-only", garbage.clone()),
+                ("frm+gar", frame_tail),
+                ("skip+gar", skip_tail),
+            ];
+            for (tag, input) in series {
+                if input.is_empty() {
+                    assert_eq!(0, decompress(&mut out, &input), "{tag} empty");
+                    continue;
+                }
+                let r = decompress(&mut out, &input);
+                // A whole frame (garbage tail of length zero) decodes.
+                if len == 0 {
+                    let want = if tag == "skip+gar" {
+                        0
+                    } else {
+                        payload.len()
+                    };
+                    assert_eq!(want, r, "{tag} len=0");
+                    continue;
+                }
+                assert!(is_error(r), "{tag} len={len} must error");
+                // A decoded frame in front promotes everything.
+                let want = if tag == "frm+gar" || len < gate {
+                    72 // srcSize_wrong
+                } else {
+                    10 // prefix_unknown
+                };
+                assert_eq!(
+                    want,
+                    error_code(r),
+                    "{tag} descriptor={descriptor:#x} len={len}"
+                );
+            }
+        }
+    }
+}
+
+/// R67 round 2, null and truncated buffers through the context family:
+/// a null dst reads as zero capacity (dstSize_tooSmall for real output,
+/// success for an empty frame); a null src below the prefix size is the
+/// reference's no-deref srcSize_wrong; valid short prefixes of a frame
+/// are leftover input.
+#[test]
+fn null_buffer_family() {
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut cmp = vec![0u8; compress_bound(payload.len())];
+    let c = compress(&mut cmp, &payload, 5);
+    let mut out = vec![0u8; 8192];
+    let dctx = dctx_with(0);
+
+    let r = unsafe {
+        zstd::ZSTD_decompressDCtx(dctx, out.as_mut_ptr().cast(), 0, cmp.as_ptr().cast(), c)
+    };
+    assert!(
+        is_error(r) && error_code(r) == 70,
+        "dst0: {}",
+        error_name(r)
+    );
+    let r = unsafe {
+        zstd::ZSTD_decompressDCtx(dctx, core::ptr::null_mut(), 100, cmp.as_ptr().cast(), c)
+    };
+    assert!(
+        is_error(r) && error_code(r) == 70,
+        "null dst: {}",
+        error_name(r)
+    );
+    let r = unsafe {
+        zstd::ZSTD_decompressDCtx(dctx, out.as_mut_ptr().cast(), 8192, core::ptr::null(), 4)
+    };
+    assert!(
+        is_error(r) && error_code(r) == 72,
+        "null src4: {}",
+        error_name(r)
+    );
+    let r = unsafe {
+        zstd::ZSTD_decompressDCtx(dctx, out.as_mut_ptr().cast(), 8192, core::ptr::null(), 0)
+    };
+    assert_eq!(0, r, "null src0");
+    for n in [1usize, 4, 8] {
+        let r = unsafe {
+            zstd::ZSTD_decompressDCtx(dctx, out.as_mut_ptr().cast(), 8192, cmp.as_ptr().cast(), n)
+        };
+        assert!(is_error(r) && error_code(r) == 72, "short src {n}");
+    }
+    unsafe { zstd::ZSTD_freeDCtx(dctx) };
+}
+
+/// R67 round 2, the deprecated DStream init family: every entry returns
+/// ZSTD_startingInputLength (5); `usingDict`/`usingDDict` arm their
+/// dictionary for the following frames, and `resetDStream` keeps it.
+#[test]
+fn deprecated_dstream_inits() {
+    let Some(dict) = formatted_dict() else {
+        return;
+    };
+    let payload = b"record-042: the same shared preamble with a varying tail 42\n".repeat(64);
+    let cctx = zstd::ZSTD_createCCtx();
+    let mut cmp = vec![0u8; compress_bound(payload.len())];
+    let c = unsafe {
+        zstd::ZSTD_compress_usingDict(
+            cctx,
+            cmp.as_mut_ptr().cast(),
+            cmp.len(),
+            payload.as_ptr().cast(),
+            payload.len(),
+            dict.as_ptr().cast(),
+            dict.len(),
+            6,
+        )
+    };
+    assert!(!is_error(c), "{}", error_name(c));
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+
+    let decode_stream = |zds: *mut zstd::ZSTD_DStream| -> usize {
+        let mut plain = vec![0u8; payload.len() + 1];
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: cmp.as_ptr().cast(),
+            size: c,
+            pos: 0,
+        };
+        let mut zout = zstd::ZSTD_outBuffer {
+            dst: plain.as_mut_ptr().cast(),
+            size: plain.len(),
+            pos: 0,
+        };
+        loop {
+            let r = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut zin) };
+            assert!(!is_error(r), "{}", error_name(r));
+            if r == 0 {
+                break;
+            }
+        }
+        zout.pos
+    };
+
+    let zds = zstd::ZSTD_createDStream();
+    assert_eq!(5, unsafe { zstd::ZSTD_initDStream(zds) });
+    assert_eq!(5, unsafe {
+        zstd::ZSTD_initDStream_usingDict(zds, dict.as_ptr().cast(), dict.len())
+    });
+    assert_eq!(payload.len(), decode_stream(zds));
+    // resetDStream keeps the dictionary; initDStream drops it.
+    assert_eq!(5, unsafe { zstd::ZSTD_resetDStream(zds) });
+    assert_eq!(payload.len(), decode_stream(zds));
+    assert_eq!(5, unsafe { zstd::ZSTD_initDStream(zds) });
+    unsafe { zstd::ZSTD_freeDStream(zds) };
+
+    let zds2 = zstd::ZSTD_createDStream();
+    let ddict = unsafe { zstd::ZSTD_createDDict(dict.as_ptr().cast(), dict.len()) };
+    assert!(!ddict.is_null());
+    assert_eq!(5, unsafe { zstd::ZSTD_initDStream_usingDDict(zds2, ddict) });
+    assert_eq!(payload.len(), decode_stream(zds2));
+    unsafe { zstd::ZSTD_freeDDict(ddict) };
+    unsafe { zstd::ZSTD_freeDStream(zds2) };
+}
+
+/// R67 round 2, the streaming no-forward-progress guard: sustained
+/// starvation mid-frame errors on the 16th call (inputEmpty with output
+/// room, destFull without); a session reset revives; the between-frames
+/// hint (9) sits before the guard; compressStream2 has no guard.
+#[test]
+fn no_forward_progress_guard() {
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut cmp = vec![0u8; compress_bound(payload.len())];
+    let c = compress(&mut cmp, &payload, 5);
+    let mut out = vec![0u8; 8192];
+
+    // Mid-frame starvation: inputEmpty on call 16, revive after a reset.
+    let zds = zstd::ZSTD_createDStream();
+    unsafe { zstd::ZSTD_initDStream(zds) };
+    let feed = 60.min(c - 1);
+    let mut zin = zstd::ZSTD_inBuffer {
+        src: cmp.as_ptr().cast(),
+        size: feed,
+        pos: 0,
+    };
+    let mut zout = zstd::ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let _ = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut zin) };
+    let mut last = 0usize;
+    let mut calls = 0;
+    for _ in 0..30 {
+        let mut ein = zstd::ZSTD_inBuffer {
+            src: core::ptr::null(),
+            size: 0,
+            pos: 0,
+        };
+        last = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut ein) };
+        calls += 1;
+        if is_error(last) {
+            break;
+        }
+    }
+    assert_eq!(16, calls);
+    assert!(
+        is_error(last) && error_code(last) == 82,
+        "{}",
+        error_name(last)
+    );
+    unsafe { zstd::ZSTD_initDStream(zds) };
+    let mut zin = zstd::ZSTD_inBuffer {
+        src: cmp.as_ptr().cast(),
+        size: c,
+        pos: 0,
+    };
+    let mut zout = zstd::ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let mut total = 0usize;
+    loop {
+        let r = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut zin) };
+        assert!(!is_error(r), "{}", error_name(r));
+        total += zout.pos;
+        zout.pos = 0;
+        if r == 0 {
+            break;
+        }
+    }
+    assert_eq!(payload.len(), total, "revive");
+    // Post-completion: the next-frame hint, never an error, never
+    // counting toward the guard.
+    for _ in 0..25 {
+        let mut ein = zstd::ZSTD_inBuffer {
+            src: core::ptr::null(),
+            size: 0,
+            pos: 0,
+        };
+        let h = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut ein) };
+        assert!(!is_error(h) && h == 9, "post-done hint {h}");
+    }
+    unsafe { zstd::ZSTD_freeDStream(zds) };
+
+    // Zero-capacity output: destFull (this layer consumes nothing with
+    // an unwritable output, so the guard fires on call 16).
+    let zds = zstd::ZSTD_createDStream();
+    unsafe { zstd::ZSTD_initDStream(zds) };
+    let mut zin = zstd::ZSTD_inBuffer {
+        src: cmp.as_ptr().cast(),
+        size: c,
+        pos: 0,
+    };
+    let mut zout = zstd::ZSTD_outBuffer {
+        dst: core::ptr::null_mut(),
+        size: 0,
+        pos: 0,
+    };
+    let mut last = 0usize;
+    let mut calls = 0;
+    for _ in 0..25 {
+        last = unsafe { zstd::ZSTD_decompressStream(zds, &raw mut zout, &raw mut zin) };
+        calls += 1;
+        if is_error(last) {
+            break;
+        }
+    }
+    assert!(
+        is_error(last) && error_code(last) == 80,
+        "{}",
+        error_name(last)
+    );
+    assert_eq!(16, calls);
+    unsafe { zstd::ZSTD_freeDStream(zds) };
+
+    // compressStream2 has no such guard: sustained empty e_continue is
+    // simply a zero-return.
+    let cctx = zstd::ZSTD_createCCtx();
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 1) };
+    let mut obuf = vec![0u8; 4096];
+    for _ in 0..20 {
+        let mut ein = zstd::ZSTD_inBuffer {
+            src: core::ptr::null(),
+            size: 0,
+            pos: 0,
+        };
+        let mut zout = zstd::ZSTD_outBuffer {
+            dst: obuf.as_mut_ptr().cast(),
+            size: obuf.len(),
+            pos: 0,
+        };
+        let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut ein, 0) };
+        assert!(!is_error(r), "{}", error_name(r));
+    }
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
 }

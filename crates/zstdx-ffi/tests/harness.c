@@ -876,6 +876,182 @@ static void test_dctx_reset_and_metadata(void) {
     free(out);
 }
 
+/* R67 round 2: one-shot bad-magic gating matrix, the null-buffer
+ * family, the deprecated DStream init entries, and the streaming
+ * no-forward-progress guard. Every expectation below is reference
+ * behavior (the suite runs against libzstd.a first). */
+static void test_r67_round2(void) {
+    unsigned char payload[4096];
+    for (size_t i = 0; i < 4096; i++) payload[i] = (unsigned char)((i * 7) % 251);
+    size_t cap = ZSTD_compressBound(4096);
+    unsigned char *cmp = malloc(cap);
+    unsigned char *out = malloc(8192);
+    size_t c = ZSTD_compress(cmp, cap, payload, 4096, 5);
+    CHECK(!ZSTD_isError(c), "setup: %s", ZSTD_getErrorName(c));
+    unsigned char skip[12] = {0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4};
+
+    /* Bad-magic tails: the descriptor byte drives the frame-header size,
+     * so a garbage tail is believed (prefix_unknown) only past
+     * fhsize + blockHeader (9 bare, 17 with an 8-byte FCS); below that it
+     * is leftover input. A decoded frame in front promotes any tail to
+     * srcSize_wrong; a skippable frame never promotes. */
+    {
+        const unsigned char fhd[2] = {0x00, 0xC0};
+        for (int d = 0; d < 2; d++) {
+            size_t gate = (d ? 14 : 6) + 3;
+            for (size_t len = 0; len <= gate + 2; len++) {
+                unsigned char g[32];
+                g[0] = 0x11; g[1] = 0x22; g[2] = 0x33; g[3] = 0x44;
+                for (size_t i = 4; i < len && i < 32; i++)
+                    g[i] = i == 4 ? fhd[d] : (unsigned char)i;
+                unsigned want_short = ZSTD_error_srcSize_wrong;
+                unsigned want_long = ZSTD_error_prefix_unknown;
+                if (len == 0) {
+                    CHECK(ZSTD_decompress(out, 8192, g, len) == 0, "empty input");
+                    continue;
+                }
+                size_t r = ZSTD_decompress(out, 8192, g, len);
+                CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) ==
+                      (len < gate ? want_short : want_long),
+                      "gar-only d=%d len=%zu: %s", d, len, ZSTD_getErrorName(r));
+                unsigned char *ser = malloc(c + len);
+                memcpy(ser, cmp, c);
+                memcpy(ser + c, g, len);
+                r = ZSTD_decompress(out, 8192, ser, c + len);
+                CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == want_short,
+                      "frm+gar d=%d len=%zu: %s", d, len, ZSTD_getErrorName(r));
+                memcpy(ser, skip, 12);
+                memcpy(ser + 12, g, len);
+                r = ZSTD_decompress(out, 8192, ser, 12 + len);
+                CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) ==
+                      (len < gate ? want_short : want_long),
+                      "skip+gar d=%d len=%zu: %s", d, len, ZSTD_getErrorName(r));
+                free(ser);
+            }
+        }
+    }
+
+    /* Null / truncated buffers through the context family. */
+    {
+        ZSTD_DCtx *dctx = ZSTD_createDCtx();
+        size_t r;
+        r = ZSTD_decompressDCtx(dctx, out, 0, cmp, c);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_dstSize_tooSmall,
+              "dctx dst0: %s", ZSTD_getErrorName(r));
+        r = ZSTD_decompressDCtx(dctx, NULL, 100, cmp, c);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_dstSize_tooSmall,
+              "dctx null dst: %s", ZSTD_getErrorName(r));
+        r = ZSTD_decompressDCtx(dctx, out, 8192, NULL, 4);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_srcSize_wrong,
+              "dctx null src4: %s", ZSTD_getErrorName(r));
+        CHECK(ZSTD_decompressDCtx(dctx, out, 8192, NULL, 0) == 0, "dctx null src0");
+        for (size_t n = 1; n <= 8; n *= 4) {
+            r = ZSTD_decompressDCtx(dctx, out, 8192, cmp, n);
+            CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_srcSize_wrong,
+                  "dctx short src %zu: %s", n, ZSTD_getErrorName(r));
+        }
+        r = ZSTD_decompress_usingDict(dctx, NULL, 100, cmp, c, NULL, 0);
+        CHECK(ZSTD_isError(r) && ZSTD_getErrorCode(r) == ZSTD_error_dstSize_tooSmall,
+              "usingDict null dst: %s", ZSTD_getErrorName(r));
+        ZSTD_freeDCtx(dctx);
+    }
+
+    /* The deprecated init family all return ZSTD_startingInputLength. */
+    {
+        ZSTD_DStream *zds = ZSTD_createDStream();
+        CHECK(ZSTD_initDStream(zds) == 5, "initDStream hint");
+        CHECK(ZSTD_initDStream_usingDict(zds, NULL, 0) == 5, "initDStream_usingDict hint");
+        CHECK(ZSTD_initDStream_usingDDict(zds, NULL) == 5, "initDStream_usingDDict hint");
+        CHECK(ZSTD_resetDStream(zds) == 5, "resetDStream hint");
+        ZSTD_freeDStream(zds);
+    }
+
+    /* No-forward-progress: sustained mid-frame starvation errors on the
+     * 16th call (inputEmpty when the output has room, destFull when it
+     * has none); the between-frames state never counts (its hint return
+     * sits before the reference guard); a session reset revives. */
+    {
+        ZSTD_DStream *zds = ZSTD_createDStream();
+        ZSTD_initDStream(zds);
+        ZSTD_inBuffer in = {cmp, c > 60 ? 60 : c - 1, 0};
+        ZSTD_outBuffer ob = {out, 8192, 0};
+        ZSTD_decompressStream(zds, &ob, &in);
+        ZSTD_inBuffer ein = {NULL, 0, 0};
+        size_t last = 0;
+        int calls = 0;
+        for (int i = 0; i < 30; i++) {
+            last = ZSTD_decompressStream(zds, &ob, &ein);
+            calls++;
+            if (ZSTD_isError(last)) break;
+        }
+        CHECK(calls == 16 && ZSTD_isError(last) &&
+              ZSTD_getErrorCode(last) == ZSTD_error_noForwardProgress_inputEmpty,
+              "inputEmpty guard: calls=%d %s", calls, ZSTD_getErrorName(last));
+        ZSTD_initDStream(zds);
+        ZSTD_inBuffer in2 = {cmp, c, 0};
+        ZSTD_outBuffer ob2 = {out, 8192, 0};
+        size_t total = 0;
+        for (;;) {
+            size_t r = ZSTD_decompressStream(zds, &ob2, &in2);
+            if (ZSTD_isError(r)) { CHECK(0, "revive: %s", ZSTD_getErrorName(r)); break; }
+            total += ob2.pos;
+            ob2.pos = 0;
+            if (r == 0) break;
+        }
+        CHECK(total == 4096, "revive output %zu", total);
+        ZSTD_freeDStream(zds);
+    }
+    {
+        ZSTD_DStream *zds = ZSTD_createDStream();
+        ZSTD_initDStream(zds);
+        ZSTD_inBuffer in = {cmp, c, 0};
+        ZSTD_outBuffer ob0 = {NULL, 0, 0};
+        size_t last = 0;
+        for (int i = 0; i < 25; i++) {
+            last = ZSTD_decompressStream(zds, &ob0, &in);
+            if (ZSTD_isError(last)) break;
+        }
+        CHECK(ZSTD_isError(last) &&
+              ZSTD_getErrorCode(last) == ZSTD_error_noForwardProgress_destFull,
+              "destFull guard: %s", ZSTD_getErrorName(last));
+        ZSTD_freeDStream(zds);
+    }
+    {
+        /* Post-completion calls ask for the next frame header (9) and
+         * never trip the guard. */
+        ZSTD_DStream *zds = ZSTD_createDStream();
+        ZSTD_initDStream(zds);
+        ZSTD_inBuffer in = {cmp, c, 0};
+        ZSTD_outBuffer ob = {out, 8192, 0};
+        size_t r = 1;
+        while (r != 0 && !ZSTD_isError(r)) r = ZSTD_decompressStream(zds, &ob, &in);
+        CHECK(r == 0, "completion");
+        ZSTD_inBuffer ein = {NULL, 0, 0};
+        ZSTD_outBuffer eb = {out, 8192, ob.pos};
+        for (int i = 0; i < 25; i++) {
+            size_t h = ZSTD_decompressStream(zds, &eb, &ein);
+            CHECK(!ZSTD_isError(h) && h == 9, "post-done hint %zu", h);
+        }
+        ZSTD_freeDStream(zds);
+    }
+    {
+        /* compressStream2 has no no-forward-progress guard. */
+        ZSTD_CCtx *cs = ZSTD_createCStream();
+        ZSTD_CCtx_reset(cs, ZSTD_reset_session_only);
+        ZSTD_inBuffer ein = {NULL, 0, 0};
+        unsigned char obuf[4096];
+        for (int i = 0; i < 20; i++) {
+            ZSTD_outBuffer o = {obuf, sizeof obuf, 0};
+            size_t r = ZSTD_compressStream2(cs, &o, &ein, ZSTD_e_continue);
+            CHECK(!ZSTD_isError(r), "cs2 starve: %s", ZSTD_getErrorName(r));
+        }
+        ZSTD_freeCCtx(cs);
+    }
+
+    free(cmp);
+    free(out);
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "produce") == 0)
         return produce(argv[2], argv[3], 3, 0);
@@ -893,6 +1069,7 @@ int main(int argc, char **argv) {
     test_reset_compress2();
     test_dicts();
     test_dctx_reset_and_metadata();
+    test_r67_round2();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;
 }

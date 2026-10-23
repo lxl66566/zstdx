@@ -1,9 +1,10 @@
 //! The simple (context-free) entry points: version constants, one-shot
 //! compression and decompression, error accessors, and frame metadata.
 
-use core::ffi::c_char;
+use core::{ffi::c_char, mem::size_of};
 
 use crate::{
+    ZSTD_FrameHeader,
     cctx::{CCtx, Settings as CSettings},
     dctx::{DCtx, Settings as DSettings},
     error::{self, ErrorCode},
@@ -167,11 +168,14 @@ pub unsafe extern "C" fn ZSTD_decompress(
     src_size: usize,
 ) -> usize {
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
-        return ret(ErrorCode::SrcBufferWrong);
+        // Below the prefix size the reference loop never derefs the src:
+        // its leftover-input check answers srcSize_wrong.
+        return ret(ErrorCode::SrcSizeWrong);
     };
-    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
-        return ret(ErrorCode::DstBufferNull);
-    };
+    // A null dst behaves as zero capacity on every reference path that
+    // does not crash it: non-empty output answers dstSize_tooSmall, an
+    // empty one succeeds.
+    let dst = unsafe { crate::as_mut_slice(dst, dst_capacity) };
     match crate::dctx::decompress_oneshot(&DSettings::default(), None, src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
@@ -256,7 +260,7 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getFrameHeader(
-    zfh_ptr: *mut crate::ZSTD_FrameHeader,
+    zfh_ptr: *mut ZSTD_FrameHeader,
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
@@ -278,11 +282,7 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
         // The reference memsets the whole struct, tail padding included;
         // a plain Rust assignment would leave the padding bytes alone.
         unsafe {
-            core::ptr::write_bytes(
-                zfh_ptr.cast::<u8>(),
-                0,
-                core::mem::size_of::<crate::ZSTD_FrameHeader>(),
-            );
+            core::ptr::write_bytes(zfh_ptr.cast::<u8>(), 0, size_of::<ZSTD_FrameHeader>());
         }
     }
     match parsed {
