@@ -19,6 +19,8 @@
 
 use alloc::vec::Vec;
 
+#[cfg(debug_assertions)]
+use super::compressed::vec_poison;
 use super::compressed::{
     BlockOutcome, BlockScratch, BlockTables, DictEntropy, FseTableMode, LitStreams, PrevTable,
     StagedBlock, encode_staged_block, entropy_log2, histogram_literals, repeat_bit_cost,
@@ -95,9 +97,21 @@ pub(crate) fn compress_split_block<M: Matcher>(
         huff,
         split,
     } = scratch;
+    // Staging checkpoint: see `compress_block`'s twin (the splitter shares
+    // the pooled staging with the stock path).
+    #[cfg(debug_assertions)]
+    {
+        vec_poison::assert(lits, "split staging literals");
+        vec_poison::assert(seqs, "split staging seqs");
+    }
     lits.clear();
     seqs.clear();
     matcher.start_matching_codes(lits, seqs);
+    #[cfg(debug_assertions)]
+    {
+        vec_poison::fill(lits);
+        vec_poison::fill(seqs);
+    }
     let nb_seq = seqs.len();
     if nb_seq < MIN_SEQUENCES_BLOCK_SPLITTING {
         return SplitOutcome::Single(single_block(

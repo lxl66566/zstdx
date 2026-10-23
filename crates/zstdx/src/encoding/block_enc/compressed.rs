@@ -10,6 +10,62 @@ use crate::{
     huff0::huff0_encoder,
 };
 
+/// Debug poison wall over a staging Vec's spare capacity — the ASAN-blind
+/// zone past the pooled buffers' logical length. The staging protocol:
+/// [`vec_poison::fill`] arms the wall right after the matcher fills a
+/// block's staging; [`vec_poison::assert`] checks it at the next block's
+/// staging entry (before `clear`), catching any touch of the slack by the
+/// whole encode/split pipeline in between. A local twin of the stream
+/// core's helper (encoding must not reach into the stream layer); same
+/// span rule: both sides key off the current length.
+#[cfg(debug_assertions)]
+pub(super) mod vec_poison {
+    use alloc::vec::Vec;
+
+    use crate::encoding::poison;
+
+    /// Wall width past the logical length (byte-wise, element-granular).
+    const WALL: usize = 4 * 1024;
+
+    /// Arm the wall over `v`'s spare capacity.
+    pub(crate) fn fill<T>(v: &mut Vec<T>) {
+        let n = span_len(v);
+        if n == 0 {
+            return;
+        }
+        let size = size_of::<T>();
+        let spare = v.spare_capacity_mut();
+        // SAFETY: the span lies inside the Vec's spare capacity; writing
+        // the pattern initializes exactly those bytes, which the Vec never
+        // reads below its own length.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), n * size) };
+        poison::fill(bytes);
+    }
+
+    /// Assert the wall armed by [`fill`] is unchanged. `ctx` names the
+    /// checkpoint so the panic localizes the offending path.
+    pub(crate) fn assert<T>(v: &Vec<T>, ctx: &str) {
+        let (n, len) = (span_len(v), v.len());
+        if n == 0 {
+            return;
+        }
+        let size = size_of::<T>();
+        // SAFETY: every asserted byte was written by the [`fill`] after the
+        // matcher's staging (nothing moves the staging between blocks), so
+        // reading them back is initialized memory.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(v.as_ptr().add(len).cast::<u8>(), n * size) };
+        poison::assert_intact(bytes, ctx);
+    }
+
+    /// Element count of the walled span at `v`'s current length.
+    fn span_len<T>(v: &Vec<T>) -> usize {
+        let size = size_of::<T>().max(1);
+        (v.capacity() - v.len()).min(WALL / size)
+    }
+}
+
 /// What one sequence table's block mode means for the caller's remembered
 /// copy: a freshly written table to adopt, no change (the decoder's table
 /// state is untouched — zero-sequence and raw-fallback blocks), or
@@ -231,9 +287,21 @@ pub(crate) fn compress_block<M: Matcher>(
         huff,
         ..
     } = scratch;
+    // Staging checkpoint: the previous block's consumers (this whole
+    // module and the splitter) must have left the armed walls intact.
+    #[cfg(debug_assertions)]
+    {
+        vec_poison::assert(literals_vec, "block staging literals");
+        vec_poison::assert(seqs, "block staging seqs");
+    }
     literals_vec.clear();
     seqs.clear();
     matcher.start_matching_codes(literals_vec, seqs);
+    #[cfg(debug_assertions)]
+    {
+        vec_poison::fill(literals_vec);
+        vec_poison::fill(seqs);
+    }
     let staged = if seqs.is_empty() {
         StagedBlock::ZeroSeq
     } else {
