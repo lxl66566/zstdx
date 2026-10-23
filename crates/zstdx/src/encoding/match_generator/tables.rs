@@ -611,7 +611,14 @@ impl TableEmit<'_> {
             }
             let pidx = (pos - self.win_base) as usize;
             let cand = (cand_abs - self.win_base) as usize;
-            if read4(win, cand) != read4(win, pidx) {
+            // With exactly MIN_MATCH bytes of block left, read4's fourth
+            // compare byte lies past the window (see `rep1_row`'s twin).
+            let head_matches = if block_end - pos > MIN_MATCH as u64 {
+                read4(win, cand) == read4(win, pidx)
+            } else {
+                win[cand..cand + MIN_MATCH] == win[pidx..pidx + MIN_MATCH]
+            };
+            if !head_matches {
                 break;
             }
             let ml = extend_match(win, pidx, cand);

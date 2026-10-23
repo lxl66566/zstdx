@@ -390,6 +390,14 @@ impl RowEmit<'_> {
         );
         let end_abs = (self.win_base + match_end as u64).min(self.insert_max);
         let from = self.win_base + start as u64;
+        // The clamped end can fall at or below the match start: a match
+        // whose start sits inside the final HASH_READ span (the one-ahead
+        // rep probe and the rep continuation both land there) meets an
+        // insert_max already behind it. The wrapped subtraction below would
+        // peel-insert positions whose hash reads run past the window.
+        if from >= end_abs {
+            return self.win_base + match_end as u64;
+        }
         let mut seg_end = end_abs;
         if end_abs - from > 384 {
             seg_end = from + 96;
@@ -438,13 +446,28 @@ impl RowEmit<'_> {
             }
             let pidx = (pos - self.win_base) as usize;
             let cand = (cand_abs - self.win_base) as usize;
-            if read4(win, cand) != read4(win, pidx) {
+            // With exactly MIN_MATCH bytes of block left, read4's fourth
+            // compare byte lies past the window (the next block's first
+            // byte mid-frame, foreign memory at the frame tail), so
+            // compare only the bytes the block holds — extend_match caps
+            // the match at the window end either way.
+            let head_matches = if block_end - pos > MIN_MATCH as u64 {
+                read4(win, cand) == read4(win, pidx)
+            } else {
+                win[cand..cand + MIN_MATCH] == win[pidx..pidx + MIN_MATCH]
+            };
+            if !head_matches {
                 break;
             }
             let ml = extend_match(win, pidx, cand);
             debug_assert!(ml >= MIN_MATCH);
-            let h = row_hash_at(win, pidx, self.hash_log, ROW_LOG, self.width);
-            row_insert_fill::<ROW_LOG>(self.table, self.heads, h, pos);
+            // The row hash reads HASH_READ bytes; a probe inside the final
+            // span has no full hash over in-window bytes, so it leaves no
+            // table entry (the scan tail never searches one).
+            if pidx + HASH_READ <= win.len() {
+                let h = row_hash_at(win, pidx, self.hash_log, ROW_LOG, self.width);
+                row_insert_fill::<ROW_LOG>(self.table, self.heads, h, pos);
+            }
             pos = self.emit::<ROW_LOG>(win, pos, pidx, ml, 1, rep);
         }
         pos
