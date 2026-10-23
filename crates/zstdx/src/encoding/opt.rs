@@ -392,6 +392,10 @@ impl OptState {
         }
         let max_len = crate::common::MAX_BLOCK_SIZE;
         if lit_length == max_len {
+            // Dead in practice: a block's literal run never spans
+            // MAX_BLOCK_SIZE (DP stretches end at the block tail; C never
+            // prices an unrepresentable ll either).
+            debug_assert!(false, "unrepresentable literal run priced");
             // Not representable in the format; price as one bit over the max.
             return BITCOST_MULTIPLIER + self.lit_length_price::<ULTRA>(max_len - 1);
         }
