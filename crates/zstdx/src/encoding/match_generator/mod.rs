@@ -1221,6 +1221,14 @@ impl MatchGeneratorDriver {
                     self.second = heads_len;
                     self.row_heads = alloc::vec![0u8; rows];
                 } else if self.tables.len() != heads_len {
+                    // `rows_kept` diverges from `heads_kept` here: two row
+                    // levels can share a row count at different hash logs
+                    // (the source-length clamp shrinks the head table one
+                    // log per row_log step), so this branch resizes the
+                    // head span while `second` still names the old one — a
+                    // stale larger `second` later slices past the buffer
+                    // (the fast family's heads-kept truncate cannot grow).
+                    self.second = heads_len;
                     self.tables.truncate(heads_len);
                     self.tables.resize_zeroed(heads_len);
                     self.row_heads.truncate(rows);
@@ -1276,6 +1284,10 @@ impl MatchGeneratorDriver {
         if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
             self.lazy_scratch = Some(LazyScratch::new());
         }
+        // The head span always fits the buffer: every consumer slices
+        // `tables[..second]` unchecked-by-branch, and a pooled driver carries
+        // the pair across frames.
+        debug_assert!(self.second <= self.tables.len());
     }
 
     /// Size the search tables for `level` (no-op when unchanged), so pooled
