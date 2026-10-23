@@ -624,6 +624,26 @@ fn read_decoder_is_transparent_over_frames() {
     assert_eq!(out, b"first frame");
 }
 
+/// single_frame leaves the source at the next frame's first byte: it must
+/// not consume the following frame's header while deciding to stop (the
+/// pass-through decode loops chain a fresh decoder per frame).
+#[test]
+fn read_decoder_single_frame_stops_at_the_boundary() {
+    let first = bulk::compress(b"first frame", Level::Fastest);
+    let second = bulk::compress(vec![7u8; 200 * 1024].as_slice(), Level::Uncompressed);
+    let stream = [first.clone(), second.clone()].concat();
+    let mut source = stream.as_slice();
+    {
+        let mut dec = read::Decoder::new(&mut source).unwrap().single_frame();
+        let mut out = Vec::new();
+        crate::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+        assert_eq!(out, b"first frame");
+    }
+    let mut remaining = Vec::new();
+    crate::io::Read::read_to_end(&mut source, &mut remaining).unwrap();
+    assert_eq!(remaining, second);
+}
+
 #[test]
 fn write_decoder_is_transparent_over_frames() {
     let (stream, plain) = multi_frame_stream();

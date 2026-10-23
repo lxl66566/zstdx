@@ -247,9 +247,16 @@ impl<R: Read> Decoder<R> {
                 return self.inner.read(buf);
             }
             if self.inner.is_finished() {
+                // The single-frame contract stops at the boundary: peeking
+                // the next frame's header would consume bytes past the
+                // frame and desynchronize a caller that keeps the source.
+                if self.single_frame {
+                    self.finished = true;
+                    return Ok(0);
+                }
                 let next = frame_source::init_next_frame(&mut self.source, &mut self.inner)
-                    .map_err(|e| crate::error::into_io(crate::Error::Frame(e)));
-                if self.single_frame || !next? {
+                    .map_err(|e| crate::error::into_io(crate::Error::Frame(e)))?;
+                if !next {
                     self.finished = true;
                     return Ok(0);
                 }
