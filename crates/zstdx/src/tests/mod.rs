@@ -182,10 +182,7 @@ fn test_decode_from_to() {
                 );
             }
             #[cfg(not(feature = "hash"))]
-            std::println!(
-                "Checksum feature not enabled, skipping. From data: {}\n",
-                chksum
-            );
+            std::println!("Checksum feature not enabled, skipping. From data: {chksum}\n");
         },
         None => std::println!("No checksums to test\n"),
     }

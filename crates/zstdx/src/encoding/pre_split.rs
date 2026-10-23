@@ -370,7 +370,9 @@ fn split_from_borders(block: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{string::ToString, vec, vec::Vec};
+    #[cfg(feature = "std")]
+    use alloc::string::ToString;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
 

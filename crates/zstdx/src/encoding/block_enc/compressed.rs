@@ -1742,6 +1742,7 @@ fn compress_literals(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     use alloc::vec::Vec;
 
     /// AVX2 small-alphabet histogram against the scalar 4-lane pass.
@@ -1803,6 +1804,7 @@ mod tests {
     }
 
     /// The four-lane scalar body of `histogram_literals` as the reference.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     fn histogram_literals_scalar(literals: &[u8], counts: &mut [usize; 256]) -> usize {
         let mut c0 = [0usize; 256];
         let mut c1 = [0usize; 256];

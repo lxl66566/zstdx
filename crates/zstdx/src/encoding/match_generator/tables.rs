@@ -173,6 +173,7 @@ impl HeadTables {
 
     /// The whole allocation: contents clears, and the row family's single
     /// packed table (its strategies hold `head_len == len`).
+    #[cfg(any(feature = "std", test))]
     #[inline]
     pub(super) fn buf(&self) -> &[u32] {
         &self.buf

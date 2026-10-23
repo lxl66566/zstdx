@@ -1156,6 +1156,7 @@ impl MtEncoderCore {
             // uninitialized.
             init_len = buf.len();
         }
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut core = Self {
             level: options.level,
             checksum,

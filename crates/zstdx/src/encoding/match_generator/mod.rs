@@ -2578,7 +2578,6 @@ impl MatchGeneratorDriver {
     /// (`rescale_freqs` re-seeds identically from a zero
     /// `lit_length_sum` either way, so this is output-neutral for the
     /// capturing frame too).
-    #[cfg(feature = "std")]
     /// Whether the driver's post-seeding resolutions equal [`dict_seed_key`]'s
     /// for the same inputs — the drift gate for the key's mirror of
     /// `apply_level` + `load_dictionary` (debug-asserted at every capture in
@@ -2589,6 +2588,7 @@ impl MatchGeneratorDriver {
         self.params == key.params && self.dict_row == key.dict_row
     }
 
+    #[cfg(feature = "std")]
     pub(crate) fn canonicalize_for_seed_capture(&mut self) {
         self.probe_stats = None;
         self.small_wide = None;

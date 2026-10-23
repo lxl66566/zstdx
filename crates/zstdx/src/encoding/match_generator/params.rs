@@ -831,10 +831,10 @@ pub(super) const fn params_for_row(
     // Light verdict takes the reduced candidate budget. Pure queries
     // never resolve a verdict, so headers and strip geometry keep the
     // stock row.
-    if let RowAttempts::Light = attempts {
-        if let Some(depth) = row_light_search_depth(level.as_i32()) {
-            p.search_depth = depth;
-        }
+    if let RowAttempts::Light = attempts
+        && let Some(depth) = row_light_search_depth(level.as_i32())
+    {
+        p.search_depth = depth;
     }
     if level.as_i32() == 0 {
         p

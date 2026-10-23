@@ -13,14 +13,13 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    fn as_str(&self) -> &'static str {
-        use ErrorKind::*;
-        match *self {
-            Interrupted => "operation interrupted",
-            UnexpectedEof => "unexpected end of file",
-            WouldBlock => "operation would block",
-            Other => "other error",
-            WriteAllEof => "write_all hit EOF",
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "operation interrupted",
+            Self::UnexpectedEof => "unexpected end of file",
+            Self::WouldBlock => "operation would block",
+            Self::Other => "other error",
+            Self::WriteAllEof => "write_all hit EOF",
         }
     }
 }
@@ -68,7 +67,7 @@ impl Error {
     }
 
     pub fn get_ref(&self) -> Option<&(dyn core::fmt::Display + Send + Sync)> {
-        self.err.as_ref().map(|e| e.as_ref())
+        self.err.as_ref().map(Box::as_ref)
     }
 
     pub fn into_inner(self) -> Option<Box<dyn core::fmt::Display + Send + Sync + 'static>> {
@@ -115,10 +114,10 @@ pub trait Read {
                 Err(e) => return Err(e),
             }
         }
-        if !buf.is_empty() {
-            Err(Error::from(ErrorKind::UnexpectedEof))
-        } else {
+        if buf.is_empty() {
             Ok(())
+        } else {
+            Err(Error::from(ErrorKind::UnexpectedEof))
         }
     }
 

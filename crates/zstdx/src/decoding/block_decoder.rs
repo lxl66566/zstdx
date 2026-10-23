@@ -456,11 +456,11 @@ mod tests {
     /// rejected at header-parse time.
     #[test]
     fn reserved_and_oversized_are_rejected() {
+        const OVER: u32 = 128 * 1024 + 1;
         assert!(matches!(
             read(&[0x06, 0x00, 0x00]),
             Err(BlockHeaderReadError::FoundReservedBlock)
         ));
-        const OVER: u32 = 128 * 1024 + 1;
         assert!(matches!(
             read(&[0x08, 0x00, 0x10]),
             Err(BlockHeaderReadError::BlockSizeError(

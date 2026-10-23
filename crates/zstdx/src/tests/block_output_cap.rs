@@ -264,6 +264,7 @@ fn mt_stage_a_rejects_huge_block_output_claim() {
 /// so the frame is corrupt before its body is even read — the output-side
 /// cap alone never sees it (a compressed body this small claims little
 /// output).
+#[cfg(feature = "std")]
 fn small_window_oversized_stored_block() -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());

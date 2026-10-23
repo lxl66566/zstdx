@@ -78,8 +78,9 @@ fn trailing_garbage_is_rejected() {
     let err = decode(&data).expect_err("trailing garbage must be rejected");
     assert!(matches!(
         err,
-        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(_))
-            | FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_))
+        FrameDecoderError::ReadFrameHeaderError(
+            ReadFrameHeaderError::MagicNumberReadError(_) | ReadFrameHeaderError::BadMagicNumber(_)
+        )
     ));
 }
 

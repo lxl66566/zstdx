@@ -160,10 +160,7 @@ fn test_dict_decoding() {
                     );
                 }
                 #[cfg(not(feature = "hash"))]
-                println!(
-                    "Checksum feature not enabled, skipping. From data: {}\n",
-                    chksum
-                );
+                println!("Checksum feature not enabled, skipping. From data: {chksum}\n");
             },
             None => println!("No checksums to test\n"),
         }

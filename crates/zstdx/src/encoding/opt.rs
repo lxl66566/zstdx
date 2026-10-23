@@ -1269,6 +1269,7 @@ pub(crate) fn seed_dict_tree(
 /// The ultra seed parse's span start for a dictionary of `keep` bytes
 /// (`run_block`'s `block_start.saturating_sub(SEED_SPAN).max(win_base)`
 /// with `win_base == 0`).
+#[cfg(feature = "std")]
 fn seed_start_of(keep: u64) -> u64 {
     keep.saturating_sub(SEED_SPAN)
 }

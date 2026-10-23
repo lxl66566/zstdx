@@ -92,9 +92,6 @@ mod tests {
         fill(&mut b);
         assert_intact(&b, "test");
         b[7] = 0;
-        assert!(matches!(
-            std::panic::catch_unwind(|| assert_intact(&b, "test")),
-            Err(_)
-        ));
+        assert!(std::panic::catch_unwind(|| assert_intact(&b, "test")).is_err());
     }
 }

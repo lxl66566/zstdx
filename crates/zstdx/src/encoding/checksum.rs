@@ -67,6 +67,9 @@ impl FrameHasher {
 }
 
 #[cfg(not(feature = "hash"))]
+// The stub keeps the hash-feature signatures verbatim so call sites compile
+// unchanged; the receiver exists only for that parity.
+#[allow(clippy::unused_self)]
 impl FrameHasher {
     pub(crate) fn new() -> Self {
         Self {}

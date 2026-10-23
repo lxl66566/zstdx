@@ -77,10 +77,7 @@ fn test_decode_corpus_files() {
                     failed.push(p.clone());
                 }
                 #[cfg(not(feature = "hash"))]
-                println!(
-                    "Checksum feature not enabled, skipping. From data: {}\n",
-                    chksum
-                );
+                println!("Checksum feature not enabled, skipping. From data: {chksum}\n");
             },
             None => println!("No checksums to test\n"),
         }

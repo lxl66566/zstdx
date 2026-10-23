@@ -446,6 +446,7 @@ fn row_band_attempts_diet_roundtrips() {
 
 /// Narrow-alphabet payload with dense near-repeats (the attempts diet's
 /// target class): 24 symbols, repeated 16-byte words.
+#[cfg(feature = "std")]
 fn narrow_repeats(len: usize) -> Vec<u8> {
     let words = [
         &b"key:value pair, "[..],

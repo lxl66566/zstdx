@@ -69,7 +69,7 @@ fn payload(len: usize) -> Vec<u8> {
     while data.len() < len {
         let take = TEMPLATE.len().min(len - data.len());
         data.extend_from_slice(&TEMPLATE[..take]);
-        if rng.next() & 7 == 0 {
+        if rng.next().trailing_zeros() >= 3 {
             let noise = 1 + rng.next() as usize % 64;
             for _ in 0..noise.min(len - data.len()) {
                 data.push(rng.byte());
@@ -191,7 +191,7 @@ fn poison_bulk_ladder() {
         for (si, data) in payloads.iter().enumerate() {
             let bits = BITS[(li * SIZES.len() + si) % BITS.len()];
             let label = format!("bulk l{li} len {}", data.len());
-            let frame = if (li * SIZES.len() + si) % BITS.len() == 0 {
+            let frame = if (li * SIZES.len() + si).is_multiple_of(BITS.len()) {
                 crate::bulk::compress(data, level)
             } else {
                 crate::bulk::compress_with(data, &cell_options(bits, level, data.len(), 0))
