@@ -10,8 +10,9 @@
 //! MT/stream-MT frame's decode must equal the ST frame's decode of the
 //! same options.
 
-use libfuzzer_sys::fuzz_target;
 use std::io::Write;
+
+use libfuzzer_sys::fuzz_target;
 use zstdx::{DecoderOptions, EncoderOptions, LdmMode, Level, bulk, stream};
 
 const LADDER: [Level; 3] = [Level::Fastest, Level::Fast, Level::Balanced];
@@ -99,15 +100,35 @@ fuzz_target!(|data: &[u8]| {
     let check = |frame: &[u8], which: &str| {
         let seq = bulk::decompress_with(frame, 0, &DecoderOptions::new())
             .unwrap_or_else(|e| panic!("{which} ({what}) does not decode sequentially: {e}"));
-        assert_eq!(&seq[..], &payload[..], "{which} ({what}) sequential roundtrip differs");
-        let mt = bulk::decompress_with(frame, 0, &DecoderOptions::new().threads(4))
-            .unwrap_or_else(|e| panic!("{which} ({what}) does not decode through the parallel decoder: {e}"));
-        assert_eq!(&mt[..], &seq[..], "{which} ({what}) parallel decode disagrees");
+        assert_eq!(
+            &seq[..],
+            &payload[..],
+            "{which} ({what}) sequential roundtrip differs"
+        );
+        let mt = bulk::decompress_with(frame, 0, &DecoderOptions::new().threads(4)).unwrap_or_else(
+            |e| panic!("{which} ({what}) does not decode through the parallel decoder: {e}"),
+        );
+        assert_eq!(
+            &mt[..],
+            &seq[..],
+            "{which} ({what}) parallel decode disagrees"
+        );
         let mut zback = Vec::new();
         zstd::stream::copy_decode(frame, &mut zback)
             .unwrap_or_else(|e| panic!("{which} ({what}) rejected by the reference decoder: {e}"));
-        assert_eq!(&zback[..], &seq[..], "{which} ({what}) reference decode disagrees");
+        assert_eq!(
+            &zback[..],
+            &seq[..],
+            "{which} ({what}) reference decode disagrees"
+        );
     };
     check(&st, "ST frame");
-    check(&mt_frame, if via_stream { "stream-MT frame" } else { "bulk-MT frame" });
+    check(
+        &mt_frame,
+        if via_stream {
+            "stream-MT frame"
+        } else {
+            "bulk-MT frame"
+        },
+    );
 });

@@ -15,19 +15,15 @@
 //! path, image-cache restore exactness on the parsed path); the cached
 //! path's frame equals the fresh-parse path's.
 
-use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
+
+use libfuzzer_sys::fuzz_target;
 use zstdx::{
     DecoderOptions, EncoderDictionary, EncoderOptions, Level, bulk, compat,
     encoding::{FrameCompressor, MatchGeneratorDriver},
 };
 
-const LADDER: [Level; 4] = [
-    Level::Fastest,
-    Level::Fast,
-    Level::Balanced,
-    Level::Best,
-];
+const LADDER: [Level; 4] = [Level::Fastest, Level::Fast, Level::Balanced, Level::Best];
 
 fn u16_at(data: &[u8], i: usize) -> usize {
     usize::from(u16::from_le_bytes([
@@ -81,10 +77,10 @@ fn fc_frame<'a>(
 fuzz_target!(|data: &[u8]| {
     // Parameter head; short inputs default everything.
     let level = LADDER[data.first().copied().unwrap_or(0) as usize % LADDER.len()];
-    let other_level = LADDER
-        [(data.first().copied().unwrap_or(0) as usize + 1
-            + data.get(12).copied().unwrap_or(0) as usize % (LADDER.len() - 1))
-            % LADDER.len()];
+    let other_level = LADDER[(data.first().copied().unwrap_or(0) as usize
+        + 1
+        + data.get(12).copied().unwrap_or(0) as usize % (LADDER.len() - 1))
+        % LADDER.len()];
     let mut mask = data.get(1).copied().unwrap_or(0);
     if mask == 0 {
         mask = 0b111;
@@ -180,8 +176,14 @@ fuzz_target!(|data: &[u8]| {
                 .pledged_size(pledge);
             let p1 = bulk::compress_with(&payload, &opts_par).unwrap();
             let p2 = bulk::compress_with(&payload, &opts_par).unwrap();
-            assert_eq!(p1, p2, "cached-path frame differs from the fresh-parse frame");
-            assert_eq!(r1, p1, "raw and parsed attachments produce different frames");
+            assert_eq!(
+                p1, p2,
+                "cached-path frame differs from the fresh-parse frame"
+            );
+            assert_eq!(
+                r1, p1,
+                "raw and parsed attachments produce different frames"
+            );
             decode_with_dict(&r1, &dict, &payload, "raw-path frame");
             decode_with_dict(&p2, &dict, &payload, "cached-path frame");
 

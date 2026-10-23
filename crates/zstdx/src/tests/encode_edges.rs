@@ -379,3 +379,47 @@ fn pooled_row_geometry() {
         check(payload, &format!("pooled-geometry/l{level}"), &opts);
     }
 }
+
+/// Pooled table geometry across the FULL ladder at the `adjust_params`
+/// clamp boundaries: the per-thread pooled slice state carries its tables
+/// between `bulk::compress_with` calls, and the source-length clamp
+/// retunes the table geometry per level (srcLog crossings at 2^9..2^12,
+/// where Row hash logs and chain table sizes step), so every (len, level)
+/// cell must re-derive its geometry from a pool the previous level left
+/// behind and still roundtrip. Serial by construction: one thread, outer
+/// loop over the lengths, inner loop over the whole ladder 0..=22.
+#[test]
+#[cfg(feature = "std")]
+fn pooled_ladder_sweep() {
+    let lens = [
+        (1 << 9) - 1,
+        1 << 9,
+        (1 << 9) + 1,
+        (1 << 10) - 1,
+        1 << 10,
+        (1 << 10) + 1,
+        (1 << 11) - 1,
+        1 << 11,
+        (1 << 11) + 1,
+        (1 << 12) - 1,
+        1 << 12,
+        (1 << 12) + 1,
+        1500,
+        750,
+    ];
+    // Rotate the payload class with the length so the sweep stresses the
+    // hash tables (text), the chain/row fill (random), repcodes (period4)
+    // and RLE literals (zeros) as it walks the ladder.
+    for (idx, &len) in lens.iter().enumerate() {
+        let kind = ["text", "random", "period4", "zeros"][idx % 4];
+        let payload = shape(kind, len);
+        for level in 0..=22 {
+            let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level));
+            check(
+                &payload,
+                &format!("pooled-sweep/{kind}/{len}/l{level}"),
+                &opts,
+            );
+        }
+    }
+}
