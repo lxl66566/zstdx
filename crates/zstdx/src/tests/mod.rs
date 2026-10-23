@@ -1436,6 +1436,8 @@ pub mod encode_edges;
 pub mod fuzz_regressions;
 pub mod multi_frame;
 pub mod parity;
+#[cfg(test)]
+pub mod poison;
 
 #[cfg(feature = "std")]
 #[test]
