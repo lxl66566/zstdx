@@ -3,8 +3,9 @@
 //! crate (level swept from the first input byte) must decode to the
 //! original bytes through both of our decode paths.
 
-use libfuzzer_sys::fuzz_target;
 use std::io::Read;
+
+use libfuzzer_sys::fuzz_target;
 use zstdx::decoding::{BlockDecodingStrategy, FrameDecoder, StreamingDecoder};
 
 fn decode_streaming(mut data: &[u8]) -> Vec<u8> {

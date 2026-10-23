@@ -4,10 +4,10 @@
 //! reads, so block boundaries and internal wrap-arounds are crossed many
 //! times) and the flat `decode_all` path.
 
-use libfuzzer_sys::fuzz_target;
 use std::io::Read;
-use zstdx::decoding::errors::FrameDecoderError;
-use zstdx::decoding::{FrameDecoder, StreamingDecoder};
+
+use libfuzzer_sys::fuzz_target;
+use zstdx::decoding::{FrameDecoder, StreamingDecoder, errors::FrameDecoderError};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(mut dec) = StreamingDecoder::new(data) else {
@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
                 assert!(step <= 1 << 30, "frame expands beyond 1 GiB");
                 flat.reserve(step);
                 step *= 2;
-            }
+            },
             Err(_) => return,
         }
     }
