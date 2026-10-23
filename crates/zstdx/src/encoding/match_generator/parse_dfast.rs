@@ -50,12 +50,12 @@ impl MatchGeneratorDriver {
         // shifts fold to immediates and the two shift registers free up);
         // clamped-window shapes pass [`RUNTIME_LOG`] for both.
         let long_log = if LONG_LOG == RUNTIME_LOG {
-            self.second.trailing_zeros()
+            self.tables.head_len().trailing_zeros()
         } else {
             LONG_LOG
         };
         let small_log = if SMALL_LOG == RUNTIME_LOG {
-            (self.tables.len() - self.second).trailing_zeros()
+            self.tables.second_len().trailing_zeros()
         } else {
             SMALL_LOG
         };
@@ -66,6 +66,8 @@ impl MatchGeneratorDriver {
         ramp.start = ramp.start.saturating_sub(shift);
         ramp.end = ramp.end.saturating_sub(shift);
         let block_end = self.block_end - shift;
+        // The window holds the committed block, so `block_end >= win_base`
+        // and the subtraction cannot wrap.
         let block_len = (block_end - win_base) as usize;
         // Probing hashes 8 bytes, so the last probeable window index; the
         // insert bound coincides with it (the window ends at the block), so
@@ -100,11 +102,11 @@ impl MatchGeneratorDriver {
         // borrows; both address the same memory, and the loop and the
         // emit helpers never access a slot concurrently.
         let split = if LONG_LOG == RUNTIME_LOG {
-            self.second
+            self.tables.head_len()
         } else {
             1usize << LONG_LOG
         };
-        let (long, small) = self.tables.split_at_mut(split);
+        let (long, small) = self.tables.split_at(split);
         let long_ptr: *mut u32 = long.as_mut_ptr();
         let small_ptr: *mut u32 = small.as_mut_ptr();
         // Dictionary frames hash the short table over 4 bytes (libzstd's
@@ -248,6 +250,9 @@ impl MatchGeneratorDriver {
                 // single-candidate table can serve it (see `seed_offset`).
                 // Mirrors the fast loop's twin block.
                 if $gated && seed_offset != 0 {
+                    // Wraps huge when the seed offset reaches past pos or
+                    // below the window floor; the `ci < ip_idx` compare
+                    // rejects both.
                     let ci = (pos_abs - seed_offset as u64 - win_base) as usize;
                     // Strictly older than the probed position: the rep
                     // probe's pos-advance can otherwise cancel a seed
@@ -442,7 +447,12 @@ impl MatchGeneratorDriver {
         // the block end): the gap scans run the stock two-phase loop with
         // every bound retargeted at the segment's, then the candidate
         // emits wholesale at its split. The phases span segments like
-        // blocks — the seeded state is the scan's, not a segment's.
+        // blocks — the seeded state is the scan's, not a segment's. The
+        // `ip_idx + 1 > seg_limit` entry guard holds both cursors at/below
+        // `seg_limit = seg_end - HASH_READ` for the whole body, so every
+        // naked `seg_end - ip_idx` / `seg_end - probe` derivation below is
+        // wrap-free by the guard; splits sit at/after the block start,
+        // which the entry debug_assert keeps at/after the shift.
         'segments: loop {
             let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
                 let e = s.split - shift;
@@ -524,7 +534,9 @@ impl MatchGeneratorDriver {
             let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split - shift);
             let mut cursor = anchor_idx;
             if rep_pending == 0 {
-                let bound_limit = ((bound - win_base) as usize).saturating_sub(HASH_READ);
+                let bound_limit = IdxRange::new(win_base, bound.max(win_base))
+                    .len()
+                    .saturating_sub(HASH_READ as u64) as usize;
                 cursor =
                     emit.rep_chain::<RAMPED, true>(win, anchor_idx, bound_limit, &mut rep, ramp);
             }

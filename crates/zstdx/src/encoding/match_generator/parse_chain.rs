@@ -28,7 +28,7 @@ impl MatchGeneratorDriver {
         seqs: &mut Vec<SeqWord>,
     ) {
         let win = window_slice(&self.win, self.ext.as_ref());
-        let (table_view, chain) = self.tables.split_at_mut(self.second);
+        let (table_view, chain) = self.tables.split();
         let chain_mask = chain.len() - 1;
         let win_base = self.win_base;
         let ramp = self.ramp;
@@ -44,6 +44,9 @@ impl MatchGeneratorDriver {
         let dict_row = self.dict_row;
         let width = ChainHashWidth::of(dict_row);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        // The span end is trivially at/after its start; tiny first blocks
+        // never reach an emit, so the bound is never consulted when
+        // `win.len() < HASH_READ`.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
         // fast loop's note on the same SROA failure); emits go through the
@@ -151,6 +154,8 @@ impl MatchGeneratorDriver {
             // any skipped byte finds its twin (match interiors are
             // `emit_chain`'s own covered fill). The no-dict rows keep the
             // tuned sparse grid (their output is byte-load-bearing).
+            // `insert_max >= win_base` and the fill cursor tracks positions
+            // at/after the window floor, so neither subtraction can wrap.
             if dict_row && pos > next_ins {
                 let cap = (pos.min(insert_max) - win_base) as usize;
                 let mut ci = (next_ins - win_base) as usize;
@@ -247,6 +252,8 @@ impl MatchGeneratorDriver {
             // gate below keeps a far seed honest.
             let mut seed_hit = false;
             if $gated && seed_offset != 0 {
+                // Wraps huge when the seed offset reaches past pos or below
+                // the window floor; the `ci < idx` compare rejects both.
                 let ci = (pos - seed_offset as u64 - win_base) as usize;
                 // The rep probe may have advanced `pos` one byte past this
                 // iteration's `idx`; a seed offset of exactly one then
@@ -544,7 +551,11 @@ impl MatchGeneratorDriver {
         // One segment per long-distance candidate (plus the final one to
         // the block end): the gap scans run the stock two-phase loop with
         // every bound retargeted at the segment end (`end`), then the
-        // candidate emits wholesale at its split.
+        // candidate emits wholesale at its split. Both bars hold `pos`
+        // inside `[win_base, end - HASH_READ]` for the whole body, so every
+        // naked `end - pos` / `pos - win_base` / `anchor - win_base`
+        // derivation below is wrap-free by the bar (pos only grows, from
+        // `self.pos >= win_base`).
         'segments: loop {
             let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
                 end = s.split;
@@ -639,6 +650,11 @@ impl MatchGeneratorDriver {
             // in-reach chain matches).
             {
                 let to = next.min(insert_max);
+                // NOTE: `next - 512` wraps on a sub-512-byte emission (a
+                // tiny unpledged stream's first LDM candidate), and the
+                // wrapped `p` skips the catch-up fill entirely —
+                // byte-load-bearing residue, do not "fix" it to saturate
+                // without a dump-diff gate.
                 let mut p = (next - 512).max(end).max(win_base);
                 while p < to {
                     insert_linked_at(

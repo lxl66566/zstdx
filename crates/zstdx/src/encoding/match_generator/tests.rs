@@ -68,10 +68,26 @@ fn strip_snapshot_adopt_is_exact() {
     let mut adopted = fresh();
     adopted.adopt_strip_snapshot(&snap, &data, 0);
 
-    assert_eq!(stock.tables, adopted.tables, "head grid tables diverge");
-    assert_eq!(stock.second, adopted.second, "chain split diverges");
-    assert_eq!(stock.tables, builder.tables, "builder head grid diverges");
-    assert_eq!(stock.second, builder.second, "chain split diverges");
+    assert_eq!(
+        stock.tables.buf(),
+        adopted.tables.buf(),
+        "head grid tables diverge"
+    );
+    assert_eq!(
+        stock.tables.head_len(),
+        adopted.tables.head_len(),
+        "chain split diverges"
+    );
+    assert_eq!(
+        stock.tables.buf(),
+        builder.tables.buf(),
+        "builder head grid diverges"
+    );
+    assert_eq!(
+        stock.tables.head_len(),
+        builder.tables.head_len(),
+        "chain split diverges"
+    );
     assert_eq!(
         stock.seed_offset, adopted.seed_offset,
         "seed offset diverges"
@@ -603,7 +619,7 @@ fn chain_epoch_roll_resolves_floor_relative() {
     // the roll bar, where it is beyond every reach.
     driver.reset(crate::Level::Balanced);
     assert_eq!(driver.head_origin, 0);
-    assert!(driver.tables.iter().all(|&e| e == 0));
+    assert!(driver.tables.buf().iter().all(|&e| e == 0));
 }
 
 /// [`fast_epoch_advance`]'s floor choice: the streaming shape (window
@@ -1385,4 +1401,31 @@ fn dict_row_span_key_rules_the_small_payload_swap() {
         unknown_small.dict_row,
         "a 16 KiB dict keeps the unknown span armed"
     );
+}
+
+/// The owned window's poison wall must fire: a byte disturbed past the
+/// staged tail (the ASAN-blind overread footprint — the wall is the only
+/// witness) panics at the next checkpoint with the checkpoint named.
+/// Debug-only with the wall itself (`cargo test --release` compiles none
+/// of it).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "poison margin disturbed")]
+fn win_poison_wall_fires_on_a_past_tail_touch() {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024);
+    let tail = driver.block_tail();
+    tail[..8].copy_from_slice(b"aaaaaaaa");
+    driver.commit_block(8);
+    // Disturb one wall byte through the fill's own widen-write-shrink
+    // dance: the committed length stays untouched, exactly like a scan
+    // overreading past the block end through the slack.
+    let staged_end = driver.win_poison_at;
+    let committed = driver.win.len();
+    let wide = (staged_end + 2).min(driver.win.capacity());
+    // SAFETY: `wide` stays inside the capacity; the restore below shrinks
+    // back to the committed length.
+    unsafe { driver.win.set_len(wide) };
+    driver.win[staged_end + 1] = 0;
+    unsafe { driver.win.set_len(committed) };
+    driver.win_poison_assert("test");
 }

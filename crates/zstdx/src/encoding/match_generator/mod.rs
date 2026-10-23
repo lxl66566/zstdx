@@ -108,6 +108,12 @@ pub struct MatchGeneratorDriver {
     /// directly into the spare tail. Hugepage-backed once a far window
     /// grows it past [`HugeBuf`]'s threshold.
     win: HugeBuf<u8>,
+    /// Debug poison wall over `win`'s slack: the staged length whose
+    /// [`poison::MARGIN`]-wide past-the-end span is walled (see
+    /// [`Self::win_poison_fill`]); `usize::MAX` while no wall is up
+    /// (fresh state, after a clear/reallocation, borrowed windows).
+    #[cfg(debug_assertions)]
+    win_poison_at: usize,
     /// Direct-window mode: the window points into caller-owned memory
     /// instead of `win` (see [`MatchGeneratorDriver::adopt_window`]).
     ext: Option<ExtWindow>,
@@ -119,17 +125,9 @@ pub struct MatchGeneratorDriver {
     anchor: u64,
     /// Absolute start of the last committed block (for `get_last_space`).
     block_start: u64,
-    /// The fast/dfast/chain strategies' two tables in one allocation —
-    /// `tables[..second]` the head hash table, `tables[second..]` the
-    /// second table (the dfast short hash or the chain links; see
-    /// [`Strategy`]), u32 entries (see [`pack_pos`]). One buffer keeps a
-    /// single base pointer live in the scan loops: the second table's
-    /// accesses are displacements off it instead of a second hot pointer.
-    /// Hugepage-backed past [`HugeBuf`]'s threshold.
-    tables: HugeBuf<u32>,
-    /// Length of the head table inside `tables` (== `tables.len()` when
-    /// the strategy has no second table).
-    second: usize,
+    /// The fast/dfast/chain/row strategies' fused head+second table pair
+    /// (see [`HeadTables`]); the tree strategies keep it empty.
+    tables: HeadTables,
     /// The row strategy's per-row insertion heads (one byte per row,
     /// libzstd's `ZSTD_row_nextIndex` state): the byte names the slot the
     /// row's last insert took, the next insert takes its predecessor, so a
@@ -201,7 +199,7 @@ pub struct MatchGeneratorDriver {
     /// retiring all stale entries at read time instead of clearing.
     opt_origin: u64,
     /// Coordinate origin of the chain strategy's head entries (the opt
-    /// tables' scheme applied to `tables[..second]`): each strip prefill —
+    /// tables' scheme applied to the head table): each strip prefill —
     /// every MT job, including job zero's empty strip — advances it past
     /// every position the state has written since the last advance, so
     /// stale entries rebuild as beyond-reach distances at read time and
@@ -481,10 +479,9 @@ pub(super) const FAST_EPOCH_SPAN: u64 = 1 << 31;
 /// the whole strip fill.
 #[cfg(feature = "std")]
 pub(crate) struct StripSnapshot {
-    /// The fused head+chain buffer; the split matches the capturing
-    /// driver's `second`.
-    tables: HugeBuf<u32>,
-    second: usize,
+    /// The fused head+chain buffer with its split (the pair moves as one;
+    /// see [`HeadTables`]).
+    tables: HeadTables,
     ldm: Option<LdmSnapshot>,
     /// The builder's head coordinate origin: the adopted entries resolve
     /// against it, so the adopter must take it with the tables (its own
@@ -906,7 +903,7 @@ impl MatchGeneratorDriver {
     /// residue would otherwise alias as candidates.
     pub(crate) fn clear_parse_tables(&mut self) {
         if !self.tables.is_empty() {
-            clear_table(&mut self.tables);
+            clear_table(self.tables.buf_mut());
         }
         if matches!(self.params.strategy, Strategy::BtLazy(_)) {
             self.dubt_table.fill(0);
@@ -924,6 +921,8 @@ impl MatchGeneratorDriver {
         if seqs.is_empty() {
             // A zero-sequence block's literals are the block itself.
             // Direct field reads: the stats borrow keeps this disjoint.
+            // The window always holds the committed block, so the cursor
+            // pair cannot wrap.
             let start = (self.block_start - self.win_base) as usize;
             let win = window_slice(&self.win, self.ext.as_ref());
             stats.absorb_literals(&win[start..]);
@@ -960,6 +959,10 @@ impl MatchGeneratorDriver {
     /// (owned-window drivers only).
     pub(crate) fn staged_window(&self) -> &[u8] {
         debug_assert!(self.ext.is_none());
+        // Valid only between `block_tail` (which extends the length by
+        // `slice_size`) and the matching `commit_block`; the assert pins
+        // that contract against a wrapped slice start.
+        debug_assert!(self.win.len() >= self.slice_size);
         &self.win[self.win.len() - self.slice_size..]
     }
 
@@ -992,14 +995,15 @@ impl MatchGeneratorDriver {
         // ~1x data volume instead of once per block.
         Self {
             win: HugeBuf::with_capacity(2 * MAX_WINDOW + slice_size),
+            #[cfg(debug_assertions)]
+            win_poison_at: usize::MAX,
             ext: None,
             win_base: 0,
             pos: 0,
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: HugeBuf::zeroed(1usize << HASH_LOG),
-            second: 1usize << HASH_LOG,
+            tables: HeadTables::zeroed(1usize << HASH_LOG, 1usize << HASH_LOG),
             row_heads: Vec::new(),
             opt_table: HugeBuf::new(),
             bt: HugeBuf::new(),
@@ -1063,14 +1067,15 @@ impl MatchGeneratorDriver {
     pub fn new_direct() -> Self {
         Self {
             win: HugeBuf::new(),
+            #[cfg(debug_assertions)]
+            win_poison_at: usize::MAX,
             ext: None,
             win_base: 0,
             pos: 0,
             block_end: 0,
             anchor: 0,
             block_start: 0,
-            tables: HugeBuf::zeroed(1usize << HASH_LOG),
-            second: 1usize << HASH_LOG,
+            tables: HeadTables::zeroed(1usize << HASH_LOG, 1usize << HASH_LOG),
             row_heads: Vec::new(),
             opt_table: HugeBuf::new(),
             bt: HugeBuf::new(),
@@ -1165,19 +1170,19 @@ impl MatchGeneratorDriver {
     /// either).
     fn resize_tables(&mut self, params: &LevelParams) {
         let heads_len = 1usize << params.hash_log;
-        let heads_kept = self.second == heads_len;
-        // The fused buffer preserves the two-table keep/refresh
-        // semantics exactly: a kept head with a resized second table
-        // truncates and re-extends (resize zeroes only the new tail),
-        // which is today's fresh-second-table behavior; any head-size
-        // change drops the whole buffer like the old two allocations.
+        let heads_kept = self.tables.head_len() == heads_len;
+        // The fused buffer preserves the two-table keep/refresh semantics
+        // exactly through the pair's resize entries: a kept head with a
+        // resized second table truncates and re-extends (resize zeroes
+        // only the new tail), which is today's fresh-second-table
+        // behavior; any head-size change drops the whole buffer like the
+        // old two allocations.
         match params.strategy {
             Strategy::Fast => {
                 if !heads_kept {
-                    self.tables = HugeBuf::zeroed(heads_len);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, heads_len);
                 } else if self.tables.len() != heads_len {
-                    self.tables.truncate(heads_len);
+                    self.tables.rebuild_second(heads_len);
                 }
             },
             Strategy::Dfast(small_log) => {
@@ -1185,11 +1190,9 @@ impl MatchGeneratorDriver {
                 if heads_kept && self.tables.len() == total {
                     // both kept
                 } else if heads_kept {
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(total);
+                    self.tables.rebuild_second(total);
                 } else {
-                    self.tables = HugeBuf::zeroed(total);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, total);
                 }
             },
             Strategy::Chain(chain_log) => {
@@ -1197,11 +1200,9 @@ impl MatchGeneratorDriver {
                 if heads_kept && self.tables.len() == total {
                     // both kept
                 } else if heads_kept {
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(total);
+                    self.tables.rebuild_second(total);
                 } else {
-                    self.tables = HugeBuf::zeroed(total);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, total);
                 }
             },
             Strategy::Row(row_log) => {
@@ -1217,20 +1218,22 @@ impl MatchGeneratorDriver {
                 let rows_kept = matches!(self.params.strategy, Strategy::Row(_))
                     && self.row_heads.len() == rows;
                 if !rows_kept {
-                    self.tables = HugeBuf::zeroed(heads_len);
-                    self.second = heads_len;
+                    self.tables.rebuild(heads_len, heads_len);
                     self.row_heads = alloc::vec![0u8; rows];
                 } else if self.tables.len() != heads_len {
                     // `rows_kept` diverges from `heads_kept` here: two row
                     // levels can share a row count at different hash logs
                     // (the source-length clamp shrinks the head table one
                     // log per row_log step), so this branch resizes the
-                    // head span while `second` still names the old one — a
-                    // stale larger `second` later slices past the buffer
-                    // (the fast family's heads-kept truncate cannot grow).
-                    self.second = heads_len;
-                    self.tables.truncate(heads_len);
-                    self.tables.resize_zeroed(heads_len);
+                    // head span while the buffer still names the old one —
+                    // the split and the buffer move together inside
+                    // `rehead`, or a stale larger span would later slice
+                    // past the buffer (the fast family's heads-kept
+                    // truncate cannot grow). The const pair walk in
+                    // `params.rs` (`LADDER_ROW_COLLISIONS`, currently 132)
+                    // pins every such collision over the whole ladder
+                    // grid, so an edit that adds one fails the build.
+                    self.tables.rehead(heads_len);
                     self.row_heads.truncate(rows);
                     self.row_heads.resize(rows, 0);
                 }
@@ -1252,8 +1255,7 @@ impl MatchGeneratorDriver {
                         Vec::new()
                     };
                 }
-                self.tables = HugeBuf::new();
-                self.second = 0;
+                self.tables = HeadTables::empty();
             },
             Strategy::BtLazy(knobs) => {
                 if self.dubt_table.len() != 1usize << params.hash_log {
@@ -1265,8 +1267,7 @@ impl MatchGeneratorDriver {
                 self.opt_table = HugeBuf::new();
                 self.bt = HugeBuf::new();
                 self.hash3 = Vec::new();
-                self.tables = HugeBuf::new();
-                self.second = 0;
+                self.tables = HeadTables::empty();
             },
         }
         if !matches!(params.strategy, Strategy::Opt(_) | Strategy::BtLazy(_)) {
@@ -1284,10 +1285,10 @@ impl MatchGeneratorDriver {
         if matches!(params.strategy, Strategy::BtLazy(_)) && self.lazy_scratch.is_none() {
             self.lazy_scratch = Some(LazyScratch::new());
         }
-        // The head span always fits the buffer: every consumer slices
-        // `tables[..second]` unchecked-by-branch, and a pooled driver carries
-        // the pair across frames.
-        debug_assert!(self.second <= self.tables.len());
+        // The split invariant (`second <= buf.len()`) is [`HeadTables`]'s
+        // own: every geometry change above went through its resize
+        // entries, which move the pair together, so every consumer's
+        // unchecked span slice holds on a pooled driver across frames.
     }
 
     /// Size the search tables for `level` (no-op when unchanged), so pooled
@@ -1428,6 +1429,10 @@ impl MatchGeneratorDriver {
                 let need = 2 * params.window + self.slice_size;
                 if self.win.capacity() < need {
                     self.win.reserve(need - self.win.len());
+                    // A reallocation moves the walled span; the next
+                    // staging re-establishes it.
+                    #[cfg(debug_assertions)]
+                    self.win_poison_drop();
                 }
             }
         }
@@ -1596,6 +1601,10 @@ impl MatchGeneratorDriver {
         let content = &content[content.len() - keep..];
         self.win.clear();
         self.win.extend_from_slice(content);
+        // Borrowed window: no staging happens while ext is set, and the
+        // re-extension above moved the walled span.
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         self.win_base = 0;
         self.pos = keep as u64;
         self.anchor = keep as u64;
@@ -1715,7 +1724,7 @@ impl MatchGeneratorDriver {
                     // the previous family left (a kept dfast/row buffer
                     // would seed the head with foreign-layout entries on
                     // <= 8 KiB frames, where the logs clamp to 14).
-                    self.second = 0;
+                    self.tables.force_fresh();
                     self.resize_tables(&row);
                     self.params = row;
                 },
@@ -1853,7 +1862,6 @@ impl MatchGeneratorDriver {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
         StripSnapshot {
             tables: self.tables.clone(),
-            second: self.second,
             ldm: self.ldm.as_ref().map(LdmState::snapshot),
             origin: self.head_origin,
             upto,
@@ -1942,7 +1950,7 @@ impl MatchGeneratorDriver {
     pub(crate) fn adopt_strip_snapshot(&mut self, snap: &StripSnapshot, data: &[u8], base: u64) {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
         debug_assert_eq!(self.tables.len(), snap.tables.len());
-        debug_assert_eq!(self.second, snap.second);
+        debug_assert_eq!(self.tables.head_len(), snap.tables.head_len());
         debug_assert!(snap.upto <= base + data.len() as u64);
         self.dubt_head = HeadPhase::Off;
         self.bt_step = BtStepPhase::Off;
@@ -2043,7 +2051,7 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
         let hash_log = self.params.hash_log;
-        let (table, chain) = self.tables.split_at_mut(self.second);
+        let (table, chain) = self.tables.split();
         let chain_mask = chain.len() - 1;
         // The from-scratch loop runs idx = 0, 3, 6, ... while idx < last;
         // a prefix fill to `from` exited at the first aligned idx >=
@@ -2233,7 +2241,7 @@ impl MatchGeneratorDriver {
         } else {
             #[cfg(feature = "job_trace")]
             let trace_clear = std::time::Instant::now();
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             #[cfg(feature = "job_trace")]
             super::job_trace::add_clear(trace_clear);
             // The clear restarts the fast/dfast tables' coordinate epoch
@@ -2267,7 +2275,7 @@ impl MatchGeneratorDriver {
             self.dubt_stale = true;
         }
         if !matches!(self.params.strategy, Strategy::Chain(_)) {
-            self.tables[self.second..].fill(0);
+            self.tables.second_mut().fill(0);
         }
         // The strip (grid fill below, or nothing for opt) is the tables'
         // entire content: any gap a previous job left open ends here, and
@@ -2331,7 +2339,7 @@ impl MatchGeneratorDriver {
                 // twin is unreachable (see PREFILL_STRIDE). Positions ride
                 // the epoch shift set above the strategy arms.
                 let shift = self.fast_shift;
-                let table = &mut self.tables[..self.second];
+                let table = self.tables.heads_mut();
                 let log = self.params.hash_log;
                 match grid {
                     FillGrid::Strip => {
@@ -2368,7 +2376,7 @@ impl MatchGeneratorDriver {
                 // The short table keys 4-byte windows on dictionary frames
                 // (the scan's `MM4` row; see `dict_row`).
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split_at_mut(self.second);
+                let (long, small) = self.tables.split();
                 let mut idx = 0;
                 while idx < last {
                     // SAFETY: both hashes are masked to their tables' sizes.
@@ -2413,7 +2421,7 @@ impl MatchGeneratorDriver {
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split_at_mut(self.second);
+                let (table, chain) = self.tables.split();
                 let chain_mask = chain.len() - 1;
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
                 // strip cannot afford a dense fill). Dictionary: every
@@ -2497,7 +2505,7 @@ impl MatchGeneratorDriver {
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.as_mut_ptr();
+                let table = self.tables.buf_mut().as_mut_ptr();
                 let heads = self.row_heads.as_mut_ptr();
                 // Same geometry decision as the chain arm: the strip is a
                 // full window, so it takes the stride grid; dictionary
@@ -2708,8 +2716,8 @@ impl MatchGeneratorDriver {
         let filled = self.dict_tree_filled();
         DriverSeedImage {
             win: self.win.to_vec(),
-            tables: self.tables.to_vec(),
-            second: self.second,
+            tables: self.tables.buf().to_vec(),
+            second: self.tables.head_len(),
             row_heads: self.row_heads.clone(),
             probe: self.probe.clone(),
             // The skip shapes capture no tree bytes: their live content is
@@ -2876,12 +2884,9 @@ impl MatchGeneratorDriver {
         // is the never-taken safety net.
         self.win.clear();
         self.win.extend_from_slice(&image.win);
-        if self.tables.len() != image.tables.len() {
-            self.tables = HugeBuf::zeroed(image.tables.len());
-        }
-        if !image.tables.is_empty() {
-            self.tables.copy_from_slice(&image.tables);
-        }
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
+        self.tables.restore(&image.tables, image.second);
         if self.row_heads.len() == image.row_heads.len() {
             self.row_heads.copy_from_slice(&image.row_heads);
         } else {
@@ -2966,7 +2971,6 @@ impl MatchGeneratorDriver {
         self.block_end = image.block_end;
         self.anchor = image.anchor;
         self.block_start = image.block_start;
-        self.second = image.second;
         self.next_update = image.next_update;
         self.gap_start = image.gap_start;
         self.opt_origin = opt_origin;
@@ -3064,17 +3068,15 @@ impl Matcher for MatchGeneratorDriver {
         self.set_reach_choice(ReachChoice::Shrink);
         self.reset(level);
         if !self.tables.is_empty() {
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             // Same fresh-state contract for the row heads (see
             // fill_window_grid).
             self.row_heads.fill(0);
         }
-        if !self.tables[self.second..].is_empty()
-            && matches!(self.params.strategy, Strategy::Chain(_))
-        {
+        if !self.tables.second().is_empty() && matches!(self.params.strategy, Strategy::Chain(_)) {
             // The dfast small table doubles as `chain`; its strategies never
             // reach here, but the clear stays strategy-exact regardless.
-            self.tables[self.second..].fill(0);
+            self.tables.second_mut().fill(0);
         }
         self.probe.clear();
     }
@@ -3165,11 +3167,15 @@ impl Matcher for MatchGeneratorDriver {
         // un-rolled origins keep the don't-clear residue semantics
         // bit-exact.
         if matches!(self.params.strategy, Strategy::Chain(_)) && (self.head_origin as i64) < 0 {
-            clear_table(&mut self.tables[..self.second]);
+            clear_table(self.tables.heads_mut());
             self.head_origin = 0;
         }
         self.ext = None;
         self.win.clear();
+        // The cleared backing's wall span is stale; the frame's first
+        // staging re-establishes it.
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         self.win_base = 0;
         self.pos = 0;
         self.block_end = 0;
@@ -3252,6 +3258,12 @@ impl Matcher for MatchGeneratorDriver {
 
     fn block_tail(&mut self) -> &mut [u8] {
         debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
+        // Everything since the last staging (the parse, the last-space
+        // reads, the skip probes) read the window; none of it may have
+        // crossed the staged tail. Runs before the compaction below
+        // moves the bytes.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("block_tail entry");
         if self.win.len() + self.slice_size > self.win.capacity() {
             let keep = self.win.len().min(self.params.window);
             let drop = self.win.len() - keep;
@@ -3265,6 +3277,10 @@ impl Matcher for MatchGeneratorDriver {
         // written count to commit_block, which shrinks the length back to
         // exactly that, so the never-written tail bytes are never observed.
         unsafe { self.win.set_len(old + self.slice_size) };
+        // Wall the slack past the staged tail for the staging round and
+        // the parse that follows its commit.
+        #[cfg(debug_assertions)]
+        self.win_poison_fill();
         &mut self.win[old..]
     }
 
@@ -3274,6 +3290,13 @@ impl Matcher for MatchGeneratorDriver {
 
     fn commit_block(&mut self, read_bytes: usize) {
         debug_assert!(self.ext.is_none(), "commit_block is owned-window only");
+        // Pairs with the `block_tail` call that staged the tail slice; the
+        // assert pins that contract against a wrapped length.
+        debug_assert!(self.win.len() >= self.slice_size);
+        // The staged wall must be intact: the caller's tail writes and
+        // the pre-split decision stayed inside the staged tail.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("commit_block");
         let old_len = self.win.len() - self.slice_size;
         // SAFETY: the caller wrote read_bytes bytes into the tail slice
         // handed out by block_tail.
@@ -3320,6 +3343,296 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        self.start_matching_codes_inner(literals, seqs);
+        // The parse read the window up to the block end; the wall past
+        // the staged tail must be intact (the wrapper covers every
+        // return path of the body below).
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("start_matching_codes");
+    }
+
+    // Outlined on purpose: with the body inlined into `compress_fastest`
+    // the block loop's layout shifted and text.fastest lost 7% wall at
+    // +0.4% instructions (pure placement). One cold call per block.
+    #[inline(never)]
+    fn skip_if_incompressible(&mut self) -> bool {
+        let win = window_slice(&self.win, self.ext.as_ref());
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
+        let block = &win[(self.block_start - self.win_base) as usize..];
+        let total = block.len();
+        if total < GATE_MIN_BLOCK {
+            return false;
+        }
+        if self.probe.is_empty() {
+            self.probe.resize(1 << GATE_PROBE_LOG, 0);
+        }
+        let probe = &mut self.probe;
+        // Strided repeat probe: a hit means a colliding 47-bit content hash
+        // exists somewhere in the history sampled so far — near-certainly
+        // the same 8 bytes — so the block may be matchable and must not be
+        // gated. The odd stride avoids period locking against structured
+        // inputs. Any match region of a stride's length or more holds a
+        // sample, so only short sparse matches escape detection — those are
+        // worth under a percent of the block, the price the threshold below
+        // already accepted. A hit exits immediately: any single repeat
+        // keeps the whole block matchable.
+        //
+        // The same pass accumulates a sampled byte bitmap: distinct < 208
+        // (the literals gate's pre-screen bar) rules the entropy bar out
+        // outright, keeping low-alphabet corpora out of the exact histogram
+        // below.
+        let stride = (total >> 11) | 1;
+        let mut bitmap = [0u64; 4];
+        let mut i = 0usize;
+        // Micro-screen checkpoints: a block whose sampled distinct count is
+        // implausibly low for a max-entropy source (uniform bytes expect 57
+        // distinct at 64 samples, 221 at 512) sits far below the entropy
+        // bar — text-like alphabets (~70 symbols) and 16-letter skewed exit
+        // at the first or second checkpoint instead of paying the rest of
+        // the probe pass. Rejecting is always the conservative side, so the
+        // screens cannot mis-gate.
+        let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
+        while i + HASH_READ <= total {
+            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
+            let tag = h as u32;
+            if probe[slot] == tag {
+                self.gate_hold = false;
+                return false;
+            }
+            probe[slot] = tag;
+            let b = h as u8 as usize;
+            bitmap[b >> 6] |= 1 << (b & 63);
+            if i == screen1 {
+                screen1 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
+                    self.gate_hold = false;
+                    return false;
+                }
+            } else if i == screen2 {
+                screen2 = usize::MAX;
+                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
+                    self.gate_hold = false;
+                    return false;
+                }
+            }
+            i += stride;
+        }
+        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if distinct < 208 {
+            self.gate_hold = false;
+            return false;
+        }
+        // The sticky hold skips the exact pass on steady-state
+        // incompressible runs (see the field's risk model); the first block
+        // of every run always pays it.
+        if !self.gate_hold {
+            // Exact byte histogram (four lanes break the store-forward chain):
+            // the entropy decision must not ride on a sample's noise band —
+            // a block wrongly kept below the bar forces a full scan (plus the
+            // table catch-up fill), hundreds of times the histogram cost.
+            let mut lanes = [[0u32; 256]; 4];
+            let (chunks, remainder) = block.as_chunks::<4>();
+            for chunk in chunks {
+                lanes[0][chunk[0] as usize] += 1;
+                lanes[1][chunk[1] as usize] += 1;
+                lanes[2][chunk[2] as usize] += 1;
+                lanes[3][chunk[3] as usize] += 1;
+            }
+            for &b in remainder {
+                lanes[0][b as usize] += 1;
+            }
+            let total_f = total as f64;
+            let mut entropy_bits = 0.0f64;
+            let mut distinct = 0u32;
+            for (s, &c0) in lanes[0].iter().enumerate() {
+                let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
+                if c > 0 {
+                    distinct += 1;
+                    entropy_bits -=
+                        c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
+                }
+            }
+            // Miller-Madow bias correction, as in the literals entropy gate.
+            let bits_per_byte =
+                entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
+            // Well past the literals gate's reject floor: huffman on literals
+            // this dense saves under 0.4% before the table description, and the
+            // probe above already ruled out matches worth more.
+            if bits_per_byte < 7.97 {
+                return false;
+            }
+            self.gate_hold = true;
+        }
+        // Advance the cursors only. The opt strategies' tree fills the
+        // skipped range lazily from `next_update`; the table strategies
+        // open the gap at the block start, and the next scan's
+        // `catch_up_insertions` restores the block as match history before
+        // any probe reads the tables — so a later duplicate of a gated
+        // block still matches.
+        if self.gap_start == u64::MAX {
+            self.gap_start = self.block_start;
+        }
+        // Donation mode: a gated block's cost model is its own bytes as
+        // literals (the frame emits it raw). Runs before the cursor
+        // advance: the block borrow must not straddle the LDM fill call.
+        if let Some(stats) = &mut self.probe_stats {
+            stats.absorb_literals(block);
+        }
+        self.ldm_fill_block(LdmFill::Skipped);
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
+        true
+    }
+
+    fn skip_matching(&mut self) {
+        self.resolve_small_src_row();
+        self.resolve_row_attempts();
+        // Only called for RLE blocks so far: every 5-byte window in a
+        // uniform run hashes to the same slot, so indexing each byte just
+        // rewrites one table entry. The first position covers that slot;
+        // future probes into the run resolve through it or the repcode
+        // chain. The opt strategies skip even that: their tree fills
+        // lazily from `next_update`, which stays at the block start and
+        // covers the run on the next block's fill.
+        // The window holds the committed block, so the cursor pair cannot
+        // wrap.
+        let idx = (self.block_start - self.win_base) as usize;
+        let win = window_slice(&self.win, self.ext.as_ref());
+        if idx + HASH_READ <= win.len() {
+            match self.params.strategy {
+                Strategy::Opt(_) | Strategy::BtLazy(_) => {},
+                Strategy::Chain(_) => {
+                    // The head hash uses params.hash_log; the pattern's
+                    // payload is the chain-table log (they differ on rows
+                    // whose head table outsizes the chain table).
+                    let h = hash_at_width(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
+                    // SAFETY: h is masked to hash_log bits, the absolute block
+                    // start to the chain size (absolute key; see
+                    // emit_chain's note on the walk side's indexing).
+                    let (heads, chain) = self.tables.split();
+                    let chain_mask = chain.len() - 1;
+                    unsafe {
+                        let head = *heads.get_unchecked(h);
+                        *chain.get_unchecked_mut(self.block_start as usize & chain_mask) = head;
+                        *heads.get_unchecked_mut(h) = pack_head(self.block_start, self.head_origin);
+                    }
+                },
+                Strategy::Dfast(small_log) => {
+                    let hl = hash8_at_log(win, idx, self.params.hash_log);
+                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
+                    // SAFETY: both hashes masked to their tables' sizes.
+                    let (long, small) = self.tables.split();
+                    unsafe {
+                        let entry = pack_pos(self.block_start - self.fast_shift);
+                        *long.get_unchecked_mut(hl) = entry;
+                        *small.get_unchecked_mut(hs) = entry;
+                    }
+                },
+                Strategy::Fast => {
+                    insert_at(
+                        win,
+                        self.tables.heads_mut(),
+                        idx,
+                        self.block_start - self.fast_shift,
+                        self.params.hash_log,
+                    );
+                },
+                Strategy::Row(row_log) => {
+                    // Same single-insert policy as the chain arm: a uniform
+                    // run hashes every position to one row, and the newest
+                    // insert covers it.
+                    let h = row_hash_at(
+                        win,
+                        idx,
+                        self.params.hash_log,
+                        row_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
+                    let table = self.tables.buf_mut().as_mut_ptr();
+                    let heads = self.row_heads.as_mut_ptr();
+                    match row_log {
+                        4 => row_insert::<4>(table, heads, h, self.block_start),
+                        5 => row_insert::<5>(table, heads, h, self.block_start),
+                        _ => row_insert::<6>(table, heads, h, self.block_start),
+                    }
+                },
+            }
+        }
+        self.ldm_fill_block(LdmFill::Skipped);
+        self.pos = self.block_end;
+        self.anchor = self.block_end;
+        // The skip's window reads stayed inside the staged tail.
+        #[cfg(debug_assertions)]
+        self.win_poison_assert("skip_matching");
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// Debug poison wall over the owned window's staging slack: the
+    /// allocation past the staged tail is the ASAN-blind overread zone
+    /// (the R68 class survived exactly there), and `HugeBuf`'s deref
+    /// stops at the logical length, so the helper widens the length to
+    /// the capacity for the fill and shrinks it back. The wall always
+    /// sits past the STAGED length, never past the committed one: the
+    /// streaming core's carry convention keeps tail bytes past a
+    /// committed block alive into the next staging round (the next fill
+    /// reads in behind them), so only the span no caller may touch —
+    /// beyond the full staged tail — is walled. A full-block commit
+    /// lands the wall directly past the block end, where every parse
+    /// overread crosses it.
+    #[cfg(debug_assertions)]
+    fn win_poison_fill(&mut self) {
+        let len = self.win.len();
+        let wide = len.saturating_add(poison::MARGIN).min(self.win.capacity());
+        if wide > len {
+            // SAFETY: `wide` stays inside the capacity; the fill below
+            // writes the whole span, so no read ever sees it unwritten.
+            unsafe { self.win.set_len(wide) };
+            poison::fill_margin(&mut self.win, len);
+            unsafe { self.win.set_len(len) };
+        }
+        self.win_poison_at = len;
+    }
+
+    /// Assert the wall from the last [`Self::win_poison_fill`] intact;
+    /// `ctx` names this checkpoint so the panic localizes the offender.
+    #[cfg(debug_assertions)]
+    fn win_poison_assert(&mut self, ctx: &str) {
+        let at = self.win_poison_at;
+        if at == usize::MAX {
+            return;
+        }
+        let len = self.win.len();
+        debug_assert!(at >= len, "wall below the logical length");
+        let wide = at.saturating_add(poison::MARGIN).min(self.win.capacity());
+        if wide > at {
+            // SAFETY: `wide` stays inside the capacity, and the span was
+            // written by the fill — a disturbance is exactly what the
+            // check reports.
+            unsafe { self.win.set_len(wide) };
+            poison::assert_margin(&self.win, at, ctx);
+            unsafe { self.win.set_len(len) };
+        }
+    }
+
+    /// Drop the wall: a clear or reallocation moves or frees the walled
+    /// span (the bytes past a copied prefix come back unwritten), so the
+    /// next staging must re-establish it.
+    #[cfg(debug_assertions)]
+    fn win_poison_drop(&mut self) {
+        self.win_poison_at = usize::MAX;
+    }
+
+    /// [`Self::start_matching_codes`]'s body, split so the poison wall
+    /// check above runs on every return path.
+    fn start_matching_codes_inner(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         self.resolve_small_src_row();
         self.resolve_row_attempts();
         if self.head_block() {
@@ -3341,7 +3654,9 @@ impl Matcher for MatchGeneratorDriver {
             // tables restart in. The chain heads' epoch rollover rides the
             // same spot for the same reason; strips already roll at their
             // fill, so this trigger only covers the scan-side span (single
-            // frames on streaming and borrowed bulk windows).
+            // frames on streaming and borrowed bulk windows). The shift is
+            // only ever set to a value at/below the scan position (0, a
+            // fill base, an epoch floor), so the subtraction cannot wrap.
             if matches!(self.params.strategy, Strategy::Fast | Strategy::Dfast(_))
                 && self.pos - self.fast_shift > FAST_EPOCH_SPAN
             {
@@ -3507,8 +3822,8 @@ impl Matcher for MatchGeneratorDriver {
                                                         >(literals, seqs);
                             }
                         } else {
-                            let long_log = self.second.trailing_zeros();
-                            let small_log = (self.tables.len() - self.second).trailing_zeros();
+                            let long_log = self.tables.head_len().trailing_zeros();
+                            let small_log = self.tables.second_len().trailing_zeros();
                             match (self.ramp.is_armed(), long_log, small_log) {
                                 (false, 17, 16) => {
                                     self.start_matching_dfast::<false, false, 17, 16, $ldm>(
@@ -3617,224 +3932,6 @@ impl Matcher for MatchGeneratorDriver {
         self.absorb_probe_stats(literals, seqs);
     }
 
-    // Outlined on purpose: with the body inlined into `compress_fastest`
-    // the block loop's layout shifted and text.fastest lost 7% wall at
-    // +0.4% instructions (pure placement). One cold call per block.
-    #[inline(never)]
-    fn skip_if_incompressible(&mut self) -> bool {
-        let win = window_slice(&self.win, self.ext.as_ref());
-        let block = &win[(self.block_start - self.win_base) as usize..];
-        let total = block.len();
-        if total < GATE_MIN_BLOCK {
-            return false;
-        }
-        if self.probe.is_empty() {
-            self.probe.resize(1 << GATE_PROBE_LOG, 0);
-        }
-        let probe = &mut self.probe;
-        // Strided repeat probe: a hit means a colliding 47-bit content hash
-        // exists somewhere in the history sampled so far — near-certainly
-        // the same 8 bytes — so the block may be matchable and must not be
-        // gated. The odd stride avoids period locking against structured
-        // inputs. Any match region of a stride's length or more holds a
-        // sample, so only short sparse matches escape detection — those are
-        // worth under a percent of the block, the price the threshold below
-        // already accepted. A hit exits immediately: any single repeat
-        // keeps the whole block matchable.
-        //
-        // The same pass accumulates a sampled byte bitmap: distinct < 208
-        // (the literals gate's pre-screen bar) rules the entropy bar out
-        // outright, keeping low-alphabet corpora out of the exact histogram
-        // below.
-        let stride = (total >> 11) | 1;
-        let mut bitmap = [0u64; 4];
-        let mut i = 0usize;
-        // Micro-screen checkpoints: a block whose sampled distinct count is
-        // implausibly low for a max-entropy source (uniform bytes expect 57
-        // distinct at 64 samples, 221 at 512) sits far below the entropy
-        // bar — text-like alphabets (~70 symbols) and 16-letter skewed exit
-        // at the first or second checkpoint instead of paying the rest of
-        // the probe pass. Rejecting is always the conservative side, so the
-        // screens cannot mis-gate.
-        let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
-        while i + HASH_READ <= total {
-            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
-            let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
-            let tag = h as u32;
-            if probe[slot] == tag {
-                self.gate_hold = false;
-                return false;
-            }
-            probe[slot] = tag;
-            let b = h as u8 as usize;
-            bitmap[b >> 6] |= 1 << (b & 63);
-            if i == screen1 {
-                screen1 = usize::MAX;
-                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 32 {
-                    self.gate_hold = false;
-                    return false;
-                }
-            } else if i == screen2 {
-                screen2 = usize::MAX;
-                if bitmap.iter().map(|w| w.count_ones()).sum::<u32>() < 96 {
-                    self.gate_hold = false;
-                    return false;
-                }
-            }
-            i += stride;
-        }
-        let distinct: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
-        if distinct < 208 {
-            self.gate_hold = false;
-            return false;
-        }
-        // The sticky hold skips the exact pass on steady-state
-        // incompressible runs (see the field's risk model); the first block
-        // of every run always pays it.
-        if !self.gate_hold {
-            // Exact byte histogram (four lanes break the store-forward chain):
-            // the entropy decision must not ride on a sample's noise band —
-            // a block wrongly kept below the bar forces a full scan (plus the
-            // table catch-up fill), hundreds of times the histogram cost.
-            let mut lanes = [[0u32; 256]; 4];
-            let (chunks, remainder) = block.as_chunks::<4>();
-            for chunk in chunks {
-                lanes[0][chunk[0] as usize] += 1;
-                lanes[1][chunk[1] as usize] += 1;
-                lanes[2][chunk[2] as usize] += 1;
-                lanes[3][chunk[3] as usize] += 1;
-            }
-            for &b in remainder {
-                lanes[0][b as usize] += 1;
-            }
-            let total_f = total as f64;
-            let mut entropy_bits = 0.0f64;
-            let mut distinct = 0u32;
-            for (s, &c0) in lanes[0].iter().enumerate() {
-                let c = c0 + lanes[1][s] + lanes[2][s] + lanes[3][s];
-                if c > 0 {
-                    distinct += 1;
-                    entropy_bits -=
-                        c as f64 * crate::fse::fse_encoder::approx_log2(c as f64 / total_f);
-                }
-            }
-            // Miller-Madow bias correction, as in the literals entropy gate.
-            let bits_per_byte =
-                entropy_bits / total_f + (distinct as f64 - 1.0) * 0.7213_4752_0559_1157 / total_f;
-            // Well past the literals gate's reject floor: huffman on literals
-            // this dense saves under 0.4% before the table description, and the
-            // probe above already ruled out matches worth more.
-            if bits_per_byte < 7.97 {
-                return false;
-            }
-            self.gate_hold = true;
-        }
-        // Advance the cursors only. The opt strategies' tree fills the
-        // skipped range lazily from `next_update`; the table strategies
-        // open the gap at the block start, and the next scan's
-        // `catch_up_insertions` restores the block as match history before
-        // any probe reads the tables — so a later duplicate of a gated
-        // block still matches.
-        if self.gap_start == u64::MAX {
-            self.gap_start = self.block_start;
-        }
-        // Donation mode: a gated block's cost model is its own bytes as
-        // literals (the frame emits it raw). Runs before the cursor
-        // advance: the block borrow must not straddle the LDM fill call.
-        if let Some(stats) = &mut self.probe_stats {
-            stats.absorb_literals(block);
-        }
-        self.ldm_fill_block(LdmFill::Skipped);
-        self.pos = self.block_end;
-        self.anchor = self.block_end;
-        true
-    }
-
-    fn skip_matching(&mut self) {
-        self.resolve_small_src_row();
-        self.resolve_row_attempts();
-        // Only called for RLE blocks so far: every 5-byte window in a
-        // uniform run hashes to the same slot, so indexing each byte just
-        // rewrites one table entry. The first position covers that slot;
-        // future probes into the run resolve through it or the repcode
-        // chain. The opt strategies skip even that: their tree fills
-        // lazily from `next_update`, which stays at the block start and
-        // covers the run on the next block's fill.
-        let idx = (self.block_start - self.win_base) as usize;
-        let win = window_slice(&self.win, self.ext.as_ref());
-        if idx + HASH_READ <= win.len() {
-            match self.params.strategy {
-                Strategy::Opt(_) | Strategy::BtLazy(_) => {},
-                Strategy::Chain(_) => {
-                    // The head hash uses params.hash_log; the pattern's
-                    // payload is the chain-table log (they differ on rows
-                    // whose head table outsizes the chain table).
-                    let h = hash_at_width(
-                        win,
-                        idx,
-                        self.params.hash_log,
-                        ChainHashWidth::of(self.dict_row),
-                    );
-                    // SAFETY: h is masked to hash_log bits, the absolute block
-                    // start to the chain size (absolute key; see
-                    // emit_chain's note on the walk side's indexing).
-                    unsafe {
-                        let head = *self.tables.get_unchecked(h);
-                        let chain_mask = self.tables.len() - self.second - 1;
-                        *self.tables.get_unchecked_mut(
-                            self.second + (self.block_start as usize & chain_mask),
-                        ) = head;
-                        *self.tables.get_unchecked_mut(h) =
-                            pack_head(self.block_start, self.head_origin);
-                    }
-                },
-                Strategy::Dfast(small_log) => {
-                    let hl = hash8_at_log(win, idx, self.params.hash_log);
-                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
-                    // SAFETY: both hashes masked to their tables' sizes.
-                    unsafe {
-                        let entry = pack_pos(self.block_start - self.fast_shift);
-                        *self.tables.get_unchecked_mut(hl) = entry;
-                        *self.tables.get_unchecked_mut(self.second + hs) = entry;
-                    }
-                },
-                Strategy::Fast => {
-                    insert_at(
-                        win,
-                        &mut self.tables[..self.second],
-                        idx,
-                        self.block_start - self.fast_shift,
-                        self.params.hash_log,
-                    );
-                },
-                Strategy::Row(row_log) => {
-                    // Same single-insert policy as the chain arm: a uniform
-                    // run hashes every position to one row, and the newest
-                    // insert covers it.
-                    let h = row_hash_at(
-                        win,
-                        idx,
-                        self.params.hash_log,
-                        row_log,
-                        ChainHashWidth::of(self.dict_row),
-                    );
-                    let table = self.tables.as_mut_ptr();
-                    let heads = self.row_heads.as_mut_ptr();
-                    match row_log {
-                        4 => row_insert::<4>(table, heads, h, self.block_start),
-                        5 => row_insert::<5>(table, heads, h, self.block_start),
-                        _ => row_insert::<6>(table, heads, h, self.block_start),
-                    }
-                },
-            }
-        }
-        self.ldm_fill_block(LdmFill::Skipped);
-        self.pos = self.block_end;
-        self.anchor = self.block_end;
-    }
-}
-
-impl MatchGeneratorDriver {
     /// LDM-index a block the scan will not parse (incompressibility-gated,
     /// RLE-skipped, or parsed by the DUBT head): the bytes stay matchable
     /// far-distance history for later blocks, and the rolling hash stays
@@ -3886,6 +3983,8 @@ impl MatchGeneratorDriver {
         }
         self.ldm_checked = true;
         let win = window_slice(&self.win, self.ext.as_ref());
+        // The window holds the committed block, so the cursor pairs cannot
+        // wrap.
         let start = (self.block_start - self.win_base) as usize;
         let end = (self.block_end - self.win_base) as usize;
         if sampled_distinct(win, start, end) < LDM_SYMS_MIN {
@@ -3912,7 +4011,11 @@ impl MatchGeneratorDriver {
         }
         if won {
             self.ldm_quiet = 0;
-        } else if !self.ldm_dead && self.block_end - self.win_base > self.params.window as u64 {
+        } else if !self.ldm_dead
+            // The window holds the committed block, so the cursor pair
+            // cannot wrap.
+            && self.block_end - self.win_base > self.params.window as u64
+        {
             self.ldm_quiet += 1;
             if self.ldm_quiet >= LDM_QUIET {
                 self.ldm_dead = true;
@@ -3965,12 +4068,14 @@ impl MatchGeneratorDriver {
     /// tables will hold and within one span of the scan, which is all the
     /// truncated-entry resolve needs; the cleared entries are all beyond
     /// every strategy's match reach, so the rollover costs no candidate.
+    /// (The caller's `pos - fast_shift > FAST_EPOCH_SPAN` trigger holds
+    /// `pos` above the span, so the floor subtraction cannot wrap.)
     fn fast_epoch_advance(&mut self) {
         debug_assert!(matches!(
             self.params.strategy,
             Strategy::Fast | Strategy::Dfast(_)
         ));
-        clear_table(&mut self.tables);
+        clear_table(self.tables.buf_mut());
         self.fast_shift = self.win_base.max(self.pos - FAST_EPOCH_SPAN);
     }
 
@@ -3986,7 +4091,7 @@ impl MatchGeneratorDriver {
     /// empty sentinel's `q > reach` rejection exact.
     fn chain_epoch_roll(&mut self, floor: u64) {
         debug_assert!(matches!(self.params.strategy, Strategy::Chain(_)));
-        clear_table(&mut self.tables[..self.second]);
+        clear_table(self.tables.heads_mut());
         self.head_origin = floor.wrapping_neg();
     }
 
@@ -4023,8 +4128,12 @@ impl MatchGeneratorDriver {
         // (`last = len - HASH_READ; while idx < last`), so the tables come
         // back scan-equivalent up to that shared conservatism and never
         // past the coverage the window guarantees.
+        // The window holds the committed block, so `block_start >= win_base`
+        // and the subtraction cannot wrap.
         let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
         let win = window_slice(&self.win, self.ext.as_ref());
+        // `from` is floored at `win_base` above, so the index derivation
+        // cannot wrap.
         let mut idx = (from - win_base) as usize;
         // The fast/dfast inserts ride their tables' coordinate epoch
         // (`fast_shift`; zero on chain/row states, which never set it).
@@ -4035,7 +4144,7 @@ impl MatchGeneratorDriver {
                 while idx < to {
                     insert_at(
                         win,
-                        &mut self.tables[..self.second],
+                        self.tables.heads_mut(),
                         idx,
                         win_base + idx as u64 - shift,
                         log,
@@ -4046,7 +4155,7 @@ impl MatchGeneratorDriver {
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split_at_mut(self.second);
+                let (long, small) = self.tables.split();
                 while idx < to {
                     // SAFETY: both hashes are masked to their tables' sizes
                     // (same pair as the dfast prefill).
@@ -4061,7 +4170,7 @@ impl MatchGeneratorDriver {
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split_at_mut(self.second);
+                let (table, chain) = self.tables.split();
                 let chain_mask = chain.len() - 1;
                 let origin = self.head_origin;
                 while idx < to {
@@ -4081,7 +4190,7 @@ impl MatchGeneratorDriver {
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.as_mut_ptr();
+                let table = self.tables.buf_mut().as_mut_ptr();
                 let heads = self.row_heads.as_mut_ptr();
                 while idx < to {
                     let h = row_hash_at(win, idx, hash_log, row_log, width);
@@ -4110,6 +4219,7 @@ mod parse_fast;
 mod parse_opt;
 mod parse_row;
 mod price;
+mod range;
 mod tables;
 #[cfg(test)]
 mod tests;
@@ -4128,6 +4238,10 @@ use params::{
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
+use range::IdxRange;
+
+#[cfg(debug_assertions)]
+use super::poison;
 
 /// Whether `level`/`shape` names a fast/dfast LDM row whose stock window
 /// sits below the far domain — the population the pre-header far-class
@@ -4210,7 +4324,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && a.ramp == b.ramp
         && a.chain_filled == b.chain_filled
         && a.opt_state == b.opt_state
-        && a.second == b.second
+        && a.tables.head_len() == b.tables.head_len()
         && a.ext.is_none()
         && b.ext.is_none()
         && a.probe_stats.is_none()
@@ -4246,8 +4360,8 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
     // is position-keyed: only the dictionary's own slots are written
     // (a fresh state holds zeros in the rest; residue there is
     // unreachable).
-    let tables = a.tables[..a.second] == b.tables[..b.second] && {
-        let (ring_a, ring_b) = (&a.tables[a.second..], &b.tables[b.second..]);
+    let tables = a.tables.heads() == b.tables.heads() && {
+        let (ring_a, ring_b) = (a.tables.second(), b.tables.second());
         let written = (a.pos as usize).min(ring_a.len());
         ring_a.len() == ring_b.len() && ring_a[..written] == ring_b[..written]
     };

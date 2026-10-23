@@ -398,8 +398,9 @@ impl RowEmit<'_> {
         if from >= end_abs {
             return self.win_base + match_end as u64;
         }
+        let span = IdxRange::new(from, end_abs);
         let mut seg_end = end_abs;
-        if end_abs - from > 384 {
+        if span.len() > 384 {
             seg_end = from + 96;
         }
         let mut p = from;
@@ -469,6 +470,12 @@ impl RowEmit<'_> {
                 row_insert_fill::<ROW_LOG>(self.table, self.heads, h, pos);
             }
             pos = self.emit::<ROW_LOG>(win, pos, pidx, ml, 1, rep);
+            // The emit's literal advance can push the cursor past the
+            // bound; the clamp keeps the loop-bar subtraction above
+            // wrap-free — the naked wrap re-enters the loop with a huge
+            // span and keeps emitting past the block (the R68 rep-tail
+            // class).
+            pos = pos.min(block_end);
         }
         pos
     }
@@ -497,13 +504,16 @@ impl MatchGeneratorDriver {
         let dict_row = self.dict_row;
         let width = ChainHashWidth::of(dict_row);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
+        // The span end is trivially at/after its start; tiny first blocks
+        // never reach an emit, so the bound is never consulted when
+        // `win.len() < HASH_READ`.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // SAFETY: the scan's table/tag accesses go through raw pointers
         // (the fast loop's SROA note); derived here, before the emit
         // context below takes its borrow, and never resized during the
         // scan. The emit helpers write through the same pointers at call
         // sites where the loop holds no conflicting borrow.
-        let table_ptr: *mut u32 = self.tables.as_mut_ptr();
+        let table_ptr: *mut u32 = self.tables.buf_mut().as_mut_ptr();
         let heads_ptr: *mut u8 = self.row_heads.as_mut_ptr();
         let mut emit = RowEmit {
             table: table_ptr,
@@ -592,6 +602,8 @@ impl MatchGeneratorDriver {
             // never pay). Mirrors the chain loop's twin block.
             let mut seed_hit = false;
             if $gated && seed_offset != 0 {
+                // Wraps huge when the seed offset reaches past pos or below
+                // the window floor; the `ci < idx` compare rejects both.
                 let ci = (pos - seed_offset as u64 - win_base) as usize;
                 // The rep probe may have advanced `pos` one byte past this
                 // iteration's `idx`; a seed offset of exactly one then
@@ -789,7 +801,11 @@ impl MatchGeneratorDriver {
             };
         }
         // Seeded phase: job starts only; each emit re-checks convergence
-        // at the head, and the values only ever wind down.
+        // at the head, and the values only ever wind down. Both bars hold
+        // `pos` inside `[win_base, block_end - HASH_READ]` for the whole
+        // body, so every naked `block_end - pos` / `pos - win_base` /
+        // `anchor - win_base` derivation below is wrap-free by the bar
+        // (pos only grows, from `self.pos >= win_base`).
         'seeded: while (rep_pending != 0 || seed_offset != 0)
             && block_end.saturating_sub(pos) >= hash_read
         {
