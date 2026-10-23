@@ -78,6 +78,61 @@ pub(super) struct LevelParams {
     pub(super) small_src: bool,
 }
 
+/// `Ord::min`/`max`/`clamp` are trait methods of a non-const trait, so
+/// the const ladder geometry below cannot call them; these inherent
+/// forms carry the same semantics for the const-callable ladder paths.
+const fn min_u32(a: u32, b: u32) -> u32 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+const fn max_u32(a: u32, b: u32) -> u32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+const fn max_u64(a: u64, b: u64) -> u64 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+const fn min_usize(a: usize, b: usize) -> usize {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+const fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+const fn clamp_u32(v: u32, lo: u32, hi: u32) -> u32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
 const fn fast(hash_log: u32, window: usize) -> LevelParams {
     LevelParams {
         hash_log,
@@ -626,8 +681,8 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     opt(22, 1 << 26, knobs(8, 999, 3, 24, true)),
 ];
 
-fn params_for_level(level: Level) -> LevelParams {
-    LEVEL_PARAMS[level.as_i32().clamp(0, 22) as usize]
+const fn params_for_level(level: Level) -> LevelParams {
+    LEVEL_PARAMS[clamp_i32(level.as_i32(), 0, 22) as usize]
 }
 
 /// Upper bound of the small-input policy band: libzstd's small-src
@@ -720,7 +775,7 @@ pub(crate) fn row_attempts_light(head: &[u8]) -> bool {
 /// (the greedy row converts worst per step, lazy2 best), spent against
 /// the band's 4.8-16% json density lead: l5 lands at -4.8% bytes vs
 /// zstd-5 and x1.29, l8-l12 at -16% and x1.19-1.25.
-fn row_light_search_depth(level: i32) -> Option<u32> {
+const fn row_light_search_depth(level: i32) -> Option<u32> {
     match level {
         5 => Some(2),
         6 => Some(3),
@@ -736,7 +791,7 @@ pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
     params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock)
 }
 
-pub(super) fn params_for_row(
+pub(super) const fn params_for_row(
     level: Level,
     shape: InputShape,
     row: SmallSrcRow,
@@ -744,7 +799,7 @@ pub(super) fn params_for_row(
 ) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
-        p.window = 1usize << wl.clamp(10, 27);
+        p.window = 1usize << clamp_u32(wl, 10, 27);
     }
     p.small_src = matches!(shape.len, Some(n) if n <= SMALL_SRC_MAX);
     // Small-input policy for the balanced tier (libzstd's <= 16 KiB table
@@ -756,7 +811,7 @@ pub(super) fn params_for_row(
     // a head verdict (`row`): the 64K-128K band pays the row's
     // per-position cost at 2-4x for none of that size on the
     // low-alphabet classes (see [`SmallSrcRow`]).
-    if row == SmallSrcRow::Btlazy && p.small_src && matches!(level.as_i32(), 9 | 10) {
+    if matches!(row, SmallSrcRow::Btlazy) && p.small_src && matches!(level.as_i32(), 9 | 10) {
         let mut p = adjust_params(btlazy(17, 1 << 17, bt_knobs(5, 16)), shape.len);
         // The replacement row's constructor defaults the flag to
         // false; the frame IS small — the downstream small-src gates
@@ -776,12 +831,12 @@ pub(super) fn params_for_row(
     // Light verdict takes the reduced candidate budget. Pure queries
     // never resolve a verdict, so headers and strip geometry keep the
     // stock row.
-    if attempts == RowAttempts::Light
-        && let Some(depth) = row_light_search_depth(level.as_i32())
-    {
-        p.search_depth = depth;
+    if let RowAttempts::Light = attempts {
+        if let Some(depth) = row_light_search_depth(level.as_i32()) {
+            p.search_depth = depth;
+        }
     }
-    if level == Level::Uncompressed {
+    if level.as_i32() == 0 {
         p
     } else {
         adjust_params(p, shape.len)
@@ -794,34 +849,38 @@ pub(super) fn params_for_row(
 /// the hash tables to windowLog+1, the chain/ring cycle to windowLog.
 /// `None` (unknown size) keeps the row untouched, like libzstd's
 /// ZSTD_CONTENTSIZE_UNKNOWN.
-fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
-    let Some(n) = src.filter(|&n| n > 0) else {
-        return p;
+const fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
+    let n = match src {
+        Some(n) if n > 0 => n,
+        _ => return p,
     };
     // srcLog = ceil(log2(max(n, 2^HASHLOG_MIN))), floored at the frame
     // format's minimum window log.
-    let t = n.max(1u64 << 6);
-    let src_log = (64 - (t - 1).leading_zeros()).max(10);
+    let t = max_u64(n, 1 << 6);
+    let src_log = max_u32(64 - (t - 1).leading_zeros(), 10);
     // Non-power-of-two windows (the Fastest row's 768 KiB) round up.
-    let wlog = (64 - (p.window as u64 - 1).leading_zeros()).min(src_log);
+    let wlog = min_u32(64 - (p.window as u64 - 1).leading_zeros(), src_log);
     p.window = 1usize << wlog;
-    p.chain_reach = p.chain_reach.map(|r| r.min(p.window));
-    p.hash_log = p.hash_log.min(wlog + 1);
+    p.chain_reach = match p.chain_reach {
+        Some(r) => Some(min_usize(r, p.window)),
+        None => None,
+    };
+    p.hash_log = min_u32(p.hash_log, wlog + 1);
     p.strategy = match p.strategy {
-        Strategy::Dfast(small) => Strategy::Dfast(small.min(wlog + 1)),
-        Strategy::Chain(c) => Strategy::Chain(c.min(wlog)),
+        Strategy::Dfast(small) => Strategy::Dfast(min_u32(small, wlog + 1)),
+        Strategy::Chain(c) => Strategy::Chain(min_u32(c, wlog)),
         // The row layout is size-invariant: rel_row + entries lands below
         // 2^hash_log for any row_log (the hash width shrinks with it), so
         // only a degenerate row_log at or above hash_log needs the clamp.
-        Strategy::Row(rl) => Strategy::Row(rl.min(wlog)),
+        Strategy::Row(rl) => Strategy::Row(min_u32(rl, wlog)),
         Strategy::Opt(mut knobs) => {
-            knobs.bt_log = knobs.bt_log.min(wlog);
-            knobs.hash3_log = knobs.hash3_log.min(wlog);
+            knobs.bt_log = min_u32(knobs.bt_log, wlog);
+            knobs.hash3_log = min_u32(knobs.hash3_log, wlog);
             Strategy::Opt(knobs)
         },
         Strategy::BtLazy(mut knobs) => {
-            knobs.bt_log = knobs.bt_log.min(wlog);
-            knobs.hash3_log = knobs.hash3_log.min(wlog);
+            knobs.bt_log = min_u32(knobs.bt_log, wlog);
+            knobs.hash3_log = min_u32(knobs.hash3_log, wlog);
             Strategy::BtLazy(knobs)
         },
         Strategy::Fast => Strategy::Fast,
@@ -897,3 +956,124 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
         shape.len,
     ))
 }
+
+/// Walk the whole reachable ladder grid and check every geometry relation
+/// the matcher's table sizing relies on, returning the count of
+/// same-row-count/different-head-span row-level pairs found (the R68
+/// rows-kept lockstep precondition — see `resize_tables`'s Row arm).
+///
+/// The grid is the full cross product the runtime can reach through
+/// `params_for_row`: every level 0..=22, every head-verdict axis
+/// (`SmallSrcRow` × `RowAttempts`), and every source-length cell that
+/// changes the geometry — `Some(1 << src_log)` for src_log 10..=27 (the
+/// exact powers of two, whose `ceil_log2` is the log itself) plus the
+/// unknown-length cell (the untouched ladder row). A forced window log
+/// adds no cell: with a known length it reduces to the
+/// `src_log = min(wlog, src_log)` cell below, and with an unknown length
+/// the length adjustment returns early and the tables keep the pure
+/// ladder row.
+///
+/// Relations proven per cell (a violation fails the build):
+/// - `hash_log` stays within 10..=30, so `1 << hash_log` fits a usize head span on every target;
+/// - a row row keeps `row_log < hash_log` (the row layout's rel_row + entries address below the
+///   head span; a degenerate row_log at or above hash_log would collapse the rows to one and break
+///   the scan's row extraction), and its row count is a power of two that exactly partitions the
+///   head span (`rows * (1 << row_log) == 1 << hash_log`);
+/// - a dfast row keeps its short-table log at or below the head log.
+///
+/// The pair walk then covers the pooled-driver transition the R68 bug #3
+/// class rode: for every pair of row levels at the same cell with equal
+/// row counts but different head spans, the rows-kept branch must rehead
+/// the fused buffer — both spans are powers of two, so the
+/// truncate/zero-extend lands exactly, and the row-heads count is
+/// unchanged. The count is pinned by [`LADDER_ROW_COLLISIONS`] below, so
+/// a ladder edit that adds or removes a collision fails the build and
+/// forces a re-verification of the lockstep branch.
+const fn prove_ladder_geometry() -> usize {
+    const VARIANTS: [(SmallSrcRow, RowAttempts); 4] = [
+        (SmallSrcRow::Btlazy, RowAttempts::Stock),
+        (SmallSrcRow::Stock, RowAttempts::Stock),
+        (SmallSrcRow::Btlazy, RowAttempts::Light),
+        (SmallSrcRow::Stock, RowAttempts::Light),
+    ];
+    let mut collisions = 0usize;
+    let mut variant = 0usize;
+    while variant < VARIANTS.len() {
+        let (row, attempts) = VARIANTS[variant];
+        let mut src_log = 10u32;
+        while src_log <= 28 {
+            // src_log 28 is the unknown-length cell: `None` keeps the
+            // ladder row untouched, which the length-clamped cells
+            // converge to as the source grows past every table.
+            let shape = if src_log == 28 {
+                InputShape {
+                    len: None,
+                    window_log: None,
+                }
+            } else {
+                InputShape {
+                    len: Some(1u64 << src_log),
+                    window_log: None,
+                }
+            };
+            // The cell's row-family geometry, for the pair walk below.
+            let mut heads = [0usize; 23];
+            let mut rows = [0usize; 23];
+            let mut row_levels = 0usize;
+            let mut level = 0i32;
+            while level <= 22 {
+                let p = params_for_row(Level::from_zstd(level), shape, row, attempts);
+                assert!(p.hash_log >= 10 && p.hash_log <= 30, "hash_log out of span");
+                match p.strategy {
+                    Strategy::Row(rl) => {
+                        assert!(rl < p.hash_log, "row_log at/above hash_log");
+                        // Every row_log dispatch site instantiates
+                        // 4/5/6 (anything else falls to the 6 arm).
+                        assert!(rl >= 4 && rl <= 6, "row_log outside the instantiated set");
+                        let cell_rows = 1usize << (p.hash_log - rl);
+                        assert!(
+                            cell_rows * (1usize << rl) == 1usize << p.hash_log,
+                            "rows do not partition the head span"
+                        );
+                        assert!(cell_rows.is_power_of_two() && cell_rows >= 2);
+                        heads[row_levels] = 1usize << p.hash_log;
+                        rows[row_levels] = cell_rows;
+                        row_levels += 1;
+                    },
+                    Strategy::Dfast(small) => {
+                        assert!(small <= p.hash_log, "dfast short table above the head");
+                    },
+                    _ => {},
+                }
+                level += 1;
+            }
+            // Pair walk: the rows-kept lockstep transitions.
+            let mut i = 0usize;
+            while i < row_levels {
+                let mut j = i + 1;
+                while j < row_levels {
+                    if rows[i] == rows[j] && heads[i] != heads[j] {
+                        collisions += 1;
+                        assert!(heads[i].is_power_of_two() && heads[j].is_power_of_two());
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+            src_log += 1;
+        }
+        variant += 1;
+    }
+    collisions
+}
+
+/// The pinned [`prove_ladder_geometry`] collision count: every entry is a
+/// row-level pair whose pooled-driver transition takes the rows-kept
+/// rehead branch. A ladder edit that moves this number fails the build —
+/// re-verify the lockstep branch in `resize_tables` (the R68 bug #3
+/// precondition: same row count at different hash logs).
+const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
+const _: () = assert!(
+    LADDER_ROW_COLLISIONS == 132,
+    "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
+);

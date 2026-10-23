@@ -1229,7 +1229,10 @@ impl MatchGeneratorDriver {
                     // the split and the buffer move together inside
                     // `rehead`, or a stale larger span would later slice
                     // past the buffer (the fast family's heads-kept
-                    // truncate cannot grow).
+                    // truncate cannot grow). The const pair walk in
+                    // `params.rs` (`LADDER_ROW_COLLISIONS`, currently 132)
+                    // pins every such collision over the whole ladder
+                    // grid, so an edit that adds one fails the build.
                     self.tables.rehead(heads_len);
                     self.row_heads.truncate(rows);
                     self.row_heads.resize(rows, 0);
