@@ -4128,9 +4128,9 @@ impl MatchGeneratorDriver {
         // (`last = len - HASH_READ; while idx < last`), so the tables come
         // back scan-equivalent up to that shared conservatism and never
         // past the coverage the window guarantees.
-        let to = IdxRange::new(win_base, block_start.max(win_base))
-            .len()
-            .saturating_sub(HASH_READ as u64) as usize;
+        // The window holds the committed block, so `block_start >= win_base`
+        // and the subtraction cannot wrap.
+        let to = ((block_start - win_base) as usize).saturating_sub(HASH_READ);
         let win = window_slice(&self.win, self.ext.as_ref());
         // `from` is floored at `win_base` above, so the index derivation
         // cannot wrap.

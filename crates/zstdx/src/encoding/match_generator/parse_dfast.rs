@@ -66,13 +66,15 @@ impl MatchGeneratorDriver {
         ramp.start = ramp.start.saturating_sub(shift);
         ramp.end = ramp.end.saturating_sub(shift);
         let block_end = self.block_end - shift;
-        let block_len = IdxRange::new(win_base, block_end).len() as usize;
+        // The window holds the committed block, so `block_end >= win_base`
+        // and the subtraction cannot wrap.
+        let block_len = (block_end - win_base) as usize;
         // Probing hashes 8 bytes, so the last probeable window index; the
         // insert bound coincides with it (the window ends at the block), so
-        // one shared limit serves both. The tighter of the block and
-        // window spans minus the margin (min(a - m, b - m) == min(a, b) - m
-        // under saturating subtraction).
-        let limit_idx = block_len.min(win.len()).saturating_sub(HASH_READ);
+        // one shared limit serves both.
+        let limit_idx = block_len
+            .saturating_sub(HASH_READ)
+            .min(win.len().saturating_sub(HASH_READ));
         let insert_max_idx = limit_idx;
         // Armed frames keep the stock scan domain through `chain_reach`
         // (the widened window is the far domain); stock frames have none.

@@ -44,7 +44,10 @@ impl MatchGeneratorDriver {
         let dict_row = self.dict_row;
         let width = ChainHashWidth::of(dict_row);
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
-        let insert_max = IdxRange::new(win_base, win_base + win.len() as u64).insert_max();
+        // The span end is trivially at/after its start; tiny first blocks
+        // never reach an emit, so the bound is never consulted when
+        // `win.len() < HASH_READ`.
+        let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
         // The scan's own table accesses go through a raw pointer (see the
         // fast loop's note on the same SROA failure); emits go through the
         // context. The chain-link reads share the pointer for the same
