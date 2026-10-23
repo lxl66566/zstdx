@@ -2054,7 +2054,16 @@ impl MtEncoderCore {
             {
                 self.resolve_probe(false);
             }
-            let end = self.job_end(self.job_start);
+            let mut end = self.job_end(self.job_start);
+            // A flush-regridded job_start sits mid-epoch, so its lattice-
+            // relative end can cross the epoch boundary past the buffered
+            // pos (posting it would encode bytes never staged). The walk
+            // in `build_bounds` clamps the same step to the epoch floor;
+            // on an untouched grid (job_start on the epoch lattice) the
+            // clamp is a no-op — a job never straddles an epoch.
+            if matches!(self.grid, JobGrid::Growing) {
+                end = end.min(self.growing_epoch_end(self.job_start));
+            }
             if !self.post_due(end) {
                 return;
             }
