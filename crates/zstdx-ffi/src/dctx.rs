@@ -525,7 +525,7 @@ impl DCtx {
         if output.pos == out_start && input.pos == in_start {
             // The between-frames state returns from before the reference
             // guard (its loadHeader shortcut); those calls never count.
-            let idle = self.stream.as_ref().is_some_and(|s| s.idle_done());
+            let idle = self.stream.as_ref().is_some_and(DStream::idle_done);
             if !idle {
                 self.no_forward += 1;
                 if self.no_forward >= NO_FORWARD_PROGRESS_MAX {

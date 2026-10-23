@@ -140,10 +140,9 @@ fn small_corpus_warns_like_zstd() {
         stderr.contains("!  Warning : data size of samples too small for target dictionary size "),
         "{stderr}"
     );
-    let cover_line = format!(
-        "WARNING: The maximum dictionary size 112640 is too large compared to the source size "
-    );
-    assert!(stderr.contains(&cover_line), "{stderr}");
+    let cover_line =
+        "WARNING: The maximum dictionary size 112640 is too large compared to the source size ";
+    assert!(stderr.contains(cover_line), "{stderr}");
 
     let out = run(&["--train", "-r", &samples, "-o", &dict, "-q"]);
     let stderr = String::from_utf8_lossy(&out.stderr);

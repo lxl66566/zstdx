@@ -723,15 +723,14 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         None => None,
     };
 
-    let filelist = match &cli.filelist {
-        Some(path) => match read_filelist(path) {
-            Ok(list) => list,
-            Err(_) => {
-                eprintln!("{PREFIX}error reading {} ", path.display());
-                return Exit::Failure;
-            },
-        },
-        None => Vec::new(),
+    let filelist = if let Some(path) = &cli.filelist {
+        let Ok(list) = read_filelist(path) else {
+            eprintln!("{PREFIX}error reading {} ", path.display());
+            return Exit::Failure;
+        };
+        list
+    } else {
+        Vec::new()
     };
 
     let mut inputs = Vec::new();
@@ -1280,14 +1279,14 @@ fn frame_eof(frame: &zstdx::decoding::errors::FrameDecoderError) -> bool {
                 DecompressBlockError::BlockContentReadError(source),
             ),
         ) => io_eof(source),
-        // Section headers that ran past the end of a truncated stream.
+        // Section headers that ran past the end of a truncated stream, or a
+        // skippable frame whose declared content ran past the input.
         FrameDecoderError::FailedToReadBlockBody(
             DecodeBlockContentError::DecompressBlockError(
                 DecompressBlockError::MalformedSectionHeader { .. },
             ),
-        ) => true,
-        // A skippable frame whose declared content ran past the input.
-        FrameDecoderError::FailedToSkipFrame => true,
+        )
+        | FrameDecoderError::FailedToSkipFrame => true,
         _ => false,
     }
 }
