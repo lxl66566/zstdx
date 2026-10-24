@@ -24,6 +24,10 @@ Two 32-bit overflows closed. `upper_bound`'s skippable-frame guard compared `8 +
 
 Both compat stream sides enforce libzstd's `ZSTD_d_windowLogMax` bounds (10..=31) through `ParameterError::WindowLogMaxOutOfRange`; the write side also gained the `started` flag, so its setter fails with `AlreadyStreaming` after the first write, matching the read side's lazy start. `EncoderOptions::workers` clamps to `MAX_WORKERS = 256`, `ZSTDMT_NBWORKERS_MAX` parity.
 
+### The finished guard covers both pump arms
+
+`pump_from` checked `is_finished`, but `pump`'s MT dispatch bypassed the check, so a finished MT core could re-enter `pump_direct` and trip its entry assert. The guard sits in `pump` ahead of both arms, and `pump_from` (whose only caller is `pump`) dropped its own copy.
+
 ## Open findings
 
 - The compat layer's bulk `Compressor` and `Decompressor` lack the parameter methods the zstd 0.13 crate gives them (`include_checksum`, `include_contentsize`, `window_log`, `multithread` on the encoder, `window_log_max` on the decoder); the compat stream types have them. The capability exists in `EncoderOptions`; only the bulk shapes are missing. Tracked in the [todo list](../todo.md).

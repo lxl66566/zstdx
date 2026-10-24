@@ -988,6 +988,12 @@ impl FrameEncoderCore {
         source: &mut impl crate::io::Read,
         chunk: &mut [u8],
     ) -> Result<()> {
+        // Both dispatch arms share the guard: a finished core would
+        // otherwise re-enter `finish` (ST) or trip the MT core's entry
+        // assert.
+        if self.is_finished() {
+            return Ok(());
+        }
         #[cfg(feature = "std")]
         {
             if let Self::Mt(core) = self {
@@ -1006,9 +1012,6 @@ impl FrameEncoderCore {
         source: &mut impl crate::io::Read,
         chunk: &mut [u8],
     ) -> Result<()> {
-        if self.is_finished() {
-            return Ok(());
-        }
         match source.read(chunk).map_err(Error::from) {
             Ok(0) => return self.finish(),
             Ok(n) => {
