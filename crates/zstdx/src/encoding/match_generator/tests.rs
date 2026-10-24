@@ -1429,3 +1429,53 @@ fn win_poison_wall_fires_on_a_past_tail_touch() {
     unsafe { driver.win.set_len(committed) };
     driver.win_poison_assert("test");
 }
+
+/// The small-src btlazy swap (levels 9/10, len <= 128 KiB) resolves under
+/// a user-forced window exactly like the ladder rows (R73): C applies the
+/// forced windowLog after the small-table pick
+/// (`ZSTD_getCParamsFromCCtxParams`: table -> `ZSTD_overrideCParams` ->
+/// adjustCParams), so the swap's declared window is the forced one with
+/// only the source clamp below it, and the swap's own geometry clamps to
+/// that final window. Pre-R73 the swap replaced the window wholesale,
+/// declaring 1<<17 under a forced w10.
+#[test]
+fn small_src_swap_honors_a_forced_window() {
+    use super::{RowAttempts, SmallSrcRow, Strategy, params_for_row};
+    let len = 100 * 1024u64;
+    for level in [9i32, 10] {
+        let forced = params_for_row(
+            crate::Level::from_zstd(level),
+            crate::InputShape {
+                len: Some(len),
+                window_log: Some(10),
+            },
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+        );
+        assert_eq!(forced.window, 1 << 10, "l{level}: declared window");
+        let wlog = 10u32;
+        match forced.strategy {
+            // The swap's bt ring and hash tables clamp under the window
+            // (clamp_geometry_to_window's relations, C's cycleLog/
+            // hashLog clamps).
+            Strategy::BtLazy(knobs) => {
+                assert!(knobs.bt_log <= wlog, "l{level}: bt_log {}", knobs.bt_log);
+            },
+            _ => panic!("l{level}: the swap must keep the btlazy row"),
+        }
+        assert!(forced.hash_log <= wlog + 1, "l{level}: hash above wlog+1");
+        // Control: without a forced window the swap keeps its own
+        // geometry (window min(17, srcLog) — byte-identical to the
+        // pre-R73 swap).
+        let stock = params_for_row(
+            crate::Level::from_zstd(level),
+            crate::InputShape {
+                len: Some(len),
+                window_log: None,
+            },
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+        );
+        assert_eq!(stock.window, 1 << 17, "l{level}: stock swap window");
+    }
+}

@@ -41,7 +41,7 @@
 - [R68 · Encoder edges](dev/review/encparity.md)
 - [R69 · Encode-path hardening](dev/review/hardening.md)
 - [R70 · Optimal parser](dev/review/opt.md)
-- [R72 · Window semantics](dev/review/winsem.md)
+- [R72/R73 · Window semantics](dev/review/winsem.md)
 
 ## Performance Optimization
 

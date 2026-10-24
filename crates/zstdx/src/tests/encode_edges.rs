@@ -405,6 +405,62 @@ fn forced_window_unpledged_streams() {
     }
 }
 
+/// Forced windows on the small-src btlazy swap (levels 9/10, len <= 128
+/// KiB, R73): the swap picks its own geometry on the known-length path
+/// and pre-R73 ignored the forced window there (declared 1<<17 under a
+/// forced w10 — legal but a fidelity deviation). C applies the user's
+/// windowLog after the small-table pick (`ZSTD_overrideCParams` inside
+/// `ZSTD_getCParamsFromCCtxParams`, then adjustCParams' source clamp),
+/// so the swap must resolve under the forced window exactly like the
+/// ladder rows: the header declares it, and the frame still
+/// reference-decodes. A wide-alphabet head keeps the swap's row
+/// (`small_src_btlazy_head`'s bar), so these cells pin the swap path
+/// itself.
+#[cfg(feature = "std")]
+#[test]
+fn forced_window_small_src_swap() {
+    let payload = shape("text", 100 * 1024);
+    let declared_window = |frame: &[u8]| {
+        crate::decoding::frame::read_frame_header(frame)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    };
+    for window_log in [10u32, 12] {
+        for level in [9i32, 10] {
+            let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level))
+                .with_input_shape(crate::InputShape::default().with_window_log(window_log));
+            let label = format!("w{window_log}/l{level}");
+            // Bulk: the known-length path the swap rides.
+            let bulk = crate::bulk::compress_with(&payload, &opts).unwrap();
+            assert_eq!(declared_window(&bulk), 1u64 << window_log, "{label}/bulk");
+            zstd::stream::decode_all(bulk.as_slice())
+                .unwrap_or_else(|e| panic!("{label}/bulk: reference decode failed: {e:?}"));
+            assert_eq!(
+                crate::bulk::decompress(&bulk, payload.len()).unwrap(),
+                payload
+            );
+            // Pledged stream twin: same declared window, same decode.
+            let mut sink = alloc::vec![];
+            {
+                use crate::io::Write;
+                let mut enc = crate::stream::write::Encoder::with_options(
+                    &mut sink,
+                    opts.clone().pledged_size(Some(payload.len() as u64)),
+                )
+                .unwrap();
+                enc.write_all(&payload).unwrap();
+                enc.finish().unwrap();
+            }
+            assert_eq!(declared_window(&sink), 1u64 << window_log, "{label}/stream");
+            zstd::stream::decode_all(&sink[..])
+                .unwrap_or_else(|e| panic!("{label}/stream: reference decode failed: {e:?}"));
+            assert_eq!(crate::stream::decode_all(&sink[..]).unwrap(), payload);
+        }
+    }
+}
+
 /// Dictionary frames at the tiny-payload edge (the first block ≤ 8 bytes
 /// class) and over the real `zstd --train` fixture: raw-content and
 /// formatted dictionaries, the id-suppressed form, single- and

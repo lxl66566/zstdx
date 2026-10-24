@@ -52,11 +52,12 @@ impl FrameHeader {
             && let Some(window_size) = header.window_size
         {
             let log = window_size.next_power_of_two().ilog2();
-            let exponent = if log > 10 {
-                log - 10
-            } else {
-                1
-            } as u8;
+            // C's byte: `(windowLog - ZSTD_WINDOWLOG_ABSOLUTEMIN) << 3`
+            // — exponent 0 (a 1<<10 window) is expressible and emitted,
+            // so a forced w10 declares 2^10 exactly, never one power up
+            // (the pre-R73 floor did; saturating covers the sub-floor
+            // test values, which the descriptor rounds up either way).
+            let exponent = log.saturating_sub(10) as u8;
             output.push(exponent << 3);
         }
 

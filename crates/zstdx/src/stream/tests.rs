@@ -1557,22 +1557,23 @@ mod mt {
     /// stream-side analog of the bulk `capture_job_size` clamp fix): a
     /// forced `with_window_log(25)` on a fast row widens the strip (the
     /// fast rows' strip IS the window) past the capture grid's 16 MiB
-    /// ceiling — the [32, 64) MiB far-class band reaches
-    /// `fast_capture_schedule` with a reach above the cap, which the
-    /// pre-fix floor clamp turned into a panic. The floor is now capped
-    /// at the ceiling (the R57 fix in `encoding::mt`, shared by this
-    /// path), and an explicit `Enable` stands the capture down with the
-    /// raised strip flooring the grid at one whole-source job instead.
-    /// Every shape must complete and decode.
+    /// ceiling. R73 made a forced window cap the far-class lattice (the
+    /// lift only raises an AUTO window), so Auto keeps the forced 2^25
+    /// with the capture stood down; the R57/R58 floor-cap class stays
+    /// exercised by the explicit `Enable` arms below, whose raised strip
+    /// floors the grid at one whole-source job instead. Every shape must
+    /// complete and decode.
     #[test]
     fn ldm_mode_stream_mt_raised_window_capture_grid() {
         let (data, _) = midband_fixture_with_random_twin();
         let raised = crate::InputShape::default().with_window_log(25);
 
-        // Auto + the forced window: the screen accepts, the capture arms
-        // past the forced window (a window descriptor is a maximum) onto
-        // the pinned lattice — the widened reach is exactly the shape the
-        // clamp fix guards.
+        // Auto + the forced window (R73): a user-forced windowLog caps
+        // the far-class lattice — the screen and capture stand down, the
+        // header keeps the forced 2^25 and the strip stays the forced
+        // window (the lift only raises an AUTO window; C's override
+        // order makes the forced value hard). Pre-R73 this widened the
+        // declared window to 2^26 on the screen's accept.
         let auto = stream_frame(
             &data,
             Level::Fastest,
@@ -1581,8 +1582,8 @@ mod mt {
             true,
             Some(raised),
         );
-        assert_eq!(frame_header_window(&auto), 1 << 26);
-        assert_both_decoders(&auto, &data, "raised-window armed stream");
+        assert_eq!(frame_header_window(&auto), 1 << 25);
+        assert_both_decoders(&auto, &data, "raised-window auto stream");
 
         // Enable + the forced window: the capture stands down; the 32 MiB
         // strip floors the grid at one whole-source job.

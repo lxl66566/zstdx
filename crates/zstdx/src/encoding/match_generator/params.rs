@@ -449,7 +449,10 @@ pub(crate) enum LdmArming {
     /// the fast rows' window widening reaches the mid-size band (declared
     /// length >= LDM_MIDSIZE_WINDOW) instead of requiring the full
     /// window — and an open-ended frame (no declared length, the
-    /// unpledged stream entry) widens on the accept alone.
+    /// unpledged stream entry) widens on the accept alone. A user-forced
+    /// windowLog never reaches here: the far-class lattice stands down
+    /// under one (the lift only raises an AUTO window, see
+    /// `fast_row_far_class`).
     FrameScreened,
     /// A multithreaded job: the table restarts per job, so only strip- and
     /// own-span-sourced candidates exist — the strip fill is an
@@ -812,7 +815,18 @@ pub(super) const fn params_for_row(
     // per-position cost at 2-4x for none of that size on the
     // low-alphabet classes (see [`SmallSrcRow`]).
     if matches!(row, SmallSrcRow::Btlazy) && p.small_src && matches!(level.as_i32(), 9 | 10) {
-        let mut p = adjust_params(btlazy(17, 1 << 17, bt_knobs(5, 16)), shape.len);
+        // A forced window rides the swap like every other row: C applies the
+        // user's windowLog AFTER the small-table pick
+        // (ZSTD_getCParamsFromCCtxParams: table -> ZSTD_overrideCParams ->
+        // adjustCParams), so the swap's declared window is the forced one
+        // (the source clamp below can only lower it further, and the
+        // geometry clamps to that final window exactly like the ladder
+        // rows' path).
+        let mut swapped = btlazy(17, 1 << 17, bt_knobs(5, 16));
+        if let Some(wl) = shape.window_log {
+            swapped.window = 1usize << clamp_u32(wl, 10, 27);
+        }
+        let mut p = adjust_params(swapped, shape.len);
         // The replacement row's constructor defaults the flag to
         // false; the frame IS small — the downstream small-src gates
         // (the btlazy tree's hash width screen) read it from the

@@ -676,7 +676,8 @@ pub(crate) fn dict_seed_key(
 ) -> DictSeedKey {
     // `apply_level`'s resolution: the stock verdicts resolve the row, the
     // Keep reach takes no shrink replacement, and the LDM switch runs its
-    // fast/dfast window split under the length bars.
+    // fast/dfast window split under the length bars (the lift only raises
+    // an AUTO window — a forced windowLog stands it down).
     let mut params = params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock);
     match ldm {
         crate::LdmMode::Auto => {},
@@ -702,7 +703,8 @@ pub(crate) fn dict_seed_key(
                 }
             },
             crate::LdmMode::Auto
-                if params.window < LDM_FULL_WINDOW
+                if shape.window_log.is_none()
+                    && params.window < LDM_FULL_WINDOW
                     && matches!(shape.len, Some(n) if n >= LDM_FULL_WINDOW as u64) =>
             {
                 params.chain_reach = Some(params.window.next_power_of_two());
@@ -1321,8 +1323,16 @@ impl MatchGeneratorDriver {
         // window/domain split. The length bar keeps every smaller frame's
         // header and parse byte-identical (the 32 MiB corpus population
         // included), and the arming-context check keeps unengaged MT jobs
-        // stock. A forced window at or past the far domain arms on its own
-        // geometry. R20: a frame-continuous caller that ran the pre-header
+        // stock. The lift only raises an AUTO window: a user-forced
+        // windowLog is a hard cap in C (the LDM default lift runs BEFORE
+        // `ZSTD_overrideCParams` in ZSTD_getCParamsFromCCtxParams, and
+        // adjustCParams never raises the window — the `--long=10`
+        // memory-bound shape), so a forced window at or past the far
+        // domain arms on its own geometry and one below it keeps the
+        // forced window (the far screens and capture windows stood down
+        // with it, see `fast_row_far_class`; this guard holds the
+        // length-driven Frame bar to the same rule). R20: a
+        // frame-continuous caller that ran the pre-header
         // far-class screen (`FrameScreened`, see
         // `fast_row_screen_pending`) arms the mid-size band too — the
         // screen, not the header-time geometry, separated the far-class
@@ -1380,7 +1390,8 @@ impl MatchGeneratorDriver {
                     }
                 },
                 crate::LdmMode::Auto
-                    if params.window < LDM_FULL_WINDOW
+                    if self.shape.window_log.is_none()
+                        && params.window < LDM_FULL_WINDOW
                         && match self.ldm_arming {
                             LdmArming::Frame => declared(LDM_FULL_WINDOW as u64),
                             LdmArming::FrameScreened => screened(LDM_MIDSIZE_WINDOW as u64),
@@ -4247,12 +4258,18 @@ use super::poison;
 /// sits below the far domain — the population the pre-header far-class
 /// screen (encoding::far_screen) serves. Every far-class arming context
 /// for these rows keys on this plus a declared-length bar (see
-/// `apply_level` and `far_screen::mt_capture_window`).
+/// `apply_level` and `far_screen::mt_capture_window`). A user-forced
+/// windowLog opts out: the window the lift would raise is the user's
+/// memory bound (C's override order — `ZSTD_getCParamsFromCCtxParams`
+/// applies the forced windowLog after the LDM default, and adjustCParams
+/// never raises it), so under one the whole far-class lattice (screens,
+/// capture windows) stands down exactly as under an explicit LDM switch.
 pub(crate) fn fast_row_far_class(level: Level, shape: InputShape) -> bool {
     let params = params_for(level, shape);
     params.ldm
         && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_))
         && params.window < LDM_FULL_WINDOW
+        && shape.window_log.is_none()
 }
 
 /// Whether a frame at `level`/`shape` should run the pre-header far-class

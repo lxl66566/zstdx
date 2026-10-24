@@ -1153,6 +1153,100 @@ fn long_distance_matching_disable_overrides_auto_arming() {
     );
 }
 
+/// A user-forced windowLog caps the far-class lift everywhere it can
+/// widen the DECLARED window (R73): the auto far-screen accept on an
+/// unpledged fast-row stream, the length-driven Frame bar, and the
+/// stream-mt capture re-serialization all stood down pre-R73 and declared
+/// 1<<26 over e.g. a forced w10 — legal frames, but C never widens past
+/// the user's value (`ZSTD_getCParamsFromCCtxParams` applies the forced
+/// windowLog AFTER the LDM default lift, and `--long=N` sets exactly
+/// that), so a forced window is the `--long=10`/`-M` memory bound. The
+/// auto twins keep their widened windows byte-for-byte (the stock ladder
+/// untouched).
+#[cfg(feature = "std")]
+#[test]
+fn forced_window_caps_the_far_class_lift() {
+    use crate::io::Write as _;
+    // The far-class mt fixture (32 MiB): its 768 KiB-period opening pair
+    // clears the screen's cheap-reject gate (twins inside the first MiB)
+    // and its tiled body the accept bar (the auto twins' 1<<26 headers
+    // below are the accept's own evidence).
+    let data = far_class_mt_source();
+    let tile = ldm_text_tile();
+    let header_window = |frame: &[u8]| {
+        crate::decoding::frame::read_frame_header(frame)
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap()
+    };
+    let open_stream = |shape: crate::InputShape, workers: u32| {
+        let mut sink = Vec::new();
+        let mut enc = crate::stream::write::Encoder::with_options(
+            &mut sink,
+            crate::EncoderOptions::new(crate::Level::Fastest)
+                .with_input_shape(shape)
+                .workers(workers),
+        )
+        .unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+        sink
+    };
+
+    // Auto (no forced window): the screen accepts, the header widens to
+    // the far domain — unchanged stock behavior, single- and
+    // multithreaded.
+    assert_eq!(
+        header_window(&open_stream(crate::InputShape::default(), 0)),
+        1 << 26
+    );
+    assert_eq!(
+        header_window(&open_stream(crate::InputShape::default(), 2)),
+        1 << 26
+    );
+
+    // Forced w10 on the same unpledged streams: the screen's verdict no
+    // longer outranks the user's window — the header declares 1<<10 and
+    // both decoders accept (pre-R73: 1<<26).
+    let forced = crate::InputShape::default().with_window_log(10);
+    let st = open_stream(forced, 0);
+    assert_eq!(header_window(&st), 1 << 10, "forced st stream");
+    assert_eq!(
+        zstd::stream::decode_all(st.as_slice()).unwrap(),
+        data,
+        "reference decodes the forced st stream"
+    );
+    assert_eq!(crate::stream::decode_all(st.as_slice()).unwrap(), data);
+    let mt = open_stream(forced, 2);
+    assert_eq!(header_window(&mt), 1 << 10, "forced mt stream");
+    assert_eq!(
+        zstd::stream::decode_all(mt.as_slice()).unwrap(),
+        data,
+        "reference decodes the forced mt stream"
+    );
+    assert_eq!(crate::stream::decode_all(mt.as_slice()).unwrap(), data);
+
+    // The length-driven Frame bar (a declared length >= 1<<26 armed the
+    // lift on geometry alone): a size hint past the bar plus a small
+    // payload pins the arm without building the full source — the header
+    // keeps the forced window.
+    let mut sink = Vec::new();
+    let mut enc = crate::stream::write::Encoder::with_options(
+        &mut sink,
+        crate::EncoderOptions::new(crate::Level::Fastest).with_input_shape(crate::InputShape {
+            len: Some(1 << 26),
+            window_log: Some(10),
+        }),
+    )
+    .unwrap();
+    enc.write_all(&tile).unwrap();
+    enc.finish().unwrap();
+    assert_eq!(header_window(&sink), 1 << 10, "forced full-bar hint");
+    assert_eq!(zstd::stream::decode_all(&sink[..]).unwrap(), tile);
+    assert_eq!(crate::stream::decode_all(&sink[..]).unwrap(), tile);
+}
+
 /// A far-class multithreaded fixture (32 MiB): the far screen's cheap
 /// reject gate wants twins inside the first MiB, so the source opens with
 /// a 768 KiB-period pair (near-field evidence) ahead of a 2 MiB-period
