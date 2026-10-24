@@ -18,6 +18,7 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 87 symbols deliberately out, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | Evolved inputs carry no beyond-window redundancy | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
+| 27 | compat bulk parameter methods | zstd 0.13 shape parity on the bulk types | Shape work only; the knobs already live in the option structs | [periph review](review/periph.md) |
 
 ## Item notes
 
@@ -100,6 +101,10 @@ The balanced json +0.44% Ir residue is placement-only. A 4x order-swapped interl
 The remaining compile-time menu holds A/B-gated refactors of hot code. Cross-domain index newtypes would keep `WinPos` and `TableIdx` from ever mixing. `NonZero` distance at the resolve sites would make distance 0 unrepresentable. Enum rep-bases would replace off-base integers. The `Option<Candidate>` arm landed on 2026-10-24 over the btlazy selection, recorded in [hardening](review/hardening.md).
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
+
+### 27. compat bulk parameter methods
+
+The compat bulk `Compressor` and `Decompressor` lack the parameter methods the zstd 0.13 crate gives them: `include_checksum`, `include_contentsize`, `window_log`, `multithread` on the encoder and `window_log_max` on the decoder. The compat stream types already carry the set, and `EncoderOptions` and `DecoderOptions` hold every knob, so the work is bulk shapes routing into the existing setters; the `window_log_max` range check currently lives in `compat/stream.rs` and moves to a shared module when the bulk setter lands.
 
 ## Identified floors
 

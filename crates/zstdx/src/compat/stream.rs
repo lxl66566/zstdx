@@ -91,6 +91,20 @@ impl<W: io::Write> EncoderState<W> {
     }
 }
 
+/// The accepted `window_log_max` range, libzstd's `ZSTD_d_windowLogMax`
+/// bounds; the upper end also keeps `1 << log` from overflowing.
+const WINDOW_LOG_MAX_RANGE: core::ops::RangeInclusive<u32> = 10..=31;
+
+fn check_window_log_max(log: u32) -> io::Result<()> {
+    if WINDOW_LOG_MAX_RANGE.contains(&log) {
+        Ok(())
+    } else {
+        Err(io::Error::other(crate::Error::Parameter(
+            crate::ParameterError::WindowLogMaxOutOfRange(log),
+        )))
+    }
+}
+
 pub mod write {
     //! io::Write-shaped types mirroring `zstd::stream::write`.
 
@@ -333,6 +347,9 @@ pub mod write {
     /// mirroring `zstd::stream::write::Decoder`.
     pub struct Decoder<W: io::Write> {
         decoder: crate::stream::write::Decoder<W>,
+        /// Set on the first write: parameter setters refuse afterwards,
+        /// the write-side counterpart of the read side's lazy start.
+        started: bool,
     }
 
     impl<W: io::Write> Decoder<W> {
@@ -340,6 +357,7 @@ pub mod write {
         pub fn new(writer: W) -> io::Result<Self> {
             Ok(Self {
                 decoder: crate::stream::write::Decoder::new(writer).map_err(io::Error::from)?,
+                started: false,
             })
         }
 
@@ -351,6 +369,7 @@ pub mod write {
                     DecoderOptions::new().dictionary(dictionary),
                 )
                 .map_err(io::Error::from)?,
+                started: false,
             })
         }
 
@@ -368,12 +387,19 @@ pub mod write {
                     DecoderOptions::new().parsed_dictionary(dict),
                 )
                 .map_err(io::Error::from)?,
+                started: false,
             })
         }
 
         /// Sets the maximum window log distance (log2 of bytes); applies to
-        /// frames not yet decoded.
+        /// frames not yet decoded and fails once a write began.
         pub fn window_log_max(&mut self, log: u32) -> io::Result<()> {
+            if self.started {
+                return Err(io::Error::other(crate::Error::Parameter(
+                    crate::ParameterError::AlreadyStreaming,
+                )));
+            }
+            check_window_log_max(log)?;
             self.decoder
                 .set_max_window_size(1u64 << log)
                 .map_err(io::Error::from)
@@ -421,6 +447,7 @@ pub mod write {
 
     impl<W: io::Write> io::Write for Decoder<W> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.started = true;
             self.decoder.write(buf)
         }
 
@@ -777,6 +804,7 @@ pub mod read {
                     crate::ParameterError::AlreadyStreaming,
                 )));
             }
+            check_window_log_max(log)?;
             self.options.max_window_size = Some(1u64 << log);
             Ok(())
         }

@@ -12,6 +12,9 @@
 
 use crate::Level;
 
+/// Upper bound on the worker count (libzstd's `ZSTDMT_NBWORKERS_MAX`).
+const MAX_WORKERS: u32 = 256;
+
 /// Externally declared input shape: what the caller knows about the whole
 /// frame beyond the level. Applied to the level's parameter row when the
 /// encoder resets.
@@ -210,11 +213,16 @@ impl EncoderOptions {
     /// job paths on std builds — both [`bulk::compress_with`][crate::bulk::compress_with]
     /// and the streaming encoders, dictionary attached or not (a dictionary
     /// seeds the frame's first job) — falling back to the single-threaded
-    /// core for raw-block levels and single-core processes. Without std the
-    /// streaming encoders reject it with
-    /// [`Error::Unsupported`][crate::Error::Unsupported].
+    /// core for raw-block levels and single-core processes. Values above
+    /// `MAX_WORKERS` clamp. Without std the streaming encoders reject it
+    /// with [`Error::Unsupported`][crate::Error::Unsupported].
     pub const fn workers(mut self, workers: u32) -> Self {
-        self.workers = workers;
+        // `Ord::min` is not const-callable; the branch form is.
+        self.workers = if workers > MAX_WORKERS {
+            MAX_WORKERS
+        } else {
+            workers
+        };
         self
     }
 }

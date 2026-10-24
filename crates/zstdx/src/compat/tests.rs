@@ -359,8 +359,10 @@ fn stream_read_decoder_shapes() {
     dec.read_to_end(&mut out).unwrap();
     assert_eq!(out, data);
 
-    // window_log_max before the first read
+    // window_log_max before the first read; outside 10..=31 it refuses
     let mut dec = compat::stream::read::Decoder::new(compressed.as_slice()).unwrap();
+    assert!(dec.window_log_max(9).is_err());
+    assert!(dec.window_log_max(32).is_err());
     dec.window_log_max(27).unwrap();
     let mut out = Vec::new();
     dec.read_to_end(&mut out).unwrap();
@@ -401,6 +403,19 @@ fn stream_write_decoder_shapes() {
             .auto_flush();
         dec.write_all(&compressed).unwrap();
     }
+    assert_eq!(sink, data);
+
+    // window_log_max: in-range applies, outside 10..=31 refuses, and a
+    // started stream refuses any value
+    let mut sink = Vec::new();
+    let mut dec = compat::stream::write::Decoder::new(&mut sink).unwrap();
+    assert!(dec.window_log_max(9).is_err());
+    assert!(dec.window_log_max(32).is_err());
+    dec.window_log_max(31).unwrap();
+    dec.write_all(&compressed).unwrap();
+    assert!(dec.window_log_max(20).is_err());
+    dec.flush().unwrap();
+    drop(dec);
     assert_eq!(sink, data);
 }
 

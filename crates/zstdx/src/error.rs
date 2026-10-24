@@ -84,6 +84,10 @@ impl fmt::Display for Feature {
 pub enum ParameterError {
     #[error("streaming already started; parameters must be set before the first read or write")]
     AlreadyStreaming,
+    /// A `window_log_max` value outside libzstd's `ZSTD_d_windowLogMax`
+    /// bounds (10..=31).
+    #[error("window_log_max {0} out of range; the window log must be within 10..=31")]
+    WindowLogMaxOutOfRange(u32),
 }
 
 #[cfg(feature = "std")]
