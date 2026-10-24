@@ -1,0 +1,46 @@
+# R72 · Window semantics (forced-window interop, both halves)
+
+todo 26, found R71. Two sibling defects around the declared window on unpledged streams: the **encoder** emitted offsets past it (libzstd rejects; at w16 its ring decodes *wrong bytes* with only the checksum catching it — the worst failure class), and the **decoder** was lenient in the other direction (validated offsets against available history, so it accepted frames libzstd rejects as corruption). Commits: `2fca1ef9` (enc), `09c402fe` (dec).
+
+## Encoder half: clamp every search domain to the final window
+
+Root cause: each family's search domain was `params.chain_reach.unwrap_or(params.window)`. `params_for_row` applied a forced `window_log` to `p.window`, but `adjust_params(p, shape.len)` returned early on an unknown length, so `chain_reach` and the table geometry kept their stock ladder values; the LDM size gate disarmed LDM at windows < 1<<25, so the opt bridge's window lift never fired either. Rows 9 (chain, reach 1<<22), 13-15 (btlazy, 1<<22) and 16-19 (opt, 1<<22/23) scanned up to their stock reach while the header declared the forced window.
+
+C avoids the class architecturally: every search loop is bounded by `ZSTD_getLowestMatchIndex(ms, curr, cParams->windowLog)` — `withinWindow = curr - maxDistance` at the FINAL windowLog (user-forced included), unconditionally (zstd_lazy.c:257/2029/2070/2102/2156, zstd_opt.c:471/619). `adjustCParams`' log clamps (`cycleLog > dictAndWindowLog`, `hashLog > dictAndWindowLog+1`) run only under a known srcSize — they are memory/aliasing clamps; legality is getLowestMatchIndex. zstdx's bt ring stores 2 u32 link slots per position, so its `bt_log` is exactly C's cycleLog (`cycleLog = chainLog - btScale`, btScale=1 for strat ≥ btlazy2): `bt_log <= windowLog` mirrors C.
+
+Fix: `adjust_params` split into the length-gated window downsize plus an unconditional `clamp_geometry_to_window` (chain_reach/chain_log/row_log/bt_log ≤ windowLog; hash_log and the dfast short table ≤ windowLog+1) — the legality half of C's semantics moved to where C carries it, expressed on our domain knobs. Idempotent with the known-length path; a no-op on every stock ladder row (reach ≤ window by construction), so stock frames keep their bytes — proven by the dump grids.
+
+### Family audit (forced window, unpledged stream, json 300 KiB prefix, pre-fix reference decode)
+
+| rows | family | domain carrier | pre-fix | post-fix |
+|---|---|---|---|---|
+| 1-2 | fast | window (reach None) | ok | ok (hash clamps to wlog+1, bytes move ~0.1-0.3% — the bulk path's relation, consistency not regression) |
+| 3-4 | dfast | window (reach None) | ok | ok (same note) |
+| 5-8, 10-12 | row | window (reach None) | ok | ok |
+| 9 | chain + reach 1<<22 | chain_reach | REJECT (w10/w12 corruption, w16 checksum) | ok |
+| 13-15 | btlazy + reach 1<<22 | chain_reach | REJECT | ok |
+| 16-19 | opt + reach 1<<22/23 | chain_reach (LDM lift never armed at forced small windows) | REJECT | ok |
+| 20-22 | opt, no reach | window | ok (control) | ok |
+
+Gates: const ladder proof extended with the forced-window axis (None + 10..=27 on both the len and window axes, per-cell domain assertions; collision pin 132 → 1388); `encode_edges::forced_window_unpledged_streams` (fails pre-fix at the first cell); dump `--all-levels` + `--stream --all-levels` byte-identical; ratio geo-mean +8.69% over 120 cells exactly unchanged; suites + paranoid; QUICK encode fuzz smoke. dict_seed_key resolves through the same `params_for_row`, so seeding stays in lockstep.
+
+Post-fix size growth on the violating cells is the fix working — the encoder loses out-of-window matches: json unpledged stream l9/l13/l16/l19 w10 55548/55927/53989/53280 → 59649/61017/59228/58617 (l19 = the no-reach rows, all window-bound now); w16 43848/46170/42664/41919 → 43731/44943/42402/41866.
+
+## Decoder half: the streaming window check is a generation model
+
+libzstd streaming never compares an offset against the declared window. The rule is per-sequence, `RETURN_ERROR_IF(sequence.offset > (size_t)(oLitEnd - virtualStart))` (ZSTD_decompressSequences*, 4 sites): the offset must stay *in-generation*. The ring's geometry (ZSTD_decodingBufferSize_internal: `windowSize` floored at 1<<10, `+ 2*blockSizeMax + 2*WILDCOPY_OVERLENGTH`, FCS-capped; wrap when `outStart + blockSizeMax > outBuffSize` and FCS doesn't cover the buffer) is chosen so the generation reach and the window almost always coincide — but they are not the same predicate: `fa_w16_o100000` (offset 100000 > 65536 window, within the 180009-byte generation) ACCEPTS under libzstd streaming, while `sw6_w16_o200000` rejects once the origin has wrapped.
+
+zstdx now mirrors the model end-to-end. `FlatOut` tracks ring generations (origin/prev_origin/prev_phys_base/seg_a_end) with libzstd's wrap threshold and FCS no-wrap gate; a raw dictionary's content is a virtual generation-0 prefix that expires at the first wrap (like C's ring discarding the dict extDict); the fused flat executor folds the generation floor into `vbase_op` so the per-sequence check keeps the whole-history shape in every instantiation, and `copy_wrapped_match` un-folds through the `FlatView` it already holds (fast linear walk for previous-generation sources, split doubling walk for straddlers). One-shot (`All`) stays whole-history by design — C's `ZSTD_decompress` decodes into one buffer, `virtualStart == prefixStart == dst`, any in-history offset accepted — and, matching another C asymmetry, only the one-shot flat path lifts the Raw/RLE `blockSizeMax` cap at execution (streaming enforces it at the header stage; `ZSTD_decompressFrame` never does). The ring executor's dict tail stays reachable only while nothing was drained; `mt.rs`/`mt_pieces.rs` segment and piece views follow the same contract.
+
+Semantics were pinned before the rewrite: a C probe (`probe.c`, libzstd 1.5.x) over crafted frames × {oneshot, stream, stream64k, oneshot_dict, stream_dict} — controls, far offsets, pledged caps, small-window sweeps, 6-block 360 KiB histories, dict-prefill expiries. Key outcomes: streaming flips reject exactly at the generation reach (w10 cap 3136: `fa_w10_o100000`, `sw_w10_o3100/3168/3200`; w16 wrap at 180000: `sw6_w16_o200000..360000` while ≤131000+ accepts); a declared FCS caps the ring but does not disable wrapping; dict reach = dictSize + produced until the first wrap. `decode_window_semantics.rs` pins every class per decode path; parity gained the `OutWindowInHistory` / `InGenerationPair` / `CrossFrameOffset` crafts (full sweep 45078 cases, 0 hard divergences, the window-violating one-shot class adjudicated as oneshot-asymmetry).
+
+Deliberate deviation, pinned: libzstd's streaming *single-pass shortcut* (FCS known + whole frame in the input + output room ≥ FCS → `ZSTD_decompress_usingDDict` one-shot) accepts out-of-window offsets (`pledged_w10_f60015_o50000` accepts under stream64k); zstdx streaming always applies the generation model and rejects. Invalid-frame class only.
+
+## Combined gate on main
+
+dump `--all-levels` (30) and `--stream --all-levels` (120) byte-identical vs the encoder-only tree; ratio geo-mean +8.69%, worst cell unchanged; forced-window interop spot-check 8/8 reference-accept (json/text × w10/w16 × l16/l19, sizes matching the enc half's table); crafted frames through the streaming CLI match the probe table 5/5. gungraun decode flat-to-negative vs base (stream_decode json −0.09%, oneshot json/text −1.4..−1.9%, small ±0.006%).
+
+## Left open
+
+- Pre-existing encoder fidelity deviations, neither interop: the small-src btlazy swap (levels 9/10, len ≤ 128 KiB) ignores the forced window (known-length path, own geometry clamped), and a far-screen accept on an unpledged fast-row stream widens the DECLARED window to 1<<26 (screen verdict outranks the user's window; legal frames). Verify documented-or-fixed — R73.
+- The malformed `single_f180015_o100000` probe frame (hand-rolled 2-byte-FCS single-segment header; the reference rejects it too) — not a semantics datapoint, excluded from pins.
