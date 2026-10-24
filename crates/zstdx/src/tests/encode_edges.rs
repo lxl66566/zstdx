@@ -62,7 +62,6 @@ fn shape(kind: &str, len: usize) -> Vec<u8> {
                 .map(|_| (0..24).map(|_| rng.byte()).collect())
                 .collect();
             let mut rng = Rng(0xfeed_face_cafe_babe);
-            let mut rng = Rng(0xfeed_face_cafe_babe);
             while data.len() < len {
                 let n = 1 + rng.next() as usize % 3;
                 for _ in 0..n {

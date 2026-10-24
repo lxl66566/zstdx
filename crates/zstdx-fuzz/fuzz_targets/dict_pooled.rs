@@ -75,6 +75,8 @@ fn fc_frame<'a>(
 }
 
 fuzz_target!(|data: &[u8]| {
+    dict_window_echo_seed(data);
+
     // Parameter head; short inputs default everything.
     let level = LADDER[data.first().copied().unwrap_or(0) as usize % LADDER.len()];
     let other_level = LADDER[(data.first().copied().unwrap_or(0) as usize
@@ -271,3 +273,121 @@ fuzz_target!(|data: &[u8]| {
         },
     }
 });
+
+/// Deterministic xorshift64 source, seeded from the fuzz bytes.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn byte(&mut self) -> u8 {
+        (self.next() >> 33) as u8
+    }
+}
+
+/// Dictionary content echoed past a FORCED window (R73): the payload
+/// repeats dictionary fragments at spans the declared window does not
+/// cover, compressed with the raw dictionary attached and the window
+/// forced small — the window-adoption edge a plain payload corpus never
+/// reaches (the R71 campaign limit). The frame decodes back through our
+/// streaming decoder and the reference STREAMING decoder with the
+/// dictionary (the generation model: dictionary content past the ring
+/// wrap is not reachable, so any offset the encoder emits past the
+/// window into expired dictionary content rejects there).
+fn dict_window_echo_seed(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
+    let seed = u64::from_le_bytes([
+        byte(0),
+        byte(1),
+        byte(2),
+        byte(3),
+        byte(4),
+        byte(5),
+        byte(6),
+        byte(7),
+    ]) | 0x0123_4567_89ab_cdef;
+    let mut rng = Rng(seed);
+    let dict_len = [4 * 1024usize, 8 * 1024, 16 * 1024][byte(0) as usize % 3];
+    let mut dict: Vec<u8> = (0..dict_len)
+        .map(|i| data.get(i % data.len().max(1)).copied().unwrap_or(0xa5))
+        .collect();
+    // Keep the dictionary raw whatever the fuzz bytes: a magic prefix
+    // would route the parse into the formatted path (and fail there).
+    dict[..4].fill(0x5a);
+    let window_log = 10 + byte(1) as usize % 3;
+    let window = 1usize << window_log;
+    let len = (window * 6).min(32 * 1024);
+
+    // The payload: dictionary fragments re-drawn with window-spanning
+    // gaps, or the dictionary's head replayed a half-payload later.
+    let payload: Vec<u8> = match byte(2) & 1 {
+        0 => {
+            let nfrag = 8 + rng.next() as usize % 24;
+            let frag_len = 8 + rng.next() as usize % 24;
+            let frags: Vec<&[u8]> = (0..nfrag)
+                .map(|k| {
+                    let start = (k * 37 + 11) % (dict_len - frag_len);
+                    &dict[start..start + frag_len]
+                })
+                .collect();
+            let gap = window / 2 + rng.next() as usize % (window / 2).max(1) + 1;
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                out.extend_from_slice(frags[rng.next() as usize % nfrag]);
+                for _ in 0..gap {
+                    out.push(rng.byte());
+                }
+            }
+            out.truncate(len);
+            out
+        },
+        _ => {
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len / 2 {
+                for _ in 0..(16 + rng.next() as usize % 32) {
+                    out.push(rng.byte());
+                }
+            }
+            let echo = &dict[..(len - out.len()).min(dict.len())];
+            out.extend_from_slice(echo);
+            out.truncate(len);
+            out
+        },
+    };
+
+    let level = Level::from_zstd([3i32, 9, 13, 19][byte(3) as usize % 4]);
+    let opts = EncoderOptions::new(level)
+        .dictionary(&dict)
+        .with_input_shape(zstdx::InputShape::default().with_window_log(window_log as u32));
+    let frame = bulk::compress_with(&payload, &opts).unwrap();
+
+    // Own streaming decode with the dictionary attached the options way.
+    let mut streaming_decoder = zstdx::decoding::FrameDecoder::new();
+    streaming_decoder
+        .add_options_dict(std::sync::Arc::new(
+            zstdx::decoding::Dictionary::load(&dict).unwrap(),
+        ))
+        .unwrap();
+    let mut dec =
+        zstdx::decoding::StreamingDecoder::new_with_decoder(frame.as_slice(), streaming_decoder)
+            .unwrap();
+    let mut back = Vec::with_capacity(payload.len() + 16);
+    std::io::Read::read_to_end(&mut dec, &mut back).unwrap();
+    assert_eq!(
+        &back[..],
+        &payload[..],
+        "zstdx streaming dict-echo decode differs"
+    );
+
+    // Reference streaming decode with the dictionary.
+    let mut zback = Vec::new();
+    let mut zdec = zstd::stream::Decoder::with_dictionary(frame.as_slice(), &dict).unwrap();
+    std::io::Read::read_to_end(&mut zdec, &mut zback)
+        .expect("reference rejects the dict-echo frame");
+    assert_eq!(&zback[..], &payload[..], "zstd dict-echo bytes differ");
+}

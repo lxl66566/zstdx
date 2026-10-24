@@ -46,7 +46,15 @@ fn seq_block(offset: u32) -> Vec<u8> {
 }
 
 /// `pre` RLE blocks of `pre_len` bytes, then the sequence block.
-fn frame(wlog: u32, pre: usize, pre_len: usize, offset: u32, fcs: Option<u64>) -> Vec<u8> {
+/// Shared with the `fuzz_regressions` walker (its reference-agreement
+/// pass replays the same classes).
+pub(super) fn frame(
+    wlog: u32,
+    pre: usize,
+    pre_len: usize,
+    offset: u32,
+    fcs: Option<u64>,
+) -> Vec<u8> {
     let mut out = vec![0x28u8, 0xb5, 0x2f, 0xfd];
     let mut fhd = 0u8;
     if fcs.is_some() {
@@ -70,7 +78,9 @@ fn frame(wlog: u32, pre: usize, pre_len: usize, offset: u32, fcs: Option<u64>) -
 }
 
 /// Raw 4 KiB content dictionary (probe's dict4096.bin).
-fn dict4096() -> Vec<u8> {
+/// Raw 4096-byte dictionary; shared with the walker (same reason as
+/// [`frame`]).
+pub(super) fn dict4096() -> Vec<u8> {
     let mut dict = alloc::vec![0x77u8; 4096];
     dict[0] = 0x42;
     dict
