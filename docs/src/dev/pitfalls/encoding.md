@@ -255,6 +255,14 @@ The crash input passes standalone because the poisoner and the victim are differ
 - Use `saturating_sub` for loop guards. Miss stepping can cross `block_end`, and unsigned subtraction wraps into a huge value.
 - `insert_max` subtraction underflows on a first block below 5 bytes, where `win_base + win.len() - MIN_HASH` goes negative. Compute it lazily or use `saturating_sub`.
 
+### Merged add width over the accumulator cap
+
+`pack_seq` 把三个字段的 add bits 合并成一个 payload，宽度 `ln + mn + on`。ln 上界 16（LL code 35，base 65536），mn 上界 16（ML code 52，base 65539），on 上界 27（`encode_offset` 取 wire 值的 ilog2，window log 被 clamp 在 27，wire 值 dist+3 不超过 2^27+2）。ln=16 与 mn=16 无法共存：两个 base 之和 131075 已超过 MAX_BLOCK_SIZE 的 131072，装不进一个块。可行组合的 ln+mn 上界是 31（16+15），因此 add_nb 最高到 58。
+
+`hot_push_raw` 的合同是 flush 后 bits < 8、任何 nb ≤ 56 都安全。nb=58 且 pending bits=7 时 `acc |= v << 7` 丢掉 payload 最高位，bits 变成 65；下一次 flush 的 `acc >>= 64` 在 debug 和 paranoid 下是 shift-overflow panic，在 release 下回绕成 `>> 0`，累加器从此失步，序列段的整个尾部损坏。绕过 56 上界的调用有两处：最后一个序列的首 push 完全没有宽度检查；split 分支的 guard 只检查了合并形态 `trans_nb + add_nb <= 56`，进入该分支后单独 push `add` 却没有再检查 add_nb 自身。
+
+触发条件苛刻，需要 w27 窗口加一条 ll+ml 不小于 98307 的序列，所以全部门禁都是绿的：bench 语料的窗口不超过 25，on ≤ 25、add_nb ≤ 56。修复是 `push_add` 在 add_nb 超过 56 时按字段拆分 push，payload 布局 `la | ma << ln | oa << (ln + mn)`，三个宽度从 code 字节恢复（LL 与 ML 走 LL_META/ML_META，offset 的 code 就是自身宽度）。拆分 push 与单次 push 的位序完全一致，先低字段后高字段，所以 add_nb ≤ 56 的所有输入保持 byte-identical，merged 快路径不动。配套的墙有三层：`seq_codes.rs` 的 `const _` 网格证明所有 base_ll + base_ml ≤ MAX_BLOCK_SIZE 的 (lc, mc) 组合满足 ln + mn ≤ 31，`hot_push_raw` 入口 debug 断言 nb ≤ 56，`encode_offset` debug 断言 log ≤ 27。容量合同写在注释里不会约束调用方，要么在每个调用点检查，要么在入口断言。
+
 ## Checksums and streaming
 
 ### Single-producer rings

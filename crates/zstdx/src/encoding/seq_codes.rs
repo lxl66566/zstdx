@@ -43,6 +43,32 @@ pub(crate) fn pack_seq(ll: u32, ml: u32, of: u32) -> SeqWord {
     }
 }
 
+/// Compile-time proof over the full (LL code, ML code) grid that the merged
+/// add width of any real sequence fits the block encoder's three-segment
+/// split: two fields' bases can co-occur in one block only when
+/// `base_ll + base_ml <= MAX_BLOCK_SIZE` (a block's content is the sum of
+/// its literal and match lengths), and every such pair satisfies
+/// `ln + mn <= 31` — the 16 + 16 pair's bases sum to 131075, one past the
+/// 131072 bound. With the offset width capped at 27 by the window-log
+/// clamp, `add_nb <= 31 + 27 = 58` always holds and the per-field split in
+/// `push_add` never sees a field wider than 27 bits. A ladder edit that
+/// breaks this fails the build instead of overflowing the bit accumulator.
+const _: () = {
+    let mut lc = 0usize;
+    while lc < 36 {
+        let mut mc = 0usize;
+        while mc < 53 {
+            let (base_ll, ln) = LL_META[lc];
+            let (base_ml, mn) = ML_META[mc];
+            if base_ll + base_ml <= crate::common::MAX_BLOCK_SIZE {
+                assert!(ln + mn <= 31, "LL+ML add widths above 31 inside one block");
+            }
+            mc += 1;
+        }
+        lc += 1;
+    }
+};
+
 /// Per-code metadata for literal lengths: (base value, extra bit count).
 const fn ll_meta() -> [(u32, u8); 36] {
     let mut t = [(0u32, 0u8); 36];
@@ -211,6 +237,11 @@ pub(crate) fn encode_match_len(len: u32) -> (u8, u32, usize) {
 #[inline]
 pub(crate) fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
+    // The window-log clamp caps the wire value at 2^27 + 2 (the match
+    // distance fits the 2^27 window, +3 for the offcode base), so the
+    // offset never contributes more than 27 add bits. A geometry change
+    // that breaks this surfaces here first.
+    debug_assert!(log <= 27, "offset wire value above the w27 clamp");
     let lower = len & ((1 << log) - 1);
     (log as u8, lower, log as usize)
 }
@@ -237,6 +268,36 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    /// The w27-window width extremes. Bases that co-occur in one 128 KiB
+    /// block cap ln + mn at 31 (16 + 15; the 16 + 16 bases sum to 131075,
+    /// past MAX_BLOCK_SIZE) and on caps at 27 (wire value dist + 3 <=
+    /// 2^27 + 2 under the window-log clamp), so a feasible merged add
+    /// width tops out at 58 — past `hot_push_raw`'s 56-bit capacity.
+    #[test]
+    fn pack_seq_wide_add_payloads() {
+        for &(ll, ml) in &[(65536u32, 32771u32), (131071, 65538), (32768, 65539)] {
+            let of = (1u32 << 27) + 1;
+            let w = pack_seq(ll, ml, of);
+            assert_eq!(w.add_nb, 58, "ll {ll} ml {ml}");
+            assert_eq!(
+                decode_packed(w.codes, w.add),
+                (ll, ml, of),
+                "ll {ll} ml {ml}"
+            );
+        }
+        // The offset alone at the clamp: on = 27 over zero add-bits of
+        // literal and match length.
+        let w = pack_seq(0, 3, (1 << 27) + 2);
+        assert_eq!(w.add_nb, 27);
+        // pack_seq stays total on hypothetical wider triples (an infeasible
+        // 16 + 16 + 27 = 59 still packs and inverts), so the push-side
+        // split never sees a truncated payload.
+        let of = (1u32 << 27) + 1;
+        let w = pack_seq(65536, 65539, of);
+        assert_eq!(w.add_nb, 59);
+        assert_eq!(decode_packed(w.codes, w.add), (65536, 65539, of));
+    }
 
     /// decode_packed must invert the three encoders for every encodable
     /// value; the add payload layout is what the reconstruction relies on.

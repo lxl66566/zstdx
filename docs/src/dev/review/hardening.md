@@ -12,6 +12,8 @@ An overread past a buffer's logical length that lands inside its allocation is i
 
 `IdxRange` provides wrap-proof spans for same-domain cursor arithmetic. Every fill bound, rep-tail scan bar and `insert_max` producer goes through it, or carries a proof comment or a loop-bar invariant. The per-byte scan loops keep naked arithmetic under their bars by design.
 
+The same pattern now pins the merged sequence add width in `seq_codes`: a `const _` grid over every LL/ML base pair that fits one block asserts `ln + mn <= 31`, so the block encoder's per-field split push (`push_add`) is provably sufficient under the w27 offset cap, and `hot_push_raw` debug-asserts the 56-bit payload cap at its entry.
+
 The btlazy selection's absent candidates are unrepresentable since 2026-10-24. `Found`'s two argmaxes are `Option`s, with `Scored` pairing the literal-offset candidate and its score so the score cannot outlive the candidate, and the driver's incumbent is an `Option<Scored>` destructured at the lazy bar. Every construction site guarantees `len >= MIN_MATCH`, which `scale_value`'s assert now pins exactly. Gungraun reads best json and text at -0.7% and -0.6% Ir at byte-identical dumps.
 
 ### Compile-time structure
@@ -77,6 +79,7 @@ Poison asserts fire at checkpoints, so a touch whose evidence is legitimately ov
 | head-link induction break | pooled tests, landed with the encoder-edge round, no typestate attempted |
 | exit-contract divergence | skill checklist, not cheaply typeable |
 | MT inline view and epoch straddle | poison sweep and pooled sweep, this round |
+| merged add width past `hot_push_raw`'s 56-bit cap | per-field split push, `seq_codes` const grid, entry debug assert |
 
 ## Follow-ups
 

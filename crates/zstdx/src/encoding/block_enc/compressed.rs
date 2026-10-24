@@ -2,7 +2,10 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::{Matcher, seq_codes::SEQ_CODE_SPACE},
+    encoding::{
+        Matcher,
+        seq_codes::{LL_META, ML_META, SEQ_CODE_SPACE},
+    },
     fse::fse_encoder::{
         FSETable, FseBuildScratch, approx_log2, build_normalized_table, flat_table,
         ncount_cost_bytes, rle_table,
@@ -1017,16 +1020,20 @@ fn encode_sequences(
     // The accumulator stays in locals for the whole loop; routing the two
     // per-sequence writes through the writer used to reload and store its
     // fields each time. Flushes leave fewer than eight bits pending, so
-    // neither push (≤45 transition bits, ≤51 add bits) can overflow.
+    // neither push (≤36 transition bits, ≤58 add bits) can overflow.
     let (mut acc, mut bits, pos) = writer.hot_state();
     {
         let out = writer.out();
-        // One reserve covers the whole loop: the last sequence adds ≤51
-        // bits, every earlier one ≤87 (36 transition + 51 add), and each
+        // One reserve covers the whole loop: the last sequence adds ≤58
+        // bits, every earlier one ≤94 (36 transition + 58 add), and each
         // flush stores eight bytes at the running position — the per-push
         // capacity probe (a Vec field load plus branch per sequence) goes
         // away. The seqs/table accesses move to raw pointers for the same
         // reason (the slice fields rode the stack through every iteration).
+        // The per-sequence estimate stays 11 bytes: payloads past 88 bits
+        // need ll + ml ≥ 16387 of block content (the width-26 literal/match
+        // bases at 8192 + 8195), so at most seven land in one block and the
+        // +32-byte slack covers their excess.
         out.reserve(nb_seq * 11 + 32);
         let base = out.as_mut_ptr();
         let sp = seqs.as_ptr();
@@ -1044,7 +1051,14 @@ fn encode_sequences(
         // deltaFindState lands the index in the code's own row).
         unsafe {
             let w = &*sp.add(li);
-            hot_push_raw(&mut cur, &mut acc, &mut bits, w.add, w.add_nb as usize);
+            push_add(
+                &mut cur,
+                &mut acc,
+                &mut bits,
+                w.add,
+                w.add_nb as usize,
+                w.codes,
+            );
         }
 
         // encode backwards so the decoder reads the first sequence first
@@ -1053,13 +1067,14 @@ fn encode_sequences(
             loop {
                 // SAFETY: the loop runs from the last sequence down to the
                 // first; p stays inside seqs.
-                let (add, add_nb, t_of, t_ml, t_ll) = unsafe {
+                let (add, add_nb, packed, t_of, t_ml, t_ll) = unsafe {
                     p = p.sub(1);
                     let w = p.read();
                     let packed = w.codes;
                     (
                         w.add,
                         w.add_nb as usize,
+                        packed,
                         *of_tt.add((packed >> 16) as u8 as usize),
                         *ml_tt.add((packed >> 8) as u8 as usize),
                         *ll_tt.add(packed as u8 as usize),
@@ -1105,7 +1120,8 @@ fn encode_sequences(
                 // sequence whenever the payload fits the accumulator. The 56
                 // cap keeps a post-flush (bits < 8) accumulator from dropping
                 // payload; wider pairs fall back to two pushes of the same
-                // bits.
+                // bits, and an add past the cap itself splits per field
+                // (see [`push_add`]).
                 let trans_nb = (of_nb + ml_nb + ll_nb) as usize;
                 // SAFETY: the upfront reserve covers the stores (see above).
                 unsafe {
@@ -1119,7 +1135,7 @@ fn encode_sequences(
                         );
                     } else {
                         hot_push_raw(&mut cur, &mut acc, &mut bits, trans, trans_nb);
-                        hot_push_raw(&mut cur, &mut acc, &mut bits, add, add_nb);
+                        push_add(&mut cur, &mut acc, &mut bits, add, add_nb, packed);
                     }
                 }
                 if p == sp {
@@ -1159,6 +1175,7 @@ fn encode_sequences(
 /// reserved once by the caller (see `encode_sequences`).
 #[inline(always)]
 unsafe fn hot_push_raw(cur: &mut *mut u8, acc: &mut u64, bits: &mut usize, v: u64, nb: usize) {
+    debug_assert!(nb <= 56, "hot_push_raw payload over the 56-bit capacity");
     let k = *bits / 8;
     // SAFETY: the caller's reserve covers the store; bytes past the
     // semantic end are overwritten by later stores or cut by set_len.
@@ -1170,6 +1187,40 @@ unsafe fn hot_push_raw(cur: &mut *mut u8, acc: &mut u64, bits: &mut usize, v: u6
     *bits -= 8 * k;
     *acc |= v << *bits;
     *bits += nb;
+}
+
+/// Push one sequence's merged add payload, splitting per field when the
+/// merged width exceeds `hot_push_raw`'s 56-bit capacity. The payload
+/// layout is `la | ma << ln | oa << (ln + mn)` (see `pack_seq`); the
+/// per-field widths recover from the code bytes — LL and ML from
+/// `LL_META`/`ML_META`, the offset's from the code itself (the wire
+/// value's log2). The split pushes emit the same bits in the same order,
+/// low field first, so every merged-width payload stays byte-identical.
+#[inline(always)]
+unsafe fn push_add(
+    cur: &mut *mut u8,
+    acc: &mut u64,
+    bits: &mut usize,
+    add: u64,
+    add_nb: usize,
+    codes: u32,
+) {
+    if add_nb <= 56 {
+        // SAFETY: the caller's reserve covers the store; nb <= 56.
+        unsafe { hot_push_raw(cur, acc, bits, add, add_nb) };
+        return;
+    }
+    let ln = LL_META[codes as u8 as usize].1 as usize;
+    let mn = ML_META[(codes >> 8) as u8 as usize].1 as usize;
+    // The offset code is its own add-bit count.
+    let on = (codes >> 16) as u8 as usize;
+    // SAFETY: every field width is at most 27, and the caller's reserve
+    // covers the stores (see `encode_sequences`).
+    unsafe {
+        hot_push_raw(cur, acc, bits, add & ((1 << ln) - 1), ln);
+        hot_push_raw(cur, acc, bits, (add >> ln) & ((1 << mn) - 1), mn);
+        hot_push_raw(cur, acc, bits, add >> (ln + mn), on);
+    }
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
@@ -1826,7 +1877,10 @@ mod tests {
         255
     }
     use super::*;
-    use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table};
+    use crate::{
+        encoding::seq_codes::pack_seq,
+        fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table},
+    };
 
     fn counts_from(symbols: &[u8]) -> [u32; SEQ_CODE_SPACE] {
         let mut counts = [0u32; SEQ_CODE_SPACE];
@@ -1834,6 +1888,91 @@ mod tests {
             counts[s as usize] += 1;
         }
         counts
+    }
+
+    /// `encode_sequences` through the plain `write_bits` path: the same
+    /// field order and the same tANS steps via `FSETable::step`, with
+    /// `entry` written first as the pending prefix. The hot loop must land
+    /// exactly these bits for any packed sequence set.
+    fn reference_sequence_bits(
+        entry: (u64, usize),
+        seqs: &[crate::encoding::SeqWord],
+        ll_table: &FSETable,
+        ml_table: &FSETable,
+        of_table: &FSETable,
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write_bits(entry.0, entry.1);
+        let li = seqs.len() - 1;
+        let packed = seqs[li].codes;
+        let mut ll_state = ll_table.start_index(packed as u8);
+        let mut ml_state = ml_table.start_index((packed >> 8) as u8);
+        let mut of_state = of_table.start_index((packed >> 16) as u8);
+        writer.write_bits(seqs[li].add, seqs[li].add_nb as usize);
+        for w in seqs[..li].iter().rev() {
+            let packed = w.codes;
+            let (of_nb, of_diff, of_next) = of_table.step((packed >> 16) as u8, of_state);
+            let (ml_nb, ml_diff, ml_next) = ml_table.step((packed >> 8) as u8, ml_state);
+            let (ll_nb, ll_diff, ll_next) = ll_table.step(packed as u8, ll_state);
+            (of_state, ml_state, ll_state) = (of_next, ml_next, ll_next);
+            let trans =
+                of_diff as u64 | (ml_diff as u64) << of_nb | (ll_diff as u64) << (of_nb + ml_nb);
+            writer.write_bits(trans, (of_nb + ml_nb + ll_nb) as usize);
+            writer.write_bits(w.add, w.add_nb as usize);
+        }
+        let ml_log = ml_table.acc_log() as usize;
+        let of_log = of_table.acc_log() as usize;
+        let ll_log = ll_table.acc_log() as usize;
+        writer.write_bits((ml_state & ((1 << ml_log) - 1)) as u64, ml_log);
+        writer.write_bits((of_state & ((1 << of_log) - 1)) as u64, of_log);
+        writer.write_bits((ll_state & ((1 << ll_log) - 1)) as u64, ll_log);
+        let fill = writer.misaligned();
+        if fill == 0 {
+            writer.write_bits(1u32, 8);
+        } else {
+            writer.write_bits(1u32, fill);
+        }
+        writer.dump()
+    }
+
+    /// Merged add payloads past `hot_push_raw`'s 56-bit capacity must land
+    /// in the stream bit for bit, split per field. The 58-bit extreme is
+    /// the w27-window ln 16 + mn 15 + on 27 shape (see
+    /// `pack_seq_wide_add_payloads`); a 7-bit entry prefix pins the worst
+    /// post-flush pending state. The wide word at the last index rides the
+    /// standalone first push, at index 0 the loop's split branch
+    /// (transition + add > 56).
+    #[test]
+    fn encode_sequences_wide_add_bitstream() {
+        let ll_table = default_ll_table();
+        let ml_table = default_ml_table();
+        let of_table = default_of_table();
+        let wide = pack_seq(65536, 32771, (1 << 27) + 1);
+        assert_eq!(wide.add_nb, 58);
+        let seqs = [wide, pack_seq(10, 8, 1234), wide];
+        for entry in [(0u64, 0usize), (0b101_0101, 7)] {
+            let mut out = Vec::new();
+            {
+                let mut writer = BitWriter::from(&mut out);
+                writer.write_bits(entry.0, entry.1);
+                encode_sequences(
+                    seqs.len(),
+                    &seqs,
+                    &mut writer,
+                    &ll_table,
+                    &ml_table,
+                    &of_table,
+                );
+                // The marker leaves the writer byte-aligned with whole
+                // pending bytes still in `partial`; flush lands them.
+                writer.flush();
+            }
+            assert_eq!(
+                out,
+                reference_sequence_bits(entry, &seqs, &ll_table, &ml_table, &of_table),
+                "entry {entry:?}"
+            );
+        }
     }
 
     #[test]
