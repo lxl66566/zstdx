@@ -12,6 +12,10 @@ This page records the 2026-10-25 review round over the modules without a dedicat
 
 `FrameCompressor::compress`'s no-dictionary reset branch cleared the matcher, the Huffman table and `dict_entropy`, but left `fse_tables.*_previous`, `state.split` and the Huffman table's pool recycling unhandled, all three of which `reset_slice_state` owns on the slice path. A second frame on a reused compressor could then pass frame one's adopted tables into its first block's selection and emit `Repeat_Mode` with no established table, which both this decoder (`TableIsUninitialized`) and libzstd reject as corruption. The shared tail is now `reset_entropy_state`, which both resets call, and `entropy_state_two_frames_reused_compressor` pins the reuse at a compressed level against decode and fresh-compressor bytes.
 
+### Sequential bulk decode honors the window bound
+
+The sequential and dictionary arms of `decompress_with` and `decompress_to_buffer_with` built a bare `FrameDecoder`, so `DecoderOptions::max_window_size` bound only the multithreaded arm. `decoder_from_options` now configures the window bound and the dictionary for every arm, and the three copies of the doubling retry loop (`bulk::decompress`, the dictionary arms, compat `Decompressor::decompress`) collapsed into `decode_all_to_vec_growing`, which stops at half of `isize::MAX` and reports `TargetTooSmall` instead of wrapping the doubling on 32-bit. `sequential_decode_honors_max_window_size` pins the rejection and the still-decoding bound.
+
 ## Open findings
 
 - The compat layer's bulk `Compressor` and `Decompressor` lack the parameter methods the zstd 0.13 crate gives them (`include_checksum`, `include_contentsize`, `window_log`, `multithread` on the encoder, `window_log_max` on the decoder); the compat stream types have them. The capability exists in `EncoderOptions`; only the bulk shapes are missing. Tracked in the [todo list](../todo.md).

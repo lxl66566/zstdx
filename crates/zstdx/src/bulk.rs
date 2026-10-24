@@ -136,6 +136,54 @@ pub fn compress_with(
     ))
 }
 
+/// A [`FrameDecoder`] configured from decode options: the window bound,
+/// then the dictionary — the parsed form shares, the raw bytes parse
+/// fallibly here.
+fn decoder_from_options(options: &crate::DecoderOptions) -> Result<FrameDecoder> {
+    let mut decoder = FrameDecoder::new();
+    if let Some(max) = options.max_window_size {
+        decoder.set_max_window_size(max);
+    }
+    let dict = match (&options.parsed_dictionary, &options.dictionary) {
+        (parsed, _) if parsed.is_some() => parsed.clone(),
+        (_, Some(raw)) => Some(alloc::sync::Arc::new(
+            crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?,
+        )),
+        (_, None) => None,
+    };
+    if let Some(dict) = dict {
+        decoder
+            .add_options_dict(dict)
+            .map_err(crate::Error::Frame)?;
+    }
+    Ok(decoder)
+}
+
+/// [`decompress`]'s retry loop: decode into a fresh Vec, doubling the
+/// capacity while the decoded data does not fit.
+pub(crate) fn decode_all_to_vec_growing(
+    decoder: &mut FrameDecoder,
+    source: &[u8],
+    capacity: usize,
+) -> Result<alloc::vec::Vec<u8>> {
+    let mut capacity = capacity.max(64 * 1024);
+    loop {
+        let mut out = alloc::vec::Vec::with_capacity(capacity);
+        match decoder.decode_all_to_vec(source, &mut out) {
+            Ok(()) => return Ok(out),
+            Err(FrameDecoderError::TargetTooSmall) => {
+                // Past half of isize::MAX the doubling would wrap: no allocatable target fits the
+                // content, which is the TargetTooSmall condition itself.
+                if capacity > (isize::MAX as usize) / 2 {
+                    return Err(FrameDecoderError::TargetTooSmall.into());
+                }
+                capacity *= 2;
+            },
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Decompress a zstd stream (possibly several concatenated frames) into a
 /// fresh Vec.
 ///
@@ -151,15 +199,7 @@ pub fn compress_with(
 /// ```
 pub fn decompress(source: &[u8], capacity: usize) -> Result<alloc::vec::Vec<u8>> {
     let mut decoder = FrameDecoder::new();
-    let mut capacity = capacity.max(64 * 1024);
-    loop {
-        let mut out = alloc::vec::Vec::with_capacity(capacity);
-        match decoder.decode_all_to_vec(source, &mut out) {
-            Ok(()) => return Ok(out),
-            Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
-            Err(e) => return Err(e.into()),
-        }
-    }
+    decode_all_to_vec_growing(&mut decoder, source, capacity)
 }
 
 /// Decompress a zstd stream into the caller's buffer.
@@ -202,26 +242,8 @@ pub fn decompress_to_buffer_with(
         return crate::decoding::mt::decode_all_mt(source, destination, options.threads, max)
             .map_err(Into::into);
     }
-    if let Some(dict) = &options.parsed_dictionary {
-        let mut decoder = FrameDecoder::new();
-        decoder
-            .add_options_dict(alloc::sync::Arc::clone(dict))
-            .map_err(crate::Error::Frame)?;
-        return decoder.decode_all(source, destination).map_err(Into::into);
-    }
-    if let Some(raw) = &options.dictionary {
-        let dict = alloc::sync::Arc::new(
-            crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?,
-        );
-        let mut decoder = FrameDecoder::new();
-        decoder
-            .add_options_dict(dict)
-            .map_err(crate::Error::Frame)?;
-        return decoder.decode_all(source, destination).map_err(Into::into);
-    }
-    #[cfg(not(feature = "std"))]
-    let _ = options;
-    decompress_to_buffer(source, destination)
+    let mut decoder = decoder_from_options(options)?;
+    decoder.decode_all(source, destination).map_err(Into::into)
 }
 
 /// [`decompress`] with a full option set (see
@@ -243,43 +265,8 @@ pub fn decompress_with(
             Err(e) => return Err(e.into()),
         }
     }
-    let shared = options.parsed_dictionary.clone();
-    if let Some(dict) = shared {
-        let mut decoder = FrameDecoder::new();
-        decoder
-            .add_options_dict(dict)
-            .map_err(crate::Error::Frame)?;
-        let mut capacity = capacity.max(64 * 1024);
-        loop {
-            let mut out = alloc::vec::Vec::with_capacity(capacity);
-            match decoder.decode_all_to_vec(source, &mut out) {
-                Ok(()) => return Ok(out),
-                Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-    if let Some(raw) = &options.dictionary {
-        let dict = alloc::sync::Arc::new(
-            crate::decoding::Dictionary::load(raw).map_err(crate::Error::Dictionary)?,
-        );
-        let mut decoder = FrameDecoder::new();
-        decoder
-            .add_options_dict(dict)
-            .map_err(crate::Error::Frame)?;
-        let mut capacity = capacity.max(64 * 1024);
-        loop {
-            let mut out = alloc::vec::Vec::with_capacity(capacity);
-            match decoder.decode_all_to_vec(source, &mut out) {
-                Ok(()) => return Ok(out),
-                Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-    #[cfg(not(feature = "std"))]
-    let _ = options;
-    decompress(source, capacity)
+    let mut decoder = decoder_from_options(options)?;
+    decode_all_to_vec_growing(&mut decoder, source, capacity)
 }
 
 #[cfg(test)]
@@ -480,6 +467,30 @@ mod tests {
         let mut exact = vec![0u8; input.len()];
         decompress_to_buffer(&compressed, &mut exact).unwrap();
         assert_eq!(&exact[..], input);
+    }
+
+    /// The sequential arms of `decompress_with`/`decompress_to_buffer_with`
+    /// honor `max_window_size` exactly like the multithreaded arm: a frame
+    /// declaring a window above the bound fails with `WindowSizeTooBig`.
+    #[test]
+    fn sequential_decode_honors_max_window_size() {
+        // Balanced sizes the window to the content (4 MiB), far above the
+        // 1 MiB bound below (Fastest would cap it at 1 MiB and pass).
+        let input = vec![0u8; 4 * 1024 * 1024];
+        let compressed = compress(&input, Level::Balanced);
+        let options = crate::DecoderOptions::new().max_window_size(1024 * 1024);
+        let mut out = vec![0u8; input.len()];
+        match decompress_to_buffer_with(&compressed, &mut out, &options) {
+            Err(crate::Error::Frame(FrameDecoderError::WindowSizeTooBig { .. })) => {},
+            other => panic!("expected WindowSizeTooBig, got {other:?}"),
+        }
+        match decompress_with(&compressed, 0, &options) {
+            Err(crate::Error::Frame(FrameDecoderError::WindowSizeTooBig { .. })) => {},
+            other => panic!("expected WindowSizeTooBig, got {other:?}"),
+        }
+        // A bound above the declared window still decodes.
+        let options = crate::DecoderOptions::new().max_window_size(8 * 1024 * 1024);
+        assert_eq!(decompress_with(&compressed, 0, &options).unwrap(), input);
     }
 
     /// A gated (incompressible) block followed by a tail block shorter than
