@@ -18,7 +18,7 @@ use alloc::{string::String, vec, vec::Vec};
 /// the tail of a one-sequence offset bitstream.
 fn bitstream_of(n: u32, v: u32) -> Vec<u8> {
     let region: u64 = (1u64 << n) | v as u64;
-    let nbytes = ((n + 1) + 7) / 8;
+    let nbytes = (n + 1).div_ceil(8);
     let mut out = Vec::new();
     for i in 0..nbytes {
         out.push(((region >> (8 * (nbytes - 1 - i))) & 0xff) as u8);
@@ -33,7 +33,7 @@ fn bitstream_of(n: u32, v: u32) -> Vec<u8> {
 /// offset value decodes to `offset - 3` (repcode bias), which the probe
 /// table's names carry as-is.
 fn seq_block(offset: u32) -> Vec<u8> {
-    let of_code = 31 - offset.leading_zeros();
+    let of_code = offset.ilog2();
     let extra = offset - (1 << of_code);
     let mut blk = Vec::new();
     blk.push(10u8 << 3);

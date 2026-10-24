@@ -254,6 +254,8 @@ A green release suite does not mean a bug-free tree. If the suite seems hung, fi
 
 The no-default-features pass also carried 11 pre-existing warnings, 4 mechanical in `io_nostd.rs`, 5 `unused_self` on the checksum-free implementation's symmetry API and 2 feature-gated dead-code functions in opt.rs and match_generator, and none blocked the gate's purpose of catching new drift. Every profile now builds and lints warning-free, and the gate is CI-enforced through `.github/workflows/lint.yml` with `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets` and `cargo clippy -p zstdx --no-default-features --all-targets`. The manual ritual had drifted again when poison-test files landed with pedantic lints, which motivated wiring it in.
 
+Clippy itself drifted a third way on 2026-10-24: a newer toolchain fired `manual_div_ceil` and `manual_ilog2` on frame-crafting helpers older than those lints, and `opt.rs`'s `prefill_hash3` turned dead-code under no-default-features behind its `std`-gated caller. Both CI commands run clean again after the sweep. A clippy bump can reopen old code, so re-read the gate output after toolchain updates.
+
 ## Profiling and attribution
 
 ### Record with ASLR off

@@ -228,7 +228,7 @@ pub fn far_offset_frame(wlog: u32, pre: usize, pre_len: usize, offset: u32) -> V
     for _ in 0..pre {
         push_rle_run(&mut out, false, 0x5a, pre_len);
     }
-    let of_code = 31 - offset.leading_zeros();
+    let of_code = offset.ilog2();
     let seq = SeqSpec {
         literals: b"ababababab".to_vec(),
         nb_seq: vec![0x01],
@@ -252,7 +252,7 @@ fn push_rle_run(out: &mut Vec<u8>, last: bool, byte: u8, len: usize) {
 /// forward-written tail of a one-sequence offset bitstream).
 fn extra_bits_stream(n: u32, v: u32) -> Vec<u8> {
     let region: u64 = (1u64 << n) | u64::from(v);
-    let nbytes = ((n + 1) + 7) / 8;
+    let nbytes = (n + 1).div_ceil(8);
     let mut out = Vec::with_capacity(nbytes as usize);
     for i in 0..nbytes {
         out.push(((region >> (8 * (nbytes - 1 - i))) & 0xff) as u8);

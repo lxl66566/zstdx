@@ -409,7 +409,7 @@ fn walker_payload(seed: u64, window: usize, len: usize, family: usize) -> Vec<u8
             while out.len() < len {
                 let start = out.len();
                 out.extend_from_slice(&unit[..(len - out.len()).min(period)]);
-                for _ in 0..(1 + rng.next() as usize % 4) {
+                for _ in 0..=(rng.next() as usize % 4) {
                     let p = start + rng.next() as usize % period;
                     if p < out.len() {
                         out[p] = rng.byte();

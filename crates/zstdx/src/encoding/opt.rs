@@ -866,6 +866,7 @@ impl Finder<'_, '_> {
     /// Fill `hash3` over `[win_base, target)` without probing -- the
     /// dict-seed prefix prefill, mirroring [`Self::update_tree`]'s eager
     /// range for the 3-byte table (see `seed_dict_tree`).
+    #[cfg(feature = "std")]
     fn prefill_hash3(&mut self, target: usize) {
         if self.hash3.is_empty() {
             return;

@@ -859,7 +859,7 @@ pub(super) const fn params_for_row(
     // (zstd_compress.c:2027); `adjust_params` applies that clamp only
     // under a known length, so a forced window carries it here.
     let wlog = p.window.trailing_zeros();
-    let p = match p.strategy {
+    match p.strategy {
         Strategy::Opt(mut knobs) => {
             knobs.hash3_log = min_u32(knobs.hash3_log, wlog);
             LevelParams {
@@ -875,8 +875,7 @@ pub(super) const fn params_for_row(
             }
         },
         _ => p,
-    };
-    p
+    }
 }
 
 /// Downsize a row for a known source length — the window half of
@@ -1090,9 +1089,8 @@ const fn prove_ladder_geometry() -> usize {
                     let wlog = 64 - (p.window as u64 - 1).leading_zeros();
                     if level != 0 {
                         assert!(p.hash_log <= wlog + 1, "hash_log above window+1");
-                        match p.chain_reach {
-                            Some(r) => assert!(r <= p.window, "chain_reach above the window"),
-                            None => {},
+                        if let Some(r) = p.chain_reach {
+                            assert!(r <= p.window, "chain_reach above the window");
                         }
                     }
                     match p.strategy {

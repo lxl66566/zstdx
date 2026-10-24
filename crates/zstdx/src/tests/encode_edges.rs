@@ -58,7 +58,7 @@ fn shape(kind: &str, len: usize) -> Vec<u8> {
         // half-payload later (past a w16 window).
         "farfrags" => {
             let mut rng = Rng(0xf00d_f00d_f00d_f00d);
-            let frags: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..40)
+            let frags: Vec<Vec<u8>> = (0..40)
                 .map(|_| (0..24).map(|_| rng.byte()).collect())
                 .collect();
             let mut rng = Rng(0xfeed_face_cafe_babe);
@@ -76,7 +76,7 @@ fn shape(kind: &str, len: usize) -> Vec<u8> {
         },
         "twinhalves" => {
             let mut rng = Rng(0x5eed_5eed_5eed_5eed);
-            let frags: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..64)
+            let frags: Vec<Vec<u8>> = (0..64)
                 .map(|_| (0..40).map(|_| rng.byte()).collect())
                 .collect();
             let mut rng = Rng(0x1bad_b002_bad0_dad1);

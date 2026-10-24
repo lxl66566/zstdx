@@ -713,6 +713,7 @@ pub(super) unsafe fn execute_segment(
 /// 16 bytes of slack below `min(buf_limit, wild_cap)`, and for reads in
 /// `[0, start)`. `offset_hist` must hold the true repcode history at
 /// `start`.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn execute_blocks(
     base: *mut u8,
     start: usize,
