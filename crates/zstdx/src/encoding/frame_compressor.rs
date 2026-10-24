@@ -214,6 +214,15 @@ pub(crate) fn reset_slice_state_mode(
     state.matcher.set_ldm_arming(ldm);
     state.matcher.reset(level);
     state.dict_entropy = DictEntropy::plain(level, shape.len);
+    reset_entropy_state(state);
+}
+
+/// Zero the frame-scoped entropy state: the pre-split savings restart and
+/// the previous frame's huffman/FSE tables retire, returning their buffers
+/// to the block scratch. Every multi-frame reuse of a `CompressState` must
+/// pass through here — leftover frame-1 statistics would steer frame 2's
+/// split and table-repeat decisions.
+pub(crate) fn reset_entropy_state<M: Matcher>(state: &mut CompressState<M>) {
     state.split = pre_split::FrameSavings::new();
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_aligned(&mut state.scratch.huff);
@@ -1139,7 +1148,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         } else {
             self.state.matcher.set_input_shape(self.input_shape);
             self.state.matcher.reset(self.compression_level);
-            self.state.last_huff_table = None;
+            reset_entropy_state(&mut self.state);
             self.state.dict_entropy =
                 DictEntropy::plain(self.compression_level, self.input_shape.len);
         }
@@ -1582,6 +1591,64 @@ mod tests {
             chksum_from_data1, chksum_from_data2,
             "frame 1 and frame 2 should have the same checksum (same data, hash must reset per \
              frame)"
+        );
+    }
+
+    #[test]
+    fn entropy_state_two_frames_reused_compressor() {
+        // Reuse at a compressed level must not carry frame 1's entropy state
+        // (pre-split savings, previous huffman/FSE tables) into frame 2:
+        // frame 2 decodes exactly and matches a fresh compressor's bytes.
+        fn gen_payload(seed: u64, template: &[u8], len: usize) -> Vec<u8> {
+            let mut data = alloc::vec![];
+            let mut state = seed;
+            while data.len() < len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                data.extend_from_slice(template);
+                data.push(b'0' + (state % 10) as u8);
+                data.push(b'0' + ((state >> 8) % 10) as u8);
+            }
+            data
+        }
+        // Multi-block payloads (>= 2 x 128 KiB) with different statistics, so
+        // the frames build real huffman/FSE tables and split decisions.
+        let first = gen_payload(
+            0x9e37_79b9_7f4a_7c15,
+            b"{\"id\":123456,\"name\":\"user\",\"tags\":[\"a\",\"b\"],\"score\":42}\n",
+            300 * 1024,
+        );
+        let second = gen_payload(
+            0x0f1e_2d3c_4b5a_6978,
+            b"2026-10-25T12:00:00Z level=info msg=request handled bytes=1024 status=200\n",
+            260 * 1024,
+        );
+
+        let mut compressor = FrameCompressor::new(crate::Level::Fastest);
+        let mut out1 = Vec::new();
+        compressor.set_source(first.as_slice());
+        compressor.set_drain(&mut out1);
+        compressor.compress();
+
+        let mut out2 = Vec::new();
+        compressor.set_source(second.as_slice());
+        compressor.set_drain(&mut out2);
+        compressor.compress();
+
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(second.len());
+        decoder.decode_all_to_vec(&out2, &mut decoded).unwrap();
+        assert_eq!(second, decoded, "frame 2: decoded data mismatch");
+
+        let mut fresh = FrameCompressor::new(crate::Level::Fastest);
+        let mut fresh_out = Vec::new();
+        fresh.set_source(second.as_slice());
+        fresh.set_drain(&mut fresh_out);
+        fresh.compress();
+        assert_eq!(
+            out2, fresh_out,
+            "frame 2 differs from a fresh compressor: entropy state carried over from frame 1"
         );
     }
 

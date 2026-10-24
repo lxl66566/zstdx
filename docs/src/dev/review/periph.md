@@ -10,7 +10,7 @@ This page records the 2026-10-25 review round over the modules without a dedicat
 
 ### FrameCompressor reuse resets the frame entropy state
 
-`FrameCompressor::compress`'s no-dictionary reset branch cleared the matcher, the Huffman table and `dict_entropy`, but left `fse_tables.*_previous`, `state.split` and the Huffman table's pool recycling unhandled, all three of which `reset_slice_state` owns on the slice path. A second frame on a reused compressor could then pass frame one's adopted tables into its first block's selection and emit `Repeat_Mode` with no established table, which both this decoder (`TableIsUninitialized`) and libzstd reject as corruption. The shared tail is now one function both resets call.
+`FrameCompressor::compress`'s no-dictionary reset branch cleared the matcher, the Huffman table and `dict_entropy`, but left `fse_tables.*_previous`, `state.split` and the Huffman table's pool recycling unhandled, all three of which `reset_slice_state` owns on the slice path. A second frame on a reused compressor could then pass frame one's adopted tables into its first block's selection and emit `Repeat_Mode` with no established table, which both this decoder (`TableIsUninitialized`) and libzstd reject as corruption. The shared tail is now `reset_entropy_state`, which both resets call, and `entropy_state_two_frames_reused_compressor` pins the reuse at a compressed level against decode and fresh-compressor bytes.
 
 ## Open findings
 
