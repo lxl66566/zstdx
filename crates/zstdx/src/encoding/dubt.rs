@@ -277,6 +277,18 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             score: i32::MIN,
         };
 
+        // Hash and head read hoisted above the rep probes: a rep hit runs a
+        // long equal-run count loop, and uops enter the ROB in program
+        // order — left below, the descent's entry load waits for the loop
+        // to drain before it can issue. Nothing writes `table` between
+        // here and the walk (the rep block, the unsorted-chain reversal,
+        // nullify and batch-sort touch only bt and locals; the early exit
+        // writes the head only after this read and returns), so the early
+        // value is identical.
+        let h = self.hash_main(idx);
+        // SAFETY: plain head read; h is masked by hash_main's table_log.
+        let head = unsafe { *self.table.as_ptr().add(h) };
+
         // Repeated-offset candidates (the cheapest offsets to encode) —
         // same contract as the optimal parser's collection walk.
         if !rep_gated {
@@ -314,7 +326,6 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                             // write — and next_update moves past it, so no later
                             // fill re-inserts it. (Runs before the main hash/head
                             // handling below; cold path.)
-                            let h = self.hash_main(idx);
                             let v = pack_pos(pos);
                             let slot = 2 * (v as usize & self.bt_mask);
                             self.bt[slot] = self.table[h];
@@ -328,7 +339,6 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             }
         }
 
-        let h = self.hash_main(idx);
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
         let unsort_limit = bt_low.max(floor);
         let mut nb_candidates = self.nb_compares;
@@ -388,7 +398,6 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             // while pricing strictly improving candidates. The strict `>`
             // keeps the first score maximum — the argmax (and its
             // tie-breaks) of the array loop the fusion replaced.
-            let head = *self.table.as_ptr().add(h);
             *self.table.as_mut_ptr().add(h) = pack_pos(pos);
             let mut cand = head;
             let mut common_smaller = 0usize;

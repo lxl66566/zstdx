@@ -900,6 +900,15 @@ impl Finder<'_, '_> {
         let mut best_len = length_to_beat - 1;
         let mut mnum = 0usize;
 
+        // Hash and head read hoisted above the rep/hash3 phases: a rep hit
+        // runs a long equal-run count loop, and uops enter the ROB in
+        // program order — left below, the tree entry load waits for the
+        // loop to drain before it can issue. Nothing writes `table` between
+        // here and the head write below (the rep and hash3 phases touch
+        // only the hash3 table and locals), so the early value is identical.
+        let h = self.hash_main(idx);
+        let head = self.table[h];
+
         // Repeated-offset candidates (the cheapest offsets to encode).
         if !rep_gated {
             for rep_code in ll0..3 + ll0 {
@@ -965,8 +974,7 @@ impl Finder<'_, '_> {
         }
 
         // Tree search.
-        let h = self.hash_main(idx);
-        let mut cand = self.resolve(self.table[h], floor, pos);
+        let mut cand = self.resolve(head, floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut match_end = pos + 9;
