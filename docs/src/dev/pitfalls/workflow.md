@@ -48,6 +48,7 @@
 - Three pitfalls of parsing zstd frames with python: in `(b1<<8)|b2+0x7f00`, `+` binds tighter than `|`; the literals-header size-field bit width misremembered; `sort -rn` mixed in kernel symbols. **Before writing an analysis tool, check its field definitions against a known-correct decoder.**
 - Background task output: avoid tail/head in pipes; persist the full output to disk, then grep.
 - gungraun comparisons need explicit `--save-baseline=X` / `--baseline=X`; the default "No change" compares the run against itself. Baseline names reject `-` (use `_`).
+- **Tests that call a parallelism-gated path directly must pass the lane count explicitly (2026-10-24, `paranoid.yml` first run)**: `parallel_fill_matches_serial` invoked `fill_parallel`, whose entry `debug_assert!(lanes > 1)` gated on `parallel_fill_lanes()` — 3 only at `available_parallelism() >= 6`, else 1 — so the 4-vCPU GitHub runner failed the assert (the paranoid profile keeps debug assertions) while every >=6-core dev box passed. `std::thread::scope` needs threads, not idle cores, so the parallel path is fully exercisable on a small box once the lane count is a parameter; machine thresholds stay in the production dispatch only.
 
 ## Corpus and reproducibility
 

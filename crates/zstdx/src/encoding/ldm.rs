@@ -861,9 +861,12 @@ impl LdmState {
             }
         }
         #[cfg(feature = "std")]
-        if end - base >= PARALLEL_FILL_MIN && parallel_fill_lanes() > 1 {
-            self.fill_parallel(win, win_base, base, end);
-            return;
+        {
+            let lanes = parallel_fill_lanes();
+            if end - base >= PARALLEL_FILL_MIN && lanes > 1 {
+                self.fill_parallel(win, win_base, base, end, lanes);
+                return;
+            }
         }
         self.fill_serial(win, win_base, base, end);
     }
@@ -901,11 +904,13 @@ impl LdmState {
     /// stock loop's insert order, so the table contents, `rolling` and
     /// `fed` are bit-identical to [`Self::fill_serial`]'s. Deterministic
     /// in the input alone: no lane interleaving reaches the table.
+    /// `lanes` is the caller's scheduling choice (the lane count cannot
+    /// move the output); only callers past the parallelism threshold
+    /// may pass more than one.
     #[cfg(feature = "std")]
-    fn fill_parallel(&mut self, win: &[u8], win_base: u64, base: u64, end: u64) {
+    fn fill_parallel(&mut self, win: &[u8], win_base: u64, base: u64, end: u64, lanes: usize) {
         debug_assert!(end - base >= MIN_MATCH_LENGTH as u64);
         self.ensure_fresh();
-        let lanes = parallel_fill_lanes();
         debug_assert!(lanes > 1);
         let floor = self.arm.max(win_base);
         let mask = self.stop_mask;
@@ -1569,7 +1574,10 @@ mod tests {
     /// The parallel fill is bit-identical to the stock serial loop on
     /// every lane-partition shape: position-pure checkpoints give the
     /// same splits, the joiner inserts in position order, and the exit
-    /// fold equals the serial loop's final state.
+    /// fold equals the serial loop's final state. The lane count is
+    /// passed explicitly — the production threshold is a machine
+    /// property, and the scan's helpers only need threads, not idle
+    /// cores, so a small box exercises the full lane layout.
     #[cfg(feature = "std")]
     #[test]
     fn parallel_fill_matches_serial() {
@@ -1594,7 +1602,7 @@ mod tests {
                     let mut par = LdmState::new(20, 1 << 20);
                     par.restart(base);
                     ser.fill_serial(win, win_base, base, end);
-                    par.fill_parallel(win, win_base, base, end);
+                    par.fill_parallel(win, win_base, base, end, 3);
                     assert!(
                         ser.snapshot().same_as(&par.snapshot()),
                         "table diverged: seed {seed:x} base {base} span {span}"
@@ -1606,7 +1614,7 @@ mod tests {
                     // lane zero adopts it directly.
                     let end2 = end + 4096;
                     ser.fill_serial(win, win_base, end, end2);
-                    par.fill_parallel(win, win_base, end, end2);
+                    par.fill_parallel(win, win_base, end, end2, 3);
                     assert!(
                         ser.snapshot().same_as(&par.snapshot()),
                         "continuation diverged: seed {seed:x} base {end}"
