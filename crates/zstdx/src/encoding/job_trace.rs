@@ -177,7 +177,7 @@ pub fn add_prefill(started: Instant) {
     add_ns(&C.prefill_ns, started.elapsed());
 }
 
-/// Record one strategy grid-fill span inside `prefill_window`.
+/// Record one reach-probe job-zero donation span (`donate_job_zero_prefix`).
 #[inline]
 pub fn add_probe(started: Instant) {
     add_ns(&C.probe_ns, started.elapsed());
