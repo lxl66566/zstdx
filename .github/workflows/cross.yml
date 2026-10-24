@@ -1,0 +1,43 @@
+name: cross tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # i686 catches 32-bit usize/pointer truncation, s390x the big-endian
+        # serialization paths.
+        target: [i686-unknown-linux-gnu, s390x-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+      # Lib unit tests only: the full suite under qemu-user (s390x) is too
+      # slow, and the lib tests are where the word-size and endianness bugs
+      # surface. The paranoid profile keeps the emulated run on release
+      # codegen with every debug wall still on.
+      - run: cross test -p zstdx --lib --profile paranoid --target ${{ matrix.target }}
+
+  aarch64:
+    name: cargo test --profile paranoid -p zstdx (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Native arm64 runner (public repo): mirrors the x86_64 paranoid gate
+      # and covers the aarch64 scalar decode tier the release binaries ship.
+      - run: cargo test --profile paranoid -p zstdx

@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: workspace + no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Covers every crate the paranoid gate skips: zstdx-ffi's Rust suite,
+      # zstdx-bench and the zstdx-cli end-to-end suite (gungraun benches are
+      # test = false and only run under cargo bench).
+      - run: cargo test --workspace
+      - run: cargo test -p zstdx --no-default-features
+
+  ffi-c:
+    name: ffi c harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The parity gate doubles as a drift check against the reference tree,
+      # pinned to the commit the ffi layer tracks (1.6.0 / 10600).
+      - uses: actions/checkout@v7
+        with:
+          repository: facebook/zstd
+          ref: d9c0c7e2cf8a8bf9fb98d3bee546dcf8dc9ac59a
+          path: zstd-ref
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make -C zstd-ref/lib -j"$(nproc)" libzstd.a
+      # run-c.sh consumes json/text slices from bench/corpus, which is not
+      # checked in.
+      - run: bash bench/gen_corpus.sh
+      - run: bash crates/zstdx-ffi/tests/run-c.sh
+        env:
+          ZSTD_REF: ${{ github.workspace }}/zstd-ref
+
+  msrv:
+    name: msrv 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      # Every crate declares rust-version 1.89. The workspace-wide check
+      # proves the manifests for all targets; a full workspace test run on
+      # the pinned toolchain doubles the runtime for little extra signal,
+      # so only the codec crate is tested.
+      - run: cargo check --workspace --all-targets
+      - run: cargo test -p zstdx
