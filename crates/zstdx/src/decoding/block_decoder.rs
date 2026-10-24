@@ -208,7 +208,7 @@ impl BlockDecoder {
                 out,
                 written,
                 virt_base,
-                view,
+                &view,
                 offset_hist,
                 headroom,
             )

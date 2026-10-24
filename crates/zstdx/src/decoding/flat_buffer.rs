@@ -1,69 +1,117 @@
-//! Flat output buffer for dictionary-free streaming decode, mirroring libzstd's
-//! `outBuff` model: blocks are decoded straight into a linear buffer and flushed
-//! to the caller from it. Flushing hands out everything pending — the bytes stay
-//! physically in the buffer afterwards, so later matches can still reference
-//! them. When the buffer fills up to its high-water mark (and everything decoded
-//! so far has been flushed), writing wraps back to the start while the previous
-//! segment's tail keeps serving as the match window.
+//! Flat output buffer for streaming decode, mirroring libzstd's `outBuff`
+//! generation model: blocks are decoded straight into a linear buffer and
+//! handed out from it; handed-out bytes stay physically in place as match
+//! history. A generation wraps when it is fully handed out and cannot fit
+//! one more block (`end + blockMax > cap`, the cap being libzstd's
+//! `ZSTD_decodingBufferSize_internal`); writing restarts at the buffer
+//! start, the virtual origin advances, and the wrapped-away previous
+//! generation keeps serving as the match window until the next wrap
+//! overwrites it — exactly libzstd's ring, where
+//! `ZSTD_checkContinuity` rebases `virtualStart` to the previous
+//! contiguous run. The per-sequence acceptance rule is thereby libzstd's
+//! `offset > oLitEnd - virtualStart` corruption check: an offset is legal
+//! iff it stays within the previous generation's length plus the position
+//! in the current one. A declared Frame_Content_Size caps the buffer
+//! (`min(fcs, window + 2*blockMax + 64)`) and disables wrapping entirely
+//! while it covers the frame (`outBuffSize < frameContentSize`).
 //!
-//! Wrap safety: the buffer holds `window + 2 * MAX_BLOCK_SIZE + slack` bytes. A
-//! wrap only happens once at least `window + MAX_BLOCK_SIZE + WILDCOPY_SLACK`
-//! bytes were produced, so a new generation's writes (block output plus the
-//! 16-byte wildcopy overshoot) stay below the wrapped-away history's in-window
-//! floor `[origin - window, origin)`: its lowest legally readable byte sits at
-//! physical `end - window >= MAX_BLOCK_SIZE + WILDCOPY_SLACK`, above anything
-//! the first block can touch. Later blocks may write over dead history, but by
-//! induction (the k-th block after a wrap writes absolute `[k*bs, (k+1)*bs)`
-//! while match references from output position `q >= k*bs` stay above
-//! `end - window + k*bs >= (k+1)*bs + WILDCOPY_SLACK`), match sources and
-//! match destinations never collide within a buffer generation.
+//! Dictionary frames decode through this buffer too: the raw dict content
+//! is prefilled as generation 0's physical prefix, so the never-wrapped
+//! (first) generation reaches `dictLen + produced` — libzstd's
+//! `virtualStart = dst - dictSize` — and the first wrap drops the dict
+//! from the window exactly when libzstd's ring discards it as extDict.
+//! The wrap threshold ignores the prefill (libzstd's ring never holds the
+//! dict), so generation lengths match the C byte for byte.
+//!
+//! One-shot decoding (strategy `All` with nothing handed out mid-frame)
+//! never satisfies the wrap precondition and grows instead, keeping the
+//! whole frame as history like `ZSTD_decompress`.
+//!
+//! Wrap safety: after a wrap the active generation writes `[0, cursor)`
+//! (overwriting the dict prefill, then the previous generation from the
+//! bottom), and `ensure_block_space` guarantees `blockMax + WILDCOPY_SLACK`
+//! bytes of target room, so no write leaves the allocation. Reads below
+//! the cursor are either the previous generation's still-intact top
+//! `[cursor, genEnd)` — always above the write cursor, per the reach rule
+//! the executor enforces — or rejected as corruption.
 
 use alloc::vec::Vec;
 
-use crate::common::MAX_BLOCK_SIZE;
-
-const MAX_BLOCK_SIZE_USIZE: usize = MAX_BLOCK_SIZE as usize;
-
-/// Extra headroom so a wrapped block's doubling copies can overshoot the
-/// nominal block end without touching the history segment.
-const WRAP_SLACK: usize = 64;
+use crate::common::{max_block_output, streaming_buffer_cap};
 
 /// Wildcopy overshoot the block target must absorb beyond a full block
 /// (16-byte chunks copying past the sequence end).
 pub(crate) const WILDCOPY_SLACK: usize = 16;
 
 /// Read-only window mapping handed to the sequence executor: virtual
-/// addresses are global frame positions; the active segment maps
-/// `v >= origin` to `v - origin`, the wrapped-away previous segment maps
-/// `prev_origin <= v < origin` to `v - prev_origin` (bounded by its physical
-/// end). Anything below is out of window.
+/// addresses are global frame positions (the dict prefill occupies
+/// `[0, dictLen)`). The active generation maps `v >= origin` to the
+/// physical offset `v - origin`, the wrapped-away previous generation maps
+/// `prev_origin <= v < origin` to `prev_phys_base + (v - prev_origin)`
+/// (bounded by its physical end). Anything below `prev_origin` is out of
+/// window.
 #[derive(Clone, Copy)]
 pub(crate) struct FlatView {
     pub origin: usize,
     pub prev_origin: usize,
-    /// Physical end of the previous segment (its bytes above the window may
-    /// have been overwritten by the active segment).
+    /// Physical offset of the previous generation's first byte (0 except
+    /// right after the dict-prefilled first generation, whose output sits
+    /// above the prefill at physical `dictLen`).
+    pub prev_phys_base: usize,
+    /// Physical end of the previous generation (`prev_phys_base +
+    /// prev_origin..origin run length`); its bytes below the active
+    /// generation's cursor may have been overwritten.
     pub seg_a_end: usize,
     pub out_len: usize,
 }
 
+impl FlatView {
+    /// One-shot mapping: the whole decode target is one contiguous
+    /// generation and the full history is addressable.
+    pub fn one_shot(out_len: usize) -> Self {
+        FlatView {
+            origin: 0,
+            prev_origin: 0,
+            prev_phys_base: 0,
+            seg_a_end: out_len,
+            out_len,
+        }
+    }
+}
+
 pub(crate) struct FlatOut {
     buf: Vec<u8>,
-    /// Virtual origin of the active segment (== total bytes produced at the
-    /// last wrap). `origin + end` is the total number of bytes produced in
-    /// the frame; virtual addresses must stay globally monotonic because
-    /// sequence offsets are global distances.
+    /// Virtual origin of the active generation (== total bytes produced at
+    /// the last wrap, dict prefill included). `origin + end - dict_total`
+    /// is the frame's produced count; virtual addresses must stay globally
+    /// monotonic because sequence offsets are global distances.
     origin: usize,
-    /// Virtual origin of the previous segment, i.e. of the history that
+    /// Virtual origin of the previous generation, i.e. of the history that
     /// still serves as the match window after a wrap.
     prev_origin: usize,
-    /// Physical end of that previous segment.
+    /// Physical offset of that previous generation (`dict_total` for the
+    /// first wrap, 0 afterwards).
+    prev_phys_base: usize,
+    /// Virtual end of that previous generation (`prev_origin + run len`).
     seg_a_end: usize,
     /// Flush cursor: `buf[start..end]` is decoded but not yet handed out.
     start: usize,
     /// Decode cursor.
     end: usize,
-    window: usize,
+    /// Streaming buffer cap (libzstd's outBuff size) and the frame's block
+    /// maximum.
+    cap: usize,
+    block_max: usize,
+    /// libzstd never wraps when the buffer already covers a declared
+    /// Frame_Content_Size (`outBuffSize < frameContentSize` guard); such a
+    /// frame decodes as one generation with the whole output as history.
+    wrap_enabled: bool,
+    /// Raw dict content prefilled at `buf[0..dict_prefill]`; part of the
+    /// first generation's window. Cleared at the first wrap (libzstd's
+    /// ring discards the dict extDict there); `dict_total` keeps the
+    /// produced-count accounting for the whole frame.
+    dict_prefill: usize,
+    dict_total: usize,
 }
 
 impl FlatOut {
@@ -72,20 +120,40 @@ impl FlatOut {
             buf: Vec::new(),
             origin: 0,
             prev_origin: 0,
+            prev_phys_base: 0,
             seg_a_end: 0,
             start: 0,
             end: 0,
-            window: 0,
+            cap: 0,
+            block_max: 0,
+            wrap_enabled: true,
+            dict_prefill: 0,
+            dict_total: 0,
         }
     }
 
-    pub fn reset(&mut self, window: usize) {
+    pub fn reset(&mut self, window: usize, fcs: Option<u64>) {
+        self.reset_with_dict(window, fcs, &[]);
+    }
+
+    /// Reset for a frame whose history starts with `dict`'s raw content
+    /// (libzstd's `ZSTD_refDictContent`; empty for dictionary-free frames).
+    pub fn reset_with_dict(&mut self, window: usize, fcs: Option<u64>, dict: &[u8]) {
         self.origin = 0;
         self.prev_origin = 0;
+        self.prev_phys_base = 0;
         self.seg_a_end = 0;
-        self.start = 0;
-        self.end = 0;
-        self.window = window;
+        self.cap = streaming_buffer_cap(window, fcs);
+        self.block_max = max_block_output(window);
+        self.wrap_enabled = fcs.is_none_or(|f| f > self.cap as u64);
+        self.dict_total = dict.len();
+        self.dict_prefill = dict.len();
+        self.start = dict.len();
+        self.end = dict.len();
+        if self.buf.len() < dict.len() {
+            self.buf.resize(dict.len(), 0);
+        }
+        self.buf[..dict.len()].copy_from_slice(dict);
     }
 
     /// Snapshot of the virtual window mapping for the sequence executor.
@@ -93,65 +161,85 @@ impl FlatOut {
         FlatView {
             origin: self.origin,
             prev_origin: self.prev_origin,
+            prev_phys_base: self.prev_phys_base,
             seg_a_end: self.seg_a_end,
             out_len: self.buf.len(),
         }
     }
 
-    /// Total bytes produced in the frame so far (size of the virtual space).
+    /// Total bytes produced in the frame so far (size of the virtual space
+    /// above the dict prefill).
     pub fn produced(&self) -> usize {
-        self.origin + self.end
+        self.origin + self.end - self.dict_total
     }
 
-    /// Make room for one more block. Returns false when the caller must first
-    /// flush the pending bytes (`start < end`); in that case no header should
-    /// have been consumed from the source yet.
+    /// Make room for one more block. Returns false when the caller must
+    /// first hand out the pending bytes (`start < end`); in that case no
+    /// header should have been consumed from the source yet.
     ///
     /// On success the block target `buf[end..]` holds at least
-    /// `MAX_BLOCK_SIZE + WILDCOPY_SLACK` bytes beyond the cursor, letting the
+    /// `block_max + WILDCOPY_SLACK` bytes beyond the cursor, letting the
     /// sequence executor drop its per-sequence bounds checks (the HEADROOM
     /// instantiation of `execute_decoded_flat`).
     ///
+    /// The wrap fires at libzstd's exact threshold — a fully handed-out
+    /// generation plus one block max over the cap — independent of the
+    /// buffer's actual size, so acceptance matches the reference even when
+    /// the buffer was force-grown earlier.
+    ///
     /// With `force`, the buffer grows past the steady-state size instead of
-    /// returning false — used by the All strategy, which promises to decode
-    /// every block before the caller reads (the ring path satisfies this by
-    /// growing without bound too).
+    /// wrapping or returning false — used by the All strategy, which
+    /// promises to decode every block before the caller reads (and by
+    /// never-wrap pledged frames whose output overruns the pledge; the
+    /// frame-tail content-size check rejects those).
     pub fn ensure_block_space(&mut self, force: bool) -> bool {
-        if self.end + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK <= self.buf.len() {
-            return true;
-        }
-        if self.start == self.end && self.end >= self.window + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK
+        // The dict prefill does not count against the cap (libzstd's ring
+        // never holds the dict), so generation lengths match the C.
+        if self.start == self.end
+            && self.wrap_enabled
+            && self.end + self.block_max > self.cap + self.dict_prefill
         {
-            // Wrap: everything decoded so far was flushed and the previous
-            // segment keeps a full window plus the wildcopy overshoot margin
-            // proven above (its lowest in-window byte is
-            // `WILDCOPY_SLACK` above anything the new generation's first
-            // block can write). Virtual origins chain so addresses stay
-            // monotonic across generations (offsets are global distances).
-            self.prev_origin = self.origin;
-            self.seg_a_end = self.end;
+            // Wrap: everything decoded so far was handed out and the
+            // generation cannot fit one more block. Virtual origins chain
+            // so addresses stay monotonic; the executor rejects sources
+            // below the new `prev_origin`, so the new generation only ever
+            // reads its own bytes, the previous generation's intact top,
+            // and the guaranteed target room. The retained window is the
+            // previous generation — starting at its virtual top edge for
+            // the dict-prefilled first generation, whose lower `dict_prefill`
+            // bytes (the dict) leave the window here exactly when libzstd's
+            // ring discards the dict extDict at the first wrap.
+            self.prev_origin = self.origin + self.dict_prefill;
+            self.prev_phys_base = self.dict_prefill;
+            self.seg_a_end = self.end - self.dict_prefill;
             self.origin += self.end;
+            self.dict_prefill = 0;
             self.start = 0;
             self.end = 0;
+        }
+        if self.end + self.block_max + WILDCOPY_SLACK <= self.buf.len() {
             return true;
         }
         let cap = self.buf.len();
-        let needed = self.window + 2 * MAX_BLOCK_SIZE_USIZE + WRAP_SLACK;
-        if cap < needed || force {
-            // Grow towards the steady-state size (beyond it when forced);
-            // the cursor semantics are index-based, so a realloc is
-            // transparent. Re-check afterwards: with a large decode cursor
-            // the grown size may still be short, in which case the caller
-            // must flush first and wrap later.
-            let target = (2 * cap).max(2 * MAX_BLOCK_SIZE_USIZE).max(needed);
+        let needed = self.cap + WILDCOPY_SLACK + self.dict_prefill;
+        if cap < needed || force || self.start == self.end {
+            // Grow towards the steady-state size (beyond it when forced, or
+            // when a wrap cannot fire — a pending-free cursor must always
+            // make progress); the cursor semantics are index-based, so a
+            // realloc is transparent. Re-check afterwards: with a large
+            // decode cursor the grown size may still be short, in which case
+            // the caller must flush first and wrap later.
+            let target = (2 * cap)
+                .max(needed)
+                .max(self.dict_prefill + self.block_max + WILDCOPY_SLACK);
             self.buf.resize(target, 0);
-            return self.end + MAX_BLOCK_SIZE_USIZE + WILDCOPY_SLACK <= self.buf.len();
+            return self.end + self.block_max + WILDCOPY_SLACK <= self.buf.len();
         }
         false
     }
 
-    /// How many bytes can currently be flushed (all pending bytes; they remain
-    /// in the buffer as match history after being handed out).
+    /// How many bytes can currently be handed out (all pending bytes; they
+    /// remain in the buffer until overwritten by a later generation).
     pub fn can_flush(&self) -> usize {
         self.end - self.start
     }
@@ -208,7 +296,8 @@ impl FlatOut {
     }
 
     /// Absolute slice for checksumming freshly decoded bytes. Both offsets
-    /// must lie in the same physical segment (blocks never straddle a wrap).
+    /// must lie in the same physical generation (blocks never straddle a
+    /// wrap).
     #[cfg(feature = "hash")]
     pub fn abs_slice(&self, a: usize, b: usize) -> &[u8] {
         &self.buf[a..b]
@@ -219,29 +308,38 @@ impl FlatOut {
         self.origin
     }
 
-    /// `(prev_origin, seg_a_end)` for wrap-margin assertions.
     #[cfg(test)]
-    pub fn prev_segment_for_test(&self) -> (usize, usize) {
-        (self.prev_origin, self.seg_a_end)
+    pub fn cap_for_test(&self) -> usize {
+        self.cap
+    }
+
+    #[cfg(test)]
+    pub fn prev_segment_for_test(&self) -> (usize, usize, usize) {
+        (self.prev_origin, self.prev_phys_base, self.seg_a_end)
+    }
+
+    #[cfg(test)]
+    pub fn buf_len_for_test(&self) -> usize {
+        self.buf.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FlatOut, WILDCOPY_SLACK};
-    use crate::common::MAX_BLOCK_SIZE;
+    use super::FlatOut;
+    use crate::common::{MAX_BLOCK_SIZE, max_block_output, streaming_buffer_cap};
 
     #[test]
     fn grows_then_wraps_without_stalling() {
-        // Tiny window so wraps happen quickly.
+        // Tiny window so wraps happen quickly (cap = 1024 + 2*1024 + 64).
         let window = 1024;
         let mut f = FlatOut::new();
-        f.reset(window);
+        f.reset(window, None);
         let mut sink = [0u8; 4096];
         let mut total = 0usize;
         let mut given_out = 0usize;
         for i in 0..2000 {
-            // Flush fully first, as the streaming layer would.
+            // Hand out fully first, as the streaming layer would.
             loop {
                 let n = f.flush_to(&mut sink);
                 given_out += n;
@@ -255,20 +353,22 @@ mod tests {
             f.advance(fill);
             total += fill;
             assert_eq!(f.produced(), total);
-            // After a wrap, flushed bytes leave the pending region (they stay
-            // in the buffer only as match history), so this is an inequality.
             assert!(given_out + f.can_flush() <= total);
         }
     }
 
     #[test]
-    fn wrap_keeps_history_addressable() {
-        // Virtual addresses below the origin must keep mapping into the
-        // history segment after a wrap.
+    fn wrap_advances_origin_at_libzstd_threshold() {
+        // The wrap fires when a fully handed-out generation cannot fit one
+        // more block: end + block_max > cap, so every generation is longer
+        // than cap - block_max and the first one starts at the buffer
+        // bottom (cap - block_max = window + block_max + 64 minimum).
         let window = MAX_BLOCK_SIZE as usize;
         let mut f = FlatOut::new();
-        f.reset(window);
-        let mut sink = alloc::vec![0u8; window];
+        f.reset(window, None);
+        let cap = f.cap_for_test();
+        let block = max_block_output(window);
+        let mut sink = alloc::vec![0u8; 8 * window];
         for i in 0..64u8 {
             loop {
                 if f.flush_to(&mut sink) == 0 {
@@ -279,70 +379,161 @@ mod tests {
             let n = window / 2;
             f.block_target()[..n].fill(i);
             f.advance(n);
+            if f.origin_for_test() != 0 {
+                // Origin == the produced count at the wrap; the threshold
+                // guarantees the generation exceeded cap - block_max, and
+                // the current generation holds exactly this fill.
+                assert!(f.origin_for_test() + block > cap);
+                assert_eq!(f.produced(), f.origin_for_test() + n);
+                return;
+            }
         }
-        let produced = f.produced();
-        assert!(produced > window);
-        // A wrap must have happened for this much production.
-        let origin = f.origin_for_test();
-        assert!(origin == 0 || origin >= window + MAX_BLOCK_SIZE as usize);
+        panic!("a wrap should have happened");
     }
 
     #[test]
-    fn wrap_never_too_early_for_wildcopy_overshoot() {
-        // The wrap point must leave the previous generation's in-window floor
-        // (physical `end - window`) above everything the new generation can
-        // write before its cursor reaches that floor: block output is capped
-        // at MAX_BLOCK_SIZE and the wildcopy overshoot adds 16 more bytes.
-        let window = 4096;
+    fn wrap_fires_independent_of_buffer_size() {
+        // A force-grown (oversized) buffer must wrap at the cap threshold,
+        // not when the block stops fitting — libzstd's ring is always
+        // exactly cap bytes, so generations delimit identically.
+        let window = 1024;
         let mut f = FlatOut::new();
-        f.reset(window);
-        // Grow to the steady-state size first, as the streaming layer would.
-        assert!(f.ensure_block_space(false));
-
-        // At the historic wrap threshold (window + MAX_BLOCK_SIZE) with a
-        // full-size buffer the block simply continues in the same generation:
-        // no wrap, no stall.
-        let old_threshold = window + MAX_BLOCK_SIZE as usize;
-        f.advance(old_threshold);
-        let _ = f.take_pending(); // start == end, everything flushed
+        f.reset(window, None);
+        let cap = f.cap_for_test();
+        // Decode four 1000-byte blocks without ever handing them out
+        // (strategy All): force growth makes the buffer oversized.
+        for _ in 0..4 {
+            assert!(f.ensure_block_space(true));
+            f.block_target()[..1000].fill(0x5a);
+            f.advance(1000);
+        }
         assert!(
-            f.ensure_block_space(false),
-            "must not stall at the old wrap threshold"
+            f.buf_len_for_test() > cap + 16,
+            "buffer should be oversized beyond the steady-state size"
         );
+        assert_eq!(f.origin_for_test(), 0);
+        // Hand everything out; the next block request must wrap at the cap
+        // threshold (4000 + 1024 > 3136) even though the oversized buffer
+        // could still fit blocks until 4000 + 1024 + 16 <= 6304.
+        let mut sink = [0u8; 8192];
+        while f.flush_to(&mut sink) != 0 {}
+        assert!(f.ensure_block_space(false));
         assert_eq!(
             f.origin_for_test(),
-            0,
-            "must not wrap below the safe margin"
+            4000,
+            "wrap must fire at the cap threshold"
         );
+    }
 
-        // Keep producing full blocks: once the cursor gate (end + block max +
-        // overshoot > buffer) can no longer serve the block in this
-        // generation, the wrap fires, and the wrapped-away segment is well
-        // above the wildcopy margin.
-        let mut sink = alloc::vec![0u8; window];
-        for i in 0..64u8 {
+    #[test]
+    fn wrap_frees_a_full_block_of_room() {
+        // After a wrap the cursor resets and a maximal block plus wildcopy
+        // slack must fit immediately (the HEADROOM contract).
+        let window = 4096;
+        let mut f = FlatOut::new();
+        f.reset(window, None);
+        let block = max_block_output(window);
+        let mut sink = alloc::vec![0u8; 64 * window];
+        let mut filled;
+        loop {
             loop {
                 if f.flush_to(&mut sink) == 0 {
                     break;
                 }
             }
-            assert!(f.ensure_block_space(false), "stalled at block {i}");
+            assert!(f.ensure_block_space(false));
+            filled = 0;
+            while filled + block <= f.block_target().len() {
+                f.block_target()[filled..filled + block].fill(0xab);
+                filled += block;
+                f.advance(block);
+            }
             if f.origin_for_test() != 0 {
-                let (prev_origin, seg_a_end) = f.prev_segment_for_test();
-                assert!(
-                    seg_a_end >= window + MAX_BLOCK_SIZE as usize + WILDCOPY_SLACK,
-                    "wrapped with only {seg_a_end} bytes of history"
-                );
-                // The in-window floor of the wrapped-away history stays above
-                // a full block plus overshoot, so the new generation's first
-                // block cannot touch readable history. Origins chain.
-                assert!(seg_a_end - window >= MAX_BLOCK_SIZE as usize + WILDCOPY_SLACK);
-                assert_eq!(f.origin_for_test(), prev_origin + seg_a_end);
+                break;
+            }
+        }
+        assert!(f.block_target().len() >= block + 16);
+        assert!(f.ensure_block_space(false));
+    }
+
+    #[test]
+    fn pledged_frame_covered_by_cap_never_wraps() {
+        // libzstd: outBuff = min(fcs, needed), and no wrap ever happens
+        // when it already covers the pledged content — the whole frame is
+        // one generation with full history (envelope lifted to one-shot).
+        let window = 1024;
+        let fcs = 3000u64; // below cap 3136
+        let mut f = FlatOut::new();
+        f.reset(window, Some(fcs));
+        assert_eq!(f.cap_for_test(), fcs as usize);
+        let mut sink = [0u8; 8192];
+        let mut total = 0usize;
+        for i in 0..40 {
+            loop {
+                if f.flush_to(&mut sink) == 0 {
+                    break;
+                }
+            }
+            assert!(f.ensure_block_space(false), "stalled at {total}");
+            let fill = 1000.min(fcs as usize - total.min(fcs as usize));
+            f.block_target()[..fill].fill((i % 251) as u8);
+            f.advance(fill);
+            total += fill;
+            assert_eq!(f.origin_for_test(), 0, "pledged frame must not wrap");
+        }
+    }
+
+    #[test]
+    fn dict_prefill_extends_then_expires() {
+        // Generation 0's window includes the dict prefill; the first wrap
+        // drops it and rebases the previous generation's physical base.
+        let window = 1024;
+        let dict: alloc::vec::Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let mut f = FlatOut::new();
+        f.reset_with_dict(window, None, &dict);
+        assert_eq!(f.produced(), 0, "prefill is not frame output");
+        assert_eq!(f.can_flush(), 0, "prefill is never handed out");
+        let mut sink = [0u8; 8192];
+        let mut total = 0usize;
+        for i in 0..16 {
+            loop {
+                if f.flush_to(&mut sink) == 0 {
+                    break;
+                }
+            }
+            assert!(f.ensure_block_space(false));
+            if f.origin_for_test() != 0 {
+                // The first wrap retains exactly the dict-topped first
+                // generation: output-only window starting at the dict top.
+                let (prev_origin, prev_phys_base, seg_a_end) = f.prev_segment_for_test();
+                assert_eq!(prev_origin, dict.len());
+                assert_eq!(prev_phys_base, dict.len());
+                assert_eq!(seg_a_end, total);
                 return;
             }
-            f.block_target()[..window].fill(i);
-            f.advance(window);
+            f.block_target()[..1000].fill(i);
+            f.advance(1000);
+            total += 1000;
+            assert_eq!(f.produced(), total);
         }
         panic!("a wrap should have happened");
+    }
+
+    #[test]
+    fn cap_follows_libzstd_formula() {
+        use crate::common::MIN_WINDOW_SIZE;
+        // unpledged: max(window, 1KiB) + 2*min(window,128K) + 64
+        assert_eq!(streaming_buffer_cap(4096, None), 4096 + 2 * 4096 + 64);
+        assert_eq!(
+            streaming_buffer_cap(MIN_WINDOW_SIZE as usize / 2, None),
+            1024 + 2 * 512 + 64
+        );
+        // pledged below the needed size: the buffer stops at the pledge
+        assert_eq!(streaming_buffer_cap(1 << 20, Some(999)), 999);
+        // pledged above it: unchanged
+        assert_eq!(
+            streaming_buffer_cap(1 << 20, Some(1 << 40)),
+            (1 << 20) + 2 * (1 << 17) + 64
+        );
     }
 }

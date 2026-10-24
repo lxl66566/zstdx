@@ -99,12 +99,13 @@ pub struct FrameDecoder {
 struct FrameDecoderState {
     pub frame_header: frame::FrameHeader,
     decoder_scratch: DecoderScratch,
-    /// Dictionary-free frames decode blocks straight into this flat buffer
-    /// instead of the ring buffer (libzstd outBuff model).
+    /// Frames decode blocks straight into this flat buffer instead of the
+    /// ring buffer (libzstd outBuff generation model); dictionary frames
+    /// prefill it with the dict content as the window's virtual prefix.
     flat: FlatOut,
-    /// Whether `flat` owns the decoded output; cleared when a dictionary
-    /// takes over mid-frame (force_dict), where its pending bytes are
-    /// dropped along with the decoder state.
+    /// Whether `flat` owns the decoded output; cleared only when a
+    /// dictionary takes over mid-frame (force_dict), whose pending bytes
+    /// are dropped along with the decoder state.
     flat_active: bool,
     frame_finished: bool,
     block_counter: usize,
@@ -157,7 +158,7 @@ impl FrameDecoderState {
             check_sum: None,
             using_dict: None,
         };
-        state.flat.reset(window_size as usize);
+        state.flat.reset(window_size as usize, state.declared_fcs());
         #[cfg(feature = "hash")]
         state
             .decoder_scratch
@@ -174,9 +175,9 @@ impl FrameDecoderState {
         self.frame_finished = false;
         self.block_counter = 0;
         self.decoder_scratch.reset(window_size as usize);
-        self.flat.reset(window_size as usize);
-        // Dictionary-free frames decode into the flat buffer; `reset()`'s
-        // caller re-disables this when the next frame carries a dictionary.
+        self.flat.reset(window_size as usize, self.declared_fcs());
+        // `reset()`'s caller re-establishes the dict prefill when the next
+        // frame carries a dictionary.
         self.flat_active = true;
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
@@ -185,6 +186,26 @@ impl FrameDecoderState {
         self.decoder_scratch
             .set_checksum_enabled(self.frame_header.descriptor.content_checksum_flag());
         Ok(())
+    }
+
+    /// The frame's declared Frame_Content_Size, when present: it caps the
+    /// streaming buffer and disables wrapping while it covers the frame
+    /// (libzstd's `min(fcs, needed)` sizing and `outBuffSize < fcs` guard).
+    fn declared_fcs(&self) -> Option<u64> {
+        self.frame_header
+            .descriptor
+            .declares_content_size()
+            .then(|| self.frame_header.frame_content_size())
+    }
+
+    /// Route a dictionary frame through the flat buffer: the dict's raw
+    /// content becomes the first generation's virtual prefix (libzstd's
+    /// `ZSTD_refDictContent` window backfill), so the dict's reach — and
+    /// its expiry at the first wrap — match the reference's ring semantics.
+    fn install_dict_prefill(&mut self, dict: &Dictionary) {
+        let window = self.decoder_scratch.buffer.window_size;
+        self.flat
+            .reset_with_dict(window, self.declared_fcs(), &dict.dict_content);
     }
 
     /// Reject a frame whose declared window exceeds the limit, before allocation.
@@ -313,14 +334,14 @@ impl FrameDecoder {
                 .ok_or(err::DictNotProvided { dict_id })?;
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
-            state.flat_active = false;
+            state.install_dict_prefill(dict);
         } else if let Some(dict) = self.dicts.get(&0) {
             // No dictID in the frame: a registered id-0 dictionary (raw
             // content, or a formatted one trained with --dictID=0) is still
             // the frame's history — libzstd applies it unconditionally.
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(0);
-            state.flat_active = false;
+            state.install_dict_prefill(dict);
         }
         Ok(())
     }
@@ -373,8 +394,14 @@ impl FrameDecoder {
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
         if state.flat_active {
+            // Mid-frame dict takeover cannot prefill history the flat
+            // buffer would have to re-derive, so the ring path takes over
+            // (it holds the dict content directly).
             state.flat_active = false;
-            state.flat.reset(state.decoder_scratch.buffer.window_size);
+            state.flat.reset(
+                state.decoder_scratch.buffer.window_size,
+                state.declared_fcs(),
+            );
         }
 
         Ok(())
@@ -709,6 +736,12 @@ impl FrameDecoder {
     /// Decode an entire frame block-by-block straight into `out`, bypassing
     /// the ring buffer. Valid only when no dictionary is attached; matches
     /// reference the frame's own output as the window. Returns bytes written.
+    ///
+    /// Mirroring `ZSTD_decompressFrame`, Raw/RLE blocks are bounded only by
+    /// the target: the per-block `min(window, MAX_BLOCK_SIZE)` cap is a
+    /// streaming-path check (`ZSTD_decompressContinue`'s header and
+    /// post-block stages), and the one-shot reference accepts blocks whose
+    /// declared output exceeds it.
     fn decode_frame_flat(
         state: &mut FrameDecoderState,
         source: &mut &[u8],
@@ -722,14 +755,6 @@ impl FrameDecoder {
                 .read_block_header(&mut *source)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += 3;
-
-            if matches!(block_header.block_type, BlockType::Raw | BlockType::RLE) {
-                check_block_output_size(
-                    state.decoder_scratch.buffer.window_size,
-                    block_header.decompressed_size,
-                )
-                .map_err(err::FailedToReadBlockBody)?;
-            }
 
             #[cfg(feature = "hash")]
             let produced_before = written;
@@ -782,12 +807,7 @@ impl FrameDecoder {
                         out,
                         &mut written,
                         0,
-                        decoding::flat_buffer::FlatView {
-                            origin: 0,
-                            prev_origin: 0,
-                            seg_a_end: out.len(),
-                            out_len: out.len(),
-                        },
+                        decoding::flat_buffer::FlatView::one_shot(out.len()),
                         false,
                     )
                     .map_err(|e| match e {
@@ -1104,26 +1124,33 @@ impl FrameDecoder {
                 Err(e) => return Err(e),
             }
             loop {
-                // Frames without a dictionary take the flat path: blocks are
-                // executed straight into the caller's buffer and the ring
-                // buffer stays empty, so nothing needs draining afterwards.
-                let flat = match &self.state {
-                    Some(s) => s.using_dict.is_none(),
+                // Frames without a dictionary decode straight into the
+                // caller's buffer; dictionary frames force-decode through
+                // the flat buffer (whole-history one-shot semantics, the
+                // dict prefill as the window's virtual prefix) and drain it
+                // afterwards.
+                let dict = match &self.state {
+                    Some(s) => s.using_dict.is_some(),
                     None => false,
                 };
-                if flat {
+                if !dict {
                     let state = self.state.as_mut().expect("state checked above");
                     let bytes_written = Self::decode_frame_flat(state, &mut input, output)?;
                     output = &mut output[bytes_written..];
                     total_bytes_written += bytes_written;
                     break;
                 }
-                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
-                let bytes_written = self
-                    .read(output)
-                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
-                output = &mut output[bytes_written..];
-                total_bytes_written += bytes_written;
+                self.decode_blocks(&mut input, BlockDecodingStrategy::All)?;
+                loop {
+                    let bytes_written = self
+                        .read(output)
+                        .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                    output = &mut output[bytes_written..];
+                    total_bytes_written += bytes_written;
+                    if bytes_written == 0 {
+                        break;
+                    }
+                }
                 if self.can_collect() != 0 {
                     return Err(FrameDecoderError::TargetTooSmall);
                 }
@@ -1220,10 +1247,11 @@ mod tests {
         }
     }
 
-    /// A dictionary frame must not pin the decoder to the ring path forever:
-    /// `reset()` puts the next dictionary-free frame back on the flat path.
+    /// Dictionary frames decode through the flat buffer too (the dict
+    /// content prefills the window), so the ring path stays reachable only
+    /// via an explicit mid-frame `force_dict`.
     #[test]
-    fn reset_restores_flat_path_after_dictionary_frame() {
+    fn dict_frames_decode_flat_with_prefill() {
         use std::io::Cursor;
 
         let mut dec = FrameDecoder::new();
@@ -1231,7 +1259,10 @@ mod tests {
 
         let mut src = Cursor::new(dict_frame());
         dec.reset(&mut src).unwrap();
-        assert!(!dec.state.as_ref().expect("initialized").flat_active);
+        assert!(
+            dec.state.as_ref().expect("initialized").flat_active,
+            "dictionary frames decode through the flat buffer"
+        );
         dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
             .unwrap();
         assert!(dec.is_finished());

@@ -265,10 +265,12 @@ unsafe fn execute_piece(
     for part in &piece.parts {
         // SAFETY: caller contract above; parts tile the piece and the
         // history carries the true state at each part start (validated).
+        // Pieces are frame-relative, so the frame base is output zero.
         unsafe {
             execute_blocks(
                 base,
                 part.start,
+                0,
                 &segs[part.seg],
                 part.blocks.clone(),
                 input,
@@ -981,16 +983,26 @@ fn run_serial(
     let mut written = 0usize;
     // Output offset where each frame began, in scan order.
     let mut frame_starts = Vec::with_capacity(plan.frame_pledges.len());
+    let mut frame_base = 0usize;
     for (id, seg) in segs.iter().enumerate() {
         if plan.segments[id].frame_start {
             offset_hist = [1, 4, 8];
             frame_starts.push(written);
+            frame_base = written;
         }
         let (base, buf_limit) = place(written, written + seg.out_size)?;
         // SAFETY: place made [0, written + out_size) valid; every match
         // source below `written` is final (in-order execution).
         unsafe {
-            execute_segment(base, written, seg, input, &mut offset_hist, buf_limit)?;
+            execute_segment(
+                base,
+                written,
+                frame_base,
+                seg,
+                input,
+                &mut offset_hist,
+                buf_limit,
+            )?;
         }
         #[cfg(feature = "hash")]
         if let Some((h, _)) = hash.as_mut() {

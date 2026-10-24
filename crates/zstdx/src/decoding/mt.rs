@@ -662,6 +662,9 @@ pub(super) fn decode_segment(
 /// Stage B: execute one staged segment at `base[seg_start..seg_start +
 /// out_size)`, reading match sources at absolute positions below
 /// `seg_start` (final output of earlier segments; stage B runs in order).
+/// `frame_base` is the owning frame's absolute output start: match sources
+/// may not reach below it (each frame is an independent history, as in
+/// `ZSTD_decompress`'s per-frame window).
 ///
 /// `buf_limit` is the absolute end of the region the writes may overshoot
 /// by up to 16 bytes (wildcopy slack): the caller's slice end, or the
@@ -676,6 +679,7 @@ pub(super) fn decode_segment(
 pub(super) unsafe fn execute_segment(
     base: *mut u8,
     seg_start: usize,
+    frame_base: usize,
     seg: &DecodedSegment,
     input: &[u8],
     offset_hist: &mut [u32; 3],
@@ -685,6 +689,7 @@ pub(super) unsafe fn execute_segment(
         execute_blocks(
             base,
             seg_start,
+            frame_base,
             seg,
             0..seg.plan.len(),
             input,
@@ -697,9 +702,11 @@ pub(super) unsafe fn execute_segment(
 
 /// Execute a contiguous block range of a staged segment starting at
 /// absolute output position `start` (the first block's own position).
-/// `wild_cap` bounds where wildcopy may overshoot beyond the copy end
-/// (the piece executor passes the piece end so parallel pieces never
-/// write into a neighbor's range; the serial path passes `usize::MAX`).
+/// `frame_base` is the owning frame's absolute output start; offsets must
+/// stay within the frame (see `execute_segment`). `wild_cap` bounds where
+/// wildcopy may overshoot beyond the copy end (the piece executor passes
+/// the piece end so parallel pieces never write into a neighbor's range;
+/// the serial path passes `usize::MAX`).
 ///
 /// # Safety
 /// `base` must be valid for writes over the blocks' combined output plus
@@ -709,6 +716,7 @@ pub(super) unsafe fn execute_segment(
 pub(super) unsafe fn execute_blocks(
     base: *mut u8,
     start: usize,
+    frame_base: usize,
     seg: &DecodedSegment,
     blocks: Range<usize>,
     input: &[u8],
@@ -784,11 +792,14 @@ pub(super) unsafe fn execute_blocks(
                         }
                         let offset = offset as usize;
                         let cur = start + w;
-                        if offset > cur {
+                        // Whole-frame history, one-shot semantics — but the
+                        // frame's own output only: a concatenated stream's
+                        // frames never share history.
+                        if offset > cur - frame_base {
                             return Err(exec_err(ExecuteSequencesError::DecodebufferError(
                                 crate::decoding::errors::DecodeBufferError::OffsetTooBig {
                                     offset,
-                                    buf_len: cur,
+                                    buf_len: cur - frame_base,
                                 },
                             )));
                         }
@@ -949,6 +960,7 @@ fn decode_parallel(
             let mut written = 0usize;
             // Output offset where each frame began, in scan order.
             let mut frame_starts = Vec::with_capacity(frame_pledges.len());
+            let mut frame_base = 0usize;
             for (id, seg_plan) in segments.iter().enumerate() {
                 let staged = {
                     let mut guard = slots[id].lock().unwrap();
@@ -961,6 +973,7 @@ fn decode_parallel(
                 if seg_plan.frame_start {
                     offset_hist = [1, 4, 8];
                     frame_starts.push(written);
+                    frame_base = written;
                 }
                 #[cfg(feature = "hash")]
                 let seg_out_start = written;
@@ -968,7 +981,15 @@ fn decode_parallel(
                 // SAFETY: `place` made [0, written + out_size) valid; every
                 // match source below `written` is final (in-order execution).
                 unsafe {
-                    execute_segment(base, written, &seg, input, &mut offset_hist, buf_limit)?;
+                    execute_segment(
+                        base,
+                        written,
+                        frame_base,
+                        &seg,
+                        input,
+                        &mut offset_hist,
+                        buf_limit,
+                    )?;
                 }
                 written += seg.out_size;
                 // The executed range is final from here on: later writes never

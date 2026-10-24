@@ -1425,6 +1425,7 @@ fn ldm_override_roundtrips_every_family() {
 pub mod bit_reader;
 pub mod block_output_cap;
 pub mod decode_corpus;
+pub mod decode_window_semantics;
 pub mod dict_test;
 #[cfg(feature = "std")]
 pub mod encode_corpus;

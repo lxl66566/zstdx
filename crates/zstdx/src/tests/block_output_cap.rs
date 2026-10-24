@@ -86,9 +86,10 @@ fn block_output_too_large(err: &FrameDecoderError) -> bool {
     }
 }
 
-/// The review's DoS shape on the ring path: with a dictionary registered the
-/// frame decodes through the ring buffer, where the block output used to be
-/// reserved up front — a ~290 KB frame forced a multi-gigabyte allocation
+/// The review's DoS shape on the ring path: dictionaries route frames
+/// through the flat buffer now, so the ring executor is reached via an
+/// explicit mid-frame `force_dict` — where the block output used to be
+/// reserved up front, a ~290 KB frame forced a multi-gigabyte allocation
 /// (panic on allocation failure). The cap must reject the block before the
 /// reserve instead.
 #[test]
@@ -99,6 +100,7 @@ fn ring_path_rejects_huge_block_output_claim() {
     let mut dec = FrameDecoder::new();
     dec.add_dict(Dictionary::load(b"history").unwrap()).unwrap();
     dec.reset(&mut src).unwrap();
+    dec.force_dict(0).unwrap();
     let err = dec
         .decode_blocks(&mut src, BlockDecodingStrategy::All)
         .expect_err("huge block output claim must be rejected");
@@ -201,18 +203,17 @@ fn small_window_rejects_oversized_raw_block() {
     ));
 
     // decode_all's direct-into-slice path, with far more target room than
-    // any legal block could fill (it is the cap, not the target, that trips).
+    // any legal block could fill: the one-shot reference
+    // (ZSTD_decompressFrame's ZSTD_copyRawBlock) bounds Raw/RLE blocks only
+    // by the destination, reserving the per-block cap for the streaming
+    // paths (ZSTD_decompressContinue's header-stage check), so the oversized
+    // block decodes here (R72 probe: pledged_w10_f400015 oneshot ACCEPT).
     let mut dec = FrameDecoder::new();
     let mut out = vec![0u8; 32 * 1024 * 1024];
-    let err = dec
+    let written = dec
         .decode_all(frame.as_slice(), &mut out)
-        .expect_err("oversized Raw block must be rejected");
-    assert!(matches!(
-        err,
-        FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::BlockOutputTooLarge {
-            max: 1024
-        })
-    ));
+        .expect("one-shot accepts Raw blocks past the window cap");
+    assert_eq!(written, 128 * 1024);
 
     // Control: a block at exactly the window decodes on the same shape.
     let frame = small_window_raw_frame(1024);

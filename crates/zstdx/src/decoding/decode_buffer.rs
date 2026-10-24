@@ -210,7 +210,13 @@ impl DecodeBuffer {
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        if self.total_output_counter <= self.window_size as u64 {
+        // The dict tail maps contiguously below the retained history only
+        // while nothing has been drained (libzstd's one-shot dict layout
+        // `virtualStart = dst - dictSize`); once bytes were handed out the
+        // virtual middle is gone, so any offset past the retained window is
+        // corruption. (Streaming dict frames take the flat buffer, whose
+        // generation model keeps the reference's reach and dict expiry.)
+        if self.buffer.len() as u64 == self.total_output_counter {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 

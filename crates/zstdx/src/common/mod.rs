@@ -38,6 +38,29 @@ pub const fn max_block_output(window_size: usize) -> usize {
     }
 }
 
+/// libzstd's buffered-streaming output buffer size, which doubles as the
+/// streaming decode acceptance envelope (`ZSTD_decodingBufferSize_internal`:
+/// `window + 2 * blockSize + 2 * WILDCOPY_OVERLENGTH`, with the window
+/// floored at 1 KiB by `ZSTD_decompressStream` before sizing and the whole
+/// size capped by a declared Frame_Content_Size). The streaming decoder
+/// wraps this buffer when a fully flushed generation cannot fit one more
+/// block (`outStart + blockSizeMax > outBuffSize`), so every generation is
+/// at least `window + blockSize + 64` long — which is what makes the
+/// per-sequence check `offset <= bytes decoded since the last wrap` a
+/// window check: in-window offsets never reach below the generation start.
+pub const fn streaming_buffer_cap(window_size: usize, fcs: Option<u64>) -> usize {
+    let window = if window_size < MIN_WINDOW_SIZE as usize {
+        MIN_WINDOW_SIZE as usize
+    } else {
+        window_size
+    };
+    let needed = window + 2 * max_block_output(window_size) + 64;
+    match fcs {
+        Some(fcs) if fcs < needed as u64 => fcs as usize,
+        _ => needed,
+    }
+}
+
 /// Runtime SIMD tier clamp (`ZSTDX_SIMD_FORCE`): the dev override that
 /// lowers runtime kernel dispatch to a narrower tier for honest
 /// measurement on wider hardware.

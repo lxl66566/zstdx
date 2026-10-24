@@ -214,6 +214,53 @@ pub fn seq_frame(spec: &SeqSpec) -> Vec<u8> {
     out
 }
 
+/// A far-offset frame: `pre` RLE runs of `pre_len` 0x5A bytes build
+/// history, then one last Compressed block whose single sequence reaches
+/// `offset` bytes back. `offset` is the stream's raw offset value (the
+/// executed match distance is `offset - 3`). The out-of-window acceptance
+/// split this class pins: the whole output is history one-shot, while the
+/// streaming generation model rejects once the offset leaves the previous
+/// generation (`ZSTD_decodingBufferSize_internal` geometry).
+pub fn far_offset_frame(wlog: u32, pre: usize, pre_len: usize, offset: u32) -> Vec<u8> {
+    let mut spec = HeaderSpec::plain();
+    spec.window_descriptor = ((wlog - 10) as u8) << 3;
+    let mut out = spec.header();
+    for _ in 0..pre {
+        push_rle_run(&mut out, false, 0x5a, pre_len);
+    }
+    let of_code = 31 - offset.leading_zeros();
+    let seq = SeqSpec {
+        literals: b"ababababab".to_vec(),
+        nb_seq: vec![0x01],
+        modes: 0b01_01_01_00,
+        rle_tables: vec![9, of_code as u8, 2],
+        bitstream: extra_bits_stream(of_code, offset - (1 << of_code)),
+    };
+    push_block(&mut out, true, BlockWireType::Compressed, &seq.block());
+    out
+}
+
+/// One non-last RLE block: the header's Block_Size is the regenerated run
+/// length, the body the single run byte.
+fn push_rle_run(out: &mut Vec<u8>, last: bool, byte: u8, len: usize) {
+    let hdr = ((len as u32) << 3) | (BlockWireType::Rle.code() << 1) | u32::from(last);
+    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+    out.push(byte);
+}
+
+/// `n` extra bits carrying `v` behind a 1 marker bit, LSB-first (the
+/// forward-written tail of a one-sequence offset bitstream).
+fn extra_bits_stream(n: u32, v: u32) -> Vec<u8> {
+    let region: u64 = (1u64 << n) | u64::from(v);
+    let nbytes = ((n + 1) + 7) / 8;
+    let mut out = Vec::with_capacity(nbytes as usize);
+    for i in 0..nbytes {
+        out.push(((region >> (8 * (nbytes - 1 - i))) & 0xff) as u8);
+    }
+    out.reverse();
+    out
+}
+
 /// A one-block frame whose literals section is RLE: `byte` repeated
 /// `size` times (header type 1), followed by `rest` (nbSeq + modes +
 /// tables + bitstream).
@@ -439,6 +486,9 @@ pub enum CraftedName {
     FourStreamUnderflow,
     SingleStreamTight,
     SingleStreamLeftover,
+    OutWindowInHistory,
+    InGenerationPair,
+    CrossFrameOffset,
 }
 
 impl CraftedName {
@@ -480,6 +530,9 @@ impl CraftedName {
             CraftedName::FourStreamUnderflow => "literals-4stream-underflow",
             CraftedName::SingleStreamTight => "literals-1stream-tight",
             CraftedName::SingleStreamLeftover => "literals-1stream-leftover",
+            CraftedName::OutWindowInHistory => "seq-out-of-window-in-history",
+            CraftedName::InGenerationPair => "seq-in-generation-pair",
+            CraftedName::CrossFrameOffset => "multi-frame-cross-offset",
         }
     }
 }
@@ -521,6 +574,30 @@ pub fn crafted_frames() -> Vec<(CraftedName, Vec<u8>)> {
         spec.bitstream = vec![0x00, 0x10];
         push(CraftedName::OffsetBeyondOutput, seq_frame(&spec));
     }
+    // --- window-semantics shapes (R72): far offsets against declared
+    // windows smaller than the built history.
+    // w10 with 180000 bytes of history and offset 100000: past the 1 KiB
+    // window, inside one-shot history (libzstd's ZSTD_decompress accepts;
+    // every streaming decoder rejects).
+    push(
+        CraftedName::OutWindowInHistory,
+        far_offset_frame(10, 180, 1000, 100000),
+    );
+    // w16 with 180000 bytes of history and offset 100000: past the 64 KiB
+    // window but inside the streaming generation pair — accepted by every
+    // decoder including buffered streaming.
+    push(
+        CraftedName::InGenerationPair,
+        far_offset_frame(16, 3, 60000, 100000),
+    );
+    // Two frames; the second's sequence reaches into the first's output
+    // (offset 2500 > its own 1009 bytes of history). Frames never share
+    // history: every decoder rejects, including the whole-buffer MT arms.
+    push(CraftedName::CrossFrameOffset, {
+        let mut frames = far_offset_frame(10, 2, 1000, 900);
+        frames.extend_from_slice(&far_offset_frame(10, 1, 1000, 2500));
+        frames
+    });
     // ll 9 over 3 literals.
     {
         let mut spec = SeqSpec::one_sequence(0b01_01_01_00);

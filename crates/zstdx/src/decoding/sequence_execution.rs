@@ -1,10 +1,6 @@
 use super::scratch::DecoderScratch;
 use crate::{blocks::sequence_section::Sequence, decoding::errors::ExecuteSequencesError};
 
-/// Largest decompressed block; a single sequence's match can never exceed it
-/// (ll + ml fit one block's content).
-const MAX_BLOCK_USIZE: usize = crate::common::MAX_BLOCK_SIZE as usize;
-
 /// Take the provided decoder and execute the sequences stored within
 pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
     let old_buffer_size = scratch.buffer.len();
@@ -111,7 +107,7 @@ pub(crate) fn execute_decoded_flat(
     out: &mut [u8],
     written: &mut usize,
     virt_base: usize,
-    view: crate::decoding::flat_buffer::FlatView,
+    view: &crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
     headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
@@ -156,7 +152,7 @@ unsafe fn execute_decoded_flat_bmi2(
     out: &mut [u8],
     written: &mut usize,
     virt_base: usize,
-    view: crate::decoding::flat_buffer::FlatView,
+    view: &crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
     headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
@@ -179,7 +175,7 @@ fn execute_decoded_flat_impl(
     out: &mut [u8],
     written: &mut usize,
     virt_base: usize,
-    view: crate::decoding::flat_buffer::FlatView,
+    view: &crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
     headroom: bool,
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
@@ -235,7 +231,7 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
     out: &mut [u8],
     written: &mut usize,
     virt_base: usize,
-    view: crate::decoding::flat_buffer::FlatView,
+    view: &crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), crate::decoding::errors::DecompressBlockError> {
     use super::sequence_section_decoder::decode_step;
@@ -259,7 +255,19 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
     } else {
         virt_base.saturating_sub(view.origin)
     };
-    let vbase_op = virt_base.wrapping_sub(out_base as usize);
+    // The generation floor (the previous generation's virtual start, 0
+    // while the buffer never wrapped) folds into the base here, once per
+    // block, so the per-sequence reach check below keeps the exact
+    // whole-history shape `offset > cur_v` in every instantiation
+    // (placement: the fused loop's instruction shape is load-bearing).
+    let floor = if NOWRAP {
+        0
+    } else {
+        view.prev_origin
+    };
+    let vbase_op = virt_base
+        .wrapping_sub(floor)
+        .wrapping_sub(out_base as usize);
     let wrap_base = (out_base as usize).wrapping_sub(block_start);
 
     // The decode state runs as loop locals instead of `dec.next()` calls:
@@ -480,7 +488,7 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     lit_end: *const u8,
     vbase_op: usize,
     wrap_base: usize,
-    view: crate::decoding::flat_buffer::FlatView,
+    view: &crate::decoding::flat_buffer::FlatView,
     offset_hist: &mut [u32; 3],
 ) -> Result<(), ExecuteSequencesError> {
     use crate::decoding::errors::ExecuteSequencesError;
@@ -524,9 +532,13 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     // sequence start, so the literal length belongs in every address below.
     let dst_a = opa + ll;
     let pos = dst_a - out_base as usize;
-    // No dictionary in the flat path, so an offset past the frame's own
-    // output is always corruption. Checked even for ml == 0 to reject
-    // corrupt frames eagerly.
+    // No dictionary in the never-wrapped flat path, so an offset past the
+    // frame's own output is always corruption. With the generation floor
+    // folded into `vbase_op` (see `execute_decoded_flat_inner`) this is
+    // exactly libzstd's `offset > oLitEnd - virtualStart` rule — the whole
+    // produced history in the first generation, the previous generation's
+    // start after wraps. Checked even for ml == 0 to reject corrupt frames
+    // eagerly.
     let cur_v = dst_a.wrapping_add(vbase_op);
     if offset > cur_v {
         return Err(ExecuteSequencesError::DecodebufferError(
@@ -545,11 +557,11 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
         // never-wrapped instantiation is always this case.
         if !NOWRAP && offset.wrapping_add(wrap_base) > dst_a {
             copy_wrapped_match(
-                view,
-                // Recovering `virt_base` from the folded `vbase_op`: the
-                // subtraction at the folding site wraps whenever the output
-                // pointer numerically exceeds the virtual base (the common
-                // case), so the re-addition must wrap back symmetrically.
+                *view,
+                // The base stays floor-folded (`virt_base - prev_origin`,
+                // see `vbase_op`): `copy_wrapped_match` holds the view and
+                // restores the true virtual base itself, so the hot loop
+                // carries no extra live value for the cold path.
                 vbase_op.wrapping_add(out_base as usize),
                 out_base,
                 pos,
@@ -582,18 +594,18 @@ fn exec_one_flat<const NOWRAP: bool, const HEADROOM: bool>(
     Ok(())
 }
 
-/// Match copy for a source at or below the active segment (see `FlatView`):
-/// the common case resolves inline at the top as one linear copy (see the
-/// fast path below); sources crossing the segment boundary fall to the
-/// generic walk, split at the physical edges with doubling out of already
-/// written bytes. Out of line — the segment-mapping state is loop-invariant
-/// but keeping it live in the fused loop costs every sequence register
-/// pressure, and the straddling path is rare outside long-offset-heavy
-/// frames.
+/// Match copy for a source at or below the active generation (see
+/// `FlatView`): the common case resolves inline at the top as one linear
+/// copy (see the fast path below); sources crossing the generation boundary
+/// fall to the generic walk, split at the physical edges with doubling out
+/// of already written bytes. Out of line — the segment-mapping state is
+/// loop-invariant but keeping it live in the fused loop costs every
+/// sequence register pressure, and the straddling path is rare outside
+/// long-offset-heavy frames.
 #[cold]
 fn copy_wrapped_match(
     view: crate::decoding::flat_buffer::FlatView,
-    virt_base: usize,
+    folded_base: usize,
     out_ptr: *mut u8,
     pos: usize,
     offset: usize,
@@ -604,27 +616,30 @@ fn copy_wrapped_match(
     let crate::decoding::flat_buffer::FlatView {
         origin,
         prev_origin,
+        prev_phys_base,
         seg_a_end,
         out_len: seg_out_len,
     } = view;
+    // Un-fold the generation floor the caller's `vbase_op` carries: every
+    // virtual address below is a true global position.
+    let virt_base = folded_base.wrapping_add(prev_origin);
     let block_start = virt_base.saturating_sub(origin);
-    // Fast path: a source entirely inside the previous segment is still one
-    // linear in-buffer copy. The previous segment physically sits
-    // `seg_a_end - offset` ABOVE the destination — the wrap margin keeps
-    // every in-window source at least MAX_BLOCK_SIZE above the write cursor
-    // (so the copy never overlaps and a sequence's ml can never exceed the
-    // distance), and its bytes at least 16 under the physical buffer end
-    // (so wildcopy overshoot stays in the allocation). `d` is how far the
-    // source reaches below the segment start: d >= ml means no straddle.
-    // Offsets past the guaranteed window (only possible beyond the frame's
-    // window bound) fall through to the generic walk below, which rejects
-    // out-of-window sources.
+    // Fast path: a source entirely inside the previous generation is still
+    // one linear in-buffer copy, reading the previous generation's intact
+    // top. `d` is how far the source reaches below the active generation's
+    // start: d >= ml means the match does not straddle. The second guard
+    // (`offset + ml <= seg_a_end`, i.e. the source stays `ml` under the
+    // previous generation's physical end) makes the source region sit at or
+    // above the destination's end (a non-overlapping forward copy, and
+    // wildcopy reads end within `buf.len()`), mirroring the physical layout
+    // of libzstd's ring after a wrap. Straddling or deeper sources fall to
+    // the generic walk, which rejects anything below `prev_origin`.
     let d = offset - block_start - pos;
-    if d >= ml && offset + MAX_BLOCK_USIZE <= seg_a_end {
+    if d >= ml && offset + ml <= seg_a_end {
         // SAFETY: bounds as documented above
         unsafe {
             let dst = out_ptr.add(pos);
-            let src = dst.add(seg_a_end - offset);
+            let src = dst.add(prev_phys_base + seg_a_end - offset);
             if wild {
                 wildcopy_match(dst, src, ml);
             } else {
@@ -639,23 +654,27 @@ fn copy_wrapped_match(
     let mut dst = pos;
     let mut remaining = ml;
     while remaining > 0 {
-        // Map into the active segment, or into the previous segment below
-        // its physical end; anything lower is out of window.
+        // Map into the active generation, or into the previous generation
+        // below its physical end; anything lower is out of window.
         let (src_abs, seg_end, active) = if src_v >= origin {
             (src_v - origin, seg_out_len, true)
         } else if src_v >= prev_origin {
-            (src_v - prev_origin, seg_a_end, false)
+            (
+                prev_phys_base + (src_v - prev_origin),
+                prev_phys_base + seg_a_end,
+                false,
+            )
         } else {
             return Err(ExecuteSequencesError::DecodebufferError(
                 DecodeBufferError::OffsetTooBig {
                     offset,
-                    buf_len: virt_base + pos,
+                    buf_len: virt_base + pos - prev_origin,
                 },
             ));
         };
         let chunk = remaining.min(seg_end - src_abs);
         if active && wild {
-            // The whole rest of the match lies in the active segment
+            // The whole rest of the match lies in the active generation
             // (virtual addresses up to the destination), so finish it in
             // one wildcopy.
             // SAFETY: same contract as the fused loop's wildcopy
