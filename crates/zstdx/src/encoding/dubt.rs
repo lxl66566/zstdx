@@ -65,26 +65,31 @@ pub(crate) fn lazy_price(off: u32) -> i32 {
 /// four-byte literal scale is `s` (the driver's `lit_scale`).
 #[inline(always)]
 pub(crate) fn scale_value(s: i32, len: usize) -> i32 {
-    debug_assert!(len >= super::match_generator::MIN_MATCH || len == 0);
+    debug_assert!(len >= super::match_generator::MIN_MATCH);
     s * len as i32 / 4
+}
+
+/// A candidate paired with the score its search priced it at.
+#[derive(Clone, Copy)]
+pub(crate) struct Scored {
+    pub(crate) m: Match,
+    /// `scale_value(scale, m.len) - lazy_price(m.off)`.
+    pub(crate) score: i32,
 }
 
 /// One search's selection, priced against the position's literal scale:
 /// the longest repcode candidate (price 0 by construction) and the best
 /// literal-offset candidate by value-minus-offset-price, either side
-/// absent at `len == 0`. This is the improving candidate set of the plain
-/// port reduced to its two argmaxes — the only facts the lazy selection
-/// consumes — computed inside the descent so the per-candidate array
-/// round trip (store per improving candidate, reload and re-price in the
-/// driver) never happens.
+/// absent as `None` — an absent candidate is never a len-0 `Match`. This
+/// is the improving candidate set of the plain port reduced to its two
+/// argmaxes — the only facts the lazy selection consumes — computed
+/// inside the descent so the per-candidate array round trip (store per
+/// improving candidate, reload and re-price in the driver) never happens.
 pub(crate) struct Found {
     /// Longest repcode candidate; `off` is the wire off-base (1-3).
-    pub(crate) rep: Match,
+    pub(crate) rep: Option<Match>,
     /// Best literal-offset candidate by `score`.
-    pub(crate) cand: Match,
-    /// `scale_value(scale, cand.len) - lazy_price(cand.off)`; `i32::MIN`
-    /// while `cand.len == 0`.
-    pub(crate) score: i32,
+    pub(crate) cand: Option<Scored>,
 }
 
 /// Marks a node as inserted but not yet sorted. The value 1 is also
@@ -272,9 +277,8 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         let floor = self.cand_floor(pos);
         let mut best_len = length_to_beat - 1;
         let mut found = Found {
-            rep: Match { off: 1, len: 0 },
-            cand: Match { off: 0, len: 0 },
-            score: i32::MIN,
+            rep: None,
+            cand: None,
         };
 
         // Hash and head read hoisted above the rep probes: a rep hit runs a
@@ -314,10 +318,10 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                     let rep_len =
                         Self::count(self.win, idx, cand, self.min_match, self.block_end_idx);
                     if rep_len > best_len {
-                        found.rep = Match {
+                        found.rep = Some(Match {
                             off: rep_code - ll0 + 1,
                             len: rep_len as u32,
-                        };
+                        });
                         best_len = rep_len;
                         if rep_len > self.sufficient_len || idx + rep_len >= self.block_end_idx {
                             // Same table contract as the normal exit: the searched
@@ -427,12 +431,14 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                     best_len = ml;
                     let off = (pos - cand_abs + 3) as u32;
                     let score = scale_value(scale, ml) - lazy_price(off);
-                    if score > found.score {
-                        found.score = score;
-                        found.cand = Match {
-                            off,
-                            len: ml as u32,
-                        };
+                    if score > found.cand.map_or(i32::MIN, |c| c.score) {
+                        found.cand = Some(Scored {
+                            m: Match {
+                                off,
+                                len: ml as u32,
+                            },
+                            score,
+                        });
                     }
                     if ml > OPT_NUM || at_end {
                         break;

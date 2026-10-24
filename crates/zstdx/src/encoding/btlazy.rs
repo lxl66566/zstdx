@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use super::{
     SeqWord,
-    dubt::{DubtFinder, Found, lazy_price, scale_value},
+    dubt::{DubtFinder, Found, Scored, lazy_price, scale_value},
     ldm::LdmSeq,
     match_generator::{HASH_READ, MIN_MATCH, push_seq_packed},
     opt::{Match, OptKnobs, count_from, count_from_long, read4},
@@ -235,32 +235,28 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
             // accepts 4-byte matches at every searchLength), then the rep0
             // probe one byte ahead when the anchor is flush (the fast and
             // chain loops' trick: that byte becomes the pending literal,
-            // keeping the rep0 offset rideable at ll>=1). `best_sv` is the
-            // incumbent's value minus its offset price at its own position —
-            // carried so no position's scale is ever gathered twice.
-            let mut best = Match { off: 0, len: 0 };
-            let mut best_sv = 0i32;
+            // keeping the rep0 offset rideable at ll>=1). `best` is the
+            // incumbent with its value-minus-offset-price at its own
+            // position — carried so no position's scale is ever gathered
+            // twice; absence is the `Option`'s.
+            let mut best: Option<Scored> = None;
             if pos >= *finder.next_update {
                 finder.fill_to(idx);
                 let scale = lit_scale(win, idx, &lit_clamp);
                 let f: Found = finder.find_best(idx, rep, ll0, MIN_MATCH, *rep_pending != 0, scale);
-                if f.rep.len > 0 || f.cand.len > 0 {
-                    // Reps precede tree candidates in the collection order and
-                    // price 0, so a score tie keeps the rep — the strict-`>`
-                    // argmax of the array loop this replaced.
-                    let rep_v = if f.rep.len > 0 {
-                        scale_value(scale, f.rep.len as usize)
-                    } else {
-                        i32::MIN
-                    };
-                    if rep_v >= f.score {
-                        best = f.rep;
-                        best_sv = rep_v;
-                    } else {
-                        best = f.cand;
-                        best_sv = f.score;
-                    }
-                }
+                // Reps precede tree candidates in the collection order and
+                // price 0, so a score tie keeps the rep — the strict-`>`
+                // argmax of the array loop this replaced.
+                let rep = f.rep.map(|m| Scored {
+                    score: scale_value(scale, m.len as usize),
+                    m,
+                });
+                best = match (rep, f.cand) {
+                    (Some(r), Some(c)) if r.score >= c.score => Some(r),
+                    (_, Some(c)) => Some(c),
+                    (Some(r), None) => Some(r),
+                    (None, None) => None,
+                };
             }
             if *rep_pending == 0 {
                 let probe = if pos == anchor {
@@ -271,24 +267,28 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
                 if let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0]) {
                     let v =
                         scale_value(lit_scale(win, (probe - win_base) as usize, &lit_clamp), ml);
-                    // An empty incumbent (no tree candidate) prices 0 — the
-                    // baseline the rep probe must beat.
-                    let incumbent = if best.len > 0 {
-                        best_sv
-                    } else {
-                        0
-                    };
-                    if v > incumbent {
-                        best = Match {
-                            off: 1,
-                            len: ml as u32,
-                        };
+                    // An empty incumbent prices 0 — the baseline the rep
+                    // probe must beat.
+                    if v > best.map_or(0, |b| b.score) {
+                        best = Some(Scored {
+                            m: Match {
+                                off: 1,
+                                len: ml as u32,
+                            },
+                            score: v,
+                        });
                         pos = probe;
-                        best_sv = v;
                     }
                 }
             }
-            if best.len < MIN_MATCH as u32 {
+            // Every found candidate clears MIN_MATCH (the search and the rep
+            // probe both count from it), so presence and the lazy bar are the
+            // same fact.
+            let Some(Scored {
+                m: mut best,
+                score: best_sv,
+            }) = best
+            else {
                 // The fill still indexes every stepped position either way.
                 pos += match step {
                     LazyStep::Ramp => {
@@ -298,7 +298,7 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
                     LazyStep::Dense => 1 + ((pos - anchor) >> 8),
                 };
                 continue;
-            }
+            };
             miss = 0;
             let mut best_pos = pos;
             let mut best_p = lazy_price(best.off);
@@ -334,27 +334,29 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
                                     *rep_pending != 0,
                                     scale2,
                                 );
-                                if f.rep.len > 0 {
-                                    let v = scale_value(scale2, f.rep.len as usize);
+                                if let Some(rep) = f.rep {
+                                    let v = scale_value(scale2, rep.len as usize);
                                     let wins = if $rep_mul == 4 {
                                         v > best_v - best_p + $rep_m
                                     } else {
                                         v * $rep_mul / 4 > best_v * $rep_mul / 4 - best_p + $rep_m
                                     };
                                     if wins {
-                                        best = f.rep;
+                                        best = rep;
                                         best_pos = p2;
                                         best_v = v;
                                         best_p = 0;
                                     }
                                 }
-                                if f.cand.len > 0 && f.score > best_v - best_p + $search_m {
-                                    best = f.cand;
-                                    best_pos = p2;
-                                    let p = lazy_price(f.cand.off);
-                                    best_v = f.score + p;
-                                    best_p = p;
-                                    continue 'lazy;
+                                if let Some(c) = f.cand {
+                                    if c.score > best_v - best_p + $search_m {
+                                        best = c.m;
+                                        best_pos = p2;
+                                        let p = lazy_price(c.m.off);
+                                        best_v = c.score + p;
+                                        best_p = p;
+                                        continue 'lazy;
+                                    }
                                 }
                             }
                         }};

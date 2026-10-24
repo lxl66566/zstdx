@@ -12,6 +12,8 @@ An overread past a buffer's logical length that lands inside its allocation is i
 
 `IdxRange` provides wrap-proof spans for same-domain cursor arithmetic. Every fill bound, rep-tail scan bar and `insert_max` producer goes through it, or carries a proof comment or a loop-bar invariant. The per-byte scan loops keep naked arithmetic under their bars by design.
 
+The btlazy selection's absent candidates are unrepresentable since 2026-10-24. `Found`'s two argmaxes are `Option`s, with `Scored` pairing the literal-offset candidate and its score so the score cannot outlive the candidate, and the driver's incumbent is an `Option<Scored>` destructured at the lazy bar. Every construction site guarantees `len >= MIN_MATCH`, which `scale_value`'s assert now pins exactly. Gungraun reads best json and text at -0.7% and -0.6% Ir at byte-identical dumps.
+
 ### Compile-time structure
 
 `HeadTables` puts the `tables` and `second` pair behind private fields with one mutation entry per resize shape. The lockstep comment from the encoder-edge review rides that single entry, and the desync class becomes unrepresentable.
@@ -78,7 +80,7 @@ Poison asserts fire at checkpoints, so a touch whose evidence is legitimately ov
 
 ## Follow-ups
 
-The balanced-Ir placement residue is closed, as the wall A/B shows. The remaining compile-time menu in the [todo](../todo.md) holds cross-domain index newtypes, NonZero distances, `Option<Candidate>` sentinels and enum rep-bases. It also holds the unpoisonable carry zone and the `-max_len` campaign above 4096, where the `encode_stream` part is closed here.
+The balanced-Ir placement residue is closed, as the wall A/B shows. The remaining compile-time menu in the [todo](../todo.md) holds cross-domain index newtypes, NonZero distances and enum rep-bases. It also holds the unpoisonable carry zone and the `-max_len` campaign above 4096, where the `encode_stream` part is closed here.
 
 ## Commits
 
