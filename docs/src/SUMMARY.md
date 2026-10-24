@@ -42,6 +42,7 @@
 - [Decode error paths](dev/review/parity.md)
 - [Decode core cleanups](dev/review/declean.md)
 - [Decode parity differential](dev/review/diffbench.md)
+- [Peripheral review](dev/review/periph.md)
 - [Dictionary-frame decode parity](dev/review/dictparity.md)
 - [FFI parity](dev/review/ffiparity.md)
 - [CLI parity](dev/review/cliparity.md)

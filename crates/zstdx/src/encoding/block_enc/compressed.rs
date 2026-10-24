@@ -1227,19 +1227,23 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     const UPPER_LIMIT: usize = 0xffff + 0x7f00;
     match seqnum {
         1..=127 => writer.write_bits(seqnum as u32, 8),
-        128..=0x7fff => {
+        // The two-byte form's high byte is `(n >> 8) | 0x80`, which reaches
+        // 0xFF — the long-form marker — at n = 0x7F00, so those counts must
+        // take the long form or every parser reframes the section.
+        128..0x7f00 => {
             let upper = ((seqnum >> 8) | 0x80) as u8;
             let lower = seqnum as u8;
             writer.write_bits(upper, 8);
             writer.write_bits(lower, 8);
         },
-        0x8000..=UPPER_LIMIT => {
+        0x7f00..=UPPER_LIMIT => {
+            // The 16-bit payload behind the 0xFF marker is little-endian
+            // (`b1 + (b2 << 8)`, unlike the two-byte form's high-bits-first
+            // layout), so the low byte goes out first.
             let encode = seqnum - 0x7f00;
-            let upper = (encode >> 8) as u8;
-            let lower = encode as u8;
             writer.write_bits(255u8, 8);
-            writer.write_bits(upper, 8);
-            writer.write_bits(lower, 8);
+            writer.write_bits(encode as u8, 8);
+            writer.write_bits((encode >> 8) as u8, 8);
         },
         _ => unreachable!(),
     }
@@ -1878,6 +1882,7 @@ mod tests {
     }
     use super::*;
     use crate::{
+        blocks::sequence_section::SequencesHeader,
         encoding::seq_codes::pack_seq,
         fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table},
     };
@@ -1937,6 +1942,37 @@ mod tests {
 
     /// Merged add payloads past `hot_push_raw`'s 56-bit capacity must land
     /// in the stream bit for bit, split per field. The 58-bit extreme is
+    /// The two-byte nbSeq form ends at 0x7EFF: its high byte is
+    /// `(n >> 8) | 0x80`, which hits the 0xFF long-form marker at 0x7F00.
+    /// Every boundary count must parse back to itself.
+    #[test]
+    fn seqnum_header_boundary_roundtrip() {
+        for n in [
+            1usize,
+            127,
+            128,
+            0x7eff,
+            0x7f00,
+            0x7f01,
+            0x7fff,
+            0x8000,
+            0xffff + 0x7f00,
+        ] {
+            let mut out = Vec::new();
+            {
+                let mut writer = BitWriter::from(&mut out);
+                encode_seqnum(n, &mut writer);
+                writer.flush();
+            }
+            // The parser reads the modes byte behind the count, so pad.
+            let mut padded = out;
+            padded.extend_from_slice(&[0u8; 2]);
+            let mut header = SequencesHeader::default();
+            header.parse_from_header(&padded).expect("header parses");
+            assert_eq!(header.num_sequences as usize, n, "nbSeq {n:#x}");
+        }
+    }
+
     /// the w27-window ln 16 + mn 15 + on 27 shape (see
     /// `pack_seq_wide_add_payloads`); a 7-bit entry prefix pins the worst
     /// post-flush pending state. The wide word at the last index rides the
