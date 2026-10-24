@@ -1,51 +1,92 @@
-# R64 review — Blocks + xxh64
+# Block layer review
 
-Scope: `crates/zstdx/src/blocks/` (block.rs, literals_section.rs, sequence_section.rs), `crates/zstdx/src/xxh64.rs`, `crates/zstdx/src/common/` (mod.rs, simd.rs), plus the call-site contracts: `decoding/block_decoder.rs`, the four frame-decode entries (ring `decode_blocks`, flat `decode_blocks_flat`/`decode_frame_flat`/`decode_from_to`), `decoding/mt.rs` stage A/B, and the encode-side checksum stack (`encoding/checksum.rs`, `encoding/async_checksum.rs`, `levels/fastest.rs` feeding sites).
+Scope: `crates/zstdx/src/blocks/` with `block.rs`, `literals_section.rs` and `sequence_section.rs`, `crates/zstdx/src/xxh64.rs`, and `crates/zstdx/src/common/` with `mod.rs` and `simd.rs`. The call-site contracts cover `decoding/block_decoder.rs`, the four frame-decode entries, the ring `decode_blocks` and the flat `decode_blocks_flat`, `decode_frame_flat` and `decode_from_to`, `decoding/mt.rs` stage A and B, and the encode-side checksum stack in `encoding/checksum.rs`, `encoding/async_checksum.rs` and the feeding sites in `levels/fastest.rs`. Reference: RFC 8878 and the libzstd sources under `/root/programs/fork/zstd`, namely `zstd_decompress_block.c` and `lib/common/xxhash.h`.
 
-Reference: RFC 8878 + libzstd sources under `/root/programs/fork/zstd` (`zstd_decompress_block.c`, `lib/common/xxhash.h`).
+## Bugs fixed
 
-## Findings
+### Short-input xxh64 seed
 
-### Fixed
+`finish()` dropped the seed for inputs shorter than 32 bytes. The short-input branch started at bare `PRIME5`. The reference `XXH64_digest` in `xxhash.h` starts at `v[2] + PRIME5`, and `v[2]` still holds the seed because no round has run. A failing test against twox-hash proved it: seed 1 with length 0 gave `0xEF46DB3751D8E999` instead of `seed+PRIME5`. Every in-tree use passes seed 0, where `v[2] == 0`, so the fix is byte-neutral for all produced frames and needed no ratio or dump differential. The nonzero-seed test stays as the regression.
 
-1. **bug, medium — xxh64 drops the seed for inputs < 32 bytes.** `finish()`'s short-input branch started at bare `PRIME5`; the reference (`xxhash.h` `XXH64_digest`) starts at `v[2] + PRIME5`, where `v[2]` still holds the seed because no round has run. Proven with a failing test vs twox-hash (seed 1, len 0 → `0xEF46DB3751D8E999` instead of `seed+PRIME5`). Every in-tree use is seed 0 (where `v[2] == 0`), so the fix is **byte-neutral for all produced frames**; no ratio/dump differential needed. Fix + nonzero-seed test: 84511678.
-2. **test gap, high — the entire header layer was pinned only by accident.** No unit tests existed for `LiteralsSection::parse_from_header`/`header_bytes_needed` (all Raw/RLE 1/2/3-byte forms incl. the sf-0-vs-2 alias, Compressed/Treeless 3/4/5-byte forms with 10/14/18-bit size pairs and 1/4 streams), `SequencesHeader::parse_from_header` (all six nbSeq forms incl. the two zero-count forms that omit the mode byte: `00` and `80 00`), the mode byte's LL/OF/ML packing with reserved low bits ignored, or `read_block_header`'s field layout/reserved/oversized/truncated rejections. The 128 KiB max boundary was unpinned. Tests: 882a241a.
-3. **smell — header docs and guards.** `BlockType::Reserved` Display typo ("Reserverd"); mangled `BlockHeader` doc sentence; `serialize_into` accepted a `block_size ≥ 2^21` that would silently wrap into the discarded fourth byte (now `debug_assert`); dead commented-out state check in `read_block_header`; "follwing" typo. 902b1d91.
-4. **hardening — `write_appending_from` resume preconditions were prose only.** A violated `hash_from` contract (≤ len, multiple of 32 or len, empty buffer) would mis-hash silently in release; the two computable ones are now `debug_assert`s. All current call sites (`fastest.rs` raw/compressed paths via `FrameHasher::scan_uniform`) verified to satisfy them: `from > 0` only arrives with `mem_len == 0`. a10d5900.
+## Hardening
 
-### Verified correct, no change
+`write_appending_from`'s resume preconditions existed only in prose. A violated `hash_from` contract, meaning a value above the length, a value that is neither a multiple of 32 nor the length, or an empty buffer, would mis-hash silently in release. The two computable conditions are now `debug_assert`s. All current call sites satisfy them, namely the raw and compressed paths in `fastest.rs` through `FrameHasher::scan_uniform`, and `from > 0` only arrives with `mem_len == 0`.
 
-- **Raw/RLE size_format**: 1-bit discriminator — bit 2 — so sf values 0 *and* 2 are the 1-byte/5-bit form (bit 3 is the regen LSB there), sf 1 → 12 bits, sf 3 → 20 bits. Matches libzstd's `case 0: case 2:` merge in `ZSTD_decodeLiteralsBlock`; the Rust code has always done this correctly.
-- **Compressed/Treeless headers**: 3/4/5-byte forms, 10/14/18-bit regen/compressed pairs, streams = 1 (sf 0) / 4 (sf 1-3). Bit packing recomputed by hand against RFC 8878 §3.1.1.1.2 — exact; now also table-pinned by tests.
-- **Sequences header**: nbSeq forms match RFC 8878 §3.1.1.3.1.1 and `ZSTD_decodeSeqHeaders`, including the 2-byte form decoding to 0 (`80 00`) omitting the mode byte. Bytes-after-zero-sequences rejected as `ExtraBits` (libzstd parity). Reserved low 2 bits of `Symbol_Compression_Modes` ignored.
-- **Block header dispatch and Block_Maximum_Size**: 3-byte layout, reserved type rejected at parse, static 128 KiB cap in `read_block_header`; the window-relative cap `max_block_output = min(window, 128 KiB)` is enforced on every decode entry — ring `decode_block_content` (Raw/RLE output), `parse_sections` (stored body *and* literals regen size, before any allocation), flat entries (`check_block_output_size` + executor budget), MT stage A scan (falls back to sequential for the typed error) and stage B (incl. the RLE repetition count). `ensure_block_space` always reserves ≥ cap + wildcopy slack. Empty-frame single empty Raw block handled on encode and decode.
-- **xxh64 exactness**: round/mergeRound/primes/finalize/avalanche identical to `xxhash.h`; streaming split (32-byte mem buffering, four chains) identical; the 2×32 unroll is schedule-only (differential vs twox over 24 lengths 0..70000 and 7-byte chunk splits). `finish()` is idempotent, which `get_calculated_checksum`/double-verify rely on. `scan_uniform_absorbing`'s consumed contract (multiple of 32 on mismatch, mem left empty) is what the `FrameHasher` fallback and `fastest.rs` resume paths rely on — holds.
-- **unsafe audit (xxh64.rs)**: every raw read/write in `absorb`/`write_appending_from`/`scan_uniform_absorbing` is bounded by its loop guard; the append path reserves exactly the stored range, writes every byte of it on every path, and `set_len`s once at the end. `out`/`input` aliasing is no worse than `Vec::extend_from_slice`'s own contract. Reads are `read_unaligned`. Sound.
-- **unsafe audit (async_checksum.rs)**: SPSC ring with the producer confined to its owning thread (`PhantomData<*const ()>`, nested frames claim from the shared head); slot payload published by `kind`-Release, slot by `head`-Release under the wake mutex so a parking worker cannot miss a post; `tail`-Release/`drain`-Acquire; `FinishCell` stack lifetime covered by the producer's spin; RESET-before-use ordering guarantees `states[state_id]` exists. Sound.
-- **`parse_sections` asserts**: `decode_literals` provably returns exactly `upper_limit_for_literals` bytes consumed and enforces the regen count (`DecodedLiteralCountMismatch`), so the asserts are unreachable internal invariants, not input-reachable panics.
-- **`decode_literals` Raw/RLE direct slicing**: pre-sliced by `parse_sections` to exactly the declared length; module is `pub(crate)`. Not input-reachable.
-- **common/mod.rs constants**: magic, 1 KiB min window, 3.75 TB max window, 128 KiB block max — all match spec. **simd.rs**: clamp tier ordering, env parsing, panic-on-typo documented and tested.
+`serialize_into` accepted a `block_size ≥ 2^21`, which would silently wrap into the discarded fourth byte. A `debug_assert` now pins the field width.
 
-### Dismissed
+## Header coverage
 
-- Unreachable `_ => panic!` arms in `header_bytes_needed`/`parse_from_header`/`decode_mode` (inputs masked to 2 bits): converting to `unreachable!()` is churn; messages are honest.
-- Unreachable error variants (`InvalidBlocktypeNumber`, `IllegalLiteralSectionType`): defensive, enums `non_exhaustive`. Keep.
-- `decode_block_content`'s Reserved panic ("How did you even get this"): all four decode entries reject Reserved at header parse; `pub(crate)` only. Defense-in-depth, keep.
-- SIMD xxh64: intentionally scalar (file header documents the vpmullq-latency argument); known falsified direction territory (see negative/entropy.md). Not retried.
+The header layer was pinned only by accident. No unit tests existed for `LiteralsSection::parse_from_header` or `header_bytes_needed` across the Raw and RLE 1, 2 and 3-byte forms, including the sf-0-versus-2 alias. The Compressed and Treeless 3, 4 and 5-byte forms with 10, 14 and 18-bit size pairs and 1 or 4 streams were untested too. `SequencesHeader::parse_from_header` was untested across all six nbSeq forms, including the two zero-count forms that omit the mode byte, `00` and `80 00`, and so was the mode byte's LL, OF and ML packing with reserved low bits ignored. `read_block_header`'s field layout and its reserved, oversized and truncated rejections were untested, and the 128 KiB maximum boundary was unpinned. The tests added below close these gaps.
+
+## Cleanups
+
+The `BlockType::Reserved` Display implementation had the typo "Reserverd", a `BlockHeader` doc sentence was mangled, and `read_block_header` carried a dead commented-out state check and the typo "follwing". All are fixed. The header docs now describe the parsed fields.
+
+## Verified correct
+
+### Literals headers
+
+The Raw and RLE size_format uses a 1-bit discriminator at bit 2, so sf values 0 and 2 both take the 1-byte, 5-bit form, with bit 3 as the regen LSB there. sf 1 takes 12 bits and sf 3 takes 20 bits. This matches libzstd's `case 0: case 2:` merge in `ZSTD_decodeLiteralsBlock`, and the Rust code has always done it correctly.
+
+The Compressed and Treeless headers use the 3, 4 and 5-byte forms with 10, 14 and 18-bit regen and compressed pairs, and one stream for sf 0 and four streams for sf 1 through 3. The bit packing was recomputed by hand against RFC 8878 section 3.1.1.1.2 and is exact. The new tests pin it in a table.
+
+### Sequences header
+
+The nbSeq forms match RFC 8878 section 3.1.1.3.1.1 and `ZSTD_decodeSeqHeaders`, including the 2-byte form `80 00` that decodes to 0 and omits the mode byte. Bytes after a zero sequence count are rejected as `ExtraBits`, matching libzstd. The reserved low 2 bits of `Symbol_Compression_Modes` are ignored.
+
+### Block header and maximum size
+
+The block header uses the 3-byte layout, rejects the reserved type at parse, and enforces the static 128 KiB cap in `read_block_header`. The window-relative cap `max_block_output = min(window, 128 KiB)` holds on every decode entry. The ring `decode_block_content` checks it for Raw and RLE output, and `parse_sections` checks it for the stored body and the literals regen size before any allocation. The flat entries check it through `check_block_output_size` and the executor budget. The MT stage A scan checks it and falls back to sequential for the typed error, and stage B checks it including the RLE repetition count. `ensure_block_space` always reserves at least the cap plus wildcopy slack. The empty frame's single empty Raw block is handled on encode and decode.
+
+### xxh64 exactness
+
+The round, mergeRound, primes, finalize and avalanche functions are identical to `xxhash.h`. The streaming split with 32-byte memory buffering and four chains is identical. The 2x32 unroll is schedule-only, checked by a differential against twox over 24 lengths from 0 to 70000 and 7-byte chunk splits. `finish()` is idempotent, which `get_calculated_checksum` and the double verify rely on. `scan_uniform_absorbing`'s consumed contract, a multiple of 32 on mismatch with `mem` left empty, is what the `FrameHasher` fallback and the `fastest.rs` resume paths rely on, and it holds.
+
+### Unsafe audit for `xxh64.rs`
+
+Every raw read and write in `absorb`, `write_appending_from` and `scan_uniform_absorbing` is bounded by its loop guard. The append path reserves exactly the stored range, writes every byte of it on every path, and calls `set_len` once at the end. The aliasing between `out` and `input` is no worse than `Vec::extend_from_slice`'s own contract. Reads use `read_unaligned`. The code is sound.
+
+### Unsafe audit for `async_checksum.rs`
+
+The SPSC ring confines the producer to its owning thread through `PhantomData<*const ()>`, and nested frames claim from the shared head. The slot payload is published by `kind` with Release, and the slot by `head` with Release under the wake mutex, so a parking worker cannot miss a post. `tail` uses Release and `drain` uses Acquire. The producer's spin covers the `FinishCell` stack lifetime. The reset-before-use ordering guarantees that `states[state_id]` exists. The code is sound.
+
+### Internal invariants
+
+`parse_sections`' asserts are unreachable internal invariants, and input cannot reach them. `decode_literals` provably returns exactly `upper_limit_for_literals` bytes consumed and enforces the regen count through `DecodedLiteralCountMismatch`. `decode_literals`' Raw and RLE direct slicing is pre-sliced by `parse_sections` to exactly the declared length, and the module is `pub(crate)`, so it is not input-reachable.
+
+The `common/mod.rs` constants match the spec: the magic, the 1 KiB minimum window, the 3.75 TB maximum window and the 128 KiB maximum block. `simd.rs` has the clamp tier ordering, env parsing, and a documented and tested panic on a typo.
+
+## Accepted limits
+
+The unreachable `_ => panic!` arms in `header_bytes_needed`, `parse_from_header` and `decode_mode` stay. The inputs are masked to 2 bits, and converting the arms to `unreachable!()` is churn. The messages are accurate.
+
+The unreachable error variants `InvalidBlocktypeNumber` and `IllegalLiteralSectionType` stay as defense in depth. The enums are `non_exhaustive`.
+
+`decode_block_content`'s Reserved panic with the message "How did you even get this" stays as defense in depth. All four decode entries reject Reserved at header parse, and the function is `pub(crate)` only.
+
+SIMD xxh64 stays scalar. The file header documents the vpmullq latency argument, and the direction is already in falsified territory, recorded in [negative/entropy.md](../negative/entropy.md). It is not retried.
 
 ## Tests added
 
-- `xxh64::tests::nonzero_seed_short_inputs_match_twox` (bug 1 proof + regression).
-- `blocks::literals_section::tests`: `raw_rle_header_forms`, `compressed_header_forms`, `header_bytes_needed_matches_parse`, `short_header_is_an_error`.
-- `blocks::sequence_section::tests`: `number_of_sequences_forms`, `bytes_read_per_form`, `short_header_is_an_error`, `compression_mode_bit_packing`.
-- `decoding::block_decoder::tests`: `header_field_layout` (incl. 128 KiB max), `reserved_and_oversized_are_rejected`, `truncated_header_is_a_read_error`.
-- `serialize_into`: 21-bit `debug_assert` (no test — encoder never violates it).
+- `xxh64::tests::nonzero_seed_short_inputs_match_twox` proves the bug and guards the fix.
+- `blocks::literals_section::tests` holds `raw_rle_header_forms`, `compressed_header_forms`, `header_bytes_needed_matches_parse` and `short_header_is_an_error`.
+- `blocks::sequence_section::tests` holds `number_of_sequences_forms`, `bytes_read_per_form`, `short_header_is_an_error` and `compression_mode_bit_packing`.
+- `decoding::block_decoder::tests` holds `header_field_layout` with the 128 KiB maximum, `reserved_and_oversized_are_rejected` and `truncated_header_is_a_read_error`.
+- `serialize_into`'s 21-bit `debug_assert` has no test, because the encoder never violates it.
 
-## Results
+## Open items
 
-Full workspace `cargo test` (debug), `--release`, and `-p zstdx --no-default-features` all green after the changes. No byte-affecting change: the xxh64 fix is identical for seed 0 (all real frames).
+`BlockDecoder`'s state machine is vestigial. `DecoderState::Failed` is never set, which its TODO admits, and `header_buffer` is zeroed after every header for no reason. It is a candidate for deletion the next time the decode paths are touched.
 
-## For later rounds
+`LiteralsSection::parse_from_header` parses type and size_format through a `BitReader` and then re-derives every field from raw bytes. The reader only serves the empty-input error, so the code could use plain byte arithmetic.
 
-- `BlockDecoder`'s state machine is vestigial: `DecoderState::Failed` is never set (its TODO admits it) and `header_buffer` is zeroed after every header for no reason. Candidate for deletion next time the decode paths are touched.
-- `LiteralsSection::parse_from_header` parses type/size_format through a `BitReader` but then re-derives every field from raw bytes; the reader only serves the empty-input error. Could be simplified to plain byte arithmetic.
+## Commits
+
+- 84511678 fixes the xxh64 short-input seed and adds the nonzero-seed test
+- 882a241a adds the header-layer tests
+- 902b1d91 fixes the header docs, the Display typo, the dead state check and the `serialize_into` guard
+- a10d5900 adds the `write_appending_from` preconditions as debug asserts
+
+## Verification
+
+Full workspace `cargo test` in debug, `--release` and `-p zstdx --no-default-features` was green after the changes. No change affects bytes, because the xxh64 fix is identical at seed 0, which every real frame uses.

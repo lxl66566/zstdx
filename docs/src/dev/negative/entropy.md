@@ -1,31 +1,121 @@
-# Falsified directions · Encoding · Entropy / Checksum / Misc
+# Falsified directions: entropy, checksum and misc
 
-> Every entry is backed by A/B data. If premises change (table structure, window, corpus, CPU), re-evaluation is allowed, but new decomposition evidence must come first; differential-testing discipline in [benchmarking methodology](../bench/methodology.md). Rules: [index](../negative.md).
+Every entry here is backed by A/B data. If the premises change, such as the table structure, window, corpus or CPU, re-evaluation is allowed, but new decomposition evidence must come first. The differential-testing discipline is in [benchmarking methodology](../bench/methodology.md), and the rules are in the [index](../negative.md).
 
-| Direction | Result | Conclusion |
-|---|---|---|
-| block-level pre-gate (sampled whole-block entropy ≥ threshold → raw directly, skipping the scan) | infeasible | **a byte histogram cannot distinguish pure randomness from randomness containing long-distance repeats**; libzstd likewise only applies suspectUncompressible to literals |
-| speculative uniform scanning (roll back and rescan on mismatch) | text -8% | 47% of bytes are long runs at block starts; rollback re-hashing doubles the cost; **the correct semantics are absorb-and-continue** |
-| encode_sequences transition-row prefetch (prefetchT0) | instructions +3.5%, no cycle improvement | ILP already covers the latency; prefetch only adds noise |
-| turning write_bits_64_cold residual bytes into stores | wall clock swings wildly, instructions unchanged | a <0.5% hotspot is pure scheduling noise that wrecks instruction layout |
-| histogram counters u64→u32 | flat | x86 `inc qword`/`inc dword` have identical throughput |
-| removing checks from the Uniform-4 bulk loop | instructions -19% but wall clock -7% | branch prediction is free; the microarchitectural change degrades instruction addressing and pipeline scheduling |
-| AVX-512 vectorization (vpmullq) of the ≤16 full-density insertion loop | hash microbench 2.2× faster, no gain on the full loop | the bottleneck is random store throughput into the 256KB table (the store floor); **approaches that only optimize hash computation are all ineffective**. Re-confirmed 2026-09-11 on the outlined `insert_covered` (vpermb 16B load → 8 lanes → vpmullq → stack spill → 8 scalar stores): +3.4% instructions vs the scalar loop — the 64B stack round-trip plus eight extract-loads costs more than the scalar per-position sequence. Re-confirmed again with a leaner srlv-built-lane variant (2 u64 loads → vpsrlvq/vpandq/vpmullq, scalar stores): +3.6% Ir AND json.fastest wall 532→504 MiB/s — with ≤2 batches per call (ml ≤ 16) the dependent vector chain never amortizes; do not retry |
-| PGO (trained on the full corpus) | zero gain | not worth the build-chain complexity |
-| integerizing the entropy pre-check | instructions flat | 92% of time is in histogram incq; the f64 entropy computation is near 0% |
-| package-merge back-walk buffer reuse (two swapped u32 Vecs instead of a fresh Vec per level; borrow-iter and drain-iter variants) | 9 fewer malloc/free pairs per table, but text fastest/fast Ir +0.08..+0.14% at 1 MiB and text-4K wall +0.5% (within noise) | the by-value fresh-Vec pattern (`for id in active` + `active = next`) codegens measurably better — the move lets LLVM drop buffer state across iterations; allocation count is not the walk's cost |
-| SeqWord 24→16 B (pack `add_nb` into the codes word's high byte, drop the field) | json.fast Ir +1.12%, text.fast +0.97% | the packing cost (width sum + shift-or) lands in the matcher's emit path, whose per-sequence weight exceeds encode_sequences'; the consumer only trades one byte load for one shift — **operand-supply savings must not be bought inside a hotter producer** |
-| entropy-scratch pooling's effect on the raw-heavy random cells (2026-09-16) | random-8K wall −5% with Ir flat (−0.09%); random-4K +0.9% Ir / wall ±2% | codegen layout shift, not work — the change touches none of random's paths (raw blocks build no tables); gate this class of change on Ir plus the json/text/skewed band, not on single raw-cell wall numbers |
-| text Opt/Ultra ratio residue hunted as a parser-side divergence (opt price model / match-finder / rep-injection / backtracking diff vs `zstd_opt.c`) | falsified by decomposition (2026-09-16): `seqstats --ref-frame` l17/l19 — 12 sequences differ of 27k (entropy bound ours 12 B better); block-aligned payload diffs show the sequence sections byte-identical with +2 B on every near-empty literals block | the residue was `raw_literals`'s hardcoded 20-bit size format (landed ladder, [encoding](../perf/encoding.md)); the opt parse against C is parity-verified at the event and byte level — do not reopen the price-model/finder audit space for this symptom |
-| the +2-3 B/big-huffman-block residue hunted as a huffman STREAM or tree divergence (2026-09-16) | falsified by weight-table decode: block-level desc dumps show the streams within 1-2 B and the length assignments equal-cost; the gap was the weight FSE description built by the legacy normalization (see [encoding](../perf/encoding.md) for the aligned port) | the tree-shape tie residual (~1 B per fresh table, package-merge vs `HUF_buildCTable` ordering) is accepted; aligning tie-breaks would fork the length assignment for no measurable corpus gain |
-| json.opt density gap hunted in the search/parse (2026-09-16) | falsified by ref-frame block dump: the ref emits 447 blocks for our 257 — libzstd's `ZSTD_deriveBlockSplits` cuts nearly every json 128K block at entropy shifts | the gap is a missing feature (block splitting, gated strategy>=btopt && windowLog>=17), not a parameter; the serialization alignment above closed everything else (−0.31%->−0.06%) |
-| cheaper exact binning of the gate histogram (wider lanes / u64-load extract feeds / deeper unroll) | falsified on paper after perf-annotate (2026-09-12) | the 4-lane loop already runs at the x86 mem-op floor: 3 mem-ops per byte (movzbl load + RMW load+store) at 3 mem-ops/cycle = ~1.04 cyc/B measured; u64-load extracts trade byte loads for shift µops that LLVM load-narrowing undoes, unrolling only drops ALU loop overhead off the port-bound path. An exact per-byte count cannot go below 1 RMW/byte — the pass can only be skipped (the sticky hold), never cheapened |
-| the -1 formatted fast-row residue hunted in `choose_tables_fast`'s dict-seeded sequence conversion (repeat gating, predefined preemption, treeless cost model vs `ZSTD_selectEncodingType`) | falsified by per-block decomposition (2026-09-18): sequence sections −259 B ahead of the CLI (its 155 blind `set_repeat`s vs our cost-picked 116 Rep + 20 Pre + 15 RLE); the entire +2.0% sat in the literals sections (24 raw blocks vs the CLI's 51 treeless) behind the gates' flat description term | the cost compare is a favorable deviation from C's fast heuristic (`nbSeq < 1000 → set_repeat`); do not port the blind repeat — the landed fix is the literals-gate repricing, [encoding](../perf/encoding.md) |
-| porting C's blind repeat of live FSE tables below 1000 sequences to dict frames anyway (2026-09-18, the fast rows' `staticFse_nbSeq_max` shortcut, on top of the width-4 parse) | fixture holdout, formatted dicts: −3 +101 B, −5 +93 B summed (+8/+9 B per file) | this encoder's parse distributions fit the dict-seeded tables worse than libzstd's own parses do — C's blind accept wins because its rows emit the parses the dict tables were trained on; keep the landed three-way cost compare |
-| exact fresh-table pricing in the dict-seeded FSE selection (build the normalized table, then cost the histogram through its real probabilities, replacing the entropy bound + description term) | no decision flips on the fixture's fast rows (2026-09-18) | on these small histograms the bound understates the fresh bitstream by a near-constant margin, so bound-vs-exact moves both contenders together; the landed compare is decision-equal at a fraction of the cost |
-| porting libzstd's `HUF_flags_preferRepeat` blind treeless acceptance for literals (rows below `ZSTD_lazy`, `srcSize <= 1024` in `ZSTD_compressLiterals`, accept any live covering table after the histogram heuristics — the huffman counterpart of the two FSE blind-repeat falsifications above) | no-dict corpus byte-identical everywhere it can fire (5 shapes x levels 1-22 full-ladder dump, 120-cell sweep incl. mt/stream); dll100 l1 +57 B / l2 +56 B (+0.0001%), l3-l5 identical; dict holdout formatted rows all worse: -1 +5 B, -2 +5 B, -4 +4/+5 B, -5 +5 B (raw-dict and no-dict rows unchanged); small band (1K-64K x fastest/fast, 3 interleaved rounds) geo-mean -0.21% mixed-sign — no speed change | the blind accept fires exactly where the landed exact treeless-vs-fresh comparison already chose a fresh table, so overriding it keeps a worse table; no threshold in the family wins (a smaller one just shrinks toward zero overrides — the exact compare IS the family's optimum wherever it is affordable, and it is: our fresh build runs at 0.57x C's own and the regime is rare no-dict — 32 MiB shapes produce no <=1 KiB-literals block with a live table at any level). The -1/-2 entropy-side dict residue is NOT the treeless acceptance semantics (2026-09-21) |
-| expanding the landed post-parse splitter beyond its gate (more rows/shapes; C-side A/B with a parameter-switch tool over libzstd 1.5.7, 2026-09-23) | postSplit (`ZSTD_c_splitAfterSequences`) net contribution measures **0.0000%** on every corpus cell — json/text/skewed/dll100 at L9/13/17/19 (the sequences-entropy estimator never found a net-positive split beyond what the default already takes) | C's own splitter is at its corpus optimum; our port's remaining json/text deltas are byte-parity residues, not headroom — do not retune thresholds or widen the gate |
-| porting libzstd's unconditional lazy+ exact three-way sequence selection to multi-block no-dict frames (levels 6+ everywhere, as C runs it; 2026-09-23, R14) | 32 MiB corpus: json l9 +4423 / l13 +3179 / l17 +2108 / l19 +6037 B, skewed l13 +33 / l17 −9823 / l19 −6926 (mixed), text l19 +2; 1 MiB json l9/l19 +68/+94 | this encoder's parses fit repeated tables worse than libzstd's own (the dict-side R12 finding's no-dict twin) — the heuristic's rebuild bias is ratio-safe on multi-block frames; the exact arm stays gated to ≤ 128 KiB single-block frames where only the predefined/fresh choice diverges |
-| porting `ZSTD_compressSuperBlock`'s sub-block splitting for small-data ratio (multi sub-blocks per block: first carries the entropy tables, the rest repeat/treeless, raw tail block; 2026-10-01, R33) | the CLI's own superblock output LOSES on the ratio path: json 64K +150/+104/+85/+125 B at l1/l3/l9/l19, text 64K likewise; at 1K/4K it never splits (estBlockSize < targetCBlockSize) and its −7..−8 B win is the single-sub-block literals layout alone, landed standalone as `LitStreams` | `targetCBlockSize` serves fixed-size transport chunks (min `ZSTD_n_MIN` 1340), not ratio: per-sub-block entropy decisions cost more than shared tables save on every measured shape. The task's proposed two-block [raw literals block][sequences-only block] form is strictly dominated by the in-block raw literals section we already emit (3 B extra block header + 1 B empty-literals section) — do not port the splitting machinery for ratio; revisit only behind an explicit targetCBlockSize API |
-| the small-payload gap (text 1-64K +7.5..+13.7% at l1/l9) hunted in the entropy sections — FSE tableLog scaling at low nseq, the predefined-vs-fresh bar, the literals reject-floor margins (`compress_literals`/`sampled_gate_rejects`' flat description term), window/table clamping at wLog 10-12, checksum-flag parity | falsified by frame-parser section diffs (2026-09-21, R8): sequence sections at parity on every diffed cell, the reject margins moved ≤ 10 B, both CLIs default the checksum on (4 B constant both sides), and adjust_params already matches `ZSTD_adjustCParams`' clamp; the gap decomposed onto frame shape (+4 B/frame), the srcSize-keyed cParams row, and the l1 parse bars | the entropy side keeps only the tail: literal Huffman descriptions +6..+10 B (landed the `HUF_optimalTableLog` cap) and the json l1 1-4K residue (+29..+112 pm, desc bytes at tiny sizes — [encoding](../perf/encoding.md)) |
-| AVX2 tier for the ldm `checksum_mask` (four quarter-bucket loads, `vpsrlq`+`vpcmpeqq`+`vmovmskpd` per quarter; 2026-10-01, R36) | dll100.fast flat: forced-avx2 448 vs forced-scalar 450 vs default-avx512 453 MiB/s (medians of 6 interleaved same-binary env-flip rounds, ranges overlapping); Ir −0.30% (15.912G→15.864G per 5 passes) against a −0.83% total tier gap on the cell | the inherited +2.3%-of-cycles perf-record attribution inside `ldm_generate` does not survive to end-to-end wall — the cell's whole SIMD tier spectrum is worth ≤0.8% Ir / ≤0.7% wall, so no AVX2 kernel lands (the decode-side sibling reached the same no-tier verdict for its sites); the kernel's unit test matched the scalar mask exactly, so the falsification is cost-side, not correctness-side |
+## Block decisions
+
+### Block-level pre-gate
+
+The idea was to sample whole-block entropy and emit the block raw when the sample crossed a threshold, skipping the scan. It is infeasible because a byte histogram cannot distinguish pure randomness from randomness containing long-distance repeats. libzstd likewise applies `suspectUncompressible` only to literals.
+
+### Json.opt density gap
+
+The json.opt density gap was hunted in the search and parse. A reference-frame block dump falsified that: the reference emits 447 blocks for our 257, because libzstd's `ZSTD_deriveBlockSplits` cuts nearly every json 128K block at entropy shifts. The gap is a missing feature, block splitting gated on `strategy>=btopt && windowLog>=17`, and not a parameter. The serialization alignment closed everything else, from -0.31% to -0.06%.
+
+### Post-parse splitter expansion
+
+The idea was to expand the landed post-parse splitter beyond its gate, with more rows and shapes and a C-side A/B through a parameter-switch tool over libzstd 1.5.7, run on 2026-09-23. The post-split measurement through `ZSTD_c_splitAfterSequences` reads 0.0000% net on every corpus cell, json, text, skewed and dll100 at L9, L13, L17 and L19, because the sequences-entropy estimator never found a net-positive split beyond the default. C's own splitter is at its corpus optimum, and our remaining json and text deltas are byte-parity residues, not headroom. Do not retune thresholds or widen the gate.
+
+### Superblock splitting
+
+The idea was to port `ZSTD_compressSuperBlock`'s sub-block splitting for the small-data ratio, with several sub-blocks per block: the first carries the entropy tables, the rest repeat or go treeless, and the raw tail block closes it. The experiment ran on 2026-10-01. The CLI's own superblock output loses on the ratio path, with json 64K at +150/+104/+85/+125 B at l1/l3/l9/l19 and text 64K likewise. At 1K and 4K it never splits because `estBlockSize < targetCBlockSize`, and its -7 to -8 B win is the single-sub-block literals layout alone, landed standalone as `LitStreams`.
+
+`targetCBlockSize` serves fixed-size transport chunks with a minimum `ZSTD_n_MIN` of 1340, and not ratio. Per-sub-block entropy decisions cost more than shared tables save on every measured shape. The proposed two-block form of a raw literals block followed by a sequences-only block is strictly dominated by the in-block raw literals section we already emit, which adds 3 B of extra block header and 1 B of empty literals section. Do not port the splitting machinery for ratio. Revisit it only behind an explicit `targetCBlockSize` API.
+
+## Scan and insertion
+
+### Speculative uniform scanning
+
+The idea was to scan uniformly, roll back and rescan on a mismatch. It cost text 8%, because 47% of bytes are long runs at block starts and rollback re-hashing doubles the cost. The correct semantics are absorb and continue.
+
+### AVX-512 insertion loop
+
+The idea was to vectorize the 16-or-fewer full-density insertion loop with AVX-512 vpmullq. The hash microbenchmark ran 2.2x faster with no gain on the full loop, because the bottleneck is random store throughput into the 256 KB table, the store floor. Approaches that only optimize hash computation are all ineffective.
+
+This was re-confirmed on 2026-09-11 on the outlined `insert_covered`, with a vpermb 16 B load, 8 lanes, vpmullq, a stack spill and 8 scalar stores. It cost +3.4% instructions against the scalar loop, because the 64 B stack round-trip plus eight extract-loads costs more than the scalar per-position sequence. It was re-confirmed again with a leaner srlv-built-lane variant using 2 u64 loads, vpsrlvq, vpandq, vpmullq and scalar stores. That variant cost +3.6% Ir and moved json.fastest wall from 532 to 504 MiB/s. With at most 2 batches per call and ml at most 16, the dependent vector chain never amortizes. Do not retry.
+
+### Cheaper exact binning
+
+The idea was cheaper exact binning of the gate histogram through wider lanes, u64-load extract feeds or a deeper unroll. It was falsified on paper after perf-annotate on 2026-09-12. The 4-lane loop already runs at the x86 mem-op floor, with 3 mem-ops per byte from a movzbl load and an RMW load plus store, at 3 mem-ops per cycle, giving the measured 1.04 cycles per byte. u64-load extracts trade byte loads for shift uops that LLVM load-narrowing undoes, and unrolling only drops ALU loop overhead off the port-bound path. An exact per-byte count cannot go below 1 RMW per byte, so the pass can only be skipped through the sticky hold, never cheapened.
+
+## Sequence encoding and table selection
+
+### Transition-row prefetch
+
+Prefetching the `encode_sequences` transition row with prefetchT0 raised instructions 3.5% with no cycle improvement. ILP already covers the latency, and the prefetch only adds noise.
+
+### Package-merge buffer reuse
+
+The idea was to reuse the package-merge back-walk buffer with two swapped u32 Vecs instead of a fresh Vec per level, in borrow-iter and drain-iter variants. It removed 9 malloc and free pairs per table, but text fastest and fast Ir rose +0.08 to +0.14% at 1 MiB and the text-4K wall rose +0.5%, within noise. The by-value fresh-Vec pattern of `for id in active` plus `active = next` codegens measurably better, because the move lets LLVM drop buffer state across iterations. Allocation count is not the walk's cost.
+
+### SeqWord 24 to 16 bytes
+
+The idea was to pack `add_nb` into the codes word's high byte and drop the field. json.fast Ir rose +1.12% and text.fast +0.97%, because the packing cost of a width sum and a shift-or lands in the matcher's emit path, whose per-sequence weight exceeds `encode_sequences`'. The consumer only trades one byte load for one shift. Operand-supply savings must not be bought inside a hotter producer.
+
+### choose_tables_fast residue
+
+The -1 formatted fast-row residue was hunted in `choose_tables_fast`'s dictionary-seeded sequence conversion, covering repeat gating, predefined preemption and the treeless cost model against `ZSTD_selectEncodingType`. A per-block decomposition on 2026-09-18 falsified it: sequence sections were 259 B ahead of the CLI, which used 155 blind `set_repeat`s against our cost-picked 116 Rep, 20 Pre and 15 RLE. The entire +2.0% sat in the literals sections, with 24 raw blocks against the CLI's 51 treeless, behind the gates' flat description term. The cost compare is a favorable deviation from C's fast heuristic of `nbSeq < 1000` leading to `set_repeat`. Do not port the blind repeat. The landed fix is the literals-gate repricing in [encoding](../perf/encoding.md).
+
+### Blind repeat on dictionary frames
+
+The idea was to port C's blind repeat of live FSE tables below 1000 sequences to dictionary frames anyway. It ran on 2026-09-18 with the fast rows' `staticFse_nbSeq_max` shortcut on top of the width-4 parse. Fixture holdout on formatted dicts read -3 +101 B and -5 +93 B summed, or +8/+9 B per file. This encoder's parse distributions fit the dict-seeded tables worse than libzstd's own parses do, and C's blind accept wins because its rows emit the parses the dict tables were trained on. Keep the landed three-way cost compare.
+
+### Exact fresh-table pricing
+
+The idea was exact fresh-table pricing in the dictionary-seeded FSE selection, building the normalized table and costing the histogram through its real probabilities instead of the entropy bound plus description term. No decision flips on the fixture's fast rows on 2026-09-18. On these small histograms the bound understates the fresh bitstream by a near-constant margin, so bound against exact moves both contenders together. The landed compare is decision-equal at a fraction of the cost.
+
+### Unconditional lazy+ selection on multi-block frames
+
+The idea was to port libzstd's unconditional lazy+ exact three-way sequence selection to multi-block no-dict frames at levels 6 and above everywhere, as C runs it. The experiment ran on 2026-09-23. On the 32 MiB corpus, json read l9 +4423, l13 +3179, l17 +2108 and l19 +6037 B, skewed read l13 +33, l17 -9823 and l19 -6926 B in a mixed result, and text l19 +2 B. On 1 MiB json, l9 and l19 read +68/+94 B. This encoder's parses fit repeated tables worse than libzstd's own, the no-dict twin of the dictionary-side finding. The heuristic's rebuild bias is ratio-safe on multi-block frames, and the exact arm stays gated to single-block frames of at most 128 KiB, where only the predefined or fresh choice diverges.
+
+## Literals and Huffman
+
+### Big-Huffman-block residue
+
+The +2 to +3 B per big Huffman block residue was hunted as a Huffman stream or tree divergence on 2026-09-16. Weight-table decoding falsified it: block-level description dumps show the streams within 1-2 B and the length assignments equal-cost. The gap was the weight FSE description built by the legacy normalization, and the aligned port is described in [encoding](../perf/encoding.md). The tree-shape tie residual of about 1 B per fresh table, from package-merge against `HUF_buildCTable` ordering, is accepted. Aligning tie-breaks would fork the length assignment for no measurable corpus gain.
+
+### Blind treeless acceptance for literals
+
+The idea was to port libzstd's `HUF_flags_preferRepeat` blind treeless acceptance for literals, which applies to rows below `ZSTD_lazy` and `srcSize <= 1024` in `ZSTD_compressLiterals` and accepts any live covering table after the histogram heuristics. It is the Huffman counterpart of the two FSE blind-repeat falsifications above. The no-dict corpus was byte-identical everywhere the code can fire, over a 5-shape by level-1-to-22 full-ladder dump and a 120-cell sweep including MT and stream. dll100 read l1 +57 B and l2 +56 B, or +0.0001%, and l3 to l5 were identical. The dict holdout formatted rows were all worse: -1 +5 B, -2 +5 B, -4 +4/+5 B and -5 +5 B, while raw-dict and no-dict rows stayed unchanged. A small band of 1K to 64K at fastest and fast over 3 interleaved rounds read geo-mean -0.21% with mixed signs and no speed change.
+
+The blind accept fires exactly where the landed exact treeless-against-fresh comparison already chose a fresh table, so overriding it keeps a worse table. No threshold in the family wins, because a smaller one shrinks toward zero overrides. The exact compare is the family's optimum wherever it is affordable, and it is affordable: our fresh build runs at 0.57x C's own, and the regime is rare without a dict, since 32 MiB shapes produce no block with literals of at most 1 KiB and a live table at any level. The -1 and -2 entropy-side dictionary residue is not the treeless acceptance semantics, as established on 2026-09-21.
+
+### Small-payload gap
+
+The small-payload gap of text 1-64K at +7.5 to +13.7% on l1 and l9 was hunted in the entropy sections: FSE tableLog scaling at low nseq, the predefined-against-fresh bar, the literals reject-floor margins in `compress_literals` and `sampled_gate_rejects`' flat description term, window and table clamping at wLog 10-12, and checksum-flag parity. Frame-parser section diffs on 2026-09-21 falsified it. Sequence sections were at parity on every diffed cell, the reject margins moved at most 10 B, both CLIs default the checksum on with a 4 B constant on both sides, and `adjust_params` already matches `ZSTD_adjustCParams`' clamp. The gap decomposed onto frame shape at +4 B per frame, the srcSize-keyed cParams row, and the l1 parse bars. The entropy side keeps only the tail: literal Huffman descriptions at +6 to +10 B, where the `HUF_optimalTableLog` cap landed, and the json l1 1-4K residue at +29 to +112 pm, from description bytes at tiny sizes, recorded in [encoding](../perf/encoding.md).
+
+## Bit I/O, histograms and dispatch
+
+### Residual byte stores in write_bits_64_cold
+
+Turning the residual bytes of `write_bits_64_cold` into stores made wall clock swing wildly with instructions unchanged. A hotspot below 0.5% is scheduling noise, and the change wrecks instruction layout.
+
+### Histogram counter width
+
+Changing histogram counters from u64 to u32 is flat. On x86, `inc qword` and `inc dword` have identical throughput.
+
+### Removing checks from the Uniform-4 loop
+
+Removing the checks from the Uniform-4 bulk loop cut instructions 19% but cost wall clock 7%. Branch prediction is free, and the microarchitectural change degrades instruction addressing and pipeline scheduling.
+
+### PGO
+
+Profile-guided optimization trained on the full corpus gave zero gain. It is not worth the build-chain complexity.
+
+### Integerizing the entropy pre-check
+
+Integerizing the entropy pre-check left instructions flat. 92% of the time is in the histogram `incq`, and the f64 entropy computation is near 0%.
+
+### Entropy-scratch pooling on random cells
+
+The effect of entropy-scratch pooling on the raw-heavy random cells was measured on 2026-09-16. random-8K wall fell 5% with flat Ir at -0.09%, while random-4K read +0.9% Ir and wall within plus or minus 2%. The movement is a codegen layout shift and not work, because the change touches none of random's paths and raw blocks build no tables. Gate this class of change on Ir plus the json, text and skewed band, and not on single raw-cell wall numbers.
+
+### AVX2 tier for the LDM checksum mask
+
+The idea was an AVX2 tier for the LDM `checksum_mask`, with four quarter-bucket loads and `vpsrlq`, `vpcmpeqq` and `vmovmskpd` per quarter, run on 2026-10-01. On dll100.fast the cell was flat: forced AVX2 read 448, forced scalar 450 and default AVX-512 453 MiB/s, as medians of 6 interleaved same-binary env-flip rounds with overlapping ranges. Ir read -0.30%, from 15.912G to 15.864G per 5 passes, against a total tier gap of -0.83% on the cell. The inherited perf-record attribution of +2.3% of cycles inside `ldm_generate` does not survive to end-to-end wall. The cell's whole SIMD tier spectrum is worth at most 0.8% Ir and 0.7% wall, so no AVX2 kernel lands, and the decode-side sibling reached the same no-tier verdict for its sites. The kernel's unit test matched the scalar mask exactly, so the falsification is cost-side and not correctness-side.
+
+## Residual attribution
+
+### Text Opt and Ultra parser residue
+
+The text Opt and Ultra ratio residue was hunted as a parser-side divergence in the opt price model, match finder, rep injection and backtracking against `zstd_opt.c`. It was falsified by decomposition on 2026-09-16. `seqstats --ref-frame` at l17 and l19 showed 12 sequences differing out of 27k, with the entropy bound 12 B better for us. Block-aligned payload diffs showed the sequence sections byte-identical with +2 B on every near-empty literals block. The residue was `raw_literals`'s hardcoded 20-bit size format, and the landed ladder is in [encoding](../perf/encoding.md). The opt parse is parity-verified against C at the event and byte level, so do not reopen the price-model or finder audit space for this symptom.

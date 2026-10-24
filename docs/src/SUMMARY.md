@@ -6,62 +6,62 @@
 
 # For Users
 
-- [User Guide](user.md)
+- [User guide](user.md)
 
 ---
 
 # Development Records
 
-- [Current Status](dev/status.md)
+- [Status overview](dev/status.md)
 
 ## Performance Comparisons
 
-- [Current Snapshot](dev/bench/snapshot.md)
-- [Wide Matrix Data](dev/bench/matrix.md)
-- [Benchmark Methodology](dev/bench/methodology.md)
-- [Decode Gap vs libzstd — Differential Attribution](dev/bench/dec-gap.md)
-- [Encode dll100 Gap vs libzstd — Differential Attribution](dev/bench/enc-dll-gap.md)
+- [Performance snapshot](dev/bench/snapshot.md)
+- [Bench matrix](dev/bench/matrix.md)
+- [Benchmark methodology](dev/bench/methodology.md)
+- [Decode stream gap against libzstd](dev/bench/dec-gap.md)
+- [Encode dll100 gap against libzstd](dev/bench/enc-dll-gap.md)
 
 ## Upstream Comparison
 
-- [zstdx vs. official zstd](dev/comparison.md)
-- [C FFI (libzstd compatibility layer)](dev/ffi.md)
+- [Comparison with official zstd](dev/comparison.md)
+- [C FFI](dev/ffi.md)
 
-## Review Rounds
+## Performance Work
 
-- [R64 · FSE core](dev/review/fse.md)
-- [R64 · Huff0 + bit I/O](dev/review/huff0.md)
-- [R64 · Blocks + xxh64](dev/review/blocks.md)
-- [R65 · Decode error-path parity](dev/review/parity.md)
-- [R65 · Decode cleanups](dev/review/declean.md)
-- [R66 · Parity bench mode](dev/review/diffbench.md)
-- [R66 · Dictionary parity](dev/review/dictparity.md)
-- [R67 · FFI parity](dev/review/ffiparity.md)
-- [R67 · CLI parity](dev/review/cliparity.md)
-- [R68 · Encoder edges](dev/review/encparity.md)
-- [R69 · Encode-path hardening](dev/review/hardening.md)
-- [R70 · Optimal parser](dev/review/opt.md)
-- [R72/R73 · Window semantics](dev/review/winsem.md)
+- [Decoding path](dev/perf/decoding.md)
+- [Encoding path](dev/perf/encoding.md)
+- [Matchers and compression levels](dev/perf/matchers.md)
+- [Multithreading and streaming](dev/perf/mt-stream.md)
 
-## Performance Optimization
+## Review Records
 
-- [Decoding Side](dev/perf/decoding.md)
-- [Encoding Side](dev/perf/encoding.md)
-- [Matchers and Compression Levels](dev/perf/matchers.md)
-- [Multithreading and Streaming](dev/perf/mt-stream.md)
+- [FSE core review](dev/review/fse.md)
+- [Huffman coder review](dev/review/huff0.md)
+- [Block layer review](dev/review/blocks.md)
+- [Decode error paths](dev/review/parity.md)
+- [Decode core cleanups](dev/review/declean.md)
+- [Decode parity differential](dev/review/diffbench.md)
+- [Dictionary-frame decode parity](dev/review/dictparity.md)
+- [FFI parity](dev/review/ffiparity.md)
+- [CLI parity](dev/review/cliparity.md)
+- [Encoder edges](dev/review/encparity.md)
+- [Encode-path hardening](dev/review/hardening.md)
+- [Optimal parser review](dev/review/opt.md)
+- [Window semantics](dev/review/winsem.md)
 
 ## Remaining Improvements
 
-- [Todo List](dev/todo.md)
-- [Disproven Directions (Do Not Retry)](dev/negative.md)
+- [Remaining improvements](dev/todo.md)
+- [Falsified directions](dev/negative.md)
   - [Decoding](dev/negative/decoding.md)
-  - [Encoding · Matchers](dev/negative/matchers.md)
-  - [Encoding · Entropy / Checksum / Misc](dev/negative/entropy.md)
-  - [Dictionary Trainer](dev/negative/dict.md)
-  - [MT / Streaming](dev/negative/mt-stream.md)
+  - [Encoding matchers](dev/negative/matchers.md)
+  - [Entropy, checksum and misc](dev/negative/entropy.md)
+  - [Dictionary trainer](dev/negative/dict.md)
+  - [MT and streaming](dev/negative/mt-stream.md)
 
 ## Pitfalls
 
-- [Decoding Side](dev/pitfalls/decoding.md)
-- [Encoding Side](dev/pitfalls/encoding.md)
-- [Engineering and Benchmark Methodology](dev/pitfalls/workflow.md)
+- [Decoding pitfalls](dev/pitfalls/decoding.md)
+- [Encoding pitfalls](dev/pitfalls/encoding.md)
+- [Workflow pitfalls](dev/pitfalls/workflow.md)

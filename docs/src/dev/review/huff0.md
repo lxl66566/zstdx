@@ -1,45 +1,84 @@
-# R64 review — Huff0 + bit I/O
+# Huffman coder review
 
-Scope: `crates/zstdx/src/huff0/` (huff0_decoder.rs, huff0_encoder.rs, mod.rs), `crates/zstdx/src/bit_io/` (bit_reader_reverse.rs, bit_reader.rs, bit_writer.rs, mod.rs), plus the call-site contracts in `decoding/literals_section_decoder.rs` and `encoding/block_enc/compressed.rs`. Reference: libzstd `entropy_common.c` (HUF_readStats), `huf_decompress.c` (X1/X2 DTable builds, 4-stream loops), `huf_compress.c` (HUF_writeCTable_wksp, HUF_compressWeights). No byte-affecting change: every fix touches malformed-input handling, unreachable-path hardening, or is a refactor; encoder output is unchanged for all inputs that already produced valid streams.
+Scope: the modules under `crates/zstdx/src/huff0/`, namely `huff0_decoder.rs`, `huff0_encoder.rs` and `mod.rs`, and under `crates/zstdx/src/bit_io/`, namely `bit_reader_reverse.rs`, `bit_reader.rs`, `bit_writer.rs` and `mod.rs`, plus the call-site contracts in `decoding/literals_section_decoder.rs` and `encoding/block_enc/compressed.rs`. Reference: libzstd `entropy_common.c` with HUF_readStats, `huf_decompress.c` with the X1 and X2 DTable builds and the 4-stream loops, and `huf_compress.c` with HUF_writeCTable_wksp and HUF_compressWeights. No change here affects bytes: every fix touches malformed-input handling or unreachable-path hardening, and encoder output stays the same for every input that already produced a valid stream.
 
-## Fixed
+## Bugs fixed
 
-### F1 — FSE weights decode could exceed 255 weights (bug, malformed input)
-`read_weights`' interleaved loop checks `weights.len() > 255` only at iteration end; the two stream-exhaustion `break`s skip it. A crafted stream that exhausts right after `dec1.update_state` at len 254 escapes with 256 weights, and `build_table_from_weights` then fills a 257-entry `bits` array whose `symbol as u8` wraps symbol 256 onto symbol 0 (wrong decode, no UB; libzstd caps at hwSize-1 = 255 and errors). Fixed with a post-loop bound check; the in-loop check stays as the liveness guard against 0-bit FSE states (unbounded push). Commit c812950c.
+### Weight count bound
 
-### F2 — missing libzstd rank-1 tree-validity check (spec deviation, error classes)
-C's `HUF_readStats` rejects `(rankStats[1] < 2) || (rankStats[1] & 1)` — the maximum-weight class (weight 1, inferred last weight included) must hold an even count of at least two symbols. Complete-but-non-canonical weight sets (raw `[2,2]` closing with inferred 3, i.e. a code whose max length is below its tableLog) parse Kraft-exact in zstdx and built a working table, so zstdx accepted input libzstd rejects. Note the odd half is mathematically implied by the leftover power-of-two gate (odd weight-1 count ⇒ odd sum ⇒ leftover 1 ⇒ inferred weight 1 ⇒ even total); only the `< 2` half adds rejecting power — both kept for structural parity with the reference. No encoder can emit a violating set (every complete prefix code has ≥ 2 max-depth leaves, and real encoders set tableLog = max code length). Commit c812950c.
+`read_weights`' interleaved loop checks `weights.len() > 255` only at the end of an iteration. The two stream-exhaustion `break`s skip the check. A crafted stream that exhausts right after `dec1.update_state` at len 254 escapes with 256 weights. `build_table_from_weights` then fills a 257-entry `bits` array, and `symbol as u8` wraps symbol 256 onto symbol 0. The decode is wrong and there is no UB. libzstd caps the count at hwSize-1, which is 255, and reports an error. A post-loop bound check now rejects the stream. The in-loop check stays as the liveness guard against 0-bit FSE states, which would otherwise push without bound.
 
-### F3 — write_table_desc header-range wrap (latent encoder corruption, unreachable)
-The FSE form's acceptance gate for wide alphabets (`n > 128`, unconditional once built) had no `fse_len < 128` bound: a value ≥ 128 would push a header byte the decoder parses as the raw form (silent corrupt stream), and the phantom-weight fallback path would then reach the raw form with `n > 128`, where the `debug_assert!`-only guard lets `n as u8 + 127` wrap in release. Unreachable in practice: a Kraft-valid table's weight stream is bounded by its class entropy, whose maximum over ≤ 255 symbols with mass ≤ 2^12 is ~1.9 bits/symbol (Lagrange optimum ≈ [42,53,47,40,31,16,4,1] over weights 1..8) — ≈ 61 B payload + ≤ ~25 B FSE table/quantization ≪ 128 B. Hardened with an explicit `fse_len < 128` gate and a hard `assert!(n <= 128)` so the invariant fails loudly instead of wrapping. Commit 70ab5f6c.
+### Rank-1 validity
 
-### F4 — duplicated padding-marker skip + wrong encode4x_only floor (smell)
-The skip-zeros-then-one loop was open-coded five times (weights parse, both literals decode paths, both round-trip helpers); the error paths always reported `skipped_bits == 9` (the loop only exits past 8 when the first 8 bits are zero). Folded into `BitReaderReversed::skip_padding_marker()`. Also: `encode4x_only`'s `assert!(data.len() >= 4)` understates the real floor — the quarter split panics at 5..8 (3·ceil(n/4) > n); stated as 6 (three quarters plus the fourth stream's end marker; the caller's one-vs-four gate only passes ≥ 256). Commit 0785ed78.
+C's `HUF_readStats` rejects `(rankStats[1] < 2) || (rankStats[1] & 1)`. The maximum-weight class, weight 1 with the inferred last weight included, must hold an even count of at least two symbols. Complete but non-canonical weight sets parsed Kraft-exact in zstdx and built a working table. An example is the raw set `[2,2]` closing with an inferred 3, a code whose maximum length is below its tableLog. zstdx therefore accepted input that libzstd rejects. The odd half is mathematically implied by the leftover power-of-two gate: an odd weight-1 count gives an odd sum, an odd sum leaves a leftover of 1, an inferred weight of 1 makes the total even. Only the `< 2` half adds rejecting power, and both checks stay for structural parity with the reference. No encoder can emit a violating set, because every complete prefix code has at least two max-depth leaves and real encoders set tableLog to the maximum code length.
 
-## Verified correct (no action)
+## Hardening
 
-- X2 table build is a line-by-line port of `HUF_readDTableX2_wksp`/`HUF_fillDTableX2`: rescale = targetLog-tableLog-1, scaleLog = nbBitsBaseline-targetLog, minWeight clamp to 1, the skip-span single-symbol fill below `rankVal[minWeight]`, level-2 spans `1 << (targetLog - totalBits)` at `start + rankVal[w2]`, single-symbol else branch. The `eligible_slots` 80% cutoff is a documented zstdx-specific perf gate, not part of the format.
-- X1 table fill: tableLog = highbit32(weightTotal)+1 matches `highest_bit_set`; rank_indexes prefix sums; the `rank_idx[0] == table.len]` assert pins Kraft exactness; weight > 11 rejection ≡ libzstd's weight ≤ 12 + tableLog ≤ 11 net effect (a weight of 12 forces tableLog ≥ 12, which the max-bits check kills).
-- Raw-weights parse bounds match C (`iSize+1 > srcSize` vs bytes_needed); FSE branch bounds (`header ≤ fse_stream.len()`, FSE-desc ≤ header, stream = header - desc) match; byte accounting `1 + header` matches C's `iSize+1`.
-- 4-stream interleaved fast loops (X1/X2): the `| 1` marker + trailing_zeros reload design, `iters` precomputed from input-bytes/7 and output/5-or/10 bounds, ip-crossing corruption checks, and `finish_streams`' foreign-bit accounting (window may extend ≤ 8 bytes below the stream start; `ext`/`foreign` math checked) are sound. The X2 u16 write cannot spill into the next segment (iteration bound keeps lookups ≥ 1 byte from seg_end; final byte via the scalar finish).
-- BitWriter: cold-path unaligned u64 store is reserve-covered and the length == bit_idx/8 invariant is maintained across write_bits_64_cold / write_packed_codes_dual_impl / write_uniform4_bulk / set_hot_state (each reserves pos + bound from the semantic position); `flush`'s byte-alignment assert holds at every call site by protocol (change_bits callers are the aligned jump-table/size-field writes); uniform4 AVX2/AVX512 packers' stores are within the bulk reserve and bit-identical to the scalar group loop (plus the dedicated AVX2-vs-scalar randomized test and the tier-forced dump gate).
-- BitReaderReversed refill: the three short-window cases (partial last window, past-end zero fill) keep `bits_consumed < 8` post-refill and account `extra_bits`; `from_parts`' `index + 8 <= len` contract is upheld by `finish_streams` (ip ≤ end-8 invariant of the reload discipline).
-- Call sites: block_decoder/mt.rs pre-validate literal-section sizes before slicing (Raw/RLE indexing cannot panic); treeless blocks reusing a stale X2 table is impossible across fresh builds (build_table_from_weights clears x2 first) and correct within treeless runs (same weights); `reinit_from` copies x2 together with the weights it was built from.
+### Table descriptor header range
 
-## Accepted (with reason)
+The FSE form's acceptance gate for wide alphabets at `n > 128`, unconditional once built, had no `fse_len < 128` bound. A value of at least 128 would push a header byte that the decoder parses as the raw form, which silently corrupts the stream. The phantom-weight fallback path could then reach the raw form with `n > 128`, where the `debug_assert!`-only guard lets `n as u8 + 127` wrap in release. The case is unreachable in practice. A Kraft-valid table's weight stream is bounded by its class entropy, whose maximum over at most 255 symbols with mass at most 2^12 is about 1.9 bits per symbol. The Lagrange optimum is about `[42,53,47,40,31,16,4,1]` over weights 1 to 8, which gives about 61 B of payload plus at most about 25 B of FSE table and quantization, far below 128 B. An explicit `fse_len < 128` gate and a hard `assert!(n <= 128)` now make the invariant fail loudly instead of wrapping.
 
-- `MAX_MAX_NUM_BITS` (decoder) and `MAX_CODE_LENGTH` (encoder) are two consts for the same 11 — unifying them couples the two modules' hot code for zero behavioral value.
-- X1/X2 entry-packing magic numbers (`& 0x3f`, `>> 53`, `<< 16`/`<< 24`) stay as documented literals; const-ifying risks codegen churn in the hottest decode loop for readability only.
-- `HuffmanDecoder::init_state` returns `num_bits` (constant per table); every caller ignores it — harmless API vestige.
-- `GetBitsError::TooManyBits` mixes usize/u8 fields — internal error type, churn > value.
-- The `n > 128` FSE acceptance being looser than libzstd's `hSize < maxSymbolValue/2` gate is a documented deliberate choice (the raw form is impossible there; the FSE form is valid per spec for any conforming decoder).
-- `BitReaderReversed::get_bits(n > 56)` would underflow the peek shift — internal contract (documented "at most 56 bits"), all callers ≤ 22.
+## Refactors
+
+The loop that skips zero bits and then consumes one was open-coded five times: in the weights parse, in both literals decode paths, and in both round-trip helpers. Its error paths always reported `skipped_bits == 9`, because the loop only exits past 8 when the first 8 bits are zero. The code now calls `BitReaderReversed::skip_padding_marker()`. `encode4x_only`'s `assert!(data.len() >= 4)` also understated the real floor. The quarter split panics at 5 to 8 because `3*ceil(n/4) > n`, and the assertion now states 6, which is three quarters plus the fourth stream's end marker. The caller's one-versus-four gate only passes at 256 or more.
+
+## Verified correct
+
+### X2 table build
+
+The X2 table build is a line-by-line port of `HUF_readDTableX2_wksp` and `HUF_fillDTableX2`. It uses `rescale = targetLog-tableLog-1` and `scaleLog = nbBitsBaseline-targetLog`. It clamps `minWeight` to 1 and fills a single symbol across the span below `rankVal[minWeight]`. Level-2 spans use `1 << (targetLog - totalBits)` at `start + rankVal[w2]`, with a single-symbol else branch. The `eligible_slots` 80% cutoff is a documented zstdx-specific perf gate and is not part of the format.
+
+### X1 table fill
+
+The X1 fill computes `tableLog = highbit32(weightTotal)+1`, which matches `highest_bit_set`. `rank_indexes` holds the prefix sums. The `rank_idx[0] == table.len` assert pins Kraft exactness. Rejecting a weight above 11 has the same net effect as libzstd's weight at most 12 plus tableLog at most 11, because a weight of 12 forces tableLog to at least 12, which the max-bits check kills.
+
+### Weight parsing
+
+The raw-weights parse bounds match C: `iSize+1 > srcSize` against `bytes_needed`. The FSE branch bounds match as well: `header ≤ fse_stream.len()`, the FSE descriptor at most the header, and the stream length equal to the header minus the descriptor. The byte accounting `1 + header` matches C's `iSize+1`.
+
+### Four-stream loops
+
+The 4-stream interleaved fast loops for X1 and X2 are sound. The design uses the `| 1` marker and a `trailing_zeros` reload. `iters` is precomputed from the input-byte bound divided by 7 and the output bounds divided by 5 or 10. The loops check ip-crossing corruption, and `finish_streams` accounts foreign bits correctly, where the window may extend at most 8 bytes below the stream start and the `ext` and `foreign` math was checked. The X2 u16 write cannot spill into the next segment, because the iteration bound keeps lookups at least 1 byte from `seg_end` and the final byte goes through the scalar finish.
+
+### BitWriter
+
+The BitWriter's cold-path unaligned u64 store is reserve-covered. The `length == bit_idx/8` invariant holds across `write_bits_64_cold`, `write_packed_codes_dual_impl`, `write_uniform4_bulk` and `set_hot_state`, each of which reserves `pos` plus a bound derived from the semantic position. `flush`'s byte-alignment assert holds at every call site by protocol, because the `change_bits` callers are the aligned jump-table and size-field writes. The uniform4 AVX2 and AVX512 packers store within the bulk reserve and are bit-identical to the scalar group loop. A dedicated randomized AVX2-versus-scalar test and the tier-forced dump gate cover them.
+
+### BitReaderReversed
+
+The `BitReaderReversed` refill handles the short-window cases, where the window is a partial last window or a past-end zero fill. It keeps `bits_consumed < 8` after the refill and accounts `extra_bits`. The `from_parts` contract `index + 8 <= len` is upheld by `finish_streams`, through the `ip <= end-8` invariant of the reload discipline.
+
+### Call sites
+
+`block_decoder/mt.rs` pre-validate literal-section sizes before slicing, so Raw and RLE indexing cannot panic. A treeless block cannot reuse a stale X2 table across fresh builds, because `build_table_from_weights` clears x2 first, and reuse within a treeless run is correct because the weights stay the same. `reinit_from` copies x2 together with the weights it was built from.
+
+## Accepted limits
+
+`MAX_MAX_NUM_BITS` in the decoder and `MAX_CODE_LENGTH` in the encoder are two constants for the same 11. Unifying them would couple the two modules' hot code for no behavioral value.
+
+The X1 and X2 entry-packing magic numbers `& 0x3f`, `>> 53`, `<< 16` and `<< 24` stay as documented literals. Turning them into constants risks codegen churn in the hottest decode loop for readability only.
+
+`HuffmanDecoder::init_state` returns `num_bits`, which is constant per table, and every caller ignores it. The return value is a harmless API vestige.
+
+`GetBitsError::TooManyBits` mixes `usize` and `u8` fields. It is an internal error type, and the churn would exceed the value.
+
+The `n > 128` FSE acceptance is looser than libzstd's `hSize < maxSymbolValue/2` gate by deliberate choice. The raw form is impossible there, and the FSE form is valid per spec for any conforming decoder.
+
+`BitReaderReversed::get_bits(n > 56)` would underflow the peek shift. The internal contract documents at most 56 bits, and all callers stay at 22 or below.
 
 ## Tests added
 
-- `rejects_weight_sets_without_rank_one_symbols`, `accepts_canonical_weight_sets` (raw-weight forms incl. single-weight and header-128 edges) — huff0_decoder.
-- `fse_weights_decode_count_bound` — FSE-crafted weight streams via the encoder pipeline: 255 (legal max) decodes, 256 rejects `TooManyWeights(256)`.
-- `wide_alphabet_table_desc_stays_fse_addressable` — near-max-entropy Kraft-exact 234-weight multiset (shuffled) must take the FSE form with header < 128 and parse back into the same weights.
-- `padding_marker_skips_zeros_then_one` — the folded reader helper.
+- `rejects_weight_sets_without_rank_one_symbols` and `accepts_canonical_weight_sets` cover raw-weight forms including the single-weight and header-128 edges in `huff0_decoder`.
+- `fse_weights_decode_count_bound` feeds FSE-crafted weight streams through the encoder pipeline: 255, the legal maximum, decodes, and 256 rejects with `TooManyWeights(256)`.
+- `wide_alphabet_table_desc_stays_fse_addressable` uses a shuffled near-max-entropy Kraft-exact 234-weight multiset, which must take the FSE form with a header below 128 and parse back into the same weights.
+- `padding_marker_skips_zeros_then_one` covers the folded reader helper.
 
-Baseline and post-change suites: `cargo test` (debug), `--release`, `--no-default-features` all green (16 result lines each); clippy zero warnings.
+## Commits
+
+- c812950c fixes the weight-count bound and the rank-1 validity check
+- 70ab5f6c adds the table-descriptor header range gate
+- 0785ed78 folds the padding-marker skip and states the `encode4x_only` floor
+
+## Verification
+
+The baseline and post-change suites were green with `cargo test` in debug, `--release` and `--no-default-features`, with 16 result lines each. Clippy reported zero warnings.

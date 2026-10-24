@@ -1,61 +1,84 @@
-# R69 review — encode-path hardening: compile-time invariants, poison walls, paranoid profile
+# Encode-path hardening
 
-Scope: the structural answer to R68's three-bug postmortem ([encparity](encparity.md)). Every recent memory-safety bug fell into one of three classes, and each class maps to a blind spot of an existing gate: an overread past a buffer's *logical* length that lands inside its *allocation* is invisible to ASAN (the streaming window's slack swallowed the row-tail reads); paired/derived state stored as independently-writable fields desyncs (`tables.len()`/`second` — prose invariants are not re-validated per new path); u64 cursor subtraction wraps under release codegen while debug overflow-checks pass a different execution path. The round erected one wall per blind spot, all zero-cost in the shipped release profile, plus the fuzz-dimension fix for pool-residue bugs (fresh-process replay cannot see them).
+This page records the structural answer to the three bugs found in the [encoder edges](encparity.md) review. Each recent memory-safety bug fell into one of three classes, and each class exposed a blind spot of an existing gate. The round built one wall per blind spot, all zero-cost in the shipped release profile, and added the fuzz dimension that catches pool-residue bugs, which fresh-process replay cannot see.
 
-## What landed
+## Blind spots
 
-| Layer | Wall | Commits |
-|---|---|---|
-| Compile-time (types) | `IdxRange` — wrap-proof spans for same-domain cursor arithmetic; every fill bound, rep-tail scan bar and `insert_max` producer goes through it (or carries a proof comment / loop-bar invariant); per-byte scan loops keep naked arithmetic under their bars by design | 29d8399b |
-| Compile-time (structure) | `HeadTables` — the `tables`/`second` pair behind private fields with one mutation entry per resize shape; the R68 lockstep comment rides the single entry; the desync class is unrepresentable | 1b005bdc |
-| Compile-time (const proof) | the ladder geometry (`params_for_*`, `adjust_params`) is `const fn`; a `const _` walk of level 0..=22 × src_log 2^10..=2^27 asserts every relation `resize_tables` relies on, and a pair walk pins `LADDER_ROW_COLLISIONS == 132` (same row count at different hash logs — the R68 #3 precondition) cited in the Row arm; a bad ladder edit now fails the build (verified live: a corrupted row and a shifted hash both trip it) | 8a99388c |
-| Debug detection | poison margins (`encoding::poison`, cfg(debug_assertions)): the owned streaming window (fill at `block_tail` staging, assert at block commit / call exits), the ST/MT stream cores' `staged`/`output`/per-job/donation slack, LDM split staging batches, pooled `BlockScratch` staging — an intra-allocation touch past a logical length panics with a checkpoint name | 8e9e7e11, 659e465d, 827f77d3, 7ccf6e5e, 97e63721, b323d67b |
-| Release-codegen detection | `[profile.paranoid]` (inherits release + `debug-assertions` + `overflow-checks`) — the walls and overflow checks over release codegen, where wrap bugs actually manifest; CI job `.github/workflows/paranoid.yml`; paranoid dump proven byte-equal to release | 5bb703e0 |
-| Fuzz dimensions | `encode`/`encode_stream` targets walk a multi-payload ladder ([level, opts, k, chunks...], chunk i at level `(level+i)%23` through one thread — pooled carryover is now a fuzz dimension); artifact walker runs forward + reverse in-process; `pooled_ladder_sweep` pins every level pair at the `adjust_params` clamp boundaries | b75081a6, 16b1209e, 4d73e225 |
+An overread past a buffer's logical length that lands inside its allocation is invisible to ASAN. The streaming window's slack swallowed the row-tail reads. Paired or derived state stored as independently writable fields can desync, as `tables.len()` and `second` did, because prose invariants are not re-validated per new path. A u64 cursor subtraction wraps under release codegen, while debug overflow checks pass through a different execution path.
 
-The sweep earned its keep immediately: it found two pre-existing MT bugs (below) that every prior gate missed.
+## Walls
 
-## The sweep's two real bugs (pre-existing, fixed)
+### Compile-time types
 
-Both reproduced identically on the pre-hardening base, both in the flush + short-window corner no prior gate drove:
+`IdxRange` provides wrap-proof spans for same-domain cursor arithmetic. Every fill bound, rep-tail scan bar and `insert_max` producer goes through it, or carries a proof comment or a loop-bar invariant. The per-byte scan loops keep naked arithmetic under their bars by design.
 
-1. **`run_inline_job`'s view anchored at the buffer, not the strip head** (a54737e4): the inline twin sliced `buf[..hi - buf_base]` while its `first` counts from `strip_lo` (every posted job's convention). After a mid-stream flush under a window shorter than the flush offset (forced window_log 9/10), the whole post-flush span re-encoded stale earlier bytes — the frame decodes fine; only a checksum/byte compare catches it. **Silent corruption without checksum.**
-2. **A flush-regridded Growing-grid post could cross its epoch end** (c248f074): `post_ready`'s `end = job_start + epoch_size` vs a gate keyed on the epoch boundary; a mid-epoch flush parks `job_start` where the two disagree — release would freeze a view reading never-staged bytes. `post_job`'s debug assert caught it under the walls.
+### Compile-time structure
 
-Mechanisms in [pitfalls/encoding](../pitfalls/encoding.md). Fixes are no-ops on untouched grids (dumps byte-identical below).
+`HeadTables` puts the `tables` and `second` pair behind private fields with one mutation entry per resize shape. The lockstep comment from the encoder-edge review rides that single entry, and the desync class becomes unrepresentable.
+
+### Compile-time constant proof
+
+The ladder geometry in `params_for_*` and `adjust_params` is `const fn`. A `const _` walk over level 0..=22 and src_log 2^10..=2^27 asserts every relation that `resize_tables` relies on. A pair walk pins `LADDER_ROW_COLLISIONS == 132`, which is the same row count at different hash logs, the precondition of the third defect in the [encoder edges](encparity.md) review, and the Row arm cites it. A bad ladder edit now fails the build. This was verified live with a corrupted row and a shifted hash, and both trip it.
+
+### Debug detection
+
+Poison margins live in `encoding::poison` under `cfg(debug_assertions)`. They cover the owned streaming window, with a fill at `block_tail` staging and asserts at block commit and call exits. They also cover the ST and MT stream cores' `staged`, `output`, per-job and donation slack, the LDM split staging batches, and the pooled `BlockScratch` staging. An intra-allocation touch past a logical length panics with a checkpoint name.
+
+### Release-codegen detection
+
+`[profile.paranoid]` inherits release and enables `debug-assertions` and `overflow-checks`, so the walls and overflow checks run over release codegen, where wrap bugs actually manifest. The CI job `.github/workflows/paranoid.yml` runs it, and the paranoid dump is proven byte-equal to release.
+
+### Fuzz dimensions
+
+The `encode` and `encode_stream` targets walk a multi-payload ladder of `[level, opts, k, chunks...]`, with chunk i at level `(level+i)%23` through one thread, so pooled carryover is now a fuzz dimension. The artifact walker runs forward and in reverse in-process. `pooled_ladder_sweep` pins every level pair at the `adjust_params` clamp boundaries.
+
+The sweep earned its keep immediately, because it found two pre-existing MT bugs that every prior gate missed.
+
+## Bugs fixed
+
+Both bugs reproduced identically on the pre-hardening base, and both sat in the flush and short-window corner that no prior gate drove.
+
+`run_inline_job`'s view was anchored at the buffer instead of the strip head. The inline twin sliced `buf[..hi - buf_base]` while its `first` counts from `strip_lo`, which is every posted job's convention. After a mid-stream flush under a window shorter than the flush offset, with a forced window_log of 9 or 10, the whole post-flush span re-encoded stale earlier bytes. The frame still decodes, and only a checksum or byte compare catches it, so this was silent corruption without a checksum.
+
+A flush-regridded Growing-grid post could cross its epoch end. `post_ready` computed `end = job_start + epoch_size`, against a gate keyed on the epoch boundary, and a mid-epoch flush parks `job_start` where the two disagree. Release would freeze a view reading bytes that were never staged. `post_job`'s debug assert caught it under the walls.
+
+The mechanisms are recorded in [pitfalls/encoding](../pitfalls/encoding.md). The fixes are no-ops on untouched grids, and the dumps below are byte-identical.
 
 ## Gate numbers
 
-- Tests: debug 416+12+21 · release 411+12+21 · no-default-features 240 · zstdx-cli 99 · **paranoid 416+12+21** — all green with every wall armed.
-- Dump byte-differential vs the pre-round base: bulk `--all-levels` and stream `--all-levels` grids **byte-identical** (the two MT fixes included — their corner is off the dump lattice, pinned by tests instead).
-- gungraun Ir vs base: fastest json **+0.004%** (flat), balanced json **+0.438%** — decomposed to `HeadTables` accessor placement on the once-per-parse chain path (a semantically identical form of the rep-tail body swung ±3% Ir without executing: register-allocation placement, not algorithmic cost; the landed shape keeps the base loop and clamps post-emit — 68c0d81c). Wall A/B closed the residue 2026-10-24: 4x order-swapped interleaved `prof enc 9` json, base median 155.5 vs HEAD 159 MiB/s, every pair favoring HEAD — the memory-bound chain tier never pays it; no recovery spent.
-- Fuzz smokes (ASAN, merged tree): `encode` 15,366 runs / `encode_stream` 4,300 runs, zero findings.
-- Poison overhead: debug suite 54.0→65.2s (walls' fill/assert inside the heavy MT tests); the sweep itself ~1s (966 cells, option bits rotated one per cell). Release unaffected: `nm` on the release rlib shows zero wall symbols.
+- The tests pass with every wall armed: debug 416+12+21, release 411+12+21, no-default-features 240, zstdx-cli 99 and paranoid 416+12+21.
+- The dump byte differential against the pre-round base is byte-identical for the bulk `--all-levels` and stream `--all-levels` grids. The two MT fixes are included, and their corner sits off the dump lattice, so tests pin it.
+- gungraun Ir against the base reads +0.004% for fastest json, which is flat, and +0.438% for balanced json. The second figure decomposes to `HeadTables` accessor placement on the once-per-parse chain path. A semantically identical form of the rep-tail body swung by about 3% Ir either way without executing, which is register-allocation placement and not algorithmic cost. The landed shape keeps the base loop and clamps post-emit in 68c0d81c. A wall A/B closed the residue on 2026-10-24. Four order-swapped interleaved `prof enc 9` runs on json gave a base median of 155.5 against 159 MiB/s for HEAD, and every pair favored HEAD. The memory-bound chain tier never pays the cost, and no recovery was spent.
+- Fuzz smokes under ASAN on the merged tree ran `encode` for 15,366 runs and `encode_stream` for 4,300 runs with zero findings.
+- Poison overhead took the debug suite from 54.0 to 65.2 s, because the walls' fill and assert work runs inside the heavy MT tests. The sweep itself takes about 1 s for 966 cells with the option bits rotated one per cell. Release is unaffected, and `nm` on the release rlib shows zero wall symbols.
 
-## Honest coverage (what the walls do not see)
+## Coverage gaps
 
-- The committed-len→staged-end zone of the owned window is **caller-live** by frame_compressor's pre-split carry convention — unpoisonable without a caller-contract change (full-block commits still land the wall directly past the block end).
-- The block_enc bitwriter's `hot_push_raw` deliberately writes past the semantic end inside its reserved span (documented discipline); the MT accumulate buffer's spare is the read pump's destination; LDM tables/buckets and the matcher's hash/row/tree tables are exact-sized (no slack); bulk input slices are caller-borrowed (ASAN-visible at the allocation end — the fuzzer's territory).
-- `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note (29d8399b).
-- Poison asserts fire at checkpoints; a touch whose evidence is legitimately overwritten before the next checkpoint escapes. Checkpoints were placed at every staging boundary to keep the window short.
+The committed-length to staged-end zone of the owned window is caller-live by `frame_compressor`'s pre-split carry convention. It cannot be poisoned without a caller-contract change, although full-block commits still land the wall directly past the block end.
 
-## Pitfall-scan: which historical bugs each wall would have killed
+The block_enc bitwriter's `hot_push_raw` deliberately writes past the semantic end inside its reserved span, which is documented discipline. The MT accumulate buffer's spare is the read pump's destination. The LDM tables and buckets and the matcher's hash, row and tree tables are exact-sized with no slack. Bulk input slices are caller-borrowed, so they are ASAN-visible at the allocation end, which is the fuzzer's territory.
+
+`parse_chain`'s `next - 512` wrap is flagged as byte-load-bearing with a do-not-fix note in 29d8399b.
+
+Poison asserts fire at checkpoints, so a touch whose evidence is legitimately overwritten before the next checkpoint escapes. The checkpoints sit at every staging boundary to keep that window short.
+
+## Historical bugs and their walls
 
 | Historical bug | Wall |
 |---|---|
-| reserve baseline (len vs pos) | writer-API consolidation — still open, todo 24b menu |
-| HASH_READ tail lockstep / catch-up fill margin | poison (window past logical end) |
-| insert_max underflow, `(end-p)&1` peel, rep-tail bars | IdxRange (empty-span floor) |
-| dist-0 self-compare | wrapping-resolve helper (landed R4x); NonZero type is todo 24b |
-| origin sentinel phantom | coordinate-cap invariant (landed R43 epoch roll) |
-| `second`/`tables.len()` desync | HeadTables (unrepresentable) + const collision count |
-| head-link induction break | pooled tests (R68 landed); typestate not attempted |
-| exit-contract divergence | skill checklist (not type-able cheaply) |
-| MT inline view / epoch straddle | poison sweep + pooled sweep (this round) |
+| reserve baseline, len against pos | writer-API consolidation, open in the [todo](../todo.md) |
+| HASH_READ tail lockstep and catch-up fill margin | poison, window past logical end |
+| insert_max underflow, `(end-p)&1` peel, rep-tail bars | IdxRange, empty-span floor |
+| dist-0 self-compare | wrapping-resolve helper, landed |
+| origin sentinel phantom | coordinate-cap invariant, landed with the epoch roll |
+| `second` and `tables.len()` desync | HeadTables, unrepresentable, plus the const collision count |
+| head-link induction break | pooled tests, landed with the encoder-edge round, no typestate attempted |
+| exit-contract divergence | skill checklist, not cheaply typeable |
+| MT inline view and epoch straddle | poison sweep and pooled sweep, this round |
 
 ## Follow-ups
 
-Todo 24: the balanced-Ir placement residue is closed (wall A/B flat-to-positive, above); the remaining compile-time menu (cross-domain index newtypes, NonZero distances, `Option<Candidate>` sentinels, enum rep-bases); the unpoisonable carry zone; the `-max_len` >4096 campaign (carried from todo 23b — 23a closed here with `encode_stream`).
+The balanced-Ir placement residue is closed, as the wall A/B shows. The remaining compile-time menu in the [todo](../todo.md) holds cross-domain index newtypes, NonZero distances, `Option<Candidate>` sentinels and enum rep-bases. It also holds the unpoisonable carry zone and the `-max_len` campaign above 4096, where the `encode_stream` part is closed here.
 
 ## Commits
 

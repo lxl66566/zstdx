@@ -1,21 +1,34 @@
-# Perf vs zstd crate · current snapshot (2026-10-18)
+# Performance Snapshot (2026-10-18)
 
-> Pre-release pass at `add0b0be`, 2026-10-18, one machine, one corpus, same flags. Provenance, raw tables and per-chunk commands: [matrix.md](matrix.md), including the full 1-22 numeric ladder (T7) and the small-payload table (T8). Encoder outputs are **byte-identical to the 10-01 pass** (all 120 ratio cells and all 110 ladder cells size-equal, geo-mean +8.69% unchanged); speed moves concentrate where the 17 interim commits point — R40/R41's reach-probe parse takes text.balanced bulk ST x1.34 → **1.10** (ladder l9 x1.34 → 1.11) and json.balanced x0.84 → **0.77**; the tree tiers read at or inside their bands (json.best 1.28 → 1.23, dll.best 1.42 → **1.26**, json.ultra 1.03 → 1.00, skewed.opt 0.95 → 0.92); decode stream cells drift a few % better (R37/R38 direction); dec-mt json mt16 1.60 → **1.65× ST**, dll100 1.83 → **1.90×**; text.balanced stream-mt8 closes to **x0.95 — every stream-mt cell now wins**. Comparison target: zstd crate / libzstd 1.5.7 (zstdmt); the ladder pairs fastest/fast/balanced/best/opt/ultra vs libzstd 1/3/9/13/17/19. Caveats: ±10% noise between runs; per-side budget 1s (500 ms on the full ladder and small); interleaved medians, spreads in the raw tables.
+This page summarizes the 2026-10-18 pre-release pass at commit `add0b0be`, run on one machine, one corpus and the same flags on both sides. The comparison target is the zstd crate and libzstd 1.5.7 with zstdmt, and the ladder pairs fastest, fast, balanced, best, opt and ultra against libzstd levels 1, 3, 9, 13, 17 and 19. Raw tables, provenance and per-chunk commands are in [matrix.md](matrix.md), including the full numeric 1-22 ladder and the small-payload table. Encoder outputs are byte-identical to the 2026-10-01 pass: all 120 ratio cells and all 110 ladder cells are size-equal and the geo-mean stays at +8.69%. Speed moves concentrate where the seventeen interim commits point: the reach-probe parse takes text.balanced bulk single-thread from x1.34 to 1.10 and its ladder row from x1.34 to 1.11, and json.balanced from 0.84 to 0.77. The tree tiers read at or inside their bands, with json.best 1.28 to 1.23, dll.best 1.42 to 1.26, json.ultra 1.03 to 1.00 and skewed.opt 0.95 to 0.92. Decode stream cells drift a few percent better, decode MT json mt16 moves from 1.60 to 1.65 times single-thread and dll100 from 1.83 to 1.90, and text.balanced stream-mt8 closes to x0.95, so every stream-mt cell now wins. Caveats: ±10% noise between runs, a per-side budget of 1 second and 500 ms on the full ladder and small payloads, interleaved medians, and spreads in the raw tables. Throughout this page x is our time divided by the reference time, so values below 1 mean we are faster, and speeds are MiB/s of raw input.
 
-## Headline
+## Headline results
 
-- **Decode ST bulk**: we win 17/18 cells (x 0.21-1.00); skewed.zst9 sits exactly at parity (x1.00). Absolute 640-12236 MiB/s ours; dll 1157-1536 MiB/s. Every cell reproduces 10-01 or reads a few % better.
-- **Decode ST streaming** (core-vs-core): zstd still wins every compressible shape — json x1.13-1.33, text x1.04-1.20, skewed x1.08-1.28, dll x1.28-1.34; we win random (x0.80) and hold zeros (1.00). The band tightened 1-6% vs 10-01 (R37/R38).
-- **Encode ST**: json fastest/fast x1.45/1.03, **balanced ahead at x0.77 carrying +21% density**, best x1.23, opt/ultra x1.01/**1.00** at ratio parity or denser (json.opt 9 B ahead of zstd-17) — four of six json tiers now at parity-or-ahead. text: fastest/fast x0.79/0.54 (we win); **balanced x1.10 at +1.65% density** (was 1.34 — R40/R41); best/opt/ultra ahead x0.61/0.55/0.64. skewed: fastest/balanced far ahead (x0.44/0.041), fast a near-tie (x1.07), best behind (x1.91), **opt/ultra ahead (x0.92/0.95)** at ratio parity. random/zeros: we win at every tier (up to 300× on incompressible high tiers); zeros fastest/fast x0.27/0.18, random x0.90/0.84. **dll**: fastest x1.06 at **−49.6% size vs zstd-1** (r 4.35 vs 2.19), fast ahead x0.97 at −31.7%, balanced x1.30 at −13.0%, best x1.26 at −12.8%, opt x1.09 at −16.2%, ultra x1.12 at −16.5%.
-- **Encode MT**: json.fastest.mt8 x1.19 (spread 0.95-1.68) the one remaining zstd mt win; every other cell ahead or inside text.balanced's own 0.99-1.47 spread. Our cold-pool mt16 json.fast (3307) still beats zstd's warm-pool reference (1593).
-- **Streaming encode ST**: json.fast ahead (x0.94); json.fastest x1.32; text.best x0.63; **text.fastest/fast x0.25/0.79 — standalone medians** (the in-pass page-dispersity collapse reproduced for the fourth consecutive pass; mechanism in the workflow pitfalls); both stay wins. json.opt x0.97 and json.ultra x0.98 stay wins.
-- **Streaming encode MT8**: every json/text cell ahead — **text.balanced x0.95 (was 0.98, now a win)**, every other cell ≤x0.64. dll100 stream-mt8 reproduces the 10-02 addendum: ahead at fast/opt (x0.80/0.95), trailing fastest x3.52, balanced x1.15, ultra x1.21 and best x5.39 (the `count_from_long` SIMD fix held) — [todo](../todo.md) 17. **R61 (2026-10-22) closed the scheduling half** — the accumulate buffer's mid-stream growth barrier retired (`reserve_decided` covers the stream; byte-identical sizes): fastest x2.36, best x3.12, ultra **x0.98 parity** ([matrix](matrix.md) T5 addendum).
-- **Decode MT** (our exclusive dimension, libzstd has none): json mt16 = 1.65× our ST = 1.23× the zstd stream reference (mt2 1.38× ST), **dll100.zst3 mt16 = 1.90× ST = 1.36× ref** (the strongest scaling row, on the real-binary payload), skewed mt16 1.25× ST / 0.96× ref (the shape's absolute band wanders ±15% across passes), text flat 0.97×.
-- **Ratio sweep**: geo-mean **+8.69% denser** over 120 cells (bulk-st +1.48%) — outputs byte-identical to the 10-01 sweep. Losing cells unchanged: json.fast mt −0.12..−0.14%, skewed.opt −0.06..−0.07%, plus −0.00..−0.04% near-ties on skewed.fast/fastest/ultra and text.ultra mt.
-- **Full 1-22 ladder** (release gate): json rows 5-8 and 10-12 hold R33's diet at **x1.23-1.31 carrying −4.8..−16.4% byte wins**; the R40/R41 parse lifts the chain band — text l9 x1.34 → **1.11**, json l9 x0.83 → 0.76; skewed 17-22 hold x0.77-0.96 and json 19-22 all ≤1.01; text chain rows hold their wins (l5-8 x0.42-0.62, l10-12 x0.36-0.57); zeros l1-4 x0.27/0.27/0.18/0.18 and random l1-4 x0.87-0.92 held. Remaining holes: text l9 (x1.11) and skewed 13-16 speed (x1.17-2.27 at ratio parity). Full tables in [matrix.md](matrix.md) T7.
-- **Small payloads**: json l9 1K/4K/64K/1M **x1.11/0.90/0.64/0.99** at stock-row bytes, text l9 keeps the swap's ratio at x1.73/1.49/2.46/1.00 — reproduces 10-01 cell for cell (level 3's 64K cells improved to 0.83/0.90). Level 1 (x1.24-1.78) and level 3 (x0.83-1.34) — the accepted trades. Full table in [matrix.md](matrix.md) T8.
+Decode single-thread bulk wins 17 of 18 cells at x0.21 to 1.00. Skewed.zst9 sits exactly at parity at x1.00. Absolute throughput runs 640 to 12236 MiB/s, and the dll cells run 1157 to 1536 MiB/s.
 
-## Decode ST (MiB/s of raw; x = ours_time/zstd_time, <1 = we faster)
+Decode single-thread streaming still goes to zstd on every compressible shape: json at x1.13 to 1.33, text at 1.04 to 1.20, skewed at 1.08 to 1.28 and dll at 1.28 to 1.34. We win random at 0.80 and hold zeros at 1.00, and the band tightened 1% to 6% against the previous pass.
+
+Encode single-thread on json reads fastest 1.45, fast 1.03, balanced 0.77 with +21% density, best 1.23, and opt and ultra 1.01 and 1.00 at ratio parity or denser, with json.opt 9 bytes ahead of zstd-17. Four of six json tiers are now at parity or ahead. Text reads fastest 0.79, fast 0.54, balanced 1.10 at +1.65% density, best 0.61, opt 0.55 and ultra 0.64. Skewed reads fastest 0.44, balanced 0.041, fast 1.07, best 1.91, and opt and ultra 0.92 and 0.95 at ratio parity.
+
+Random and zeros are ours at every tier, up to 300 times on incompressible high tiers. Zeros fastest and fast read 0.27 and 0.18, and random 0.90 and 0.84. On dll, fastest reads 1.06 at -49.6% size with ratio 4.35 against zstd-1's 2.19, fast 0.97 at -31.7%, balanced 1.30 at -13.0%, best 1.26 at -12.8%, opt 1.09 at -16.2% and ultra 1.12 at -16.5%.
+
+Encode multi-thread has one remaining zstd win: json.fastest.mt8 at x1.19 with a spread of 0.95 to 1.68. Every other cell is ahead or inside text.balanced's own 0.99 to 1.47 spread, and our cold-pool mt16 json.fast at 3307 MiB/s still beats zstd's warm-pool reference at 1593.
+
+Streaming encode single-thread reads json.fast 0.94 and json.fastest 1.32, text.best 0.63, and text.fastest and fast 0.25 and 0.79 as standalone medians, because the in-pass page-dispersity collapse reproduced for the fourth consecutive pass. Json.opt at 0.97 and json.ultra at 0.98 stay wins.
+
+Streaming encode MT8 has every json and text cell ahead. Text.balanced reads 0.95 and is a win now, and every other cell is at or below x0.64. Dll100 stream-mt8 reproduces the earlier addendum: ahead at fast 0.80 and opt 0.95, trailing at fastest 3.52, balanced 1.15, ultra 1.21 and best 5.39, where the `count_from_long` SIMD fix held. The later buffer-reserve fix closed the scheduling half at byte-identical sizes: fastest moved to x2.36, best to x3.12 and ultra to x0.98 parity, as recorded in the [matrix](matrix.md) streaming table.
+
+Decode MT is our exclusive dimension because libzstd has no MT decode. Json mt16 runs at 1.65 times our single-thread and 1.23 times the zstd stream reference, with mt2 at 1.38 times single-thread. Dll100.zst3 mt16 runs at 1.90 times single-thread and 1.36 times the reference, the strongest scaling row and a real-binary payload. Skewed mt16 reads 1.25 times single-thread and 0.96 times the reference, with its absolute band wandering ±15% across passes, and text is flat at 0.97.
+
+The ratio sweep reads a geo-mean of +8.69% denser over 120 cells, with bulk single-thread at +1.48%, and outputs are byte-identical to the 2026-10-01 sweep. The losing cells are unchanged: json.fast MT at -0.12% to -0.14%, skewed.opt at -0.06% to -0.07%, and near-ties of 0.00% to 0.04% on skewed fast, fastest and ultra and on text.ultra MT.
+
+The full 1-22 ladder keeps json rows 5-8 and 10-12 at x1.23 to 1.31 carrying -4.8% to -16.4% byte wins. The reach-probe parse lifts the chain band, taking text level 9 from x1.34 to 1.11 and json level 9 from 0.83 to 0.76. Skewed rows 17-22 hold x0.77 to 0.96 and json rows 19-22 stay at or below 1.01. Text chain rows hold their wins at x0.42 to 0.62 for levels 5-8 and 0.36 to 0.57 for 10-12. Zeros levels 1-4 read 0.27, 0.27, 0.18 and 0.18, and random levels 1-4 read 0.87 to 0.92. The remaining holes are text level 9 at x1.11 and skewed levels 13-16 at x1.17 to 2.27 at ratio parity.
+
+Small payloads read json level 9 at x1.11, 0.90, 0.64 and 0.99 for 1K, 4K, 64K and 1M at stock-row bytes, and text level 9 keeps the swap's ratio at x1.73, 1.49, 2.46 and 1.00. Level 3 at 64K improved to 0.83 and 0.90. Level 1 at 1.24 to 1.78 and level 3 at 0.83 to 1.34 remain the accepted trades.
+
+## Decode single-thread
+
+Throughput is MiB/s of raw data for bulk decode and streaming decode with 64 KiB pulls. x is our time divided by zstd's time, so values below 1 mean we are faster.
 
 | file | bulk ours | bulk zstd | bulk x | stream ours | stream zstd | stream x |
 |---|---:|---:|---:|---:|---:|---:|
@@ -38,7 +51,9 @@
 | dll100.zst9 | 1536 | 1137 | 0.74 | 1575 | 2081 | 1.32 |
 | dll100.zst19 | 1326 | 1048 | 0.79 | 1379 | 1819 | 1.32 |
 
-## Encode ST bulk (checksums off; x = ours_time/zstd_time; pairs 1/3/9/13/17/19)
+## Encode single-thread bulk
+
+Throughput and ratio are per shape, with checksums off on both sides. The tier column names the ladder tier and the pairing is 1, 3, 9, 13, 17 and 19 against libzstd. x is our time divided by zstd's, so values below 1 mean we are faster.
 
 | level | shape | ours MiB/s | ours ratio | zstd MiB/s | zstd ratio | x |
 |---|---|---:|---:|---:|---:|---:|
@@ -79,9 +94,11 @@
 | ultra | zeros | 39748 | 32577 | 634 | 32202 | 0.016 |
 | ultra | dll | 8 | 6.32 | 9 | 5.28 | 1.12 |
 
-Ratio verdict (unchanged from 10-01, outputs byte-identical): denser or at parity on json and text at every level (json.opt 9 B ahead); skewed wins everywhere except near-ties; random/zeros tie or win; dll denser at every tier — −49.6% bytes at fastest, −31.7% at fast, double digits from balanced up. Checksum on/off (ours): json.fast 1.00, text.fast 0.86.
+The ratio verdict is unchanged from the previous sweep because outputs are byte-identical. We are denser or at parity on json and text at every level, with json.opt 9 bytes ahead, skewed wins everywhere except near-ties, random and zeros tie or win, and dll is denser at every tier: -49.6% bytes at fastest, -31.7% at fast and double digits from balanced up. Checksums on versus off on our side read json.fast 1.00 and text.fast 0.86.
 
-## Encode MT bulk (1 pass; cold pool per call both sides; MiB/s)
+## Encode multi-thread bulk
+
+Throughput is MiB/s at 8 and 16 workers with one pass, using a cold pool per call on both sides. The x8 and x16 columns are our time divided by zstd's at the same worker count, and the ratio columns are at 16 workers.
 
 | cell | ours mt8 | zstd mt8 | x8 | ours mt16 | zstd mt16 | x16 | ratio ours mt16 | ratio zstd mt16 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -95,7 +112,9 @@ Ratio verdict (unchanged from 10-01, outputs byte-identical): denser or at parit
 | skewed.fast | 1193 | 631 | 0.54 | 1633 | 635 | 0.39 | 1.92 | 1.92 |
 | skewed.balanced | 681 | 120 | 0.18 | 750 | 122 | 0.16 | 2.00 | 1.84 |
 
-## Streaming encode (64KiB pulls; json/text; interleaved medians)
+## Streaming encode
+
+Throughput uses 64 KiB pulls and interleaved medians, with single-thread and MT8 columns. x is our time divided by zstd's at the same mode, so values below 1 mean we are faster.
 
 | cell | ST ours | ST zstd | ST x | MT8 ours | MT8 zstd | MT8 x |
 |---|---:|---:|---:|---:|---:|---:|
@@ -112,9 +131,11 @@ Ratio verdict (unchanged from 10-01, outputs byte-identical): denser or at parit
 | text.opt | 750 | 414 | 0.55 | 669 | 371 | 0.55 |
 | text.ultra | 389 | 247 | 0.63 | 366 | 236 | 0.64 |
 
-*Standalone medians (the in-pass collapse read 5601/5502 — fourth consecutive pass; [workflow pitfalls](../pitfalls/workflow.md)). Unknown-size text.fastest streaming: zstd emits 1.84MB (ratio 18.3) vs our 108KB (ratio 309). dll100 stream cells in [matrix.md](matrix.md) T5.
+The two text single-thread fast cells carry standalone medians under the established protocol, because the in-pass table read 5601 and 5502 at x0.310 and 0.909 and the same-process page-dispersity collapse reproduced in four consecutive full passes. The mechanism and reproducer are in the [workflow pitfalls](../pitfalls/workflow.md). Unknown-size text.fastest streaming has zstd emitting 1.84 MB at ratio 18.3 against our 108 KB at ratio 309. Dll100 stream cells are in the [matrix](matrix.md) streaming table.
 
-## Decode MT scaling (1 pass; our solo dimension; MiB/s)
+## Decode multi-thread scaling
+
+Fixtures are the same files as the single-thread table, and throughput is MiB/s at 1, 2, 4, 8 and 16 workers. The last column is zstd's single-thread streaming decode, because libzstd has no MT decode, so the scaling columns have no zstd counterpart.
 
 | file | ours ST | mt2 | mt4 | mt8 | mt16 | zstd ST stream ref |
 |---|---:|---:|---:|---:|---:|---:|
@@ -124,24 +145,28 @@ Ratio verdict (unchanged from 10-01, outputs byte-identical): denser or at parit
 | random.zst3 | 9678 | 9458 | 9479 | 9476 | 9471 | 8928 |
 | dll100.zst3 | 1225 | 1872 | 2102 | 2241 | 2322 | 1709 |
 
-dll100 measured via `files --threads` (see [matrix.md](matrix.md) T2) — the restart-point decode scales best on the large real-binary payload (mt16 1.90× ST = 1.36× ref, up from 1.83×/1.31×). json mt16 1.65× ST / 1.23× ref (was 1.60×/1.18×); skewed's mt rows hold 1.25× ST at 0.96× ref; text flat 0.97×.
+Dll100 is measured through `files --threads`. The restart-point decode scales best on the large real-binary payload at mt16 1.90 times single-thread and 1.36 times the reference, up from 1.83 and 1.31. Json mt16 reads 1.65 times single-thread and 1.23 times the reference, up from 1.60 and 1.18. Skewed holds 1.25 times single-thread at 0.96 times the reference, and text is flat at 0.97.
 
-## Compression-ratio sweep (`zstdx-bench ratio`, 2026-10-18)
+## Compression-ratio sweep
 
-Geo-mean Δ over 120 cells **+8.69%**; per mode bulk-st +1.48% / bulk-mt +11.08% / stream-st +11.43% / stream-mt +11.11%; per shape json +4.41%, text +40.36%, skewed +1.41%, random ±0, zeros +2.06%. Outputs byte-identical to the 10-01 sweep. Losing cells (complete): json.fast mt −0.12..−0.14%, text.ultra mt −0.02%, skewed.opt −0.06..−0.07%, skewed.ultra −0.04%, skewed.fast mt −0.01..−0.03%, skewed.fastest −0.00%. Details in [matrix.md](matrix.md) T6.
+The sweep runs `zstdx-bench ratio` on 5 shapes, 6 tiers, bulk and stream modes and single-thread and 4-worker MT, one deterministic pass per cell with checksums off. The reported delta is ours over zstd's ratio minus 1, aggregated as a geo-mean, and every cell is roundtrip-gated. The geo-mean over 120 cells is **+8.69%**. By mode it reads bulk single-thread +1.48%, bulk MT +11.08%, stream single-thread +11.43% and stream MT +11.11%. By shape it reads json +4.41%, text +40.36%, skewed +1.41%, random plus or minus zero and zeros +2.06%. Outputs are byte-identical to the 2026-10-01 sweep. The complete losing cells are json.fast MT at -0.12% to -0.14%, text.ultra MT at -0.02%, skewed.opt at -0.06% to -0.07%, skewed.ultra at -0.04%, skewed.fast MT at -0.01% to -0.03% and skewed.fastest at -0.00%. Details are in the [matrix](matrix.md) ratio section.
 
-## Top open deficits (from this run, x = ours/zstd wall time)
+## Open and closed deficits
 
-1. **Small-payload level 9** (todo 4): CLOSED 2026-09-28 (R27) — the flip was R8's small-src btlazy swap, now an 8 KiB head verdict (bar 48 distinct): json l9 x1.11/0.90/0.64/0.99 at 1K/4K/64K/1M (stock row), text keeps the swap at x1.73/1.49/2.46/1.00 carrying −0.9% vs zstd-9 at 64K. Level 1's 1K-4K slide (the R14 tiny dense bars) stays as the accepted trade.
-2. **json chain rows 5-8 and 10-12** (full-ladder T7): CLOSED 2026-10-01 (R33) — head-gated attempts diet (`RowAttempts::Light`): x1.23-1.31 at −4.8..−16.4% bytes vs zstd; every other corpus byte-identical (mechanism and gates in [matchers](perf/matchers.md)). This pass holds those cells.
-3. **text.balanced speed**: ST x1.34 → **1.10** after R40/R41's concurrent probe parse (2026-10-17, `measure_shrink_concurrent` + the stock probe's parallel parse; bulk-mt8 x1.08, stream-mt8 x0.95 — a win now); the residual cold-start DUBT head per-frame cost stands; ratio +1.65% denser than zstd-9 (floor in [todo](../todo.md)).
-4. **Streaming decode on compressible shapes**: json x1.13-1.33, skewed x1.08-1.28, text x1.04-1.20, dll x1.28-1.34 — the fused-loop serial chain remains (closed as a measured op-volume floor, [dec-gap](dec-gap.md)).
-5. **json.fastest x1.45 ST / x1.19 mt8** (the cells' known spreads) — the steady scan loop's inherent branch-mispredict budget; realistic ceiling ~x1.3-1.4 (todo 3). json.fast x1.03 is near closed.
-6. **Best-tier core**: json x1.23, skewed x1.91 (memory-latency tree walk; floor in [todo](../todo.md)). Caps the json.best stream ST cell (x1.16).
-7. **json opt/ultra**: CLOSED 2026-10-01 (R30's hugepage-backed buffers) — this pass reads x1.01/**1.00** (ratio parity, json.opt 9 B ahead) and skewed opt/ultra ahead (x0.92/0.95).
-8. **MT decode scaling** (todo 1): json mt16 1.65× ST = 1.23× ref, dll100 1.90×/1.36×, skewed 1.25× ST / 0.96× ref (its band wanders); text flat 0.97× — the memory-bound verdict/execute walls stand (no lever short of overlapping execute with the verdict, a falsified class).
-9. **dll100 balanced x1.30 at −13.0% size** (best now x1.26 — was 1.42; the chain chase remains; floor in [todo](../todo.md), differential attribution in [enc-dll-gap](enc-dll-gap.md)); fastest/fast are speed near-parity carrying −49.6/−31.7% size.
-10. **text ST stream fastest/fast**: the in-pass page-dispersity collapse reproduced for the fourth consecutive pass (5601/5502 in-pass vs 6960/6695 standalone, x0.25/0.79) — root-caused 2026-09-29 (workflow pitfalls: a best/L13 row preceding the pooled ST core scatters the big buffers' pages; THP recovers ~11%, residual unattributed, todo 15). The real residue vs 09-19 is the R23 unpledged-stream screen's ~4% sampling tax; still wins.
-11. **Fast-row screen tax on compressible-flat data**: random fastest/fast x0.90/0.84 (the shortened bar leg plus the 1 MiB twin-scan reject — a deliberate arming-recall bound); zeros fastest/fast x0.27/0.18 and skewed chain rows x≤0.06 all held. Every cell still wins.
-12. **Ratio residues**: json.fast mt −0.12..−0.14%, skewed.opt −0.07% (near-tie), dictionary small-payload parse-side (todo 6).
-13. **dll100 streaming-MT encode** (todo 17): stream-mt8 vs libzstd-mt8 trails at four of six tiers (fastest x3.52, balanced x1.15, ultra x1.21, best x5.39) and runs at 52-93% of its own bulk-mt8 ceilings — the libzstd-MT losses are the open item ([todo](../todo.md) 17); the stream-vs-ceiling gap itself matches text's recorded fast-row class. **R61 (2026-10-22)**: the growth-barrier retirement lifts the cells to 82-93% of their bulk ceilings (fastest 587→897 MiB/s x2.36, best 16→27 x3.12, ultra 15→18 **x0.98 parity**, balanced 157→161) at byte-identical sizes; the remaining fastest/best losses are measured-out classes (per-job whole-window LDM cold fills + dll's content spread; zstd's 2154 MiB/s headline buys 48 MB out vs our 24 MB — not iso-ratio).
+Each row names a measured deficit and its status in this pass. The x figures are wall-time ratios, so values below 1 mean we are faster.
+
+| Deficit | Status in this pass |
+|---|---|
+| Small-payload level 9 | Closed on 2026-09-28. The flip was the small-src btlazy swap, now an 8 KiB head verdict with a 48-distinct bar. Json level 9 reads x1.11, 0.90, 0.64 and 0.99 at 1K, 4K, 64K and 1M on the stock row. Text keeps the swap at x1.73, 1.49, 2.46 and 1.00 carrying -0.9% against zstd-9 at 64K. The level 1 slide at 1K-4K remains the accepted trade |
+| Json chain rows 5-8 and 10-12 | Closed on 2026-10-01 with the head-gated attempts diet. The rows read x1.23 to 1.31 at -4.8% to -16.4% bytes against zstd while every other corpus stays byte-identical, with the mechanism and `RowAttempts::Light` in [matchers](../perf/matchers.md). This pass holds those cells |
+| text.balanced speed | Single-thread moved from x1.34 to 1.10 after the concurrent probe parse on 2026-10-17 through `measure_shrink_concurrent`, and bulk-mt8 reads 1.08 while stream-mt8 reads 0.95 and is a win. The residual cold-start DUBT head cost stands, and ratio is +1.65% denser than zstd-9 |
+| Streaming decode on compressible shapes | Json reads x1.13 to 1.33, skewed 1.08 to 1.28, text 1.04 to 1.20 and dll 1.28 to 1.34. The fused-loop serial chain remains, closed as a measured op-volume floor in [dec-gap](dec-gap.md) |
+| json.fastest | x1.45 single-thread and 1.19 mt8, inside the cells' known spreads. The steady scan loop's branch-mispredict budget sets a realistic ceiling of about x1.3 to 1.4. Json.fast at 1.03 is near closed |
+| Best-tier core | Json 1.23 and skewed 1.91, a memory-latency tree walk with its floor in the [todo](../todo.md). It caps the json.best stream single-thread cell at x1.16 |
+| json opt and ultra | Closed on 2026-10-01 with hugepage-backed buffers. This pass reads x1.01 and 1.00 at ratio parity, with json.opt 9 bytes ahead, and skewed opt and ultra ahead at 0.92 and 0.95 |
+| MT decode scaling | Json mt16 reads 1.65 times single-thread and 1.23 times the reference, dll100 1.90 and 1.36, skewed 1.25 and 0.96, and text is flat at 0.97. The memory-bound verdict and execute walls stand, with no lever short of overlapping execute with the verdict, a falsified class |
+| dll100 balanced | x1.30 at -13.0% size, with best at 1.26 against 1.42 before. The chain chase remains, with its floor in the [todo](../todo.md) and its differential attribution in [enc-dll-gap](enc-dll-gap.md). Fastest and fast are speed near-parity carrying -49.6% and -31.7% size |
+| text single-thread stream fastest and fast | The in-pass page-dispersity collapse reproduced for the fourth consecutive pass at 5601 and 5502 in-pass against 6960 and 6695 standalone, at x0.25 and 0.79. It was root-caused on 2026-09-29 in the [workflow pitfalls](../pitfalls/workflow.md), where a best or L13 row preceding the pooled single-thread core scatters the big buffers' pages and THP recovers about 11%, leaving the residual unattributed. The real residue against 2026-09-19 is the unpledged-stream screen's about 4% sampling tax. Both cells still win |
+| Fast-row screen tax on compressible-flat data | Random fastest and fast read x0.90 and 0.84 from the shortened bar leg plus the 1 MiB twin-scan reject, a deliberate arming-recall bound. Zeros fastest and fast read 0.27 and 0.18, and skewed chain rows read at or below 0.06. Every cell still wins |
+| Ratio residues | Json.fast MT at -0.12% to -0.14%, skewed.opt at -0.07% as a near-tie, and the dictionary small-payload parse on the encoding side |
+| dll100 streaming-MT encode | Stream-mt8 trails libzstd-mt8 at four of six tiers: fastest x3.52, balanced 1.15, ultra 1.21 and best 5.39, while running at 52% to 93% of its own bulk-mt8 ceilings. The libzstd-MT losses are the open item in the [todo](../todo.md). The buffer-reserve fix on 2026-10-22 through `reserve_decided` lifted the cells to 82% to 93% of their bulk ceilings at byte-identical sizes: fastest 587 to 897 MiB/s at x2.36, best 16 to 27 at x3.12, ultra 15 to 18 at x0.98 parity and balanced 157 to 161. The remaining fastest and best losses are measured-out classes: per-job whole-window LDM cold fills plus dll's content spread, while zstd's 2154 MiB/s headline buys 48 MB of output against our 24 MB, so the two run at different output sizes |
