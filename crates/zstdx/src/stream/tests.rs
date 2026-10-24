@@ -539,6 +539,78 @@ fn partial_write_then_error_keeps_pending_output() {
     }
 }
 
+/// Regression: `finish` after a partially drained output must not patch the
+/// last-block flag into bytes the writer already received. A failed drain
+/// leaves `out_read` inside the buffer with the block header delivered, and
+/// the in-place patch arm only checked `off < output.len()`: it patched the
+/// delivered byte, emitted no closing block, appended the checksum and
+/// returned Ok — an unclosed frame on the wire. The arm must also require
+/// `off >= out_read`, so this stream closes with an empty last block like
+/// any eagerly drained consumer's.
+#[test]
+fn finish_after_partial_drain_closes_the_frame() {
+    #[derive(Debug)]
+    enum Stage {
+        First,
+        Stall,
+        Drain,
+    }
+    /// Accepts all but the final byte of the first write, fails once, then
+    /// accepts everything: the drain stalls with the whole block history
+    /// delivered and one byte pending.
+    struct StallOnceWriter {
+        stage: Stage,
+        received: Vec<u8>,
+    }
+    impl crate::io::Write for StallOnceWriter {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, crate::io::Error> {
+            match self.stage {
+                Stage::First => {
+                    self.stage = Stage::Stall;
+                    let n = buf.len() - 1;
+                    self.received.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                },
+                Stage::Stall => {
+                    self.stage = Stage::Drain;
+                    Err(would_block())
+                },
+                Stage::Drain => {
+                    self.received.extend_from_slice(buf);
+                    Ok(buf.len())
+                },
+            }
+        }
+
+        fn flush(&mut self) -> Result<(), crate::io::Error> {
+            Ok(())
+        }
+    }
+    // Two-plus full blocks past the fast rows' screen-staging gate (4 MiB:
+    // below it a single write defers every emission to finish) on the
+    // fixed 128 KiB grid (Fastest never pre-splits), so the drain carries
+    // whole blocks and finish runs with an empty staging.
+    let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut writer = StallOnceWriter {
+        stage: Stage::First,
+        received: Vec::new(),
+    };
+    let mut enc = write::Encoder::new(&mut writer, Level::Fastest).unwrap();
+    // the io backends map the inner error's kind differently, so only the
+    // failure itself is part of the contract here
+    assert!(crate::io::Write::write(&mut enc, &data).is_err());
+    // The documented retry contract: finish delivers the pending tail and
+    // the assembled stream must decode back to the input.
+    let writer = enc.finish().unwrap();
+    assert_eq!(bulk::decompress(&writer.received, 0).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(writer.received.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+}
+
 #[test]
 fn workers_option_routes() {
     // std builds accept workers > 1 (multithreaded core, or the

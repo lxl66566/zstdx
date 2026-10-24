@@ -263,6 +263,14 @@ The crash input passes standalone because the poisoner and the victim are differ
 
 触发条件苛刻，需要 w27 窗口加一条 ll+ml 不小于 98307 的序列，所以全部门禁都是绿的：bench 语料的窗口不超过 25，on ≤ 25、add_nb ≤ 56。修复是 `push_add` 在 add_nb 超过 56 时按字段拆分 push，payload 布局 `la | ma << ln | oa << (ln + mn)`，三个宽度从 code 字节恢复（LL 与 ML 走 LL_META/ML_META，offset 的 code 就是自身宽度）。拆分 push 与单次 push 的位序完全一致，先低字段后高字段，所以 add_nb ≤ 56 的所有输入保持 byte-identical，merged 快路径不动。配套的墙有三层：`seq_codes.rs` 的 `const _` 网格证明所有 base_ll + base_ml ≤ MAX_BLOCK_SIZE 的 (lc, mc) 组合满足 ln + mn ≤ 31，`hot_push_raw` 入口 debug 断言 nb ≤ 56，`encode_offset` debug 断言 log ≤ 27。容量合同写在注释里不会约束调用方，要么在每个调用点检查，要么在入口断言。
 
+### finish 的 last-block 补丁越过已交付字节
+
+ST 流核心 finish 的 `BlockTail::Open(off)` 补丁分支只检查了 `off < self.output.len()`。`output` 只在完全排空时清空；一次失败的 drain 把 `out_read` 留在缓冲区中间，已交付前缀仍然留在 `output` 里。write 侧的文档合同明示失败后可以重试（输入可能已被接受，重试只补发未交付的输出），所以报错后调 finish 是合法用法。
+
+可达路径是：底层 writer 接受了覆盖最后一个块头的字节后报错（WouldBlock 或 ENOSPC），用户调 finish，补丁打在已交付的 output 字节上，线上看不到这次修改；随后不再发空闭合块，校验和照常追加，finish 返回 Ok。wire 上是 last 标志缺失的无效帧，解码器在校验和字节处把块头读成 reserved 块。MT 核的输出不走这个原地补丁形态，不受影响。
+
+修复是补丁分支的 guard 增加 `off >= self.out_read`，不满足时自然落到空闭合块分支，也就是 eagerly drained 消费者的既有形态。教训是：原地补丁只对仍然归编码器所有的字节有效，一旦存在 drain 游标，"位置在缓冲区内"必须收紧为"位置在未交付跨度内"。
+
 ## Checksums and streaming
 
 ### Single-producer rings

@@ -647,9 +647,12 @@ impl FrameEncoderCoreSt {
         // A frame needs at least one block: empty input, and an input that
         // is an exact multiple of the block size, encode one empty raw last
         // block. When the last real block's header is still pending in the
-        // output buffer, set its last-block flag instead (libzstd's
-        // one-shot shape, 3 bytes shorter); an eagerly drained consumer
-        // that already took those bytes keeps the empty-block form.
+        // output buffer — not yet handed to the consumer (`off >=
+        // out_read`, so a partially drained output whose undelivered tail
+        // starts past the header keeps the empty-block form too) — set its
+        // last-block flag instead (libzstd's one-shot shape, 3 bytes
+        // shorter); an eagerly drained consumer that already took those
+        // bytes keeps the empty-block form.
         //
         // A still-pending probe or screen means the frame never staged its
         // head (a short input or an early finish): the stock frame stays,
@@ -671,7 +674,8 @@ impl FrameEncoderCoreSt {
                 if !staged_head
                     && self.staged_start == self.staged.len()
                     && self.blocks > 0
-                    && off < self.output.len() =>
+                    && off < self.output.len()
+                    && off >= self.out_read =>
             {
                 self.output[off] |= 1;
             },

@@ -80,6 +80,7 @@ Poison asserts fire at checkpoints, so a touch whose evidence is legitimately ov
 | exit-contract divergence | skill checklist, not cheaply typeable |
 | MT inline view and epoch straddle | poison sweep and pooled sweep, this round |
 | merged add width past `hot_push_raw`'s 56-bit cap | per-field split push, `seq_codes` const grid, entry debug assert |
+| finish's last-block patch over drained bytes | `out_read` guard on the patch arm, empty-block fallback |
 
 ## Follow-ups
 
