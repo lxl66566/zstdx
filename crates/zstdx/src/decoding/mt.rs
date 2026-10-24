@@ -542,7 +542,12 @@ pub(super) fn decode_segment(
                 if blk.body.len() > block_out_max {
                     return Err(output_too_large());
                 }
-                out_size += blk.body.len();
+                // Saturating: 32-bit targets must not wrap the segment
+                // total (each block is capped at the block maximum, the
+                // block count is not); a wrapped total would size the
+                // stage-B output short while every per-block cap passed.
+                // Saturation instead fails the region sizing cleanly.
+                out_size = out_size.saturating_add(blk.body.len());
                 blocks.push(BlockPlan::Raw {
                     body: blk.body.clone(),
                     out: blk.body.len(),
@@ -552,7 +557,7 @@ pub(super) fn decode_segment(
                 if blk.raw_size as usize > block_out_max {
                     return Err(output_too_large());
                 }
-                out_size += blk.raw_size as usize;
+                out_size = out_size.saturating_add(blk.raw_size as usize);
                 blocks.push(BlockPlan::Rle {
                     byte: input[blk.body.start],
                     len: blk.raw_size as usize,
@@ -641,7 +646,7 @@ pub(super) fn decode_segment(
                 if block_out > block_out_max {
                     return Err(output_too_large());
                 }
-                out_size += block_out;
+                out_size = out_size.saturating_add(block_out);
                 blocks.push(BlockPlan::Compressed {
                     lits: lits_start..literals.len(),
                     seqs: seqs_start..sequences.len(),
@@ -728,7 +733,12 @@ pub(super) unsafe fn execute_blocks(
     use crate::decoding::errors::ExecuteSequencesError;
     let exec_err =
         |e: ExecuteSequencesError| block_body_err(DecompressBlockError::ExecuteSequencesError(e));
-    let cap: usize = seg.plan[blocks.clone()].iter().map(BlockPlan::out).sum();
+    // Saturating: same 32-bit wrap concern as stage A's out_size; the
+    // budget checks below read this cap directly.
+    let cap: usize = seg.plan[blocks.clone()]
+        .iter()
+        .map(BlockPlan::out)
+        .fold(0usize, usize::saturating_add);
     let write_limit = buf_limit.min(wild_cap);
     let mut w = 0usize;
     for block in &seg.plan[blocks] {

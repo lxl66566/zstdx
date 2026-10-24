@@ -164,6 +164,15 @@ impl BlockDecoder {
         // real target had more room), a TargetTooSmall from below is the
         // block cap, not a small caller buffer, and is reclassified below.
         let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
+        // HEADROOM chain, consumer side: `headroom` promises the backing
+        // allocation holds the block maximum plus wildcopy slack beyond the
+        // cursor (`FlatOut::ensure_block_space`'s true return, asserted at
+        // its checked entry), because the executor's HEADROOM instantiation
+        // wildcopies without a per-sequence slack check. Checked here, the
+        // one place that knows the block maximum.
+        debug_assert!(
+            !headroom || out.len() >= block_out_max + crate::decoding::flat_buffer::WILDCOPY_SLACK
+        );
         let DecoderScratch {
             huf,
             fse,

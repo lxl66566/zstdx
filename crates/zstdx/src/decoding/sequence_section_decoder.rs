@@ -144,6 +144,22 @@ fn pack_seq_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
             | ((e.base_line as u64) << 8)
             | e.num_bits as u64;
     }
+    // Factory proof over the packed entries: the decode loop computes its
+    // next state as `next_state_base + add_bits` and indexes the slot with
+    // it, so the raw table's transition theorem must survive the bit
+    // packing (the u16 field keeps the base only while the theorem holds,
+    // since it bounds the base below 1 << accuracy_log). The stale slot
+    // tail beyond the real table length is unreachable exactly while every
+    // packed entry keeps its transition below that length.
+    #[cfg(debug_assertions)]
+    for (i, &p) in out[..table.decode.len()].iter().enumerate() {
+        let (base_t, nb_t) = (((p >> 8) & 0xffff) as usize, (p & 0xff) as u32);
+        debug_assert!(
+            base_t + (1usize << nb_t) <= table.decode.len(),
+            "packed seq entry {i} transitions past the table: {base_t} + 2^{nb_t} > {}",
+            table.decode.len(),
+        );
+    }
 }
 
 /// (base value, additional bits) per literal length code.
@@ -468,7 +484,10 @@ pub(crate) fn decode_step<const FUSED: bool>(
 ) -> Result<Sequence, DecodeSequenceError> {
     // SAFETY: FSE table construction keeps every reachable state below the
     // table size (RLE streams sit at state 0, their own fake slot),
-    // independent of the bitstream content
+    // independent of the bitstream content. The debug factory-proof scans
+    // in `build_decoding_table` and `pack_seq_table` pin this theorem per
+    // built table, so a builder regression panics here in debug builds
+    // instead of turning this load into an overread.
     let ll_entry = unsafe { *tbl.add(LL_SLOT + *ll_state as usize) };
     // SAFETY: same invariant as the ll stream
     let ml_entry = unsafe { *tbl.add(ML_SLOT + *ml_state as usize) };

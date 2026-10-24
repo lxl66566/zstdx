@@ -58,9 +58,10 @@ pub(crate) struct FlatView {
     /// right after the dict-prefilled first generation, whose output sits
     /// above the prefill at physical `dictLen`).
     pub prev_phys_base: usize,
-    /// Physical end of the previous generation (`prev_phys_base +
-    /// prev_origin..origin run length`); its bytes below the active
-    /// generation's cursor may have been overwritten.
+    /// Run length of the previous generation (`origin - prev_origin`); its
+    /// bytes sit at `[prev_phys_base, prev_phys_base + seg_a_end)` and its
+    /// virtual span is `[prev_origin, origin)`. Its low bytes may already
+    /// be overwritten by the active generation's writes.
     pub seg_a_end: usize,
     pub out_len: usize,
 }
@@ -92,7 +93,9 @@ pub(crate) struct FlatOut {
     /// Physical offset of that previous generation (`dict_total` for the
     /// first wrap, 0 afterwards).
     prev_phys_base: usize,
-    /// Virtual end of that previous generation (`prev_origin + run len`).
+    /// Run length of that previous generation (`origin - prev_origin`,
+    /// the dict prefill excluded); its bytes sit at
+    /// `[prev_phys_base, prev_phys_base + seg_a_end)`.
     seg_a_end: usize,
     /// Flush cursor: `buf[start..end]` is decoded but not yet handed out.
     start: usize,
@@ -139,10 +142,7 @@ impl FlatOut {
     /// Reset for a frame whose history starts with `dict`'s raw content
     /// (libzstd's `ZSTD_refDictContent`; empty for dictionary-free frames).
     pub fn reset_with_dict(&mut self, window: usize, fcs: Option<u64>, dict: &[u8]) {
-        self.origin = 0;
-        self.prev_origin = 0;
-        self.prev_phys_base = 0;
-        self.seg_a_end = 0;
+        self.set_generation_chain(0, 0, 0, 0);
         self.cap = streaming_buffer_cap(window, fcs);
         self.block_max = max_block_output(window);
         self.wrap_enabled = fcs.is_none_or(|f| f > self.cap as u64);
@@ -154,10 +154,55 @@ impl FlatOut {
             self.buf.resize(dict.len(), 0);
         }
         self.buf[..dict.len()].copy_from_slice(dict);
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
+    }
+
+    /// The generation chain's single write point: the active generation's
+    /// virtual origin together with the retained previous generation
+    /// (`prev_origin`, `prev_phys_base`, run length). The chain identity
+    /// `origin == prev_origin + seg_a_end` is what `copy_wrapped_match`'s
+    /// fast path folds into one pointer add, so it is checked at every
+    /// transition instead of living in comments.
+    #[inline]
+    fn set_generation_chain(
+        &mut self,
+        origin: usize,
+        prev_origin: usize,
+        prev_phys_base: usize,
+        seg_a_end: usize,
+    ) {
+        debug_assert_eq!(
+            origin,
+            prev_origin.wrapping_add(seg_a_end),
+            "generation chain identity"
+        );
+        self.origin = origin;
+        self.prev_origin = prev_origin;
+        self.prev_phys_base = prev_phys_base;
+        self.seg_a_end = seg_a_end;
+    }
+
+    /// Debug check of the cursor and generation invariants, run at the
+    /// mutation entries (per block or per flush, never per byte): the
+    /// chain identity, ordered cursors inside the buffer, the prefill
+    /// never handed out, and a non-negative produced count.
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) {
+        debug_assert_eq!(
+            self.origin,
+            self.prev_origin.wrapping_add(self.seg_a_end),
+            "generation chain identity"
+        );
+        debug_assert!(self.start <= self.end && self.end <= self.buf.len());
+        debug_assert!(self.start >= self.dict_prefill || self.start == 0);
+        debug_assert!(self.origin + self.end >= self.dict_total);
     }
 
     /// Snapshot of the virtual window mapping for the sequence executor.
     pub fn view(&self) -> FlatView {
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
         FlatView {
             origin: self.origin,
             prev_origin: self.prev_origin,
@@ -171,6 +216,26 @@ impl FlatOut {
     /// above the dict prefill).
     pub fn produced(&self) -> usize {
         self.origin + self.end - self.dict_total
+    }
+
+    /// Make room for one more block (checked entry; the room logic is
+    /// [`Self::ensure_block_space_inner`]). On a `true` return the block
+    /// target `buf[end..]` holds at least `block_max + WILDCOPY_SLACK`
+    /// bytes beyond the cursor — the HEADROOM chain's producer promise,
+    /// asserted here so a regression fails at the boundary instead of
+    /// surfacing as an executor overread.
+    #[inline]
+    pub fn ensure_block_space(&mut self, force: bool) -> bool {
+        let ok = self.ensure_block_space_inner(force);
+        #[cfg(debug_assertions)]
+        if ok {
+            debug_assert!(
+                self.buf.len() >= self.end + self.block_max + WILDCOPY_SLACK,
+                "true return must guarantee the block target plus wildcopy slack"
+            );
+            self.assert_invariants();
+        }
+        ok
     }
 
     /// Make room for one more block. Returns false when the caller must
@@ -192,7 +257,9 @@ impl FlatOut {
     /// promises to decode every block before the caller reads (and by
     /// never-wrap pledged frames whose output overruns the pledge; the
     /// frame-tail content-size check rejects those).
-    pub fn ensure_block_space(&mut self, force: bool) -> bool {
+    fn ensure_block_space_inner(&mut self, force: bool) -> bool {
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
         // The dict prefill does not count against the cap (libzstd's ring
         // never holds the dict), so generation lengths match the C.
         if self.start == self.end
@@ -209,10 +276,16 @@ impl FlatOut {
             // the dict-prefilled first generation, whose lower `dict_prefill`
             // bytes (the dict) leave the window here exactly when libzstd's
             // ring discards the dict extDict at the first wrap.
-            self.prev_origin = self.origin + self.dict_prefill;
-            self.prev_phys_base = self.dict_prefill;
-            self.seg_a_end = self.end - self.dict_prefill;
-            self.origin += self.end;
+            // The start cursor began at the prefill and only grows, so the
+            // run length below cannot underflow.
+            debug_assert!(self.end >= self.dict_prefill);
+            let origin = self.origin + self.end;
+            self.set_generation_chain(
+                origin,
+                self.origin + self.dict_prefill,
+                self.dict_prefill,
+                self.end - self.dict_prefill,
+            );
             self.dict_prefill = 0;
             self.start = 0;
             self.end = 0;
@@ -285,8 +358,13 @@ impl FlatOut {
         &mut self.buf[self.end..]
     }
 
-    /// Advance the decode cursor after a block wrote `n` bytes.
+    /// Advance the decode cursor after a block wrote `n` bytes. The block
+    /// never straddles a wrap (wraps only fire in
+    /// [`Self::ensure_block_space_inner`] on a fully handed-out buffer, and
+    /// blocks decode into `block_target` within one generation), so `end`
+    /// stays a same-generation cursor.
     pub fn advance(&mut self, n: usize) {
+        debug_assert!(self.end + n <= self.buf.len());
         self.end += n;
     }
 

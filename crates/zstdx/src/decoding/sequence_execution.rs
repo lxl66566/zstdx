@@ -672,6 +672,12 @@ fn copy_wrapped_match(
                 },
             ));
         };
+        // Both mappings land strictly inside their segment: the active one
+        // below the physical write cursor (sources sit behind the
+        // destination), the previous one below its physical end by the
+        // chain identity `origin == prev_origin + seg_a_end`. Pins the
+        // `seg_end - src_abs` subtraction below against a mapping bug.
+        debug_assert!(src_abs < seg_end);
         let chunk = remaining.min(seg_end - src_abs);
         if active && wild {
             // The whole rest of the match lies in the active generation

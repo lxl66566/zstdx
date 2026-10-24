@@ -54,6 +54,60 @@ impl RingBuffer {
         }
     }
 
+    /// Debug bound check on the two cursors (invariant 3), which is
+    /// exactly `wrap_add`'s `pos < cap` precondition: both stay below the
+    /// capacity, with the empty allocation's `cap == 0` carrying the
+    /// doubly-dangling (0, 0) pair.
+    #[inline(always)]
+    fn assert_cursors_in_bounds(&self) {
+        debug_assert!(
+            self.cap == 0 || (self.head < self.cap && self.tail < self.cap),
+            "ring cursor out of bounds: head {}, tail {}, cap {}",
+            self.head,
+            self.tail,
+            self.cap,
+        );
+    }
+
+    /// Advance the write cursor past `len` wrapped positions — the single
+    /// write point for `tail` outside reallocation. Every append funnels
+    /// here once its bytes are in place, so `wrap_add`'s preconditions
+    /// (`tail < cap`, and `tail + len < 2 * cap` via `len <= free()`) have
+    /// one checked home.
+    #[inline(always)]
+    fn advance_tail(&mut self, len: usize) {
+        self.assert_cursors_in_bounds();
+        // The sentinel slot keeps the filled length below the capacity.
+        debug_assert!(self.cap == 0 || self.len() + len < self.cap);
+        self.tail = wrap_add(self.tail, len, self.cap);
+        self.assert_cursors_in_bounds();
+    }
+
+    /// Advance the read cursor past `len` wrapped positions — the single
+    /// write point for `head` outside reallocation. Callers keep
+    /// `len <= len()`.
+    #[inline(always)]
+    fn advance_head(&mut self, len: usize) {
+        self.assert_cursors_in_bounds();
+        debug_assert!(len <= self.len());
+        self.head = wrap_add(self.head, len, self.cap);
+        self.assert_cursors_in_bounds();
+    }
+
+    /// Install a freshly allocated block: the single write point for the
+    /// (buf, cap) pair together with the rebased cursors. The caller has
+    /// already laid the live bytes out from physical offset 0, so head is
+    /// 0 and tail is the data length.
+    fn install_allocation(&mut self, buf: NonNull<u8>, cap: usize, data_len: usize) {
+        // The sentinel slot keeps the data length below the capacity.
+        debug_assert!(data_len < cap);
+        self.buf = buf;
+        self.cap = cap;
+        self.head = 0;
+        self.tail = data_len;
+        self.assert_cursors_in_bounds();
+    }
+
     /// Return the number of bytes in the buffer.
     pub fn len(&self) -> usize {
         let (x, y) = self.data_slice_lengths();
@@ -72,6 +126,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 3; 0 is always valid
         self.head = 0;
         self.tail = 0;
+        self.assert_cursors_in_bounds();
     }
 
     /// Ensure that there's space for `amount` elements in the buffer.
@@ -128,7 +183,7 @@ impl RingBuffer {
         };
 
         // If we had data before, copy it over to the newly alloced memory region
-        if self.cap > 0 {
+        let data_len = if self.cap > 0 {
             let ((s1_ptr, s1_len), (s2_ptr, s2_len)) = self.data_slice_parts();
 
             unsafe {
@@ -140,15 +195,13 @@ impl RingBuffer {
                     .copy_from_nonoverlapping(s2_ptr, s2_len);
                 dealloc(self.buf.as_ptr(), current_layout);
             }
-
-            // SAFETY: Upholds invariant 3, head is 0 and in bounds, tail is only ever `cap` if the
-            // buffer is entirely full
-            self.tail = s1_len + s2_len;
-            self.head = 0;
-        }
-        // SAFETY: Upholds invariant 1: the buffer was just allocated correctly
-        self.buf = new_buf;
-        self.cap = new_cap;
+            s1_len + s2_len
+        } else {
+            0
+        };
+        // SAFETY: Upholds invariants 1 and 3 through the single install
+        // point (head 0, tail the copied data length, both below new_cap)
+        self.install_allocation(new_buf, new_cap, data_len);
     }
 
     #[allow(dead_code)]
@@ -158,7 +211,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 2 by writing initialized memory
         unsafe { self.buf.as_ptr().add(self.tail).write(byte) };
         // SAFETY: Upholds invariant 3 by wrapping `tail` around
-        self.tail = wrap_add(self.tail, 1, self.cap);
+        self.advance_tail(1);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
@@ -208,7 +261,7 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = wrap_add(self.tail, len, self.cap);
+        self.advance_tail(len);
     }
 
     /// Append `data` without ensuring capacity first.
@@ -238,7 +291,7 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = wrap_add(self.tail, len, self.cap);
+        self.advance_tail(len);
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -248,7 +301,7 @@ impl RingBuffer {
         let amount = usize::min(amount, self.len());
         // SAFETY: we maintain invariant 2 here since this will always lead to a smaller buffer
         // for amount≤len
-        self.head = wrap_add(self.head, amount, self.cap);
+        self.advance_head(amount);
     }
 
     /// Return the size of the two contiguous occupied sections of memory used
@@ -267,6 +320,7 @@ impl RingBuffer {
     // SAFETY: other code relies on this pointing to initialized halves of the buffer only
     /// Return pointers to the head and tail, and the length of each section.
     fn data_slice_parts(&self) -> ((*const u8, usize), (*const u8, usize)) {
+        self.assert_cursors_in_bounds();
         let (len_after_head, len_to_tail) = self.data_slice_lengths();
 
         (
@@ -304,6 +358,7 @@ impl RingBuffer {
     // SAFETY: Other code relies on this pointing to the free zones, data after the first and before
     // the second must be valid
     fn free_slice_parts(&self) -> ((*mut u8, usize), (*mut u8, usize)) {
+        self.assert_cursors_in_bounds();
         let (len_to_head, len_after_tail) = self.free_slice_lengths();
 
         (
@@ -509,7 +564,7 @@ impl RingBuffer {
             }
         }
 
-        self.tail = wrap_add(self.tail, len, self.cap);
+        self.advance_tail(len);
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -530,7 +585,7 @@ impl RingBuffer {
                 ptr2.write_bytes(fill_with, fill2);
             }
         }
-        self.tail = wrap_add(self.tail, fill_length, self.cap);
+        self.advance_tail(fill_length);
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -559,7 +614,7 @@ impl RingBuffer {
             };
             read.read_exact(s2)?;
         }
-        self.tail = wrap_add(self.tail, fill_length, self.cap);
+        self.advance_tail(fill_length);
         Ok(())
     }
 
@@ -621,7 +676,7 @@ impl RingBuffer {
             copy_with_checks(
                 m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
             );
-            self.tail = wrap_add(self.tail, len, self.cap);
+            self.advance_tail(len);
         }
     }
 }

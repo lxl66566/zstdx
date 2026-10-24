@@ -249,6 +249,22 @@ impl FSETable {
             entry.base_line = bl;
             entry.num_bits = nb;
         }
+
+        // Factory proof over the finished table: every transition stays
+        // inside it (`base_line + (1 << num_bits) <= 1 << accuracy_log`),
+        // the theorem the spread-info math above derives and every
+        // raw-index consumer loads against (FSEDecoder::update_state, the
+        // packed sequence tables' `*tbl.add(state)` reads). A builder
+        // regression here is a heap overread at decode time otherwise.
+        #[cfg(debug_assertions)]
+        for (idx, e) in self.decode.iter().enumerate() {
+            debug_assert!(
+                u64::from(e.base_line) + (1u64 << e.num_bits) <= table_size as u64,
+                "FSE table entry {idx} transitions past the table: base {} + 2^{} > {table_size}",
+                e.base_line,
+                e.num_bits,
+            );
+        }
         Ok(())
     }
 

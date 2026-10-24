@@ -138,6 +138,22 @@ fn decompress_literals(
             // memset a full literals section on every block for nothing.
             let out_start = target.len();
             target.reserve(total_out);
+            #[cfg(debug_assertions)]
+            {
+                // Poison wall over the region `set_len` is about to publish
+                // plus the margin behind it (the encoding::poison contract,
+                // mirrored on the decode side): a byte the interleave never
+                // writes reads back as the pattern — defined behavior where
+                // the raw uninitialized read would be UB — and any write
+                // past the published region disturbs the margin, which the
+                // exit check below reports with this checkpoint. The extra
+                // reserve grows the allocation only in debug builds.
+                use crate::encoding::poison;
+                target.reserve(total_out + poison::MARGIN);
+                for b in &mut target.spare_capacity_mut()[..total_out + poison::MARGIN] {
+                    b.write(poison::PATTERN);
+                }
+            }
             // SAFETY: the spare capacity was reserved above; the whole
             // region is written on success and the length is restored on
             // the error paths. clippy::uninit_vec flags exactly the pattern
@@ -154,6 +170,26 @@ fn decompress_literals(
             } else {
                 decompress_4streams_interleaved_x2(&scratch.table, source, &stream_bounds, out)
             };
+            #[cfg(debug_assertions)]
+            {
+                // Margin check before the error path restores the length:
+                // the loops hand their op[] offsets back bounded by the
+                // segment ends (finish_streams rejects anything past them),
+                // so nothing legitimately touches the margin on either
+                // outcome. Runs here, before the caller's 16-byte literal
+                // wildcopy zeroing may legitimately overwrite the first
+                // slack bytes.
+                use crate::encoding::poison;
+                let end = out_start + total_out;
+                let span = (target.capacity() - end).min(poison::MARGIN);
+                if span > 0 {
+                    // The fill above initialized the margin, so reading it
+                    // back is defined.
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts(target.as_ptr().add(end), span) };
+                    poison::assert_intact(bytes, "literals staging (4-stream interleave exit)");
+                }
+            }
             if let Err(e) = res {
                 target.truncate(out_start);
                 return Err(e);

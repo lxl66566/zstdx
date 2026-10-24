@@ -47,6 +47,7 @@
 - [CLI parity](dev/review/cliparity.md)
 - [Encoder edges](dev/review/encparity.md)
 - [Encode-path hardening](dev/review/hardening.md)
+- [Decode-path walls](dev/review/decode-walls.md)
 - [Optimal parser review](dev/review/opt.md)
 - [Window semantics](dev/review/winsem.md)
 
