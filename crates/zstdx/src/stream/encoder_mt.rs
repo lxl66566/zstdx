@@ -546,7 +546,9 @@ const SPF_PUBLISH_LOOK: u64 = 2 * 1024 * 1024;
 /// grows into the live need through `make_space` instead, whose wrap
 /// recycles at the same grid lines the unpledged path already runs at.
 fn initial_reserve(workers: u32, initial_job: usize, extra: usize) -> usize {
-    ((workers as usize).max(2) * initial_job + extra + 64 * 1024).min(BUF_CAP_MAX)
+    // u64 arithmetic: on 32-bit the usize sum could wrap before the cap.
+    let reserve = (workers as u64).max(2) * initial_job as u64 + extra as u64 + 64 * 1024;
+    reserve.min(BUF_CAP_MAX as u64) as usize
 }
 
 // Take the pooled accumulate buffer, or a fresh one, with room for `want`

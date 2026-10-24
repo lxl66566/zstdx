@@ -132,7 +132,8 @@ impl Decompressor {
             // A complete skippable frame carries no content; a truncated
             // one is unreadable (both the reference's answers).
             Err(crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. })
-                if data.len() >= 8 + length as usize =>
+                // u64 arithmetic: a length near u32::MAX overflows the usize sum on 32-bit targets.
+                if data.len() as u64 >= 8 + u64::from(length) =>
             {
                 Some(0)
             },

@@ -16,6 +16,10 @@ This page records the 2026-10-25 review round over the modules without a dedicat
 
 The sequential and dictionary arms of `decompress_with` and `decompress_to_buffer_with` built a bare `FrameDecoder`, so `DecoderOptions::max_window_size` bound only the multithreaded arm. `decoder_from_options` now configures the window bound and the dictionary for every arm, and the three copies of the doubling retry loop (`bulk::decompress`, the dictionary arms, compat `Decompressor::decompress`) collapsed into `decode_all_to_vec_growing`, which stops at half of `isize::MAX` and reports `TargetTooSmall` instead of wrapping the doubling on 32-bit. `sequential_decode_honors_max_window_size` pins the rejection and the still-decoding bound.
 
+### Width-independent size bounds
+
+Two 32-bit overflows closed. `upper_bound`'s skippable-frame guard compared `8 + length` in usize, which wraps on i386 for a length near `u32::MAX` and would admit a truncated skippable frame as complete; the comparison runs in u64 now. The MT encoder's `initial_reserve` multiplied its job-size terms in usize, wrapping before the `BUF_CAP_MAX` clamp on 32-bit worker counts; the sum runs in u64 and clamps in u64.
+
 ## Open findings
 
 - The compat layer's bulk `Compressor` and `Decompressor` lack the parameter methods the zstd 0.13 crate gives them (`include_checksum`, `include_contentsize`, `window_log`, `multithread` on the encoder, `window_log_max` on the decoder); the compat stream types have them. The capability exists in `EncoderOptions`; only the bulk shapes are missing. Tracked in the [todo list](../todo.md).
