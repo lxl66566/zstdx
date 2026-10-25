@@ -98,6 +98,8 @@ Collateral was text.fast solo +8.0%, which is the fix itself, text.fastest -0.1%
 
 The transferable lessons are three. A 30-byte hot loop straddling a 64-byte line can cost about 8% wall at identical instruction counts, so check loop phase against 64-byte lines when a flat-Ir wall swing appears after a code-shape change. A check against 32-byte windows misses it. Rustc drops alignment directives in inline asm, so phase robustness must be built into the emitted code, and the two-copy-plus-stub pattern is the reusable form. Entering mid-instruction-stream through nop padding is safe only with 1-byte 0x90 nops, because multi-byte long-nop encodings fault at a wrong phase, and the stub's indirect jump must target an early-out register with a lateout register avoided to keep a live input intact.
 
+The pattern's second application confirms the lesson's generality: the 2026-10-25 dll100.best minus 10 percent regression was the same straddle arriving through an unrelated caller's code growth, and porting the two-copy stub to the dubt count loop in `count_run` restored the cell at zero stub cost on long compares. That walk is in the [matchers notes](../perf/matchers.md).
+
 ### Copy-chain deletion is closed
 
 The probe gathered the whole stream into a reused thread-local buffer and used the bulk direct-window core, env-flipped inside one binary with position-balanced alternating matrix rounds. It held every healthy stream cell at stock speed: text.fast 6644 to 6742 against 6712 to 6903 MiB/s, text.fastest 7083 to 7114 against 7094, text.best 1022 against 1021, json.fast 432 to 446 against 448 to 464, and json.best 29 to 30 on both sides, with zstd sides flat at 5248 to 5355. The zero-copy bulk core measured 10973 MiB/s on the same shape, +63%.

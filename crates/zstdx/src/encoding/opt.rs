@@ -467,22 +467,13 @@ pub(crate) fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
 /// `ZSTD_count` returns only the delta from its start pointers).
 pub(crate) fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
     debug_assert!(cand <= idx && idx <= limit);
-    let mut len = start;
-    // SAFETY: the u64 reads stay inside [.., limit) which is at or before
-    // the window end; cand <= idx bounds the candidate side.
-    unsafe {
-        let base = win.as_ptr();
-        while len + 8 <= limit - idx {
-            let a = base.add(idx + len).cast::<u64>().read_unaligned();
-            let b = base.add(cand + len).cast::<u64>().read_unaligned();
-            if a == b {
-                len += 8;
-            } else {
-                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
-            }
-        }
+    let room = limit - idx;
+    let (mut len, diff) = count_run(win, idx, cand, start, room);
+    if diff != 0 {
+        // The mismatching pair already advanced `len` by 8.
+        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
     }
-    while len < limit - idx && win[idx + len] == win[cand + len] {
+    while len < room && win[idx + len] == win[cand + len] {
         len += 1;
     }
     len
@@ -494,7 +485,7 @@ pub(crate) fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limi
 /// the caller's const `LONG` instantiation — the mt jobs' shallow,
 /// per-job re-sorted trees pay multi-KiB twin compares the deep ST tree
 /// avoids (see docs/src/dev/perf/matchers.md), so only their finders
-/// monomorphize this form and the ST rows keep the exact stock loop.
+/// monomorphize this form; the ST rows keep the scalar u64 loop.
 #[inline(always)]
 pub(crate) fn count_from_long(
     win: &[u8],
@@ -506,44 +497,168 @@ pub(crate) fn count_from_long(
     debug_assert!(cand <= idx && idx <= limit);
     let room = limit - idx;
     // Two phases so the kernel switch costs nothing per compared byte:
-    // phase one is exactly the plain scalar loop, just capped at the 64 B
-    // switch point; only a compare still running there pays the (cold,
+    // phase one is the same u64 run, just capped at the 64 B switch
+    // point; only a compare still running there pays the (cold,
     // once-per-process resolved) kernel call.
     let switch_at = start + 64;
     let stop1 = switch_at.min(room);
-    let mut len = start;
-    // SAFETY: same bounds as `count_from`.
-    unsafe {
-        let base = win.as_ptr();
-        while len + 8 <= stop1 {
-            let a = base.add(idx + len).cast::<u64>().read_unaligned();
-            let b = base.add(cand + len).cast::<u64>().read_unaligned();
-            if a != b {
-                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
-            }
-            len += 8;
-        }
+    let (len, diff) = count_run(win, idx, cand, start, stop1);
+    if diff != 0 {
+        // The mismatching pair already advanced `len` by 8.
+        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
     }
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     if len >= switch_at && len + 64 <= room {
         return count_from_kernel(win, idx, cand, len, limit);
     }
     // The scalar remainder: u64 steps to the limit, then the byte tail.
-    unsafe {
-        let base = win.as_ptr();
-        while len + 8 <= room {
-            let a = base.add(idx + len).cast::<u64>().read_unaligned();
-            let b = base.add(cand + len).cast::<u64>().read_unaligned();
-            if a != b {
-                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
-            }
-            len += 8;
-        }
+    let (mut len, diff) = count_run(win, idx, cand, len, room);
+    if diff != 0 {
+        // The mismatching pair already advanced `len` by 8.
+        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
     }
     while len < room && win[idx + len] == win[cand + len] {
         len += 1;
     }
     len
+}
+
+/// The u64 compare run shared by [`count_from`] and [`count_from_long`]:
+/// advances `start` in 8-byte steps until a mismatching pair or `cap`.
+/// Returns the advanced length and the mismatching pair's xor, 0 when the
+/// run drained `cap` without mismatching; on mismatch the length points 8
+/// past the pair (the asm copy's optimistic advance), so the byte result
+/// is `len - 8 + tz(xor) / 8`.
+#[inline(always)]
+fn count_run(win: &[u8], idx: usize, cand: usize, start: usize, cap: usize) -> (usize, u64) {
+    if cap < 8 {
+        return (start, 0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        count_run_aligned(win, idx, cand, start, cap)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        count_run_portable(win, idx, cand, start, cap)
+    }
+}
+
+/// The portable u64 run: the semantic reference for
+/// [`count_run_aligned`]'s hand-written loop.
+// Dead in x86-64 lib builds (the asm path serves them); the differential
+// test keeps it compiled there.
+#[cfg_attr(not(test), allow(dead_code))]
+fn count_run_portable(
+    win: &[u8],
+    idx: usize,
+    cand: usize,
+    start: usize,
+    cap: usize,
+) -> (usize, u64) {
+    let mut len = start;
+    // SAFETY: the u64 reads stay inside [.., cap) which the caller keeps
+    // at or before the window end; cand <= idx bounds the candidate side.
+    unsafe {
+        let base = win.as_ptr();
+        while len + 8 <= cap {
+            let a = base.add(idx + len).cast::<u64>().read_unaligned();
+            let b = base.add(cand + len).cast::<u64>().read_unaligned();
+            len += 8;
+            if a != b {
+                return (len, a ^ b);
+            }
+        }
+    }
+    (len, 0)
+}
+
+/// `count_run` on x86-64: the hand-written two-copy loop with R32's
+/// phase-proof entry (the mechanism and its binary-patch confirmation are
+/// documented on `extend_match_aligned` in `match_generator::hash`). The
+/// plain inlined loop straddling a 64-byte icache/op-cache line cost
+/// dll100.best ~10% wall at identical instruction, branch and miss
+/// counts (2026-10-25: the nbSeq emit fix at 93c84b22 shifted every dubt
+/// instantiation +0x20 and rolled this loop onto a line boundary), and
+/// rustc drops inline-asm `.p2align` directives, so the dual-copy entry
+/// is the only stable lever.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn count_run_aligned(
+    win: &[u8],
+    idx: usize,
+    cand: usize,
+    start: usize,
+    cap: usize,
+) -> (usize, u64) {
+    debug_assert!(cap >= 8);
+    let lim8 = cap - 8;
+    let mut len = start;
+    let diff: u64;
+    // SAFETY: baseline x86-64 instructions only. Reads exactly
+    // win[idx+len..idx+len+8] and win[cand+len..cand+len+8] while len <=
+    // cap-8 (the caller keeps cap at or before the window end; cand <=
+    // idx bounds the other read); writes no memory and touches no stack.
+    unsafe {
+        core::arch::asm!(
+            // Entry stub: entering at +32 from copy 1 (its head or, if
+            // copy 2 slipped to +33, the pad byte just before it) always
+            // lands at line phase <= 31, so the executing copy never
+            // straddles a 64B line. Branchless select: k = t & 32 is 0
+            // or 32 (the line-phase bit); the indirect jump's target is
+            // constant per load, so it predicts.
+            "leaq 1f(%rip), {t}",
+            "movq {t}, {k}",
+            "andq $32, {k}",
+            "addq {k}, {t}",
+            "jmp *{t}",
+            // Loop copy 1: 27 bytes with register-independent encodings
+            // (cmp/ja guard before the loads, optimistic advance before
+            // the compare) + 5 pad bytes; copy 2 starts at +32, or +33
+            // when a load base is rbp/r13 (disp8) — the entry then
+            // executes the last pad nop first.
+            "1:",
+            "cmpq {lim}, {len}",
+            "ja 4f",
+            "movq ({wi},{len},1), {a}",
+            "movq ({wj},{len},1), {b}",
+            "addq $8, {len}",
+            "cmpq {b}, {a}",
+            "je 1b",
+            "xorq {b}, {a}",
+            "jmp 5f",
+            ".byte 0x90,0x90,0x90,0x90,0x90",
+            // Loop copy 2; its backedge and exit displacements differ
+            // from copy 1's, everything else is identical.
+            "2:",
+            "cmpq {lim}, {len}",
+            "ja 4f",
+            "movq ({wi},{len},1), {a}",
+            "movq ({wj},{len},1), {b}",
+            "addq $8, {len}",
+            "cmpq {b}, {a}",
+            "je 2b",
+            "xorq {b}, {a}",
+            "jmp 5f",
+            "4:", // length-limited exit
+            "xorq {a}, {a}",
+            "5:",
+            wi = in(reg) win.as_ptr().add(idx),
+            wj = in(reg) win.as_ptr().add(cand),
+            lim = in(reg) lim8,
+            len = inout(reg) len,
+            // early (not late) outs: the template reads {wj} after
+            // writing {a} (first load then second load), so a lateout
+            // sharing {wj}'s register would corrupt the second load's
+            // base.
+            a = out(reg) diff,
+            b = out(reg) _,
+            t = out(reg) _,
+            k = out(reg) _,
+            options(nostack, att_syntax)
+        );
+    }
+    (len, diff)
 }
 
 /// The kernel dispatch, outlined and cold so the dispatching body stays
@@ -1706,5 +1821,83 @@ mod tests {
         assert_eq!(new_rep(&[10, 20, 30], 1, true), [20, 10, 30]);
         // repcode 3 at ll0 uses rep0 - 1.
         assert_eq!(new_rep(&[10, 20, 30], 3, true), [9, 10, 20]);
+    }
+
+    /// The x86-64 `count_run` hands its u64 run to the same two-copy
+    /// phase-proof loop `extend_match` uses (R32); the portable body is
+    /// the semantic reference. Differential over planted match/mismatch
+    /// shapes: a planted equal run with the mismatch placed at every byte
+    /// offset of the first two u64s (the tzcnt arithmetic), nonzero
+    /// starts, caps that cut an equal run mid-u64, and every tail length
+    /// below 8.
+    #[test]
+    fn count_run_asm_matches_portable() {
+        if cfg!(not(target_arch = "x86_64")) {
+            return;
+        }
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Half random noise, half a repeated 97-byte motif: runs of every
+        // length mod 8 appear, ending both in mismatches and at the cap.
+        let motif: Vec<u8> = (0..97).map(|_| (rand() & 0xff) as u8).collect();
+        let mut win: Vec<u8> = (0..4096).map(|_| (rand() & 0xff) as u8).collect();
+        while win.len() < 32 * 1024 {
+            win.extend_from_slice(&motif);
+        }
+        win.truncate(32 * 1024);
+        let mut cases: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for _ in 0..4000 {
+            let idx = 8 + (rand() as usize) % (win.len() - 16);
+            let cand = (rand() as usize) % idx;
+            let start = (rand() as usize) % 128;
+            let cap = 8 + (rand() as usize) % (win.len() - idx);
+            cases.push((idx, cand, start, cap));
+        }
+        // Deterministic edges: every mismatch offset inside the first two
+        // u64s of a planted repeat behind a nonzero start, caps that cut
+        // the planted run mid-u64, sub-8 caps, and start past the cap.
+        {
+            let idx = 8192 + 40;
+            let cand = idx - 32;
+            for t in 0..64 {
+                win[cand + t] = win[idx + t]; // plant a guaranteed-equal run at (idx, cand)
+            }
+            for k in 0..16 {
+                win[cand + k] ^= 0x80; // mismatch exactly at offset k
+                assert_eq!(
+                    count_run(&win, idx, cand, 0, win.len() - idx),
+                    count_run_portable(&win, idx, cand, 0, win.len() - idx),
+                    "count_run with a planted mismatch at offset {k}"
+                );
+                win[cand + k] ^= 0x80;
+            }
+            for start in [0usize, 1, 7, 8, 9, 16, 33, 64] {
+                for cap in [start + 8, start + 12, start + 64, win.len() - idx] {
+                    assert_eq!(
+                        count_run(&win, idx, cand, start, cap.min(win.len() - idx)),
+                        count_run_portable(&win, idx, cand, start, cap.min(win.len() - idx)),
+                        "count_run(start {start}, cap {})",
+                        cap.min(win.len() - idx)
+                    );
+                }
+            }
+        }
+        for cap in 0..8 {
+            for start in [0usize, 3, 8, 20] {
+                cases.push((100, 60, start, cap));
+            }
+        }
+        for (idx, cand, start, cap) in cases {
+            assert_eq!(
+                count_run(&win, idx, cand, start, cap),
+                count_run_portable(&win, idx, cand, start, cap),
+                "count_run({idx}, {cand}, {start}, {cap})"
+            );
+        }
     }
 }
