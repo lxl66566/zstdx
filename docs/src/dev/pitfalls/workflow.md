@@ -306,6 +306,12 @@ The 2026-10-24 first run of the paranoid profile caught `parallel_fill_matches_s
 
 The 2026-10-26 i686 cross job caught an address-layout literal that only fits a 64-bit `usize` (`hugepage`'s `HINT_BASE`, a hard `overflowing_literals` error), and a helper compiled everywhere whose callers all sit in `x86_64` cfg blocks (`common::simd`, dead-code warnings). Address-layout constants need one cfg arm per pointer width, and a helper module's cfg must match its narrowest caller, because the host build never sees either problem.
 
+The same job's 190 test failures all traced to one idiom: `product_u64 as usize >> (64 - log)`. On a 32-bit target the cast truncates the product first and every `64 - log` shift then crosses the type width, so the paranoid overflow checks panic in every search loop. The shift belongs in the u64 domain with the cast after it; lookalikes that shift in the u32 or u64 domain before casting (`opt`, `pre_split`, the gate probe) are width-independent and stay.
+
+### Running the i686 suite locally without cross
+
+`cross` needs a container runtime; a plain local loop needs only zig and the nix 32-bit glibc. Build with a wrapper as `CC_i686_unknown_linux_gnu` and `CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER` that strips `-m32` and `--target=…` and execs `zig cc -target x86-linux-gnu` (zig rejects the `i686` architecture name). zig's synthesized glibc links but cannot run — use the real loader from `pkgsi686Linux.glibc` as `CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUNNER="<store-path>/lib/ld-linux.so.2 --library-path <store-path>/lib"`. Run with `--test-threads=1`: parallel encoder-window tests overflow the 3 GiB address space and the failed allocation aborts the whole process.
+
 ### Members cannot override an inherited dep's default-features
 
 A member dependency `{ workspace = true, default-features = false, ... }` is a hard error on newer cargo ("`default-features = false` cannot override workspace's `default-features`"), while older nightlies still accept it, so the host build stays green until CI's stable toolchain moves. List the wanted features explicitly instead: when the list already equals the workspace defaults, dropping the flag changes nothing in feature resolution.

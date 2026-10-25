@@ -1,6 +1,10 @@
 //! Window hashing and word loads shared by every search loop: the
 //! multiply-shift hashes, their width variants, and the unaligned reads
 //! plus [`extend_match`].
+//!
+//! Every table-index shift runs in the u64 domain, casting to `usize`
+//! only after: a cast first truncates the product on 32-bit targets and
+//! the `64 - log` shift then crosses the type width.
 
 /// Marker for the const-generic dfast logs meaning "read the runtime
 /// value" (real logs are never zero); only clamped-window shapes
@@ -20,7 +24,7 @@ pub(super) const HASH_PRIME: u64 = 0xc2b2_ae3d_27d4_eb4f;
 pub(super) fn hash5_log(v: u64, log: u32) -> usize {
     // No low mask: the >> (64 - log) already leaves exactly `log` bits, and
     // a runtime `log` would make LLVM rebuild the mask per call.
-    (v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) as usize >> (64 - log)
+    ((v & 0x00ff_ffff_ffff).wrapping_mul(HASH_PRIME) >> (64 - log)) as usize
 }
 
 /// Input width of the chain-table hash and the dfast short-table hash:
@@ -61,7 +65,7 @@ pub(super) fn hash_at_width(win: &[u8], idx: usize, log: u32, width: ChainHashWi
     // SAFETY: see the contract above.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & width.mask();
-        v.wrapping_mul(HASH_PRIME) as usize >> (64 - log)
+        (v.wrapping_mul(HASH_PRIME) >> (64 - log)) as usize
     }
 }
 
@@ -80,7 +84,7 @@ pub(super) fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at_log.
     unsafe {
         let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned();
-        v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) as usize >> (64 - log)
+        (v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) >> (64 - log)) as usize
     }
 }
 

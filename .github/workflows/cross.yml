@@ -30,7 +30,16 @@ jobs:
       # slow, and the lib tests are where the word-size and endianness bugs
       # surface. The paranoid profile keeps the emulated run on release
       # codegen with every debug wall still on.
-      - run: cross test -p zstdx --lib --profile paranoid --target ${{ matrix.target }}
+      #
+      # i686 runs serially: the encoder-window tests hold 128 MiB to 1 GiB
+      # buffers, and several in parallel overflow the 3 GiB address space of
+      # a 32-bit process (allocation failure aborts the whole run).
+      - run: |
+          SERIALIZE=""
+          if [ "${{ matrix.target }}" = "i686-unknown-linux-gnu" ]; then
+            SERIALIZE="-- --test-threads=1"
+          fi
+          cross test -p zstdx --lib --profile paranoid --target ${{ matrix.target }} $SERIALIZE
 
   aarch64:
     name: cargo test --profile paranoid -p zstdx (aarch64)
