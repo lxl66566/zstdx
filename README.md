@@ -65,11 +65,11 @@ On unknown-size text streams, libzstd's fastest tier emits a 1.84 MB frame at ra
 
 ![Streaming encode, 8 workers vs libzstd at 8 workers](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/encode-stream-mt.svg)
 
-With 8 workers and 64 KiB pulls, streaming encode leads libzstd at every tier on json by 1.6x to 5.8x and at every tier on text by 1.1x to 3.7x. On the dll payload it leads at fast and opt, and trails at fastest, balanced, ultra and best, with best at 0.19x. Those cells run at 52% to 92% of zstdx's own bulk-mt throughput, which the bench documentation records as headroom.
+With 8 workers and 64 KiB pulls, streaming encode leads libzstd at every tier on json by 1.5x to 5.8x and at every tier on text by 1.0x to 3.5x. On the dll payload it leads at fast, opt and ultra, and trails at fastest, balanced and best, with best at 0.33x. Those cells run at 84% to 93% of zstdx's own bulk-mt throughput, which the bench documentation records as headroom.
 
 ![Streaming decode speedup over libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/decode-speedup.svg)
 
-Streaming decode wins on incompressible data, by 1.2x to 1.3x on random and at parity on zeros. It trails on compressible shapes, where libzstd's edge is 1.04x to 1.34x, and the pull-size bands barely move from 4 KiB to 1 MiB reads. Bulk decode wins 17 of 18 cells by up to 4.8x. The 16-worker decoder reaches 1.23x libzstd's single-threaded streaming decode on json and 1.36x on dll100.
+Streaming decode wins on incompressible data, by 1.2x to 1.3x on random and at parity on zeros. It trails on compressible shapes, where libzstd's edge is 1.06x to 1.29x, and the pull-size bands barely move from 4 KiB to 1 MiB reads. Bulk decode wins 17 of 18 cells by up to 4.8x. The 16-worker decoder reaches 1.17x libzstd's single-threaded streaming decode on json and 1.34x on dll100.
 
 Across the full sweep of 5 shapes, 6 levels, both APIs and both threading modes, the geometric mean ratio is 8.7% denser than libzstd at matched numeric levels. Per-level tables for levels 1 to 22 are in [snapshot.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/matrix.md).
 

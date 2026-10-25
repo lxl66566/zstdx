@@ -1,6 +1,6 @@
 [package]
 name    = "zstdx-ffi"
-version = "0.2.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.89"
 description  = "libzstd-compatible C ABI (drop-in `libzstd`) over the zstdx codec"
@@ -24,7 +24,7 @@ path        = "src/lib.rs"
 # hash brings the xxh64 frame checksum (encode + verified decode); the
 # set is exactly zstdx's defaults, listed so the ABI surface stays
 # explicit if the defaults ever grow.
-zstdx = { path = "../zstdx", version = "0.2.1", features = ["std", "hash"] }
+zstdx = { workspace = true, features = ["std", "hash"] }
 
 [lints]
 workspace = true

@@ -14,7 +14,7 @@ rayon = "1.12.0"
 zstd  = { version = "0.13.2", features = ["zstdmt"] }
 # fuzz_exports: the shared handcrafted-frame constructors of the
 # parity subcommand corpus (zstdx::parity).
-zstdx = { path = "../zstdx", features = ["dict_builder", "fuzz_exports"] }
+zstdx = { workspace = true, features = ["dict_builder", "fuzz_exports"] }
 
 [features]
 # Enables `jobdecomp` (encoder-side per-job cost spans). Off by default:

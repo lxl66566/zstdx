@@ -4,6 +4,14 @@ members  = ["crates/*"]
 # cargo-fuzz crate with its own workspace
 exclude  = ["crates/zstdx-fuzz"]
 
+[workspace.package]
+version = "0.3.0"
+
+[workspace.dependencies]
+# The `version` key stays: `cargo publish` rewrites a path dep into a
+# registry requirement and rejects one without it.
+zstdx = { path = "crates/zstdx", version = "0.3.0" }
+
 [workspace.lints.clippy]
 all                      = { level = "warn", priority = -1 }
 # `is_empty()`/`!is_empty()` state the predicate; clippy's `assert_ne!(x, [] as
