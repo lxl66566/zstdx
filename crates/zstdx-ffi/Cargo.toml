@@ -21,8 +21,10 @@ crate-type  = ["cdylib", "staticlib", "rlib"]
 path        = "src/lib.rs"
 
 [dependencies]
-# hash brings the xxh64 frame checksum (encode + verified decode)
-zstdx = { path = "../zstdx", version = "0.2.1", default-features = false, features = ["std", "hash"] }
+# hash brings the xxh64 frame checksum (encode + verified decode); the
+# set is exactly zstdx's defaults, listed so the ABI surface stays
+# explicit if the defaults ever grow.
+zstdx = { path = "../zstdx", version = "0.2.1", features = ["std", "hash"] }
 
 [lints]
 workspace = true
