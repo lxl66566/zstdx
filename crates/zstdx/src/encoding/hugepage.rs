@@ -34,8 +34,14 @@ const HUGE_ALIGN: usize = 2 << 20;
 /// top-down mmap region (~0x7f…) nothing else maps into. The cursor only
 /// advances (freed mappings are not reused) — exhausting it would take
 /// millions of multi-MiB mappings against a 128 TiB space.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const HINT_BASE: usize = 0x0000_2000_0000_0000;
+
+/// 32-bit counterpart: the 3 GiB user space has no spare TiB, so the
+/// cursor starts in the gap below the PIE (~0x55…) and the busy-slot
+/// fallback in `aligned_mmap` covers the tighter span.
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+const HINT_BASE: usize = 0x4000_0000;
 
 /// Next aligned mapping address (see [`HINT_BASE`]); `fetch_add` hands
 /// concurrent threads disjoint slots.

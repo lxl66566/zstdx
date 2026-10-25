@@ -63,6 +63,7 @@ pub const fn streaming_buffer_cap(window_size: usize, fcs: Option<u64>) -> usize
 
 /// Runtime SIMD tier clamp (`ZSTDX_SIMD_FORCE`): the dev override that
 /// lowers runtime kernel dispatch to a narrower tier for honest
-/// measurement on wider hardware.
-#[cfg(feature = "std")]
+/// measurement on wider hardware. Every dispatched kernel lives under
+/// `core::arch::x86_64`, so the module is x86_64-only.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub(crate) mod simd;

@@ -302,6 +302,10 @@ The 2026-10-24 first run of the paranoid profile caught `parallel_fill_matches_s
 
 `std::thread::scope` needs runnable threads, so a core count alone is insufficient for the parallel path. The lane count parameter makes the path fully exercisable on a small box, and machine thresholds stay in the production dispatch only.
 
+### 32-bit cross targets catch two whole-crate patterns
+
+The 2026-10-26 i686 cross job caught an address-layout literal that only fits a 64-bit `usize` (`hugepage`'s `HINT_BASE`, a hard `overflowing_literals` error), and a helper compiled everywhere whose callers all sit in `x86_64` cfg blocks (`common::simd`, dead-code warnings). Address-layout constants need one cfg arm per pointer width, and a helper module's cfg must match its narrowest caller, because the host build never sees either problem.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.
