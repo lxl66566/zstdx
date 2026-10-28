@@ -184,25 +184,26 @@ struct DStream {
     /// just finished; the next call then asks for the next frame's
     /// header, like the reference's between-frames loadHeader shortcut.
     done_reported: bool,
+    /// The context's `use_once` prefix: consumed when the first frame
+    /// completes (subsequent frames decode plain, as the reference's
+    /// getDDict does).
+    dict_use_once: bool,
+    /// The dictionary generation this stream's decoder was armed with.
+    dict_generation: u32,
+    /// A frame consumed the use-once prefix this pump; the context slot
+    /// clears when the call returns.
+    use_once_consumed: bool,
 }
 
 impl DStream {
-    fn new(settings: &Settings, dict: Option<&SharedDict>) -> Result<Self, ErrorCode> {
-        let mut inner = FrameDecoder::new();
-        if let Some(log) = settings.window_log_max {
-            inner.set_max_window_size(1_u64 << log);
-        }
-        if let Some(dict) = dict {
-            // The options-based registration rule: under the dictionary's
-            // own id and the null id — libzstd applies a ref'd dictionary
-            // to every frame regardless of the header's dictID field, so a
-            // dictIDFlag-suppressed frame decodes with it attached.
-            inner
-                .add_options_dict(Arc::clone(dict))
-                .map_err(|_| ErrorCode::Generic)?;
-        }
-        Ok(Self {
-            inner,
+    fn new(
+        settings: &Settings,
+        dict: Option<&SharedDict>,
+        dict_use_once: bool,
+        dict_generation: u32,
+    ) -> Result<Self, ErrorCode> {
+        let mut stream = Self {
+            inner: FrameDecoder::new(),
             input: Vec::new(),
             start: 0,
             inited: false,
@@ -211,7 +212,70 @@ impl DStream {
             delivered: 0,
             frames_done: 0,
             done_reported: false,
-        })
+            dict_use_once,
+            dict_generation,
+            use_once_consumed: false,
+        };
+        stream.arm_decoder(settings, dict)?;
+        Ok(stream)
+    }
+
+    /// Point the stream's decoder at `dict`: a fresh `FrameDecoder` with
+    /// the window limit and the dictionary registered under the options
+    /// rule (the dictionary's own id and the null id — libzstd applies a
+    /// ref'd dictionary to every frame regardless of the header's dictID
+    /// field, so a dictIDFlag-suppressed frame decodes with it attached).
+    fn arm_decoder(
+        &mut self,
+        settings: &Settings,
+        dict: Option<&SharedDict>,
+    ) -> Result<(), ErrorCode> {
+        let mut inner = FrameDecoder::new();
+        if let Some(log) = settings.window_log_max {
+            inner.set_max_window_size(1_u64 << log);
+        }
+        if let Some(dict) = dict {
+            inner
+                .add_options_dict(Arc::clone(dict))
+                .map_err(|_| ErrorCode::Generic)?;
+        }
+        self.inner = inner;
+        Ok(())
+    }
+
+    /// Re-arm at a frame boundary after a dictionary-slot change.
+    fn rearm(
+        &mut self,
+        settings: &Settings,
+        dict: Option<&SharedDict>,
+        use_once: bool,
+        generation: u32,
+    ) -> Result<(), ErrorCode> {
+        self.arm_decoder(settings, dict)?;
+        self.dict_use_once = use_once;
+        self.dict_generation = generation;
+        // The fresh decoder never parsed a frame: force the header parse
+        // for the next one (a finished predecessor leaves `inited` set).
+        self.inited = false;
+        Ok(())
+    }
+
+    /// Drop a consumed prefix dictionary: the next frame parses into a
+    /// fresh, dictionary-less decoder. Called at the first frame boundary.
+    fn drop_use_once_dict(
+        &mut self,
+        settings: &Settings,
+        generation: u32,
+    ) -> Result<(), ErrorCode> {
+        if !core::mem::take(&mut self.dict_use_once) {
+            return Ok(());
+        }
+        self.arm_decoder(settings, None)?;
+        // The context clears the slot (generation + 1) after this pump;
+        // recording the cleared generation keeps them in step.
+        self.dict_generation = generation.wrapping_add(1);
+        self.use_once_consumed = true;
+        Ok(())
     }
 
     fn staged(&self) -> &[u8] {
@@ -261,7 +325,7 @@ impl DStream {
     }
 
     /// Decode as much staged input as the block granularity allows.
-    fn pump(&mut self) -> Result<(), ErrorCode> {
+    fn pump(&mut self, settings: &Settings, generation: u32) -> Result<(), ErrorCode> {
         loop {
             if !self.inited {
                 if !self.init_frame()? {
@@ -274,6 +338,7 @@ impl DStream {
                     .collect_to_writer(&mut self.sink)
                     .map_err(|_| ErrorCode::Generic)?;
                 self.frames_done += 1;
+                self.drop_use_once_dict(settings, generation)?;
                 if self.start == self.input.len() {
                     self.compact();
                     return Ok(());
@@ -395,6 +460,12 @@ pub struct DCtx {
     /// (set by `usingDict` — sticky until `initDStream` per the legacy
     /// contract — or `loadDictionary`; cleared by a parameters reset).
     pub dict: Option<SharedDict>,
+    /// `refPrefix` dictionaries decode one frame (libzstd's `use_once`).
+    pub dict_use_once: bool,
+    /// Bumped on every dictionary-slot change; a live stream compares it
+    /// to re-arm its decoder at the next frame boundary (the reference
+    /// consults its dictionary reference per frame).
+    dict_generation: u32,
     stream: Option<DStream>,
     /// Sticky first error (libzstd calls a failed stream undefined; this
     /// layer replays the code until a reset).
@@ -409,10 +480,20 @@ impl DCtx {
         Self {
             settings: Settings::default(),
             dict: None,
+            dict_use_once: false,
+            dict_generation: 0,
             stream: None,
             sticky: None,
             no_forward: 0,
         }
+    }
+
+    /// Replace the dictionary slot (any live stream re-arms at its next
+    /// frame boundary).
+    pub fn set_dict(&mut self, dict: Option<SharedDict>) {
+        self.dict = dict;
+        self.dict_use_once = false;
+        self.dict_generation = self.dict_generation.wrapping_add(1);
     }
 
     /// `ZSTD_DCtx_loadDictionary`: rejected mid-frame; a null or empty
@@ -420,16 +501,96 @@ impl DCtx {
     /// digested once), so an unloadable dictionary fails here — libzstd
     /// digests eagerly on the decode side too.
     pub fn load_dictionary(&mut self, dict: Option<&[u8]>) -> Result<(), ErrorCode> {
+        self.load_dictionary_typed(dict, crate::params::DictContentType::Auto)
+    }
+
+    /// `loadDictionary` with the advanced content type. `rawContent`
+    /// builds the pure match-history dictionary whatever the bytes start
+    /// with (the reference's forced-raw load); `fullDict` refuses plain
+    /// content with `dictionary_corrupted`.
+    pub fn load_dictionary_typed(
+        &mut self,
+        dict: Option<&[u8]>,
+        content_type: crate::params::DictContentType,
+    ) -> Result<(), ErrorCode> {
         if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
             return Err(ErrorCode::StageWrong);
         }
-        self.dict = match dict {
+        let parsed = match dict {
             Some(bytes) => Some(Arc::new(
-                zstdx::decoding::Dictionary::load(bytes)
+                self.parse_dict(bytes, content_type)
                     .map_err(|_| ErrorCode::DictionaryCorrupted)?,
             )),
             None => None,
         };
+        self.set_dict(parsed);
+        Ok(())
+    }
+
+    fn parse_dict(
+        &self,
+        bytes: &[u8],
+        content_type: crate::params::DictContentType,
+    ) -> Result<zstdx::decoding::Dictionary, ()> {
+        use crate::params::DictContentType;
+        match content_type {
+            // The auto parse: formatted on the magic, raw content below it.
+            DictContentType::Auto => zstdx::decoding::Dictionary::load(bytes).map_err(|_| ()),
+            // Forced raw content, the plain match history.
+            DictContentType::RawContent => Ok(zstdx::decoding::Dictionary::raw_content(bytes)),
+            // A formatted dictionary only; anything else is corrupted.
+            DictContentType::FullDict => {
+                if bytes.len() < 8 || bytes.first_chunk::<4>() != Some(&crate::params::DICT_MAGIC) {
+                    return Err(());
+                }
+                zstdx::decoding::Dictionary::decode_dict(bytes).map_err(|_| ())
+            },
+        }
+    }
+
+    /// `ZSTD_DCtx_refPrefix`: the prefix dictionary for exactly the next
+    /// frame (`use_once`), clearing any existing reference.
+    pub fn ref_prefix_typed(
+        &mut self,
+        prefix: Option<&[u8]>,
+        content_type: crate::params::DictContentType,
+    ) -> Result<(), ErrorCode> {
+        self.load_dictionary_typed(prefix, content_type)?;
+        self.dict_use_once = self.dict.is_some();
+        Ok(())
+    }
+
+    /// `ZSTD_DCtx_refDDict`: attach a parsed handle dictionary to every
+    /// following frame; a null handle clears the slot.
+    pub fn ref_ddict(&mut self, ddict: Option<&SharedDict>) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.set_dict(ddict.cloned());
+        Ok(())
+    }
+
+    /// Consume a `use_once` dictionary (after the frame that used it).
+    pub fn consume_use_once(&mut self) {
+        if self.dict_use_once {
+            self.set_dict(None);
+        }
+    }
+
+    /// `ZSTD_DCtx_setMaxWindowSize`: the byte form of the window limit
+    /// (no 0-means-default special case; out-of-range bytes error).
+    pub fn set_max_window_size(&mut self, max_window_size: usize) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.at_boundary()) {
+            return Err(ErrorCode::StageWrong);
+        }
+        let min = 1_usize << 10;
+        let max = 1_usize << 31;
+        if max_window_size < min || max_window_size > max {
+            return Err(ErrorCode::ParameterOutOfBound);
+        }
+        // Stored as the log (highbit32 of the byte limit, the value
+        // getParameter reports); the 2^10..=2^31 range maps losslessly.
+        self.settings.window_log_max = Some(31 - (max_window_size as u32).leading_zeros());
         Ok(())
     }
 
@@ -469,6 +630,7 @@ impl DCtx {
         }
         self.settings = Settings::default();
         self.dict = None;
+        self.dict_use_once = false;
         Ok(())
     }
 
@@ -480,6 +642,7 @@ impl DCtx {
     pub fn init_stream(&mut self) {
         self.reset_session();
         self.dict = None;
+        self.dict_use_once = false;
     }
 
     /// `ZSTD_initDStream_usingDict`: session reset then a dictionary
@@ -495,7 +658,7 @@ impl DCtx {
     /// handle clears it).
     pub fn init_stream_with_ddict(&mut self, dict: Option<&SharedDict>) {
         self.reset_session();
-        self.dict = dict.cloned();
+        self.set_dict(dict.cloned());
     }
 
     /// `ZSTD_resetDStream`: a bare session reset (the dictionary
@@ -549,7 +712,12 @@ impl DCtx {
     ) -> Result<usize, ErrorCode> {
         if self.stream.is_none() {
             let dict = self.dict.as_ref();
-            match DStream::new(&self.settings, dict) {
+            match DStream::new(
+                &self.settings,
+                dict,
+                self.dict_use_once,
+                self.dict_generation,
+            ) {
                 Ok(stream) => self.stream = Some(stream),
                 Err(e) => {
                     self.sticky = Some(e);
@@ -557,9 +725,25 @@ impl DCtx {
                 },
             }
         }
+        // A dictionary change made at a frame boundary (refPrefix,
+        // loadDictionary, refDDict between frames) re-arms the stream's
+        // decoder for the next frame, as the reference's per-frame
+        // dictionary consult does.
+        if let Some(stream) = self.stream.as_mut() {
+            let at_boundary = !stream.inited || stream.inner.is_finished();
+            if at_boundary && stream.dict_generation != self.dict_generation {
+                stream.rearm(
+                    &self.settings,
+                    self.dict.as_ref(),
+                    self.dict_use_once,
+                    self.dict_generation,
+                )?;
+            }
+        }
         let stream = self.stream.as_mut().expect("just ensured");
         let out = unsafe { crate::as_mut_slice(output.dst, output.size) };
         let mut in_pos = input.pos;
+        let mut use_once_consumed = false;
         loop {
             stream.deliver(out, &mut output.pos);
             if output.pos == output.size || in_pos == input.size {
@@ -572,10 +756,21 @@ impl DCtx {
             in_pos += take;
             input.pos = in_pos;
             stream.done_reported = false;
-            stream.pump()?;
+            let generation = self.dict_generation;
+            stream.pump(&self.settings, generation)?;
+            if stream.use_once_consumed {
+                stream.use_once_consumed = false;
+                use_once_consumed = true;
+            }
         }
         stream.deliver(out, &mut output.pos);
         input.pos = in_pos;
+        if use_once_consumed {
+            // A frame consumed the use-once prefix; the slot clears before
+            // the answer goes out (re-borrow the stream below).
+            self.consume_use_once();
+        }
+        let stream = self.stream.as_mut().expect("still present");
         if stream.sink.len() > stream.delivered {
             // Output the caller's buffer could not fit yet.
             return Ok(stream.sink.len() - stream.delivered);

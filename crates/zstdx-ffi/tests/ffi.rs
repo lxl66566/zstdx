@@ -2076,3 +2076,667 @@ fn no_forward_progress_guard() {
     }
     unsafe { zstd::ZSTD_freeCCtx(cctx) };
 }
+
+// ---------------------------------------------------------------------------
+// r75: bounds, cParams helpers, estimates, frame walk, readback, prefixes
+// ---------------------------------------------------------------------------
+
+fn bounds_c(param: c_int) -> (i64, i32, i32) {
+    let b = unsafe { zstd::ZSTD_cParam_getBounds(param) };
+    (b.error as i64, b.lowerBound, b.upperBound)
+}
+
+fn bounds_d(param: c_int) -> (i64, i32, i32) {
+    let b = unsafe { zstd::ZSTD_dParam_getBounds(param) };
+    (b.error as i64, b.lowerBound, b.upperBound)
+}
+
+#[test]
+fn param_bounds_matrix() {
+    // Reference values of the non-multithread build.
+    for (id, err, lo, hi) in [
+        (100, 0, -131_072, 22),
+        (101, 0, 10, 31),
+        (102, 0, 6, 30),
+        (103, 0, 6, 30),
+        (104, 0, 1, 30),
+        (105, 0, 3, 7),
+        (106, 0, 0, 131_072),
+        (107, 0, 1, 9),
+        (160, 0, 0, 2),
+        (161, 0, 6, 30),
+        (162, 0, 4, 4096),
+        (163, 0, 1, 8),
+        (164, 0, 0, 25),
+        (200, 0, 0, 1),
+        (201, 0, 0, 1),
+        (202, 0, 0, 1),
+        // The worker knobs collapse without ZSTD_MULTITHREAD.
+        (400, 0, 0, 0),
+        (401, 0, 0, 0),
+        (402, 0, 0, 0),
+        (500, 0, 0, 1),
+        (1000, 0, 0, 1),
+        (1001, 0, 0, 3),
+        (1002, 0, 0, 2),
+        (1004, 0, 0, i32::MAX),
+        (1015, 0, 1024, 131_072),
+        (1016, 0, 0, 2),
+        (1017, 0, 0, 6),
+        // Unknown ids, and 1003 which the reference retired.
+        (99, 40, 0, 0),
+        (1003, 40, 0, 0),
+        (1018, 40, 0, 0),
+    ] {
+        assert_eq!(bounds_c(id), (-err, lo, hi), "c bounds {id}");
+    }
+    for (id, err, lo, hi) in [
+        (100, 0, 10, 31),
+        (1000, 0, 0, 1),
+        (1001, 0, 0, 1),
+        (1002, 0, 0, 1),
+        (1003, 0, 0, 1),
+        (1004, 0, 0, 1),
+        (1005, 0, 1024, 131_072),
+        (99, 40, 0, 0),
+        (1006, 40, 0, 0),
+    ] {
+        assert_eq!(bounds_d(id), (-err, lo, hi), "d bounds {id}");
+    }
+}
+
+#[test]
+fn cparams_helpers_match_reference_rows() {
+    let cp = unsafe { zstd::ZSTD_getCParams(3, 0, 0) };
+    assert_eq!(
+        (
+            cp.windowLog,
+            cp.chainLog,
+            cp.hashLog,
+            cp.searchLog,
+            cp.minMatch,
+            cp.targetLength
+        ),
+        (21, 16, 17, 1, 5, 0)
+    );
+    assert_eq!(cp.strategy, zstd::ZSTD_strategy::ZSTD_dfast);
+    // The small-source rows downsize through the adjust chain.
+    let cp = unsafe { zstd::ZSTD_getCParams(3, 16 * 1024, 0) };
+    assert_eq!(cp.windowLog, 14);
+    let cp = unsafe { zstd::ZSTD_getCParams(3, 16 * 1024 + 1, 0) };
+    assert_eq!(
+        (cp.windowLog, cp.chainLog, cp.hashLog, cp.searchLog),
+        (15, 15, 16, 2)
+    );
+    // Negative levels ride row 0 with the acceleration target length.
+    let cp = unsafe { zstd::ZSTD_getCParams(-7, 0, 0) };
+    assert_eq!(
+        (cp.windowLog, cp.targetLength, cp.strategy),
+        (19, 7, zstd::ZSTD_strategy::ZSTD_fast)
+    );
+    let cp = unsafe { zstd::ZSTD_getCParams(-131_072, 0, 0) };
+    assert_eq!(cp.targetLength, 131_072);
+    let cp = unsafe { zstd::ZSTD_getCParams(100, 0, 0) };
+    assert_eq!(
+        (cp.windowLog, cp.strategy),
+        (27, zstd::ZSTD_strategy::ZSTD_btultra2)
+    );
+    // getParams adds the default frame flags.
+    let p = unsafe { zstd::ZSTD_getParams(1, 1 << 20, 4096) };
+    assert_eq!(
+        (
+            p.fParams.contentSizeFlag,
+            p.fParams.checksumFlag,
+            p.fParams.noDictIDFlag
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(p.cParams.windowLog, 19);
+
+    // adjustCParams clamps garbage into range; checkCParams rejects it.
+    let wild = zstd::ZSTD_compressionParameters {
+        windowLog: 45,
+        chainLog: 3,
+        hashLog: 77,
+        searchLog: 0,
+        minMatch: 1,
+        targetLength: 999_999,
+        strategy: zstd::ZSTD_strategy(12),
+    };
+    let r = unsafe { zstd::ZSTD_checkCParams(wild) };
+    assert_eq!(error_code(r), 42); // parameter_outOfBound
+    let adj = unsafe { zstd::ZSTD_adjustCParams(wild, 1 << 17, 0) };
+    assert_eq!(
+        (
+            adj.windowLog,
+            adj.chainLog,
+            adj.hashLog,
+            adj.searchLog,
+            adj.minMatch,
+            adj.targetLength,
+            adj.strategy
+        ),
+        (17, 6, 18, 1, 3, 131_072, zstd::ZSTD_strategy::ZSTD_btultra2)
+    );
+    let row = unsafe { zstd::ZSTD_getCParams(12, 0, 0) };
+    assert_eq!(unsafe { zstd::ZSTD_checkCParams(row) }, 0);
+    // srcSize 0 adjusts as unknown; a known size shrinks the window.
+    let adj =
+        unsafe { zstd::ZSTD_adjustCParams(unsafe { zstd::ZSTD_getCParams(19, 0, 0) }, 8192, 0) };
+    assert_eq!(adj.windowLog, 13);
+}
+
+#[test]
+fn estimates_match_reference_numbers() {
+    // Reference-object constants of the tracked build (see docs/dev/ffi.md).
+    assert_eq!(unsafe { zstd::ZSTD_estimateDCtxSize() }, 95_976);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(-1) }, 549_912);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(1) }, 582_680);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(3) }, 1_303_576);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(19) }, 85_196_950);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(22) }, 739_590_294);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(100) }, unsafe {
+        zstd::ZSTD_estimateCCtxSize(22)
+    });
+    assert_eq!(unsafe { zstd::ZSTD_estimateCStreamSize(1) }, 1_369_625);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCStreamSize(22) }, 874_070_679);
+    assert!(
+        unsafe { zstd::ZSTD_estimateCStreamSize(1) } > unsafe { zstd::ZSTD_estimateCCtxSize(1) }
+    );
+    let fast = zstd::ZSTD_compressionParameters {
+        windowLog: 10,
+        chainLog: 10,
+        hashLog: 17,
+        searchLog: 1,
+        minMatch: 5,
+        targetLength: 0,
+        strategy: zstd::ZSTD_strategy::ZSTD_fast,
+    };
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(fast) },
+        553_752
+    );
+    let lazy2 = zstd::ZSTD_compressionParameters {
+        windowLog: 21,
+        chainLog: 21,
+        hashLog: 22,
+        searchLog: 5,
+        minMatch: 3,
+        targetLength: 16,
+        strategy: zstd::ZSTD_strategy::ZSTD_lazy2,
+    };
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(lazy2) },
+        26_327_446
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateCStreamSize_usingCParams(lazy2) },
+        28_687_255
+    );
+    assert_eq!(unsafe { zstd::ZSTD_estimateCDictSize(0, 3) }, 801_344);
+    assert_eq!(unsafe { zstd::ZSTD_estimateCDictSize(4096, 3) }, 117_312);
+    assert_eq!(
+        unsafe {
+            zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByReference)
+        },
+        543_296
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByCopy) },
+        547_392
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateDDictSize(0, zstd::DictLoadMethod::ByReference) },
+        27_352
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateDDictSize(1000, zstd::DictLoadMethod::ByCopy) },
+        28_352
+    );
+    assert_eq!(unsafe { zstd::ZSTD_estimateDStreamSize(0) }, 96_040);
+    assert_eq!(unsafe { zstd::ZSTD_estimateDStreamSize(131_072) }, 620_328);
+    assert_eq!(unsafe { zstd::ZSTD_sequenceBound(0) }, 2);
+    assert_eq!(unsafe { zstd::ZSTD_sequenceBound(131_072) }, 43_820);
+    assert_eq!(
+        unsafe { zstd::ZSTD_decodingBufferSize_min(1 << 20, u64::MAX) },
+        (1 << 20) + 2 * 131_072 + 64
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_decodingBufferSize_min(1 << 20, 100) },
+        100
+    );
+    // LDM-heavy rows grow through the LDM tables.
+    let ultra = zstd::ZSTD_compressionParameters {
+        windowLog: 27,
+        chainLog: 27,
+        hashLog: 25,
+        searchLog: 9,
+        minMatch: 3,
+        targetLength: 999,
+        strategy: zstd::ZSTD_strategy::ZSTD_btultra2,
+    };
+    assert!(
+        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(ultra) }
+            > unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(fast) }
+    );
+}
+
+#[test]
+fn frame_walk_entries() {
+    let src: Vec<u8> = (0..70_000u32)
+        .map(|i| (b'a' + (i % 23) as u8) + (i % 7 < 5) as u8 * 3)
+        .collect();
+    let mut cmp = vec![0u8; compress_bound(src.len())];
+    let c = compress(&mut cmp, &src, 5);
+    let frame = &cmp[..c];
+    assert_eq!(
+        unsafe { zstd::ZSTD_decompressBound(frame.as_ptr().cast(), c) },
+        70_000
+    );
+    // Margin: header + block headers + one block of slack, structurally.
+    let margin = unsafe { zstd::ZSTD_decompressionMargin(frame.as_ptr().cast(), c) };
+    assert!(margin >= c && margin - c < 3 * 131_072 + 64);
+    // fromFrame agrees with the size-driven estimate.
+    let window = unsafe { zstd::ZSTD_getFrameContentSize(frame.as_ptr().cast(), c) } as usize;
+    assert_eq!(
+        unsafe { zstd::ZSTD_estimateDStreamSize_fromFrame(frame.as_ptr().cast(), c) },
+        unsafe { zstd::ZSTD_estimateDStreamSize(window) }
+    );
+    // Error cells match the reference codes.
+    assert_eq!(
+        unsafe { zstd::ZSTD_decompressBound(core::ptr::null(), 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_decompressBound(frame.as_ptr().cast(), 0) },
+        0
+    );
+    let junk = [7u8; 32];
+    assert_eq!(
+        unsafe { zstd::ZSTD_decompressBound(junk.as_ptr().cast(), 32) },
+        u64::MAX - 1
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_decompressionMargin(junk.as_ptr().cast(), 32) }),
+        10
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_decompressionMargin(frame.as_ptr().cast(), c - 1) }),
+        20
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_estimateDStreamSize_fromFrame(junk.as_ptr().cast(), 32) }),
+        10
+    );
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_estimateDStreamSize_fromFrame(frame.as_ptr().cast(), 3) }),
+        72
+    );
+}
+
+#[test]
+fn skippable_payload_roundtrip() {
+    let payload = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let mut out = [0u8; 32];
+    let w = unsafe {
+        zstd::ZSTD_writeSkippableFrame(
+            out.as_mut_ptr().cast(),
+            out.len(),
+            payload.as_ptr().cast(),
+            payload.len(),
+            9,
+        )
+    };
+    assert_eq!(w, 8 + payload.len());
+    assert_eq!(&out[..4], &0x184d_2a59u32.to_le_bytes());
+    assert_eq!(
+        u32::from_le_bytes(out[4..8].try_into().unwrap()),
+        payload.len() as u32
+    );
+    let mut back = [0u8; 32];
+    let mut variant = 99u32;
+    let r = unsafe {
+        zstd::ZSTD_readSkippableFrame(
+            back.as_mut_ptr().cast(),
+            back.len(),
+            &raw mut variant,
+            out.as_ptr().cast(),
+            w,
+        )
+    };
+    assert_eq!(r, payload.len());
+    assert_eq!(variant, 9);
+    assert_eq!(&back[..payload.len()], &payload);
+    // Variant and capacity bounds, and the non-skippable rejection.
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_writeSkippableFrame(
+                out.as_mut_ptr().cast(),
+                out.len(),
+                payload.as_ptr().cast(),
+                payload.len(),
+                16,
+            )
+        }),
+        42
+    );
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_writeSkippableFrame(
+                out.as_mut_ptr().cast(),
+                8,
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+            )
+        }),
+        70
+    );
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_readSkippableFrame(
+                back.as_mut_ptr().cast(),
+                back.len(),
+                core::ptr::null_mut(),
+                payload.as_ptr().cast(),
+                payload.len(),
+            )
+        }),
+        14
+    );
+    // A zstd frame answers frameParameter_unsupported, magic first.
+    let src = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0xa0, 0x70, 0x11, 0x01, 0, 0, 0, 0];
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_readSkippableFrame(
+                back.as_mut_ptr().cast(),
+                back.len(),
+                core::ptr::null_mut(),
+                src.as_ptr().cast(),
+                src.len(),
+            )
+        }),
+        14
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_isSkippableFrame(out.as_ptr().cast(), w) },
+        1
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_isSkippableFrame(src.as_ptr().cast(), src.len()) },
+        0
+    );
+    assert_eq!(unsafe { zstd::ZSTD_isDeterministicBuild() }, 1);
+}
+
+#[test]
+fn parameter_readback_and_block_size() {
+    let cctx = zstd::ZSTD_createCCtx();
+    let read = |param: c_int| -> (usize, i32) {
+        let mut v = -7777;
+        let r = unsafe { zstd::ZSTD_CCtx_getParameter(cctx, param, &raw mut v) };
+        (r, v)
+    };
+    assert_eq!(read(100), (0, 3));
+    assert_eq!(read(101), (0, 0));
+    assert_eq!(read(102), (0, 0));
+    assert_eq!(read(106), (0, 0));
+    assert_eq!(read(107), (0, 0));
+    assert_eq!(read(160), (0, 0));
+    assert_eq!(read(200), (0, 1));
+    assert_eq!(read(201), (0, 0));
+    assert_eq!(read(202), (0, 1));
+    assert_eq!(read(400), (0, 0));
+    assert_eq!(error_code(read(401).0), 40);
+    assert_eq!(error_code(read(12345).0), 40);
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 9) };
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 101, 20) };
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 160, 1) };
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 200, 0) };
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 201, 1) };
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 202, 0) };
+    assert_eq!(read(100), (0, 9));
+    assert_eq!(read(101), (0, 20));
+    assert_eq!(read(160), (0, 1));
+    assert_eq!(read(200), (0, 0));
+    assert_eq!(read(201), (0, 1));
+    assert_eq!(read(202), (0, 0));
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 0) };
+    assert_eq!(read(100), (0, 3));
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 3) };
+    assert_eq!(read(101), (0, 0));
+
+    // getBlockSize: 0 fresh, the applied frame's shape after compress2,
+    // surviving a session reset.
+    assert_eq!(unsafe { zstd::ZSTD_getBlockSize(cctx) }, 0);
+    let data: Vec<u8> = (0..4096u32).map(|i| b'x' + (i % 9) as u8).collect();
+    let mut cmp = vec![0u8; compress_bound(4096)];
+    unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            cmp.as_mut_ptr().cast(),
+            cmp.len(),
+            data.as_ptr().cast(),
+            4096,
+        )
+    };
+    assert_eq!(unsafe { zstd::ZSTD_getBlockSize(cctx) }, 4096);
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 1) };
+    assert_eq!(unsafe { zstd::ZSTD_getBlockSize(cctx) }, 4096);
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+
+    let dctx = zstd::ZSTD_createDCtx();
+    let mut v = -7777;
+    let r = unsafe { zstd::ZSTD_DCtx_getParameter(dctx, 100, &raw mut v) };
+    assert_eq!((r, v), (0, 27));
+    unsafe { zstd::ZSTD_DCtx_setParameter(dctx, 100, 24) };
+    let r = unsafe { zstd::ZSTD_DCtx_getParameter(dctx, 100, &raw mut v) };
+    assert_eq!((r, v), (0, 24));
+    let r = unsafe { zstd::ZSTD_DCtx_getParameter(dctx, 1000, &raw mut v) };
+    assert_eq!((r, v), (0, 0));
+    let r = unsafe { zstd::ZSTD_DCtx_getParameter(dctx, 1006, &raw mut v) };
+    assert_eq!(error_code(r), 40);
+    unsafe { zstd::ZSTD_freeDCtx(dctx) };
+}
+
+#[test]
+fn prefix_family_roundtrip_and_single_use() {
+    let buf: Vec<u8> = (0..(1u32 << 19))
+        .map(|i| b'a' + (i % 23) as u8 + (i % 11 < 7) as u8 * 5)
+        .collect();
+    let (prefix, tail) = buf.split_at(1 << 18);
+    let cap = compress_bound(tail.len());
+    let mut cmp = vec![0u8; cap * 2];
+    let mut out = vec![0u8; 1 << 18];
+
+    let cctx = zstd::ZSTD_createCCtx();
+    unsafe { zstd::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr().cast(), prefix.len()) };
+    let c1 = unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            cmp.as_mut_ptr().cast(),
+            cmp.len(),
+            tail.as_ptr().cast(),
+            tail.len(),
+        )
+    };
+    assert!(!is_error(c1));
+    // The prefix is single-use: the next frame matches a fresh-context
+    // compression byte for byte.
+    let c2 = unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            cmp[c1..].as_mut_ptr().cast(),
+            cmp.len() - c1,
+            tail.as_ptr().cast(),
+            tail.len(),
+        )
+    };
+    let mut fresh = vec![0u8; cap];
+    let c2_plain = unsafe {
+        zstd::ZSTD_CCtx_reset(cctx, 3);
+        zstd::ZSTD_compress2(
+            cctx,
+            fresh.as_mut_ptr().cast(),
+            fresh.len(),
+            tail.as_ptr().cast(),
+            tail.len(),
+        )
+    };
+    assert_eq!(c2, c2_plain);
+    assert_eq!(&cmp[c1..c1 + c2], &fresh[..c2]);
+
+    let dctx = zstd::ZSTD_createDCtx();
+    unsafe { zstd::ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr().cast(), prefix.len()) };
+    let d = unsafe {
+        zstd::ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            cmp.as_ptr().cast(),
+            c1,
+        )
+    };
+    assert_eq!(d, tail.len());
+    assert_eq!(&out[..tail.len()], tail);
+    // The decode prefix is use_once: the same frame fails a second read.
+    let d = unsafe {
+        zstd::ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            cmp.as_ptr().cast(),
+            c1,
+        )
+    };
+    assert!(is_error(d), "use_once prefix decoded twice");
+    // The plain second frame decodes without any prefix.
+    let d = unsafe {
+        zstd::ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            cmp[c1..].as_ptr().cast(),
+            c2,
+        )
+    };
+    assert_eq!(d, tail.len());
+
+    // refPrefix mid-frame is stage_wrong.
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 3) };
+    let mut obuf = vec![0u8; cap];
+    let mut ein = zstd::ZSTD_inBuffer {
+        src: tail.as_ptr().cast(),
+        size: tail.len(),
+        pos: 0,
+    };
+    let mut eout = zstd::ZSTD_outBuffer {
+        dst: obuf.as_mut_ptr().cast(),
+        size: obuf.len(),
+        pos: 0,
+    };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut eout, &raw mut ein, 0) };
+    let r = unsafe { zstd::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr().cast(), 4096) };
+    assert_eq!(error_code(r), 60); // stage_wrong
+
+    // loadDictionary_advanced content types.
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 3) };
+    unsafe {
+        zstd::ZSTD_CCtx_loadDictionary_advanced(
+            cctx,
+            tail.as_ptr().cast(),
+            4096,
+            zstd::DictLoadMethod::ByCopy,
+            zstd::DictContentType::FullDict,
+        )
+    };
+    let r = unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            tail.as_ptr().cast(),
+            1000,
+        )
+    };
+    assert_eq!(error_code(r), 30); // dictionary_corrupted (lazy, at the frame)
+    unsafe { zstd::ZSTD_CCtx_reset(cctx, 3) };
+    let r = unsafe { zstd::ZSTD_CCtx_loadDictionary_byReference(cctx, tail.as_ptr().cast(), 4096) };
+    assert_eq!(r, 0);
+
+    // refDDict attach and clear.
+    let ddict = unsafe { zstd::ZSTD_createDDict(prefix.as_ptr().cast(), prefix.len()) };
+    unsafe { zstd::ZSTD_DCtx_reset(dctx, 3) };
+    let r = unsafe { zstd::ZSTD_DCtx_refDDict(dctx, ddict) };
+    assert_eq!(r, 0);
+    let d = unsafe {
+        zstd::ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            cmp.as_ptr().cast(),
+            c1,
+        )
+    };
+    assert_eq!(d, tail.len());
+    assert_eq!(
+        unsafe { zstd::ZSTD_DCtx_refDDict(dctx, core::ptr::null()) },
+        0
+    );
+    unsafe { zstd::ZSTD_freeDDict(ddict) };
+
+    // A prefix attached at a frame boundary applies to the NEXT frame of a
+    // live stream (the generation re-arm): frame A decodes plain, then the
+    // prefix is attached before frame B, which needs it.
+    let a_plain = {
+        let mut abuf = vec![0u8; cap];
+        let n = compress(&mut abuf, tail, 3);
+        abuf.truncate(n);
+        abuf
+    };
+    unsafe { zstd::ZSTD_DCtx_reset(dctx, 3) };
+    let mut dout = zstd::ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    // Frame A completes with a 0 return (fed alone: one call would stage
+    // through into frame B).
+    let mut din = zstd::ZSTD_inBuffer {
+        src: a_plain.as_ptr().cast(),
+        size: a_plain.len(),
+        pos: 0,
+    };
+    loop {
+        let h = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut dout, &raw mut din) };
+        assert!(!is_error(h), "{}", error_name(h));
+        if h == 0 {
+            break;
+        }
+    }
+    assert_eq!(dout.pos, tail.len());
+    // ...then the prefix attaches between frames and frame B decodes with
+    // it (no re-arm would leave B undecodable).
+    assert_eq!(
+        unsafe { zstd::ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr().cast(), prefix.len()) },
+        0
+    );
+    dout.pos = 0;
+    let mut din_b = zstd::ZSTD_inBuffer {
+        src: cmp.as_ptr().cast(),
+        size: c1,
+        pos: 0,
+    };
+    loop {
+        let h = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut dout, &raw mut din_b) };
+        assert!(!is_error(h), "{}", error_name(h));
+        if h == 0 {
+            break;
+        }
+    }
+    assert_eq!(dout.pos, tail.len());
+    assert_eq!(&out[..tail.len()], tail);
+
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+    unsafe { zstd::ZSTD_freeDCtx(dctx) };
+}

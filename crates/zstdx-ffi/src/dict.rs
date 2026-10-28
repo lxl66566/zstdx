@@ -63,6 +63,18 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     }
 }
 
+/// `ZSTD_createCDict_byReference`: the handle digests into owned state
+/// either way, so the reference load method only strengthens the caller's
+/// lifetime contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_createCDict_byReference(
+    dict_buffer: *const core::ffi::c_void,
+    dict_size: usize,
+    compression_level: core::ffi::c_int,
+) -> *mut ZSTD_CDict {
+    unsafe { ZSTD_createCDict(dict_buffer, dict_size, compression_level) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_freeCDict(cdict: *mut ZSTD_CDict) -> usize {
     if cdict.is_null() {
@@ -123,6 +135,62 @@ pub unsafe extern "C" fn ZSTD_createDDict(
 ) -> *mut ZSTD_DDict {
     let bytes = unsafe { dict_bytes(dict_buffer, dict_size) }.unwrap_or(&[]);
     match zstdx::decoding::Dictionary::load(bytes) {
+        Ok(dict) => Box::into_raw(Box::new(DDict {
+            dict: Arc::new(dict),
+        }))
+        .cast(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// `ZSTD_createDDict_byReference`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_createDDict_byReference(
+    dict_buffer: *const core::ffi::c_void,
+    dict_size: usize,
+) -> *mut ZSTD_DDict {
+    unsafe { ZSTD_createDDict(dict_buffer, dict_size) }
+}
+
+/// `ZSTD_createDDict_advanced`: custom allocators are refused (the
+/// null-default `customMem` only); the content types load as the DCtx
+/// family does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_createDDict_advanced(
+    dict_buffer: *const core::ffi::c_void,
+    dict_size: usize,
+    dict_load_method: crate::params::DictLoadMethod,
+    dict_content_type: crate::params::DictContentType,
+    custom_mem: crate::ZSTD_customMem,
+) -> *mut ZSTD_DDict {
+    let _ = dict_load_method;
+    if !custom_mem.is_default() {
+        // The reference accepts a matched allocator pair; this layer has
+        // no hook for caller allocation, so the request is refused.
+        return core::ptr::null_mut();
+    }
+    let bytes = match unsafe { dict_bytes(dict_buffer, dict_size) } {
+        Some(bytes) => bytes,
+        None => {
+            return Box::into_raw(Box::new(DDict {
+                dict: Arc::new(zstdx::decoding::Dictionary::raw_content(&[])),
+            }))
+            .cast()
+        },
+    };
+    let parsed = match dict_content_type {
+        crate::params::DictContentType::Auto => zstdx::decoding::Dictionary::load(bytes),
+        crate::params::DictContentType::RawContent => {
+            Ok(zstdx::decoding::Dictionary::raw_content(bytes))
+        },
+        crate::params::DictContentType::FullDict => {
+            if bytes.len() < 8 || bytes.first_chunk::<4>() != Some(&crate::params::DICT_MAGIC) {
+                return core::ptr::null_mut();
+            }
+            zstdx::decoding::Dictionary::decode_dict(bytes)
+        },
+    };
+    match parsed {
         Ok(dict) => Box::into_raw(Box::new(DDict {
             dict: Arc::new(dict),
         }))

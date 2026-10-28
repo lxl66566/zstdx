@@ -258,6 +258,22 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(
     crate::frame::header_size_formula(src[4])
 }
 
+/// `ZSTD_getFrameHeader_advanced`: the `zstd1` format answers exactly as
+/// [`ZSTD_getFrameHeader`]; the magicless format is refused (the codec
+/// carries no magicless mode).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getFrameHeader_advanced(
+    zfh_ptr: *mut ZSTD_FrameHeader,
+    src: *const core::ffi::c_void,
+    src_size: usize,
+    format: core::ffi::c_int,
+) -> usize {
+    if format != 0 {
+        return ret(ErrorCode::ParameterUnsupported);
+    }
+    unsafe { ZSTD_getFrameHeader(zfh_ptr, src, src_size) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getFrameHeader(
     zfh_ptr: *mut ZSTD_FrameHeader,

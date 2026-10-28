@@ -1052,6 +1052,378 @@ static void test_r67_round2(void) {
     free(out);
 }
 
+
+/* ---------------------------------------------------------------- -- r75 --
+ * Bounds, cParams helpers, estimates, frame-walk entries, the parameter
+ * readback, the prefix family and skippable payload I/O. Expectations are
+ * identical on the reference and this build (the numbers below are the
+ * reference's).
+ */
+
+static void test_bounds(void) {
+    struct { int id; long long err; int lo, hi; } crows[] = {
+        {100, 0, -131072, 22}, {101, 0, 10, 31}, {102, 0, 6, 30},
+        {103, 0, 6, 30}, {104, 0, 1, 30}, {105, 0, 3, 7},
+        {106, 0, 0, 131072}, {107, 0, 1, 9}, {160, 0, 0, 2},
+        {161, 0, 6, 30}, {162, 0, 4, 4096}, {163, 0, 1, 8},
+        {164, 0, 0, 25}, {200, 0, 0, 1}, {201, 0, 0, 1}, {202, 0, 0, 1},
+        {400, 0, 0, 0}, {401, 0, 0, 0}, {402, 0, 0, 0}, {500, 0, 0, 1},
+        {1000, 0, 0, 1}, {1001, 0, 0, 3}, {1002, 0, 0, 2},
+        {1004, 0, 0, 2147483647}, {1005, 0, 0, 1}, {1006, 0, 0, 1},
+        {1007, 0, 0, 1}, {1008, 0, 0, 1}, {1009, 0, 0, 1},
+        {1010, 0, 0, 2}, {1011, 0, 0, 2}, {1012, 0, 0, 1},
+        {1013, 0, 0, 2}, {1014, 0, 0, 1}, {1015, 0, 1024, 131072},
+        {1016, 0, 0, 2}, {1017, 0, 0, 6},
+        {99, -40, 0, 0}, {1003, -40, 0, 0}, {1018, -40, 0, 0}, {0, -40, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(crows) / sizeof(crows[0]); i++) {
+        ZSTD_bounds b = ZSTD_cParam_getBounds((ZSTD_cParameter)crows[i].id);
+        CHECK((long long)b.error == crows[i].err && b.lowerBound == crows[i].lo
+              && b.upperBound == crows[i].hi,
+              "cbounds %d: err=%lld lo=%d hi=%d", crows[i].id,
+              (long long)b.error, b.lowerBound, b.upperBound);
+    }
+    struct { int id; long long err; int lo, hi; } drows[] = {
+        {100, 0, 10, 31}, {1000, 0, 0, 1}, {1001, 0, 0, 1}, {1002, 0, 0, 1},
+        {1003, 0, 0, 1}, {1004, 0, 0, 1}, {1005, 0, 1024, 131072},
+        {99, -40, 0, 0}, {1006, -40, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(drows) / sizeof(drows[0]); i++) {
+        ZSTD_bounds b = ZSTD_dParam_getBounds((ZSTD_dParameter)drows[i].id);
+        CHECK((long long)b.error == drows[i].err && b.lowerBound == drows[i].lo
+              && b.upperBound == drows[i].hi,
+              "dbounds %d: err=%lld lo=%d hi=%d", drows[i].id,
+              (long long)b.error, b.lowerBound, b.upperBound);
+    }
+}
+
+static void test_cparams_helpers(void) {
+    ZSTD_compressionParameters cp = ZSTD_getCParams(3, 0, 0);
+    CHECK(cp.windowLog == 21 && cp.chainLog == 16 && cp.hashLog == 17
+          && cp.searchLog == 1 && cp.minMatch == 5 && cp.targetLength == 0
+          && cp.strategy == ZSTD_dfast,
+          "level3 row %u/%u/%u/%u/%u/%u/%u", cp.windowLog, cp.chainLog,
+          cp.hashLog, cp.searchLog, cp.minMatch, cp.targetLength,
+          (unsigned)cp.strategy);
+    /* 0 hint means unknown; explicit small sizes select tighter rows and
+     * the adjust chain shrinks the window to the source. */
+    cp = ZSTD_getCParams(3, 16 * 1024, 0);
+    CHECK(cp.windowLog == 14 && cp.strategy == ZSTD_dfast, "16K row");
+    cp = ZSTD_getCParams(3, 16 * 1024 + 1, 0);
+    CHECK(cp.windowLog == 15 && cp.chainLog == 15 && cp.hashLog == 16
+          && cp.strategy == ZSTD_dfast, "just past 16K");
+    /* negative levels: row 0 plus the acceleration target length. */
+    cp = ZSTD_getCParams(-7, 0, 0);
+    CHECK(cp.windowLog == 19 && cp.targetLength == 7 && cp.strategy == ZSTD_fast,
+          "negative row");
+    cp = ZSTD_getCParams(-131072, 0, 0);
+    CHECK(cp.targetLength == 131072, "clamped acceleration");
+    cp = ZSTD_getCParams(100, 0, 0);
+    CHECK(cp.windowLog == 27 && cp.strategy == ZSTD_btultra2, "level clamps at 22");
+    /* getParams fills the default frame flags. */
+    ZSTD_parameters p = ZSTD_getParams(1, 1 << 20, 4096);
+    CHECK(p.fParams.contentSizeFlag == 1 && p.fParams.checksumFlag == 0
+          && p.fParams.noDictIDFlag == 0, "getParams flags");
+    CHECK(p.cParams.windowLog == 19 && p.cParams.minMatch == 7
+          && p.cParams.strategy == ZSTD_fast, "dict grows the row size hint");
+    /* adjustCParams clamps out-of-range knobs... */
+    ZSTD_compressionParameters wild = {45, 3, 77, 0, 1, 999999, 12};
+    ZSTD_compressionParameters adj = ZSTD_adjustCParams(wild, 1 << 17, 0);
+    CHECK(adj.windowLog == 17 && adj.chainLog == 6 && adj.hashLog == 18
+          && adj.searchLog == 1 && adj.minMatch == 3 && adj.targetLength == 131072
+          && adj.strategy == ZSTD_btultra2,
+          "adjust clamps: %u/%u/%u/%u/%u/%u/%u", adj.windowLog, adj.chainLog,
+          adj.hashLog, adj.searchLog, adj.minMatch, adj.targetLength,
+          (unsigned)adj.strategy);
+    /* ...and checkCParams rejects them. */
+    CHECK(ZSTD_isError(ZSTD_checkCParams(wild))
+          && ZSTD_getErrorCode(ZSTD_checkCParams(wild)) == ZSTD_error_parameter_outOfBound,
+          "checkCParams out of bound");
+    CHECK(ZSTD_checkCParams(ZSTD_getCParams(12, 0, 0)) == 0, "checkCParams row ok");
+    /* srcSize 0 adjusts as unknown; a known size shrinks the window. */
+    adj = ZSTD_adjustCParams(ZSTD_getCParams(19, 0, 0), 8192, 0);
+    CHECK(adj.windowLog == 13, "adjust shrinks to srcLog");
+}
+
+static size_t align_up_probe(size_t n) { return (n + 7) / 8 * 8; }
+
+static void test_estimates(void) {
+    CHECK(ZSTD_estimateDCtxSize() == 95976, "estimateDCtxSize %zu",
+          ZSTD_estimateDCtxSize());
+    CHECK(ZSTD_estimateCCtxSize(-1) == 549912, "ecc(-1) %zu", ZSTD_estimateCCtxSize(-1));
+    CHECK(ZSTD_estimateCCtxSize(1) == 582680, "ecc(1) %zu", ZSTD_estimateCCtxSize(1));
+    CHECK(ZSTD_estimateCCtxSize(3) == 1303576, "ecc(3) %zu", ZSTD_estimateCCtxSize(3));
+    CHECK(ZSTD_estimateCCtxSize(19) == 85196950, "ecc(19) %zu", ZSTD_estimateCCtxSize(19));
+    CHECK(ZSTD_estimateCCtxSize(22) == 739590294, "ecc(22) %zu", ZSTD_estimateCCtxSize(22));
+    CHECK(ZSTD_estimateCCtxSize(100) == ZSTD_estimateCCtxSize(22), "ecc clamps");
+    CHECK(ZSTD_estimateCStreamSize(1) == 1369625, "ecs(1) %zu", ZSTD_estimateCStreamSize(1));
+    CHECK(ZSTD_estimateCStreamSize(22) == 874070679, "ecs(22) %zu", ZSTD_estimateCStreamSize(22));
+    CHECK(ZSTD_estimateCStreamSize(1) > ZSTD_estimateCCtxSize(1), "stream adds buffers");
+    /* via raw cParams: a hand-made row, both row-finder layouts. */
+    ZSTD_compressionParameters cp = {21, 21, 22, 5, 3, 16, ZSTD_lazy2};
+    CHECK(ZSTD_estimateCCtxSize_usingCParams(cp) == 26327446,
+          "eccu lazy2 %zu", ZSTD_estimateCCtxSize_usingCParams(cp));
+    CHECK(ZSTD_estimateCStreamSize_usingCParams(cp) == 28687255,
+          "ecsu lazy2 %zu", ZSTD_estimateCStreamSize_usingCParams(cp));
+    CHECK(ZSTD_estimateCStreamSize_usingCParams(cp)
+          > ZSTD_estimateCCtxSize_usingCParams(cp), "stream buffers grow");
+    ZSTD_compressionParameters fast = {10, 10, 17, 1, 5, 0, ZSTD_fast};
+    CHECK(ZSTD_estimateCCtxSize_usingCParams(fast) == 553752,
+          "eccu fast %zu", ZSTD_estimateCCtxSize_usingCParams(fast));
+    /* LDM rows grow the budget through the LDM tables. */
+    ZSTD_compressionParameters ultra = {27, 27, 25, 9, 3, 999, ZSTD_btultra2};
+    CHECK(ZSTD_estimateCCtxSize_usingCParams(ultra) > ZSTD_estimateCCtxSize_usingCParams(fast),
+          "ldm row grows");
+    /* dictionary estimates: a CDict build for a known dictionary shrinks
+     * its row below the unknown-dict budget. */
+    CHECK(ZSTD_estimateCDictSize(0, 3) == 801344, "ecd(0,3) %zu", ZSTD_estimateCDictSize(0, 3));
+    CHECK(ZSTD_estimateCDictSize(4096, 3) == 117312, "ecd(4096,3) %zu", ZSTD_estimateCDictSize(4096, 3));
+    CHECK(ZSTD_estimateCDictSize_advanced(4096, fast, ZSTD_dlm_byRef) == 543296,
+          "ecda byRef %zu", ZSTD_estimateCDictSize_advanced(4096, fast, ZSTD_dlm_byRef));
+    CHECK(ZSTD_estimateCDictSize_advanced(4096, fast, ZSTD_dlm_byCopy) == 547392,
+          "ecda byCopy %zu", ZSTD_estimateCDictSize_advanced(4096, fast, ZSTD_dlm_byCopy));
+    CHECK(ZSTD_estimateDDictSize(0, ZSTD_dlm_byRef) == 27352, "edd byRef %zu",
+          ZSTD_estimateDDictSize(0, ZSTD_dlm_byRef));
+    CHECK(ZSTD_estimateDDictSize(1000, ZSTD_dlm_byCopy) == 28352, "edd byCopy %zu",
+          ZSTD_estimateDDictSize(1000, ZSTD_dlm_byCopy));
+    /* streaming decode budget */
+    CHECK(ZSTD_estimateDStreamSize(0) == 96040, "eds(0) %zu", ZSTD_estimateDStreamSize(0));
+    CHECK(ZSTD_estimateDStreamSize(131072) == 620328,
+          "eds(128K) %zu", ZSTD_estimateDStreamSize(131072));
+    /* sequence and output-buffer bounds */
+    CHECK(ZSTD_sequenceBound(0) == 2 && ZSTD_sequenceBound(131072) == 43820,
+          "sequenceBound");
+    CHECK(ZSTD_decodingBufferSize_min(1 << 20, ZSTD_CONTENTSIZE_UNKNOWN)
+          == (1 << 20) + 2 * 131072 + 64, "dbmin");
+    CHECK(ZSTD_decodingBufferSize_min(1 << 20, 100) == 100, "dbmin caps at fcs");
+}
+
+static void test_frame_walk(void) {
+    unsigned char *src = gen_input(70000);
+    size_t cap = ZSTD_compressBound(70000);
+    unsigned char *cmp = malloc(cap);
+    unsigned char *out = malloc(70001);
+    size_t c = ZSTD_compress(cmp, cap, src, 70000, 5);
+    CHECK(!ZSTD_isError(c), "walk compress");
+    /* A declared-size frame bounds to exactly its content. */
+    CHECK(ZSTD_decompressBound(cmp, c) == 70000, "bound exact %llu",
+          (unsigned long long)ZSTD_decompressBound(cmp, c));
+    /* Margin: header + block headers + one block of slack, structural. */
+    size_t margin = ZSTD_decompressionMargin(cmp, c);
+    CHECK(margin >= c && margin - c < 3 * 131072 + 64, "margin shape %zu", margin);
+    /* fromFrame agrees with the size-driven estimate. */
+    CHECK(ZSTD_estimateDStreamSize_fromFrame(cmp, c)
+          == ZSTD_estimateDStreamSize((size_t)ZSTD_getFrameContentSize(cmp, c)),
+          "fromFrame");
+    /* error cells: garbage, truncation, empty */
+    CHECK(ZSTD_decompressBound(NULL, 0) == 0, "empty bound is 0");
+    CHECK(ZSTD_decompressBound(cmp, 0) == 0, "zero-size input bounds to 0");
+    unsigned char junk[32];
+    for (size_t k = 0; k < 32; k++) junk[k] = (unsigned char)(k * 13 + 7);
+    CHECK(ZSTD_decompressBound(junk, 32) == (unsigned long long)(0 - 2), "garbage bound");
+    CHECK(ZSTD_getErrorCode(ZSTD_decompressionMargin(junk, 32))
+          == ZSTD_error_prefix_unknown, "garbage margin code");
+    CHECK(ZSTD_getErrorCode(ZSTD_decompressionMargin(cmp, c - 1))
+          == ZSTD_error_corruption_detected, "truncated margin code");
+    CHECK(ZSTD_getErrorCode(ZSTD_estimateDStreamSize_fromFrame(junk, 32))
+          == ZSTD_error_prefix_unknown, "garbage fromFrame");
+    CHECK(ZSTD_getErrorCode(ZSTD_estimateDStreamSize_fromFrame(cmp, 3))
+          == ZSTD_error_srcSize_wrong, "short fromFrame");
+    /* skippable frames skip whole through the bound walk */
+    unsigned char skip[16];
+    CHECK(ZSTD_writeSkippableFrame(skip, 16, src, 4, 7) == 12, "write skip");
+    CHECK(ZSTD_isSkippableFrame(skip, 12) == 1 && ZSTD_isSkippableFrame(cmp, c) == 0,
+          "isSkippable");
+    CHECK(ZSTD_decompressBound(skip, 12) == 0, "skip bound");
+    CHECK(ZSTD_decompressionMargin(skip, 12) == 12, "skip margin");
+    unsigned variant = 99;
+    CHECK(ZSTD_readSkippableFrame(out, 70000, &variant, skip, 12) == 4
+          && variant == 7 && memcmp(out, src, 4) == 0, "read skip");
+    CHECK(ZSTD_getErrorCode(ZSTD_readSkippableFrame(out, 70000, NULL, cmp, c))
+          == ZSTD_error_frameParameter_unsupported, "read skip on zstd frame");
+    CHECK(ZSTD_getErrorCode(ZSTD_readSkippableFrame(out, 70000, NULL, skip, 4))
+          == ZSTD_error_srcSize_wrong, "read skip short");
+    CHECK(ZSTD_getErrorCode(ZSTD_writeSkippableFrame(skip, 16, src, 4, 16))
+          == ZSTD_error_parameter_outOfBound, "variant bound");
+    CHECK(ZSTD_getErrorCode(ZSTD_writeSkippableFrame(skip, 11, src, 4, 0))
+          == ZSTD_error_dstSize_tooSmall, "write capacity");
+    CHECK(ZSTD_isDeterministicBuild() == 1, "deterministic build");
+    free(src); free(cmp); free(out);
+}
+
+static void test_parameter_readback(void) {
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    int v = -1;
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_compressionLevel, &v) == 0 && v == 3,
+          "fresh level %d", v);
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_windowLog, &v) == 0 && v == 0, "fresh wlog");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_hashLog, &v) == 0 && v == 0, "fresh hlog");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_strategy, &v) == 0 && v == 0, "fresh strat");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_enableLongDistanceMatching, &v) == 0 && v == 0,
+          "fresh ldm");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_contentSizeFlag, &v) == 0 && v == 1, "fcs flag");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_checksumFlag, &v) == 0 && v == 0, "ck flag");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_dictIDFlag, &v) == 0 && v == 1, "dictid flag");
+    CHECK(ZSTD_CCtx_getParameter(cctx, ZSTD_c_nbWorkers, &v) == 0 && v == 0, "workers");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_getParameter(cctx, ZSTD_c_jobSize, &v))
+          == ZSTD_error_parameter_unsupported, "jobSize unsupported");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_getParameter(cctx, (ZSTD_cParameter)12345, &v))
+          == ZSTD_error_parameter_unsupported, "unknown id");
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 9);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 20);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_contentSizeFlag, 0);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 0);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_compressionLevel, &v);
+    CHECK(v == 9, "level readback %d", v);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_windowLog, &v);
+    CHECK(v == 20, "wlog readback %d", v);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_enableLongDistanceMatching, &v);
+    CHECK(v == 1, "ldm readback %d", v);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_contentSizeFlag, &v);
+    CHECK(v == 0, "fcs readback");
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_checksumFlag, &v);
+    CHECK(v == 1, "ck readback");
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_dictIDFlag, &v);
+    CHECK(v == 0, "dictid readback");
+    /* level 0 stores the default */
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 0);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_compressionLevel, &v);
+    CHECK(v == 3, "level 0 readback %d", v);
+    /* parameters reset returns the defaults */
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_getParameter(cctx, ZSTD_c_windowLog, &v);
+    CHECK(v == 0, "reset readback");
+    /* getBlockSize: 0 fresh, then the applied frame's shape */
+    CHECK(ZSTD_getBlockSize(cctx) == 0, "fresh getBlockSize");
+    ZSTD_freeCCtx(cctx);
+
+    cctx = ZSTD_createCCtx();
+    static unsigned char buf[1 << 21];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)('a' + (i % 23));
+    static unsigned char cmpbuf[4 << 20];
+    ZSTD_compress2(cctx, cmpbuf, sizeof(cmpbuf), buf, 100);
+    CHECK(ZSTD_getBlockSize(cctx) == 1024, "tiny frame block %zu", ZSTD_getBlockSize(cctx));
+    ZSTD_compress2(cctx, cmpbuf, sizeof(cmpbuf), buf, 4096);
+    CHECK(ZSTD_getBlockSize(cctx) == 4096, "4K frame block %zu", ZSTD_getBlockSize(cctx));
+    ZSTD_compress2(cctx, cmpbuf, sizeof(cmpbuf), buf, 1 << 20);
+    CHECK(ZSTD_getBlockSize(cctx) == 131072, "1M frame block %zu", ZSTD_getBlockSize(cctx));
+    /* survives a session reset like appliedParams */
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+    CHECK(ZSTD_getBlockSize(cctx) == 131072, "post-reset block");
+    ZSTD_freeCCtx(cctx);
+
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_windowLogMax, &v) == 0 && v == 27,
+          "fresh dwindow %d", v);
+    ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 24);
+    ZSTD_DCtx_getParameter(dctx, ZSTD_d_windowLogMax, &v);
+    CHECK(v == 24, "dwindow readback %d", v);
+    /* The other dParameters read back their never-changed defaults. */
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_format, &v) == 0 && v == 0, "dformat %d", v);
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_stableOutBuffer, &v) == 0 && v == 0,
+          "dstable %d", v);
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_forceIgnoreChecksum, &v) == 0 && v == 0,
+          "dchecksum %d", v);
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_refMultipleDDicts, &v) == 0 && v == 0,
+          "dmulti %d", v);
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_disableHuffmanAssembly, &v) == 0 && v == 0,
+          "dhuf %d", v);
+    CHECK(ZSTD_DCtx_getParameter(dctx, ZSTD_d_maxBlockSize, &v) == 0 && v == 0,
+          "dmaxblock %d", v);
+    CHECK(ZSTD_getErrorCode(ZSTD_DCtx_getParameter(dctx, (ZSTD_dParameter)1006, &v))
+          == ZSTD_error_parameter_unsupported, "dparam unknown");
+    ZSTD_freeDCtx(dctx);
+}
+
+static void test_prefix_family(void) {
+    static unsigned char buf[1 << 21];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)('a' + (i % 23));
+    static unsigned char cmpbuf[4 << 20];
+    static unsigned char out[1 << 21];
+    size_t cap = sizeof(cmpbuf);
+
+    /* compress the tail with the head as prefix; decode needs the prefix. */
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    ZSTD_CCtx_refPrefix(cctx, buf, 1 << 18);
+    size_t c1 = ZSTD_compress2(cctx, cmpbuf, cap, buf + (1 << 18), 1 << 18);
+    CHECK(!ZSTD_isError(c1), "prefix compress2 %zu", c1);
+    /* the prefix is single-use: the next frame is byte-identical to a
+     * fresh-context compression of the same bytes. */
+    size_t c2 = ZSTD_compress2(cctx, cmpbuf + c1, cap - c1, buf + (1 << 18), 1 << 18);
+    CHECK(!ZSTD_isError(c2), "second frame");
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    size_t c2_plain = ZSTD_compress2(cctx, out, 1 << 20, buf + (1 << 18), 1 << 18);
+    CHECK(c2 == c2_plain && memcmp(cmpbuf + c1, out, c2) == 0,
+          "single-use prefix lingers (%zu vs %zu)", c2, c2_plain);
+
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    ZSTD_DCtx_refPrefix(dctx, buf, 1 << 18);
+    size_t d = ZSTD_decompressDCtx(dctx, out, 1 << 18, cmpbuf, c1);
+    CHECK(d == (1 << 18) && memcmp(out, buf + (1 << 18), 1 << 18) == 0, "prefix decode");
+    /* the decode prefix is consumed too: re-decoding the same frame now
+     * fails exactly as the reference's use_once dictates. */
+    d = ZSTD_decompressDCtx(dctx, out, 1 << 18, cmpbuf, c1);
+    CHECK(ZSTD_isError(d), "use_once second decode unexpectedly ok");
+    /* a fresh prefix makes it decodable again */
+    ZSTD_DCtx_refPrefix(dctx, buf, 1 << 18);
+    d = ZSTD_decompressDCtx(dctx, out, 1 << 18, cmpbuf, c1);
+    CHECK(!ZSTD_isError(d) && memcmp(out, buf + (1 << 18), 1 << 18) == 0, "re-armed prefix");
+    /* the plain second frame decodes without any prefix */
+    d = ZSTD_decompressDCtx(dctx, out, 1 << 18, cmpbuf + c1, c2);
+    CHECK(!ZSTD_isError(d) && memcmp(out, buf + (1 << 18), 1 << 18) == 0, "plain frame");
+
+    /* refPrefix mid-frame is stage_wrong */
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_outBuffer ob = {out, 1 << 20, 0};
+    ZSTD_inBuffer ib = {buf, 1 << 18, 0};
+    ZSTD_compressStream2(cctx, &ob, &ib, ZSTD_e_continue);
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_refPrefix(cctx, buf, 4096))
+          == ZSTD_error_stage_wrong, "mid-frame refPrefix");
+    ZSTD_inBuffer ib2 = {buf, 0, 0};
+    ZSTD_compressStream2(cctx, &ob, &ib2, ZSTD_e_end);
+
+    /* advanced content types: fullDict on plain content is an error at
+     * frame time; rawContent rides the forced-raw load. */
+    /* (into `out`: cmpbuf[0..c1) must survive for the decode checks) */
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_loadDictionary_advanced(cctx, buf, 4096, ZSTD_dlm_byCopy, ZSTD_dct_fullDict);
+    size_t r = ZSTD_compress2(cctx, out, 1 << 20, buf, 1000);
+    CHECK(ZSTD_isError(r), "fullDict plain errors");
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_loadDictionary_byReference(cctx, buf, 4096);
+    r = ZSTD_compress2(cctx, out, 1 << 20, buf, 1000);
+    CHECK(!ZSTD_isError(r), "byReference load compresses");
+
+    /* refDDict attach and the streaming prefix path */
+    ZSTD_DDict *ddict = ZSTD_createDDict(buf, 1 << 18);
+    ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+    ZSTD_DCtx_refDDict(dctx, ddict);
+    d = ZSTD_decompressDCtx(dctx, out, 1 << 18, cmpbuf, c1);
+    CHECK(!ZSTD_isError(d) && memcmp(out, buf + (1 << 18), 1 << 18) == 0, "refDDict decode");
+    /* refDDict(NULL) clears */
+    ZSTD_DCtx_refDDict(dctx, NULL);
+    CHECK(ZSTD_getErrorCode(ZSTD_DCtx_refDDict(dctx, NULL)) == 0, "clear ok");
+    ZSTD_freeDDict(ddict);
+
+    /* streaming decode with a prefix across a two-frame stream */
+    ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+    ZSTD_DCtx_refPrefix(dctx, buf, 1 << 18);
+    size_t both = c1; /* frame 1 needs the prefix, frame 2 is plain */
+    ZSTD_inBuffer dib = {cmpbuf, both, 0};
+    ZSTD_outBuffer dob = {out, 1 << 20, 0};
+    for (int i = 0; i < 8 && dib.pos < dib.size; i++) {
+        size_t h = ZSTD_decompressStream(dctx, &dob, &dib);
+        CHECK(!ZSTD_isError(h), "stream prefix decode %s", ZSTD_getErrorName(h));
+        if (ZSTD_isError(h)) break;
+    }
+    CHECK(dib.pos == both && dob.pos == (1 << 18), "stream prefix drained in=%zu out=%zu",
+          dib.pos, dob.pos);
+    ZSTD_freeCCtx(cctx);
+    ZSTD_freeDCtx(dctx);
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "produce") == 0)
         return produce(argv[2], argv[3], 3, 0);
@@ -1070,6 +1442,12 @@ int main(int argc, char **argv) {
     test_dicts();
     test_dctx_reset_and_metadata();
     test_r67_round2();
+    test_bounds();
+    test_cparams_helpers();
+    test_estimates();
+    test_frame_walk();
+    test_parameter_readback();
+    test_prefix_family();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;
 }

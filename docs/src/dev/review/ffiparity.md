@@ -6,9 +6,11 @@ This page records the C ABI comparison between `crates/zstdx-ffi` and libzstd 1.
 
 Differential C probes are compiled once against the reference and once against the built `libzstd.so`, and their outputs are byte-diffed. Every pinned expectation is first verified on the reference. `tests/run-c.sh` runs the same harness against `libzstd.a` as a parity gate.
 
+The bounds, cParams, estimate and frame-walk families were pinned by a golden grid: a C probe printing every cell (the full bounds matrices, the level rows over 31 levels by 16 size hints by 9 dictionary sizes, the adjust and check matrices, the estimates over levels, cParams grids, dictionary sizes and load methods, and the frame-walk answers over real, truncated and garbage frames) run against both libraries and byte-diffed. The grid is byte-identical except where a cell embeds this codec's own compressed output as input, where the derived answers were compared field by field. The estimate constants were calibrated against the same probe: the struct sizes were read from the reference headers directly and the private `CDict`/`DDict` sizes solved from reference estimate answers over rows whose every other term is hand-computable.
+
 ## Symbol coverage
 
-The layer covers 65 of the 152 `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` symbols that the reference header declares. Coverage was probed with `nm` on both builds and diffed against the `ZSTDLIB_*_API` declarations in `zstd.h`.
+The layer covers 106 of the 152 `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` symbols that the reference header declares. Coverage was probed with `nm` on both builds and diffed against the `ZSTDLIB_*_API` declarations in `zstd.h`.
 
 - Version and metadata: complete for what consumers call, with `versionNumber/String/Major/Minor/Release`, `maxCLevel/minCLevel/defaultCLevel`, `compressBound`, `getFrameContentSize`, `getDecompressedSize`, `findDecompressedSize`, `findFrameCompressedSize`, `frameHeaderSize`, `getFrameHeader` and `isFrame`.
 - One-shot: `compress`, `decompress`, and the context and dictionary variants `compressCCtx`, `decompressDCtx`, `compress_usingDict/decompress_usingDict`, `compress_usingCDict/decompress_usingDDict` and `compress2`.
@@ -16,8 +18,22 @@ The layer covers 65 of the 152 `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` symbols th
 - Contexts and parameters: create, free and reset on both sides, `setParameter`/`loadDictionary`/`setPledgedSrcSize` on both sides, and the `ZSTD_dParameter` bounds.
 - Dictionaries: CDict and DDict create and free, the four `getDictID_from*` entries, `createCDict` and `createDDict`.
 - Streaming: create, free and init on both sides, including the deprecated init family, `compressStream2`, `compressStream`/`flushStream`/`endStream`, `decompressStream`, and the four size helpers.
+- Bounds and readback: `cParam_getBounds`/`dParam_getBounds` over the full id space, `CCtx_getParameter`/`DCtx_getParameter`, `DCtx_setMaxWindowSize` and `getBlockSize`.
+- cParams helpers: `getCParams`/`getParams`/`adjustCParams`/`checkCParams`, ported formula-exact from the reference level table.
+- Estimates: the ten `estimate*` entries over the level rows and raw cParams, plus `decodingBufferSize_min` and `sequenceBound`.
+- Frame walk and skippable payload: `decompressBound`, `decompressionMargin`, `writeSkippableFrame`, `readSkippableFrame`, `isSkippableFrame`, `isDeterministicBuild` and `getFrameHeader_advanced` for the `zstd1` format.
+- Prefix and dictionary references: `CCtx_refPrefix`/`_advanced`, `DCtx_refPrefix`/`_advanced`, `DCtx_refDDict`, the `loadDictionary_byReference`/`_advanced` variants on both sides and the `createCDict_byReference`/`createDDict_byReference`/`createDDict_advanced` constructors.
 
-The remainder is deliberately uncovered. It holds `estimate*` with 14 entries, `initStatic*` with 6 entries, the `*_advanced` and `*_byReference` context and dictionary constructors, `refPrefix`/`refCDict`/`refDDict`/`refThreadPool`, the block-level API of `compressBlock`/`decompressBlock`/`insertBlock`/`getcBlockSize`, the legacy push API of `decompressContinue`/`decompressBegin`, `copyCCtx`/`copyDCtx`, `writeSkippableFrame`/`readSkippableFrame`, `decompressStream_simpleArgs`/`compressStream2_simpleArgs`, the thread-pool and inspect entries, and `ZSTD_getCParams`/`getParams`/`adjustCParams`/`checkCParams`. Each family needs its own parity round if a consumer calls it, and none is reachable through the stable `zstd` crate bindings.
+The remainder, 46 symbols, is deliberately uncovered:
+- The `initStatic*` family (6): the contexts are heap objects; there is no caller-provided workspace to init into.
+- The legacy push API (11: `compressBegin` and kin, `decompressBegin`/`decompressContinue`, `nextInputType`, `nextSrcSizeToDecompress`): a second streaming engine around the same core.
+- The `ZSTD_CCtx_params` bag and its users (12: `createCCtxParams`, `freeCCtxParams`, the `CCtxParams_*` setters, `CCtx_setParams`/`setCParams`/`setFParams`/`setParametersUsingCCtxParams`, `estimateCCtxSize_usingCCtxParams`, `estimateCStreamSize_usingCCtxParams`): the bag accepts engine knobs (hashLog through strategy, the LDM set) that the codec does not expose, so adopting one could only silently ignore it and change the frame bytes against the reference.
+- Constructors with explicit cParams, params or custom allocators (6: `createCCtx_advanced`, `createCDict_advanced`, `createCDict_advanced2`, the `*_advanced` stream constructors): the same knob problem; `createDDict_advanced` is in and refuses a non-default `customMem`, since caller allocation has no hook here.
+- `CCtx_refCDict` and the thread pool (4): the attach-dict parameter precedence and worker-pool plumbing have no engine counterpart.
+- Block-level decode (2: `decompressBlock`, `mergeBlockDelimiters`) and introspection (8: `getFrameProgression`, `toFlushNow`, the six `sizeof_*`): the first need sequence-store level access; the introspection entries report the reference's object sizes, which are not this implementation's.
+- `copyDCtx` (1): a deprecated field-range copy between reference-layout objects.
+
+Each family needs its own parity round if a consumer calls it, and none is reachable through the stable `zstd` crate bindings.
 
 ## Divergences fixed
 
@@ -51,6 +67,8 @@ The earlier commits fixed several contracts. Commit 4fdc4872 fixed `getFrameHead
 - `ZSTD_decompressContinue`'s own no-forward-progress counter, `dctx->noForwardProgress`, is moot while the push API is unimplemented.
 - Legacy-format frames on the `ZSTD_isLegacy` paths are unsupported by this codec, and no probe exercised legacy magic on the decode entries.
 - The exact between-frames hint when a partial next-frame prefix under 5 bytes is staged is unprobed. The reference computes `max(6, hSize) - lhSize + 3`, and this layer returns the same formula only in the nothing-staged shape of 9, falling back to the block suggestion once 5 bytes arrive.
+
+- The estimate family, the cParams helpers, the bounds matrices, the readback entries, the frame-walk entries, the skippable payload I/O and the prefix family landed reference-exact, pinned by the golden grid and the extended harness. The decode-side dictionary re-arm at frame boundaries (a prefix, a load or a `refDDict` between frames now applies to the next frame of a live stream) came out of that round; the earlier behavior ignored dictionary changes on a live stream.
 
 ## Commits
 

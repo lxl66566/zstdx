@@ -173,11 +173,12 @@ impl Settings {
 }
 
 /// The context's loaded dictionary, parsed once so every following frame
-/// skips the digest. A dictionary that fails to parse is retained as a
-/// pending error: libzstd digests lazily too, so the failure surfaces when
-/// the next frame starts, not at the load call.
+/// skips the digest. The raw byte length rides along (the reference sizes
+/// the frame window by the whole loaded buffer). A dictionary that fails
+/// to parse is retained as a pending error: libzstd digests lazily too, so
+/// the failure surfaces when the next frame starts, not at the load call.
 pub enum LoadedDict {
-    Parsed(zstdx::EncoderDictionary),
+    Parsed(zstdx::EncoderDictionary, usize),
     Invalid,
 }
 
@@ -294,6 +295,13 @@ pub struct CCtx {
     /// Session dictionary (`loadDictionary`; sticky until a parameters
     /// reset or `initCStream`'s legacy clear).
     dict: Option<LoadedDict>,
+    /// `refPrefix` dictionaries are single-use (libzstd's `prefixDict` is
+    /// consumed when the next frame opens).
+    dict_use_once: bool,
+    /// The running frame's block size (`ZSTD_getBlockSize`), 0 before any
+    /// frame opens. It survives the frame and a session reset, like the
+    /// reference's `appliedParams`.
+    pub applied_block_size: usize,
     /// `ZSTD_CCtx_setPledgedSrcSize`: applies to the next frame only and is
     /// consumed when that frame completes.
     pledged: Option<u64>,
@@ -308,6 +316,8 @@ impl CCtx {
         Self {
             settings: Settings::default(),
             dict: None,
+            dict_use_once: false,
+            applied_block_size: 0,
             pledged: None,
             stream: None,
             sticky: None,
@@ -318,7 +328,7 @@ impl CCtx {
     /// next frame.
     fn dict(&self) -> Result<Option<&zstdx::EncoderDictionary>, ErrorCode> {
         match &self.dict {
-            Some(LoadedDict::Parsed(dict)) => Ok(Some(dict)),
+            Some(LoadedDict::Parsed(dict, _)) => Ok(Some(dict)),
             Some(LoadedDict::Invalid) => Err(ErrorCode::DictionaryCorrupted),
             None => Ok(None),
         }
@@ -355,18 +365,85 @@ impl CCtx {
     /// `ZSTD_CCtx_loadDictionary`: rejected mid-frame; a null or empty
     /// dictionary clears the slot.
     pub fn load_dictionary(&mut self, dict: Option<&[u8]>) -> Result<(), ErrorCode> {
+        self.load_dictionary_typed(dict, crate::params::DictContentType::Auto)
+    }
+
+    /// `ZSTD_CCtx_loadDictionary` with the advanced content type:
+    /// `rawContent` loads the plain match history whatever the bytes start
+    /// with, `auto` parses the magic, and `fullDict` accepts formatted
+    /// dictionaries only (a plain one stays a pending error, surfacing at
+    /// the next frame like every digest failure).
+    pub fn load_dictionary_typed(
+        &mut self,
+        dict: Option<&[u8]>,
+        content_type: crate::params::DictContentType,
+    ) -> Result<(), ErrorCode> {
+        use crate::params::DictContentType;
         if self.stream.as_ref().is_some_and(|s| !s.finished) {
             return Err(ErrorCode::StageWrong);
         }
+        self.dict_use_once = false;
         self.dict = match dict {
-            Some(bytes) => match zstdx::EncoderDictionary::parse(bytes) {
-                Ok(parsed) => Some(LoadedDict::Parsed(parsed)),
-                // Retained: the error surfaces when a frame tries to use it.
-                Err(_) => Some(LoadedDict::Invalid),
+            Some(bytes) => {
+                let parse = match content_type {
+                    DictContentType::RawContent => Ok(zstdx::EncoderDictionary::raw_content(bytes)),
+                    DictContentType::Auto => zstdx::EncoderDictionary::parse(bytes),
+                    DictContentType::FullDict => {
+                        if bytes.len() < 8
+                            || bytes.first_chunk::<4>() != Some(&crate::params::DICT_MAGIC)
+                        {
+                            Err(zstdx::Error::Dictionary(
+                                zstdx::decoding::errors::DictionaryDecodeError::NotEnoughBytes,
+                            ))
+                        } else {
+                            zstdx::EncoderDictionary::parse(bytes)
+                        }
+                    },
+                };
+                match parse {
+                    Ok(parsed) => Some(LoadedDict::Parsed(parsed, bytes.len())),
+                    // Retained: the error surfaces when a frame tries to use it.
+                    Err(_) => Some(LoadedDict::Invalid),
+                }
             },
             None => None,
         };
         Ok(())
+    }
+
+    /// `ZSTD_CCtx_refPrefix`: like `loadDictionary` but single-use — the
+    /// slot clears when the next frame opens. A null or empty prefix only
+    /// clears any existing dictionary, as in the reference.
+    pub fn ref_prefix(
+        &mut self,
+        prefix: Option<&[u8]>,
+        content_type: crate::params::DictContentType,
+    ) -> Result<(), ErrorCode> {
+        self.load_dictionary_typed(prefix, content_type)?;
+        self.dict_use_once = self.dict.is_some();
+        Ok(())
+    }
+
+    /// The frame's block size for `ZSTD_getBlockSize` (the reference's
+    /// appliedParams snapshot).
+    fn applied_block_size_snapshot(&self, pledged: Option<u64>) -> usize {
+        let dict_len = match &self.dict {
+            Some(LoadedDict::Parsed(_, len)) => *len,
+            _ => 0,
+        };
+        crate::params::applied_block_size(&self.settings, pledged, dict_len)
+    }
+
+    /// Consume a single-use dictionary at frame open and snapshot the
+    /// frame's block size for `ZSTD_getBlockSize`.
+    fn frame_opened(&mut self, pledged: Option<u64>) {
+        // The snapshot sees the dictionary the frame opens with, the
+        // use-once prefix included, then the prefix retires.
+        self.applied_block_size = self.applied_block_size_snapshot(pledged);
+        if self.dict_use_once {
+            self.dict = None;
+            self.dict_use_once = false;
+        }
     }
 
     /// `ZSTD_CCtx_reset`: session resets never fail; parameter resets fail
@@ -417,9 +494,16 @@ impl CCtx {
     /// override in libzstd's init).
     pub fn compress2(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, ErrorCode> {
         self.reset_session();
-        let dict = self.dict()?;
         let settings = self.settings.clone();
-        compress_oneshot(&settings, dict, src, dst)
+        let applied = self.applied_block_size_snapshot(Some(src.len() as u64));
+        let dict = self.dict()?.cloned();
+        self.applied_block_size = applied;
+        // A refPrefix dictionary retires with the frame it opened.
+        if self.dict_use_once {
+            self.dict = None;
+            self.dict_use_once = false;
+        }
+        compress_oneshot(&settings, dict.as_ref(), src, dst)
     }
 
     /// `ZSTD_compressStream2` core; the return is the bytes-left-to-flush
@@ -463,6 +547,7 @@ impl CCtx {
                     return Err(e);
                 },
             }
+            self.frame_opened(pledged);
         }
         let state = self.stream.as_mut().expect("just ensured");
 

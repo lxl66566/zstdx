@@ -17,6 +17,7 @@ mod dctx;
 mod dict;
 mod error;
 mod frame;
+mod params;
 mod simple;
 
 use core::ffi::c_void;
@@ -24,6 +25,8 @@ use core::ffi::c_void;
 // The C symbols live at the crate root, as on the C side.
 pub use dict::*;
 pub use error::{ErrorCode, MAX_CODE};
+pub use frame::*;
+pub use params::*;
 pub use simple::*;
 
 /// Opaque context handles: zero-sized Rust stand-ins for the C structs; the
@@ -403,6 +406,186 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary(
     }
 }
 
+/// `ZSTD_customMem` (only the null-default shape is honored; custom
+/// allocators are a static-workspace concern this layer does not carry).
+#[allow(non_snake_case)]
+#[repr(C)]
+pub struct ZSTD_customMem {
+    pub customAlloc: Option<unsafe extern "C" fn(core::ffi::c_uint) -> *mut c_void>,
+    pub customFree: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub opaque: *mut c_void,
+}
+
+impl ZSTD_customMem {
+    /// The reference's validity rule: alloc and free must come as a pair.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.customAlloc.is_none() && self.customFree.is_none() && self.opaque.is_null()
+    }
+}
+
+/// `ZSTD_CCtx_loadDictionary_byReference`: the parse copies into owned
+/// state either way, so the reference load method only strengthens the
+/// caller's lifetime contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_byReference(
+    cctx: *mut ZSTD_CCtx,
+    dict: *const c_void,
+    dict_size: usize,
+) -> usize {
+    unsafe { ZSTD_CCtx_loadDictionary(cctx, dict, dict_size) }
+}
+
+/// `ZSTD_CCtx_loadDictionary_advanced`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_advanced(
+    cctx: *mut ZSTD_CCtx,
+    dict: *const c_void,
+    dict_size: usize,
+    dict_load_method: DictLoadMethod,
+    dict_content_type: DictContentType,
+) -> usize {
+    let _ = dict_load_method; // byRef/byCopy parse identically here
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(dict, dict_size) };
+    match unsafe { cctx_mut(cctx) }.load_dictionary_typed(bytes, dict_content_type) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_DCtx_loadDictionary_byReference`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_byReference(
+    dctx: *mut ZSTD_DCtx,
+    dict: *const c_void,
+    dict_size: usize,
+) -> usize {
+    unsafe { ZSTD_DCtx_loadDictionary(dctx, dict, dict_size) }
+}
+
+/// `ZSTD_DCtx_loadDictionary_advanced`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_advanced(
+    dctx: *mut ZSTD_DCtx,
+    dict: *const c_void,
+    dict_size: usize,
+    dict_load_method: DictLoadMethod,
+    dict_content_type: DictContentType,
+) -> usize {
+    let _ = dict_load_method;
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(dict, dict_size) };
+    match unsafe { dctx_mut(dctx) }.load_dictionary_typed(bytes, dict_content_type) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_CCtx_refPrefix`: the raw-content prefix for the next frame only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_refPrefix(
+    cctx: *mut ZSTD_CCtx,
+    prefix: *const c_void,
+    prefix_size: usize,
+) -> usize {
+    unsafe { ZSTD_CCtx_refPrefix_advanced(cctx, prefix, prefix_size, DictContentType::RawContent) }
+}
+
+/// `ZSTD_CCtx_refPrefix_advanced`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_refPrefix_advanced(
+    cctx: *mut ZSTD_CCtx,
+    prefix: *const c_void,
+    prefix_size: usize,
+    dict_content_type: DictContentType,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(prefix, prefix_size) };
+    match unsafe { cctx_mut(cctx) }.ref_prefix(bytes, dict_content_type) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_DCtx_refPrefix`: the raw-content prefix for the next frame only
+/// (`use_once`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
+    dctx: *mut ZSTD_DCtx,
+    prefix: *const c_void,
+    prefix_size: usize,
+) -> usize {
+    unsafe { ZSTD_DCtx_refPrefix_advanced(dctx, prefix, prefix_size, DictContentType::RawContent) }
+}
+
+/// `ZSTD_DCtx_refPrefix_advanced`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
+    dctx: *mut ZSTD_DCtx,
+    prefix: *const c_void,
+    prefix_size: usize,
+    dict_content_type: DictContentType,
+) -> usize {
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let bytes = unsafe { dict_bytes(prefix, prefix_size) };
+    match unsafe { dctx_mut(dctx) }.ref_prefix_typed(bytes, dict_content_type) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_DCtx_setMaxWindowSize`: the byte form of `ZSTD_d_windowLogMax`
+/// (no 0-means-default special case here; out-of-range bytes error).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_setMaxWindowSize(
+    dctx: *mut ZSTD_DCtx,
+    max_window_size: usize,
+) -> usize {
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    match unsafe { dctx_mut(dctx) }.set_max_window_size(max_window_size) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_DCtx_refDDict`: attach a parsed handle dictionary to every
+/// following frame; a null handle clears the slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
+    dctx: *mut ZSTD_DCtx,
+    ddict: *const ZSTD_DDict,
+) -> usize {
+    if dctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    let dict = (!ddict.is_null()).then(|| unsafe { &*ddict.cast::<DDict>() });
+    match unsafe { dctx_mut(dctx) }.ref_ddict(dict.map(|d| &d.dict)) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_getBlockSize`: the running (or last) frame's block size; 0
+/// before any frame opened, as the reference's zeroed `appliedParams`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getBlockSize(cctx: *const ZSTD_CCtx) -> usize {
+    if cctx.is_null() {
+        return 0;
+    }
+    unsafe { &*cctx.cast::<cctx::CCtx>() }.applied_block_size
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_compressCCtx(
     cctx: *mut ZSTD_CCtx,
@@ -447,7 +630,11 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
         return ret(ErrorCode::Generic);
     }
     let ctx = unsafe { dctx_mut(dctx) };
-    match dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst) {
+    let result = dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst);
+    // A refPrefix dictionary covers this one call (the reference's
+    // getDDict consumes use_once at entry).
+    ctx.consume_use_once();
+    match result {
         Ok(written) => written,
         Err(e) => ret(e),
     }
@@ -520,13 +707,14 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     // The dictionary is loaded into the context (libzstd's usingDict leaves
     // it loaded for the following calls) and survives until initDStream.
     // Parsed once: the slot is shared with the streams that follow.
-    ctx.dict = match unsafe { dict_bytes(dict, dict_size) } {
+    let loaded = match unsafe { dict_bytes(dict, dict_size) } {
         Some(bytes) => match zstdx::decoding::Dictionary::load(bytes) {
             Ok(parsed) => Some(std::sync::Arc::new(parsed)),
             Err(_) => return ret(ErrorCode::DictionaryCorrupted),
         },
         None => None,
     };
+    ctx.set_dict(loaded);
     match dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
@@ -685,7 +873,7 @@ pub unsafe extern "C" fn ZSTD_initDStream(zds: *mut ZSTD_DStream) -> usize {
     unsafe { dctx_mut(zds) }.init_stream();
     // The reference returns ZSTD_startingInputLength: the prefix size a
     // first read wants, not the general DStreamInSize.
-    frame::HEADER_PREFIX
+    HEADER_PREFIX
 }
 
 #[unsafe(no_mangle)]
@@ -699,7 +887,7 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
     }
     let dctx = unsafe { dctx_mut(zds) };
     match dctx.init_stream_with_dict(unsafe { dict_bytes(dict, dict_size) }) {
-        Ok(()) => frame::HEADER_PREFIX,
+        Ok(()) => HEADER_PREFIX,
         Err(e) => ret(e),
     }
 }
@@ -715,7 +903,7 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDDict(
     // A null handle clears the slot, as ZSTD_DCtx_refDDict(zds, NULL).
     let dict = (!ddict.is_null()).then(|| unsafe { &*ddict.cast::<DDict>() });
     unsafe { dctx_mut(zds) }.init_stream_with_ddict(dict.map(|d| &d.dict));
-    frame::HEADER_PREFIX
+    HEADER_PREFIX
 }
 
 #[unsafe(no_mangle)]
@@ -726,7 +914,7 @@ pub unsafe extern "C" fn ZSTD_resetDStream(zds: *mut ZSTD_DStream) -> usize {
     // Session-only: the dictionary reference survives, unlike
     // ZSTD_initDStream.
     unsafe { dctx_mut(zds) }.init_stream_keep_dict();
-    frame::HEADER_PREFIX
+    HEADER_PREFIX
 }
 
 #[unsafe(no_mangle)]

@@ -15,7 +15,7 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 18 | compat knobs without an `EncoderOptions` field | None for `set_target_cblock_size` | Sub-block splitting loses ratio on every measured shape | [negative](negative/entropy.md) |
 | 19 | Dictionary-frame parse residuals | About 54 µs per call at level 9, and the 13/15 4 KiB parse | Dictionary twin-field candidate density | [encoding](perf/encoding.md) |
 | 6 | Greedy -4 dictionary row | 13 to 96 B per seed | No isolated mechanism, exact-once insert discipline | [negative](negative/matchers.md), [encoding](perf/encoding.md) |
-| 22 | FFI parity coverage | Parity for the remaining FFI families | 87 symbols deliberately out, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
+| 22 | FFI parity coverage | Parity for the remaining FFI families | 46 symbols deliberately out with recorded reasons, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
 
@@ -83,7 +83,7 @@ Everything else in this area is closed or falsified. The small-payload row swaps
 
 ### 22. FFI parity coverage
 
-The FFI unprobed families are estimate, static, advanced, ref*, block-level and the push API. That is about 87 symbols deliberately left out. The streaming block-granular staging also deviates: `destFull` arrives at call 16 against the reference's 17. Matching it needs an internal decode-ahead redesign. See [ffiparity](review/ffiparity.md).
+R75 (2026-10-29) landed the tractable out-families: the estimate family with the cParams helpers it rides on, the full bounds matrices, the parameter readback, `getBlockSize`, the frame-walk entries (`decompressBound`, `decompressionMargin`), the skippable payload I/O, and the prefix family with the dictionary re-arm at frame boundaries. The layer now exports 106 of the 152 header symbols, reference-exact per the golden grid and the extended harness. Still out, with reasons: the static-workspace family, the push API, the `CCtx_params` bag (engine knobs this codec does not expose), the cParams-based constructors, `refCDict`, the thread pool, block-level decode, introspection and `copyDCtx`. The streaming block-granular staging still deviates: `destFull` arrives at call 16 against the reference's 17, which needs an internal decode-ahead redesign. See [ffiparity](review/ffiparity.md).
 
 The rest of the follow-ups are closed. The CLI `-l` level-3 residue is the dfast row's recorded near-tie band, confirmed by a size and shape sweep around parity, and it is not a defect. Pass-through decode landed with `--pass-through` and `--no-pass-through` and the `-f` plus stdout default, over a fileio-style frame loop. That loop exposed and fixed `single_frame` consuming the next frame's header past the boundary. `--train` small-corpus warnings landed as DiB's level-2 pair plus `COVER_warnOnSmallCorpus`'s level-1 line over `TrainOutcome.dmers`. See [cliparity](review/cliparity.md).
 

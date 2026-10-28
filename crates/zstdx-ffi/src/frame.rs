@@ -540,3 +540,299 @@ mod tests {
         assert_eq!(window_from_descriptor(0xa0), 1 << 30);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Frame-size walk (decompressBound / decompressionMargin / fromFrame)
+// ---------------------------------------------------------------------------
+
+/// `ParseError` as the wire error code the reference entries answer.
+pub fn parse_error_code(error: ParseError) -> crate::error::ErrorCode {
+    use crate::error::ErrorCode;
+    match error {
+        ParseError::NeedMore | ParseError::BadMagic | ParseError::Malformed => {
+            ErrorCode::PrefixUnknown
+        },
+        ParseError::ReservedBit => ErrorCode::FrameParameterUnsupported,
+        ParseError::WindowTooLarge => ErrorCode::FrameParameterWindowTooLarge,
+    }
+}
+
+/// `ZSTD_findFrameSizeInfo`: the first frame's serialized size, block
+/// count and decompressed bound. The walk mirrors the reference exactly:
+/// block sizes are taken from the headers with no 128 KiB ceiling (that
+/// check is decode-time, not walk-time), RLE bodies count one byte, and a
+/// truncated structure anywhere is `srcSize_wrong`.
+pub struct FrameSizeInfo {
+    pub compressed_size: usize,
+    pub nb_blocks: u64,
+    /// The frame's largest decompressed size: its declared FCS, or one
+    /// full block per block. Skippable frames bound to 0.
+    pub decompressed_bound: Option<u64>,
+    /// Whether the frame is skippable (margin adds its whole size).
+    pub skippable: bool,
+    pub header_size: usize,
+    pub checksum: bool,
+    pub block_size_max: u64,
+}
+
+/// `readSkippableFrameSize`: the serialized size of a skippable frame.
+fn skippable_frame_size(src: &[u8]) -> Result<usize, crate::error::ErrorCode> {
+    use crate::error::ErrorCode;
+    debug_assert!(src.len() >= 4 && is_skippable_magic(src));
+    if src.len() < SKIPPABLE_HEADER {
+        return Err(ErrorCode::SrcSizeWrong);
+    }
+    let content = u32::from_le_bytes(src[4..8].try_into().expect("8 bytes checked"));
+    if content.wrapping_add(SKIPPABLE_HEADER as u32) < content {
+        // The 32-bit size field would wrap the frame past addressable input.
+        return Err(ErrorCode::FrameParameterUnsupported);
+    }
+    let total = SKIPPABLE_HEADER + content as usize;
+    if total > src.len() {
+        return Err(ErrorCode::SrcSizeWrong);
+    }
+    Ok(total)
+}
+
+fn is_skippable_magic(src: &[u8]) -> bool {
+    if src.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes(src[..4].try_into().expect("4 bytes checked"));
+    (SKIPPABLE_MIN..=SKIPPABLE_MAX).contains(&magic)
+}
+
+/// Walk the first frame of `src` (see [`FrameSizeInfo`]).
+pub fn frame_size_info(src: &[u8]) -> Result<FrameSizeInfo, crate::error::ErrorCode> {
+    use crate::error::ErrorCode;
+    if src.len() >= 4 && is_skippable_magic(src) {
+        let total = skippable_frame_size(src)?;
+        return Ok(FrameSizeInfo {
+            compressed_size: total,
+            nb_blocks: 0,
+            decompressed_bound: Some(0),
+            skippable: true,
+            header_size: SKIPPABLE_HEADER,
+            checksum: false,
+            block_size_max: 0,
+        });
+    }
+    let header = match parse_full_header(src) {
+        Ok(HeaderParse::Complete(header)) => header,
+        // A valid prefix: the reference's frameSizeInfo answers the walk's
+        // precondition failure as srcSize_wrong.
+        Ok(HeaderParse::Wanted(_)) => return Err(ErrorCode::SrcSizeWrong),
+        Err(e) => return Err(parse_error_code(e)),
+    };
+    let mut pos = header.header_size;
+    let mut nb_blocks: u64 = 0;
+    loop {
+        let [b0, b1, b2, ..] = src[pos..] else {
+            return Err(ErrorCode::SrcSizeWrong);
+        };
+        let last = b0 & 1 != 0;
+        let block_type = (b0 >> 1) & 3;
+        let size = (u32::from(b0) >> 3) | (u32::from(b1) << 5) | (u32::from(b2) << 13);
+        let body = match block_type {
+            0 | 2 => size as usize, // Raw / Compressed carry `size` bytes
+            1 => 1,                 // RLE encodes one content byte
+            _ => return Err(ErrorCode::CorruptionDetected),
+        };
+        pos += 3 + body;
+        if src.len() < pos {
+            return Err(ErrorCode::SrcSizeWrong);
+        }
+        nb_blocks += 1;
+        if last {
+            break;
+        }
+    }
+    if header.checksum {
+        if src.len() < pos + 4 {
+            return Err(ErrorCode::SrcSizeWrong);
+        }
+        pos += 4;
+    }
+    Ok(FrameSizeInfo {
+        compressed_size: pos,
+        nb_blocks,
+        decompressed_bound: Some(
+            header
+                .content_size
+                .unwrap_or(nb_blocks * header.block_size_max),
+        ),
+        skippable: false,
+        header_size: header.header_size,
+        checksum: header.checksum,
+        block_size_max: header.block_size_max,
+    })
+}
+
+/// `ZSTD_decompressBound`: the summed bound of every frame in the series;
+/// any walk failure answers `ZSTD_CONTENTSIZE_ERROR`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_decompressBound(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> u64 {
+    const CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
+    let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return CONTENTSIZE_ERROR;
+    };
+    let mut bound: u64 = 0;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match frame_size_info(rest) {
+            Ok(info) => {
+                bound = bound.wrapping_add(info.decompressed_bound.unwrap_or(u64::MAX - 1));
+                rest = &rest[info.compressed_size..];
+            },
+            Err(_) => return CONTENTSIZE_ERROR,
+        }
+    }
+    bound
+}
+
+/// `ZSTD_decompressionMargin`: how many more input bytes than output the
+/// series may need (headers, block headers, checksums, one block of
+/// slack). A header-parse failure passes through; a walk failure after a
+/// parseable header is `corruption_detected`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_decompressionMargin(
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> usize {
+    use crate::error::{ErrorCode, code};
+    let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return code(ErrorCode::SrcSizeWrong);
+    };
+    let mut margin: usize = 0;
+    let mut max_block_size: u64 = 0;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        // The reference consults getFrameHeader before the walk: a header
+        // that fails to parse passes its own code through, while any walk
+        // failure behind a parseable header answers corruption_detected.
+        let info = match frame_size_info(rest) {
+            Ok(info) => info,
+            Err(_) => {
+                return match parse_full_header(rest) {
+                    Err(e) => code(parse_error_code(e)),
+                    Ok(_) => code(ErrorCode::CorruptionDetected),
+                }
+            },
+        };
+        if info.skippable {
+            margin += info.compressed_size;
+        } else {
+            margin += info.header_size;
+            margin += usize::from(info.checksum) * 4;
+            margin += 3 * info.nb_blocks as usize;
+            max_block_size = max_block_size.max(info.block_size_max);
+        }
+        rest = &rest[info.compressed_size..];
+    }
+    margin += max_block_size as usize;
+    margin
+}
+
+/// `ZSTD_isSkippableFrame`: the skippable magic family, 4 bytes minimum.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_isSkippableFrame(
+    buffer: *const core::ffi::c_void,
+    size: usize,
+) -> core::ffi::c_uint {
+    let Ok(bytes) = (unsafe { crate::as_slice(buffer, size) }) else {
+        return 0;
+    };
+    u32::from(is_skippable_magic(bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Skippable-frame payload entry points
+// ---------------------------------------------------------------------------
+
+/// `ZSTD_writeSkippableFrame`: the magic variant, size field and payload.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_writeSkippableFrame(
+    dst: *mut core::ffi::c_void,
+    dst_capacity: usize,
+    src: *const core::ffi::c_void,
+    src_size: usize,
+    magic_variant: core::ffi::c_uint,
+) -> usize {
+    use crate::error::{ErrorCode, code};
+    const SKIPPABLE_HEADER_SIZE: usize = 8;
+    if dst_capacity < src_size + SKIPPABLE_HEADER_SIZE {
+        return code(ErrorCode::DstSizeTooSmall);
+    }
+    if src_size > u32::MAX as usize {
+        return code(ErrorCode::SrcSizeWrong);
+    }
+    if magic_variant > 15 {
+        return code(ErrorCode::ParameterOutOfBound);
+    }
+    let Ok(payload) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return code(ErrorCode::SrcBufferWrong);
+    };
+    let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
+        return code(ErrorCode::DstBufferNull);
+    };
+    let magic = SKIPPABLE_MIN + magic_variant;
+    dst[..4].copy_from_slice(&magic.to_le_bytes());
+    dst[4..8].copy_from_slice(&(src_size as u32).to_le_bytes());
+    dst[8..8 + src_size].copy_from_slice(payload);
+    src_size + SKIPPABLE_HEADER_SIZE
+}
+
+/// `ZSTD_readSkippableFrame`: the payload of a skippable frame plus its
+/// magic variant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_readSkippableFrame(
+    dst: *mut core::ffi::c_void,
+    dst_capacity: usize,
+    magic_variant: *mut core::ffi::c_uint,
+    src: *const core::ffi::c_void,
+    src_size: usize,
+) -> usize {
+    use crate::error::{ErrorCode, code};
+    let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
+        return code(ErrorCode::SrcSizeWrong);
+    };
+    if bytes.len() < 8 {
+        return code(ErrorCode::SrcSizeWrong);
+    }
+    // The magic is judged before the size field: a non-skippable frame
+    // answers frameParameter_unsupported whatever its bytes 4..8 hold.
+    if !is_skippable_magic(bytes) {
+        return code(ErrorCode::FrameParameterUnsupported);
+    }
+    let total = match skippable_frame_size(bytes) {
+        Ok(total) => total,
+        Err(e) => return code(e),
+    };
+    let content = total - 8;
+    if content > dst_capacity {
+        return code(ErrorCode::DstSizeTooSmall);
+    }
+    if content > 0 {
+        if dst.is_null() {
+            return code(ErrorCode::DstBufferNull);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(8), dst.cast::<u8>(), content);
+        }
+    }
+    if !magic_variant.is_null() {
+        let magic = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes checked"));
+        unsafe { *magic_variant = magic - SKIPPABLE_MIN };
+    }
+    content
+}
+
+/// `ZSTD_isDeterministicBuild`: this layer carries no sanitizer or race
+/// detector instrumentation.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_isDeterministicBuild() -> core::ffi::c_uint {
+    1
+}
