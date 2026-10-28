@@ -52,6 +52,18 @@ impl core::fmt::Debug for Dictionary {
 }
 
 impl Dictionary {
+    /// A raw-content dictionary: pure match history, no id and no entropy
+    /// tables (libzstd's `ZSTD_dct_rawContent` load).
+    pub fn raw_content(content: &[u8]) -> Dictionary {
+        Dictionary {
+            id: 0,
+            fse: FSEScratch::new(),
+            huf: HuffmanScratch::new(),
+            dict_content: content.to_vec(),
+            offset_hist: [1, 4, 8],
+        }
+    }
+
     /// Load a dictionary: formatted dictionaries parse their entropy tables;
     /// content without the magic loads as a raw-content dictionary — pure
     /// match history with the format-default repcodes, mirroring libzstd's

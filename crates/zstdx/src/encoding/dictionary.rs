@@ -323,6 +323,14 @@ impl EncoderDictionary {
         })
     }
 
+    /// A raw-content dictionary, pure match history with no id and no
+    /// entropy tables (libzstd's `ZSTD_dct_rawContent` load).
+    pub fn raw_content(content: &[u8]) -> Self {
+        Self {
+            inner: alloc::sync::Arc::new(EncDictionary::raw_content(content)),
+        }
+    }
+
     /// The dictID frames built from this dictionary declare (see [EncDictionary::header_id]).
     pub fn header_id(&self) -> Option<u32> {
         self.inner.header_id()
