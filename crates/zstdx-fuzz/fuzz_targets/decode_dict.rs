@@ -28,20 +28,12 @@ use zstdx::decoding::{Dictionary, FrameDecoder, StreamingDecoder, errors::FrameD
 /// Output past this bound skips every check.
 const MAX_CHECK: usize = 32 << 20;
 
-fuzz_target!(|data: &[u8]| {
-    Dictionary::decode_dict(data).ok(); // may return error on invalid data, may not panic.
-
-    let (head, rest) = match data {
-        [a, b, rest @ ..] => (u16::from_le_bytes([*a, *b]) as usize, rest),
-        _ => return,
-    };
-    let dlen = head.min(rest.len()).min(64 * 1024);
-    let (dict, frame) = rest.split_at(dlen);
-    Dictionary::decode_dict(dict).ok();
+/// The pair oracle over an explicit (dict, frame) split.
+fn oracle(dict_raw: &[u8], frame: &[u8]) {
     if frame.is_empty() {
         return;
     }
-    let Ok(dict) = Dictionary::load(dict) else {
+    let Ok(dict) = Dictionary::load(dict_raw) else {
         return;
     };
     let dict = Arc::new(dict);
@@ -99,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
     // expect. Runs before the streamed compare: agreement with the
     // reference streaming output is the layout-independence adjudicator.
     let mut rbuf = vec![0u8; flat.capacity().max(1 << 16)];
-    let n = zstd::bulk::Decompressor::with_dictionary(&rest[..dlen])
+    let n = zstd::bulk::Decompressor::with_dictionary(dict_raw)
         .expect("reference decoder init failed on a parsed dictionary")
         .decompress_to_buffer(frame, &mut rbuf)
         .expect("reference oneshot rejects a dict frame zstdx flat accepted");
@@ -112,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
     if let Some(streamed) = &streamed {
         let mut zstream = Vec::new();
         let mut zdec =
-            zstd::stream::Decoder::with_dictionary(std::io::Cursor::new(frame), &rest[..dlen])
+            zstd::stream::Decoder::with_dictionary(std::io::Cursor::new(frame), dict_raw)
                 .expect("reference decoder init failed on a parsed dictionary");
         zdec.read_to_end(&mut zstream)
             .expect("reference rejects a dict frame zstdx streaming accepted");
@@ -124,4 +116,108 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
+}
+
+/// `n` extra bits carrying `v`, preceded by a `1` marker bit, LSB-first.
+/// Keep the builders in lockstep with `tests/decode_edges.rs`.
+fn bitstream_of(n: u32, v: u32) -> Vec<u8> {
+    let region: u64 = (1u64 << n) | u64::from(v);
+    let nbytes = (n + 1).div_ceil(8);
+    let mut out = Vec::new();
+    for i in 0..nbytes {
+        out.push(((region >> (8 * (nbytes - 1 - i))) & 0xff) as u8);
+    }
+    out.reverse();
+    out
+}
+
+/// One compressed block: 10 raw literals, one RLE-coded sequence (LL 9,
+/// ML code 2 => 5, OF code `offset.ilog2()`), output 15 bytes.
+fn seq_block(offset: u32) -> Vec<u8> {
+    let of_code = offset.ilog2();
+    let extra = offset - (1 << of_code);
+    let mut blk = Vec::new();
+    blk.push(10u8 << 3);
+    blk.extend_from_slice(b"ababababab");
+    blk.push(0x01);
+    blk.push(0b01_01_01_00);
+    blk.extend_from_slice(&[9u8, of_code as u8, 2u8]);
+    blk.extend_from_slice(&bitstream_of(of_code, extra));
+    blk
+}
+
+fn edge_rle(out: &mut Vec<u8>, last: bool, len: u32, byte: u8) {
+    let hdr = (len << 3) | (1 << 1) | u32::from(last);
+    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+    out.push(byte);
+}
+
+fn edge_block(out: &mut Vec<u8>, last: bool, btype: u32, content: &[u8]) {
+    let hdr = ((content.len() as u32) << 3) | (btype << 1) | u32::from(last);
+    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+    out.extend_from_slice(content);
+}
+
+fn edge_header(out: &mut Vec<u8>, wlog: u32) {
+    out.extend_from_slice(&0xfd2fb528u32.to_le_bytes());
+    out.push(0x00);
+    out.push(((wlog - 10) as u8) << 3);
+}
+
+/// Deterministic dictionary-edge seeds (R66 constructor pattern): a raw
+/// dictionary whose content is reachable from the frame's matches — the
+/// dict-tail reach class, the past-the-dict corruption class, and the
+/// dict-expiry-at-first-wrap class pinned in
+/// `tests/decode_window_semantics.rs::window_semantics_dict`, replayed
+/// through the same pair oracle.
+fn dict_edge_seed(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0x77);
+    // Raw content dictionary (magic-free bytes parse as raw content); the
+    // first bytes keep clear of the format magic so the parse stays raw.
+    let mut dict: Vec<u8> = (0..4096u32).map(|i| byte((i % 64) as usize)).collect();
+    dict[..4].fill(0x77);
+    let mut frame = Vec::new();
+    edge_header(&mut frame, 10);
+    match byte(0) % 3 {
+        // 2000 produced: a 4000-byte offset reaches 2000 bytes into the
+        // dict tail — accepted everywhere with identical bytes.
+        0 => {
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            let a = seq_block(4003);
+            edge_block(&mut frame, true, 2, &a);
+        },
+        // Past dict plus output: corruption everywhere.
+        1 => {
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            let a = seq_block(7003);
+            edge_block(&mut frame, true, 2, &a);
+        },
+        // 4000 produced wraps the ring (cap 3136): the dict expired, so
+        // streaming rejects while flat whole-history accepts.
+        _ => {
+            for _ in 0..4 {
+                edge_rle(&mut frame, false, 1000, 0x5a);
+            }
+            let a = seq_block(4503);
+            edge_block(&mut frame, true, 2, &a);
+        },
+    }
+    oracle(&dict, &frame);
+}
+
+fuzz_target!(|data: &[u8]| {
+    Dictionary::decode_dict(data).ok(); // may return error on invalid data, may not panic.
+
+    dict_edge_seed(data);
+
+    let (head, rest) = match data {
+        [a, b, rest @ ..] => (u16::from_le_bytes([*a, *b]) as usize, rest),
+        _ => return,
+    };
+    let dlen = head.min(rest.len()).min(64 * 1024);
+    let (dict, frame) = rest.split_at(dlen);
+    Dictionary::decode_dict(dict).ok();
+    oracle(dict, frame);
 });

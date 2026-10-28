@@ -16,6 +16,10 @@ A skippable-only stream failed `StreamingDecoder` initialization with `MagicNumb
 
 `MAX_WINDOW_SIZE` was the wire-format maximum of windowLog 41, or 3.75 TB. A caller that raised the per-decoder limit could therefore accept windows that no libzstd configuration decodes. The header parse rejects windowLog above 31, which is `ZSTD_WINDOWLOG_MAX`, and `ZSTD_d_windowLogMax` and `ZSTD_DCtx_setMaxWindowSize` cannot be raised past 2^31. Default-path behavior was already identical, because both sides rejected values above 128 MiB + 1. The absolute ceiling is now 1<<31 inclusive, and `set_max_window_size` clamps to it.
 
+## R74 edge pins
+
+The crafted-frame edges from the fuzz-edge round are pinned in `tests/decode_edges.rs` and replayed as deterministic seed constructors in the decode-family fuzz targets (one class per input, `decode.rs`'s `edge_frames_seed`, `decode_dict.rs`'s `dict_edge_seed`, `decode_mt.rs`'s `mt_frames_seed` with the ramp override armed so the piece planner validates real job grids). The classes: a raw and an RLE block at exactly Block_Maximum_Size, repcode reach in-generation and its expiry two ring wraps later (streaming rejects through the repcode path, one-shot accepts, reference agrees per path), corrupt and truncated checksum trailers on the streaming path, tiny 1..8-byte raw frames, skippable-only streams, and a truncation walk over every prefix of a checksummed frame. Mid-literal and mid-sequence segment boundaries are absent by construction: the MT scan and the piece grid cut only at restart blocks.
+
 ## Accepted differences
 
 NCount tables over a sequence alphabet's cap, which is LL 35, ML 52 and OF 31, differ only in error class. C breaks inside `FSE_readNCount` on `charnum > maxSV` and reports corruption or `maxSymbolValue_tooSmall`. zstdx reads to the sum and rejects at `build_decoding_table` with `TooManySymbols`. Both sides reject the same inputs. This is the same pattern recorded in the [FSE core review](fse.md), now verified for all three sequence tables, and unifying the class buys nothing.

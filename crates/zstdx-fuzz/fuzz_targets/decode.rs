@@ -40,7 +40,7 @@ use zstdx::decoding::{FrameDecoder, StreamingDecoder, errors::FrameDecoderError}
 /// Output past this bound skips every check (see the module doc).
 const MAX_CHECK: usize = 32 << 20;
 
-fuzz_target!(|data: &[u8]| {
+fn oracle(data: &[u8]) {
     // Streaming pass; a mid-stream error leaves `streamed` unset (the
     // flat path still gets its own reference check — a frame streaming
     // rejects but flat accepts is the by-design generation-model class).
@@ -117,4 +117,182 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
+}
+
+/// `n` extra bits carrying `v`, preceded by a `1` marker bit, LSB-first —
+/// the tail of a one-sequence offset bitstream. Keep the builders in
+/// lockstep with `tests/decode_edges.rs` when editing either.
+fn bitstream_of(n: u32, v: u32) -> Vec<u8> {
+    let region: u64 = (1u64 << n) | u64::from(v);
+    let nbytes = (n + 1).div_ceil(8);
+    let mut out = Vec::new();
+    for i in 0..nbytes {
+        out.push(((region >> (8 * (nbytes - 1 - i))) & 0xff) as u8);
+    }
+    out.reverse();
+    out
+}
+
+/// One compressed block with 10 raw literals and a single RLE-coded
+/// sequence (LL 9, ML code 2 => 5, OF code `offset.ilog2()`): output 15
+/// bytes, decoded offset value `offset` (`offset == 1` selects the repcode
+/// domain, OF code 0 = reuse `rep0`).
+fn seq_block(offset: u32) -> Vec<u8> {
+    let of_code = offset.ilog2();
+    let extra = offset - (1 << of_code);
+    let mut blk = Vec::new();
+    blk.push(10u8 << 3);
+    blk.extend_from_slice(b"ababababab");
+    blk.push(0x01);
+    blk.push(0b01_01_01_00);
+    blk.extend_from_slice(&[9u8, of_code as u8, 2u8]);
+    blk.extend_from_slice(&bitstream_of(of_code, extra));
+    blk
+}
+
+fn edge_block(out: &mut Vec<u8>, last: bool, btype: u32, content: &[u8]) {
+    let hdr = ((content.len() as u32) << 3) | (btype << 1) | u32::from(last);
+    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+    out.extend_from_slice(content);
+}
+
+fn edge_rle(out: &mut Vec<u8>, last: bool, len: u32, byte: u8) {
+    let hdr = (len << 3) | (1 << 1) | u32::from(last);
+    out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+    out.push(byte);
+}
+
+fn edge_header(out: &mut Vec<u8>, wlog: u32, fcs: Option<u64>, checksum: bool) {
+    out.extend_from_slice(&0xfd2fb528u32.to_le_bytes());
+    let mut fhd = 0u8;
+    if fcs.is_some() {
+        fhd |= 3 << 6;
+    }
+    if checksum {
+        fhd |= 1 << 2;
+    }
+    out.push(fhd);
+    out.push(((wlog - 10) as u8) << 3);
+    if let Some(f) = fcs {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+}
+
+/// Deterministic edge-frame seeds (R66 constructor pattern): the crafted
+/// decode-edge classes pinned in `tests/decode_edges.rs`, parameterized by
+/// the fuzz bytes and replayed through the same oracle as the raw input.
+/// One class per input keeps the per-input cost flat. Checksummed variants
+/// carry a zero trailer: the verification-mismatch path with reference
+/// agreement on the reject (the ok-checksum class is the corpus's stock
+/// shape and the unit tests' pin).
+fn edge_frames_seed(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
+    match byte(0) % 6 {
+        // A raw and an RLE block at exactly Block_Maximum_Size.
+        0 => {
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 17, None, false);
+            edge_block(&mut frame, true, 0, &vec![byte(3); 131072]);
+            oracle(&frame);
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 17, None, false);
+            edge_rle(&mut frame, true, 131072, byte(4));
+            oracle(&frame);
+        },
+        // Repcode chains: rep0 set near the streaming reach boundary, reused
+        // in-generation (legal everywhere) and across two wraps (streaming
+        // rejects, flat whole-history accepts — the by-design class).
+        1 => {
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 10, None, false);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            let a = seq_block(2003 + u32::from(byte(5)) % 7);
+            edge_block(&mut frame, false, 2, &a);
+            let b = seq_block(1);
+            edge_block(&mut frame, true, 2, &b);
+            oracle(&frame);
+
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 10, None, false);
+            for _ in 0..3 {
+                edge_rle(&mut frame, false, 1000, 0x5a);
+            }
+            let a = seq_block(3012);
+            edge_block(&mut frame, false, 2, &a);
+            for _ in 0..3 {
+                edge_rle(&mut frame, false, 1000, 0x5a);
+            }
+            edge_rle(&mut frame, false, 1024, 0x33);
+            edge_rle(&mut frame, false, 1024, 0x33);
+            edge_rle(&mut frame, false, 65, 0x33);
+            let c = seq_block(1);
+            edge_block(&mut frame, true, 2, &c);
+            oracle(&frame);
+        },
+        // Tiny raw frames, 1..8 bytes, declared FCS included.
+        2 => {
+            for n in 1..=8usize {
+                let payload: Vec<u8> = (0..n)
+                    .map(|i| data.get(i % data.len().max(1)).copied().unwrap_or(0x31))
+                    .collect();
+                let mut frame = Vec::new();
+                edge_header(&mut frame, 10, Some(n as u64), false);
+                edge_block(&mut frame, true, 0, &payload);
+                oracle(&frame);
+            }
+        },
+        // Skippable-only streams (empty skippable included).
+        3 => {
+            let skippable = |payload: &[u8], out: &mut Vec<u8>| {
+                out.extend_from_slice(&0x184d2a50u32.to_le_bytes());
+                out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                out.extend_from_slice(payload);
+            };
+            let mut input = Vec::new();
+            skippable(&data[..data.len().min(16)], &mut input);
+            skippable(&[], &mut input);
+            oracle(&input);
+        },
+        // Truncations at every boundary class of a checksum-flagged frame
+        // (zero trailer: the mismatch reject path).
+        4 => {
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 10, None, true);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            let seq = seq_block(1003);
+            edge_block(&mut frame, true, 2, &seq);
+            frame.extend_from_slice(&[0; 4]);
+            let len = frame.len();
+            let cuts = [
+                1 + byte(5) as usize % 4,
+                4 + byte(6) as usize % 2,
+                6,
+                7 + byte(7) as usize % 8,
+                len - 8 + byte(8) as usize % 8,
+                len - 4 + byte(9) as usize % 4,
+            ];
+            for cut in cuts {
+                oracle(&frame[..cut.min(len).max(1)]);
+            }
+        },
+        // A zero trailer on an otherwise legal checksummed frame, plus a
+        // single flipped trailer byte.
+        _ => {
+            let mut frame = Vec::new();
+            edge_header(&mut frame, 10, None, true);
+            edge_rle(&mut frame, false, 1000, 0x5a);
+            edge_rle(&mut frame, true, 1000, 0x5a);
+            frame.extend_from_slice(&[0; 4]);
+            oracle(&frame);
+            let last = frame.len() - 1 - byte(5) as usize % 4;
+            frame[last] ^= byte(6).max(1);
+            oracle(&frame);
+        },
+    }
+}
+
+fuzz_target!(|data: &[u8]| {
+    edge_frames_seed(data);
+    oracle(data);
 });
