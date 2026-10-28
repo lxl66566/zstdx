@@ -223,7 +223,7 @@ The `zstdx-cli` binary mirrors the `zstd` command line with flags and no subcomm
 
 - Default output names are `FILE.zst` when compressing and the name without the `.zst` suffix when decompressing. Inputs are kept unless `--rm` is given.
 - Levels are `-1` to `-19`, default 3, and `--fast[=N]` selects negative levels. `--ultra` unlocks 20 to 22.
-- `-T N` sets worker threads, `-T0` uses all cores, and `--single-thread` equals `-T1`. `-D DICT` compresses or decompresses against a dictionary.
+- `-T N` sets worker threads, `-T0` uses the machine's cores and `--single-thread` equals `-T1`. `-T0` counts physical cores by default, like zstd, and `--auto-threads=logical` switches to logical cores. `-D DICT` compresses or decompresses against a dictionary, and repeating any value flag keeps the last occurrence, as zstd does.
 - `-c` writes to stdout and `-o FILE` sets the output for a single input. `-k` keeps inputs, which is the default. `-f` overwrites without asking, `-r` recurses into directories, `-t` tests archives, and `-q` and `-v` adjust verbosity.
 - `--[no-]progress` overrides the auto progress-bar rule, which shows a bar on an interactive stderr with a known size. The bar never pollutes pipes.
 - `--ignore-errors` is rejected with `Incorrect parameter: --ignore-errors`, matching zstd 1.5.7, which removed the flag.
@@ -231,7 +231,12 @@ The `zstdx-cli` binary mirrors the `zstd` command line with flags and no subcomm
 - `--[no-]check` toggles the frame checksum, default on. Both forms are compression-only. Decoding always validates a present checksum, and the flags are rejected in decode modes instead of ignored.
 - `--stream-size=N` pledges the exact stdin size, and a mismatch fails, as in zstd. `--size-hint=N` sizes the encoder row for an approximate stdin size without a header promise. Both are stdin-only and rejected for file inputs, whose sizes are already pledged.
 - `-M N` and `--memory=N` bound decode memory by capping the frame window, with zstd's syntax of bare bytes or `K`, `M` and `G` suffixes. Values below 1K reject every frame and are refused, as in zstd. Compression rejects the flag, where zstd silently ignores it.
-- `--filelist LIST`, alias `--file`, reads the input list from LIST with one path per line, and `-` reads the list itself from stdin.
+- `--filelist LIST` reads the input list from LIST with one path per line. There is no `--file` alias and no stdin list form, matching zstd 1.5.7.
+- `-r` walks directories recursively. Inputs that expand to nothing, an empty directory for example, decline with zstd's one-line notice and exit 0. `--exclude-compressed` skips inputs whose extension marks them as already compressed, using zstd's full suffix table.
+- `-V` answers at its position on the command line: the banner line by default, the bare version after `-q`, plus the format-support line at `-v`. `-h`, `-H` and `--help` print the help text.
+- `--no-dictID` leaves the dictionary id out of the frame header while the dictionary stays in effect, `-C` is the short form of `--check`, and `--[no-]content-size` toggles the header's content-size field, with a suppressed `--stream-size` pledge still enforced.
+- `--memory=N` bounds decode memory, `-M N` and `--memlimit=N` are the same flag, and `--output-dir-flat=DIR` writes derived output names under an existing DIR.
+- Flags with no engine knob reject loudly with their reason: `--rsyncable`, `--[no-]compress-literals`, `--[no-]row-match-finder`, `--target-compressed-block-size`, `--zstd=`, `--max`, `--trace`, `--show-default-cparams`, `--priority=rt`, the trainer and bench knobs `-s#`, `-S`, `-p`, `-P#`, the console test hooks and `--output-dir-mirror`. The full audit table is in the developer docs under cliparity.
 - `--sparse` and `--no-sparse` are rejected with an explicit unsupported error, because output is always dense and sparse decode-to-seek is not implemented.
 - A failed compression or decompression to a file removes the partial output it created, mirroring zstd.
 - Overwrite prompts read from the controlling terminal at `/dev/tty`, never from piped stdin. Without a terminal, existing outputs are refused unless `-f` is given.

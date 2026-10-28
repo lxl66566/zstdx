@@ -204,6 +204,11 @@ struct Settings {
     size_hint: Option<u64>,
     /// Decode window bound (-M), the dominant decode memory allocation.
     max_window: Option<u64>,
+    /// Whether the frame header declares the content size (--no-content-size
+    /// clears it; the known size still reaches the row as a hint).
+    content_size: bool,
+    /// Whether the frame header declares the dictionary id (--no-dictID).
+    include_dictid: bool,
 }
 
 // Boolean flags mirror zstd's CLI switches one-to-one.
@@ -339,7 +344,7 @@ struct Cli {
     force: bool,
 
     /// Recurse into directories given as FILES
-    #[arg(short = 'r', long)]
+    #[arg(short = 'r')]
     recursive: bool,
 
     /// Suppress progress and informational output; repeat to also suppress
@@ -373,7 +378,7 @@ struct Cli {
 
     /// Zstd dictionary to (de)compress against (as produced by `zstd
     /// --train`)
-    #[arg(short = 'D', long, value_name = "DICT")]
+    #[arg(short = 'D', value_name = "DICT")]
     dict: Option<PathBuf>,
 
     /// Compress/decompress as a diff against REF: compression treats REF
@@ -418,7 +423,7 @@ struct Cli {
     adapt: Option<adapt::AdaptRange>,
 
     /// Write a frame content checksum (the default)
-    #[arg(long, conflicts_with = "no_check")]
+    #[arg(short = 'C', long, conflicts_with = "no_check")]
     check: bool,
 
     /// Omit the frame content checksum. Compression only: decoding always
@@ -438,12 +443,19 @@ struct Cli {
 
     /// Bound decode memory: frames whose window exceeds N bytes fail to
     /// decode (suffixes K/M/G accepted); decode modes only
-    #[arg(short = 'M', long, value_name = "N", value_parser = parse_size)]
+    #[arg(
+        short = 'M',
+        long,
+        alias = "memlimit",
+        alias = "memlimit-decompress",
+        value_name = "N",
+        value_parser = parse_size
+    )]
     memory: Option<u64>,
 
     /// Read the list of input files from LIST, one per line; a LIST of `-`
     /// reads the list itself from stdin
-    #[arg(long, alias = "file", value_name = "LIST")]
+    #[arg(long, value_name = "LIST")]
     filelist: Option<PathBuf>,
 
     /// Force the progress bar on (it still needs a known input size, so
@@ -474,6 +486,162 @@ struct Cli {
     /// Disable the pass-through default of -f with stdout output
     #[arg(long)]
     no_pass_through: bool,
+
+    /// Omit the dictionary id from the frame header; the dictionary still
+    /// applies in full, decoders must be given it explicitly (compression
+    /// with -D or --patch-from)
+    #[arg(long = "no-dictID")]
+    no_dict_id: bool,
+
+    /// Write the frame content size into the header (the default whenever
+    /// the size is known)
+    #[arg(long, conflicts_with = "no_content_size")]
+    content_size: bool,
+
+    /// Omit the frame content size from the header; a known size still
+    /// shapes the encoder row as a hint
+    #[arg(long)]
+    no_content_size: bool,
+
+    /// Skip files whose extension marks them as already compressed
+    /// (.zst/.tzst plus the gz/xz/lz4 and media families; compression only)
+    #[arg(long)]
+    exclude_compressed: bool,
+
+    /// Store outputs under their plain file name in DIR, which must exist;
+    /// -o and stdout outputs are unaffected
+    #[arg(long, value_name = "DIR")]
+    output_dir_flat: Option<PathBuf>,
+
+    /// Core-count basis for -T0: physical cores like zstd's default, or
+    /// logical cores
+    #[arg(long, hide = true, value_parser = ["physical", "logical"])]
+    auto_threads: Option<String>,
+
+    // Identity flags: zstd 1.5.7 accepts these and this build's behavior
+    // with them is identical by construction, so they parse and do nothing.
+    /// gzip-compat spelling: zstd stores no file name in frames either
+    #[arg(short = 'n', hide = true)]
+    no_name: bool,
+
+    /// Async file IO request; zstd itself falls back to synchronous IO
+    /// without an AIO backend, which is what this build always does
+    #[arg(long, hide = true, conflicts_with = "no_asyncio")]
+    asyncio: bool,
+
+    /// See --asyncio
+    #[arg(long, hide = true)]
+    no_asyncio: bool,
+
+    /// Dictionary memory-map request; dictionaries are read in full either
+    /// way, which is observably identical
+    #[arg(long, hide = true, conflicts_with = "no_mmap_dict")]
+    mmap_dict: bool,
+
+    /// See --mmap-dict
+    #[arg(long, hide = true)]
+    no_mmap_dict: bool,
+
+    /// Select the zstd output format: the only format this build has, and
+    /// the default (the reference without zlib/lzma/lz4 answers the other
+    /// values as unknown flags)
+    #[arg(long, hide = true, require_equals = true)]
+    format: Option<String>,
+
+    // Rejected flags: kept parseable so the diagnostic names the flag;
+    // rejected in run() because the engine has no knob for them.
+    /// Not supported: the engine has no rsync-friendly block splitting
+    #[arg(long, hide = true)]
+    rsyncable: bool,
+
+    /// Not supported: literal entropy mode is chosen per block
+    #[arg(long, hide = true)]
+    compress_literals: bool,
+
+    /// Not supported: see --compress-literals
+    #[arg(long, hide = true)]
+    no_compress_literals: bool,
+
+    /// Not supported: the matchfinder is selected per level row
+    #[arg(long, hide = true)]
+    row_match_finder: bool,
+
+    /// Not supported: see --row-match-finder
+    #[arg(long, hide = true)]
+    no_row_match_finder: bool,
+
+    /// Not supported: no compressed-block-size target exists
+    #[arg(
+        long = "target-compressed-block-size",
+        hide = true,
+        value_name = "#",
+        value_parser = parse_size,
+        require_equals = true
+    )]
+    target_cblock_size: Option<u64>,
+
+    /// Not supported: raw compression-parameter forcing is not exposed
+    #[arg(
+        long = "zstd",
+        hide = true,
+        value_name = "PARAMS",
+        require_equals = true
+    )]
+    zstd_params: Option<String>,
+
+    /// Not supported: needs raw compression-parameter forcing
+    #[arg(long, hide = true)]
+    max: bool,
+
+    /// Not supported: the engine has no trace hooks
+    #[arg(long, hide = true, value_name = "FILE")]
+    trace: Option<PathBuf>,
+
+    /// Not supported: see --trace
+    #[arg(long, hide = true)]
+    trace_file_stat: bool,
+
+    /// Not supported: the engine's level parameters are not exposed for
+    /// printing
+    #[arg(long, hide = true)]
+    show_default_cparams: bool,
+
+    /// Not supported: no scheduler control is available
+    #[arg(long, hide = true, require_equals = true)]
+    priority: Option<String>,
+
+    /// Not supported: the trainer has no selectivity knob
+    #[arg(short = 's', hide = true, value_name = "#")]
+    dict_select: Option<u32>,
+
+    /// Not supported: the benchmark consolidates its files
+    #[arg(short = 'S', hide = true)]
+    separate_files: bool,
+
+    /// Not supported: the pause hook is not available
+    #[arg(short = 'p', hide = true)]
+    pause: bool,
+
+    /// Not supported: the synthetic benchmark corpus is the fixed lorem
+    /// text
+    #[arg(short = 'P', hide = true, value_name = "#")]
+    compressibility: Option<u32>,
+
+    /// Not supported: the console-detection test hooks are not available
+    #[arg(long, hide = true)]
+    fake_stdin_is_console: bool,
+
+    /// Not supported: see --fake-stdin-is-console
+    #[arg(long, hide = true)]
+    fake_stdout_is_console: bool,
+
+    /// Not supported: see --fake-stdin-is-console
+    #[arg(long, hide = true)]
+    fake_stderr_is_console: bool,
+
+    /// Not supported: mirrored output directories are not implemented
+    #[arg(long, hide = true, value_name = "DIR")]
+    output_dir_mirror: Option<PathBuf>,
 
     // Rejected flags: parsing them keeps the diagnostic a clear
     // "unsupported" error instead of clap's generic unknown-argument text.
@@ -510,6 +678,9 @@ enum Output {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = early_exit(std::env::args_os()) {
+        return code;
+    }
     let args = match normalize_args(std::env::args_os()) {
         Ok(args) => args,
         Err(message) => {
@@ -616,6 +787,22 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         eprintln!("{PREFIX}--maxdict only applies with --train");
         return Exit::Failure;
     }
+    // Parser-shaped rejections come first: a value the reference's own
+    // parser never spells is an unknown flag there.
+    if let Some(value) = cli.format.as_deref().filter(|format| *format != "zstd") {
+        eprintln!("Incorrect parameter: --format={value} ");
+        return Exit::Failure;
+    }
+    if let Some(value) = cli.priority.as_deref().filter(|value| *value != "rt") {
+        eprintln!("Incorrect parameter: --priority={value} ");
+        return Exit::Failure;
+    }
+    // Flags with no engine knob reject loudly with their reason; the
+    // identity flags never appear here (see their definitions).
+    if let Some((flag, reason)) = unsupported_flag(cli) {
+        eprintln!("{PREFIX}{flag} is not supported: {reason}");
+        return Exit::Failure;
+    }
 
     // Benchmark mode is self-contained: it gathers its own inputs and
     // rejects the flags it cannot honor (its own orphan knobs included).
@@ -673,7 +860,25 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     let threads = if cli.single_thread || cli.threads == 1 {
         1
     } else if cli.threads == 0 {
-        std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+        // zstd's -T0: physical cores by default, --auto-threads=logical
+        // switches the basis, announced at display level 3.
+        let physical = cli.auto_threads.as_deref() != Some("logical");
+        let count = if physical {
+            count_physical_cores()
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+        };
+        if cli.verbose >= 1 {
+            info!(
+                "Note: {count} {} core(s) detected ",
+                if physical {
+                    "physical"
+                } else {
+                    "logical"
+                }
+            );
+        }
+        count
     } else {
         cli.threads
     };
@@ -748,6 +953,15 @@ fn run(cli: &Cli, rm: bool) -> Exit {
             );
         }
     }
+    // zstdcli.c's post-expansion check: explicit inputs that expanded to
+    // nothing (empty directories) decline with this line at display level 1
+    // and still exit 0. A collection error already decided the failure.
+    if inputs.is_empty() && ok {
+        if cli.quiet < 2 {
+            eprintln!("please provide correct input file(s) or non-empty directories -- ignored ");
+        }
+        return Exit::Success;
+    }
 
     // Size flags shape the stdin stream's encoder row; a file input already
     // carries its exact size as the pledge, so honoring a second, looser
@@ -798,6 +1012,8 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         stream_size: cli.stream_size,
         size_hint: cli.size_hint,
         max_window: patch_max_window.or(cli.memory),
+        content_size: !cli.no_content_size,
+        include_dictid: !cli.no_dict_id,
     };
 
     let stdout_output =
@@ -864,6 +1080,174 @@ fn is_fifo(meta: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_fifo(_meta: &fs::Metadata) -> bool {
     false
+}
+
+/// The first flag on the command line the engine cannot honor, as its
+/// display form and the rejection reason.
+fn unsupported_flag(cli: &Cli) -> Option<(&'static str, &'static str)> {
+    [
+        (
+            cli.rsyncable,
+            "--rsyncable",
+            "the engine has no rsync-friendly block splitting",
+        ),
+        (
+            cli.compress_literals,
+            "--compress-literals",
+            "literal entropy mode is chosen per block by the encoder",
+        ),
+        (
+            cli.no_compress_literals,
+            "--no-compress-literals",
+            "literal entropy mode is chosen per block by the encoder",
+        ),
+        (
+            cli.row_match_finder,
+            "--row-match-finder",
+            "the matchfinder is selected per level row",
+        ),
+        (
+            cli.no_row_match_finder,
+            "--no-row-match-finder",
+            "the matchfinder is selected per level row",
+        ),
+        (
+            cli.target_cblock_size.is_some(),
+            "--target-compressed-block-size",
+            "no compressed-block-size target exists",
+        ),
+        (
+            cli.zstd_params.is_some(),
+            "--zstd=",
+            "raw compression-parameter forcing is not exposed",
+        ),
+        (
+            cli.max,
+            "--max",
+            "maximum-parameter compression needs raw parameter forcing",
+        ),
+        (
+            cli.trace.is_some(),
+            "--trace",
+            "the engine has no trace hooks",
+        ),
+        (
+            cli.trace_file_stat,
+            "--trace-file-stat",
+            "the engine has no trace hooks",
+        ),
+        (
+            cli.show_default_cparams,
+            "--show-default-cparams",
+            "the engine's level parameters are not exposed for printing",
+        ),
+        (
+            cli.priority.is_some(),
+            "--priority=rt",
+            "no scheduler control is available",
+        ),
+        (
+            cli.dict_select.is_some(),
+            "-s",
+            "the trainer has no selectivity knob",
+        ),
+        (
+            cli.separate_files,
+            "-S",
+            "the benchmark consolidates its files",
+        ),
+        (cli.pause, "-p", "the pause hook is not available"),
+        (
+            cli.compressibility.is_some(),
+            "-P",
+            "the synthetic benchmark corpus is the fixed lorem text",
+        ),
+        (
+            cli.fake_stdin_is_console,
+            "--fake-stdin-is-console",
+            "the console-detection test hooks are not available",
+        ),
+        (
+            cli.fake_stdout_is_console,
+            "--fake-stdout-is-console",
+            "the console-detection test hooks are not available",
+        ),
+        (
+            cli.fake_stderr_is_console,
+            "--fake-stderr-is-console",
+            "the console-detection test hooks are not available",
+        ),
+        (
+            cli.output_dir_mirror.is_some(),
+            "--output-dir-mirror",
+            "mirrored output directories are not implemented",
+        ),
+    ]
+    .into_iter()
+    .find(|(set, ..)| *set)
+    .map(|(_, flag, reason)| (flag, reason))
+}
+
+/// Distinct (physical id, core id) pairs from /proc/cpuinfo, zstd's
+/// UTIL_countPhysicalCores rule for -T0 and --auto-threads=physical; the
+/// logical core count stands in when the file is missing or empty-handed.
+fn count_physical_cores() -> u32 {
+    let logical = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let Ok(text) = fs::read_to_string("/proc/cpuinfo") else {
+        return logical;
+    };
+    let mut cores = std::collections::HashSet::new();
+    let (mut physical, mut core) = (None, None);
+    for line in text.lines() {
+        let value = || -> Option<u32> { line.split_once(':')?.1.trim().parse().ok() };
+        if line.starts_with("physical id") {
+            physical = value();
+        } else if line.starts_with("core id") {
+            core = value();
+        } else if line.is_empty() {
+            if let (Some(p), Some(c)) = (physical, core) {
+                cores.insert((p, c));
+            }
+            physical = None;
+            core = None;
+        }
+    }
+    if let (Some(p), Some(c)) = (physical, core) {
+        cores.insert((p, c));
+    }
+    if cores.is_empty() {
+        logical
+    } else {
+        cores.len() as u32
+    }
+}
+
+/// fileio.c's compressedFileExtensions table, verbatim: --exclude-compressed
+/// skips an input whose name ends in one of these.
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    ".zst", ".tzst", ".gz", ".tgz", ".lzma", ".xz", ".txz", ".lz4", ".tlz4", ".7z", ".aa3", ".aac",
+    ".aar", ".ace", ".alac", ".ape", ".apk", ".apng", ".arc", ".archive", ".arj", ".ark", ".asf",
+    ".avi", ".avif", ".ba", ".br", ".bz2", ".cab", ".cdx", ".chm", ".cr2", ".divx", ".dmg", ".dng",
+    ".docm", ".docx", ".dotm", ".dotx", ".dsft", ".ear", ".eftx", ".emz", ".eot", ".epub", ".f4v",
+    ".flac", ".flv", ".gho", ".gif", ".gifv", ".gnp", ".iso", ".jar", ".jpeg", ".jpg", ".jxl",
+    ".lz", ".lzh", ".m4a", ".m4v", ".mkv", ".mov", ".mp2", ".mp3", ".mp4", ".mpa", ".mpc", ".mpe",
+    ".mpeg", ".mpg", ".mpl", ".mpv", ".msi", ".odp", ".ods", ".odt", ".ogg", ".ogv", ".otp",
+    ".ots", ".ott", ".pea", ".png", ".pptx", ".qt", ".rar", ".s7z", ".sfx", ".sit", ".sitx",
+    ".sqx", ".svgz", ".swf", ".tbz2", ".tib", ".tlz", ".vob", ".war", ".webm", ".webp", ".wma",
+    ".wmv", ".woff",
+];
+
+/// Whether the name's extension is one of fileio's compressed extensions
+/// (its UTIL_getFileExtension rule: the last dot's tail, and a dot at
+/// position zero is no extension).
+fn is_compressed_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    match name.rfind('.') {
+        Some(at) if at > 0 => COMPRESSED_EXTENSIONS.contains(&&name[at..]),
+        _ => false,
+    }
 }
 
 /// How [`collect_input`] vets each path: the (de)compression modes stat up
@@ -978,6 +1362,15 @@ fn process(
     dict: Option<&[u8]>,
     rm: bool,
 ) -> AnyResult<()> {
+    // --exclude-compressed: an input whose extension marks it as already
+    // compressed is skipped silently (zstd notes it at display level 4).
+    if mode == Mode::Compress
+        && cli.exclude_compressed
+        && let Input::File(path) = input
+        && is_compressed_name(path)
+    {
+        return Ok(());
+    }
     let output = match mode {
         Mode::Test => Output::Sink,
         _ => {
@@ -989,7 +1382,14 @@ fn process(
                 let Input::File(path) = input else {
                     unreachable!()
                 };
-                Output::File(default_output_name(path, mode)?)
+                let mut out = default_output_name(path, mode)?;
+                // --output-dir-flat relocates derived names under DIR.
+                if let Some(dir) = &cli.output_dir_flat
+                    && let Some(name) = out.file_name()
+                {
+                    out = dir.join(name);
+                }
+                Output::File(out)
             }
         },
     };
@@ -1354,11 +1754,12 @@ fn compress(
     let mut options =
         EncoderOptions::new(Level::from_zstd(settings.level)).checksum(settings.checksum);
     // A file input pledges its metadata size; a stdin stream pledges
-    // --stream-size or nothing.
-    let pledged = settings
+    // --stream-size or nothing. --no-content-size keeps the size out of the
+    // header while it still shapes the row through the hint.
+    let known_size = settings
         .stream_size
         .or((source_size > 0).then_some(source_size as u64));
-    options = options.pledged_size(pledged);
+    options = options.pledged_size(settings.content_size.then_some(known_size).flatten());
     // --long forces the window, --size-hint sizes the row; a known pledge
     // still shrinks the window to the source inside the engine, as zstd
     // does.
@@ -1366,7 +1767,10 @@ fn compress(
     if let Some(log) = settings.window_log {
         shape = shape.with_window_log(log);
     }
-    if let Some(hint) = settings.size_hint {
+    let hint = settings
+        .size_hint
+        .or((!settings.content_size).then_some(known_size).flatten());
+    if let Some(hint) = hint {
         shape = shape.with_len(hint);
     }
     options = options.with_input_shape(shape);
@@ -1376,6 +1780,19 @@ fn compress(
     }
     if let Some(dict) = dict {
         options = options.dictionary(dict);
+    }
+    if !settings.include_dictid {
+        options = options.include_dictid(false);
+    }
+
+    // A suppressed --stream-size pledge still binds: the read byte count is
+    // checked here, with the encoder's own mismatch diagnostic.
+    if !settings.content_size
+        && let Some(pledged) = settings.stream_size
+    {
+        let count = Rc::new(Cell::new(0u64));
+        let reader = Box::new(CountingReader::new(reader, Rc::clone(&count)));
+        return compress_counted(reader, output, options, pledged, &count);
     }
 
     let (writer, out_file) = open_output(output)?;
@@ -1399,6 +1816,46 @@ fn compress(
     })();
     if written.is_err() {
         remove_partial_output(output);
+    }
+    written
+}
+
+/// The counted tail of [`compress`] for a suppressed --stream-size pledge:
+/// the encoder carries no pledge, so the mismatch check runs here on the
+/// read counter and fails with the engine's error-11 line.
+fn compress_counted(
+    mut reader: Box<dyn Read>,
+    output: &Output,
+    options: EncoderOptions,
+    pledged: u64,
+    count: &Rc<Cell<u64>>,
+) -> AnyResult<u64> {
+    let (writer, out_file) = open_output(output)?;
+    let written: AnyResult<u64> = (|| {
+        if let Some(file) = out_file {
+            let mut encoder = zstdx::stream::write::Encoder::with_options(writer, options)?;
+            io::copy(&mut reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(file.metadata()?.len())
+        } else {
+            let mut out = CountingWriter::new(writer);
+            let mut encoder = zstdx::stream::write::Encoder::with_options(&mut out, options)?;
+            io::copy(&mut reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(out.count)
+        }
+    })();
+    if written.is_err() {
+        remove_partial_output(output);
+        return written;
+    }
+    if count.get() != pledged {
+        remove_partial_output(output);
+        return Err(Diagnostic {
+            code: 11,
+            lines: vec![format!("{PREFIX}error 11 : Src size is incorrect ")],
+        }
+        .into());
     }
     written
 }
@@ -1661,7 +2118,15 @@ fn open_output(output: &Output) -> AnyResult<(Box<dyn Write>, Option<File>)> {
         Output::Stdout => Ok((Box::new(io::stdout().lock()), None)),
         Output::Sink => Ok((Box::new(io::sink()), None)),
         Output::File(path) => {
-            let file = File::create(path)?;
+            // FIO_openDstFile's refusal: the destination path with
+            // strerror, no input-name prefix.
+            let file = File::create(path).map_err(|err| {
+                Diagnostic::plain(vec![format!(
+                    "{PREFIX}{}: {}",
+                    path.display(),
+                    strerror(&err)
+                )])
+            })?;
             Ok((Box::new(file.try_clone()?), Some(file)))
         },
     }
@@ -1734,18 +2199,96 @@ const SEPARATE_VALUE_FLAGS: &[&str] = &[
     "-o",
     "--output",
     "-D",
-    "--dict",
     "-T",
     "--threads",
     "-M",
     "--memory",
+    "--memlimit",
+    "--memlimit-decompress",
     "--filelist",
-    "--file",
     "--patch-from",
     "--stream-size",
     "--size-hint",
     "--maxdict",
+    "--dictID",
+    "--target-compressed-block-size",
+    "--trace",
 ];
+
+/// The flags zstdcli.c answers inside its own argv scan, before any mode
+/// runs: -V/--version and the help trio. They exit at their argv position
+/// with the verbosity seen so far, so `-q -V` differs from `-V -q`.
+fn early_exit<I: IntoIterator<Item = OsString>>(args: I) -> Option<ExitCode> {
+    let mut args = args.into_iter();
+    args.next()?;
+    let mut level: i32 = 2;
+    for arg in args {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            return None;
+        }
+        if let Some(long) = text.strip_prefix("--") {
+            match long.split('=').next().unwrap_or(long) {
+                "version" => {
+                    print_version(level);
+                    return Some(ExitCode::SUCCESS);
+                },
+                "help" => {
+                    print_help();
+                    return Some(ExitCode::SUCCESS);
+                },
+                "quiet" => level -= 1,
+                "verbose" => level += 1,
+                _ => {},
+            }
+            continue;
+        }
+        for c in text.strip_prefix('-')?.chars() {
+            match c {
+                'V' => {
+                    print_version(level);
+                    return Some(ExitCode::SUCCESS);
+                },
+                'h' | 'H' => {
+                    print_help();
+                    return Some(ExitCode::SUCCESS);
+                },
+                'q' => level -= 1,
+                'v' => level += 1,
+                _ => {},
+            }
+        }
+    }
+    None
+}
+
+/// printVersion's shape: the bare version string below the default display
+/// level, the banner line otherwise, plus the format-support line from -v
+/// up. The text is zstdx's own; printing zstd's banner would claim false
+/// provenance.
+fn print_version(level: i32) {
+    if level < 2 {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    println!(
+        "*** zstdx command line interface (64-bit) v{}, pure-Rust Zstandard ***",
+        env!("CARGO_PKG_VERSION")
+    );
+    if level >= 3 {
+        println!("*** supports: zstd");
+    }
+}
+
+/// The help entries -h, -H and --help all share: zstd splits them into a
+/// short and a long usage, this build prints its full help for each.
+fn print_help() {
+    let mut command = Cli::command();
+    let help = command.render_help();
+    println!("{help}");
+}
 
 /// Translate zstd's `-#` level flags (`-1` .. `-19`) into the hidden
 /// `--level` option so clap can parse them, rejecting separated flag values
@@ -1754,6 +2297,10 @@ const SEPARATE_VALUE_FLAGS: &[&str] = &[
 fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<OsString>, String> {
     let mut normalized = Vec::new();
     let mut literal_args = false;
+    // zstdcli.c checks this pair after parsing; the line and the exit
+    // status are its own.
+    let mut has_dict = false;
+    let mut has_patch = false;
     let mut args = args.into_iter().enumerate().peekable();
     while let Some((index, arg)) = args.next() {
         if index == 0 || literal_args {
@@ -1764,6 +2311,17 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<OsStr
             literal_args = true;
             normalized.push(arg);
             continue;
+        }
+        if let Some(text) = arg.to_str() {
+            if text == "-D" {
+                has_dict = true;
+            }
+            if text == "--patch-from" || text.starts_with("--patch-from=") {
+                has_patch = true;
+            }
+        }
+        if has_dict && has_patch {
+            return Err("error : can't use -D and --patch-from=# at the same time ".into());
         }
         if let Some(text) = arg.to_str()
             && SEPARATE_VALUE_FLAGS.contains(&text)
@@ -1819,7 +2377,112 @@ fn normalize_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<OsStr
             None => normalized.push(arg),
         }
     }
+    // zstdcli.c overwrites a value flag's variable on every occurrence, so
+    // the last occurrence wins; clap rejects repeats, so earlier ones are
+    // dropped here together with their separated value argument. Anything
+    // at or after `--` is a file name.
+    let literal_at = normalized
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(normalized.len());
+    let mut last_index = std::collections::HashMap::new();
+    for (index, arg) in normalized[..literal_at].iter().enumerate() {
+        if let Some(key) = value_flag_key(arg) {
+            last_index.insert(key, index);
+        }
+    }
+    let mut dropped = std::collections::HashSet::new();
+    for (index, arg) in normalized[..literal_at].iter().enumerate() {
+        let Some(key) = value_flag_key(arg) else {
+            continue;
+        };
+        if last_index[&key] != index {
+            dropped.insert(index);
+            // a bare NEXT_FIELD spelling owns the following argument as its
+            // value; an `=`-attached one carries it inside
+            if arg
+                .to_str()
+                .is_some_and(|text| SEPARATE_VALUE_FLAGS.contains(&text))
+                && index + 1 < literal_at
+            {
+                dropped.insert(index + 1);
+            }
+        }
+    }
+    normalized = normalized
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped.contains(index))
+        .map(|(_, arg)| arg)
+        .collect();
     Ok(normalized)
+}
+
+/// Value-flag spellings whose repetition means last-wins in zstdcli.c
+/// (every NEXT_FIELD and readU32FromChar variable is a plain overwrite).
+const REPEATED_VALUE_FLAGS: &[&str] = &[
+    "--level",
+    "--fast",
+    "--adapt",
+    "--long",
+    "--zstd",
+    "--priority",
+    "--auto-threads",
+    "--format",
+    "-b",
+    "-e",
+    "-i",
+    "-B",
+    "-o",
+    "--output",
+    "-D",
+    "-T",
+    "--threads",
+    "-M",
+    "--memory",
+    "--memlimit",
+    "--memlimit-decompress",
+    "--filelist",
+    "--patch-from",
+    "--stream-size",
+    "--size-hint",
+    "--maxdict",
+    "--dictID",
+    "--target-compressed-block-size",
+    "--trace",
+    "-s",
+    "-P",
+    "--output-dir-flat",
+    "--output-dir-mirror",
+];
+
+/// The repeat-identity of one normalized argument: the long spelling up to
+/// `=`, or a value-flag short letter with a value-looking tail (digits and
+/// the size suffix letters) for `-oFILE`-style spellings. Bundled flag
+/// clusters and files never identify.
+fn value_flag_key(arg: &OsString) -> Option<String> {
+    let text = arg.to_str()?;
+    if !text.starts_with('-') || text == "-" {
+        return None;
+    }
+    if let Some(long) = text.strip_prefix("--") {
+        let head = long.split('=').next().unwrap_or(long);
+        let spelled = format!("--{head}");
+        return REPEATED_VALUE_FLAGS
+            .contains(&spelled.as_str())
+            .then_some(spelled);
+    }
+    let mut chars = text.chars();
+    let letter = chars.nth(1)?;
+    let tail: String = chars.collect();
+    let short = format!("-{letter}");
+    if !REPEATED_VALUE_FLAGS.contains(&short.as_str()) {
+        return None;
+    }
+    let value_like = tail
+        .chars()
+        .all(|c| c.is_ascii_digit() || "KMGiB".contains(c));
+    (tail.is_empty() || value_like).then_some(short)
 }
 
 /// A temporary utility function that appends a file extension
@@ -1840,7 +2503,7 @@ mod tests {
     use std::{
         ffi::OsString,
         io::{Cursor, Write as _},
-        path::PathBuf,
+        path::{Path, PathBuf},
     };
 
     use clap::Parser as _;
@@ -1848,8 +2511,8 @@ mod tests {
 
     use crate::{
         Cli, Diagnostic, Input, Mode, Output, Settings, add_extension, compress,
-        decode_failure_lines, decompress, default_output_name, normalize_args, parse_size,
-        progress_visible, rm_flag_last_wins,
+        decode_failure_lines, decompress, default_output_name, early_exit, is_compressed_name,
+        normalize_args, parse_size, progress_visible, rm_flag_last_wins,
     };
 
     /// A per-test temp path, pre-cleaned so reruns start from nothing.
@@ -1875,6 +2538,8 @@ mod tests {
             size_hint: None,
             max_window: None,
             adapt: None,
+            content_size: true,
+            include_dictid: true,
         }
     }
 
@@ -2374,7 +3039,7 @@ mod tests {
             "--single-thread",
             "--no-progress",
             "--ignore-errors",
-            "--file",
+            "--filelist",
             "list.txt",
         ])
         .unwrap();
@@ -2398,6 +3063,181 @@ mod tests {
 
         // --rm and -k coexist: run resolves them by position, like zstd
         assert!(Cli::try_parse_from(["zstdx", "--rm", "-k", "f"]).is_ok());
+    }
+
+    /// The R75 surface parses: -C, --no-dictID, --[no-]content-size,
+    /// --exclude-compressed, --memlimit aliases, --output-dir-flat,
+    /// --auto-threads, the identity flags, and the rejected spellings
+    /// (rejection happens in run, with the reason).
+    #[test]
+    fn r75_flags_parse() {
+        let cli = Cli::try_parse_from(["zstdx", "-C", "f"]).unwrap();
+        assert!(cli.check);
+        let cli = Cli::try_parse_from(["zstdx", "--no-dictID", "f"]).unwrap();
+        assert!(cli.no_dict_id);
+        let cli = Cli::try_parse_from(["zstdx", "--content-size", "f"]).unwrap();
+        assert!(cli.content_size);
+        let cli = Cli::try_parse_from(["zstdx", "--no-content-size", "f"]).unwrap();
+        assert!(cli.no_content_size);
+        assert!(Cli::try_parse_from(["zstdx", "--content-size", "--no-content-size"]).is_err());
+        let cli = Cli::try_parse_from(["zstdx", "--exclude-compressed", "f"]).unwrap();
+        assert!(cli.exclude_compressed);
+        let cli = Cli::try_parse_from(["zstdx", "--memlimit=1M", "f"]).unwrap();
+        assert_eq!(cli.memory, Some(1 << 20));
+        let cli = Cli::try_parse_from(["zstdx", "--memlimit-decompress", "512K", "f"]).unwrap();
+        assert_eq!(cli.memory, Some(512 << 10));
+        let cli = Cli::try_parse_from(["zstdx", "--output-dir-flat", "out", "f"]).unwrap();
+        assert_eq!(cli.output_dir_flat, Some(PathBuf::from("out")));
+        let cli = Cli::try_parse_from(["zstdx", "--auto-threads=logical", "f"]).unwrap();
+        assert_eq!(cli.auto_threads.as_deref(), Some("logical"));
+        let cli = Cli::try_parse_from(["zstdx", "--auto-threads", "physical", "f"]).unwrap();
+        assert_eq!(cli.auto_threads.as_deref(), Some("physical"));
+        assert!(Cli::try_parse_from(["zstdx", "--auto-threads=hybrid"]).is_err());
+        for identity in [
+            vec!["zstdx", "-n", "f"],
+            vec!["zstdx", "--asyncio", "f"],
+            vec!["zstdx", "--no-asyncio", "f"],
+            vec!["zstdx", "--mmap-dict", "f"],
+            vec!["zstdx", "--no-mmap-dict", "f"],
+            vec!["zstdx", "--format=zstd", "f"],
+        ] {
+            assert!(Cli::try_parse_from(identity.as_slice()).is_ok());
+        }
+        for rejected in [
+            vec!["zstdx", "--rsyncable", "f"],
+            vec!["zstdx", "--compress-literals", "f"],
+            vec!["zstdx", "--no-compress-literals", "f"],
+            vec!["zstdx", "--row-match-finder", "f"],
+            vec!["zstdx", "--no-row-match-finder", "f"],
+            vec!["zstdx", "--target-compressed-block-size=4K", "f"],
+            vec!["zstdx", "--zstd=wlog=20", "f"],
+            vec!["zstdx", "--max", "f"],
+            vec!["zstdx", "--trace", "t.log", "f"],
+            vec!["zstdx", "--trace=trace.log", "f"],
+            vec!["zstdx", "--trace-file-stat", "f"],
+            vec!["zstdx", "--show-default-cparams", "f"],
+            vec!["zstdx", "--priority=rt", "f"],
+            vec!["zstdx", "-s9", "f"],
+            vec!["zstdx", "-S", "f"],
+            vec!["zstdx", "-p", "f"],
+            vec!["zstdx", "-P50", "f"],
+            vec!["zstdx", "--fake-stdin-is-console"],
+            vec!["zstdx", "--fake-stdout-is-console"],
+            vec!["zstdx", "--fake-stderr-is-console"],
+            vec!["zstdx", "--output-dir-mirror", "out", "f"],
+        ] {
+            assert!(
+                Cli::try_parse_from(rejected.as_slice()).is_ok(),
+                "{rejected:?} must stay parseable for the run-time rejection"
+            );
+        }
+        // the aliases zstd 1.5.7 lacks fall back to unknown flags
+        for missing in [
+            vec!["zstdx", "--file", "list"],
+            vec!["zstdx", "--dict", "d.dict", "f"],
+            vec!["zstdx", "--recursive", "dir"],
+            vec!["zstdx", "--patch-apply", "ref", "f"],
+            vec!["zstdx", "--jobsize=1M", "f"],
+            vec!["zstdx", "--split=64K", "f"],
+        ] {
+            assert!(Cli::try_parse_from(missing.as_slice()).is_err());
+        }
+    }
+
+    /// Repeated value flags keep only the last occurrence, like zstdcli.c's
+    /// plain-variable overwrites; bundled flags and files never dedup.
+    #[test]
+    fn repeated_value_flags_last_wins() {
+        let normalize = |args: &[&str]| {
+            normalize_args(
+                std::iter::once("zstdx")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>()
+        };
+        // separated, attached and long= spellings all collapse to the last
+        assert_eq!(normalize(&["-D", "a", "-D", "b", "f"]), [
+            OsString::from("-D"),
+            OsString::from("b"),
+            OsString::from("f")
+        ]);
+        assert_eq!(normalize(&["-T4", "-T8", "f"]), [
+            OsString::from("-T8"),
+            OsString::from("f")
+        ]);
+        assert_eq!(normalize(&["--level=3", "--level=9", "f"]), [
+            OsString::from("--level=9"),
+            OsString::from("f")
+        ]);
+        assert_eq!(normalize(&["-o", "a", "-o", "b", "f"]), [
+            OsString::from("-o"),
+            OsString::from("b"),
+            OsString::from("f")
+        ]);
+        // after `--` every dash word is a file, and bundles stay whole
+        assert_eq!(normalize(&["-D", "a", "--", "-D", "b"]), [
+            OsString::from("-D"),
+            OsString::from("a"),
+            OsString::from("--"),
+            OsString::from("-D"),
+            OsString::from("b")
+        ]);
+        assert_eq!(normalize(&["-fk", "-D", "a", "f"]), [
+            OsString::from("-fk"),
+            OsString::from("-D"),
+            OsString::from("a"),
+            OsString::from("f")
+        ]);
+        // -D together with --patch-from is zstd's own parser error
+        assert_eq!(
+            normalize_args(
+                ["zstdx", "-D", "d", "--patch-from", "r", "f"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap_err(),
+            "error : can't use -D and --patch-from=# at the same time "
+        );
+    }
+
+    /// fileio's compressed-extension table governs --exclude-compressed,
+    /// with the leading-dot rule of UTIL_getFileExtension.
+    #[test]
+    fn compressed_name_rules() {
+        assert!(is_compressed_name(Path::new("a.zst")));
+        assert!(is_compressed_name(Path::new("b.tar.gz")));
+        assert!(is_compressed_name(Path::new("c.mp4")));
+        assert!(is_compressed_name(Path::new("d.woff")));
+        assert!(!is_compressed_name(Path::new("e.txt")));
+        assert!(!is_compressed_name(Path::new(".zst")), "dotfile stem");
+        assert!(!is_compressed_name(Path::new("noext")));
+    }
+
+    /// -V answers at its argv position with the verbosity seen so far, and
+    /// -h/-H/--help print the full help; nothing else intercepts.
+    #[test]
+    fn early_exit_flags() {
+        assert!(early_exit([OsString::from("zstdx")]).is_none());
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("f")]).is_none());
+        assert!(
+            early_exit([
+                OsString::from("zstdx"),
+                OsString::from("--"),
+                OsString::from("-V")
+            ])
+            .is_none()
+        );
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("-d")]).is_none());
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("-V")]).is_some());
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("-qV")]).is_some());
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("-H")]).is_some());
+        assert!(early_exit([OsString::from("zstdx"), OsString::from("--help")]).is_some());
     }
 
     /// --adapt parses with zstd's spellings: bare, either key alone, both

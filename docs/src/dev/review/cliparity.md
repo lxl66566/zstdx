@@ -50,6 +50,58 @@ Train-basic stderr also landed. DiB_train's level-2 small-corpus pair reports `!
 
 The encoder ratio gap was attributed and is not a defect. A level-3 size sweep over json, text and skewed at 64K to 32M, plus plain source text at 316K and 1M, reads -0.44 to +0.21% around parity. The CLI review's +0.045% text cell sits inside the dfast row's recorded near-tie band, together with json 32 MiB ST at +0.18% and the 09-12 ladder's dfast rows at +0.2 to +0.3%. It is not a new regression, and no probe was opened.
 
+## Flag surface audit (R75)
+
+The audit compared every flag zstd 1.5.7 accepts against the zstdx parser. The reference is the system zstd 1.5.7 binary (probed flag by flag for acceptance, diagnostics and exit codes) plus `zstdcli.c`, `fileio.c` and `util.c` for the semantics behind each acceptance. The source checkout at `/root/programs/fork/zstd` is 1.6.0-dev, so every flag it gained after 1.5.7 (`--patch-apply`, `--jobsize`, `--split`, the `--priority=` forms beyond `rt`) stays in the unknown-flag path here, matching 1.5.7's own `Incorrect parameter` answer.
+
+### Implemented this round
+
+| Flag | Behavior |
+|---|---|
+| `-C` | Short form of `--check`. |
+| `--no-dictID` | Omit the header Dictionary_ID through `EncoderOptions::include_dictid(false)`. The dictionary stays fully in effect. Inert in decode modes, like the reference. |
+| `--[no-]content-size` | `--no-content-size` keeps the size out of the header and moves it into the input-shape hint, so the row still sizes to the source. A suppressed `--stream-size` pledge is validated in the CLI by a read counter, keeping the error-11 line. |
+| `--exclude-compressed` | fileio's per-input skip against the verbatim `compressedFileExtensions` table (98 suffixes), compression only, silent, exit 0. |
+| `--memlimit`, `--memlimit-decompress` | Aliases of `--memory`. |
+| `--output-dir-flat=DIR` | Derived output names relocate under DIR. The directory must exist, and a missing one fails with `FIO_openDstFile`'s `zstd: <dst>: <strerror>` line, which now also covers every other destination-open failure. |
+| `--auto-threads={physical,logical}` | Selects the `-T0` basis. Physical is the default and counts distinct `/proc/cpuinfo` (physical id, core id) pairs like `UTIL_countPhysicalCores`, announced at `-v` with the `Note: N physical core(s) detected` line. |
+| `-n`, `--[no-]asyncio`, `--[no-]mmap-dict`, `--format=zstd` | Identity flags: the reference accepts them and this build's observable behavior is identical by construction, so they parse and change nothing. `--format` rejects the other values as `Incorrect parameter`, which is exactly what a zstd built without zlib/lzma/lz4 does. |
+| `-V`, `-h`, `-H`, `--help` | Answered during an argv scan before clap, at the verbosity seen so far: `-q -V` prints the bare version, `-V -v` adds `*** supports: zstd`. The text is zstdx's own (see deviations). |
+| repeated value flags | zstdcli.c overwrites each value variable, so the last occurrence wins. `normalize_args` now drops earlier occurrences together with their separated value, covering `-D a -D b`, `-T4 -T8`, `-o a -o b` and every other repeatable knob. |
+| empty expansion | Explicit inputs that expand to nothing (empty directories under `-r`) decline with `please provide correct input file(s) or non-empty directories -- ignored ` at display level 1 and exit 0, like zstdcli.c's post-expansion check. |
+| `-D` with `--patch-from` | zstdcli.c's own `error : can't use -D and --patch-from=# at the same time ` line, exit 1. |
+
+### Rejected loudly, engine knob needed
+
+Each parses and then rejects with `zstdx: <flag> is not supported: <reason>`, exit 1. The reasons live in `unsupported_flag`.
+
+- `--rsyncable` - no rsync-friendly block splitting. The reference itself errors with `Rsyncable mode is not compatible with single thread mode` only when `--single-thread` is set; our engine has no rsyncable mode at any thread count, so the rejection is unconditional and the divergence is deliberate.
+- `--[no-]compress-literals` - literal entropy mode is per block.
+- `--[no-]row-match-finder` - matchfinder selection is per level row.
+- `--target-compressed-block-size=#` - no block-size target exists.
+- `--zstd=PARAMS`, `--max` - raw compression-parameter forcing is not exposed.
+- `--trace=FILE`, `--trace-file-stat` - no engine trace hooks.
+- `--show-default-cparams` - the level table is not exposed for printing.
+- `--priority=rt` - no scheduler control; in 1.5.7 the flag only affects bench mode anyway.
+- `-s#` (dict selectivity), `-S` (bench separates files), `-p` (pause), `-P#` (synthetic corpus compressibility) - trainer and bench knobs that do not exist here.
+- `--fake-{stdin,stdout,stderr}-is-console` - zstd's own console-detection test hooks.
+- `--output-dir-mirror=DIR` - mirrored output trees need walk-relative path tracking; the only rejection that is fileio work rather than engine work.
+
+### Still out, deliberate
+
+- `--sparse`/`--no-sparse`, `--ignore-errors`, `--dictID=`, `--train-cover`, `--train-fastcover`, `--train-legacy` - unchanged from the earlier rounds.
+- The 1.6.0-dev-only flags stay unknown arguments, which is byte-matching with 1.5.7.
+
+### Audit deviations (accepted)
+
+- `-V` prints zstdx's own banner and version instead of zstd's `*** Zstandard CLI (64-bit) v1.5.7 ... ` line: printing zstd's banner from zstdx would claim false provenance, the same reasoning as the `-l -v` banner deviation. `-h` and `-H` both print the single clap help text; zstd splits them into a short and a long usage, and reproducing zstd's texts would document flags this build does not have.
+- The extra spellings zstd 1.5.7 lacks were removed: `--file` (filelist alias), `--dict` (long form of `-D`) and `--recursive` (long form of `-r`) now fall into `Incorrect parameter` like the reference. `--file` had been pinned as accepted, so the pin flipped.
+- Reference parser corners that stay ours: a separated `-M 512K`, `-T 4`, `-e 5`, `-i 1` or `-B 1M` value is consumed by clap, while zstd's inline-only `readU32FromChar` reads 0 and treats the value as a file name. The audit kept the clap shapes because matching would mean inventing input errors nobody asks for. `--memlimit-decompress=1M` is unreachable in the reference (its `--memlimit` prefix match swallows the flag first and then errors on the next entry); here it is a plain alias.
+- `-T` defaults to 1 where the reference defaults to an auto-sized MT worker pool (physical cores), because the default thread count changes the emitted frame bytes. `-T0` resolves the basis like the reference but the default stays single-threaded. Decode with `-T>1` also stays silent where zstd warns `decompression does not support multi-threading`, because MT decode is real here.
+- A trailing-slash directory argument produces reference names like `t//f.txt` (its strcat walk); the Rust join collapses the double slash. The file sets are identical.
+
+One pre-existing engine observation surfaced during the audit interop pass: at small source sizes with a dictionary attached, our frame header picks single-segment off while libzstd picks it on, so dict frames differ in header layout at those sizes (plain and `--no-content-size` frames are byte-identical on the same corpus). Both forms decode identically in both directions. Byte-pinning the dict-frame header is engine work under item 21a's dictionary surface, not a CLI defect.
+
 ## Accepted deviations
 
 - `-l` with `-v` or `-vv` would print zstd's banner `*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***`, and at `-vv` the line `Compressing with N worker threads` with a machine-dependent N. Printing zstd's banner from zstdx would claim false provenance, and the thread line depends on the MT configuration.
@@ -61,7 +113,7 @@ The final differential before the closeout landed at cases1 57/57 and cases2 50/
 
 ## Tests
 
-`cargo test -p zstdx-cli` is green with 97 tests, 43 unit and 54 integration. The train suite is now active in the default build, where the feature gate previously left it at zero. Pins were updated for the long9, long28 and stream-size exit codes and messages, the `--split` rejection, the partial-magic `unknown header`, the bench smoke `Exit::Success`, and train's dibio-shaped report. `cargo test -p zstdx` in debug is green. The closeout adds a pass-through unit test for copy-through, frame plus garbage, skippable positions, a truncated skippable frame and the foreign-format lines, and a small-corpus warning test for both lines and the `-q` and `-qq` layering. Decode walls are unchanged in a CLI A/B of old against new on json, text and skewed at zst3 and zst19, within 1 ms. The `parity --cases 4000` differential stays clean.
+`cargo test -p zstdx-cli` is green with 116 tests, 48 unit and 68 integration. The train suite is now active in the default build, where the feature gate previously left it at zero. Pins were updated for the long9, long28 and stream-size exit codes and messages, the `--split` rejection, the partial-magic `unknown header`, the bench smoke `Exit::Success`, and train's dibio-shaped report. `cargo test -p zstdx` in debug is green. The closeout adds a pass-through unit test for copy-through, frame plus garbage, skippable positions, a truncated skippable frame and the foreign-format lines, and a small-corpus warning test for both lines and the `-q` and `-qq` layering. Decode walls are unchanged in a CLI A/B of old against new on json, text and skewed at zst3 and zst19, within 1 ms. The `parity --cases 4000` differential stays clean.
 
 ## Commits
 

@@ -294,17 +294,23 @@ fn chunk_options(
     len: usize,
     dictionary: Option<&EncoderDictionary>,
 ) -> EncoderOptions {
+    let mut shape =
+        InputShape::default().with_window_log(settings.window_log.unwrap_or(ADAPT_WINDOW_LOG));
+    if !settings.content_size {
+        shape = shape.with_len(len as u64);
+    }
     let mut options = EncoderOptions::new(Level::from_zstd(level))
         .checksum(settings.checksum)
-        .pledged_size(Some(len as u64))
-        .with_input_shape(
-            InputShape::default().with_window_log(settings.window_log.unwrap_or(ADAPT_WINDOW_LOG)),
-        );
+        .pledged_size(settings.content_size.then_some(len as u64))
+        .with_input_shape(shape);
     if settings.threads > 1 {
         options = options.workers(settings.threads);
     }
     if let Some(dictionary) = dictionary {
         options = options.parsed_dictionary(dictionary);
+    }
+    if !settings.include_dictid {
+        options = options.include_dictid(false);
     }
     options
 }
@@ -447,6 +453,8 @@ mod tests {
             size_hint: None,
             max_window: None,
             adapt: Some(range),
+            content_size: true,
+            include_dictid: true,
         }
     }
 
