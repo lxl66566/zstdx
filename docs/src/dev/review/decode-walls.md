@@ -32,6 +32,10 @@ The ring's invariant 3 (`head < cap` and `tail < cap`) is exactly `wrap_add`'s p
 
 Stage A's `out_size` accumulation (Raw, RLE and Compressed arms) and stage B's `cap` fold now use saturating arithmetic, in the same style as the existing saturated Σml comments. On 32-bit targets a segment with enough capped blocks wrapped both consistently; today that is memory-safe through the per-block caps, but the accounting that sizes the stage-B region degraded silently. Saturation fails the region sizing loudly instead.
 
+## R74 follow-up pins
+
+Three more comment-only contracts became debug checks: `repeat_in_chunks` pins its doubling-anchor identity (`buffer.len() == start_idx + offset + copied`) at every step, the dict-reach gate in `repeat_from_dict` pins `total_output_counter >= buffer.len()` (the equality below is a well-defined "nothing drained" test only while that holds), and `FlatOut::abs_slice` pins the checksum range inside the decoded cursor of one physical generation.
+
 ## Gate numbers
 
 - Tests with every wall armed: debug 432+12+21, release 427+12+21, no-default-features 253+21, paranoid 432+12+21. Zero failures anywhere.

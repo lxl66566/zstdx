@@ -378,6 +378,10 @@ impl FlatOut {
     /// wrap).
     #[cfg(feature = "hash")]
     pub fn abs_slice(&self, a: usize, b: usize) -> &[u8] {
+        // Wraps fire in `ensure_block_space_inner` before a block's range
+        // is captured, so a legal caller's range always sits inside the
+        // decoded cursor of the current physical generation.
+        debug_assert!(a <= b && b <= self.end, "range leaves the decoded cursor");
         &self.buf[a..b]
     }
 

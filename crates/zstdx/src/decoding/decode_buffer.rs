@@ -191,6 +191,14 @@ impl DecodeBuffer {
         // matters a lot for small offsets (e.g. offset=1 used to copy byte by byte).
         let mut copied = 0;
         while copied < match_length {
+            // Pins the SAFETY argument's core identity at every step: the
+            // anchor stays put while both sides grow in lockstep, so each
+            // chunk reads only initialized bytes behind it.
+            debug_assert_eq!(
+                self.buffer.len(),
+                start_idx + offset + copied,
+                "doubling anchor must stay glued to the write cursor"
+            );
             // SAFETY: Requirements checked:
             // 1. start_idx + chunk must be <= self.buffer.len() chunk <= offset + copied, and
             //    buffer.len() == start_idx + offset + copied at this point (start of the first
@@ -216,6 +224,15 @@ impl DecodeBuffer {
         // virtual middle is gone, so any offset past the retained window is
         // corruption. (Streaming dict frames take the flat buffer, whose
         // generation model keeps the reference's reach and dict expiry.)
+        // The counter never trails the buffer (every append path counts,
+        // drains only remove), so the equality below is a well-defined
+        // "nothing was handed out yet" test.
+        debug_assert!(
+            self.total_output_counter >= self.buffer.len() as u64,
+            "output counter {} trails the buffered {} bytes",
+            self.total_output_counter,
+            self.buffer.len()
+        );
         if self.buffer.len() as u64 == self.total_output_counter {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
