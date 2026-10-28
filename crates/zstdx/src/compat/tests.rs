@@ -14,6 +14,28 @@ fn payload() -> Vec<u8> {
     (0..300 * 1024).map(|i| (i % 251) as u8).collect()
 }
 
+/// An 8 KiB random tile repeated: matches live at the tile period, so a
+/// forced 1 KiB window loses them, and 3 MiB or more clears the 2 MiB
+/// multithread engagement gate.
+fn wide_period_payload(repeats: usize) -> Vec<u8> {
+    let tile: Vec<u8> = {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..8 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 33) as u8
+            })
+            .collect()
+    };
+    let mut data = Vec::with_capacity(tile.len() * repeats);
+    for _ in 0..repeats {
+        data.extend_from_slice(&tile);
+    }
+    data
+}
+
 #[test]
 fn bulk_roundtrip() {
     let data = payload();
@@ -92,6 +114,166 @@ fn bulk_content_size_parity() {
         compat::bulk::decompress(&empty, 0).unwrap(),
         Vec::<u8>::new()
     );
+}
+
+/// The bulk `Compressor` parameter methods: `include_checksum` and
+/// `include_contentsize` flip their frame-header fields, and both survive
+/// a dictionary re-register like libzstd's context parameters (a bulk
+/// context has no started state — every `compress` call is a complete
+/// job, so the setters apply to each next job and never fail mid-stream).
+#[test]
+fn bulk_compressor_frame_parameters() {
+    let data = payload();
+
+    // include_checksum: the header flag and the four frame-tail bytes
+    let mut on = compat::bulk::Compressor::new(3).unwrap();
+    on.include_checksum(true).unwrap();
+    let with = on.compress(&data).unwrap();
+    let mut off = compat::bulk::Compressor::new(3).unwrap();
+    off.include_checksum(false).unwrap();
+    let without = off.compress(&data).unwrap();
+    let (header, _) = crate::decoding::frame::read_frame_header(with.as_slice()).unwrap();
+    assert!(header.descriptor.content_checksum_flag());
+    let (header, _) = crate::decoding::frame::read_frame_header(without.as_slice()).unwrap();
+    assert!(!header.descriptor.content_checksum_flag());
+    assert_eq!(
+        without.len() + 4,
+        with.len(),
+        "the checksum is four tail bytes"
+    );
+    // the setting persists across jobs, and both frames decode
+    assert_eq!(off.compress(&data).unwrap(), without);
+    assert_eq!(
+        compat::bulk::decompress(&without, data.len()).unwrap(),
+        data
+    );
+    // libzstd's checksum-less frame decodes through the compat layer
+    let mut zoff = zstd::bulk::Compressor::new(3).unwrap();
+    zoff.include_checksum(false).unwrap();
+    let zmade = zoff.compress(&data).unwrap();
+    assert_eq!(compat::bulk::decompress(&zmade, data.len()).unwrap(), data);
+
+    // include_contentsize: the pledge still sizes the frame, but the
+    // header carries no content-size field
+    let mut on = compat::bulk::Compressor::new(3).unwrap();
+    let with = on.compress(&data).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&with)
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap()),
+        Some(data.len())
+    );
+    let mut off = compat::bulk::Compressor::new(3).unwrap();
+    off.include_contentsize(false).unwrap();
+    let without = off.compress(&data).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&without).unwrap(),
+        None
+    );
+    assert_eq!(compat::bulk::Decompressor::upper_bound(&without), None);
+    assert_eq!(compat::bulk::decompress(&without, 0).unwrap(), data);
+
+    // the parameters are context state: a dictionary re-register keeps them
+    let dict: Vec<u8> = b"[Unit]\nDescription=shared boilerplate block\n".repeat(48);
+    let content = b"[Unit]\nDescription=shared boilerplate block\npayload line\n".repeat(64);
+    let mut compressor = compat::bulk::Compressor::new(3).unwrap();
+    compressor.include_contentsize(false).unwrap();
+    compressor.include_checksum(false).unwrap();
+    compressor.set_dictionary(5, &dict).unwrap();
+    let frame = compressor.compress(&content).unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+        None
+    );
+    let (header, _) = crate::decoding::frame::read_frame_header(frame.as_slice()).unwrap();
+    assert!(!header.descriptor.content_checksum_flag());
+    let mut dec = compat::bulk::Decompressor::with_dictionary(&dict).unwrap();
+    assert_eq!(dec.decompress(&frame, 0).unwrap(), content);
+}
+
+/// The bulk `Compressor`'s `window_log` and `multithread`: a forced
+/// window clamps to the format's 10..=27 and shows in the frame header,
+/// and a worker count above one routes onto the native multithreaded
+/// bulk path (below the 2 MiB engagement gate, or at `workers <= 1`, the
+/// single-threaded core answers with its own bytes).
+#[test]
+fn bulk_compressor_window_and_workers() {
+    let data = wide_period_payload(384);
+
+    // forced 1 KiB window: the header window is the forced value (the
+    // below-minimum 9 clamps up to 10) and the far matches are lost
+    let mut plain = compat::bulk::Compressor::new(3).unwrap();
+    let open = plain.compress(&data).unwrap();
+    let mut forced = compat::bulk::Compressor::new(3).unwrap();
+    forced.window_log(9).unwrap();
+    let clamped = forced.compress(&data).unwrap();
+    let (header, _) = crate::decoding::frame::read_frame_header(clamped.as_slice()).unwrap();
+    assert_eq!(header.window_size().unwrap(), 1024);
+    assert!(clamped.len() > open.len());
+    assert_eq!(compat::bulk::decompress(&clamped, 0).unwrap(), data);
+
+    // workers > 1: byte-identical to the native options entry, and a
+    // restart-point frame the ST path never emits
+    let mut mt = compat::bulk::Compressor::new(3).unwrap();
+    mt.multithread(4).unwrap();
+    let frame = mt.compress(&data).unwrap();
+    let native = crate::bulk::compress_with(
+        &data,
+        &crate::EncoderOptions::new(crate::Level::from_zstd(3))
+            .pledged_size(Some(data.len() as u64))
+            .workers(4),
+    )
+    .unwrap();
+    assert_eq!(frame, native);
+    assert_ne!(frame, open);
+    // both engines decode the MT frame
+    assert_eq!(compat::bulk::decompress(&frame, 0).unwrap(), data);
+    let mut zdecoded = Vec::new();
+    zstd::stream::copy_decode(frame.as_slice(), &mut zdecoded).unwrap();
+    assert_eq!(zdecoded, data);
+
+    // workers <= 1 stays single-threaded, and a small payload under
+    // multithread keeps the ST bytes through the engagement gate
+    let mut one = compat::bulk::Compressor::new(3).unwrap();
+    one.multithread(1).unwrap();
+    assert_eq!(one.compress(&data).unwrap(), open);
+    let small = payload();
+    let mut st = compat::bulk::Compressor::new(3).unwrap();
+    let st_small = st.compress(&small).unwrap();
+    let mut demoted = compat::bulk::Compressor::new(3).unwrap();
+    demoted.multithread(4).unwrap();
+    assert_eq!(demoted.compress(&small).unwrap(), st_small);
+}
+
+/// The bulk `Decompressor`'s `window_log_max`: the same 10..=31 range
+/// gate as the stream decoders, and the bound refuses frames whose
+/// header window exceeds it on every later job.
+#[test]
+fn bulk_decompressor_window_log_max() {
+    // 5 MiB of content keeps the forced 4 MiB window above the source
+    // clamp (a 3 MiB source would clamp it down to 3 MiB, as in libzstd)
+    let data = wide_period_payload(640);
+    let mut enc = compat::bulk::Compressor::new(3).unwrap();
+    enc.window_log(22).unwrap();
+    let frame = enc.compress(&data).unwrap();
+    let (header, _) = crate::decoding::frame::read_frame_header(frame.as_slice()).unwrap();
+    assert_eq!(header.window_size().unwrap(), 1 << 22);
+
+    // outside the range: refused without touching the context's bound
+    let mut dec = compat::bulk::Decompressor::new().unwrap();
+    assert!(dec.window_log_max(9).is_err());
+    assert!(dec.window_log_max(32).is_err());
+    // a bound below the frame's window refuses, one at it decodes
+    dec.window_log_max(21).unwrap();
+    assert!(dec.decompress(&frame, 0).is_err());
+    let mut wide = compat::bulk::Decompressor::new().unwrap();
+    wide.window_log_max(22).unwrap();
+    assert_eq!(wide.decompress(&frame, 0).unwrap(), data);
+    // the narrow bound persists across jobs: small frames decode, the
+    // wide one keeps refusing
+    let small = compat::bulk::compress(&payload(), 3).unwrap();
+    assert_eq!(dec.decompress(&small, 0).unwrap(), payload());
+    assert!(dec.decompress(&frame, 0).is_err());
 }
 
 /// The zstd crate's dictionary lifecycle on `bulk::Compressor`:

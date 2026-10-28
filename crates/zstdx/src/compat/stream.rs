@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::{
+    check_window_log_max,
     dict::{DecoderDictionary, EncoderDictionary},
     map_level,
 };
@@ -88,20 +89,6 @@ impl<W: io::Write> EncoderState<W> {
                 .expect("do_finish ran before the writer is reclaimed"),
             None => self.writer.take().expect("writer kept until start"),
         }
-    }
-}
-
-/// The accepted `window_log_max` range, libzstd's `ZSTD_d_windowLogMax`
-/// bounds; the upper end also keeps `1 << log` from overflowing.
-const WINDOW_LOG_MAX_RANGE: core::ops::RangeInclusive<u32> = 10..=31;
-
-fn check_window_log_max(log: u32) -> io::Result<()> {
-    if WINDOW_LOG_MAX_RANGE.contains(&log) {
-        Ok(())
-    } else {
-        Err(io::Error::other(crate::Error::Parameter(
-            crate::ParameterError::WindowLogMaxOutOfRange(log),
-        )))
     }
 }
 

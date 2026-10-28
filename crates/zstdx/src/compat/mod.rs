@@ -15,8 +15,11 @@
 //!   behind the `dict_builder` feature.
 //! - `zstd_safe` (and the `stream::{raw,zio}` layer around it) has no equivalent; the native
 //!   low-level API is [`crate::encoding`]/[`crate::decoding`]. The context wrappers therefore take
-//!   no `'a` lifetime, and `with_context`/`with_writer`/`with_encoder`/`set_parameter`/
-//!   `context_mut` have no counterpart.
+//!   no `'a` lifetime, and `with_context`/`with_writer`/`with_encoder`/`with_decoder`/
+//!   `set_parameter`/`context_mut` and the borrowing
+//!   `dict::{EncoderDictionary,DecoderDictionary}::new` constructors have no counterpart.
+//!   `set_target_cblock_size` is out as well: honoring it needs sub-block splitting, which loses
+//!   ratio on every measured shape.
 //! - `bulk::Decompressor::decompress` treats `capacity` as a growing hint, where the zstd crate
 //!   errors when the content exceeds it; [`bulk::Decompressor::upper_bound`] always answers
 //!   (upstream needs the `experimental` feature).
@@ -24,6 +27,8 @@
 //!   `BufReader`, so `get_ref`/`get_mut`/`finish` expose `R`, not `BufReader<R>`.
 //!
 //! [`zstd` crate]: https://docs.rs/zstd/0.13
+
+use std::io;
 
 pub mod bulk;
 pub mod dict;
@@ -38,6 +43,22 @@ mod tests;
 pub use stream::{decode_all, encode_all, read::Decoder, write::Encoder};
 
 use crate::Level;
+
+/// The accepted `window_log_max` range, libzstd's `ZSTD_d_windowLogMax`
+/// bounds; the upper end also keeps `1 << log` from overflowing. Shared by
+/// the stream decoders and the bulk `Decompressor`.
+const WINDOW_LOG_MAX_RANGE: core::ops::RangeInclusive<u32> = 10..=31;
+
+/// Validates a `window_log_max` value against libzstd's bounds.
+fn check_window_log_max(log: u32) -> io::Result<()> {
+    if WINDOW_LOG_MAX_RANGE.contains(&log) {
+        Ok(())
+    } else {
+        Err(io::Error::other(crate::Error::Parameter(
+            crate::ParameterError::WindowLogMaxOutOfRange(log),
+        )))
+    }
+}
 
 /// Default compression level, mirroring the zstd crate's constant.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;

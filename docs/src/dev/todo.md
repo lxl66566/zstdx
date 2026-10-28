@@ -18,7 +18,6 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 87 symbols deliberately out, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
-| 27 | compat bulk parameter methods | zstd 0.13 shape parity on the bulk types | Shape work only; the knobs already live in the option structs | [periph review](review/periph.md) |
 
 ## Item notes
 
@@ -104,10 +103,6 @@ The remaining compile-time menu holds A/B-gated refactors of hot code. Cross-dom
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
 
-### 27. compat bulk parameter methods
-
-The compat bulk `Compressor` and `Decompressor` lack the parameter methods the zstd 0.13 crate gives them: `include_checksum`, `include_contentsize`, `window_log`, `multithread` on the encoder and `window_log_max` on the decoder. The compat stream types already carry the set, and `EncoderOptions` and `DecoderOptions` hold every knob, so the work is bulk shapes routing into the existing setters; the `window_log_max` range check currently lives in `compat/stream.rs` and moves to a shared module when the bulk setter lands.
-
 ## Identified floors
 
 - Streaming decode reads json x1.13 to x1.33, skewed x1.08 to x1.28, text x1.04 to x1.20 and dll x1.28 to x1.34. The fused bit-read is in place as a per-callsite `const FUSED` monomorphization: the flat executor is fused, and the staging split stays machine-code-identical. The real-offset constant rotation is also in place, with json stream at -1.1% to -1.6%, skewed.zst3/9 stream at -2.4% and -3.0%, dll100 at +1% to +1.4% and text flat. The fused loop's cycle gap is pure dispatched-op volume under identical front-end service: op-cache occupancy is 99.5% on both sides, the loop buffer is unused, the front-end stall differential is at most 2.4 cycle-equivalent percentage points, and the IBS fetch latency in the loop is near zero. Every instruction-volume, structural and layout lever is falsified or measured out. See [decoding](perf/decoding.md) and [dec-gap](bench/dec-gap.md).
@@ -129,6 +124,7 @@ The compat bulk `Compressor` and `Decompressor` lack the parameter methods the z
 | 8 | Intermediate SIMD tiers | Every AVX2-capable CPU already runs the top decode tier, SSE2 is baseline, and the vector batching class is falsified. The experimental API entries and language bindings are deliberate gaps. | [negative](negative/decoding.md), [negative](negative/entropy.md), [encoding](perf/encoding.md) |
 | 20 | Entropy-core review follow-ups | The weights FSE table caps at 11, the parity sweep closed with zero divergences, dead block-decoder state was removed, and the fuzz seeds cover the new classes. | [declean](review/declean.md), [parity](review/parity.md) |
 | 21 | Parity follow-ups | The dictionary differential swept 204k cases, `zstdx-bench parity` institutionalizes the differential, OR scans are first-class mutations, and the weight-cap shape is a fuzz seed. | [dictparity](review/dictparity.md), [diffbench](review/diffbench.md) |
+| 27 | compat bulk parameter methods | The bulk `Compressor` carries `include_checksum`, `include_contentsize`, `window_log` and `multithread`, the `Decompressor` `window_log_max`, all routed into the existing option structs with the range gate shared with the stream side. | [periph review](review/periph.md) |
 
 ## Closed-item notes
 
@@ -163,6 +159,10 @@ The CLI `-l` level-3 residue of +0.045% on the 316 KiB corpus is attributed to t
 ### Item 24
 
 The balanced json +0.44% Ir residue is placement-only. A 4x order-swapped interleaved wall A/B on `prof enc 9` json, with base `e640cf30` against HEAD, is flat to positive, with a base median of 155.5 against 159 MiB/s and every pair favoring HEAD, so the memory-bound chain tier never pays the extra instructions and no placement recovery was spent. The compile-time menu remains an A/B-gated refactor of hot code: `WinPos` and `TableIdx` index newtypes that never mix, `NonZero` distance at the resolve sites so distance 0 is unrepresentable, and enum rep-bases replacing off-base integers. The `Option<Candidate>` arm is landed over the btlazy selection, with the btlazy len-0 sentinels gone and `Scored` owning the candidate-score pair. The owned window's committed-length to staged-end carry zone is caller-live under the pre-split convention, so walling it needs a caller-contract change and waits for a bug to land there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
+
+### Item 27
+
+The compat bulk types carry the zstd 0.13 parameter methods. `Compressor` gains `include_checksum`, `include_contentsize`, `window_log` and `multithread`, `Decompressor` gains `window_log_max`; every one routes into `EncoderOptions` or the `FrameDecoder` window bound, with no new engine knobs. A bulk context is job-shaped, so each setter applies to the next job and none has a started-state refusal, and the parameters survive a dictionary re-register like libzstd's context parameters. `include_contentsize(false)` degrades the always-on bulk pledge to an input-shape hint, the mapping the stream encoders apply at materialize, so the header keeps no content-size field while the length still sizes the frame. `window_log` feeds `InputShape::window_log` with the engine's 10..=27 clamp, and `multithread` rides the native MT bulk entry, so the small-input and dict-id-suppressed engagement demotions apply as on the native path. The `window_log_max` range check moved from `compat/stream.rs` to the compat module and serves the stream decoders and the bulk setter. The remaining non-experimental exclusions are the deliberate ones: `set_target_cblock_size` (item 18) and the zstd_safe-passthrough family.
 
 ## Deleted item numbers
 

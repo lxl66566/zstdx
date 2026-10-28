@@ -3,6 +3,7 @@
 use std::{io, vec::Vec};
 
 use super::{
+    check_window_log_max,
     dict::{DecoderDictionary, EncoderDictionary},
     map_level,
 };
@@ -101,6 +102,16 @@ impl Decompressor {
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))
     }
 
+    /// Sets the maximum window log distance as `2^log_distance` (the
+    /// accepted range is libzstd's `ZSTD_d_windowLogMax` bounds, 10..=31).
+    /// Frames needing a larger window fail to decode; affects future
+    /// decompressions, like every other parameter on this context.
+    pub fn window_log_max(&mut self, log_distance: u32) -> io::Result<()> {
+        check_window_log_max(log_distance)?;
+        self.inner.set_max_window_size(1u64 << log_distance);
+        Ok(())
+    }
+
     /// Decompresses into the Vec, growing it if the capacity is too small.
     /// Decodes through this decompressor, so a dictionary attached at
     /// construction applies (the zstd crate's semantics).
@@ -178,6 +189,18 @@ pub struct Compressor {
     /// libzstd's dictIDFlag, a context parameter that outlives dictionary
     /// changes (unlike the dictionary itself).
     include_dictid: bool,
+    /// libzstd's checksumFlag; gated by the `hash` feature, like
+    /// `EncoderOptions::checksum`.
+    checksum: bool,
+    /// libzstd's contentSizeFlag: `false` keeps the source length as a
+    /// sizing hint but leaves the header without the content-size field.
+    contentsize_flag: bool,
+    /// Forced window log (`ZSTD_c_windowLog`), clamped by the engine to
+    /// the format's 10..=27.
+    window_log: Option<u32>,
+    /// Worker count (`ZSTD_c_nbWorkers`); above one engages the
+    /// multithreaded bulk path.
+    workers: u32,
     /// Explicit long-distance-matching switch (the zstd crate's bool maps
     /// true to force-enable, false to libzstd's auto value).
     long_distance_matching: crate::LdmMode,
@@ -190,6 +213,10 @@ impl Compressor {
             level,
             dict: Attachment::None,
             include_dictid: true,
+            checksum: true,
+            contentsize_flag: true,
+            window_log: None,
+            workers: 0,
             long_distance_matching: crate::LdmMode::Auto,
         })
     }
@@ -215,6 +242,10 @@ impl Compressor {
             level: dictionary.compression_level(),
             dict: Attachment::Prepared(dictionary.clone()),
             include_dictid: true,
+            checksum: true,
+            contentsize_flag: true,
+            window_log: None,
+            workers: 0,
             long_distance_matching: crate::LdmMode::Auto,
         })
     }
@@ -263,6 +294,42 @@ impl Compressor {
     /// dictionary changes, like any context parameter.
     pub fn include_dictid(&mut self, include: bool) -> io::Result<()> {
         self.include_dictid = include;
+        Ok(())
+    }
+
+    /// Controls whether each frame ends with a content checksum (default
+    /// on; inert when the `hash` feature is off). Affects future
+    /// compression jobs.
+    pub fn include_checksum(&mut self, include_checksum: bool) -> io::Result<()> {
+        self.checksum = include_checksum;
+        Ok(())
+    }
+
+    /// Enables or disables storing of the content size in the frame
+    /// header (default on). The bulk paths pledge the source length
+    /// either way; with the flag off the pledge still sizes the frame
+    /// but the header carries no content-size field. Affects future
+    /// compression jobs.
+    pub fn include_contentsize(&mut self, include_contentsize: bool) -> io::Result<()> {
+        self.contentsize_flag = include_contentsize;
+        Ok(())
+    }
+
+    /// Sets the maximum back-reference distance as `2^log_distance`
+    /// (clamped to the format's 10..=27); a known smaller source clamps
+    /// it further, as in libzstd. Affects future compression jobs.
+    pub fn window_log(&mut self, log_distance: u32) -> io::Result<()> {
+        self.window_log = Some(log_distance);
+        Ok(())
+    }
+
+    /// Enables multithreaded compression: `workers > 1` engages the
+    /// native multithreaded bulk path; `workers <= 1` stays
+    /// single-threaded. Affects future compression jobs. Unlike the
+    /// stream encoders there is no started state — every `compress` call
+    /// is a complete job, so the setters always apply to the next one.
+    pub fn multithread(&mut self, workers: u32) -> io::Result<()> {
+        self.workers = workers;
         Ok(())
     }
 
@@ -326,9 +393,23 @@ impl Compressor {
             Attachment::Prepared(dict) => dict.compression_level(),
             _ => self.level,
         };
-        let mut options = crate::EncoderOptions::new(map_level(level)).pledged_size(Some(len));
+        let mut options = crate::EncoderOptions::new(map_level(level));
+        // ContentSizeFlag=false: the pledge degrades to a sizing hint
+        // (`input_shape.len`) and the header carries no content-size
+        // field, the same mapping the compat stream encoders apply at
+        // materialize.
+        if self.contentsize_flag {
+            options.pledged_size = Some(len);
+        } else {
+            let mut shape = options.input_shape;
+            shape.len = Some(len);
+            options = options.with_input_shape(shape);
+        }
+        options.checksum = self.checksum && cfg!(feature = "hash");
         options.include_dictid = self.include_dictid;
         options.long_distance_matching = self.long_distance_matching;
+        options.workers = self.workers;
+        options.input_shape.window_log = self.window_log;
         match &self.dict {
             Attachment::None => Ok(options),
             Attachment::Raw(_) => unreachable!("resolved above"),
