@@ -14,11 +14,14 @@
 //!   length), bits 2..5 a window nibble (0 keeps the row's window, 1..=15 force window log nibble+9
 //!   — sub-block windows included, offsets must stay inside whatever window the frame declares),
 //!   bits 6..7 the LDM tri-state (0/3 Auto, 1 Enable, 2 Disable).
-//! - `k`: number of length-prefixed chunks ahead of a final remainder chunk. `pos = 0`; for `i in
-//!   0..=k`: when `i < k` and at least two bytes of `rest` remain, a `u16` LE length prefix at
-//!   `rest[pos..]` picks `chunk = rest[pos+2 .. pos+2+len]` (clamped to the available bytes) and
-//!   advances `pos` past it; otherwise the chunk is the whole remainder — so ALL of `rest` is
-//!   covered. Inputs shorter than the header bytes degrade to a single empty payload.
+//! - `k` with bit 7 clear: number of length-prefixed chunks ahead of a final remainder chunk.
+//!   `pos = 0`; for `i in 0..=k`: when `i < k` and at least two bytes of `rest` remain, a `u16` LE
+//!   length prefix at `rest[pos..]` picks `chunk = rest[pos+2 .. pos+2+len]` (clamped to the
+//!   available bytes) and advances `pos` past it; otherwise the chunk is the whole remainder — so
+//!   ALL of `rest` is covered. Inputs shorter than the header bytes degrade to a single empty
+//!   payload. Bit 7 set switches `rest` to structure mode: a small program expanded
+//!   deterministically into one large payload (see [`expand_program`]), the R74
+//!   lever for the multi-KiB-period structure mutation never builds.
 //!
 //! Every chunk's frame must decode back to that chunk through both our
 //! decoder and the reference implementation.
@@ -26,13 +29,15 @@
 //! `cross_window_seed` additionally constructs a beyond-window redundancy
 //! payload per input (R73): the R71 campaign proved evolved inputs never
 //! build multi-KiB-period structure, so that class is pinned here as
-//! committed seed-construction code instead.
+//! committed seed-construction code instead. `structured_seed` (R74) does
+//! the same through the program grammar at block-crossing scale.
 
 use libfuzzer_sys::fuzz_target;
 use zstdx::{Level, decoding::FrameDecoder};
 
 fuzz_target!(|data: &[u8]| {
     cross_window_seed(data);
+    structured_seed(data);
 
     let (level_byte, opt_byte, k, rest) = match data {
         [l, o, k, rest @ ..] => (*l, *o, *k, rest),
@@ -40,6 +45,11 @@ fuzz_target!(|data: &[u8]| {
         [l] => (*l, 0, 0, &[][..]),
         _ => (0, 0, 0, &[][..]),
     };
+
+    if k & 0x80 != 0 {
+        structured_roundtrip(level_byte, opt_byte, rest);
+        return;
+    }
 
     let mut pos = 0;
     for i in 0..=k {
@@ -236,4 +246,268 @@ fn cross_window_payload(
     }
     out.truncate(len);
     out
+}
+
+/// Structure-mode expansion cap: two full 128 KiB blocks plus tail, so
+/// repeat events can cross block boundaries.
+const EXPAND_CAP: usize = 256 * 1024;
+
+/// FNV-1a over the program bytes; `| 1` keeps the xorshift state nonzero.
+fn program_seed(prog: &[u8]) -> u64 {
+    prog.iter()
+        .fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+        | 1
+}
+
+/// Operand readers; bytes past the program end read as zero, so truncated
+/// events execute with defaulted operands instead of failing.
+fn u16_field(prog: &[u8], i: usize) -> usize {
+    usize::from(u16::from_le_bytes([
+        prog.get(i).copied().unwrap_or(0),
+        prog.get(i + 1).copied().unwrap_or(0),
+    ]))
+}
+
+fn u24_field(prog: &[u8], i: usize) -> usize {
+    u16_field(prog, i) | (usize::from(prog.get(i + 2).copied().unwrap_or(0)) << 16)
+}
+
+/// Structure mode (R74): `rest` is a small program expanded
+/// deterministically into one payload of up to [`EXPAND_CAP`] bytes plus
+/// an optional synthetic raw dictionary. A 7-byte repeat event demands a
+/// copy at any distance up to 16 MiB, so `max_len` stays small while the
+/// encoder sees multi-KiB-period structure: repeats past 128 KiB block
+/// boundaries, past a declared window, and into dictionary content.
+///
+/// Grammar, after the program byte `ph` (bit 0 attaches the dictionary,
+/// bits 1..4 set its log size `1 << (4 + v)`, bits 5..7 are ignored
+/// here). Each event tag is `op << 6`:
+/// - 0 LIT: `n = (tag & 0x3f) + 1` verbatim bytes follow;
+/// - 1 REP: `dist = u24 + 1`, `len = u16 + 1`, `flips = u8 & 0x0f`; copies
+///   `len` bytes from `dist` back in the virtual history (dictionary
+///   content, then output), so a distance past the output echoes the
+///   dictionary; `flips` pseudo-random bytes inside the copied span are
+///   replaced — the mutated-copy class;
+/// - 2 NOISE: `n = u24 + 1` pseudo-random bytes;
+/// - 3 PAD: `n = u24 + 1` copies of the next byte — long RLE spans.
+///
+/// Every length clamps to the program end and the cap, and an
+/// unreachable distance clamps to the virtual history, so garbage
+/// degrades to fewer events and never panics. Expansion is pure: one
+/// xorshift stream seeded over the program bytes feeds the dictionary
+/// content and every pseudo-random byte, so the walker mirrors it byte
+/// for byte. Duplicated in `encode_stream.rs` and in the walker.
+fn expand_program(prog: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut rng = Rng(program_seed(prog));
+    let ph = prog.first().copied().unwrap_or(0);
+    let dict = if ph & 1 != 0 {
+        let log = 4 + usize::from((ph >> 1) & 0x0f);
+        Some((0..1usize << log.min(19)).map(|_| rng.byte()).collect())
+    } else {
+        None
+    };
+    let dict_len = dict.as_ref().map_or(0, Vec::len);
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1;
+    while i < prog.len() && out.len() < EXPAND_CAP {
+        let tag = prog[i];
+        i += 1;
+        match tag >> 6 {
+            0 => {
+                let n = (usize::from(tag & 0x3f) + 1)
+                    .min(prog.len() - i)
+                    .min(EXPAND_CAP - out.len());
+                out.extend_from_slice(&prog[i..i + n]);
+                i += n;
+            },
+            1 => {
+                let dist = u24_field(prog, i) + 1;
+                let len = (u16_field(prog, i + 3) + 1).min(EXPAND_CAP - out.len());
+                let flips = prog.get(i + 5).copied().unwrap_or(0) & 0x0f;
+                i = (i + 6).min(prog.len());
+                // Virtual history = dict ++ out. The source index stays
+                // behind the write cursor, so an overlapping copy reads
+                // the bytes it just wrote.
+                let hist = dict_len + out.len();
+                if hist == 0 {
+                    continue;
+                }
+                let base = hist - dist.min(hist);
+                let start = out.len();
+                for j in 0..len {
+                    let b = if base + j < dict_len {
+                        dict.as_ref().unwrap()[base + j]
+                    } else {
+                        out[base + j - dict_len]
+                    };
+                    out.push(b);
+                }
+                for _ in 0..flips {
+                    let p = start + rng.next() as usize % (out.len() - start);
+                    out[p] = rng.byte();
+                }
+            },
+            2 => {
+                let n = (u24_field(prog, i) + 1).min(EXPAND_CAP - out.len());
+                i = (i + 3).min(prog.len());
+                for _ in 0..n {
+                    out.push(rng.byte());
+                }
+            },
+            _ => {
+                let n = (u24_field(prog, i) + 1).min(EXPAND_CAP - out.len());
+                let v = prog.get(i + 3).copied().unwrap_or(0);
+                i = (i + 4).min(prog.len());
+                out.extend(vec![v; n]);
+            },
+        }
+    }
+    (out, dict)
+}
+
+/// One structure-mode roundtrip through the bulk core: expand, encode on
+/// the shared option surface, decode back through both decoders — with
+/// the dictionary attached when the program built one, because the frame
+/// declares it. Mirrored in the walker's artifact pass.
+fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
+    let (payload, dict) = expand_program(prog);
+    let level = Level::from_zstd(i32::from(level_byte) % 23);
+    let mut opts = zstdx::EncoderOptions::new(level).checksum(opt_byte & 1 == 1);
+    if opt_byte & 2 != 0 {
+        opts = opts.pledged_size(Some(payload.len() as u64));
+    }
+    let window = (opt_byte >> 2) & 0x0f;
+    if window != 0 {
+        opts = opts.with_input_shape(
+            zstdx::InputShape::default().with_window_log(u32::from(window) + 9),
+        );
+    }
+    let ldm = match (opt_byte >> 6) & 3 {
+        1 => zstdx::LdmMode::Enable,
+        2 => zstdx::LdmMode::Disable,
+        _ => zstdx::LdmMode::Auto,
+    };
+    opts = opts.long_distance_matching(ldm);
+    if let Some(d) = dict.as_deref() {
+        opts = opts.dictionary(d);
+    }
+
+    let comp = zstdx::bulk::compress_with(&payload, &opts).unwrap();
+
+    let back = match dict.as_deref() {
+        Some(d) => {
+            zstdx::bulk::decompress_with(&comp, 0, &zstdx::DecoderOptions::new().dictionary(d))
+                .unwrap()
+        },
+        None => {
+            let mut back = Vec::with_capacity(payload.len() + 16);
+            FrameDecoder::new()
+                .decode_all_to_vec(&comp, &mut back)
+                .unwrap();
+            back
+        },
+    };
+    assert_eq!(
+        &back[..], &payload[..],
+        "zstdx decode of structured payload differs"
+    );
+
+    match dict.as_deref() {
+        Some(d) => {
+            let mut rbuf = vec![0u8; payload.len() + 64];
+            let n = zstd::bulk::Decompressor::with_dictionary(d)
+                .unwrap()
+                .decompress_to_buffer(&comp, &mut rbuf)
+                .unwrap();
+            assert_eq!(
+                n, payload.len(),
+                "zstd decode of structured payload length differs"
+            );
+            assert_eq!(
+                &rbuf[..n], &payload[..],
+                "zstd decode of structured payload differs"
+            );
+        },
+        None => {
+            let mut zback = Vec::new();
+            zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
+            assert_eq!(
+                &zback[..], &payload[..],
+                "zstd decode of structured payload differs"
+            );
+        },
+    }
+}
+
+/// Event writers for the seed constructor. Each writes exactly the
+/// operand layout `expand_program` reads.
+fn push_u24(prog: &mut Vec<u8>, v: usize) {
+    prog.push((v & 0xff) as u8);
+    prog.push(((v >> 8) & 0xff) as u8);
+    prog.push(((v >> 16) & 0xff) as u8);
+}
+
+fn push_noise(prog: &mut Vec<u8>, n: usize) {
+    prog.push(0x80);
+    push_u24(prog, n - 1);
+}
+
+fn push_repeat(prog: &mut Vec<u8>, dist: usize, len: usize, flips: u8) {
+    prog.push(0x40);
+    push_u24(prog, dist - 1);
+    prog.extend_from_slice(&(len as u16 - 1).to_le_bytes());
+    prog.push(flips);
+}
+
+/// Committed structured-seed constructor (the R66/R73 pattern), the R74
+/// scale class `cross_window_seed` cannot reach: it derives a compact
+/// program from the fuzz bytes and roundtrips its expansion, so payload
+/// shapes with twins past the 128 KiB block boundary — and dictionary
+/// echoes — run on every input regardless of corpus state. The two large
+/// period classes put every twin more than one block out; the window
+/// nibble then decides whether they sit past the declared window too.
+fn structured_seed(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
+    let period = [17 * 1024, 40 * 1024, 96 * 1024, 200 * 1024][byte(0) as usize & 3];
+    let twin = 6 * 1024usize;
+    let gap = 64 + byte(6) as usize % 512;
+    let dict_log = 6 + byte(2) as usize % 6; // 64 B..2 KiB
+    let mut prog = Vec::new();
+    if byte(2) & 3 == 0 {
+        prog.push(1 | ((dict_log - 4) as u8) << 1);
+    } else {
+        prog.push(0);
+    }
+    let litn = 8 + byte(4) as usize % 57;
+    prog.push(litn as u8 - 1);
+    prog.extend((0..litn).map(|j| byte(j + 8)));
+    push_noise(&mut prog, period - litn);
+    // With the dictionary attached, the echo distance reaches into it:
+    // the twins sit at dict content plus payload span, the prefill
+    // match class.
+    let dist = if prog[0] & 1 != 0 {
+        (1 << dict_log) + period
+    } else {
+        period
+    };
+    for _ in 0..3 {
+        push_repeat(&mut prog, dist, twin, byte(5) & 0x0f);
+        push_noise(&mut prog, gap);
+    }
+    // Modest constant tail: repcode adaptation inside the last block.
+    prog.push(0xc0);
+    push_u24(&mut prog, 2048 + byte(7) as usize % 8192);
+    prog.push(byte(7) ^ 0xa5);
+
+    let rows = [3u8, 9, 13, 19, 22];
+    let level_byte = rows[byte(3) as usize % rows.len()];
+    let nibble = if byte(1) & 0x20 != 0 {
+        1 + byte(1) % 7 // window log 10..=16; the 96/200 KiB periods sit past it
+    } else {
+        0
+    };
+    let opt_byte = (byte(1) & 3) | (nibble << 2);
+    structured_roundtrip(level_byte, opt_byte, &prog);
 }

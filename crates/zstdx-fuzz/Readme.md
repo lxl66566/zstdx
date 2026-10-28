@@ -11,8 +11,27 @@ This page answers which fuzz targets exist, how to run a bounded smoke test, how
 | `encode` | bulk core, multi-payload level ladder plus option bits for checksum, pledged size, window and LDM, and pooled carryover. Checks against our decoder and the reference. |
 | `encode_stream` | streaming cores on the same `[level, opts, k, chunks]` layout |
 | `decode`, `decode_dict`, `fse`, `huff0`, `interop`, `ldm_mt_parity` | decode paths, entropy cores, cross-implementation interop |
+| `decode_mt` | MT decode: parallel entry points (segment executor; piece executor via the router override, forced on in the dedicated process) against sequential decode parity |
+| `dict_pooled` | pooled dictionary encode identity across the raw, parsed, compat re-set and reused-`FrameCompressor` attach surfaces |
 
-The encode family shares the layout `[level:u8, opts:u8, k:u8, rest...]`. Chunk *i* compresses at level `(level+i) % 23` through one thread, which is the pooled thread-local carryover dimension. The exact walk is duplicated in `crates/zstdx/src/tests/fuzz_regressions.rs`, the artifact walker, so keep the two in lockstep when editing either.
+The encode family shares the layout `[level:u8, opts:u8, k:u8, rest...]`. Chunk *i* compresses at level `(level+i) % 23` through one thread, which is the pooled thread-local carryover dimension. `k` with bit 7 clear counts length-prefixed chunks ahead of a final remainder chunk; bit 7 set switches `rest` to a structure-mode program (next section). The exact walk is duplicated in `crates/zstdx/src/tests/fuzz_regressions.rs`, the artifact walker, so keep the two in lockstep when editing either.
+
+## Structure mode
+
+The documented limit of raw mutation is that coverage-guided edits never build multi-KiB-period structure: a 7-byte program event can demand a copy at any distance up to 16 MiB, so inputs stay small while the encoder sees repeats past 128 KiB block boundaries, past a declared window, and into dictionary content. `max_len` bounds the program, not the payload.
+
+With `k` bit 7 set, `rest` is `[ph:u8, events...]`. `ph` bit 0 attaches a synthetic raw dictionary of `1 << (4 + bits 1..4)` bytes, and `encode_stream` reads `ph` bit 6 to pick its core. Every event tag is `op << 6`:
+
+| op | event | operands |
+|---|---|---|
+| 0 | LIT — verbatim run | `n = (tag & 0x3f) + 1` bytes follow |
+| 1 | REP — copy from history | `dist = u24 + 1`, `len = u16 + 1`, `flips = u8 & 0x0f` |
+| 2 | NOISE | `n = u24 + 1` pseudo-random bytes |
+| 3 | PAD — constant run | `n = u24 + 1` copies of the next byte |
+
+REP copies from the virtual history `dict ++ output`, so a distance past the output echoes dictionary content (the prefill match class) and a distance shorter than the length overlaps like a repcode; `flips` replaces that many pseudo-random bytes inside the copied span, the mutated-copy class. Truncated operands read as zero, every length clamps to the program end and the 256 KiB expansion cap, and an unreachable distance clamps to the virtual history, so garbage programs degrade to fewer events and never panic. Expansion is pure (one xorshift stream seeded over the program bytes), so the walker mirrors it byte for byte: `test_structured_programs` pins the grammar, the far-match property and the dictionary echo, and the artifact pass replays program-mode artifacts.
+
+Both encode targets additionally run committed seed constructors on every input (`cross_window_seed` at small scale, `structured_seed` at block-crossing scale through the program grammar), so the classes run regardless of corpus state.
 
 ## Smoke runs
 
@@ -64,4 +83,6 @@ Crash inputs land under `artifacts/<target>/`, which is gitignored, and `smoke.s
   -len_control=20 -rss_limit_mb=2560 -artifact_prefix=<artifacts>/ <corpus>
 ```
 
-The first pass ran on 2026-10-24 as two 25-minute runs over encode and encode_stream. It found zero crashes over more than 50k units. One limit remains: evolved inputs carry no beyond-window redundancy. Pre-campaign seeds are all 4096 B or smaller, and coverage-guided mutation rarely builds multi-KiB-period structure, so a dict-seeded corpus remains the lever for cross-window shapes. Re-merge the corpus after a campaign. This one grew encode from 4807 to 7103 seeds and encode_stream from 1667 to 5250 seeds.
+The first pass ran on 2026-10-24 as two 25-minute runs over encode and encode_stream. It found zero crashes over more than 50k units. One limit remained: evolved inputs carried no beyond-window redundancy, so the R73 pass added committed seed constructors, and R74 added structure mode. In program mode the payload does not grow with the input, so a structure campaign takes a modest `-max_len` (65536 is plenty: a useful program is a few dozen bytes, and `-len_control=20` still pushes inputs toward the cap where multi-event programs live) while every expansion still reaches the 256 KiB cap.
+
+Re-merge the corpus after a campaign. Reference growth from the 2026-10-24 first pass: encode 4807 to 7103 seeds, encode_stream 1667 to 5250.
