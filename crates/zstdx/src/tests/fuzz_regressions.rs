@@ -479,18 +479,14 @@ fn walker_structured(pass: usize, level_byte: u8, opt_byte: u8, prog: &[u8]) {
     }
 
     let comp = crate::bulk::compress_with(&payload, &opts).unwrap();
-    let back = match dict.as_deref() {
-        Some(d) => {
-            crate::bulk::decompress_with(&comp, 0, &crate::DecoderOptions::new().dictionary(d))
-                .unwrap()
-        },
-        None => {
-            let mut back = Vec::with_capacity(payload.len() + 16);
-            FrameDecoder::new()
-                .decode_all_to_vec(&comp, &mut back)
-                .unwrap();
-            back
-        },
+    let back = if let Some(d) = dict.as_deref() {
+        crate::bulk::decompress_with(&comp, 0, &crate::DecoderOptions::new().dictionary(d)).unwrap()
+    } else {
+        let mut back = Vec::with_capacity(payload.len() + 16);
+        FrameDecoder::new()
+            .decode_all_to_vec(&comp, &mut back)
+            .unwrap();
+        back
     };
     assert_eq!(
         &back[..],
@@ -498,29 +494,26 @@ fn walker_structured(pass: usize, level_byte: u8, opt_byte: u8, prog: &[u8]) {
         "pass {pass}: zstdx decode of structured payload differs"
     );
 
-    match dict.as_deref() {
-        Some(d) => {
-            let mut rbuf = vec![0u8; payload.len() + 64];
-            let n = zstd::bulk::Decompressor::with_dictionary(d)
-                .unwrap()
-                .decompress_to_buffer(&comp, &mut rbuf)
-                .unwrap();
-            assert_eq!(n, payload.len(), "pass {pass}: reference length differs");
-            assert_eq!(
-                &rbuf[..n],
-                &payload[..],
-                "pass {pass}: reference bytes differ"
-            );
-        },
-        None => {
-            let mut zback = Vec::new();
-            zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
-            assert_eq!(
-                &zback[..],
-                &payload[..],
-                "pass {pass}: zstd decode of structured payload differs"
-            );
-        },
+    if let Some(d) = dict.as_deref() {
+        let mut rbuf = vec![0u8; payload.len() + 64];
+        let n = zstd::bulk::Decompressor::with_dictionary(d)
+            .unwrap()
+            .decompress_to_buffer(&comp, &mut rbuf)
+            .unwrap();
+        assert_eq!(n, payload.len(), "pass {pass}: reference length differs");
+        assert_eq!(
+            &rbuf[..n],
+            &payload[..],
+            "pass {pass}: reference bytes differ"
+        );
+    } else {
+        let mut zback = Vec::new();
+        zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
+        assert_eq!(
+            &zback[..],
+            &payload[..],
+            "pass {pass}: zstd decode of structured payload differs"
+        );
     }
 }
 

@@ -150,6 +150,10 @@ The hunt state now rides on the `FrameDecoder` through `NextFrameStaging`, so st
 
 Follow-up: staging is stream-scoped state on a reusable decoder, so a decoder abandoned mid-hunt and rebound to a new source replayed the stale magic into the new stream's head and was misparsed as "Reserved block occured". `init_first_frame` and `FrameDecoder::reset` now drop the staging, and the hunt itself is unaffected because `start_frame` lifts the staging out for each attempt before any reset runs.
 
+### A skippable frame is a frame for EOF purposes
+
+A skippable-only stream died at `StreamingDecoder::new` with `MagicNumberReadError(UnexpectedEof)`: the hunt consumed the skippable frames, probed the next magic, and treated the clean end of the source as a truncation because the position marker still said "no data frame decoded yet". The reference CLI decodes a skippable-only input to empty output with exit 0, while the empty input stays an error ("unexpected end of file"), so the marker must track whether any frame at all was consumed, not whether a data frame was. Pinned by `tests/decode_edges.rs::skippable_only_stream_decodes_to_nothing`.
+
 ## MT decoding
 
 ### Piece grids must be fully cut

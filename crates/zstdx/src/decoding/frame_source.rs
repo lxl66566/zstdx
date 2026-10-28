@@ -46,8 +46,9 @@ pub(super) enum NextFrameStaging {
 /// Where the decoder stands when asking for the next frame.
 #[derive(Clone, Copy)]
 enum StreamPosition {
-    /// No frame was decoded yet; an exhausted source is an error (an empty
-    /// stream is not a stream of frames, as in the reference decoders).
+    /// No data frame was decoded yet; an exhausted source is an error (an
+    /// empty stream is not a stream of frames, as in the reference
+    /// decoders) unless a consumed skippable frame already made it one.
     Start,
     /// A frame completed; an exhausted source is the clean end of the stream.
     AfterFrame,
@@ -103,6 +104,11 @@ fn hunt_frame_start<R: Read>(
     staging: &mut NextFrameStaging,
     position: StreamPosition,
 ) -> Result<FrameStart, FrameDecoderError> {
+    // A skippable frame consumed in this hunt already makes the source a
+    // stream of frames: a later clean end of the source is the stream's
+    // end, not a truncation (the reference CLI decodes a skippable-only
+    // input to empty output; only the empty input is an error).
+    let mut skipped_any = false;
     loop {
         // Resume a failed attempt: finish a pending skippable-frame discard,
         // or replay the staged header bytes below.
@@ -115,15 +121,18 @@ fn hunt_frame_start<R: Read>(
         if !peek.peek_magic()? {
             *staging = NextFrameStaging::Idle;
             return match position {
-                StreamPosition::Start => Err(ReadFrameHeaderError::MagicNumberReadError(
-                    Error::from(ErrorKind::UnexpectedEof),
-                )
-                .into()),
-                StreamPosition::AfterFrame => Ok(FrameStart::CleanEnd),
+                StreamPosition::Start if !skipped_any => {
+                    Err(ReadFrameHeaderError::MagicNumberReadError(Error::from(
+                        ErrorKind::UnexpectedEof,
+                    ))
+                    .into())
+                },
+                StreamPosition::AfterFrame | StreamPosition::Start => Ok(FrameStart::CleanEnd),
             };
         }
         if is_skippable_magic(peek.magic()) {
             peek.skip_skippable()?;
+            skipped_any = true;
             continue;
         }
         decoder.reset(&mut peek)?;
