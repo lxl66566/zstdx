@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use super::block_enc::compressed::LitStreams;
 use super::{
     Matcher, SeqWord, Sequence,
-    btlazy::{LazyScratch, LazyStep},
+    btlazy::{LazyScratch, LazyStep, LongCompare},
     hugepage::HugeBuf,
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
@@ -341,6 +341,13 @@ pub struct MatchGeneratorDriver {
     /// Cold-head probe-step phase for the btlazy2 rows (see
     /// [`BtStepPhase`]).
     bt_step: BtStepPhase,
+
+    /// The btlazy rows' compare-form verdict (see [`LongCompare`]):
+    /// frame rows arm `Long` by parse feedback (an emitted match of
+    /// `LONG_COMPARE_ML` bytes), jobs start there. Re-derived with the
+    /// arming context; never shapes output (both compare forms are pure
+    /// window functions).
+    long_compare: LongCompare,
     /// Live reach-probe accumulator while a donating entry point runs the
     /// frame's own keep-side blocks as the probe's keep measurement (see
     /// [`super::reach_probe`]); `None` on every other path, so the
@@ -614,6 +621,8 @@ pub struct DriverSeedImage {
     ldm_mode: crate::LdmMode,
     dubt_head: HeadPhase,
     bt_step: BtStepPhase,
+
+    long_compare: LongCompare,
     dubt_stale: bool,
     ldm_quiet: u8,
     ldm_dead: bool,
@@ -961,6 +970,17 @@ impl MatchGeneratorDriver {
     /// `reset`; like the reach choice it survives resets until changed.
     pub(crate) fn set_ldm_arming(&mut self, arming: LdmArming) {
         self.ldm_arming = arming;
+        self.long_compare = Self::long_compare_for(arming);
+    }
+
+    /// The compare-form verdict an arming context starts with (see
+    /// [`LongCompare`]): jobs take the long form outright, frames arm it
+    /// by parse feedback.
+    fn long_compare_for(arming: LdmArming) -> LongCompare {
+        match arming {
+            LdmArming::Frame | LdmArming::FrameScreened => LongCompare::Short,
+            _ => LongCompare::Long,
+        }
     }
 
     /// Declare the frame's explicit LDM switch (see [`crate::LdmMode`])
@@ -1059,6 +1079,7 @@ impl MatchGeneratorDriver {
             ldm_mode: crate::LdmMode::Auto,
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
+            long_compare: LongCompare::Short,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -1131,6 +1152,7 @@ impl MatchGeneratorDriver {
             ldm_mode: crate::LdmMode::Auto,
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
+            long_compare: LongCompare::Short,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -1547,6 +1569,7 @@ impl MatchGeneratorDriver {
         } else {
             BtStepPhase::Off
         };
+        self.long_compare = Self::long_compare_for(self.ldm_arming);
         self.dubt_head = if self.head_eligible() {
             HeadPhase::Armed
         } else {
@@ -2851,6 +2874,7 @@ impl MatchGeneratorDriver {
             ldm_mode: self.ldm_mode,
             dubt_head: self.dubt_head,
             bt_step: self.bt_step,
+            long_compare: self.long_compare,
             dubt_stale: self.dubt_stale,
             ldm_quiet: self.ldm_quiet,
             ldm_dead: self.ldm_dead,
@@ -3066,6 +3090,7 @@ impl MatchGeneratorDriver {
         self.ldm_mode = image.ldm_mode;
         self.dubt_head = image.dubt_head;
         self.bt_step = image.bt_step;
+        self.long_compare = image.long_compare;
         self.dubt_stale = image.dubt_stale;
         self.ldm_quiet = image.ldm_quiet;
         self.ldm_dead = image.ldm_dead;
@@ -4425,6 +4450,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && a.ldm_mode == b.ldm_mode
         && a.dubt_head == b.dubt_head
         && a.bt_step == b.bt_step
+        && a.long_compare == b.long_compare
         && a.dubt_stale == b.dubt_stale
         && a.ldm_quiet == b.ldm_quiet
         && a.ldm_dead == b.ldm_dead

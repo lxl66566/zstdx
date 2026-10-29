@@ -39,12 +39,10 @@ impl MatchGeneratorDriver {
             unreachable!("btlazy scratch allocated by apply_level")
         };
         let lit_lens = self.lit_lens;
-        // Long-compare form for the job machinery only: the per-job
-        // re-sorted shallow trees re-pay multi-KiB twin compares that the
-        // frame-continuous rows' deep tree avoids (see [`DubtFinder`]'s
-        // `LONG`). Keyed on the LDM arming context, which already splits
-        // jobs from frames.
-        let long_compare = !matches!(self.ldm_arming, LdmArming::Frame | LdmArming::FrameScreened);
+        // Compare-form verdict (see `LongCompare`): jobs start long,
+        // frame rows arm it by the parse feedback below.
+        let long_compare = matches!(self.long_compare, LongCompare::Long);
+        let seq_mark = seqs.len();
         // Disjoint field borrows: the window (win/ext) against the tables.
         let ldm_won = crate::encoding::btlazy::run_block_lazy(
             &knobs,
@@ -71,6 +69,16 @@ impl MatchGeneratorDriver {
         self.anchor = self.block_end;
         self.rep = rep;
         self.rep_pending = rep_pending;
+        // The arming evidence: one emitted match of LONG_COMPARE_ML bytes
+        // or more means a compare verified that length, which is the SIMD
+        // kernel's regime. The scan short-circuits early on such shapes.
+        if !long_compare
+            && seqs[seq_mark..].iter().any(|s| {
+                decode_packed(s.codes, s.add).1 >= crate::encoding::btlazy::LONG_COMPARE_ML
+            })
+        {
+            self.long_compare = LongCompare::Long;
+        }
         ldm_won
     }
 }

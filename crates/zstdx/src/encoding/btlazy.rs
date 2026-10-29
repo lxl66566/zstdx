@@ -91,6 +91,29 @@ pub(crate) enum LazyStep {
     Dense,
 }
 
+/// The btlazy rows' compare-form verdict (see [`DubtFinder`]'s `LONG`).
+/// Job machinery is always [`LongCompare::Long`]; frame-continuous rows
+/// arm it by parse feedback — a block that emits a match of
+/// [`LONG_COMPARE_ML`] bytes or more verified a compare of that length,
+/// which is the SIMD kernel's switch regime. Measured per shape at rows
+/// 13-15: json and skewed never emit one over 32 MiB, with every compare
+/// under 64 B where the long form's phase-cap arithmetic is a pure tax
+/// (-5% json wall when forced on), while dll-class and tiled-text
+/// content emits them from the first blocks and carries about 90% of
+/// its compared bytes in that tail. Both forms are pure functions of
+/// the window bytes, so the verdict never shapes output.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LongCompare {
+    /// No long match emitted yet: scalar compare form.
+    Short,
+    /// A long match was emitted: SIMD compare form from the next block.
+    Long,
+}
+
+/// The emitted-match length that arms [`LongCompare::Long`], aligned
+/// with `count_from_long`'s 64 B kernel switch point.
+pub(crate) const LONG_COMPARE_ML: u32 = 64;
+
 /// One full block parsed with the btlazy2 strategy. Selection is libzstd's
 /// lazy-generic loop at depth 2: each position's repcode and tree
 /// candidates compete on value-minus-offset-price, a two-deep lazy walk
