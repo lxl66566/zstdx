@@ -36,8 +36,9 @@ use super::{
     },
     frame_header::FrameHeader,
     match_generator::{
-        LDM_FULL_WINDOW, LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX,
-        SPF_SEG, StripSnapshot, ldm_head_parses,
+        BALANCED_STORE_HEAD_SPAN, BalancedStore, LDM_FULL_WINDOW, LdmArming, LdmPrefixSnapshot,
+        MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, balanced_store,
+        ldm_head_parses,
     },
     reach_probe,
 };
@@ -85,8 +86,14 @@ pub fn mt_job_size_for(
     head: &[u8],
 ) -> usize {
     // The frame's reach probe result (see reach_probe) decides the strip
-    // with it.
-    let choice = reach_probe::probe_reach_choice(head, level, shape);
+    // with it, with the wide-head stand-down mirrored so the analysis
+    // grid is the one the encoder actually runs (the prediction resolves
+    // the same Keep the probe measures on every measured class).
+    let choice = if head_predicts_keep(head) {
+        reach_probe::ReachChoice::Keep
+    } else {
+        reach_probe::probe_reach_choice(head, level, shape)
+    };
     let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     // Capture frames pin the grid at the reach floor (worker-independent
     // — see `capture_grid`); the analysis tools must cut at the grid the
@@ -518,6 +525,22 @@ struct ReachGate {
     donation_prefix: bool,
 }
 
+/// Whether a frame head predicts the reach probe's Keep verdict: the
+/// storage verdict's wide-head classification (see `balanced_store`,
+/// the same sample the ST entries substitute the row twin on). The
+/// shrink class is near-local repeat data — json logs, tiled records —
+/// and every measured shape of that class samples a narrow alphabet
+/// (json 38-39 distinct, skewed 16), while the wide classes read Keep
+/// with margins of 6.15x on text and 1.21x on dll32, so the sampled
+/// alphabet carries the verdict. A wide head the class never measured
+/// (wide alphabet, near-local repeats) would parse at the stock keep
+/// reach instead of the shrunk one — the same bet the ST row
+/// substitution already makes on this sample, with the chain parse kept.
+pub(crate) fn head_predicts_keep(head: &[u8]) -> bool {
+    let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
+    balanced_store(&head[..span]) != BalancedStore::Chain
+}
+
 /// Resolve the frame's reach verdict and the job-zero donation it arms:
 /// The frame's head decides its chain reach (see reach_probe), and with
 /// it the strip: a shrunk search domain shrinks the strip to match.
@@ -525,7 +548,13 @@ struct ReachGate {
 /// `donate_job_zero_prefix`): the first span blocks run as job zero's
 /// own blocks on the calling thread through the job machinery, so only
 /// a Shrink verdict pays a re-parse. The keep grid must leave job zero
-/// work beyond the span for the continuation to take over.
+/// work beyond the span for the continuation to take over. A wide head
+/// (see [`head_predicts_keep`]) skips the donation outright: the keep
+/// parse runs serial on the calling thread before any job starts, at
+/// 60% of text.balanced bulk-mt8's wall, 40% of dll32's and 14% of
+/// dll100's (jobdecomp 2026-10-30), so the predicted-Keep frame posts
+/// its jobs at once and job zero parses its whole span from a pooled
+/// state like an undonated frame.
 fn resolve_reach_gate(
     src: &[u8],
     level: Level,
@@ -586,6 +615,19 @@ fn resolve_reach_gate(
             ldm_mode,
         );
         donation_prefix = keep_plan.is_some();
+        if head_predicts_keep(head) {
+            // The wide-head Keep prediction stands the donation down. The
+            // plan above is exactly the one a Keep verdict runs, so the
+            // schedule is the donated-Keep one; job zero's own parse
+            // differs from the donated span only at the span-end pre-split
+            // clamp (the dll class, see mt-stream.md).
+            return ReachGate {
+                choice: reach_probe::ReachChoice::Keep,
+                donation: None,
+                keep_plan,
+                donation_prefix,
+            };
+        }
         #[cfg(feature = "job_trace")]
         let trace_probe = std::time::Instant::now();
         let (donated_choice, state, prefix) = donate_job_zero_prefix(
@@ -1628,8 +1670,8 @@ mod tests {
 
     use super::{
         CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
-        dict_job_arming, donation_arming, fast_capture_schedule, job_size_for, plan_prefix_ldm,
-        prefix_last_job, take_slice_state,
+        dict_job_arming, donation_arming, fast_capture_schedule, head_predicts_keep, job_size_for,
+        plan_prefix_ldm, prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
@@ -1658,6 +1700,81 @@ mod tests {
             head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
         }
         head
+    }
+
+    /// An alphabet head of `syms` distinct bytes, mixed by an LCG so the
+    /// sample reads the full width at the verdict's 8 KiB span.
+    fn alphabet_head(len: usize, syms: u8) -> Vec<u8> {
+        let mut head = Vec::with_capacity(len);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while head.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.push((state >> 33) as u8 % syms);
+        }
+        head
+    }
+
+    /// The Keep prediction splits on the storage verdict's own bars: the
+    /// narrow class (json 38-39, skewed 16) keeps the probe's donation,
+    /// the wide classes (text 66-79, dll 108-213) stand it down.
+    #[test]
+    fn head_predicts_keep_splits_on_the_sampled_alphabet() {
+        assert!(!head_predicts_keep(&alphabet_head(8 * 1024, 16)));
+        assert!(!head_predicts_keep(&alphabet_head(8 * 1024, 40)));
+        assert!(head_predicts_keep(&alphabet_head(8 * 1024, 64)));
+        assert!(head_predicts_keep(&alphabet_head(8 * 1024, 200)));
+        assert!(head_predicts_keep(&pattern_head(8 * 1024)));
+        // A short head samples what is there, like the verdict itself.
+        assert!(!head_predicts_keep(&alphabet_head(64, 16)));
+    }
+
+    /// The prediction is the probe's own verdict on the wide fixture
+    /// class: the pattern head (dll-class twins, wide alphabet) measures
+    /// Keep through the real dual parse, so standing the donation down
+    /// leaves the frame on the reach it would have chosen.
+    #[test]
+    fn wide_head_prediction_matches_the_probe_verdict() {
+        let src = pattern_head(9 << 20);
+        let shape = crate::InputShape {
+            len: Some(src.len() as u64),
+            window_log: None,
+        };
+        assert!(head_predicts_keep(&src));
+        assert_eq!(
+            crate::encoding::reach_probe::probe_reach_choice(&src, Level::Balanced, shape),
+            ReachChoice::Keep
+        );
+    }
+
+    /// A wide-head frame over the probe's size bar encodes through the
+    /// stand-down path: worker-count invariant, and roundtrips.
+    #[test]
+    fn wide_head_bulk_mt_is_worker_invariant() {
+        let src = pattern_head((8 << 20) + (511 << 10));
+        let one = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            2,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        let four = compress_slice_mt(
+            &src,
+            Level::Balanced,
+            false,
+            4,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        assert_eq!(one, four);
+        let mut back = vec![0u8; src.len()];
+        let n = FrameDecoder::new().decode_all(&four, &mut back).unwrap();
+        assert_eq!((n, &back[..n]), (src.len(), &src[..]));
     }
 
     /// Pooled-state provenance cannot reach the bytes (R25): the bulk
