@@ -4358,13 +4358,15 @@ pub(super) use gates::RampGate;
 use gates::*;
 pub(in crate::encoding) use hash::extend_match;
 use hash::*;
+// SMALL_SRC_MAX feeds only `dict_seed_key`'s std-gated body.
+#[cfg(feature = "std")]
+use params::SMALL_SRC_MAX;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
-    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SMALL_SRC_MAX, SmallDictRow,
-    SmallSrcRow, Strategy, ldm_min_window, params_for, params_for_row, row_attempts_light,
-    sampled_distinct, small_dict_row, small_src_btlazy_head, small_src_class_plain_only,
-    small_src_class_swapped,
+    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy,
+    ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
+    small_dict_row, small_src_btlazy_head, small_src_class_plain_only, small_src_class_swapped,
 };
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]

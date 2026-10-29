@@ -1425,7 +1425,6 @@ pub(crate) fn seed_dict_tree(
     finder.prefill_hash3(fill_target);
 }
 
-#[cfg(feature = "std")]
 /// The caller guarantees the tables match the knobs' logs, the window covers
 /// `[win_base, block_end]`, and `bt.len() >= 2`.
 #[allow(clippy::too_many_arguments)]

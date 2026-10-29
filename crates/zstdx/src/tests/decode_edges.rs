@@ -76,10 +76,17 @@ fn header(out: &mut Vec<u8>, wlog: u32, fcs: Option<u64>, checksum: bool) {
     }
 }
 
+/// Without `hash` the decoder still reads the 4-byte trailer but stands
+/// verification down, so the appended value is arbitrary.
 fn with_checksum(mut frame: Vec<u8>, payload: &[u8]) -> Vec<u8> {
-    let mut hash = crate::xxh64::Xxh64::new(0);
-    hash.write(payload);
-    frame.extend_from_slice(&(hash.finish() as u32).to_le_bytes());
+    #[cfg(feature = "hash")]
+    {
+        let mut hash = crate::xxh64::Xxh64::new(0);
+        hash.write(payload);
+        frame.extend_from_slice(&(hash.finish() as u32).to_le_bytes());
+    }
+    #[cfg(not(feature = "hash"))]
+    frame.extend_from_slice(&[0u8; 4]);
     frame
 }
 
@@ -227,6 +234,8 @@ fn checksum_trailer_edges_streaming() {
     let frame = with_checksum(frame, &payload);
     assert_eq!(stream(&frame).unwrap(), payload);
 
+    // Verification only exists under `hash`.
+    #[cfg(feature = "hash")]
     for flip in [0usize, 1, 2, 3] {
         let mut bad = frame.clone();
         let at = bad.len() - 4 + flip;
