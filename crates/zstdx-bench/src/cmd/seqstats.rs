@@ -87,6 +87,16 @@ impl Matcher for RecordingMatcher {
     fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {
         self.inner.load_dictionary(content, rep, level);
     }
+
+    fn seed_opt_prices_from_dict(
+        &mut self,
+        huff: &zstdx::huff0::huff0_encoder::HuffmanTable,
+        ll: &zstdx::fse::fse_encoder::FSETable,
+        ml: &zstdx::fse::fse_encoder::FSETable,
+        of: &zstdx::fse::fse_encoder::FSETable,
+    ) {
+        self.inner.seed_opt_prices_from_dict(huff, ll, ml, of);
+    }
 }
 
 fn ll_code(len: u32) -> (u8, u32) {

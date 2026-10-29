@@ -818,8 +818,12 @@ fn dict_seed_image_state_equality() {
             crate::LdmMode::Auto,
         );
         fresh.matcher.canonicalize_for_seed_capture();
-        // The eager tree fill mirrors the capture path's seeding order
-        // (canonicalize, fill, capture).
+        // The price seeding and eager tree fill mirror the capture
+        // path's seeding order (canonicalize, seed prices, fill,
+        // capture).
+        if let Some((huff, ll, ml, of)) = dict.entropy_tables() {
+            fresh.matcher.seed_opt_prices_from_dict(huff, ll, ml, of);
+        }
         fresh.matcher.seed_fill_dictionary_tree();
         // Pooled seeding: capture, run a frame to dirty the state,
         // displace the key with another level, dirty again, then a key
@@ -1161,6 +1165,9 @@ fn dict_seed_image_len_class_restore() {
             crate::LdmMode::Auto,
         );
         fresh.matcher.canonicalize_for_seed_capture();
+        if let Some((huff, ll, ml, of)) = dict.entropy_tables() {
+            fresh.matcher.seed_opt_prices_from_dict(huff, ll, ml, of);
+        }
         fresh.matcher.seed_fill_dictionary_tree();
         // Pooled: capture at the longer length, dirty the state with a
         // frame, then seed the shorter length — a same-class restore.
@@ -1337,5 +1344,71 @@ fn dict_frame_single_segment_header_matches_reference() {
             .unwrap();
             assert_eq!(&back[..], &data[..], "decode at len {len} level {level}");
         }
+    }
+}
+
+/// The opt family's dictionary-frame prices come from the dictionary's
+/// own entropy tables (`ZSTD_rescaleFreqs`' dictionary branch), never
+/// from a statistics parse replayed over the dictionary content: the
+/// replay's own-parse prior fragmented the sequence stream on
+/// foreign-content dictionaries, reading json 64 KiB over the systemd
+/// fixture at level 19 at +1274 B against libzstd with 4050 sequences
+/// against its 2450. The pin bounds every opt row's dictionary frame
+/// against the zstd crate's own frame of the same payload over the same
+/// dictionary, and round-trips our frame through the reference decoder.
+#[test]
+fn dict_opt_rows_stay_in_the_reference_class() {
+    extern crate std;
+    use alloc::vec::Vec;
+    use std::format;
+
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    // Json-shaped records: a foreign-content payload for the systemd
+    // fixture, the shape the replay prior fragmented.
+    let mut payload = Vec::with_capacity(64 * 1024);
+    let mut i = 0u32;
+    while payload.len() < 64 * 1024 {
+        let rec = format!(
+            "{{\"id\":{},\"name\":\"record-{}\",\"tags\":[\"a\",\"b\"],\"ok\":{}}}\n",
+            i,
+            i,
+            (i % 2 == 0) as u8
+        );
+        payload.extend_from_slice(rec.as_bytes());
+        i += 1;
+    }
+    payload.truncate(64 * 1024);
+    let len = payload.len();
+    for level in [17, 19, 22] {
+        let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level))
+            .checksum(false)
+            .dictionary(&dict)
+            .pledged_size(Some(len as u64));
+        let ours = crate::bulk::compress_with(&payload, &opts).unwrap();
+        let mut zenc = zstd::bulk::Compressor::with_dictionary(level, &dict).unwrap();
+        let theirs = zenc.compress(&payload).unwrap();
+        // The table prior reads within the reference class (measured
+        // +75 B at level 19 on this cell; the bound leaves tuning room
+        // without re-admitting the four-figure fragmentation class).
+        assert!(
+            ours.len() <= theirs.len() + 128,
+            "level {level}: ours {} vs reference {}",
+            ours.len(),
+            theirs.len()
+        );
+        // Our frame round-trips through both decoders.
+        let back = crate::bulk::decompress_with(
+            &ours,
+            len,
+            &crate::DecoderOptions::new().dictionary(&dict),
+        )
+        .unwrap();
+        assert_eq!(&back[..], &payload[..], "our decode at level {level}");
+        let mut zdec = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+        let mut zout = alloc::vec![0u8; len];
+        let n = zdec.decompress_to_buffer(&ours, &mut zout).unwrap();
+        assert_eq!(&zout[..n], &payload[..], "libzstd decode at level {level}");
     }
 }

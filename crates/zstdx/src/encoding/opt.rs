@@ -356,6 +356,53 @@ impl OptState {
         self.set_base_prices::<ULTRA>();
     }
 
+    /// `ZSTD_rescaleFreqs`' dictionary branch: a formatted dictionary
+    /// seeds the first block's statistics from its own entropy tables,
+    /// inverting each table's per-symbol cost at the branch's scales
+    /// (literals `1 << (11 - bits)`, sequence codes `1 << (10 - bits)`),
+    /// with a floor of 1 for symbols the table does not carry. This
+    /// prior replaces the statistics-parse seeding: libzstd gates
+    /// `ZSTD_initStats_ultra` off whenever a dictionary is loaded.
+    pub(crate) fn seed_from_dict_tables<const ULTRA: bool>(
+        &mut self,
+        huff: &crate::huff0::huff0_encoder::HuffmanTable,
+        ll: &crate::fse::fse_encoder::FSETable,
+        ml: &crate::fse::fse_encoder::FSETable,
+        of: &crate::fse::fse_encoder::FSETable,
+    ) {
+        let seq_freq = |table: &crate::fse::fse_encoder::FSETable, code: usize| -> u32 {
+            let bits = table.max_nb_bits(code as u8);
+            if bits == 0 || bits >= 10 {
+                1
+            } else {
+                1 << (10 - bits)
+            }
+        };
+        for b in 0..256u16 {
+            let bits = huff.code_bits(b as u8) as u32;
+            self.lit_freq[b as usize] = if bits == 0 || bits > 11 {
+                1
+            } else {
+                1 << (11 - bits)
+            };
+        }
+        self.lit_sum = self.lit_freq.iter().sum();
+        for code in 0..self.lit_length_freq.len() {
+            self.lit_length_freq[code] = seq_freq(ll, code);
+        }
+        self.lit_length_sum = self.lit_length_freq.iter().sum();
+        for code in 0..self.match_length_freq.len() {
+            self.match_length_freq[code] = seq_freq(ml, code);
+        }
+        self.match_length_sum = self.match_length_freq.iter().sum();
+        for code in 0..self.off_code_freq.len() {
+            self.off_code_freq[code] = seq_freq(of, code);
+        }
+        self.off_code_sum = self.off_code_freq.iter().sum();
+        self.predef = false;
+        self.set_base_prices::<ULTRA>();
+    }
+
     /// `ZSTD_updateStats`: fold one emitted sequence into the statistics.
     fn update_stats(&mut self, lit_length: u32, literals: &[u8], off_base: u32, match_length: u32) {
         for &b in literals {
@@ -1187,6 +1234,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     literals: &mut Vec<u8>,
     seqs: &mut Vec<SeqWord>,
     clamp_lag: bool,
+    dict_prefix: bool,
 ) -> bool {
     let block_len = (block_end - block_start) as usize;
     // btultra2: seed statistics with a throwaway parse before the first real
@@ -1199,7 +1247,12 @@ pub(crate) fn run_block<const ULTRA: bool>(
     // frame start whose parse shape the prices then reinforce (seeding with
     // the strip reachable recovers none of the boundary loss; see
     // dev/negative.md).
-    if ULTRA && state.lit_length_sum == 0 && block_len > PREDEF_THRESHOLD {
+    // libzstd gates `ZSTD_initStats_ultra` off whenever a dictionary is
+    // loaded (`ms->window.dictLimit == ms->window.lowLimit`): a dictionary
+    // frame's first-block prices come from the dictionary's own entropy
+    // tables instead (see `OptState::seed_from_dict_tables`), so the seed
+    // parse stands down there entirely.
+    if ULTRA && !dict_prefix && state.lit_length_sum == 0 && block_len > PREDEF_THRESHOLD {
         let frame_start = block_start == 0;
         let seed_start = if frame_start {
             block_start
@@ -1309,28 +1362,22 @@ pub(crate) fn run_block<const ULTRA: bool>(
 /// The dictionary seed-time tree machinery for the opt rows (the R58
 /// seed-image fill; `win` is the freshly seeded window -- dictionary
 /// content alone, `win.len() == pos`, `win_base == 0`, `next_update == 0`,
-/// tables already canonicalized to zero): replay the ultra rows'
-/// frame-start statistics parse over the dictionary content exactly as the
-/// first block's `initStats` seed would run it on a dictionary frame (the
-/// re-based `else`-branch span with a throwaway emission, no origin
-/// advance, cursor rewound to the window base), then thread the fill
-/// prefix `[0, len - OPT_NUM)`.
+/// tables already canonicalized to zero): thread the fill prefix
+/// `[0, len - OPT_NUM)`. The statistics parse libzstd seeds a dictionary
+/// frame's prices from is the dictionary's own entropy tables
+/// (`ZSTD_rescaleFreqs`' dictionary branch; see
+/// `OptState::seed_from_dict_tables`), never a replay parse, so this fill
+/// carries no statistics side effect.
 ///
 /// Byte-exactness vs the lazy frame fill (the seed image's restore contract):
-/// - The replay shapes `state` the same way (so the frame's own seed parse, gated on a zero
-///   `lit_length_sum`, is skipped) and leaves the tree in the seed parse's post-threading form; the
-///   prefix re-fill then re-inserts `[0, len - OPT_NUM)` in the same order and with the same
-///   per-position count caps (`min(win.len(), idx + OPT_NUM)` equals the frame's `min(win.len() +
-///   first_block_len, idx + OPT_NUM)` for every `idx` below the bound), leaving the first block's
+/// - The prefix fill re-inserts `[0, len - OPT_NUM)` in ascending order and with the per-position
+///   count caps `min(win.len(), idx + OPT_NUM)`, which equal the frame's `min(win.len() +
+///   first_block_len, idx + OPT_NUM)` for every `idx` below the bound, leaving the first block's
 ///   `update_tree` only the tail `[len - OPT_NUM, len)` to fill with the true frame caps over the
 ///   same prefix tree.
-/// - Non-ultra rows skip the replay (their frame flow has none): the eager prefix fill starts from
-///   the canonical zero tables, which thread exactly like the residue the lazy fill starts from on
-///   a pooled state (stale entries resolve to `None` and end the walk, zero entries are `EMPTY` and
-///   end the walk).
-/// - The known corner: a first block of <= `PREDEF_THRESHOLD` bytes skips the frame's seed parse in
-///   the lazy flow while the eager replay has already shaped `state`; such frames parse differently
-///   (still valid, just a different legal parse).
+/// - The fill starts from the canonical zero tables, which thread exactly like the residue the lazy
+///   fill starts from on a pooled state (stale entries resolve to `None` and end the walk, zero
+///   entries are `EMPTY` and end the walk).
 #[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn seed_dict_tree(
@@ -1342,49 +1389,8 @@ pub(crate) fn seed_dict_tree(
     bt: &mut [u32],
     hash3: &mut [u32],
     next_update: &mut u64,
-    state: &mut OptState,
-    scratch: &mut OptScratch,
-    rep: &mut [u32; 3],
-    rep_pending: &mut u8,
 ) {
-    let keep = win.len() as u64;
     debug_assert_eq!(*next_update, 0);
-    if knobs.ultra && keep - seed_start_of(keep) > PREDEF_THRESHOLD as u64 {
-        let seed_start = seed_start_of(keep);
-        let saved_rep = *rep;
-        let saved_pending = *rep_pending;
-        // Re-base the window slice to the span (the empty-window frame
-        // start; identical to the plain case when `keep <= SEED_SPAN`).
-        let seed_win = &win[seed_start as usize..];
-        let mut literals = Vec::new();
-        let mut seqs = Vec::new();
-        run_once::<true>(
-            knobs,
-            seed_win,
-            seed_start,
-            seed_start,
-            keep,
-            max_window,
-            &[],
-            origin,
-            table,
-            bt,
-            hash3,
-            next_update,
-            state,
-            scratch,
-            rep,
-            rep_pending,
-            &mut literals,
-            &mut seqs,
-        );
-        *rep = saved_rep;
-        *rep_pending = saved_pending;
-        // The isolated seed left its span threaded and the cursor advanced;
-        // rewind it so the fill prefix below re-inserts the span (the head
-        // rejects the duplicate position -- run_block's own rewind).
-        *next_update = 0;
-    }
     let table_log = table.len().trailing_zeros();
     let bt_mask = bt.len() / 2 - 1;
     let mut finder = Finder {
@@ -1412,22 +1418,14 @@ pub(crate) fn seed_dict_tree(
     finder.update_tree(fill_target);
     // hash3's per-block cursor derives from `next_update`
     // (`nextToUpdate3 = nextToUpdate`, zstd_opt.c:1098), which the fill
-    // above advanced to `keep - OPT_NUM` -- but the seed parse only wrote
-    // `[seed_start, T_replay)`, so slots below the cursor would read EMPTY
-    // where the lazy dict flow's contiguous fill (cursor 0) holds an
-    // entry. Prefill the same prefix; the rewrite of the replay's span is
-    // idempotent (same positions into the same slots, ascending order).
+    // above advanced to `keep - OPT_NUM`. The lazy dict flow fills from
+    // cursor 0, so prefill the same prefix (the rewrite of the fill's own
+    // span is idempotent: same positions into the same slots, ascending
+    // order).
     finder.prefill_hash3(fill_target);
 }
 
-/// The ultra seed parse's span start for a dictionary of `keep` bytes
-/// (`run_block`'s `block_start.saturating_sub(SEED_SPAN).max(win_base)`
-/// with `win_base == 0`).
 #[cfg(feature = "std")]
-fn seed_start_of(keep: u64) -> u64 {
-    keep.saturating_sub(SEED_SPAN)
-}
-
 /// The caller guarantees the tables match the knobs' logs, the window covers
 /// `[win_base, block_end]`, and `bt.len() >= 2`.
 #[allow(clippy::too_many_arguments)]
@@ -1807,6 +1805,35 @@ mod tests {
         let sum = scale_stats(&mut table, 11);
         assert!(sum <= (1 << 12) + 36, "sum {sum}");
         assert!(table.iter().all(|&v| v >= 1));
+    }
+
+    /// `ZSTD_rescaleFreqs`' dictionary branch inverts the tables' bit
+    /// costs at C's scales: literals `1 << (11 - nb)` with a floor of 1
+    /// for absent symbols, sequence codes `1 << (10 - getMaxNbBits)`.
+    #[test]
+    fn dict_table_prior_inverts_bit_costs() {
+        let huff =
+            crate::huff0::huff0_encoder::HuffmanTable::build_from_code_lengths(&[2, 2, 2, 2]);
+        let ll =
+            crate::fse::fse_encoder::build_table_from_probabilities(&[2, 2, 2, 2, 2, 2, 2, 2], 4);
+        let mut state = OptState::new();
+        state.seed_from_dict_tables::<true>(&huff, &ll, &ll, &ll);
+        // Four 2-bit symbols at scale 11, every other symbol floored at 1.
+        assert_eq!(state.lit_freq[0], 1 << 9);
+        assert_eq!(state.lit_freq[4], 1);
+        assert_eq!(state.lit_sum, (1 << 9) * 4 + 252);
+        // A flat 8-symbol FSE table at accuracy 4: every code's max-bit
+        // width is 4 (the table log), so each frequency is `1 << (10 - 4)`.
+        assert_eq!(state.lit_length_freq[0], 1 << 6);
+        assert_eq!(
+            state.lit_length_sum,
+            (1 << 6) * 8 + (36 - 8),
+            "carried codes at 1<<6, the absent tail floored at 1"
+        );
+        // The prior is dynamic (not predefined) and the first-block gate
+        // sees non-zero statistics: no statistics parse follows.
+        assert!(!state.predef);
+        assert_ne!(state.lit_length_sum, 0);
     }
 
     #[test]

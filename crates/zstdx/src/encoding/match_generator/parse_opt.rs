@@ -75,6 +75,7 @@ impl MatchGeneratorDriver {
                 literals,
                 seqs,
                 clamp_lag,
+                self.dict_prefix,
             )
         } else {
             crate::encoding::opt::run_block::<false>(
@@ -97,6 +98,7 @@ impl MatchGeneratorDriver {
                 literals,
                 seqs,
                 clamp_lag,
+                self.dict_prefix,
             )
         };
         self.opt_origin = origin;

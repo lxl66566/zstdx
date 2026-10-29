@@ -367,6 +367,12 @@ impl HuffmanTable {
             .div_ceil(8)
     }
 
+    /// A symbol's code length in bits, 0 for symbols the table does
+    /// not carry.
+    pub(crate) fn code_bits(&self, symbol: u8) -> u8 {
+        (self.packed[symbol as usize] & 0xf) as u8
+    }
+
     /// Per-symbol wire weights into a recycled buffer (the format's
     /// weight form; see [`write_table_desc`]).
     pub(crate) fn write_weights_into(&self, out: &mut Vec<u8>) {

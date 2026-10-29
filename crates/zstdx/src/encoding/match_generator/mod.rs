@@ -389,6 +389,12 @@ pub struct MatchGeneratorDriver {
     /// probe stays 8-byte). Cleared by [`Self::reset`]; a no-dict frame never
     /// touches it.
     dict_row: bool,
+    /// Whether dictionary content precedes the frame's data
+    /// ([`Self::load_dictionary`] sets it, the seed image restores it,
+    /// `reset` and non-empty strip prefills clear it). libzstd never runs
+    /// `ZSTD_initStats_ultra` on such a frame, so the ultra seed parse
+    /// stands down (see `opt::run_block`).
+    dict_prefix: bool,
     /// Armed deep-offset ramp for the current job ([`RampGate`]); OFF on
     /// every single-job path.
     ramp: RampGate,
@@ -615,6 +621,7 @@ pub struct DriverSeedImage {
     ldm_checked: bool,
     strip_parse: bool,
     dict_row: bool,
+    dict_prefix: bool,
     gate_hold: bool,
     ramp: RampGate,
     chain_filled: u64,
@@ -1063,6 +1070,7 @@ impl MatchGeneratorDriver {
             ldm_checked: false,
             strip_parse: false,
             dict_row: false,
+            dict_prefix: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1134,6 +1142,7 @@ impl MatchGeneratorDriver {
             ldm_checked: false,
             strip_parse: false,
             dict_row: false,
+            dict_prefix: false,
             rep: [1, 4, 8],
             rep_pending: 0,
             lit_lens: DEFAULT_LIT_LENS,
@@ -1788,6 +1797,30 @@ impl MatchGeneratorDriver {
         // (see FillGrid::Dictionary) — small payloads parse against this
         // window, so candidate coverage dominates.
         self.fill_window_grid(content, 0, FillGrid::Dictionary, LdmStripFill::Ingest);
+        self.dict_prefix = true;
+    }
+
+    /// libzstd's `ZSTD_rescaleFreqs` dictionary branch: a formatted
+    /// dictionary's own entropy tables are the opt family's first-block
+    /// price prior (no statistics parse runs on a dictionary frame).
+    pub fn seed_opt_prices_from_dict(
+        &mut self,
+        huff: &crate::huff0::huff0_encoder::HuffmanTable,
+        ll: &crate::fse::fse_encoder::FSETable,
+        ml: &crate::fse::fse_encoder::FSETable,
+        of: &crate::fse::fse_encoder::FSETable,
+    ) {
+        let ultra = match self.params.strategy {
+            Strategy::Opt(knobs) => knobs.ultra,
+            _ => return,
+        };
+        if ultra {
+            self.opt_state
+                .seed_from_dict_tables::<true>(huff, ll, ml, of);
+        } else {
+            self.opt_state
+                .seed_from_dict_tables::<false>(huff, ll, ml, of);
+        }
     }
 
     /// Declare `[start, end)` (absolute offsets inside the adopted window)
@@ -2244,6 +2277,11 @@ impl MatchGeneratorDriver {
         } else {
             HeadPhase::Off
         };
+        // A non-empty strip is a later MT job over frame data, not a
+        // dictionary frame's first block (job zero's strip is empty).
+        if !data.is_empty() {
+            self.dict_prefix = false;
+        }
         // The same cold-start rule for the btlazy2 rows' probe step: the
         // empty strip is a genuine frame start (mt job zero, or reset),
         // anything prefilled is warm.
@@ -2698,11 +2736,6 @@ impl MatchGeneratorDriver {
                     max_window = max_window.max(self.params.window as u64);
                 }
                 let win = window_slice(&self.win, self.ext.as_ref());
-                let Some(scratch) = self.opt_scratch.as_mut() else {
-                    unreachable!("opt scratch allocated by apply_level")
-                };
-                let mut rep = self.rep;
-                let mut rep_pending = self.rep_pending;
                 super::opt::seed_dict_tree(
                     &knobs,
                     win,
@@ -2712,13 +2745,7 @@ impl MatchGeneratorDriver {
                     &mut self.bt,
                     &mut self.hash3,
                     &mut self.next_update,
-                    &mut self.opt_state,
-                    scratch,
-                    &mut rep,
-                    &mut rep_pending,
                 );
-                self.rep = rep;
-                self.rep_pending = rep_pending;
             },
             Strategy::BtLazy(knobs) => {
                 if self.params.small_src {
@@ -2825,6 +2852,7 @@ impl MatchGeneratorDriver {
             ldm_checked: self.ldm_checked,
             strip_parse: self.strip_parse,
             dict_row: self.dict_row,
+            dict_prefix: self.dict_prefix,
             gate_hold: self.gate_hold,
             ramp: self.ramp,
             chain_filled: self.chain_filled,
@@ -3039,6 +3067,7 @@ impl MatchGeneratorDriver {
         self.ldm_checked = image.ldm_checked;
         self.strip_parse = image.strip_parse;
         self.dict_row = image.dict_row;
+        self.dict_prefix = image.dict_prefix;
         self.gate_hold = image.gate_hold;
         self.ramp = image.ramp;
         self.chain_filled = image.chain_filled;
@@ -3140,6 +3169,16 @@ impl Matcher for MatchGeneratorDriver {
         self.load_dictionary(content, rep, level);
     }
 
+    fn seed_opt_prices_from_dict(
+        &mut self,
+        huff: &crate::huff0::huff0_encoder::HuffmanTable,
+        ll: &crate::fse::fse_encoder::FSETable,
+        ml: &crate::fse::fse_encoder::FSETable,
+        of: &crate::fse::fse_encoder::FSETable,
+    ) {
+        MatchGeneratorDriver::seed_opt_prices_from_dict(self, huff, ll, ml, of);
+    }
+
     #[cfg(feature = "std")]
     fn force_dict_frame_inputs(&mut self) {
         // The deterministic dict-frame inputs (see `dictionary::seed_with_cache`):
@@ -3182,6 +3221,7 @@ impl Matcher for MatchGeneratorDriver {
         // Every frame starts at the stock attempts: the verdict is
         // per-frame state, resolved at the first matching entry.
         self.row_attempts = RowAttempts::Stock;
+        self.dict_prefix = false;
         self.apply_level(level);
         // Stale opt-table entries from previous frames decode below the
         // window floor once the origin advances past them (read before the

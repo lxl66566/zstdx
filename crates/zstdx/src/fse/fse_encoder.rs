@@ -376,6 +376,13 @@ impl FSETable {
         ))
     }
 
+    /// libzstd's `FSE_getMaxNbBits`: the widest bit draw decoding `symbol`
+    /// can take, `(deltaNbBits + 2^16 - 1) >> 16` off the table's
+    /// arithmetic form.
+    pub(crate) fn max_nb_bits(&self, symbol: u8) -> u32 {
+        (self.tab[symbol as usize] as u32 + 0xffff) >> 16
+    }
+
     /// Return the table buffer to a build pool (see
     /// [`FseBuildScratch`]); the table must not be used afterwards.
     pub(crate) fn recycle(self, scratch: &mut FseBuildScratch) {

@@ -45,6 +45,19 @@ impl core::fmt::Debug for EncDictionary {
 }
 
 impl EncDictionary {
+    /// The entropy tables when the dictionary is formatted (all four
+    /// present); `None` for raw content. `ZSTD_rescaleFreqs`' dictionary
+    /// branch reads all four at once.
+    pub(crate) fn entropy_tables(
+        &self,
+    ) -> Option<(&HuffmanTable, &FSETable, &FSETable, &FSETable)> {
+        let (Some(huff), Some(ll), Some(ml), Some(of)) = (&self.huff, &self.ll, &self.ml, &self.of)
+        else {
+            return None;
+        };
+        Some((huff, ll, ml, of))
+    }
+
     /// A raw-content dictionary: pure match history, no id, no entropy
     /// tables (libzstd's `ZSTD_dct_rawContent` load).
     pub(crate) fn raw_content(content: &[u8]) -> Self {
@@ -145,6 +158,13 @@ pub(crate) fn reset_with_dictionary_mode<M: Matcher>(
     state
         .matcher
         .load_dictionary(&dict.content, dict.rep, level);
+    // A formatted dictionary's own entropy tables are the opt family's
+    // first-block price prior (`ZSTD_rescaleFreqs`' dictionary branch);
+    // raw content carries no tables, and its first block then seeds from
+    // the payload like a plain frame.
+    if let Some((huff, ll, ml, of)) = dict.entropy_tables() {
+        state.matcher.seed_opt_prices_from_dict(huff, ll, ml, of);
+    }
     state.last_huff_table = None;
     state.fse_tables.ll_previous = None;
     state.fse_tables.ml_previous = None;
@@ -280,10 +300,15 @@ pub(crate) fn seed_with_cache<M: Matcher>(
         "dict_seed_key diverged from the seeding's own resolutions"
     );
     state.matcher.canonicalize_for_seed_capture();
-    // The eager tree fill runs after the canonicalization (the ultra rows'
-    // replayed statistics parse shapes the fresh-form price state the
-    // image then captures) and before the capture (the image holds the
-    // filled tree; see the driver's method).
+    // The canonicalization resets the opt price state (the image's
+    // purity), so the dictionary-branch seeding re-runs after it: the
+    // image then captures the table-seeded state (see
+    // `Matcher::seed_opt_prices_from_dict`).
+    if let Some((huff, ll, ml, of)) = dict.entropy_tables() {
+        state.matcher.seed_opt_prices_from_dict(huff, ll, ml, of);
+    }
+    // The eager tree fill runs after the canonicalization and before the
+    // capture (the image holds the filled tree; see the driver's method).
     state.matcher.seed_fill_dictionary_tree();
     if let Some(driver) = state.matcher.capture_seed_image() {
         state.seed_cache = Some(alloc::boxed::Box::new(SeedCache {

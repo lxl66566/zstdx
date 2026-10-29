@@ -446,6 +446,18 @@ pub trait Matcher {
     /// declares the dictionary id and entropy tables — sequences simply
     /// never reference the content).
     fn load_dictionary(&mut self, _content: &[u8], _rep: [u32; 3], _level: Level) {}
+    /// libzstd's `ZSTD_rescaleFreqs` dictionary branch: seed the opt
+    /// family's first-block price statistics from a formatted dictionary's
+    /// own entropy tables. Called right after `load_dictionary` when the
+    /// dictionary carries entropy tables; the default does nothing.
+    fn seed_opt_prices_from_dict(
+        &mut self,
+        _huff: &crate::huff0::huff0_encoder::HuffmanTable,
+        _ll: &crate::fse::fse_encoder::FSETable,
+        _ml: &crate::fse::fse_encoder::FSETable,
+        _of: &crate::fse::fse_encoder::FSETable,
+    ) {
+    }
     /// The size of the window the decoder will need to execute all sequences produced by this
     /// matcher
     ///
