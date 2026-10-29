@@ -198,6 +198,16 @@ pub(super) const DENSE_BAR_MIN_DIST: usize = 1024;
 /// (skipping them shrinks size AND raises speed), text's are payload —
 /// hence dense-mode only.
 pub(super) const DENSE_STEP_AFTER: usize = 3;
+/// Table geometry of the dense scan body. The row's hash_log sweep priced
+/// 2^13/2^14 as json size -0.35/-0.16% at solo cycles -8.7/-5.6% while
+/// text pays +6.0/+2.2% and dll100 +6.9/+4.4%, so the row, the fills and
+/// the allocation keep 2^15 — but the covered-symbol bar above already
+/// isolates the json class (dll's dense-band blocks sit at 43+ symbols
+/// and never gate), so the dense body alone scans the smaller table: its
+/// proximity bias wins json's near-field repeats denser and faster while
+/// every plain-body byte stays stock. The scan and its covered fill touch
+/// only the low 2^13 slots of the unchanged allocation.
+pub(super) const DENSE_HASH_LOG: u32 = 13;
 
 /// Count the symbols the fed-back literal table covers (code lengths below
 /// the 11-bit cap [`MatchGeneratorDriver::note_literal_costs`] maps

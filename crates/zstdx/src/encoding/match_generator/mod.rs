@@ -2415,8 +2415,14 @@ impl MatchGeneratorDriver {
                 // twin is unreachable (see PREFILL_STRIDE). Positions ride
                 // the epoch shift set above the strategy arms.
                 let shift = self.fast_shift;
+                // Only the strip grid follows the upcoming scan's
+                // instantiation: the dictionary grid indexes content the
+                // whole frame parses against, whatever its blocks' density.
+                let log = match grid {
+                    FillGrid::Strip => self.fast_fill_log(),
+                    FillGrid::Dictionary => self.params.hash_log,
+                };
                 let table = self.tables.heads_mut();
-                let log = self.params.hash_log;
                 match grid {
                     FillGrid::Strip => {
                         // Only the strip's retention tail is inserted
@@ -3614,12 +3620,13 @@ impl Matcher for MatchGeneratorDriver {
                     }
                 },
                 Strategy::Fast => {
+                    let log = self.fast_fill_log();
                     insert_at(
                         win,
                         self.tables.heads_mut(),
                         idx,
                         self.block_start - self.fast_shift,
-                        self.params.hash_log,
+                        log,
                     );
                 },
                 Strategy::Row(row_log) => {
@@ -3763,15 +3770,17 @@ impl MatchGeneratorDriver {
                 self.ldm_alphabet_gate();
                 self.ldm_generate();
                 // The instantiation pair is compile-time: plain blocks run
-                // a body with every dense-mode lever folded out.
-                // The log axis instantiates the row's full value (HASH_LOG,
-                // everything at or above ~32 KiB of input) for the dense
-                // body only: its re-roll measured json −3.4% Ir while the
-                // plain body's re-roll measured dll +1.4% (the register
-                // freed by the constant shift is a lottery per body — the
-                // negative notes' lesson), so the plain body keeps the
-                // runtime-log codegen byte for byte. Clamped-window shapes
-                // (hash log below the row) take the [`RUNTIME_LOG`]
+                // a body with every dense-mode lever folded out. The log
+                // axis is a const for the dense body only: its re-roll
+                // measured json −3.4% Ir while the plain body's re-roll
+                // measured dll +1.4% (the register freed by the constant
+                // shift is a lottery per body — the negative notes'
+                // lesson), so the plain body keeps the runtime-log codegen
+                // byte for byte. The dense const is [`DENSE_HASH_LOG`], the
+                // small-table geometry the covered-symbol bar pays for on
+                // json-class frames; clamped-window shapes (hash log below
+                // the row) and dictionary frames (their content is indexed
+                // under the row's geometry) take the [`RUNTIME_LOG`]
                 // instantiation either way. The LDM axis follows the chain
                 // row's pattern: the empty candidate set (LDM off, gated,
                 // latched, far-less) takes the `LDM = false` instantiation,
@@ -3803,8 +3812,8 @@ impl MatchGeneratorDriver {
                                 }
                             },
                             (false, ScanDensity::Dense) => {
-                                if self.params.hash_log == HASH_LOG {
-                                    self.start_matching_fast::<false, true, HASH_LOG, false, $ldm>(
+                                if self.params.hash_log == HASH_LOG && !self.dict_prefix {
+                                    self.start_matching_fast::<false, true, DENSE_HASH_LOG, false, $ldm>(
                                         literals, seqs,
                                     );
                                 } else {
@@ -3814,8 +3823,8 @@ impl MatchGeneratorDriver {
                                 }
                             },
                             (true, ScanDensity::Dense) => {
-                                if self.params.hash_log == HASH_LOG {
-                                    self.start_matching_fast::<true, true, HASH_LOG, false, $ldm>(
+                                if self.params.hash_log == HASH_LOG && !self.dict_prefix {
+                                    self.start_matching_fast::<true, true, DENSE_HASH_LOG, false, $ldm>(
                                         literals, seqs,
                                     );
                                 } else {
@@ -4173,6 +4182,24 @@ impl MatchGeneratorDriver {
         self.head_origin = floor.wrapping_neg();
     }
 
+    /// Hash log of the table writes that target the upcoming fast scan
+    /// (the gap fill, the strip fill, the RLE insert). A dense block of a
+    /// full-row no-dict frame scans the gated [`DENSE_HASH_LOG`] half, so
+    /// its fills must index the same half or their candidates stay
+    /// invisible. The strip fill runs ahead of a job's first block and
+    /// reads the verdict the previous block left behind — the same verdict
+    /// that block's dispatch consumes.
+    fn fast_fill_log(&self) -> u32 {
+        if self.scan_density == ScanDensity::Dense
+            && self.params.hash_log == HASH_LOG
+            && !self.dict_prefix
+        {
+            DENSE_HASH_LOG
+        } else {
+            self.params.hash_log
+        }
+    }
+
     /// Dense catch-up fill for the table strategies: the positions an
     /// incompressibility-gated block skipped ([`Matcher::skip_if_incompressible`])
     /// become searchable again before the next scan reads the tables. Gated
@@ -4218,7 +4245,7 @@ impl MatchGeneratorDriver {
         let shift = self.fast_shift;
         match self.params.strategy {
             Strategy::Fast => {
-                let log = self.params.hash_log;
+                let log = self.fast_fill_log();
                 while idx < to {
                     insert_at(
                         win,

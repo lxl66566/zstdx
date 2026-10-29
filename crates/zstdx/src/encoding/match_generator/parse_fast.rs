@@ -62,10 +62,11 @@ impl MatchGeneratorDriver {
         // both address the same memory, and the loop and the emit helpers
         // never access a slot concurrently. The table is never resized.
         let table_ptr: *mut u32 = self.tables.heads_mut().as_mut_ptr();
-        // Known rows instantiate with the fastest row's log as a constant
-        // (the hash shift folds to an immediate and the shift-count register
-        // frees — the same disease the dfast const-log landing treated);
-        // clamped-window inputs (hash log below the row) take the
+        // The log arrives as a constant (the hash shift folds to an
+        // immediate and the shift-count register frees — the same disease
+        // the dfast const-log landing treated): the dense body's const is
+        // the gated [`DENSE_HASH_LOG`] geometry, while clamped-window
+        // inputs (hash log below the row) and dictionary frames take the
         // [`RUNTIME_LOG`] instantiation.
         let hash_log = if HASH_LOG == RUNTIME_LOG {
             self.params.hash_log

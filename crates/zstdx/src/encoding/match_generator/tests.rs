@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use super::{LdmArming, MatchGeneratorDriver, ldm_min_window, pack_pos, unpack_pos};
+use super::{LdmArming, MatchGeneratorDriver, ScanDensity, ldm_min_window, pack_pos, unpack_pos};
 use crate::encoding::{Matcher, Sequence, reach_probe::ReachChoice};
 
 /// The 64 KiB unit both LDM far-class tests duplicate.
@@ -1352,6 +1352,95 @@ fn row_attempts_verdict_tracks_head_alphabet() {
             } else {
                 "wide"
             }
+        );
+    }
+}
+
+/// The dense scan body runs a smaller table geometry than its row
+/// ([`DENSE_HASH_LOG`]) behind the same covered-symbol bar that arms its
+/// other levers: a narrow-alphabet block flow must gate Dense and
+/// reconstruct through the geometry, while a wide alphabet of the same
+/// shape stays Plain (every non-json-class frame's bytes are the plain
+/// body's).
+#[test]
+fn dense_geometry_rides_the_covered_bar() {
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // A 17-symbol alphabet with repeated words: dense near-repeats whose
+    // fed-back literal table stays far under the bar of 32.
+    let words = [
+        &b"abcdef ghijkl "[..],
+        &b"mnopab cdefgh "[..],
+        &b"ijklmn opabcd "[..],
+        &b"ghijkl mnopab "[..],
+    ];
+    let mut narrow = Vec::with_capacity(256 * 1024);
+    while narrow.len() < 256 * 1024 {
+        narrow.extend_from_slice(words[(rand() as usize) % words.len()]);
+    }
+    // The frame's per-block feedback: code lengths over the payload's own
+    // alphabet (uncovered symbols map to the 11-bit cap inside
+    // `note_literal_costs`).
+    let mut lens = [0u8; 256];
+    for &b in &narrow {
+        lens[b as usize] = 4;
+    }
+    let wide: Vec<u8> = (0..256 * 1024).map(|_| (rand() & 0xff) as u8).collect();
+    let mut wide_lens = [0u8; 256];
+    for &b in &wide {
+        wide_lens[b as usize] = 5;
+    }
+    for (data, lens, dense) in [(&narrow, &lens, true), (&wide, &wide_lens, false)] {
+        let mut driver = MatchGeneratorDriver::new(128 * 1024);
+        driver.reset(crate::Level::Fastest);
+        let mut rep = [1u32, 4, 8];
+        let mut reconstructed = Vec::new();
+        let mut gated = None;
+        for (i, block) in data.chunks(128 * 1024).enumerate() {
+            if i > 0 {
+                // Block i's instantiation was decided from block i-1's
+                // parse plus this fed-back table.
+                driver.note_literal_costs(lens);
+                gated = Some(driver.scan_density);
+            }
+            driver.block_tail()[..block.len()].copy_from_slice(block);
+            driver.commit_block(block.len());
+            driver.start_matching(|seq| match seq {
+                Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => {
+                    reconstructed.extend_from_slice(literals);
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    );
+                    let start = reconstructed.len() - actual as usize;
+                    for j in 0..match_len {
+                        let b = reconstructed[start + j];
+                        reconstructed.push(b);
+                    }
+                },
+            });
+        }
+        assert_eq!(&reconstructed, data, "parse must reconstruct");
+        assert_eq!(
+            gated == Some(ScanDensity::Dense),
+            dense,
+            "covered-symbol verdict for a {} alphabet",
+            if dense {
+                "narrow"
+            } else {
+                "wide"
+            },
         );
     }
 }
