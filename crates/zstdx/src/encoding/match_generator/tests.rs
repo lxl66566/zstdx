@@ -1403,6 +1403,144 @@ fn dict_row_span_key_rules_the_small_payload_swap() {
     );
 }
 
+/// The small-src class swap's band (R76, `small_src_class_row`): every
+/// level 5-17 takes a swap row under the default verdict at a known
+/// length <= 128 KiB, and the stock verdict keeps the ladder row. Levels
+/// outside the band are verdict-invariant.
+#[test]
+fn small_src_class_swap_band_rows() {
+    use super::{RowAttempts, SmallSrcRow, Strategy, params_for_row};
+    let shape = crate::InputShape {
+        len: Some(40 * 1024),
+        window_log: None,
+    };
+    // 11-17 adopt the 18 row ungated: a narrow-alphabet head must not hold
+    // them on the ladder rows (json's 32-39-symbol frames read smaller on
+    // the 18 row).
+    for level in [5i32, 6, 7, 8, 9, 10] {
+        let swapped = params_for_row(
+            crate::Level::from_zstd(level),
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+        );
+        assert!(
+            matches!(swapped.strategy, Strategy::BtLazy(_)),
+            "l{level}: the class row is the btlazy swap"
+        );
+    }
+    for level in [11i32, 12, 13, 14, 15, 16, 17] {
+        let swapped = params_for_row(
+            crate::Level::from_zstd(level),
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+        );
+        assert!(
+            matches!(&swapped.strategy, Strategy::Opt(k) if k.ultra),
+            "l{level}: the class row is the ladder's 18 row"
+        );
+    }
+    // Level 4 swaps behind its own 16 KiB boundary (R77): inside it the
+    // default verdict takes R8's row and the stock verdict keeps the
+    // dfast ladder row; outside it (the 40 KiB shape above) the level is
+    // verdict-invariant, which the 1..=22 loop already asserts.
+    let small = crate::InputShape {
+        len: Some(8 * 1024),
+        window_log: None,
+    };
+    let swapped = params_for_row(
+        crate::Level::from_zstd(4),
+        small,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Stock,
+    );
+    assert!(
+        matches!(swapped.strategy, Strategy::BtLazy(_)),
+        "l4 inside the boundary takes the btlazy swap row"
+    );
+    let stock = params_for_row(
+        crate::Level::from_zstd(4),
+        small,
+        SmallSrcRow::Stock,
+        RowAttempts::Stock,
+    );
+    assert!(
+        matches!(stock.strategy, Strategy::Dfast(_)),
+        "l4's stock verdict keeps the dfast ladder row"
+    );
+
+    // The stock verdict keeps every ladder row, and the levels outside
+    // the band never see a verdict difference at all.
+    for level in 1..=22i32 {
+        let stock = params_for_row(
+            crate::Level::from_zstd(level),
+            shape,
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+        );
+        let default = params_for_row(
+            crate::Level::from_zstd(level),
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+        );
+        let differs = stock.strategy != default.strategy;
+        assert_eq!(
+            differs,
+            matches!(level, 5..=17),
+            "l{level}: the verdict difference must follow the band"
+        );
+        if !matches!(level, 5..=17) {
+            let stock_row = (stock.hash_log, stock.window, stock.search_depth);
+            let default_row = (default.hash_log, default.window, default.search_depth);
+            assert_eq!(
+                stock_row, default_row,
+                "l{level}: outside the band the verdict changes nothing"
+            );
+        }
+    }
+}
+
+/// A dictionary frame stands the extended class swap down
+/// (`load_dictionary`'s stock resolution) and lands on `small_dict_row`'s
+/// own band, not the plain-frame 18 row: 13 keeps the small-dict opt row
+/// (tree ring 15, against the 18 row's 23) and 16 the small-dict ultra
+/// row. 9/10 keep R8's btlazy swap row on dictionary frames.
+#[test]
+fn dict_frames_keep_ladder_rows_in_the_class_band() {
+    use super::Strategy;
+    let load = |level: i32| {
+        super::params_for_row(
+            crate::Level::from_zstd(level),
+            crate::InputShape {
+                len: Some(20 * 1024),
+                window_log: None,
+            },
+            // `load_dictionary`'s stock resolution of the extended band.
+            if super::small_src_class_plain_only(level) {
+                super::SmallSrcRow::Stock
+            } else {
+                super::SmallSrcRow::Btlazy
+            },
+            super::RowAttempts::Stock,
+        )
+        .strategy
+    };
+    assert!(
+        matches!(load(13), Strategy::BtLazy(_)),
+        "l13 pure resolution keeps the btlazy2 ladder row"
+    );
+    assert!(
+        matches!(load(16), Strategy::Opt(ref k) if !k.ultra),
+        "l16 pure resolution keeps the non-ultra opt ladder row"
+    );
+    assert!(
+        matches!(load(4), Strategy::Dfast(_)),
+        "l4 pure resolution keeps the dfast ladder row in the dict band"
+    );
+}
+
 /// The owned window's poison wall must fire: a byte disturbed past the
 /// staged tail (the ASAN-blind overread footprint — the wall is the only
 /// witness) panics at the next checkpoint with the checkpoint named.

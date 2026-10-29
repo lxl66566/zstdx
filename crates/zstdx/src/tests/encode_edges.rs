@@ -460,6 +460,101 @@ fn forced_window_small_src_swap() {
     }
 }
 
+/// The small-src class swap's extended band end to end (R76): a
+/// wide-alphabet head (`small_src_btlazy_head`'s bar) at a known length
+/// <= 128 KiB collapses levels 5-10 onto the 9/10 swap row's bytes, and
+/// 11-17 collapse onto the ladder's 18-row bytes ungated — the same
+/// collapse the 9/10 swap already produced inside its band.
+#[cfg(feature = "std")]
+#[test]
+fn small_src_class_swap_collapses_wide_bands() {
+    let wide = shape("farfrags", 40 * 1024);
+    let enc = |level: i32| {
+        crate::bulk::compress_with(
+            &wide,
+            &crate::EncoderOptions::new(crate::Level::from_zstd(level)),
+        )
+        .unwrap()
+    };
+    let nine = enc(9);
+    for level in [5, 6, 7, 8, 10] {
+        assert_eq!(
+            enc(level),
+            nine,
+            "l{level}: the class row must emit the 9/10 swap bytes"
+        );
+    }
+    let eighteen = enc(18);
+    for level in [11, 12, 13, 14, 15, 16, 17] {
+        assert_eq!(
+            enc(level),
+            eighteen,
+            "l{level}: the class row must emit the 18 row's bytes"
+        );
+    }
+    // Reference decode of both collapsed classes.
+    zstd::stream::decode_all(nine.as_slice()).unwrap();
+    zstd::stream::decode_all(eighteen.as_slice()).unwrap();
+}
+
+/// The class swap's level-4 arm rides its own 16 KiB boundary (R77):
+/// inside, a wide-alphabet head collapses l4 onto the 9/10 swap bytes;
+/// outside, l4 keeps the dfast ladder row; a narrow head inside keeps it
+/// too, through the same 48-symbol verdict as 5-10.
+#[cfg(feature = "std")]
+#[test]
+fn small_src_class_swap_l4_boundary() {
+    let enc = |kind: &str, len: usize, level: i32| {
+        crate::bulk::compress_with(
+            &shape(kind, len),
+            &crate::EncoderOptions::new(crate::Level::from_zstd(level)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        enc("farfrags", 8 * 1024, 4),
+        enc("farfrags", 8 * 1024, 9),
+        "l4 inside the boundary emits the swap row's bytes on a wide head"
+    );
+    assert_ne!(
+        enc("farfrags", 40 * 1024, 4),
+        enc("farfrags", 40 * 1024, 9),
+        "l4 outside the boundary keeps the dfast ladder row"
+    );
+    // A narrow-alphabet head (24 symbols, so the sampled verdict reads
+    // under the 48 bar) over fragment repeats: real matches, a parse the
+    // dfast row and the 9 row resolve differently.
+    let mut pick = Rng(0x1234_5678_9abc_def0);
+    let frags: Vec<Vec<u8>> = (0..64)
+        .map(|_| {
+            let n = 20 + pick.next() as usize % 20;
+            (0..n)
+                .map(|_| b'a' + (pick.next() as usize % 24) as u8)
+                .collect()
+        })
+        .collect();
+    let mut narrow = Vec::with_capacity(8 * 1024);
+    while narrow.len() < 8 * 1024 {
+        let frag = &frags[pick.next() as usize % frags.len()];
+        narrow.extend_from_slice(frag);
+    }
+    narrow.truncate(8 * 1024);
+    let four = crate::bulk::compress_with(
+        &narrow,
+        &crate::EncoderOptions::new(crate::Level::from_zstd(4)),
+    )
+    .unwrap();
+    let nine = crate::bulk::compress_with(
+        &narrow,
+        &crate::EncoderOptions::new(crate::Level::from_zstd(9)),
+    )
+    .unwrap();
+    assert_ne!(four, nine, "a narrow head holds l4 on the dfast ladder row");
+    // Both forms decode through the reference.
+    zstd::stream::decode_all(enc("farfrags", 8 * 1024, 4).as_slice()).unwrap();
+    zstd::stream::decode_all(four.as_slice()).unwrap();
+}
+
 /// Dictionary frames at the tiny-payload edge (the first block ≤ 8 bytes
 /// class) and over the real `zstd --train` fixture: raw-content and
 /// formatted dictionaries, the id-suppressed form, single- and

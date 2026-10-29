@@ -678,7 +678,17 @@ pub(crate) fn dict_seed_key(
     // Keep reach takes no shrink replacement, and the LDM switch runs its
     // fast/dfast window split under the length bars (the lift only raises
     // an AUTO window — a forced windowLog stands it down).
-    let mut params = params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock);
+    // `load_dictionary` resolves the extended class-swap band (5-8,
+    // 11-17) to the ladder row on dictionary frames; mirror the starting
+    // verdict so the projection stays the frame's own decision path.
+    let base_row = if shape.len.is_some_and(|n| n <= SMALL_SRC_MAX)
+        && small_src_class_plain_only(level.as_i32())
+    {
+        SmallSrcRow::Stock
+    } else {
+        SmallSrcRow::Btlazy
+    };
+    let mut params = params_for_row(level, shape, base_row, RowAttempts::Stock);
     match ldm {
         crate::LdmMode::Auto => {},
         crate::LdmMode::Disable => params.ldm = false,
@@ -687,13 +697,19 @@ pub(crate) fn dict_seed_key(
     if params.ldm && matches!(params.strategy, Strategy::Fast | Strategy::Dfast(_)) {
         match ldm {
             crate::LdmMode::Enable => {
+                // The stock query carries the same starting verdict the
+                // real path's `self.small_src_row` holds at its own Enable
+                // arm (the stand-down's Stock at the plain-only levels,
+                // the Btlazy default elsewhere): the class swap's level-4
+                // arm changes the queried row's window at <= 16 KiB, so a
+                // hard-coded Btlazy would drift the projection there.
                 let stock = params_for_row(
                     level,
                     InputShape {
                         len: shape.len,
                         window_log: None,
                     },
-                    SmallSrcRow::Btlazy,
+                    base_row,
                     RowAttempts::Stock,
                 )
                 .window
@@ -1498,7 +1514,7 @@ impl MatchGeneratorDriver {
         // stays a single pass.
         self.small_src_pending = (self.small_src_row == SmallSrcRow::Btlazy
             && self.params.small_src
-            && matches!(level.as_i32(), 9 | 10))
+            && small_src_class_swapped(level.as_i32()))
         .then_some(level);
         // A row-band level arms the attempts verdict — resolved at the
         // frame's first matching entry, where the head sits in the window
@@ -1607,6 +1623,17 @@ impl MatchGeneratorDriver {
         // pending attempts verdict dies with it, for the same reason.
         self.small_src_pending = None;
         self.row_attempts_pending = None;
+        // The extended class-swap band (5-8, 11-17) stands down here:
+        // `small_dict_row`'s band owns these levels on dictionary frames,
+        // and its rows key on the ladder strategy; 9/10 keep R8's swap
+        // row, as ever.
+        if self.params.small_src && small_src_class_plain_only(level.as_i32()) {
+            self.small_src_row = SmallSrcRow::Stock;
+            self.apply_level(level);
+            self.strategy_phase_reset();
+            self.small_src_pending = None;
+            self.row_attempts_pending = None;
+        }
         let dict_len = content.len() as u64;
         let keep = content.len().min(self.params.window);
         let content = &content[content.len() - keep..];
@@ -4242,9 +4269,10 @@ use hash::*;
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
-    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy,
-    ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
-    small_dict_row, small_src_btlazy_head,
+    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SMALL_SRC_MAX, SmallDictRow,
+    SmallSrcRow, Strategy, ldm_min_window, params_for, params_for_row, row_attempts_light,
+    sampled_distinct, small_dict_row, small_src_btlazy_head, small_src_class_plain_only,
+    small_src_class_swapped,
 };
 pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]

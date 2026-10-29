@@ -692,6 +692,12 @@ const fn params_for_level(level: Level) -> LevelParams {
 /// cParams table boundary (srcSize <= 128 KiB).
 pub(crate) const SMALL_SRC_MAX: u64 = 128 * 1024;
 
+/// The class swap's level-4 boundary: libzstd's <= 16 KiB column swaps
+/// its level-4 row to greedy while the 128/256 KiB columns keep dfast —
+/// the one class-shift arm whose size boundary sits below
+/// [`SMALL_SRC_MAX`].
+const SMALL_SRC_CLASS_L4_MAX: u64 = 16 * 1024;
+
 /// [`params_for_level`] adjusted to what the caller declared about the
 /// input: a forced window log overrides the row's window first, then a
 /// known length downsizes (libzstd's override-then-adjust order, so a
@@ -790,6 +796,69 @@ const fn row_light_search_depth(level: i32) -> Option<u32> {
     }
 }
 
+/// Whether a level's small-src frames adopt a class-swap row behind the
+/// head verdict (see [`small_src_class_row`]): libzstd's srcSize-keyed
+/// clevels columns change strategy class one band earlier than the
+/// default table, and the plain ladder trails those classes on
+/// wide-alphabet small frames. Level 4's arm carries its own 16 KiB
+/// boundary inside `small_src_class_row`, so the verdict it pends here
+/// is inert above the boundary (the class row returns None and the
+/// ladder row resolves either way).
+pub(super) const fn small_src_class_swapped(level: i32) -> bool {
+    matches!(level, 4..=10)
+}
+
+/// The class swap's extended band, 4 and 5-8 and 11-17, on plain frames
+/// only. A dictionary frame resolves [`SmallSrcRow::Stock`] before its
+/// own row semantics (see `load_dictionary`), because `small_dict_row`'s
+/// band owns these levels there; 9/10 keep R8's swap row on every frame,
+/// so they stay out (the seed-image projection mirrors this predicate).
+/// Level 4 stands down over the whole 128 KiB small-src span: above its
+/// 16 KiB swap boundary the class row returns None, so the stock
+/// resolution coincides with the swap one at dfast.
+pub(super) const fn small_src_class_plain_only(level: i32) -> bool {
+    matches!(level, 4 | 5..=8 | 11..=17)
+}
+
+/// The row a small-src frame adopts through the class swap: libzstd's
+/// srcSize-keyed clevels columns change strategy class one band earlier
+/// than the default table — its 16 KiB column runs btlazy2 from 9 and
+/// btopt from 11, its 128 KiB column btlazy2 at 11-12, btopt at 13-15
+/// and btultra at 16-17 — while this ladder keeps the row matcher through
+/// 12 and non-ultra rows at 13-17. Measured against the 1.5.7 CLI at
+/// 1-64 KiB (the R76 plain-frame differential), text l5-12 read
+/// +7..+16% and dll l11-17 +3..+20%. The swap maps the band onto this
+/// engine's own rows: 5-10 take R8's btlazy row behind the same
+/// 48-symbol head verdict as 9/10 (narrow-alphabet frames keep their
+/// ladder rows — the swap's per-position cost is a speed trade the
+/// low-alphabet classes do not pay back), and 11-17 take the ladder's
+/// 18 row ungated (the opt-ultra class the columns run from 13; the
+/// head verdict would hold json's 32-39-symbol frames on the deficit
+/// rows, and every measured shape — json l14 16K +117 B, dll l11 2K
+/// +21 B — reads smaller on the 18 row, narrow alphabets included).
+/// R77 added the 16 KiB column's level-4 arm behind its own size
+/// boundary: that column runs greedy where the ladder keeps dfast (the
+/// 128/256 KiB columns do not), so level 4 at a known length <= 16 KiB
+/// takes R8's row behind the same head verdict as 5-10.
+const fn small_src_class_row(level: i32, len: Option<u64>) -> Option<LevelParams> {
+    match level {
+        // The 16 KiB column's greedy row one rung down (R77): the column
+        // swaps level 4 to greedy where the 128/256 KiB columns keep
+        // dfast, and 32 KiB frames sit at parity, so the boundary is the
+        // column's own. Literal ports of the column's chain row left text
+        // l4 +2.3..+5.2% behind the CLI (the row matcher's own greedy row
+        // +6..+12%), while R8's btlazy row reads ahead of the reference's
+        // greedy itself — the engine's own row, behind the same
+        // 48-symbol head verdict as 5-10.
+        4 if matches!(len, Some(n) if n <= SMALL_SRC_CLASS_L4_MAX) => {
+            Some(btlazy(17, 1 << 17, bt_knobs(5, 16)))
+        },
+        5..=10 => Some(btlazy(17, 1 << 17, bt_knobs(5, 16))),
+        11..=17 => Some(LEVEL_PARAMS[18]),
+        _ => None,
+    }
+}
+
 pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
     params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock)
 }
@@ -805,16 +874,21 @@ pub(super) const fn params_for_row(
         p.window = 1usize << clamp_u32(wl, 10, 27);
     }
     p.small_src = matches!(shape.len, Some(n) if n <= SMALL_SRC_MAX);
-    // Small-input policy for the balanced tier (libzstd's <= 16 KiB table
-    // swaps its level 9-10 lazy2 rows to btlazy2, searchLog 5): the
-    // chain's newest-first selection accepts nearer-shorter candidates
-    // where the tiny window leaves the tree's full coverage cheap, and
-    // the DUBT parse measured strictly smaller on every class (text 16
-    // KiB -282 B vs the chain, json -107, skewed +9). R27 made the swap
-    // a head verdict (`row`): the 64K-128K band pays the row's
-    // per-position cost at 2-4x for none of that size on the
-    // low-alphabet classes (see [`SmallSrcRow`]).
-    if matches!(row, SmallSrcRow::Btlazy) && p.small_src && matches!(level.as_i32(), 9 | 10) {
+    // Small-input class swap (libzstd's srcSize-keyed clevels columns;
+    // see [`small_src_class_row`]). R8 swapped the balanced tier's 9/10
+    // lazy2 rows to a btlazy row — the chain's newest-first selection
+    // accepts nearer-shorter candidates where the tiny window leaves the
+    // tree's full coverage cheap, and the DUBT parse measured strictly
+    // smaller on every class (text 16 KiB -282 B vs the chain, json
+    // -107, skewed +9). R27 made the swap a head verdict (`row`): the
+    // 64K-128K band pays the row's per-position cost at 2-4x for none of
+    // that size on the low-alphabet classes (see [`SmallSrcRow`]); R76
+    // extended the same class shift and verdict to the columns' own bands
+    // (see [`small_src_class_row`]).
+    if matches!(row, SmallSrcRow::Btlazy)
+        && p.small_src
+        && let Some(swap) = small_src_class_row(level.as_i32(), shape.len)
+    {
         // A forced window rides the swap like every other row: C applies the
         // user's windowLog AFTER the small-table pick
         // (ZSTD_getCParamsFromCCtxParams: table -> ZSTD_overrideCParams ->
@@ -822,7 +896,7 @@ pub(super) const fn params_for_row(
         // (the source clamp below can only lower it further, and the
         // geometry clamps to that final window exactly like the ladder
         // rows' path).
-        let mut swapped = btlazy(17, 1 << 17, bt_knobs(5, 16));
+        let mut swapped = swap;
         if let Some(wl) = shape.window_log {
             swapped.window = 1usize << clamp_u32(wl, 10, 27);
         }
