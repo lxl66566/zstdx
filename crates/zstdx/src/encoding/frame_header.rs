@@ -89,6 +89,22 @@ impl FrameHeader {
         self
     }
 
+    /// The FCS field class a pledged size serializes into, as libzstd's
+    /// `fcsCode = (v>=256) + (v>=65536+256) + (v>=0xFFFFFFFF)` picks it:
+    /// the 2-byte class's -256 offset stretches it to 65791, and the
+    /// 4-byte class stops at 0xFFFFFFFE because 0xFFFFFFFF is the
+    /// content-size-unknown sentinel C never declares. A plain
+    /// `find_min_size` would put every size in [65536, 65791] into the
+    /// 4-byte class one byte early.
+    fn fcs_field_class(val: u64) -> u8 {
+        match val {
+            0..=255 => 1,
+            256..=65791 => 2,
+            v if v < u32::MAX as u64 => 4,
+            _ => 8,
+        }
+    }
+
     /// Generate a serialized frame header descriptor for the frame header.
     ///
     /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header_descriptor
@@ -163,15 +179,16 @@ impl FrameHeader {
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
-            let field_size = find_min_size(frame_content_size);
-            // FCS flag encodes the field size (RFC 8878): 0 -> 1 byte,
-            // 1 -> 2, 2 -> 4, 3 -> 8. `find_min_size` yields 1/2/4/8.
-            let flag_value: u8 = match field_size {
+            // FCS flag encodes the field class (RFC 8878): 0 -> 1 byte,
+            // 1 -> 2, 2 -> 4, 3 -> 8, at the same class edges C picks
+            // (see [`Self::fcs_field_class`]). Flag 0's 1-byte field only
+            // exists under the single-segment flag; `normalized` dropped
+            // such sizes from windowed frames already.
+            let flag_value: u8 = match Self::fcs_field_class(frame_content_size) {
                 1 => 0,
                 2 => 1,
                 4 => 2,
-                8 => 3,
-                _ => panic!(),
+                _ => 3,
             };
 
             bw.write_bits(flag_value, 2);
@@ -191,7 +208,7 @@ impl FrameHeader {
 ///
 /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size
 fn minify_val_fcs(val: u64) -> Vec<u8> {
-    let new_size = find_min_size(val);
+    let new_size = FrameHeader::fcs_field_class(val) as usize;
     let mut val = val;
     if new_size == 2 {
         val -= 256;
@@ -236,8 +253,16 @@ mod tests {
             (255, 0, &[0xff]),
             (256, 1, &[0x00, 0x00]),
             (u16::MAX as u64, 1, &[0xff, 0xfe]),
-            (1 << 16, 2, &[0x00, 0x00, 0x01, 0x00]),
-            (u32::MAX as u64, 2, &[0xff, 0xff, 0xff, 0xff]),
+            // The 2-byte class's -256 offset holds through 65791, one
+            // 256-value band past 2^16 that a plain byte-width split
+            // misses (C's fcsCode edge `v >= 65536+256`).
+            (1 << 16, 1, &[0x00, 0xff]),
+            (65791, 1, &[0xff, 0xff]),
+            (65792, 2, &[0x00, 0x01, 0x01, 0x00]),
+            (u32::MAX as u64 - 1, 2, &[0xfe, 0xff, 0xff, 0xff]),
+            // 0xFFFFFFFF is the unknown sentinel; C never declares it as
+            // a 4-byte field and goes straight to the 8-byte class.
+            (u32::MAX as u64, 3, &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]),
             (1u64 << 32, 3, &[
                 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
             ]),

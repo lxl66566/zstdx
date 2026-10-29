@@ -1230,7 +1230,9 @@ mod mt {
             );
             assert_eq!(sink, bulk, "window log {window_log}");
         }
-        // Dictionary frames keep the windowed header and declare there too.
+        // Dictionary frames follow the same single-segment rule: their
+        // dict-widened window covers the pledge, so the window descriptor
+        // drops there too, and the stream and bulk entries still agree.
         if let Ok(dict) = std::fs::read("./dict_tests/dictionary") {
             let data = textish(128 * 1024);
             let opts = || {
@@ -1242,6 +1244,7 @@ mod mt {
             let mut enc = write::Encoder::with_options(&mut sink, opts()).unwrap();
             enc.write_all(&data).unwrap();
             enc.finish().unwrap();
+            assert_eq!((sink[4] >> 5) & 1, 1, "dict pledge takes single-segment");
             let bulk = bulk::compress_with(&data, &opts()).unwrap();
             assert_eq!(sink, bulk);
         }

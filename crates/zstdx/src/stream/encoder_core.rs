@@ -425,9 +425,11 @@ impl FrameEncoderCoreSt {
         // libzstd's frame-header shape: a pledged size the window already
         // covers drops the window descriptor for the single-segment form
         // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=
-        // pledgedSrcSize`). Dictionary frames keep the windowed form.
+        // pledgedSrcSize`), with no dictionary carve-out. The dictionary
+        // widens the window through the shape fold, so a pledged dict
+        // stream qualifies the same way a plain one does.
         let window = self.state.matcher.window_size();
-        let single_segment = dict.is_none() && options.pledged_size.is_some_and(|n| n <= window);
+        let single_segment = options.pledged_size.is_some_and(|n| n <= window);
         let header = FrameHeader {
             frame_content_size: options.pledged_size,
             single_segment,

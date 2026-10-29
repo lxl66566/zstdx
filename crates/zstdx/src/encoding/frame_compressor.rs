@@ -698,9 +698,8 @@ fn compress_with_state_donated(
 /// borrowed zero-copy window, so blocks stage through the matcher's own
 /// buffer), with the dictionary's id in the header. `state` must have been
 /// reset through [`super::dictionary::reset_with_dictionary`]. A declared
-/// content size lands in the header, but the frame stays windowed (the
-/// dictionary's history reaches past the content, as the streaming core
-/// keeps it).
+/// content size the window covers takes the single-segment form, exactly
+/// like a plain frame (see the header construction below).
 pub(crate) fn compress_with_state_dictionary(
     state: &mut CompressState<MatchGeneratorDriver>,
     src: &[u8],
@@ -712,12 +711,18 @@ pub(crate) fn compress_with_state_dictionary(
     let block_size = state.matcher.block_size();
     let block_overhead = 3 * (src.len() / block_size.min(pre_split::SPLIT_MIN) + 1);
     let mut output = Vec::with_capacity(src.len() + block_overhead + 32);
+    // libzstd's `ZSTD_writeFrameHeader` has no dictionary carve-out:
+    // `singleSegment = contentSizeFlag && windowSize >= pledgedSrcSize`.
+    // The dictionary widens the window through the rSize fold, so a
+    // pledged payload at or below it drops the window descriptor like a
+    // plain frame; the dictionary stays fully in effect through its id.
+    let window = state.matcher.window_size();
     let header = FrameHeader {
         frame_content_size: declared,
-        single_segment: false,
+        single_segment: declared.is_some_and(|n| n <= window),
         content_checksum: checksum && cfg!(feature = "hash"),
         dictionary_id: dict_id,
-        window_size: Some(state.matcher.window_size()),
+        window_size: Some(window),
     };
     header.serialize(&mut output);
     compress_dict_span_blocks(state, src, 0..src.len(), true, &mut output, &mut hasher);

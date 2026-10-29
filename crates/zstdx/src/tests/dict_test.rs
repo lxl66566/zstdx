@@ -1263,3 +1263,79 @@ fn unpledged_frame_compressor_dict_keeps_full_window() {
         .expect("the unpledged dict frame must decode");
     assert_eq!(&back[..], &src[..]);
 }
+
+/// libzstd's `ZSTD_writeFrameHeader` has no dictionary carve-out:
+/// `singleSegment = contentSizeFlag && windowSize >= pledgedSrcSize`. A
+/// dictionary frame whose window covers the pledged size drops the window
+/// descriptor exactly like a plain frame, and the FCS field rides the same
+/// class edges plain frames use (the 2-byte class's -256 offset stretches
+/// it to 65791). Pinned by byte-comparing our header prefix against the
+/// reference's own dictionary frame of the same content, at sizes around
+/// the FCS class boundary, plus a dictionary decode of our frame.
+#[test]
+fn dict_frame_single_segment_header_matches_reference() {
+    extern crate std;
+    use alloc::vec::Vec;
+
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    let dict_id = crate::EncoderDictionary::parse(&dict)
+        .unwrap()
+        .header_id()
+        .expect("the fixture dictionary declares an id");
+    let dict_id_len = match dict_id {
+        1..=0xff => 1usize,
+        0x100..=0xffff => 2,
+        _ => 4,
+    };
+    let payload = |len: usize| -> Vec<u8> {
+        let line = b"[Unit]\nDescription=dictionary frame header fixture\n";
+        (0u16..)
+            .flat_map(|i| line.iter().copied().chain([b'a' + (i % 26) as u8]))
+            .take(len)
+            .collect()
+    };
+    // Inside the 2-byte FCS class, at its top edge 65791, and one past it.
+    for len in [300usize, 4096, 65791, 65792] {
+        let data = payload(len);
+        for level in [1, 9, 19] {
+            let opts = crate::EncoderOptions::new(crate::Level::from_zstd(level))
+                .checksum(false)
+                .dictionary(&dict)
+                .pledged_size(Some(len as u64));
+            let ours = crate::bulk::compress_with(&data, &opts).unwrap();
+            let mut zenc = zstd::bulk::Compressor::with_dictionary(level, &dict).unwrap();
+            let theirs = zenc.compress(&data).unwrap();
+            let desc = ours[4];
+            // The dict-widened window covers every one of these sizes: the
+            // single-segment form, no window descriptor byte.
+            assert_eq!(
+                desc >> 5 & 1,
+                1,
+                "single-segment at len {len} level {level}"
+            );
+            // libzstd's fcsCode edges: (v>=256) + (v>=65536+256) + (v>=0xFFFFFFFF)
+            let fcs_flag = match len as u64 {
+                0..=255 => 0u8,
+                256..=65791 => 1,
+                v if v < u32::MAX as u64 => 2,
+                _ => 3,
+            };
+            assert_eq!(desc >> 6, fcs_flag, "fcs class at len {len}");
+            let header_len = 4 + 1 + dict_id_len + [1usize, 2, 4, 8][fcs_flag as usize];
+            assert_eq!(
+                &ours[..header_len],
+                &theirs[..header_len],
+                "header prefix at len {len} level {level}"
+            );
+            let back = crate::bulk::decompress_with(
+                &ours,
+                len,
+                &crate::DecoderOptions::new().dictionary(&dict),
+            )
+            .unwrap();
+            assert_eq!(&back[..], &data[..], "decode at len {len} level {level}");
+        }
+    }
+}
