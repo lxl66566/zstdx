@@ -78,6 +78,37 @@ fn payload() -> Vec<u8> {
     data
 }
 
+/// An empty source pledges 0 whatever the input kind, matching zstd's
+/// own empty frame byte for byte: the single-segment form with a 1-byte
+/// FCS field of zero (magic, descriptor 0x24, FCS 0x00, one empty last
+/// raw block, the empty-input checksum). A non-empty stdin keeps the
+/// unpledged windowed form, exactly like zstd's stream path.
+#[test]
+fn empty_sources_pledge_zero() {
+    const EMPTY_FRAME: [u8; 13] = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x01, 0x00, 0x00, 0x99, 0xe9, 0xd8, 0x51,
+    ];
+    let (output, stdout) = run_piped(&["-q", "-1", "-c"], b"");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(stdout, EMPTY_FRAME);
+
+    let scratch = Scratch::new("empty-pledge");
+    let input = scratch.path("empty.bin");
+    fs::write(&input, b"").unwrap();
+    let output = run(&["-q", "-1", "-c", input.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, EMPTY_FRAME);
+
+    // A non-empty stdin never pledges (zstd's stream shape): the
+    // descriptor's FCS flag stays clear.
+    let (_, stdout) = run_piped(&["-q", "-1", "-c"], b"payload bytes");
+    assert_eq!(
+        stdout[4] & 0xc0,
+        0,
+        "a non-empty stdin keeps the pledge off"
+    );
+}
+
 #[test]
 fn file_roundtrip_default_names() {
     let scratch = Scratch::new("roundtrip");

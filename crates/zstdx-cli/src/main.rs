@@ -1714,6 +1714,26 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+/// The one-chunk prefix the empty-source pledge probe read ahead (see
+/// [`compress`]): replays the prefix, then delegates to the inner reader.
+struct PrefixReader {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: Box<dyn Read>,
+}
+
+impl Read for PrefixReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = buf.len().min(self.prefix.len() - self.pos);
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// Whether the failure is the encoder rejecting a --stream-size pledge
 /// the input did not meet (both error-chain shapes: bare and io-wrapped).
 fn pledged_size_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -1756,9 +1776,29 @@ fn compress(
     // A file input pledges its metadata size; a stdin stream pledges
     // --stream-size or nothing. --no-content-size keeps the size out of the
     // header while it still shapes the row through the hint.
-    let known_size = settings
+    let mut reader = reader;
+    let mut known_size = settings
         .stream_size
         .or((source_size > 0).then_some(source_size as u64));
+    // An empty source pledges 0, matching zstd on both input kinds: its
+    // read pool settles a 0-byte first read before the frame header
+    // flushes, so a file of size 0 and a stdin that opens empty both
+    // carry the FCS field. The peek runs once, only while no size is
+    // known yet; a 0-byte read is EOF, which settles emptiness, and any
+    // bytes read ride ahead of the stream through [`PrefixReader`].
+    if known_size.is_none() && settings.content_size {
+        let mut first = [0u8; 64 * 1024];
+        let n = reader.read(&mut first)?;
+        if n == 0 {
+            known_size = Some(0);
+        } else {
+            reader = Box::new(PrefixReader {
+                prefix: first[..n].to_vec(),
+                pos: 0,
+                inner: reader,
+            });
+        }
+    }
     options = options.pledged_size(settings.content_size.then_some(known_size).flatten());
     // --long forces the window, --size-hint sizes the row; a known pledge
     // still shrinks the window to the source inside the engine, as zstd
