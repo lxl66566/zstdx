@@ -208,6 +208,24 @@ Full u64 hashing without 40-bit truncation wins json both ways but costs text 7%
 
 Changing table entries from u64 to u32 at Fastest 2^15 with a 2-bit epoch scheme gave identical output at +0.09% instructions. Entry width is not a lever while the table lives in L2, which contrasts with Balanced's 16 MiB working set, where u32 is a big win in `327bc99`.
 
+## Balanced row substitution calibration
+
+### RowLog 5 at 31 attempts for the balanced row twin
+
+The balanced storage swap's frontier sweep tried the L10 geometry as the row twin, `row(22, 5, W26, 31 attempts)` with LDM at the W24 search domain, against the landed `row(21, 4, W26, 15)`. The wider row bought size on every column, text 88,608 against 89,436 bytes and dll100 19,380,181 against 19,518,759, but read dll100 at 71 MiB/s against the landed twin's 134 and the chain's 114, x1.82 against libzstd. Dll's candidates sit dense in their rows, so 31 verifies per position are pure scan volume, and the twin's density on that shape is carried by the LDM far classes the attempts never touch. Text's +0.9% from the wider row is redundant behind the cold-start head, which lands the text frame byte-identical to the chain's at either geometry. The dll class refuses the trade; the record is the swap's landing evidence, not a general rowLog verdict, and reopens only if the dll class's density bar moves.
+
+## Row matcher attempts tuning
+
+### Per-block adaptive attempts budgets
+
+Per-block adaptive attempts budgets, the R79 novel-direction track, asked whether the row band's per-search candidate budget could follow live per-block feedback instead of the attempts diet's per-frame constant. The offline bound came first, through a temporary bench-crate instrumentation of the row search, removed with the round: per block it recorded wall and emitted bytes plus the search count, the attempts-consumed fraction, the hit rate and the winner-rank histogram, while a runtime multiplier swept the resolved budget from 25 to 200 percent inside one interleaved process. The cells covered json, text, dll32 and dll100 at rows 5, 7, 10 and 11 plus the balanced row twin, bulk single-thread, three to five rounds per multiplier.
+
+The headroom is real. An oracle that picks each block's budget from the measured per-block time and size, under a Lagrangian weight holding the frame at the stock size, saves time out of sample, with the schedule fitted on half the rounds and judged on the other half: json 3.3-4.0% at l7 and l10 and 8.8-9.9% at l11, dll32 2.9-3.0% at l7, 3.5-4.8% at the twin and 14.5% at l11, dll100 1.5-1.8% at l7, 3.4-5.6% at the twin and 9.8-10.8% at l11. The per-block cut exchange rate, nanoseconds of parse saved per byte paid, is a stable block property at 0.86-1.00 cross-half correlation on those cells, so the oracle gains are signal. Text is attempts-insensitive: the twin's frame is byte-identical from 7 to 22 attempts, and the band's rows pay size for cuts that save no per-block time.
+
+Every observable statistic fails to predict the profitable budget. The exchange rate correlates at 0.01-0.41 with the search count, the attempts-consumed fraction, the hit and found rates, the mean winner rank, the deep-winner share past rank 3 and the top-two share, measured on the same block and at lag one. The correlation peaks where the headroom is smallest, 0.34-0.41 on json l5 and l7 against a 0.7-3.6% oracle cap, and collapses on the dll cells that carry 10-14.5%, under 0.28 at l7 and under 0.12 at l11 and the twin. A six-feature linear model reads out-of-sample R2 of 0.001-0.074 on dll and 0.130-0.146 on json l5 and l7. Position in frame stays under 0.14. The stats are themselves stationary on json at 0.89-1.00 lag-one autocorrelation and wander on dll at 0.11-0.40, so neither regime hides a usable signal. A threshold policy mapping the previous block's consumed fraction to a budget, fitted on one half at the iso-size weight, gains about 0.1% judged on the other half, and every variant that moved time paid size past the iso-size line.
+
+The mechanism reading closes the direction. Search volume predicts the cut's time saving at 0.81-0.91 and its size price at 0.67-0.84 on dll, so the blocks that would save more are the same blocks that pay more, and the rate between them is idiosyncratic. Whether a block's best match sits past the cut depth is a content accident, knowable only by running the search the budget exists to bound. A second parse to learn it is the reach-probe class and costs more than the 3-15% it could harvest. The static half of the sweep agrees: on every cell the stock budget is the best uniform multiplier at iso-size beyond measurement noise, so the landed per-frame diet's calibration stands. Reopening needs a content screen that predicts deep winners, the same class as the falsified parse-statistic gates for dense mode.
+
 ## Chain and lazy walks
 
 ### lazySkipping port

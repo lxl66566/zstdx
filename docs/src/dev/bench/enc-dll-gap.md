@@ -32,9 +32,9 @@ The emit-side live-set shrink hypothesis does not explain the gap. Summing the s
 
 The fast and dfast scan loops carry +414M and +538M instructions. Their register-budget levers are measured out, with the const-log, OR-fold and restructure entries recorded in the [matcher negative results](../negative/matchers.md). `insert_covered` carries +425M at level 1 and is uop-volume-bound at about 9 to 14 instructions per insert. Every fill-thinning policy costs size on json and text, and the density-gated stride-2 form has already shipped. A dual-anchor-everywhere fill buys 0.46% dll size for 7.3% wall at level 1, which the size axis rejects, and a const-log instantiation of the outlined body would save about 1 instruction per insert, about 0.7% of level 1 and below the noise floor.
 
-## What remains open
+## The balanced tier after the storage swap
 
-The balanced tier's only lever that touches the latency mechanism is row-based candidate storage, libzstd's `ZSTD_RowFindBestMatch`. That is a matcher rearchitecture rather than an attrition item, and it is the open work for the tier.
+The balanced tier's latency mechanism is closed as of 2026-10-30. Row-based candidate storage, the lever this page named, landed as a per-frame verdict over the frame head's sampled alphabet: wide heads on frame-continuous frames take the tagged row twin of row 9 with LDM, narrow heads keep the chain, and the dll100 cell moved from 114 MiB/s at ratio 5.31 to 134 at 5.37 against libzstd's 149 at 4.62, x1.30 to x1.12. Text reads 1856 MiB/s at 384.66 against libzstd's 1726 at 378.41, ahead on both axes from the chain's 1560. The mechanism, geometry and gates are on the [matchers page](../perf/matchers.md) under the balanced storage swap. What remains of the dll cell is the W26-plus-LDM density lead's price, with an attempts diet for the dll class as the named follow-up.
 
 The fastest and fast tiers are bounded by scan-loop instruction volume. The loop's register budget re-rolls on every added live value, so only register-negative changes convert, and the landed examples are the const-log instantiation and the fused table allocation. No removable live value remains identified in the loop.
 

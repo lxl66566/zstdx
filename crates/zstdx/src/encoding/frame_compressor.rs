@@ -13,7 +13,10 @@ use super::{
     far_screen,
     frame_header::FrameHeader,
     levels::*,
-    match_generator::{LdmArming, MatchGeneratorDriver, fast_row_screen_pending},
+    match_generator::{
+        BALANCED_STORE_HEAD_SPAN, BalancedStore, LdmArming, MatchGeneratorDriver, balanced_store,
+        fast_row_screen_pending,
+    },
     pre_split, reach_probe,
 };
 use crate::{
@@ -421,7 +424,16 @@ pub(crate) fn compress_slice_shaped_ldm(
     } else {
         LdmArming::Frame
     };
-    if reach_probe::eligible(level, shape) {
+    // The balanced row's storage verdict (see `BalancedStore`): a wide
+    // head on a level-9 frame of the probe's size bar takes the
+    // row-matcher twin, and the reach probe — a chain-row experiment —
+    // stands down with it (the row parses the frame whole; no reach is
+    // traded away).
+    let head_span = src.len().min(BALANCED_STORE_HEAD_SPAN);
+    let bal_row = level.as_i32() == 9
+        && shape.len.is_some_and(|n| n >= reach_probe::PROBE_MIN_FRAME)
+        && balanced_store(&src[..head_span]) != BalancedStore::Chain;
+    if !bal_row && reach_probe::eligible(level, shape) {
         // The probe's keep side donates: the first span blocks run as the
         // frame's own blocks through the full pipeline, and only a Shrink
         // verdict restarts the frame (see `compress_with_state_donated`).
@@ -431,9 +443,19 @@ pub(crate) fn compress_slice_shaped_ldm(
         return_slice_state(state);
         return output;
     }
-    // The frame's head decides its chain reach (see reach_probe).
-    let choice = reach_probe::probe_reach_choice(src, level, shape);
+    // The frame's head decides its chain reach (see reach_probe); a
+    // storage-substituted frame keeps the stock reach.
+    let choice = if bal_row {
+        reach_probe::ReachChoice::Keep
+    } else {
+        reach_probe::probe_reach_choice(src, level, shape)
+    };
     let mut state = take_slice_state_ldm(level, shape, choice, ldm, ldm_mode);
+    if bal_row {
+        state
+            .matcher
+            .consider_balanced_store(&src[..head_span], level);
+    }
     let output = compress_with_state(&mut state, src, level, checksum, declared);
     return_slice_state(state);
     output

@@ -6,7 +6,10 @@
 use super::{HASH_LOG, MAX_WINDOW, MIN_MATCH};
 #[cfg(feature = "std")]
 use super::{HASH_READ, read8};
-use crate::{InputShape, Level, encoding::opt::OptKnobs};
+use crate::{
+    InputShape, Level,
+    encoding::{opt::OptKnobs, reach_probe::KEEP_REACH},
+};
 
 /// Which search loop the matcher runs. The `chain` buffer is the second
 /// table for the two-table strategies and empty for [`Strategy::Fast`].
@@ -616,6 +619,10 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     row(20, 4, 1 << 21, 16, 2),
     // 9: the Balanced tier's row. libzstd's L9 is W22; the chain stays
     // C20, aliasing beyond 1 MiB like libzstd's cLog-below-wLog chains.
+    // Wide-alphabet frames take the row-storage twin through
+    // [`BalancedStore`] (see `balanced_row_params`): the chain walk's
+    // link chase is the tier's latency wall, and the twin keeps this
+    // row's window, LDM far domain and cold-start head.
     // The cold-start head parses the first HEAD_LIMIT bytes through the
     // DUBT tree: the chain's newest-first selection accepts nearer-shorter
     // candidates while no cross-tile history exists yet (the text
@@ -796,6 +803,81 @@ const fn row_light_search_depth(level: i32) -> Option<u32> {
     }
 }
 
+/// The balanced row's candidate storage, decided by the frame head's
+/// sampled alphabet (see [`balanced_store`]). The chain walk is
+/// latency-bound at about 66 cycles per link step over the 12 MiB
+/// two-table working set, a regime wide-alphabet shapes pay in full
+/// because their candidates sit megabytes apart, while libzstd's own
+/// lazy-family rows hold every candidate inside one cache line per
+/// bucket. Narrow-alphabet frames keep the chain: their dense
+/// near-repeats are the chain's selection edge (json's reach-probe
+/// shrink is its ratio win), and the row's per-search scan volume is
+/// real work there (json measured x1.73 against the chain's x0.77).
+#[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
+pub(crate) enum BalancedStore {
+    /// The ladder's stock hash-chain row 9 — the default of every frame
+    /// at reset, of every pure `(level, shape)` query (headers, strip
+    /// geometry) and of every multithreaded job.
+    #[default]
+    Chain,
+    /// The tagged row matcher at the balanced row's window and search
+    /// domain (dll-class heads; see [`BALANCED_ROW_HEAD_SYMS`]): wide
+    /// alphabets whose duplicated mass lives in the 1-16 MiB distance
+    /// classes the row reach serves and whose cold start the chain's
+    /// literal-aware selection already serves best.
+    Row,
+    /// [`BalancedStore::Row`] plus the DUBT cold-start head (text-class
+    /// heads): the row shares the chain's newest-first cold-start
+    /// deficit — nearer-shorter candidates while no cross-tile history
+    /// exists — which the tree's oldest-first order closes (text
+    /// measured +2.5% size without it; dll paid the head's btlazy parse
+    /// as pure wall cost for +0.07% size, so the head rides the narrower
+    /// wide class only).
+    RowHead,
+}
+
+/// Head sample the storage verdict reads: the same 8 KiB span the
+/// small-src and attempts verdicts sample.
+pub(crate) const BALANCED_STORE_HEAD_SPAN: usize = 8 * 1024;
+
+/// The storage verdict's sampled-alphabet bar: json heads read 38-39
+/// distinct bytes and skewed 16 below it, text 66-79 and dll 108-213
+/// above (the small-src swap's corpus calibration, measured on heads at
+/// 1K-128K).
+const BALANCED_ROW_SYMS: u32 = 48;
+
+/// The cold-head bar inside the wide class: text heads read 66-79 below
+/// it, dll 108-213 above.
+const BALANCED_ROW_HEAD_SYMS: u32 = 96;
+
+/// The frame head's storage verdict (see [`BalancedStore`]). A pure
+/// function of the head bytes.
+pub(crate) fn balanced_store(head: &[u8]) -> BalancedStore {
+    let syms = sampled_distinct(head, 0, head.len());
+    if syms >= BALANCED_ROW_HEAD_SYMS {
+        BalancedStore::Row
+    } else if syms >= BALANCED_ROW_SYMS {
+        BalancedStore::RowHead
+    } else {
+        BalancedStore::Chain
+    }
+}
+
+/// The balanced row's row-storage twin (see [`BalancedStore`]): libzstd's
+/// own L9 geometry (H21 at rowLog 4, 15 attempts, lazy2) at this ladder's
+/// W26 window and LDM far domain, with the search domain capped at W24 —
+/// the row entry's 24-bit position domain wraps past 16 MiB, so the
+/// reach check must stay inside it or wrapped older entries rebuild as
+/// phantom in-window candidates, and LDM owns the classes beyond the cap
+/// through generate's `offset > reach` retain bar.
+const fn balanced_row_params(store: BalancedStore) -> LevelParams {
+    let p = with_ldm(with_chain_reach(row(21, 4, 1 << 26, 16, 2), 1 << 24));
+    match store {
+        BalancedStore::RowHead => with_head(p),
+        _ => p,
+    }
+}
+
 /// Whether a level's small-src frames adopt a class-swap row behind the
 /// head verdict (see [`small_src_class_row`]): libzstd's srcSize-keyed
 /// clevels columns change strategy class one band earlier than the
@@ -860,7 +942,13 @@ const fn small_src_class_row(level: i32, len: Option<u64>) -> Option<LevelParams
 }
 
 pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
-    params_for_row(level, shape, SmallSrcRow::Btlazy, RowAttempts::Stock)
+    params_for_row(
+        level,
+        shape,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Stock,
+        BalancedStore::Chain,
+    )
 }
 
 pub(super) const fn params_for_row(
@@ -868,6 +956,7 @@ pub(super) const fn params_for_row(
     shape: InputShape,
     row: SmallSrcRow,
     attempts: RowAttempts,
+    store: BalancedStore,
 ) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
@@ -907,6 +996,24 @@ pub(super) const fn params_for_row(
         // adopted row, not from this branch.
         p.small_src = true;
         return p;
+    }
+    // The balanced row's storage substitution (see [`BalancedStore`]):
+    // only the stock chain row 9 qualifies — the small-src swap above
+    // returned early, and a forced window rides the twin like every
+    // other row. The verdict engages on frame-continuous
+    // single-threaded frames of at least the reach probe's size bar (see
+    // the entry points), so pure queries, MT jobs and smaller frames
+    // keep the stock chain bytes.
+    if !matches!(store, BalancedStore::Chain)
+        && level.as_i32() == 9
+        && matches!(p.strategy, Strategy::Chain(_))
+        && matches!(p.chain_reach, Some(KEEP_REACH))
+    {
+        let mut swapped = balanced_row_params(store);
+        if let Some(wl) = shape.window_log {
+            swapped.window = 1usize << clamp_u32(wl, 10, 27);
+        }
+        return adjust_params(swapped, shape.len);
     }
     // Small-input policy (libzstd's small-src rows run searchLength 4 at
     // every lazy-family level): the row matcher's default 5 prices
@@ -1121,16 +1228,36 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 /// a ladder edit that adds or removes a collision fails the build and
 /// forces a re-verification of the lockstep branch.
 const fn prove_ladder_geometry() -> usize {
-    const VARIANTS: [(SmallSrcRow, RowAttempts); 4] = [
-        (SmallSrcRow::Btlazy, RowAttempts::Stock),
-        (SmallSrcRow::Stock, RowAttempts::Stock),
-        (SmallSrcRow::Btlazy, RowAttempts::Light),
-        (SmallSrcRow::Stock, RowAttempts::Light),
+    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore); 8] = [
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+        ),
+        (SmallSrcRow::Stock, RowAttempts::Stock, BalancedStore::Chain),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+        ),
+        (SmallSrcRow::Stock, RowAttempts::Light, BalancedStore::Chain),
+        (SmallSrcRow::Btlazy, RowAttempts::Stock, BalancedStore::Row),
+        (SmallSrcRow::Stock, RowAttempts::Stock, BalancedStore::Row),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+        ),
     ];
     let mut collisions = 0usize;
     let mut variant = 0usize;
     while variant < VARIANTS.len() {
-        let (row, attempts) = VARIANTS[variant];
+        let (row, attempts, store) = VARIANTS[variant];
         // Axis value 0 is the unknown cell (`None`); 10..=27 the known
         // powers/clamps. Every axis value pairs with every other.
         let mut w_axis = 0u32;
@@ -1154,7 +1281,7 @@ const fn prove_ladder_geometry() -> usize {
                 let mut row_levels = 0usize;
                 let mut level = 0i32;
                 while level <= 22 {
-                    let p = params_for_row(Level::from_zstd(level), shape, row, attempts);
+                    let p = params_for_row(Level::from_zstd(level), shape, row, attempts, store);
                     assert!(p.hash_log >= 10 && p.hash_log <= 30, "hash_log out of span");
                     // The todo-26 domain/geometry relations: everything a
                     // search can walk sits inside the final window. Level
@@ -1235,6 +1362,6 @@ const fn prove_ladder_geometry() -> usize {
 /// precondition: same row count at different hash logs).
 const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
 const _: () = assert!(
-    LADDER_ROW_COLLISIONS == 1388,
+    LADDER_ROW_COLLISIONS == 3228,
     "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
 );

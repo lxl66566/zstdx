@@ -1,6 +1,9 @@
 use alloc::vec::Vec;
 
-use super::{LdmArming, MatchGeneratorDriver, ScanDensity, ldm_min_window, pack_pos, unpack_pos};
+use super::{
+    LdmArming, MatchGeneratorDriver, ScanDensity, ldm_min_window, pack_pos, params::BalancedStore,
+    unpack_pos,
+};
 use crate::encoding::{Matcher, Sequence, reach_probe::ReachChoice};
 
 /// The 64 KiB unit both LDM far-class tests duplicate.
@@ -1281,6 +1284,188 @@ fn extend_match_asm_matches_portable() {
     }
 }
 
+/// Local synthetic heads for the balanced storage verdict: a narrow
+/// structured alphabet (json-class), a wide-but-textual one and a full
+/// binary one, all over the verdict's 8 KiB sample span.
+fn balanced_store_heads() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    const SPAN: usize = super::params::BALANCED_STORE_HEAD_SPAN;
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut narrow = Vec::with_capacity(SPAN);
+    let words = [
+        &b"key:value pair, "[..],
+        &b"list[0]=item; "[..],
+        &b"{\"id\": 42, "[..],
+        &b"true, null, "[..],
+    ];
+    while narrow.len() < SPAN {
+        narrow.extend_from_slice(words[(rand() as usize) % words.len()]);
+    }
+    // Text-class: every byte value below 80 (the corpus's text heads
+    // sample 66-79 distinct), shuffled.
+    let textish: Vec<u8> = (0..SPAN)
+        .map(|i| ((i.wrapping_mul(2654435761) as u64 ^ rand()) % 80) as u8)
+        .collect();
+    let wide: Vec<u8> = (0..SPAN).map(|_| (rand() & 0xff) as u8).collect();
+    (narrow[..SPAN].to_vec(), textish, wide[..SPAN].to_vec())
+}
+
+/// The balanced row's storage verdict: a narrow head keeps the chain row
+/// (json 38-39 sampled distinct, skewed 16), a text-class head takes the
+/// row twin plus the DUBT cold head (66-79), a dll-class head the bare
+/// row twin (108-213, where the head's btlazy parse is pure wall cost).
+#[test]
+fn balanced_store_verdict_separates_head_classes() {
+    let (narrow, textish, wide) = balanced_store_heads();
+    assert_eq!(super::params::balanced_store(&narrow), BalancedStore::Chain);
+    assert_eq!(
+        super::params::balanced_store(&textish),
+        BalancedStore::RowHead
+    );
+    assert_eq!(super::params::balanced_store(&wide), BalancedStore::Row);
+}
+
+/// The verdict's parse-side effect: a wide head at level 9 flips the
+/// driver onto the row twin (Strategy::Row at the W24 search domain and
+/// the balanced window) before the first block parses, the parse
+/// reconstructs, and a narrow head leaves the stock chain row in place.
+#[test]
+fn balanced_row_substitutes_wide_heads() {
+    let (narrow, _textish, wide) = balanced_store_heads();
+    // A parseable wide frame: the head sample plus enough repeated
+    // content for real matches.
+    let mut frame = wide.clone();
+    frame.extend_from_slice(&wide);
+    frame.extend_from_slice(&wide);
+    frame.extend_from_slice(&narrow[..1024]);
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(crate::Level::from_zstd(9));
+    driver.consider_balanced_store(&frame, crate::Level::from_zstd(9));
+    assert!(matches!(driver.params.strategy, super::Strategy::Row(_)));
+    assert_eq!(driver.params.chain_reach, Some(1 << 24));
+    assert_eq!(driver.params.window, 1 << 26);
+    driver.adopt_window(&frame, 0);
+    driver.set_block(0, frame.len() as u64);
+    let mut reconstructed = Vec::new();
+    let mut rep = [1u32, 4, 8];
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            reconstructed.extend_from_slice(literals);
+            let actual = crate::decoding::sequence_execution::do_offset_history(
+                offset as u32,
+                literals.len() as u32,
+                &mut rep,
+            );
+            let from = reconstructed.len() - actual as usize;
+            for i in 0..match_len {
+                let b = reconstructed[from + i];
+                reconstructed.push(b);
+            }
+        },
+    });
+    assert_eq!(&reconstructed, &frame, "row parse must reconstruct");
+
+    // The narrow class keeps the stock chain row whatever came before.
+    driver.reset(crate::Level::from_zstd(9));
+    driver.consider_balanced_store(&narrow, crate::Level::from_zstd(9));
+    assert!(matches!(driver.params.strategy, super::Strategy::Chain(_)));
+}
+
+/// A pooled driver's row-to-chain table transition must rebuild, not keep:
+/// the row buffer's tag-packed entries share the chain heads' u32 shape,
+/// and kept as heads they steer the walk through byte-verified garbage
+/// (caught by the stream dump as a pooled skewed-frame split). The heads
+/// families may keep spans among themselves; a row buffer never feeds
+/// them.
+#[test]
+fn row_to_chain_table_transition_rebuilds() {
+    let (narrow, _textish, wide) = balanced_store_heads();
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(crate::Level::from_zstd(9));
+    driver.consider_balanced_store(&wide, crate::Level::from_zstd(9));
+    assert!(matches!(driver.params.strategy, super::Strategy::Row(_)));
+    // Row 9's twin and its chain row share the H21 head span: the
+    // transition would keep the span if the family check were missing.
+    assert_eq!(driver.tables.head_len(), 1 << 21);
+    driver.reset(crate::Level::from_zstd(9));
+    driver.consider_balanced_store(&narrow, crate::Level::from_zstd(9));
+    assert!(matches!(driver.params.strategy, super::Strategy::Chain(_)));
+    let (heads, second) = driver.tables.split();
+    assert_eq!(heads.len(), 1 << 21);
+    assert_eq!(second.len(), 1 << 20);
+    assert!(
+        heads.iter().all(|&e| e == 0),
+        "chain heads must be rebuilt zeroed off a row buffer"
+    );
+}
+
+/// The pooled slice state cannot inherit another frame's storage verdict:
+/// a narrow level-9 frame after a wide one parses on the chain row
+/// exactly as it does alone, and the wide frame reproduces its own bytes
+/// across repeats (the verdict is per-frame state, cleared at reset).
+#[cfg(feature = "std")]
+#[test]
+fn balanced_store_pooled_reuse_is_output_neutral() {
+    use crate::encoding::frame_compressor::compress_slice_shaped_ldm;
+    let (narrow_head, _textish, wide_head) = balanced_store_heads();
+    let mut wide = wide_head.clone();
+    while wide.len() < 8 * 1024 * 1024 + 64 * 1024 {
+        wide.extend_from_slice(&wide_head);
+        wide.extend_from_slice(&narrow_head[..512]);
+    }
+    wide.truncate(8 * 1024 * 1024 + 64 * 1024);
+    let mut narrow = Vec::with_capacity(wide.len());
+    let words = [
+        &b"key:value pair, "[..],
+        &b"list[0]=item; "[..],
+        &b"{\"id\": 42, "[..],
+        &b"true, null, "[..],
+    ];
+    let mut i = 0usize;
+    while narrow.len() < wide.len() {
+        narrow.extend_from_slice(words[i % words.len()]);
+        i += 1;
+    }
+    narrow.truncate(wide.len());
+    let level = crate::Level::from_zstd(9);
+    let shape = crate::InputShape::default();
+    let enc = |data: &[u8]| {
+        compress_slice_shaped_ldm(data, level, false, shape, crate::LdmMode::Auto, None)
+    };
+    let narrow_alone = enc(&narrow);
+    let wide_a = enc(&wide);
+    let narrow_after = enc(&narrow);
+    let wide_b = enc(&wide);
+    assert_eq!(
+        narrow_alone, narrow_after,
+        "a pooled wide frame's row verdict must not leak into a later narrow frame"
+    );
+    assert_eq!(
+        wide_a, wide_b,
+        "the wide frame's bytes are content-deterministic"
+    );
+    assert_eq!(
+        crate::bulk::decompress(&wide_a, 0).unwrap(),
+        wide,
+        "the substituted frame must roundtrip"
+    );
+    assert_eq!(
+        crate::bulk::decompress(&narrow_alone, 0).unwrap(),
+        narrow,
+        "the chain frame must roundtrip"
+    );
+}
+
 /// The row band's attempts verdict (R33): a narrow-alphabet frame head
 /// halves the row matcher's candidate budget (json-class heads read
 /// 38-39 sampled distinct against the bar of 48), a wide head keeps the
@@ -1512,6 +1697,7 @@ fn small_src_class_swap_band_rows() {
             shape,
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         assert!(
             matches!(swapped.strategy, Strategy::BtLazy(_)),
@@ -1524,6 +1710,7 @@ fn small_src_class_swap_band_rows() {
             shape,
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         assert!(
             matches!(&swapped.strategy, Strategy::Opt(k) if k.ultra),
@@ -1543,6 +1730,7 @@ fn small_src_class_swap_band_rows() {
         small,
         SmallSrcRow::Btlazy,
         RowAttempts::Stock,
+        BalancedStore::Chain,
     );
     assert!(
         matches!(swapped.strategy, Strategy::BtLazy(_)),
@@ -1553,6 +1741,7 @@ fn small_src_class_swap_band_rows() {
         small,
         SmallSrcRow::Stock,
         RowAttempts::Stock,
+        BalancedStore::Chain,
     );
     assert!(
         matches!(stock.strategy, Strategy::Dfast(_)),
@@ -1567,12 +1756,14 @@ fn small_src_class_swap_band_rows() {
             shape,
             SmallSrcRow::Stock,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         let default = params_for_row(
             crate::Level::from_zstd(level),
             shape,
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         let differs = stock.strategy != default.strategy;
         assert_eq!(
@@ -1613,6 +1804,7 @@ fn dict_frames_keep_ladder_rows_in_the_class_band() {
                 super::SmallSrcRow::Btlazy
             },
             super::RowAttempts::Stock,
+            BalancedStore::Chain,
         )
         .strategy
     };
@@ -1678,6 +1870,7 @@ fn small_src_swap_honors_a_forced_window() {
             },
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         assert_eq!(forced.window, 1 << 10, "l{level}: declared window");
         let wlog = 10u32;
@@ -1702,6 +1895,7 @@ fn small_src_swap_honors_a_forced_window() {
             },
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
+            BalancedStore::Chain,
         );
         assert_eq!(stock.window, 1 << 17, "l{level}: stock swap window");
     }

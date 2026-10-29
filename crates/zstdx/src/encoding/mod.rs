@@ -388,6 +388,13 @@ pub trait Matcher {
     /// (the reset's size gate reads it). Per frame; the default keeps the
     /// matcher's own arming policy.
     fn set_ldm_mode(&mut self, _mode: crate::LdmMode) {}
+    /// Decide the balanced row's candidate storage from the frame's head
+    /// (the built-in matcher's row-9 substitution, see
+    /// `match_generator::params::BalancedStore`): called once per frame by
+    /// the frame-continuous entry points that hold the head before the
+    /// first block parses, on frames the verdict's size bar cleared. The
+    /// default keeps the ladder's stock chain row.
+    fn consider_balanced_store(&mut self, _head: &[u8], _level: Level) {}
     /// Decide the frame's chain reach from its first bytes (the built-in
     /// matcher's shape-adaptive row-9 probe, see
     /// `match_generator::reach_probe`): called once per frame, before the

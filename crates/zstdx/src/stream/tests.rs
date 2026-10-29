@@ -1997,6 +1997,74 @@ fn near_local(len: usize) -> Vec<u8> {
     out
 }
 
+/// The balanced storage verdict's stream-core residue contract (R78): a
+/// substituted frame skips the reach probe, and the pooled single-threaded
+/// core carries `reach_choice` across frames by design — so the row frame
+/// must re-declare Keep itself. Without it, a shrink-class frame ahead of
+/// a wide one hands the row's successor a stale Shrink and collapses a
+/// later chain frame's domain (the stream dump caught it as a skewed-cell
+/// split). The pin: a narrow unpledged frame after [shrink, row] parses
+/// exactly as it does after [row] alone.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn balanced_row_frame_redeclares_reach_on_the_pooled_core() {
+    let fixture = |rel: &str| match std::fs::read(rel) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::println!("skipping: {rel} not present (bench corpus)");
+            None
+        },
+        Err(e) => panic!("failed to read fixture {rel}: {e}"),
+    };
+    // The corpus's own classes: json shrinks (the probe's calibration),
+    // text takes the row twin, skewed stays a narrow chain frame.
+    let Some(json) = fixture("../../bench/corpus/json.raw") else {
+        return;
+    };
+    let Some(text) = fixture("../../bench/corpus/text.raw") else {
+        return;
+    };
+    let Some(skewed) = fixture("../../bench/corpus/skewed.raw") else {
+        return;
+    };
+    let level = Level::Balanced;
+    let pledged = |data: &[u8]| {
+        let mut enc = read::Encoder::with_options(
+            data,
+            EncoderOptions::new(level)
+                .checksum(false)
+                .pledged_size(Some(data.len() as u64)),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        crate::io::Read::read_to_end(&mut enc, &mut out).unwrap();
+        enc.finish().unwrap();
+        out
+    };
+    let open = |data: &[u8]| {
+        let mut enc =
+            read::Encoder::with_options(data, EncoderOptions::new(level).checksum(false)).unwrap();
+        let mut out = Vec::new();
+        crate::io::Read::read_to_end(&mut enc, &mut out).unwrap();
+        enc.finish().unwrap();
+        out
+    };
+    // The reference runs first, on a pool whose reach residue is the
+    // default Keep: [row] then narrow-unpledged pins the narrow frame's
+    // Keep-parse bytes. The probe sequence then runs [shrink, row] ahead
+    // of the same narrow frame — the substituted frame must re-declare
+    // Keep, or the shrink rides through it into the narrow parse.
+    let _ = pledged(&text);
+    let after_row = open(&skewed);
+    let _ = pledged(&json);
+    let _ = pledged(&text);
+    let after_shrink_row = open(&skewed);
+    assert_eq!(
+        after_shrink_row, after_row,
+        "a substituted frame must leave the pooled core's reach at Keep"
+    );
+}
+
 /// Json-shaped records (a small user pool over near-local structure): the
 /// shrink class of the reach probe (see `encoding::reach_probe`) — its far
 /// chain candidates displace nearer repcode reuse, so the shrunk reach

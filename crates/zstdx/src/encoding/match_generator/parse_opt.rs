@@ -116,7 +116,7 @@ impl MatchGeneratorDriver {
     /// [`HEAD_MIN_TOTAL`] would be parsed entirely by the head).
     pub(super) fn head_eligible(&self) -> bool {
         self.params.dubt_head
-            && matches!(self.params.strategy, Strategy::Chain(_))
+            && matches!(self.params.strategy, Strategy::Chain(_) | Strategy::Row(_))
             // A shrunk frame never runs the head: the shrink side is the
             // chain-selection class, so the probe's measurement and the
             // executed parse stay the same object on both reach sides.

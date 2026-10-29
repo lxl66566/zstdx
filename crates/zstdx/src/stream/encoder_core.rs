@@ -22,7 +22,10 @@ use crate::{
         compress_fastest, far_screen,
         frame_compressor::{CompressState, FseTables},
         frame_header::FrameHeader,
-        match_generator::{LdmArming, MatchGeneratorDriver, fast_row_screen_pending},
+        match_generator::{
+            BALANCED_STORE_HEAD_SPAN, BalancedStore, LdmArming, MatchGeneratorDriver,
+            balanced_store, fast_row_screen_pending,
+        },
         pre_split, reach_probe, util,
     },
 };
@@ -519,9 +522,33 @@ impl FrameEncoderCoreSt {
             data = &data[n..];
             if self.staged.len() - self.staged_start == limit {
                 if self.probe_pending {
-                    self.state
-                        .matcher
-                        .consider_reach_probe(&self.staged[self.staged_start..], self.level);
+                    let head = &self.staged[self.staged_start..];
+                    // The probe's staging gate doubles as the storage
+                    // verdict's window: a wide level-9 head behind the
+                    // probe's size bar takes the row twin and skips the
+                    // reach probe (a chain-row experiment) outright.
+                    let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
+                    let bal_row = self.level.as_i32() == 9
+                        && matches!(self.pledged, Some(n) if n >= reach_probe::PROBE_MIN_FRAME)
+                        && balanced_store(&head[..span]) != BalancedStore::Chain;
+                    if bal_row {
+                        // A substituted frame keeps the stock reach, and
+                        // it must re-declare it: the pooled core carries
+                        // `reach_choice` across frames (the probe's own
+                        // contract), so skipping the probe would hand the
+                        // next chain frame whatever verdict an earlier
+                        // frame left (a json Shrink collapses a later
+                        // skewed frame's domain). The row twin ignores the
+                        // choice in its own apply, so the order is free.
+                        self.state
+                            .matcher
+                            .set_reach_choice(reach_probe::ReachChoice::Keep);
+                        self.state
+                            .matcher
+                            .consider_balanced_store(&head[..span], self.level);
+                    } else {
+                        self.state.matcher.consider_reach_probe(head, self.level);
+                    }
                     self.probe_pending = false;
                 }
                 if self.screen_pending {

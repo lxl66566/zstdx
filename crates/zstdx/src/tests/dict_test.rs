@@ -1374,7 +1374,7 @@ fn dict_opt_rows_stay_in_the_reference_class() {
             "{{\"id\":{},\"name\":\"record-{}\",\"tags\":[\"a\",\"b\"],\"ok\":{}}}\n",
             i,
             i,
-            (i % 2 == 0) as u8
+            i.is_multiple_of(2) as u8
         );
         payload.extend_from_slice(rec.as_bytes());
         i += 1;

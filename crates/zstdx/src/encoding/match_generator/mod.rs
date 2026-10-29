@@ -325,6 +325,12 @@ pub struct MatchGeneratorDriver {
     /// the level's strategy is a row row; taken by the frame's first
     /// matching entry.
     row_attempts_pending: Option<Level>,
+    /// The balanced row's storage verdict (row 9, see [`BalancedStore`]):
+    /// every frame starts at [`BalancedStore::Chain`], and a
+    /// frame-continuous entry point whose head sample reads wide may flip
+    /// it before the first block parses (see
+    /// [`Self::consider_balanced_store`]).
+    bal_store: BalancedStore,
     /// LDM arming context (see [`LdmArming`]); applied inside
     /// [`Self::apply_level`]'s size gate, so entry points set it before
     /// `reset`.
@@ -704,7 +710,13 @@ pub(crate) fn dict_seed_key(
     } else {
         SmallSrcRow::Btlazy
     };
-    let mut params = params_for_row(level, shape, base_row, RowAttempts::Stock);
+    let mut params = params_for_row(
+        level,
+        shape,
+        base_row,
+        RowAttempts::Stock,
+        BalancedStore::Chain,
+    );
     match ldm {
         crate::LdmMode::Auto => {},
         crate::LdmMode::Disable => params.ldm = false,
@@ -727,6 +739,7 @@ pub(crate) fn dict_seed_key(
                     },
                     base_row,
                     RowAttempts::Stock,
+                    BalancedStore::Chain,
                 )
                 .window
                 .next_power_of_two();
@@ -1101,6 +1114,7 @@ impl MatchGeneratorDriver {
             small_src_row: SmallSrcRow::Btlazy,
             small_src_pending: None,
             row_attempts: RowAttempts::Stock,
+            bal_store: BalancedStore::Chain,
             row_attempts_pending: None,
             slice_size,
             ramp: RampGate::OFF,
@@ -1174,6 +1188,7 @@ impl MatchGeneratorDriver {
             small_src_row: SmallSrcRow::Btlazy,
             small_src_pending: None,
             row_attempts: RowAttempts::Stock,
+            bal_store: BalancedStore::Chain,
             row_attempts_pending: None,
             slice_size: 0,
             ramp: RampGate::OFF,
@@ -1219,7 +1234,14 @@ impl MatchGeneratorDriver {
     /// either).
     fn resize_tables(&mut self, params: &LevelParams) {
         let heads_len = 1usize << params.hash_log;
-        let heads_kept = self.tables.head_len() == heads_len;
+        // A row buffer's span can equal a heads family's span at the same
+        // hash log, but its entries are tag-packed, not positions: kept as
+        // chain heads they steer the walk through byte-verified garbage
+        // (the R78 pooled row-to-chain split, caught by the stream dump on
+        // skewed). The heads families keep their spans only among
+        // themselves; the row arm keeps its own buffer by row count.
+        let heads_kept = self.tables.head_len() == heads_len
+            && !matches!(self.params.strategy, Strategy::Row(_));
         // The fused buffer preserves the two-table keep/refresh semantics
         // exactly through the pair's resize entries: a kept head with a
         // resized second table truncates and re-extends (resize zeroes
@@ -1279,7 +1301,8 @@ impl MatchGeneratorDriver {
                     // `rehead`, or a stale larger span would later slice
                     // past the buffer (the fast family's heads-kept
                     // truncate cannot grow). The const pair walk in
-                    // `params.rs` (`LADDER_ROW_COLLISIONS`, currently 132)
+                    // `params.rs` (`LADDER_ROW_COLLISIONS`, whose pinned count
+                    // lives beside the walker)
                     // pins every such collision over the whole ladder
                     // grid, so an edit that adds one fails the build.
                     self.tables.rehead(heads_len);
@@ -1343,7 +1366,13 @@ impl MatchGeneratorDriver {
     /// Size the search tables for `level` (no-op when unchanged), so pooled
     /// states re-size at most once per level or hint change.
     fn apply_level(&mut self, level: Level) {
-        let mut params = params_for_row(level, self.shape, self.small_src_row, self.row_attempts);
+        let mut params = params_for_row(
+            level,
+            self.shape,
+            self.small_src_row,
+            self.row_attempts,
+            self.bal_store,
+        );
         // The frame's reach probe result: only a probe-subject row's
         // stock reach is replaceable — never a shape-clamped one, and
         // never a row that merely shares the KEEP_REACH value: the
@@ -1429,6 +1458,7 @@ impl MatchGeneratorDriver {
                         },
                         self.small_src_row,
                         self.row_attempts,
+                        self.bal_store,
                     )
                     .window
                     .next_power_of_two();
@@ -1512,6 +1542,7 @@ impl MatchGeneratorDriver {
                 Strategy::Fast
                     | Strategy::Dfast(_)
                     | Strategy::Chain(_)
+                    | Strategy::Row(_)
                     | Strategy::Opt(_)
                     | Strategy::BtLazy(_)
             )
@@ -1623,6 +1654,24 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Resolve the balanced row's storage verdict from a head sample the
+    /// calling entry point holds (see [`BalancedStore`]): the bulk slice
+    /// and pledged stream cores see the frame's head before its first
+    /// block parses, and those are exactly the frame-continuous paths the
+    /// verdict engages on. A [`BalancedStore::Chain`] sample on an
+    /// already-stock driver is a no-op, so narrow frames keep the probe's
+    /// bytes end to end.
+    pub(crate) fn consider_balanced_store(&mut self, head: &[u8], level: Level) {
+        let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
+        let store = balanced_store(&head[..span]);
+        if store == self.bal_store {
+            return;
+        }
+        self.bal_store = store;
+        self.apply_level(level);
+        self.strategy_phase_reset();
+    }
+
     /// Point the window at caller-owned memory: `data` holds the bytes at
     /// absolute offset `base`. The caller must then declare the block to
     /// match with [`Self::set_block`]. `data` must stay alive and unmodified
@@ -1652,9 +1701,11 @@ impl MatchGeneratorDriver {
         // The pending small-src row verdict dies here: the window head a
         // resolution would sample is dictionary content, not the frame's
         // own, so dictionary frames keep R8's swap row at 9/10. The
-        // pending attempts verdict dies with it, for the same reason.
+        // pending attempts verdict dies with it, for the same reason, and
+        // the storage verdict stands down with them.
         self.small_src_pending = None;
         self.row_attempts_pending = None;
+        self.bal_store = BalancedStore::Chain;
         // The extended class-swap band (5-8, 11-17) stands down here:
         // `small_dict_row`'s band owns these levels on dictionary frames,
         // and its rows key on the ladder strategy; 9/10 keep R8's swap
@@ -3179,6 +3230,10 @@ impl Matcher for MatchGeneratorDriver {
         self.probe.clear();
     }
 
+    fn consider_balanced_store(&mut self, head: &[u8], level: Level) {
+        MatchGeneratorDriver::consider_balanced_store(self, head, level);
+    }
+
     fn consider_reach_probe(&mut self, head: &[u8], level: Level) {
         let choice = super::reach_probe::probe_reach_choice(head, level, self.shape);
         if choice != self.reach_choice {
@@ -3252,6 +3307,12 @@ impl Matcher for MatchGeneratorDriver {
         // Every frame starts at the stock attempts: the verdict is
         // per-frame state, resolved at the first matching entry.
         self.row_attempts = RowAttempts::Stock;
+        // Every frame starts at the stock chain storage: the verdict is
+        // per-frame state, resolved by the frame-continuous entry points
+        // (see `consider_balanced_store`). MT jobs and entries without a
+        // head sample never resolve one, so they cannot inherit another
+        // frame's row parse.
+        self.bal_store = BalancedStore::Chain;
         self.dict_prefix = false;
         self.apply_level(level);
         // Stale opt-table entries from previous frames decode below the
@@ -3996,22 +4057,37 @@ impl MatchGeneratorDriver {
                 }
             },
             Strategy::Row(row_log) => {
+                // The LDM candidate set is generated ahead of the scan
+                // (the chain row's order: alphabet gate first, then
+                // generate); the consuming axis is compile-time below,
+                // folding to the stock scan on the empty set exactly like
+                // the chain arm.
+                self.ldm_alphabet_gate();
+                self.ldm_generate();
                 // The ramp gate folds out of the per-candidate loop on
                 // disarmed frames (the fast loop's RAMPED discipline; the
                 // env-gated ramp never arms on default paths).
-                let ramped = self.ramp.is_armed();
-                if ramped {
-                    match row_log {
-                        4 => self.start_matching_row::<4, true>(literals, seqs),
-                        5 => self.start_matching_row::<5, true>(literals, seqs),
-                        _ => self.start_matching_row::<6, true>(literals, seqs),
-                    }
+                macro_rules! scan_row_ldm {
+                    ($ldm:literal) => {
+                        if self.ramp.is_armed() {
+                            match row_log {
+                                4 => self.start_matching_row::<4, true, $ldm>(literals, seqs),
+                                5 => self.start_matching_row::<5, true, $ldm>(literals, seqs),
+                                _ => self.start_matching_row::<6, true, $ldm>(literals, seqs),
+                            }
+                        } else {
+                            match row_log {
+                                4 => self.start_matching_row::<4, false, $ldm>(literals, seqs),
+                                5 => self.start_matching_row::<5, false, $ldm>(literals, seqs),
+                                _ => self.start_matching_row::<6, false, $ldm>(literals, seqs),
+                            }
+                        }
+                    };
+                }
+                if self.ldm.is_some() {
+                    scan_row_ldm!(true);
                 } else {
-                    match row_log {
-                        4 => self.start_matching_row::<4, false>(literals, seqs),
-                        5 => self.start_matching_row::<5, false>(literals, seqs),
-                        _ => self.start_matching_row::<6, false>(literals, seqs),
-                    }
+                    scan_row_ldm!(false);
                 }
             },
             Strategy::Opt(knobs) => {
@@ -4065,7 +4141,7 @@ impl MatchGeneratorDriver {
         if why == LdmFill::Skipped
             && !(matches!(
                 self.params.strategy,
-                Strategy::Chain(_) | Strategy::Fast | Strategy::Dfast(_)
+                Strategy::Chain(_) | Strategy::Fast | Strategy::Dfast(_) | Strategy::Row(_)
             ) && self.params.window >= LDM_FULL_WINDOW)
         {
             return;
@@ -4361,6 +4437,10 @@ use hash::*;
 // SMALL_SRC_MAX feeds only `dict_seed_key`'s std-gated body.
 #[cfg(feature = "std")]
 use params::SMALL_SRC_MAX;
+pub(crate) use params::{
+    BALANCED_STORE_HEAD_SPAN, BalancedStore, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN,
+    LdmArming, balanced_store,
+};
 use params::{
     BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
     HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
@@ -4368,7 +4448,6 @@ use params::{
     ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
     small_dict_row, small_src_btlazy_head, small_src_class_plain_only, small_src_class_swapped,
 };
-pub(crate) use params::{LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming};
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
 use range::IdxRange;
