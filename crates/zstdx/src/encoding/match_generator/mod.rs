@@ -689,6 +689,24 @@ impl core::fmt::Debug for DictSeedKey {
 /// reach, the Frame arming context). [`MatchGeneratorDriver::
 /// seed_key_mirror_ok`] pins this arithmetic to what the real seeding left
 /// on the driver, debug-asserted at every capture and swept in the tests.
+/// `load_dictionary`'s mid-band dictionary row for the opt family: on a
+/// known payload above the small-band swap, inside the armed span, the
+/// non-ultra (btopt) rows follow libzstd's srcSize columns, which run
+/// levels 16-17 as btultra — parser min match and hash width 3 plus the
+/// fractional-price model — while the row's geometry stays stock. Shared
+/// by the seeding and the seed-key mirror so the two cannot drift.
+fn midband_dict_opt_row(strategy: &mut Strategy) {
+    if !matches!(strategy, Strategy::Opt(knobs) if !knobs.ultra) {
+        return;
+    }
+    let Strategy::Opt(knobs) = strategy else {
+        unreachable!("the guard pinned the variant")
+    };
+    knobs.min_match = 3;
+    knobs.mls = 3;
+    knobs.ultra = true;
+}
+
 #[cfg(feature = "std")]
 pub(crate) fn dict_seed_key(
     level: Level,
@@ -794,6 +812,8 @@ pub(crate) fn dict_seed_key(
             Some(SmallDictRow::Opt(row)) => params = row,
             None => {},
         }
+    } else if dict_rows_armed && payload.is_some() {
+        midband_dict_opt_row(&mut params.strategy);
     }
     DictSeedKey {
         params,
@@ -1864,6 +1884,12 @@ impl MatchGeneratorDriver {
                 },
                 None => {},
             }
+        } else if dict_rows_armed && payload.is_some() {
+            // The mid-band dictionary row for the btopt rows (the knob
+            // semantics on [`midband_dict_opt_row`]): the mid-band dll
+            // dictionary cells read 350-620 B behind the reference on the
+            // stock rows while every btultra row reads ahead.
+            midband_dict_opt_row(&mut self.params.strategy);
         }
         // The owned window is filled above; prefill over the caller's slice
         // avoids the self-borrow (identical bytes). The dictionary grid:

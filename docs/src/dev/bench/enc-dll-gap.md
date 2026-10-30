@@ -39,3 +39,14 @@ The balanced tier's latency mechanism is closed as of 2026-10-30. Row-based cand
 The fastest and fast tiers are bounded by scan-loop instruction volume. The loop's register budget re-rolls on every added live value, so only register-negative changes convert, and the landed examples are the const-log instantiation and the fused table allocation. No removable live value remains identified in the loop.
 
 `insert_covered` fill density is a speed-priority knob that stays rejected on the size axis. Its remaining const-log saving is below the noise floor, so no open lever is identified there either.
+
+## The opt and ultra tier
+
+Measured on 2026-10-30: solo perf stat on dll100 plus whole-program callgrind on dll32 at levels 17 and 19, our side against the zstd crate twin harness at the plain numeric levels. Ours carries the optLdm far classes over the W26 window, the reference runs plain L17 and L19 with no long-distance machinery, so the two sides do not parse the same stream: dll100 reads ratio 6.04 against 5.06 at l17 and 6.32 against 5.28 at l19.
+
+| cell | ours Ir | zstd Ir | ratio | search ours/zstd | fill ours/zstd | DP ours/zstd |
+|---|---:|---:|---:|---|---|---|
+| dll32 l17 | 13.23G | 10.88G | 1.22 | 4.96G / 3.72G | 4.49G / 2.88G | 3.11G / 3.12G |
+| dll32 l19 | 26.83G | 22.20G | 1.21 | 12.67G / 7.45G | 2.19G / 0.78G | 10.62G / 12.51G |
+
+Per pass on dll100 ours runs 68.2G instructions at l17 against the reference's 52.1G and 144.1G against 108.4G at l19, at cycles x1.06 and x1.18 and IPC ahead on both cells. The DP driver is at parity at l17 and ahead at l19, the entropy side is ahead at both, and the excess sits in the tree search and the fill. The search's extra events are the density mechanism itself, the wider candidate set the far classes and the W26-to-window floor lift feed the DP, and the per-event remainder is the same distributed codegen differential the best tier's decomposition bounded. The compare lump inside both search and fill was measured directly and is small on this tier: the long-compare verdict port is falsified in the [matcher negative results](../negative/matchers.md), so the residual x1.06 to x1.18 wall is the density lead's price at instruction parity of the mechanism, and no safe lever is identified short of cutting the far classes themselves.
