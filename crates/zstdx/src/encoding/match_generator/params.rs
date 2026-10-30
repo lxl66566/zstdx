@@ -1070,11 +1070,11 @@ pub(super) const fn params_for_row(
 /// stream must shrink the domain too (todo 26: the ring-reach rows
 /// scanned past the declared window and libzstd rejected the frames).
 const fn adjust_params(mut p: LevelParams, src: Option<u64>) -> LevelParams {
-    if let Some(n) = src
-        && n > 0
-    {
+    if let Some(n) = src {
         // srcLog = ceil(log2(max(n, 2^HASHLOG_MIN))), floored at the frame
-        // format's minimum window log.
+        // format's minimum window log. A known-empty source clamps too:
+        // tSize 0 lands at the HASHLOG_MIN floor, so a windowed empty
+        // frame declares the format's 1 KiB minimum, C's srcLog ladder.
         let t = max_u64(n, 1 << 6);
         let src_log = max_u32(64 - (t - 1).leading_zeros(), 10);
         // Non-power-of-two windows (the Fastest row's 768 KiB) round up.

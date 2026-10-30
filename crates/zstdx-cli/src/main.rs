@@ -1424,12 +1424,12 @@ fn process(
     let reader = CountingReader::new(reader, Rc::clone(&read_bytes));
     let show_progress = progress_visible(
         cli,
-        source_size > 0,
+        source_size.is_some_and(|s| s > 0),
         matches!(output, Output::Stdout),
         io::stderr().is_terminal(),
     );
     let reader: Box<dyn Read> = if show_progress {
-        Box::new(ProgressMonitor::new(reader, source_size, true))
+        Box::new(ProgressMonitor::new(reader, source_size.unwrap_or(0), true))
     } else {
         Box::new(reader)
     };
@@ -1471,20 +1471,20 @@ fn process(
     if cli.quiet == 0 {
         match mode {
             Mode::Compress => {
-                let ratio = if source_size == 0 {
+                let ratio = if source_size.is_none_or(|s| s == 0) {
                     0.0
                 } else {
-                    written as f64 / source_size as f64 * 100.0
+                    written as f64 / source_size.unwrap() as f64 * 100.0
                 };
                 info!(
                     "{} ——> {} ({ratio:.2}%)",
-                    fmt_size(source_size as f64),
+                    fmt_size(source_size.unwrap_or(0) as f64),
                     fmt_size(written as f64)
                 );
             },
             Mode::Decompress => info!(
                 "{} ——> {}",
-                fmt_size(source_size as f64),
+                fmt_size(source_size.unwrap_or(0) as f64),
                 fmt_size(written as f64)
             ),
             Mode::Test => info!("{} tested ok", fmt_size(written as f64)),
@@ -1749,23 +1749,28 @@ fn pledged_size_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
         .is_some_and(is_mismatch)
 }
 
-fn open_input(input: &Input) -> AnyResult<(Box<dyn Read>, usize)> {
+/// The size is the file's metadata, `None` on stdin where no size is
+/// known: the distinction is load-bearing on the header path, because a
+/// known-empty source clamps the window descriptor while an unknown one
+/// keeps the row's stock window (ZSTD_adjustCParams only shrinks known
+/// sizes).
+fn open_input(input: &Input) -> AnyResult<(Box<dyn Read>, Option<usize>)> {
     match input {
-        Input::Stdin => Ok((Box::new(io::stdin()), 0)),
+        Input::Stdin => Ok((Box::new(io::stdin()), None)),
         Input::File(path) => {
             let file = File::open(path)?;
             let size = file.metadata()?.len() as usize;
-            Ok((Box::new(BufReader::new(file)), size))
+            Ok((Box::new(BufReader::new(file)), Some(size)))
         },
     }
 }
 
 /// Returns the number of bytes written.
 fn compress(
-    mut reader: Box<dyn Read>,
+    reader: Box<dyn Read>,
     output: &Output,
     settings: &Settings,
-    source_size: usize,
+    source_size: Option<usize>,
     dict: Option<&[u8]>,
 ) -> AnyResult<u64> {
     if settings.adapt.is_some() {
@@ -1777,16 +1782,18 @@ fn compress(
     // --stream-size or nothing. --no-content-size keeps the size out of the
     // header while it still shapes the row through the hint.
     let mut reader = reader;
-    let mut known_size = settings
-        .stream_size
-        .or((source_size > 0).then_some(source_size as u64));
-    // An empty source pledges 0, matching zstd on both input kinds: its
-    // read pool settles a 0-byte first read before the frame header
-    // flushes, so a file of size 0 and a stdin that opens empty both
-    // carry the FCS field. The peek runs once, only while no size is
-    // known yet; a 0-byte read is EOF, which settles emptiness, and any
-    // bytes read ride ahead of the stream through [`PrefixReader`].
-    if known_size.is_none() && settings.content_size {
+    let mut known_size = settings.stream_size.or(source_size.map(|s| s as u64));
+    // An empty source settles before the frame header flushes, matching
+    // zstd on both input kinds: its read pool settles a 0-byte first
+    // read, so a file of size 0 and a stdin that opens empty both know
+    // the source is empty. With the FCS field on that pledges 0; with it
+    // off the emptiness still clamps the window descriptor through the
+    // hint (zstd shrinks any known size, empty included, down to
+    // ZSTD_WINDOWLOG_ABSOLUTEMIN). The peek runs once, only while no
+    // size is known yet; a 0-byte read is EOF, which settles emptiness,
+    // and any bytes read ride ahead of the stream through
+    // [`PrefixReader`].
+    if known_size.is_none() {
         let mut first = [0u8; 64 * 1024];
         let n = reader.read(&mut first)?;
         if n == 0 {
@@ -2625,7 +2632,7 @@ mod tests {
             Box::new(&b"payload"[..]),
             &Output::File(out.clone()),
             &plain_settings(),
-            0,
+            None,
             Some(&broken),
         );
         assert!(result.is_err());
@@ -2642,7 +2649,7 @@ mod tests {
             Box::new(Cursor::new(data.clone())),
             &Output::Sink,
             &plain_settings(),
-            data.len(),
+            Some(data.len()),
             None,
         )
         .unwrap();

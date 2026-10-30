@@ -342,6 +342,33 @@ fn window_and_ldm_edges() {
     }
 }
 
+/// A windowed empty frame with the content-size field suppressed
+/// declares the format's 1 KiB window at every level, the reference's
+/// own srcLog clamp on a known-empty source
+/// (`ZSTD_adjustCParams_internal` floors the shrunk window at
+/// `ZSTD_WINDOWLOG_ABSOLUTEMIN`). The frame is magic, descriptor `00`,
+/// window byte `00` and one raw empty block, and the reference decodes
+/// it empty.
+#[cfg(feature = "std")]
+#[test]
+fn empty_windowed_frame_declares_the_floor_window() {
+    for level in [1i32, 9, 17, 19] {
+        let mut c = crate::compat::bulk::Compressor::new(level).unwrap();
+        c.include_contentsize(false).unwrap();
+        c.include_checksum(false).unwrap();
+        let out = c.compress(&[]).unwrap();
+        assert_eq!(
+            &out[..6],
+            &[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00],
+            "level {level}: windowed empty header"
+        );
+        assert_eq!(out.len(), 9, "level {level}: raw empty block tail");
+        let mut back = Vec::new();
+        zstd::stream::copy_decode(out.as_slice(), &mut back).unwrap();
+        assert!(back.is_empty(), "level {level}: reference decode");
+    }
+}
+
 /// Forced windows on UNPLEDGED streams (todo 26): the unknown length
 /// leaves the source clamp out of param resolution, so every row whose
 /// search domain rides `chain_reach` (chain 9, btlazy 13-15, opt 16-19)
