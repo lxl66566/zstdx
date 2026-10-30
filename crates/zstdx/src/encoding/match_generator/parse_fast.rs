@@ -103,18 +103,21 @@ impl MatchGeneratorDriver {
         // plain instantiation stays byte-for-byte the stock body.
         let lit_lens = self.lit_lens;
         // Long-distance candidates of this block ([`Self::ldm_generate`]):
-        // `ldm_i` is the first unconsumed one, each ending a segment at
-        // its split. Generate's anchor skip keeps spans disjoint and
-        // splits ascending. The `LDM = false` instantiation binds the
-        // empty slice constant, so the segment loop folds to the stock
-        // single-segment scan.
-        let ldm_seqs: &[LdmSeq] = if LDM {
-            &self.ldm_seqs[..]
-        } else {
-            &[]
-        };
-        let mut ldm_i = 0usize;
-        let mut ldm_won = false;
+        // `ldm_i` (a driver field) is the first unconsumed one, each
+        // ending a segment at its split. Generate's anchor skip keeps
+        // spans disjoint and splits ascending. The segment state is
+        // memory-resident on purpose: as locals, the slice pointer and
+        // length, the cursor and the win flag stayed in registers across
+        // the gap-scan back edge, and that loop spills whatever it cannot
+        // keep (the armed dll scan's per-event excess sits exactly there).
+        // The per-boundary reloads are segment-granular and the loop's raw
+        // table stores stop LLVM from hoisting them back into registers.
+        // The `LDM = false` instantiation folds every access below away,
+        // so the segment loop stays the stock single-segment scan.
+        if LDM {
+            self.ldm_i = 0;
+            self.ldm_won = false;
+        }
 
         // Resolve a table entry to a window index. The truncated
         // (epoch-rebased, see `fast_shift`) position is rebuilt as a
@@ -610,12 +613,14 @@ impl MatchGeneratorDriver {
         // below is wrap-free by the bar (pos only grows, from
         // `self.pos >= win_base`).
         'segments: loop {
-            let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
-                end = s.split - shift;
-                Some(*s)
+            // Only `end` crosses into the scan loop (the stock body's own
+            // bound); the candidate itself re-reads at the boundary.
+            end = if LDM {
+                self.ldm_seqs
+                    .get(self.ldm_i)
+                    .map_or(block_end, |s| s.split - shift)
             } else {
-                end = block_end;
-                None
+                block_end
             };
             // Seeded phase: job starts only (bulk-ST skips it entirely); each
             // emit re-checks convergence at the head, and the values only
@@ -628,6 +633,11 @@ impl MatchGeneratorDriver {
             'restart: while end.saturating_sub(pos) >= hash_read {
                 scan_fast!('restart, false, LDM);
             }
+            let seq = if LDM {
+                self.ldm_seqs.get(self.ldm_i).copied()
+            } else {
+                None
+            };
             let Some(seq) = seq else {
                 // Last segment: the stock literals-only tail rule.
                 if !emit.seqs.is_empty() && anchor < block_end {
@@ -636,7 +646,7 @@ impl MatchGeneratorDriver {
                 }
                 break 'segments;
             };
-            ldm_i += 1;
+            self.ldm_i += 1;
             debug_assert_eq!(seq.split - shift, end);
             // The 4-byte guard only defends a stale candidate (generate
             // verified the whole span at fill time); a failure drops it and
@@ -674,7 +684,7 @@ impl MatchGeneratorDriver {
                 ml += 1;
             }
             anchor = emit.emit(win, anchor, start, ml, seq.offset + 3, &mut rep);
-            ldm_won = true;
+            self.ldm_won = true;
             // A wholesale emission is a literal-offset sequence: the
             // job-start rep gate counts it.
             rep_pending = rep_pending.saturating_sub(1);
@@ -683,13 +693,16 @@ impl MatchGeneratorDriver {
             // the next candidate's split; a chain that covers a split drops
             // that candidate (the coverage rule — its span is emitted
             // content).
-            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split - shift);
+            let bound = self
+                .ldm_seqs
+                .get(self.ldm_i)
+                .map_or(block_end, |s| s.split - shift);
             let mut cursor = anchor;
             if rep_pending == 0 {
                 cursor = emit.rep1_chain::<RAMPED>(win, None, anchor, bound, &mut rep, ramp);
             }
-            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < cursor {
-                ldm_i += 1;
+            while self.ldm_i < self.ldm_seqs.len() && self.ldm_seqs[self.ldm_i].split < cursor {
+                self.ldm_i += 1;
             }
             // Fresh segment, fresh literal-run ramp (the emission reset the
             // miss streak's meaning across the skipped interior).
@@ -701,7 +714,7 @@ impl MatchGeneratorDriver {
             anchor = cursor;
         }
         if LDM {
-            self.ldm_note_block(ldm_won);
+            self.ldm_note_block(self.ldm_won);
         }
         // A zero-sequence block stages nothing: its literals are exactly the
         // block, which the caller reads through get_last_space() instead of

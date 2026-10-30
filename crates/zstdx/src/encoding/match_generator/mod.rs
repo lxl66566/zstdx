@@ -375,6 +375,14 @@ pub struct MatchGeneratorDriver {
     /// Long-distance candidates of the block being scanned (regenerated
     /// per block by [`Self::ldm_generate`]).
     ldm_seqs: Vec<LdmSeq>,
+    /// Scan-transient segment cursor of the armed fast rows: the first
+    /// unconsumed candidate of `ldm_seqs`. Memory-resident by design (see
+    /// `start_matching_fast`), written at each scan entry and consumed at
+    /// its exit, never live across blocks.
+    ldm_i: usize,
+    /// Scan-transient armed flag of the same scans: whether any candidate
+    /// was emitted wholesale. Same lifetime discipline as `ldm_i`.
+    ldm_won: bool,
     /// Consecutive winless scanned blocks past the reach horizon (see
     /// [`LDM_QUIET`]); counts toward the shutoff latch.
     ldm_quiet: u8,
@@ -1118,6 +1126,8 @@ impl MatchGeneratorDriver {
             ldm: None,
             ldm_parked: None,
             ldm_seqs: Vec::new(),
+            ldm_i: 0,
+            ldm_won: false,
             ldm_quiet: 0,
             ldm_dead: false,
             ldm_canary: 0,
@@ -1192,6 +1202,8 @@ impl MatchGeneratorDriver {
             ldm: None,
             ldm_parked: None,
             ldm_seqs: Vec::new(),
+            ldm_i: 0,
+            ldm_won: false,
             ldm_quiet: 0,
             ldm_dead: false,
             ldm_canary: 0,

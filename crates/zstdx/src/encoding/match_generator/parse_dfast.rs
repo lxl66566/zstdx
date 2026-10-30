@@ -131,18 +131,21 @@ impl MatchGeneratorDriver {
         };
 
         // Long-distance candidates of this block ([`Self::ldm_generate`]):
-        // `ldm_i` is the first unconsumed one, each ending a segment at
-        // its split. Generate's anchor skip keeps spans disjoint and
-        // splits ascending. The `LDM = false` instantiation binds the
-        // empty slice constant, so the segment loop folds to the stock
-        // single-segment scan.
-        let ldm_seqs: &[LdmSeq] = if LDM {
-            &self.ldm_seqs[..]
-        } else {
-            &[]
-        };
-        let mut ldm_i = 0usize;
-        let mut ldm_won = false;
+        // `ldm_i` (a driver field) is the first unconsumed one, each
+        // ending a segment at its split. Generate's anchor skip keeps
+        // spans disjoint and splits ascending. The segment state is
+        // memory-resident on purpose: as locals, the slice pointer and
+        // length, the cursor and the win flag stayed in registers across
+        // the gap-scan back edge, and that loop spills whatever it cannot
+        // keep (the armed dll scan's per-event excess sits exactly there).
+        // The per-boundary reloads are segment-granular and the loop's raw
+        // table stores stop LLVM from hoisting them back into registers.
+        // The `LDM = false` instantiation folds every access below away,
+        // so the segment loop stays the stock single-segment scan.
+        if LDM {
+            self.ldm_i = 0;
+            self.ldm_won = false;
+        }
 
         // Resolve a table entry to a window index. Same distance trick as
         // the fast loop's `resolve`: `dist = pos - (entry - 1)` wraps huge
@@ -454,13 +457,15 @@ impl MatchGeneratorDriver {
         // wrap-free by the guard; splits sit at/after the block start,
         // which the entry debug_assert keeps at/after the shift.
         'segments: loop {
-            let seq = if let Some(s) = ldm_seqs.get(ldm_i) {
-                let e = s.split - shift;
-                seg_end = (e - win_base) as usize;
-                Some(*s)
+            // Only the segment bounds cross into the scan loop (the stock
+            // body's own); the candidate re-reads at the boundary, the
+            // same memory-residency form as the fast loop's segment state.
+            seg_end = if LDM {
+                self.ldm_seqs
+                    .get(self.ldm_i)
+                    .map_or(block_len, |s| (s.split - shift - win_base) as usize)
             } else {
-                seg_end = block_len;
-                None
+                block_len
             };
             seg_limit = seg_end.saturating_sub(HASH_READ);
             // Seeded phase (job starts only; bulk-ST skips it entirely),
@@ -472,6 +477,11 @@ impl MatchGeneratorDriver {
             'outer: loop {
                 scan_dfast!('outer, false, LDM);
             }
+            let seq = if LDM {
+                self.ldm_seqs.get(self.ldm_i).copied()
+            } else {
+                None
+            };
             let Some(seq) = seq else {
                 // Last segment: the stock literals-only tail rule.
                 if !emit.seqs.is_empty() && anchor_idx < block_len {
@@ -479,7 +489,7 @@ impl MatchGeneratorDriver {
                 }
                 break 'segments;
             };
-            ldm_i += 1;
+            self.ldm_i += 1;
             debug_assert_eq!(seq.split - shift, win_base + seg_end as u64);
             // The 4-byte guard only defends a stale candidate (generate
             // verified the whole span at fill time); a failure drops it and
@@ -522,7 +532,7 @@ impl MatchGeneratorDriver {
                 seq.offset + 3,
                 &mut rep,
             );
-            ldm_won = true;
+            self.ldm_won = true;
             // A wholesale emission is a literal-offset sequence: the
             // job-start rep gate counts it.
             rep_pending = rep_pending.saturating_sub(1);
@@ -531,7 +541,10 @@ impl MatchGeneratorDriver {
             // bounded at the next candidate's split; a chain that covers a
             // split drops that candidate (the coverage rule — its span is
             // emitted content).
-            let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split - shift);
+            let bound = self
+                .ldm_seqs
+                .get(self.ldm_i)
+                .map_or(block_end, |s| s.split - shift);
             let mut cursor = anchor_idx;
             if rep_pending == 0 {
                 let bound_limit = IdxRange::new(win_base, bound.max(win_base))
@@ -540,9 +553,10 @@ impl MatchGeneratorDriver {
                 cursor =
                     emit.rep_chain::<RAMPED, true>(win, anchor_idx, bound_limit, &mut rep, ramp);
             }
-            while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split - shift < win_base + cursor as u64
+            while self.ldm_i < self.ldm_seqs.len()
+                && self.ldm_seqs[self.ldm_i].split - shift < win_base + cursor as u64
             {
-                ldm_i += 1;
+                self.ldm_i += 1;
             }
             if cursor >= block_len {
                 break 'segments;
@@ -551,7 +565,7 @@ impl MatchGeneratorDriver {
             anchor_idx = cursor;
         }
         if LDM {
-            self.ldm_note_block(ldm_won);
+            self.ldm_note_block(self.ldm_won);
         }
         self.pos = self.block_end;
         self.anchor = self.block_end;
