@@ -39,7 +39,11 @@
 //! length, so the decision waits for [`reach_probe::PROBE_MIN_FRAME`]
 //! streamed bytes (a size hint of that bar or more stages early, the ST
 //! entry's own eligibility — see `probe_gate`). A stream that ends or
-//! flushes before the gate keeps the stock reach.
+//! flushes before the gate keeps the stock reach. A wide head stands the
+//! donation down (see `stage_probe`): the storage verdict's own sample
+//! resolves the frame as Keep outright, job zero parses undonated, and the
+//! pre-split clamp divergence the donated span end buys is the bulk
+//! stand-down's own recorded class (dll's active block splitter).
 //!
 //! The chain rows' whole-window strip carries exactly one reader beyond
 //! the row's search domain: LDM's far class (the chain walk rejects
@@ -127,7 +131,8 @@ use crate::{
         },
         mt::{
             CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, capture_band, capture_job_size,
-            donate_keep_span, fast_capture_schedule, job_size_for, prepare_job_state, run_job_with,
+            donate_keep_span, fast_capture_schedule, head_predicts_keep, job_size_for,
+            prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -1491,6 +1496,32 @@ impl MtEncoderCore {
         }
     }
 
+    /// The staging gate fired (the probe's head sits staged whole at the
+    /// buffer's start): decide how the verdict is reached. A wide head
+    /// (see [`head_predicts_keep`], the bulk dispatch's own stand-down)
+    /// resolves the frame as Keep outright — the prediction is the probe's
+    /// measured verdict on every measured class — so no donation ever
+    /// posts: `choice` stays `Keep`, job zero parses undonated from a
+    /// pooled state like any other job, and the capture engagement plus
+    /// decided reserve the Keep verdict itself would run (`resolve_probe`)
+    /// happen right here, before any post. The finish tail then never
+    /// waits the two serial probe parses (dll32 stream-mt8's finish settle
+    /// wait measured 35 ms, jobdecomp 2026-10-30). A narrow head keeps the
+    /// donation (see [`Self::post_donation`]): the shrink classes are the
+    /// probe's own, and their bytes ride the measured verdict.
+    fn stage_probe(&mut self) {
+        self.probe_pending = false;
+        debug_assert_eq!(self.job_start, 0);
+        debug_assert_eq!(self.buf_base, 0);
+        debug_assert!(self.pos >= reach_probe::PROBE_SPAN as u64);
+        if head_predicts_keep(&self.buf[..reach_probe::PROBE_SPAN]) {
+            self.engage_midsize_capture();
+            self.reserve_decided();
+            return;
+        }
+        self.post_donation();
+    }
+
     /// Post the probe's keep-side donation (see [`reach_probe`],
     /// `donate_span`): a pool worker runs job zero's first span blocks
     /// through the job machinery and parks the verdict, while the pump
@@ -1501,7 +1532,6 @@ impl MtEncoderCore {
     /// so the donated head still sits at the buffer's start; the donation
     /// counts in `n_incomplete`, so buffer recycling waits it out.
     fn post_donation(&mut self) {
-        self.probe_pending = false;
         debug_assert_eq!(self.job_start, 0);
         debug_assert_eq!(self.buf_base, 0);
         debug_assert!(self.pos >= reach_probe::PROBE_SPAN as u64);
@@ -2028,12 +2058,12 @@ impl MtEncoderCore {
         if self.probe_pending {
             // Nothing posts until the probe's head is staged and decided
             // (see the module docs) — the schedule below must never see a
-            // pending frame. The donation itself posts here and its
-            // verdict is consumed lazily, only where the schedule needs it.
+            // pending frame. The staging itself decides how the verdict is
+            // reached (see `stage_probe`).
             if self.pos < self.probe_gate() {
                 return;
             }
-            self.post_donation();
+            self.stage_probe();
         }
         if let Some(span) = self.fast_capture.stage_span() {
             // The fast rows' capture stages its evidence the same way (see
@@ -3090,6 +3120,66 @@ mod tests {
         assert_eq!(core.growing_epoch_end(0), 8 * cap);
         // strip + staged epoch stays at the buffer's own scale.
         assert!(core.overlap as u64 + 8 * cap <= BUF_CAP_MAX as u64);
+    }
+
+    /// The staging gate's wide-head stand-down: a chain-row stream whose
+    /// head predicts Keep resolves its reach at staging without ever
+    /// posting a donation. `choice` stays Keep, no donation task runs, and
+    /// the donated-state carry a resolved Keep verdict installs
+    /// (`resolve_probe`) never appears, so job zero parses undonated. A
+    /// narrow head posts the donation as before, observable mid-stream on
+    /// the growing grid where no epoch is due yet.
+    #[test]
+    fn wide_head_stages_keep_without_donation() {
+        let mib = 1024 * 1024usize;
+        let data = dllish(16 * mib);
+        assert!(
+            head_predicts_keep(&data),
+            "dllish's head is the wide class the stand-down bets on"
+        );
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Balanced).workers(4));
+        core.write(&data[..8 * mib]).unwrap();
+        assert!(!core.probe_pending);
+        assert!(core.probe_wait.is_none());
+        assert_eq!(core.choice, ReachChoice::Keep);
+        assert!(
+            core.donation.is_none(),
+            "the stand-down resolves Keep before any post"
+        );
+        core.write(&data[8 * mib..]).unwrap();
+        core.finish().unwrap();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+
+        // Narrow twin: a 16-symbol tile repeated at a near-local lag
+        // (skewed's shape) keeps the donation, pinned at the same
+        // mid-stream point no post can have consumed it at.
+        let mut tile = Vec::with_capacity(16 * 1024);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while tile.len() < 16 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            tile.push((state >> 33) as u8 % 16);
+        }
+        let mut narrow = Vec::with_capacity(16 * mib);
+        while narrow.len() < 16 * mib {
+            narrow.extend_from_slice(&tile);
+        }
+        assert!(!head_predicts_keep(&narrow));
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Balanced).workers(4));
+        core.write(&narrow[..8 * mib]).unwrap();
+        assert!(!core.probe_pending);
+        assert!(
+            core.probe_wait.is_some(),
+            "a narrow head still posts the donation"
+        );
+        core.write(&narrow[8 * mib..]).unwrap();
+        core.finish().unwrap();
+        let mut out = vec![0u8; narrow.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (narrow.len(), &narrow[..]));
     }
 
     /// The finish tail's shared prefix fill pins its adoption schedule:
