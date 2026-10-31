@@ -34,6 +34,24 @@ pub fn new() -> BlockDecoder {
     }
 }
 
+/// Give the literals staging buffer its 16-byte zeroed tail behind the
+/// length: the flat executor's `wildcopy_literals` reads up to 15 bytes
+/// past the final literal (see `sequence_execution`), `reserve` keeps the
+/// overshoot inside the allocation, and zeroing the overshoot window keeps
+/// the read initialized — under the strict Rust model, scanning the
+/// uninitialized capacity tail is UB even when the values are never used
+/// (libzstd's ZSTD_wildcopy over-reads the same shape in C and gets away
+/// with it there). The cost is a 16-byte memset per block; the buffer is
+/// pooled and the reserve is a no-op after the first block, so this never
+/// reallocates. The staging buffer's every producer must route through
+/// here before the flat executor reads it.
+fn zero_wildcopy_tail(literals_buffer: &mut Vec<u8>) {
+    literals_buffer.reserve(16);
+    let len = literals_buffer.len();
+    literals_buffer.resize(len + 16, 0);
+    literals_buffer.truncate(len);
+}
+
 impl BlockDecoder {
     pub fn decode_block_content(
         header: &BlockHeader,
@@ -196,20 +214,11 @@ impl BlockDecoder {
         let out = &mut out[..block_limit];
 
         if seq_section.num_sequences != 0 {
-            // The flat executor's inline 16-byte literal chunks read up to
-            // 15 bytes past the final literal (see `wildcopy_literals`).
-            // `reserve` keeps the overshoot inside the allocation; zeroing
-            // the overshoot window keeps the read initialized — under the
-            // strict Rust model, scanning the uninitialized capacity tail
-            // is UB even when the values are never used (libzstd's
-            // ZSTD_wildcopy over-reads the same shape in C and gets away
-            // with it there). The cost is a 16-byte memset per block; the
-            // buffer is pooled and `reserve` ran above, so this never
-            // reallocates.
-            literals_buffer.reserve(16);
-            let len = literals_buffer.len();
-            literals_buffer.resize(len + 16, 0);
-            literals_buffer.truncate(len);
+            // The flat executor's `wildcopy_literals` reads up to 15 bytes
+            // past the final literal; give the staging buffer its 16-byte
+            // zeroed tail so the overread stays initialized (see
+            // `zero_wildcopy_tail`).
+            zero_wildcopy_tail(literals_buffer);
             let mut dec = SeqDecoder::new(&seq_section, raw, fse)?;
             execute_decoded_flat(
                 &mut dec,

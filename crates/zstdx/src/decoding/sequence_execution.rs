@@ -1,8 +1,23 @@
 use super::scratch::DecoderScratch;
 use crate::{blocks::sequence_section::Sequence, decoding::errors::ExecuteSequencesError};
 
-/// Take the provided decoder and execute the sequences stored within
-pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
+/// Proof that a `DecodeBuffer`'s ring buffer was reserved for a whole
+/// block's output (Σ literal plus match lengths, minted by
+/// [`execute_sequences`]' reserve). The pre-reserved append entries
+/// (`DecodeBuffer::push_pre_reserved` / `repeat_pre_reserved`) take it
+/// instead of trusting that the block-level reserve covers the append:
+/// the typestate replaces the trust, and only the reserve site can
+/// construct one (private field).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockBudget {
+    _reserved: (),
+}
+
+/// Take the provided decoder and execute the sequences stored within,
+/// returning the [`BlockBudget`] its reserve minted.
+pub fn execute_sequences(
+    scratch: &mut DecoderScratch,
+) -> Result<BlockBudget, ExecuteSequencesError> {
     let old_buffer_size = scratch.buffer.len();
 
     // Reserve once for the entire block: every literal plus every match
@@ -28,6 +43,9 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         return Err(ExecuteSequencesError::BlockOutputTooLarge { max: block_out_max });
     }
     scratch.buffer.reserve(total_out);
+    // Minted only after the reserve above: it is the proof every
+    // pre-reserved append below relies on.
+    let budget = BlockBudget { _reserved: () };
 
     let DecoderScratch {
         sequences,
@@ -52,7 +70,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
             let literals = &literals_buffer[literals_copy_counter..high];
             literals_copy_counter += seq.ll as usize;
 
-            buffer.push_pre_reserved(literals);
+            buffer.push_pre_reserved(literals, budget);
         }
 
         let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
@@ -60,7 +78,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
             return Err(ExecuteSequencesError::ZeroOffset);
         }
         if seq.ml > 0 {
-            buffer.repeat_pre_reserved(actual_offset as usize, seq.ml as usize)?;
+            buffer.repeat_pre_reserved(actual_offset as usize, seq.ml as usize, budget)?;
         }
 
         seq_sum += seq.ml;
@@ -68,7 +86,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     }
     if literals_copy_counter < literals_buffer.len() {
         let rest_literals = &literals_buffer[literals_copy_counter..];
-        buffer.push_pre_reserved(rest_literals);
+        buffer.push_pre_reserved(rest_literals, budget);
         seq_sum += rest_literals.len() as u32;
     }
 
@@ -77,7 +95,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         seq_sum as usize == diff,
         "Seq_sum: {seq_sum} is different from the difference in buffersize: {diff}"
     );
-    Ok(())
+    Ok(budget)
 }
 
 /// Execute the sequences decoded by `dec` straight into the flat target at
@@ -624,6 +642,11 @@ fn copy_wrapped_match(
     // virtual address below is a true global position.
     let virt_base = folded_base.wrapping_add(prev_origin);
     let block_start = virt_base.saturating_sub(origin);
+    // The dispatch in `exec_one_flat` (`offset.wrapping_add(wrap_base) >
+    // dst_a`, i.e. `offset > block_start + pos`) admits only sources
+    // strictly below the physical buffer start; the reach
+    // `offset - block_start - pos` below relies on that to stay positive.
+    debug_assert!(offset > block_start.saturating_add(pos));
     // Fast path: a source entirely inside the previous generation is still
     // one linear in-buffer copy, reading the previous generation's intact
     // top. `d` is how far the source reaches below the active generation's

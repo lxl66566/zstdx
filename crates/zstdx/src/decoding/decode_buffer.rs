@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use super::ringbuffer::RingBuffer;
+use super::{ringbuffer::RingBuffer, sequence_execution::BlockBudget};
 #[cfg(feature = "hash")]
 use crate::xxh64::Xxh64;
 use crate::{
@@ -128,9 +128,11 @@ impl DecodeBuffer {
     }
 
     /// Like `push` but for buffers whose capacity was reserved up front for
-    /// the whole block (see `execute_sequences`); skips the free-space check.
+    /// the whole block: `budget` is minted by that reserve
+    /// (`execute_sequences`), proving this append is covered, so the
+    /// free-space check is skipped.
     #[inline]
-    pub fn push_pre_reserved(&mut self, data: &[u8]) {
+    pub fn push_pre_reserved(&mut self, data: &[u8], _budget: BlockBudget) {
         debug_assert!(self.buffer.free() >= data.len());
         // SAFETY: the block-level reserve covers this append.
         unsafe { self.buffer.extend_pre_reserved(data) };
@@ -139,13 +141,27 @@ impl DecodeBuffer {
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         self.buffer.reserve(match_length);
-        self.repeat_pre_reserved(offset, match_length)
+        self.repeat_reserved(offset, match_length)
     }
 
     /// Like `repeat` but for buffers whose capacity was reserved up front for
-    /// the whole block (see `execute_sequences`); skips the free-space check.
+    /// the whole block: `budget` is minted by that reserve
+    /// (`execute_sequences`), proving this append is covered, so the
+    /// free-space check is skipped.
     #[inline]
     pub fn repeat_pre_reserved(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+        _budget: BlockBudget,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_reserved(offset, match_length)
+    }
+
+    /// Append the match `offset` bytes behind the write cursor, assuming the
+    /// capacity for `match_length` more bytes is already there (the caller
+    /// reserved it, via [`Self::repeat`] or a `BlockBudget`).
+    fn repeat_reserved(
         &mut self,
         offset: usize,
         match_length: usize,

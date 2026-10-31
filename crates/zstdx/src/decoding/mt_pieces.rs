@@ -49,8 +49,8 @@ use std::sync::{Condvar, Mutex};
 use super::{
     errors::FrameDecoderError,
     mt::{
-        BlockPlan, DecodedSegment, ScanPlan, SegmentPlan, SegmentScratch, decode_segment,
-        execute_blocks, execute_segment,
+        BlockPlan, DecodedSegment, OutRegion, ScanPlan, SegmentPlan, SegmentScratch,
+        decode_segment, execute_blocks, execute_segment,
     },
     sequence_execution::do_offset_history,
 };
@@ -247,15 +247,14 @@ fn validate_piece(segs: &[Arc<DecodedSegment>], piece: &Piece) -> Option<usize> 
 /// watermark has reached `piece.max_top` (every external read is final).
 ///
 /// # Safety
-/// `base` must be valid for writes over `[piece.start, piece.end)` plus 16
-/// bytes of wildcopy slack below `min(buf_limit, piece.end)`, and for
+/// `region.base()` must be valid for writes over `[piece.start, piece.end)`
+/// plus 16 bytes of wildcopy slack below the region's bounds, and for
 /// reads over the final output below `piece.start`.
 unsafe fn execute_piece(
-    base: *mut u8,
+    region: OutRegion,
     input: &[u8],
     segs: &[Arc<DecodedSegment>],
     piece: &Piece,
-    buf_limit: usize,
 ) -> Result<(), FrameDecoderError> {
     let mut hist = if piece.start == 0 {
         [1u32, 4, 8]
@@ -268,15 +267,13 @@ unsafe fn execute_piece(
         // Pieces are frame-relative, so the frame base is output zero.
         unsafe {
             execute_blocks(
-                base,
+                region,
                 part.start,
                 0,
                 &segs[part.seg],
                 part.blocks.clone(),
                 input,
                 &mut hist,
-                buf_limit,
-                piece.end,
             )?;
         }
     }
@@ -667,8 +664,19 @@ impl Pool<'_> {
         };
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: place() covered [0, fcs) at `base`; the watermark
-            // gate made every external read final.
-            unsafe { execute_piece(base, self.input, &segs, &pieces[i], buf_limit) }
+            // gate made every external read final. The piece end caps the
+            // wildcopy overshoot so parallel pieces never spill into a
+            // neighbor's range.
+            unsafe {
+                execute_piece(
+                    // SAFETY: `base` is the non-null place() pointer over
+                    // the whole frame, `buf_limit` its writable end.
+                    OutRegion::new(base, buf_limit, pieces[i].end),
+                    self.input,
+                    &segs,
+                    &pieces[i],
+                )
+            }
         }));
         let mut d = self.mtx.lock().unwrap();
         match attempt {
@@ -993,23 +1001,20 @@ fn run_serial(
         let (base, buf_limit) = place(written, written + seg.out_size)?;
         // SAFETY: place made [0, written + out_size) valid; every match
         // source below `written` is final (in-order execution).
+        let region = unsafe { OutRegion::new(base, buf_limit, usize::MAX) };
+        // SAFETY: region's contract above.
         unsafe {
-            execute_segment(
-                base,
-                written,
-                frame_base,
-                seg,
-                input,
-                &mut offset_hist,
-                buf_limit,
-            )?;
+            execute_segment(region, written, frame_base, seg, input, &mut offset_hist)?;
         }
         #[cfg(feature = "hash")]
         if let Some((h, _)) = hash.as_mut() {
             // SAFETY: same-thread absorb of just-executed bytes, before the
             // next `place` call may move the output.
             unsafe {
-                h.write(core::slice::from_raw_parts(base.add(written), seg.out_size));
+                h.write(core::slice::from_raw_parts(
+                    region.base().add(written),
+                    seg.out_size,
+                ));
             }
         }
         written += seg.out_size;

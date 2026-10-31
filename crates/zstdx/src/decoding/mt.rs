@@ -40,6 +40,7 @@
 use alloc::vec::Vec;
 use core::{
     ops::Range,
+    ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::sync::{Condvar, Mutex};
@@ -664,43 +665,80 @@ pub(super) fn decode_segment(
     })
 }
 
-/// Stage B: execute one staged segment at `base[seg_start..seg_start +
+/// The output region stage B executes into. Absolute output positions
+/// index from `base`; `write_limit` is the absolute end of the memory the
+/// writes may overshoot into by up to 16 bytes (wildcopy slack: the
+/// caller's slice end, or the vector's capacity — the slack bytes are
+/// overwritten in address order before anything can read them, same
+/// contract as the flat executor); `wild_cap` additionally bounds how far
+/// past its own end a copy may overshoot (`usize::MAX` when only the
+/// memory end matters, a parallel piece's end so pieces never spill into a
+/// neighbor's range). All the stage-B wildcopy-slack arithmetic lives in
+/// [`OutRegion::wild_ok`].
+#[derive(Clone, Copy)]
+pub(super) struct OutRegion {
+    base: NonNull<u8>,
+    write_limit: usize,
+    wild_cap: usize,
+}
+
+impl OutRegion {
+    /// # Safety
+    /// `base` must be non-null and valid for writes in `[0, write_limit)`
+    /// and for reads of the final output below the executed watermark, as
+    /// the executor contracts state.
+    pub(super) unsafe fn new(base: *mut u8, write_limit: usize, wild_cap: usize) -> Self {
+        // SAFETY: the caller's contract provides a valid, non-null base
+        unsafe {
+            OutRegion {
+                base: NonNull::new_unchecked(base),
+                write_limit,
+                wild_cap,
+            }
+        }
+    }
+
+    pub(super) fn base(&self) -> *mut u8 {
+        self.base.as_ptr()
+    }
+
+    /// Whether the copy ending at absolute `end` may take the wildcopy
+    /// path: its 16-byte overshoot stays inside both bounds.
+    #[inline(always)]
+    pub(super) fn wild_ok(&self, end: usize) -> bool {
+        end + 16 <= self.write_limit && end + 16 <= self.wild_cap
+    }
+}
+
+/// Stage B: execute one staged segment at `region.base()[seg_start..seg_start +
 /// out_size)`, reading match sources at absolute positions below
 /// `seg_start` (final output of earlier segments; stage B runs in order).
 /// `frame_base` is the owning frame's absolute output start: match sources
 /// may not reach below it (each frame is an independent history, as in
 /// `ZSTD_decompress`'s per-frame window).
 ///
-/// `buf_limit` is the absolute end of the region the writes may overshoot
-/// by up to 16 bytes (wildcopy slack): the caller's slice end, or the
-/// vector's capacity. The slack bytes are overwritten in address order
-/// before anything can read them (same contract as the flat executor).
-///
 /// # Safety
-/// `base` must be valid for writes in `[seg_start, seg_start + out_size)`
-/// plus 16 bytes of slack below `buf_limit`, and for reads in
-/// `[0, seg_start)`. The caller guarantees both by sizing the output
-/// before each segment and executing in order.
+/// `region.base()` must be valid for writes in `[seg_start, seg_start +
+/// out_size)` plus 16 bytes of slack below the region's bounds, and for
+/// reads in `[0, seg_start)`. The caller guarantees both by sizing the
+/// output before each segment and executing in order.
 pub(super) unsafe fn execute_segment(
-    base: *mut u8,
+    region: OutRegion,
     seg_start: usize,
     frame_base: usize,
     seg: &DecodedSegment,
     input: &[u8],
     offset_hist: &mut [u32; 3],
-    buf_limit: usize,
 ) -> Result<(), FrameDecoderError> {
     unsafe {
         execute_blocks(
-            base,
+            region,
             seg_start,
             frame_base,
             seg,
             0..seg.plan.len(),
             input,
             offset_hist,
-            buf_limit,
-            usize::MAX,
         )
     }
 }
@@ -708,27 +746,21 @@ pub(super) unsafe fn execute_segment(
 /// Execute a contiguous block range of a staged segment starting at
 /// absolute output position `start` (the first block's own position).
 /// `frame_base` is the owning frame's absolute output start; offsets must
-/// stay within the frame (see `execute_segment`). `wild_cap` bounds where
-/// wildcopy may overshoot beyond the copy end (the piece executor passes
-/// the piece end so parallel pieces never write into a neighbor's range;
-/// the serial path passes `usize::MAX`).
+/// stay within the frame (see `execute_segment`).
 ///
 /// # Safety
-/// `base` must be valid for writes over the blocks' combined output plus
-/// 16 bytes of slack below `min(buf_limit, wild_cap)`, and for reads in
-/// `[0, start)`. `offset_hist` must hold the true repcode history at
+/// `region.base()` must be valid for writes over the blocks' combined
+/// output plus 16 bytes of slack below the region's bounds, and for reads
+/// in `[0, start)`. `offset_hist` must hold the true repcode history at
 /// `start`.
-#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn execute_blocks(
-    base: *mut u8,
+    region: OutRegion,
     start: usize,
     frame_base: usize,
     seg: &DecodedSegment,
     blocks: Range<usize>,
     input: &[u8],
     offset_hist: &mut [u32; 3],
-    buf_limit: usize,
-    wild_cap: usize,
 ) -> Result<(), FrameDecoderError> {
     use crate::decoding::errors::ExecuteSequencesError;
     let exec_err =
@@ -739,7 +771,7 @@ pub(super) unsafe fn execute_blocks(
         .iter()
         .map(BlockPlan::out)
         .fold(0usize, usize::saturating_add);
-    let write_limit = buf_limit.min(wild_cap);
+    let base = region.base();
     let mut w = 0usize;
     for block in &seg.plan[blocks] {
         match block {
@@ -779,13 +811,14 @@ pub(super) unsafe fn execute_blocks(
                         }));
                     }
                     // Wildcopy when the 16-byte overshoot of both the
-                    // literal and the match copy stays below the write
-                    // limit; the literal side additionally needs its own
-                    // 16-byte overread to stay inside the staged literals.
+                    // literal and the match copy stays inside the region
+                    // (`OutRegion::wild_ok` carries the slack arithmetic);
+                    // the literal side additionally needs its own 16-byte
+                    // overread to stay inside the staged literals.
                     // SAFETY: budget checks bound the writes; the literal
                     // range was checked above
                     let end = start + w + ll + ml;
-                    let wild = end + 16 <= write_limit;
+                    let wild = region.wild_ok(end);
                     unsafe {
                         let dst = base.add(start + w);
                         if ll > 0 {
@@ -991,22 +1024,16 @@ fn decode_parallel(
                 let (base, buf_limit) = place(written, written + seg.out_size)?;
                 // SAFETY: `place` made [0, written + out_size) valid; every
                 // match source below `written` is final (in-order execution).
+                let region = unsafe { OutRegion::new(base, buf_limit, usize::MAX) };
+                // SAFETY: region's contract above.
                 unsafe {
-                    execute_segment(
-                        base,
-                        written,
-                        frame_base,
-                        &seg,
-                        input,
-                        &mut offset_hist,
-                        buf_limit,
-                    )?;
+                    execute_segment(region, written, frame_base, &seg, input, &mut offset_hist)?;
                 }
                 written += seg.out_size;
                 // The executed range is final from here on: later writes never
                 // land below the executor cursor.
                 #[cfg(feature = "hash")]
-                after_segment(base.cast_const(), seg_out_start..written);
+                after_segment(region.base().cast_const(), seg_out_start..written);
                 consumed.store(id + 1, Ordering::Release);
                 ready.notify_all();
             }
