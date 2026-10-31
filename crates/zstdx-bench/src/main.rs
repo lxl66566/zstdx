@@ -11,6 +11,7 @@
 mod cmd;
 mod common;
 mod corpus;
+mod pool;
 
 use clap::{Parser, Subcommand};
 
