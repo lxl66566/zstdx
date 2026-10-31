@@ -124,13 +124,30 @@ pub(super) fn read8(win: &[u8], idx: usize) -> u64 {
 /// surrounding code.
 #[inline(always)]
 pub(in crate::encoding) fn extend_match(win: &[u8], i: usize, j: usize) -> usize {
+    extend_match_lim(win, i, j, win.len() - i)
+}
+
+/// [`extend_match`] capped at `cap` bytes: byte-identical to
+/// `extend_match(win, i, j).min(cap)`, with the cap folded into the compare
+/// loop so bytes past it are never read. The armed rows' segmenting scans
+/// clamp every emission at the gap end anyway (C's per-gap compressor
+/// call), while the unclamped extend runs to the twin mismatch or the
+/// window edge — MB-scale gap twins paid full-twin compares per probe for
+/// a clamped-away result.
+#[inline(always)]
+pub(in crate::encoding) fn extend_match_gap(win: &[u8], i: usize, j: usize, cap: usize) -> usize {
+    extend_match_lim(win, i, j, cap.min(win.len() - i))
+}
+
+#[inline(always)]
+fn extend_match_lim(win: &[u8], i: usize, j: usize, limit: usize) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        extend_match_aligned(win, i, j)
+        extend_match_aligned(win, i, j, limit)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        extend_match_portable(win, i, j)
+        extend_match_portable(win, i, j, limit)
     }
 }
 
@@ -138,8 +155,7 @@ pub(in crate::encoding) fn extend_match(win: &[u8], i: usize, j: usize) -> usize
 // Dead in x86-64 lib builds (the asm path serves them); the differential
 // test keeps it compiled there.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn extend_match_portable(win: &[u8], i: usize, j: usize) -> usize {
-    let limit = win.len() - i;
+pub(super) fn extend_match_portable(win: &[u8], i: usize, j: usize, limit: usize) -> usize {
     let base = win.as_ptr();
     let mut len = 0;
     // SAFETY: i and j are valid indices and i + len + 8 <= win.len() bounds
@@ -163,8 +179,7 @@ pub(super) fn extend_match_portable(win: &[u8], i: usize, j: usize) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn extend_match_aligned(win: &[u8], i: usize, j: usize) -> usize {
-    let limit = win.len() - i;
+fn extend_match_aligned(win: &[u8], i: usize, j: usize, limit: usize) -> usize {
     let mut len = 0usize;
     if limit >= 8 {
         let lim8 = limit - 8;

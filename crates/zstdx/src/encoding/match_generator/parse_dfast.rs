@@ -231,12 +231,15 @@ impl MatchGeneratorDriver {
                                 win_base + cand as u64,
                             )
                         {
-                            let mut ml = extend_match(win, probe, cand);
-                            // Gap bound: the chained emission below must
-                            // not cover bytes past the split.
-                            if $ldm {
-                                ml = ml.min(seg_end - probe);
-                            }
+                            // Gap bound folded into the extend
+                            // (`extend_match_gap` is the clamp folded in,
+                            // byte-identical): the chained emission below
+                            // must not cover bytes past the split.
+                            let ml = if $ldm {
+                                extend_match_gap(win, probe, cand, seg_end - probe)
+                            } else {
+                                extend_match(win, probe, cand)
+                            };
                             debug_assert!(ml >= MIN_MATCH);
                             anchor_idx =
                                 emit.emit(win, anchor_idx, ip_idx, probe, ml, 1, &mut rep);
@@ -262,11 +265,13 @@ impl MatchGeneratorDriver {
                     // offset of one into a zero-offset self-compare (the
                     // pays gate's ilog2(0)).
                     if ci < ip_idx && read4(win, ci) == read4(win, ip_idx) {
-                        let mut ml = extend_match(win, ip_idx, ci);
-                        // Gap bound, as above (the match starts at ip_idx).
-                        if $ldm {
-                            ml = ml.min(seg_end - ip_idx);
-                        }
+                        // Gap bound folded into the extend (the match
+                        // starts at ip_idx), as above.
+                        let mut ml = if $ldm {
+                            extend_match_gap(win, ip_idx, ci, seg_end - ip_idx)
+                        } else {
+                            extend_match(win, ip_idx, ci)
+                        };
                         if ml >= 6
                             && pays_for_offset(ml, ip_idx, ci, false)
                             && !ramp_blocks::<RAMPED>(ramp, pos_abs, win_base + ci as u64)
@@ -313,11 +318,12 @@ impl MatchGeneratorDriver {
                     {
                         let mut start = ip_idx;
                         let mut c = cand;
-                        let mut ml = extend_match(win, ip_idx, cand);
-                        // Gap bound, as above.
-                        if $ldm {
-                            ml = ml.min(seg_end - ip_idx);
-                        }
+                        // Gap bound folded into the extend, as above.
+                        let mut ml = if $ldm {
+                            extend_match_gap(win, ip_idx, cand, seg_end - ip_idx)
+                        } else {
+                            extend_match(win, ip_idx, cand)
+                        };
                         let cfl = ramp_ext_floor::<RAMPED>(ramp, cand, win_base);
                         // Backward catch-up into the pending literals; the
                         // offset (start - c) stays constant.
@@ -368,21 +374,23 @@ impl MatchGeneratorDriver {
                     if cand != ip_idx && read4(win, cand) == read4(win, ip_idx) {
                         let mut start = ip_idx;
                         let mut c = cand;
-                        let mut ml = extend_match(win, ip_idx, cand);
-                        // Gap bound, as above.
-                        if $ldm {
-                            ml = ml.min(seg_end - ip_idx);
-                        }
+                        // Gap bound folded into the extend, as above.
+                        let mut ml = if $ldm {
+                            extend_match_gap(win, ip_idx, cand, seg_end - ip_idx)
+                        } else {
+                            extend_match(win, ip_idx, cand)
+                        };
                         let pos1_abs = win_base + ip1_idx as u64;
                         let reach1 = (pos1_abs - win_base).min(max_window);
                         let c1 = resolve(entry_l1, pos1_abs, reach1, ip1_idx);
                         if c1 != ip1_idx && read8(win, c1) == read8(win, ip1_idx) {
-                            let mut l1len = extend_match(win, ip1_idx, c1);
-                            // Gap bound for the upgrade candidate (its
-                            // match starts at ip1).
-                            if $ldm {
-                                l1len = l1len.min(seg_end - ip1_idx);
-                            }
+                            // Gap bound folded into the extend for the
+                            // upgrade candidate (its match starts at ip1).
+                            let l1len = if $ldm {
+                                extend_match_gap(win, ip1_idx, c1, seg_end - ip1_idx)
+                            } else {
+                                extend_match(win, ip1_idx, c1)
+                            };
                             if l1len > ml {
                                 start = ip1_idx;
                                 c = c1;

@@ -378,6 +378,14 @@ The walk's memory-level parallelism is already harvested by out-of-order specula
 
 ## LDM integration
 
+### Distance-keyed extension memoization
+
+Distance-keyed extension memoization, an extend at (p, p-d) reaching length L proving the tail for a later probe at the same d inside [p, p+L), was simulated inside the `enc_counters` decomposition build on armed dll100 fastest and fast single-thread. Same-distance re-extension covers 0.0% of the compared bytes at every scan extend site on both rows, because the newest-wins tables resolve each hash hit to a fresh distance and the repcode probes rotate their offsets through the emission history. Only the offset-2 chains re-extend a covered distance, at 34% of their own volume, which is a few million bytes per encode. The memo table a real implementation would carry costs more than the chains it could serve, and the lever is closed for the scan side.
+
+### Armed extend caps below the segment end
+
+A byte-changing extend cap on the armed far-class rows, cutting an extend below the segment end to bound the gap-twin cost, was falsified by the same decomposition before any build. After the gap clamp folded into the compare loop (see [matchers](../perf/matchers.md)), the armed rows' remaining forward-extend volume is 41M bytes per encode and all of it is emission-clamped: every compared byte is a length the parse can consume, so a tighter cap trades emitted match bytes for time exactly as an acceptance-bar change would. The armed dll100 fastest row's 49.7% density lead over zstd-1 is the tier's product on that shape, and the sweep cost of defending a deliberate trade buys nothing the byte-identical cut already banked. The stock controls veto the unconditional form outright, with text's 17.1M rep0 extend bytes per encode concentrating in 131 MB-scale runs that are the frame's payload emissions. Extend cost per byte, the remaining 2x against `ZSTD_count`, is per-call entry overhead on a short-skewed mix and stays inside the falsified per-step-cost class.
+
 ### Dense dfast strip fill at MT job heads
 
 A dense or back-filled dfast strip fill at MT job heads, in the FillGrid dictionary form or at full stride-1 density, was floated for the json.fast MT-versus-ST differential and is analytically dead with no build run. A window-length strip's stride-3 grid already saturates both tables, with l3 at about 700K inserts into 2^17 long slots leaving about 0.4% empty, and the small table's exponent is twice that. Per slot the newest-wins holder under stride 3 differs from the dense holder by at most 2 bytes of position, so candidate quality is identical while the fill triples.

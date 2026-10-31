@@ -1227,7 +1227,7 @@ fn gate_probe_empty_strip_on_warm_table() {
 /// (the byte tail), and `i` flush against the window end.
 #[test]
 fn extend_match_asm_matches_portable() {
-    use super::hash::{extend_match, extend_match_portable};
+    use super::hash::{extend_match, extend_match_gap, extend_match_portable};
     if cfg!(not(target_arch = "x86_64")) {
         return;
     }
@@ -1265,7 +1265,7 @@ fn extend_match_asm_matches_portable() {
             win[j + k] ^= 0x80; // mismatch exactly at offset k
             assert_eq!(
                 extend_match(&win, i, j),
-                extend_match_portable(&win, i, j),
+                extend_match_portable(&win, i, j, win.len() - i),
                 "extend_match({i}, {j}) with a planted mismatch at offset {k}"
             );
             win[j + k] ^= 0x80;
@@ -1275,12 +1275,37 @@ fn extend_match_asm_matches_portable() {
         let i = win.len() - tail;
         cases.push((i, 4096));
     }
-    for (i, j) in cases {
+    for &(i, j) in &cases {
         assert_eq!(
             extend_match(&win, i, j),
-            extend_match_portable(&win, i, j),
+            extend_match_portable(&win, i, j, win.len() - i),
             "extend_match({i}, {j})"
         );
+    }
+    // The gap form must equal the plain form clamped after the fact, at
+    // every cap regime: below, at and past the true mismatch, and past the
+    // window tail (the cap is floored at the window's own limit).
+    for &(i, j) in &cases {
+        let full = extend_match(&win, i, j);
+        for cap in [
+            0,
+            1,
+            4,
+            7,
+            8,
+            9,
+            16,
+            full.saturating_sub(1),
+            full,
+            full + 1,
+            win.len() - i + 8,
+        ] {
+            assert_eq!(
+                extend_match_gap(&win, i, j, cap),
+                full.min(cap),
+                "extend_match_gap({i}, {j}, cap {cap})"
+            );
+        }
     }
 }
 

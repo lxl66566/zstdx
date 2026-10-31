@@ -7,7 +7,10 @@ use alloc::vec::Vec;
 use super::{
     MIN_MATCH, PREFILL_STRIDE,
     gates::{CoveredFill, RampGate},
-    hash::{ChainHashWidth, extend_match, hash_at_log, hash_at_width, hash8_at_log, read4},
+    hash::{
+        ChainHashWidth, extend_match, extend_match_gap, hash_at_log, hash_at_width, hash8_at_log,
+        read4,
+    },
 };
 use crate::{
     decoding::sequence_execution::do_offset_history,
@@ -801,12 +804,13 @@ impl TableEmit<'_> {
             if !head_matches {
                 break;
             }
-            let ml = extend_match(win, pidx, cand);
-            // The bound also clamps the emitted length: single-segment
-            // scans pass the window end (a no-op — the window buffer ends
-            // there), the chain's gap-parse pass a segment end so no
-            // chained match may cross a wholesale LDM emission's split.
-            let ml = ml.min((block_end - pos) as usize);
+            // The bound clamps the emitted length and rides the extend
+            // (`extend_match_gap` is the clamp folded in, byte-identical):
+            // single-segment scans pass the window end (a no-op — the
+            // window buffer ends there), the chain's gap-parse pass a
+            // segment end so no chained match may cross a wholesale LDM
+            // emission's split.
+            let ml = extend_match_gap(win, pidx, cand, (block_end - pos) as usize);
             debug_assert!(ml >= MIN_MATCH);
             pos = match chain.as_deref_mut() {
                 Some(chain) => self.emit_linked(win, chain, pos, pidx, ml, rep),
@@ -955,18 +959,19 @@ impl DfastEmit<'_> {
             if read4(win, cand) != read4(win, pos) {
                 break;
             }
-            let ml = extend_match(win, pos, cand);
             // The gap-parse segment pass bounds the chain at the segment
             // end, `HASH_READ` past the probe margin `ilimit_idx` (C's
             // per-gap compressor call counts to the gap end): a chained
             // match may cover bytes up to the split but never cross it —
-            // the wholesale emission owns the bytes from there. The stock
-            // single-segment callers pass `CLAMP = false` (the window ends
-            // at their block end, the clamp would be a no-op).
+            // the wholesale emission owns the bytes from there. The bound
+            // rides the extend (`extend_match_gap` is the clamp folded in,
+            // byte-identical). The stock single-segment callers pass
+            // `CLAMP = false` (the window ends at their block end, the
+            // clamp would be a no-op).
             let ml = if CLAMP {
-                ml.min(ilimit_idx + super::HASH_READ - pos)
+                extend_match_gap(win, pos, cand, ilimit_idx + super::HASH_READ - pos)
             } else {
-                ml
+                extend_match(win, pos, cand)
             };
             debug_assert!(ml >= MIN_MATCH);
             self.insert_both(win, pos);

@@ -301,14 +301,22 @@ impl MatchGeneratorDriver {
                         if (a == 0) | (b == 0) {
                             if a == 0 {
                                 let mut cand = pidx - r;
-                                let mut ml = extend_match(win, pidx, cand);
                                 // Gap bound (C's per-gap compressor call
                                 // counts to the gap end): no emission may
                                 // cover bytes past the split — the wholesale
-                                // emission there owns them.
-                                if $ldm {
-                                    ml = ml.min((end - win_base - pidx as u64) as usize);
-                                }
+                                // emission there owns them. The bound rides
+                                // the extend (`extend_match_gap` is the
+                                // clamp folded in, byte-identical).
+                                let mut ml = if $ldm {
+                                    extend_match_gap(
+                                        win,
+                                        pidx,
+                                        cand,
+                                        (end - win_base - pidx as u64) as usize,
+                                    )
+                                } else {
+                                    extend_match(win, pidx, cand)
+                                };
                                 if ml >= MIN_MATCH
                                     && !ramp_blocks::<RAMPED>(ramp, win_base + pidx as u64, win_base + cand as u64)
                                 {
@@ -354,11 +362,12 @@ impl MatchGeneratorDriver {
                     // offset of one into a zero-offset self-compare (the
                     // pays gate's ilog2(0)).
                     if ci < idx0 && read4(win, ci) == cur0 {
-                        let mut ml = extend_match(win, idx0, ci);
-                        // Gap bound, as above.
-                        if $ldm {
-                            ml = ml.min((end - pos) as usize);
-                        }
+                        // Gap bound folded into the extend, as above.
+                        let mut ml = if $ldm {
+                            extend_match_gap(win, idx0, ci, (end - pos) as usize)
+                        } else {
+                            extend_match(win, idx0, ci)
+                        };
                         // Same bar as the hash path: below 6 the sequence
                         // overhead eats the match, and the offset-gain gate
                         // keeps a far seed honest about its worth.
@@ -428,16 +437,18 @@ impl MatchGeneratorDriver {
                 'probes: {
                 if (m0 == 0) | (m1 == 0) {
                     if m0 == 0 {
-                        let mut ml = extend_match(win, idx0, cand0);
                         // A hash match already spans 5 bytes; below 6 the
                         // sequence overhead roughly equals the literals
                         // it covers, and rejecting it lets the scan try
                         // the next position where a longer match may
                         // start.
-                        // Gap bound, as above (the match starts at `pos`).
-                        if $ldm {
-                            ml = ml.min((end - pos) as usize);
-                        }
+                        // Gap bound folded into the extend (the match
+                        // starts at `pos`), as above.
+                        let mut ml = if $ldm {
+                            extend_match_gap(win, idx0, cand0, (end - pos) as usize)
+                        } else {
+                            extend_match(win, idx0, cand0)
+                        };
                         if ml >= MIN_ML && !ramp_blocks::<RAMPED>(ramp, pos, win_base + cand0 as u64) {
                             let anchor_idx = (anchor - win_base) as usize;
                             let mut start = idx0;
@@ -501,11 +512,13 @@ impl MatchGeneratorDriver {
                 // and the job-start gate), so it runs compare-free.
                 if rep1_armed {
                     let mut cand = idx1 - rep[0] as usize;
-                    let mut ml = extend_match(win, idx1, cand);
-                    // Gap bound, as above (the match starts at `pos1`).
-                    if $ldm {
-                        ml = ml.min((end - pos1) as usize);
-                    }
+                    // Gap bound folded into the extend (the match starts
+                    // at `pos1`), as above.
+                    let mut ml = if $ldm {
+                        extend_match_gap(win, idx1, cand, (end - pos1) as usize)
+                    } else {
+                        extend_match(win, idx1, cand)
+                    };
                     if ml >= MIN_MATCH
                         && !ramp_blocks::<RAMPED>(ramp, win_base + idx1 as u64, win_base + cand as u64)
                     {
@@ -529,11 +542,13 @@ impl MatchGeneratorDriver {
                 }
 
                 if m1 == 0 {
-                    let mut ml = extend_match(win, idx1, cand1);
-                    // Gap bound, as above (the match starts at `pos1`).
-                    if $ldm {
-                        ml = ml.min((end - pos1) as usize);
-                    }
+                    // Gap bound folded into the extend (the match starts
+                    // at `pos1`), as above.
+                    let mut ml = if $ldm {
+                        extend_match_gap(win, idx1, cand1, (end - pos1) as usize)
+                    } else {
+                        extend_match(win, idx1, cand1)
+                    };
                     if ml >= MIN_ML && !ramp_blocks::<RAMPED>(ramp, pos1, win_base + cand1 as u64) {
                         let anchor_idx = (anchor - win_base) as usize;
                         let mut start = idx1;
