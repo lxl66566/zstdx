@@ -104,21 +104,53 @@ const UNSORTED: u32 = 1;
 /// unsorted mark, exactly the sentinel collisions the u64 port carried).
 const POS_BIAS: u64 = 0;
 
-/// Truncate a position to its stored u32 form.
-#[inline(always)]
-fn pack_pos(pos: u64) -> u32 {
-    (pos + POS_BIAS) as u32
-}
+/// A window position in its stored u32 form — the type of every value the
+/// hash heads and tree ring hold. Ring indexing and the position rebuild
+/// go through its methods, so a stored value can never silently stand in
+/// for a ring index or an absolute position, and neither can flow back
+/// into a slot. The domain includes the sentinels: under POS_BIAS 0 the
+/// null link is position 0's stored form and [`UNSORTED`] position 1's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PackedPos(u32);
 
-/// Rebuild the absolute position of stored entry `v` read while scanning
-/// `pos`. Candidates are window-bounded (far below 4 GiB away), so the
-/// entry's high bits are implied by `pos`; a stale entry from an earlier
-/// 4 GiB period rebuilds as a phantom inside that band, which the range
-/// checks reject or the byte compare verifies — it can only waste work.
-#[inline(always)]
-fn unpack_pos(v: u32, pos: u64) -> u64 {
-    pos.wrapping_sub((pos as u32).wrapping_sub(v) as u64)
-        .wrapping_sub(POS_BIAS)
+impl PackedPos {
+    /// The null link: position 0's stored form under POS_BIAS 0.
+    const NULL: Self = Self(0);
+
+    /// Truncate a position to its stored u32 form.
+    #[inline(always)]
+    fn pack(pos: u64) -> Self {
+        Self((pos + POS_BIAS) as u32)
+    }
+
+    /// Wrap a raw slot value read out of the heads or ring.
+    #[inline(always)]
+    fn from_slot(v: u32) -> Self {
+        Self(v)
+    }
+
+    /// The stored form, for slot writes.
+    #[inline(always)]
+    fn slot(self) -> u32 {
+        self.0
+    }
+
+    /// Base of this value's ring slots (two u32 slots per position).
+    #[inline(always)]
+    fn ring_base(self, bt_mask: usize) -> usize {
+        2 * (self.0 as usize & bt_mask)
+    }
+
+    /// Rebuild the absolute position of this entry read while scanning
+    /// `pos`. Candidates are window-bounded (far below 4 GiB away), so the
+    /// entry's high bits are implied by `pos`; a stale entry from an earlier
+    /// 4 GiB period rebuilds as a phantom inside that band, which the range
+    /// checks reject or the byte compare verifies — it can only waste work.
+    #[inline(always)]
+    fn unpack(self, pos: u64) -> u64 {
+        pos.wrapping_sub((pos as u32).wrapping_sub(self.0) as u64)
+            .wrapping_sub(POS_BIAS)
+    }
 }
 
 /// The DUBT finder: hash heads (`table`) plus the two-slot ring (`bt`),
@@ -210,19 +242,23 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         // each raw site); window reads stay inside the block (count_from
         // caps at block_end and the equal-tail break precedes the ordering
         // byte compare).
+        // The chain-link local keeps the raw slot value with only its
+        // pack/unpack crossings typed: the fully-typed local re-rolls this
+        // inlined body's register allocation and costs json.best +1.4% Ir,
+        // while the crossings alone are codegen-identical to the base form.
         unsafe {
             let bt = self.bt.as_mut_ptr();
-            let own = 2 * (pack_pos(curr) as usize & self.bt_mask);
+            let own = 2 * (PackedPos::pack(curr).slot() as usize & self.bt_mask);
             debug_assert!(own + 1 < self.bt.len());
             let own = bt.add(own);
             let mut smaller: *mut u32 = own;
             let mut larger: *mut u32 = own.add(1);
-            let mut v = *smaller; // the fill-time chain link
+            let mut v: u32 = *smaller; // the fill-time chain link
             // Fused range check: `floor < cand < curr` as one unsigned
             // compare (`floor < curr` always holds, so the span is the bound).
             let span = curr - (floor + 1);
             while nb > 0 {
-                let cand = unpack_pos(v, curr);
+                let cand = PackedPos::from_slot(v).unpack(curr);
                 if cand.wrapping_sub(floor + 1) >= span {
                     break;
                 }
@@ -258,8 +294,8 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                     v = *node;
                 }
             }
-            *smaller = 0;
-            *larger = 0;
+            *smaller = PackedPos::NULL.slot();
+            *larger = PackedPos::NULL.slot();
         }
     }
 
@@ -297,7 +333,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         let h = self.hash_main(idx);
         debug_assert!(h < self.table.len());
         // SAFETY: plain head read; h is masked by hash_main's table_log.
-        let head = unsafe { *self.table.as_ptr().add(h) };
+        let head = PackedPos::from_slot(unsafe { *self.table.as_ptr().add(h) });
 
         // Repeated-offset candidates (the cheapest offsets to encode) —
         // same contract as the optimal parser's collection walk.
@@ -336,11 +372,11 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                             // write — and next_update moves past it, so no later
                             // fill re-inserts it. (Runs before the main hash/head
                             // handling below; cold path.)
-                            let v = pack_pos(pos);
-                            let slot = 2 * (v as usize & self.bt_mask);
+                            let v = PackedPos::pack(pos);
+                            let slot = v.ring_base(self.bt_mask);
                             self.bt[slot] = self.table[h];
                             self.bt[slot + 1] = UNSORTED;
-                            self.table[h] = v;
+                            self.table[h] = v.slot();
                             *self.next_update = (*self.next_update).max(pos + 1);
                             return found;
                         }
@@ -362,23 +398,23 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             // Walk the unsorted chain from the head, reversing slot[1] into
             // a backtrack link toward newer nodes.
             debug_assert!(h < self.table.len());
-            let mut cand = *self.table.as_ptr().add(h);
-            let mut prev = 0u32;
+            let mut cand = PackedPos::from_slot(*self.table.as_ptr().add(h));
+            let mut prev = PackedPos::NULL;
             // Fused `unsort_limit < cand < pos` range check (one compare).
             let unsort_span = pos - (unsort_limit + 1);
             loop {
-                let cand_abs = unpack_pos(cand, pos);
+                let cand_abs = cand.unpack(pos);
                 if cand_abs.wrapping_sub(unsort_limit + 1) >= unsort_span {
                     break;
                 }
-                debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
-                let node = bt.add(2 * (cand as usize & self.bt_mask));
+                debug_assert!(cand.ring_base(self.bt_mask) + 1 < self.bt.len());
+                let node = bt.add(cand.ring_base(self.bt_mask));
                 if *node.add(1) != UNSORTED || nb_candidates <= 1 {
                     break;
                 }
-                *node.add(1) = prev;
+                *node.add(1) = prev.slot();
                 prev = cand;
-                cand = *node;
+                cand = PackedPos::from_slot(*node);
                 nb_candidates -= 1;
             }
             // Nullify the chain's far end: the boundary node becomes a
@@ -387,24 +423,24 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             {
                 // The null link (cand == 0) rebuilds huge and fails this
                 // range check, so it skips the nullify block too.
-                let cand_abs = unpack_pos(cand, pos);
+                let cand_abs = cand.unpack(pos);
                 if cand_abs > unsort_limit && cand_abs < pos {
-                    debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
-                    let node = bt.add(2 * (cand as usize & self.bt_mask));
+                    debug_assert!(cand.ring_base(self.bt_mask) + 1 < self.bt.len());
+                    let node = bt.add(cand.ring_base(self.bt_mask));
                     if *node.add(1) == UNSORTED {
-                        *node = 0;
-                        *node.add(1) = 0;
+                        *node = PackedPos::NULL.slot();
+                        *node.add(1) = PackedPos::NULL.slot();
                     }
                 }
             }
             // Batch-sort the walked nodes oldest-to-newest; the backtrack
             // link must be read before the sort overwrites the slot.
             let mut m = prev;
-            while m != 0 {
-                debug_assert!(2 * (m as usize & self.bt_mask) + 1 < self.bt.len());
-                let node = bt.add(2 * (m as usize & self.bt_mask));
-                let newer = *node.add(1);
-                self.insert_dubt1(unpack_pos(m, pos), nb_candidates, unsort_limit);
+            while m != PackedPos::NULL {
+                debug_assert!(m.ring_base(self.bt_mask) + 1 < self.bt.len());
+                let node = bt.add(m.ring_base(self.bt_mask));
+                let newer = PackedPos::from_slot(*node.add(1));
+                self.insert_dubt1(m.unpack(pos), nb_candidates, unsort_limit);
                 m = newer;
                 nb_candidates += 1;
             }
@@ -413,13 +449,13 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             // while pricing strictly improving candidates. The strict `>`
             // keeps the first score maximum — the argmax (and its
             // tie-breaks) of the array loop the fusion replaced.
-            *self.table.as_mut_ptr().add(h) = pack_pos(pos);
+            *self.table.as_mut_ptr().add(h) = PackedPos::pack(pos).slot();
             let mut cand = head;
             let mut common_smaller = 0usize;
             let mut common_larger = 0usize;
             let mut nb = self.nb_compares;
             let mut dummy = 0u32;
-            let own = 2 * (pack_pos(pos) as usize & self.bt_mask);
+            let own = PackedPos::pack(pos).ring_base(self.bt_mask);
             debug_assert!(own + 1 < self.bt.len());
             let own = bt.add(own);
             let mut smaller: *mut u32 = own;
@@ -428,7 +464,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             // one unsigned compare.
             let span = pos - (floor + 1);
             while nb > 0 {
-                let cand_abs = unpack_pos(cand, pos);
+                let cand_abs = cand.unpack(pos);
                 if cand_abs.wrapping_sub(floor + 1) >= span {
                     break;
                 }
@@ -460,31 +496,31 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 if at_end {
                     break;
                 }
-                debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
-                let node = bt.add(2 * (cand as usize & self.bt_mask));
+                debug_assert!(cand.ring_base(self.bt_mask) + 1 < self.bt.len());
+                let node = bt.add(cand.ring_base(self.bt_mask));
                 debug_assert!(cidx + ml < self.win.len() && idx + ml < self.win.len());
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = cand;
+                    *smaller = cand.slot();
                     common_smaller = ml;
                     if cand_abs <= bt_low {
                         smaller = &raw mut dummy;
                         break;
                     }
                     smaller = node.add(1);
-                    cand = *node.add(1);
+                    cand = PackedPos::from_slot(*node.add(1));
                 } else {
-                    *larger = cand;
+                    *larger = cand.slot();
                     common_larger = ml;
                     if cand_abs <= bt_low {
                         larger = &raw mut dummy;
                         break;
                     }
                     larger = node;
-                    cand = *node;
+                    cand = PackedPos::from_slot(*node);
                 }
             }
-            *smaller = 0;
-            *larger = 0;
+            *smaller = PackedPos::NULL.slot();
+            *larger = PackedPos::NULL.slot();
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
@@ -545,14 +581,49 @@ fn fill_range<const MLS: usize>(
                 _ => hash5_at(win, idx, table_log),
             };
             debug_assert!(h < table_len);
-            let v = pack_pos(win_base + idx as u64);
-            let slot = 2 * (v as usize & bt_mask);
+            let v = PackedPos::pack(win_base + idx as u64);
+            let slot = v.ring_base(bt_mask);
             debug_assert!(slot + 1 < bt_len);
             let slot = bt.add(slot);
             *slot = *table.add(h);
             *slot.add(1) = UNSORTED;
-            *table.add(h) = v;
+            *table.add(h) = v.slot();
             idx += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored value read while scanning `pos` rebuilds the exact position
+    /// it packed, across 4 GiB wraps on both sides; the null link rebuilds
+    /// to the scan position's 4 GiB floor — outside `(floor, pos)` for any
+    /// live window, so the range checks reject it by arithmetic alone.
+    /// `ring_base` masks the stored form onto the ring, two slots per
+    /// position.
+    #[test]
+    fn packed_pos_roundtrip_across_cycles() {
+        for abs in [
+            0u64,
+            1,
+            2,
+            1000,
+            0x1_0000_0000,
+            0x1_0000_0005,
+            0x0100_0000_0000,
+        ] {
+            let v = PackedPos::pack(abs);
+            for delta in [1u64, 64, 4096, 0xffff_ffff] {
+                let pos = abs + delta;
+                assert_eq!(v.unpack(pos), abs, "abs {abs:#x} read at {pos:#x}");
+            }
+        }
+        // The null link is position 0's stored form under POS_BIAS 0.
+        assert_eq!(PackedPos::NULL.unpack(0x1_0000_1000), 0x1_0000_0000);
+        assert_eq!(PackedPos::NULL.unpack(1000), 0);
+        assert_eq!(PackedPos::from_slot(7).ring_base(0xff), 14);
+        assert_eq!(PackedPos::from_slot(0x100).ring_base(0xff), 0);
     }
 }

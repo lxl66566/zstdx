@@ -107,7 +107,7 @@ R74 (2026-10-29) replaced the corpus-growth lever with structure mode: `k` bit 7
 
 The balanced json +0.44% Ir residue is placement-only. A 4x order-swapped interleaved wall A/B on `prof enc 9` json is flat to positive, with a base median of 155.5 against 159 MiB/s and every pair favoring the newer build. The memory-bound chain tier never pays the extra instructions, so no placement recovery was spent.
 
-The remaining compile-time menu holds A/B-gated refactors of hot code. Cross-domain index newtypes would keep `WinPos` and `TableIdx` from ever mixing. `NonZero` distance at the resolve sites would make distance 0 unrepresentable. Enum rep-bases would replace off-base integers. The `Option<Candidate>` arm landed on 2026-10-24 over the btlazy selection, recorded in [hardening](review/hardening.md).
+The remaining compile-time menu holds A/B-gated refactors of hot code. The tree families' packed entries became their own `PackedPos` domain on 2026-10-31, recorded in [hardening](review/hardening.md); the chain/row scans' `WinPos`-versus-window-index threading is what remains of the newtype arm. `NonZero` distance at the resolve sites would make distance 0 unrepresentable. Enum rep-bases would replace off-base integers. The `Option<Candidate>` arm landed on 2026-10-24 over the btlazy selection.
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
 

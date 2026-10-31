@@ -45,8 +45,32 @@ const PREDEF_THRESHOLD: usize = 8;
 /// half the seed cost).
 const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
 
+/// A tree-table entry: a position in its stored form
+/// `(position + origin + POS_BIAS) mod 2^32`. Packing, resolving and the
+/// never-valid [`EMPTY`] live on the type, so a raw u32 cannot stand in
+/// for an entry and an entry cannot be mistaken for a position or a ring
+/// index. The ring is keyed by the ABSOLUTE position's low bits (see
+/// [`Finder::ring_base`]), which the stored form does not share once the
+/// origin advances.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PackedPos(u32);
+
+impl PackedPos {
+    /// Wrap a raw slot value read out of the head or ring tables.
+    #[inline(always)]
+    fn from_slot(v: u32) -> Self {
+        Self(v)
+    }
+
+    /// The stored form, for slot writes.
+    #[inline(always)]
+    fn slot(self) -> u32 {
+        self.0
+    }
+}
+
 /// The never-valid table entry (also written to terminate tree links).
-const EMPTY: u32 = 0;
+const EMPTY: PackedPos = PackedPos(0);
 /// Storage bias: keeps position 0's entry nonzero — the tagged form
 /// resolved position 0 as a candidate, so the bias preserves that — and
 /// cancels in the distance math at read time.
@@ -821,24 +845,34 @@ impl Finder<'_, '_> {
     /// Resolve a table entry to an absolute candidate position in
     /// `[floor, pos)`; anything else ends the walk.
     #[inline]
-    fn resolve(&self, entry: u32, floor: u64, pos: u64) -> Option<u64> {
+    fn resolve(&self, entry: PackedPos, floor: u64, pos: u64) -> Option<u64> {
         if entry == EMPTY {
             return None;
         }
         let dist = (pos as u32)
             .wrapping_add(self.origin as u32)
             .wrapping_add(POS_BIAS)
-            .wrapping_sub(entry);
+            .wrapping_sub(entry.0);
         let cand = pos.wrapping_sub(dist as u64);
         (cand >= floor && cand < pos).then_some(cand)
     }
 
-    /// Pack an absolute position into its stored u32 form.
+    /// Pack an absolute position into its stored entry form.
     #[inline(always)]
-    fn pack(&self, pos: u64) -> u32 {
-        (pos as u32)
-            .wrapping_add(self.origin as u32)
-            .wrapping_add(POS_BIAS)
+    fn pack(&self, pos: u64) -> PackedPos {
+        PackedPos(
+            (pos as u32)
+                .wrapping_add(self.origin as u32)
+                .wrapping_add(POS_BIAS),
+        )
+    }
+
+    /// Base of `abs`'s ring slots (two u32 per position). The ring is
+    /// keyed by the absolute position, not by the packed entry — the
+    /// origin shifts the stored form off the ring key.
+    #[inline(always)]
+    fn ring_base(&self, abs: u64) -> usize {
+        2 * (abs as usize & self.bt_mask)
     }
 
     #[inline(always)]
@@ -857,7 +891,7 @@ impl Finder<'_, '_> {
         let pos = self.win_base + idx as u64;
         let floor = self.cand_floor(pos);
         let h = self.hash_main(idx);
-        let mut cand = self.resolve(self.table[h], floor, pos);
+        let mut cand = self.resolve(PackedPos::from_slot(self.table[h]), floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut best_len = 8usize;
@@ -875,8 +909,8 @@ impl Finder<'_, '_> {
         // Checked indexing (the walk is branchy per step; the masked ring
         // slots and the count-capped window reads the raw-pointer form
         // asserted by construction are index checks here).
-        self.table[h] = self.pack(pos);
-        let own = 2 * (pos as usize & self.bt_mask);
+        self.table[h] = self.pack(pos).slot();
+        let own = self.ring_base(pos);
         let mut smaller = own;
         let mut larger = own + 1;
         // The trailing EMPTY stores are suppressed when the walk stopped on
@@ -903,32 +937,32 @@ impl Finder<'_, '_> {
             if idx + ml >= count_limit {
                 break;
             }
-            let node = 2 * (ca as usize & self.bt_mask);
+            let node = self.ring_base(ca);
             if self.win[cidx + ml] < self.win[idx + ml] {
-                self.bt[smaller] = self.pack(ca);
+                self.bt[smaller] = self.pack(ca).slot();
                 common_smaller = ml;
                 if ca <= bt_low {
                     smaller_open = false;
                     break;
                 }
                 smaller = node + 1;
-                cand = self.resolve(self.bt[node + 1], floor, pos);
+                cand = self.resolve(PackedPos::from_slot(self.bt[node + 1]), floor, pos);
             } else {
-                self.bt[larger] = self.pack(ca);
+                self.bt[larger] = self.pack(ca).slot();
                 common_larger = ml;
                 if ca <= bt_low {
                     larger_open = false;
                     break;
                 }
                 larger = node;
-                cand = self.resolve(self.bt[node], floor, pos);
+                cand = self.resolve(PackedPos::from_slot(self.bt[node]), floor, pos);
             }
         }
         if smaller_open {
-            self.bt[smaller] = EMPTY;
+            self.bt[smaller] = EMPTY.slot();
         }
         if larger_open {
-            self.bt[larger] = EMPTY;
+            self.bt[larger] = EMPTY.slot();
         }
         let positions = if best_len > 384 {
             (best_len - 384).min(192)
@@ -985,7 +1019,7 @@ impl Finder<'_, '_> {
         unsafe {
             while p < target {
                 let h = hash3_at(self.win, (p - self.win_base) as usize, self.hash3_log) & mask;
-                *self.hash3.get_unchecked_mut(h) = self.pack(p);
+                *self.hash3.get_unchecked_mut(h) = self.pack(p).slot();
                 p += 1;
             }
         }
@@ -995,7 +1029,7 @@ impl Finder<'_, '_> {
         }
         *cursor = target;
         let h = hash3_at(self.win, idx, self.hash3_log) & mask;
-        self.resolve(self.hash3[h], 0, target)
+        self.resolve(PackedPos::from_slot(self.hash3[h]), 0, target)
     }
 
     /// Fill `hash3` over `[win_base, target)` without probing -- the
@@ -1011,7 +1045,7 @@ impl Finder<'_, '_> {
         unsafe {
             for p in 0..target {
                 let h = hash3_at(self.win, p, self.hash3_log) & mask;
-                *self.hash3.get_unchecked_mut(h) = self.pack(self.win_base + p as u64);
+                *self.hash3.get_unchecked_mut(h) = self.pack(self.win_base + p as u64).slot();
             }
         }
     }
@@ -1110,15 +1144,15 @@ impl Finder<'_, '_> {
         }
 
         // Tree search.
-        let mut cand = self.resolve(head, floor, pos);
+        let mut cand = self.resolve(PackedPos::from_slot(head), floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut match_end = pos + 9;
         let mut nb = self.nb_compares;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
         // Checked indexing throughout (see `insert_bt1`).
-        self.table[h] = self.pack(pos);
-        let own = 2 * (pos as usize & self.bt_mask);
+        self.table[h] = self.pack(pos).slot();
+        let own = self.ring_base(pos);
         let mut smaller = own;
         let mut larger = own + 1;
         // The trailing EMPTY stores are suppressed when the walk stopped on
@@ -1150,32 +1184,32 @@ impl Finder<'_, '_> {
             if idx + ml >= self.block_end_idx {
                 break;
             }
-            let node = 2 * (ca as usize & self.bt_mask);
+            let node = self.ring_base(ca);
             if self.win[cidx + ml] < self.win[idx + ml] {
-                self.bt[smaller] = self.pack(ca);
+                self.bt[smaller] = self.pack(ca).slot();
                 common_smaller = ml;
                 if ca <= bt_low {
                     smaller_open = false;
                     break;
                 }
                 smaller = node + 1;
-                cand = self.resolve(self.bt[node + 1], floor, pos);
+                cand = self.resolve(PackedPos::from_slot(self.bt[node + 1]), floor, pos);
             } else {
-                self.bt[larger] = self.pack(ca);
+                self.bt[larger] = self.pack(ca).slot();
                 common_larger = ml;
                 if ca <= bt_low {
                     larger_open = false;
                     break;
                 }
                 larger = node;
-                cand = self.resolve(self.bt[node], floor, pos);
+                cand = self.resolve(PackedPos::from_slot(self.bt[node]), floor, pos);
             }
         }
         if smaller_open {
-            self.bt[smaller] = EMPTY;
+            self.bt[smaller] = EMPTY.slot();
         }
         if larger_open {
-            self.bt[larger] = EMPTY;
+            self.bt[larger] = EMPTY.slot();
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
@@ -1762,6 +1796,48 @@ fn run_once<const ULTRA: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tree entries roundtrip through the origin-biased form: a live entry
+    /// resolves to its exact position whatever the origin's accumulated
+    /// advance (u32 wraps included), a stale entry from an earlier origin
+    /// keeps the advance and lands outside `[floor, pos)`, and [`EMPTY`]
+    /// never resolves.
+    #[test]
+    fn tree_entry_roundtrip_across_origin() {
+        let mut table = [0u32; 1 << 4];
+        let mut bt = [0u32; 2 << 4];
+        let mut hash3 = [0u32; 0];
+        let mut next_update = 0u64;
+        let mut f = Finder {
+            win: &[],
+            win_base: 0,
+            block_end_idx: 0,
+            origin: 3 << 30,
+            max_window: 1 << 20,
+            table: &mut table,
+            table_log: 4,
+            bt: &mut bt,
+            bt_mask: 15,
+            hash3: &mut hash3,
+            hash3_log: 0,
+            min_match: 3,
+            mls: 5,
+            nb_compares: 1,
+            insert_compares: 1,
+            sufficient_len: 64,
+            next_update: &mut next_update,
+        };
+        let pos = 1 << 22;
+        for delta in [1u64, 64, 4096, 1 << 20] {
+            assert_eq!(f.resolve(f.pack(pos - delta), 0, pos), Some(pos - delta));
+        }
+        f.origin = f.origin.wrapping_add(1 << 31);
+        assert_eq!(f.resolve(f.pack(pos - 5), 0, pos), Some(pos - 5));
+        let stale = f.pack(pos - 5);
+        f.origin = f.origin.wrapping_add(1 << 30);
+        assert_eq!(f.resolve(stale, 0, pos), None);
+        assert_eq!(f.resolve(EMPTY, 0, pos), None);
+    }
 
     #[test]
     fn weights_match_reference_points() {

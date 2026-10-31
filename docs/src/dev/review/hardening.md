@@ -16,6 +16,8 @@ The same pattern now pins the merged sequence add width in `seq_codes`: a `const
 
 The btlazy selection's absent candidates are unrepresentable since 2026-10-24. `Found`'s two argmaxes are `Option`s, with `Scored` pairing the literal-offset candidate and its score so the score cannot outlive the candidate, and the driver's incumbent is an `Option<Scored>` destructured at the lazy bar. Every construction site guarantees `len >= MIN_MATCH`, which `scale_value`'s assert now pins exactly. Gungraun reads best json and text at -0.7% and -0.6% Ir at byte-identical dumps.
 
+The tree matchers' stored entries are their own domain since 2026-10-31. `PackedPos` wraps the u32 the DUBT heads and ring and the opt tree hold, and packing, resolving and the ring-slot derivation are its methods, so a stored value cannot silently stand in for a ring index or an absolute position. The two trees differ on purpose: the DUBT's ring is keyed by the packed value, the opt tree's by the absolute position (`Finder::ring_base`), which the origin-shifted entry does not share. Gungraun reads best at -0.04% to -0.05% Ir and opt/ultra dead flat at byte-identical dumps. One codegen trap is pinned in the tree: typing `insert_dubt1`'s chain-link local instead of only its pack/unpack crossings re-rolled the inlined body's register allocation at +1.4% Ir on json.best, so that local keeps the raw slot value.
+
 ### Compile-time structure
 
 `HeadTables` puts the `tables` and `second` pair behind private fields with one mutation entry per resize shape. The lockstep comment from the encoder-edge review rides that single entry, and the desync class becomes unrepresentable.
