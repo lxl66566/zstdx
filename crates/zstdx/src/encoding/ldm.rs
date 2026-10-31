@@ -23,6 +23,10 @@
 
 use alloc::vec::Vec;
 
+// Only the portable `gear_run` fallback scans in `gear4` groups; on x86-64
+// the whole-loop asm below took over the scan.
+#[cfg(not(target_arch = "x86_64"))]
+use super::gear::gear4;
 use super::{
     hugepage::HugeBuf,
     match_generator::{extend_match, pack_pos},
@@ -327,92 +331,6 @@ static GEAR_TAB: [u64; 256] = [
     0x2b4da14f2613d8f4,
 ];
 
-/// The four gear checkpoints over the bytes `w[0..4]` from chain state
-/// `h`: `(2h+g0, 4h+2g0+g1, 8h+4g0+2g1+g2, 16h+8g0+4g1+2g2+g3)` — exactly
-/// the naive serial states, re-associated so the state-to-state dependency
-/// is one add per group. See `LdmState::gear_feed` for why the x86-64 form
-/// is hand-written.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-#[inline(always)]
-fn gear4_portable(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
-    debug_assert!(w.len() >= 4);
-    let g0 = GEAR_TAB[w[0] as usize];
-    let g1 = GEAR_TAB[w[1] as usize];
-    let g2 = GEAR_TAB[w[2] as usize];
-    let g3 = GEAR_TAB[w[3] as usize];
-    let p2 = g1.wrapping_add(g0 << 1);
-    let p3 = g2.wrapping_add(p2 << 1);
-    let p4 = g3.wrapping_add(p3 << 1);
-    (
-        g0.wrapping_add(h << 1),
-        p2.wrapping_add(h << 2),
-        p3.wrapping_add(h << 3),
-        p4.wrapping_add(h << 4),
-    )
-}
-
-/// x86-64 `gear4`: forces the re-associated schedule (LEA per checkpoint,
-/// `shl`+add for the x16 group step, loads hoisted off the chain). The
-/// portable `gear4` above is semantically identical but compiles back into
-/// the one-byte serial chain. Idle since `gear_run`'s whole-loop asm took
-/// over the scan; kept as the tuned per-group fallback.
-#[cfg(target_arch = "x86_64")]
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-#[inline(always)]
-fn gear4_asm(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
-    debug_assert!(w.len() >= 4);
-    let (mut t0, mut t1, mut t2, mut t3, mut t4) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    let (c1, c2, c3, c4);
-    // SAFETY: baseline x86-64 instructions only; reads exactly w[0..4] and
-    // the 2 KiB GEAR_TAB, writes nothing.
-    unsafe {
-        core::arch::asm!(
-            "movzbl ({wp}), {t0:e}",
-            "movzbl 1({wp}), {t1:e}",
-            "movzbl 2({wp}), {t2:e}",
-            "movzbl 3({wp}), {t3:e}",
-            "mov ({tab}, {t0}, 8), {t0}",
-            "mov ({tab}, {t1}, 8), {t1}",
-            "mov ({tab}, {t2}, 8), {t2}",
-            "mov ({tab}, {t3}, 8), {t3}",
-            "lea ({t0}, {h}, 2), {c1}",
-            "lea ({t1}, {t0}, 2), {t4}",
-            "lea ({t4}, {h}, 4), {c2}",
-            "lea ({t2}, {t4}, 2), {t4}",
-            "lea ({t4}, {h}, 8), {c3}",
-            "lea ({t3}, {t4}, 2), {t4}",
-            "mov {h}, {t0}",
-            "shlq $4, {t0}",
-            "lea ({t4}, {t0}), {c4}",
-            wp = in(reg) w.as_ptr(),
-            tab = in(reg) GEAR_TAB.as_ptr(),
-            h = in(reg) h,
-            t0 = out(reg) t0,
-            t1 = out(reg) t1,
-            t2 = out(reg) t2,
-            t3 = out(reg) t3,
-            t4 = out(reg) t4,
-            // early (not late) outs: the template reads `h` after writing
-            // `c1`/`c2`, so a lateout sharing `h`'s register would corrupt
-            // `c3`/`c4` (lateouts may alias inputs by contract).
-            c1 = out(reg) c1,
-            c2 = out(reg) c2,
-            c3 = out(reg) c3,
-            c4 = out(reg) c4,
-            options(nostack, att_syntax)
-        );
-    }
-    let _ = (t0, t1, t2, t3, t4);
-    (c1, c2, c3, c4)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-#[inline(always)]
-fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
-    gear4_asm(w, h)
-}
-
 /// Whole-loop gear scan (see `gear_scan`): feeds groups of four from `h`
 /// without returning, exiting at the FIRST checkpoint whose top bits
 /// (under `mask`) are zero — the state there and the fed byte count come
@@ -525,7 +443,7 @@ fn gear_run(win: &[u8], mut h: u64, mask: u64) -> (usize, u64, bool) {
 fn gear_run(win: &[u8], mut h: u64, mask: u64) -> (usize, u64, bool) {
     let mut n = 0;
     while n + 4 <= win.len() {
-        let (c1, c2, c3, c4) = gear4(&win[n..], h);
+        let (c1, c2, c3, c4) = gear4(&GEAR_TAB, &win[n..], h);
         for (m, c) in [(1usize, c1), (2, c2), (3, c3), (4, c4)] {
             if c & mask == 0 {
                 return (n + m, c, true);
@@ -535,12 +453,6 @@ fn gear_run(win: &[u8], mut h: u64, mask: u64) -> (usize, u64, bool) {
         n += 4;
     }
     (n, h, false)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn gear4(w: &[u8], h: u64) -> (u64, u64, u64, u64) {
-    gear4_portable(w, h)
 }
 
 /// Checksum-hit mask over one bucket: bit `i` set when entry `i`'s checksum
