@@ -79,11 +79,22 @@ where
         .map(|(_, raw_len, _)| batch_width(max_width, *raw_len))
         .min()
         .unwrap_or(1);
-    if width <= 1 || cells.len() == 1 {
-        return cells.into_iter().map(|(_, _, run)| run()).collect();
-    }
     let total = cells.len();
     let done = AtomicUsize::new(0);
+    let finish = |name: &str| {
+        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("[{n}/{total}] {name}");
+    };
+    if width <= 1 || cells.len() == 1 {
+        return cells
+            .into_iter()
+            .map(|(name, _, run)| {
+                let out = run();
+                finish(&name);
+                out
+            })
+            .collect();
+    }
     rayon::ThreadPoolBuilder::new()
         .num_threads(width)
         .build()
@@ -93,8 +104,7 @@ where
                 .into_par_iter()
                 .map(|(name, _, run)| {
                     let out = run();
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    eprintln!("[{n}/{total}] {name}");
+                    finish(&name);
                     out
                 })
                 .collect()

@@ -25,7 +25,7 @@ The tools are a standalone crate run as `cargo run --release -p zstdx-bench -- <
 | `small` | Small loads from 1 KiB to 1 MiB. `--size` and `--impl` pin a single size and implementation for profiler targeting |
 | `files` | Decoding timing for arbitrary `.zst` files, budget-based, with automatic reference discovery for verification through any `zst*` suffix |
 | `prof` | Single-side profiling loops: `prof dec <f> [n]`, `prof enc <lvl> <n> <f...>` and `prof enc-stream <lvl> <n> <f>`. The `RUZ_CKSUM` environment variable toggles the checksum path |
-| `dump` | Corpus byte snapshots as a deterministic regression probe. Dump one directory per build and run `diff -r`. `--all-levels` covers all six levels tagged l1, l3, l6, l12, l16 and l19, and `--stream` swaps in the streaming cores as the one-command stream differential gate |
+| `dump` | Corpus byte snapshots as a deterministic regression probe. Dump one directory per build and run `diff -r`. `--all-levels` covers all six levels tagged l1, l3, l6, l12, l16 and l19, and `--stream` swaps in the streaming cores as the one-command stream differential gate, and frames emit on the bounded cell pool (`--parallel`, default 6), which a 2026-11-01 diff of a parallel run against a serial run verified byte-identical |
 | `corrupt` | Random-corruption smoke test that must produce zero panics, covering streaming and flat paths |
 | `mtcheck` | MT decode cross-check against the zstd CLI, with `--workers` selecting the level |
 | `seqstats` | Sequence statistics and entropy lower bound |

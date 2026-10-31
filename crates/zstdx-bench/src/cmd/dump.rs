@@ -8,16 +8,24 @@
 //! swaps the bulk encoders for the streaming cores (read-side, driven like
 //! `matrix --mode enc-stream`): each shape × level lands as the
 //! {st, mt} × {pledged, open} grid.
+//!
+//! Frames are independent and the gates are per-frame, so emission runs on
+//! the bounded cell pool (`--parallel`, see `pool`); bytes are
+//! deterministic regardless of the schedule.
 
 use std::{
     fs,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use zstdx::{EncoderOptions, Level, bulk};
 
-use crate::corpus::{LADDER, LevelName, assert_roundtrip, corpus_dir};
+use crate::{
+    corpus::{LADDER, LevelName, assert_roundtrip, corpus_dir},
+    pool::{DEFAULT_MAX_WIDTH, run_cells},
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -40,6 +48,10 @@ pub struct Args {
     /// never diff them across --workers values.
     #[arg(long)]
     pub stream: bool,
+    /// Maximum frames emitted at once, bounded by a built-in memory budget
+    /// over the payload size; 0 = one per logical core, 1 = serial emission
+    #[arg(long, default_value_t = DEFAULT_MAX_WIDTH)]
+    pub parallel: usize,
 }
 
 /// One `--stream` cell: the streaming core and the pledge axis.
@@ -132,6 +144,13 @@ fn write_gated(out_dir: &Path, file: &str, frame: &[u8], raw: &[u8]) {
     assert_eq!(&cli.stdout[..], raw, "libzstd CLI mismatch for {file}");
 }
 
+/// One frame's encode step: raw bytes in, frame out.
+type EncodeFn = Box<dyn FnOnce(&[u8]) -> Vec<u8> + Send>;
+
+/// One frame's emission: the output filename, the shared raw bytes and the
+/// encode step that turns them into the frame.
+type FrameJob = (String, Arc<Vec<u8>>, EncodeFn);
+
 pub fn run(args: &Args) {
     fs::create_dir_all(&args.out_dir).unwrap();
     let mut names: Vec<String> = Vec::new();
@@ -153,39 +172,58 @@ pub fn run(args: &Args) {
     let cells = args
         .stream
         .then(|| StreamCell::grid(args.workers.unwrap_or(4)));
-    let per_level = cells.as_ref().map_or(1, |c| c.len());
-    let mut done = 0usize;
-    let total = names.len() * levels.len() * per_level;
-    for name in &names {
-        let raw = fs::read(corpus_dir().join(name)).unwrap();
+
+    // each shape's bytes are shared across its frames
+    let raws: Vec<Arc<Vec<u8>>> = names
+        .iter()
+        .map(|n| Arc::new(fs::read(corpus_dir().join(n)).unwrap()))
+        .collect();
+    let mut jobs: Vec<FrameJob> = Vec::new();
+    for (name, raw) in names.iter().zip(&raws) {
         for (level, z) in &levels {
             let suffix = if args.all_levels {
                 format!(".l{z}")
             } else {
                 String::new()
             };
-            let mut emit = |file: String, frame: Vec<u8>| {
-                write_gated(&args.out_dir, &file, &frame, &raw);
-                done += 1;
-                eprintln!("[{done}/{total}] {file}");
-            };
+            // copies, not borrows: the boxed closures outlive the loops
+            let level = *level;
             if let Some(cells) = &cells {
-                for cell in cells {
+                for &cell in cells {
                     let file = format!("{name}.{}{suffix}.zst", cell.tag());
-                    emit(file, stream_frame(&raw, cell.options(level.pair().0, &raw)));
+                    let job = Box::new(move |raw: &[u8]| {
+                        stream_frame(raw, cell.options(level.pair().0, raw))
+                    });
+                    jobs.push((file, Arc::clone(raw), job));
                 }
             } else {
-                let comp = match args.workers {
-                    None => zstdx::encoding::compress_slice_to_vec(&raw[..], level.pair().0),
-                    Some(w) => {
+                let file = format!("{name}{suffix}.zst");
+                let job: EncodeFn = match args.workers {
+                    None => Box::new(move |raw: &[u8]| {
+                        zstdx::encoding::compress_slice_to_vec(raw, level.pair().0)
+                    }),
+                    Some(w) => Box::new(move |raw: &[u8]| {
                         let opts = EncoderOptions::new(level.pair().0)
                             .checksum(false)
                             .workers(w);
-                        bulk::compress_with(&raw[..], &opts).unwrap()
-                    },
+                        bulk::compress_with(raw, &opts).unwrap()
+                    }),
                 };
-                emit(format!("{name}{suffix}.zst"), comp);
+                jobs.push((file, Arc::clone(raw), job));
             }
         }
     }
+
+    let out_dir = args.out_dir.clone();
+    let pool_cells: Vec<(String, usize, _)> = jobs
+        .into_iter()
+        .map(|(file, raw, encode)| {
+            let out_dir = out_dir.clone();
+            (file.clone(), raw.len(), move || {
+                let frame = encode(&raw);
+                write_gated(&out_dir, &file, &frame, &raw);
+            })
+        })
+        .collect();
+    run_cells(pool_cells, args.parallel);
 }
