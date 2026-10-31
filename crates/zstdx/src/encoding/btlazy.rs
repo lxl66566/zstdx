@@ -263,7 +263,9 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
             // position — carried so no position's scale is ever gathered
             // twice; absence is the `Option`'s.
             let mut best: Option<Scored> = None;
+            let mut searched = false;
             if pos >= *finder.next_update {
+                searched = true;
                 finder.fill_to(idx);
                 let scale = lit_scale(win, idx, &lit_clamp);
                 let f: Found = finder.find_best(idx, rep, ll0, MIN_MATCH, *rep_pending != 0, scale);
@@ -287,20 +289,36 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
                 } else {
                     pos
                 };
-                if let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0]) {
-                    let v =
-                        scale_value(lit_scale(win, (probe - win_base) as usize, &lit_clamp), ml);
-                    // An empty incumbent prices 0 — the baseline the rep
-                    // probe must beat.
-                    if v > best.map_or(0, |b| b.score) {
-                        best = Some(Scored {
-                            m: Match {
-                                off: 1,
-                                len: ml as u32,
-                            },
-                            score: v,
-                        });
-                        pos = probe;
+                // When the probe re-derives the search's own rep0 candidate,
+                // it is dead: the search probed rep0 at `pos` with the same
+                // count bound and the same literal scale, so `best` already
+                // holds the longest rep at price 0 and an equal score cannot
+                // pass the strict `>` below. The skip's soundness condition
+                // is one register compare: with `rep0 <= max_window` the
+                // candidate resolves either at or above the search's floor
+                // (the search probed it identically) or below the window
+                // base (both skip it), and only a longer-than-domain rep0 —
+                // an LDM-class offset — leaves a band the search floors
+                // away but this probe, bounded at the window base, accepts.
+                let covered = searched && probe == pos && rep[0] as u64 <= finder.max_window;
+                if !covered {
+                    if let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0]) {
+                        let v = scale_value(
+                            lit_scale(win, (probe - win_base) as usize, &lit_clamp),
+                            ml,
+                        );
+                        // An empty incumbent prices 0 — the baseline the rep
+                        // probe must beat.
+                        if v > best.map_or(0, |b| b.score) {
+                            best = Some(Scored {
+                                m: Match {
+                                    off: 1,
+                                    len: ml as u32,
+                                },
+                                score: v,
+                            });
+                            pos = probe;
+                        }
                     }
                 }
             }
