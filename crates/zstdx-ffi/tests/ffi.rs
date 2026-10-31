@@ -1,6 +1,10 @@
 //! Integration tests: exercise the exported C ABI from Rust, covering the
 //! semantics real consumers rely on (buffer-advance contracts, flush
 //! returns, error codes, frame metadata).
+//!
+//! The unsafe blocks are thin one-call wrappers around the exports; the src
+//! side carries the contracts.
+#![allow(clippy::undocumented_unsafe_blocks)]
 
 use core::ffi::{c_char, c_int};
 

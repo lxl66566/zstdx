@@ -676,6 +676,8 @@ pub unsafe extern "C" fn ZSTD_decompressBound(
     src_size: usize,
 ) -> u64 {
     const CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
         return CONTENTSIZE_ERROR;
     };
@@ -703,6 +705,8 @@ pub unsafe extern "C" fn ZSTD_decompressionMargin(
     src_size: usize,
 ) -> usize {
     use crate::error::{ErrorCode, code};
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
         return code(ErrorCode::SrcSizeWrong);
     };
@@ -742,6 +746,8 @@ pub unsafe extern "C" fn ZSTD_isSkippableFrame(
     buffer: *const core::ffi::c_void,
     size: usize,
 ) -> core::ffi::c_uint {
+    // SAFETY: the caller-validated (buffer, size) read pair, per as_slice's
+    // contract.
     let Ok(bytes) = (unsafe { crate::as_slice(buffer, size) }) else {
         return 0;
     };
@@ -774,9 +780,13 @@ pub unsafe extern "C" fn ZSTD_writeSkippableFrame(
     if magic_variant > 15 {
         return code(ErrorCode::ParameterOutOfBound);
     }
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(payload) = (unsafe { crate::as_slice(src, src_size) }) else {
         return code(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
         return code(ErrorCode::DstBufferNull);
     };
@@ -798,6 +808,8 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
     src_size: usize,
 ) -> usize {
     use crate::error::{ErrorCode, code};
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
         return code(ErrorCode::SrcSizeWrong);
     };
@@ -821,12 +833,16 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
         if dst.is_null() {
             return code(ErrorCode::DstBufferNull);
         }
+        // SAFETY: skippable_frame_size checked bytes[..8+content] against the
+        // slice, and dst holds content bytes (both checked above).
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr().add(8), dst.cast::<u8>(), content);
         }
     }
     if !magic_variant.is_null() {
         let magic = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes checked"));
+        // SAFETY: magic_variant is non-null above and a caller-provided valid
+        // u32 target.
         unsafe { *magic_variant = magic - SKIPPABLE_MIN };
     }
     content

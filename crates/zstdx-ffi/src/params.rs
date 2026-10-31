@@ -1269,6 +1269,8 @@ pub unsafe extern "C" fn ZSTD_estimateDStreamSize_fromFrame(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(bytes) = (unsafe { crate::as_slice(src, src_size) }) else {
         // The reference's getFrameHeader deref is guarded the same way by
         // its own srcSize gate before any read.
@@ -1363,6 +1365,8 @@ pub extern "C" fn ZSTD_sequenceBound(src_size: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 unsafe fn cctx_ref<'a>(ptr: *const ZSTD_CCtx) -> &'a crate::cctx::CCtx {
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
     unsafe { &*ptr.cast::<crate::cctx::CCtx>() }
 }
 
@@ -1379,6 +1383,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_getParameter(
     if cctx.is_null() || value.is_null() {
         return code(ErrorCode::Generic);
     }
+    // SAFETY: the caller-provided handle, live per the create's box
+    // round-trip.
     let settings = &unsafe { cctx_ref(cctx) }.settings;
     let Some(id) = CParamId::from_raw(param) else {
         return code(ErrorCode::ParameterUnsupported);
@@ -1416,6 +1422,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_getParameter(
         },
         _ => return code(ErrorCode::ParameterUnsupported),
     };
+    // SAFETY: value is non-null above and a caller-provided valid c_int
+    // target.
     unsafe { *value = read };
     0
 }
@@ -1431,6 +1439,8 @@ pub unsafe extern "C" fn ZSTD_DCtx_getParameter(
     if dctx.is_null() || value.is_null() {
         return code(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
     let settings = &unsafe { &*dctx.cast::<crate::dctx::DCtx>() }.settings;
     let Some(id) = DParamId::from_raw(param) else {
         return code(ErrorCode::ParameterUnsupported);
@@ -1451,6 +1461,8 @@ pub unsafe extern "C" fn ZSTD_DCtx_getParameter(
         | id::DisableHuffmanAssembly
         | id::MaxBlockSize => 0,
     };
+    // SAFETY: value is non-null above and a caller-provided valid c_int
+    // target.
     unsafe { *value = read };
     0
 }

@@ -52,6 +52,38 @@ pub struct ZSTD_DDict {
     _opaque: [u8; 0],
 }
 
+/// The create/free pair for one opaque handle type: `create` boxes a fresh
+/// state behind the opaque pointer, `free` takes it back (a null free is a
+/// no-op, the libzstd convention). The state type is spelled per pair, so
+/// a wrong-type cast cannot creep in.
+macro_rules! handle_pair {
+    ($create:ident, $free:ident, $opaque:ty, $state:ty) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $create() -> *mut $opaque {
+            Box::into_raw(Box::new(<$state>::new())).cast()
+        }
+        crate::handle_free!($free, $opaque, $state);
+    };
+}
+pub(crate) use handle_pair;
+
+/// The free half alone, for handles whose create builds a custom payload.
+macro_rules! handle_free {
+    ($free:ident, $opaque:ty, $state:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $free(handle: *mut $opaque) -> usize {
+            if handle.is_null() {
+                return 0;
+            }
+            // SAFETY: the handle round-trips the create's `Box::into_raw` of
+            // a `$state`.
+            drop(unsafe { Box::from_raw(handle.cast::<$state>()) });
+            0
+        }
+    };
+}
+pub(crate) use handle_free;
+
 /// `ZSTD_ResetDirective`. Values outside the enum reach libzstd's reset
 /// entries as no-ops (its two `if`s fall through and return 0); this layer
 /// mirrors that instead of erroring.
@@ -124,6 +156,7 @@ impl ZSTD_inBuffer {
         if len == 0 {
             return &[];
         }
+        // SAFETY: the caller contract: `src[pos..pos+len]` is valid for reads.
         unsafe { core::slice::from_raw_parts(self.src.cast::<u8>().add(pos), len) }
     }
 }
@@ -233,6 +266,8 @@ pub unsafe fn as_slice<'a>(ptr: *const c_void, len: usize) -> Result<&'a [u8], E
     if ptr.is_null() {
         return Err(ErrorCode::SrcBufferWrong);
     }
+    // SAFETY: the caller contract: `ptr[..len]` is valid for reads (null and
+    // empty handled above).
     Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) })
 }
 
@@ -251,6 +286,8 @@ pub unsafe fn as_dst<'a>(ptr: *mut c_void, len: usize) -> Option<&'a mut [u8]> {
     if ptr.is_null() {
         return None;
     }
+    // SAFETY: the caller contract: `ptr[..len]` is valid for writes (null and
+    // empty handled above).
     Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) })
 }
 
@@ -263,6 +300,8 @@ pub unsafe fn as_mut_slice<'a>(ptr: *mut c_void, len: usize) -> &'a mut [u8] {
     if len == 0 || ptr.is_null() {
         return &mut [];
     }
+    // SAFETY: the caller contract: `ptr[..len]` is valid for writes (null and
+    // empty handled above).
     unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) }
 }
 
@@ -271,10 +310,14 @@ pub unsafe fn as_mut_slice<'a>(ptr: *mut c_void, len: usize) -> &'a mut [u8] {
 // ---------------------------------------------------------------------------
 
 unsafe fn cctx_mut<'a>(ptr: *mut ZSTD_CCtx) -> &'a mut cctx::CCtx {
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { &mut *ptr.cast::<cctx::CCtx>() }
 }
 
 unsafe fn dctx_mut<'a>(ptr: *mut ZSTD_DCtx) -> &'a mut dctx::DCtx {
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { &mut *ptr.cast::<dctx::DCtx>() }
 }
 
@@ -287,6 +330,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { cctx_mut(cctx) };
     match ctx.set_parameter(param, value) {
         // The reference setters return the applied value on success.
@@ -304,6 +349,8 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { dctx_mut(dctx) };
     match ctx.set_parameter(param, value) {
         Ok(()) => 0,
@@ -319,6 +366,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_setPledgedSrcSize(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.set_pledged(pledged_src_size) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -335,6 +384,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: core::ffi:
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.reset(directive) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -349,6 +400,8 @@ pub unsafe extern "C" fn ZSTD_DCtx_reset(dctx: *mut ZSTD_DCtx, reset: core::ffi:
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.reset(directive) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -363,9 +416,13 @@ pub unsafe extern "C" fn ZSTD_compress2(
     src: *const c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
         return ret(ErrorCode::DstBufferNull);
     };
@@ -374,6 +431,8 @@ pub unsafe extern "C" fn ZSTD_compress2(
     }
     // Sticky settings and the loaded dictionary; always a fresh frame with
     // the source size pledged (libzstd's single-round override).
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.compress2(src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
@@ -389,7 +448,11 @@ pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict, dict_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.load_dictionary(bytes) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -405,7 +468,11 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict, dict_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.load_dictionary(bytes) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -439,6 +506,7 @@ pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_byReference(
     dict: *const c_void,
     dict_size: usize,
 ) -> usize {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_CCtx_loadDictionary(cctx, dict, dict_size) }
 }
 
@@ -455,7 +523,11 @@ pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_advanced(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict, dict_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.load_dictionary_typed(bytes, dict_content_type) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -469,6 +541,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_byReference(
     dict: *const c_void,
     dict_size: usize,
 ) -> usize {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_DCtx_loadDictionary(dctx, dict, dict_size) }
 }
 
@@ -485,7 +558,11 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_advanced(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict, dict_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.load_dictionary_typed(bytes, dict_content_type) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -499,6 +576,7 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix(
     prefix: *const c_void,
     prefix_size: usize,
 ) -> usize {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_CCtx_refPrefix_advanced(cctx, prefix, prefix_size, DictContentType::RawContent) }
 }
 
@@ -513,7 +591,11 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix_advanced(
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated (prefix, prefix_size) read pair, per
+    // dict_bytes's contract.
     let bytes = unsafe { dict_bytes(prefix, prefix_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { cctx_mut(cctx) }.ref_prefix(bytes, dict_content_type) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -528,6 +610,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
     prefix: *const c_void,
     prefix_size: usize,
 ) -> usize {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_DCtx_refPrefix_advanced(dctx, prefix, prefix_size, DictContentType::RawContent) }
 }
 
@@ -542,7 +625,11 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated (prefix, prefix_size) read pair, per
+    // dict_bytes's contract.
     let bytes = unsafe { dict_bytes(prefix, prefix_size) };
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.ref_prefix_typed(bytes, dict_content_type) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -559,6 +646,8 @@ pub unsafe extern "C" fn ZSTD_DCtx_setMaxWindowSize(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.set_max_window_size(max_window_size) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -575,7 +664,11 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from the create's box round-trip; null excluded
+    // by the guard.
     let dict = (!ddict.is_null()).then(|| unsafe { &*ddict.cast::<DDict>() });
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     match unsafe { dctx_mut(dctx) }.ref_ddict(dict.map(|d| &d.dict)) {
         Ok(()) => 0,
         Err(e) => ret(e),
@@ -589,6 +682,8 @@ pub unsafe extern "C" fn ZSTD_getBlockSize(cctx: *const ZSTD_CCtx) -> usize {
     if cctx.is_null() {
         return 0;
     }
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
     unsafe { &*cctx.cast::<cctx::CCtx>() }.applied_block_size
 }
 
@@ -601,9 +696,13 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     src_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
         return ret(ErrorCode::DstBufferNull);
     };
@@ -627,14 +726,20 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     src: *const c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcSizeWrong);
     };
     // Null dst reads as zero capacity, like ZSTD_decompress.
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_mut_slice's contract.
     let dst = unsafe { as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { dctx_mut(dctx) };
     let result = dctx::decompress_oneshot(&ctx.settings, ctx.dict.as_ref(), src, dst);
     // A refPrefix dictionary covers this one call (the reference's
@@ -657,9 +762,13 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     dict_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { as_dst(dst, dst_capacity) }) else {
         return ret(ErrorCode::DstBufferNull);
     };
@@ -669,6 +778,8 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     // Fresh level-only settings, like compressCCtx; the dictionary is this
     // call's alone and does not linger on the context.
     let settings = cctx::Settings::one_shot(compression_level);
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let parsed = parse_cdict_bytes(unsafe { dict_bytes(dict, dict_size) });
     let parsed = match parsed {
         Ok(parsed) => parsed,
@@ -701,18 +812,26 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     dict: *const c_void,
     dict_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcSizeWrong);
     };
     // Null dst reads as zero capacity, like ZSTD_decompress.
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_mut_slice's contract.
     let dst = unsafe { as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { dctx_mut(dctx) };
     // The dictionary is loaded into the context (libzstd's usingDict leaves
     // it loaded for the following calls) and survives until initDStream.
     // Parsed once: the slot is shared with the streams that follow.
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let loaded = match unsafe { dict_bytes(dict, dict_size) } {
         Some(bytes) => match zstdx::decoding::Dictionary::load(bytes) {
             Ok(parsed) => Some(std::sync::Arc::new(parsed)),
@@ -731,19 +850,12 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
 // Streaming compression
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_createCStream() -> *mut ZSTD_CStream {
-    Box::into_raw(Box::new(cctx::CCtx::new())).cast()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeCStream(zcs: *mut ZSTD_CStream) -> usize {
-    if zcs.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(zcs.cast::<cctx::CCtx>()) });
-    0
-}
+crate::handle_pair!(
+    ZSTD_createCStream,
+    ZSTD_freeCStream,
+    ZSTD_CStream,
+    cctx::CCtx
+);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_CStreamInSize() -> usize {
@@ -764,6 +876,8 @@ pub unsafe extern "C" fn ZSTD_initCStream(
     if zcs.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { cctx_mut(zcs) }.init_stream(compression_level);
     0
 }
@@ -781,6 +895,8 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     let Ok(mode) = ZSTD_EndDirective::try_from(end_op) else {
         return ret(ErrorCode::ParameterOutOfBound);
     };
+    // SAFETY: non-null above; caller-provided buffer structs valid for reads
+    // and writes.
     let (output, input) = unsafe { (&mut *output, &mut *input) };
     // Wild cursors are rejected exactly as the reference does, output first.
     if output.pos > output.size {
@@ -789,6 +905,8 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     if input.pos > input.size {
         return ret(ErrorCode::SrcSizeWrong);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { cctx_mut(cctx) };
     match ctx.compress_stream2(output, input, mode) {
         Ok(hint) => hint,
@@ -806,6 +924,7 @@ pub unsafe extern "C" fn ZSTD_compressStream(
     output: *mut ZSTD_outBuffer,
     input: *mut ZSTD_inBuffer,
 ) -> usize {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_compressStream2(zcs, output, input, ZSTD_EndDirective::Continue as i32) }
 }
 
@@ -823,6 +942,7 @@ pub unsafe extern "C" fn ZSTD_flushStream(
         size: 0,
         pos: 0,
     };
+    // SAFETY: output is non-null above; empty is a valid local buffer struct.
     unsafe { ZSTD_compressStream2(zcs, output, &raw mut empty, ZSTD_EndDirective::Flush as i32) }
 }
 
@@ -840,6 +960,7 @@ pub unsafe extern "C" fn ZSTD_endStream(
         size: 0,
         pos: 0,
     };
+    // SAFETY: output is non-null above; empty is a valid local buffer struct.
     unsafe { ZSTD_compressStream2(zcs, output, &raw mut empty, ZSTD_EndDirective::End as i32) }
 }
 
@@ -847,19 +968,12 @@ pub unsafe extern "C" fn ZSTD_endStream(
 // Streaming decompression
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_createDStream() -> *mut ZSTD_DStream {
-    Box::into_raw(Box::new(dctx::DCtx::new())).cast()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeDStream(zds: *mut ZSTD_DStream) -> usize {
-    if zds.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(zds.cast::<dctx::DCtx>()) });
-    0
-}
+crate::handle_pair!(
+    ZSTD_createDStream,
+    ZSTD_freeDStream,
+    ZSTD_DStream,
+    dctx::DCtx
+);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_DStreamInSize() -> usize {
@@ -876,6 +990,8 @@ pub unsafe extern "C" fn ZSTD_initDStream(zds: *mut ZSTD_DStream) -> usize {
     if zds.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { dctx_mut(zds) }.init_stream();
     // The reference returns ZSTD_startingInputLength: the prefix size a
     // first read wants, not the general DStreamInSize.
@@ -891,7 +1007,11 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
     if zds.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let dctx = unsafe { dctx_mut(zds) };
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     match dctx.init_stream_with_dict(unsafe { dict_bytes(dict, dict_size) }) {
         Ok(()) => HEADER_PREFIX,
         Err(e) => ret(e),
@@ -907,7 +1027,11 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDDict(
         return ret(ErrorCode::Generic);
     }
     // A null handle clears the slot, as ZSTD_DCtx_refDDict(zds, NULL).
+    // SAFETY: the handle came from the create's box round-trip; null excluded
+    // by the guard.
     let dict = (!ddict.is_null()).then(|| unsafe { &*ddict.cast::<DDict>() });
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { dctx_mut(zds) }.init_stream_with_ddict(dict.map(|d| &d.dict));
     HEADER_PREFIX
 }
@@ -919,6 +1043,8 @@ pub unsafe extern "C" fn ZSTD_resetDStream(zds: *mut ZSTD_DStream) -> usize {
     }
     // Session-only: the dictionary reference survives, unlike
     // ZSTD_initDStream.
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     unsafe { dctx_mut(zds) }.init_stream_keep_dict();
     HEADER_PREFIX
 }
@@ -932,6 +1058,8 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
     if zds.is_null() || output.is_null() || input.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: non-null above; caller-provided buffer structs valid for reads
+    // and writes.
     let (output, input) = unsafe { (&mut *output, &mut *input) };
     // Wild cursors rejected in the reference order: input first, then output.
     if input.pos > input.size {
@@ -940,6 +1068,8 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
     if output.pos > output.size {
         return ret(ErrorCode::DstSizeTooSmall);
     }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
     let ctx = unsafe { dctx_mut(zds) };
     match ctx.decompress_stream(output, input) {
         Ok(hint) => hint,

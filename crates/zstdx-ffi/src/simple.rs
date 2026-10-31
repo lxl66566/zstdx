@@ -144,9 +144,13 @@ pub unsafe extern "C" fn ZSTD_compress(
     src_size: usize,
     compression_level: core::ffi::c_int,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
         return ret(ErrorCode::DstBufferNull);
     };
@@ -167,6 +171,8 @@ pub unsafe extern "C" fn ZSTD_decompress(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         // Below the prefix size the reference loop never derefs the src:
         // its leftover-input check answers srcSize_wrong.
@@ -175,6 +181,8 @@ pub unsafe extern "C" fn ZSTD_decompress(
     // A null dst behaves as zero capacity on every reference path that
     // does not crash it: non-empty output answers dstSize_tooSmall, an
     // empty one succeeds.
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_mut_slice's contract.
     let dst = unsafe { crate::as_mut_slice(dst, dst_capacity) };
     match crate::dctx::decompress_oneshot(&DSettings::default(), None, src, dst) {
         Ok(written) => written,
@@ -195,6 +203,8 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> u64 {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return CONTENTSIZE_ERROR;
     };
@@ -217,6 +227,7 @@ pub unsafe extern "C" fn ZSTD_getDecompressedSize(
 ) -> u64 {
     // The obsolete blend: known-and-nonempty keeps its value, everything
     // else (unknown, error, empty, skippable) collapses to 0.
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     let fcs = unsafe { ZSTD_getFrameContentSize(src, src_size) };
     if fcs >= CONTENTSIZE_ERROR {
         0
@@ -230,6 +241,8 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> u64 {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return CONTENTSIZE_ERROR;
     };
@@ -246,6 +259,8 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
@@ -271,6 +286,7 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader_advanced(
     if format != 0 {
         return ret(ErrorCode::ParameterUnsupported);
     }
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_getFrameHeader(zfh_ptr, src, src_size) }
 }
 
@@ -283,11 +299,15 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
     if zfh_ptr.is_null() {
         return ret(ErrorCode::Generic);
     }
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         // A null src with a positive size hits the reference entry check
         // (GENERIC, never a deref); size 0 stays on the wants-5 path.
         return ret(ErrorCode::Generic);
     };
+    // SAFETY: zfh_ptr is non-null above and a caller-provided struct valid
+    // for writes.
     let zfh = unsafe { &mut *zfh_ptr };
     let parsed = crate::frame::parse_full_header(src);
     // The struct-write contract mirrors the reference memset placement:
@@ -297,6 +317,8 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
     if src.len() >= crate::frame::HEADER_PREFIX {
         // The reference memsets the whole struct, tail padding included;
         // a plain Rust assignment would leave the padding bytes alone.
+        // SAFETY: zfh_ptr is non-null above and stays valid for the struct's
+        // whole size (the caller contract of this entry).
         unsafe {
             core::ptr::write_bytes(zfh_ptr.cast::<u8>(), 0, size_of::<ZSTD_FrameHeader>());
         }
@@ -334,6 +356,8 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromDict(
 ) -> core::ffi::c_uint {
     // The reference reads the four bytes behind the dictionary magic with
     // no validity judgment of the tables that follow.
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let Some(bytes) = (unsafe { crate::dict::dict_bytes(dict, dict_size) }) else {
         return 0;
     };
@@ -348,6 +372,8 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromFrame(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> core::ffi::c_uint {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return 0;
     };
@@ -365,6 +391,8 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
@@ -387,6 +415,8 @@ pub unsafe extern "C" fn ZSTD_isFrame(
     src: *const core::ffi::c_void,
     src_size: usize,
 ) -> core::ffi::c_uint {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return 0;
     };
@@ -401,33 +431,9 @@ pub unsafe extern "C" fn ZSTD_isFrame(
 // Context management (both stream types share the objects)
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_createCCtx() -> *mut crate::ZSTD_CCtx {
-    Box::into_raw(Box::new(CCtx::new())).cast()
-}
+crate::handle_pair!(ZSTD_createCCtx, ZSTD_freeCCtx, crate::ZSTD_CCtx, CCtx);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut crate::ZSTD_CCtx) -> usize {
-    if cctx.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(cctx.cast::<CCtx>()) });
-    0
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_createDCtx() -> *mut crate::ZSTD_DCtx {
-    Box::into_raw(Box::new(DCtx::new())).cast()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeDCtx(dctx: *mut crate::ZSTD_DCtx) -> usize {
-    if dctx.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(dctx.cast::<DCtx>()) });
-    0
-}
+crate::handle_pair!(ZSTD_createDCtx, ZSTD_freeDCtx, crate::ZSTD_DCtx, DCtx);
 
 #[cfg(test)]
 mod tests {

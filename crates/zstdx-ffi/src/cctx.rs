@@ -551,6 +551,8 @@ impl CCtx {
         }
         let state = self.stream.as_mut().expect("just ensured");
 
+        // SAFETY: output.dst[..output.size] is the caller-validated write
+        // pair from the C entry.
         let out = unsafe { crate::as_mut_slice(output.dst, output.size) };
         let mut in_pos = input.pos;
         loop {
@@ -561,6 +563,8 @@ impl CCtx {
             let take = (input.size - in_pos).min(FEED_CHUNK);
             state
                 .encoder
+                // SAFETY: take <= input.size - in_pos, so src[in_pos..in_pos+take]
+                // stays inside the caller's read buffer.
                 .write_all(unsafe { input.slice_at(in_pos, take) })
                 .map_err(|e| map_io(&e))?;
             in_pos += take;

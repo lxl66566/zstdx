@@ -26,10 +26,14 @@ pub struct DDict {
 }
 
 unsafe fn cdict_ref<'a>(ptr: *const ZSTD_CDict) -> Option<&'a CDict> {
+    // SAFETY: the handle came from the create's box round-trip; null excluded
+    // by the guard.
     (!ptr.is_null()).then(|| unsafe { &*ptr.cast::<CDict>() })
 }
 
 unsafe fn ddict_ref<'a>(ptr: *const ZSTD_DDict) -> Option<&'a DDict> {
+    // SAFETY: the handle came from the create's box round-trip; null excluded
+    // by the guard.
     (!ptr.is_null()).then(|| unsafe { &*ptr.cast::<DDict>() })
 }
 
@@ -41,6 +45,8 @@ pub(crate) unsafe fn dict_bytes(
     if dict.is_null() || size < 8 {
         return None;
     }
+    // SAFETY: the caller-validated dictionary read pair, per as_slice's
+    // contract.
     unsafe { crate::as_slice(dict, size).ok() }
 }
 
@@ -50,6 +56,8 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     dict_size: usize,
     compression_level: core::ffi::c_int,
 ) -> *mut ZSTD_CDict {
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict_buffer, dict_size) }.unwrap_or(&[]);
     // libzstd digests at creation and answers NULL for an unloadable
     // dictionary (an empty buffer stays a valid level-only handle).
@@ -72,20 +80,16 @@ pub unsafe extern "C" fn ZSTD_createCDict_byReference(
     dict_size: usize,
     compression_level: core::ffi::c_int,
 ) -> *mut ZSTD_CDict {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_createCDict(dict_buffer, dict_size, compression_level) }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeCDict(cdict: *mut ZSTD_CDict) -> usize {
-    if cdict.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(cdict.cast::<CDict>()) });
-    0
-}
+crate::handle_free!(ZSTD_freeCDict, ZSTD_CDict, CDict);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getDictID_fromCDict(cdict: *const ZSTD_CDict) -> core::ffi::c_uint {
+    // SAFETY: the caller-provided handle, live per the create's box
+    // round-trip.
     match unsafe { cdict_ref(cdict) } {
         Some(cdict) => cdict
             .dict
@@ -105,12 +109,18 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
     src_size: usize,
     cdict: *const ZSTD_CDict,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcBufferWrong);
     };
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_dst's contract.
     let Some(dst) = (unsafe { crate::as_dst(dst, dst_capacity) }) else {
         return ret(ErrorCode::DstBufferNull);
     };
+    // SAFETY: the caller-provided handle, live per the create's box
+    // round-trip.
     let Some(cdict) = (unsafe { cdict_ref(cdict) }) else {
         // libzstd's usingCDict_internal rejects the NULL handle outright.
         return ret(ErrorCode::DictionaryWrong);
@@ -133,6 +143,8 @@ pub unsafe extern "C" fn ZSTD_createDDict(
     dict_buffer: *const core::ffi::c_void,
     dict_size: usize,
 ) -> *mut ZSTD_DDict {
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = unsafe { dict_bytes(dict_buffer, dict_size) }.unwrap_or(&[]);
     match zstdx::decoding::Dictionary::load(bytes) {
         Ok(dict) => Box::into_raw(Box::new(DDict {
@@ -149,6 +161,7 @@ pub unsafe extern "C" fn ZSTD_createDDict_byReference(
     dict_buffer: *const core::ffi::c_void,
     dict_size: usize,
 ) -> *mut ZSTD_DDict {
+    // SAFETY: forwarding to the same contract with the caller's arguments.
     unsafe { ZSTD_createDDict(dict_buffer, dict_size) }
 }
 
@@ -169,6 +182,8 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
         // no hook for caller allocation, so the request is refused.
         return core::ptr::null_mut();
     }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
     let bytes = match unsafe { dict_bytes(dict_buffer, dict_size) } {
         Some(bytes) => bytes,
         None => {
@@ -199,17 +214,12 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_freeDDict(ddict: *mut ZSTD_DDict) -> usize {
-    if ddict.is_null() {
-        return 0;
-    }
-    drop(unsafe { Box::from_raw(ddict.cast::<DDict>()) });
-    0
-}
+crate::handle_free!(ZSTD_freeDDict, ZSTD_DDict, DDict);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getDictID_fromDDict(ddict: *const ZSTD_DDict) -> core::ffi::c_uint {
+    // SAFETY: the caller-provided handle, live per the create's box
+    // round-trip.
     match unsafe { ddict_ref(ddict) } {
         Some(ddict) if ddict.dict.id != 0 => ddict.dict.id,
         _ => 0,
@@ -225,10 +235,14 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     src_size: usize,
     ddict: *const ZSTD_DDict,
 ) -> usize {
+    // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
+    // contract.
     let Ok(src) = (unsafe { crate::as_slice(src, src_size) }) else {
         return ret(ErrorCode::SrcSizeWrong);
     };
     // Null dst reads as zero capacity, like ZSTD_decompress.
+    // SAFETY: the caller-validated (dst, dst_capacity) write pair, per
+    // as_mut_slice's contract.
     let dst = unsafe { crate::as_mut_slice(dst, dst_capacity) };
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -236,7 +250,11 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     // The handle's dictionary is exclusive for this call; a NULL handle
     // decodes plain, ignoring the context's dictionary (libzstd's
     // decompressBegin_usingDDict(NULL) clears).
+    // SAFETY: the caller-provided handle, live per the create's box
+    // round-trip.
     let dict = unsafe { ddict_ref(ddict) }.map(|ddict| &ddict.dict);
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
     let ctx = unsafe { &mut *dctx.cast::<dctx::DCtx>() };
     match dctx::decompress_oneshot(&ctx.settings, dict, src, dst) {
         Ok(written) => written,

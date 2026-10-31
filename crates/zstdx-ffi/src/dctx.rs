@@ -741,6 +741,8 @@ impl DCtx {
             }
         }
         let stream = self.stream.as_mut().expect("just ensured");
+        // SAFETY: output.dst[..output.size] is the caller-validated write
+        // pair from the C entry.
         let out = unsafe { crate::as_mut_slice(output.dst, output.size) };
         let mut in_pos = input.pos;
         let mut use_once_consumed = false;
@@ -752,6 +754,8 @@ impl DCtx {
             let take = (input.size - in_pos).min(FEED_CHUNK);
             stream
                 .input
+                // SAFETY: take <= input.size - in_pos, so src[in_pos..in_pos+take]
+                // stays inside the caller's read buffer.
                 .extend_from_slice(unsafe { input.slice_at(in_pos, take) });
             in_pos += take;
             input.pos = in_pos;
