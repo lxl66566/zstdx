@@ -52,6 +52,7 @@
 - [Decode-path walls](dev/review/decode-walls.md)
 - [Optimal parser review](dev/review/opt.md)
 - [Window semantics](dev/review/winsem.md)
+- [MT job machinery review](dev/review/mtjobs.md)
 
 ## Remaining Improvements
 

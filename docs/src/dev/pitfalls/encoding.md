@@ -353,6 +353,12 @@ Both reserves are now capped at `BUF_CAP_MAX`, the same ceiling the unpledged gr
 
 The costs are that jobs below the whole-window strip pay strip-fill per job, measured at 7.5% slower wall for L9 w8 on a 2 GiB unpledged stream and 12% to 25% faster for L3 because smaller jobs pipeline better, and that long unpledged streams' frame bytes move to a denser job grid. The 32 MiB bench corpus is byte-identical, with zero deltas across the full 120-cell ratio A/B. Reclaiming the L9 redundancy wants the finish tail's shared prefix fill extended to streaming posts. An epoch-staged posting gate makes the job-size ceiling a memory bound, and a ceiling shared with the bulk formula is not one for the streaming grid.
 
+### Arming bars read the clamped window
+
+`ldm_min_window`'s `LdmArming::Job` arm demanded the row's full 64 MiB window, a bar written against the row parameter. The bulk MT path declares the input length, and `adjust_params` clamps the window to the next power of two of the source, so every deep-row job on a [32,64) MiB source evaluated the bar against 32 MiB and disarmed LDM, while the same row's ST frame passes an unknown length, keeps the 64 MiB window and arms at the 32 MiB midsize bar. dll32 best bulk-mt8 paid +25.2% size with the DUBT tree carrying the whole far class at 458 GiB of compares, and the defect hid behind the twin-whale attribution for a round because the grid sweep's single-job cell, not any per-job span, was what isolated it.
+
+Any bar keyed on `params.window` must be evaluated against the window the caller's shape actually produced, and a job-only bar stricter than its frame's needs a source-clamp audit. The isolation pattern generalizes: when a defect is attributed to the job split, run the one-job cell first, because it removes every boundary at once and costs one jobdecomp invocation.
+
 ### LDM limitTableUpdate floor
 
 The btlazy gap-parse set `next_update = next - 512` unconditionally once an LDM emission cleared the 1024 bar, but libzstd's `ZSTD_ldm_limitTableUpdate` also caps the backstep at `curr - nextToUpdate - 1024` through `MIN(512, ...)`, so the update point never lands below `next_update + 1024`. The floor raises the update point, which makes the tree fill skip more, and does not add insertions. Our bare `-512` indexed up to 512 extra positions whenever the emission only just cleared the bar, with a gap in the 1024 to 1536 range.

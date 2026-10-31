@@ -18,6 +18,7 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 46 symbols deliberately out with recorded reasons, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
+| 28 | MT donation span repair | Frame correctness on open balanced streams at five workers or more | The growing tail re-slice can cut job zero below the probe span while a donation is parked | [mtjobs](review/mtjobs.md) |
 
 ## Item notes
 
@@ -112,6 +113,10 @@ The balanced json +0.44% Ir residue is placement-only. A 4x order-swapped interl
 The remaining compile-time menu holds A/B-gated refactors of hot code. The tree families' packed entries became their own `PackedPos` domain on 2026-10-31 and the chain, row and LDM resolve sites carry their admitted distances as `NonZero`, both recorded in [hardening](review/hardening.md). What remains: `WinPos`-versus-window-index threading for the chain/row scan helpers (their idx/abs argument pairs), `NonZero` on the `LdmSeq` offset and the repcode history (the fast/dfast consumers and the decoder-side offset history own those boundaries), and enum rep-bases over `Match::off`/`of_value` (the opt DP's matches array would double in width under a tagged enum, and `push_seq_packed` is shared with the fast/dfast scans). The `Option<Candidate>` arm landed on 2026-10-24 over the btlazy selection.
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
+
+### Item 28
+
+The reach probe's donated prefix encodes the first PROBE_SPAN bytes, so job zero must end at or past the span for the continuation to own its own bytes. The growing grid's tail re-slice floors its jobs at MIN_JOB_SIZE, which sits below the span, so an open balanced stream at five workers or more whose total lands between PROBE_MIN_FRAME and two burst-job spans duplicates the band between the donated prefix and job one. Libzstd rejects the frame on the checksum, verified live at eight workers over 8 MiB in R85. The repair floors the re-slice or widens the discard to any job zero ending at or below the span, with the span bound asserted at the continuation entry and the fixture pinned. See the [mt job machinery review](review/mtjobs.md).
 
 ## Identified floors
 

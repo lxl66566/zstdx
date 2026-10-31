@@ -112,13 +112,17 @@ fn strip_snapshot_adopt_is_exact() {
 
 #[test]
 fn ldm_arming_bars() {
-    // The mid-size bar arms one step under the row window; the job bar
-    // requires the clamp to have left the row window intact; the probe's
-    // keep parse and the far-dead screen never arm.
+    // The midsize bar arms one step under the row window, for frames and
+    // plain jobs alike (R85: a job-only full-window bar disarmed every
+    // deep-row job on a [32,64) MiB source, where the declared-length
+    // clamp pulls the window below the row's 64 MiB); the prefix-capture
+    // arm shares it; the probe's keep parse and the far-dead screen never
+    // arm.
     assert_eq!(ldm_min_window(LdmArming::Frame), Some(1 << 25));
     #[cfg(feature = "std")]
     {
-        assert_eq!(ldm_min_window(LdmArming::Job), Some(1 << 26));
+        assert_eq!(ldm_min_window(LdmArming::Job), Some(1 << 25));
+        assert_eq!(ldm_min_window(LdmArming::JobPrefix), Some(1 << 25));
         assert_eq!(ldm_min_window(LdmArming::FarDead), None);
     }
     assert_eq!(ldm_min_window(LdmArming::ProbeKeep), None);

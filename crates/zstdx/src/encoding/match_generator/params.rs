@@ -328,8 +328,8 @@ pub(super) const LDM_CANARY: u8 = 8;
 /// same-size far-less shapes pay.
 pub(crate) const LDM_MIDSIZE_WINDOW: usize = 1 << 25;
 
-/// The [`LdmArming::Job`] bar: the row's full window, meaning the source
-/// clamp left it intact.
+/// The full-band far window (the fast rows' screen class and the
+/// windowed capture band's floor).
 pub(crate) const LDM_FULL_WINDOW: usize = 1 << 26;
 
 /// Sampled distinct-byte count the mid-size population's first parsed
@@ -499,7 +499,13 @@ pub(super) const fn ldm_min_window(arming: LdmArming) -> Option<usize> {
     match arming {
         LdmArming::Frame | LdmArming::FrameScreened => Some(LDM_MIDSIZE_WINDOW),
         #[cfg(feature = "std")]
-        LdmArming::Job => Some(LDM_FULL_WINDOW),
+        // R85: a plain job's LDM bar is the frame bar. The old FULL bar
+        // disarmed every deep-row job on a [32,64) MiB source, where the
+        // declared-length clamp pulls the window below 1<<26 while the
+        // row's own ST frame arms at the midsize bar: the job's DUBT tree
+        // then carried the whole far class (dll32 best mt8 +25% size at
+        // 458 GiB compares against ST's 2.08).
+        LdmArming::Job => Some(LDM_MIDSIZE_WINDOW),
         #[cfg(feature = "std")]
         LdmArming::JobPrefix => Some(LDM_MIDSIZE_WINDOW),
         #[cfg(feature = "std")]
