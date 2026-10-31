@@ -9,10 +9,11 @@ use super::{
     gates::{CoveredFill, RampGate},
     hash::{
         ChainHashWidth, extend_match, extend_match_gap, hash_at_log, hash_at_width, hash8_at_log,
-        read4,
+        read4, read8,
     },
 };
 use crate::{
+    common::overrun,
     decoding::sequence_execution::do_offset_history,
     encoding::{SeqWord, hugepage::HugeBuf, seq_codes::pack_seq},
 };
@@ -456,21 +457,20 @@ pub(in crate::encoding) fn push_seq_packed(
         seqs.push(pack_seq(0, match_len as u32, of_value));
         return (0, start + match_len);
     }
-    // SAFETY: both sides are within the window / buffer; unaligned because
-    // byte-granular. The 8-byte read may overlap the match that follows the
-    // literals, so it stays in bounds whenever 8 bytes from the anchor fit
-    // the window; the write may spill up to 7 bytes past the new length, but
-    // reserve(8) covers them and later pushes overwrite them.
-    unsafe {
-        if lits.len() <= 8 && anchor_idx + 8 <= win.len() {
+    if lits.len() <= 8 && anchor_idx + 8 <= win.len() {
+        // SAFETY: the 8-byte read stays in bounds because the anchor plus 8
+        // fits the window; the overrun store spills up to 7 bytes past the
+        // published length, covered by the reserve (`common::overrun`), and
+        // later pushes overwrite them.
+        let v = read8(win, anchor_idx);
+        unsafe {
             literals.reserve(8);
-            let dst = literals.as_mut_ptr().add(literals.len());
-            let v = lits.as_ptr().cast::<u64>().read_unaligned();
-            dst.cast::<u64>().write_unaligned(v);
-            literals.set_len(literals.len() + lits.len());
-        } else {
-            literals.extend_from_slice(lits);
+            let end = literals.len();
+            overrun::store_u64(literals, end, v);
+            overrun::publish_len(literals, end + lits.len());
         }
+    } else {
+        literals.extend_from_slice(lits);
     }
     do_offset_history(of_value, ll, rep);
     seqs.push(pack_seq(ll, match_len as u32, of_value));

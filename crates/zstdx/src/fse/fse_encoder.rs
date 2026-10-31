@@ -7,6 +7,7 @@ use crate::{
         LL_DEFAULT_ACC_LOG, LL_DEFAULT_DISTRIBUTION, ML_DEFAULT_ACC_LOG, ML_DEFAULT_DISTRIBUTION,
         OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
     },
+    common::overrun,
     encoding::seq_codes::SEQ_CODE_SPACE,
 };
 
@@ -423,7 +424,6 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
     if pos + bound > output.capacity() {
         output.reserve(pos + bound - output.len());
     }
-    let ptr = output.as_mut_ptr();
 
     // Push the full bytes of `acc` to the output; the u64 store's
     // overshoot past pos + nb/8 is overwritten by the next store or cut
@@ -433,8 +433,8 @@ pub(crate) fn write_ncount<V: AsMut<Vec<u8>>>(
         () => {
             if nb >= 48 {
                 // SAFETY: the reserve above covers pos + 8 for every
-                // store; see `bound`.
-                unsafe { ptr.add(pos).cast::<u64>().write_unaligned(acc.to_le()) };
+                // store (`common::overrun`); see `bound`.
+                unsafe { overrun::store_u64(output, pos, acc) };
                 pos += nb >> 3;
                 acc >>= (nb >> 3) * 8;
                 nb &= 7;

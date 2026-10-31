@@ -67,3 +67,5 @@ pub const fn streaming_buffer_cap(window_size: usize, fcs: Option<u64>) -> usize
 /// `core::arch::x86_64`, so the module is x86_64-only.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub(crate) mod simd;
+
+pub(crate) mod overrun;

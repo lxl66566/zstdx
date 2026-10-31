@@ -1,6 +1,8 @@
 //! Use [BitWriter] to write an arbitrary amount of bits into a buffer.
 use alloc::vec::Vec;
 
+use crate::common::overrun;
+
 /// An interface for writing an arbitrary number of bits into a buffer. Write new bits into the
 /// buffer with `write_bits`, and obtain the output using `dump`.
 #[derive(Debug)]
@@ -148,15 +150,12 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let output = self.output.as_mut();
         output.reserve(8);
         let len = output.len();
-        // SAFETY: reserve covered the 8 bytes; only the low bytes are
-        // semantically part of the output once bit_idx advances.
+        // SAFETY: the reserve covers the store and the overshoot publish
+        // (`common::overrun`); the low bytes are the semantic output once
+        // bit_idx advances.
         unsafe {
-            output
-                .as_mut_ptr()
-                .add(len)
-                .cast::<u64>()
-                .write_unaligned(merged.to_le());
-            output.set_len(len + 8);
+            overrun::store_u64(output, len, merged);
+            overrun::publish_len(output, len + 8);
         }
         self.bit_idx += 64;
         self.partial = 0;
@@ -339,11 +338,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 let sym = unsafe { *data.get_unchecked($i) };
                 let e = aligned[sym as usize];
                 $c >>= (e & 63) as u32;
-                $c |= if $clean {
-                    e & !0xf
-                } else {
-                    e
-                };
+                $c |= if $clean { e & !0xf } else { e };
                 $b = $b.wrapping_add(e);
             }};
         }
@@ -385,10 +380,9 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             flush!();
             i -= group;
         }
-        // SAFETY: pos matches the semantic end of the output; shrinking or
-        // growing within the reserved capacity keeps the invariant that the
-        // length equals bit_idx / 8.
-        unsafe { output.set_len(pos) };
+        // SAFETY: pos matches the semantic end of the output; the publish
+        // (`common::overrun`) keeps length == bit_idx / 8.
+        unsafe { overrun::publish_len(output, pos) };
         let pending = (b0 & 7) as u32;
         self.partial = if pending == 0 {
             0
@@ -424,16 +418,10 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             if pos + 16 > output.capacity() {
                 output.reserve(pos + 16 - output.len());
             }
-            // SAFETY: the capacity check covers the 8-byte store; only the
-            // low k bytes are semantic, the overshoot is overwritten by the
-            // bulk stores or snapped off by the final set_len.
-            unsafe {
-                output
-                    .as_mut_ptr()
-                    .add(pos)
-                    .cast::<u64>()
-                    .write_unaligned(acc.to_le());
-            }
+            // SAFETY: the capacity check covers the store (`common::overrun`);
+            // only the low k bytes are semantic, the overshoot is overwritten
+            // by the bulk stores or snapped off by the final publish.
+            unsafe { overrun::store_u64(output, pos, acc) };
             pos += k;
             acc >>= 8 * k;
             bits -= 8 * k;
@@ -533,7 +521,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             pos += total;
         }
         // SAFETY: pos is the semantic end; see write_packed_codes_rev.
-        unsafe { output.set_len(pos) };
+        unsafe { overrun::publish_len(output, pos) };
         self.partial = acc;
         self.bits_in_partial = bits;
         self.bit_idx = pos * 8;
@@ -587,9 +575,9 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let output = self.output.as_mut();
         debug_assert!(pos <= output.capacity());
         // SAFETY: the batched loop reserved pos + slack and only advanced pos
-        // over bytes it wrote, so growing (or snapping off overshoot) within
-        // the capacity keeps the length == bit_idx / 8 invariant.
-        unsafe { output.set_len(pos) };
+        // over bytes it wrote, so the publish (`common::overrun`) keeps the
+        // length == bit_idx / 8 invariant.
+        unsafe { overrun::publish_len(output, pos) };
         self.partial = partial;
         self.bits_in_partial = bits;
         self.bit_idx = pos * 8;
