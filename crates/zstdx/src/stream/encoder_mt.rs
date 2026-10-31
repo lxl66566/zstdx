@@ -405,17 +405,16 @@ struct Job {
 }
 
 enum JobKind {
-    /// Encode `[first, len)` of the frozen source view as the job's own
-    /// blocks.
+    /// Encode `[first, src.end)` of the frozen source view as the job's
+    /// own blocks.
     Encode {
         /// The frozen source view (see the recycling rules in
         /// [`MtEncoderCore`]'s docs — the backing bytes cannot move before
         /// this job completes).
         src: FrozenSrc,
-        /// Index of the job's strip start inside `src`, and the job's own
-        /// range relative to it.
+        /// Index of the job's strip start inside `src` (the view head
+        /// carries the strip prefill).
         first: usize,
-        len: usize,
         last_frame_block: bool,
         overlap: usize,
         /// The job's LDM arming context: `JobPrefix` on the pledged
@@ -491,11 +490,34 @@ impl Job {
 // and reallocations happen only at quiescence, after every job reading the
 // buffer has completed.
 unsafe impl Send for FrozenSrc {}
+// SAFETY: same contract as `Send` — the view's bytes are frozen for the
+// job's lifetime and never mutated through a shared reference.
 unsafe impl Sync for FrozenSrc {}
 
-/// Frozen job source handed to the worker pool.
+/// Frozen job source handed to the worker pool: one span of the accumulate
+/// buffer's initialized extent.
 struct FrozenSrc {
     ptr: *const u8,
+    /// The view's end in bytes from `ptr`; the worker slices exactly
+    /// `[ptr, ptr + end)`.
+    end: usize,
+}
+
+impl FrozenSrc {
+    /// Freezes the buffer's `[off, off + end)` span as a job source.
+    ///
+    /// Debug mode pins the span inside the buffer's live extent: a view
+    /// reaching past it (or a wrapped offset underflowing into a huge
+    /// `off`) is the recorded view-bug class (see `hardening.md`) — stale
+    /// or uninitialized bytes reaching an encoder.
+    fn freeze(buf: &[u8], off: usize, end: usize) -> Self {
+        debug_assert!(off + end <= buf.len());
+        Self {
+            // SAFETY: the live-extent assert bounds `off` inside the buffer.
+            ptr: unsafe { buf.as_ptr().add(off) },
+            end,
+        }
+    }
 }
 
 // Reusable accumulate buffers: a fresh encoder mapping its multi-megabyte
@@ -675,9 +697,9 @@ pub(super) fn serve_queue(
         #[cfg(feature = "job_trace")]
         let tl_first = if timeline::probe_on() {
             match &job.kind {
-                JobKind::Encode { first, len, .. } => {
-                    timeline::tl!("TL CLAIM {}..{} at {}", first, len, timeline::rel_us());
-                    Some((*first, *len))
+                JobKind::Encode { src, first, .. } => {
+                    timeline::tl!("TL CLAIM {}..{} at {}", first, src.end, timeline::rel_us());
+                    Some((*first, src.end))
                 },
                 _ => None,
             }
@@ -731,7 +753,6 @@ fn run_claimed_job(
         JobKind::Encode {
             src: frozen,
             first,
-            len,
             last_frame_block,
             overlap,
             ldm,
@@ -741,8 +762,9 @@ fn run_claimed_job(
             ..
         } => {
             // SAFETY: the posting thread keeps the backing bytes stable for
-            // this job's whole lifetime (see FrozenSrc).
-            let src = unsafe { slice::from_raw_parts(frozen.ptr, *len) };
+            // this job's whole lifetime (see FrozenSrc); the span is the
+            // one `freeze` pinned inside the initialized extent.
+            let src = unsafe { slice::from_raw_parts(frozen.ptr, frozen.end) };
             let spf = spf.lock().unwrap().clone();
             #[cfg_attr(not(debug_assertions), allow(unused_mut))]
             let mut bytes = if let Some(dict) = &job.dict {
@@ -752,7 +774,7 @@ fn run_claimed_job(
                 debug_assert_eq!(*first, 0, "a dictionary job starts the frame");
                 crate::encoding::mt::run_dict_job_zero(
                     src,
-                    *first..*len,
+                    *first..frozen.end,
                     *last_frame_block,
                     job.level,
                     job.shape,
@@ -772,7 +794,7 @@ fn run_claimed_job(
                 let out = compress_job_blocks_inner(
                     &mut dstate,
                     src,
-                    *first..*len,
+                    *first..frozen.end,
                     *overlap,
                     *last_frame_block,
                     reach_probe::PROBE_SPAN,
@@ -801,7 +823,7 @@ fn run_claimed_job(
                         compress_job_blocks_inner(
                             state,
                             src,
-                            *first..*len,
+                            *first..frozen.end,
                             *overlap,
                             *last_frame_block,
                             *first,
@@ -817,7 +839,7 @@ fn run_claimed_job(
                     cold @ (JobSpfStream::Windowed | JobSpfStream::None) => run_job_with(
                         state,
                         src,
-                        *first..*len,
+                        *first..frozen.end,
                         *overlap,
                         *last_frame_block,
                         job.level,
@@ -1358,11 +1380,9 @@ impl MtEncoderCore {
             // Zero-fill the next region once per buffer region: the pool
             // carries the extent across encoders, so steady-state streams
             // pay this only for freshly grown capacity.
-            // SAFETY: [len, target) lies inside the allocation, past the
-            // live data; writing it initializes the bytes for future reads.
             let target = (len + want).min(self.buf.capacity());
-            unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), target - len) }
-                .fill(0);
+            let spare = &mut self.buf.spare_capacity_mut()[..target - len];
+            spare.fill(core::mem::MaybeUninit::new(0));
             self.init_len = target;
         }
         // SAFETY: [len, init_len) is initialized (zero-fill above or the
@@ -2653,9 +2673,9 @@ impl MtEncoderCore {
             let discarded = donation.take().unwrap();
             crate::encoding::mt::return_donation_state(discarded.state);
         }
-        // SAFETY: strip_lo >= buf_base (asserted above); the view is the
-        // buffer's [strip_lo, end), so `first` indexes from its head.
-        let ptr = unsafe { self.buf.as_ptr().add((strip_lo - self.buf_base) as usize) };
+        // The view is the buffer's [strip_lo, end), so `first` indexes from
+        // its head; `freeze` pins the span inside the live extent.
+        let frozen = FrozenSrc::freeze(&self.buf, (strip_lo - self.buf_base) as usize, len);
         // The job's prefix-fill share: the finish tail's snapshot (chain
         // rows) or the engaged fast capture's SelfFill split — the two
         // never coexist (the tail build is growing-grid-only, the capture
@@ -2675,9 +2695,8 @@ impl MtEncoderCore {
             dict: (start == 0).then(|| self.dict.clone()).flatten(),
             head: None,
             kind: JobKind::Encode {
-                src: FrozenSrc { ptr },
+                src: frozen,
                 first,
-                len,
                 overlap: self.strip_span(),
                 ldm: self.job_ldm,
                 last_frame_block,
@@ -3570,11 +3589,8 @@ mod tests {
             kind: JobKind::Encode {
                 // The job never runs; the view only needs a stable address
                 // for the struct to exist.
-                src: FrozenSrc {
-                    ptr: core.buf.as_ptr(),
-                },
+                src: FrozenSrc::freeze(&core.buf, 0, 0),
                 first: 0,
-                len: 0,
                 last_frame_block: false,
                 overlap: 0,
                 ldm: LdmArming::Job,
@@ -3634,11 +3650,8 @@ mod tests {
             ldm_mode: crate::LdmMode::Auto,
             head: None,
             kind: JobKind::Encode {
-                src: FrozenSrc {
-                    ptr: core.buf.as_ptr(),
-                },
+                src: FrozenSrc::freeze(&core.buf, 0, 0),
                 first: 0,
-                len: 0,
                 last_frame_block: false,
                 overlap: 0,
                 ldm: LdmArming::Job,
