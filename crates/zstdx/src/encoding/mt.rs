@@ -73,6 +73,35 @@ pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
         .min(MAX_JOB_SIZE as u64) as usize
 }
 
+/// The btlazy rows' (the Best family, levels 13-15) MT job size, R85:
+/// pinned at four of the row's search domains — 16 MiB at the stock 4 MiB
+/// chain reach — worker-independent like the capture grids, so the frame
+/// bytes no longer key on the worker count. The worker-scaled ladder ran
+/// dll100 best bulk-mt8 as a two-wave 16x6.25 MiB grid; the pinned
+/// 7x16 MiB one-wave grid reads 2516-2932 ms against its 4023 at 1.3%
+/// smaller size, and dll32 best (with the job LDM bar fixed, see
+/// `ldm_min_window`) collapsed from 3261 to 632-710 ms at -6.6% size,
+/// the two 16 MiB jobs paying 8.6 GiB of DUBT compares against the
+/// 8-job grid's 286 GiB. Ultra and opt keep the stock formula: R85's
+/// grid found no cell dominating their baselines (dll100 ultra's wall
+/// winners cost +2.9% size, its size winners +13-26% wall; dll32's
+/// apparent overlap wins were the LDM-disarm defect showing through).
+pub(crate) fn btlazy_job_size(overlap: usize) -> usize {
+    (overlap * 4).clamp(MIN_JOB_SIZE, MAX_JOB_SIZE)
+}
+
+/// [`job_size_for`] with the btlazy rows' pinned grid (see
+/// [`btlazy_job_size`]): the level-keyed entry every plain job grid
+/// derivation goes through, so the bulk and pledged-stream paths stay
+/// byte-identical.
+pub(crate) fn job_size_for_level(level: Level, len: u64, workers: u32, overlap: usize) -> usize {
+    if MatchGeneratorDriver::btlazy_row(level) {
+        btlazy_job_size(overlap)
+    } else {
+        job_size_for(len, workers, overlap)
+    }
+}
+
 /// The encoder's exact MT job size for an input, with the overlap the
 /// level implies — dev tooling (`emitframe`/`piecepipe`) cuts its analysis
 /// pieces at these boundaries, so it must not re-derive the formula.
@@ -110,7 +139,7 @@ pub fn mt_job_size_for(
         fast_window,
         crate::LdmMode::Auto,
     )
-    .unwrap_or_else(|| job_size_for(len, workers.max(2), overlap))
+    .unwrap_or_else(|| job_size_for_level(level, len, workers.max(2), overlap))
 }
 
 /// Compress `src` into one frame using up to `workers` threads.
@@ -220,7 +249,7 @@ pub fn compress_slice_mt(
         fast_window,
         ldm_mode,
     )
-    .unwrap_or_else(|| job_size_for(src.len() as u64, workers, overlap));
+    .unwrap_or_else(|| job_size_for_level(level, src.len() as u64, workers, overlap));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 

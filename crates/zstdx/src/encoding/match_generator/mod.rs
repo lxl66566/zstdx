@@ -869,6 +869,18 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Whether the level runs a btlazy2 row (the Best family, levels
+    /// 13-15): the rows whose MT job grid `mt::btlazy_job_size` pins
+    /// worker-independently at four search domains per job (R85; see
+    /// `mt.rs`).
+    #[cfg(feature = "std")]
+    pub(crate) fn btlazy_row(level: Level) -> bool {
+        matches!(
+            params_for(level, InputShape::default()).strategy,
+            Strategy::BtLazy(_)
+        )
+    }
+
     /// The multithreaded job strip: the dense matchers' search domain.
     /// LDM rows keep a wide frame window (their far reach) but only the
     /// chain's domain needs cross-job strip coverage — within a job the

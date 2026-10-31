@@ -132,7 +132,7 @@ use crate::{
         mt::{
             CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, capture_band, capture_job_size,
             donate_keep_span, fast_capture_schedule, head_predicts_keep, job_size_for,
-            prepare_job_state, run_job_with,
+            job_size_for_level, prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -1125,7 +1125,12 @@ impl MtEncoderCore {
         // when the input matches the pledge); an open-ended stream grows
         // its jobs along the stream (see JobGrid).
         let grid = match options.pledged_size {
-            Some(n) => JobGrid::Fixed(job_size_for(n, options.workers, overlap)),
+            Some(n) => JobGrid::Fixed(job_size_for_level(
+                options.level,
+                n,
+                options.workers,
+                overlap,
+            )),
             None => JobGrid::Growing,
         };
         // The reach probe (see reach_probe): a probe-eligible frame defers
