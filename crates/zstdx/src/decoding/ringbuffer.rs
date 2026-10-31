@@ -187,6 +187,9 @@ impl RingBuffer {
 
         // alloc the new memory region and panic if alloc fails
         // TODO maybe rework this to generate an error?
+        // SAFETY: `new_layout` is a valid non-zero-size layout (checked when
+        // built above) and `expect` turns the null case into a panic, so the
+        // pointer is valid for `new_layout` bytes.
         let new_buf = unsafe {
             let new_buf = alloc(new_layout);
 
@@ -233,6 +236,8 @@ impl RingBuffer {
             // SAFETY: Establishes invariants on memory being initialized and the range being
             // in-bounds (Invariants 2 & 3)
             let idx = wrap_add(self.head, idx, self.cap);
+            // SAFETY: `idx < cap` inside the valid allocation, and the
+            // occupied region is initialized (invariants 1-3).
             Some(unsafe { self.buf.as_ptr().add(idx).read() })
         } else {
             None
@@ -335,6 +340,8 @@ impl RingBuffer {
         let (len_after_head, len_to_tail) = self.data_slice_lengths();
 
         (
+            // SAFETY: `head < cap` (asserted above) keeps the offset inside
+            // the valid allocation.
             (unsafe { self.buf.as_ptr().add(self.head) }, len_after_head),
             (self.buf.as_ptr(), len_to_tail),
         )
@@ -373,6 +380,8 @@ impl RingBuffer {
         let (len_to_head, len_after_tail) = self.free_slice_lengths();
 
         (
+            // SAFETY: `tail < cap` (asserted above) keeps the offset inside
+            // the valid allocation.
             (unsafe { self.buf.as_ptr().add(self.tail) }, len_after_tail),
             (self.buf.as_ptr(), len_to_head),
         )
@@ -586,12 +595,17 @@ impl RingBuffer {
         let ((ptr1, len1), (ptr2, len2)) = self.free_slice_parts();
         debug_assert!(len1 + len2 >= fill_length);
         let fill1 = usize::min(len1, fill_length);
+        // SAFETY: `fill1 <= len1`, so the write stays inside the first free
+        // section of the valid allocation.
         unsafe {
             ptr1.write_bytes(fill_with, fill1);
         }
         if fill1 < fill_length {
             let fill2 = fill_length - fill1;
             debug_assert_eq!(fill_length, fill1 + fill2);
+            // SAFETY: `reserve` made the free sections total more than
+            // `fill_length` (sentinel included), so `fill2 <= len2` and the
+            // write stays inside the second free section.
             unsafe {
                 ptr2.write_bytes(fill_with, fill2);
             }
@@ -611,6 +625,8 @@ impl RingBuffer {
         let ((ptr1, len1), (ptr2, len2)) = self.free_slice_parts();
         debug_assert!(len1 + len2 >= fill_length);
         let fill1 = usize::min(len1, fill_length);
+        // SAFETY: `fill1 <= len1` keeps the zeroing and the slice inside the
+        // first free section, and the zeroing initializes those bytes.
         let s1 = unsafe {
             ptr1.write_bytes(0, fill1);
             slice::from_raw_parts_mut(ptr1, fill1)
@@ -619,6 +635,9 @@ impl RingBuffer {
         if fill1 < fill_length {
             let fill2 = fill_length - fill1;
             debug_assert_eq!(fill_length, fill1 + fill2);
+            // SAFETY: `reserve` made the free sections total more than
+            // `fill_length` (sentinel included), so `fill2 <= len2`; the
+            // zeroing initializes the bytes the slice exposes.
             let s2 = unsafe {
                 ptr2.write_bytes(0, fill2);
                 slice::from_raw_parts_mut(ptr2, fill2)
@@ -640,6 +659,8 @@ impl Drop for RingBuffer {
         // also valid do so now Relies on / establishes invariant 1
         let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
 
+        // SAFETY: `buf` was allocated with this same layout and the `cap > 0`
+        // check above rules out the dangling pointer.
         unsafe {
             dealloc(self.buf.as_ptr(), current_layout);
         }
@@ -665,6 +686,8 @@ unsafe fn copy_bytes_overshooting(
     dst: (*mut u8, usize),
     copy_at_least: usize,
 ) {
+    // SAFETY: the caller guarantees both buffers are valid for reads/writes
+    // over their stated lengths; every branch below stays inside them.
     unsafe {
         // By default use usize as the copy size
         #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]

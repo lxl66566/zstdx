@@ -376,6 +376,8 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
 /// readable/writable bytes (the wildcopy budget checks provide them).
 #[inline(always)]
 unsafe fn copy8(dst: *mut u8, src: *const u8) {
+    // SAFETY: the caller guarantees 8 readable bytes at `src` and 8
+    // writable bytes at `dst`.
     unsafe {
         dst.cast::<u64>()
             .write_unaligned(src.cast::<u64>().read_unaligned());
@@ -385,6 +387,8 @@ unsafe fn copy8(dst: *mut u8, src: *const u8) {
 /// Inline 16-byte copy (see [`copy8`]).
 #[inline(always)]
 unsafe fn copy16(dst: *mut u8, src: *const u8) {
+    // SAFETY: the caller guarantees 16 readable bytes at `src` and 16
+    // writable bytes at `dst`.
     unsafe {
         dst.cast::<u128>()
             .write_unaligned(src.cast::<u128>().read_unaligned());
@@ -405,6 +409,9 @@ const DEC_BACK: [isize; 8] = [0, 0, 0, 1, 0, -1, -2, -3];
 /// caller's buffers belong to.
 #[inline(always)]
 unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
+    // SAFETY: the caller's contract (distance 1..16, 8 readable/writable
+    // bytes at both cursors) bounds every access below; the d+4 load only
+    // reads bytes the stores above already wrote.
     unsafe {
         let offset = (*dst as usize).wrapping_sub(*src as usize);
         debug_assert!((1..16).contains(&offset));
@@ -443,6 +450,9 @@ unsafe fn overlap_copy8(dst: &mut *mut u8, src: &mut *const u8) {
 /// match before anything can read it.
 #[inline(always)]
 pub(crate) unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize) {
+    // SAFETY: the caller's budget (`end + 16 <= out_len`) keeps the 16-byte
+    // chunk overshoot inside the output buffer, and the source distance
+    // contract keeps every load behind the write cursor.
     unsafe {
         let end = d.add(ml);
         if (d as usize).wrapping_sub(s as usize) >= 16 {
@@ -468,6 +478,9 @@ pub(crate) unsafe fn wildcopy_match(mut d: *mut u8, mut s: *const u8, ml: usize)
 /// literals buffer's allocation (16 bytes reserved).
 #[inline(always)]
 unsafe fn wildcopy_literals(d0: *mut u8, s0: *const u8, ll: usize) {
+    // SAFETY: the caller keeps the 16-byte source overshoot inside the
+    // literals buffer's allocation and the output budget covers `ll + 16`,
+    // so every chunk below is in bounds.
     unsafe {
         copy16(d0, s0);
         if ll > 16 {

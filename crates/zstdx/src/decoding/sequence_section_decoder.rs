@@ -106,12 +106,12 @@ fn decode_sequences_into_impl(
     let nseq = section.num_sequences as usize;
     let start = target.len();
     target.reserve(nseq);
-    // SAFETY: start + nseq slots were just reserved; each iteration writes
-    // exactly one Sequence
     let out = target.as_mut_ptr();
     let mut idx = 0;
     while dec.rem > 0 {
         let seq = dec.next()?;
+        // SAFETY: start + nseq slots were just reserved; `rem > 0` keeps
+        // `idx` below it and each iteration writes exactly one Sequence.
         unsafe { *out.add(start + idx) = seq };
         idx += 1;
     }
@@ -806,10 +806,10 @@ fn reload(src_ptr: *const u8, ip: &mut usize, win: &mut u64, consumed: &mut u32)
         return Reload::Overflow;
     }
     if *ip >= 8 {
-        // SAFETY: ip only ever decreases from its initial value len-8, so
-        // ip+8 <= src_len holds on this path
         *ip -= (*consumed >> 3) as usize;
         *consumed &= 7;
+        // SAFETY: ip only ever decreases from its initial value len-8, so
+        // ip+8 <= src_len holds on this path
         let bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
         *win = bits << *consumed;
         return Reload::Unfinished;

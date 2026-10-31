@@ -554,6 +554,9 @@ pub(in crate::encoding) fn push_seq_packed(
         // published length, covered by the reserve (`common::overrun`), and
         // later pushes overwrite them.
         let v = read8(win, anchor_idx);
+        // SAFETY: the reserve covers the 8-byte store and the publish keeps
+        // the length at the written prefix, so `literals` never exposes
+        // uninitialized bytes.
         unsafe {
             literals.reserve(8);
             let end = literals.len();
@@ -1120,6 +1123,8 @@ pub(super) fn clear_table(t: &mut [u32]) {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn clear_table_avx512(t: &mut [u32]) {
+    // SAFETY: AVX-512 intrinsics only (the fn's `target_feature` attribute
+    // guarantees the CPU support), and every store below lands inside `t`.
     unsafe {
         use core::arch::x86_64::*;
         let zero = _mm512_setzero_si512();

@@ -434,8 +434,9 @@ struct ExtWindow {
     len: usize,
 }
 
-// The pointer never escapes the matcher, and the compress_slice entry points
-// keep the borrowed buffer on the same thread's stack for the whole call.
+// SAFETY: the `ExtWindow` pointer never escapes the matcher, and the
+// compress_slice entry points keep the borrowed buffer on the same thread's
+// stack for the whole call.
 unsafe impl Send for MatchGeneratorDriver {}
 
 #[cfg(feature = "std")]
@@ -3799,6 +3800,8 @@ impl MatchGeneratorDriver {
             // writes the whole span, so no read ever sees it unwritten.
             unsafe { self.win.set_len(wide) };
             poison::fill_margin(&mut self.win, len);
+            // SAFETY: shrinking back to the pre-widen length, whose bytes
+            // were the buffer's live contents all along.
             unsafe { self.win.set_len(len) };
         }
         self.win_poison_at = len;
@@ -3821,6 +3824,8 @@ impl MatchGeneratorDriver {
             // check reports.
             unsafe { self.win.set_len(wide) };
             poison::assert_margin(&self.win, at, ctx);
+            // SAFETY: shrinking back to the pre-widen length, whose bytes
+            // were the buffer's live contents all along.
             unsafe { self.win.set_len(len) };
         }
     }

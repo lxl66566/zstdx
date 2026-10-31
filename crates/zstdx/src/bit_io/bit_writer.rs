@@ -598,6 +598,9 @@ unsafe fn uniform4_pack_avx512(
     mut dst: *mut u8,
     tab: &[u8; 256],
 ) -> *mut u8 {
+    // SAFETY: AVX-512 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support, and every load reads a local array, the
+    // 256-entry `tab`, or a chunk of `data`.
     unsafe {
         use core::arch::x86_64::*;
 
@@ -664,6 +667,9 @@ unsafe fn uniform4_pack_avx2(
     slots: &[(u8, u8); 16],
     nslots: usize,
 ) -> *mut u8 {
+    // SAFETY: AVX2 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support, and every load reads a local array, the
+    // 16-slot list, or a chunk of `data`.
     unsafe {
         use core::arch::x86_64::*;
         // Per-lane shuffle indices taking every other code byte in

@@ -42,6 +42,8 @@ pub(super) mod vec_poison {
         // SAFETY: the pattern element is never read as a `T`; every byte of
         // its layout is initialized here.
         let mut pat = MaybeUninit::<T>::uninit();
+        // SAFETY: the write initializes every byte of the `MaybeUninit`
+        // layout, and the pattern is never read as a `T` here.
         unsafe {
             pat.as_mut_ptr()
                 .cast::<u8>()
@@ -1051,6 +1053,8 @@ fn encode_sequences(
         // slot every sequence (register pressure) and pay the add in the
         // store's addressing anyway. The loop below also terminates on the
         // SeqWord cursor instead of a counter, so no index stays live.
+        // SAFETY: `hot_state` guarantees `out.len()` equals the byte
+        // position, so `base + pos` stays inside the Vec's buffer.
         let mut cur = unsafe { base.add(pos) };
         // SAFETY: the reserve above covers every flush store (≤ nb_seq*11+8
         // bytes past the entry position, with ≤16 bytes of store overshoot).
@@ -1072,6 +1076,7 @@ fn encode_sequences(
 
         // encode backwards so the decoder reads the first sequence first
         if nb_seq > 1 {
+            // SAFETY: `li` is the last sequence index, inside `seqs`.
             let mut p = unsafe { sp.add(li) };
             loop {
                 // SAFETY: the loop runs from the last sequence down to the
@@ -1381,6 +1386,8 @@ unsafe fn histogram_small_alpha_avx512(
     literals: &[u8],
     counts: &mut [usize; 256],
 ) -> Option<usize> {
+    // SAFETY: AVX-512 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support every call below needs.
     unsafe {
         use core::arch::x86_64::*;
 
@@ -1507,6 +1514,8 @@ unsafe fn histogram_small_alpha_avx2(literals: &[u8], counts: &mut [usize; 256])
     let mut nslots = 0usize;
     let mut acc = [0u32; 16];
     let mut i = 0usize;
+    // SAFETY: AVX2 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support every call below needs.
     unsafe {
         while i + 64 <= literals.len() {
             // SAFETY: the loop guard bounds both 32-byte loads.

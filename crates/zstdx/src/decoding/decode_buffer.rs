@@ -215,6 +215,7 @@ impl DecodeBuffer {
                 start_idx + offset + copied,
                 "doubling anchor must stay glued to the write cursor"
             );
+            let chunk = usize::min(offset + copied, match_length - copied);
             // SAFETY: Requirements checked:
             // 1. start_idx + chunk must be <= self.buffer.len() chunk <= offset + copied, and
             //    buffer.len() == start_idx + offset + copied at this point (start of the first
@@ -222,7 +223,6 @@ impl DecodeBuffer {
             //    grow by the same amount each iteration). Thus start_idx + chunk <= buffer.len().
             //
             // 2. explicitly reserved enough memory for the whole match_length
-            let chunk = usize::min(offset + copied, match_length - copied);
             unsafe { self.buffer.extend_from_within_unchecked(start_idx, chunk) };
             copied += chunk;
         }

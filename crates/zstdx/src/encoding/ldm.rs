@@ -465,6 +465,8 @@ fn checksum_mask(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
         use crate::common::simd::{self, SimdTier};
         // SAFETY: guarded by the feature check; reads exactly the bucket.
         if simd::allows(SimdTier::Avx512) && std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the feature was just detected; the callee reads
+            // exactly this 16-entry bucket.
             return unsafe { checksum_mask_avx512(entries, checksum) };
         }
     }
@@ -483,6 +485,8 @@ fn checksum_mask(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
 #[target_feature(enable = "avx512f")]
 unsafe fn checksum_mask_avx512(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) -> u16 {
     use core::arch::x86_64::*;
+    // SAFETY: AVX-512 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support, and the two loads read exactly the bucket.
     unsafe {
         let cks = _mm512_set1_epi64(checksum as i64);
         let lo = _mm512_loadu_si512(entries.as_ptr().cast());
@@ -1205,6 +1209,9 @@ const INSERT_PREFETCH_DIST: usize = 16;
 #[inline(always)]
 fn prefetch_hit(table: &[u64], offsets: &[u8], hash: usize) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: `hash` is masked below the bucket count both slices are sized
+    // for, so the offsets stay in bounds; the prefetches are hints that
+    // never dereference.
     unsafe {
         core::arch::x86_64::_mm_prefetch(
             offsets.as_ptr().add(hash).cast::<i8>(),

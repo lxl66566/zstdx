@@ -179,10 +179,15 @@ pub(super) fn row_match_mask<const ROW_LOG: u32>(row: *const u32, tag: u8) -> u6
         // SAFETY: the row spans `entries` u32 slots (the caller's bounds).
         let want = unsafe { _mm_set1_epi32(tag as i32) };
         for c in (0..entries / 4).rev() {
+            // SAFETY: `c * 4 + 3 < entries`, inside the row's slot span.
             let chunk = unsafe { _mm_loadu_si128(row.add(c * 4).cast()) };
+            // SAFETY: baseline SSE2 register ops on the loaded chunk.
             let tags = unsafe { _mm_srli_epi32(chunk, 24) };
+            // SAFETY: baseline SSE2 register ops.
             let eq = unsafe { _mm_cmpeq_epi32(tags, want) };
             m = (m << 4)
+                // SAFETY: baseline SSE2 register op; the transmute keeps the
+                // lane bits intact.
                 | unsafe { _mm_movemask_ps(core::mem::transmute::<__m128i, __m128>(eq)) } as u64;
         }
     }

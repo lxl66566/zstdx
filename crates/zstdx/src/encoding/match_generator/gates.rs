@@ -308,6 +308,8 @@ pub(super) fn strip_is_uniform(win: &[u8]) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn strip_is_uniform_avx512(win: &[u8]) -> bool {
+    // SAFETY: AVX-512 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support, and every load reads a full block of `win`.
     unsafe {
         use core::arch::x86_64::*;
         let pat = _mm512_set1_epi8(win[0] as i8);
@@ -387,6 +389,9 @@ pub(super) fn seed_confirms(data: &[u8], u: usize, last: usize) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn seed_scan_avx512(data: &[u8], last: usize, a8: u64) -> Option<usize> {
+    // SAFETY: AVX-512 intrinsics only; the fn's `target_feature` attribute
+    // guarantees the CPU support, and the load bounds are derived in the
+    // function doc plus the per-load comments below.
     unsafe {
         use core::arch::x86_64::*;
         let pat = _mm512_set1_epi64(a8 as i64);

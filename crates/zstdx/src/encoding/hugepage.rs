@@ -260,6 +260,8 @@ impl<T: BufElem> HugeBuf<T> {
     /// read (the staging-tail pattern).
     pub(crate) unsafe fn set_len(&mut self, n: usize) {
         match &mut self.backing {
+            // SAFETY: forwards the documented contract (`n` within capacity,
+            // tail initialized before any read) to `Vec::set_len`.
             Backing::Vec(v) => unsafe { v.set_len(n) },
             Backing::Map { len, cap, .. } => {
                 debug_assert!(n <= *cap);
@@ -299,6 +301,9 @@ impl<T: BufElem> DerefMut for HugeBuf<T> {
 // never escapes it; moving the buffer moves the mapping, so the element
 // data has exactly the thread semantics of the equivalent `Vec<T>`.
 unsafe impl<T: BufElem + Send> Send for HugeBuf<T> {}
+// SAFETY: shared access exposes only `&[T]` over the initialized elements
+// (through `Deref`) with no interior mutability, so the semantics match
+// `&Vec<T>`.
 unsafe impl<T: BufElem + Sync> Sync for HugeBuf<T> {}
 
 impl<T: BufElem> Drop for HugeBuf<T> {

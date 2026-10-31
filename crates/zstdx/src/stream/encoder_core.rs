@@ -61,6 +61,8 @@ pub(crate) mod vec_poison {
         // SAFETY: the pattern element is never read as a `T`; every byte of
         // its layout is initialized here.
         let mut pat = MaybeUninit::<T>::uninit();
+        // SAFETY: the pattern element is never read as a `T`; every byte of
+        // its layout is initialized here.
         unsafe {
             pat.as_mut_ptr()
                 .cast::<u8>()

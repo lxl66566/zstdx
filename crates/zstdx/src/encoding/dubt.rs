@@ -295,8 +295,8 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         // writes the head only after this read and returns), so the early
         // value is identical.
         let h = self.hash_main(idx);
-        // SAFETY: plain head read; h is masked by hash_main's table_log.
         debug_assert!(h < self.table.len());
+        // SAFETY: plain head read; h is masked by hash_main's table_log.
         let head = unsafe { *self.table.as_ptr().add(h) };
 
         // Repeated-offset candidates (the cheapest offsets to encode) —
@@ -531,10 +531,10 @@ fn fill_range<const MLS: usize>(
     mut idx: usize,
     target_idx: usize,
 ) {
+    let (table_len, bt_len) = (table.len(), bt.len());
     // SAFETY: the hash masks to the table size and the ring slot to the
     // ring by construction (debug-pinned below); positions are live window
     // offsets.
-    let (table_len, bt_len) = (table.len(), bt.len());
     unsafe {
         let table = table.as_mut_ptr();
         let bt = bt.as_mut_ptr();

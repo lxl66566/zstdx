@@ -1870,6 +1870,8 @@ fn win_poison_wall_fires_on_a_past_tail_touch() {
     // back to the committed length.
     unsafe { driver.win.set_len(wide) };
     driver.win[staged_end + 1] = 0;
+    // SAFETY: shrinking back to the committed length, whose bytes were the
+    // buffer's live contents all along.
     unsafe { driver.win.set_len(committed) };
     driver.win_poison_assert("test");
 }

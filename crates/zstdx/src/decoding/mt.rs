@@ -730,6 +730,8 @@ pub(super) unsafe fn execute_segment(
     input: &[u8],
     offset_hist: &mut [u32; 3],
 ) -> Result<(), FrameDecoderError> {
+    // SAFETY: forwards to `execute_blocks` under the caller's contract
+    // documented above.
     unsafe {
         execute_blocks(
             region,
@@ -796,6 +798,7 @@ pub(super) unsafe fn execute_blocks(
             BlockPlan::Compressed { lits, seqs, .. } => {
                 // SAFETY: lits is a range of seg.literals
                 let lit_base = unsafe { seg.literals.as_ptr().add(lits.start) };
+                // SAFETY: as above, `lits.end` is inside `seg.literals`.
                 let lit_end = unsafe { seg.literals.as_ptr().add(lits.end) };
                 let mut lit = lit_base;
                 for seq in &seg.sequences[seqs.clone()] {
@@ -815,10 +818,12 @@ pub(super) unsafe fn execute_blocks(
                     // (`OutRegion::wild_ok` carries the slack arithmetic);
                     // the literal side additionally needs its own 16-byte
                     // overread to stay inside the staged literals.
-                    // SAFETY: budget checks bound the writes; the literal
-                    // range was checked above
                     let end = start + w + ll + ml;
                     let wild = region.wild_ok(end);
+                    // SAFETY: the budget check bounds every write (with the
+                    // overshoot gated by `wild`), the literal cursor was
+                    // checked against `lit_end`, and the offset check keeps
+                    // the match source inside the frame's committed output.
                     unsafe {
                         let dst = base.add(start + w);
                         if ll > 0 {
@@ -890,6 +895,9 @@ pub(super) unsafe fn execute_blocks(
 /// read bound).
 #[inline(always)]
 unsafe fn copy16_chunks(mut d: *mut u8, mut s: *const u8, len: usize) {
+    // SAFETY: the caller guarantees `len` readable bytes at `s` and `len`
+    // writable bytes at `d`, keeping the 16-byte chunk overshoot inside
+    // both bounds.
     unsafe {
         d.cast::<u128>()
             .write_unaligned(s.cast::<u128>().read_unaligned());

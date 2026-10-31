@@ -183,8 +183,8 @@ fn decompress_literals(
                 let end = out_start + total_out;
                 let span = (target.capacity() - end).min(poison::MARGIN);
                 if span > 0 {
-                    // The fill above initialized the margin, so reading it
-                    // back is defined.
+                    // SAFETY: `end + span` stays inside the margin the poison
+                    // fill initialized above, so the bytes read are defined.
                     let bytes =
                         unsafe { core::slice::from_raw_parts(target.as_ptr().add(end), span) };
                     poison::assert_intact(bytes, "literals staging (4-stream interleave exit)");
@@ -326,18 +326,23 @@ fn decompress_4streams_interleaved(
         } else {
             0
         };
+        // SAFETY: `p` is a stream end minus 8; the caller keeps every stream
+        // end inside `region`, so the offset stays in bounds.
         ip[s] = unsafe { base.add(p) };
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
 
     // stream k starts writing at k * segment (stream 4 takes the remainder)
     let out_base = out.as_mut_ptr();
+    // SAFETY: the caller's fast-path gate `total_out > 3 * segment` keeps
+    // every stream offset below `out.len()`.
     let mut op = [
         out_base,
         unsafe { out_base.add(segment) },
         unsafe { out_base.add(2 * segment) },
         unsafe { out_base.add(3 * segment) },
     ];
+    // SAFETY: one past the end of `out`.
     let out_end = unsafe { out_base.add(total_out) };
 
     macro_rules! decode_sym {
@@ -346,6 +351,9 @@ fn decompress_4streams_interleaved(
             // construction, and the write lands below the iteration bound
             // precomputed from the output size.
             let entry = unsafe { *packed.get_unchecked((bits[$s] >> shift) as usize) };
+            // SAFETY: each stream advances 5 bytes per inner iteration and
+            // the `iters` bound keeps even op[3] (the highest cursor) below
+            // `out_end`, so the write at +$k lands inside `out`.
             unsafe { *op[$s].add($k) = (entry >> 8) as u8 };
             bits[$s] <<= entry & 0x3f;
         }};
@@ -380,6 +388,8 @@ fn decompress_4streams_interleaved(
         if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
             break;
         }
+        // SAFETY: `iters` is capped by `(out_end - op[3]) / 5` above, so the
+        // offset stays at or before `out_end`.
         let olimit = unsafe { op[3].add(iters * 5) };
 
         loop {
@@ -611,17 +621,23 @@ fn decompress_4streams_interleaved_x2(
         } else {
             0
         };
+        // SAFETY: `p` is a stream end minus 8; the caller keeps every stream
+        // end inside `region`, so the offset stays in bounds.
         ip[s] = unsafe { base.add(p) };
         bits[s] = (u64::from_le_bytes(region[p..][..8].try_into().unwrap()) | 1) << skip;
     }
 
     let out_base = out.as_mut_ptr();
+    // SAFETY: the caller's fast-path gate `total_out > 3 * segment` keeps
+    // every stream offset below `out.len()`.
     let mut op = [
         out_base,
         unsafe { out_base.add(segment) },
         unsafe { out_base.add(2 * segment) },
         unsafe { out_base.add(3 * segment) },
     ];
+    // SAFETY: the segment ends sit below `out.len()` (same gate), and
+    // `seg_end[3]` is exactly one past the end.
     let oend = [
         unsafe { out_base.add(seg_end[0]) },
         unsafe { out_base.add(seg_end[1]) },
@@ -636,6 +652,10 @@ fn decompress_4streams_interleaved_x2(
             // level comment, and `op[s]` is advanced by the entry length so it
             // never passes `seg_end[s]`.
             let entry = unsafe { *dt.get_unchecked((bits[$s] >> 53) as usize) };
+            // SAFETY: one inner iteration advances op[$s] by at most 10
+            // bytes and the `iters` bound reserves 10 per iteration from
+            // oend[$s], so the 2-byte write and the advance stay inside
+            // the segment.
             unsafe {
                 (op[$s].cast::<u16>()).write_unaligned(entry as u16);
                 op[$s] = op[$s].add((entry >> 24) as usize);
@@ -678,6 +698,8 @@ fn decompress_4streams_interleaved_x2(
             });
         }
         // each iteration advances op[3] by at least 5 bytes
+        // SAFETY: `iters` is capped by every stream's `(oend[s] - op[s]) / 10`,
+        // so the offset stays inside `out`.
         let olimit = unsafe { op[3].add(iters * 5) };
 
         loop {
