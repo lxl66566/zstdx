@@ -29,15 +29,23 @@ pub(crate) enum SimdTier {
 }
 
 impl SimdTier {
-    /// Clamp value for an environment setting. Unknown values abort
-    /// loudly: a typo silently benching the default tier is exactly the
-    /// failure this override exists to prevent.
+    /// Clamp value for an environment setting. Unknown values warn and
+    /// disable the clamp: a stray variable must not abort a library host,
+    /// and the warning keeps a typo from silently benching the wrong tier.
     fn from_env(raw: &str) -> Self {
         match raw.trim() {
             "" | "auto" | "avx512" => Self::Avx512,
             "avx2" => Self::Avx2,
             "scalar" => Self::Scalar,
-            other => panic!("ZSTDX_SIMD_FORCE={other:?}: expected auto|avx512|avx2|scalar"),
+            other => {
+                // Parsed once per process, so the message also fires once.
+                #[cfg(feature = "std")]
+                std::eprintln!(
+                    "warning: ZSTDX_SIMD_FORCE={other:?} is invalid (auto|avx512|avx2|scalar); \
+                     dispatching unclamped"
+                );
+                Self::Avx512
+            },
         }
     }
 }
@@ -67,8 +75,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ZSTDX_SIMD_FORCE")]
-    fn env_rejects_unknown() {
-        SimdTier::from_env("sse2");
+    fn env_falls_back_on_unknown() {
+        assert_eq!(SimdTier::from_env("sse2"), SimdTier::Avx512);
     }
 }

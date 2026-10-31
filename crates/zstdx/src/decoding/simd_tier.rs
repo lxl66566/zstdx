@@ -4,8 +4,9 @@
 //! shlx/shrx; every AVX2-capable CPU ships BMI2, so this is the top tier real
 //! silicon reaches — see `Tier::Bmi2`). `ZSTDX_DEC_SIMD_TIER` forces a tier so
 //! the path a lower-tier CPU would take can be measured and roundtrip-gated on
-//! any machine: `scalar` or `bmi2`, unset means detect. An invalid value panics
-//! loudly instead of silently measuring the detected tier.
+//! any machine: `scalar` or `bmi2`, unset means detect. An invalid value warns
+//! and falls back to detection: a stray variable must not abort a library
+//! host, and the warning keeps a typo from silently benching the wrong tier.
 
 use std::sync::OnceLock;
 
@@ -51,7 +52,16 @@ pub(super) fn bmi2() -> bool {
                 );
                 true
             },
-            None => panic!("ZSTDX_DEC_SIMD_TIER: invalid tier {value:?} (scalar|bmi2 or unset)"),
+            None => {
+                // Warn, then fall back to detection. The tier is resolved
+                // once per process, so the message also fires exactly once.
+                #[cfg(feature = "std")]
+                std::eprintln!(
+                    "warning: ZSTDX_DEC_SIMD_TIER={value:?} is invalid (scalar|bmi2 or unset); \
+                     using the detected tier"
+                );
+                std::is_x86_feature_detected!("bmi2")
+            },
         }
     })
 }
