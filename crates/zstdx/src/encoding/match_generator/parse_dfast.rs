@@ -89,26 +89,23 @@ impl MatchGeneratorDriver {
         // comes out of the fields' side of the difference).
         let mut anchor_idx = (self.anchor - shift - win_base) as usize;
         let mut ip_idx = (self.pos - shift - win_base) as usize;
-        // The scan's own table writes go through raw pointers: routing them
-        // through the emit context's slice fields kept the pointers,
-        // log shifts and tag stack-resident (a re-load per access, the
-        // classic SROA failure at this loop's live-value count).
+        // The scan's own table writes go through the Copy handles: routing
+        // them through slice fields kept the pointers, log shifts and tag
+        // stack-resident (a re-load per access, the classic SROA failure at
+        // this loop's live-value count).
         // The two tables live in ONE allocation: the small table is a
         // fixed displacement off the long table's base (the row's const
         // log), so the loop keeps a single table base live instead of
         // two pointers — one register and its spill round-trips off the
-        // hottest loop's live set.
-        // SAFETY: derived here, before the context below takes its
-        // borrows; both address the same memory, and the loop and the
-        // emit helpers never access a slot concurrently.
+        // hottest loop's live set. The split contract becomes the pair
+        // construction ([`HeadTables::dfast_pair`]); the known-log rows
+        // pass the compile-time head size so the displacement folds.
         let split = if LONG_LOG == RUNTIME_LOG {
             self.tables.head_len()
         } else {
             1usize << LONG_LOG
         };
-        let (long, small) = self.tables.split_at(split);
-        let long_ptr: *mut u32 = long.as_mut_ptr();
-        let small_ptr: *mut u32 = small.as_mut_ptr();
+        let (long, small) = self.tables.dfast_pair(split, long_log, small_log);
         // Dictionary frames hash the short table over 4 bytes (libzstd's
         // small-table dfast rows, minMatch 4 — see `dict_row`); every other
         // instantiation keeps the 5-byte width, so its body compiles
@@ -195,24 +192,19 @@ impl MatchGeneratorDriver {
                 }
                 let mut ip1_idx = ip_idx + 1;
                 let mut hl0 = hash8_at_log(win, ip_idx, long_log);
-                // SAFETY: hl0 is masked to the long table size.
-                let mut entry_l0 = unsafe { *long_ptr.add(hl0) };
+                let mut entry_l0 = long.get(hl0);
 
                 loop {
                 let hs0 = hash_at_width(win, ip_idx, small_log, short_width);
-                // SAFETY: hs0 is masked to the small table size.
-                let entry_s0 = unsafe { *small_ptr.add(hs0) };
+                let entry_s0 = small.get(hs0);
                 let pos_abs = win_base + ip_idx as u64;
                 // Oldest usable candidate age: within the level window and
                 // inside the live window buffer.
                 let reach = (pos_abs - win_base).min(max_window);
                 // Insert after both lookups, before probing (newest-wins).
-                // SAFETY: both hashes masked to their tables' sizes.
-                unsafe {
-                    let entry = pack_pos(pos_abs);
-                    *long_ptr.add(hl0) = entry;
-                    *small_ptr.add(hs0) = entry;
-                }
+                let entry = pack_pos(pos_abs);
+                long.put(hl0, entry);
+                small.put(hs0, entry);
 
                 // Repcode pre-probe one byte ahead: the probed byte stays a
                 // pending literal, so of_value 1 encodes rep0 instead of a
@@ -339,10 +331,7 @@ impl MatchGeneratorDriver {
                             // The emit moved the anchor past ip1, so the
                             // match covers it: indexing it cannot pollute
                             // later probes.
-                            // SAFETY: hl1 is masked to the long table size.
-                            unsafe {
-                                *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
-                            }
+                            long.put(hl1, pack_pos(win_base + ip1_idx as u64));
                         }
                         // A literal offset shifts the decoder's history one
                         // slot down; after the third one a job-start gate
@@ -364,8 +353,7 @@ impl MatchGeneratorDriver {
                     }
                 }
 
-                // SAFETY: hl1 is masked to the long table size.
-                let entry_l1 = unsafe { *long_ptr.add(hl1) };
+                let entry_l1 = long.get(hl1);
 
                 // Short probe: 4 bytes at the short-hash candidate, upgraded
                 // by the long probe prepared for the next position.
@@ -414,11 +402,7 @@ impl MatchGeneratorDriver {
                                 // The emit moved the anchor past ip1, so the
                                 // match covers it: indexing it cannot pollute
                                 // later probes.
-                                // SAFETY: hl1 is masked to the long table
-                                // size; see the long probe above.
-                                unsafe {
-                                    *long_ptr.add(hl1) = pack_pos(win_base + ip1_idx as u64);
-                                }
+                                long.put(hl1, pack_pos(win_base + ip1_idx as u64));
                             }
                             if $gated {
                                 rep_pending = rep_pending.saturating_sub(1);

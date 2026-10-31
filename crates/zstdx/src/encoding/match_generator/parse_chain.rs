@@ -28,8 +28,7 @@ impl MatchGeneratorDriver {
         seqs: &mut Vec<SeqWord>,
     ) {
         let win = window_slice(&self.win, self.ext.as_ref());
-        let (table_view, chain) = self.tables.split();
-        let chain_mask = chain.len() - 1;
+        let (heads, links) = self.tables.chain_pair(self.params.hash_log);
         let win_base = self.win_base;
         let ramp = self.ramp;
         // The chain heads' coordinate origin (see `head_origin`): a
@@ -48,17 +47,13 @@ impl MatchGeneratorDriver {
         // never reach an emit, so the bound is never consulted when
         // `win.len() < HASH_READ`.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
-        // The scan's own table accesses go through a raw pointer (see the
-        // fast loop's note on the same SROA failure); emits go through the
-        // context. The chain-link reads share the pointer for the same
-        // reason (the walk's slot reads must not re-derive the slice).
-        // SAFETY: derived here, before the context below takes its borrow;
-        // both address the same memory, and the loop and the emit helpers
-        // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u32 = table_view.as_mut_ptr();
-        let chain_ptr: *const u32 = chain.as_ptr();
+        // The scan's own table accesses go through the Copy handles (see
+        // the fast loop's note on the same SROA failure); emits go through
+        // the context. Derived here, before the context below takes its
+        // borrow; the loop and the emit helpers never access a slot
+        // concurrently, and the tables are never resized.
         let mut emit = TableEmit {
-            table: table_view,
+            table: heads,
             literals,
             seqs,
             win_base,
@@ -110,22 +105,20 @@ impl MatchGeneratorDriver {
         // insert block links the same value — see there). `bound` is the
         // current segment end — the block end, or the next candidate's
         // split.
-        let search =
-            |win: &[u8], chain: *const u32, idx: usize, entry: u32, bound: u64| -> (usize, usize) {
-                chain_search(
-                    win,
-                    chain,
-                    idx,
-                    entry,
-                    win_base,
-                    bound,
-                    search_depth,
-                    chain_mask,
-                    max_window,
-                    origin,
-                    ramp,
-                )
-            };
+        let search = |win: &[u8], idx: usize, entry: u32, bound: u64| -> (usize, usize) {
+            chain_search(
+                win,
+                links,
+                idx,
+                entry,
+                win_base,
+                bound,
+                search_depth,
+                max_window,
+                origin,
+                ramp,
+            )
+        };
 
         // The current segment's end: the block end, or the next
         // long-distance candidate's split (retargeted per segment below).
@@ -161,15 +154,7 @@ impl MatchGeneratorDriver {
                 let mut ci = (next_ins - win_base) as usize;
                 while ci < cap {
                     let abs = win_base + ci as u64;
-                    // SAFETY: the hash masks to hash_log bits, the
-                    // absolute position to the chain size (absolute key;
-                    // see emit_chain's note on the walk side's indexing).
-                    unsafe {
-                        let h = hash_at_width(win, ci, hash_log, width);
-                        let head = *table_ptr.add(h);
-                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table_ptr.add(h) = pack_head(abs, origin);
-                    }
+                    insert_linked_at(win, heads, links, ci, abs, hash_log, width, origin);
                     ci += 1;
                 }
             }
@@ -177,10 +162,8 @@ impl MatchGeneratorDriver {
             // Hash and head read once per position: the search, and the
             // insert below (whose chain link wants the same previous head),
             // share them — nothing writes the table in between.
-            // SAFETY: hash_at_log masks to hash_log bits and the table holds
-            // 1 << hash_log slots.
             let h = hash_at_width(win, idx, hash_log, width);
-            let entry = unsafe { *table_ptr.add(h) };
+            let entry = heads.get(h);
             // Cross-position pipelining of the hash+head read (the dfast
             // ip0/ip1 pattern): the lazy walk below usually searches pos+1
             // first, and that head read is an L3-class random load that
@@ -197,11 +180,9 @@ impl MatchGeneratorDriver {
             let piped = end - pos > hash_read;
             if piped {
                 pre1.0 = hash_at_width(win, idx + 1, hash_log, width);
-                // SAFETY: the hash masks to hash_log bits and the table
-                // holds 1 << hash_log slots.
-                pre1.1 = unsafe { *table_ptr.add(pre1.0) };
+                pre1.1 = heads.get(pre1.0);
             }
-            let (mut best_len, mut best_cand) = search(win, chain_ptr, idx, entry, end);
+            let (mut best_len, mut best_cand) = search(win, idx, entry, end);
             // Gap bound (C's per-gap compressor call counts to the gap
             // end): a chain candidate's forward run stops at the split —
             // the wholesale emission owns the bytes from there.
@@ -288,13 +269,11 @@ impl MatchGeneratorDriver {
             // Insert this position behind the probe (newest-wins), linking
             // the chain to the previous head. The chain slot key is the
             // absolute position — what the walk resolves candidates with.
-            // The head value is the one read before the search: nothing has
-            // written the table since.
-            // SAFETY: both indices are masked to their tables' sizes.
-            unsafe {
-                *chain.get_unchecked_mut(pos as usize & chain_mask) = entry;
-                *table_ptr.add(h) = pack_head(pos, origin);
-            }
+            // The head value is the one read before the search (kept out of
+            // the linked-insert's re-read): nothing has written the table
+            // since.
+            links.put_abs(pos, entry);
+            heads.put(h, pack_head(pos, origin));
             next_ins = pos + 1;
 
             // Resolve the pipelined head for the lazy walk below: the
@@ -397,10 +376,7 @@ impl MatchGeneratorDriver {
                             Some(pre) => pre,
                             None => {
                                 let hf = hash_at_width(win, idx2, hash_log, width);
-                                // SAFETY: hash_at_log masks to hash_log
-                                // bits and the table holds 1 << hash_log
-                                // slots.
-                                unsafe { *table_ptr.add(hf) }
+                                heads.get(hf)
                             }
                         };
                         // Refresh the pipeline for the next search (this
@@ -409,8 +385,7 @@ impl MatchGeneratorDriver {
                         // never consumed.
                         if end.saturating_sub(p2 + 1) >= hash_read {
                             let hn = hash_at_width(win, idx2 + 1, hash_log, width);
-                            // SAFETY: as above.
-                            pipe = Some(unsafe { *table_ptr.add(hn) });
+                            pipe = Some(heads.get(hn));
                         }
                         // Repcode probe at the stepped position; literals are
                         // pending by construction (the walk advanced past the
@@ -462,7 +437,7 @@ impl MatchGeneratorDriver {
                         }
                         // Chain search at the stepped position, on the
                         // pipelined hash+head read above.
-                        let (len2, cand2) = search(win, chain_ptr, idx2, entry2, end);
+                        let (len2, cand2) = search(win, idx2, entry2, end);
                         let mut len2 = len2;
                         if $ldm {
                             len2 = len2.min((end - p2) as usize);
@@ -520,7 +495,7 @@ impl MatchGeneratorDriver {
             } else {
                 (start - cand + 3) as u32
             };
-            anchor = emit.emit_chain(win, chain, hash_log, anchor, start, ml, of_value, &mut rep);
+            anchor = emit.emit_chain(win, links, hash_log, anchor, start, ml, of_value, &mut rep);
             if $gated && rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
@@ -535,7 +510,7 @@ impl MatchGeneratorDriver {
             } else {
                 pos = emit.rep1_chain::<true>(
                     win,
-                    Some(&mut *chain),
+                    Some(links),
                     anchor,
                     end,
                     &mut rep,
@@ -660,7 +635,7 @@ impl MatchGeneratorDriver {
                     insert_linked_at(
                         win,
                         emit.table,
-                        &mut *chain,
+                        links,
                         (p - win_base) as usize,
                         p,
                         hash_log,
@@ -679,8 +654,7 @@ impl MatchGeneratorDriver {
             let bound = ldm_seqs.get(ldm_i).map_or(block_end, |s| s.split);
             let mut cursor = next;
             if rep_pending == 0 {
-                cursor =
-                    emit.rep1_chain::<true>(win, Some(&mut *chain), next, bound, &mut rep, ramp);
+                cursor = emit.rep1_chain::<true>(win, Some(links), next, bound, &mut rep, ramp);
             }
             next_ins = next_ins.max(cursor);
             while ldm_i < ldm_seqs.len() && ldm_seqs[ldm_i].split < cursor {

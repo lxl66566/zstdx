@@ -72,21 +72,78 @@ unsafe fn prefetch_l1(p: *const u8) {
     }
 }
 
+/// Copy handle over the row strategy's pair — the packed entry table and
+/// the per-row head bytes — one value instead of two pointer arguments
+/// through the search/insert/fill signatures. By value with
+/// `#[inline(always)]` accessors, so the scan keeps it SROA'd (the fast
+/// loop's note). The row-width masks are the const-generic `ROW_LOG`
+/// forms; the handle adds no masking of its own, only the row-count
+/// asserts (dead weight in release, dropped with the asserts).
+#[derive(Clone, Copy)]
+pub(super) struct RowHandle {
+    table: *mut u32,
+    heads: *mut u8,
+    /// Row count (also the head-byte count; the entry table holds
+    /// `rows << ROW_LOG` entries).
+    rows: usize,
+}
+
+impl RowHandle {
+    /// Handle over `rows` rows: `table` holds `rows << ROW_LOG` packed
+    /// entries, `heads` one byte per row.
+    #[inline(always)]
+    pub(super) fn at(table: *mut u32, heads: *mut u8, rows: usize) -> Self {
+        Self { table, heads, rows }
+    }
+
+    /// The base pointer of the row `hash` selects (the mask scan and the
+    /// prefetch share it).
+    #[inline(always)]
+    pub(super) fn row_base<const ROW_LOG: u32>(self, hash: u32) -> *mut u32 {
+        let rel_row = ((hash >> ROW_TAG_BITS) << ROW_LOG) as usize;
+        debug_assert!(rel_row + (1usize << ROW_LOG) <= self.rows << ROW_LOG);
+        // SAFETY: rel_row starts a full row inside the table (row_hash_at's
+        // width derivation; the assert above).
+        unsafe { self.table.add(rel_row) }
+    }
+
+    /// The head byte of the row `hash` selects (the last-insert slot's
+    /// index; see [`row_insert`]).
+    #[inline(always)]
+    pub(super) fn head(self, hash: u32) -> u8 {
+        let i = (hash >> ROW_TAG_BITS) as usize;
+        debug_assert!(i < self.rows);
+        // SAFETY: the head index is within the row count (row_hash_at's
+        // width derivation; the assert above).
+        unsafe { *self.heads.add(i) }
+    }
+
+    /// [`RowHandle::head`] as a pointer, for [`row_insert`]'s
+    /// read-modify-write.
+    #[inline(always)]
+    pub(super) fn head_ptr(self, hash: u32) -> *mut u8 {
+        let i = (hash >> ROW_TAG_BITS) as usize;
+        debug_assert!(i < self.rows);
+        // SAFETY: as `head`.
+        unsafe { self.heads.add(i) }
+    }
+}
+
 /// Prefetch the row `hash` selects (the scan loop's pipelining: issued
 /// one search ahead, under the incumbent's shadow).
 #[inline(always)]
-pub(super) fn row_prefetch<const ROW_LOG: u32>(table: *const u32, hash: u32) {
-    let rel_row = ((hash >> ROW_TAG_BITS) << ROW_LOG) as usize;
-    // SAFETY: rel_row + entries stays inside the table (row_hash_at's
-    // width derivation); prefetch tolerates any address.
+pub(super) fn row_prefetch<const ROW_LOG: u32>(t: RowHandle, hash: u32) {
+    let row = t.row_base::<ROW_LOG>(hash);
+    // SAFETY: the row's entries stay inside the table (row_base's
+    // contract); prefetch tolerates any address.
     unsafe {
-        prefetch_l1(table.add(rel_row).cast());
+        prefetch_l1(row.cast());
         if ROW_LOG >= 5 {
-            prefetch_l1(table.add(rel_row + 16).cast());
+            prefetch_l1(row.add(16).cast());
         }
         if ROW_LOG >= 6 {
-            prefetch_l1(table.add(rel_row + 32).cast());
-            prefetch_l1(table.add(rel_row + 48).cast());
+            prefetch_l1(row.add(32).cast());
+            prefetch_l1(row.add(48).cast());
         }
     }
 }
@@ -158,8 +215,7 @@ pub(super) fn row_match_mask<const ROW_LOG: u32>(row: *const u32, tag: u8) -> u6
 #[allow(clippy::too_many_arguments)]
 pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     win: &[u8],
-    table: *const u32,
-    heads: *const u8,
+    t: RowHandle,
     idx: usize,
     hash: u32,
     win_base: u64,
@@ -175,15 +231,15 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     // ROW_LOG instantiation carries exactly its row.
     if ROW_LOG >= 6 {
         row_search_cap::<ROW_LOG, 64, RAMPED>(
-            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
         )
     } else if ROW_LOG >= 5 {
         row_search_cap::<ROW_LOG, 32, RAMPED>(
-            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
         )
     } else {
         row_search_cap::<ROW_LOG, 16, RAMPED>(
-            win, table, heads, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
         )
     }
 }
@@ -193,8 +249,7 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
 #[allow(clippy::too_many_arguments)]
 fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>(
     win: &[u8],
-    table: *const u32,
-    heads: *const u8,
+    t: RowHandle,
     idx: usize,
     hash: u32,
     win_base: u64,
@@ -203,8 +258,7 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
     max_window: u64,
     ramp: RampGate,
 ) -> (usize, usize) {
-    let rel_row = ((hash >> ROW_TAG_BITS) << ROW_LOG) as usize;
-    let row = table.wrapping_add(rel_row);
+    let row = t.row_base::<ROW_LOG>(hash);
     let tag = (hash & ROW_TAG_MASK) as u8;
     let mut matches = row_match_mask::<ROW_LOG>(row, tag);
     // The head orders the row newest-first: rotate the slot-indexed mask
@@ -215,8 +269,7 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
     // mixed ages in a row, and a break would cut the walk short of newer
     // in-window candidates behind one stale entry.
     let row_mask = (1usize << ROW_LOG) - 1;
-    // SAFETY: the head byte is the row's own (bounds as row_insert).
-    let head = unsafe { *heads.add((hash >> ROW_TAG_BITS) as usize) } as usize & row_mask;
+    let head = t.head(hash) as usize & row_mask;
     if head != 0 {
         // The rotated field spans exactly the row's entries. At ROW_LOG 6
         // the field is the whole u64 and `1u64 << entries` would overflow
@@ -253,7 +306,8 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
         let age = matches.trailing_zeros() as usize;
         matches &= matches - 1;
         let slot = (head + age) & row_mask;
-        // SAFETY: slot ranges over [0, entries).
+        debug_assert!(slot < 1usize << ROW_LOG);
+        // SAFETY: slot ranges over [0, entries) — the row base's own span.
         let entry = unsafe { *row.add(slot) };
         if entry & POS24_MASK == 0 {
             continue;
@@ -311,15 +365,15 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
 /// line (a same-line head costs the fill loop a load/compute/store chain
 /// behind its own cold-line stores) and L2-resident at the row count.
 #[inline(always)]
-pub(super) fn row_insert<const ROW_LOG: u32>(table: *mut u32, heads: *mut u8, hash: u32, abs: u64) {
-    let rel_row = ((hash >> ROW_TAG_BITS) << ROW_LOG) as usize;
-    // SAFETY: the head index masks to the row count (row_hash_at's width
-    // derivation); the entry slot masks to the row width.
+pub(super) fn row_insert<const ROW_LOG: u32>(t: RowHandle, hash: u32, abs: u64) {
+    let hp = t.head_ptr(hash);
+    // SAFETY: the head byte read/write is the row's own (head_ptr's
+    // contract); the slot masks to the row width and the entry store
+    // stays inside that row (row_base's contract).
     unsafe {
-        let hp = heads.add((hash >> ROW_TAG_BITS) as usize);
         let slot = (*hp).wrapping_sub(1) as usize & ((1usize << ROW_LOG) - 1);
         *hp = slot as u8;
-        *table.add(rel_row + slot) = row_entry(hash, abs);
+        *t.row_base::<ROW_LOG>(hash).add(slot) = row_entry(hash, abs);
     }
 }
 
@@ -327,22 +381,18 @@ pub(super) fn row_insert<const ROW_LOG: u32>(table: *mut u32, heads: *mut u8, ha
 /// entry store per position, still cheaper than the chain's head+link
 /// pair.
 #[inline(always)]
-pub(super) fn row_insert_fill<const ROW_LOG: u32>(
-    table: *mut u32,
-    heads: *mut u8,
-    hash: u32,
-    abs: u64,
-) {
-    row_insert::<ROW_LOG>(table, heads, hash, abs);
+pub(super) fn row_insert_fill<const ROW_LOG: u32>(t: RowHandle, hash: u32, abs: u64) {
+    row_insert::<ROW_LOG>(t, hash, abs);
 }
 
-/// Shared mutable state of the row scan's emit path: the two table views
-/// as raw pointers (the scan loop's SROA discipline — the driver's slice
-/// borrows must not be re-derived per call), the output streams and the
+/// Shared mutable state of the row scan's emit path: the row tables as
+/// one Copy handle (the scan loop's SROA discipline — the driver's slice
+/// borrows must not be re-derived per call; the handle SROAs into the
+/// same two base pointers raw-pointer fields kept, so the emit helpers'
+/// register behavior is unchanged), the output streams and the
 /// per-block constants.
 pub(super) struct RowEmit<'a> {
-    pub(super) table: *mut u32,
-    pub(super) heads: *mut u8,
+    pub(super) tables: RowHandle,
     pub(super) literals: &'a mut Vec<u8>,
     pub(super) seqs: &'a mut Vec<SeqWord>,
     pub(super) win_base: u64,
@@ -407,7 +457,7 @@ impl RowEmit<'_> {
         while p < seg_end {
             let i = (p - self.win_base) as usize;
             let h = row_hash_at(win, i, self.hash_log, ROW_LOG, self.width);
-            row_insert_fill::<ROW_LOG>(self.table, self.heads, h, p);
+            row_insert_fill::<ROW_LOG>(self.tables, h, p);
             p += 1;
         }
         if seg_end < end_abs {
@@ -415,7 +465,7 @@ impl RowEmit<'_> {
             while p < end_abs {
                 let i = (p - self.win_base) as usize;
                 let h = row_hash_at(win, i, self.hash_log, ROW_LOG, self.width);
-                row_insert_fill::<ROW_LOG>(self.table, self.heads, h, p);
+                row_insert_fill::<ROW_LOG>(self.tables, h, p);
                 p += 1;
             }
         }
@@ -473,7 +523,7 @@ impl RowEmit<'_> {
             // table entry (the scan tail never searches one).
             if pidx + HASH_READ <= win.len() {
                 let h = row_hash_at(win, pidx, self.hash_log, ROW_LOG, self.width);
-                row_insert_fill::<ROW_LOG>(self.table, self.heads, h, pos);
+                row_insert_fill::<ROW_LOG>(self.tables, h, pos);
             }
             pos = self.emit::<ROW_LOG>(win, pos, pidx, ml, 1, rep);
             // The emit's literal advance can push the cursor past the
@@ -514,16 +564,19 @@ impl MatchGeneratorDriver {
         // never reach an emit, so the bound is never consulted when
         // `win.len() < HASH_READ`.
         let insert_max = win_base + win.len().saturating_sub(HASH_READ) as u64;
-        // SAFETY: the scan's table/tag accesses go through raw pointers
-        // (the fast loop's SROA note); derived here, before the emit
-        // context below takes its borrow, and never resized during the
-        // scan. The emit helpers write through the same pointers at call
-        // sites where the loop holds no conflicting borrow.
-        let table_ptr: *mut u32 = self.tables.buf_mut().as_mut_ptr();
-        let heads_ptr: *mut u8 = self.row_heads.as_mut_ptr();
+        // The scan's table/tag accesses go through the Copy handle (the
+        // fast loop's SROA note); derived here, before the emit context
+        // below takes its borrow, and never resized during the scan. The
+        // emit helpers write through the same pointers at call sites
+        // where the loop holds no conflicting borrow.
+        debug_assert_eq!(self.tables.len(), self.row_heads.len() << ROW_LOG);
+        let tables = RowHandle::at(
+            self.tables.buf_mut().as_mut_ptr(),
+            self.row_heads.as_mut_ptr(),
+            self.row_heads.len(),
+        );
         let mut emit = RowEmit {
-            table: table_ptr,
-            heads: heads_ptr,
+            tables,
             literals,
             seqs,
             win_base,
@@ -547,7 +600,7 @@ impl MatchGeneratorDriver {
         // its calling convention per position).
         let search = |win: &[u8], idx: usize, hash: u32, bound: u64| -> (usize, usize) {
             row_search::<ROW_LOG, RAMPED>(
-                win, table_ptr, heads_ptr, idx, hash, win_base, bound, attempts, max_window, ramp,
+                win, tables, idx, hash, win_base, bound, attempts, max_window, ramp,
             )
         };
         // Long-distance candidates of this block ([`Self::ldm_generate`]):
@@ -582,7 +635,7 @@ impl MatchGeneratorDriver {
             // lesson).
             if end - pos > hash_read {
                 let hn = row_hash_at(win, idx + 1, hash_log, ROW_LOG, width);
-                row_prefetch::<ROW_LOG>(table_ptr, hn);
+                row_prefetch::<ROW_LOG>(tables, hn);
             }
             let (mut best_len, mut best_cand) = search(win, idx, h, end);
             // Gap bound (C's per-gap compressor call counts to the gap
@@ -668,7 +721,7 @@ impl MatchGeneratorDriver {
             // Insert this position behind the probe (the chain's form: the
             // possibly rep-advanced `pos` is stored at the searched
             // position's hash).
-            row_insert::<ROW_LOG>(table_ptr, heads_ptr, h, pos);
+            row_insert::<ROW_LOG>(tables, h, pos);
 
             // Repcode matches stay legal from MIN_MATCH up regardless of
             // the row's min_match; the offset-pays gate matches the chain
@@ -720,7 +773,7 @@ impl MatchGeneratorDriver {
                         let hash2 = row_hash_at(win, idx2, hash_log, ROW_LOG, width);
                         if end.saturating_sub(p2 + 1) >= hash_read {
                             let hn = row_hash_at(win, idx2 + 1, hash_log, ROW_LOG, width);
-                            row_prefetch::<ROW_LOG>(table_ptr, hn);
+                            row_prefetch::<ROW_LOG>(tables, hn);
                         }
                         // Repcode probe at the stepped position (the chain
                         // loop's skip-when-incumbent-is-rep form).
@@ -823,7 +876,7 @@ impl MatchGeneratorDriver {
             let next = win_base + (start + ml) as u64;
             if end.saturating_sub(next) > hash_read {
                 let hn = row_hash_at(win, start + ml, hash_log, ROW_LOG, width);
-                row_prefetch::<ROW_LOG>(table_ptr, hn);
+                row_prefetch::<ROW_LOG>(tables, hn);
             }
             anchor = emit.emit::<ROW_LOG>(win, anchor, start, ml, of_value, &mut rep);
             if $gated && rep_pending != 0 && of_value > 3 {
@@ -944,7 +997,7 @@ impl MatchGeneratorDriver {
                 while p < to {
                     let i = (p - win_base) as usize;
                     let h = row_hash_at(win, i, hash_log, ROW_LOG, width);
-                    row_insert_fill::<ROW_LOG>(table_ptr, heads_ptr, h, p);
+                    row_insert_fill::<ROW_LOG>(tables, h, p);
                     p += 1;
                 }
             }

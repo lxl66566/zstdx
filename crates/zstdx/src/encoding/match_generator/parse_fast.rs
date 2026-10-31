@@ -54,14 +54,6 @@ impl MatchGeneratorDriver {
         // at the span start; tiny first blocks never reach an emit, so the
         // bound is never consulted when win.len() < HASH_READ).
         let insert_max = IdxRange::new(win_base, win_base + win.len() as u64).insert_max();
-        // The scan's own table accesses go through a raw pointer: routing
-        // them through the emit context's slice field kept the pointer
-        // stack-resident (a re-load per access; see the dfast loop's note on
-        // the same SROA failure).
-        // SAFETY: derived here, before the context below takes its borrow;
-        // both address the same memory, and the loop and the emit helpers
-        // never access a slot concurrently. The table is never resized.
-        let table_ptr: *mut u32 = self.tables.heads_mut().as_mut_ptr();
         // The log arrives as a constant (the hash shift folds to an
         // immediate and the shift-count register frees — the same disease
         // the dfast const-log landing treated): the dense body's const is
@@ -73,8 +65,15 @@ impl MatchGeneratorDriver {
         } else {
             HASH_LOG
         };
+        // The scan's own table accesses go through the Copy handle: routing
+        // them through a slice field kept the pointer stack-resident (a
+        // re-load per access; see the dfast loop's note on the same SROA
+        // failure). Derived here, before the context below takes its
+        // borrow; the loop and the emit helpers never access a slot
+        // concurrently, and the table is never resized.
+        let heads = TableHandle::at(self.tables.heads_mut().as_mut_ptr(), hash_log);
         let mut emit = TableEmit {
-            table: self.tables.heads_mut(),
+            table: heads,
             literals,
             seqs,
             win_base,
@@ -221,9 +220,7 @@ impl MatchGeneratorDriver {
                 // probe prefilter (its low half) and the repcode compares.
                 let v0 = read8(win, idx0);
                 let h0 = hash5_log(v0, hash_log);
-                // SAFETY: the hash masks to hash_log bits and the table
-                // always holds 1 << hash_log slots (see insert_at).
-                let prev0 = unsafe { *table_ptr.add(h0) };
+                let prev0 = heads.get(h0);
                 let cur0 = v0 as u32;
                 let mut pair_len = 1u64;
                 let mut idx1 = idx0;
@@ -235,21 +232,14 @@ impl MatchGeneratorDriver {
                     idx1 = idx0 + 1;
                     let v1 = read8(win, idx1);
                     h1 = hash5_log(v1, hash_log);
-                    // SAFETY: as above.
-                    prev1 = unsafe { *table_ptr.add(h1) };
+                    prev1 = heads.get(h1);
                     cur1 = v1 as u32;
                 }
                 // Store after both lookups so each probe sees the pre-store
                 // entry (newest-wins).
-                // SAFETY: as above.
-                unsafe {
-                    *table_ptr.add(h0) = pack_pos(pos);
-                }
+                heads.put(h0, pack_pos(pos));
                 if pair_len == 2 {
-                    // SAFETY: as above.
-                    unsafe {
-                        *table_ptr.add(h1) = pack_pos(pos + 1);
-                    }
+                    heads.put(h1, pack_pos(pos + 1));
                 }
 
                 // Probe the first position. Repcode candidate first (mirrors

@@ -165,16 +165,6 @@ impl HeadTables {
         self.buf.split_at_mut(self.second)
     }
 
-    /// Both spans at once, split at `at`, which must coincide with the
-    /// head span: the dfast known-log instantiations pass their
-    /// compile-time head size (equal to the span by the sizing that
-    /// picked the row) so the split point folds to an immediate.
-    #[inline]
-    pub(super) fn split_at(&mut self, at: usize) -> (&mut [u32], &mut [u32]) {
-        debug_assert_eq!(at, self.second);
-        self.buf.split_at_mut(at)
-    }
-
     /// The whole allocation: contents clears, and the row family's single
     /// packed table (its strategies hold `head_len == len`).
     #[cfg(any(feature = "std", test))]
@@ -186,6 +176,128 @@ impl HeadTables {
     #[inline]
     pub(super) fn buf_mut(&mut self) -> &mut [u32] {
         &mut self.buf
+    }
+
+    /// Handles over the chain strategy's pair: the head table spans the
+    /// head entries at `head_log`, the chain links the second span (their
+    /// absolute keys mask against their own length).
+    #[inline(always)]
+    pub(super) fn chain_pair(&mut self, head_log: u32) -> (TableHandle, TableHandle) {
+        debug_assert_eq!(self.second, 1usize << head_log);
+        let (heads, links) = self.split();
+        (
+            TableHandle::at(heads.as_mut_ptr(), head_log),
+            TableHandle::of_slice(links),
+        )
+    }
+
+    /// Handles over the dfast pair: the long table spans the head entries
+    /// at `long_log`, the small table follows at `split` — the one
+    /// allocation's fixed displacement, so the scan loops keep a single
+    /// table base live. Known-log instantiations pass their compile-time
+    /// head size (equal to the span by the sizing that picked the row), so
+    /// the displacement folds into the addressing mode's immediate and
+    /// stays off the register live set.
+    #[inline(always)]
+    pub(super) fn dfast_pair(
+        &mut self,
+        split: usize,
+        long_log: u32,
+        small_log: u32,
+    ) -> (TableHandle, TableHandle) {
+        debug_assert_eq!(self.second, split);
+        debug_assert_eq!(split, 1usize << long_log);
+        debug_assert_eq!(self.buf.len() - self.second, 1usize << small_log);
+        // SAFETY: the small table's span starts at the split entry, inside
+        // the allocation.
+        unsafe {
+            (
+                TableHandle::at(self.buf.as_mut_ptr(), long_log),
+                TableHandle::at(self.buf.as_mut_ptr().add(split), small_log),
+            )
+        }
+    }
+}
+
+/// Copy handle over one u32 table with power-of-two slot count: the base
+/// pointer plus the slot mask. The head hash tables, the dfast pair and
+/// the chain links share the shape. By value with `#[inline(always)]`
+/// accessors, so a handle stays two SROA'd registers in the scan loops
+/// (the slice-borrow form kept the base pointer stack-resident; see the
+/// fast/dfast loop notes). `get`/`put` take a masked index and assert it;
+/// the absolute-key forms mask here, which is the chain links' contract
+/// (see `emit_chain`'s note on the walk side's indexing).
+#[derive(Clone, Copy)]
+pub(super) struct TableHandle {
+    ptr: *mut u32,
+    /// Slot count minus one.
+    mask: usize,
+}
+
+impl TableHandle {
+    /// Handle over `1 << log` slots at `ptr`. The allocation must cover
+    /// the slots; the hash supplies the masking (a fill may pass a log
+    /// below the allocation's, the scans' log always matches it).
+    #[inline(always)]
+    pub(super) fn at(ptr: *mut u32, log: u32) -> Self {
+        debug_assert!(log < 32);
+        Self {
+            ptr,
+            mask: (1usize << log) - 1,
+        }
+    }
+
+    /// Handle over a whole slice (the chain links: their keys mask
+    /// against the table size, not a separate log).
+    #[inline(always)]
+    pub(super) fn of_slice(t: &mut [u32]) -> Self {
+        debug_assert!(t.len().is_power_of_two());
+        Self {
+            ptr: t.as_mut_ptr(),
+            mask: t.len() - 1,
+        }
+    }
+
+    /// Slot load; `h` is a masked index.
+    #[inline(always)]
+    pub(super) fn get(self, h: usize) -> u32 {
+        debug_assert!(h <= self.mask);
+        // SAFETY: h names a slot — at most `mask` (the assert), and the
+        // allocation covers `mask + 1` slots (the constructors' contract).
+        unsafe { *self.ptr.add(h) }
+    }
+
+    /// Slot store; [`get`]'s index contract.
+    #[inline(always)]
+    pub(super) fn put(self, h: usize, v: u32) {
+        debug_assert!(h <= self.mask);
+        // SAFETY: as `get`.
+        unsafe { *self.ptr.add(h) = v };
+    }
+
+    /// [`get`] keyed by an absolute position masked here.
+    #[inline(always)]
+    pub(super) fn get_abs(self, abs: u64) -> u32 {
+        self.get(abs as usize & self.mask)
+    }
+
+    /// [`put`] keyed by an absolute position masked here.
+    #[inline(always)]
+    pub(super) fn put_abs(self, abs: u64, v: u32) {
+        self.put(abs as usize & self.mask, v);
+    }
+
+    /// The linked head insert (the chain strategies' newest-wins form):
+    /// the previous head moves to the position's chain link, the packed
+    /// head takes the slot. The link key is the ABSOLUTE position — the
+    /// walk side resolves candidates absolutely, so a window-relative
+    /// index diverges from it once win_base stops being a multiple of
+    /// the chain size (see the note on `emit_chain`'s loop).
+    #[inline(always)]
+    pub(super) fn put_linked(self, links: TableHandle, h: usize, abs: u64, origin: u64) {
+        let head = self.get(h);
+        links.put_abs(abs, head);
+        self.put(h, pack_head(abs, origin));
     }
 }
 
@@ -273,13 +385,12 @@ pub(super) fn unpack_pos(entry: u32, pos: u64) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chain_search(
     win: &[u8],
-    chain: *const u32,
+    links: TableHandle,
     idx: usize,
     entry: u32,
     win_base: u64,
     block_end: u64,
     search_depth: usize,
-    chain_mask: usize,
     max_window: u64,
     origin: u64,
     ramp: RampGate,
@@ -329,22 +440,17 @@ pub(super) fn chain_search(
             }
         }
         tried += 1;
-        // SAFETY: masked to the chain table size.
-        let entry = unsafe { *chain.add(cand_abs as usize & chain_mask) };
+        let entry = links.get_abs(cand_abs);
         dist = entry_dist(entry, q);
     }
     (best_len, best_cand)
 }
 
-/// Store `abs` as the newest position for its hash into a table of `log`
-/// bits. Caller guarantees `idx` has at least 5 bytes of window behind it.
+/// Store `abs` as the newest position for its hash into `table`'s `log`
+/// slots. Caller guarantees `idx` has at least 5 bytes of window behind it.
 #[inline(always)]
-pub(super) fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64, log: u32) {
-    // SAFETY: hash_at_log masks to log bits and the table holds
-    // 1 << log slots, so the index cannot leave it.
-    unsafe {
-        *table.get_unchecked_mut(hash_at_log(win, idx, log)) = pack_pos(abs);
-    }
+pub(super) fn insert_at(win: &[u8], table: TableHandle, idx: usize, abs: u64, log: u32) {
+    table.put(hash_at_log(win, idx, log), pack_pos(abs));
 }
 
 /// Dictionary-load backfill of one stride group's skipped positions (the
@@ -353,23 +459,19 @@ pub(super) fn insert_at(win: &[u8], table: &mut [u32], idx: usize, abs: u64, log
 /// inserts are untouched and the oldest twin of an otherwise-idle slot
 /// survives (libzstd's `ZSTD_dtlm_full` fill). 5-byte hash variant.
 pub(super) fn backfill_empty(
-    table: &mut [u32],
+    table: TableHandle,
     win: &[u8],
     base: u64,
     idx: usize,
     log: u32,
     last: usize,
 ) {
-    // SAFETY: same indexing contract as insert_at; the slot check reads
-    // before the write, both inside the table.
-    unsafe {
-        for p in 1..PREFILL_STRIDE {
-            let q = idx + p;
-            if q < last {
-                let h = hash_at_log(win, q, log);
-                if *table.get_unchecked(h) == 0 {
-                    *table.get_unchecked_mut(h) = pack_pos(base + q as u64);
-                }
+    for p in 1..PREFILL_STRIDE {
+        let q = idx + p;
+        if q < last {
+            let h = hash_at_log(win, q, log);
+            if table.get(h) == 0 {
+                table.put(h, pack_pos(base + q as u64));
             }
         }
     }
@@ -377,23 +479,19 @@ pub(super) fn backfill_empty(
 
 /// [`backfill_empty`]'s 8-byte hash variant (the dfast long table).
 pub(super) fn backfill8_empty(
-    table: &mut [u32],
+    table: TableHandle,
     win: &[u8],
     base: u64,
     idx: usize,
     log: u32,
     last: usize,
 ) {
-    // SAFETY: same indexing contract as insert_at; the slot check reads
-    // before the write, both inside the table.
-    unsafe {
-        for p in 1..PREFILL_STRIDE {
-            let q = idx + p;
-            if q < last {
-                let h = hash8_at_log(win, q, log);
-                if *table.get_unchecked(h) == 0 {
-                    *table.get_unchecked_mut(h) = pack_pos(base + q as u64);
-                }
+    for p in 1..PREFILL_STRIDE {
+        let q = idx + p;
+        if q < last {
+            let h = hash8_at_log(win, q, log);
+            if table.get(h) == 0 {
+                table.put(h, pack_pos(base + q as u64));
             }
         }
     }
@@ -407,23 +505,16 @@ pub(super) fn backfill8_empty(
 #[inline(always)]
 pub(super) fn insert_linked_at(
     win: &[u8],
-    table: &mut [u32],
-    chain: &mut [u32],
+    heads: TableHandle,
+    links: TableHandle,
     idx: usize,
     abs: u64,
     log: u32,
     width: ChainHashWidth,
     origin: u64,
 ) {
-    // SAFETY: hash_at_width masks to log bits and the tables hold 1 << log
-    // and chain.len() slots; the absolute position masks to the chain size
-    // (absolute key; see emit_chain's note on the walk side's indexing).
-    unsafe {
-        let h = hash_at_width(win, idx, log, width);
-        let head = *table.get_unchecked(h);
-        *chain.get_unchecked_mut(abs as usize & (chain.len() - 1)) = head;
-        *table.get_unchecked_mut(h) = pack_head(abs, origin);
-    }
+    let h = hash_at_width(win, idx, log, width);
+    heads.put_linked(links, h, abs, origin);
 }
 
 /// Push one sequence's literals and packed code/add-bits streams, and
@@ -490,8 +581,8 @@ pub(in crate::encoding) fn push_seq_packed(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn insert_covered(
     win: &[u8],
-    table: &mut [u32],
-    mut chain: Option<&mut [u32]>,
+    table: TableHandle,
+    chain: Option<TableHandle>,
     win_base: u64,
     start: usize,
     match_len: usize,
@@ -507,8 +598,8 @@ pub(super) fn insert_covered(
     // cleared per job, the shift stays 0).
     macro_rules! put {
         ($idx:expr, $abs:expr) => {
-            match chain.as_deref_mut() {
-                Some(chain) => insert_linked_at(win, table, chain, $idx, $abs, log, width, origin),
+            match chain {
+                Some(links) => insert_linked_at(win, table, links, $idx, $abs, log, width, origin),
                 None => insert_at(win, table, $idx, $abs, log),
             }
         };
@@ -587,7 +678,10 @@ pub(super) fn insert_covered(
 /// (their former twelve-to-fourteen-argument free signatures moved several
 /// arguments through the stack on every call).
 pub(super) struct TableEmit<'a> {
-    pub(super) table: &'a mut [u32],
+    /// The head table as a Copy handle: the scan loops' own probes and the
+    /// emit helpers share the one register pair (the slice field kept the
+    /// base pointer memory-resident; see the fast loop's SROA note).
+    pub(super) table: TableHandle,
     pub(super) literals: &'a mut Vec<u8>,
     pub(super) seqs: &'a mut Vec<SeqWord>,
     pub(super) win_base: u64,
@@ -664,7 +758,7 @@ impl TableEmit<'_> {
     pub(super) fn emit_linked(
         &mut self,
         win: &[u8],
-        chain: &mut [u32],
+        links: TableHandle,
         anchor: u64,
         start: usize,
         match_len: usize,
@@ -684,7 +778,7 @@ impl TableEmit<'_> {
         insert_covered(
             win,
             self.table,
-            Some(chain),
+            Some(links),
             self.win_base,
             start,
             match_len,
@@ -710,7 +804,7 @@ impl TableEmit<'_> {
     pub(super) fn emit_chain(
         &mut self,
         win: &[u8],
-        chain: &mut [u32],
+        links: TableHandle,
         hash_log: u32,
         anchor: u64,
         start: usize,
@@ -729,7 +823,6 @@ impl TableEmit<'_> {
             self.literals,
             self.seqs,
         );
-        let chain_mask = chain.len() - 1;
         // Covered-fill stride: dense up to 64 match bytes, every 4th
         // position beyond. libzstd's lazy rows index every interior
         // position; the grid bounds the fill work of huge same-hash runs
@@ -748,18 +841,13 @@ impl TableEmit<'_> {
         while p < end_abs {
             let i = (p - self.win_base) as usize;
             let h = hash_at_width(win, i, hash_log, self.width);
-            // SAFETY: h is masked to hash_log bits, p to the chain table
-            // size. The chain slot key is the ABSOLUTE position — the walk
-            // side resolves candidates absolutely: a window-relative index
+            // The chain slot key is the ABSOLUTE position — the walk side
+            // resolves candidates absolutely: a window-relative index
             // diverges from it once win_base stops being a multiple of the
             // chain size (window compaction in streaming, per-block adopted
             // windows in bulk, job-relative windows in MT), scrambling every
             // walk past its first hop.
-            unsafe {
-                let head = *self.table.get_unchecked(h);
-                *chain.get_unchecked_mut(p as usize & chain_mask) = head;
-                *self.table.get_unchecked_mut(h) = pack_head(p, self.origin);
-            }
+            self.table.put_linked(links, h, p, self.origin);
             p += step;
         }
         self.win_base + match_end as u64
@@ -775,7 +863,7 @@ impl TableEmit<'_> {
     pub(super) fn rep1_chain<const RAMPED: bool>(
         &mut self,
         win: &[u8],
-        mut chain: Option<&mut [u32]>,
+        chain: Option<TableHandle>,
         pos: u64,
         block_end: u64,
         rep: &mut [u32; 3],
@@ -812,8 +900,8 @@ impl TableEmit<'_> {
             // emission's split.
             let ml = extend_match_gap(win, pidx, cand, (block_end - pos) as usize);
             debug_assert!(ml >= MIN_MATCH);
-            pos = match chain.as_deref_mut() {
-                Some(chain) => self.emit_linked(win, chain, pos, pidx, ml, rep),
+            pos = match chain {
+                Some(links) => self.emit_linked(win, links, pos, pidx, ml, rep),
                 None => self.emit(win, pos, pidx, ml, 1, rep),
             };
             // The emit's literal advance can push the cursor past the
@@ -832,8 +920,10 @@ impl TableEmit<'_> {
 /// inside the register argument budget (their former fourteen-argument
 /// signatures moved several arguments through the stack on every call).
 pub(super) struct DfastEmit<'a> {
-    pub(super) long: &'a mut [u32],
-    pub(super) small: &'a mut [u32],
+    /// Both tables as Copy handles (the scan loop's SROA discipline; see
+    /// [`TableEmit::table`]).
+    pub(super) long: TableHandle,
+    pub(super) small: TableHandle,
     pub(super) literals: &'a mut Vec<u8>,
     pub(super) seqs: &'a mut Vec<SeqWord>,
     pub(super) win_base: u64,
@@ -847,21 +937,41 @@ pub(super) struct DfastEmit<'a> {
     pub(super) width: ChainHashWidth,
 }
 
+/// Both dfast tables take `abs`'s entry — the fill loops' insert form
+/// (the scan-side wrapper is [`DfastEmit::insert_both`]). Caller
+/// guarantees `idx + HASH_READ` bytes of window.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn put_both(
+    long: TableHandle,
+    small: TableHandle,
+    win: &[u8],
+    idx: usize,
+    abs: u64,
+    long_log: u32,
+    small_log: u32,
+    width: ChainHashWidth,
+) {
+    let entry = pack_pos(abs);
+    long.put(hash8_at_log(win, idx, long_log), entry);
+    small.put(hash_at_width(win, idx, small_log, width), entry);
+}
+
 impl DfastEmit<'_> {
     /// Insert `idx` into both tables. Caller guarantees `idx + HASH_READ`
     /// bytes of window.
     #[inline(always)]
     pub(super) fn insert_both(&mut self, win: &[u8], idx: usize) {
-        // SAFETY: both hashes are masked to their tables' sizes.
-        unsafe {
-            let entry = pack_pos(self.win_base + idx as u64);
-            *self
-                .long
-                .get_unchecked_mut(hash8_at_log(win, idx, self.long_log)) = entry;
-            *self
-                .small
-                .get_unchecked_mut(hash_at_width(win, idx, self.small_log, self.width)) = entry;
-        }
+        put_both(
+            self.long,
+            self.small,
+            win,
+            idx,
+            self.win_base + idx as u64,
+            self.long_log,
+            self.small_log,
+            self.width,
+        );
     }
 
     /// Emit one sequence (literals from `anchor_idx`, match at `start`) and
@@ -905,24 +1015,16 @@ impl DfastEmit<'_> {
             self.insert_both(win, curr_idx + 2);
         }
         if match_end >= 2 && match_end - 2 <= self.insert_max_idx {
-            // SAFETY: masked to the long table size.
-            unsafe {
-                *self
-                    .long
-                    .get_unchecked_mut(hash8_at_log(win, match_end - 2, self.long_log)) =
-                    pack_pos(self.win_base + (match_end - 2) as u64);
-            }
+            self.long.put(
+                hash8_at_log(win, match_end - 2, self.long_log),
+                pack_pos(self.win_base + (match_end - 2) as u64),
+            );
         }
         if match_end >= 1 && match_end - 1 <= self.insert_max_idx {
-            // SAFETY: masked to the small table size.
-            unsafe {
-                *self.small.get_unchecked_mut(hash_at_width(
-                    win,
-                    match_end - 1,
-                    self.small_log,
-                    self.width,
-                )) = pack_pos(self.win_base + (match_end - 1) as u64);
-            }
+            self.small.put(
+                hash_at_width(win, match_end - 1, self.small_log, self.width),
+                pack_pos(self.win_base + (match_end - 1) as u64),
+            );
         }
         match_end
     }

@@ -2234,8 +2234,7 @@ impl MatchGeneratorDriver {
     #[cfg(feature = "std")]
     fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
         let hash_log = self.params.hash_log;
-        let (table, chain) = self.tables.split();
-        let chain_mask = chain.len() - 1;
+        let (heads, links) = self.tables.chain_pair(hash_log);
         // The from-scratch loop runs idx = 0, 3, 6, ... while idx < last;
         // a prefix fill to `from` exited at the first aligned idx >=
         // from - HASH_READ, which is exactly where this resumes.
@@ -2246,15 +2245,18 @@ impl MatchGeneratorDriver {
         let origin = self.head_origin;
         while idx < last {
             let abs = base + idx as u64;
-            // SAFETY: the hash masks to hash_log bits, the absolute
-            // position to the chain size (absolute key; see emit_chain's
-            // note on the walk side's indexing).
-            unsafe {
-                let h = hash_at_log(data, idx, hash_log);
-                let head = *table.get_unchecked(h);
-                *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                *table.get_unchecked_mut(h) = pack_head(abs, origin);
-            }
+            // The grid keeps the stock 5-byte head hash (hash_at_log's
+            // form; the width-carrying fills run in prefill_window).
+            insert_linked_at(
+                data,
+                heads,
+                links,
+                idx,
+                abs,
+                hash_log,
+                ChainHashWidth::Five,
+                origin,
+            );
             idx += PREFILL_STRIDE;
         }
         // A fill writer the scan cursor never sees (spf builders and
@@ -2535,6 +2537,7 @@ impl MatchGeneratorDriver {
                     FillGrid::Dictionary => self.params.hash_log,
                 };
                 let table = self.tables.heads_mut();
+                let heads = TableHandle::at(table.as_mut_ptr(), log);
                 match grid {
                     FillGrid::Strip => {
                         // Only the strip's retention tail is inserted
@@ -2544,7 +2547,7 @@ impl MatchGeneratorDriver {
                         let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
                         let mut idx = last.saturating_sub(retain);
                         while idx < last {
-                            insert_at(data, table, idx, base + idx as u64 - shift, log);
+                            insert_at(data, heads, idx, base + idx as u64 - shift, log);
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -2556,8 +2559,8 @@ impl MatchGeneratorDriver {
                         // retention cap would drop dictionary-head entries.
                         let mut idx = 0;
                         while idx < last {
-                            insert_at(data, table, idx, base + idx as u64 - shift, log);
-                            backfill_empty(table, data, base - shift, idx, log, last);
+                            insert_at(data, heads, idx, base + idx as u64 - shift, log);
+                            backfill_empty(heads, data, base - shift, idx, log, last);
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -2570,36 +2573,37 @@ impl MatchGeneratorDriver {
                 // The short table keys 4-byte windows on dictionary frames
                 // (the scan's `MM4` row; see `dict_row`).
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split();
+                let (long, small) = self
+                    .tables
+                    .dfast_pair(1usize << long_log, long_log, small_log);
                 let mut idx = 0;
                 while idx < last {
-                    // SAFETY: both hashes are masked to their tables' sizes.
-                    unsafe {
-                        let entry = pack_pos(base + idx as u64 - shift);
-                        *long.get_unchecked_mut(hash8_at_log(data, idx, long_log)) = entry;
-                        *small.get_unchecked_mut(hash_at_width(data, idx, small_log, width)) =
-                            entry;
-                        if grid == FillGrid::Dictionary && idx + 2 < last {
-                            // Beyond libzstd's dict fill, whose small table
-                            // stays on the stride grid (off-grid twins stay
-                            // reachable only through the long probe's
-                            // empty-slot backfill, mml 8): dense small
-                            // writes make off-grid 4-class dict twins
-                            // candidates — 13/15 of the remaining missed
-                            // sources in the fixture decomposition.
-                            *small.get_unchecked_mut(hash_at_width(
-                                data,
-                                idx + 1,
-                                small_log,
-                                width,
-                            )) = pack_pos(base + idx as u64 + 1 - shift);
-                            *small.get_unchecked_mut(hash_at_width(
-                                data,
-                                idx + 2,
-                                small_log,
-                                width,
-                            )) = pack_pos(base + idx as u64 + 2 - shift);
-                        }
+                    put_both(
+                        long,
+                        small,
+                        data,
+                        idx,
+                        base + idx as u64 - shift,
+                        long_log,
+                        small_log,
+                        width,
+                    );
+                    if grid == FillGrid::Dictionary && idx + 2 < last {
+                        // Beyond libzstd's dict fill, whose small table
+                        // stays on the stride grid (off-grid twins stay
+                        // reachable only through the long probe's
+                        // empty-slot backfill, mml 8): dense small
+                        // writes make off-grid 4-class dict twins
+                        // candidates — 13/15 of the remaining missed
+                        // sources in the fixture decomposition.
+                        small.put(
+                            hash_at_width(data, idx + 1, small_log, width),
+                            pack_pos(base + idx as u64 + 1 - shift),
+                        );
+                        small.put(
+                            hash_at_width(data, idx + 2, small_log, width),
+                            pack_pos(base + idx as u64 + 2 - shift),
+                        );
                     }
                     if grid == FillGrid::Dictionary {
                         // The long table takes the empty-slot backfill
@@ -2615,8 +2619,7 @@ impl MatchGeneratorDriver {
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split();
-                let chain_mask = chain.len() - 1;
+                let (heads, links) = self.tables.chain_pair(hash_log);
                 // Strip: the stride grid (PREFILL_STRIDE's note — a windowed
                 // strip cannot afford a dense fill). Dictionary: every
                 // position, oldest-to-newest, linked — libzstd's dict load
@@ -2649,31 +2652,18 @@ impl MatchGeneratorDriver {
                 // link and the stock path is cheap anyway).
                 let depth = self.params.search_depth as usize;
                 if grid == FillGrid::Strip && uniform && last > (depth + 2) * PREFILL_STRIDE {
-                    // SAFETY: the hash masks to hash_log bits, the
-                    // positions to the chain size (absolute key).
-                    unsafe {
-                        let h0 = hash_at_width(data, 0, hash_log, width);
-                        let newest = base + (((last - 1) / PREFILL_STRIDE) * PREFILL_STRIDE) as u64;
-                        for k in 0..=depth {
-                            let pos = newest - k as u64 * PREFILL_STRIDE as u64;
-                            *chain.get_unchecked_mut(pos as usize & chain_mask) =
-                                pack_head(pos - PREFILL_STRIDE as u64, origin);
-                        }
-                        *table.get_unchecked_mut(h0) = pack_head(newest, origin);
+                    let h0 = hash_at_width(data, 0, hash_log, width);
+                    let newest = base + (((last - 1) / PREFILL_STRIDE) * PREFILL_STRIDE) as u64;
+                    for k in 0..=depth {
+                        let pos = newest - k as u64 * PREFILL_STRIDE as u64;
+                        links.put_abs(pos, pack_head(pos - PREFILL_STRIDE as u64, origin));
                     }
+                    heads.put(h0, pack_head(newest, origin));
                 } else {
                     let mut idx = 0;
                     while idx < last {
                         let abs = base + idx as u64;
-                        // SAFETY: the hash masks to hash_log bits, the absolute
-                        // position to the chain size (absolute key; see
-                        // emit_chain's note on the walk side's indexing).
-                        unsafe {
-                            let h = hash_at_width(data, idx, hash_log, width);
-                            let head = *table.get_unchecked(h);
-                            *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                            *table.get_unchecked_mut(h) = pack_head(abs, origin);
-                        }
+                        insert_linked_at(data, heads, links, idx, abs, hash_log, width, origin);
                         idx += stride;
                     }
                 }
@@ -2699,8 +2689,11 @@ impl MatchGeneratorDriver {
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.buf_mut().as_mut_ptr();
-                let heads = self.row_heads.as_mut_ptr();
+                let tables = RowHandle::at(
+                    self.tables.buf_mut().as_mut_ptr(),
+                    self.row_heads.as_mut_ptr(),
+                    self.row_heads.len(),
+                );
                 // Same geometry decision as the chain arm: the strip is a
                 // full window, so it takes the stride grid; dictionary
                 // content is at most one window and parses against it, so
@@ -2717,9 +2710,9 @@ impl MatchGeneratorDriver {
                     let abs = base + idx as u64;
                     let h = row_hash_at(data, idx, hash_log, row_log, width);
                     match row_log {
-                        4 => row_insert_fill::<4>(table, heads, h, abs),
-                        5 => row_insert_fill::<5>(table, heads, h, abs),
-                        _ => row_insert_fill::<6>(table, heads, h, abs),
+                        4 => row_insert_fill::<4>(tables, h, abs),
+                        5 => row_insert_fill::<5>(tables, h, abs),
+                        _ => row_insert_fill::<6>(tables, h, abs),
                     }
                     idx += stride;
                 }
@@ -3721,33 +3714,31 @@ impl Matcher for MatchGeneratorDriver {
                         self.params.hash_log,
                         ChainHashWidth::of(self.dict_row),
                     );
-                    // SAFETY: h is masked to hash_log bits, the absolute block
-                    // start to the chain size (absolute key; see
-                    // emit_chain's note on the walk side's indexing).
-                    let (heads, chain) = self.tables.split();
-                    let chain_mask = chain.len() - 1;
-                    unsafe {
-                        let head = *heads.get_unchecked(h);
-                        *chain.get_unchecked_mut(self.block_start as usize & chain_mask) = head;
-                        *heads.get_unchecked_mut(h) = pack_head(self.block_start, self.head_origin);
-                    }
+                    let (heads, links) = self.tables.chain_pair(self.params.hash_log);
+                    heads.put_linked(links, h, self.block_start, self.head_origin);
                 },
                 Strategy::Dfast(small_log) => {
-                    let hl = hash8_at_log(win, idx, self.params.hash_log);
-                    let hs = hash_at_width(win, idx, small_log, ChainHashWidth::of(self.dict_row));
-                    // SAFETY: both hashes masked to their tables' sizes.
-                    let (long, small) = self.tables.split();
-                    unsafe {
-                        let entry = pack_pos(self.block_start - self.fast_shift);
-                        *long.get_unchecked_mut(hl) = entry;
-                        *small.get_unchecked_mut(hs) = entry;
-                    }
+                    let (long, small) = self.tables.dfast_pair(
+                        1usize << self.params.hash_log,
+                        self.params.hash_log,
+                        small_log,
+                    );
+                    put_both(
+                        long,
+                        small,
+                        win,
+                        idx,
+                        self.block_start - self.fast_shift,
+                        self.params.hash_log,
+                        small_log,
+                        ChainHashWidth::of(self.dict_row),
+                    );
                 },
                 Strategy::Fast => {
                     let log = self.fast_fill_log();
                     insert_at(
                         win,
-                        self.tables.heads_mut(),
+                        TableHandle::at(self.tables.heads_mut().as_mut_ptr(), log),
                         idx,
                         self.block_start - self.fast_shift,
                         log,
@@ -3764,12 +3755,15 @@ impl Matcher for MatchGeneratorDriver {
                         row_log,
                         ChainHashWidth::of(self.dict_row),
                     );
-                    let table = self.tables.buf_mut().as_mut_ptr();
-                    let heads = self.row_heads.as_mut_ptr();
+                    let tables = RowHandle::at(
+                        self.tables.buf_mut().as_mut_ptr(),
+                        self.row_heads.as_mut_ptr(),
+                        self.row_heads.len(),
+                    );
                     match row_log {
-                        4 => row_insert::<4>(table, heads, h, self.block_start),
-                        5 => row_insert::<5>(table, heads, h, self.block_start),
-                        _ => row_insert::<6>(table, heads, h, self.block_start),
+                        4 => row_insert::<4>(tables, h, self.block_start),
+                        5 => row_insert::<5>(tables, h, self.block_start),
+                        _ => row_insert::<6>(tables, h, self.block_start),
                     }
                 },
             }
@@ -4385,63 +4379,57 @@ impl MatchGeneratorDriver {
         match self.params.strategy {
             Strategy::Fast => {
                 let log = self.fast_fill_log();
+                let heads = TableHandle::at(self.tables.heads_mut().as_mut_ptr(), log);
                 while idx < to {
-                    insert_at(
-                        win,
-                        self.tables.heads_mut(),
-                        idx,
-                        win_base + idx as u64 - shift,
-                        log,
-                    );
+                    insert_at(win, heads, idx, win_base + idx as u64 - shift, log);
                     idx += 1;
                 }
             },
             Strategy::Dfast(small_log) => {
                 let long_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (long, small) = self.tables.split();
+                let (long, small) = self
+                    .tables
+                    .dfast_pair(1usize << long_log, long_log, small_log);
                 while idx < to {
-                    // SAFETY: both hashes are masked to their tables' sizes
-                    // (same pair as the dfast prefill).
-                    unsafe {
-                        let entry = pack_pos(win_base + idx as u64 - shift);
-                        *long.get_unchecked_mut(hash8_at_log(win, idx, long_log)) = entry;
-                        *small.get_unchecked_mut(hash_at_width(win, idx, small_log, width)) = entry;
-                    }
+                    put_both(
+                        long,
+                        small,
+                        win,
+                        idx,
+                        win_base + idx as u64 - shift,
+                        long_log,
+                        small_log,
+                        width,
+                    );
                     idx += 1;
                 }
             },
             Strategy::Chain(_) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let (table, chain) = self.tables.split();
-                let chain_mask = chain.len() - 1;
+                let (heads, links) = self.tables.chain_pair(hash_log);
                 let origin = self.head_origin;
                 while idx < to {
                     let abs = win_base + idx as u64;
-                    // SAFETY: the hash masks to hash_log bits, the absolute
-                    // position to the chain size (absolute key; see
-                    // emit_chain's note on the walk side's indexing).
-                    unsafe {
-                        let h = hash_at_width(win, idx, hash_log, width);
-                        let head = *table.get_unchecked(h);
-                        *chain.get_unchecked_mut(abs as usize & chain_mask) = head;
-                        *table.get_unchecked_mut(h) = pack_head(abs, origin);
-                    }
+                    insert_linked_at(win, heads, links, idx, abs, hash_log, width, origin);
                     idx += 1;
                 }
             },
             Strategy::Row(row_log) => {
                 let hash_log = self.params.hash_log;
                 let width = ChainHashWidth::of(self.dict_row);
-                let table = self.tables.buf_mut().as_mut_ptr();
-                let heads = self.row_heads.as_mut_ptr();
+                let tables = RowHandle::at(
+                    self.tables.buf_mut().as_mut_ptr(),
+                    self.row_heads.as_mut_ptr(),
+                    self.row_heads.len(),
+                );
                 while idx < to {
                     let h = row_hash_at(win, idx, hash_log, row_log, width);
                     match row_log {
-                        4 => row_insert_fill::<4>(table, heads, h, win_base + idx as u64),
-                        5 => row_insert_fill::<5>(table, heads, h, win_base + idx as u64),
-                        _ => row_insert_fill::<6>(table, heads, h, win_base + idx as u64),
+                        4 => row_insert_fill::<4>(tables, h, win_base + idx as u64),
+                        5 => row_insert_fill::<5>(tables, h, win_base + idx as u64),
+                        _ => row_insert_fill::<6>(tables, h, win_base + idx as u64),
                     }
                     idx += 1;
                 }
@@ -4654,7 +4642,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
     scalars && origins && tables && buffers && ldm
 }
 
-use parse_row::{row_hash_at, row_insert, row_insert_fill};
+use parse_row::{RowHandle, row_hash_at, row_insert, row_insert_fill};
 use price::*;
 use tables::*;
 pub(in crate::encoding) use tables::{pack_pos, push_seq_packed};
