@@ -98,6 +98,22 @@ impl AbReport {
             rounds = self.rounds,
         );
     }
+
+    /// Same line as `print`, returned for sections that buffer cell output
+    /// and print it in section order.
+    pub fn line(&self, name: &str, bytes: u64) -> String {
+        format!(
+            "{name:<16}{a_mibs:>9.0} {b_mibs:>9.0}  x{ratio:>6.3} ±{mad:.3}  [{lo:.3}..{hi:.3}]  \
+             n={rounds}",
+            a_mibs = self.a.mibs(bytes),
+            b_mibs = self.b.mibs(bytes),
+            ratio = self.ratios.median,
+            mad = self.ratios.mad,
+            lo = self.ratios.min,
+            hi = self.ratios.max,
+            rounds = self.rounds,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
