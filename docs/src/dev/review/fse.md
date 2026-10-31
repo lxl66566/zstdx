@@ -32,7 +32,7 @@ The audit compared each routine with the reference line by line and found no beh
 
 ### Unsafe audit
 
-The unsafe code is sound. `write_ncount` raw-pointer stores are covered by a reserve for `pos+8`, and no realloc happens between pointer derivation and `set_hot_state`. The aliasing is sound. `build_table_body` splits a `tab_len = 448 + ceil(ts/2)` u64 buffer into regions at offsets 0, 2048, 3072 and 3584. The regions are disjoint and u64-aligned. The spread run stores have `ts+8` slack. The `tab_parts`, `state_table`, `probs` and `start` slices are in bounds. No UB was found. Each site documents the contract its callers must uphold: dead-symbol tt entries hold stale pooled data, and `step` on a dead symbol stays in bounds through the dead fill.
+The unsafe code is sound. `write_ncount` raw-pointer stores are covered by a reserve for `pos+8`, and no realloc happens between pointer derivation and `set_hot_state`. The aliasing is sound. `build_table_body` casts a `tab_len = 448 + ceil(ts/2)` u64 buffer's head to a `#[repr(C)]` struct holding tt, probs and start, whose size const-asserts to 3584 bytes, and derives the trailing state table from the same base pointer. The regions are disjoint and u64-aligned, and every offset follows from the struct's size. The spread run stores have `ts+8` slack. The `tab_parts` and `state_table` slices are in bounds. No UB was found. Each site documents the contract its callers must uphold: dead-symbol tt entries hold stale pooled data, and `step` on a dead symbol stays in bounds through the dead fill.
 
 ### Call-site contracts
 

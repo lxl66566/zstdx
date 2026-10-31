@@ -248,9 +248,9 @@ pub struct FSETable {
     nsym: u16,
     /// All per-table data in ONE pooled buffer, so moving the table (build
     /// return, mode enum, previous-table slot) moves one pointer instead of
-    /// memcpy-ing the fat per-symbol arrays:
-    /// `[tt: u64 x 256][probs: i32 x 256][start: u16 x 256]
-    /// [state_table: u16 x table_size]`.
+    /// memcpy-ing the fat per-symbol arrays: an [`FseHead`] (tt, probs,
+    /// start) with the state table (`table_size` u16 entries) trailing at
+    /// the head's const-asserted size.
     ///
     /// `tt[code]` (libzstd's `FSE_CTable` arithmetic form) packs
     /// `delta_nb_bits` (low u32) and `delta_find_state` (high u32, two's
@@ -267,17 +267,41 @@ pub struct FSETable {
     tab: Vec<u64>,
 }
 
-/// u64 length of the tt region of [`FSETable::tab`].
-const TT_LEN: usize = 256;
-/// i32 index of the probs region inside [`FSETable::tab`] (byte 2048).
-const PROB_I32_OFF: usize = TT_LEN * 2;
-/// u16 index of the start region inside [`FSETable::tab`] (byte 3072).
-const START_U16_OFF: usize = PROB_I32_OFF * 2 + 512;
-/// u16 index of the state table inside [`FSETable::tab`] (byte 3584).
-const ST_U16_OFF: usize = START_U16_OFF + 256;
-/// u64 length of the fixed regions (tt + probs + start) of
-/// [`FSETable::tab`]; the state table follows.
-const FIXED_U64_LEN: usize = ST_U16_OFF / 4;
+/// The fixed per-symbol regions of [`FSETable::tab`], in build order.
+/// `#[repr(C)]` pins the field order, so the trailing state table starts at
+/// the struct's size and the overlay carries no hand-computed offsets.
+#[repr(C)]
+struct FseHead {
+    /// Transition entries (see [`FSETable::tab`]).
+    tt: [u64; 256],
+    /// Normalized probability per symbol (the NCount domain).
+    probs: [i32; 256],
+    /// Biased encode start state per symbol (see [`FSETable::start_index`]).
+    start: [u16; 256],
+}
+
+const _: () = {
+    // Pins the overlay the build walks and the encode addressing assume:
+    // the state table starts at the head's size, on a u64 boundary (byte
+    // 3584, where the previous hand-computed constants put it).
+    assert!(size_of::<FseHead>() == 3584);
+    assert!(size_of::<FseHead>().is_multiple_of(size_of::<u64>()));
+};
+
+/// u64 length of the [`FseHead`] region of a tab buffer.
+const HEAD_U64_LEN: usize = size_of::<FseHead>() / size_of::<u64>();
+/// u16 offset of the state table right behind [`FseHead`].
+const HEAD_U16_OFF: usize = size_of::<FseHead>() / size_of::<u16>();
+
+/// Hot-loop parts of one [`FSETable`] (see [`FSETable::tab_parts`]): the
+/// transition array and the state table, derived once per table so the
+/// encode loop's step stays at two indexed loads.
+pub(crate) struct FseParts<'a> {
+    /// Transition entries (`tt[code]`, libzstd's arithmetic form).
+    pub(crate) tt: &'a [u64; 256],
+    /// The state table (`table_size` u16 entries, symbol-major rows).
+    pub(crate) st: &'a [u16],
+}
 
 impl FSETable {
     /// One tANS encode step: `(nb_bits, emitted value, next state)` for
@@ -285,7 +309,7 @@ impl FSETable {
     /// emitted value is already masked to `nb_bits`.
     #[inline(always)]
     pub(crate) fn step(&self, code: u8, state: u32) -> (u32, u32, u32) {
-        let t = self.tab[code as usize];
+        let t = self.head().tt[code as usize];
         let nb = state.wrapping_add(t as u32) >> 16;
         let emit = state & ((1 << nb) - 1);
         let idx = (state >> nb).wrapping_add((t >> 32) as u32);
@@ -293,24 +317,31 @@ impl FSETable {
         (nb, emit, next)
     }
 
-    /// Raw table pointers for hot encode loops: the tt base (`u64` entries)
-    /// and the state-table base (`u16` entries at the fixed byte offset
-    /// 3584), so one base register serves both.
-    pub(crate) fn tab_parts(&self) -> (*const u64, *const u16) {
-        let tt = self.tab.as_ptr();
-        // SAFETY: the state table lives at ST_U16_OFF inside the same
-        // allocation, with `table_size` u16 entries.
-        let st = unsafe { tt.cast::<u16>().add(ST_U16_OFF) };
-        (tt, st)
+    /// The fixed head regions of the table buffer (see [`FseHead`]).
+    fn head(&self) -> &FseHead {
+        // SAFETY: the buffer's u64 length covers the head and its bytes are
+        // initialized: fresh buffers are zeroed
+        // ([`build_table_from_probabilities`]), pooled ones keep the prefix
+        // written by earlier builds ([`FseBuildScratch::take_tab`]).
+        unsafe { &*self.tab.as_ptr().cast::<FseHead>() }
+    }
+
+    /// Hot-loop parts of the table (see [`FseParts`]): one derivation per
+    /// table serves a whole encode loop.
+    pub(crate) fn tab_parts(&self) -> FseParts<'_> {
+        FseParts {
+            tt: &self.head().tt,
+            st: self.state_table(),
+        }
     }
 
     fn state_table(&self) -> &[u16] {
-        // SAFETY: the state table is `table_size` u16 entries at a fixed
-        // offset inside the tab allocation (the buffer's u64 length covers
-        // FIXED_U64_LEN + ceil(table_size / 2)).
+        // SAFETY: the state table is `table_size` u16 entries at the
+        // const-asserted head-size offset inside the tab allocation (the
+        // buffer's u64 length covers HEAD_U64_LEN + ceil(table_size / 2)).
         unsafe {
             core::slice::from_raw_parts(
-                self.tab.as_ptr().cast::<u16>().add(ST_U16_OFF),
+                self.tab.as_ptr().cast::<u16>().add(HEAD_U16_OFF),
                 self.table_size,
             )
         }
@@ -321,29 +352,14 @@ impl FSETable {
     /// The normalized probabilities (the NCount domain: `-1` marks the
     /// low-probability wire form), read by cross-entropy costing.
     pub(crate) fn probs_slice(&self) -> &[i32] {
-        self.probs()
-    }
-
-    fn probs(&self) -> &[i32] {
-        // SAFETY: 256 i32 at PROB_I32_OFF inside the tab allocation.
-        unsafe {
-            core::slice::from_raw_parts(self.tab.as_ptr().cast::<i32>().add(PROB_I32_OFF), 256)
-        }
-    }
-
-    /// Biased encoding start states over the live alphabet prefix.
-    fn start(&self) -> &[u16] {
-        // SAFETY: 256 u16 at START_U16_OFF inside the tab allocation.
-        unsafe {
-            core::slice::from_raw_parts(self.tab.as_ptr().cast::<u16>().add(START_U16_OFF), 256)
-        }
+        &self.head().probs
     }
 
     /// Index of the state encoding a block's last `symbol` starts from
     /// (biased: `table_size + index`).
     #[inline(always)]
     pub(crate) fn start_index(&self, symbol: u8) -> u32 {
-        self.start()[symbol as usize] as u32
+        self.head().start[symbol as usize] as u32
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -368,7 +384,7 @@ impl FSETable {
         if symbol as usize >= self.nsym as usize {
             return None;
         }
-        let p = self.probs()[symbol as usize];
+        let p = self.head().probs[symbol as usize];
         if p == 0 {
             return None;
         }
@@ -381,7 +397,7 @@ impl FSETable {
     /// can take, `(deltaNbBits + 2^16 - 1) >> 16` off the table's
     /// arithmetic form.
     pub(crate) fn max_nb_bits(&self, symbol: u8) -> u32 {
-        (self.tab[symbol as usize] as u32 + 0xffff) >> 16
+        (self.head().tt[symbol as usize] as u32 + 0xffff) >> 16
     }
 
     /// Return the table buffer to a build pool (see
@@ -391,7 +407,11 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        write_ncount(&self.probs()[..self.nsym as usize], self.acc_log(), writer);
+        write_ncount(
+            &self.head().probs[..self.nsym as usize],
+            self.acc_log(),
+            writer,
+        );
     }
 }
 
@@ -953,10 +973,10 @@ pub(crate) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     build_table_body(probs, acc_log, &mut owner, &mut spread, &mut tab)
 }
 
-/// u64 length of a tab buffer covering the fixed regions plus the state
-/// table for `table_size` states.
+/// u64 length of a tab buffer covering the [`FseHead`] regions plus the
+/// state table for `table_size` states.
 fn tab_len(table_size: usize) -> usize {
-    FIXED_U64_LEN + table_size.div_ceil(2)
+    HEAD_U64_LEN + table_size.div_ceil(2)
 }
 
 /// The pooled [`build_table_from_probabilities`]: recycles the table buffer
@@ -1001,21 +1021,28 @@ fn build_table_body(
     let table_size = 1usize << acc_log;
     let owner = &mut owner[..table_size];
     let spread = &mut spread[..table_size + 8];
-    // The per-symbol regions of the tab buffer: probs and start are written
-    // in place (no staging arrays to move out), and `start` doubles as the
-    // state-table walk's cursor below, then transforms into the biased
-    // encode start state.
-    // SAFETY: the tt region is 256 u64 at the buffer base, the probs region
-    // 256 i32 at PROB_I32_OFF and the start region 256 u16 at START_U16_OFF
-    // inside the tab allocation (whose u64 length covers all three, see
-    // [`tab_len`]); the three regions are disjoint.
-    let (tt, probs_full, start) = unsafe {
+    // The head regions of the tab buffer, cast as one `#[repr(C)]` struct:
+    // probs and start are written in place (no staging arrays to move out),
+    // and `start` doubles as the state-table walk's cursor below, then
+    // transforms into the biased encode start state. The state table is
+    // derived from the same base pointer; it starts at the head's
+    // const-asserted size, so the two stay disjoint.
+    // SAFETY: the buffer's u64 length covers head plus state table (see
+    // [`tab_len`]) and its bytes are initialized (fresh buffers are zeroed,
+    // pooled ones keep their written prefix, see
+    // [`FseBuildScratch::take_tab`]); the head and the state table occupy
+    // disjoint, properly aligned regions.
+    let (head, st) = unsafe {
         let base = tab.as_mut_ptr();
-        let tt = core::slice::from_raw_parts_mut(base, TT_LEN);
-        let probs = core::slice::from_raw_parts_mut(base.cast::<i32>().add(PROB_I32_OFF), 256);
-        let start = core::slice::from_raw_parts_mut(base.cast::<u16>().add(START_U16_OFF), 256);
-        (tt, probs, start)
+        let head = &mut *base.cast::<FseHead>();
+        let st = core::slice::from_raw_parts_mut(base.cast::<u16>().add(HEAD_U16_OFF), table_size);
+        (head, st)
     };
+    let FseHead {
+        tt,
+        probs: probs_full,
+        start,
+    } = head;
     probs_full[..probs.len()].copy_from_slice(probs);
     // The tail past the live prefix is dead by construction: every reader
     // (`write_table`'s serialization, `symbol_bit_cost`'s coverage check)
@@ -1099,12 +1126,6 @@ fn build_table_body(
     // k-th state of a symbol is its k-th smallest spread position. The walk
     // consumes `start` as its per-symbol cursor (libzstd mutates `cumul`
     // in place the same way).
-    // SAFETY: the state table is `table_size` u16 entries at ST_U16_OFF in
-    // the tab buffer (whose u64 length covers FIXED_U64_LEN +
-    // ceil(table_size/2)), disjoint from the tt/probs/start regions.
-    let st = unsafe {
-        core::slice::from_raw_parts_mut(tab.as_mut_ptr().cast::<u16>().add(ST_U16_OFF), table_size)
-    };
     for (u, &symbol) in owner.iter().enumerate() {
         let s = symbol as usize;
         st[start[s] as usize] = (table_size + u) as u16;
@@ -1372,7 +1393,7 @@ mod soa_tests {
                     0
                 };
                 assert_eq!(
-                    table.start()[s],
+                    table.head().start[s],
                     expect,
                     "case {case} start {s} probs {probs:?} acc {acc_log}"
                 );

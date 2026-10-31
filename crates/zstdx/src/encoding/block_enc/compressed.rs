@@ -710,7 +710,7 @@ fn fse_bit_cost_bits(
     let table_log = u32::from(prev.acc_log());
     let table_size = 1u32 << table_log;
     let bad_cost = (u64::from(table_log) + 1) << 8;
-    let (tt, _) = prev.tab_parts();
+    let tt = prev.tab_parts().tt;
     let probs = prev.probs_slice();
     let mut cost = 0u64;
     for s in 0..=max_symbol {
@@ -723,7 +723,9 @@ fn fse_bit_cost_bits(
         if s > prev.max_symbol() as usize || probs[s] == 0 {
             return None;
         }
-        let dnb = unsafe { *tt.add(s) as u32 };
+        // SAFETY: s <= max_symbol <= SEQ_CODE_SPACE - 1 stays inside the
+        // 256-entry tt array.
+        let dnb = unsafe { *tt.get_unchecked(s) as u32 };
         let min_nb = dnb >> 16;
         let threshold = (min_nb + 1) << 16;
         let delta_from_threshold = threshold - (dnb + table_size);
@@ -1007,9 +1009,9 @@ fn encode_sequences(
     // states (`table_size + index`), and the emitted value is the biased
     // state's low `nb` bits — no materialized transition matrix, no
     // per-block row-pointer setup, and both tables are L1-resident.
-    let (ll_tt, ll_st) = ll_table.tab_parts();
-    let (ml_tt, ml_st) = ml_table.tab_parts();
-    let (of_tt, of_st) = of_table.tab_parts();
+    let ll = ll_table.tab_parts();
+    let ml = ml_table.tab_parts();
+    let of = of_table.tab_parts();
 
     let li = nb_seq - 1;
     let packed = seqs[li].codes;
@@ -1082,9 +1084,9 @@ fn encode_sequences(
                         w.add,
                         w.add_nb as usize,
                         packed,
-                        *of_tt.add((packed >> 16) as u8 as usize),
-                        *ml_tt.add((packed >> 8) as u8 as usize),
-                        *ll_tt.add(packed as u8 as usize),
+                        *of.tt.get_unchecked((packed >> 16) as u8 as usize),
+                        *ml.tt.get_unchecked((packed >> 8) as u8 as usize),
+                        *ll.tt.get_unchecked(packed as u8 as usize),
                     )
                 };
                 debug_assert!(of_state < 2 * of_table.table_size as u32);
@@ -1104,15 +1106,15 @@ fn encode_sequences(
                 // SAFETY: the tt entries hold deltaFindState in their high
                 // half; the index lands in the code's own state-table row.
                 unsafe {
-                    of_state = *of_st
-                        .add((of_state >> of_nb).wrapping_add((t_of >> 32) as u32) as usize)
-                        as u32;
-                    ml_state = *ml_st
-                        .add((ml_state >> ml_nb).wrapping_add((t_ml >> 32) as u32) as usize)
-                        as u32;
-                    ll_state = *ll_st
-                        .add((ll_state >> ll_nb).wrapping_add((t_ll >> 32) as u32) as usize)
-                        as u32;
+                    of_state = *of.st.get_unchecked(
+                        (of_state >> of_nb).wrapping_add((t_of >> 32) as u32) as usize,
+                    ) as u32;
+                    ml_state = *ml.st.get_unchecked(
+                        (ml_state >> ml_nb).wrapping_add((t_ml >> 32) as u32) as usize,
+                    ) as u32;
+                    ll_state = *ll.st.get_unchecked(
+                        (ll_state >> ll_nb).wrapping_add((t_ll >> 32) as u32) as usize,
+                    ) as u32;
                 }
 
                 // The three state-transition bit groups (max 12 bits each:
