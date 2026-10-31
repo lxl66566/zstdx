@@ -90,16 +90,38 @@ pub(super) fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
 
 /// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
 #[inline(always)]
-pub(super) fn read4(win: &[u8], idx: usize) -> u32 {
+pub(in crate::encoding) fn read4(win: &[u8], idx: usize) -> u32 {
     // SAFETY: see contract above; unaligned because byte-granular.
     unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
 }
 
 /// Read 8 window bytes at `idx`. Caller guarantees `idx + 8 <= win.len()`.
 #[inline(always)]
-pub(super) fn read8(win: &[u8], idx: usize) -> u64 {
+pub(in crate::encoding) fn read8(win: &[u8], idx: usize) -> u64 {
     // SAFETY: see contract above; unaligned because byte-granular.
     unsafe { win.as_ptr().add(idx).cast::<u64>().read_unaligned() }
+}
+
+/// libzstd's 3-byte hash (`ZSTD_hash3`: low 24 bits times prime3bytes).
+#[inline(always)]
+pub(in crate::encoding) fn hash3_at(win: &[u8], idx: usize, log: u32) -> usize {
+    debug_assert!((1..32).contains(&log));
+    (((read4(win, idx) << 8).wrapping_mul(506832829)) >> (32 - log)) as usize
+}
+
+/// libzstd's 4-byte hash (`ZSTD_hash4`).
+#[inline(always)]
+pub(in crate::encoding) fn hash4_at(win: &[u8], idx: usize, log: u32) -> usize {
+    debug_assert!((1..32).contains(&log));
+    ((read4(win, idx).wrapping_mul(2654435761)) >> (32 - log)) as usize
+}
+
+/// libzstd's 5-byte hash (`ZSTD_hash5`: low 40 bits times prime5bytes).
+#[inline(always)]
+pub(in crate::encoding) fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
+    debug_assert!((1..64).contains(&log));
+    let v = read8(win, idx) & 0xff_ffff_ffff;
+    (((v << 24).wrapping_mul(889523592379)) >> (64 - log)) as usize
 }
 
 /// Longest common prefix of `win[i..]` and `win[j..]` in u64 chunks. `i` is

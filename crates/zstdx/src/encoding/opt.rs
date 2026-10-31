@@ -15,6 +15,9 @@
 
 use alloc::vec::Vec;
 
+// Window reads and the C-form hashes: match_generator/hash.rs is the
+// canonical home; re-exported so dubt/btlazy's `opt::` imports hold.
+pub(in crate::encoding) use super::match_generator::{hash3_at, hash4_at, hash5_at, read4};
 use super::{
     SeqWord,
     ldm::LdmSeq,
@@ -472,42 +475,6 @@ impl OptState {
     }
 }
 
-/// Read 4 window bytes (same contract as the match_generator helpers).
-#[inline(always)]
-pub(crate) fn read4(win: &[u8], idx: usize) -> u32 {
-    // SAFETY: callers only read positions with 4 bytes inside the window.
-    unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
-}
-
-/// Read 8 window bytes.
-#[inline(always)]
-pub(crate) fn read8(win: &[u8], idx: usize) -> u64 {
-    // SAFETY: callers only read positions with 8 bytes inside the window.
-    unsafe { win.as_ptr().add(idx).cast::<u64>().read_unaligned() }
-}
-
-/// libzstd's 3-byte hash (`ZSTD_hash3`: low 24 bits times prime3bytes).
-#[inline(always)]
-pub(crate) fn hash3_at(win: &[u8], idx: usize, log: u32) -> usize {
-    debug_assert!((1..32).contains(&log));
-    (((read4(win, idx) << 8).wrapping_mul(506832829)) >> (32 - log)) as usize
-}
-
-/// libzstd's 4-byte hash (`ZSTD_hash4`).
-#[inline(always)]
-pub(crate) fn hash4_at(win: &[u8], idx: usize, log: u32) -> usize {
-    debug_assert!((1..32).contains(&log));
-    ((read4(win, idx).wrapping_mul(2654435761)) >> (32 - log)) as usize
-}
-
-/// libzstd's 5-byte hash (`ZSTD_hash5`: low 40 bits times prime5bytes).
-#[inline(always)]
-pub(crate) fn hash5_at(win: &[u8], idx: usize, log: u32) -> usize {
-    debug_assert!((1..64).contains(&log));
-    let v = read8(win, idx) & 0xff_ffff_ffff;
-    (((v << 24).wrapping_mul(889523592379)) >> (64 - log)) as usize
-}
-
 /// Common-prefix length of `win[idx..]` and `win[cand..]` given `start`
 /// pre-verified bytes, bounded by window index `limit`. Returns the full
 /// length from offset zero, so callers take the result as-is (libzstd's
@@ -897,7 +864,6 @@ impl Finder<'_, '_> {
         let mut match_end = pos + 9;
         let mut nb = self.insert_compares;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
-        let mut dummy = EMPTY;
         // Insert-side counts cap at the DP window: the parser can only
         // exploit matches up to OPT_NUM positions, so a longer common prefix
         // cannot improve the tree's usefulness here. Without the cap,
@@ -906,56 +872,63 @@ impl Finder<'_, '_> {
         // heads. Search-side counts stay exact; a cap hit breaks the walk
         // with the same "equal tail" semantics as the block-end hit.
         let count_limit = self.block_end_idx.min(idx + OPT_NUM);
-        // SAFETY: h is masked to the table size and bt slots to the ring by
-        // construction; window reads stay inside the block (count_from caps
-        // at count_limit and the equal-tail case breaks before the byte
-        // compare). Verified by debug_asserts at the call sites.
-        unsafe {
-            *self.table.get_unchecked_mut(h) = self.pack(pos);
-            let mut smaller: *mut u32 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
-            let mut larger: *mut u32 = smaller.add(1);
-            while let Some(ca) = cand {
-                if nb == 0 {
-                    break;
-                }
-                nb -= 1;
-                let cidx = (ca - self.win_base) as usize;
-                let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, idx, cidx, ml, count_limit);
-                if ml > best_len {
-                    best_len = ml;
-                    if ca + ml as u64 > match_end {
-                        match_end = ca + ml as u64;
-                    }
-                }
-                // An equal tail cannot order the candidate; stop to keep the
-                // tree consistent. A cap hit is just as unordered.
-                if idx + ml >= count_limit {
-                    break;
-                }
-                let node = 2 * (ca as usize & self.bt_mask);
-                if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.pack(ca);
-                    common_smaller = ml;
-                    if ca <= bt_low {
-                        smaller = &raw mut dummy;
-                        break;
-                    }
-                    smaller = self.bt.as_mut_ptr().add(node + 1);
-                    cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
-                } else {
-                    *larger = self.pack(ca);
-                    common_larger = ml;
-                    if ca <= bt_low {
-                        larger = &raw mut dummy;
-                        break;
-                    }
-                    larger = self.bt.as_mut_ptr().add(node);
-                    cand = self.resolve(*self.bt.get_unchecked(node), floor, pos);
+        // Checked indexing (the walk is branchy per step; the masked ring
+        // slots and the count-capped window reads the raw-pointer form
+        // asserted by construction are index checks here).
+        self.table[h] = self.pack(pos);
+        let own = 2 * (pos as usize & self.bt_mask);
+        let mut smaller = own;
+        let mut larger = own + 1;
+        // The trailing EMPTY stores are suppressed when the walk stopped on
+        // the ring floor: that slot holds the freshly threaded link (the
+        // raw-pointer form pointed the cursor at a dummy local instead).
+        let mut smaller_open = true;
+        let mut larger_open = true;
+        while let Some(ca) = cand {
+            if nb == 0 {
+                break;
+            }
+            nb -= 1;
+            let cidx = (ca - self.win_base) as usize;
+            let mut ml = common_smaller.min(common_larger);
+            ml = count_from(self.win, idx, cidx, ml, count_limit);
+            if ml > best_len {
+                best_len = ml;
+                if ca + ml as u64 > match_end {
+                    match_end = ca + ml as u64;
                 }
             }
-            *smaller = EMPTY;
-            *larger = EMPTY;
+            // An equal tail cannot order the candidate; stop to keep the
+            // tree consistent. A cap hit is just as unordered.
+            if idx + ml >= count_limit {
+                break;
+            }
+            let node = 2 * (ca as usize & self.bt_mask);
+            if self.win[cidx + ml] < self.win[idx + ml] {
+                self.bt[smaller] = self.pack(ca);
+                common_smaller = ml;
+                if ca <= bt_low {
+                    smaller_open = false;
+                    break;
+                }
+                smaller = node + 1;
+                cand = self.resolve(self.bt[node + 1], floor, pos);
+            } else {
+                self.bt[larger] = self.pack(ca);
+                common_larger = ml;
+                if ca <= bt_low {
+                    larger_open = false;
+                    break;
+                }
+                larger = node;
+                cand = self.resolve(self.bt[node], floor, pos);
+            }
+        }
+        if smaller_open {
+            self.bt[smaller] = EMPTY;
+        }
+        if larger_open {
+            self.bt[larger] = EMPTY;
         }
         let positions = if best_len > 384 {
             (best_len - 384).min(192)
@@ -1143,60 +1116,66 @@ impl Finder<'_, '_> {
         let mut match_end = pos + 9;
         let mut nb = self.nb_compares;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
-        let mut dummy = EMPTY;
-        // SAFETY: same invariants as insert_bt1.
-        unsafe {
-            *self.table.get_unchecked_mut(h) = self.pack(pos);
-            let mut smaller: *mut u32 = self.bt.as_mut_ptr().add(2 * (pos as usize & self.bt_mask));
-            let mut larger: *mut u32 = smaller.add(1);
-            while let Some(ca) = cand {
-                if nb == 0 {
+        // Checked indexing throughout (see `insert_bt1`).
+        self.table[h] = self.pack(pos);
+        let own = 2 * (pos as usize & self.bt_mask);
+        let mut smaller = own;
+        let mut larger = own + 1;
+        // The trailing EMPTY stores are suppressed when the walk stopped on
+        // the ring floor (see `insert_bt1`).
+        let mut smaller_open = true;
+        let mut larger_open = true;
+        while let Some(ca) = cand {
+            if nb == 0 {
+                break;
+            }
+            nb -= 1;
+            let cidx = (ca - self.win_base) as usize;
+            let mut ml = common_smaller.min(common_larger);
+            ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+            if ml > best_len {
+                if ca + ml as u64 > match_end {
+                    match_end = ca + ml as u64;
+                }
+                best_len = ml;
+                matches[mnum] = Match {
+                    off: (pos - ca + 3) as u32,
+                    len: ml as u32,
+                };
+                mnum += 1;
+                if ml > OPT_NUM || idx + ml >= self.block_end_idx {
                     break;
-                }
-                nb -= 1;
-                let cidx = (ca - self.win_base) as usize;
-                let mut ml = common_smaller.min(common_larger);
-                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
-                if ml > best_len {
-                    if ca + ml as u64 > match_end {
-                        match_end = ca + ml as u64;
-                    }
-                    best_len = ml;
-                    matches[mnum] = Match {
-                        off: (pos - ca + 3) as u32,
-                        len: ml as u32,
-                    };
-                    mnum += 1;
-                    if ml > OPT_NUM || idx + ml >= self.block_end_idx {
-                        break;
-                    }
-                }
-                if idx + ml >= self.block_end_idx {
-                    break;
-                }
-                let node = 2 * (ca as usize & self.bt_mask);
-                if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
-                    *smaller = self.pack(ca);
-                    common_smaller = ml;
-                    if ca <= bt_low {
-                        smaller = &raw mut dummy;
-                        break;
-                    }
-                    smaller = self.bt.as_mut_ptr().add(node + 1);
-                    cand = self.resolve(*self.bt.get_unchecked(node + 1), floor, pos);
-                } else {
-                    *larger = self.pack(ca);
-                    common_larger = ml;
-                    if ca <= bt_low {
-                        larger = &raw mut dummy;
-                        break;
-                    }
-                    larger = self.bt.as_mut_ptr().add(node);
-                    cand = self.resolve(*self.bt.get_unchecked(node), floor, pos);
                 }
             }
-            *smaller = EMPTY;
-            *larger = EMPTY;
+            if idx + ml >= self.block_end_idx {
+                break;
+            }
+            let node = 2 * (ca as usize & self.bt_mask);
+            if self.win[cidx + ml] < self.win[idx + ml] {
+                self.bt[smaller] = self.pack(ca);
+                common_smaller = ml;
+                if ca <= bt_low {
+                    smaller_open = false;
+                    break;
+                }
+                smaller = node + 1;
+                cand = self.resolve(self.bt[node + 1], floor, pos);
+            } else {
+                self.bt[larger] = self.pack(ca);
+                common_larger = ml;
+                if ca <= bt_low {
+                    larger_open = false;
+                    break;
+                }
+                larger = node;
+                cand = self.resolve(self.bt[node], floor, pos);
+            }
+        }
+        if smaller_open {
+            self.bt[smaller] = EMPTY;
+        }
+        if larger_open {
+            self.bt[larger] = EMPTY;
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;

@@ -206,12 +206,15 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut dummy = 0u32;
-        // SAFETY: ring slots are masked by construction; window reads stay
-        // inside the block (count_from caps at block_end and the equal-tail
-        // break precedes the ordering byte compare).
+        // SAFETY: ring slots are masked by construction (debug-pinned at
+        // each raw site); window reads stay inside the block (count_from
+        // caps at block_end and the equal-tail break precedes the ordering
+        // byte compare).
         unsafe {
             let bt = self.bt.as_mut_ptr();
-            let own = bt.add(2 * (pack_pos(curr) as usize & self.bt_mask));
+            let own = 2 * (pack_pos(curr) as usize & self.bt_mask);
+            debug_assert!(own + 1 < self.bt.len());
+            let own = bt.add(own);
             let mut smaller: *mut u32 = own;
             let mut larger: *mut u32 = own.add(1);
             let mut v = *smaller; // the fill-time chain link
@@ -232,7 +235,9 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 if curr_idx + ml >= self.block_end_idx {
                     break;
                 }
+                debug_assert!(2 * (v as usize & self.bt_mask) + 1 < self.bt.len());
                 let node = bt.add(2 * (v as usize & self.bt_mask));
+                debug_assert!(cidx + ml < self.win.len() && curr_idx + ml < self.win.len());
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(curr_idx + ml) {
                     *smaller = v;
                     common_smaller = ml;
@@ -291,6 +296,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         // value is identical.
         let h = self.hash_main(idx);
         // SAFETY: plain head read; h is masked by hash_main's table_log.
+        debug_assert!(h < self.table.len());
         let head = unsafe { *self.table.as_ptr().add(h) };
 
         // Repeated-offset candidates (the cheapest offsets to encode) —
@@ -348,12 +354,14 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         let mut nb_candidates = self.nb_compares;
 
         let mut match_end = pos + 9;
-        // SAFETY: slots are masked to the ring; candidate reads are floor-
-        // and pos-checked; window reads as in insert_dubt1.
+        // SAFETY: slots are masked to the ring (debug-pinned at each raw
+        // site); candidate reads are floor- and pos-checked; window reads
+        // as in insert_dubt1.
         unsafe {
             let bt = self.bt.as_mut_ptr();
             // Walk the unsorted chain from the head, reversing slot[1] into
             // a backtrack link toward newer nodes.
+            debug_assert!(h < self.table.len());
             let mut cand = *self.table.as_ptr().add(h);
             let mut prev = 0u32;
             // Fused `unsort_limit < cand < pos` range check (one compare).
@@ -363,6 +371,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 if cand_abs.wrapping_sub(unsort_limit + 1) >= unsort_span {
                     break;
                 }
+                debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
                 if *node.add(1) != UNSORTED || nb_candidates <= 1 {
                     break;
@@ -380,6 +389,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 // range check, so it skips the nullify block too.
                 let cand_abs = unpack_pos(cand, pos);
                 if cand_abs > unsort_limit && cand_abs < pos {
+                    debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
                     let node = bt.add(2 * (cand as usize & self.bt_mask));
                     if *node.add(1) == UNSORTED {
                         *node = 0;
@@ -391,6 +401,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             // link must be read before the sort overwrites the slot.
             let mut m = prev;
             while m != 0 {
+                debug_assert!(2 * (m as usize & self.bt_mask) + 1 < self.bt.len());
                 let node = bt.add(2 * (m as usize & self.bt_mask));
                 let newer = *node.add(1);
                 self.insert_dubt1(unpack_pos(m, pos), nb_candidates, unsort_limit);
@@ -408,7 +419,9 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             let mut common_larger = 0usize;
             let mut nb = self.nb_compares;
             let mut dummy = 0u32;
-            let own = bt.add(2 * (pack_pos(pos) as usize & self.bt_mask));
+            let own = 2 * (pack_pos(pos) as usize & self.bt_mask);
+            debug_assert!(own + 1 < self.bt.len());
+            let own = bt.add(own);
             let mut smaller: *mut u32 = own;
             let mut larger: *mut u32 = own.add(1);
             // Fused range check as in insert_dubt1: `floor < cand < pos` in
@@ -447,7 +460,9 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 if at_end {
                     break;
                 }
+                debug_assert!(2 * (cand as usize & self.bt_mask) + 1 < self.bt.len());
                 let node = bt.add(2 * (cand as usize & self.bt_mask));
+                debug_assert!(cidx + ml < self.win.len() && idx + ml < self.win.len());
                 if *self.win.get_unchecked(cidx + ml) < *self.win.get_unchecked(idx + ml) {
                     *smaller = cand;
                     common_smaller = ml;
@@ -517,7 +532,9 @@ fn fill_range<const MLS: usize>(
     target_idx: usize,
 ) {
     // SAFETY: the hash masks to the table size and the ring slot to the
-    // ring by construction; positions are live window offsets.
+    // ring by construction (debug-pinned below); positions are live window
+    // offsets.
+    let (table_len, bt_len) = (table.len(), bt.len());
     unsafe {
         let table = table.as_mut_ptr();
         let bt = bt.as_mut_ptr();
@@ -527,8 +544,11 @@ fn fill_range<const MLS: usize>(
                 4 => hash4_at(win, idx, table_log),
                 _ => hash5_at(win, idx, table_log),
             };
+            debug_assert!(h < table_len);
             let v = pack_pos(win_base + idx as u64);
-            let slot = bt.add(2 * (v as usize & bt_mask));
+            let slot = 2 * (v as usize & bt_mask);
+            debug_assert!(slot + 1 < bt_len);
+            let slot = bt.add(slot);
             *slot = *table.add(h);
             *slot.add(1) = UNSORTED;
             *table.add(h) = v;
