@@ -3,7 +3,9 @@
 //! Design goals for machines with noticeable performance drift:
 //! - **Interleaving**: A and B alternate round by round, so slow drift (thermal, clocks, background
 //!   load) hits both sides equally; the per-round ratio is the primary output.
-//! - **Warmup**: one unmeasured round each before timing starts.
+//! - **Warmup**: one unmeasured round each before timing starts. A round slow enough that no cache
+//!   holds the working set between rounds makes that warmup round wasted wall time, so the first
+//!   round is then kept as a sample instead.
 //! - **Time budget**: rounds accumulate until each side ran for `min_secs` (default 0.5 s, override
 //!   with `--budget-ms` or the `BENCH_BUDGET_MS` env var), so the total wall time is bounded
 //!   without fixing an iteration count. A side that is far faster than its counterpart only needs
@@ -23,6 +25,13 @@ use std::time::Instant;
 /// seconds per round and ours runs milliseconds): once the slow side spent
 /// its full budget, the fast side stops at this fraction.
 const FAST_SIDE_BUDGET_FRAC: f64 = 0.125;
+
+/// A round at least this slow is kept as the first sample instead of being
+/// discarded as warmup. Below this bound the payload plausibly stays in a
+/// cache across rounds and the first round reads cold, so the discard
+/// stands. Derived from the budget, not a wall-clock constant, so
+/// `--budget-ms` moves both together.
+const SLOW_ROUND_FRAC: f64 = 1.0 / 3.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
@@ -128,6 +137,13 @@ pub fn apply_budget(ms: Option<f64>) {
     }
 }
 
+/// Calibration override: `ZSTDX_BENCH_WARMUP=always` forces the
+/// unconditional warmup discard of the older harness, for A/B-ing the
+/// slow-round skip on the same build.
+fn warmup_forced() -> bool {
+    std::env::var("ZSTDX_BENCH_WARMUP").as_deref() == Ok("always")
+}
+
 impl Ab {
     /// Interleaved A/B measurement of two round closures.
     pub fn measure<A, B>(&self, mut a: A, mut b: B) -> AbReport
@@ -135,14 +151,26 @@ impl Ab {
         A: FnMut(),
         B: FnMut(),
     {
-        for _ in 0..self.warmup_rounds {
-            a();
-            b();
-        }
         let mut a_times = Vec::new();
         let mut b_times = Vec::new();
+        for _ in 0..self.warmup_rounds {
+            let t = Instant::now();
+            a();
+            let ta = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            b();
+            let tb = t.elapsed().as_secs_f64();
+            // A round this slow cannot warm anything the next round reads,
+            // so it counts as a sample; fast rounds are the warmup discard.
+            let slow =
+                ta >= self.min_secs * SLOW_ROUND_FRAC || tb >= self.min_secs * SLOW_ROUND_FRAC;
+            if slow && !warmup_forced() {
+                a_times.push(ta);
+                b_times.push(tb);
+            }
+        }
         let fast_secs = self.min_secs * FAST_SIDE_BUDGET_FRAC;
-        let mut rounds = 0usize;
+        let mut rounds = a_times.len();
         loop {
             let t = Instant::now();
             a();
