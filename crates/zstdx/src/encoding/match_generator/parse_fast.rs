@@ -432,6 +432,19 @@ impl MatchGeneratorDriver {
                         // it covers, and rejecting it lets the scan try
                         // the next position where a longer match may
                         // start.
+                        // Dense bodies pre-validate the 6th byte: a differing
+                        // byte 5 caps the extend at ml < 6 whatever byte 4
+                        // does (hash5 collisions included), so the gate
+                        // below would reject the outcome anyway and the
+                        // extend call is skipped outright — the ml-5 band
+                        // is the whole reject population there (counters:
+                        // ml 4 never occurs). Byte-identical by
+                        // construction; folds to the unguarded body when
+                        // DENSE is false. Dense dispatch always pairs with
+                        // MIN_ML 6 (SMALL_WIDE never arms dense), pinned by
+                        // the assert.
+                        debug_assert!(!DENSE || MIN_ML == 6);
+                        if !DENSE || win[cand0 + 5] == win[idx0 + 5] {
                         // Gap bound folded into the extend (the match
                         // starts at `pos`), as above.
                         let mut ml = if $ldm {
@@ -489,6 +502,7 @@ impl MatchGeneratorDriver {
                                 continue $restart;
                             }
                         }
+                        }
                     }
                 } else if !rep1_armed {
                     break 'probes;
@@ -532,6 +546,10 @@ impl MatchGeneratorDriver {
                 }
 
                 if m1 == 0 {
+                    // Dense 6th-byte pre-validation, as at the first
+                    // position above.
+                    debug_assert!(!DENSE || MIN_ML == 6);
+                    if !DENSE || win[cand1 + 5] == win[idx1 + 5] {
                     // Gap bound folded into the extend (the match starts
                     // at `pos1`), as above.
                     let mut ml = if $ldm {
@@ -577,6 +595,7 @@ impl MatchGeneratorDriver {
                             miss_count = 0;
                             continue $restart;
                         }
+                    }
                     }
                 }
                 }
