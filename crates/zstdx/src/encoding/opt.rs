@@ -22,7 +22,7 @@ use super::{
     SeqWord,
     ldm::LdmSeq,
     match_generator::{HASH_READ, push_seq_packed},
-    seq_codes::{encode_literal_length, encode_match_len},
+    seq_codes::{LL_META, ML_META, encode_literal_length, encode_match_len},
 };
 use crate::decoding::sequence_execution::do_offset_history;
 
@@ -247,6 +247,18 @@ pub(crate) struct OptKnobs {
 
 /// Price statistics persisting across blocks; a zero `lit_length_sum` means
 /// "first block" and re-seeds (`ZSTD_rescaleFreqs`).
+///
+/// The price-table mirrors below hold the per-symbol weight folded with
+/// each code's fixed surcharge (`LL_META`/`ML_META` bits, the match
+/// surcharge, the non-ultra offset handicap), so a price lookup is one
+/// masked read plus the base price. Each table is a power of two long and
+/// every index function stays below it, so the mask drops the bounds
+/// check. The mirrors are pure functions of the frequencies at one
+/// `ULTRA` instantiation: every path that writes a frequency rewrites its
+/// mirror entry, and every `rescale_freqs` rebuilds all of them (a pooled
+/// state that switches `ULTRA` re-seeds on its first block, which runs
+/// the first-block branch and the rebuild). Entries above the widest code
+/// are never read.
 #[derive(Clone, PartialEq)]
 pub(crate) struct OptState {
     lit_freq: [u32; 256],
@@ -254,6 +266,19 @@ pub(crate) struct OptState {
     match_length_freq: [u32; 53],
     /// Indexed by `highbit32(off_base)`.
     off_code_freq: [u32; 32],
+    /// `WEIGHT(lit_freq[b])`; the price clamp stays at lookup because the
+    /// base price moves per series.
+    lit_weight: [u32; 256],
+    /// `LL_META[code].1 * BITCOST_MULTIPLIER - WEIGHT(ll_freq[code])`,
+    /// indexed by literal-length code.
+    ll_price: [u32; 64],
+    /// `ML_META[code].1 * BITCOST_MULTIPLIER - WEIGHT(ml_freq[code])`
+    /// plus the `BITCOST_MULTIPLIER / 5` match surcharge, indexed by
+    /// match-length code.
+    ml_price: [u32; 128],
+    /// `code * BITCOST_MULTIPLIER - WEIGHT(off_freq[code])` plus the
+    /// non-ultra long-offset handicap, indexed by `highbit32(off_base)`.
+    off_price: [u32; 32],
     lit_sum: u32,
     lit_length_sum: u32,
     match_length_sum: u32,
@@ -323,6 +348,46 @@ fn weight<const ULTRA: bool>(stat: u32) -> u32 {
     }
 }
 
+/// `WEIGHT` for a whole table through the f32 bit pattern: for
+/// `stat + 1 < 2^24` the conversion is exact, the exponent field reads
+/// `highbit32(stat + 1) + 127` and the top mantissa bits carry the
+/// fraction, so `bits >> 23` and `bits >> 15` give the whole-bit and
+/// fractional weights up to a constant. The loop has no integer log, so
+/// it vectorizes. A table holding any statistic of `2^24` or above is
+/// redone with the integer form, which wraps exactly like the scalar
+/// path does there.
+fn weights_bulk<const ULTRA: bool>(stats: &[u32], out: &mut [u32]) {
+    let len = stats.len().min(out.len());
+    let (stats, out) = (&stats[..len], &mut out[..len]);
+    let mut seen = 0u32;
+    let bits = |stat: u32| (stat.wrapping_add(1) as f32).to_bits();
+    if ULTRA {
+        for (weight_out, &stat) in out.iter_mut().zip(stats) {
+            seen |= stat.wrapping_add(1);
+            *weight_out = (bits(stat) >> 15).wrapping_sub(126 * BITCOST_MULTIPLIER);
+        }
+    } else {
+        for (weight_out, &stat) in out.iter_mut().zip(stats) {
+            seen |= stat.wrapping_add(1);
+            *weight_out = ((bits(stat) >> 23).wrapping_sub(127)).wrapping_mul(BITCOST_MULTIPLIER);
+        }
+    }
+    if seen >= 1 << 24 {
+        // The scalar form's release semantics, spelled total: the shift
+        // wraps past 2^24 and the debug assert in `frac_weight` does not
+        // hold there, so the arithmetic is inline.
+        for (weight_out, &stat) in out.iter_mut().zip(stats) {
+            let stat = stat.wrapping_add(1);
+            let hb = 31 - (stat | 1).leading_zeros();
+            *weight_out = if ULTRA {
+                (hb * BITCOST_MULTIPLIER).wrapping_add((stat << 8) >> hb)
+            } else {
+                hb * BITCOST_MULTIPLIER
+            };
+        }
+    }
+}
+
 #[inline]
 fn ll_inc_price<const ULTRA: bool>(state: &OptState, lit_length: u32) -> i64 {
     state.lit_length_price::<ULTRA>(lit_length) as i64
@@ -336,6 +401,10 @@ impl OptState {
             lit_length_freq: [0; 36],
             match_length_freq: [0; 53],
             off_code_freq: [0; 32],
+            lit_weight: [0; 256],
+            ll_price: [0; 64],
+            ml_price: [0; 128],
+            off_price: [0; 32],
             lit_sum: 0,
             lit_length_sum: 0,
             match_length_sum: 0,
@@ -359,6 +428,40 @@ impl OptState {
         self.off_code_base_price = weight::<ULTRA>(self.off_code_sum);
     }
 
+    /// Rebuild every price-table mirror from the frequencies (see the
+    /// struct doc). Runs on every rescale and on the dictionary seeding,
+    /// the two points where whole tables change.
+    fn rebuild_price_tables<const ULTRA: bool>(&mut self) {
+        weights_bulk::<ULTRA>(&self.lit_freq, &mut self.lit_weight[..]);
+        // Entry arithmetic wraps like C's u32: a code with no extra bits
+        // and a nonzero weight wraps the entry, and the lookup's add of
+        // the base price wraps it back to the true price (the base is at
+        // or above the weight, so the true price is representable).
+        let mut weight_of = [0u32; 128];
+        weights_bulk::<ULTRA>(&self.lit_length_freq, &mut weight_of[..36]);
+        for code in 0..self.lit_length_freq.len() {
+            self.ll_price[code] =
+                (LL_META[code].1 as u32 * BITCOST_MULTIPLIER).wrapping_sub(weight_of[code]);
+        }
+        weights_bulk::<ULTRA>(&self.match_length_freq, &mut weight_of[..53]);
+        for code in 0..self.match_length_freq.len() {
+            self.ml_price[code] = (ML_META[code].1 as u32 * BITCOST_MULTIPLIER)
+                .wrapping_sub(weight_of[code])
+                .wrapping_add(BITCOST_MULTIPLIER / 5);
+        }
+        weights_bulk::<ULTRA>(&self.off_code_freq, &mut weight_of[..32]);
+        for code in 0..self.off_code_freq.len() {
+            let handicap = if !ULTRA && code >= 20 {
+                (code as u32 - 19) * 2 * BITCOST_MULTIPLIER
+            } else {
+                0
+            };
+            self.off_price[code] = (code as u32 * BITCOST_MULTIPLIER)
+                .wrapping_sub(weight_of[code])
+                .wrapping_add(handicap);
+        }
+    }
+
     /// `ZSTD_rescaleFreqs`: seed the first block, downscale afterwards.
     fn rescale_freqs<const ULTRA: bool>(&mut self, src: &[u8]) {
         self.predef = src.len() <= PREDEF_THRESHOLD;
@@ -380,6 +483,7 @@ impl OptState {
             self.match_length_sum = scale_stats(&mut self.match_length_freq, 11);
             self.off_code_sum = scale_stats(&mut self.off_code_freq, 11);
         }
+        self.rebuild_price_tables::<ULTRA>();
         self.set_base_prices::<ULTRA>();
     }
 
@@ -427,23 +531,49 @@ impl OptState {
         }
         self.off_code_sum = self.off_code_freq.iter().sum();
         self.predef = false;
+        self.rebuild_price_tables::<ULTRA>();
         self.set_base_prices::<ULTRA>();
     }
 
-    /// `ZSTD_updateStats`: fold one emitted sequence into the statistics.
-    fn update_stats(&mut self, lit_length: u32, literals: &[u8], off_base: u32, match_length: u32) {
+    /// `ZSTD_updateStats`: fold one emitted sequence into the statistics
+    /// and the price-table mirrors of every entry it touches.
+    fn update_stats<const ULTRA: bool>(
+        &mut self,
+        lit_length: u32,
+        literals: &[u8],
+        off_base: u32,
+        match_length: u32,
+    ) {
         for &b in literals {
-            self.lit_freq[b as usize] += LITFREQ_ADD;
+            let freq = &mut self.lit_freq[b as usize];
+            *freq += LITFREQ_ADD;
+            self.lit_weight[b as usize] = weight::<ULTRA>(*freq);
         }
         self.lit_sum += lit_length * LITFREQ_ADD;
         let (ll_code, ..) = encode_literal_length(lit_length);
-        self.lit_length_freq[ll_code as usize] += 1;
+        let ll_freq = &mut self.lit_length_freq[ll_code as usize];
+        *ll_freq += 1;
+        self.ll_price[ll_code as usize] = (LL_META[ll_code as usize].1 as u32 * BITCOST_MULTIPLIER)
+            .wrapping_sub(weight::<ULTRA>(*ll_freq));
         self.lit_length_sum += 1;
-        let off_code = off_base.ilog2();
-        self.off_code_freq[off_code as usize] += 1;
+        let off_code = off_base.ilog2() as usize;
+        let off_freq = &mut self.off_code_freq[off_code];
+        *off_freq += 1;
+        let handicap = if !ULTRA && off_code >= 20 {
+            (off_code as u32 - 19) * 2 * BITCOST_MULTIPLIER
+        } else {
+            0
+        };
+        self.off_price[off_code] = (off_code as u32 * BITCOST_MULTIPLIER)
+            .wrapping_sub(weight::<ULTRA>(*off_freq))
+            .wrapping_add(handicap);
         self.off_code_sum += 1;
         let (ml_code, ..) = encode_match_len(match_length);
-        self.match_length_freq[ml_code as usize] += 1;
+        let ml_freq = &mut self.match_length_freq[ml_code as usize];
+        *ml_freq += 1;
+        self.ml_price[ml_code as usize] = (ML_META[ml_code as usize].1 as u32 * BITCOST_MULTIPLIER)
+            .wrapping_sub(weight::<ULTRA>(*ml_freq))
+            .wrapping_add(BITCOST_MULTIPLIER / 5);
         self.match_length_sum += 1;
     }
 
@@ -453,7 +583,9 @@ impl OptState {
         if self.predef {
             return 6 * BITCOST_MULTIPLIER;
         }
-        let price = weight::<ULTRA>(self.lit_freq[lit as usize]);
+        // The mirror holds the weight; the max clamp reads the live base
+        // price, which `set_base_prices` moves per series.
+        let price = self.lit_weight[lit as usize];
         let max = self.lit_base_price - BITCOST_MULTIPLIER;
         self.lit_base_price - price.min(max)
     }
@@ -473,9 +605,11 @@ impl OptState {
             // Not representable in the format; price as one bit over the max.
             return BITCOST_MULTIPLIER + self.lit_length_price::<ULTRA>(max_len - 1);
         }
-        let (code, _, nb) = encode_literal_length(lit_length);
-        nb as u32 * BITCOST_MULTIPLIER + self.lit_length_base_price
-            - weight::<ULTRA>(self.lit_length_freq[code as usize])
+        let (code, ..) = encode_literal_length(lit_length);
+        // The code ladder stays; the bits and the frequency weight ride
+        // the mirror. The mask is a no-op below 64 and kills the bounds
+        // check.
+        self.ll_price[code as usize & 63].wrapping_add(self.lit_length_base_price)
     }
 
     /// Price of the match half of a sequence (`ZSTD_getMatchPrice`).
@@ -485,17 +619,14 @@ impl OptState {
         if self.predef {
             return weight::<ULTRA>(match_length - 3) + (16 + off_code) * BITCOST_MULTIPLIER;
         }
-        let mut price = off_code * BITCOST_MULTIPLIER + self.off_code_base_price
-            - weight::<ULTRA>(self.off_code_freq[off_code as usize]);
-        // Non-ultra handicaps long offsets to favor decode cache locality.
-        if !ULTRA && off_code >= 20 {
-            price += (off_code - 19) * 2 * BITCOST_MULTIPLIER;
-        }
-        let (ml_code, _, nb) = encode_match_len(match_length);
-        price += nb as u32 * BITCOST_MULTIPLIER + self.match_length_base_price
-            - weight::<ULTRA>(self.match_length_freq[ml_code as usize]);
-        // Heuristic: make matches slightly costlier to favor fewer sequences.
-        price + BITCOST_MULTIPLIER / 5
+        // The mirrors carry the per-code weights with the non-ultra
+        // long-offset handicap and the match surcharge folded in; the
+        // masks are no-ops in range and kill the bounds checks.
+        let (ml_code, ..) = encode_match_len(match_length);
+        self.off_price[off_code as usize & 31]
+            .wrapping_add(self.off_code_base_price)
+            .wrapping_add(self.ml_price[ml_code as usize & 127])
+            .wrapping_add(self.match_length_base_price)
     }
 }
 
@@ -1765,7 +1896,7 @@ fn run_once<const ULTRA: bool>(
             }
             let anchor_idx = (anchor - win_base) as usize;
             let start_idx = anchor_idx + litlen_s as usize;
-            state.update_stats(litlen_s, &win[anchor_idx..start_idx], off_s, mlen_s);
+            state.update_stats::<ULTRA>(litlen_s, &win[anchor_idx..start_idx], off_s, mlen_s);
             let (_, match_end_idx) = push_seq_packed(
                 win,
                 win_base,
@@ -1837,6 +1968,176 @@ mod tests {
         f.origin = f.origin.wrapping_add(1 << 30);
         assert_eq!(f.resolve(stale, 0, pos), None);
         assert_eq!(f.resolve(EMPTY, 0, pos), None);
+    }
+
+    /// The integer weight form with the release wrap semantics, the
+    /// reference for statistics past `frac_weight`'s debug bound.
+    fn weight_u32<const ULTRA: bool>(stat: u32) -> u32 {
+        let stat = stat.wrapping_add(1);
+        let hb = 31 - (stat | 1).leading_zeros();
+        if ULTRA {
+            (hb * BITCOST_MULTIPLIER).wrapping_add((stat << 8) >> hb)
+        } else {
+            hb * BITCOST_MULTIPLIER
+        }
+    }
+
+    #[test]
+    fn bulk_weights_match_scalar_below_2p24() {
+        // The f32 exponent/mantissa read must reproduce the integer weight
+        // for every exact-conversion statistic, whole-bit and fractional.
+        let mut stats: Vec<u32> = (0..=1024u32).collect();
+        for hb in 0..24 {
+            let one = 1u32 << hb;
+            stats.extend([one - 1, one, one + 1, 2 * one - 1]);
+        }
+        stats.push((1 << 24) - 1);
+        for ultra in [false, true] {
+            let mut out: Vec<u32> = (0..stats.len()).map(|_| 0).collect();
+            if ultra {
+                weights_bulk::<true>(&stats, &mut out);
+            } else {
+                weights_bulk::<false>(&stats, &mut out);
+            }
+            for (i, &stat) in stats.iter().enumerate() {
+                let scalar = if ultra {
+                    weight_u32::<true>(stat)
+                } else {
+                    weight_u32::<false>(stat)
+                };
+                assert_eq!(out[i], scalar, "stat {stat}, ultra {ultra}");
+            }
+        }
+        // Below frac_weight's debug bound the wrap form is the production
+        // scalar, so the f32 read is pinned to it there.
+        for stat in 0..(1 << 20) {
+            assert_eq!(weight_u32::<true>(stat), frac_weight(stat));
+            assert_eq!(weight_u32::<false>(stat), bit_weight(stat));
+        }
+    }
+
+    #[test]
+    fn bulk_weights_fall_back_at_2p24() {
+        // At and above 2^24 the f32 conversion rounds, so the loop must
+        // produce the integer form, which wraps like the release path.
+        let stats = [(1 << 24) + 5, (1 << 25) + 12345, u32::MAX - 1];
+        let mut out = [0u32; 3];
+        weights_bulk::<true>(&stats, &mut out);
+        for (i, &stat) in stats.iter().enumerate() {
+            assert_eq!(out[i], weight_u32::<true>(stat));
+        }
+        weights_bulk::<false>(&stats, &mut out);
+        for (i, &stat) in stats.iter().enumerate() {
+            assert_eq!(out[i], weight_u32::<false>(stat));
+        }
+    }
+
+    /// The price-table mirrors must equal the scalar C-form price at every
+    /// statistics mutation point: after a rescale and after each
+    /// `update_stats` fold.
+    #[test]
+    fn price_mirrors_match_scalar_formulas() {
+        let src: &[u8] = b"the quick brown fox jumps over the lazy dog, and then some more bytes to grow the histogram a little";
+        for ultra in [false, true] {
+            let mut state = OptState::new();
+            let rescale = |state: &mut OptState| {
+                if ultra {
+                    state.rescale_freqs::<true>(src);
+                } else {
+                    state.rescale_freqs::<false>(src);
+                }
+            };
+            rescale(&mut state);
+            // A spread of sequences exercising the ll/ml/offcode ladders,
+            // including the non-ultra handicap band at off_code >= 20.
+            for (ll, off, ml) in [
+                (0u32, 1u32, 3u32),
+                (1, 2, 4),
+                (5, 3, 10),
+                (17, 4004, 33),
+                (63, 1 << 21, 258),
+                (300, (1 << 23) + 7, 5000),
+                (4, (1 << 25) + 100, 70_000),
+                (1, 3, 3),
+            ] {
+                let lits: Vec<u8> = (0..ll).map(|i| (i * 7 + 3) as u8).collect();
+                if ultra {
+                    state.update_stats::<true>(ll, &lits, off, ml);
+                } else {
+                    state.update_stats::<false>(ll, &lits, off, ml);
+                }
+                rescale(&mut state);
+                for lit_length in [0u32, 1, 2, 15, 16, 17, 18, 19, 63, 64, 65, 128, 4096, 65536] {
+                    let table = if ultra {
+                        state.lit_length_price::<true>(lit_length)
+                    } else {
+                        state.lit_length_price::<false>(lit_length)
+                    };
+                    let (code, _, nb) = encode_literal_length(lit_length);
+                    let scalar = if ultra {
+                        nb as u32 * BITCOST_MULTIPLIER + state.lit_length_base_price
+                            - frac_weight(state.lit_length_freq[code as usize])
+                    } else {
+                        nb as u32 * BITCOST_MULTIPLIER + state.lit_length_base_price
+                            - bit_weight(state.lit_length_freq[code as usize])
+                    };
+                    assert_eq!(table, scalar, "ll {lit_length}, ultra {ultra}");
+                }
+                for off in [
+                    1u32,
+                    2,
+                    3,
+                    4,
+                    100,
+                    4004,
+                    1 << 21,
+                    (1 << 23) + 7,
+                    (1 << 26) + 9,
+                ] {
+                    for ml in [3u32, 4, 9, 33, 130, 258, 5000, 70_000] {
+                        let table = if ultra {
+                            state.match_price::<true>(off, ml)
+                        } else {
+                            state.match_price::<false>(off, ml)
+                        };
+                        let off_code = off.ilog2();
+                        let mut scalar = off_code * BITCOST_MULTIPLIER + state.off_code_base_price;
+                        scalar -= if ultra {
+                            frac_weight(state.off_code_freq[off_code as usize])
+                        } else {
+                            bit_weight(state.off_code_freq[off_code as usize])
+                        };
+                        if !ultra && off_code >= 20 {
+                            scalar += (off_code - 19) * 2 * BITCOST_MULTIPLIER;
+                        }
+                        let (ml_code, _, nb) = encode_match_len(ml);
+                        scalar += nb as u32 * BITCOST_MULTIPLIER + state.match_length_base_price;
+                        scalar -= if ultra {
+                            frac_weight(state.match_length_freq[ml_code as usize])
+                        } else {
+                            bit_weight(state.match_length_freq[ml_code as usize])
+                        };
+                        scalar += BITCOST_MULTIPLIER / 5;
+                        assert_eq!(table, scalar, "off {off} ml {ml}, ultra {ultra}");
+                    }
+                }
+                for b in 0..=255u8 {
+                    let table = if ultra {
+                        state.lit_price::<true>(b)
+                    } else {
+                        state.lit_price::<false>(b)
+                    };
+                    let raw = if ultra {
+                        frac_weight(state.lit_freq[b as usize])
+                    } else {
+                        bit_weight(state.lit_freq[b as usize])
+                    };
+                    let max = state.lit_base_price - BITCOST_MULTIPLIER;
+                    let scalar = state.lit_base_price - raw.min(max);
+                    assert_eq!(table, scalar, "lit {b}, ultra {ultra}");
+                }
+            }
+        }
     }
 
     #[test]
