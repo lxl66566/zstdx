@@ -21,6 +21,14 @@ On every sequence-dense shape we execute 1.34 to 1.41 times the instructions at 
 
 Text.zst3 is the exception that proves the split: we execute fewer instructions at 0.92 of zstd's yet lose cycles. Its reference parse has only 57K sequences per 32 MiB, so the shape is copy-bound and the per-sequence budget is about 1% of the decode. The residual is latency exposure at IPC 2.52 against 2.94, in the documented above-9-GB/s zone where wall-clock is untrustworthy. A later round corrected the implied literal volume: the reference parse of text.zst3 carries about one literal per sequence and about zero literal bytes per 32 MiB, so there is no literal tail.
 
+## The bulk cell's reference handicap
+
+The 2026-10-31 matrix read the bulk cells as wins, json x0.58 to x0.77, while the stream cells on the same frames read x1.17 to x1.32, and that asymmetry sat on the reference side of the harness. The bulk cell's zstd closure called `zstd::bulk::decompress`, which allocates a fresh output vector per iteration, while our side reused its decoder and buffer. A fresh 33.55 MB allocation costs about 7,920 minor faults per decode through the kernel, and the fault handlers read as reference-side instructions and cycles.
+
+Measured on 2026-11-01 with `perf stat` over 30 rounds per shape, alternating the free `decompress` form against `Decompressor::decompress_to_buffer` into a reused buffer, at one effective clock of 5.31 GHz across both modes: the allocation form pays plus 42.6 M instructions and plus 66.8 M cycles per json decode, and its json time of 31.5 ms matches the matrix cell's implied 30.0 ms at 1065 MiB/s within 5%, so the measurement pinned the cell path. The alloc share of the allocation form's time is 34% on skewed, 40% on json, 69% on text and random, and 76% on zeros, because the fault count scales with the output size while the decode work varies. The fault delta is constant at about 7,920 per decode on every shape.
+
+Corrected for it, the bulk cells line up with the stream cells: json.zst3's honest bulk x is about 1.25 against the stream cell's 1.32, with the residue being the streaming pair's drain copies that both sides pay. Our own stream and bulk differ by 2.2% on json.zst3, 1408 against 1439 MiB/s, which is the wrapper's total residual and matches the non-loop parity above. The matrix bulk cell now reuses the reference's decoder and buffer through `decompress_to_buffer`, the same form the gungraun zc benches use, and its first gated run read the json bulk cells at x1.14 to x1.26 in line with the stream cells.
+
 ## Where the gap comes from
 
 Per-function instruction counts on json.zst3, one decode, about half the totals:

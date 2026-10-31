@@ -270,9 +270,14 @@ fn dec_st_cells(ab: &Ab, args: &Args, comp: &[u8], raw: &[u8], name: &str) -> Ve
     gate_zstd_dec(comp, raw, name);
     let mut lines = Vec::new();
 
-    // bulk / slice path
+    // Bulk / slice path. Both sides reuse their decoder and output buffer:
+    // the reference's `zstd::bulk::decompress` allocates a fresh output per
+    // call, and its page faults read as reference-side decode time (the
+    // measurement is in bench/dec-gap).
     let mut fr = FrameDecoder::new();
     let mut out = vec![0u8; raw.len()];
+    let mut zdec = zstd::bulk::Decompressor::new().unwrap();
+    let mut zout = vec![0u8; raw.len()];
     lines.push(
         ab.measure(
             || {
@@ -280,7 +285,8 @@ fn dec_st_cells(ab: &Ab, args: &Args, comp: &[u8], raw: &[u8], name: &str) -> Ve
                 black_box(&out);
             },
             || {
-                black_box(zstd::bulk::decompress(comp, raw.len()).unwrap());
+                let n = zdec.decompress_to_buffer(comp, &mut zout).unwrap();
+                black_box(n);
             },
         )
         .line(&pad(&format!("{name}.bulk")), bytes),

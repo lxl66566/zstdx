@@ -50,6 +50,7 @@
 - [Encoder edges](dev/review/encparity.md)
 - [Encode-path hardening](dev/review/hardening.md)
 - [Decode-path walls](dev/review/decode-walls.md)
+- [mzstd decode-side review](dev/review/mzstd-dec.md)
 - [Optimal parser review](dev/review/opt.md)
 - [Window semantics](dev/review/winsem.md)
 - [MT job machinery review](dev/review/mtjobs.md)
