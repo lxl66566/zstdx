@@ -941,6 +941,21 @@ fn count_from_scalar(win: &[u8], idx: usize, cand: usize, start: usize, limit: u
     len
 }
 
+/// L1 prefetch hint (no-op off x86_64). The pointer is only handed to
+/// the prefetch instruction, never dereferenced.
+#[inline(always)]
+fn prefetch_l1(p: *const u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: prefetch is a hint, legal on any addressable pointer.
+        unsafe { core::arch::x86_64::_mm_prefetch(p.cast(), core::arch::x86_64::_MM_HINT_T0) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = p;
+    }
+}
+
 /// Binary-tree match finder plus the per-block constants (`ZSTD_insertBt1` /
 /// `ZSTD_insertBtAndGetAllMatches`).
 pub(crate) struct Finder<'a, 'b> {
@@ -1015,6 +1030,37 @@ impl Finder<'_, '_> {
         }
     }
 
+    /// Hint the head cells the search at `idx + 4` will read. The parse
+    /// and the fill advance almost position by position, a search is far
+    /// shorter than a head-slot miss on the window-sized tables, and the
+    /// bytes at `idx + 4` sit in cache on the sequential input stream, so
+    /// the next-next hash is cheap to compute here while its cell load
+    /// hides behind this position's own walk. Both table families are
+    /// hinted on the mls-3 rows, whose searches read the 3-byte table
+    /// too. Dropped at the block tail, where `idx + 4`'s hash bytes end
+    /// past the block.
+    #[inline(always)]
+    fn prefetch_head_ahead(&self, idx: usize) {
+        let ahead = idx + 4;
+        let read = if self.mls == 5 {
+            8
+        } else {
+            4
+        };
+        if ahead + read > self.block_end_idx {
+            return;
+        }
+        // SAFETY: both indices are log-masked below their table lengths,
+        // and the hint never dereferences.
+        unsafe {
+            prefetch_l1(self.table.as_ptr().add(self.hash_main(ahead)));
+            if self.min_match == 3 && !self.hash3.is_empty() {
+                let h3 = hash3_at(self.win, ahead, self.hash3_log) & (self.hash3.len() - 1);
+                prefetch_l1(self.hash3.as_ptr().add(h3));
+            }
+        }
+    }
+
     /// Insert position `idx` into the tree, threading its node among up to
     /// `nb_compares` candidates. Returns how many following positions the
     /// caller may skip (indexing the interior of long matches is redundant).
@@ -1022,6 +1068,7 @@ impl Finder<'_, '_> {
         let pos = self.win_base + idx as u64;
         let floor = self.cand_floor(pos);
         let h = self.hash_main(idx);
+        self.prefetch_head_ahead(idx);
         let mut cand = self.resolve(PackedPos::from_slot(self.table[h]), floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
@@ -1209,6 +1256,7 @@ impl Finder<'_, '_> {
         // only the hash3 table and locals), so the early value is identical.
         let h = self.hash_main(idx);
         let head = self.table[h];
+        self.prefetch_head_ahead(idx);
 
         // Repeated-offset candidates (the cheapest offsets to encode).
         if !rep_gated {
