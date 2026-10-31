@@ -420,30 +420,39 @@ fn t2_dec_mt(args: &Args) {
 
 // ---------- encode, single-thread bulk, ladder vs zstd levels ----------
 
-/// One encode cell: sizes + gates + interleaved A/B, tagged `<stem>.<tag>`.
+/// One encode cell: sizes + interleaved A/B, tagged `<stem>.<tag>`.
+///
+/// The timed rounds produce deterministic frames, so the last round's frame
+/// doubles as the gate frame: it is roundtripped through both decoders
+/// after the measurement instead of spending a separate gate encoding per
+/// side, which on the deep tiers cost a full round pair per cell. A broken
+/// encoder now fails the cell after its timing instead of before.
 fn enc_st_cell(ab: &Ab, raw: &[u8], stem: &str, tag: &str, level: Level, z: i32) {
     let bytes = raw.len() as u64;
-    let rc = gate_ruz_enc(raw, level, tag);
-    let zc = gate_zstd_enc(raw, z, tag);
-    println!(
-        "sizes {stem}.{tag}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
-        rc.len(),
-        raw.len() as f64 / rc.len() as f64,
-        zc.len(),
-        raw.len() as f64 / zc.len() as f64,
-    );
-    ab.measure(
+    let label = format!("{stem}.{tag}");
+    let mut ruz_frame = Vec::new();
+    let mut z_frame = Vec::new();
+    let report = ab.measure(
         || {
-            black_box(compress_with_ok(
+            ruz_frame = black_box(compress_with_ok(
                 raw,
                 &EncoderOptions::new(level).checksum(false),
             ));
         },
         || {
-            black_box(zstd::bulk::compress(raw, z).unwrap());
+            z_frame = black_box(zstd::bulk::compress(raw, z).unwrap());
         },
-    )
-    .print(&pad(&format!("{stem}.{tag}")), bytes);
+    );
+    assert_roundtrip(&ruz_frame, raw, &label);
+    assert_roundtrip(&z_frame, raw, &label);
+    println!(
+        "sizes {label}  ruz {:>9} (r {:7.2})   zstd {:>9} (r {:7.2})",
+        ruz_frame.len(),
+        raw.len() as f64 / ruz_frame.len() as f64,
+        z_frame.len(),
+        raw.len() as f64 / z_frame.len() as f64,
+    );
+    report.print(&pad(&label), bytes);
 }
 
 fn t3_enc_st(ab: &Ab, args: &Args) {
@@ -661,31 +670,18 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
     for (name, raw) in t5_payloads(args) {
         let bytes = raw.len() as u64;
         for (label, level, z) in ladder_axis(args, &LADDER) {
-            // gate: both sides' streaming outputs must roundtrip to the raw input
+            // The frames are deterministic and pull-size independent, so the
+            // last round's accumulated frame doubles as the gate frame: it is
+            // roundtripped after the measurement instead of spending a
+            // separate gate encoding per side.
             let mut comp = Vec::new();
-            let mut enc = zstdx::stream::read::Encoder::with_options(
-                &raw[..],
-                EncoderOptions::new(level).checksum(false),
-            )
-            .unwrap();
-            enc.read_to_end(&mut comp).unwrap();
-            enc.finish().unwrap();
-            assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
-            let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
-            zenc.read_to_end(&mut zcomp).unwrap();
-            zenc.finish();
-            assert_roundtrip(&zcomp, &raw, &label);
-            println!(
-                "sizes {name}.{label}.stream  ruz {}   zstd {}",
-                comp.len(),
-                zcomp.len()
-            );
 
             // one cell per pull size
-            for &pull in &args.pull {
-                ab.measure(
+            for (i, &pull) in args.pull.iter().enumerate() {
+                let report = ab.measure(
                     || {
+                        comp.clear();
                         let mut enc = zstdx::stream::read::Encoder::with_options(
                             &raw[..],
                             EncoderOptions::new(level).checksum(false),
@@ -693,24 +689,38 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                         .unwrap();
                         let mut sink = vec![0u8; pull];
                         loop {
-                            if enc.read(&mut sink).unwrap() == 0 {
+                            let n = enc.read(&mut sink).unwrap();
+                            if n == 0 {
                                 break;
                             }
+                            comp.extend_from_slice(&sink[..n]);
                         }
                         enc.finish().unwrap();
                     },
                     || {
+                        zcomp.clear();
                         let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
                         let mut sink = vec![0u8; pull];
                         loop {
-                            if enc.read(&mut sink).unwrap() == 0 {
+                            let n = enc.read(&mut sink).unwrap();
+                            if n == 0 {
                                 break;
                             }
+                            zcomp.extend_from_slice(&sink[..n]);
                         }
                         enc.finish();
                     },
-                )
-                .print(
+                );
+                assert_roundtrip(&comp, &raw, &label);
+                assert_roundtrip(&zcomp, &raw, &label);
+                if i == 0 {
+                    println!(
+                        "sizes {name}.{label}.stream  ruz {}   zstd {}",
+                        comp.len(),
+                        zcomp.len()
+                    );
+                }
+                report.print(
                     &pad(&stream_cell_name(&format!("{name}.{label}.stream"), pull)),
                     bytes,
                 );
@@ -735,31 +745,13 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             LevelName::Opt,
             LevelName::Ultra,
         ]) {
-            // gate: both sides' multithreaded streaming outputs must roundtrip
+            // Same gate reuse as the ST cells: the last round's frames are
+            // deterministic, so they are roundtripped after the measurement.
             let mut comp = Vec::new();
-            let mut enc = zstdx::stream::read::Encoder::with_options(
-                &raw[..],
-                EncoderOptions::new(level).checksum(false).workers(mt),
-            )
-            .unwrap();
-            enc.read_to_end(&mut comp).unwrap();
-            enc.finish().unwrap();
-            assert_roundtrip(&comp, &raw, &label);
             let mut zcomp = Vec::new();
-            let mut zenc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
-            zenc.multithread(mt).unwrap();
-            zenc.read_to_end(&mut zcomp).unwrap();
-            zenc.finish();
-            assert_roundtrip(&zcomp, &raw, &label);
-            println!(
-                "sizes {}.{label}.stream-mt{mt}  ruz {}   zstd {}",
-                name,
-                comp.len(),
-                zcomp.len()
-            );
-
-            ab.measure(
+            let report = ab.measure(
                 || {
+                    comp.clear();
                     let mut enc = zstdx::stream::read::Encoder::with_options(
                         &raw[..],
                         EncoderOptions::new(level).checksum(false).workers(mt),
@@ -767,25 +759,38 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                     .unwrap();
                     let mut sink = vec![0u8; 64 * 1024];
                     loop {
-                        if enc.read(&mut sink).unwrap() == 0 {
+                        let n = enc.read(&mut sink).unwrap();
+                        if n == 0 {
                             break;
                         }
+                        comp.extend_from_slice(&sink[..n]);
                     }
                     enc.finish().unwrap();
                 },
                 || {
+                    zcomp.clear();
                     let mut enc = zstd::stream::read::Encoder::new(&raw[..], z).unwrap();
                     enc.multithread(mt).unwrap();
                     let mut sink = vec![0u8; 64 * 1024];
                     loop {
-                        if enc.read(&mut sink).unwrap() == 0 {
+                        let n = enc.read(&mut sink).unwrap();
+                        if n == 0 {
                             break;
                         }
+                        zcomp.extend_from_slice(&sink[..n]);
                     }
                     enc.finish();
                 },
-            )
-            .print(&pad(&format!("{name}.{label}.stream-mt{mt}")), bytes);
+            );
+            assert_roundtrip(&comp, &raw, &label);
+            assert_roundtrip(&zcomp, &raw, &label);
+            println!(
+                "sizes {}.{label}.stream-mt{mt}  ruz {}   zstd {}",
+                name,
+                comp.len(),
+                zcomp.len()
+            );
+            report.print(&pad(&format!("{name}.{label}.stream-mt{mt}")), bytes);
         }
 
         // ceiling reference: our bulk mt path over the same bytes (the
@@ -798,17 +803,15 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             LevelName::Opt,
             LevelName::Ultra,
         ]) {
-            let comp = compress_with_ok(
-                &raw,
-                &EncoderOptions::new(level).checksum(false).workers(mt),
-            );
-            assert_roundtrip(&comp, &raw, &label);
+            // the solo rounds are deterministic too: gate the last frame
+            let mut comp = Vec::new();
             let stats = measure_solo(|| {
-                black_box(compress_with_ok(
+                comp = black_box(compress_with_ok(
                     &raw,
                     &EncoderOptions::new(level).checksum(false).workers(mt),
                 ));
             });
+            assert_roundtrip(&comp, &raw, &label);
             println!(
                 "{:<32}{:>8.0}  (zstdx {}.{label} bulk mt{mt} ceiling)",
                 "ref",

@@ -33,7 +33,7 @@ Run this after every encoder change that may alter output sizes. Use `dump` belo
 
 ### `matrix`: wide wall-clock A/B
 
-This is the heavyweight tool. Narrow it with `--mode` and filters instead of running `all` while iterating. Sections are `dec-st` for bulk and streaming decode, `dec-mt` for our parallel decode scaling where libzstd has no MT decode, `enc-st` for all ladder levels with size and ratio per cell, `enc-mt` for equal worker counts plus a zstd warm-pool reference, and `enc-stream` for streaming encode ST and MT against libzstd plus the bulk-MT ceiling. Every cell is roundtrip-gated first.
+This is the heavyweight tool. Narrow it with `--mode` and filters instead of running `all` while iterating. Sections are `dec-st` for bulk and streaming decode, `dec-mt` for our parallel decode scaling where libzstd has no MT decode, `enc-st` for all ladder levels with size and ratio per cell, `enc-mt` for equal worker counts plus a zstd warm-pool reference, and `enc-stream` for streaming encode ST and MT against libzstd plus the bulk-MT ceiling. Every timed encode cell is gated on its own last round's frame: the frames are deterministic, so the cell roundtrips that frame through both decoders after the measurement instead of encoding a separate gate pass.
 
 ```bash
 cargo run --release -p zstdx-bench -- matrix --mode enc-st --shape json
