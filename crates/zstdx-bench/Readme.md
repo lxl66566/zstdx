@@ -35,7 +35,7 @@ Run this after every encoder change that may alter output sizes. Use `dump` belo
 
 This is the heavyweight tool. Narrow it with `--mode` and filters instead of running `all` while iterating. Sections are `dec-st` for bulk and streaming decode, `dec-mt` for our parallel decode scaling where libzstd has no MT decode, `enc-st` for all ladder levels with size and ratio per cell, `enc-mt` for equal worker counts plus a zstd warm-pool reference, and `enc-stream` for streaming encode ST and MT against libzstd plus the bulk-MT ceiling. Every timed encode cell is gated on its own last round's frame: the frames are deterministic, so the cell roundtrips that frame through both decoders after the measurement instead of encoding a separate gate pass.
 
-`--parallel N` bounds the cells running at once in `enc-st` (tier and `--full-ladder` axes) and the `enc-stream` ST section, capped by a built-in memory budget over the payload size. Each cell keeps its interleaved A/B on one thread, so the per-round ratio stays the verdict, but cells share the machine: the default 2 held every calibrated cell within 5 percent of its serial x, width 3 read json.ultra at x1.65 against 1.03 serial, and `--parallel 1` is the old serial behavior. `dec-st` and the mt sections never parallelize; decode cells are bandwidth-bound and the bulk pair reads x-inflated under sharing.
+`--parallel N` bounds the cells running at once in `enc-st` (tier and `--full-ladder` axes) and the `enc-stream` ST section, capped by a built-in memory budget over the payload size. Each cell keeps its interleaved A/B on one thread, so the per-round ratio stays the verdict, but cells share the machine: the default 2 held the calibrated json cells within 5 percent of their serial x, width 3 read json.ultra at x1.65 against 1.03 serial, and `--parallel 1` is the old serial behavior. Cells in the 10 GB/s class inflate further under pairing, with text.fastest reading x0.90 at width 2 against 0.80 serial, so a verdict on such a cell needs a serial rerun. `dec-st` and the mt sections never parallelize; decode cells are bandwidth-bound and the bulk pair reads x-inflated under sharing.
 
 ```bash
 cargo run --release -p zstdx-bench -- matrix --mode enc-st --shape json
@@ -194,3 +194,7 @@ Trainer knob overrides for A/B isolation, all defaulting to the library's values
 cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384
 cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --size 16384 --formatted
 ```
+
+## `bench/pass.sh`: full-pass driver
+
+`bash bench/pass.sh` builds the release binary once and then runs every section of a daily pass against the prebuilt binary under the shared machine lock, with per-section wall times in a summary table and each section's output in `<out>/<section>.log` (default under `bench/scratch/`). Sections default to `dec-st dec-mt files-dll enc-st enc-mt8 enc-mt16 enc-stream small ratio`; `bash bench/pass.sh all` adds the per-shape full numeric ladders, the release gate. Name sections explicitly to run a subset, and `--out DIR` relocates the logs. dll100 payloads join automatically when `bench/big` carries them, so run `bash bench/gen_big.sh` once beforehand.
