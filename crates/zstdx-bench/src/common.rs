@@ -29,20 +29,31 @@ impl Stats {
     pub fn from_samples(mut samples: Vec<f64>) -> Self {
         assert!(!samples.is_empty(), "stats need at least one sample");
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = samples.len() / 2;
-        let median = samples[mid];
+        let median = mid_statistic(&samples);
         let mut devs: Vec<f64> = samples.iter().map(|s| (s - median).abs()).collect();
         devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         Self {
             median,
             min: samples[0],
             max: samples[samples.len() - 1],
-            mad: devs[devs.len() / 2],
+            mad: mid_statistic(&devs),
         }
     }
 
     pub fn mibs(&self, bytes: u64) -> f64 {
         bytes as f64 / (1024.0 * 1024.0) / self.median
+    }
+}
+
+/// Median of a sorted sample: the middle element for odd lengths, the mean
+/// of the two middle elements for even lengths (an even round count is
+/// common because the budget rule appends rounds one at a time).
+fn mid_statistic(sorted: &[f64]) -> f64 {
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        f64::midpoint(sorted[mid - 1], sorted[mid])
     }
 }
 
@@ -176,6 +187,33 @@ pub fn measure_solo<F: FnMut()>(mut f: F) -> Stats {
 /// Selection filter: empty selection means "no restriction".
 pub fn want<T: PartialEq>(selected: &[T], v: &T) -> bool {
     selected.is_empty() || selected.contains(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn median_averages_even_samples() {
+        // even count: mean of the two middle samples, for the samples
+        // themselves and for the MAD computed off that median
+        let s = Stats::from_samples(vec![4.0, 1.0, 3.0, 2.0]);
+        assert_eq!(s.median, 2.5);
+        // deviations [1.5, 0.5, 0.5, 1.5] -> even-length median 1.0
+        assert_eq!(s.mad, 1.0);
+        // odd count: the middle sample
+        let s = Stats::from_samples(vec![5.0, 1.0, 3.0]);
+        assert_eq!(s.median, 3.0);
+        assert_eq!(s.mad, 2.0);
+    }
+
+    #[test]
+    fn min_max_survive_median_averaging() {
+        let s = Stats::from_samples(vec![10.0, 0.0, 7.0, 3.0]);
+        assert_eq!(s.min, 0.0);
+        assert_eq!(s.max, 10.0);
+        assert_eq!(s.median, 5.0);
+    }
 }
 
 #[inline(never)]

@@ -22,7 +22,17 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) {
-    for shape in [Shape::Random, Shape::Text, Shape::Json] {
+    // Only these three shapes carry a meaningful prefill story; a selection
+    // outside them would silently produce no cells.
+    let supported = [Shape::Random, Shape::Text, Shape::Json];
+    if !supported.iter().any(|s| want(&args.shape, s)) {
+        eprintln!(
+            "no supported shape selected (supported: random,text,json; got {:?})",
+            args.shape
+        );
+        return;
+    }
+    for shape in supported {
         if !want(&args.shape, &shape) {
             continue;
         }

@@ -28,9 +28,18 @@ pub struct Args {
     pledge: bool,
 }
 
+/// Tier names or a numeric level 0-22 (0 = the store-only frame). Out of
+/// range numbers reject instead of silently clamping through `from_zstd`,
+/// because the summary line echoes the requested level verbatim.
 fn parse_level(s: &str) -> Level {
     match s.parse::<i32>() {
-        Ok(n) => Level::from_zstd(n),
+        Ok(n) => {
+            assert!(
+                (0..=Level::MAX.as_i32()).contains(&n),
+                "level {n} out of range 0-22"
+            );
+            Level::from_zstd(n)
+        },
         Err(_) => match s {
             "fastest" => Level::Fastest,
             "fast" => Level::Fast,
@@ -89,5 +98,32 @@ pub fn run(args: &Args) {
         let job =
             zstdx::encoding::mt_job_size_for(raw.len() as u64, args.workers, level, shape, &raw);
         println!("job_size {job}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zstdx::Level;
+
+    use super::parse_level;
+
+    #[test]
+    fn parse_level_accepts_tiers_and_bounds() {
+        assert_eq!(parse_level("fastest"), Level::Fastest);
+        assert_eq!(parse_level("ultra"), Level::Ultra);
+        assert_eq!(parse_level("0"), Level::Uncompressed);
+        assert_eq!(parse_level("22"), Level::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "level 23 out of range 0-22")]
+    fn parse_level_rejects_out_of_range() {
+        parse_level("23");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown level")]
+    fn parse_level_rejects_garbage() {
+        parse_level("turbo");
     }
 }

@@ -1,6 +1,6 @@
-# Bench Matrix (2026-10-30)
+# Bench Matrix (2026-10-31)
 
-This page holds the raw measurement tables for the 2026-10-30 pass. Each section states what the table measures and how to read its columns. Throughout the page `x = ours_time / zstd_time`, so values below 1 mean we are faster, throughput is MiB/s of raw input, and ratio is input bytes divided by output bytes. The comparison target is libzstd 1.5.7 with `zstdmt` enabled. Conclusions are in [snapshot.md](snapshot.md), and earlier archives from the 2026-10-25, 10-18, 10-01, 09-28, 09-27 and 09-19 passes live in this file's git history.
+This page holds the raw measurement tables for the 2026-10-30 pass with the 2026-10-31 section refresh described under Run provenance. Each section states what the table measures and how to read its columns. Throughout the page `x = ours_time / zstd_time`, so values below 1 mean we are faster, throughput is MiB/s of raw input, and ratio is input bytes divided by output bytes. The comparison target is libzstd 1.5.7 with `zstdmt` enabled. Conclusions are in [snapshot.md](snapshot.md), and earlier archives from the 2026-10-30, 10-25, 10-18, 10-01, 09-28, 09-27 and 09-19 passes live in this file's git history.
 
 ## Run provenance
 
@@ -8,7 +8,9 @@ The pass ran at commit `f7680db7` on 2026-10-30 from a clean tree in one continu
 
 Four encoder commits in the window moved the measured cells, and the rest of the tree kept its bytes. The gated dense geometry `e94ce0f2` scans the json-class dense body at a 2^13 table, moving json fastest to x1.34 bulk and 1.10 mt8 at 0.34% denser output. The balanced row substitution `13d76d43` runs text-class and dll-class heads on the row twin at libzstd's L9 geometry, moving text balanced to 0.95 bulk at an unchanged 384.66 ratio and dll balanced to 1.12 at ratio 5.37 against 5.31. The wide-head donation stand-down `834f6ba3` lifts the bulk-mt cells, with text.balanced.mt8 moving 1.05 to 0.85 and mt16 1.15 to 0.81. The btlazy SIMD arming `1f208e1d` arms the long compare on single-thread best rows by parse feedback, holding dll best at x1.22 bulk and 1.16 stream at byte-identical output. The mid-band dictionary rows `9ea40553` and the empty-frame clamp `396e2291` touch dictionary frames and CLI edges off this corpus.
 
-The commands ran through `cargo run --release -p zstdx-bench` with `dec-st` at 64 KiB pulls, `enc-st` chunked per shape with dll100 through `--file bench/big/dll100.raw`, `enc-mt` at workers 8 and 16 in two runs, `enc-stream` at workers 8 with the standalone-median rerun for text fastest and fast, and `ratio` at 141 s. The MT decode scaling table, the full 1-22 ladder and the small-payload tables carry the 2026-10-25 pass, because their rows sat still in this window with json level 1 the one exception, its sizes 0.34% denser through the dense geometry. The timing sections ran between 11:57 and 12:44, the ratio sweep ran in a resumed session afterwards, and every log carried its footer before the docs were written.
+The commands ran through `cargo run --release -p zstdx-bench` with `dec-st` at 64 KiB pulls, `enc-st` chunked per shape with dll100 through `--file bench/big/dll100.raw`, `enc-mt` at workers 8 and 16 in two runs, `enc-stream` at workers 8 with the standalone-median rerun for text fastest and fast, and `ratio` at 141 s. The timing sections ran between 11:57 and 12:44, the ratio sweep ran in a resumed session afterwards, and every log carried its footer before the docs were written.
+
+The 2026-10-31 refresh at `0a60b531` reran five sections on the same machine and toolchain through the prebuilt release binary under the shared lock: `matrix --mode dec-mt` with `files --threads 2,4,8,16` on `bench/big/dll100.zst3`, `matrix --mode enc-stream` and the same section over `--file bench/big/dll100.raw`, `small --shape json,text --level 1,3,9`, `matrix --mode enc-st --full-ladder` split per shape with the json and skewed tails split again by level range after a session interruption, and a `dec-st` pull sweep at `--pull 4k,16k,64k,256k,1m` with the four dll100 `.zst` inputs feeding the README figures. Every rerun section ran at the default per-side budget of 500 ms, interleaved, roundtrip-gated, with the harness header printing `libzstd 1.5.7, binding 10507`. A single-core co-tenant dump from a parallel worktree ran during parts of the dll100 stream segment, and the json deep-tier stream cells read slower in both refresh invocations than in the pass, so treat those cells as parity-band rather than wins. The full ladder's slow cells stop at three rounds per side as before, and the fast-side budget rule still accumulates over a hundred rounds on random levels 17-19 where the reference side is the slow one.
 
 ## Decode single-thread
 
@@ -39,17 +41,17 @@ Bulk holds 17 of 18 wins with skewed.zst9 at x0.99 as the near-tie. The stream c
 
 ## Decode multi-thread scaling
 
-This table carries the 2026-10-25 measurement, because the decode surfaces sat still in this window. Throughput is MiB/s at 1, 2, 4, 8 and 16 workers, and libzstd has no MT decode, so the reference column is its single-thread streaming cell from the decode table. The dll row comes from `files --threads`, the solo tool at the same budget.
+This table carries the 2026-10-31 refresh at `0a60b531`. Throughput is MiB/s at 1, 2, 4, 8 and 16 workers, and libzstd has no MT decode, so the reference column is its single-thread streaming cell. The dll row comes from `files --threads`, the solo tool at the same budget, with its reference taken from this pass's `dll100.zst3` streaming cell.
 
 | file | ours ST | zstd stream ST ref | mt2 | mt4 | mt8 | mt16 |
 |---|---:|---:|---:|---:|---:|---:|
-| json.zst3 | 1409 | 1880 | 1824 | 2075 | 2202 | 2193 |
-| text.zst3 | 11222 | 11178 | 10842 | 10831 | 10826 | 10850 |
-| skewed.zst9 | 624 | 792 | 758 | 712 | 754 | 752 |
-| random.zst3 | 9700 | 8873 | 9382 | 9320 | 9323 | 9323 |
-| dll100.zst3 | 1250 | 1702 | 1828 | 2088 | 2216 | 2287 |
+| json.zst3 | 1384 | 1878 | 1797 | 2025 | 2188 | 2196 |
+| text.zst3 | 10850 | 11216 | 10756 | 10951 | 10554 | 10671 |
+| skewed.zst9 | 647 | 792 | 736 | 757 | 768 | 747 |
+| random.zst3 | 9793 | 8812 | 9467 | 9455 | 9441 | 9511 |
+| dll100.zst3 | 1260 | 1703 | 1852 | 2103 | 2226 | 2278 |
 
-Json mt16 runs at 1.56 times single-thread and 1.17 times the reference. Dll100 mt16 runs at 1.83 times single-thread and 1.34 times the reference, so the strongest scaling row holds its band. Skewed reads 1.21 times single-thread and 0.95 times the reference with its band wandering ±15% across passes, text is flat at 0.97, and random is flat at 0.96 times single-thread and 1.05 times the reference.
+Json mt16 runs at 1.59 times single-thread and 1.17 times the reference. Dll100 mt16 runs at 1.81 times single-thread and 1.34 times the reference, so the strongest scaling row holds its band. Skewed reads 1.16 times single-thread and 0.94 times the reference with its band wandering ±15% across passes, text is flat at 0.98, and random is flat at 0.97 times single-thread and 1.08 times the reference. The json single-thread solo cell is a first-run page-state outlier: the section's opening invocation read 1014 with every mt cell unchanged, and the immediate rerun read 1384, so the warm reading is the tabulated one and the mt16-over-ST factor moves with it (2.22 on the cold reading).
 
 ## Encode single-thread bulk
 
@@ -116,26 +118,26 @@ Json.fastest.mt8 at x1.10 is the one zstd MT win, inside the cell's known noise 
 
 ## Encode streaming
 
-Throughput uses 64 KiB pulls and interleaved medians, with single-thread and MT8 columns. x is our time divided by zstd's at the same mode, so below 1 means we are faster.
+Throughput uses 64 KiB pulls and interleaved medians, with single-thread and MT8 columns. x is our time divided by zstd's at the same mode, so below 1 means we are faster. This section carries the 2026-10-31 refresh at `0a60b531`, because the two commits after the 2026-10-30 pass touched stream cells: the stream probe stand-down `b8247325` moved dll l9 stream bytes and lifts text.balanced stream-mt8 from x1.05 to 0.84, and the armed-row driver state `0a60b531` re-rolled the fast-row layout.
 
 | cell | ST ours | ST zstd | ST x | MT8 ours | MT8 zstd | MT8 x |
 |---|---:|---:|---:|---:|---:|---:|
-| json.fastest | 621 | 770 | 1.24 | 3268 | 1888 | 0.57 |
-| json.fast | 463 | 440 | 0.95 | 1884 | 406 | 0.21 |
-| json.balanced | 87 | 106 | 1.22 | 366 | 111 | 0.31 |
-| json.best | 30 | 36 | 1.21 | 76 | 51 | 0.66 |
-| json.opt | 7 | 7 | 0.97 | 16 | 7 | 0.42 |
-| json.ultra | 3 | 3 | 0.99 | 6 | 3 | 0.52 |
-| text.fastest | 6744* | 1759 | 0.26 | 7756 | 3890 | 0.50 |
-| text.fast | 6498* | 5209 | 0.80 | 5699 | 1573 | 0.28 |
-| text.balanced | 1395 | 1617 | 1.16 | 907 | 943 | 1.05 |
-| text.best | 1003 | 643 | 0.64 | 837 | 358 | 0.43 |
-| text.opt | 750 | 415 | 0.56 | 668 | 371 | 0.56 |
-| text.ultra | 387 | 250 | 0.65 | 347 | 234 | 0.68 |
+| json.fastest | 628 | 771 | 1.23 | 3023 | 1804 | 0.61 |
+| json.fast | 465 | 450 | 0.97 | 1716 | 396 | 0.23 |
+| json.balanced | 84 | 105 | 1.25 | 343 | 111 | 0.31 |
+| json.best | 24 | 33 | 1.42 | 77 | 49 | 0.64 |
+| json.opt | 6 | 7 | 1.08 | 16 | 7 | 0.42 |
+| json.ultra | 3 | 3 | 1.09 | 6 | 3 | 0.51 |
+| text.fastest | 6633* | 1748 | 0.26 | 7999 | 3785 | 0.48 |
+| text.fast | 6391* | 5144 | 0.80 | 5604 | 1638 | 0.30 |
+| text.balanced | 1302 | 1535 | 1.18 | 1175 | 980 | 0.84 |
+| text.best | 907 | 632 | 0.70 | 792 | 359 | 0.44 |
+| text.opt | 725 | 407 | 0.56 | 660 | 377 | 0.57 |
+| text.ultra | 378 | 246 | 0.65 | 362 | 229 | 0.64 |
 
-The two text single-thread fast cells carry standalone medians under the established protocol. The in-pass table read 5424 and 5370 at x0.320 and 0.930, the same-process page-dispersity collapse reproduced for the sixth consecutive pass, and the mechanism and reproducer are in the [workflow pitfalls](../pitfalls/workflow.md). Unknown-size text.fastest streaming has zstd emitting 1.84 MB at ratio 18.3 against our 108 KB at ratio 309. Text.balanced stream-mt8 reads x1.05 this pass against the release pass's 0.998, inside the cell's 0.94 to 1.18 spread and the one stream-mt cell above the line. Stream-mt8 against our own bulk-mt8 ceilings reads json 88%, 75%, 87%, 99%, 123% and 120%, and text 41%, 42%, 64%, 101%, 111% and 102%.
+The two text single-thread fast cells carry standalone medians under the established protocol. The in-pass table read 4695 and 4653 at x0.365 and 1.030, the same-process page-dispersity collapse reproduced for the seventh consecutive pass, and the mechanism and reproducer are in the [workflow pitfalls](../pitfalls/workflow.md). Unknown-size text.fastest streaming has zstd emitting 1.84 MB at ratio 18.3 against our 108 KB at ratio 309. Json's deep-tier stream cells drifted this session: best reads 1.42 against the pass's 1.21, and the same-day dll-section rerun read 1.33, while opt and ultra read 1.08 and 1.09 against 0.97 and 0.99 with the rerun at 1.01 and 1.05, so the two deep tiers sit at parity-band and best carries a real slower reading. Stream-mt8 against our own bulk-mt8 ceilings reads json 84%, 73%, 85%, 100%, 133% and 120%, and text 40%, 40%, 70%, 84%, 103% and 109%.
 
-The dll100 stream cells read single-thread fastest 499 against 509 at x1.02, fast 446 against 396 at 0.89, balanced 118 against 139 at 1.18, best 32 against 37 at 1.16, opt 13 against 14 at 1.05 and ultra 8 against 9 at 1.07, with best carrying the armed long compare and balanced the substituted row. Stream-mt8 reads fastest 956 against 2143 at x2.26, fast 818 against 435 at 0.53, balanced 134 against 199 at 1.48, best 27 against 85 at 3.20, opt 30 against 25 at 0.83 and ultra 17 against 18 at 1.04 near-parity. The cells run at 75% to 96% of the bulk-mt8 ceilings of 1045, 960, 178, 28, 34 and 21 MiB/s, with best the highest share at 96% and balanced the lowest at 75%, and the fastest and best losses stay the open item in the [todo](../todo.md).
+The dll100 stream cells read single-thread fastest 500 against 509 at x1.02, fast 436 against 394 at 0.90, balanced 108 against 138 at 1.27, best 29 against 36 at 1.26, opt 10 against 13 at 1.16 and ultra 7 against 8 at 1.12, all six cells level with or slower than the pass's readings inside the noise band. Stream-mt8 reads fastest 859 against 1753 at x2.05, fast 769 against 430 at 0.57, balanced 126 against 194 at 1.54, best 25 against 78 at 3.08, opt 29 against 23 at 0.79 and ultra 17 against 17 at 0.96 near-parity. The cells run at 70% to 89% of the bulk-mt8 ceilings of 1016, 957, 181, 28, 34 and 20 MiB/s, with best the highest share at 89% and balanced the lowest at 70%, and the fastest, balanced and best losses stay the open item in the [todo](../todo.md).
 
 ## Compression-ratio sweep
 
@@ -147,44 +149,44 @@ The four json fastest cells are the only cells that moved against the 2026-10-25
 
 ## Full numeric ladder
 
-This section carries the 2026-10-25 pass. Json level 1 is the one row the window moved, its sizes 0.34% denser through the dense geometry and its speed to this pass's x1.34 enc-st reading, and every other row is current. Both sides run at the same numeric level with a per-side budget of 500 ms, and the cell text reads ours/zstd throughput followed by the x ratio. Cells whose three minimum rounds already cover the 500 ms budget stop at n=3, which affects json levels 6-22 and skewed 4 and 13-22, so those absolutes carry the widest drift band. The rest accumulate n of at least 4, with text at 5 or more, random at 36 or more and zeros at 504 or more. x is our time divided by zstd's, so below 1 means we are faster.
+This section carries the 2026-10-31 refresh at `0a60b531`, rerun split per shape under the shared lock at the same per-side budget of 500 ms, and the cell text reads ours/zstd throughput followed by the x ratio. Cells whose three minimum rounds already cover the 500 ms budget stop at n=3, which affects json levels 6-22 and skewed 4 and 13-22, so those absolutes carry the widest drift band. The rest accumulate n of at least 4, with text at 4 or more, random at 32 or more and zeros at 392 or more. x is our time divided by zstd's, so below 1 means we are faster. Every ratio cell reproduces the 2026-10-25 bytes, with json level 1 the one moved row at 0.34% denser through the dense geometry.
 
 ### Ladder speed
 
 | level | json | text | skewed | random | zeros |
 |---|---|---|---|---|---|
-| 1 | 578/850 x1.47 | 12850/10440 x0.81 | 2854/1257 x0.44 | 2269/2036 x0.90 | 48985/13285 x0.27 |
-| 2 | 541/657 x1.22 | 12862/10265 x0.80 | 2781/858 x0.31 | 2286/2049 x0.90 | 49166/13273 x0.27 |
-| 3 | 464/478 x1.04 | 13546/7263 x0.54 | 211/224 x1.07 | 2281/1905 x0.84 | 49126/8683 x0.18 |
-| 4 | 422/434 x1.03 | 12134/6938 x0.57 | 151/165 x1.09 | 2259/1942 x0.86 | 48786/8626 x0.18 |
-| 5 | 199/263 x1.32 | 7390/4591 x0.62 | 1996/126 x0.063 | 2377/1703 x0.72 | 47587/6289 x0.13 |
-| 6 | 145/187 x1.29 | 5839/2746 x0.47 | 1989/106 x0.053 | 2365/1682 x0.71 | 45887/2768 x0.061 |
-| 7 | 125/165 x1.33 | 4873/2602 x0.53 | 1664/99 x0.060 | 2359/1613 x0.68 | 45058/2749 x0.061 |
-| 8 | 99/126 x1.27 | 4086/1748 x0.43 | 1653/82 x0.050 | 2403/1634 x0.68 | 44400/1772 x0.040 |
-| 9 | 156/120 x0.77 | 1410/1659 x1.18 | 1860/75 x0.040 | 2204/1400 x0.64 | 32894/1749 x0.053 |
-| 10 | 75/90 x1.20 | 3146/1549 x0.49 | 1343/61 x0.045 | 2334/1251 x0.54 | 42087/1688 x0.040 |
-| 11 | 53/65 x1.23 | 2456/1424 x0.58 | 1518/48 x0.031 | 2342/1325 x0.57 | 42089/1687 x0.040 |
-| 12 | 45/55 x1.22 | 2377/811 x0.34 | 1237/25 x0.020 | 2261/601 x0.27 | 43902/944 x0.021 |
-| 13 | 29/36 x1.25 | 1125/662 x0.59 | 7/14 x1.83 | 2212/244 x0.11 | 46002/790 x0.017 |
-| 14 | 24/27 x1.11 | 979/538 x0.56 | 7/12 x1.65 | 2175/116 x0.053 | 45612/673 x0.015 |
-| 15 | 22/16 x0.74 | 919/430 x0.47 | 7/8 x1.11 | 2186/111 x0.051 | 45075/591 x0.013 |
-| 16 | 8/10 x1.24 | 832/497 x0.60 | 4/8 x2.17 | 2194/21 x0.010 | 46253/1026 x0.022 |
-| 17 | 7/7 x0.99 | 827/437 x0.53 | 3/3 x0.91 | 9292/12 x0.001 | 45671/861 x0.019 |
-| 18 | 4/5 x1.23 | 476/365 x0.77 | 2/3 x1.32 | 9035/10 x0.001 | 45624/818 x0.018 |
-| 19 | 3/3 x1.01 | 403/255 x0.63 | 2/2 x0.93 | 9526/8 x0.001 | 44670/611 x0.014 |
-| 20 | 3/2 x0.80 | 261/194 x0.75 | 2/2 x0.76 | 2274/6 x0.003 | 44230/377 x0.009 |
-| 21 | 2/2 x0.88 | 257/134 x0.52 | 2/1 x0.89 | 2290/8 x0.003 | 42675/212 x0.005 |
-| 22 | 2/1 x0.52 | 243/117 x0.48 | 2/1 x0.87 | 2319/9 x0.004 | 42045/181 x0.004 |
+| 1 | 614/853 x1.39 | 12135/10109 x0.83 | 2828/1245 x0.44 | 2186/1981 x0.90 | 42538/13117 x0.31 |
+| 2 | 503/633 x1.26 | 11902/9843 x0.83 | 2760/874 x0.32 | 2173/1945 x0.90 | 43037/13078 x0.30 |
+| 3 | 458/471 x1.03 | 12525/7097 x0.57 | 205/223 x1.08 | 2286/1903 x0.83 | 42328/8453 x0.20 |
+| 4 | 412/435 x1.05 | 12043/6936 x0.58 | 152/166 x1.09 | 2288/1955 x0.86 | 41810/8430 x0.20 |
+| 5 | 201/265 x1.32 | 7341/4575 x0.62 | 2038/128 x0.063 | 2419/1731 x0.72 | 40257/6264 x0.16 |
+| 6 | 143/186 x1.30 | 5098/2670 x0.52 | 2030/107 x0.052 | 2432/1725 x0.71 | 38233/2764 x0.072 |
+| 7 | 124/164 x1.33 | 4313/2509 x0.58 | 1578/99 x0.062 | 2423/1675 x0.69 | 38197/2733 x0.072 |
+| 8 | 99/125 x1.27 | 3704/1709 x0.46 | 1617/81 x0.050 | 2416/1669 x0.69 | 37415/1759 x0.047 |
+| 9 | 154/117 x0.76 | 1795/1727 x0.96 | 1833/74 x0.040 | 2429/1555 x0.64 | 27911/1731 x0.062 |
+| 10 | 54/75 x1.45 | 2969/1511 x0.51 | 1300/60 x0.047 | 2349/1267 x0.54 | 36792/1684 x0.046 |
+| 11 | 45/54 x1.22 | 2401/1491 x0.62 | 1450/48 x0.032 | 2402/1348 x0.56 | 37589/1684 x0.045 |
+| 12 | 38/45 x1.21 | 2312/800 x0.35 | 1169/23 x0.020 | 2260/604 x0.27 | 36140/922 x0.026 |
+| 13 | 19/24 x1.28 | 1085/654 x0.60 | 6/10 x1.65 | 2252/234 x0.10 | 36056/777 x0.022 |
+| 14 | 15/18 x1.25 | 934/539 x0.58 | 6/11 x1.98 | 2252/115 x0.051 | 26171/664 x0.025 |
+| 15 | 17/13 x0.82 | 871/429 x0.49 | 6/8 x1.26 | 2218/94 x0.043 | 27577/591 x0.021 |
+| 16 | 5/7 x1.37 | 809/497 x0.62 | 3/8 x2.89 | 2216/16 x0.007 | 35530/1027 x0.029 |
+| 17 | 6/6 x1.04 | 799/433 x0.54 | 3/3 x0.94 | 8836/11 x0.001 | 25650/850 x0.033 |
+| 18 | 3/4 x1.33 | 467/362 x0.78 | 2/3 x1.36 | 8962/10 x0.001 | 35900/819 x0.023 |
+| 19 | 3/3 x1.02 | 395/251 x0.64 | 2/2 x0.94 | 8968/7 x0.001 | 29474/608 x0.021 |
+| 20 | 3/2 x0.75 | 261/191 x0.72 | 2/2 x0.76 | 2203/6 x0.003 | 25434/368 x0.009 |
+| 21 | 2/2 x0.95 | 265/137 x0.52 | 2/1 x0.89 | 2197/8 x0.003 | 31969/211 x0.007 |
+| 22 | 1/1 x0.51 | 251/119 x0.48 | 2/1 x0.88 | 2193/9 x0.004 | 33647/180 x0.005 |
 
-The bands hold against the release pass: json levels 13 and 14 at 1.25 and 1.11, text levels 13-15 at 0.47 to 0.59, json levels 5-8 and 10-12 at x1.22 to 1.33 carrying their byte wins, skewed levels 13-16 at 1.11 to 2.17, and every high-tier row at or below 1.01 on json levels 17-22 and at or below 0.93 on skewed levels 17-22. Random levels 17-19 read 9292, 9035 and 9526 MiB/s at byte-exact ratio 1.00 through the raw-block fast path, while levels 20-22 keep the full ultra parse. The remaining holes are unchanged: text level 9 at x1.18 and skewed levels 13-16 speed at ratio parity.
+The bands read level with the 2026-10-25 table where the encoder window left them: json levels 5-8 at x1.27 to 1.33 carrying their byte wins, json 13 and 14 at 1.28 and 1.25, text levels 13-15 at 0.49 to 0.60, and the high tiers at or below 1.04 on json 17-22 and 0.94 on skewed 17-22, with json 18 at 1.33 and skewed 18 at 1.36 the two exceptions. Text level 9 flips from x1.18 to 0.96 through the balanced row substitution, closing the old hole. Random levels 17-19 read 8836, 8962 and 8968 MiB/s at byte-exact ratio 1.00 through the raw-block fast path, while levels 20-22 keep the full ultra parse. The n=3 cells wander the widest this session: json level 10 reads 1.45 against the old 1.20 and skewed level 16 reads 2.89 against 2.17, with both sides slower in absolute terms on json 10. The remaining hole is skewed levels 13-16 speed at 1.26 to 2.89 on ratio parity.
 
 ### Ladder ratio
 
-This table carries the 2026-10-25 pass with one row moved: json level 1 now reads 6.41 against the table's 6.39 through the dense geometry, and the sweep's json fastest cells carry the current values. The ratio table reads ours over zstd at the same numeric level, where a higher number means we are denser.
+This table carries the 2026-10-31 refresh: every cell reproduces the 2026-10-25 bytes, with json level 1 the one moved row at 6.41 against 6.39 through the dense geometry. The ratio table reads ours over zstd at the same numeric level, where a higher number means we are denser.
 
 | level | json | text | skewed | random | zeros |
 |---|---|---|---|---|---|
-| 1 | 6.39/6.11 | 309.23/308.94 | 2.00/2.00 | 1.00/1.00 | 32577/32171 |
+| 1 | 6.41/6.11 | 309.23/308.94 | 2.00/2.00 | 1.00/1.00 | 32577/32171 |
 | 2 | 6.39/5.73 | 312.55/315.95 | 2.00/2.00 | 1.00/1.00 | 32577/32171 |
 | 3 | 5.30/5.29 | 333.03/332.90 | 1.92/1.92 | 1.00/1.00 | 32577/32171 |
 | 4 | 5.29/5.28 | 333.26/333.23 | 1.81/1.81 | 1.00/1.00 | 32577/32171 |
@@ -209,15 +211,15 @@ This table carries the 2026-10-25 pass with one row moved: json level 1 now read
 
 ## Small-payload encode
 
-This section carries the 2026-10-25 pass, with json level 1 sizes 0.34% denser since at 1 MiB through the dense geometry. Each cell is a per-call encode of the given size with checksums off, and x is our time divided by zstd's, so below 1 means we are faster. Sizes run 1 KiB, 4 KiB, 64 KiB and 1024 KiB for json and text at levels 1, 3 and 9.
+This section carries the 2026-10-31 refresh at `0a60b531`. Each cell is a per-call encode of the given size with checksums off, and x is our time divided by zstd's, so below 1 means we are faster. Sizes run 1 KiB, 4 KiB, 64 KiB and 1024 KiB for json and text at levels 1, 3 and 9.
 
 | level | shape | 1K | 4K | 64K | 1024K |
 |---|---|---:|---:|---:|---:|
-| 1 | json | 1.25 | 1.41 | 1.52 | 1.39 |
-| 1 | text | 1.67 | 1.60 | 1.92 | 1.58 |
-| 3 | json | 1.31 | 1.14 | 0.97 | 1.14 |
-| 3 | text | 1.32 | 1.10 | 1.06 | 1.02 |
-| 9 | json | 1.07 | 0.90 | 0.65 | 1.00 |
-| 9 | text | 1.69 | 1.43 | 2.78 | 1.00 |
+| 1 | json | 1.25 | 1.42 | 1.49 | 1.34 |
+| 1 | text | 1.67 | 1.54 | 1.89 | 1.56 |
+| 3 | json | 1.31 | 1.17 | 0.99 | 1.15 |
+| 3 | text | 1.37 | 1.14 | 1.06 | 1.03 |
+| 9 | json | 1.08 | 0.92 | 0.64 | 1.02 |
+| 9 | text | 1.77 | 1.56 | 2.80 | 1.02 |
 
-Json level 9 stays on the stock row at x1.07, 0.90, 0.65 and 1.00. Text level 9 keeps the swap's bytes at x1.69, 1.43, 2.78 and 1.00. The two 64K cells wander inside their drift band across passes, json level 3 at 1.01, 0.83 and 0.97 over three passes and text level 9 at 2.76, 2.46 and 2.78. Level 1's accepted trades are unchanged, and the stock-row exemption for dictionary frames shows only in dictionary fixtures' bytes, not here.
+Json level 9 stays on the stock row at x1.08, 0.92, 0.64 and 1.02. Text level 9 keeps the swap's bytes at x1.77, 1.56, 2.80 and 1.02. The two 64K cells keep wandering inside their drift band across passes, json level 3 at 1.01, 0.83, 0.97 and 0.99 over four passes and text level 9 at 2.76, 2.46, 2.78 and 2.80. Level 1's accepted trades are unchanged, and the stock-row exemption for dictionary frames shows only in dictionary fixtures' bytes, not here.

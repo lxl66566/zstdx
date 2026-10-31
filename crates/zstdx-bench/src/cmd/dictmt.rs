@@ -44,7 +44,16 @@ fn parse_levels(spec: &str) -> Vec<zstdx::Level> {
                 "best" => zstdx::Level::Best,
                 "opt" => zstdx::Level::Opt,
                 "ultra" => zstdx::Level::Ultra,
-                n => zstdx::Level::from_zstd(n.parse::<i32>().expect("numeric level")),
+                n => {
+                    // Reject out-of-range numbers instead of silently
+                    // clamping through `from_zstd`.
+                    let n: i32 = n.parse().unwrap_or_else(|_| panic!("bad level {n}"));
+                    assert!(
+                        (0..=zstdx::Level::MAX.as_i32()).contains(&n),
+                        "level {n} out of range 0-22"
+                    );
+                    zstdx::Level::from_zstd(n)
+                },
             }
         })
         .collect()
