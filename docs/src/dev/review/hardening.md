@@ -18,6 +18,8 @@ The btlazy selection's absent candidates are unrepresentable since 2026-10-24. `
 
 The tree matchers' stored entries are their own domain since 2026-10-31. `PackedPos` wraps the u32 the DUBT heads and ring and the opt tree hold, and packing, resolving and the ring-slot derivation are its methods, so a stored value cannot silently stand in for a ring index or an absolute position. The two trees differ on purpose: the DUBT's ring is keyed by the packed value, the opt tree's by the absolute position (`Finder::ring_base`), which the origin-shifted entry does not share. Gungraun reads best at -0.04% to -0.05% Ir and opt/ultra dead flat at byte-identical dumps. One codegen trap is pinned in the tree: typing `insert_dubt1`'s chain-link local instead of only its pack/unpack crossings re-rolled the inlined body's register allocation at +1.4% Ir on json.best, so that local keeps the raw slot value.
 
+The matcher resolve sites carry their admitted distances as `NonZero` since 2026-10-31: the chain walk's, the row scan's and LDM's candidate distances convert right after the admission compares that already reject zero (`dist - 1 < reach`, `dist == 0 || dist > window`), so a zero distance cannot re-enter the candidate arithmetic past its gate. The conversions fold into the compares they follow; every gungraun tier reads dead flat at byte-identical dumps. The `LdmSeq` offset and the repcode history stay plain u32, because the fast/dfast scans and the decoder-side offset history own those boundaries.
+
 ### Compile-time structure
 
 `HeadTables` puts the `tables` and `second` pair behind private fields with one mutation entry per resize shape. The lockstep comment from the encoder-edge review rides that single entry, and the desync class becomes unrepresentable.
@@ -86,7 +88,7 @@ Poison asserts fire at checkpoints, so a touch whose evidence is legitimately ov
 
 ## Follow-ups
 
-The balanced-Ir placement residue is closed, as the wall A/B shows. The remaining compile-time menu in the [todo](../todo.md) holds cross-domain index newtypes, NonZero distances and enum rep-bases. It also holds the unpoisonable carry zone and the `-max_len` campaign above 4096, where the `encode_stream` part is closed here.
+The balanced-Ir placement residue is closed, as the wall A/B shows. The remaining compile-time menu in the [todo](../todo.md) holds the chain/row scans' `WinPos` threading, `NonZero` on the `LdmSeq` offset and the repcode history, and enum rep-bases — each stopped at a boundary the dense-dispatch files or the decoder own. It also holds the unpoisonable carry zone and the `-max_len` campaign above 4096, where the `encode_stream` part is closed here.
 
 ## Commits
 

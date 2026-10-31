@@ -22,6 +22,7 @@
 //!   bound.
 
 use alloc::vec::Vec;
+use core::num::NonZero;
 
 // Only the portable `gear_run` fallback scans in `gear4` groups; on x86-64
 // the whole-loop asm below took over the scan.
@@ -978,8 +979,9 @@ impl LdmState {
             for &split in splits.iter().take(count) {
                 let (hash, checksum) = self.window_hash(win, (split - win_base) as usize);
                 // (offset, forward match end); the longest forward run
-                // wins — the consumer re-prices the offset itself.
-                let mut best: Option<(u64, u64)> = None;
+                // wins — the consumer re-prices the offset itself. The
+                // offset is NonZero from its admission to the stored seq.
+                let mut best: Option<(NonZero<u64>, u64)> = None;
                 if split >= anchor {
                     let entries = self.bucket(hash);
                     // Ascending hit order keeps the first-longest tie-break
@@ -993,12 +995,17 @@ impl LdmState {
                         if dist == 0 || dist > self.window {
                             continue;
                         }
+                        // The rejection leaves the distance in [1, window].
+                        debug_assert!(dist != 0);
+                        // SAFETY: the compare above rejected distance 0, so
+                        // the value is nonzero.
+                        let dist = unsafe { NonZero::new_unchecked(dist) };
                         // A distance past the split itself is the dead entry
                         // encoding: an unwritten slot, or the one position
                         // whose pack_pos bias wraps to zero. There is no
                         // source to extend against, and a wrapped `cand_abs`
                         // would reach far outside the window buffer.
-                        let Some(cand_abs) = split.checked_sub(dist) else {
+                        let Some(cand_abs) = split.checked_sub(dist.get()) else {
                             continue;
                         };
                         if cand_abs < win_base {
@@ -1020,7 +1027,7 @@ impl LdmState {
                 if let Some((dist, match_end)) = best {
                     out.push(LdmSeq {
                         split,
-                        offset: dist as u32,
+                        offset: dist.get() as u32,
                         len: (match_end - split) as u32,
                     });
                     anchor = match_end;

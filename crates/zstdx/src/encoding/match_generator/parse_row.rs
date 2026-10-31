@@ -26,6 +26,8 @@
 //! position admits the unique candidate in `[pos - 2^24, pos)`, which the
 //! window check (≤ 4 MiB) arbitrates.
 
+use core::num::NonZero;
+
 use super::*;
 
 /// Tag width carved out of the row hash (libzstd's `ZSTD_ROW_HASH_TAG_BITS`).
@@ -321,7 +323,14 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
         if d.wrapping_sub(1) >= reach {
             continue;
         }
-        let cand = (idx as u32).wrapping_sub(d);
+        // The admission compare proved the distance ∈ [1, reach], so it is
+        // NonZero-typed from the admission to its use: the dist-0
+        // self-compare class stays unrepresentable past the gate.
+        debug_assert!(d != 0);
+        // SAFETY: the compare above admits the distance into [1, reach]
+        // (reach is window-bounded, far below u32::MAX), so it is nonzero.
+        let d = unsafe { NonZero::new_unchecked(d) };
+        let cand = (idx as u32).wrapping_sub(d.get());
         // SAFETY: the reach check bounds the candidate below and the
         // scan's HASH_READ margin above; prefetch tolerates any address
         // regardless.

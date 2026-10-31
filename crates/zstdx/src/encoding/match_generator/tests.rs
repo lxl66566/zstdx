@@ -618,6 +618,13 @@ fn chain_epoch_roll_resolves_floor_relative() {
     // The empty sentinel maps above any window reach (reach here: 8).
     let sentinel = q.wrapping_sub(0);
     assert!(sentinel.wrapping_sub(1) >= 8);
+    // A slot holding the scan position's own entry value resolves to
+    // distance 0; the admission wraps it to u64::MAX and rejects it (the
+    // self-compare class the walk's NonZero-typed admitted distance makes
+    // unrepresentable).
+    let dist0 = q.wrapping_sub((q as u32) as u64);
+    assert_eq!(dist0, 0);
+    assert!(dist0.wrapping_sub(1) >= 8);
     // reset clears a rolled epoch; the residue it drops only exists past
     // the roll bar, where it is beyond every reach.
     driver.reset(crate::Level::Balanced);

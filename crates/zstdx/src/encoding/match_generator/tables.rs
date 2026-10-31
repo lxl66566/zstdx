@@ -3,6 +3,7 @@
 //! backfills, the chain walk, and the job-start table clear.
 
 use alloc::vec::Vec;
+use core::num::NonZero;
 
 use super::{
     MIN_MATCH, PREFILL_STRIDE,
@@ -406,7 +407,7 @@ pub(super) fn chain_search(
     // The scan position's own entry value under the current origin (u64
     // domain; see [`entry_dist`]).
     let q = pos_abs.wrapping_add(origin).wrapping_add(1);
-    let mut dist = entry_dist(entry, q);
+    let mut raw_dist = entry_dist(entry, q);
     // `dist - 1 < reach` admits exactly dist ∈ [1, reach]: dist 0 is a
     // stale slot holding this very position (pack_pos is injective per
     // 4-GiB cycle, but old-cycle slots alias anything), whose candidate
@@ -417,8 +418,16 @@ pub(super) fn chain_search(
     // out-of-window dist the exact break the old candidate-floor check
     // was. The subtraction is wrapping for the same reason: dist 0 must
     // wrap to u64::MAX to be rejected, not panic in debug builds.
-    while tried < search_depth && dist.wrapping_sub(1) < reach {
-        let cand_abs = pos_abs - dist;
+    while tried < search_depth && raw_dist.wrapping_sub(1) < reach {
+        // The admission compare just proved the distance ∈ [1, reach], so
+        // it is NonZero-typed from the admission to its only use — a
+        // dist-0 self-compare cannot re-enter the walk's arithmetic even
+        // if a later edit reworks the admission.
+        debug_assert!(raw_dist != 0);
+        // SAFETY: the loop condition admits the distance into [1, reach]
+        // (reach is window-bounded, far below u64::MAX), so it is nonzero.
+        let dist = unsafe { NonZero::new_unchecked(raw_dist) };
+        let cand_abs = pos_abs - dist.get();
         let cand = (cand_abs - win_base) as usize;
         // Beat-check (libzstd's "potentially better" read): the 4 bytes
         // ending at best_len+1 decide whether the candidate can strictly
@@ -441,7 +450,7 @@ pub(super) fn chain_search(
         }
         tried += 1;
         let entry = links.get_abs(cand_abs);
-        dist = entry_dist(entry, q);
+        raw_dist = entry_dist(entry, q);
     }
     (best_len, best_cand)
 }
