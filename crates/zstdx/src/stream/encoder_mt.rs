@@ -672,11 +672,27 @@ pub(super) fn serve_queue(
             }
         };
         let mut poisoned = false;
+        #[cfg(feature = "job_trace")]
+        let tl_first = if timeline::probe_on() {
+            match &job.kind {
+                JobKind::Encode { first, len, .. } => {
+                    timeline::tl!("TL CLAIM {}..{} at {}", first, len, timeline::rel_us());
+                    Some((*first, *len))
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         // SAFETY: the posting thread keeps the backing bytes stable for
         // this job's whole lifetime (see FrozenSrc).
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_claimed_job(&job, state);
         }));
+        #[cfg(feature = "job_trace")]
+        if let Some((first, len)) = tl_first {
+            timeline::tl!("TL DONE {}..{} at {}", first, len, timeline::rel_us());
+        }
         match attempt {
             Ok(()) => {
                 mark_done(&job);
@@ -865,6 +881,36 @@ fn run_claimed_job(
     }
 }
 
+/// A per-process job schedule timeline, `job_trace` builds only: set
+/// `ZSTDX_TRACE_TIMELINE` to print one stderr line per post, claim,
+/// completion and finish boundary with microseconds since the first
+/// encoder's construction. The claim lines print the job's view-relative
+/// `(first, len)` pair, not absolute offsets.
+#[cfg(feature = "job_trace")]
+mod timeline {
+    use std::{sync::OnceLock, time::Instant};
+    pub static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    pub static ON: OnceLock<bool> = OnceLock::new();
+    pub fn probe_on() -> bool {
+        *ON.get_or_init(|| std::env::var("ZSTDX_TRACE_TIMELINE").is_ok())
+    }
+    pub fn mark() {
+        probe_on();
+        ORIGIN.get_or_init(Instant::now);
+    }
+    pub fn rel_us() -> u128 {
+        ORIGIN.get().map_or(0, |t| t.elapsed().as_micros())
+    }
+    macro_rules! tl {
+        ($($arg:tt)*) => {
+            if timeline::ON.get().is_some_and(|&b| b) {
+                std::eprintln!($($arg)*);
+            }
+        };
+    }
+    pub(crate) use tl;
+}
+
 /// Publish a successfully run job's result (Release-paired with
 /// [`Job::is_done`]).
 fn mark_done(job: &Job) {
@@ -1028,6 +1074,8 @@ impl MtEncoderCore {
         options: &EncoderOptions,
         dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
     ) -> Self {
+        #[cfg(feature = "job_trace")]
+        timeline::mark();
         let checksum = options.checksum && cfg!(feature = "hash");
         let ldm_mode = options.long_distance_matching;
         // The pledge is the frame's authoritative length; the forced window
@@ -1377,6 +1425,8 @@ impl MtEncoderCore {
         }
         #[cfg(feature = "job_trace")]
         let fin_t0 = std::time::Instant::now();
+        #[cfg(feature = "job_trace")]
+        timeline::tl!("TL FINISH begin at {}", timeline::rel_us());
         self.surface_poison();
         if self.pos > self.job_start {
             // Post the tail before waiting: posting first lets workers
@@ -1404,6 +1454,8 @@ impl MtEncoderCore {
         self.finished = true;
         #[cfg(debug_assertions)]
         vec_poison::fill(&mut self.output);
+        #[cfg(feature = "job_trace")]
+        timeline::tl!("TL FINISH end at {}", timeline::rel_us());
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_fin(fin_t0);
         Ok(())
@@ -2638,6 +2690,8 @@ impl MtEncoderCore {
         // Register before publishing: a worker's completion decrement must
         // never race ahead of the registration (the queue push below is the
         // earliest a worker can see the job).
+        #[cfg(feature = "job_trace")]
+        timeline::tl!("TL POST {}..{} at {}", start, end, timeline::rel_us());
         self.shared.n_incomplete.fetch_add(1, Ordering::Release);
         {
             let mut inner = self.shared.inner.lock().unwrap();
