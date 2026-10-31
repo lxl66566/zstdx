@@ -101,6 +101,10 @@ pub struct Snapshot {
     /// own span the wall's largest single piece is invisible to the
     /// decomposition (the R25 lesson — the probe outruns every job).
     pub probe_ns: u64,
+    /// DUBT compare calls (`DubtFinder::count`) and their summed match
+    /// lengths — the compare volume the search pays, ST against job.
+    pub cmp_calls: u64,
+    pub cmp_bytes: u64,
 }
 
 macro_rules! counters {
@@ -157,6 +161,8 @@ counters! {
     hash3_ns,
     hash3_bytes,
     probe_ns,
+    cmp_calls,
+    cmp_bytes,
 }
 
 #[inline]
@@ -318,9 +324,65 @@ pub fn add_hash3(started: Instant, bytes: u64) {
     C.hash3_bytes.fetch_add(bytes, Ordering::Relaxed);
 }
 
+/// Record one DUBT compare (`DubtFinder::count`): the call count and the
+/// matched length separate compare volume from compare count.
+#[inline]
+pub fn add_cmp(bytes: usize) {
+    C.cmp_calls.fetch_add(1, Ordering::Relaxed);
+    C.cmp_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
 /// Start a fill span of `bytes` if it crosses the trace threshold;
 /// otherwise `None`, and the call site skips all recording.
 #[inline]
 pub fn fill_start(bytes: u64) -> Option<Instant> {
     (bytes >= FILL_MIN_BYTES).then(Instant::now)
+}
+
+/// The bulk path's schedule timeline, this module's build only: with
+/// `ZSTDX_TRACE_TIMELINE` set, one stderr line per job claim and
+/// completion, in microseconds since the first claim. The span sums
+/// above cannot answer makespan questions (which job sets the wall, how
+/// wide the per-job cost spread is), and the stream core's probe of the
+/// same variable does not cover the bulk path.
+mod bulk_timeline {
+    use alloc::format;
+    use std::{eprintln, sync::OnceLock, time::Instant};
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+    fn on() -> bool {
+        *ON.get_or_init(|| std::env::var("ZSTDX_TRACE_TIMELINE").is_ok())
+    }
+
+    fn rel_us() -> u128 {
+        ORIGIN.get_or_init(Instant::now).elapsed().as_micros()
+    }
+
+    pub fn claim(id: usize, start: usize, end: usize) {
+        if on() {
+            eprintln!("bulk claim {id} {start}..{end} @{}", rel_us());
+        }
+    }
+
+    pub fn done(id: usize, started: Instant) {
+        if on() {
+            eprintln!(
+                "bulk done {id} took {} @{}",
+                started.elapsed().as_micros(),
+                rel_us()
+            );
+        }
+    }
+}
+
+/// Timeline hook: a worker claimed bulk job `id` over `[start, end)`.
+pub fn bulk_claim(id: usize, start: usize, end: usize) {
+    bulk_timeline::claim(id, start, end);
+}
+
+/// Timeline hook: bulk job `id` finished (started at `started`).
+pub fn bulk_done(id: usize, started: Instant) {
+    bulk_timeline::done(id, started);
 }

@@ -183,6 +183,20 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
     /// The compare proper, in the instantiation's form.
     #[inline(always)]
     fn count(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+        // The trace build records the matched length; the default build
+        // keeps the plain tail form untouched (this inline's register
+        // allocation is load-bearing, see matchers.md).
+        #[cfg(feature = "job_trace")]
+        {
+            let ml = if LONG {
+                count_from_long(win, idx, cand, start, limit)
+            } else {
+                count_from(win, idx, cand, start, limit)
+            };
+            super::job_trace::add_cmp(ml);
+            ml
+        }
+        #[cfg(not(feature = "job_trace"))]
         if LONG {
             count_from_long(win, idx, cand, start, limit)
         } else {

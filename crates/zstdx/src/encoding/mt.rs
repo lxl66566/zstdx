@@ -322,6 +322,8 @@ pub fn compress_slice_mt(
                     }
                     let start = id * job_size;
                     let end = (start + job_size).min(src.len());
+                    #[cfg(feature = "job_trace")]
+                    super::job_trace::bulk_claim(id, start, end);
                     // The no-build capture never waits: an above-median
                     // job takes the snapshot-less windowed prefill and
                     // cold-fills its own span, a below-median job the
@@ -376,6 +378,8 @@ pub fn compress_slice_mt(
                     // The first job starts where the decoder's repeated-offset
                     // history is still the format default [1, 4, 8]; the gate
                     // is job.start > 0 (applied inside the state preparation).
+                    #[cfg(feature = "job_trace")]
+                    let trace_job = std::time::Instant::now();
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if id == 0
                             && let Some(dict) = dict
@@ -427,6 +431,8 @@ pub fn compress_slice_mt(
                             ldm_mode,
                         )
                     }));
+                    #[cfg(feature = "job_trace")]
+                    super::job_trace::bulk_done(id, trace_job);
                     match attempt {
                         Ok(bytes) => {
                             *slots[id].lock().unwrap() = Some(bytes);

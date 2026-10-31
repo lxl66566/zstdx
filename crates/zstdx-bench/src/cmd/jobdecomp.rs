@@ -148,6 +148,16 @@ mod trace {
             share(rest, s.job_ns),
         );
         println!(
+            "  dubt cmp   {:>10} calls  {:>7.2} GiB matched  ({:>6.0} B/call)",
+            s.cmp_calls,
+            s.cmp_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            if s.cmp_calls == 0 {
+                0.0
+            } else {
+                s.cmp_bytes as f64 / s.cmp_calls as f64
+            },
+        );
+        println!(
             "  head clear {:>7.2} ms ({:4.1}% of job, {:>6.2} ms/job)",
             ms(s.clear_ns),
             share(s.clear_ns, s.job_ns),
@@ -273,6 +283,8 @@ mod trace {
             don_wait_ns,
             fin_post_ns,
             fin_drain_ns,
+            cmp_calls,
+            cmp_bytes,
         } = s;
         acc.jobs += jobs;
         acc.job_ns += job_ns;
@@ -304,6 +316,8 @@ mod trace {
         acc.don_wait_ns += don_wait_ns;
         acc.fin_post_ns += fin_post_ns;
         acc.fin_drain_ns += fin_drain_ns;
+        acc.cmp_calls += cmp_calls;
+        acc.cmp_bytes += cmp_bytes;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {
