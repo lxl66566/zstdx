@@ -293,7 +293,12 @@ fn decompress_4streams_interleaved(
     stream_bounds: &[(usize, usize); 4],
     out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
-    let tl = table.max_num_bits; // 1..=11
+    let tl = table.max_num_bits;
+    // Checked input, not an assumption: the table builder rejects
+    // `MaxBitsTooHigh` (huff0 `build_table_from_weights`) before a table
+    // with tl > 11 is ever published. The reload retreat below reads up to
+    // 7 bytes per iteration, which stays in bounds only while 5 symbols
+    // cost at most 55 bits, i.e. tl <= 11.
     debug_assert!((1..=11).contains(&tl));
     let shift = 64 - tl as u32;
     let packed = table.packed_table();

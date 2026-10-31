@@ -376,6 +376,14 @@ impl HuffmanTable {
         }
 
         let max_bits = highest_bit_set(weight_sum) as u8;
+        // Enforce the format's 11-bit code cap before any table state is
+        // published: the fast loops' `64 - tl` shifts and 7-byte reload
+        // retreat (literals_section_decoder) and the X2 table's fixed 2^11
+        // window are sound only for tl <= 11, and `max_num_bits` must not
+        // outlive a failed build over stale (or cleared) arrays.
+        if max_bits > MAX_MAX_NUM_BITS {
+            return Err(err::MaxBitsTooHigh { got: max_bits });
+        }
         let left_over = (1 << max_bits) - weight_sum;
 
         // left_over must be power of two
@@ -408,10 +416,6 @@ impl HuffmanTable {
 
         self.bits[self.weights.len()] = max_bits + 1 - last_weight;
         self.max_num_bits = max_bits;
-
-        if max_bits > MAX_MAX_NUM_BITS {
-            return Err(err::MaxBitsTooHigh { got: max_bits });
-        }
 
         self.bit_ranks.clear();
         self.bit_ranks.resize((max_bits + 1) as usize, 0);
