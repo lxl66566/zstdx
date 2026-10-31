@@ -24,6 +24,7 @@ use crate::{
 #[cfg(debug_assertions)]
 pub(super) mod vec_poison {
     use alloc::vec::Vec;
+    use core::mem::MaybeUninit;
 
     use crate::encoding::poison;
 
@@ -31,19 +32,25 @@ pub(super) mod vec_poison {
     const WALL: usize = 4 * 1024;
 
     /// Arm the wall over `v`'s spare capacity.
-    pub(crate) fn fill<T>(v: &mut Vec<T>) {
+    pub(crate) fn fill<T: Copy>(v: &mut Vec<T>) {
         let n = span_len(v);
         if n == 0 {
             return;
         }
-        let size = size_of::<T>();
-        let spare = v.spare_capacity_mut();
-        // SAFETY: the span lies inside the Vec's spare capacity; writing
-        // the pattern initializes exactly those bytes, which the Vec never
-        // reads below its own length.
-        let bytes =
-            unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), n * size) };
-        poison::fill(bytes);
+        // The pattern element: PATTERN in every byte of `T`'s layout, built
+        // once and copied bitwise into the span by `fill`.
+        // SAFETY: the pattern element is never read as a `T`; every byte of
+        // its layout is initialized here.
+        let mut pat = MaybeUninit::<T>::uninit();
+        unsafe {
+            pat.as_mut_ptr()
+                .cast::<u8>()
+                .write_bytes(poison::PATTERN, size_of::<T>());
+        }
+        // The span lies inside the Vec's spare capacity; the pattern
+        // initializes exactly those slots, which the Vec never reads below
+        // its own length.
+        v.spare_capacity_mut()[..n].fill(pat);
     }
 
     /// Assert the wall armed by [`fill`] is unchanged. `ctx` names the
