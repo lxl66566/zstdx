@@ -6,7 +6,9 @@
 //! - **Warmup**: one unmeasured round each before timing starts.
 //! - **Time budget**: rounds accumulate until each side ran for `min_secs` (default 0.5 s, override
 //!   with `--budget-ms` or the `BENCH_BUDGET_MS` env var), so the total wall time is bounded
-//!   without fixing an iteration count.
+//!   without fixing an iteration count. A side that is far faster than its counterpart only needs
+//!   `FAST_SIDE_BUDGET_FRAC` of the budget once the slow side is done, because every extra round
+//!   then buys one full slow-side round for a handful of fast-side samples.
 //! - **Robust stats**: median/min/max plus the median absolute deviation of the ratios; medians
 //!   absorb spikes, min approximates the noise floor.
 //!
@@ -15,6 +17,12 @@
 //! per-round `Instant::now()` overhead pollutes the sample.
 
 use std::time::Instant;
+
+/// Fraction of `min_secs` that suffices for the fast side of a strongly
+/// asymmetric cell (deep-level random rows, where the libzstd side runs
+/// seconds per round and ours runs milliseconds): once the slow side spent
+/// its full budget, the fast side stops at this fraction.
+const FAST_SIDE_BUDGET_FRAC: f64 = 0.125;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
@@ -67,7 +75,7 @@ pub struct AbReport {
 }
 
 impl AbReport {
-    /// One line: `<name>  a  b  ratio ±mad [min..max] n=rounds`.
+    /// One line: `<name>  a  b  ratio ±mad [min..max]  n=rounds`.
     pub fn print(&self, name: &str, bytes: u64) {
         println!(
             "{name:<16}{a_mibs:>9.0} {b_mibs:>9.0}  x{ratio:>6.3} ±{mad:.3}  [{lo:.3}..{hi:.3}]  \
@@ -133,6 +141,7 @@ impl Ab {
         }
         let mut a_times = Vec::new();
         let mut b_times = Vec::new();
+        let fast_secs = self.min_secs * FAST_SIDE_BUDGET_FRAC;
         let mut rounds = 0usize;
         loop {
             let t = Instant::now();
@@ -144,8 +153,12 @@ impl Ab {
             rounds += 1;
             let a_total: f64 = a_times.iter().sum();
             let b_total: f64 = b_times.iter().sum();
-            let done =
-                rounds >= self.min_rounds && a_total >= self.min_secs && b_total >= self.min_secs;
+            // both sides at the full budget, or one side at the full budget
+            // and the other clearly the fast side of an asymmetric cell
+            let done = rounds >= self.min_rounds
+                && ((a_total >= self.min_secs
+                    && (b_total >= self.min_secs || b_total >= fast_secs))
+                    || (b_total >= self.min_secs && a_total >= fast_secs));
             // safety cap for closures that are too fast to ever accumulate
             // the budget (see the module docs about batching)
             if done || rounds >= 100_000 {
