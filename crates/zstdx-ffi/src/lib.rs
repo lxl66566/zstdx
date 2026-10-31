@@ -221,9 +221,12 @@ impl TryFrom<i32> for ZSTD_EndDirective {
 /// buffer error rather than a crash (libzstd would read it, but a defensive
 /// error beats UB for the same callers).
 ///
+/// The returned borrow is unbounded: every caller consumes the slice within
+/// the call and must never retain it past the raw pointers' validity.
+///
 /// # Safety
 /// `ptr[..len]` must be valid for reads when non-null.
-pub unsafe fn as_slice(ptr: *const c_void, len: usize) -> Result<&'static [u8], ErrorCode> {
+pub unsafe fn as_slice<'a>(ptr: *const c_void, len: usize) -> Result<&'a [u8], ErrorCode> {
     if len == 0 {
         return Ok(&[]);
     }
@@ -237,9 +240,11 @@ pub unsafe fn as_slice(ptr: *const c_void, len: usize) -> Result<&'static [u8], 
 /// `dstBuffer_null`; zero capacity yields an empty (unwritable) slice so the
 /// codec reports `dstSize_tooSmall` itself.
 ///
+/// The returned borrow is unbounded, with the same consume-within-call rule.
+///
 /// # Safety
 /// `ptr[..len]` must be valid for writes when non-null.
-pub unsafe fn as_dst(ptr: *mut c_void, len: usize) -> Option<&'static mut [u8]> {
+pub unsafe fn as_dst<'a>(ptr: *mut c_void, len: usize) -> Option<&'a mut [u8]> {
     if len == 0 {
         return Some(&mut []);
     }
@@ -249,11 +254,12 @@ pub unsafe fn as_dst(ptr: *mut c_void, len: usize) -> Option<&'static mut [u8]> 
     Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) })
 }
 
-/// Output slice of an out-buffer.
+/// Output slice of an out-buffer, with the same unbounded-borrow rule as
+/// [`as_slice`].
 ///
 /// # Safety
 /// `dst[..size]` must be valid for writes when non-null.
-pub unsafe fn as_mut_slice(ptr: *mut c_void, len: usize) -> &'static mut [u8] {
+pub unsafe fn as_mut_slice<'a>(ptr: *mut c_void, len: usize) -> &'a mut [u8] {
     if len == 0 || ptr.is_null() {
         return &mut [];
     }

@@ -763,11 +763,13 @@ pub unsafe extern "C" fn ZSTD_writeSkippableFrame(
 ) -> usize {
     use crate::error::{ErrorCode, code};
     const SKIPPABLE_HEADER_SIZE: usize = 8;
-    if dst_capacity < src_size + SKIPPABLE_HEADER_SIZE {
-        return code(ErrorCode::DstSizeTooSmall);
-    }
+    // The size guard runs first: it also keeps the capacity sum below from
+    // wrapping in a debug build and from passing an extreme size at all.
     if src_size > u32::MAX as usize {
         return code(ErrorCode::SrcSizeWrong);
+    }
+    if dst_capacity < src_size + SKIPPABLE_HEADER_SIZE {
+        return code(ErrorCode::DstSizeTooSmall);
     }
     if magic_variant > 15 {
         return code(ErrorCode::ParameterOutOfBound);
