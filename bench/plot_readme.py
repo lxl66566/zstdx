@@ -3,7 +3,7 @@
 
 Streaming-first: real deployments stream (Read/Write), so the figures show
 the streaming paths; the bulk story lives in docs/src/dev/bench/. Data
-source: the 2026-10-31 section refresh at `0a60b531` —
+source: the 2026-11-01 release pass at `2ba353fa` —
 - `matrix --mode dec-st --pull 4k,16k,64k,256k,1m` (+ the four dll100 .zst
   files) for the streaming-decode pull sweep, the dec-mt section +
   `files --threads` for the MT-decode rows (vs the zstd ST streaming
@@ -32,13 +32,13 @@ LEVELS = (1, 3, 9, 13, 17, 19)
 # tight clusters. Unknown-size streams on both sides: on text, libzstd's
 # fastest cell emits a 1.84 MB frame (ratio 18.3) vs our 108 KB (309.2) —
 # the panel is log-x to keep that dominated outlier honest. The text l1/l3
-# throughput cells carry the standalone medians (in-pass cells read 4695
-# and 4653 through the page-dispersity collapse, seventh consecutive pass).
+# throughput cells carry the standalone medians (in-pass cells read 5067
+# and 5014 through the page-dispersity collapse, ninth consecutive pass).
 ENCODE = {
     "json · 32 MiB": {
         "xlim": (4.95, 7.78), "ylim": (1.8, 1700),
-        "zstdx": {1: (6.413, 628), 3: (5.296, 465), 9: (7.128, 84), 13: (6.258, 24), 17: (7.488, 6), 19: (7.424, 3)},
-        "libzstd": {1: (6.106, 771), 3: (5.252, 450), 9: (5.950, 105), 13: (6.100, 33), 17: (7.486, 7), 19: (7.416, 3)},
+        "zstdx": {1: (6.413, 573), 3: (5.296, 453), 9: (7.128, 76), 13: (6.258, 20), 17: (7.488, 5), 19: (7.424, 3)},
+        "libzstd": {1: (6.106, 743), 3: (5.252, 435), 9: (5.950, 98), 13: (6.100, 25), 17: (7.486, 5), 19: (7.416, 2)},
         "off": {
             ("zstdx", 17): (9, 6), ("libzstd", 17): (-9, -7),
             ("zstdx", 19): (9, -8), ("libzstd", 19): (-9, 7),
@@ -46,8 +46,8 @@ ENCODE = {
     },
     "text · 32 MiB": {
         "xlim": (14, 1100), "ylim": (150, 9000), "xlog": True,
-        "zstdx": {1: (309.22, 6633), 3: (333.02, 6391), 9: (384.65, 1302), 13: (386.40, 907), 17: (410.22, 725), 19: (414.11, 378)},
-        "libzstd": {1: (18.25, 1748), 3: (332.90, 5144), 9: (378.20, 1535), 13: (385.63, 632), 17: (410.00, 407), 19: (413.86, 246)},
+        "zstdx": {1: (309.22, 6638), 3: (333.02, 6082), 9: (384.65, 1352), 13: (386.40, 881), 17: (410.22, 810), 19: (414.11, 413)},
+        "libzstd": {1: (18.25, 1721), 3: (332.90, 5125), 9: (378.20, 1597), 13: (385.63, 584), 17: (410.00, 410), 19: (413.86, 249)},
         "off": {
             ("zstdx", 3): (8, 6), ("libzstd", 3): (-8, -8),
             ("zstdx", 9): (8, -2), ("libzstd", 9): (-8, 3),
@@ -55,8 +55,8 @@ ENCODE = {
     },
     "dll100 · 100 MB": {
         "xlim": (1.85, 6.8), "ylim": (5, 900),
-        "zstdx": {1: (4.344, 500), 3: (4.969, 436), 9: (5.311, 108), 13: (5.352, 29), 17: (6.038, 10), 19: (6.322, 7)},
-        "libzstd": {1: (2.188, 509), 3: (3.427, 394), 9: (4.592, 138), 13: (4.645, 36), 17: (5.052, 13), 19: (5.272, 8)},
+        "zstdx": {1: (4.345, 465), 3: (4.970, 426), 9: (5.311, 107), 13: (5.353, 27), 17: (6.040, 13), 19: (6.322, 8)},
+        "libzstd": {1: (2.188, 503), 3: (3.427, 391), 9: (4.592, 132), 13: (4.645, 30), 17: (5.054, 11), 19: (5.272, 8)},
         "off": {
             ("zstdx", 19): (8, 5), ("libzstd", 19): (-8, -8),
             ("zstdx", 17): (8, -7), ("libzstd", 17): (-8, 6),
@@ -67,15 +67,15 @@ ENCODE = {
 # Streaming-encode MT(8) speedup (ours/zstd throughput, both sides at 8
 # workers, 64 KiB pulls) per tier: payload -> (x at each of the 6 tiers).
 # Each value is the inverse of the harness's median per-round time ratio.
-# The dll100 cells trail libzstd's MT at three tiers and sit at 70-89% of
+# The dll100 cells trail libzstd's MT at three tiers and sit at 47-91% of
 # zstdx's own bulk-mt8 ceilings (todo 17).
 ENCODE_MT = {
-    "fastest": {"json": 1.64, "text": 2.09, "dll100": 0.49},
-    "fast": {"json": 4.33, "text": 3.32, "dll100": 1.76},
-    "balanced": {"json": 3.24, "text": 1.19, "dll100": 0.65},
-    "best": {"json": 1.57, "text": 2.25, "dll100": 0.33},
-    "opt": {"json": 2.40, "text": 1.75, "dll100": 1.26},
-    "ultra": {"json": 1.95, "text": 1.57, "dll100": 1.05},
+    "fastest": {"json": 1.71, "text": 1.97, "dll100": 0.49},
+    "fast": {"json": 5.59, "text": 3.60, "dll100": 1.85},
+    "balanced": {"json": 3.46, "text": 1.24, "dll100": 0.83},
+    "best": {"json": 1.59, "text": 2.43, "dll100": 0.32},
+    "opt": {"json": 2.65, "text": 2.05, "dll100": 1.49},
+    "ultra": {"json": 2.07, "text": 1.75, "dll100": 1.09},
 }
 
 # Streaming-decode speedup (libzstd_time/ours_time) per corpus cell:
@@ -83,26 +83,26 @@ ENCODE_MT = {
 # mt16-vs-zstd-stream or None). Both sides single-threaded; the reader loop
 # pulls `pull` bytes per read. >1 = zstdx faster.
 DECODE = [
-    ("json zst1", (0.808, 0.817, 0.817), None),
-    ("json zst3", (0.763, 0.765, 0.767), None),
-    ("json zst9", (0.789, 0.791, 0.795), None),
-    ("json zst19", (0.855, 0.858, 0.863), None),
-    ("text zst1", (0.841, 0.844, 0.846), None),
-    ("text zst3", (0.933, 0.938, 0.947), None),
-    ("text zst9", (0.948, 0.958, 0.976), None),
-    ("text zst19", (0.946, 0.954, 0.969), None),
-    ("skewed zst1", (0.914, 0.926, 0.930), None),
-    ("skewed zst3", (0.841, 0.843, 0.848), None),
-    ("skewed zst9", (0.775, 0.775, 0.779), None),
-    ("skewed zst19", (0.890, 0.898, 0.901), None),
-    ("random zst3", (1.232, 1.244, 1.299), None),
-    ("zeros zst3", (0.986, 0.996, 1.017), None),
-    ("dll100 zst1", (0.787, 0.792, 0.794), None),
-    ("dll100 zst3", (0.758, 0.760, 0.762), None),
-    ("dll100 zst9", (0.758, 0.758, 0.766), None),
-    ("dll100 zst19", (0.770, 0.772, 0.773), None),
-    ("json zst3 · 16 threads", (None, 1.17, None), True),
-    ("dll100 zst3 · 16 threads", (None, 1.34, None), True),
+    ("json zst1", (0.808, 0.817, 0.818), None),
+    ("json zst3", (0.756, 0.759, 0.764), None),
+    ("json zst9", (0.781, 0.782, 0.785), None),
+    ("json zst19", (0.851, 0.853, 0.858), None),
+    ("text zst1", (0.829, 0.829, 0.837), None),
+    ("text zst3", (0.926, 0.933, 0.938), None),
+    ("text zst9", (0.950, 0.959, 0.980), None),
+    ("text zst19", (0.948, 0.955, 0.974), None),
+    ("skewed zst1", (0.921, 0.925, 0.928), None),
+    ("skewed zst3", (0.842, 0.844, 0.846), None),
+    ("skewed zst9", (0.779, 0.782, 0.783), None),
+    ("skewed zst19", (0.911, 0.917, 0.929), None),
+    ("random zst3", (1.227, 1.242, 1.289), None),
+    ("zeros zst3", (0.988, 0.995, 1.016), None),
+    ("dll100 zst1", (0.790, 0.801, 0.801), None),
+    ("dll100 zst3", (0.760, 0.760, 0.763), None),
+    ("dll100 zst9", (0.765, 0.768, 0.768), None),
+    ("dll100 zst19", (0.770, 0.770, 0.774), None),
+    ("json zst3 · 16 threads", (None, 1.20, None), True),
+    ("dll100 zst3 · 16 threads", (None, 1.32, None), True),
 ]
 
 

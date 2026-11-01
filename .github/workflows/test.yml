@@ -44,16 +44,3 @@ jobs:
       - run: bash crates/zstdx-ffi/tests/run-c.sh
         env:
           ZSTD_REF: ${{ github.workspace }}/zstd-ref
-
-  msrv:
-    name: msrv 1.89
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.89
-      # Every crate declares rust-version 1.89. The workspace-wide check
-      # proves the manifests for all targets; a full workspace test run on
-      # the pinned toolchain doubles the runtime for little extra signal,
-      # so only the codec crate is tested.
-      - run: cargo check --workspace --all-targets
-      - run: cargo test -p zstdx

@@ -338,7 +338,11 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
                 let sym = unsafe { *data.get_unchecked($i) };
                 let e = aligned[sym as usize];
                 $c >>= (e & 63) as u32;
-                $c |= if $clean { e & !0xf } else { e };
+                $c |= if $clean {
+                    e & !0xf
+                } else {
+                    e
+                };
                 $b = $b.wrapping_add(e);
             }};
         }

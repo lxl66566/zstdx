@@ -1012,6 +1012,7 @@ impl MatchGeneratorDriver {
 
     /// The current reach verdict; reads the pooled-residue contract in
     /// tests (see `stream::encoder_core`'s pool round-trip test).
+    #[cfg(test)]
     pub(crate) const fn reach_choice(&self) -> ReachChoice {
         self.reach_choice
     }
