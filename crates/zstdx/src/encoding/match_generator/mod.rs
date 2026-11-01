@@ -983,6 +983,12 @@ impl MatchGeneratorDriver {
         self.reach_choice = choice;
     }
 
+    /// The current reach verdict; reads the pooled-residue contract in
+    /// tests (see `stream::encoder_core`'s pool round-trip test).
+    pub(crate) const fn reach_choice(&self) -> ReachChoice {
+        self.reach_choice
+    }
+
     /// Clear the parse tables for a fresh deterministic parse on a driver
     /// whose allocations persist across reach flips: the probe's pooled
     /// driver parses keep and shrink sides (and the feedback prefix)

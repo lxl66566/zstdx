@@ -18,7 +18,6 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 46 symbols deliberately out with recorded reasons, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
-| 29 | Dump-stream nondeterminism | Gate trust: the byte-exact dump differential must be a function of the build alone | One-off degenerate emission of `text.raw.stream.l9.zst` under the parallel dump pool, at 4.66 MB against the 87,238 B stable size, ratio 7.2 against 384 | [benchharness](review/benchharness.md) |
 
 ## Item notes
 
@@ -116,10 +115,6 @@ The remaining compile-time menu holds A/B-gated refactors of hot code. The tree 
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
 
-### Item 29
-
-The R86 consolidation belt caught one degenerate stream dump: the pre-round build emitted `text.raw.stream.l9.zst` at 4,662,041 bytes where every neighboring run emits 87,238, a ratio collapse to 7.2 on the balanced tier that no round change touches. The frame itself is legal and decodes to the exact input. Three reruns on the same binary, the same corpus and the same flags, plus two on the post-round build, all reproduce the 87,238 B frame, so the degenerate emission is a rare concurrent-path event inside the parallel dump pool, either a race in the stream core's shared state or a cross-cell parameter leak between pool slots. The dump differential is the round gate for byte-exactness, so a one-in-many degenerate cell can silently flip a verdict; until the cause lands, a differing single stream cell is re-emitted before it is read as a regression.
-
 ## Identified floors
 
 - Streaming decode reads json x1.13 to x1.33, skewed x1.08 to x1.28, text x1.04 to x1.20 and dll x1.28 to x1.34. The fused bit-read is in place as a per-callsite `const FUSED` monomorphization: the flat executor is fused, and the staging split stays machine-code-identical. The real-offset constant rotation is also in place, with json stream at -1.1% to -1.6%, skewed.zst3/9 stream at -2.4% and -3.0%, dll100 at +1% to +1.4% and text flat. The fused loop's cycle gap is pure dispatched-op volume under identical front-end service: op-cache occupancy is 99.5% on both sides, the loop buffer is unused, the front-end stall differential is at most 2.4 cycle-equivalent percentage points, and the IBS fetch latency in the loop is near zero. Every instruction-volume, structural and layout lever is falsified or measured out. The 2026-11-01 bulk-cell correction removed the reference's per-call output allocation from the matrix bulk cells, whose apparent wins were that handicap: the honest bulk x on json.zst3 is about 1.25, in line with the stream cell, and the mzstd decode-side audit of R86 Track 4 found no transferable lever. See [decoding](perf/decoding.md), [dec-gap](bench/dec-gap.md) and [mzstd review](review/mzstd-dec.md).
@@ -137,6 +132,7 @@ The R86 consolidation belt caught one degenerate stream dump: the pre-round buil
 
 | # | Item | Outcome | Evidence |
 |---|---|---|---|
+| 29 | Dump-stream nondeterminism | `FrameEncoderCoreSt::configure` re-declares the stock reach beside the arming, so a pledged probe's Shrink no longer carries onto the next open stream on the same pooled core; the regression test pins the pool round-trip and the degenerate 4,662,041 B frame reproduced deterministically without the pool. | [benchharness](review/benchharness.md), [encoding pitfalls](pitfalls/encoding.md) |
 | 5b | Dictionary MT follow-ups | Width-4 dictionary-row semantics disarm above a 256 KiB span, the MT capture and reach classes arm on dictionary frames, and the unpledged dictionary stream keeps its full window. The reach probe stays off dictionary frames as a falsification. | [mt-stream](perf/mt-stream.md), [negative](negative/dict.md), [encoding](perf/encoding.md) |
 | 8 | Intermediate SIMD tiers | Every AVX2-capable CPU already runs the top decode tier, SSE2 is baseline, and the vector batching class is falsified. The experimental API entries and language bindings are deliberate gaps. | [negative](negative/decoding.md), [negative](negative/entropy.md), [encoding](perf/encoding.md) |
 | 20 | Entropy-core review follow-ups | The weights FSE table caps at 11, the parity sweep closed with zero divergences, dead block-decoder state was removed, and the fuzz seeds cover the new classes. | [declean](review/declean.md), [parity](review/parity.md) |

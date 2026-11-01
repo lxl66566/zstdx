@@ -373,6 +373,15 @@ impl FrameEncoderCoreSt {
         // one's header without a screen (the mid-band fast rows) and a
         // ProbeKeep residue would ride the wrong strip policy.
         self.state.matcher.set_ldm_arming(LdmArming::Frame);
+        // The reach verdict survives resets by the same contract, and an
+        // open stream never probes (the probe's size gate needs a declared
+        // length), so a Shrink verdict left by an earlier pledged frame on
+        // this pooled core would collapse the whole frame onto the 4 KiB
+        // reach — the R87 dump gate caught text.stream.l9 at 4,662,041 B
+        // against the stable 87,238 B (see pitfalls/encoding).
+        self.state
+            .matcher
+            .set_reach_choice(reach_probe::ReachChoice::Keep);
         // `InputShape::len` is a non-binding size hint: it sizes the row
         // when no pledge exists (libzstd's `srcSizeHint`). The pledge
         // stays the only hard contract — header promise, finish check,
@@ -1079,5 +1088,35 @@ impl FrameEncoderCore {
             #[cfg(feature = "std")]
             Self::Mt(core) => core.split_output(buf),
         }
+    }
+}
+
+#[cfg(test)]
+mod reach_residue_tests {
+    use super::*;
+    use crate::EncoderOptions;
+
+    /// A pooled core's next frame must start at the stock reach, not at
+    /// whatever verdict the previous frame's probe left on the pooled
+    /// matcher. An open stream never probes (the probe's size gate needs a
+    /// declared length), so a leftover Shrink would collapse the whole
+    /// frame onto the 4 KiB reach — the R87 dump gate caught exactly that
+    /// as a one-off degenerate `text.raw.stream.l9` emission at
+    /// 4,662,041 B against the stable 87,238 B.
+    #[cfg(feature = "std")]
+    #[test]
+    fn pooled_reinit_redeclares_stock_reach() {
+        let options = EncoderOptions::new(Level::Balanced);
+        let mut core = FrameEncoderCoreSt::new(&options);
+        core.state
+            .matcher
+            .set_reach_choice(reach_probe::ReachChoice::Shrink);
+        return_pooled_st_core(alloc::boxed::Box::new(core));
+        let reinit = FrameEncoderCoreSt::new(&options);
+        assert_eq!(
+            reinit.state.matcher.reach_choice(),
+            reach_probe::ReachChoice::Keep,
+            "pooled reinit carried the previous frame's reach verdict"
+        );
     }
 }

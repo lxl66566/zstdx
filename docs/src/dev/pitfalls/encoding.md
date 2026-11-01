@@ -46,6 +46,8 @@ The first mid-frame mutation through `resolve_far_screen` to `FrameScreened` let
 
 Every `set_*` mode on the pooled matcher needs a per-frame re-declaration audit at each pool return path, and byte-contract tests must pin header observables such as the descriptor byte, not only sizes.
 
+The reach choice was this lesson again, twice removed. R63 stopped a leftover Shrink from collapsing rows that merely share the KEEP_REACH value through a value check in `apply_level`, and the bulk entry re-declares Keep per frame, but the single-threaded stream core's `configure` still carried a probe verdict across frames, and an open stream never re-decides it because the probe's size gate needs a declared length. A pledged json or zeros donor at level 9 left its Shrink on the pooled core and the next open stream collapsed onto the 4 KiB reach: the R87 dump gate caught `text.raw.stream.l9` at 4,662,041 B against the stable 87,238 B, one scheduling decision of the parallel pool away, reproducible deterministically on one thread. `configure` now re-declares both modes together, and the pool round-trip test in `encoder_core` pins the contract.
+
 ### Cursor and anchor invariants
 
 `commit_space` must not set the pos cursor to the block end. Doing so left the matcher fully idle and degraded all blocks to pure literals, while rebuild-style unit tests kept passing. It must be paired with index-validity assertions for skip-matching and with repcode emission assertions.
