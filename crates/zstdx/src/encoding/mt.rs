@@ -310,7 +310,15 @@ pub fn compress_slice_mt(
         Some(w) if fast_window.is_some() => w.max(window),
         _ => window,
     };
-    let job_overlap = capture_window.map_or(overlap, |w| w as usize);
+    // The deep tree rows' windowed LDM class (see `deep_ldm_band`): each
+    // job's match window widens to the row's own clamped window so the far
+    // candidates stay byte-verifiable, while the tree keeps its reach-tail
+    // strip and every job cold-fills its own LDM window span — the
+    // no-build schedule (nothing shared, nothing waited on; the tier's
+    // parse dwarfs the fill), so the frame bytes stay a pure function of
+    // the input at the pinned grid.
+    let deep_ldm = deep_ldm_band(level, shape, choice, head, ldm_mode);
+    let job_overlap = deep_ldm.or(capture_window).map_or(overlap, |w| w as usize);
     let job_ldm = if spf.is_some() {
         LdmArming::JobPrefix
     } else {
@@ -365,44 +373,51 @@ pub fn compress_slice_mt(
                     // at or below its start (the adoption is
                     // byte-invariant in the snapshot's boundary, so which
                     // one lands is pure scheduling).
-                    let snapshot = match spf.as_ref() {
-                        Some(PrefixPlan::SelfFill { med }) if start as u64 > *med => {
-                            JobSpfOwned::Windowed(None)
-                        },
-                        Some(PrefixPlan::SelfFill { .. }) => JobSpfOwned::None,
-                        Some(plan) if start as u64 > plan_med(plan) => match plan {
-                            PrefixPlan::Whole { med: _, share } => {
-                                if let Some((upto, snap)) =
-                                    wait_prefix_build(share, &ready, &poison)
-                                {
-                                    JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
-                                } else {
-                                    // Poisoned while waiting: release the
-                                    // slot so the ordered assembly drains
-                                    // before the panic resumes.
-                                    *slots[id].lock().unwrap() = Some(Vec::new());
-                                    ready.notify_all();
-                                    break;
-                                }
+                    let snapshot = if deep_ldm.is_some() {
+                        // The deep rows' no-build windowed schedule: every
+                        // job owns its whole-window LDM fill (job zero's
+                        // empty span folds to the stock job-start state).
+                        JobSpfOwned::Windowed(None)
+                    } else {
+                        match spf.as_ref() {
+                            Some(PrefixPlan::SelfFill { med }) if start as u64 > *med => {
+                                JobSpfOwned::Windowed(None)
                             },
-                            PrefixPlan::Windowed(w) => {
-                                match wait_ldm_snapshot(w, &ready, &poison, start as u64) {
-                                    Some(snap) => JobSpfOwned::Windowed(Some(snap)),
-                                    None if poison.lock().unwrap().is_some() => {
+                            Some(PrefixPlan::SelfFill { .. }) => JobSpfOwned::None,
+                            Some(plan) if start as u64 > plan_med(plan) => match plan {
+                                PrefixPlan::Whole { med: _, share } => {
+                                    if let Some((upto, snap)) =
+                                        wait_prefix_build(share, &ready, &poison)
+                                    {
+                                        JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
+                                    } else {
+                                        // Poisoned while waiting: release the
+                                        // slot so the ordered assembly drains
+                                        // before the panic resumes.
                                         *slots[id].lock().unwrap() = Some(Vec::new());
                                         ready.notify_all();
                                         break;
-                                    },
-                                    // The build ended without a usable
-                                    // publish: the stock from-zero fill
-                                    // (byte-equal to an adoption there).
-                                    None => JobSpfOwned::Windowed(None),
-                                }
+                                    }
+                                },
+                                PrefixPlan::Windowed(w) => {
+                                    match wait_ldm_snapshot(w, &ready, &poison, start as u64) {
+                                        Some(snap) => JobSpfOwned::Windowed(Some(snap)),
+                                        None if poison.lock().unwrap().is_some() => {
+                                            *slots[id].lock().unwrap() = Some(Vec::new());
+                                            ready.notify_all();
+                                            break;
+                                        },
+                                        // The build ended without a usable
+                                        // publish: the stock from-zero fill
+                                        // (byte-equal to an adoption there).
+                                        None => JobSpfOwned::Windowed(None),
+                                    }
+                                },
+                                // Intercepted by the no-build arms above.
+                                PrefixPlan::SelfFill { .. } => unreachable!(),
                             },
-                            // Intercepted by the no-build arms above.
-                            PrefixPlan::SelfFill { .. } => unreachable!(),
-                        },
-                        _ => JobSpfOwned::None,
+                            _ => JobSpfOwned::None,
+                        }
                     };
                     // The first job starts where the decoder's repeated-offset
                     // history is still the format default [1, 4, 8]; the gate
@@ -1273,6 +1288,33 @@ pub(crate) fn capture_band(
         },
         (false, window) => CaptureBand::MidSize { window },
     })
+}
+
+/// The deep tree rows' (btlazy2, levels 13-15) windowed-LDM engagement
+/// over a frame's schedule inputs: the row's own clamped window (see
+/// `MatchGeneratorDriver::deep_ldm_window`) when the head parses — the
+/// same collision screen class the capture lattice uses
+/// (`ldm_head_parses`, keeping max-entropy and low-alphabet heads on the
+/// per-job strip model) — under every mode but an explicit `Disable`.
+/// Shared by the bulk dispatch and the pledged stream core so the two run
+/// the same schedule and stay byte-identical. `head` is the frame's first
+/// block.
+pub(crate) fn deep_ldm_band(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    head: &[u8],
+    ldm_mode: crate::LdmMode,
+) -> Option<u64> {
+    if ldm_mode == crate::LdmMode::Disable {
+        return None;
+    }
+    let window = MatchGeneratorDriver::deep_ldm_window(level, shape, choice)?;
+    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
+    if !ldm_head_parses(head) {
+        return None;
+    }
+    Some(window)
 }
 
 /// The last job index in `1..n_jobs` whose start `(i * job_size)` sits
@@ -2471,6 +2513,96 @@ mod tests {
                 "{level:?}: the far class must survive the self-fill: mt {} vs armed st {}",
                 mt8.len(),
                 st.len()
+            );
+        }
+    }
+
+    /// The deep rows' windowed LDM (R88): a dll-class Best-tier frame — a
+    /// wide-alphabet head that parses plus whole-unit copies at a 5 MiB
+    /// period, beyond the tree domain and inside the clamped window —
+    /// runs every job on the snapshot-less windowed prefill. The frame
+    /// stays worker-independent and deterministic (no shared build, no
+    /// scheduling input), roundtrips through both decoders, and the far
+    /// class beyond the tree domain survives the job split within the
+    /// job-split noise of the frame-continuous parse.
+    #[test]
+    fn deep_rows_windowed_ldm_carries_far_repeats() {
+        const MIB: usize = 1024 * 1024;
+        let total = 17 * MIB + 123 * 1024;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        unit[..head_len].copy_from_slice(&pattern_head(head_len));
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let encode = |workers: u32| {
+            compress_slice_mt(
+                &data,
+                Level::Best,
+                true,
+                workers,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let st = encode(1);
+        let mt4 = encode(4);
+        let mt8 = encode(8);
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&mt8, &mut out)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(mt8.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data, "libzstd");
+        assert_eq!(mt4, mt8, "mt4 != mt8");
+        assert_eq!(mt8, encode(8), "run-to-run determinism");
+        assert!(
+            mt8.len() <= st.len() + st.len() / 20,
+            "the far class must survive the windowed prefill: mt {} vs armed st {}",
+            mt8.len(),
+            st.len()
+        );
+        // The engagement itself: this fixture arms the btlazy row, and the
+        // opt family stays out until its finder carries the long-compare
+        // form (the measured wall falsification, see dev/negative).
+        let shape = crate::InputShape {
+            len: Some(data.len() as u64),
+            window_log: None,
+        };
+        let head = &data[..data.len().min(MAX_BLOCK_SIZE as usize)];
+        assert!(
+            super::deep_ldm_band(
+                Level::Best,
+                shape,
+                ReachChoice::Keep,
+                head,
+                crate::LdmMode::Auto
+            )
+            .is_some()
+        );
+        for level in [Level::Opt, Level::Ultra] {
+            assert!(
+                super::deep_ldm_band(level, shape, ReachChoice::Keep, head, crate::LdmMode::Auto)
+                    .is_none(),
+                "{level:?}: the windowed schedule stands down on the opt family"
             );
         }
     }

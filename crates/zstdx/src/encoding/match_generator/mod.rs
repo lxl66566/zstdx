@@ -951,6 +951,33 @@ impl MatchGeneratorDriver {
         window >= LDM_FULL_WINDOW as u64
     }
 
+    /// The deep tree rows' (btlazy2, levels 13-15) windowed-LDM window:
+    /// the row's own clamped window when the row's LDM capability is on
+    /// and the reach verdict kept the stock domain — each MT job then
+    /// carries its LDM history over the whole window through the
+    /// snapshot-less windowed prefill (see `windowed_ldm_prefill`) while
+    /// the DUBT tree keeps its reach-tail strip, so the far class beyond
+    /// the tree domain survives the job split exactly as the
+    /// frame-continuous parse holds it. `None` keeps the per-job strip
+    /// restart (the stock job model). The btlazy rows are never probe
+    /// subjects, so `choice` is their stock `Keep` whenever they run. The
+    /// opt family stays out: its finder's insert compares re-pay the
+    /// cold-tree long-compare class once the far class is alive in a job
+    /// (measured out, see dev/negative/mt-stream.md).
+    #[cfg(feature = "std")]
+    pub(crate) fn deep_ldm_window(
+        level: Level,
+        shape: InputShape,
+        choice: ReachChoice,
+    ) -> Option<u64> {
+        let p = params_for(level, shape);
+        (matches!(p.strategy, Strategy::BtLazy(_))
+            && p.ldm
+            && choice == ReachChoice::Keep
+            && p.window >= LDM_MIDSIZE_WINDOW)
+            .then_some(p.window as u64)
+    }
+
     /// Whether the shape-adaptive reach probe (see `super::reach_probe`)
     /// may decide this frame's reach: only the Balanced chain row with its
     /// stock reach still in place — the opt rows share the `chain_reach`
@@ -2356,7 +2383,15 @@ impl MatchGeneratorDriver {
         #[cfg(feature = "job_trace")]
         super::job_trace::add_uniform(trace_uniform);
         self.seed_gate_probe(ldm_win, uniform);
-        if ldm_win.len() >= HASH_READ {
+        // The seed scan serves the parses that probe the job-start seed
+        // offset; the tree rows' parses never read it, so their window span
+        // skips the backward walk.
+        if ldm_win.len() >= HASH_READ
+            && matches!(
+                self.params.strategy,
+                Strategy::Fast | Strategy::Dfast(_) | Strategy::Chain(_) | Strategy::Row(_)
+            )
+        {
             self.acquire_seed(ldm_win, ldm_win.len() - HASH_READ);
         }
     }

@@ -2546,4 +2546,72 @@ mod mt_dict {
             assert_eq!(sink, bulk, "workers {workers} checksum {checksum}");
         }
     }
+
+    /// The deep rows' windowed-LDM class (R88, `mt::deep_ldm_band`): a
+    /// pledged Best-tier frame whose far repeats sit beyond the tree
+    /// domain engages the windowed schedule at its first post, and the
+    /// pledged stream keeps matching the bulk frame byte for byte — the
+    /// pinned grid, the window-wide job views and the per-job cold LDM
+    /// fill are the same schedule on both sides whatever the write
+    /// chunking and the worker count.
+    #[test]
+    fn deep_rows_windowed_ldm_pledged_stream_matches_bulk() {
+        const MIB: usize = 1024 * 1024;
+        let total = 17 * MIB + 123 * 1024;
+        let unit_len = 5 * MIB;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut unit: Vec<u8> = (0..unit_len).map(|_| (rand() & 0xff) as u8).collect();
+        let head_len = 256 * 1024;
+        let blocks: Vec<Vec<u8>> = (0..96)
+            .map(|_| (0..64).map(|_| (rand() & 0xff) as u8).collect())
+            .collect();
+        let mut pick = 0xdead_beef_cafeu64;
+        let mut i = 0;
+        while i + 64 <= head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let block = &blocks[(pick >> 33) as usize % 96];
+            unit[i..i + 64].copy_from_slice(block);
+            i += 64;
+        }
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        for (workers, chunk) in [(2u32, usize::MAX), (4, 1024 * 1024), (4, 7 * 1024)] {
+            let opts = || {
+                EncoderOptions::new(Level::Best)
+                    .workers(workers)
+                    .checksum(true)
+                    .pledged_size(Some(data.len() as u64))
+            };
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts()).unwrap();
+            for piece in data.chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            let bulk = bulk::compress_with(&data, &opts()).unwrap();
+            assert_eq!(sink, bulk, "workers {workers} chunk {chunk}");
+            let back =
+                crate::bulk::decompress_with(&sink, 0, &crate::DecoderOptions::new()).unwrap();
+            assert_eq!(back, data, "workers {workers} chunk {chunk}");
+        }
+    }
 }

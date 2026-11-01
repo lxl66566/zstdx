@@ -131,8 +131,8 @@ use crate::{
         },
         mt::{
             CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, capture_band, capture_job_size,
-            donate_keep_span, fast_capture_schedule, head_predicts_keep, job_size_for,
-            job_size_for_level, prepare_job_state, run_job_with,
+            deep_ldm_band, donate_keep_span, fast_capture_schedule, head_predicts_keep,
+            job_size_for, job_size_for_level, prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -205,6 +205,19 @@ enum FarClass {
     /// Both screens rejected the far class: strips cap at the row's
     /// chain reach and job LDM disarms for the frame.
     Dead,
+}
+
+/// The deep tree rows' (btlazy2, levels 13-15) windowed-LDM schedule state
+/// (see `mt::deep_ldm_band` and [`MtEncoderCore::resolve_deep_ldm`]).
+enum DeepLdm {
+    /// The first post has not run yet.
+    Pending,
+    /// The frame engaged: every job takes the snapshot-less windowed
+    /// prefill over the row's clamped window.
+    Engaged,
+    /// A non-class frame, or a resolution site that could not read the
+    /// head: the stock per-job strip model stands.
+    Off,
 }
 
 /// The fast rows' far-class capture engagement (see the module docs and
@@ -986,6 +999,13 @@ pub(crate) struct MtEncoderCore {
     /// over fixed input spans (see [`Self::resolve_far_class`]) — a pure
     /// function of the input, never of the write cadence.
     far_class: FarClass,
+    /// The deep tree rows' windowed-LDM engagement (see `mt::deep_ldm_band`):
+    /// resolved once at the first post (see [`Self::resolve_deep_ldm`]) on
+    /// a pledged fixed-grid frame, widening `overlap` to the row's clamped
+    /// window and flipping every job onto the snapshot-less windowed
+    /// prefill — the bulk schedule for the same frame, keeping the
+    /// pledged-equals-bulk contract on the class.
+    deep_ldm: DeepLdm,
     /// The fast rows' far-class capture (see [`FastCapture`]): the
     /// pledged fast row's staging state, then its engaged schedule.
     fast_capture: FastCapture,
@@ -1263,6 +1283,7 @@ impl MtEncoderCore {
             } else {
                 FarClass::Pending
             },
+            deep_ldm: DeepLdm::Pending,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             // Pledged dictionary frames alone: the open-ended twin keeps
@@ -1958,6 +1979,41 @@ impl MtEncoderCore {
         }
     }
 
+    /// Resolve the deep tree rows' windowed-LDM engagement once per frame
+    /// (see `mt::deep_ldm_band`): the first post already carries the whole
+    /// first job plus its strip staged, so the head block the predicate
+    /// screens is long since buffered and the verdict is a pure function
+    /// of the input whatever the write cadence. Pledged fixed-grid frames
+    /// alone — the unpledged growing grid keeps its worker-keyed stock
+    /// schedule (the sanctioned divergence). The engagement only widens
+    /// `overlap` (the buffer retention and the job views follow it) and
+    /// flips the jobs' prefill: the pinned grid the fixed schedule already
+    /// cut at is the bulk one, so the pledged stream keeps matching the
+    /// bulk frame byte for byte on the class.
+    fn resolve_deep_ldm(&mut self) {
+        if !matches!(self.deep_ldm, DeepLdm::Pending) {
+            return;
+        }
+        self.deep_ldm = DeepLdm::Off;
+        // The frame head must still be the buffer's own: resolving at the
+        // first post (or a never-posted inline job zero) keeps buf_base at
+        // zero, and any later site would read a wrapped buffer.
+        if self.job_start != 0 || self.buf_base != 0 {
+            return;
+        }
+        if self.pledged.is_none() || !matches!(self.grid, JobGrid::Fixed(_)) {
+            return;
+        }
+        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let Some(window) = deep_ldm_band(self.level, self.shape, self.choice, head, self.ldm_mode)
+        else {
+            return;
+        };
+        self.overlap = window as usize;
+        self.deep_ldm = DeepLdm::Engaged;
+        self.reserve_decided();
+    }
+
     /// The far-class screens over the live buffer: the head engagement
     /// pass, then far-repeat dominance over the first job's span. Pure
     /// buffer functions of `(buf, overlap, reach)` — the verdict
@@ -2572,6 +2628,7 @@ impl MtEncoderCore {
         // — byte-identical, but the donation's work would be wasted).
         debug_assert!(self.donation.is_none() || !self.pool_threads.is_empty());
         self.resolve_far_class();
+        self.resolve_deep_ldm();
         let strip = self.strip_span();
         let strip_lo = self.job_start.saturating_sub(strip as u64);
         debug_assert!(self.buf_base <= strip_lo);
@@ -2610,10 +2667,16 @@ impl MtEncoderCore {
         let mut state = take_pooled_state();
         // The engaged fast capture's SelfFill split applies to the inline
         // tail job exactly as to a posted one (belt: an engaged frame has
-        // posted before, so the pool exists and this arm stays cold).
-        let spf = match &self.fast_capture {
-            FastCapture::Engaged { med } if self.job_start > *med => JobSpf::Windowed(None),
-            _ => JobSpf::None,
+        // posted before, so the pool exists and this arm stays cold), and
+        // the deep rows' engaged schedule takes every job windowed the
+        // same way.
+        let spf = if matches!(self.deep_ldm, DeepLdm::Engaged) {
+            JobSpf::Windowed(None)
+        } else {
+            match &self.fast_capture {
+                FastCapture::Engaged { med } if self.job_start > *med => JobSpf::Windowed(None),
+                _ => JobSpf::None,
+            }
         };
         let bytes = run_job_with(
             &mut state,
@@ -2648,8 +2711,11 @@ impl MtEncoderCore {
         debug_assert!(self.pos >= end);
         // The far-class screen lands with the first post (the probe
         // machinery has settled by then), so every job of the frame —
-        // including this one — sees the same strip and arming.
+        // including this one — sees the same strip and arming. The deep
+        // rows' windowed-LDM engagement resolves at the same site, ahead
+        // of the strip this very job's view borrows.
         self.resolve_far_class();
+        self.resolve_deep_ldm();
         // The post cadence is also the assembly and panic-surfacing cadence:
         // per-write calls would burn millions of polls on the pump path.
         self.surface_poison();
@@ -2693,6 +2759,10 @@ impl MtEncoderCore {
         // fixed-grid-only), and both are pure functions of the job start.
         let spf = match spf {
             Some(snap) => JobSpfStream::Whole(snap),
+            // The deep rows' engaged windowed schedule: every job owns its
+            // whole-window LDM fill (job zero's empty span folds to the
+            // stock job-start state).
+            None if matches!(self.deep_ldm, DeepLdm::Engaged) => JobSpfStream::Windowed,
             None => match &self.fast_capture {
                 FastCapture::Engaged { med } if start > *med => JobSpfStream::Windowed,
                 _ => JobSpfStream::None,
