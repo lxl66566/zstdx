@@ -94,3 +94,17 @@ The ultra fill-overlap prefill pipeline meets its constraint surface in the queu
 ## What was checked and held
 
 The bulk claim loop, the ordered assembly and the checksum overlap were checked against the poisoning protocol and hold. The no-build capture paths, the `SelfFill` split and `FastCapture::Engaged`, were checked for wait-freedom and worker invariance and hold. The shared prefix fill's publication gate, its far-class prediction and the adoption exactness were checked and hold. The stream pump boundary, `write`, `pump_direct`, `finish`, `flush_block` and both output drains, was checked against the retry and pledged-size contracts and holds. Duplicated state was hunted: the poison flag mirror, the three pending flags and the `JobSpfStream` to `JobSpf` bridge each carry an ordering or bridging story, and no dead field was found.
+
+## R88 addendum: the landed R85/R87 code
+
+R88 Track B reviewed the three deep-row landings the R85/R87 rounds carried, read-only against 466a4b12.
+
+`btlazy_job_size` and `job_size_for_level` (mt.rs:89-102) hold. The pin keys on `MatchGeneratorDriver::btlazy_row(level)`, which reads the strategy off `params_for(level, InputShape::default())`; the strategy is shape-independent on rows 13-15, so the grid cannot drift with the caller's shape while the strip does. A Shrink reach verdict would shrink the pinned size through its `overlap * 4` input, and the reach probe is row-9-only, so that arm is unreachable for these rows today; the coupling is worth a comment if the probe ever widens.
+
+`ldm_min_window`'s Job arm at the midsize window (params.rs:498-512) matches the frame bar and carries the R85 pins. The clamp-audit lesson from its own pitfall entry is applied: the bar now reads the window the caller's shape produced.
+
+The R87 donation discard (encoder_mt.rs:2661-2686, frame_compressor.rs:996-1006) holds. Any job zero ending at or below the span parses undonated, the continuation entry asserts both sides of the span bound, and `donated_span_survives_the_growing_tail_reslice` pins the band at eight workers. This closes the R85 review's finding 1 backstop question: the belt exists at the shared entry.
+
+Finding 2 of the R85 review remains open as documented: the bulk donation eligibility gate still checks the stock `job_size_for` while the run grid may be the capture `keep_job_size` (mt.rs:615-640), safe through the three-constant argument and backstopped by the continuation-entry assert. No change this round.
+
+job_trace's compare counter now covers the opt rows' tree searches (opt.rs, wired this round at both descent sites), which closes the R84 coverage gap where ultra read zero compares. The counter's per-compare atomics stretch the opt rows' own fills about 8x under the feature (1 MiB/s against the clean build's 8), so span shares for those rows under `job_trace` are upper bounds while the call and byte counts stay exact and deterministic.

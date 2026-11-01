@@ -1103,7 +1103,18 @@ impl Finder<'_, '_> {
             nb -= 1;
             let cidx = (ca - self.win_base) as usize;
             let mut ml = common_smaller.min(common_larger);
-            ml = count_from(self.win, idx, cidx, ml, count_limit);
+            // The trace build records the compare like `dubt::count` does,
+            // so the opt rows' tree volume lands in the same counter;
+            // default builds keep the plain call.
+            #[cfg(feature = "job_trace")]
+            {
+                ml = count_from(self.win, idx, cidx, ml, count_limit);
+                super::job_trace::add_cmp(ml);
+            }
+            #[cfg(not(feature = "job_trace"))]
+            {
+                ml = count_from(self.win, idx, cidx, ml, count_limit);
+            }
             if ml > best_len {
                 best_len = ml;
                 if ca + ml as u64 > match_end {
@@ -1345,7 +1356,16 @@ impl Finder<'_, '_> {
             nb -= 1;
             let cidx = (ca - self.win_base) as usize;
             let mut ml = common_smaller.min(common_larger);
-            ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+            // Trace recording as at the `find_all_matches` site above.
+            #[cfg(feature = "job_trace")]
+            {
+                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+                super::job_trace::add_cmp(ml);
+            }
+            #[cfg(not(feature = "job_trace"))]
+            {
+                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
+            }
             if ml > best_len {
                 if ca + ml as u64 > match_end {
                     match_end = ca + ml as u64;

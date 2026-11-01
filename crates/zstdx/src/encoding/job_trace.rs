@@ -324,8 +324,9 @@ pub fn add_hash3(started: Instant, bytes: u64) {
     C.hash3_bytes.fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// Record one DUBT compare (`DubtFinder::count`): the call count and the
-/// matched length separate compare volume from compare count.
+/// Record one DUBT-tree compare (`dubt::count` and the opt rows'
+/// tree-search sites): the call count and the matched length separate
+/// compare volume from compare count.
 #[inline]
 pub fn add_cmp(bytes: usize) {
     C.cmp_calls.fetch_add(1, Ordering::Relaxed);
