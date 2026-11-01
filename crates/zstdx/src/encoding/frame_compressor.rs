@@ -996,6 +996,11 @@ pub(crate) fn compress_job_blocks_inner(
     #[cfg(feature = "job_trace")]
     super::job_trace::add_prefill(trace_prefill);
     debug_assert!(start_cursor >= job.start);
+    // The donated prefix encodes [0, start_cursor), so the job must own
+    // bytes through it: a job zero ending inside the span hands the
+    // donated band's tail to the next job, which the prefix already
+    // encoded. Belt for the donation span bound.
+    debug_assert!(start_cursor <= job.end);
     let mut cursor = start_cursor.max(job.start);
     while cursor < job.end {
         let window_end = (cursor + block_size).min(job.end);

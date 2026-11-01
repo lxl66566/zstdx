@@ -339,6 +339,12 @@ The reach probe's donation hard-armed `LdmArming::Job`, but a Keep verdict can r
 
 The arming is decidable before the verdict, because the capture engages exactly when a Keep verdict would run it, so the donation gate computes the capture plan first and arms the donation with its arming. The Shrink verdict pays the span's split pass for nothing, which is the band's price, and debug asserts pair the frame's capture with the donation's arming on both paths. A contract that says the donated span is job zero's parse must arm the donation from the job's final schedule, never from the pre-verdict default.
 
+### A donated span must end inside job zero
+
+The reach probe's donated prefix encodes the first `PROBE_SPAN` bytes as job zero's own blocks, so every schedule that hands job zero to a worker must keep the job's end past the span. The growing grid's tail re-slice floors its jobs at `MIN_JOB_SIZE`, half the span, and the continuation entry asserted the contract's lower side alone (`start_cursor >= job.start`). An open balanced stream at five workers or more with a total in `[PROBE_MIN_FRAME, 2 x burst_jobs MiB)` then shipped a frame with the band between job one and the span encoded twice, and the checksum rejected it.
+
+The repair widened the posting-side gate, `post_job`'s discard, to any job zero ending at or below the span, and asserted the upper side at the continuation entry. A donated-prefix contract has one consumer-side entry and one posting-side gate: wall both, because every path that re-slices job zero is a new way to move its end under the span.
+
 ### Initial reserve is a scheduling scale
 
 The mt stream's initial and probe-settle reserves sized to `workers * initial_job + overlap`. With the CLI always pledging the file size, a 16 GiB file at `-T8` with the job size at the `MAX_JOB_SIZE` 1 GiB ceiling reserved about 8 GiB up front and held that much input resident for the whole stream, because the pump recycles only at a full buffer.

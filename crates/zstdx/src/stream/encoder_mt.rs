@@ -2661,10 +2661,16 @@ impl MtEncoderCore {
         let len = (end - strip_lo) as usize;
         self.ensure_workers();
         // Job zero carries the probe's donated keep side when one was
-        // parked (see `resolve_probe`); a donation whose continuation
-        // cannot take the last-block flag (the job ends at the span, so
-        // the donated blocks' non-last emission would stand) is discarded —
-        // job zero parses undonated, byte-identical to the stock schedule.
+        // parked (see `resolve_probe`). The donated prefix encodes the
+        // whole span as non-last blocks, so only a job owning bytes past
+        // the span can continue it: a job ending inside the span would
+        // leave the donated band's tail to job one, which the prefix
+        // already encoded, and a last job ending at the span cannot re-
+        // emit the donated blocks' last flag. The growing tail re-slice
+        // can cut job zero below the span (MIN_JOB_SIZE floors the slice
+        // at half of it). Any job zero ending at or below the span
+        // discards: job zero parses undonated, byte-identical to the
+        // stock schedule.
         let mut donation = if start == 0 {
             self.donation.take()
         } else {
@@ -2673,7 +2679,7 @@ impl MtEncoderCore {
         };
         if donation
             .as_ref()
-            .is_some_and(|_| last_frame_block && end <= reach_probe::PROBE_SPAN as u64)
+            .is_some_and(|_| end <= reach_probe::PROBE_SPAN as u64)
         {
             let discarded = donation.take().unwrap();
             crate::encoding::mt::return_donation_state(discarded.state);
@@ -3258,6 +3264,62 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
         assert_eq!((n, &out[..n]), (narrow.len(), &narrow[..]));
+    }
+
+    /// The donated continuation's span bound (mtjobs finding 1): the
+    /// growing tail re-slice floors its jobs at MIN_JOB_SIZE, half the
+    /// probe span, so an open balanced stream at five workers or more
+    /// whose total lands in [PROBE_MIN_FRAME, 2 * burst_jobs MiB) cuts
+    /// job zero below the span while the donation is parked, and the
+    /// assembled frame encodes the band between job one and the span
+    /// twice. Pinned across that band at R85's live parameters (eight
+    /// workers, a 16-symbol unit repeated at a 1 MiB lag: narrow head,
+    /// Keep verdict), with the below-gate control and the span-edge
+    /// total on either side, all in one process so pooled residue stays
+    /// an input dimension.
+    #[test]
+    fn donated_span_survives_the_growing_tail_reslice() {
+        let mib = 1024 * 1024usize;
+        let mut unit = Vec::with_capacity(mib);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while unit.len() < mib {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            unit.push((state >> 33) as u8 % 16);
+        }
+        // The band edges: below the staging gate no donation exists, the
+        // gate itself opens the band, and 2 x burst_jobs MiB re-slices
+        // job zero exactly onto the span.
+        for total in [
+            reach_probe::PROBE_MIN_FRAME as usize - 128 * 1024,
+            reach_probe::PROBE_MIN_FRAME as usize,
+            12 * mib,
+            15 * mib,
+            16 * mib,
+        ] {
+            let mut data = Vec::with_capacity(total);
+            while data.len() < total {
+                let take = (total - data.len()).min(mib);
+                data.extend_from_slice(&unit[..take]);
+            }
+            let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Balanced).workers(8));
+            core.write(&data).unwrap();
+            if total as u64 >= reach_probe::PROBE_MIN_FRAME {
+                assert!(
+                    core.probe_wait.is_some() || core.donation.is_some(),
+                    "the narrow head keeps the donation at {total}"
+                );
+            }
+            core.finish().unwrap();
+            assert_eq!(
+                core.choice,
+                ReachChoice::Keep,
+                "the 1 MiB lag is the keep class"
+            );
+            let mut out = vec![0u8; data.len()];
+            let mut decoder = FrameDecoder::new();
+            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            assert_eq!((n, &out[..n]), (data.len(), &data[..]), "total {total}");
+        }
     }
 
     /// The finish tail's shared prefix fill pins its adoption schedule:

@@ -18,7 +18,6 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 46 symbols deliberately out with recorded reasons, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
-| 28 | MT donation span repair | Frame correctness on open balanced streams at five workers or more | The growing tail re-slice can cut job zero below the probe span while a donation is parked | [mtjobs](review/mtjobs.md) |
 | 29 | Dump-stream nondeterminism | Gate trust: the byte-exact dump differential must be a function of the build alone | One-off degenerate emission of `text.raw.stream.l9.zst` under the parallel dump pool, at 4.66 MB against the 87,238 B stable size, ratio 7.2 against 384 | [benchharness](review/benchharness.md) |
 
 ## Item notes
@@ -117,10 +116,6 @@ The remaining compile-time menu holds A/B-gated refactors of hot code. The tree 
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
 
-### Item 28
-
-The reach probe's donated prefix encodes the first PROBE_SPAN bytes, so job zero must end at or past the span for the continuation to own its own bytes. The growing grid's tail re-slice floors its jobs at MIN_JOB_SIZE, which sits below the span, so an open balanced stream at five workers or more whose total lands between PROBE_MIN_FRAME and two burst-job spans duplicates the band between the donated prefix and job one. Libzstd rejects the frame on the checksum, verified live at eight workers over 8 MiB in R85. The repair floors the re-slice or widens the discard to any job zero ending at or below the span, with the span bound asserted at the continuation entry and the fixture pinned. See the [mt job machinery review](review/mtjobs.md).
-
 ### Item 29
 
 The R86 consolidation belt caught one degenerate stream dump: the pre-round build emitted `text.raw.stream.l9.zst` at 4,662,041 bytes where every neighboring run emits 87,238, a ratio collapse to 7.2 on the balanced tier that no round change touches. The frame itself is legal and decodes to the exact input. Three reruns on the same binary, the same corpus and the same flags, plus two on the post-round build, all reproduce the 87,238 B frame, so the degenerate emission is a rare concurrent-path event inside the parallel dump pool, either a race in the stream core's shared state or a cross-cell parameter leak between pool slots. The dump differential is the round gate for byte-exactness, so a one-in-many degenerate cell can silently flip a verdict; until the cause lands, a differing single stream cell is re-emitted before it is read as a regression.
@@ -147,6 +142,7 @@ The R86 consolidation belt caught one degenerate stream dump: the pre-round buil
 | 20 | Entropy-core review follow-ups | The weights FSE table caps at 11, the parity sweep closed with zero divergences, dead block-decoder state was removed, and the fuzz seeds cover the new classes. | [declean](review/declean.md), [parity](review/parity.md) |
 | 21 | Parity follow-ups | The dictionary differential swept 204k cases, `zstdx-bench parity` institutionalizes the differential, OR scans are first-class mutations, and the weight-cap shape is a fuzz seed. | [dictparity](review/dictparity.md), [diffbench](review/diffbench.md) |
 | 27 | compat bulk parameter methods | The bulk `Compressor` carries `include_checksum`, `include_contentsize`, `window_log` and `multithread`, the `Decompressor` `window_log_max`, all routed into the existing option structs with the range gate shared with the stream side. | [periph review](review/periph.md) |
+| 28 | MT donation span repair | `post_job` discards any donation whose job zero ends at or below the probe span, the continuation entry asserts the span bound, and the band fixture pins the corner red-to-green at eight workers. | [mtjobs](review/mtjobs.md) |
 
 ## Closed-item notes
 

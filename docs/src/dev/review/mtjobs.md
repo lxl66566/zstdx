@@ -6,7 +6,7 @@ R85 Track B reviewed the multithreaded scheduling and job-state machinery after 
 
 ### 1. The donated prefix can exceed job zero's span on the growing tail re-slice
 
-Severity: critical. Verified live.
+Severity: critical. Verified live. Fixed in R87 as todo 28 (see the repair note below).
 
 The contract at risk: `compress_job_blocks_inner` takes a `start_cursor` (the donated span, `PROBE_SPAN` = 2 MiB) plus the span's encoded blocks as `prefix`, emits the prefix verbatim and parses from `max(start_cursor, job.start)` to `job.end` (frame_compressor.rs:927-1010). The prefix encodes `[0, PROBE_SPAN)` of the stream, so job zero must end at or past `PROBE_SPAN` whenever it carries a donation. The entry asserts only the lower side, `start_cursor >= job.start` (frame_compressor.rs:998), and the upper side is stated nowhere.
 
@@ -16,7 +16,7 @@ The exposure window: an open balanced stream (unpledged and hint-less) stages th
 
 Verified live with a scratch test at balanced, workers 8, and an 8 MiB input built from a 16-symbol unit repeated at a 1 MiB lag (narrow head, Keep verdict). The frame fails libzstd's checksum check, while the same input at 128 KiB below the staging gate round-trips byte-identical through both decoders. A mid-stream flush inside the band hits the same re-slice and corrupts the rest of the frame permanently.
 
-Repair scope: floor the tail re-slice's first job at `PROBE_SPAN` while a donation is parked, or drop the `last_frame_block` conjunct from the discard so any job zero ending at or below the span parses undonated, which the existing comment already calls byte-identical. Add `debug_assert!(start_cursor <= job.end)` at frame_compressor.rs:998 as the belt, and pin the corner with the scratch fixture.
+Repair (R87, todo 28): `post_job`'s discard dropped the `last_frame_block` conjunct, so any job zero ending at or below the span parses undonated, byte-identical to the stock schedule, and the grid stays a pure function of the offsets. The belt is `debug_assert!(start_cursor <= job.end)` at the continuation entry in `compress_job_blocks_inner`, which covers the bulk and stream donation sites alike. `donated_span_survives_the_growing_tail_reslice` (encoder_mt.rs) pins the corner with this round's fixture at eight workers across the band edges: on the unfixed tree the below-gate control round-tripped while the 8 MiB cell failed decode with `TargetTooSmall`, the duplicated band pushing the frame past the input length, and the suite read green after the repair. The 150-cell dump gate (bulk and stream, all levels) stayed byte-identical.
 
 ### 2. The donation span bound lives in arithmetic spread over three constants
 
@@ -72,7 +72,7 @@ Each invariant below is enforced by a check, a type or a lock protocol in the tr
 
 Each item below is sound by reading but enforced by prose or by arithmetic rather than by a check in the tree.
 
-- The donation span bound itself, finding 1, violated on the growing grid and arithmetic-only everywhere else, finding 2.
+- Finding 2's three-constant agreement (the stock formula's `KEEP_REACH` floor, the capture band's `len/8`, and `PROBE_SPAN`'s 2 MiB) stays arithmetic-only at the donation sites; the R87 repair's continuation-entry assert is the backstop that fires first if a geometry change breaks it.
 - `resolve_probe` reads `buf[..PROBE_SPAN]` at verdict time (encoder_mt.rs:1727-1763). The read is safe because `job_start` stays 0 while the verdict is unconsumed, so `movable_lo` saturates to 0 and no wrap can run, and growth preserves the head bytes. The argument is control flow plus the staging asserts at post time (encoder_mt.rs:1606-1610), with no assert at the resolve site.
 - The owned window's committed-length to staged-end carry zone: the block loop stages a whole block tail and leaves the uncommitted remainder physically at the window head, where the pre-split detector reads it (frame_compressor.rs:1231-1282). [hardening](hardening.md) records it as caller-live, with the wall waiting on a caller-contract change.
 - The buffer pool's keep cap: `BUF_POOL_KEEP_MAX = BUF_CAP_MAX` rests on the measured drop-time re-fault argument (encoder_mt.rs:534-540), with no test retaining a cap-scale buffer across encoders.
@@ -81,7 +81,6 @@ Each item below is sound by reading but enforced by prose or by arithmetic rathe
 
 ## Test gaps
 
-- The donation continuation span contract has no test, which is why finding 1 survived the suite. The scratch fixture from this round is the pinning test's body.
 - The bulk poison paths have no test: the Err-path slot fill, the assembly's empty-the-unclaimed branch and the post-scope resume. The stream core carries three poison tests, the bulk core none.
 - The buffer pool's retention behavior has no test.
 - `stage_probe`'s decided reserve at staging has no coverage: `huge_pledge_caps_initial_reserve` pins the constructor and an empty finish, since nothing is fed and the staging gate never fires, and it does not control the head class.
