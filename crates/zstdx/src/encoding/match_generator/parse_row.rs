@@ -55,7 +55,7 @@ pub(super) fn row_hash_at(
     // SAFETY: same read contract as hash_at_width (HASH_READ bytes of
     // window ahead of idx; the callers bound-check once per loop).
     unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & width.mask();
+        let v = crate::bit_io::load_le64(win.as_ptr().add(idx)) & width.mask();
         (v.wrapping_mul(HASH_PRIME) >> (64 - hbits)) as u32
     }
 }

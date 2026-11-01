@@ -146,6 +146,8 @@ The seqstats "ours" parse always comes from the current build, so two runs in th
 
 After a base build through `git checkout --`, re-verify that the patch is applied before the next new measurement, since a stale binary silently reverts the experiment.
 
+A baseline worktree carries its own untracked `Cargo.lock`, and drift between it and the main repo's lock silently rebuilds dependency crates on one side only. The 2026-11-02 gungraun A/B read a 13% Ir shift on the libzstd reference side from a zstd 0.13.4 versus 0.13.3 lock drift before either side of the change under review was measured. Copy the main repo's lock into the baseline worktree and re-verify both sides' dependency versions whenever a worktree joins an Ir comparison.
+
 ### Long locked benches run detached
 
 A follow-up command in the same shell bucket blocks until the locked bench finishes, and the queued command's client has long timed out, so its output is lost while the command still executes. A queued `rm` once deleted a finished matrix run's only output copy.
@@ -311,6 +313,12 @@ The same job's 190 test failures all traced to one idiom: `product_u64 as usize 
 ### Running the i686 suite locally without cross
 
 `cross` needs a container runtime; a plain local loop needs only zig and the nix 32-bit glibc. Build with a wrapper as `CC_i686_unknown_linux_gnu` and `CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER` that strips `-m32` and `--target=…` and execs `zig cc -target x86-linux-gnu` (zig rejects the `i686` architecture name). zig's synthesized glibc links but cannot run — use the real loader from `pkgsi686Linux.glibc` as `CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUNNER="<store-path>/lib/ld-linux.so.2 --library-path <store-path>/lib"`. Run with `--test-threads=1`: parallel encoder-window tests overflow the 3 GiB address space and the failed allocation aborts the whole process.
+
+### Running the s390x suite under qemu-user
+
+The big-endian loop reuses the zig wrapper pattern with `-target s390x-linux-gnu`, and zig's synthesized glibc segfaults under qemu-user even when it links, so the sysroot must be the real s390x `libc6` deb from Ubuntu ports, unpacked under its own `usr/lib/s390x-linux-gnu` layout and handed to the runner as `qemu-s390x -L <sysroot>`. qemu-user executes the suite's threads correctly, so the default test parallelism stands and the full lib suite drops from 362 s serial to 88 s; the i686 single-thread rule is about that target's 3 GiB address space, not about emulation.
+
+The 2026-11-02 run also confirmed the pipe trap's cost: a compile whose errors were piped through `rg` left `$?` reporting the filter's status, the stale host-endian binary then ran and produced a wrong conclusion, and the expensive rebuild had to be redone. After every cross build, check the test binary's mtime before running it.
 
 ### Members cannot override an inherited dep's default-features
 

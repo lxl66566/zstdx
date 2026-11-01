@@ -8,7 +8,9 @@
 
 use alloc::vec::Vec;
 
-/// Stores `val` unaligned at byte offset `end`.
+/// Stores `val` unaligned at byte offset `end`, little-endian: the value's
+/// low byte lands at `end`. This is the bitstream writers' store; paired
+/// with a little-endian load it is also the byte-preserving copy.
 ///
 /// # Safety
 /// The buffer's capacity must cover `end + 8`. `end` addresses bytes that

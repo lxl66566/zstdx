@@ -367,7 +367,7 @@ fn decompress_4streams_interleaved(
             // back to back inside it).
             unsafe {
                 ip[$s] = ip[$s].sub(ctz >> 3);
-                bits[$s] = (ip[$s].cast::<u64>().read_unaligned() | 1) << (ctz & 7);
+                bits[$s] = (crate::bit_io::load_le64(ip[$s]) | 1) << (ctz & 7);
                 op[$s] = op[$s].add(5);
             }
         }};
@@ -657,7 +657,7 @@ fn decompress_4streams_interleaved_x2(
             // oend[$s], so the 2-byte write and the advance stay inside
             // the segment.
             unsafe {
-                (op[$s].cast::<u16>()).write_unaligned(entry as u16);
+                crate::bit_io::store_le16(op[$s], entry as u16);
                 op[$s] = op[$s].add((entry >> 24) as usize);
             }
             bits[$s] <<= (entry >> 16) & 0x3f;
@@ -672,7 +672,7 @@ fn decompress_4streams_interleaved_x2(
             // inside `region` (streams sit back to back).
             unsafe {
                 ip[$s] = ip[$s].sub(ctz >> 3);
-                bits[$s] = (ip[$s].cast::<u64>().read_unaligned() | 1) << (ctz & 7);
+                bits[$s] = (crate::bit_io::load_le64(ip[$s]) | 1) << (ctz & 7);
             }
         }};
     }

@@ -810,7 +810,7 @@ fn reload(src_ptr: *const u8, ip: &mut usize, win: &mut u64, consumed: &mut u32)
         *consumed &= 7;
         // SAFETY: ip only ever decreases from its initial value len-8, so
         // ip+8 <= src_len holds on this path
-        let bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
+        let bits = unsafe { crate::bit_io::load_le64(src_ptr.add(*ip)) };
         *win = bits << *consumed;
         return Reload::Unfinished;
     }
@@ -831,7 +831,7 @@ fn reload_slow(src_ptr: *const u8, ip: &mut usize, win: &mut u64, consumed: &mut
         *ip -= nb;
         *consumed -= (nb * 8) as u32;
         // SAFETY: ip + 8 <= src_len as proven above
-        let bits = unsafe { src_ptr.add(*ip).cast::<u64>().read_unaligned() };
+        let bits = unsafe { crate::bit_io::load_le64(src_ptr.add(*ip)) };
         // wrapping: consumed can reach 64 here (error path detects it later)
         *win = bits.wrapping_shl(*consumed);
     }

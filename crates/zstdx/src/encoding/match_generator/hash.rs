@@ -6,6 +6,8 @@
 //! only after: a cast first truncates the product on 32-bit targets and
 //! the `64 - log` shift then crosses the type width.
 
+use crate::encoding::util::first_diff_byte;
+
 /// Marker for the const-generic dfast logs meaning "read the runtime
 /// value" (real logs are never zero); only clamped-window shapes
 /// (inputs small enough to shrink the row's tables) take that path.
@@ -64,7 +66,7 @@ impl ChainHashWidth {
 pub(super) fn hash_at_width(win: &[u8], idx: usize, log: u32, width: ChainHashWidth) -> usize {
     // SAFETY: see the contract above.
     unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned() & width.mask();
+        let v = crate::bit_io::load_le64(win.as_ptr().add(idx)) & width.mask();
         (v.wrapping_mul(HASH_PRIME) >> (64 - log)) as usize
     }
 }
@@ -83,23 +85,35 @@ pub(super) fn hash_at_log(win: &[u8], idx: usize, log: u32) -> usize {
 pub(super) fn hash8_at_log(win: &[u8], idx: usize, log: u32) -> usize {
     // SAFETY: same contract as hash_at_log.
     unsafe {
-        let v = win.as_ptr().add(idx).cast::<u64>().read_unaligned();
+        let v = crate::bit_io::load_le64(win.as_ptr().add(idx));
         (v.wrapping_mul(0xcf1b_bcdc_b7a5_6463) >> (64 - log)) as usize
     }
 }
 
-/// Read 4 window bytes at `idx`. Caller guarantees `idx + 4 <= win.len()`.
+/// Read 4 window bytes at `idx` as the format's little-endian word, the
+/// value the hashes and prefilters are defined over (libzstd's
+/// `MEM_readLE32`). Callers guarantee `idx + 4 <= win.len()`.
 #[inline(always)]
 pub(in crate::encoding) fn read4(win: &[u8], idx: usize) -> u32 {
     // SAFETY: see contract above; unaligned because byte-granular.
-    unsafe { win.as_ptr().add(idx).cast::<u32>().read_unaligned() }
+    unsafe { crate::bit_io::load_le32(win.as_ptr().add(idx)) }
 }
 
-/// Read 8 window bytes at `idx`. Caller guarantees `idx + 8 <= win.len()`.
+/// Whether the first three window bytes at both positions match: the
+/// min-match-3 candidate gate. The `<< 8` drops the fourth byte of the
+/// little-endian read, leaving the three bytes the min match covers.
+#[inline(always)]
+pub(in crate::encoding) fn hit3(win: &[u8], a: usize, b: usize) -> bool {
+    (read4(win, a) << 8) == (read4(win, b) << 8)
+}
+
+/// Read 8 window bytes at `idx` as the format's little-endian word
+/// (libzstd's `MEM_readLEST`). Callers guarantee `idx + 8 <= win.len()`.
+/// A byte-preserving copy must pair this with a little-endian store.
 #[inline(always)]
 pub(in crate::encoding) fn read8(win: &[u8], idx: usize) -> u64 {
     // SAFETY: see contract above; unaligned because byte-granular.
-    unsafe { win.as_ptr().add(idx).cast::<u64>().read_unaligned() }
+    unsafe { crate::bit_io::load_le64(win.as_ptr().add(idx)) }
 }
 
 /// libzstd's 3-byte hash (`ZSTD_hash3`: low 24 bits times prime3bytes).
@@ -189,7 +203,7 @@ pub(super) fn extend_match_portable(win: &[u8], i: usize, j: usize, limit: usize
             if a == b {
                 len += 8;
             } else {
-                return len + ((a ^ b).trailing_zeros() >> 3) as usize;
+                return len + first_diff_byte(a ^ b);
             }
         }
     }

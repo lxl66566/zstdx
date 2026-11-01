@@ -2609,8 +2609,7 @@ mod mt_dict {
             enc.finish().unwrap();
             let bulk = bulk::compress_with(&data, &opts()).unwrap();
             assert_eq!(sink, bulk, "workers {workers} chunk {chunk}");
-            let back =
-                crate::bulk::decompress_with(&sink, 0, &crate::DecoderOptions::new()).unwrap();
+            let back = bulk::decompress_with(&sink, 0, &crate::DecoderOptions::new()).unwrap();
             assert_eq!(back, data, "workers {workers} chunk {chunk}");
         }
     }

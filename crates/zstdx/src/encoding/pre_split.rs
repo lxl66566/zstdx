@@ -239,15 +239,17 @@ impl Fingerprint {
     }
 }
 
-/// `hash2`: for hashLog == 8 the byte itself, else the 2-byte native
-/// read scaled by Knuth's constant into the table.
+/// `hash2`: for hashLog == 8 the byte itself, else the 2-byte
+/// little-endian read scaled by Knuth's constant into the table. The
+/// fingerprint parity with the reference fixtures is defined by their
+/// little-endian recorded values, so the read is LE on every target.
 #[inline]
 fn hash2(p: &[u8], hash_log: u32) -> usize {
     debug_assert!((8..=HASHLOG_MAX).contains(&hash_log));
     if hash_log == 8 {
         return p[0] as usize;
     }
-    let pair = u16::from_ne_bytes([p[0], p[1]]) as u32;
+    let pair = u16::from_le_bytes([p[0], p[1]]) as u32;
     pair.wrapping_mul(KNUTH) as usize >> (32 - hash_log)
 }
 

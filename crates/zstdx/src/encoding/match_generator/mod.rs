@@ -4517,7 +4517,9 @@ mod tests;
 pub(super) use gates::RampGate;
 use gates::*;
 use hash::*;
-pub(in crate::encoding) use hash::{extend_match, hash3_at, hash4_at, hash5_at, read4, read8};
+pub(in crate::encoding) use hash::{
+    extend_match, hash3_at, hash4_at, hash5_at, hit3, read4, read8,
+};
 // SMALL_SRC_MAX feeds only `dict_seed_key`'s std-gated body.
 #[cfg(feature = "std")]
 use params::SMALL_SRC_MAX;

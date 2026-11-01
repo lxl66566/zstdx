@@ -114,6 +114,10 @@ Refactoring the bitstream reader so the read's shift count absorbs the consumed 
 
 The old `consumed += n` lived inside `read`, so no-reload paths were accounted automatically. Any reader shape that moves the accounting out of the read must repeat it on every path. The corpus roundtrip tests caught this, not review.
 
+### Reload loads follow the stream's byte order
+
+The Huffman and FSE reload paths filled their bit registers with the target's native word order. On s390x every backward bitstream then consumed its bytes reversed, and all frames failed `ChecksumMismatch` even though the same frames decoded correctly through the reference CLI with the checksum suppressed. The frame carries the bytes in the stream's own order, so the register refill goes through `bit_io`'s little-endian load on every target, exactly like the bitstream writers' stores on the encoding side.
+
 ## Streaming and multi-frame semantics
 
 ### Streaming window semantics use a generation model

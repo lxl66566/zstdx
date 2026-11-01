@@ -36,6 +36,14 @@ The FCS flag mapping read `3 => 8` where `find_min_size` yields 1, 2, 4 and 8, a
 
 Spec-table mappings need boundary tests per class at 255, 256, 64K, 4G-1 and 4G, which pin the descriptor flag, the field width and the decode roundtrip at once. The Dictionary_ID flag had the same shape, where its `_ => panic!()` fired for ids above `u32::MAX` on the publicly constructible `FrameHeader`. The field had no wider wire class at all, so the right fix was the type: `dictionary_id: Option<u32>`, matching the decoder side, makes the panic arm unreachable by construction. A wire field with a finite width belongs in the field's type, not in a match arm's reject case.
 
+### Word loads follow the format's byte order
+
+A bare unaligned `read_unaligned`/`write_unaligned` compiles to the target's native word order, and the s390x cross job turned every such load that feeds the frame into a byte-reversed one. The backward bitstreams consumed words through the decoder reload macros, so Huffman and FSE decode read garbage; the checksum loops absorbed native words, so every frame failed `ChecksumMismatch` on both our decoder and the reference CLI; the Huffman X2 pair store reversed its two symbols; the sequence emitter's literal fast path copied bytes through an LE store of a native load, which reordered each 8-byte literal group.
+
+The fix routes each such primitive through `bit_io`'s little-endian helpers, because the byte order of these words belongs to the format, not to the target: the bitstreams and the checksums are defined low-byte-first on every platform. Two pairing rules keep the remaining paths honest. A byte-preserving copy pairs an LE load with an LE store; a native load pairs with a native store, and mixing the two reverses bytes on big-endian. A byte-index compare over a native load's xor follows the load's byte order, so `first_diff_byte` scans from the low byte on little-endian and the high byte on big-endian.
+
+The diagnosis tool worth keeping: an env-gated check inside `push_seq_packed` that re-derives each sequence's effective offset from the rep history and byte-compares the claimed match span against the window. It printed the exact invalid sequences and their first differing byte while the frame still decoded to almost-correct output, which pinned the rep-gate bug below in one run.
+
 ## Matcher
 
 ### Re-declare frame-scoped matcher modes
@@ -149,6 +157,12 @@ The correct lane-wide form is `cmpeq_epi32` after the shift, where upper bytes a
 Chain tables' pooled residue is sound because stale entries are only read, range-checked and byte-verified, while live entry placement is a pure function of position. A row matcher's cycling insertion head breaks that shape, because the head chooses where the next insert lands. A residual head makes this job's live-entry placement depend on the pooled state's job history, so two worker-claim orders place different candidates in different slots and the frame bytes diverge run to run.
 
 This is the chain-link landmine's class, reached through new state instead of a missed link. The row heads clear per job with the head table in `fill_window_grid`, and the per-job clear is why the head lives in its own small array and stays out of libzstd's in-row byte 0. A 32 to 64 KiB array clears in microseconds, while in-band state would need re-deriving.
+
+### Hashes are defined over the byte sequence
+
+The matcher hash primitives loaded their words with the target's byte order. Every hash stayed self-consistent within one process, so frames decoded correctly, but the values differed from libzstd's `MEM_readLE*` definitions: on s390x the row matcher lost most of its matches and level 3 output ran 78% over the reference size, `c_fixture_parity` failed, and pre-split's fingerprint diverged from its recorded fixtures. The same native read also broke the min-match-3 rep gate, whose `<< 8` intends to drop the fourth byte of a little-endian read; on big-endian it dropped byte 0 instead, admitted rep candidates whose first three bytes were never verified, and emitted matches that decoded to single wrong bytes at template repeat boundaries.
+
+The fix defines every hash input load, the rep gate and the fingerprint hash over little-endian words on every target, matching libzstd. Match decisions then match the reference and match the other architectures, which turns the byte-identical cross-target dump into a free parity gate: dump the same corpus on two endiannesses and `diff` the frames. A hash that only needs to agree with itself may use any byte order; a hash calibrated against the reference or against fixtures must agree with the reference's definition.
 
 ## Entropy coding and bitstream
 

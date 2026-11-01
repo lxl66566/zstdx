@@ -42,6 +42,17 @@ fn read32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[..4].try_into().unwrap())
 }
 
+/// Little-endian counterpart of [`crate::bit_io::load_le64`] for the fused
+/// copy loops.
+// SAFETY: callers bound the 8-byte write.
+#[inline(always)]
+unsafe fn store64(p: *mut u8, v: u64) {
+    #[cfg(target_endian = "big")]
+    let v = v.swap_bytes();
+    // SAFETY: the caller's bound covers this unaligned write.
+    unsafe { p.cast::<u64>().write_unaligned(v) }
+}
+
 /// Streaming XXH64 (seed 0 is all the frame checksum needs; kept general).
 #[derive(Clone, Copy)]
 pub(crate) struct Xxh64 {
@@ -98,14 +109,14 @@ impl Xxh64 {
             unsafe {
                 let a = input.as_ptr();
                 let b = a.add(32);
-                v[0] = round(v[0], a.cast::<u64>().read_unaligned());
-                v[1] = round(v[1], a.add(8).cast::<u64>().read_unaligned());
-                v[2] = round(v[2], a.add(16).cast::<u64>().read_unaligned());
-                v[3] = round(v[3], a.add(24).cast::<u64>().read_unaligned());
-                v[0] = round(v[0], b.cast::<u64>().read_unaligned());
-                v[1] = round(v[1], b.add(8).cast::<u64>().read_unaligned());
-                v[2] = round(v[2], b.add(16).cast::<u64>().read_unaligned());
-                v[3] = round(v[3], b.add(24).cast::<u64>().read_unaligned());
+                v[0] = round(v[0], crate::bit_io::load_le64(a));
+                v[1] = round(v[1], crate::bit_io::load_le64(a.add(8)));
+                v[2] = round(v[2], crate::bit_io::load_le64(a.add(16)));
+                v[3] = round(v[3], crate::bit_io::load_le64(a.add(24)));
+                v[0] = round(v[0], crate::bit_io::load_le64(b));
+                v[1] = round(v[1], crate::bit_io::load_le64(b.add(8)));
+                v[2] = round(v[2], crate::bit_io::load_le64(b.add(16)));
+                v[3] = round(v[3], crate::bit_io::load_le64(b.add(24)));
             }
             input = &input[64..];
         }
@@ -191,14 +202,14 @@ impl Xxh64 {
             while i + 64 <= input.len() {
                 let p = src.add(i);
                 let q = src.add(i + 32);
-                let a0 = p.cast::<u64>().read_unaligned();
-                let a1 = p.add(8).cast::<u64>().read_unaligned();
-                let a2 = p.add(16).cast::<u64>().read_unaligned();
-                let a3 = p.add(24).cast::<u64>().read_unaligned();
-                let b0 = q.cast::<u64>().read_unaligned();
-                let b1 = q.add(8).cast::<u64>().read_unaligned();
-                let b2 = q.add(16).cast::<u64>().read_unaligned();
-                let b3 = q.add(24).cast::<u64>().read_unaligned();
+                let a0 = crate::bit_io::load_le64(p);
+                let a1 = crate::bit_io::load_le64(p.add(8));
+                let a2 = crate::bit_io::load_le64(p.add(16));
+                let a3 = crate::bit_io::load_le64(p.add(24));
+                let b0 = crate::bit_io::load_le64(q);
+                let b1 = crate::bit_io::load_le64(q.add(8));
+                let b2 = crate::bit_io::load_le64(q.add(16));
+                let b3 = crate::bit_io::load_le64(q.add(24));
                 v[0] = round(v[0], a0);
                 v[1] = round(v[1], a1);
                 v[2] = round(v[2], a2);
@@ -208,32 +219,32 @@ impl Xxh64 {
                 v[2] = round(v[2], b2);
                 v[3] = round(v[3], b3);
                 let d = dst.add(i);
-                d.cast::<u64>().write_unaligned(a0);
-                d.add(8).cast::<u64>().write_unaligned(a1);
-                d.add(16).cast::<u64>().write_unaligned(a2);
-                d.add(24).cast::<u64>().write_unaligned(a3);
+                store64(d, a0);
+                store64(d.add(8), a1);
+                store64(d.add(16), a2);
+                store64(d.add(24), a3);
                 let e = dst.add(i + 32);
-                e.cast::<u64>().write_unaligned(b0);
-                e.add(8).cast::<u64>().write_unaligned(b1);
-                e.add(16).cast::<u64>().write_unaligned(b2);
-                e.add(24).cast::<u64>().write_unaligned(b3);
+                store64(e, b0);
+                store64(e.add(8), b1);
+                store64(e.add(16), b2);
+                store64(e.add(24), b3);
                 i += 64;
             }
             while i + 32 <= input.len() {
                 let p = src.add(i);
-                let c0 = p.cast::<u64>().read_unaligned();
-                let c1 = p.add(8).cast::<u64>().read_unaligned();
-                let c2 = p.add(16).cast::<u64>().read_unaligned();
-                let c3 = p.add(24).cast::<u64>().read_unaligned();
+                let c0 = crate::bit_io::load_le64(p);
+                let c1 = crate::bit_io::load_le64(p.add(8));
+                let c2 = crate::bit_io::load_le64(p.add(16));
+                let c3 = crate::bit_io::load_le64(p.add(24));
                 v[0] = round(v[0], c0);
                 v[1] = round(v[1], c1);
                 v[2] = round(v[2], c2);
                 v[3] = round(v[3], c3);
                 let d = dst.add(i);
-                d.cast::<u64>().write_unaligned(c0);
-                d.add(8).cast::<u64>().write_unaligned(c1);
-                d.add(16).cast::<u64>().write_unaligned(c2);
-                d.add(24).cast::<u64>().write_unaligned(c3);
+                store64(d, c0);
+                store64(d.add(8), c1);
+                store64(d.add(16), c2);
+                store64(d.add(24), c3);
                 i += 32;
             }
             self.v = v;
@@ -273,14 +284,14 @@ impl Xxh64 {
             'outer: while i + 64 <= len {
                 let p = base.add(i);
                 let q = p.add(32);
-                let a0 = p.cast::<u64>().read_unaligned();
-                let a1 = p.add(8).cast::<u64>().read_unaligned();
-                let a2 = p.add(16).cast::<u64>().read_unaligned();
-                let a3 = p.add(24).cast::<u64>().read_unaligned();
-                let b0 = q.cast::<u64>().read_unaligned();
-                let b1 = q.add(8).cast::<u64>().read_unaligned();
-                let b2 = q.add(16).cast::<u64>().read_unaligned();
-                let b3 = q.add(24).cast::<u64>().read_unaligned();
+                let a0 = crate::bit_io::load_le64(p);
+                let a1 = crate::bit_io::load_le64(p.add(8));
+                let a2 = crate::bit_io::load_le64(p.add(16));
+                let a3 = crate::bit_io::load_le64(p.add(24));
+                let b0 = crate::bit_io::load_le64(q);
+                let b1 = crate::bit_io::load_le64(q.add(8));
+                let b2 = crate::bit_io::load_le64(q.add(16));
+                let b3 = crate::bit_io::load_le64(q.add(24));
                 v[0] = round(v[0], a0);
                 v[1] = round(v[1], a1);
                 v[2] = round(v[2], a2);
@@ -306,10 +317,10 @@ impl Xxh64 {
             }
             if uniform && i + 32 <= len {
                 let p = base.add(i);
-                let c0 = p.cast::<u64>().read_unaligned();
-                let c1 = p.add(8).cast::<u64>().read_unaligned();
-                let c2 = p.add(16).cast::<u64>().read_unaligned();
-                let c3 = p.add(24).cast::<u64>().read_unaligned();
+                let c0 = crate::bit_io::load_le64(p);
+                let c1 = crate::bit_io::load_le64(p.add(8));
+                let c2 = crate::bit_io::load_le64(p.add(16));
+                let c3 = crate::bit_io::load_le64(p.add(24));
                 v[0] = round(v[0], c0);
                 v[1] = round(v[1], c1);
                 v[2] = round(v[2], c2);

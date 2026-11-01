@@ -565,7 +565,8 @@ pub(in crate::encoding) fn push_seq_packed(
         let v = read8(win, anchor_idx);
         // SAFETY: the reserve covers the 8-byte store and the publish keeps
         // the length at the written prefix, so `literals` never exposes
-        // uninitialized bytes.
+        // uninitialized bytes. The little-endian store reproduces read8's
+        // little-endian value as the same bytes on every target.
         unsafe {
             literals.reserve(8);
             let end = literals.len();

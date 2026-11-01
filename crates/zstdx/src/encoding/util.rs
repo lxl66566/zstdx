@@ -35,6 +35,21 @@ pub(crate) fn is_uniform(data: &[u8]) -> bool {
     rem.iter().all(|&b| b == first)
 }
 
+/// Index of the first differing byte in `xor`, the xor of two native word
+/// loads: on little-endian byte 0 sits in the lowest byte, on big-endian in
+/// the highest, so the scan direction follows the load.
+#[inline(always)]
+pub(crate) fn first_diff_byte(xor: u64) -> usize {
+    #[cfg(target_endian = "little")]
+    {
+        (xor.trailing_zeros() >> 3) as usize
+    }
+    #[cfg(target_endian = "big")]
+    {
+        (xor.leading_zeros() >> 3) as usize
+    }
+}
+
 /// Returns the minimum number of bytes needed to represent this value, as
 /// either 1, 2, 4, or 8 bytes. A value of 0 will still return one byte.
 ///

@@ -47,7 +47,7 @@
 //! before use.
 
 use super::opt::{
-    Match, OPT_NUM, count_from, count_from_long, hash3_at, hash4_at, hash5_at, read4,
+    Match, OPT_NUM, count_from, count_from_long, hash3_at, hash4_at, hash5_at, hit3, read4,
 };
 
 /// Offset price class (`highbit32(offBase)`); ~free for repcodes and for
@@ -366,7 +366,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
                 }
                 let cand = (cand_abs - self.win_base) as usize;
                 let hit = if self.min_match == 3 {
-                    (read4(self.win, cand) << 8) == (read4(self.win, idx) << 8)
+                    hit3(self.win, cand, idx)
                 } else {
                     read4(self.win, cand) == read4(self.win, idx)
                 };

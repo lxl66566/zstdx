@@ -17,12 +17,13 @@ use alloc::vec::Vec;
 
 // Window reads and the C-form hashes: match_generator/hash.rs is the
 // canonical home; re-exported so dubt/btlazy's `opt::` imports hold.
-pub(in crate::encoding) use super::match_generator::{hash3_at, hash4_at, hash5_at, read4};
+pub(in crate::encoding) use super::match_generator::{hash3_at, hash4_at, hash5_at, hit3, read4};
 use super::{
     SeqWord,
     ldm::LdmSeq,
     match_generator::{HASH_READ, push_seq_packed},
     seq_codes::{LL_META, ML_META, encode_literal_length, encode_match_len},
+    util::first_diff_byte,
 };
 use crate::decoding::sequence_execution::do_offset_history;
 
@@ -640,7 +641,7 @@ pub(crate) fn count_from(win: &[u8], idx: usize, cand: usize, start: usize, limi
     let (mut len, diff) = count_run(win, idx, cand, start, room);
     if diff != 0 {
         // The mismatching pair already advanced `len` by 8.
-        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
+        return len - 8 + first_diff_byte(diff);
     }
     while len < room && win[idx + len] == win[cand + len] {
         len += 1;
@@ -674,7 +675,7 @@ pub(crate) fn count_from_long(
     let (len, diff) = count_run(win, idx, cand, start, stop1);
     if diff != 0 {
         // The mismatching pair already advanced `len` by 8.
-        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
+        return len - 8 + first_diff_byte(diff);
     }
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     if len >= switch_at && len + 64 <= room {
@@ -684,7 +685,7 @@ pub(crate) fn count_from_long(
     let (mut len, diff) = count_run(win, idx, cand, len, room);
     if diff != 0 {
         // The mismatching pair already advanced `len` by 8.
-        return len - 8 + (diff.trailing_zeros() >> 3) as usize;
+        return len - 8 + first_diff_byte(diff);
     }
     while len < room && win[idx + len] == win[cand + len] {
         len += 1;
@@ -1287,7 +1288,7 @@ impl Finder<'_, '_> {
                 // `ZSTD_readMINMATCH`: for width 3 both sides compare their
                 // first three bytes (the low 24 bits of the u32 read).
                 let hit = if self.min_match == 3 {
-                    (read4(self.win, cand) << 8) == (read4(self.win, idx) << 8)
+                    hit3(self.win, cand, idx)
                 } else {
                     read4(self.win, cand) == read4(self.win, idx)
                 };
