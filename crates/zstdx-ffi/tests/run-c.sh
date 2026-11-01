@@ -9,6 +9,18 @@ ref="${ZSTD_REF:-/root/programs/fork/zstd}"
 work="$(mktemp -d /tmp/zstdx-ffi-c.XXXXXX)"
 trap 'rm -rf "$work"' EXIT
 
+# The harness expectations and the ffi size constants embed the reference's
+# struct sizes, which move with the build target: a default of x86-64-v3 or
+# newer defines __BMI2__, DYNAMIC_BMI2 turns off, the CCtx bmi2 field
+# disappears and every compress-side estimate shifts by -8. Build the
+# pinned tree from scratch at the x86-64 baseline march so every host and
+# runner image produces the same libzstd.a instead of trusting a prebuilt
+# one built at whatever the local toolchain defaults to.
+reflib="$work/zstd-ref-lib"
+mkdir "$reflib"
+git -C "$ref" archive HEAD lib | tar -x -C "$reflib"
+make -C "$reflib/lib" -j"$(nproc)" libzstd.a MOREFLAGS=-march=x86-64 >/dev/null
+
 cd "$root"
 cargo build -p zstdx-ffi --release >/dev/null
 lib="$root/target/release/libzstd.so"
@@ -17,11 +29,11 @@ test -f "$lib" || { echo "missing $lib"; exit 1; }
 exported=$(nm -D "$lib" | grep -c " T ZSTD_")
 echo "libzstd.so exports $exported ZSTD_* symbols"
 
-cc_common=(-O1 -Wall -Wextra -DZSTD_STATIC_LINKING_ONLY -I "$ref/lib")
+cc_common=(-O1 -Wall -Wextra -DZSTD_STATIC_LINKING_ONLY -I "$reflib/lib")
 gcc "${cc_common[@]}" "$root/crates/zstdx-ffi/tests/harness.c" -o "$work/self" \
     -L "$root/target/release" -l:libzstd.so
 gcc "${cc_common[@]}" "$root/crates/zstdx-ffi/tests/harness.c" -o "$work/ref" \
-    "$ref/lib/libzstd.a" -lpthread -lm
+    "$reflib/lib/libzstd.a" -lpthread -lm
 
 # The same self-tests against the reference library: the suite doubles as
 # a parity check, so expectations that drift from libzstd fail here first.

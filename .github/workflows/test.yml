@@ -28,14 +28,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The parity gate doubles as a drift check against the reference tree,
-      # pinned to the commit the ffi layer tracks (1.6.0 / 10600).
+      # pinned to the commit the ffi layer tracks (1.6.0 / 10600). run-c.sh
+      # builds the static ref itself at the x86-64 baseline march, because
+      # the estimate expectations embed the reference's struct sizes, which
+      # a runner default of x86-64-v3 shifts.
       - uses: actions/checkout@v7
         with:
           repository: facebook/zstd
           ref: d9c0c7e2cf8a8bf9fb98d3bee546dcf8dc9ac59a
           path: zstd-ref
       - uses: dtolnay/rust-toolchain@stable
-      - run: make -C zstd-ref/lib -j"$(nproc)" libzstd.a
       # run-c.sh consumes json/text slices from bench/corpus, which is not
       # checked in.
       - run: bash bench/gen_corpus.sh

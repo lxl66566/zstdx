@@ -3281,8 +3281,10 @@ mod tests {
     /// posting a donation. `choice` stays Keep, no donation task runs, and
     /// the donated-state carry a resolved Keep verdict installs
     /// (`resolve_probe`) never appears, so job zero parses undonated. A
-    /// narrow head posts the donation as before, observable mid-stream on
-    /// the growing grid where no epoch is due yet.
+    /// narrow head posts the donation as before, pinned mid-stream on the
+    /// growing grid where no epoch is due yet; the poll at the next
+    /// `post_ready` consumes a landed verdict for free, so the post shows
+    /// as the parked wait or as the carry the Keep verdict installed.
     #[test]
     fn wide_head_stages_keep_without_donation() {
         let mib = 1024 * 1024usize;
@@ -3308,8 +3310,11 @@ mod tests {
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
 
         // Narrow twin: a 16-symbol tile repeated at a near-local lag
-        // (skewed's shape) keeps the donation, pinned at the same
-        // mid-stream point no post can have consumed it at.
+        // (skewed's shape) posts the donation. The observation point stays
+        // mid-stream where no epoch is due, but a landed verdict is
+        // consumed for free at the next `post_ready` poll, so the wait may
+        // already be resolved here; the Keep verdict's donated carry
+        // (see `resolve_probe`) is the posted wait's other trace.
         let mut tile = Vec::with_capacity(16 * 1024);
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         while tile.len() < 16 * 1024 {
@@ -3325,7 +3330,7 @@ mod tests {
         core.write(&narrow[..8 * mib]).unwrap();
         assert!(!core.probe_pending);
         assert!(
-            core.probe_wait.is_some(),
+            core.probe_wait.is_some() || core.donation.is_some(),
             "a narrow head still posts the donation"
         );
         core.write(&narrow[8 * mib..]).unwrap();

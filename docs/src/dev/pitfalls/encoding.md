@@ -361,6 +361,12 @@ The reach probe's donated prefix encodes the first `PROBE_SPAN` bytes as job zer
 
 The repair widened the posting-side gate, `post_job`'s discard, to any job zero ending at or below the span, and asserted the upper side at the continuation entry. A donated-prefix contract has one consumer-side entry and one posting-side gate: wall both, because every path that re-slices job zero is a new way to move its end under the span.
 
+### Pin the donation post, not its parked wait
+
+The wide-head stand-down test asserted `probe_wait.is_some()` right after the staging write. `post_ready`'s loop polls the two donated parses for a landed verdict before every posting decision, and a landed verdict is consumed for free there. When the posting thread stalls past the parses' completion, the write itself resolves the probe and the wait is gone at the assert. The window is the poll's own span in code and stretches to the parses' runtime under a loaded scheduler. The paranoid suite hit it once across many runs, while every isolated and locally loaded rerun stayed green.
+
+The pinned fact is the post, which leaves two deterministic traces: the parked wait, or the donated carry a Keep verdict installs in `resolve_probe`. The assertion now reads the pair, the same one `donated_span_survives_the_growing_tail_reslice` already reads. An assertion over scheduler-dependent intermediate state fails as a flake while the code is correct, so the test pins the state's cause.
+
 ### Initial reserve is a scheduling scale
 
 The mt stream's initial and probe-settle reserves sized to `workers * initial_job + overlap`. With the CLI always pledging the file size, a 16 GiB file at `-T8` with the job size at the `MAX_JOB_SIZE` 1 GiB ceiling reserved about 8 GiB up front and held that much input resident for the whole stream, because the pump recycles only at a full buffer.

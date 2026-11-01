@@ -324,6 +324,12 @@ The 2026-11-02 run also confirmed the pipe trap's cost: a compile whose errors w
 
 A member dependency `{ workspace = true, default-features = false, ... }` is a hard error on newer cargo ("`default-features = false` cannot override workspace's `default-features`"), while older nightlies still accept it, so the host build stays green until CI's stable toolchain moves. List the wanted features explicitly instead: when the list already equals the workspace defaults, dropping the flag changes nothing in feature resolution.
 
+### Reference ABI numbers move with the build target
+
+The 2026-11-02 ffi-c run failed all ten compress-side estimate checks against the reference with every value exactly 8 bytes below the pinned expectation, while the same suite passed on the dev host and every decoder-side estimate matched on both. The harness expectations and the ffi size constants embed the reference's `sizeof(ZSTD_CCtx)`, which depends on the build target: a default of x86-64-v3 or newer defines `__BMI2__`, `DYNAMIC_BMI2` turns off, the CCtx `bmi2` field disappears and the struct shrinks by 8. The ubuntu-26.04 runner's gcc defaults to a BMI2-capable baseline, where the dev host's gcc still defaults to plain x86-64. `ZSTD_DCtx` carries the same gated field, but its padding absorbs the loss, which is why `estimateDCtxSize` and the dictionary estimates matched everywhere.
+
+`tests/run-c.sh` therefore builds the reference static lib itself, from the pinned tree at `MOREFLAGS=-march=x86-64`, and the workflow no longer builds a ref lib step. Trusting a prebuilt `libzstd.a` couples the parity gate to whatever the local toolchain's default target happens to be, and the failure then reads as an expectations drift instead of a configuration mismatch.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.

@@ -44,7 +44,7 @@ The parameters are `ZSTD_c_compressionLevel`, `ZSTD_c_windowLog`, `ZSTD_c_conten
 
 ### Estimates
 
-The `estimate*` family is a formula-exact port of the reference arithmetic: the cwksp sizing over the level rows, the row/chain match-finder layouts, the LDM tables and the streaming buffers, all returning byte-identical numbers to the reference build. Four reference object sizes are embedded as constants (`CCtx` 5280, `DCtx` 95976, `CDict` 6080, `DDict` 27352, probed from `libzstd.a` on this host), so the numbers are advisory budgets in the reference's units rather than reports of this implementation's allocations. The `initStatic*` family that would consume them is not exported.
+The `estimate*` family is a formula-exact port of the reference arithmetic: the cwksp sizing over the level rows, the row/chain match-finder layouts, the LDM tables and the streaming buffers, all returning byte-identical numbers to the reference build. Four reference object sizes are embedded as constants (`CCtx` 5280, `DCtx` 95976, `CDict` 6080, `DDict` 27352, probed from `libzstd.a` on this host), so the numbers are advisory budgets in the reference's units rather than reports of this implementation's allocations. The constants hold for the reference build `tests/run-c.sh` produces, the x86-64 baseline march; the target dependence behind that pin is recorded in [workflow pitfalls](pitfalls/workflow.md). The `initStatic*` family that would consume them is not exported.
 
 ### Prefix references
 
@@ -72,7 +72,7 @@ Negative levels clamp to 1, because zstdx has no accelerated levels. `ZSTD_minCL
 
 `windowLog` above 27 is accepted but the engine caps it at 27. `ZSTD_c_windowLog` validates 10 to 31, the reference's 64-bit range, and the codec's own window ceiling is 2^27, so frames asking for 28 to 31 are produced with the capped window.
 
-`nbWorkers` of 0 or 1 stays single-threaded, and 2 or more engages the MT job paths. A dictionary forces the single-threaded core, which is an engine limit and mirrors libzstd's no-MT-without-`ZSTD_MULTITHREAD` behavior rather than erroring. The reference `libzstd.a` on this host is built without `ZSTD_MULTITHREAD`, so it answers `parameter_unsupported` for `nbWorkers` at 1 or above, where this layer accepts and uses the value.
+`nbWorkers` of 0 or 1 stays single-threaded, and 2 or more engages the MT job paths. A dictionary forces the single-threaded core, which is an engine limit and mirrors libzstd's no-MT-without-`ZSTD_MULTITHREAD` behavior rather than erroring. The reference `libzstd.a` that `tests/run-c.sh` builds carries no `ZSTD_MULTITHREAD` (the static default), so it answers `parameter_unsupported` for `nbWorkers` at 1 or above, where this layer accepts and uses the value.
 
 ### Dictionary caching
 

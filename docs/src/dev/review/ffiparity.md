@@ -1,6 +1,6 @@
 # FFI parity
 
-This page records the C ABI comparison between `crates/zstdx-ffi` and libzstd 1.6.0. It answers which symbols the layer covers, which reported differences are fixed, which are deliberate, and which areas remain unprobed. The comparison covers the whole exported C ABI against the tracked reference tree at `/root/programs/fork/zstd`, with `libzstd.a` built on this host.
+This page records the C ABI comparison between `crates/zstdx-ffi` and libzstd 1.6.0. It answers which symbols the layer covers, which reported differences are fixed, which are deliberate, and which areas remain unprobed. The comparison covers the whole exported C ABI against the tracked reference tree at `/root/programs/fork/zstd`, with `libzstd.a` built on this host at the x86-64 baseline march.
 
 ## Method
 
