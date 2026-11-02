@@ -28,6 +28,8 @@ pub(crate) mod literals_section_decoder;
 pub(crate) mod mt;
 #[cfg(feature = "std")]
 pub(crate) mod mt_pieces;
+#[cfg(feature = "std")]
+pub(crate) mod mt_pool;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;

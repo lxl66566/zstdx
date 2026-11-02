@@ -4,6 +4,29 @@ Every entry here is backed by A/B data. If the premises change, such as the tabl
 
 ## MT decode and checksums
 
+### Stage-A direct literal placement
+
+The idea was to move the literals staging-to-output copy out of serial stage B by having stage A place each literal run at its final output position. Literal-run destinations are running sums of ll plus ml over the preceding sequences, all wire-known at stage-A time, so a scatter pass after the segment's entropy decode copies the runs staging to output in parallel, and stage B executes matches only. Engagement required a stable output region, which the fixed-slice entry (`decode_all_mt`, every dec-mt matrix cell) provides; a start table gave each worker its prefix-sum start once the earlier segments had published their staged sizes. The form decoding literals per run straight inside the entropy loop was rejected up front: the X1 4-stream decoder produces contiguous quarters, and per-run destinations break that form.
+
+Correctness held everywhere, with the full paranoid, debug and release suites plus mtcheck over corpus and big, corrupt and the 45078-case parity sweep all green, because the design paid two structural taxes the staged executor escapes. A match's wildcopy overshoot lands on the next literal run's first bytes, and the staged executor's unconditional literal copy rewrites that dirt in address order as a free side effect. With literals pre-placed, that rewrite is gone, so the placed executor repaired the first 16 bytes of every run from staging, and the consumer capped its wild cap at the segment end so a segment's last match could stay clear of the next segment's pre-placed range. On top of the repair tax, the scatter is a second full pass over the literal bytes at run granularity, placed on the stage-A side that already shares the wall with execute on json and dll100.
+
+The locked interleaved A/B, five then seven rounds across two sessions against base 432d1b5a, read:
+
+| cell | base | placed | delta |
+|---|---:|---:|---:|
+| json.zst3 mt8 | 3126, 3135 | 2096, 1779 | -33 to -43% |
+| json.zst3 mt16 | 3181, 3179 | 2040, 2023 | -36% |
+| dll100.zst3 mt8 | 3001, 3009 | 1731, 1710 | -42% |
+| dll100.zst3 mt16 | 3057, 3078 | 1719, 1709 | -44% |
+| skewed.zst9 mt8 | 1056, 1039 | 649, 637 | -38% |
+| skewed.zst9 mt16 | 1048, 1057 | 654, 630 | -38 to -40% |
+| text.zst3 mt8, mt16 | 11686, 11688 | 11698, 11700 | flat |
+| skewed.zst19 mt8, mt16 | 2397, 2409 | 2430, 2430 | flat |
+
+The attribution on skewed.zst9 mt8, a 4000 ms budget with per-iteration medians of 30.3 against 51 ms and therefore 132 against 78 iterations, puts the placed stage-B executor at 118M cycles per iteration against the staged executor's 71M while copying fewer bytes, and the scatter itself at 62M cycles per iteration on the workers, about 1.24 cycles per literal byte, the short-run byte-copy rate. On json the whole-process instruction count fell 13 percent while the mt8 median fell 33, so the removed copies returned as scatter work and serial-stage stalls. Restart-poor skewed.zst9 also carried the scatter on its critical path, because its second segment could only scatter after the first segment's staging published the start.
+
+The falsified premise is the pairing break, the same mechanism the flat-path entry under Memory layout records for single-thread decode: the staged literal copy is load-bearing as the wildcopy repair, and replacing it costs a per-sequence repair plus a parallel re-copy of the same bytes. The one variant left open, exact-tail match copies with no repair at all, buys clean placement at the 30 percent long-match copy tax the copy-kernel falsification already prices against text. Reopening needs a placement whose literal runs sit outside every wildcopy overshoot path.
+
 ### Fixed-offset ramp at job starts
 
 The idea was to suppress matches whose offset sits below a 4-64 KiB floor near MT job starts, so decode pieces never wait on near-boundary reads. The piece-pipeline ceiling stayed at about 1.0-1.14x at every floor. The binding constraint is a crossing read's depth below the cut, computed as `start - src`, and the offset does not matter. A piece can start a copy the moment its source range is published, and a deep source unblocks it regardless of the match's offset size. An offset floor suppresses the wrong set, namely large offsets whose sources are deep and harmless, and leaves shallow-depth reads untouched, where any offset with a source just below the cut qualifies. The depth-semantics ramp, where crossing reads must reach at least D below the job start, is what works. It is landed and env-gated, tracked in the [todo](../todo.md).

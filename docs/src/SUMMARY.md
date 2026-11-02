@@ -42,6 +42,7 @@
 - [Decode error paths](dev/review/parity.md)
 - [Decode core cleanups](dev/review/declean.md)
 - [Sequence-loop port review](dev/review/decloop.md)
+- [Stage-A pool review](dev/review/decpool.md)
 - [Decode parity differential](dev/review/diffbench.md)
 - [Bench harness review](dev/review/benchharness.md)
 - [Peripheral review](dev/review/periph.md)

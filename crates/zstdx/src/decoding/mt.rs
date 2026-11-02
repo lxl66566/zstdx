@@ -1052,10 +1052,132 @@ pub(super) fn verify_frame_content_sizes(
     Ok(())
 }
 
+/// Per-call state shared between the calling thread (stage B) and the
+/// leased pool workers (stage A). The input and segment plans are frozen
+/// borrows: a worker touches them only while serving the lease, and
+/// `decode_parallel` waits every lease out before returning, so the
+/// borrows outlive the freeze (the encoder-side `FrozenSrc` contract).
+pub(super) struct StageAJob {
+    input: *const [u8],
+    segments: *const [SegmentPlan],
+    n_segments: usize,
+    /// Leased worker count: the staging backpressure bound, so staging
+    /// memory stays proportional to the worker count, not the input.
+    threads: usize,
+    slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>>,
+    ready: Condvar,
+    next_job: AtomicUsize,
+    consumed: AtomicUsize,
+    abort: AtomicBool,
+    /// Worker panic payload; doubles as the backpressure sleep token.
+    poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+}
+
+// SAFETY: the frozen slices are dereferenced only by a thread serving the
+// job's lease, and every lease is waited out (`mt_pool::wait_leave`) before
+// the leasing `decode_parallel` returns, inside the caller's borrow. The
+// mutexes, atomics and condvar are thread-safe by construction.
+unsafe impl Send for StageAJob {}
+unsafe impl Sync for StageAJob {}
+
+/// Test injection: the input base address and segment id whose stage-A
+/// decode panics instead of running (null / usize::MAX disable). Keyed to
+/// one input's address so a concurrently running test's decode never trips
+/// it in the shared-process test harness. Compiled out of non-test builds.
+#[cfg(test)]
+static STAGE_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+#[cfg(test)]
+static STAGE_PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// One lease's stage-A service on a pool worker: claim segments, stage each
+/// one's literals and sequences into its slot. Returns whether the thread
+/// must retire (a job panicked on it; the scratch is dropped in that case).
+pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>) -> bool {
+    // SAFETY: this thread serves the job's lease, so the frozen slices are
+    // live for the whole call.
+    let input: &[u8] = unsafe { &*job.input };
+    let segments: &[SegmentPlan] = unsafe { &*job.segments };
+    loop {
+        if job.abort.load(Ordering::Relaxed) || job.poison.lock().unwrap().is_some() {
+            return false;
+        }
+        let id = job.next_job.fetch_add(1, Ordering::Relaxed);
+        if id >= job.n_segments {
+            return false;
+        }
+        // Backpressure sleep while this segment runs too far ahead of the
+        // ordered consumer. The poison mutex is only the sleep token; the
+        // predicate (consumed) is atomic.
+        while id > job.consumed.load(Ordering::Acquire) + job.threads {
+            if job.abort.load(Ordering::Relaxed) {
+                break;
+            }
+            let guard = job.poison.lock().unwrap();
+            let (_guard, _timeout) = job
+                .ready
+                .wait_timeout(guard, core::time::Duration::from_millis(50))
+                .unwrap();
+        }
+        if job.abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        if scratch.is_none() {
+            *scratch = Some(SegmentScratch::new());
+        }
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if id == STAGE_PANIC_AT.load(Ordering::Relaxed)
+                && STAGE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr()
+            {
+                panic!("injected stage-A panic");
+            }
+            decode_segment(input, &segments[id], scratch.as_mut().unwrap())
+        }));
+        match attempt {
+            Ok(res) => *job.slots[id].lock().unwrap() = Some(res),
+            Err(payload) => {
+                *job.poison.lock().unwrap() = Some(payload);
+                // Release the slot so the ordered consumer can run to
+                // completion; this error is never observed (resume_unwind
+                // replaces it after the leases are waited out).
+                *job.slots[id].lock().unwrap() = Some(Err(FrameDecoderError::NotYetInitialized));
+                // The scratch may be mid-decode garbage: drop it rather
+                // than reuse, and retire this thread (never reuse a thread
+                // that has seen an unwind).
+                *scratch = None;
+                return true;
+            },
+        }
+        job.ready.notify_all();
+    }
+}
+
+/// End-of-lease guard, the join equivalent of the old `thread::scope`: any
+/// exit path — stage B error, caller panic, worker panic resume — aborts
+/// the workers and waits every lease out, so no worker can touch the frozen
+/// input or segment plans after the borrows end.
+struct LeaseOut<'a> {
+    job: &'a std::sync::Arc<StageAJob>,
+    slots: &'a [std::sync::Arc<super::mt_pool::WorkerSlot>],
+}
+
+impl Drop for LeaseOut<'_> {
+    fn drop(&mut self) {
+        self.job.abort.store(true, Ordering::Release);
+        self.job.ready.notify_all();
+        for slot in self.slots {
+            super::mt_pool::wait_leave(slot, self.job);
+        }
+    }
+}
+
 /// Two-stage pipeline driver. `place(start, end)` makes the output region
 /// valid for absolute positions `[0, end)` and returns its base pointer
 /// (called per segment, so a growing Vec may move between calls). Returns
-/// the total number of decoded bytes.
+/// the total number of decoded bytes. Stage A runs on leased pool workers
+/// (see `mt_pool`), so repeated decodes pay a slot handoff instead of a
+/// worker spawn+join per call.
 fn decode_parallel(
     input: &[u8],
     workers: u32,
@@ -1066,112 +1188,72 @@ fn decode_parallel(
 ) -> Result<usize, FrameDecoderError> {
     let n_segments = segments.len();
     let threads = (workers as usize).min(n_segments);
-    let slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>> =
-        (0..n_segments).map(|_| Mutex::new(None)).collect();
-    let ready = Condvar::new();
-    let next_job = AtomicUsize::new(0);
-    let consumed = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
-    let poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>> = Mutex::new(None);
-
-    let result = std::thread::scope(|scope| -> Result<usize, FrameDecoderError> {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let mut scratch = SegmentScratch::new();
-                loop {
-                    if abort.load(Ordering::Relaxed) || poison.lock().unwrap().is_some() {
-                        break;
-                    }
-                    let id = next_job.fetch_add(1, Ordering::Relaxed);
-                    if id >= n_segments {
-                        break;
-                    }
-                    // Bound staged-but-unexecuted segments so staging memory
-                    // stays proportional to the worker count, not the input.
-                    // The poison mutex is only the sleep token; the predicate
-                    // (consumed) is atomic.
-                    while id > consumed.load(Ordering::Acquire) + threads {
-                        if abort.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let guard = poison.lock().unwrap();
-                        let (_guard, _timeout) = ready
-                            .wait_timeout(guard, core::time::Duration::from_millis(50))
-                            .unwrap();
-                    }
-                    if abort.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        decode_segment(input, &segments[id], &mut scratch)
-                    }));
-                    match attempt {
-                        Ok(res) => *slots[id].lock().unwrap() = Some(res),
-                        Err(payload) => {
-                            *poison.lock().unwrap() = Some(payload);
-                            // Release the slot so the ordered consumer can run
-                            // to completion; this error is never observed
-                            // (resume_unwind replaces it after the scope).
-                            *slots[id].lock().unwrap() =
-                                Some(Err(FrameDecoderError::NotYetInitialized));
-                        },
-                    }
-                    ready.notify_all();
-                }
-            });
-        }
-
-        let mut offset_hist = [1u32, 4, 8];
-        let exec_result = (|| -> Result<usize, FrameDecoderError> {
-            let mut written = 0usize;
-            // Output offset where each frame began, in scan order.
-            let mut frame_starts = Vec::with_capacity(frame_pledges.len());
-            let mut frame_base = 0usize;
-            for (id, seg_plan) in segments.iter().enumerate() {
-                let staged = {
-                    let mut guard = slots[id].lock().unwrap();
-                    while guard.is_none() {
-                        guard = ready.wait(guard).unwrap();
-                    }
-                    guard.take().unwrap()
-                };
-                let seg = staged?;
-                if seg_plan.frame_start {
-                    offset_hist = [1, 4, 8];
-                    frame_starts.push(written);
-                    frame_base = written;
-                }
-                #[cfg(feature = "hash")]
-                let seg_out_start = written;
-                let (base, buf_limit) = place(written, written + seg.out_size)?;
-                // SAFETY: `place` made [0, written + out_size) valid; every
-                // match source below `written` is final (in-order execution).
-                let region = unsafe { OutRegion::new(base, buf_limit, usize::MAX) };
-                // SAFETY: region's contract above.
-                unsafe {
-                    execute_segment(region, written, frame_base, &seg, input, &mut offset_hist)?;
-                }
-                written += seg.out_size;
-                // The executed range is final from here on: later writes never
-                // land below the executor cursor.
-                #[cfg(feature = "hash")]
-                after_segment(region.base().cast_const(), seg_out_start..written);
-                consumed.store(id + 1, Ordering::Release);
-                ready.notify_all();
-            }
-            verify_frame_content_sizes(frame_pledges, &frame_starts, written)?;
-            Ok(written)
-        })();
-        if exec_result.is_err() {
-            abort.store(true, Ordering::Release);
-            ready.notify_all();
-        }
-        exec_result
+    let job = std::sync::Arc::new(StageAJob {
+        input,
+        segments,
+        n_segments,
+        threads,
+        slots: (0..n_segments).map(|_| Mutex::new(None)).collect(),
+        ready: Condvar::new(),
+        next_job: AtomicUsize::new(0),
+        consumed: AtomicUsize::new(0),
+        abort: AtomicBool::new(false),
+        poison: Mutex::new(None),
     });
-    if let Some(payload) = poison.into_inner().unwrap() {
+    let leased = super::mt_pool::lease_workers(threads, &job);
+    let out_guard = LeaseOut {
+        job: &job,
+        slots: &leased,
+    };
+
+    let mut offset_hist = [1u32, 4, 8];
+    let exec_result = (|| -> Result<usize, FrameDecoderError> {
+        let mut written = 0usize;
+        // Output offset where each frame began, in scan order.
+        let mut frame_starts = Vec::with_capacity(frame_pledges.len());
+        let mut frame_base = 0usize;
+        for (id, seg_plan) in segments.iter().enumerate() {
+            let staged = {
+                let mut guard = job.slots[id].lock().unwrap();
+                while guard.is_none() {
+                    guard = job.ready.wait(guard).unwrap();
+                }
+                guard.take().unwrap()
+            };
+            let seg = staged?;
+            if seg_plan.frame_start {
+                offset_hist = [1, 4, 8];
+                frame_starts.push(written);
+                frame_base = written;
+            }
+            #[cfg(feature = "hash")]
+            let seg_out_start = written;
+            let (base, buf_limit) = place(written, written + seg.out_size)?;
+            // SAFETY: `place` made [0, written + out_size) valid; every
+            // match source below `written` is final (in-order execution).
+            let region = unsafe { OutRegion::new(base, buf_limit, usize::MAX) };
+            // SAFETY: region's contract above.
+            unsafe {
+                execute_segment(region, written, frame_base, &seg, input, &mut offset_hist)?;
+            }
+            written += seg.out_size;
+            // The executed range is final from here on: later writes never
+            // land below the executor cursor.
+            #[cfg(feature = "hash")]
+            after_segment(region.base().cast_const(), seg_out_start..written);
+            job.consumed.store(id + 1, Ordering::Release);
+            job.ready.notify_all();
+        }
+        verify_frame_content_sizes(frame_pledges, &frame_starts, written)?;
+        Ok(written)
+    })();
+    // The guard is the scope-join equivalent: workers stop touching the
+    // frozen input and segment plans before any panic resumes.
+    drop(out_guard);
+    if let Some(payload) = job.poison.lock().unwrap().take() {
         std::panic::resume_unwind(payload);
     }
-    result
+    exec_result
 }
 
 /// Below [`MIN_MT_INPUT`] the compressed size says nothing about the decode
@@ -1858,6 +1940,101 @@ mod tests {
             let mut vec_out = Vec::new();
             decode_to_vec_mt(&frame, &mut vec_out, workers, MAX_WINDOW).unwrap();
             assert_eq!(vec_out, expect, "{workers}");
+        }
+    }
+
+    /// Repeated decodes over alternating inputs must stay byte-exact: the
+    /// pool reuses worker threads and staging buffers across calls, and
+    /// every reuse re-initializes what execution reads (scratch tables
+    /// reset per segment, staging overwritten exactly).
+    #[test]
+    fn repeated_decodes_stay_identical() {
+        let a = textish(6 * 1024 * 1024);
+        let b: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let ca = bulk::compress_with(&a, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let cb = bulk::compress_with(&b, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        for round in 0..6 {
+            let (src, expect) = if round % 2 == 0 {
+                (&ca, &a)
+            } else {
+                (&cb, &b)
+            };
+            let mut out = Vec::new();
+            decode_to_vec_mt(src, &mut out, 4, MAX_WINDOW).unwrap();
+            assert_eq!(out[..], expect[..], "round {round}");
+        }
+    }
+
+    /// A panic inside a stage-A worker must surface to the decode caller
+    /// (the poison payload resumes once every lease is waited out), and the
+    /// retired worker's slot must not stall the next decode: a fresh thread
+    /// serves it, byte-exact.
+    #[test]
+    fn stage_a_panic_surfaces_and_pool_recovers() {
+        let data = textish(8 * 1024 * 1024);
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let mut out = vec![0u8; data.len()];
+        super::STAGE_PANIC_INPUT.store(
+            compressed.as_ptr() as *mut u8,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        super::STAGE_PANIC_AT.store(3, core::sync::atomic::Ordering::Relaxed);
+        let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW);
+        }));
+        super::STAGE_PANIC_AT.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+        super::STAGE_PANIC_INPUT
+            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        let payload = blew.expect_err("the worker panic must surface");
+        let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
+            payload
+                .downcast_ref::<alloc::string::String>()
+                .map(|s| s.as_str())
+        });
+        assert_eq!(msg, Some("injected stage-A panic"));
+
+        out.iter_mut().for_each(|b| *b = 0);
+        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        assert_eq!(&out[..n], &data[..]);
+    }
+
+    /// The pool's parked threads retire when the pool drains, so a decode
+    /// leaves no threads outside the bounded idle window. Linux counts the
+    /// named workers through /proc, so other tests' threads never pollute
+    /// the count.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pool_threads_retire_after_decode() {
+        fn dec_pool_threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|e| {
+                    let path = e.unwrap().path();
+                    let comm = std::fs::read_to_string(format!("{}/comm", path.display())).ok()?;
+                    (comm.trim() == "zstdx-dec-pool").then_some(1)
+                })
+                .sum()
+        }
+        let data = textish(8 * 1024 * 1024);
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let mut out = vec![0u8; data.len()];
+        let n = decode_all_mt(&compressed, &mut out, 8, MAX_WINDOW).unwrap();
+        assert_eq!(&out[..n], &data[..]);
+        // The workers served the lease and parked back in the pool.
+        assert!(dec_pool_threads() > 0, "decode must lease pool threads");
+        // Draining retires every parked worker; each exits at the flag. A
+        // worker between lease-leave and repark misses the first drain, so
+        // re-drain while the count settles.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while dec_pool_threads() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parked pool threads must retire when drained"
+            );
+            super::super::mt_pool::retire_all_for_test();
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
