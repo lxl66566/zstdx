@@ -69,7 +69,7 @@ With 8 workers and 64 KiB pulls, streaming encode leads libzstd at every tier on
 
 ![Streaming decode speedup over libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/decode-speedup.svg)
 
-Streaming decode wins on incompressible data, by 1.2x to 1.3x on random and at parity on zeros. It trails on compressible shapes, where libzstd's edge is 1.04x to 1.32x, and the pull-size bands barely move from 4 KiB to 1 MiB reads. Bulk decode reads the same margins as streaming, and the 16-worker decoder reaches 1.20x libzstd's single-threaded streaming decode on json and 1.32x on dll100.
+Streaming decode runs at 0.89x to 1.03x libzstd's speed on compressible shapes: ahead on skewed level 9, within 4% on json and text at levels 3 and 9, and within 10% on dll100. It wins on incompressible data, by 1.2x to 1.3x on random and at parity on zeros, and the pull-size bands barely move from 4 KiB to 1 MiB reads. Bulk decode is at parity or ahead on json, text and skewed level 9, trails by 4% to 15% on dll100, and trails by 1.33x on skewed levels 1 and 19. The 16-worker decoder reaches 1.20x libzstd's single-threaded streaming decode on json and 1.32x on dll100.
 
 Across the full sweep of 5 shapes, 6 levels, both APIs and both threading modes, the geometric mean ratio is 8.7% denser than libzstd at matched numeric levels. Per-level tables for levels 1 to 22 are in [snapshot.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/matrix.md).
 

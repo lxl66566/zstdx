@@ -32,99 +32,39 @@ Parallel chunked xxh64 with a merge is impossible by construction. XXH64's spec 
 
 ## Fused loop structure
 
+The batch and pipeline entries below were measured on the batched-read loop that the libzstd-shaped loop replaced on 2026-11-02. They split decode from execution, which the new loop keeps fused like libzstd, so they stay closed until a decomposition of the new loop says otherwise.
+
+### Single pieces of libzstd's loop
+
+From 2026-09 to 2026-10, four pieces of libzstd's sequence loop were landed one at a time on the batched-read loop, and each was recorded as falsified. The unconditional literal copy16 cut skewed misses by 62% and cost text 9.3%. libzstd's `ZSTD_seqSymbol` field-per-load entry cut 15.1 instructions per sequence while IPC fell about 1:1. Register-resident repcodes read json -2% and skewed +8% to 11%. libzstd's wildcopy issue order shrank the copy half and grew the decode half by spills. Every piece re-rolled register allocation inside one saturated loop and lost to the text-stream placement gate.
+
+The whole structure, ported at once on 2026-11-02, won every dense shape by 14% to 51% with text ahead as well, as recorded in [dec-gap](../bench/dec-gap.md). The piece verdicts are withdrawn. A piece's loss inside a register-saturated loop says nothing about a structure that changes the live set as a whole.
+
 ### Batch processing split
 
 Splitting the fused loop into decode-batch and exec-batch dual loops, in 3 variants, lost 15 to 21%. The intermediate Vec round-trip is not the bottleneck. Batch buffering breaks LLVM register residency and loses the fused out-of-order overlap.
 
 ### Two-stage batch pipeline
 
-A two-stage batch pipeline with batch 16 and codegen fully on target gave cycles +9-15% and misses +14-30%. The interleaved decode and exec branch stream inside the fused loop carries the TAGE and BTB load, and splitting it into two pure streams destroys history correlation. The fused structure is a local optimum.
-
-### Streaming decode_step rework
-
-A structural rework of streaming `decode_step`, aimed at the json and skewed residue of 1.05-1.3x, hit the register wall. About 20 live values exceed the 15 GPRs, and the three batch reworks above are the structural attempts. There is no headroom unless the live values shrink first. The next order of magnitude needs an algorithm-level change, such as libzstd's 8-deep sequence ring-buffer pipeline, and its benefit and risk need assessment first.
+A two-stage batch pipeline with batch 16 and codegen fully on target gave cycles +9-15% and misses +14-30%. The interleaved decode and exec branch stream inside the fused loop carries the TAGE and BTB load, and splitting it into two pure streams destroys history correlation.
 
 ### Eight-deep sequence ring pipeline
 
-The idea was libzstd's `ZSTD_decompressSequencesLong` model, with decode-ahead into an in-memory ring, match-source prefetch through a decode-side output cursor, and offset resolution moved to decode time. Two variants were built, an 8-slot store-after-exec and a 16-slot store-first so no decoded value crosses the exec body. The results were json.zst3 1380 to 1105-1231, or -11 to -20%, skewed.zst3 -4 to -9%, text.zst3 -1 to -4%, dll100.zst19 1350 to 1162-1233, and dll100.zst9 1536 to 1366-1433. The prefetch alone lost 5% on every shape, including far-match W19 dll streams.
+The idea was libzstd's `ZSTD_decompressSequencesLong` model, with decode-ahead into an in-memory ring, match-source prefetch through a decode-side output cursor, and offset resolution moved to decode time. Two variants were built, an 8-slot store-after-exec and a 16-slot store-first so no decoded value crosses the exec body. The results were json.zst3 1380 to 1105-1231, or -11 to -20%, skewed.zst3 -4 to -9%, text.zst3 -1 to -4%, dll100.zst19 1350 to 1162-1233, and dll100.zst9 1536 to 1366-1433. The prefetch alone lost 5% on every shape, including far-match W19 dll streams. Zen4's hardware prefetchers and memory-level parallelism already hide the source-load latency, so two exact-address prefetches per sequence cost about 5% even 8 deep.
 
-The fused loop is throughput-bound and not latency-bound. Whole-decode IPC is 3.45 with a flat per-instruction cycle profile, nothing above about 3%, so the out-of-order engine already overlaps decode N+1 with exec N for free. The ring's added work converts about 1:1 into lost wall: three stack round-trips for the FSE states, the ring store and load, and the cursor add chain. Software prefetch of match sources hurts uniformly, because Zen4's hardware prefetchers and memory-level parallelism already hide the source-load latency, and 2 exact-address prefetches per sequence cost about 5% even 8 deep. Ring and prefetch structures on this loop are closed, and the residue is instruction-count attrition.
+### Wide decode body in the staging loops
 
-### Copy issue scheduling in the fused loop
-
-The idea was to port libzstd's `ZSTD_wildcopy` issue structure onto the existing wildcopy kernels without a new copy kernel. It used a head-first unconditional copy16 carrying the `ml <= 16` test, a 2x-unrolled tail landing on one exact final chunk inside the 16-byte overshoot budget, unlike libzstd's 32-byte WILDCOPY_OVERLENGTH, and it removed the statically dead `ml > 0` branch, since every ML code base is at least 3. Three builds were measured: the full landing schedule, head-peel only, and ml0-removal only.
-
-Against the pre-change baseline, gungraun stream Ir read full json +2.14%, text +0.79% and skewed +0.10%, peel json +0.24%, text -0.39% and skewed -0.30%, and ml0-only +0.28 to +0.43% on all three. The wall with the peel build under `dec-st` interleaving read json 1.263 to 1.277, 1.355 to 1.362 and 1.290 to 1.306, text 1.213 to 1.217, 1.066 to 1.077 and 1.045 to 1.054, and skewed 1.186 to 1.225 and 1.268 to 1.319. Text got worse even where Ir improved, because the spilled decode half costs more per instruction than the copies it displaced. The exec half shrank as designed, with json exec-file attribution -608K/-522K Ir, skewed -141K and text -98K, but the decode half of the same inlined loop grew +624 to +812K on every shape, through the `offset_hist` base pointer demoted to a per-sequence stack reload and an extra spill store.
-
-The fused loop is one register-allocation domain. Any exec-half shape change re-rolls allocation across the whole loop, and the saturated register budget returns the copy-side saving as decode-half spills at worse than 1:1. skewed.zst9, the 6M-sequence shape, loses 3-4% wall. Even the provably dead `ml > 0` branch removal nets +0.3-0.4% Ir. Copy issue scheduling is closed as a gap-closer. The copy structure is at parity with libzstd's, and the whole residue is the decode half's fixed cost under allocation fragility.
-
-### Unconditional ll above zero
-
-Making ll above zero unconditional, with a copy16 even at ll 0 and garbage overwritten, cut skewed misses by 62% but cost text 9.3%. The reordering effect of removing the branch itself hurts critical files through TAGE and BTB history.
-
-### Inlining the fast path
-
-Inlining the fast path into the fused loop cost json 1.2%. The hot-loop layout is disturbed, so new code goes into an existing out-of-line callee.
-
-### Instantiation slimming
-
-Instantiation slimming, by shrinking the `HEADROOM=false` build, has no mechanism to help. The streaming hot path only instantiates `HEADROOM=true`, and outlining error paths risks homing.
+The idea was one window read serving the add-bits and the transitions, shared between the flat executor and the staging pass that `SeqDecoder::next` drives. Three shapes were built: a two-phase split body, an out-pointer result with a cursor-derived last-sequence flag, and a loop-local state direct call. The staging-loop codegen showed mid-loop pushes rising from 0 to 11, stack traffic from 35 to 102 operations, and bzhi gone. json mt2 on pinned dedicated cores read 1786 to 1195, or -33%, and SMT siblings 1491 to 628, or -58%. The staging loops carry their own output cursor, so a six-widths-six-bases live set spills there, and `decode_step` keeps the two-read split body.
 
 ## Branching and state layout
-
-### Repcode registerization
-
-Repcode registerization with fully branchless parsing gave json -2% and misses -22% but skewed +8-11%. The register budget is saturated, and the 3 added live values necessarily evict hotter ones, so the branch-elimination gains stay below the spill cost.
-
-### Purely branchless repcode
-
-A purely branchless repcode, with a cmov chain and a `%3` fold pseudo-slot, regresses json by 5-6%. The repcode branch predicts well enough that removing branches is not a speedup. The final version uses 1 cmov on the parse side and a single branch on the update side.
 
 ### Three FSE states in one word
 
 Packing 3 FSE states into one u32 or u64 regresses. The pack and unpack land on the serial FSE chain and cost more than the spills they save.
 
-### Select-ifying the wrapped branch
+### Bit-container forms
 
-Select-ifying the wrapped branch left misses unmoved and cost json 2.9%. The branch is 74% taken and drifts with `pos`, and it already predicts well. Stub-attribute the branch before trying a select.
-
-### Read-side fold
-
-The idea was to carry the raw bit container and fold the reload's window rebuild into the read. The count becomes `bits >> (64 - consumed - n)`, and the reload becomes a pointer retreat plus a plain load, which removes the read-tail `win <<= n` and the reload's `bits << consumed`, or 2 variable shifts per sequence, exactly as designed. gungraun stream Ir read json -2.1%, text -1.9% and skewed -1.2%. Solo cycles read json.zst3 -1.8% at IPC 3.608 to 3.632, dll100.zst3 -1.1%, text.zst1 +1.4 to +1.8%, and text.zst3 +3.4%, reproduced twice. The dec-st stream xslow read json -1.4 to -2.2%, dll100 -0.8 to -1.6%, skewed.zst3/9 -3.1/-4.1%, text.zst1 +1.3 to +1.5%, and text.zst3/9/19 +3.0/+4.5/+5.0%, with the ours side at -1.6 to -4.8% and the zstd side flat within 0.3%.
-
-The fold moves the consumed offset off the window, where the pre-shift kept it off the read's count chain, and into the count, in series with `n`. Throughput-bound shapes at IPC 3.6 convert the uop cut into cycles, and the long-sequence text mix pays the longer serial count chain more than the removed shifts buy. The per-shape bar of text staying flat rejects the trade.
-
-### Folding consumed into ip
-
-The idea was a single bit cursor `u = N−57` replacing the `(ip, consumed)` pair. The reload degenerates to loading the container at `src + (u'>>3)`, the tail regime pins the head container, and cold paths run on a local pre-shifted window. Ir stayed flat, with json -0.1% and skewed +0.1%, because the removed retreat and mask operations return as the regime test and sar/cmov. Solo cycles read json -0.2%, dll100 +0.1%, text.zst1 +2.3% and text.zst3 +3.5%. The dec-st stream read json -0.3 to -0.5%, skewed.zst1 +2.6% while zst3/9/19 read -2.1 to -2.6%, and text +2.7 to +3.2%.
-
-One fewer live value and one fewer branch do not survive the re-roll. The raw-bits base's json win vanishes while the text loss persists at the same magnitude. Two independent source shapes losing about 3% text cycles at flat-or-better Ir isolate the mechanism to the count-carrying read itself, and not to allocation luck. The read-side fold family is closed against the per-shape bar.
-
-### Shared fused bit-read body
-
-The idea was one window read serving add-bits and transitions, shared between the flat executor and the staging pass. Three shapes were built: a two-phase split body, an out-pointer result with a cursor-derived last-sequence flag, and a loop-local state direct call. The staging-loop codegen showed mid-loop pushes rising from 0 to 11, stack traffic from 35 to 102 operations, and bzhi gone. json mt2 on pinned dedicated cores read 1786 to 1195, or -33%, and SMT siblings 1491 to 628, or -58%. Unpinned runs read -16 to -25% for every rework, while each rework beat the pre-fusion build on controlled dedicated-core placements by +4 to +12%. The ST flat executor itself improved +1.7-2.8% stream.
-
-The six-widths-six-bases live set fits only a caller without its own cursor state. The staging pass carries one, so every shared fused variant spills there. This was resolved on 2026-10-07 by stopping the sharing. `decode_step<const FUSED>` monomorphizes per call site, with the flat executor fused and the staging split, the staging symbols are instruction-identical to the pre-fusion build, and the ST gains are recovered with no MT exposure as recorded in [perf/decoding](../perf/decoding.md). The shared-body family stays falsified. The early-materialization sub-lever inside the fused body also lost standalone, at solo perf cycles +5-6% on json.zst3 with +0.3% Ir. Scheduling inside the fused loop is part of the optimization, and cycles are the metric when it is reshuffled.
-
-### Real-offset constant rotation
-
-The idea was a fast path in `do_offset_history` for `of > 3` that rotates `hist[2]=hist[1]; hist[1]=hist[0]; hist[0]=of-3` and leaves the repcode slot machinery untouched. It was motivated by a 2026-09-20 differential: libzstd pays 3 moves, while our select rotation ran on every real offset, costing +12 Ir per sequence at the 87-100% real-offset share of json, dll and skewed. Callgrind on json read the fused loop 737.6 to 700.7 M Ir, or -8.7 Ir per sequence and 174.1 to 165.4, with the whole decode at -3.8%. The wall A/B/B/A matrix read json.zst1/3/9/19 -1.0 to -1.8%, skewed.zst3 -1.3%, skewed.zst9 -3.5% and dll100.zst3 -0.4%, but text.zst3/9/19 read +2.8/+4.2/+5.0% on both B runs with more than 300 rounds each and mad of 0.001-0.002, a net loss across the cell set. Solo perf stat on text read instructions -1.0%, cycles +2.5%, and misses and L1d unchanged.
-
-The Ir cut is real, but the fused symbol's codegen re-roll taxes text reproducibly. On text the per-sequence budget is about 1% of the decode, with 57 K sequences at an average ml of 311, so +2.5-5% cannot be the loop's own instructions. It is non-loop code displaced by the relayout, through xxh64-absorb placement or copy-tail layout. Any machine-code change inside the fused symbol, even a strict Ir cut, must clear a text-stream A/B/B/A gate. The rotation was relanded on 2026-10-07: on the reworked codebase it re-rolled text-benign, with solo text.zst3 Ir -0.98% at flat cycles, dec-st text cells within 0.8% noise, json stream -1.1 to -1.6%, skewed.zst3/9 -2.4/-3.0%, dll100 +1 to +1.4%, and mt2/8 spot ahead as recorded in [perf/decoding](../perf/decoding.md). The tax is a per-roll placement lottery, not a property of the cut, and the mandatory text-stream gate arbitrates every roll.
-
-### Five-bit nb fields
-
-The idea was 5-bit nb fields in the packed FSE entry, using `& 0x1f` instead of `& 0xff` at extraction, since every storable nb is at most 31 and the six `and $0x3f` guards LLVM emits before the bzhi counts in the two split phases should die. Callgrind on json read the fused loop 737.6 to 749.4 M Ir, +1.6%, and the whole decode +1.2%. The change lost deterministically at the instruction level before any wall run, because the mask change re-rolled the loop's register allocation and the added spills outweigh the removed guards. This was a second same-day confirmation that source-level micro-cuts do not survive translation into this loop's codegen.
-
-### FSE entry layout swap
-
-The idea was libzstd's exact `ZSTD_seqSymbol` layout of `{u16 next_state, u8 nb_add_bits, u8 nb_bits, u32 base}`, so the loop's unpack becomes 12 single-field loads with no serial shift chain off 3 packed u64 loads, and slot addressing stays unchanged. Callgrind on json read the fused loop 737.6 to 673.8 M Ir, or -15.1 Ir per sequence and 174.1 to 159.0, with the whole decode at -6.8%. gungraun stream Ir read json -3.45%, text -3.37% and skewed -1.38%. Solo perf A/B/A/B under lock read instructions json -7.4%, skewed -4.8% and dll100 -6.0% at uniformly dropped IPC, json 3.61 to 3.35, skewed 3.77 to 3.63 and dll100 3.62 to 3.41, which gave cycles json -0.1%, skewed -1.4%, dll100 -0.4% and text.zst1/3 +0.45/+0.80%. The dec-st matrix A/B/B/A read text.zst1/3/9/19 stream +0.6/+2.0/+1.1/+2.2% on all four cells and both B runs, json.zst3.stream +1.0%, json bulk +1 to +3%, dll100 stream +0.1%, json zst1/9/19 stream -0.8 to -1.2%, and skewed stream -0.2 to -2.0%.
-
-The removed unpack uops were ALU-port filler that the out-of-order engine already hid behind the loop's serial and miss latency. The 15 fewer Ir per sequence buy about 0 cycles, because the 12 field loads consume issue and AGU bandwidth and a second loop-carried pointer makes the table base reload twice per sequence in this codegen. IPC falls about 1:1 with the instruction cut on every shape. The loop is issue and latency saturated, not uop-count saturated. On text the same machine-code change additionally re-rolls the placement tax. The text gate failed and the primary dense cell, json.zst3, regressed, so the change is judged negative despite the largest single-loop Ir cut measured here.
-
-### FSE entry layout swap, two-u32 variant
-
-A 2xu32 field-group variant, with `{u32 [nb_add | nb_bits<<8 | next<<16], u32 base}`, 6 loads, one mask between the load and the read-count sum, and a direct base load, read the fused loop at 737.6 to 756.9 M Ir on json, +2.6% at about 178.6 Ir per sequence. gungraun stream Ir read json +0.28% and skewed +1.11%, and the change lost deterministically before any wall run. Halving the load count re-introduces transition-extraction shifts, and the allocation re-roll spills the value bases back to the stack, visible as the `0x78/0x88/0x90/0xe0` store cluster, so Ir rises. The entry-layout family is closed. The packed u64 with in-loop unpack is locally optimal on this machine, and with this result dies the offset-history fold's only possible partner for a bundle of 5% or more.
+Two forms were measured on the batched-read loop. Carrying the raw container, so the read count folds the consumed offset and the reload is a pointer retreat plus a plain load, cut json instructions 2.1% and won json, dll and skewed by 1% to 4%, but lost text 3% to 5% wall reproducibly. A single bit cursor `u = N−57` replacing the `(ip, consumed)` pair read flat instructions and lost text about 3%. The raw-container form is libzstd's own reader, so on the libzstd-shaped loop the premise changed and the form is reopenable.
 
 ## Copy and hash kernels
 
@@ -148,7 +88,7 @@ An AVX-512 vpmullq vector core for xxhash came out worse. The vpmullq latency of
 
 The long-match wide-copy kernels were re-evaluated under the long-match premise from [dec-gap](../bench/dec-gap.md). The earlier AVX2 copy32 and copy-loop pairing rows used json premises, and the new premise is text.zst3's 151 average 112 KB tile matches at offsets 256K-2M, which are 94% of match bytes. The candidates were libzstd's first-16-peel plus 2x16B per iteration overshoot schedule, 2x16B per iteration and 4x16B per iteration exact-backward-tail, AVX2 256-bit chunks, AVX-512 512-bit chunks, libc memcpy per match, and NT streaming stores at 16, 32 and 64 B with aligned peel. The kernels were replayed on the recorded executed-match trace over a frame-sized buffer, one kernel per process, in 4 interleaved rounds measured in ps/B over the offset-at-least-32 domain. The current 16B loop read 23.0, the libzstd schedule 22.2, or -3.5% copy-only and about -0.8% decode, the exact-tail variants 30.2-30.5, AVX2 48.3, AVX-512 32.0, memcpy 27.7, and NT 157-162, about 7x, where movntdq also needs a 16B-aligned destination and faults when unaligned. In situ the loop holds IPC 3.57 at about 10 B/cycle, the per-core L3 ceiling for the 2.3 MiB streaming window, while the issue ceiling would be about 21 B/cycle.
 
-The long-match copy loop is bandwidth-bound at its ceiling, not latency or issue bound. No kernel converts into decode time, and the one schedule that wins on copy time alone stays below the documented fused-symbol re-roll tax of +3-5% on text-stream. The copy-tail family stays closed under the new premise. Text's unchecked gap of x1.15 belongs to the dense shapes' instruction-volume family described in [dec-gap](../bench/dec-gap.md).
+The long-match copy loop is bandwidth-bound at its ceiling, not latency or issue bound. No kernel converts into decode time, and the copy-tail family stays closed under the long-match premise.
 
 ## Table builds and entropy
 
@@ -182,10 +122,10 @@ Decode is insensitive to dispersity, not merely unexposed. The flat path's outpu
 
 ### AVX2 constant threaded dispatch
 
-AVX2 constant threaded dispatch with 8 instantiations is feasible but regresses. The nested `target_feature` pattern works, and the codegen risk is high. It stays on the intermediate-tier todo.
+AVX2 constant threaded dispatch with 8 instantiations is feasible but regresses. The nested `target_feature` pattern works, and the codegen risk is high.
 
 ### AVX2 intermediate tier for decode dispatch
 
-The idea was an AVX2 intermediate tier for the three BMI2 gates: the fused flat executor, the two-pass sequence decode, and the MT segment decode. The premise was that mid-tier AVX2-only CPUs fall to scalar and lose the decode lead. Forced-scalar against BMI2 on Zen4, same binary, position-balanced over 8 rounds through `ZSTDX_DEC_SIMD_TIER`, read json.zst3/19 -6.7/-7.3%, dll100.zst3/9 -5.6/-6.3% and skewed.zst3 -3.9% stream wall, while text.zst3/19 read -1.9/-1.3% and skewed.zst19 -0.4% because the copy-bound cells are flat. Perf stat on json.zst3 read scalar +18.0% instructions at IPC 3.83 against 3.49, or +7.4% cycles, and the gap is pure variable-shift instruction volume. The bmi2 instantiations emit shlx, shrx and bzhi only, with 32/36/32 sites in the fused symbol and zero pdep or pext, so they are Zen1 and Zen2 microcode-safe. The default-path canary of base against override build read plus or minus 0.0-0.7%, with no codegen interference.
+The idea was an AVX2 intermediate tier for the three BMI2 gates: the flat executor, the two-pass sequence decode, and the MT segment decode. The premise was that mid-tier AVX2-only CPUs fall to scalar and lose the decode lead. Forced-scalar against BMI2 on Zen4, same binary, position-balanced over 8 rounds through `ZSTDX_DEC_SIMD_TIER`, read json.zst3/19 -6.7/-7.3%, dll100.zst3/9 -5.6/-6.3% and skewed.zst3 -3.9% stream wall, while text.zst3/19 read -1.9/-1.3% and skewed.zst19 -0.4% because the copy-bound cells are flat. Perf stat on json.zst3 read scalar +18.0% instructions at IPC 3.83 against 3.49, or +7.4% cycles, and the gap is pure variable-shift instruction volume. The bmi2 instantiations emit shlx, shrx and bzhi only, with zero pdep or pext, so they are Zen1 and Zen2 microcode-safe. The default-path canary of base against override build read plus or minus 0.0-0.7%, with no codegen interference.
 
 No such CPU exists. The decode wide gate is BMI2, and AVX2 and BMI2 shipped in the same silicon generations, Haswell in 2013 and Zen in 2017. No later x86 part separates them, and Intel's AVX-cut Celeron and Pentium lines drop AVX2 as well. Every AVX2-capable machine already runs the BMI2 tier, and the scalar fallback population of pre-Haswell and pre-Zen parts has no AVX2 to exploit. AVX2 also has no scalar variable-shift instruction, and batching through vpsrlvq and vpsllvq is the falsified batch and packing class above. Even a synthetic AVX2-without-BMI2 CPUID from QEMU surgery has nothing to select. The decode lead on mid-tier CPUs is protected by the existing BMI2 tier, and wide-copy AVX2 kernels for the decode copies were falsified separately. Tiers are forceable through `ZSTDX_DEC_SIMD_TIER=scalar|bmi2`, where unset means detect and an invalid value panics, and the files, mtcheck and corrupt gates pass under both forced tiers.

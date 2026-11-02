@@ -132,7 +132,7 @@ A raw dictionary is a virtual generation-0 prefix that expires at the first wrap
 
 ### Folded bases and virtual addresses
 
-Passing the generation floor as a live value rolled the fused executor's register allocation by 2% Ir, so the floor was folded into the pre-computed `vbase_op`. One helper still reconstructed `virt_base` as `vbase_op + out_base`, which after the folding equals `virt_base - prev_origin`. From the second wrap on, every previous-generation address was shifted, producing wrong bytes, a bogus `OffsetTooBig`, or a debug underflow, with four different test failures from one root cause.
+The flat executor folds the generation floor into its per-block bases, `folded_base = virt_base - prev_origin` and `virtual_start` derived from it, so the floor never rides the loop as a live value. One helper once reconstructed `virt_base` from the folded base without un-folding, which equals `virt_base - prev_origin`. From the second wrap on, every previous-generation address was shifted, producing wrong bytes, a bogus `OffsetTooBig`, or a debug underflow, with four different test failures from one root cause.
 
 When a base carries a folded term, every consumer that rebuilds an address from it must un-fold through the same view. Structural values such as the 5-word `FlatView` never enter the fused loop by value, and per-block scalars are derived in the prologue instead.
 
@@ -210,15 +210,13 @@ For cycle-level A/B on text-class cells, only back-to-back runs inside one scrip
 
 A strict cut of 8.7 Ir per sequence from the real-offset rotation fold cost text.zst3, text.zst9 and text.zst19 2.8%, 4.2% and 5.0% reproducibly while winning json and skewed. On text the per-sequence budget is about 1% of the decode, so the source is displaced non-loop code such as the xxh64-absorb and copy-tail layout.
 
-Gate every fused-loop change on a text-stream cell, not only on the shape it targets, and expect the tax to dwarf cuts below 10 Ir per sequence.
+Gate every fused-loop change on a text-stream cell, not only on the shape it targets, and expect the tax to dwarf cuts below 10 Ir per sequence. A placement draw can reject a piece, never a structure, as the next entry records.
 
-### Removed uops become lost IPC
+### Piece verdicts inside a saturated loop
 
-Swapping the packed FSE entry for libzstd's per-field layout removed 15 Ir per sequence, which was 8.6% of loop Ir and the largest cut measured in this loop, and bought 0.1% cycles on json. IPC fell from 3.61 to 3.35 while instructions fell 7.4%, uniformly across shapes, with branch-miss and L1d profiles unchanged.
+On the batched-read loop, swapping the packed FSE entry for libzstd's per-field layout removed 15 Ir per sequence and bought 0.1% cycles on json, with IPC falling from 3.61 to 3.35. The unconditional literal copy and register-resident repcodes lost the same way. Each change re-rolled register allocation across one saturated loop, so the A/B measured the re-roll rather than the change. The same three pieces are part of the libzstd-shaped loop that won 14% to 51% on 2026-11-02.
 
-The loop is issue and latency saturated, so ALU uops that look removable are already hidden behind the serial state to load to read chain. Replacing 3 wide loads with 12 narrow ones consumes issue and AGU bandwidth and adds a second loop-carried table pointer. Instruction-count attribution alone over-values a lever that only shaves parallel uops.
-
-A candidate must shorten the serial chain or the issue structure, and solo cycles are the first gate, ahead of Ir.
+When a reference loop is far ahead, first build the reference with our compiler backend to confirm the gap is structure, then port the structure whole and measure that. See [dec-gap](../bench/dec-gap.md).
 
 ### AMD annotate percentages
 

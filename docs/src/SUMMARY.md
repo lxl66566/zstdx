@@ -19,7 +19,7 @@
 - [Performance snapshot](dev/bench/snapshot.md)
 - [Bench matrix](dev/bench/matrix.md)
 - [Benchmark methodology](dev/bench/methodology.md)
-- [Decode stream gap against libzstd](dev/bench/dec-gap.md)
+- [Decode gap against libzstd](dev/bench/dec-gap.md)
 - [Encode dll100 gap against libzstd](dev/bench/enc-dll-gap.md)
 
 ## Upstream Comparison

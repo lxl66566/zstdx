@@ -37,7 +37,7 @@ Throughput is MiB/s of raw data for bulk and streaming decode with 64 KiB pulls.
 | dll100.zst9 | 1573 | 2135 | 1.36 | 1596 | 2077 | 1.30 |
 | dll100.zst19 | 1362 | 1830 | 1.34 | 1391 | 1800 | 1.29 |
 
-The bulk and stream columns keep their agreement: every compressible shape reads x1.05 to 1.38 on both paths, with json.zst3 at bulk 1.38 against stream 1.32, text.zst3 bulk at 1.00 and dll100.zst3 bulk at 1.38. Text bulk sits at parity with 0.98 to 1.08, random wins both paths at 0.99 bulk and 0.81 stream, and zeros reads 0.92 bulk against 1.00 stream. The stream cells read level with the R86 pass, with json 1.17 to 1.32 against its 1.17 to 1.31 and dll 1.26 to 1.32 against its 1.25 to 1.32. The residual gap on both paths is the fused decode loop's op volume, measured in [dec-gap](dec-gap.md) and [mzstd-dec](../review/mzstd-dec.md).
+Every compressible shape reads x1.05 to 1.38 on both paths in this pass, which predates the libzstd-shaped sequence loop of 2026-11-02. The post-loop cells are in [dec-gap](dec-gap.md).
 
 ## Decode multi-thread scaling
 
