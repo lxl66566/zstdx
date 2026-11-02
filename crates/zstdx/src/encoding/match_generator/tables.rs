@@ -368,7 +368,53 @@ pub(super) fn unpack_pos(entry: u32, pos: u64) -> Option<u64> {
     Some(cand)
 }
 
-/// Chain-walk search from the hash head `entry` at window index `idx`,
+/// A scan position in the window's two coordinate forms at once: the
+/// absolute position and the window base it indexes against. The chain and
+/// row searches take their scan position as this type, so the window-index
+/// form exists only as a derivation off one constructor — an `idx`/
+/// `win_base` pair that drifted apart at a call site cannot reach a search
+/// body (the raw pair crossed the helper boundary before, with the
+/// `abs = win_base + idx` relation implicit).
+///
+/// The search bodies destructure to raw locals right at entry and keep them
+/// raw through the loops: typing the walk's own locals re-rolled its
+/// register allocation (the PackedPos lesson).
+#[derive(Clone, Copy)]
+pub(super) struct WinPos {
+    base: u64,
+    abs: u64,
+}
+
+impl WinPos {
+    /// The position `abs` inside the window based at `base`. The scan bars
+    /// hold `abs >= base` (the cursor only grows from the window floor),
+    /// which every derived form relies on.
+    #[inline(always)]
+    pub(super) fn new(base: u64, abs: u64) -> Self {
+        debug_assert!(abs >= base);
+        Self { base, abs }
+    }
+
+    /// The absolute form.
+    #[inline(always)]
+    pub(super) fn abs(self) -> u64 {
+        self.abs
+    }
+
+    /// The window base (the index form's zero point).
+    #[inline(always)]
+    pub(super) fn base(self) -> u64 {
+        self.base
+    }
+
+    /// The window-index form: how deep `abs` sits into the window.
+    #[inline(always)]
+    pub(super) fn idx(self) -> usize {
+        (self.abs - self.base) as usize
+    }
+}
+
+/// Chain-walk search from the hash head `entry` at the scan position `pos`,
 /// returning the longest match's (length, candidate window index) —
 /// `(0, usize::MAX)` when nothing matched. Every candidate is beat-checked,
 /// so stale chain links (see the sparse fill in rep1_chain) only cost probes,
@@ -387,16 +433,19 @@ pub(super) fn unpack_pos(entry: u32, pos: u64) -> Option<u64> {
 pub(super) fn chain_search(
     win: &[u8],
     links: TableHandle,
-    idx: usize,
+    pos: WinPos,
     entry: u32,
-    win_base: u64,
     block_end: u64,
     search_depth: usize,
     max_window: u64,
     origin: u64,
     ramp: RampGate,
 ) -> (usize, usize) {
-    let pos_abs = win_base + idx as u64;
+    // The typed crossing ends here: the walk's own arithmetic stays on the
+    // raw locals below (the type's doc).
+    let idx = pos.idx();
+    let pos_abs = pos.abs();
+    let win_base = pos.base();
     // Oldest usable candidate age: within the level window and inside the
     // live window buffer, folded into one distance compare (below) — the
     // same resolve form as the fast loop's.
@@ -553,7 +602,9 @@ pub(in crate::encoding) fn push_seq_packed(
     // copy is skipped outright.
     let lits = &win[anchor_idx..start];
     if ll == 0 {
-        do_offset_history(of_value, 0, rep);
+        // The emit path only needs the history update; the resolved
+        // offset is the decoder's business.
+        let _ = do_offset_history(of_value, 0, rep);
         seqs.push(pack_seq(0, match_len as u32, of_value));
         return (0, start + match_len);
     }
@@ -576,7 +627,7 @@ pub(in crate::encoding) fn push_seq_packed(
     } else {
         literals.extend_from_slice(lits);
     }
-    do_offset_history(of_value, ll, rep);
+    let _ = do_offset_history(of_value, ll, rep);
     seqs.push(pack_seq(ll, match_len as u32, of_value));
     (ll, start + match_len)
 }

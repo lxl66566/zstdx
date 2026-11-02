@@ -98,20 +98,19 @@ impl MatchGeneratorDriver {
         let mut ldm_i = 0usize;
         let mut ldm_won = false;
 
-        // Chain-walk search from the hash head `entry` at window index `idx`,
+        // Chain-walk search from the hash head `entry` at the scan position,
         // returning the longest match's (length, candidate window index):
         // the module-level [`chain_search`], inlined here and in the lazy
         // walk below. The head entry is computed once by the caller (the
         // insert block links the same value — see there). `bound` is the
         // current segment end — the block end, or the next candidate's
         // split.
-        let search = |win: &[u8], idx: usize, entry: u32, bound: u64| -> (usize, usize) {
+        let search = |win: &[u8], pos: WinPos, entry: u32, bound: u64| -> (usize, usize) {
             chain_search(
                 win,
                 links,
-                idx,
+                pos,
                 entry,
-                win_base,
                 bound,
                 search_depth,
                 max_window,
@@ -182,7 +181,8 @@ impl MatchGeneratorDriver {
                 pre1.0 = hash_at_width(win, idx + 1, hash_log, width);
                 pre1.1 = heads.get(pre1.0);
             }
-            let (mut best_len, mut best_cand) = search(win, idx, entry, end);
+            let (mut best_len, mut best_cand) =
+                search(win, WinPos::new(win_base, pos), entry, end);
             // Gap bound (C's per-gap compressor call counts to the gap
             // end): a chain candidate's forward run stops at the split —
             // the wholesale emission owns the bytes from there.
@@ -437,7 +437,7 @@ impl MatchGeneratorDriver {
                         }
                         // Chain search at the stepped position, on the
                         // pipelined hash+head read above.
-                        let (len2, cand2) = search(win, idx2, entry2, end);
+                        let (len2, cand2) = search(win, WinPos::new(win_base, p2), entry2, end);
                         let mut len2 = len2;
                         if $ldm {
                             len2 = len2.min((end - p2) as usize);

@@ -224,11 +224,13 @@ fn validate_piece(segs: &[Arc<DecodedSegment>], piece: &Piece) -> Option<usize> 
                     for seq in &seg.sequences[seqs.clone()] {
                         pos += seq.ll as usize;
                         lits_used += seq.ll as usize;
-                        let off = do_offset_history(seq.of, seq.ll, &mut hist);
-                        if off == 0 || off as usize > pos {
+                        let Some(off) = do_offset_history(seq.of, seq.ll, &mut hist) else {
+                            return None;
+                        };
+                        if off.get() as usize > pos {
                             return None;
                         }
-                        let src = pos - off as usize;
+                        let src = pos - off.get() as usize;
                         if src < piece.start {
                             max_top = max_top.max((src + seq.ml as usize + 16).min(piece.start));
                         }

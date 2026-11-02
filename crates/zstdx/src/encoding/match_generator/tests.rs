@@ -161,7 +161,7 @@ fn match_and_reconstruct_collecting_offsets(data: &[u8], offsets: &mut Vec<usize
                     literals.len() as u32,
                     &mut rep,
                 );
-                let start = reconstructed.len() - actual as usize;
+                let start = reconstructed.len() - actual.unwrap().get() as usize;
                 for i in 0..match_len {
                     let b = reconstructed[start + i];
                     reconstructed.push(b);
@@ -197,7 +197,7 @@ fn match_and_reconstruct(data: &[u8], block_size: usize) -> Vec<u8> {
                     &mut rep,
                 );
                 // Matches may overlap their own output (offset < match_len).
-                let start = reconstructed.len() - actual as usize;
+                let start = reconstructed.len() - actual.unwrap().get() as usize;
                 for i in 0..match_len {
                     let b = reconstructed[start + i];
                     reconstructed.push(b);
@@ -447,7 +447,7 @@ fn ldm_high_rows_cover_beyond_tree_domain() {
                         literals.len() as u32,
                         &mut rep,
                     );
-                    let start = reconstructed.len() - actual as usize;
+                    let start = reconstructed.len() - actual.unwrap().get() as usize;
                     for i in 0..match_len {
                         let b = reconstructed[start + i];
                         reconstructed.push(b);
@@ -497,7 +497,7 @@ fn opt_levels_reconstruct() {
                         literals.len() as u32,
                         &mut rep,
                     );
-                    let start = reconstructed.len() - actual as usize;
+                    let start = reconstructed.len() - actual.unwrap().get() as usize;
                     for i in 0..match_len {
                         let b = reconstructed[start + i];
                         reconstructed.push(b);
@@ -875,7 +875,7 @@ fn stale_entries_survive_frame_reset() {
                             literals.len() as u32,
                             &mut rep,
                         );
-                        let start = reconstructed.len() - actual as usize;
+                        let start = reconstructed.len() - actual.unwrap().get() as usize;
                         for i in 0..match_len {
                             let b = reconstructed[start + i];
                             reconstructed.push(b);
@@ -1048,7 +1048,7 @@ fn ultra_job_boundary_reconstructs() {
                     literals.len() as u32,
                     &mut rep,
                 );
-                let from = reconstructed.len() - actual as usize;
+                let from = reconstructed.len() - actual.unwrap().get() as usize;
                 for i in 0..match_len {
                     let b = reconstructed[from + i];
                     reconstructed.push(b);
@@ -1110,7 +1110,7 @@ fn dubt_head_roundtrips() {
                             literals.len() as u32,
                             &mut rep,
                         );
-                        let from = reconstructed.len() - actual as usize;
+                        let from = reconstructed.len() - actual.unwrap().get() as usize;
                         for i in 0..match_len {
                             let b = reconstructed[from + i];
                             reconstructed.push(b);
@@ -1201,7 +1201,7 @@ fn dubt_head_hands_off_across_gated_block() {
                     literals.len() as u32,
                     &mut rep,
                 );
-                let from = reconstructed.len() - actual as usize;
+                let from = reconstructed.len() - actual.unwrap().get() as usize;
                 for i in 0..match_len {
                     let b = reconstructed[from + i];
                     reconstructed.push(b);
@@ -1402,7 +1402,7 @@ fn balanced_row_substitutes_wide_heads() {
                 literals.len() as u32,
                 &mut rep,
             );
-            let from = reconstructed.len() - actual as usize;
+            let from = reconstructed.len() - actual.unwrap().get() as usize;
             for i in 0..match_len {
                 let b = reconstructed[from + i];
                 reconstructed.push(b);
@@ -1550,7 +1550,7 @@ fn row_attempts_verdict_tracks_head_alphabet() {
                     literals.len() as u32,
                     &mut rep,
                 );
-                let from = reconstructed.len() - actual as usize;
+                let from = reconstructed.len() - actual.unwrap().get() as usize;
                 for i in 0..match_len {
                     let b = reconstructed[from + i];
                     reconstructed.push(b);
@@ -1644,7 +1644,7 @@ fn dense_geometry_rides_the_covered_bar() {
                         literals.len() as u32,
                         &mut rep,
                     );
-                    let start = reconstructed.len() - actual as usize;
+                    let start = reconstructed.len() - actual.unwrap().get() as usize;
                     for j in 0..match_len {
                         let b = reconstructed[start + j];
                         reconstructed.push(b);

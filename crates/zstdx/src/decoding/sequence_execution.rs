@@ -1,3 +1,5 @@
+use core::num::NonZero;
+
 use super::scratch::DecoderScratch;
 use crate::decoding::errors::ExecuteSequencesError;
 
@@ -73,12 +75,14 @@ pub fn execute_sequences(
             buffer.push_pre_reserved(literals, budget);
         }
 
-        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
-        if actual_offset == 0 {
+        // The resolution owns the zero-offset boundary: a wire value past
+        // the +3 bias resolves provably nonzero, and a repcode resolving to
+        // zero is the malformed-history bug class rejected here.
+        let Some(actual_offset) = do_offset_history(seq.of, seq.ll, offset_hist) else {
             return Err(ExecuteSequencesError::ZeroOffset);
-        }
+        };
         if seq.ml > 0 {
-            buffer.repeat_pre_reserved(actual_offset as usize, seq.ml as usize, budget)?;
+            buffer.repeat_pre_reserved(actual_offset.get() as usize, seq.ml as usize, budget)?;
         }
 
         seq_sum += seq.ml;
@@ -869,7 +873,10 @@ fn copy_wrapped_match(
 
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are
-/// needed before you get a functional number.
+/// needed before you get a functional number. The return is `None` exactly when the resolution
+/// lands on offset 0 (a malformed dictionary seeding the history), which every caller rejects;
+/// every other resolution is nonzero by construction, so the `NonZero` type carries that past
+/// the boundary.
 ///
 /// Real offsets (`offset_value > 3`, the 87-100% share on json/dll/skewed)
 /// take a constant 3-move rotation and return immediately (R38): they need
@@ -887,7 +894,11 @@ fn copy_wrapped_match(
 /// the largest branch-miss clusters of the fused decode loop before the
 /// select rewrite. The slot load stays in bounds by masking the (garbage)
 /// index, whose loaded value the selects then discard.
-pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+pub(crate) fn do_offset_history(
+    offset_value: u32,
+    lit_len: u32,
+    scratch: &mut [u32; 3],
+) -> Option<NonZero<u32>> {
     // Real offsets (the 87-100% share on json/dll/skewed) need no slot
     // machinery: a constant 3-move rotation, off the select chain the
     // repcode domain keeps.
@@ -896,7 +907,9 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
         scratch[2] = scratch[1];
         scratch[1] = scratch[0];
         scratch[0] = actual;
-        return actual;
+        debug_assert!(actual != 0);
+        // SAFETY: offset_value > 3 proves actual = offset_value - 3 >= 1.
+        return Some(unsafe { NonZero::new_unchecked(actual) });
     }
     let idx = offset_value
         .wrapping_sub(1)
@@ -940,11 +953,13 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
         actual_offset
     };
 
-    actual_offset
+    NonZero::new(actual_offset)
 }
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZero;
+
     use super::do_offset_history;
 
     #[test]
@@ -955,7 +970,7 @@ mod tests {
         // 0, which the caller rejects as ExecuteSequencesError::ZeroOffset rather
         // than panicking (debug) or wrapping to u32::MAX (release). See #115.
         let mut scratch = [0u32, 4, 8];
-        assert_eq!(do_offset_history(3, 0, &mut scratch), 0);
+        assert_eq!(do_offset_history(3, 0, &mut scratch), None);
     }
 
     /// Reference: the spec's offset-code table, as the match-tree
@@ -997,7 +1012,12 @@ mod tests {
                     let mut b = a;
                     let ra = do_offset_history(of, ll, &mut a);
                     let rb = reference(of, ll, &mut b);
-                    assert_eq!((ra, a), (rb, b), "of={of} ll={ll} seed={seed}");
+                    // The reference's plain-u32 form maps 0 onto `None`.
+                    assert_eq!(
+                        (ra, a),
+                        (NonZero::new(rb), b),
+                        "of={of} ll={ll} seed={seed}"
+                    );
                 }
             }
         }
@@ -1007,7 +1027,7 @@ mod tests {
             let mut b = a;
             assert_eq!(
                 do_offset_history(of, 0, &mut a),
-                reference(of, 0, &mut b),
+                NonZero::new(reference(of, 0, &mut b)),
                 "of={of}"
             );
             assert_eq!(a, b, "of={of}");

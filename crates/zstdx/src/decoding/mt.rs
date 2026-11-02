@@ -39,6 +39,7 @@
 
 use alloc::vec::Vec;
 use core::{
+    num::NonZero,
     ops::Range,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -825,14 +826,21 @@ pub(super) unsafe fn execute_blocks(
                     // Offset resolution in libzstd's decode order: wire
                     // values above 3 are real offsets carrying the +3
                     // repcode bias, 1..=3 are repcode selectors (the mapping
-                    // `do_offset_history` pins for its own callers).
+                    // `do_offset_history` pins for its own callers). The
+                    // resolution owns the zero-offset boundary: wire values
+                    // past the bias are provably nonzero, a repcode
+                    // resolving to zero is the malformed-history bug class
+                    // rejected right here, and the copy arithmetic below
+                    // takes the offset as NonZero.
                     let of = seq.of as usize;
-                    let offset = if of > 3 {
+                    let resolved = if of > 3 {
                         let actual = of - 3;
                         rep2 = rep1;
                         rep1 = rep0;
                         rep0 = actual;
-                        actual
+                        debug_assert!(actual != 0);
+                        // SAFETY: of > 3 proves actual = of - 3 >= 1.
+                        Some(unsafe { NonZero::<usize>::new_unchecked(actual) })
                     } else if of == 1 {
                         // Code 0: rep0, or rep1 when the sequence carries
                         // no literals.
@@ -848,7 +856,7 @@ pub(super) unsafe fn execute_blocks(
                             rep1
                         };
                         rep0 = temp;
-                        temp
+                        NonZero::new(temp)
                     } else {
                         // Codes 1 (wire 2..3): the low bit extends the
                         // selector to rep1, rep2 or the rep0-1 pseudo slot.
@@ -867,11 +875,11 @@ pub(super) unsafe fn execute_blocks(
                         }
                         rep1 = rep0;
                         rep0 = temp;
-                        temp
+                        NonZero::new(temp)
                     };
-                    if offset == 0 {
+                    let Some(offset) = resolved else {
                         return Err(exec_err(ExecuteSequencesError::ZeroOffset));
-                    }
+                    };
                     let o_lit_end = op + ll;
                     let o_match_end = o_lit_end + ml;
                     let i_lit_end = lit + ll;
@@ -908,10 +916,10 @@ pub(super) unsafe fn execute_blocks(
                     // Whole-frame history, one-shot semantics — but the
                     // frame's own output only: a concatenated stream's
                     // frames never share history.
-                    if offset > o_lit_end - frame_base {
+                    if offset.get() > o_lit_end - frame_base {
                         return Err(exec_err(ExecuteSequencesError::DecodebufferError(
                             crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                                offset,
+                                offset: offset.get(),
                                 buf_len: o_lit_end - frame_base,
                             },
                         )));
@@ -923,7 +931,7 @@ pub(super) unsafe fn execute_blocks(
                     // sub-16-offset path's 8-byte writes stay inside it.
                     unsafe {
                         let dst = base.add(o_lit_end);
-                        wildcopy_match(dst, dst.sub(offset), ml);
+                        wildcopy_match(dst, dst.sub(offset.get()), ml);
                     }
                     op = o_match_end;
                 }
@@ -950,7 +958,8 @@ pub(super) unsafe fn execute_blocks(
 /// Slow path for staged sequences near the wildcopy limit or past their
 /// literals: exact copies with the bounds re-checked in the staged
 /// executor's order (the ST loop's `exec_sequence_end` shape). The offset
-/// arrives resolved and nonzero (the hot loop checked both).
+/// arrives resolved; the `NonZero` type is the hot loop's zero check
+/// carried into the signature.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -959,7 +968,7 @@ unsafe fn exec_staged_end(
     op: usize,
     ll: usize,
     ml: usize,
-    offset: usize,
+    offset: NonZero<usize>,
     lit: &mut usize,
     lit_base: usize,
     lit_end: usize,
@@ -980,10 +989,10 @@ unsafe fn exec_staged_end(
     // SAFETY: both ranges were bounds-checked above
     unsafe { core::ptr::copy_nonoverlapping(*lit as *const u8, base.add(op), ll) };
     *lit += ll;
-    if offset > o_lit_end - frame_base {
+    if offset.get() > o_lit_end - frame_base {
         return Err(ExecuteSequencesError::DecodebufferError(
             crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                offset,
+                offset: offset.get(),
                 buf_len: o_lit_end - frame_base,
             },
         ));
@@ -993,10 +1002,10 @@ unsafe fn exec_staged_end(
     // source keep reads behind the write cursor.
     unsafe {
         let dst = base.add(o_lit_end);
-        let src = dst.sub(offset);
+        let src = dst.sub(offset.get());
         let mut copied = 0;
         while copied < ml {
-            let chunk = (offset + copied).min(ml - copied);
+            let chunk = (offset.get() + copied).min(ml - copied);
             core::ptr::copy(src, dst.add(copied), chunk);
             copied += chunk;
         }
@@ -2096,6 +2105,129 @@ mod tests {
             super::super::mt_pool::retire_all_for_test();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// The staged executor's inline offset selector against
+    /// `do_offset_history`: both implement the one offset-code spec table
+    /// in two shapes, and the inline shape was pinned only end-to-end
+    /// before (the sequence-loop review recorded the gap). Each case runs
+    /// one segment through `execute_blocks` and against a reference that
+    /// resolves every sequence through `do_offset_history`, over the full
+    /// repcode grid (wire 1..=3 at both ll0 flags), real offsets past the
+    /// +3 bias, and a zero-seeded history whose slots must error or
+    /// resolve per the saturation rule.
+    #[test]
+    fn staged_selector_matches_offset_history() {
+        use super::{BlockPlan, DecodedSegment, OutRegion, execute_blocks};
+        use crate::{
+            blocks::sequence_section::Sequence, decoding::sequence_execution::do_offset_history,
+        };
+
+        fn run_case(seed: [u32; 3], seqs: &[(u32, u32, u32)], lit_len: usize) {
+            // Distinct literal bytes make every match copy's source
+            // window identify the offset it read.
+            let alphabet: Vec<u8> = (0..48u8).map(|b| b + 1).collect();
+            // Expected bytes and history from the reference resolution;
+            // the match is the semantic overlapping repeat at the
+            // resolved offset.
+            let mut ref_hist = seed;
+            let mut expect: Vec<u8> = Vec::new();
+            let mut expect_err = false;
+            let mut lit = 0usize;
+            for &(ll, ml, of) in seqs {
+                expect.extend_from_slice(&alphabet[lit..lit + ll as usize]);
+                lit += ll as usize;
+                let o_lit_end = expect.len();
+                match do_offset_history(of, ll, &mut ref_hist) {
+                    Some(r) => {
+                        let r = r.get() as usize;
+                        assert!(
+                            r <= o_lit_end,
+                            "case must keep sources inside the frame: r={r} end={o_lit_end}"
+                        );
+                        for _ in 0..ml {
+                            let b = expect[expect.len() - r];
+                            expect.push(b);
+                        }
+                    },
+                    None => {
+                        expect_err = true;
+                        break;
+                    },
+                }
+            }
+
+            // The staged segment: real literals plus the 16-byte zero tail
+            // the hot path's unconditional 16-byte copies overread into.
+            let mut literals = alphabet[..lit_len].to_vec();
+            literals.extend_from_slice(&[0u8; 16]);
+            let out_total: usize = seqs.iter().map(|&(l, m, _)| l as usize + m as usize).sum();
+            let seg = DecodedSegment {
+                literals,
+                sequences: seqs
+                    .iter()
+                    .map(|&(ll, ml, of)| Sequence { ll, ml, of })
+                    .collect(),
+                plan: vec![BlockPlan::Compressed {
+                    lits: 0..lit_len,
+                    seqs: 0..seqs.len(),
+                    out: out_total,
+                }],
+                out_size: out_total,
+            };
+            let mut buf = vec![0u8; out_total + 32];
+            let mut hist = seed;
+            let result = {
+                // SAFETY: the region spans the whole buffer (every write
+                // plus the 16-byte wildcopy slack), and the reference above
+                // proved every offset and budget inside the frame; the
+                // input slice is never read (no Raw blocks).
+                unsafe {
+                    let region = OutRegion::new(buf.as_mut_ptr(), buf.len(), usize::MAX);
+                    execute_blocks(region, 0, 0, &seg, 0..1, &[], &mut hist)
+                }
+            };
+            if expect_err {
+                assert!(
+                    result.is_err(),
+                    "case {seed:?} {seqs:?} must reject the zero offset"
+                );
+                return;
+            }
+            result.expect("case must execute");
+            assert_eq!(
+                &buf[..out_total],
+                &expect[..],
+                "bytes of case {seed:?} {seqs:?}"
+            );
+            assert_eq!(hist, ref_hist, "history of case {seed:?} {seqs:?}");
+        }
+
+        // One real-offset lead sequence builds output and rotates the
+        // history, then the probe lands the case's selector.
+        for seed in [[1u32, 4, 8], [7, 3, 9], [0, 5, 9]] {
+            for of in 1u32..=7 {
+                for ll in [0u32, 1, 2] {
+                    let seqs = [(12u32, 4u32, 11u32), (ll, 3, of)];
+                    run_case(seed, &seqs, 12 + ll as usize);
+                }
+            }
+        }
+        // A repcode chain exercises the rotations and the carry across a
+        // block's sequence run.
+        run_case(
+            [1, 4, 8],
+            &[
+                (12, 4, 11),
+                (0, 3, 1),
+                (0, 3, 1),
+                (1, 3, 1),
+                (0, 3, 2),
+                (2, 3, 3),
+                (0, 3, 3),
+            ],
+            15,
+        );
     }
 
     /// Corrupt input must surface an error, not silent garbage.

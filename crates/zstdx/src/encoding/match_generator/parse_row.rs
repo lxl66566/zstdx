@@ -203,7 +203,7 @@ pub(super) fn row_match_mask<const ROW_LOG: u32>(row: *const u32, tag: u8) -> u6
     m
 }
 
-/// Row search from the position's full hash, returning the longest
+/// Row search from the scan position's full hash, returning the longest
 /// match's (length, candidate window index) — `(0, usize::MAX)` when
 /// nothing matched. The tag mask filters the row's entries first; the
 /// survivors are collected with their window lines prefetched (libzstd's
@@ -223,9 +223,8 @@ pub(super) fn row_match_mask<const ROW_LOG: u32>(row: *const u32, tag: u8) -> u6
 pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     win: &[u8],
     t: RowHandle,
-    idx: usize,
+    pos: WinPos,
     hash: u32,
-    win_base: u64,
     block_end: u64,
     attempts: usize,
     max_window: u64,
@@ -238,15 +237,15 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
     // ROW_LOG instantiation carries exactly its row.
     if ROW_LOG >= 6 {
         row_search_cap::<ROW_LOG, 64, RAMPED>(
-            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, pos, hash, block_end, attempts, max_window, ramp,
         )
     } else if ROW_LOG >= 5 {
         row_search_cap::<ROW_LOG, 32, RAMPED>(
-            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, pos, hash, block_end, attempts, max_window, ramp,
         )
     } else {
         row_search_cap::<ROW_LOG, 16, RAMPED>(
-            win, t, idx, hash, win_base, block_end, attempts, max_window, ramp,
+            win, t, pos, hash, block_end, attempts, max_window, ramp,
         )
     }
 }
@@ -257,14 +256,18 @@ pub(super) fn row_search<const ROW_LOG: u32, const RAMPED: bool>(
 fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>(
     win: &[u8],
     t: RowHandle,
-    idx: usize,
+    pos: WinPos,
     hash: u32,
-    win_base: u64,
     block_end: u64,
     attempts: usize,
     max_window: u64,
     ramp: RampGate,
 ) -> (usize, usize) {
+    // The typed crossing ends here: the scan body's own arithmetic stays
+    // on the raw locals below (the type's doc).
+    let idx = pos.idx();
+    let pos_abs = pos.abs();
+    let win_base = pos.base();
     let row = t.row_base::<ROW_LOG>(hash);
     let tag = (hash & ROW_TAG_MASK) as u8;
     let mut matches = row_match_mask::<ROW_LOG>(row, tag);
@@ -291,7 +294,6 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
                 & ((1u64 << (row_mask + 1)) - 1)
         };
     }
-    let pos_abs = win_base + idx as u64;
     // Oldest usable candidate distance: within the level window and
     // inside the live window buffer. The phase-1 loop works entirely in
     // the 24-bit wrap domain: `((pos + 1) - entry) mod 2^24` IS the true
@@ -612,10 +614,8 @@ impl MatchGeneratorDriver {
         // Row search from the full hash, inlined at both call sites (the
         // chain loop's chain_search discipline: an outlined search pays
         // its calling convention per position).
-        let search = |win: &[u8], idx: usize, hash: u32, bound: u64| -> (usize, usize) {
-            row_search::<ROW_LOG, RAMPED>(
-                win, tables, idx, hash, win_base, bound, attempts, max_window, ramp,
-            )
+        let search = |win: &[u8], pos: WinPos, hash: u32, bound: u64| -> (usize, usize) {
+            row_search::<ROW_LOG, RAMPED>(win, tables, pos, hash, bound, attempts, max_window, ramp)
         };
         // Long-distance candidates of this block ([`Self::ldm_generate`]):
         // `ldm_i` is the first unconsumed one, each ending a segment at
@@ -651,7 +651,8 @@ impl MatchGeneratorDriver {
                 let hn = row_hash_at(win, idx + 1, hash_log, ROW_LOG, width);
                 row_prefetch::<ROW_LOG>(tables, hn);
             }
-            let (mut best_len, mut best_cand) = search(win, idx, h, end);
+            let (mut best_len, mut best_cand) =
+                search(win, WinPos::new(win_base, pos), h, end);
             // Gap bound (C's per-gap compressor call counts to the gap
             // end): a row candidate's forward run stops at the split —
             // the wholesale emission owns the bytes from there.
@@ -826,7 +827,8 @@ impl MatchGeneratorDriver {
                         }
                         // Row search at the stepped position, on the piped
                         // hash above.
-                        let (mut len2, cand2) = search(win, idx2, hash2, end);
+                        let (mut len2, cand2) =
+                            search(win, WinPos::new(win_base, p2), hash2, end);
                         if $ldm {
                             len2 = len2.min((end - p2) as usize);
                         }
