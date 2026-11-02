@@ -45,6 +45,12 @@ const PREDEF_THRESHOLD: usize = 8;
 /// text's tile period, so its parse runs literal-dense — half the span,
 /// half the seed cost).
 const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
+/// Density floor for the strip admission: minimum positions advanced per
+/// insert while the fill frontier is still inside an MT job's strip (see
+/// [`Finder::update_tree`]). Four held the corpus sweep inside a +0.056%
+/// worst cell while cutting dll100 ultra's traced fill span 4.7x; eight
+/// already read dll100 ultra +0.60% size.
+const STRIP_ADMIT_STRIDE: usize = 4;
 
 /// A tree-table entry: a position in its stored form
 /// `(position + origin + POS_BIAS) mod 2^32`. Packing, resolving and the
@@ -980,6 +986,12 @@ pub(crate) struct Finder<'a, 'b> {
     pub(crate) insert_compares: usize,
     pub(crate) sufficient_len: usize,
     pub(crate) next_update: &'b mut u64,
+    /// Admission ceiling of the strip density floor: while the fill
+    /// frontier sits below this absolute position — an MT job's parse
+    /// start, with the adopted strip below it — the fill advances at
+    /// least [`STRIP_ADMIT_STRIDE`] per insert. Zero on every
+    /// frame-continuous parse, so the stock law runs unchanged.
+    pub(crate) strip_top: u64,
 }
 
 impl Finder<'_, '_> {
@@ -1186,7 +1198,16 @@ impl Finder<'_, '_> {
             })
         };
         while idx < target_idx {
-            let forward = self.insert_bt1(idx).max(1);
+            // The strip admission's density floor: the frontier crossing
+            // the strip advances at least [`STRIP_ADMIT_STRIDE`] per
+            // insert, near the parse's own admitted density on twin-rich
+            // shapes. The whole strip still crosses inside this one call —
+            // ascending inserts only: the ring and the prefix carries
+            // require the sweep to finish before the parse's own inserts
+            // begin.
+            let floor =
+                ((self.win_base + idx as u64) < self.strip_top) as usize * STRIP_ADMIT_STRIDE;
+            let forward = self.insert_bt1(idx).max(floor).max(1);
             idx += forward;
         }
         #[cfg(feature = "job_trace")]
@@ -1434,6 +1455,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     block_start: u64,
     block_end: u64,
     max_window: u64,
+    strip_top: u64,
     ldm_seqs: &[LdmSeq],
     origin: &mut u64,
     table: &mut [u32],
@@ -1497,6 +1519,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
                 seed_start,
                 seed_end,
                 max_window,
+                seed_win_base,
                 ldm_seqs,
                 *origin,
                 table,
@@ -1539,6 +1562,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         block_start,
         block_end,
         max_window,
+        strip_top,
         ldm_seqs,
         *origin,
         table,
@@ -1626,6 +1650,7 @@ pub(crate) fn seed_dict_tree(
         insert_compares: 1usize << knobs.insert_log,
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
+        strip_top: 0,
     };
     let fill_target = win.len().saturating_sub(OPT_NUM);
     finder.update_tree(fill_target);
@@ -1651,6 +1676,7 @@ fn run_once<const ULTRA: bool>(
     block_start: u64,
     block_end: u64,
     max_window: u64,
+    strip_top: u64,
     ldm_seqs: &[LdmSeq],
     origin: u64,
     table: &mut [u32],
@@ -1688,6 +1714,7 @@ fn run_once<const ULTRA: bool>(
         insert_compares: 1usize << knobs.insert_log,
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
+        strip_top,
     };
     let mut next_update3 = *finder.next_update;
 
@@ -2026,6 +2053,7 @@ mod tests {
             insert_compares: 1,
             sufficient_len: 64,
             next_update: &mut next_update,
+            strip_top: 0,
         };
         let pos = 1 << 22;
         for delta in [1u64, 64, 4096, 1 << 20] {
