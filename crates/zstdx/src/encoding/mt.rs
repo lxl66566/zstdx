@@ -21,7 +21,7 @@
 use alloc::vec::Vec;
 use core::{
     ops::Range,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -35,6 +35,7 @@ use super::{
         take_pooled_slice_state, take_slice_state,
     },
     frame_header::FrameHeader,
+    ldm::{LdmSeq, LdmState},
     match_generator::{
         BALANCED_STORE_HEAD_SPAN, BalancedStore, LDM_FULL_WINDOW, LdmArming, LdmPrefixSnapshot,
         MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, balanced_store,
@@ -318,6 +319,20 @@ pub fn compress_slice_mt(
     // parse dwarfs the fill), so the frame bytes stay a pure function of
     // the input at the pinned grid.
     let deep_ldm = deep_ldm_band(level, shape, choice, head, ldm_mode);
+    // The opt family's serial LDM feed (R89 map): the far class moves off
+    // every job's critical path — one frame-continuous pass publishes the
+    // candidates ahead of any job, so the covered spans never enter a
+    // strip fill and the windowed form's insert-side twin compares stay
+    // out of the freshly filled trees.
+    let opt_feed = if dict.is_none() && n_jobs > 1 {
+        opt_ldm_feed_band(level, shape, choice, head, ldm_mode)
+    } else {
+        None
+    };
+    // The feed window names the far candidates' reach and the gate
+    // replay's span alone: the opt consumer prices the stored span
+    // (generation verified it over the whole input), so the job keeps
+    // the stock strip window and the shallow tree the stock grid runs.
     let job_overlap = deep_ldm.or(capture_window).map_or(overlap, |w| w as usize);
     let job_ldm = if spf.is_some() {
         LdmArming::JobPrefix
@@ -346,7 +361,25 @@ pub fn compress_slice_mt(
     let next_job = AtomicUsize::new(0);
     let poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>> = Mutex::new(None);
 
+    let feed_window = opt_feed.unwrap_or(0);
+    let feed_gate = opt_feed.map(|window| {
+        Mutex::new(LdmFeedGate {
+            window,
+            seqs: Vec::new(),
+            published: 0,
+            panicked: false,
+        })
+    });
+
     std::thread::scope(|scope| {
+        // The feed thread runs at t=0 beside the workers: generation is
+        // strictly sequential in input order, so a job's wait ends as soon
+        // as the pass crosses its end.
+        if let Some(gate) = &feed_gate {
+            let ready = &ready;
+            let poison = &poison;
+            scope.spawn(|| run_ldm_feed(src, gate, ready, poison));
+        }
         for _ in 0..threads {
             scope.spawn(|| {
                 loop {
@@ -373,7 +406,23 @@ pub fn compress_slice_mt(
                     // at or below its start (the adoption is
                     // byte-invariant in the snapshot's boundary, so which
                     // one lands is pure scheduling).
-                    let snapshot = if deep_ldm.is_some() {
+                    let snapshot = if let Some(gate) = &feed_gate {
+                        match take_feed_span(gate, &ready, start as u64, end as u64, overlap as u64)
+                        {
+                            Some(span) => JobSpfOwned::Feed {
+                                span,
+                                window: feed_window,
+                            },
+                            None => {
+                                // The feed panicked: release the slot so
+                                // the ordered assembly drains before the
+                                // panic resumes below.
+                                *slots[id].lock().unwrap() = Some(Vec::new());
+                                ready.notify_all();
+                                break;
+                            },
+                        }
+                    } else if deep_ldm.is_some() {
                         // The deep rows' no-build windowed schedule: every
                         // job owns its whole-window LDM fill (job zero's
                         // empty span folds to the stock job-start state).
@@ -811,11 +860,22 @@ fn st_fallback(
 /// parse unconstrained; see `match_generator::RampGate` for the semantics.
 static RAMP_TEST_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Test-only serial-feed override (see `set_ldm_feed_for_tests`).
+static FEED_TEST_OVERRIDE: AtomicBool = AtomicBool::new(true);
+
 /// Test-only ramp override (env parsing is process-global; tests must not
 /// race other tests' encodes through `set_var`). Hidden: not API-stable.
 #[doc(hidden)]
 pub fn set_mt_ramp_depth_for_tests(depth: u64) {
     RAMP_TEST_OVERRIDE.store(depth, Ordering::Relaxed);
+}
+
+/// Test-only feed switch: stands the opt rows' serial feed down (and back
+/// on) so a test can hold the stock per-job bytes as its reference.
+/// Hidden: not API-stable.
+#[doc(hidden)]
+pub fn set_ldm_feed_for_tests(enabled: bool) {
+    FEED_TEST_OVERRIDE.store(enabled, Ordering::Relaxed);
 }
 
 fn ramp_depth_from_env() -> u64 {
@@ -1175,6 +1235,7 @@ enum JobSpfOwned {
     None,
     Whole(Option<Arc<StripSnapshot>>),
     Windowed(Option<Arc<LdmPrefixSnapshot>>),
+    Feed { span: Vec<LdmSeq>, window: u64 },
 }
 
 impl JobSpfOwned {
@@ -1188,8 +1249,96 @@ impl JobSpfOwned {
                 None => JobSpf::None,
             },
             JobSpfOwned::Windowed(snap) => JobSpf::Windowed(snap.as_deref()),
+            JobSpfOwned::Feed { span, window } => JobSpf::Feed(span, *window),
         }
     }
+}
+
+/// The serial LDM feed's publication state (the opt rows' far class): one
+/// frame-continuous generation appends far sequences in split order while
+/// `published` advances per block chunk, so a job's span is final once
+/// `published` covers the job's end.
+struct LdmFeedGate {
+    /// The row window the generating `LdmState` is sized for.
+    window: u64,
+    seqs: Vec<LdmSeq>,
+    published: u64,
+    panicked: bool,
+}
+
+/// One frame-continuous LDM generation pass over the whole declared input
+/// (the serial feed, R89 map): chunk-bounded forward counts like the
+/// frame-continuous parse's own block-bounded generation, publishing after
+/// every chunk so jobs start as soon as their span is final. A panic parks
+/// its payload in the pool's poison slot and wakes every waiter, so the
+/// ordered assembly drains before the panic resumes (the lost-wakeup
+/// pitfall's class).
+fn run_ldm_feed(
+    src: &[u8],
+    gate: &Mutex<LdmFeedGate>,
+    ready: &Condvar,
+    poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+) {
+    #[cfg(feature = "job_trace")]
+    let trace_feed = std::time::Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let window = gate.lock().unwrap().window;
+        let mut ldm = LdmState::new(window.ilog2(), window);
+        let mut chunk = Vec::new();
+        let mut pos = 0usize;
+        while pos < src.len() {
+            let end = (pos + MAX_BLOCK_SIZE as usize).min(src.len());
+            chunk.clear();
+            ldm.generate(&mut chunk, &src[..end], 0, pos as u64, end as u64);
+            let mut g = gate.lock().unwrap();
+            g.seqs.extend_from_slice(&chunk);
+            g.published = end as u64;
+            drop(g);
+            ready.notify_all();
+            pos = end;
+        }
+    }));
+    #[cfg(feature = "job_trace")]
+    super::job_trace::add_spf_build(trace_feed);
+    if result.is_err() {
+        if let Ok(mut p) = poison.lock() {
+            if p.is_none() {
+                *p = result.err();
+            }
+        }
+        gate.lock().unwrap().panicked = true;
+        ready.notify_all();
+    }
+}
+
+/// A job's published feed span: waits for the generation to cross the
+/// job's end, then copies the sequences whose split lands inside the job
+/// with the consumer's beyond-reach filter applied (the same retain
+/// `ldm_generate` runs on its own generation). `None` when the feed
+/// panicked.
+fn take_feed_span(
+    gate: &Mutex<LdmFeedGate>,
+    ready: &Condvar,
+    start: u64,
+    end: u64,
+    reach: u64,
+) -> Option<Vec<LdmSeq>> {
+    let mut g = gate.lock().unwrap();
+    while g.published < end {
+        if g.panicked {
+            return None;
+        }
+        g = ready.wait(g).unwrap();
+    }
+    let lo = g.seqs.partition_point(|s| s.split < start);
+    let hi = g.seqs.partition_point(|s| s.split < end);
+    Some(
+        g.seqs[lo..hi]
+            .iter()
+            .filter(|s| s.offset as u64 > reach)
+            .copied()
+            .collect(),
+    )
 }
 
 /// The capture grid's job size for a source of `len` bytes at a chain
@@ -1325,6 +1474,32 @@ pub(crate) fn deep_ldm_band(
 /// u64::MAX-class pledge walked ~2^60 candidates before the first staged
 /// band resolved, stalling `write` for minutes), while the answer never
 /// depends on entries past `window / job_size`.
+/// The opt family's serial-LDM feed engagement over a frame's schedule
+/// inputs: the row's own clamped window (see
+/// `MatchGeneratorDriver::opt_ldm_feed_window`) when the head parses —
+/// the same collision screen class the deep band uses — under every mode
+/// but an explicit `Disable`. Dictionary frames stay out (their job zero
+/// is the dictionary seed job) and so do single-job frames (job zero
+/// already runs the frame-continuous LDM of a frame start, so the feed
+/// would only move bytes without buying reach).
+pub(crate) fn opt_ldm_feed_band(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    head: &[u8],
+    ldm_mode: crate::LdmMode,
+) -> Option<u64> {
+    if ldm_mode == crate::LdmMode::Disable || !FEED_TEST_OVERRIDE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let window = MatchGeneratorDriver::opt_ldm_feed_window(level, shape, choice)?;
+    let head = &head[..head.len().min(MAX_BLOCK_SIZE as usize)];
+    if !ldm_head_parses(head) {
+        return None;
+    }
+    Some(window)
+}
+
 fn prefix_last_job(n_jobs: u64, job_size: u64, window: u64) -> Option<u64> {
     let last = window / job_size;
     // The empty scan (n_jobs <= 1) has no candidate; the clamp below can
@@ -1688,7 +1863,7 @@ pub(crate) fn run_job_with(
     super::job_trace::add_reset(trace_reset);
     // The windowed band's chain tables cover the reach tail; every other
     // engagement indexes the whole strip `overlap` names.
-    let chain_overlap = if matches!(spf, JobSpf::Windowed(_)) {
+    let chain_overlap = if matches!(spf, JobSpf::Windowed(_) | JobSpf::Feed(..)) {
         MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize
     } else {
         overlap
@@ -2605,6 +2780,118 @@ mod tests {
                 "{level:?}: the windowed schedule stands down on the opt family"
             );
         }
+    }
+
+    /// The opt family's serial LDM feed (R92): one frame-continuous pass
+    /// publishes each job's far-candidate span ahead of the jobs, so the
+    /// far class survives the job split on the opt rows. The fixture sits
+    /// in the [32, 64) MiB mid-size band with a parsing head, the band the
+    /// feed arms on; a head that does not parse keeps the per-job model.
+    #[test]
+    fn opt_serial_ldm_feed_carries_far_repeats() {
+        const MIB: usize = 1024 * 1024;
+        let total = 33 * MIB + 123 * 1024;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        unit[..head_len].copy_from_slice(&pattern_head(head_len));
+        let mut data = Vec::with_capacity(total);
+        while data.len() < total {
+            let take = unit.len().min(total - data.len());
+            data.extend_from_slice(&unit[..take]);
+        }
+        let shape = crate::InputShape {
+            len: Some(data.len() as u64),
+            window_log: None,
+        };
+        let head = &data[..data.len().min(MAX_BLOCK_SIZE as usize)];
+        for level in [Level::Opt, Level::Ultra] {
+            assert!(
+                super::opt_ldm_feed_band(
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    head,
+                    crate::LdmMode::Auto
+                )
+                .is_some(),
+                "{level:?}: the fixture must arm the feed"
+            );
+            assert!(
+                super::opt_ldm_feed_band(
+                    level,
+                    shape,
+                    ReachChoice::Keep,
+                    head,
+                    crate::LdmMode::Disable
+                )
+                .is_none(),
+                "{level:?}: an explicit Disable stands the feed down"
+            );
+        }
+        assert!(
+            super::opt_ldm_feed_band(
+                Level::Opt,
+                shape,
+                ReachChoice::Keep,
+                &lcg(MAX_BLOCK_SIZE as usize),
+                crate::LdmMode::Auto
+            )
+            .is_none(),
+            "a head that does not parse keeps the per-job model"
+        );
+        let encode = |workers: u32| {
+            compress_slice_mt(
+                &data,
+                Level::Opt,
+                true,
+                workers,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let st = encode(1);
+        let mt8 = encode(8);
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&mt8, &mut out)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(mt8.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data, "libzstd");
+        // A far-less frame between two identical calls keeps the bytes
+        // fixed: the pooled states must not carry another frame's
+        // published candidates.
+        let noise = textish(2 * MIB);
+        let interleaved = compress_slice_mt(
+            &noise,
+            Level::Ultra,
+            true,
+            8,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        assert!(interleaved.len() < noise.len());
+        assert_eq!(mt8, encode(8), "pooled-state determinism across frames");
+        // The stock per-job bytes are the reference the feed must beat on
+        // this fixture (its exact-copy units keep a paying far class
+        // while the row's job-boundary resets cost the stock row).
+        super::set_ldm_feed_for_tests(false);
+        let stock = encode(8);
+        super::set_ldm_feed_for_tests(true);
+        assert_ne!(stock, mt8, "the feed must move the armed cells' bytes");
+        assert!(
+            mt8.len() <= stock.len() - stock.len() / 10,
+            "the feed must hold the far class over the stock jobs: feed {} vs stock {}",
+            mt8.len(),
+            stock.len()
+        );
     }
 
     /// Text-like data: repeating vocabulary with variation, so matches,

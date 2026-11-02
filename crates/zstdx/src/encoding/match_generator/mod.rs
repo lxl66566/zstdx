@@ -380,6 +380,13 @@ pub struct MatchGeneratorDriver {
     /// Long-distance candidates of the block being scanned (regenerated
     /// per block by [`Self::ldm_generate`]).
     ldm_seqs: Vec<LdmSeq>,
+    /// The serial feed's published candidates for the job being scanned
+    /// (see `mt::compress_slice_mt`): when present, [`Self::ldm_generate`]
+    /// slices this instead of running the parked own-state restart, and
+    /// the opt parse's far-class domain widening keys on it. Owned per
+    /// job; `reset` clears it, so a pooled driver never carries another
+    /// job's candidates.
+    ldm_feed: Option<Vec<LdmSeq>>,
     /// Scan-transient segment cursor of the armed fast rows: the first
     /// unconsumed candidate of `ldm_seqs`. Memory-resident by design (see
     /// `start_matching_fast`), written at each scan entry and consumed at
@@ -983,6 +990,30 @@ impl MatchGeneratorDriver {
             .then_some(p.window as u64)
     }
 
+    /// The opt family's serial-LDM feed window: the row's own clamped
+    /// window on the same engagement keys the deep band uses — LDM
+    /// capability, a kept reach verdict and the mid-size bar. The feed
+    /// publishes frame-continuous far sequences ahead of every job (see
+    /// `mt::opt_ldm_feed_band`); the window names the candidates' reach
+    /// and the gate replay's span, while the jobs keep the stock strip
+    /// windows and trees (the opt consumer prices the stored span, which
+    /// generation verified over the whole input). `None` keeps the
+    /// per-job LDM restart. The opt rows are never probe subjects, so
+    /// `choice` is their stock `Keep` whenever they run.
+    #[cfg(feature = "std")]
+    pub(crate) fn opt_ldm_feed_window(
+        level: Level,
+        shape: InputShape,
+        choice: ReachChoice,
+    ) -> Option<u64> {
+        let p = params_for(level, shape);
+        (matches!(p.strategy, Strategy::Opt(_))
+            && p.ldm
+            && choice == ReachChoice::Keep
+            && p.window >= LDM_MIDSIZE_WINDOW)
+            .then_some(p.window as u64)
+    }
+
     /// Whether the shape-adaptive reach probe (see `super::reach_probe`)
     /// may decide this frame's reach: only the Balanced chain row with its
     /// stock reach still in place — the opt rows share the `chain_reach`
@@ -1179,6 +1210,7 @@ impl MatchGeneratorDriver {
             ldm: None,
             ldm_parked: None,
             ldm_seqs: Vec::new(),
+            ldm_feed: None,
             ldm_i: 0,
             ldm_won: false,
             ldm_quiet: 0,
@@ -1256,6 +1288,7 @@ impl MatchGeneratorDriver {
             ldm: None,
             ldm_parked: None,
             ldm_seqs: Vec::new(),
+            ldm_feed: None,
             ldm_i: 0,
             ldm_won: false,
             ldm_quiet: 0,
@@ -2408,6 +2441,32 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Install a published far-candidate feed for one job (the serial LDM
+    /// feed, see `mt::compress_slice_mt`): the driver's own LDM state
+    /// parks for the job's duration and [`Self::ldm_generate`] slices the
+    /// feed per block. The next `reset` clears the feed and re-derives
+    /// the parked state, so a pooled driver never carries another job's
+    /// candidates.
+    #[cfg(feature = "std")]
+    pub(crate) fn install_ldm_feed(&mut self, feed: Vec<LdmSeq>) {
+        self.ldm_parked = self.ldm.take().or_else(|| self.ldm_parked.take());
+        self.ldm_feed = Some(feed);
+        self.ldm_quiet = 0;
+        self.ldm_dead = false;
+        self.ldm_canary = 0;
+    }
+
+    /// The feed job's window-span gate replay: the whole-span seeding
+    /// [`Self::windowed_ldm_prefill`] runs for the deep band, minus its
+    /// LDM state work (the feed published the candidates ahead of time).
+    /// A fresh worker's gate otherwise kills far-only blocks before any
+    /// candidate can serve them.
+    #[cfg(feature = "std")]
+    pub(crate) fn seed_gate_span(&mut self, span: &[u8]) {
+        let uniform = strip_is_uniform(span);
+        self.seed_gate_probe(span, uniform);
+    }
+
     /// The windowed capture band's builder half (see
     /// `LdmPrefixSnapshot`): advance this driver's LDM fill from
     /// `[base, base + from)` to the first batch-freeze at or beyond
@@ -3479,6 +3538,7 @@ impl Matcher for MatchGeneratorDriver {
             self.probe.fill(0);
         }
         self.ldm_seqs.clear();
+        self.ldm_feed = None;
         self.ldm_quiet = 0;
         self.ldm_dead = false;
         self.ldm_canary = 0;
@@ -4321,6 +4381,16 @@ impl MatchGeneratorDriver {
     #[inline(never)]
     fn ldm_generate(&mut self) {
         self.ldm_seqs.clear();
+        if let Some(feed) = self.ldm_feed.as_deref() {
+            // The serial feed: candidates were generated frame-continuously
+            // ahead of every job (the beyond-reach filter ran at
+            // publication), so this block's set is the published span's
+            // slice by split position.
+            let lo = feed.partition_point(|s| s.split < self.pos);
+            let hi = feed.partition_point(|s| s.split < self.block_end);
+            self.ldm_seqs.extend_from_slice(&feed[lo..hi]);
+            return;
+        }
         if self.ldm_dead {
             self.ldm_canary += 1;
             if self.ldm_canary < LDM_CANARY {

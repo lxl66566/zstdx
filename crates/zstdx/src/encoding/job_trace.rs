@@ -220,7 +220,8 @@ pub fn add_ldm_fill(started: Instant) {
 
 /// Record one caller-side shared-prefix-fill build span (the stream core's
 /// `build_spf` fill loop plus its snapshot clone, the bulk path's
-/// `build_prefix_snapshot` — see [`Snapshot::spf_build_ns`]).
+/// `build_prefix_snapshot`, the serial LDM feed's whole generation pass —
+/// see [`Snapshot::spf_build_ns`]).
 #[inline]
 pub fn add_spf_build(started: Instant) {
     add_ns(&C.spf_build_ns, started.elapsed());

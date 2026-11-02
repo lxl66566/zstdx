@@ -48,7 +48,7 @@ pub use match_generator::MatchGeneratorDriver;
 pub use mt::mt_job_size_for;
 #[cfg(feature = "std")]
 #[doc(hidden)]
-pub use mt::set_mt_ramp_depth_for_tests;
+pub use mt::{set_ldm_feed_for_tests, set_mt_ramp_depth_for_tests};
 use seq_codes::pack_seq;
 
 use crate::{

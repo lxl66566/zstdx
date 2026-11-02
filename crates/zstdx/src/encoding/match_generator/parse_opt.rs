@@ -32,9 +32,11 @@ impl MatchGeneratorDriver {
         // head-named terminal step of each descent branch (plus repcode
         // probes, which C bounds by windowLow too). Ring, fill, strips and
         // the LDM retain filter all stay keyed to the stock domain — this
-        // lift only removes the floor clamp. MT jobs are inert here: their
-        // per-job windows already bind the floor at `win_base`.
-        if self.ldm.is_some() {
+        // lift only removes the floor clamp. Stock MT jobs are inert here:
+        // their per-job windows already bind the floor at `win_base`; a
+        // feed job's adopted window spans the row window, so the floor
+        // follows the published candidates' reach.
+        if self.ldm.is_some() || self.ldm_feed.is_some() {
             max_window = max_window.max(self.params.window as u64);
         }
         let ldm_seqs: &[LdmSeq] = &self.ldm_seqs[..];

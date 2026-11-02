@@ -68,6 +68,9 @@ pub use decoding::mt_pieces::{piece_engagements, set_piece_decode_for_tests};
 pub use encoding::EncoderDictionary;
 #[cfg(feature = "std")]
 #[doc(hidden)]
+pub use encoding::set_ldm_feed_for_tests;
+#[cfg(feature = "std")]
+#[doc(hidden)]
 pub use encoding::set_mt_ramp_depth_for_tests;
 pub use error::{Error, Feature, ParameterError, Result};
 pub use level::Level;

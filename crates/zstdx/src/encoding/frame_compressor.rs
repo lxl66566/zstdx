@@ -12,6 +12,7 @@ use super::{
     checksum::{BlockChecksum, FrameHasher, SliceChecksum},
     far_screen,
     frame_header::FrameHeader,
+    ldm::LdmSeq,
     levels::*,
     match_generator::{
         BALANCED_STORE_HEAD_SPAN, BalancedStore, LdmArming, MatchGeneratorDriver, balanced_store,
@@ -908,6 +909,13 @@ pub(crate) enum JobSpf<'a> {
     None,
     Whole(&'a StripSnapshot),
     Windowed(Option<&'a LdmPrefixSnapshot>),
+    /// The serial LDM feed's published span for this job (the opt rows'
+    /// far class, see `mt::compress_slice_mt`): the job consumes the
+    /// published candidates instead of running its own restarted LDM
+    /// state. `window` is the feed's reach — the gate replay's span, not
+    /// an adopted match window (the opt consumer prices the stored span,
+    /// which generation verified over the whole input).
+    Feed(&'a [LdmSeq], u64),
 }
 
 /// [`compress_job_blocks`] with a donated prefix: `start_cursor` blocks of
@@ -990,6 +998,23 @@ pub(crate) fn compress_job_blocks_inner(
                 state
                     .matcher
                     .prefill_job_strip(&src[strip..job.start], strip as u64);
+            }
+        },
+        JobSpf::Feed(seqs, window) => {
+            // The serial feed's job: the published candidates replace the
+            // driver's own LDM, so its strip half parks (no restart, no
+            // split pass) while the opt tree bound and the admission
+            // ceiling arm as on any strip job.
+            state.matcher.install_ldm_feed(seqs.to_vec());
+            if start_cursor <= job.start {
+                state
+                    .matcher
+                    .prefill_job_strip(&src[strip..job.start], strip as u64);
+                // The gate replays over the feed's window span, like the
+                // deep band's windowed prefill: a fresh worker's gate must
+                // probe the far twins its parse cannot reach.
+                let win_base = job.start.saturating_sub(window as usize);
+                state.matcher.seed_gate_span(&src[win_base..job.start]);
             }
         },
     }

@@ -78,6 +78,14 @@ The premise's density asymmetry also fails to transfer. ST's parse-coupled fill 
 
 The exactness-safe extraction of the map's premise, an admission density floor that finishes the sweep before the parse's own inserts begin, landed in [mt-stream](../perf/mt-stream.md)'s R91 section.
 
+### Widened window adoption under the opt feed
+
+The serial feed's first form, measured on 2026-11-03, adopted the row window as each opt job's match window, the falsified windowed form's geometry, with the feed publishing the candidates ahead of the jobs. The sizes were the round's best: dll100 ultra bulk-mt8 read 19,368,661 to 16,647,917 B and dll100 opt 20,222,742 to 17,528,218, both under the windowed extension's own 16.77 MB reading for ultra. The wall failed on ultra: the locked interleaved A/B read dll100 ultra 3314 to 5677 ms medians, 1.71x, with dll100 opt and both dll32 cells flat.
+
+The mechanism is the ultra seed parse's rewind inside `opt::run_block`. A widened job adopts `hist = cursor - row window`, so `win_base` slides per block instead of holding at the strip base, and the job-boundary seed leaves `next_update = win_base` so the real parse rebuilds from there. The first search of each job then fills the whole 45-plus MiB window span where the stock job fills its 8 MiB strip: the traced strip fill read 544.0 MiB over 12 fills against the stock 96.0 MiB over 12, 179.5 against 20.0 s summed, and the compare volume rose to 16.34 GiB over 1.31 G calls against 7.78 GiB over 0.79 G. The far window's twin regions entered the tree's fills and searches, the windowed form's insert-side class with the seed rewind as the amplifier.
+
+The feed's candidate class needs none of those bytes, because the opt parse prices the stored span that generation verified over the whole input. The landed form keeps the stock strip window and reads 17.82 MB on dll100 ultra at the stock wall with the traced fills and compares at stock levels; the 1.17 MB between the two forms is the far tree candidate class, which a shallow job tree buys only through these fills. Reopening the widened form needs the seed rewind bounded to the strip base and the far window's indexing paid somewhere cheaper than the insert descent.
+
 ### Job-start seed probes against a stale index
 The job-start seed and LDM probes compared candidates against a stale scan index, which caused unpledged row-9 stream-MT frames to corrupt deterministically past 32 MiB on 2026-09-17. text.raw x1.5, x2 and x3 corrupted at w2, w4 and w8, and stayed clean at w1 and at l3, l13 and l17. The rep probe may advance `pos` one byte past the iteration's `idx`, and a seed or LDM offset of exactly that advance resolves the candidate onto `idx` itself. `read4` and the extension then trivially match the position against itself, and the store gate prices the zero offset with `ilog2(0)`, with a release backtrace straight into `pays_for_offset_lit`.
 
