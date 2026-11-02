@@ -1,14 +1,16 @@
 //! `ZSTD_DCtx`: the decode-side parameters and the streaming-decode state
 //! behind `ZSTD_decompressStream`.
 //!
-//! The streaming machine stages unconsumed input in the context (libzstd
-//! does the same through its internal `inBuff`): input is accepted when a
-//! full block (plus the checksum trailer behind a last block) is staged,
-//! decoded one block per step through the public `FrameDecoder` API, and
-//! drained into the caller's buffer as far as it fits. Frame boundaries
-//! consume skippable frames and roll into the next frame, so concatenated
-//! streams decode transparently; the return value is 0 exactly when a frame
-//! completed and everything decoded from it has been flushed.
+//! The streaming machine is a port of the reference's
+//! `ZSTD_decompressStream` stage engine: input is claimed piece by piece
+//! (frame header chunks, 3-byte block headers, whole block bodies, 4-byte
+//! checksum trailers, skippable content), every completed piece is
+//! processed at once, and decoded output is released one flush round per
+//! block. A flush round that cannot empty the pending buffer ends the
+//! call, a frame ends every call that finishes it, and a frame whose
+//! output is still pending at its end holds back one input byte until the
+//! flush completes. The return value is the reference's exact next-input
+//! hint: 0 when a frame is completely decoded and fully flushed.
 //!
 //! The context dictionary is one parsed instance shared with every decoder
 //! built from the context (and with `DDict` handles): a `usingDict` call
@@ -24,15 +26,10 @@ use crate::{
     error::{self, DecodeSite, ErrorCode},
 };
 
-/// `ZSTD_DStreamOutSize`: one block of output; also the "more to do" hint.
+/// `ZSTD_DStreamOutSize`: one block of output.
 pub const DSTREAM_OUT_SIZE: usize = 128 * 1024;
 /// `ZSTD_DStreamInSize`: one block plus its header.
 pub const DSTREAM_IN_SIZE: usize = DSTREAM_OUT_SIZE + 3;
-/// Input staged before the staging buffer is compacted (one memmove per this
-/// many consumed bytes; the live tail stays bounded by a block extent).
-const COMPACT_LIMIT: usize = 512 * 1024;
-/// Input handed to the decoder per pump step.
-const FEED_CHUNK: usize = 128 * 1024;
 
 /// A parsed decoding dictionary shared between the context, its streams and
 /// any `ZSTD_DDict` handle.
@@ -160,37 +157,146 @@ fn bad_magic_tail_code(src: &[u8]) -> ErrorCode {
     }
 }
 
-/// Live streaming-decoder state inside a DCtx.
+/// The wire type of a block body. The reserved type never reaches a body:
+/// the header-piece parse rejects it first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockWireType {
+    Raw,
+    Rle,
+    Compressed,
+}
+
+/// What the streaming machine accumulates or awaits next: the reference's
+/// per-piece stages (`ZSTDds_*`) with its streaming stages (`zdss_*`)
+/// folded in. Input is claimed piece by piece, never in bulk.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// No frame is open: the next frame header accumulates at the staging
+    /// cursor (the reference's `zdss_loadHeader` over its `headerBuffer`).
+    FrameHeader,
+    /// A 3-byte block header awaits at the cursor.
+    BlockHeader,
+    /// A block body: the wire type, the last-block flag, the whole body's
+    /// wire size, and the wire bytes still to claim. Raw bodies release
+    /// piecewise as their bytes arrive; the others wait for the whole
+    /// body and decode in one step.
+    BlockBody {
+        wire: BlockWireType,
+        last: bool,
+        size: usize,
+        remaining: usize,
+    },
+    /// The frame's 4-byte checksum trailer awaits.
+    Checksum,
+    /// Skippable-frame content: this many bytes to claim and discard.
+    SkipContent(usize),
+    /// The frame's last piece went out: the next result is the completion
+    /// answer (0), or 1 while decoded output is still pending.
+    FrameEnded,
+}
+
+/// One `ZSTD_decompressStream` call's answer.
+struct CallOutcome {
+    /// The libzstd hint: 0 when a frame is completely decoded and fully
+    /// flushed, otherwise the next input piece's wanted size.
+    hint: usize,
+    /// The reference's `zdss_loadHeader` short-header return, which sits
+    /// before its no-forward-progress guard and never counts there.
+    guard_exempt: bool,
+}
+
+/// The staged prefix plus the call's remaining input, as one address space
+/// for the shortcut's frame walk. Position 0 is the frame start.
+fn chained_byte(staged: &[u8], rest: &[u8], pos: usize) -> Option<u8> {
+    staged
+        .get(pos)
+        .copied()
+        .or_else(|| rest.get(pos - staged.len()).copied())
+}
+
+/// `ZSTD_findFrameCompressedSize` over the staged prefix plus the call's
+/// remaining input: the reference measures the single-pass shortcut from
+/// this call's input start, so a frame that began in an earlier call has
+/// its start bytes invisible here, fails the walk and loses the shortcut.
+fn chained_frame_size(staged: &[u8], rest: &[u8]) -> Option<usize> {
+    let full = match crate::frame::parse_full_header(staged) {
+        Ok(crate::frame::HeaderParse::Complete(full)) => full,
+        _ => return None,
+    };
+    let total = staged.len() + rest.len();
+    let mut pos = full.header_size;
+    loop {
+        if pos + 3 > total {
+            return None;
+        }
+        let b0 = chained_byte(staged, rest, pos)?;
+        let b1 = chained_byte(staged, rest, pos + 1)?;
+        let b2 = chained_byte(staged, rest, pos + 2)?;
+        let last = b0 & 1 == 1;
+        let block_type = (b0 >> 1) & 3;
+        let size = (usize::from(b0) >> 3) | (usize::from(b1) << 5) | (usize::from(b2) << 13);
+        // The walk itself takes header sizes at face value (the 128 KiB
+        // ceiling is a decode-time check), exactly as frame_compressed_size.
+        let body = match block_type {
+            0 | 2 => size,
+            1 => 1,
+            _ => return None,
+        };
+        pos += 3 + body;
+        if pos > total {
+            return None;
+        }
+        if last {
+            if full.checksum {
+                pos += 4;
+                if pos > total {
+                    return None;
+                }
+            }
+            return Some(pos);
+        }
+    }
+}
+
+/// Live streaming-decoder state inside a DCtx: a port of the reference's
+/// `ZSTD_decompressStream` stage engine. Input is claimed piece by piece
+/// (frame header chunks, 3-byte block headers, whole block bodies, 4-byte
+/// checksums, skippable content), each piece is processed as it completes,
+/// and decoded output is released to the caller one flush round per block.
+/// A flush round that cannot empty the pending buffer ends the call, and a
+/// frame whose output is still pending at its end holds back one input
+/// byte (the reference's hostage) until the flush completes.
 struct DStream {
     inner: FrameDecoder,
-    /// Compressed bytes that arrived but were not consumed yet;
-    /// `input[..start]` is already decoded.
-    input: Vec<u8>,
-    start: usize,
-    /// False until a frame header was parsed; reset at every frame boundary.
-    inited: bool,
-    /// Whether the frame parsed last announced a content checksum (the
-    /// trailer must be staged with the last block).
+    /// Input claimed from the caller but not yet processed; `cursor` is
+    /// the machine's position, everything below it is spent.
+    staging: Vec<u8>,
+    cursor: usize,
+    stage: Stage,
+    /// The frame being decoded announces a content checksum.
     checksummed: bool,
-    /// Decoded output not yet handed to the caller; `delivered` counts what
-    /// left the sink.
-    sink: Vec<u8>,
+    /// `min(window, 128 KiB)` of the open frame: the header-piece bound on
+    /// a block's declared size.
+    block_size_max: usize,
+    /// Decoded output not yet handed to the caller.
+    pending: Vec<u8>,
     delivered: usize,
-    /// Frames completed on this stream; the final "fully flushed" answer
-    /// (0) requires at least one, so a stream of only skippable frames
-    /// never reports completion.
-    frames_done: u32,
-    /// Whether the completion answer (0) already went out for the frame
-    /// just finished; the next call then asks for the next frame's
-    /// header, like the reference's between-frames loadHeader shortcut.
-    done_reported: bool,
-    /// The context's `use_once` prefix: consumed when the first frame
+    /// Raw-body bytes already handed out during piecewise arrival; skipped
+    /// when the engine releases the completed block, so they are not
+    /// delivered twice.
+    pre_released: usize,
+    /// A frame ended with output pending: one claimed input byte is held
+    /// back until the flush completes.
+    hostage: bool,
+    /// A real (non-skippable) frame is open.
+    frame_open: bool,
+    /// The context's `use_once` prefix: consumed when the first real frame
     /// completes (subsequent frames decode plain, as the reference's
     /// getDDict does).
     dict_use_once: bool,
     /// The dictionary generation this stream's decoder was armed with.
     dict_generation: u32,
-    /// A frame consumed the use-once prefix this pump; the context slot
+    /// A frame consumed the use-once prefix this call; the context slot
     /// clears when the call returns.
     use_once_consumed: bool,
 }
@@ -204,14 +310,16 @@ impl DStream {
     ) -> Result<Self, ErrorCode> {
         let mut stream = Self {
             inner: FrameDecoder::new(),
-            input: Vec::new(),
-            start: 0,
-            inited: false,
+            staging: Vec::new(),
+            cursor: 0,
+            stage: Stage::FrameHeader,
             checksummed: false,
-            sink: Vec::new(),
+            block_size_max: 0,
+            pending: Vec::new(),
             delivered: 0,
-            frames_done: 0,
-            done_reported: false,
+            pre_released: 0,
+            hostage: false,
+            frame_open: false,
             dict_use_once,
             dict_generation,
             use_once_consumed: false,
@@ -243,204 +351,497 @@ impl DStream {
         Ok(())
     }
 
-    /// Re-arm at a frame boundary after a dictionary-slot change.
-    fn rearm(
-        &mut self,
-        settings: &Settings,
-        dict: Option<&SharedDict>,
-        use_once: bool,
-        generation: u32,
-    ) -> Result<(), ErrorCode> {
-        self.arm_decoder(settings, dict)?;
-        self.dict_use_once = use_once;
-        self.dict_generation = generation;
-        // The fresh decoder never parsed a frame: force the header parse
-        // for the next one (a finished predecessor leaves `inited` set).
-        self.inited = false;
-        Ok(())
-    }
-
-    /// Drop a consumed prefix dictionary: the next frame parses into a
-    /// fresh, dictionary-less decoder. Called at the first frame boundary.
-    fn drop_use_once_dict(
-        &mut self,
-        settings: &Settings,
-        generation: u32,
-    ) -> Result<(), ErrorCode> {
-        if !core::mem::take(&mut self.dict_use_once) {
-            return Ok(());
-        }
-        self.arm_decoder(settings, None)?;
-        // The context clears the slot (generation + 1) after this pump;
-        // recording the cleared generation keeps them in step.
-        self.dict_generation = generation.wrapping_add(1);
-        self.use_once_consumed = true;
-        Ok(())
-    }
-
     fn staged(&self) -> &[u8] {
-        &self.input[self.start..]
+        &self.staging[self.cursor..]
     }
 
-    /// Drop the consumed prefix; the steady state only advances the cursor.
-    fn compact(&mut self) {
-        if self.start == self.input.len() || self.start >= COMPACT_LIMIT {
-            self.input.drain(..self.start);
-            self.start = 0;
+    /// Claim `n` input bytes into staging.
+    ///
+    /// # Safety
+    /// `n` must not exceed the input's unread span (callers bound it by
+    /// the piece arithmetic).
+    unsafe fn claim(&mut self, input: &ZSTD_inBuffer, in_pos: &mut usize, n: usize) {
+        if n > 0 {
+            // SAFETY: n <= input.size - in_pos per the contract above.
+            self.staging
+                .extend_from_slice(unsafe { input.slice_at(*in_pos, n) });
+            *in_pos += n;
         }
     }
 
-    /// Copy staged output into the caller's buffer.
+    /// Drop spent staging below the cursor, keeping the last `keep` bytes
+    /// under it: a block body in flight keeps its 3-byte header there,
+    /// because the engine reads the whole block back out of staging once
+    /// the body completes. Raw bodies stage their pieces above the cursor
+    /// as they arrive, so their compaction waits for the completion.
+    fn compact(&mut self, keep: usize) {
+        if self.cursor < COMPACT_LIMIT && self.cursor < self.staging.len() {
+            return;
+        }
+        let cut = self.cursor.saturating_sub(keep);
+        if cut == 0 {
+            return;
+        }
+        self.staging.drain(..cut);
+        self.cursor -= cut;
+    }
+
+    /// Copy pending output into the caller's buffer.
     fn deliver(&mut self, out: &mut [u8], pos: &mut usize) {
-        let take = (self.sink.len() - self.delivered).min(out.len() - *pos);
-        out[*pos..*pos + take].copy_from_slice(&self.sink[self.delivered..self.delivered + take]);
+        let take = (self.pending.len() - self.delivered).min(out.len() - *pos);
+        out[*pos..*pos + take]
+            .copy_from_slice(&self.pending[self.delivered..self.delivered + take]);
         *pos += take;
         self.delivered += take;
-        if self.delivered == self.sink.len() {
-            self.sink.clear();
+        if self.delivered == self.pending.len() {
+            self.pending.clear();
             self.delivered = 0;
         }
     }
 
-    /// Whether the stream sits on a frame boundary with nothing staged or
-    /// pending: the state a parameters reset requires.
+    /// Whether the stream sits between frames with nothing staged or
+    /// pending: the state a parameters reset requires (the reference's
+    /// `zdss_init`).
     fn at_boundary(&self) -> bool {
-        self.start == self.input.len()
-            && self.sink.len() == self.delivered
-            && (!self.inited || self.inner.is_finished())
+        matches!(self.stage, Stage::FrameHeader)
+            && self.pending.is_empty()
+            && self.cursor == self.staging.len()
     }
 
-    /// The between-frames state: a real frame finished, everything
-    /// decoded from it was flushed, nothing is staged. The completion
-    /// answer (0) is given once; afterwards this is the state the
-    /// reference answers from its loadHeader shortcut, which also sits
-    /// before its no-forward-progress guard.
-    fn idle_done(&self) -> bool {
-        let frame_done = self.inited
-            && self.inner.is_finished()
-            && self.inner.can_collect() == 0
-            && self.start == self.input.len();
-        let boundary_idle = !self.inited && self.frames_done > 0 && self.start == self.input.len();
-        self.sink.len() == self.delivered && (frame_done || boundary_idle)
+    /// The frame's last piece went out: enter the completion state and
+    /// consume the use-once prefix when a real frame used it.
+    fn finish_frame(&mut self) {
+        self.stage = Stage::FrameEnded;
+        if self.frame_open && core::mem::take(&mut self.dict_use_once) {
+            self.use_once_consumed = true;
+        }
+        self.frame_open = false;
     }
 
-    /// Decode as much staged input as the block granularity allows.
-    fn pump(&mut self, settings: &Settings, generation: u32) -> Result<(), ErrorCode> {
+    /// Decode one whole block (its 3-byte header plus body, both staged)
+    /// through the engine and release the block's output into the pending
+    /// buffer. The last block of a checksummed frame is fed without its
+    /// trailer: the engine then reports the missing checksum, which the
+    /// machine serves as its own piece next.
+    fn decode_block(
+        &mut self,
+        header_pos: usize,
+        body_end: usize,
+        last: bool,
+    ) -> Result<(), ErrorCode> {
+        // Direct field slices: the source borrows `staging` while
+        // `decode_blocks` mutates `inner` (disjoint fields).
+        let mut source: &[u8] = &self.staging[header_pos..body_end];
+        match self
+            .inner
+            .decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1))
+        {
+            Ok(_) => {},
+            Err(zstdx::decoding::errors::FrameDecoderError::FailedToReadChecksum(_))
+                if last && self.checksummed => {},
+            Err(e) => return Err(error::frame(&e, DecodeSite::Stream)),
+        }
+        debug_assert!(source.is_empty());
+        let mut released = Vec::new();
+        self.inner
+            .collect_to_writer(&mut released)
+            .map_err(|_| ErrorCode::Generic)?;
+        let skip = self.pre_released.min(released.len());
+        self.pending.extend_from_slice(&released[skip..]);
+        self.pre_released = 0;
+        Ok(())
+    }
+
+    /// One `ZSTD_decompressStream` call: the reference's stage loop over
+    /// flush rounds and input pieces. Positions are the caller's cursors,
+    /// committed by the caller only on success.
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        &mut self,
+        settings: &Settings,
+        dict: Option<&SharedDict>,
+        dict_use_once: bool,
+        generation: u32,
+        out: &mut [u8],
+        out_pos: &mut usize,
+        input: &mut ZSTD_inBuffer,
+        in_pos: &mut usize,
+    ) -> Result<CallOutcome, ErrorCode> {
+        // This call's input starts here in staging: the single-pass
+        // shortcut measures from it, so a header that began in an earlier
+        // call cannot shortcut.
+        let call_start = self.staging.len();
         loop {
-            if !self.inited {
-                if !self.init_frame()? {
-                    return Ok(());
+            // Flush round: pending output to the caller; a round that
+            // cannot empty the pending buffer ends the call.
+            if self.delivered < self.pending.len() {
+                self.deliver(out, out_pos);
+                if self.delivered < self.pending.len() {
+                    break;
                 }
-                continue;
+                self.pending.clear();
+                self.delivered = 0;
             }
-            if self.inner.is_finished() {
-                self.inner
-                    .collect_to_writer(&mut self.sink)
-                    .map_err(|_| ErrorCode::Generic)?;
-                self.frames_done += 1;
-                self.drop_use_once_dict(settings, generation)?;
-                if self.start == self.input.len() {
-                    self.compact();
-                    return Ok(());
+            let remaining = input.size - *in_pos;
+            match self.stage {
+                Stage::FrameHeader => {
+                    match crate::frame::parse_full_header(self.staged()) {
+                        Ok(crate::frame::HeaderParse::Complete(full)) => {
+                            match full.frame_type {
+                                crate::frame::FrameType::Skippable => {
+                                    self.cursor += full.header_size;
+                                    self.compact(0);
+                                    self.checksummed = false;
+                                    self.frame_open = false;
+                                    self.stage = Stage::SkipContent(
+                                        full.content_size.expect("skippable sets it") as usize,
+                                    );
+                                    continue;
+                                },
+                                crate::frame::FrameType::Zstd => {
+                                    // Single-pass shortcut: a frame with a
+                                    // pledged size that fits the caller's
+                                    // buffer and arrives whole in this call
+                                    // decodes in one step, straight into
+                                    // the caller's output.
+                                    if let Some(fcs) = full.content_size {
+                                        if (out.len() - *out_pos) as u64 >= fcs {
+                                            let have = self.staging.len() - call_start;
+                                            // SAFETY: remaining is the
+                                            // input's unread span.
+                                            let rest =
+                                                unsafe { input.slice_at(*in_pos, remaining) };
+                                            if let Some(csize) = chained_frame_size(
+                                                &self.staging[call_start..],
+                                                rest,
+                                            ) {
+                                                if csize >= have && csize - have <= remaining {
+                                                    // SAFETY: csize - have <= remaining.
+                                                    unsafe {
+                                                        self.claim(input, in_pos, csize - have)
+                                                    };
+                                                    let frame_end = call_start + csize;
+                                                    let written = decompress_oneshot(
+                                                        settings,
+                                                        dict,
+                                                        &self.staging[call_start..frame_end],
+                                                        &mut out[*out_pos..],
+                                                    )?;
+                                                    *out_pos += written;
+                                                    self.staging.truncate(call_start);
+                                                    self.cursor = call_start;
+                                                    self.finish_frame();
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // The per-frame dictionary consult: a
+                                    // slot change re-arms the decoder.
+                                    if self.dict_generation != generation {
+                                        self.arm_decoder(settings, dict)?;
+                                        self.dict_use_once = dict_use_once;
+                                        self.dict_generation = generation;
+                                    }
+                                    // Direct field slices: the source
+                                    // borrows `staging` while `reset`
+                                    // mutates `inner` (disjoint fields).
+                                    let tail_len = self.staging.len() - self.cursor;
+                                    let mut source: &[u8] = &self.staging[self.cursor..];
+                                    self.inner
+                                        .reset(&mut source)
+                                        .map_err(|e| error::frame(&e, DecodeSite::Stream))?;
+                                    self.cursor += tail_len - source.len();
+                                    self.compact(0);
+                                    self.checksummed = full.checksum;
+                                    self.block_size_max = full.block_size_max as usize;
+                                    self.frame_open = true;
+                                    self.stage = Stage::BlockHeader;
+                                    continue;
+                                },
+                            }
+                        },
+                        Ok(crate::frame::HeaderParse::Wanted(want)) => {
+                            let staged = self.staging.len() - self.cursor;
+                            let to_load = want - staged;
+                            if to_load > remaining {
+                                // Claim what is there and ask for the rest;
+                                // the enlarged visible prefix is judged
+                                // before the hint goes out.
+                                // SAFETY: remaining is the input's unread span.
+                                unsafe { self.claim(input, in_pos, remaining) };
+                                let want = match crate::frame::parse_full_header(self.staged()) {
+                                    Ok(crate::frame::HeaderParse::Wanted(w)) => w,
+                                    // The claim was strictly short of the
+                                    // header, so this cannot complete.
+                                    Ok(crate::frame::HeaderParse::Complete(_)) => want,
+                                    Err(e) => {
+                                        // This error path is behind the
+                                        // reference's `input->pos = input->size`
+                                        // commit; the claim stands.
+                                        input.pos = *in_pos;
+                                        return Err(crate::frame::parse_error_code(e));
+                                    },
+                                };
+                                let staged = self.staging.len() - self.cursor;
+                                return Ok(CallOutcome {
+                                    hint: want.max(FRAME_HEADER_MIN) - staged + 3,
+                                    guard_exempt: true,
+                                });
+                            }
+                            // SAFETY: to_load <= remaining.
+                            unsafe { self.claim(input, in_pos, to_load) };
+                            continue;
+                        },
+                        Err(e) => return Err(crate::frame::parse_error_code(e)),
+                    }
+                },
+                Stage::BlockHeader => {
+                    let staged = self.staging.len() - self.cursor;
+                    if staged < 3 {
+                        let need = 3 - staged;
+                        if need > remaining {
+                            // SAFETY: remaining is the input's unread span.
+                            unsafe { self.claim(input, in_pos, remaining) };
+                            break;
+                        }
+                        // SAFETY: need <= remaining.
+                        unsafe { self.claim(input, in_pos, need) };
+                    }
+                    let [b0, b1, b2, ..] = *self.staged() else {
+                        break;
+                    };
+                    let last = b0 & 1 == 1;
+                    let wire = match (b0 >> 1) & 3 {
+                        0 => BlockWireType::Raw,
+                        1 => BlockWireType::Rle,
+                        2 => BlockWireType::Compressed,
+                        // The reserved block type is corruption at the
+                        // header piece, exactly as getcBlockSize.
+                        _ => return Err(ErrorCode::CorruptionDetected),
+                    };
+                    let size =
+                        (usize::from(b0) >> 3) | (usize::from(b1) << 5) | (usize::from(b2) << 13);
+                    // getcBlockSize: the RLE body is its single content
+                    // byte; `size` is then the regenerated length.
+                    let c_size = if wire == BlockWireType::Rle {
+                        1
+                    } else {
+                        size
+                    };
+                    if c_size > self.block_size_max {
+                        return Err(ErrorCode::CorruptionDetected);
+                    }
+                    self.cursor += 3;
+                    self.compact(3);
+                    if c_size == 0 {
+                        // An empty block carries no body piece and produces
+                        // no output: straight to the next header or the
+                        // trailer.
+                        if last {
+                            if self.checksummed {
+                                self.stage = Stage::Checksum;
+                            } else {
+                                self.finish_frame();
+                            }
+                        }
+                        continue;
+                    }
+                    self.stage = Stage::BlockBody {
+                        wire,
+                        last,
+                        size: c_size,
+                        remaining: c_size,
+                    };
+                    continue;
+                },
+                Stage::BlockBody {
+                    wire: BlockWireType::Raw,
+                    last,
+                    size,
+                    remaining,
+                } => {
+                    // Raw bodies stream piecewise: every byte that
+                    // arrives is output already, at least one byte per
+                    // piece (an empty input stops the call instead).
+                    if input.size == *in_pos {
+                        break;
+                    }
+                    let piece = remaining.min(input.size - *in_pos);
+                    // SAFETY: piece <= remaining input.
+                    unsafe { self.claim(input, in_pos, piece) };
+                    let start = self.staging.len() - piece;
+                    self.pending.extend_from_slice(&self.staging[start..]);
+                    self.pre_released += piece;
+                    self.cursor += piece;
+                    let rest = remaining - piece;
+                    if rest == 0 {
+                        let header_pos = self.cursor - size - 3;
+                        let body_end = self.cursor;
+                        self.decode_block(header_pos, body_end, last)?;
+                        self.compact(0);
+                        if last {
+                            if self.checksummed {
+                                self.stage = Stage::Checksum;
+                            } else {
+                                self.finish_frame();
+                            }
+                        } else {
+                            self.stage = Stage::BlockHeader;
+                        }
+                    } else {
+                        self.stage = Stage::BlockBody {
+                            wire: BlockWireType::Raw,
+                            last,
+                            size,
+                            remaining: rest,
+                        };
+                    }
+                    continue;
+                },
+                Stage::BlockBody {
+                    wire,
+                    last,
+                    size,
+                    remaining,
+                } => {
+                    // Compressed and RLE bodies decode whole: stage the
+                    // rest of the piece first.
+                    let staged = self.staging.len() - self.cursor;
+                    let need = remaining - staged;
+                    if need > input.size - *in_pos {
+                        // SAFETY: the input's unread span.
+                        unsafe { self.claim(input, in_pos, input.size - *in_pos) };
+                        break;
+                    }
+                    // SAFETY: need <= remaining input.
+                    unsafe { self.claim(input, in_pos, need) };
+                    let header_pos = self.cursor - 3;
+                    let body_end = self.cursor + size;
+                    self.decode_block(header_pos, body_end, last)?;
+                    self.cursor = body_end;
+                    self.compact(0);
+                    let _ = wire;
+                    if last {
+                        if self.checksummed {
+                            self.stage = Stage::Checksum;
+                        } else {
+                            self.finish_frame();
+                        }
+                    } else {
+                        self.stage = Stage::BlockHeader;
+                    }
+                    continue;
+                },
+                Stage::Checksum => {
+                    let staged = self.staging.len() - self.cursor;
+                    let need = 4 - staged;
+                    if need > remaining {
+                        // SAFETY: remaining is the input's unread span.
+                        unsafe { self.claim(input, in_pos, remaining) };
+                        break;
+                    }
+                    // SAFETY: need <= remaining.
+                    unsafe { self.claim(input, in_pos, need) };
+                    // Direct field slices: the source borrows `staging`
+                    // while the decoder call mutates `inner`.
+                    let source: &[u8] = &self.staging[self.cursor..self.cursor + 4];
+                    let mut sink = [0u8; 0];
+                    match self.inner.decode_from_to(source, &mut sink) {
+                        Ok(_) => {},
+                        Err(e) => return Err(error::frame(&e, DecodeSite::Stream)),
+                    }
+                    self.cursor += 4;
+                    self.compact(0);
+                    self.finish_frame();
+                    continue;
+                },
+                Stage::SkipContent(rest) => {
+                    if rest == 0 {
+                        self.finish_frame();
+                        continue;
+                    }
+                    let take = rest.min(remaining);
+                    if take == 0 {
+                        break;
+                    }
+                    // Skippable content is claimed and discarded in place,
+                    // never staged.
+                    *in_pos += take;
+                    if take == rest {
+                        self.finish_frame();
+                    } else {
+                        self.stage = Stage::SkipContent(rest - take);
+                    }
+                    continue;
+                },
+                Stage::FrameEnded => break,
+            }
+        }
+        // Result: the completion answer or the piece hint.
+        if matches!(self.stage, Stage::FrameEnded) {
+            if self.pending.is_empty() {
+                if self.hostage {
+                    if *in_pos >= input.size {
+                        // The hostage byte was not re-offered; stay.
+                        return Ok(CallOutcome {
+                            hint: 1,
+                            guard_exempt: false,
+                        });
+                    }
+                    // Release the hostage: the byte belongs to the
+                    // finished frame and is consumed unread.
+                    *in_pos += 1;
+                    self.hostage = false;
                 }
-                self.inited = false;
-                continue;
+                self.stage = Stage::FrameHeader;
+                return Ok(CallOutcome {
+                    hint: 0,
+                    guard_exempt: false,
+                });
             }
-            match self.next_block_need()? {
-                Some(need) if self.staged().len() >= need => {},
-                _ => return Ok(()),
+            if !self.hostage {
+                // Output pending: hold one claimed input byte back so the
+                // caller must call again. It is a byte of the finished
+                // frame, so the hold-back only rewinds the claim.
+                debug_assert_eq!(self.staging.len(), self.cursor);
+                debug_assert!(*in_pos > 0);
+                *in_pos -= 1;
+                if self.cursor > 0 {
+                    self.staging.pop();
+                    self.cursor -= 1;
+                }
+                self.hostage = true;
             }
-            let read_before = self.inner.bytes_read_from_source();
-            // Direct field slices: the source borrows `input` while
-            // `decode_blocks` mutates `inner` (disjoint fields).
-            let mut source: &[u8] = &self.input[self.start..];
-            self.inner
-                .decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1))
-                .map_err(|e| error::frame(&e, DecodeSite::Stream))?;
-            let consumed = (self.inner.bytes_read_from_source() - read_before) as usize;
-            self.start += consumed;
-            self.compact();
-            self.inner
-                .collect_to_writer(&mut self.sink)
-                .map_err(|_| ErrorCode::Generic)?;
+            return Ok(CallOutcome {
+                hint: 1,
+                guard_exempt: false,
+            });
         }
-    }
-
-    /// Bytes the next block needs before it can be decoded safely (header
-    /// plus body plus, behind the last block of a checksummed frame, the
-    /// trailer): `None` when too little is staged to even parse the header.
-    fn next_block_need(&self) -> Result<Option<usize>, ErrorCode> {
-        let staged: &[u8] = &self.input[self.start..];
-        let [b0, b1, b2, ..] = *staged else {
-            return Ok(None);
+        let staged = self.staging.len() - self.cursor;
+        let hint = match self.stage {
+            Stage::BlockHeader => 3 - staged,
+            Stage::BlockBody {
+                last: false,
+                remaining,
+                ..
+            } => remaining + 3 - staged,
+            Stage::BlockBody {
+                last: true,
+                remaining,
+                ..
+            } => remaining - staged,
+            Stage::Checksum => 4 - staged,
+            // Skippable content is claimed directly, nothing is staged.
+            Stage::SkipContent(rest) => rest,
+            Stage::FrameHeader | Stage::FrameEnded => {
+                unreachable!("both stages return their own hint above")
+            },
         };
-        let last = b0 & 1 == 1;
-        let block_type = (b0 >> 1) & 3;
-        let size = (usize::from(b0) >> 3) | (usize::from(b1) << 5) | (usize::from(b2) << 13);
-        // The format's block maximum, the write-shaped decoder's twin
-        // check: without it a corrupt 21-bit size claim makes the stream
-        // stage up to 2 MiB of body bytes that never arrive instead of
-        // erroring (the core would reject the block only once staged).
-        if size > crate::frame::MAX_BLOCK_CONTENT {
-            return Err(ErrorCode::CorruptionDetected);
-        }
-        let body = match block_type {
-            0 | 2 => size, // Raw / Compressed carry `size` content bytes
-            1 => 1,        // RLE encodes a single byte
-            _ => return Err(ErrorCode::CorruptionDetected),
-        };
-        let trailer = if last && self.checksummed {
-            4
-        } else {
-            0
-        };
-        Ok(Some(3 + body + trailer))
-    }
-
-    /// Parse the next frame header from the staged input, consuming
-    /// skippable frames on the way. `Ok(false)` means more input is needed.
-    fn init_frame(&mut self) -> Result<bool, ErrorCode> {
-        loop {
-            if self.staged().len() < 4 {
-                return Ok(false);
-            }
-            match crate::frame::parse_header(self.staged()) {
-                Ok(crate::frame::Header::Skippable { total }) => {
-                    if self.staged().len() < total {
-                        return Ok(false);
-                    }
-                    self.start += total;
-                    self.compact();
-                },
-                Ok(crate::frame::Header::Zstd(header)) => {
-                    if self.staged().len() < header.header_len {
-                        return Ok(false);
-                    }
-                    self.checksummed = header.checksum;
-                    let mut source: &[u8] = &self.input[self.start..];
-                    self.inner
-                        .reset(&mut source)
-                        .map_err(|e| error::frame(&e, DecodeSite::Stream))?;
-                    let consumed = self.input.len() - self.start - source.len();
-                    self.start += consumed;
-                    self.compact();
-                    self.inited = true;
-                    return Ok(true);
-                },
-                Err(crate::frame::ParseError::NeedMore) => return Ok(false),
-                Err(crate::frame::ParseError::BadMagic | crate::frame::ParseError::Malformed) => {
-                    return Err(ErrorCode::PrefixUnknown);
-                },
-                // Frame-head constraints the walker can judge on its own;
-                // libzstd's streaming decode reports the same codes.
-                Err(crate::frame::ParseError::ReservedBit) => {
-                    return Err(ErrorCode::FrameParameterUnsupported);
-                },
-                Err(crate::frame::ParseError::WindowTooLarge) => {
-                    return Err(ErrorCode::FrameParameterWindowTooLarge);
-                },
-            }
-        }
+        Ok(CallOutcome {
+            hint,
+            guard_exempt: false,
+        })
     }
 }
 
@@ -448,10 +849,13 @@ impl DStream {
 /// calls before the reference refuses.
 const NO_FORWARD_PROGRESS_MAX: u32 = 16;
 
-/// The between-frames suggestion: the reference's loadHeader shortcut
-/// returns max(ZSTD_FRAMEHEADERSIZE_MIN, hSize) - staged + blockHeaderSize
-/// before its no-forward-progress guard; with nothing staged that is 9.
-const NEXT_FRAME_HINT: usize = 6 + 3;
+/// `ZSTD_FRAMEHEADERSIZE_MIN` for the zstd1 format: the floor of the
+/// loadHeader hint (`MAX(FRAMEHEADERSIZE_MIN, hSize) - staged + 3`).
+const FRAME_HEADER_MIN: usize = 6;
+
+/// Spent staging below this many bytes stays until the whole tail is
+/// consumed (one drain per frame in the steady state).
+const COMPACT_LIMIT: usize = 4096;
 
 /// The `ZSTD_DCtx` object.
 pub struct DCtx {
@@ -678,38 +1082,32 @@ impl DCtx {
             return Err(sticky);
         }
         let (out_start, in_start) = (output.pos, input.pos);
-        let hint = self.decompress_stream_inner(output, input)?;
-        if hint == 0 {
-            // A completed frame restarts the guard, as the reference's
-            // decompressBegin does at every frame boundary.
-            self.no_forward = 0;
-            return Ok(0);
+        let outcome = self.decompress_stream_inner(output, input)?;
+        self.settle_use_once();
+        if outcome.guard_exempt {
+            // The reference's loadHeader return sits before its guard.
+            return Ok(outcome.hint);
         }
         if output.pos == out_start && input.pos == in_start {
-            // The between-frames state returns from before the reference
-            // guard (its loadHeader shortcut); those calls never count.
-            let idle = self.stream.as_ref().is_some_and(DStream::idle_done);
-            if !idle {
-                self.no_forward += 1;
-                if self.no_forward >= NO_FORWARD_PROGRESS_MAX {
-                    return Err(if output.pos == output.size {
-                        ErrorCode::NoForwardProgressDestFull
-                    } else {
-                        ErrorCode::NoForwardProgressInputEmpty
-                    });
-                }
+            self.no_forward += 1;
+            if self.no_forward >= NO_FORWARD_PROGRESS_MAX {
+                return Err(if output.pos == output.size {
+                    ErrorCode::NoForwardProgressDestFull
+                } else {
+                    ErrorCode::NoForwardProgressInputEmpty
+                });
             }
         } else {
             self.no_forward = 0;
         }
-        Ok(hint)
+        Ok(outcome.hint)
     }
 
     fn decompress_stream_inner(
         &mut self,
         output: &mut ZSTD_outBuffer,
         input: &mut ZSTD_inBuffer,
-    ) -> Result<usize, ErrorCode> {
+    ) -> Result<CallOutcome, ErrorCode> {
         if self.stream.is_none() {
             let dict = self.dict.as_ref();
             match DStream::new(
@@ -725,72 +1123,45 @@ impl DCtx {
                 },
             }
         }
-        // A dictionary change made at a frame boundary (refPrefix,
-        // loadDictionary, refDDict between frames) re-arms the stream's
-        // decoder for the next frame, as the reference's per-frame
-        // dictionary consult does.
-        if let Some(stream) = self.stream.as_mut() {
-            let at_boundary = !stream.inited || stream.inner.is_finished();
-            if at_boundary && stream.dict_generation != self.dict_generation {
-                stream.rearm(
-                    &self.settings,
-                    self.dict.as_ref(),
-                    self.dict_use_once,
-                    self.dict_generation,
-                )?;
-            }
-        }
-        let stream = self.stream.as_mut().expect("just ensured");
         // SAFETY: output.dst[..output.size] is the caller-validated write
         // pair from the C entry.
         let out = unsafe { crate::as_mut_slice(output.dst, output.size) };
+        let mut out_pos = output.pos;
         let mut in_pos = input.pos;
-        let mut use_once_consumed = false;
-        loop {
-            stream.deliver(out, &mut output.pos);
-            if output.pos == output.size || in_pos == input.size {
-                break;
-            }
-            let take = (input.size - in_pos).min(FEED_CHUNK);
-            stream
-                .input
-                // SAFETY: take <= input.size - in_pos, so src[in_pos..in_pos+take]
-                // stays inside the caller's read buffer.
-                .extend_from_slice(unsafe { input.slice_at(in_pos, take) });
-            in_pos += take;
-            input.pos = in_pos;
-            stream.done_reported = false;
-            let generation = self.dict_generation;
-            stream.pump(&self.settings, generation)?;
+        let dict = self.dict.clone();
+        let generation = self.dict_generation;
+        let stream = self.stream.as_mut().expect("just ensured");
+        let result = stream.advance(
+            &self.settings,
+            dict.as_ref(),
+            self.dict_use_once,
+            generation,
+            out,
+            &mut out_pos,
+            input,
+            &mut in_pos,
+        );
+        match result {
+            Ok(outcome) => {
+                // Positions commit only on success; the reference leaves
+                // the caller's cursors untouched when it errors mid-loop.
+                output.pos = out_pos;
+                input.pos = in_pos;
+                Ok(outcome)
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Complete a call whose frame consumed the use-once prefix: the
+    /// context slot clears before the answer goes out.
+    pub fn settle_use_once(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
             if stream.use_once_consumed {
                 stream.use_once_consumed = false;
-                use_once_consumed = true;
+                self.consume_use_once();
             }
         }
-        stream.deliver(out, &mut output.pos);
-        input.pos = in_pos;
-        if use_once_consumed {
-            // A frame consumed the use-once prefix; the slot clears before
-            // the answer goes out (re-borrow the stream below).
-            self.consume_use_once();
-        }
-        let stream = self.stream.as_mut().expect("still present");
-        if stream.sink.len() > stream.delivered {
-            // Output the caller's buffer could not fit yet.
-            return Ok(stream.sink.len() - stream.delivered);
-        }
-        if stream.idle_done() {
-            // The completion answer goes out once per finished frame;
-            // further calls want the next frame's header, like the
-            // reference's between-frames loadHeader shortcut.
-            if core::mem::replace(&mut stream.done_reported, true) {
-                return Ok(NEXT_FRAME_HINT);
-            }
-            return Ok(0);
-        }
-        // More input or output will advance the frame; the hint is the
-        // block-sized suggestion libzstd gives.
-        Ok(DSTREAM_OUT_SIZE)
     }
 
     pub fn record_error(&mut self, code: ErrorCode) {
