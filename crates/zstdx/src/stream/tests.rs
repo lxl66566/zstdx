@@ -2613,4 +2613,280 @@ mod mt_dict {
             assert_eq!(back, data, "workers {workers} chunk {chunk}");
         }
     }
+
+    /// The deep rows' windowed-LDM class on the open stream (the unpledged
+    /// twin of the test above): the staging span's length evidence arms the
+    /// class once the stream proves itself mid-size-class, and the
+    /// engagement re-grids the frame onto the pinned bulk lattice from
+    /// offset zero, so the armed bytes are identical across worker counts
+    /// and write chunkings (the growing grid's epochs were worker-keyed).
+    /// A stream that ends below the span never arms: its bytes stay the
+    /// stock growing-grid model whatever the switch says.
+    #[test]
+    fn deep_rows_windowed_ldm_open_stream_arms_at_the_staging_span() {
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
+        const MIB: usize = 1024 * 1024;
+        let total = 17 * MIB + 123 * 1024;
+        let unit_len = 5 * MIB;
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut unit: Vec<u8> = (0..unit_len).map(|_| (rand() & 0xff) as u8).collect();
+        let head_len = 256 * 1024;
+        let blocks: Vec<Vec<u8>> = (0..96)
+            .map(|_| (0..64).map(|_| (rand() & 0xff) as u8).collect())
+            .collect();
+        let mut pick = 0x0dd_ba11_5eedu64;
+        let mut i = 0;
+        while i + 64 <= head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let block = &blocks[(pick >> 33) as usize % 96];
+            unit[i..i + 64].copy_from_slice(block);
+            i += 64;
+        }
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let encode = |data: &[u8], workers: u32, chunk: usize| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Best)
+                    .workers(workers)
+                    .checksum(true),
+            )
+            .unwrap();
+            for piece in data.chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        // The armed frame is worker- and chunking-independent.
+        let armed = encode(&data, 2, usize::MAX);
+        for (workers, chunk) in [(4u32, 1024 * 1024), (4, 7 * 1024), (8, 256 * 1024)] {
+            assert_eq!(
+                encode(&data, workers, chunk),
+                armed,
+                "workers {workers} chunk {chunk}"
+            );
+        }
+        let back = bulk::decompress_with(&armed, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data, "armed open deep band");
+        // The stock growing-grid model is the reference the class must
+        // beat on this fixture (its tiled unit keeps a paying far class
+        // while the per-job LDM restarts cost the stock row).
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock = encode(&data, 4, 1024 * 1024);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        assert_ne!(
+            stock, armed,
+            "the open arm must move the armed cells' bytes"
+        );
+        assert!(
+            armed.len() < stock.len(),
+            "the far class must pay: armed {} vs stock {}",
+            armed.len(),
+            stock.len()
+        );
+        // Below the staging span the class never arms: the short stream's
+        // bytes are the stock model with the arm on or off, including a
+        // length that lands exactly on the growing grid's first epoch
+        // boundary (the cancel's posting catch-up keeps the stock
+        // close-through-the-empty-block shape) and one inside a job.
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock_boundary = encode(&data[..16 * MIB], 4, 1024 * 1024);
+        let stock_mid = encode(&data[..15 * MIB], 4, 1024 * 1024);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        let armed_boundary = encode(&data[..16 * MIB], 4, 1024 * 1024);
+        let armed_mid = encode(&data[..15 * MIB], 4, 1024 * 1024);
+        assert_eq!(
+            armed_boundary, stock_boundary,
+            "a stream below the staging span never arms (epoch boundary)"
+        );
+        assert_eq!(
+            armed_mid, stock_mid,
+            "a stream below the staging span never arms (mid-job)"
+        );
+        let back =
+            bulk::decompress_with(&armed_boundary, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, &data[..16 * MIB], "below-span open deep band");
+    }
+
+    /// Serializes the tests that flip the process-global unpledged
+    /// deep-band switch (`set_stream_deep_band_for_tests`).
+    static DEEP_BAND_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Far-structured payload for the deep-band stream tests: a random
+    /// unit whose head repeats a small block vocabulary (the paying far
+    /// class the head screen keys on), tiled to `total` with one flipped
+    /// byte per 4096 so the far distance stays the only redundancy.
+    fn deep_band_far_fixture(total: usize, unit_len: usize) -> Vec<u8> {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut unit: Vec<u8> = (0..unit_len).map(|_| (rand() & 0xff) as u8).collect();
+        let head_len = 256 * 1024;
+        let blocks: Vec<Vec<u8>> = (0..96)
+            .map(|_| (0..64).map(|_| (rand() & 0xff) as u8).collect())
+            .collect();
+        let mut pick = 0x0dd_ba11_5eedu64;
+        let mut i = 0;
+        while i + 64 <= head_len.min(unit_len) {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let block = &blocks[(pick >> 33) as usize % 96];
+            unit[i..i + 64].copy_from_slice(block);
+            i += 64;
+        }
+        let mut data = Vec::with_capacity(total);
+        for copy in 0..u32::MAX {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        data
+    }
+
+    /// A forced `window_log` below the mid-size bar keeps an open deep-row
+    /// stream on the stock growing grid by construction: the subject check
+    /// keys on the row window, so the staging gate never holds a post and
+    /// the arm switch moves no byte. A small size hint clamps the row
+    /// window below the bar the same way. The unforced control on the
+    /// same payload arms, so the pinned gate is the window key and not a
+    /// dead fixture.
+    #[test]
+    fn forced_small_window_keeps_the_stock_deep_grid() {
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
+        const MIB: usize = 1024 * 1024;
+        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let encode = |shape: crate::InputShape| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Best)
+                    .workers(4)
+                    .checksum(true)
+                    .with_input_shape(shape),
+            )
+            .unwrap();
+            for piece in data.chunks(MIB) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        // Forced window below the mid-size bar: stock bytes either way.
+        let forced = crate::InputShape::default().with_window_log(24);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock = encode(forced);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        assert_eq!(encode(forced), stock, "a forced small window never stages");
+        // A small size hint clamps the row window below the bar too.
+        let hinted = crate::InputShape::default().with_len(8 * MIB as u64);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock_hint = encode(hinted);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        assert_eq!(encode(hinted), stock_hint, "a small size hint never stages");
+        // Control: unforced, the same payload arms and the far class pays.
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock_plain = encode(crate::InputShape::default());
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        let armed = encode(crate::InputShape::default());
+        assert_ne!(stock_plain, armed, "the control payload must arm");
+        assert!(
+            armed.len() < stock_plain.len(),
+            "the far class must pay: armed {} vs stock {}",
+            armed.len(),
+            stock_plain.len()
+        );
+    }
+
+    /// An unpledged deep-row stream past the staging buffer's own 256 MiB
+    /// cap. The armed frame keeps its pinned-grid bytes worker-independent
+    /// over the whole stream, with the windowed prefill's 64 MiB retention
+    /// live, and roundtrips through our decoder and the reference one. The
+    /// armed grid posts each job the moment it stages, so its live span
+    /// stays at the strip plus one job and the capped buffer never wraps;
+    /// the stock growing-grid twin is the stream that fills the cap, so
+    /// its leg pins the cap's own recycle: one stock encode past the cap,
+    /// roundtrip-clean through both decoders at a second worker count.
+    #[test]
+    fn deep_band_open_stream_past_the_buffer_cap() {
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
+        const MIB: usize = 1024 * 1024;
+        let data = deep_band_far_fixture(264 * MIB, 5 * MIB);
+        let encode = |workers: u32| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Best)
+                    .workers(workers)
+                    .checksum(true),
+            )
+            .unwrap();
+            for piece in data.chunks(4 * MIB) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        let armed8 = encode(8);
+        let armed4 = encode(4);
+        assert_eq!(armed4, armed8, "the armed grid stays worker-independent");
+        drop(armed4);
+        let back = bulk::decompress_with(&armed8, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data, "armed open deep band past the cap");
+        drop(back);
+        let mut reference = Vec::new();
+        zstd::stream::copy_decode(armed8.as_slice(), &mut reference).unwrap();
+        assert_eq!(reference, data, "reference decode of the armed frame");
+        drop(reference);
+        // The stock leg is the wrap case: the growing grid stages a whole
+        // epoch before any of it posts, so past the cap the buffer
+        // recycles at grid lines under the row's stock retention. Its
+        // bytes are worker-keyed by design, so the pin is the roundtrip.
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
+        let stock = encode(4);
+        crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
+        assert_ne!(stock, armed8, "the stock leg must differ from armed");
+        assert!(
+            armed8.len() < stock.len(),
+            "the far class must pay at scale"
+        );
+        let back = bulk::decompress_with(&stock, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data, "the wrapped stock frame roundtrips");
+        drop(back);
+        let mut reference = Vec::new();
+        zstd::stream::copy_decode(stock.as_slice(), &mut reference).unwrap();
+        assert_eq!(reference, data, "reference decode of the wrapped frame");
+    }
 }

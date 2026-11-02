@@ -126,13 +126,13 @@ use crate::{
         },
         frame_header::FrameHeader,
         match_generator::{
-            LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG,
-            StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
+            LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX,
+            SPF_SEG, StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
-            CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, capture_band, capture_job_size,
-            deep_ldm_band, donate_keep_span, fast_capture_schedule, head_predicts_keep,
-            job_size_for, job_size_for_level, prepare_job_state, run_job_with,
+            CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, btlazy_job_size, capture_band,
+            capture_job_size, deep_ldm_band, donate_keep_span, fast_capture_schedule,
+            head_predicts_keep, job_size_for, job_size_for_level, prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -210,14 +210,36 @@ enum FarClass {
 /// The deep tree rows' (btlazy2, levels 13-15) windowed-LDM schedule state
 /// (see `mt::deep_ldm_band` and [`MtEncoderCore::resolve_deep_ldm`]).
 enum DeepLdm {
-    /// The first post has not run yet.
+    /// The resolution has not run yet: a pledged frame waits for its
+    /// first post, an open frame for the staging span (see
+    /// [`DEEP_LDM_STAGE_SPAN`]).
     Pending,
     /// The frame engaged: every job takes the snapshot-less windowed
     /// prefill over the row's clamped window.
     Engaged,
-    /// A non-class frame, or a resolution site that could not read the
-    /// head: the stock per-job strip model stands.
+    /// A non-class frame, a cancelled staging, or a resolution site that
+    /// could not read the head: the stock per-job strip model stands.
     Off,
+}
+
+/// The unpledged deep band's staging span: the smallest byte count whose
+/// source clamp reaches the mid-size bar — `adjust_params` clamps the row
+/// window at ceil(log2(n)), so 2^24+1 is the first length that clamps to
+/// 2^25 — making the staged evidence exactly "a stream that would arm if
+/// pledged at its own length". Every shorter stream keeps the growing
+/// grid's stock bytes.
+const DEEP_LDM_STAGE_SPAN: u64 = LDM_MIDSIZE_WINDOW as u64 / 2 + 1;
+
+/// Test-only unpledged-arm switch (see `set_stream_deep_band_for_tests`).
+static UNPLEDGED_DEEP_BAND: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Test-only unpledged deep-band switch: stands the open stream's staging
+/// down (and back on) so a test can hold the stock growing-grid bytes as
+/// its reference. The pledged arm and the bulk path never read it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_stream_deep_band_for_tests(enabled: bool) {
+    UNPLEDGED_DEEP_BAND.store(enabled, Ordering::Relaxed);
 }
 
 /// The fast rows' far-class capture engagement (see the module docs and
@@ -1474,6 +1496,7 @@ impl MtEncoderCore {
         #[cfg(feature = "job_trace")]
         timeline::tl!("TL FINISH begin at {}", timeline::rel_us());
         self.surface_poison();
+        self.cancel_deep_staging();
         if self.pos > self.job_start {
             // Post the tail before waiting: posting first lets workers
             // claim tail jobs the moment earlier ones free them, instead
@@ -1519,6 +1542,7 @@ impl MtEncoderCore {
         // the output before it returns (encode_jobs drains everything it
         // posts; with nothing new pending, the drain below covers them).
         self.surface_poison();
+        self.cancel_deep_staging();
         if self.pos > self.job_start {
             self.encode_jobs(self.pos, false);
         } else {
@@ -1717,6 +1741,21 @@ impl MtEncoderCore {
         // never taken, so the schedule keeps its pure-function property).
         if self.fast_capture.stage_span().is_some() {
             self.fast_capture = FastCapture::Stock;
+        }
+    }
+
+    /// Cancel the unpledged deep band's staging at a flush/finish boundary
+    /// below the span (the never-taken verdict: the stock growing grid and
+    /// bytes stand), then catch the posting loop up: the staging gate held
+    /// every post, so posts the stock cadence had already made were
+    /// deferred, and re-running them here — same absolute bounds, non-last
+    /// — leaves the tail exactly the stock flush/finish shape (without the
+    /// catch-up, a stream ending on a due epoch boundary would close
+    /// through its last job instead of the empty closing block).
+    fn cancel_deep_staging(&mut self) {
+        if matches!(self.deep_ldm, DeepLdm::Pending) && self.deep_open_subject() {
+            self.deep_ldm = DeepLdm::Off;
+            self.post_ready();
         }
     }
 
@@ -1979,17 +2018,39 @@ impl MtEncoderCore {
         }
     }
 
+    /// Whether the frame is an unpledged deep-band subject (see
+    /// [`DEEP_LDM_STAGE_SPAN`]): an open growing-grid frame whose shape
+    /// already resolves the class window — the strategy, LDM capability
+    /// and mid-size bar of `deep_ldm_window`, so a small length hint or a
+    /// forced window keeps the stock schedule — under every mode but an
+    /// explicit `Disable`. Dictionary frames stage nothing (their job zero
+    /// is the dictionary seed, which the capture classes never touch) and
+    /// neither do pledged frames, whose fixed grid resolves at the first
+    /// post directly.
+    fn deep_open_subject(&self) -> bool {
+        UNPLEDGED_DEEP_BAND.load(Ordering::Relaxed)
+            && self.pledged.is_none()
+            && matches!(self.grid, JobGrid::Growing)
+            && self.dict.is_none()
+            && self.ldm_mode != crate::LdmMode::Disable
+            && MatchGeneratorDriver::deep_ldm_window(self.level, self.shape, self.choice).is_some()
+    }
+
     /// Resolve the deep tree rows' windowed-LDM engagement once per frame
-    /// (see `mt::deep_ldm_band`): the first post already carries the whole
-    /// first job plus its strip staged, so the head block the predicate
-    /// screens is long since buffered and the verdict is a pure function
-    /// of the input whatever the write cadence. Pledged fixed-grid frames
-    /// alone — the unpledged growing grid keeps its worker-keyed stock
-    /// schedule (the sanctioned divergence). The engagement only widens
-    /// `overlap` (the buffer retention and the job views follow it) and
-    /// flips the jobs' prefill: the pinned grid the fixed schedule already
-    /// cut at is the bulk one, so the pledged stream keeps matching the
-    /// bulk frame byte for byte on the class.
+    /// (see `mt::deep_ldm_band`): the resolving site already carries the
+    /// whole first job plus its strip staged — the pledged fixed grid at
+    /// its first post, the open frame once the staging span buffered (a
+    /// flush or finish below the span cancels first, see
+    /// `cancel_deep_staging`) —
+    /// so the head block the predicate screens is long since buffered and
+    /// the verdict is a pure function of the input whatever the write
+    /// cadence. The engagement widens `overlap` (the buffer retention and
+    /// the job views follow it) and flips the jobs' prefill; the pledged
+    /// grid the fixed schedule already cut at is the bulk one, so the
+    /// pledged stream keeps matching the bulk frame byte for byte on the
+    /// class, while the open frame re-grids onto the same pinned lattice
+    /// from offset zero (nothing had posted), making the armed bytes
+    /// worker-independent.
     fn resolve_deep_ldm(&mut self) {
         if !matches!(self.deep_ldm, DeepLdm::Pending) {
             return;
@@ -2001,14 +2062,28 @@ impl MtEncoderCore {
         if self.job_start != 0 || self.buf_base != 0 {
             return;
         }
-        if self.pledged.is_none() || !matches!(self.grid, JobGrid::Fixed(_)) {
-            return;
-        }
         let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
         let Some(window) = deep_ldm_band(self.level, self.shape, self.choice, head, self.ldm_mode)
         else {
             return;
         };
+        if self.pledged.is_some() {
+            if !matches!(self.grid, JobGrid::Fixed(_)) {
+                return;
+            }
+        } else if self.deep_open_subject() && self.pos >= DEEP_LDM_STAGE_SPAN {
+            // The open frame arms only on its staged length evidence (the
+            // span of [`DEEP_LDM_STAGE_SPAN`], checked here as well as at
+            // the staging gate so no other call site can arm a below-span
+            // frame), then joins the pinned bulk grid — `btlazy_job_size`
+            // at the stock strip (the search domain the constructor set,
+            // before the widening below) — tiling absolute offsets from
+            // zero, worker- and length-independent like every capture
+            // lattice.
+            self.grid = JobGrid::Fixed(btlazy_job_size(self.overlap));
+        } else {
+            return;
+        }
         self.overlap = window as usize;
         self.deep_ldm = DeepLdm::Engaged;
         self.reserve_decided();
@@ -2207,6 +2282,17 @@ impl MtEncoderCore {
                 return;
             }
             self.resolve_fast_capture();
+        }
+        if matches!(self.deep_ldm, DeepLdm::Pending) && self.deep_open_subject() {
+            // The deep band's open arm stages its length evidence the same
+            // way: nothing posts until the staging span buffers whole, so
+            // the engagement re-grids a frame whose head is still the
+            // buffer's own and whose schedule stays a pure function of the
+            // input whatever the write cadence.
+            if self.pos < DEEP_LDM_STAGE_SPAN {
+                return;
+            }
+            self.resolve_deep_ldm();
         }
         self.settle_dict_capture();
         loop {
