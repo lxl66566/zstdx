@@ -46,6 +46,54 @@ impl MatchGeneratorDriver {
         // itself is sliced forward to keep indexing non-negative.
         let shift = self.fast_shift;
         debug_assert!(self.pos >= shift && self.anchor >= shift && self.block_end >= shift);
+        #[cfg(feature = "job_trace")]
+        {
+            use crate::encoding::job_trace::scan_capture;
+            let off0 = shift.saturating_sub(self.win_base) as usize;
+            let win0 = &window_slice(&self.win, self.ext.as_ref())[off0..];
+            let wb0 = self.win_base.saturating_sub(shift);
+            scan_capture::at_entry(&scan_capture::EntryState {
+                flags: ((RAMPED as u32) * scan_capture::flags::RAMPED)
+                    | ((DENSE as u32) * scan_capture::flags::DENSE)
+                    | ((SMALL_WIDE as u32) * scan_capture::flags::SMALL_WIDE)
+                    | ((LDM as u32) * scan_capture::flags::LDM)
+                    | ((HASH_LOG != RUNTIME_LOG) as u32 * scan_capture::flags::CONST_LOG)
+                    | ((LDM && !self.ldm_seqs.is_empty()) as u32 * scan_capture::flags::LDM_CAND),
+                hash_log: if HASH_LOG == RUNTIME_LOG {
+                    self.params.hash_log
+                } else {
+                    HASH_LOG
+                },
+                covered_fill: match self.covered_fill {
+                    CoveredFill::Dense => scan_capture::fill::DENSE,
+                    CoveredFill::Strided => scan_capture::fill::STRIDED,
+                    CoveredFill::DictDense => scan_capture::fill::DICT_DENSE,
+                },
+                win: win0,
+                table: self.tables.heads_mut(),
+                lit_lens: &self.lit_lens,
+                win_base: wb0,
+                fast_shift: shift,
+                block_end: self.block_end - shift,
+                pos: self.pos - shift,
+                anchor: self.anchor - shift,
+                insert_max: IdxRange::new(wb0, wb0 + win0.len() as u64).insert_max(),
+                max_window: self.params.chain_reach.unwrap_or(self.params.window) as u64,
+                miss_count: self.miss_count as u64,
+                ramp: [
+                    self.ramp.start.saturating_sub(shift),
+                    self.ramp.end.saturating_sub(shift),
+                    self.ramp.depth,
+                ],
+                rep: self.rep,
+                rep_pending: self.rep_pending as u32,
+                seed_offset: self.seed_offset,
+                seed_hits: self.seed_hits as u32,
+                seed_budget: self.seed_budget,
+                lits_len: literals.len() as u32,
+                seqs_len: seqs.len() as u32,
+            });
+        }
         let off = shift.saturating_sub(self.win_base) as usize;
         let win = &window_slice(&self.win, self.ext.as_ref())[off..];
         let win_base = self.win_base.saturating_sub(shift);
@@ -753,5 +801,23 @@ impl MatchGeneratorDriver {
         self.seed_offset = seed_offset;
         self.seed_hits = seed_hits;
         self.seed_budget = seed_budget;
+        #[cfg(feature = "job_trace")]
+        {
+            use crate::encoding::job_trace::scan_capture;
+            scan_capture::at_exit(
+                self.tables.heads_mut(),
+                literals,
+                seqs,
+                &scan_capture::ExitState {
+                    pos: self.pos,
+                    miss_count: self.miss_count as u64,
+                    rep: self.rep,
+                    rep_pending: self.rep_pending as u32,
+                    seed_offset: self.seed_offset,
+                    seed_hits: self.seed_hits as u32,
+                    seed_budget: self.seed_budget,
+                },
+            );
+        }
     }
 }

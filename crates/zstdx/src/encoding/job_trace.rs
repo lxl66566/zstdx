@@ -348,7 +348,6 @@ pub fn fill_start(bytes: u64) -> Option<Instant> {
 /// wide the per-job cost spread is), and the stream core's probe of the
 /// same variable does not cover the bulk path.
 mod bulk_timeline {
-    use alloc::format;
     use std::{eprintln, sync::OnceLock, time::Instant};
 
     static ON: OnceLock<bool> = OnceLock::new();
@@ -612,6 +611,304 @@ pub mod descent_capture {
         // SAFETY: CallRecord is repr(C); read-only view.
         unsafe {
             std::slice::from_raw_parts(std::ptr::addr_of!(*r).cast(), size_of::<CallRecord>())
+        }
+    }
+
+    fn slice_as_u8(s: &[u32]) -> &[u8] {
+        // SAFETY: u32 slice reinterpreted as bytes; alignment of u8 is 1.
+        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), s.len() * 4) }
+    }
+}
+
+/// Whole-block fast-scan capture for out-of-tree scan-kernel probes
+/// (`ZSTDX_SCAN_CAPTURE=<path>,<pos_threshold>,<max_records>`). The first
+/// `start_matching_fast` entry at or past `pos_threshold` (absolute
+/// position) arms the file; each of the following fast-scan block
+/// invocations becomes one record: the scan's full entry state (window
+/// slice, head table, cursor/repcode/seed/ramp state, instantiation
+/// flags) written ahead of the body, and its full result (literals,
+/// packed sequences, post table, post driver state) after it. Restoring
+/// the entry state and re-running the same instantiation must reproduce
+/// the recorded result bit-exactly — the replay harness's exactness gate
+/// — and timing the re-runs gives the per-position tsc figure kernel
+/// probes compare against. Single-threaded encodes only: pool workers
+/// share the recorder and would interleave records.
+pub mod scan_capture {
+    use std::{
+        eprintln,
+        fs::File,
+        io::{BufWriter, Write},
+        string::String,
+        sync::{
+            Mutex,
+            atomic::{AtomicU8, Ordering},
+        },
+    };
+
+    use crate::encoding::SeqWord;
+
+    const FILE_MAGIC: u32 = 0x53434631;
+    const RECORD_MAGIC: u32 = 0x53435231;
+
+    /// Instantiation flags of the recorded scan body (the const-generic
+    /// axes of `start_matching_fast` plus derived state).
+    pub mod flags {
+        pub const RAMPED: u32 = 1 << 0;
+        pub const DENSE: u32 = 1 << 1;
+        pub const SMALL_WIDE: u32 = 1 << 2;
+        pub const LDM: u32 = 1 << 3;
+        /// `HASH_LOG` is a real const, not the runtime-log marker.
+        pub const CONST_LOG: u32 = 1 << 4;
+        /// The block carries unconsumed LDM candidates inside its span
+        /// (replay through the stock single-segment body requires this
+        /// clear: a live candidate ends a segment early).
+        pub const LDM_CAND: u32 = 1 << 5;
+    }
+
+    /// `CoveredFill` wire codes (the fast scan sees the first two).
+    pub mod fill {
+        pub const DENSE: u32 = 0;
+        pub const STRIDED: u32 = 1;
+        pub const DICT_DENSE: u32 = 2;
+    }
+
+    /// Entry state of one recorded scan block, extracted by the call
+    /// site. Cursor fields are rebased (`abs - fast_shift`) exactly as
+    /// the scan body derives them; `fast_shift` rebuilds the trues.
+    #[allow(clippy::struct_excessive_bools)]
+    pub struct EntryState<'a> {
+        pub flags: u32,
+        pub hash_log: u32,
+        pub covered_fill: u32,
+        pub win: &'a [u8],
+        pub table: &'a [u32],
+        pub lit_lens: &'a [u8; 256],
+        pub win_base: u64,
+        pub fast_shift: u64,
+        pub block_end: u64,
+        pub pos: u64,
+        pub anchor: u64,
+        pub insert_max: u64,
+        pub max_window: u64,
+        pub miss_count: u64,
+        /// Rebased `start`, `end`, `depth`.
+        pub ramp: [u64; 3],
+        pub rep: [u32; 3],
+        pub rep_pending: u32,
+        pub seed_offset: u32,
+        pub seed_hits: u32,
+        pub seed_budget: u32,
+        pub lits_len: u32,
+        pub seqs_len: u32,
+    }
+
+    #[repr(C)]
+    struct EntryHeader {
+        magic: u32,
+        flags: u32,
+        hash_log: u32,
+        table_len: u32,
+        covered_fill: u32,
+        win_len: u64,
+        win_base: u64,
+        fast_shift: u64,
+        block_end: u64,
+        pos: u64,
+        anchor: u64,
+        insert_max: u64,
+        max_window: u64,
+        miss_count: u64,
+        ramp: [u64; 3],
+        rep: [u32; 3],
+        rep_pending: u32,
+        seed_offset: u32,
+        seed_hits: u32,
+        seed_budget: u32,
+        lits_len: u32,
+        seqs_len: u32,
+    }
+
+    /// Post-scan driver state of one recorded scan block. `pos` and
+    /// `anchor` are the save-back values (both `self.block_end`, true
+    /// coordinates); the covered-fill and scan-density picks for the next
+    /// block arrive through the next record's entry header.
+    pub struct ExitState {
+        pub pos: u64,
+        pub miss_count: u64,
+        pub rep: [u32; 3],
+        pub rep_pending: u32,
+        pub seed_offset: u32,
+        pub seed_hits: u32,
+        pub seed_budget: u32,
+    }
+
+    #[repr(C)]
+    struct ExitHeader {
+        magic: u32,
+        pos: u64,
+        miss_count: u64,
+        rep: [u32; 3],
+        rep_pending: u32,
+        seed_offset: u32,
+        seed_hits: u32,
+        seed_budget: u32,
+        lits_len: u32,
+        seqs_len: u32,
+    }
+
+    #[repr(C)]
+    struct FileHeader {
+        magic: u32,
+        version: u32,
+    }
+
+    // 0 idle, 1 disabled, 2 armed, 3 done (record budget spent). OPEN
+    // pairs the two hooks: an entry record without budget must not leave
+    // its exit hook writing an orphan half-record.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static OPEN: AtomicU8 = AtomicU8::new(0);
+    static WRITER: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+    static REMAINING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn env_cfg() -> Option<&'static (String, u64, u64)> {
+        static CFG: std::sync::OnceLock<Option<(String, u64, u64)>> = std::sync::OnceLock::new();
+        CFG.get_or_init(|| {
+            let v = std::env::var("ZSTDX_SCAN_CAPTURE").ok()?;
+            let mut it = v.split(',');
+            let path = String::from(it.next()?);
+            let pos: u64 = it.next()?.parse().ok()?;
+            let max: u64 = it.next().unwrap_or("8").parse().ok()?;
+            Some((path, pos, max))
+        })
+        .as_ref()
+    }
+
+    /// Scan-entry hook: arm at the configured position, then write one
+    /// entry record per fast-scan block while the budget lasts. A no-op
+    /// without the env or after the budget.
+    pub fn at_entry(e: &EntryState<'_>) {
+        let state = STATE.load(Ordering::Relaxed);
+        if state == 1 || state == 3 {
+            return;
+        }
+        if state == 0 {
+            let Some((path, threshold, max)) = env_cfg() else {
+                STATE.store(1, Ordering::Relaxed);
+                return;
+            };
+            if e.pos + e.fast_shift < *threshold {
+                // Keep polling until the threshold is crossed (env cached).
+                return;
+            }
+            let file = File::create(path.as_str()).expect("scan capture: create");
+            let mut w = BufWriter::with_capacity(1 << 20, file);
+            let hdr = FileHeader {
+                magic: FILE_MAGIC,
+                version: 1,
+            };
+            // SAFETY: FileHeader is repr(C); read-only view.
+            w.write_all(unsafe {
+                std::slice::from_raw_parts(std::ptr::addr_of!(hdr).cast(), size_of::<FileHeader>())
+            })
+            .unwrap();
+            *WRITER.lock().unwrap() = Some(w);
+            REMAINING.store(*max, Ordering::Relaxed);
+            STATE.store(2, Ordering::Relaxed);
+            eprintln!(
+                "scan capture armed at pos {} -> {}",
+                e.pos + e.fast_shift,
+                path
+            );
+        }
+        if REMAINING.load(Ordering::Relaxed) == 0 {
+            close();
+            return;
+        }
+        REMAINING.fetch_sub(1, Ordering::Relaxed);
+        OPEN.store(1, Ordering::Relaxed);
+        let hdr = EntryHeader {
+            magic: RECORD_MAGIC,
+            flags: e.flags,
+            hash_log: e.hash_log,
+            table_len: e.table.len() as u32,
+            covered_fill: e.covered_fill,
+            win_len: e.win.len() as u64,
+            win_base: e.win_base,
+            fast_shift: e.fast_shift,
+            block_end: e.block_end,
+            pos: e.pos,
+            anchor: e.anchor,
+            insert_max: e.insert_max,
+            max_window: e.max_window,
+            miss_count: e.miss_count,
+            ramp: e.ramp,
+            rep: e.rep,
+            rep_pending: e.rep_pending,
+            seed_offset: e.seed_offset,
+            seed_hits: e.seed_hits,
+            seed_budget: e.seed_budget,
+            lits_len: e.lits_len,
+            seqs_len: e.seqs_len,
+        };
+        let mut guard = WRITER.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            // SAFETY: EntryHeader is repr(C); read-only view.
+            w.write_all(unsafe {
+                std::slice::from_raw_parts(std::ptr::addr_of!(hdr).cast(), size_of::<EntryHeader>())
+            })
+            .unwrap();
+            w.write_all(e.win).unwrap();
+            w.write_all(slice_as_u8(e.table)).unwrap();
+            w.write_all(e.lit_lens).unwrap();
+        }
+    }
+
+    /// Scan-exit hook: complete the armed record with the block's output
+    /// and post state.
+    pub fn at_exit(table: &[u32], literals: &[u8], seqs: &[SeqWord], x: &ExitState) {
+        if OPEN.swap(0, Ordering::Relaxed) == 0 {
+            return;
+        }
+        let hdr = ExitHeader {
+            magic: RECORD_MAGIC,
+            pos: x.pos,
+            miss_count: x.miss_count,
+            rep: x.rep,
+            rep_pending: x.rep_pending,
+            seed_offset: x.seed_offset,
+            seed_hits: x.seed_hits,
+            seed_budget: x.seed_budget,
+            lits_len: literals.len() as u32,
+            seqs_len: seqs.len() as u32,
+        };
+        let mut guard = WRITER.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            // SAFETY: ExitHeader is repr(C); read-only view.
+            w.write_all(unsafe {
+                std::slice::from_raw_parts(std::ptr::addr_of!(hdr).cast(), size_of::<ExitHeader>())
+            })
+            .unwrap();
+            w.write_all(literals).unwrap();
+            for word in seqs {
+                w.write_all(&word.codes.to_le_bytes()).unwrap();
+                w.write_all(&word.add.to_le_bytes()).unwrap();
+                w.write_all(&word.add_nb.to_le_bytes()).unwrap();
+            }
+            w.write_all(slice_as_u8(table)).unwrap();
+        }
+        if REMAINING.load(Ordering::Relaxed) == 0 {
+            drop(guard);
+            close();
+        }
+    }
+
+    fn close() {
+        if let Some(mut w) = WRITER.lock().unwrap().take() {
+            let _ = w.flush();
+        }
+        if STATE.load(Ordering::Relaxed) == 2 {
+            STATE.store(3, Ordering::Relaxed);
+            eprintln!("scan capture done");
         }
     }
 

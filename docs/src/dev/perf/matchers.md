@@ -84,6 +84,46 @@ The whole encode is 121.46M instructions against C's 76.27M, and the sides split
 
 The resolve block is large because the u64 distance, reach and `(pos - win_base) - dist` chain carries window-base, max-window and previous-pointer spill reloads on the candidate load's address chain. C pays about 6 instructions per position in u32 index space. Both structural levers off this table are falsified, the u32 index-space resolve measured the same day and the register-removal class of incremental index and position cursors measured on 2026-09-23. The index forms trade the base's free position low half at the stores and resolve, one `sub` for the index at addressing, for a spilled `win_base32` reloaded every pair plus LEA rebuilds, as recorded in the [matcher negative results](../negative/matchers.md). The per-event excess is the closed price of the 2^15 newest-wins geometry.
 
+### The scan's dispatch-slot regime
+
+A 2026-11-03 top-down pairing asked whether the tier's json residue sits in the deep walk's regime, where instruction cuts buy near-zero cycles, or in an issue-bound regime where they convert at the dispatch rate. The vehicles were `prof enc` on json 32 MiB against the zstd crate's bulk loop, both with a fresh context per iteration, one pinned core, 40 iterations per side, and the AMD dispatch-stall counters (`ex_ret_ops`, `de_no_dispatch_per_slot.*`).
+
+| metric per encode | zstdx | libzstd 1.5.7 |
+|---|---:|---:|
+| wall | 633-639 MiB/s | 837-846 MiB/s |
+| cycles | 268.1M | 203.8M |
+| instructions | 1043.2M | 615.3M |
+| IPC | 3.88 | 3.02 |
+| dispatched ops, 6-wide utilization | 1029.2M, 64% | 624.7M, 51% |
+| backend-stall slots | 201.3M, 0.75/cycle | 239.7M, 1.18/cycle |
+| frontend no-op slots | 192.4M, 0.72/cycle | 174.5M, 0.86/cycle |
+| branch misses | 2.00M | 1.53M |
+| L1 load misses | 8.4M at 2.8% | 12.9M at 4.9% |
+| L2 misses | 0.10M | 0.20M |
+
+The scan symbol (the dense const-log `start_matching_fast`) holds 145.7M cycles against 537.1M instructions, IPC 3.68 at 61% utilization, losing 0.63 backend plus 0.71 frontend slots per cycle. `insert_covered` holds 70.9M against 248.4M at IPC 3.49, and the entropy side runs at IPC 5.58. Libzstd's `ZSTD_compressBlock_fast` holds 127.4M cycles against 332.1M instructions, IPC 2.61 at 43% utilization, losing 1.13 plus 0.95 slots per cycle. Neither loop misses L2 at this shape, so the walk's miss stream is absent on both sides and L1 misses sit at half of C's rate.
+
+The ruling: the dense scan is not walk-class. C's scan is the more stall-bound loop of the pair, so our 1.62x scan instruction excess yields only 1.14x scan cycles and the whole-encode instruction excess of 1.70x yields 1.32x cycles. Our scan dispatches 78% of its slots, loses 22% to explicit stalls, and pays about 11% of cycles in mispredict recovery. A 20% scan instruction cut projects to about minus 29M cycles, minus 11% of the encode, if the stall structure holds constant, and the walk's zero-conversion regime is excluded by the dispatching share. The projection needed a measured cut to pin the real rate, and the two probes of that round measured it from both sides: a hand-written resolve+fold asm island and a profile-guided relayout both failed to move the tier, recorded in the [matcher negative results](../negative/matchers.md). What remains open is the whole-loop kernel form, which owns the emit and `rep1_chain` paths instead of routing around them.
+
+### Scan capture and replay
+
+The whole-loop question needed a cheap trial vehicle, so a capture hook after the `job_trace` pattern landed behind the same feature: `ZSTDX_SCAN_CAPTURE=<path>,<pos_threshold>,<max_records>` arms at the first `start_matching_fast` entry at or past the threshold, and every following fast-scan block becomes one record. The record holds the block's full entry state — the window slice, the head table, the cursor, repcode, seed, ramp and covered-fill state, the instantiation flags — and its full result: literals, packed sequences, the post table and the post driver state. Single-threaded encodes only, since pool workers would interleave records.
+
+The replay side is out-of-tree scratch: restore the entry state, re-run a copy of the steady single-segment body over it, and require the copy to reproduce the recorded literals, sequences, table and state bit-exactly. That gate caught two transcription bugs during the build, a wrong accept bar on the armed second-position rep probe and a missing pre-store read order, so it has teeth. Captures exist for json at 8 and 24 MiB windows, text and skewed, eight blocks each. Verify plus timing runs in about a second per capture, and the default build compiles none of it.
+
+The captured streams also give clean event-rate coverage for the dense body, measured over 77.6K pairs at 13.5 positions per pair on json: the rep fold fires its first-position hit on 19.2% of pairs and 19.3% emit, the first position validates its hash candidate on 38.3% and emits on 32.3%, the second validates on 10.7% and emits on 9.9%, and 38.5% of pairs take the miss path.
+
+The same harness timed the whole-loop kernel's upper bound, and the table is the R94 input. The spine column replaces the pair-fixed spine — both loads, hashes, pre-store table reads, newest-wins stores and both resolve+fold terms — with one asm block; the prefilter column adds the rep OR-fold as a second block. Everything else, the extends, the bar, emit and `rep1_chain`, stays shared Rust calling the same helpers.
+
+| capture, 8 blocks | rust tsc/pos | spine asm | spine + prefilter asm |
+|---|---:|---:|---:|
+| json 8 MiB window | 3.2-4.6 | -5.2% | -0.7% |
+| json 24 MiB window | 4.7 | -6.2% | -1.6% |
+| text rep-chain blocks | 0.08 | -0.0% | -0.2% |
+| skewed miss blocks | 0.05 | -5.7% | +13.9% |
+
+The absolute tsc/pos swings with the machine's frequency drift, but the interleaved ratios are stable to a tenth of a percent within a binary. The buy saturates at the spine: 5-6% of the replayed scan on probe-mix and miss-path blocks, nothing on rep-chain blocks where the spine runs once per block. Extending ownership to the prefilter gives the entire buy back on json and turns negative on skewed, because the second per-pair block boundary costs more marshaling than the prefilter's arithmetic saves. The scan symbol holds 54% of the tier's json cycles, so 5-6% of the scan projects to about 3% of the encode. The verdict and the falsification are recorded in the [matcher negative results](../negative/matchers.md).
+
 ### Fast-row stream coordinates
 
 `pack_pos` stores `abs as u32 + 1`, so once a stream passes 2^32 positions every in-window candidate rebuilds a distance of 2^32 or more and the u64 resolve rejects the whole table. Past 4 GiB the ratio collapses to repcodes only. A 6-GiB streamed token replay produced 3.46 GB broken against about 1.24 GB fixed, with the rate tripling past 4 GiB, and the output stayed decode-valid throughout, so the defect is ratio-only.

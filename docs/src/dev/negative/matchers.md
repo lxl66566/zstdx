@@ -148,6 +148,28 @@ A full-window distinct-byte scan as the alphabet screen cost skewed-16K fastest 
 
 Runtime-variable parse bars, with `ml >= min_ml` and `miss >> ramp_shift` locals in the fast row's hot loop, cost text-16K fastest 22% wall against the same values as instantiation constants. LLVM folds `if CONST {4} else {6}` but keeps a runtime bar live in the loop, so small-source bars ship as the `SMALL_WIDE` const generic.
 
+### Profile-guided layout on the fastest tier
+
+The walk's PGO falsification motivated the same probe on the fastest tier's json gap. One profile-generate build trained on json and skewed at levels 1 and 3, two `prof enc` passes each under the bench lock, merged through `llvm-profdata`, and one profile-use build. The locked four-round position-alternating A/B read json fastest single-thread at base 629 against pgo 630 MiB/s medians with paired ratios of +0.7%, and stream-mt8 at base 2150 against pgo 2093 at -2.6%, with byte-identical outputs.
+
+Falsified: layout carries no material weight on the fastest tier's gap, against a bar of recovering 15% of it. This pairs with the dispatch-slot decomposition in [matchers](../perf/matchers.md), whose ruling puts the residue in per-event issue pressure and serialization rather than placement.
+
+### The resolve+fold asm island
+
+The probe replaced the dense body's resolve+fold region with a hand-written x86-64 block pair, hosted behind the existing `DENSE && const-log` const split so the plain body's codegen stays byte-identical. The block reproduces the closure's arithmetic exactly, wrapping distance, reach select, candidate alias and the `(cand == ip)` OR term included, and the full-ladder bulk and stream dumps gated it at byte-identical output.
+
+Two hosting facts came first. A fused 16-operand block exceeds the allocatable register file outright, the compiler rejects it with "inline assembly requires more registers than available", so the block splits per position at nine operands each. And the m-term's `setcc` needs its byte register zeroed ahead of the compare, because the temp's upper bits still carry the reach value and the `or` would pollute the u32 after truncation.
+
+Gungraun read json.fastest 33,387,475 to 33,681,387 instructions, +0.88%, with text, skewed, random and zeros exactly unchanged. Two mechanisms caused it. The hand sequence spends about 32 instructions per pair, and the measured +294K instructions per json MiB at 58.1K pairs puts the compiler form at 26 or below, because the region's documented 44-instruction lump counts spill reloads riding the chain rather than straight-line arithmetic, so there was no arithmetic to remove. And the nine-register island is an allocation obstacle inside the saturated loop: LLVM routes the displaced spills back into the loop head, the same famine the u32-resolve and cursor falsifications recorded for source edits. An asm block inherits the famine unless it owns the whole loop, and the fast scan's whole loop includes the emit and `rep1_chain` paths, which run on about half of all pairs. A whole-loop kernel is the one form left untried on this tier, and the boundary cost it must absorb is the reopen condition.
+
+### The whole-loop kernel at prototype
+
+The R93-K probe built the vehicle the reopen condition asked for. A `scan_capture` hook behind `job_trace` snapshots whole fast-scan blocks from real encodes, entry state and full result, and an out-of-tree replay harness re-runs a bit-exact copy of the steady body over the records. Two variants went through it. The spine form replaces the pair-fixed spine, meaning both loads, both hashes, both pre-store reads, both newest-wins stores and both resolve+fold terms, with one asm block of about 55 instructions at 15 register operands. The prefilter form adds the rep OR-fold as a second per-pair block.
+
+The spine island is bit-exact over every captured stream and buys 5.2% and 6.2% tsc/position on the json dense replay at two windows, 5.7% on skewed's miss-path blocks, and nothing on text's rep-chain blocks where the spine runs once per block. The prefilter extension returns the whole buy, reading -0.7% and -1.6% on json and +13.9% on skewed: the second block's operand marshaling costs more than the fold's arithmetic, so the island's arithmetic win saturates the moment its boundary multiplies. The scan symbol holds 54% of the tier's json cycles, so the saturated buy projects to about 3% of the encode.
+
+Falsified at prototype, against a bar of 5% per-position: the whole-loop form's measurable ceiling sits under the bar, and the one growth direction past the spine measured negative. The remaining unowned shares, the extends at 14% and emit plus `rep1_chain` at 11%, are shared call targets in every variant here, and fusing them would multiply the boundary cost the prefilter result already prices. The harness itself is the round's keep: the capture hook is in-tree behind `job_trace`, and the replay numbers above reproduce from `ZSTDX_SCAN_CAPTURE` dumps in about a second per capture.
+
 ## Fast-tier hash and table geometry
 
 ### hash4 revivals
