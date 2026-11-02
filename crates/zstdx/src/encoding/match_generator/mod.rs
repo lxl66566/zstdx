@@ -2335,15 +2335,13 @@ impl MatchGeneratorDriver {
             * PREFILL_STRIDE;
         let origin = self.head_origin;
         while idx < last {
-            let abs = base + idx as u64;
             // The grid keeps the stock 5-byte head hash (hash_at_log's
             // form; the width-carrying fills run in prefill_window).
             insert_linked_at(
                 data,
                 heads,
                 links,
-                idx,
-                abs,
+                WinPos::new(base, base + idx as u64),
                 hash_log,
                 ChainHashWidth::Five,
                 origin,
@@ -2672,7 +2670,13 @@ impl MatchGeneratorDriver {
                         let retain = table.len() * PREFILL_STRIDE * PREFILL_RETAIN_HORIZONS;
                         let mut idx = last.saturating_sub(retain);
                         while idx < last {
-                            insert_at(data, heads, idx, base + idx as u64 - shift, log);
+                            insert_at(
+                                data,
+                                heads,
+                                WinPos::new(base, base + idx as u64),
+                                shift,
+                                log,
+                            );
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -2684,8 +2688,9 @@ impl MatchGeneratorDriver {
                         // retention cap would drop dictionary-head entries.
                         let mut idx = 0;
                         while idx < last {
-                            insert_at(data, heads, idx, base + idx as u64 - shift, log);
-                            backfill_empty(heads, data, base - shift, idx, log, last);
+                            let pos = WinPos::new(base, base + idx as u64);
+                            insert_at(data, heads, pos, shift, log);
+                            backfill_empty(heads, data, pos, shift, log, last);
                             idx += PREFILL_STRIDE;
                         }
                     },
@@ -2703,16 +2708,8 @@ impl MatchGeneratorDriver {
                     .dfast_pair(1usize << long_log, long_log, small_log);
                 let mut idx = 0;
                 while idx < last {
-                    put_both(
-                        long,
-                        small,
-                        data,
-                        idx,
-                        base + idx as u64 - shift,
-                        long_log,
-                        small_log,
-                        width,
-                    );
+                    let pos = WinPos::new(base, base + idx as u64);
+                    put_both(long, small, data, pos, shift, long_log, small_log, width);
                     if grid == FillGrid::Dictionary && idx + 2 < last {
                         // Beyond libzstd's dict fill, whose small table
                         // stays on the stride grid (off-grid twins stay
@@ -2733,7 +2730,7 @@ impl MatchGeneratorDriver {
                     if grid == FillGrid::Dictionary {
                         // The long table takes the empty-slot backfill
                         // (libzstd's fillDoubleHashTableForCDict).
-                        backfill8_empty(long, data, base - shift, idx, long_log, last);
+                        backfill8_empty(long, data, pos, shift, long_log, last);
                     }
                     idx += PREFILL_STRIDE;
                 }
@@ -2787,8 +2784,15 @@ impl MatchGeneratorDriver {
                 } else {
                     let mut idx = 0;
                     while idx < last {
-                        let abs = base + idx as u64;
-                        insert_linked_at(data, heads, links, idx, abs, hash_log, width, origin);
+                        insert_linked_at(
+                            data,
+                            heads,
+                            links,
+                            WinPos::new(base, base + idx as u64),
+                            hash_log,
+                            width,
+                            origin,
+                        );
                         idx += stride;
                     }
                 }
@@ -3855,8 +3859,8 @@ impl Matcher for MatchGeneratorDriver {
                         long,
                         small,
                         win,
-                        idx,
-                        self.block_start - self.fast_shift,
+                        WinPos::new(self.win_base, self.block_start),
+                        self.fast_shift,
                         self.params.hash_log,
                         small_log,
                         ChainHashWidth::of(self.dict_row),
@@ -3867,8 +3871,8 @@ impl Matcher for MatchGeneratorDriver {
                     insert_at(
                         win,
                         TableHandle::at(self.tables.heads_mut().as_mut_ptr(), log),
-                        idx,
-                        self.block_start - self.fast_shift,
+                        WinPos::new(self.win_base, self.block_start),
+                        self.fast_shift,
                         log,
                     );
                 },
@@ -4413,7 +4417,7 @@ impl MatchGeneratorDriver {
             // newest-wins heads already serve the modal repeat distance),
             // and probing them measured as pure interference — a far read
             // per split plus a miss-step clamp on tiled data.
-            self.ldm_seqs.retain(|s| s.offset as u64 > reach);
+            self.ldm_seqs.retain(|s| s.offset.get() as u64 > reach);
             if self.ldm_dead && !self.ldm_seqs.is_empty() {
                 self.ldm_dead = false;
                 self.ldm_quiet = 0;
@@ -4523,7 +4527,13 @@ impl MatchGeneratorDriver {
                 let log = self.fast_fill_log();
                 let heads = TableHandle::at(self.tables.heads_mut().as_mut_ptr(), log);
                 while idx < to {
-                    insert_at(win, heads, idx, win_base + idx as u64 - shift, log);
+                    insert_at(
+                        win,
+                        heads,
+                        WinPos::new(win_base, win_base + idx as u64),
+                        shift,
+                        log,
+                    );
                     idx += 1;
                 }
             },
@@ -4538,8 +4548,8 @@ impl MatchGeneratorDriver {
                         long,
                         small,
                         win,
-                        idx,
-                        win_base + idx as u64 - shift,
+                        WinPos::new(win_base, win_base + idx as u64),
+                        shift,
                         long_log,
                         small_log,
                         width,
@@ -4553,8 +4563,15 @@ impl MatchGeneratorDriver {
                 let (heads, links) = self.tables.chain_pair(hash_log);
                 let origin = self.head_origin;
                 while idx < to {
-                    let abs = win_base + idx as u64;
-                    insert_linked_at(win, heads, links, idx, abs, hash_log, width, origin);
+                    insert_linked_at(
+                        win,
+                        heads,
+                        links,
+                        WinPos::new(win_base, win_base + idx as u64),
+                        hash_log,
+                        width,
+                        origin,
+                    );
                     idx += 1;
                 }
             },

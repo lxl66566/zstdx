@@ -676,7 +676,7 @@ impl MatchGeneratorDriver {
             // verified the whole span at fill time); a failure drops it and
             // re-opens the split as gap bytes of the next segment, the
             // pending literals still attached.
-            let cand_abs = end.checked_sub(seq.offset as u64);
+            let cand_abs = end.checked_sub(seq.offset.get() as u64);
             let valid = match cand_abs {
                 Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
                     read4(win, (c - win_base) as usize) == read4(win, (end - win_base) as usize)
@@ -707,7 +707,7 @@ impl MatchGeneratorDriver {
                 start -= 1;
                 ml += 1;
             }
-            anchor = emit.emit(win, anchor, start, ml, seq.offset + 3, &mut rep);
+            anchor = emit.emit(win, anchor, start, ml, seq.offset.get() + 3, &mut rep);
             self.ldm_won = true;
             // A wholesale emission is a literal-offset sequence: the
             // job-start rep gate counts it.

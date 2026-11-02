@@ -506,7 +506,11 @@ unsafe fn checksum_mask_avx512(entries: &[u64; ENTS_PER_BUCKET], checksum: u32) 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LdmSeq {
     pub split: u64,
-    pub offset: u32,
+    /// The candidate distance, in `[1, window]` at the admission
+    /// compare: nonzero by construction, kept unrepresentable here so a
+    /// zero distance cannot re-enter the consumers candidate arithmetic
+    /// (their 4-byte guard self-compares and would admit it).
+    pub offset: NonZero<u32>,
     pub len: u32,
 }
 
@@ -1025,9 +1029,15 @@ impl LdmState {
                 }
                 self.insert(hash, split, checksum);
                 if let Some((dist, match_end)) = best {
+                    // The admission compare left the distance in
+                    // [1, window] and the row window log clamps at
+                    // 27, so the u32 narrowing is lossless.
+                    debug_assert!(dist.get() <= u32::MAX as u64);
                     out.push(LdmSeq {
                         split,
-                        offset: dist.get() as u32,
+                        // SAFETY: nonzero by the admission compare and
+                        // lossless by the window clamp asserted above.
+                        offset: unsafe { NonZero::new_unchecked(dist.get() as u32) },
                         len: (match_end - split) as u32,
                     });
                     anchor = match_end;
@@ -1285,14 +1295,17 @@ mod tests {
             off = end;
         }
         for s in &seqs {
-            assert!(s.offset >= 1, "offset 0");
-            assert!(s.split >= s.offset as u64, "source below zero");
+            assert!(s.split >= s.offset.get() as u64, "source below zero");
             assert!(
-                s.offset as u64 <= 1 << window_log,
+                s.offset.get() as u64 <= 1 << window_log,
                 "offset {} beyond window",
                 s.offset
             );
-            let fwd = extend_match(data, s.split as usize, s.split as usize - s.offset as usize);
+            let fwd = extend_match(
+                data,
+                s.split as usize,
+                s.split as usize - s.offset.get() as usize,
+            );
             assert!(
                 fwd >= MIN_MATCH_LENGTH,
                 "candidate at {} offset {} verifies only {}",
@@ -1352,7 +1365,7 @@ mod tests {
         let seqs = collect_and_verify(&data, 128 * 1024, 21);
         assert!(
             seqs.iter()
-                .any(|s| s.split >= (1 << 20) && s.offset >= (1 << 20) - 8192),
+                .any(|s| s.split >= (1 << 20) && s.offset.get() >= (1 << 20) - 8192),
             "no far candidate in {} seqs",
             seqs.len()
         );
@@ -1369,7 +1382,7 @@ mod tests {
         data.extend_from_slice(&block);
         let seqs = collect_and_verify(&data, 128 * 1024, 17);
         assert!(
-            seqs.iter().all(|s| s.offset as u64 <= 1 << 17),
+            seqs.iter().all(|s| s.offset.get() as u64 <= 1 << 17),
             "candidate beyond the window leaked"
         );
     }
@@ -1409,7 +1422,7 @@ mod tests {
         assert!(
             seqs.iter()
                 .any(|s| s.split >= (strip.len() + 256 * 1024) as u64
-                    && s.offset as u64 >= 256 * 1024),
+                    && s.offset.get() as u64 >= 256 * 1024),
             "no candidate into the filled strip"
         );
     }
@@ -1429,9 +1442,9 @@ mod tests {
         let mut seqs = Vec::new();
         st.generate(&mut seqs, &all, 0, strip.len() as u64, all.len() as u64);
         assert!(
-            seqs.iter().any(
-                |s| s.split >= (strip.len() + 64 * 1024) as u64 && s.offset as u64 >= 64 * 1024
-            ),
+            seqs.iter()
+                .any(|s| s.split >= (strip.len() + 64 * 1024) as u64
+                    && s.offset.get() as u64 >= 64 * 1024),
             "no candidate after restart"
         );
     }

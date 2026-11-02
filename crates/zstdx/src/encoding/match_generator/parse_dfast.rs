@@ -487,7 +487,7 @@ impl MatchGeneratorDriver {
             // verified the whole span at fill time); a failure drops it and
             // re-opens the split as gap bytes of the next segment, the
             // pending literals still attached.
-            let cand_abs = (win_base + seg_end as u64).checked_sub(seq.offset as u64);
+            let cand_abs = (win_base + seg_end as u64).checked_sub(seq.offset.get() as u64);
             let valid = match cand_abs {
                 Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
                     read4(win, (c - win_base) as usize) == read4(win, seg_end)
@@ -521,7 +521,7 @@ impl MatchGeneratorDriver {
                 seg_end,
                 start,
                 ml,
-                seq.offset + 3,
+                seq.offset.get() + 3,
                 &mut rep,
             );
             self.ldm_won = true;

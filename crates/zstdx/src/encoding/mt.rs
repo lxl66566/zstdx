@@ -1335,7 +1335,7 @@ fn take_feed_span(
     Some(
         g.seqs[lo..hi]
             .iter()
-            .filter(|s| s.offset as u64 > reach)
+            .filter(|s| s.offset.get() as u64 > reach)
             .copied()
             .collect(),
     )

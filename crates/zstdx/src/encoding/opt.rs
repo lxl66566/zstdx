@@ -181,7 +181,7 @@ impl<'a> LdmCursor<'a> {
             self.next += 1;
             let end = s.split + s.len as u64;
             if pos < end {
-                self.active = Some((s.offset, end));
+                self.active = Some((s.offset.get(), end));
             }
         }
         let Some(&(off, end)) = self.active.as_ref() else {

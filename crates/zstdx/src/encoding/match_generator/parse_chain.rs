@@ -152,8 +152,15 @@ impl MatchGeneratorDriver {
                 let cap = (pos.min(insert_max) - win_base) as usize;
                 let mut ci = (next_ins - win_base) as usize;
                 while ci < cap {
-                    let abs = win_base + ci as u64;
-                    insert_linked_at(win, heads, links, ci, abs, hash_log, width, origin);
+                    insert_linked_at(
+                        win,
+                        heads,
+                        links,
+                        WinPos::new(win_base, win_base + ci as u64),
+                        hash_log,
+                        width,
+                        origin,
+                    );
                     ci += 1;
                 }
             }
@@ -565,7 +572,7 @@ impl MatchGeneratorDriver {
             // verified the whole span at fill time); a failure drops it and
             // re-opens the split as gap bytes of the next segment, the
             // pending literals still attached.
-            let cand_abs = end.checked_sub(seq.offset as u64);
+            let cand_abs = end.checked_sub(seq.offset.get() as u64);
             let valid = match cand_abs {
                 Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
                     read4(win, (c - win_base) as usize) == read4(win, (end - win_base) as usize)
@@ -599,7 +606,7 @@ impl MatchGeneratorDriver {
                 anchor,
                 start,
                 ml,
-                seq.offset + 3,
+                seq.offset.get() + 3,
                 &mut rep,
                 emit.literals,
                 emit.seqs,
@@ -636,8 +643,7 @@ impl MatchGeneratorDriver {
                         win,
                         emit.table,
                         links,
-                        (p - win_base) as usize,
-                        p,
+                        WinPos::new(win_base, p),
                         hash_log,
                         width,
                         origin,

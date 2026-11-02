@@ -504,11 +504,16 @@ pub(super) fn chain_search(
     (best_len, best_cand)
 }
 
-/// Store `abs` as the newest position for its hash into `table`'s `log`
-/// slots. Caller guarantees `idx` has at least 5 bytes of window behind it.
+/// Store `pos` as the newest position for its hash into `table`'s `log`
+/// slots, in the fast/dfast tables' epoch coordinates (`pos.abs() -
+/// shift`, the driver's `fast_shift`). Caller guarantees the position's
+/// window index has at least 5 bytes of window behind it.
 #[inline(always)]
-pub(super) fn insert_at(win: &[u8], table: TableHandle, idx: usize, abs: u64, log: u32) {
-    table.put(hash_at_log(win, idx, log), pack_pos(abs));
+pub(super) fn insert_at(win: &[u8], table: TableHandle, pos: WinPos, shift: u64, log: u32) {
+    table.put(
+        hash_at_log(win, pos.idx(), log),
+        pack_pos(pos.abs() - shift),
+    );
 }
 
 /// Dictionary-load backfill of one stride group's skipped positions (the
@@ -519,17 +524,19 @@ pub(super) fn insert_at(win: &[u8], table: TableHandle, idx: usize, abs: u64, lo
 pub(super) fn backfill_empty(
     table: TableHandle,
     win: &[u8],
-    base: u64,
-    idx: usize,
+    pos: WinPos,
+    shift: u64,
     log: u32,
     last: usize,
 ) {
+    let base = pos.base();
+    let idx = pos.idx();
     for p in 1..PREFILL_STRIDE {
         let q = idx + p;
         if q < last {
             let h = hash_at_log(win, q, log);
             if table.get(h) == 0 {
-                table.put(h, pack_pos(base + q as u64));
+                table.put(h, pack_pos(base + q as u64 - shift));
             }
         }
     }
@@ -539,17 +546,19 @@ pub(super) fn backfill_empty(
 pub(super) fn backfill8_empty(
     table: TableHandle,
     win: &[u8],
-    base: u64,
-    idx: usize,
+    pos: WinPos,
+    shift: u64,
     log: u32,
     last: usize,
 ) {
+    let base = pos.base();
+    let idx = pos.idx();
     for p in 1..PREFILL_STRIDE {
         let q = idx + p;
         if q < last {
             let h = hash8_at_log(win, q, log);
             if table.get(h) == 0 {
-                table.put(h, pack_pos(base + q as u64));
+                table.put(h, pack_pos(base + q as u64 - shift));
             }
         }
     }
@@ -565,14 +574,13 @@ pub(super) fn insert_linked_at(
     win: &[u8],
     heads: TableHandle,
     links: TableHandle,
-    idx: usize,
-    abs: u64,
+    pos: WinPos,
     log: u32,
     width: ChainHashWidth,
     origin: u64,
 ) {
-    let h = hash_at_width(win, idx, log, width);
-    heads.put_linked(links, h, abs, origin);
+    let h = hash_at_width(win, pos.idx(), log, width);
+    heads.put_linked(links, h, pos.abs(), origin);
 }
 
 /// Push one sequence's literals and packed code/add-bits streams, and
@@ -661,10 +669,12 @@ pub(super) fn insert_covered(
     // strategy has no chain to link (and no origin — its tables are
     // cleared per job, the shift stays 0).
     macro_rules! put {
-        ($idx:expr, $abs:expr) => {
+        ($pos:expr) => {
             match chain {
-                Some(links) => insert_linked_at(win, table, links, $idx, $abs, log, width, origin),
-                None => insert_at(win, table, $idx, $abs, log),
+                Some(links) => insert_linked_at(win, table, links, $pos, log, width, origin),
+                // The fast arm has no chain and no origin; its tables are
+                // cleared per job, so the epoch shift stays 0.
+                None => insert_at(win, table, $pos, 0, log),
             }
         };
     }
@@ -689,7 +699,7 @@ pub(super) fn insert_covered(
             // inserts, where an unrolled pair form's peel and tail checks
             // cost more than they save (measured on dll100).
             while p < end {
-                put!((p - win_base) as usize, p);
+                put!(WinPos::new(win_base, p));
                 p += 2;
             }
             return;
@@ -698,12 +708,12 @@ pub(super) fn insert_covered(
         // mod 2 behind a per-entry parity guard that mispredicts on every
         // other insert (measured on json.fastest).
         if (end - p) & 1 == 1 {
-            put!((p - win_base) as usize, p);
+            put!(WinPos::new(win_base, p));
             p += 1;
         }
         while p < end {
-            put!((p - win_base) as usize, p);
-            put!((p + 1 - win_base) as usize, p + 1);
+            put!(WinPos::new(win_base, p));
+            put!(WinPos::new(win_base, p + 1));
             p += 2;
         }
     } else if fill == CoveredFill::DictDense {
@@ -715,11 +725,11 @@ pub(super) fn insert_covered(
         // subtraction only evaluates on the ordered side of it (an empty
         // span when the clamp put the end at/below the match start).
         if p < end && (end - p) & 1 == 1 {
-            put!((p - win_base) as usize, p);
+            put!(WinPos::new(win_base, p));
             p += 1;
         }
         while p < end {
-            put!((p - win_base) as usize, p);
+            put!(WinPos::new(win_base, p));
             p += 1;
         }
     } else {
@@ -728,9 +738,9 @@ pub(super) fn insert_covered(
         let hi = base + match_len as u64 - 2;
         if hi <= insert_max {
             let lo = base + 2;
-            put!((lo - win_base) as usize, lo);
+            put!(WinPos::new(win_base, lo));
             if hi > lo {
-                put!((hi - win_base) as usize, hi);
+                put!(WinPos::new(win_base, hi));
             }
         }
     }
@@ -1001,24 +1011,25 @@ pub(super) struct DfastEmit<'a> {
     pub(super) width: ChainHashWidth,
 }
 
-/// Both dfast tables take `abs`'s entry — the fill loops' insert form
-/// (the scan-side wrapper is [`DfastEmit::insert_both`]). Caller
-/// guarantees `idx + HASH_READ` bytes of window.
+/// Both dfast tables take `pos`'s entry, in the epoch coordinates
+/// (`pos.abs() - shift`; the scan-side wrapper [`DfastEmit::insert_both`]
+/// rebases at its own entry and passes zero). Caller guarantees the
+/// position's window index plus `HASH_READ` bytes of window.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn put_both(
     long: TableHandle,
     small: TableHandle,
     win: &[u8],
-    idx: usize,
-    abs: u64,
+    pos: WinPos,
+    shift: u64,
     long_log: u32,
     small_log: u32,
     width: ChainHashWidth,
 ) {
-    let entry = pack_pos(abs);
-    long.put(hash8_at_log(win, idx, long_log), entry);
-    small.put(hash_at_width(win, idx, small_log, width), entry);
+    let entry = pack_pos(pos.abs() - shift);
+    long.put(hash8_at_log(win, pos.idx(), long_log), entry);
+    small.put(hash_at_width(win, pos.idx(), small_log, width), entry);
 }
 
 impl DfastEmit<'_> {
@@ -1030,8 +1041,8 @@ impl DfastEmit<'_> {
             self.long,
             self.small,
             win,
-            idx,
-            self.win_base + idx as u64,
+            WinPos::new(self.win_base, self.win_base + idx as u64),
+            0,
             self.long_log,
             self.small_log,
             self.width,

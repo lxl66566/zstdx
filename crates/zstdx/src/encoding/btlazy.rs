@@ -461,7 +461,8 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
         // The 4-byte guard only defends a stale candidate (generate verified
         // the whole span at fill time); a failure drops it and re-opens the
         // segment from the split.
-        let cand_abs = end.checked_sub(seq.offset as u64);
+        let off = seq.offset.get();
+        let cand_abs = end.checked_sub(off as u64);
         let valid = match cand_abs {
             Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
                 read4(win, (c - win_base) as usize) == read4(win, end_idx)
@@ -481,7 +482,7 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
             anchor,
             end_idx,
             seq.len as usize,
-            seq.offset + 3,
+            off + 3,
             rep,
             literals,
             seqs,
