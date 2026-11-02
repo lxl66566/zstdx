@@ -1089,6 +1089,11 @@ static STAGE_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(test)]
 static STAGE_PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Sentinel arming the panic injection on the job's last segment, so a
+/// test can shape the geometry where the poison fill is the final event
+/// of the whole decode.
+#[cfg(test)]
+static STAGE_PANIC_LAST: AtomicBool = AtomicBool::new(false);
 
 /// One lease's stage-A service on a pool worker: claim segments, stage each
 /// one's literals and sequences into its slot. Returns whether the thread
@@ -1127,13 +1132,19 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
         }
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if id == STAGE_PANIC_AT.load(Ordering::Relaxed)
+            if (id == STAGE_PANIC_AT.load(Ordering::Relaxed)
+                || (STAGE_PANIC_LAST.load(Ordering::Relaxed) && id + 1 == job.n_segments))
                 && STAGE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr()
             {
                 panic!("injected stage-A panic");
             }
             decode_segment(input, &segments[id], scratch.as_mut().unwrap())
         }));
+        // Every filled slot must wake the ordered consumer on the way out
+        // of this match, so no fill arm may return past the notify: a
+        // poison fill without one parks the consumer forever once no later
+        // segment completes (review 2026-11-03).
+        let mut retire = false;
         match attempt {
             Ok(res) => *job.slots[id].lock().unwrap() = Some(res),
             Err(payload) => {
@@ -1146,10 +1157,13 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
                 // than reuse, and retire this thread (never reuse a thread
                 // that has seen an unwind).
                 *scratch = None;
-                return true;
+                retire = true;
             },
         }
         job.ready.notify_all();
+        if retire {
+            return true;
+        }
     }
 }
 
@@ -1513,6 +1527,14 @@ mod tests {
     }
 
     const MAX_WINDOW: u64 = crate::decoding::DEFAULT_MAX_WINDOW_SIZE;
+
+    /// The injection atomics are process-global, so the injection tests
+    /// must not overlap: a concurrent test's `STAGE_PANIC_INPUT` store
+    /// would re-key the other's injection to its own input and the probe
+    /// decode would run clean (the "must surface" assert then fires on a
+    /// healthy decode). The guard spans store-to-restore in every test
+    /// that arms the injection.
+    static INJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Our own multithreaded encoder output must decode identically through
     /// the parallel decoder, our sequential decoder and libzstd.
@@ -1975,6 +1997,7 @@ mod tests {
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut out = vec![0u8; data.len()];
+        let _inject = INJECT_LOCK.lock().unwrap();
         super::STAGE_PANIC_INPUT.store(
             compressed.as_ptr() as *mut u8,
             core::sync::atomic::Ordering::Relaxed,
@@ -1986,6 +2009,7 @@ mod tests {
         super::STAGE_PANIC_AT.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
         super::STAGE_PANIC_INPUT
             .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        drop(_inject);
         let payload = blew.expect_err("the worker panic must surface");
         let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
             payload
@@ -1997,6 +2021,42 @@ mod tests {
         out.iter_mut().for_each(|b| *b = 0);
         let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
         assert_eq!(&out[..n], &data[..]);
+    }
+
+    /// The poison fill of the job's last segment is the decode's final
+    /// event, so a notify lost on the panic arm parks the ordered consumer
+    /// forever. The watchdog bounds the call: a lost wakeup fails the
+    /// suite instead of hanging it.
+    #[test]
+    fn stage_a_panic_on_last_segment_surfaces() {
+        let data = textish(6 * 1024 * 1024);
+        let compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let _inject = INJECT_LOCK.lock().unwrap();
+        super::STAGE_PANIC_INPUT.store(
+            compressed.as_ptr() as *mut u8,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        super::STAGE_PANIC_LAST.store(true, core::sync::atomic::Ordering::Relaxed);
+        let n = data.len();
+        let handle = std::thread::spawn(move || {
+            let mut out = vec![0u8; n];
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = decode_all_mt(&compressed, &mut out[..], 4, MAX_WINDOW);
+            }))
+        });
+        let blew = handle.join().expect("the decode must terminate, not hang");
+        super::STAGE_PANIC_LAST.store(false, core::sync::atomic::Ordering::Relaxed);
+        super::STAGE_PANIC_INPUT
+            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        drop(_inject);
+        let payload = blew.expect_err("the worker panic must surface");
+        let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
+            payload
+                .downcast_ref::<alloc::string::String>()
+                .map(|s| s.as_str())
+        });
+        assert_eq!(msg, Some("injected stage-A panic"));
     }
 
     /// The pool's parked threads retire when the pool drains, so a decode
