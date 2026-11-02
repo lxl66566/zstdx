@@ -6,7 +6,7 @@ use super::{
         literals_section::{LiteralsSection, LiteralsSectionType},
         sequence_section::SequencesHeader,
     },
-    literals_section_decoder::decode_literals,
+    literals_section_decoder::{decode_literals, decode_literals_direct},
     sequence_section_decoder::decode_sequences,
 };
 use crate::{
@@ -129,13 +129,14 @@ impl BlockDecoder {
             sequences,
             block_content_buffer,
         } = workspace;
-        let (seq_section, raw) = Self::parse_sections(
+        let (seq_section, raw, ..) = Self::parse_sections(
             header,
             block_content_buffer,
             huf,
             literals_buffer,
             block_out_max,
             &mut source,
+            None,
         )?;
 
         if seq_section.num_sequences != 0 {
@@ -174,23 +175,7 @@ impl BlockDecoder {
         view: crate::decoding::flat_buffer::FlatView,
         headroom: bool,
     ) -> Result<usize, DecompressBlockError> {
-        // Enforce the per-block output cap by bounding the executor's
-        // target: a block may never produce more than
-        // min(window, MAX_BLOCK_SIZE) bytes, so a sequence section claiming
-        // beyond that is stopped by the existing budget checks against the
-        // bounded slice. When the bounded slice was the binding bound (the
-        // real target had more room), a TargetTooSmall from below is the
-        // block cap, not a small caller buffer, and is reclassified below.
         let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
-        // HEADROOM chain, consumer side: `headroom` promises the backing
-        // allocation holds the block maximum plus wildcopy slack beyond the
-        // cursor (`FlatOut::ensure_block_space`'s true return, asserted at
-        // its checked entry), because the executor's HEADROOM instantiation
-        // wildcopies without a per-sequence slack check. Checked here, the
-        // one place that knows the block maximum.
-        debug_assert!(
-            !headroom || out.len() >= block_out_max + crate::decoding::flat_buffer::WILDCOPY_SLACK
-        );
         let DecoderScratch {
             huf,
             fse,
@@ -200,13 +185,118 @@ impl BlockDecoder {
             block_content_buffer,
             ..
         } = workspace;
-        let (seq_section, raw) = Self::parse_sections(
+        block_content_buffer.resize(header.content_size as usize, 0);
+        source.read_exact(block_content_buffer.as_mut_slice())?;
+        Self::decompress_block_flat_body(
             header,
+            block_out_max,
             block_content_buffer,
+            huf,
+            fse,
+            offset_hist,
+            literals_buffer,
+            sequences,
+            out,
+            written,
+            virt_base,
+            view,
+            headroom,
+        )
+    }
+
+    /// Slice-source twin of [`Self::decompress_block_flat`]: the block body
+    /// is split off the input slice and parsed in place, so the per-block
+    /// copy into the staging buffer disappears. A body shorter than the
+    /// header's content size reports the same error the `Read` path's
+    /// `read_exact` produces.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decompress_block_flat_slice(
+        header: &BlockHeader,
+        workspace: &mut DecoderScratch,
+        source: &mut &[u8],
+        out: &mut [u8],
+        written: &mut usize,
+        virt_base: usize,
+        view: crate::decoding::flat_buffer::FlatView,
+        headroom: bool,
+    ) -> Result<usize, DecompressBlockError> {
+        let Some(body) = source.get(..header.content_size as usize) else {
+            return Err(DecompressBlockError::BlockContentReadError(
+                crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
+            ));
+        };
+        let rest = &source[header.content_size as usize..];
+        *source = rest;
+        let block_out_max = crate::common::max_block_output(workspace.buffer.window_size);
+        let DecoderScratch {
+            huf,
+            fse,
+            offset_hist,
+            literals_buffer,
+            sequences,
+            ..
+        } = workspace;
+        Self::decompress_block_flat_body(
+            header,
+            block_out_max,
+            body,
+            huf,
+            fse,
+            offset_hist,
+            literals_buffer,
+            sequences,
+            out,
+            written,
+            virt_base,
+            view,
+            headroom,
+        )
+    }
+
+    /// The flat compressed-block decode over an already fetched body: the
+    /// section parse (direct literals included) and the fused execution,
+    /// shared by the `Read` and slice entries. Takes the scratch fields
+    /// individually so the fetched body (from either buffer) borrows
+    /// alongside them.
+    #[allow(clippy::too_many_arguments)]
+    fn decompress_block_flat_body(
+        header: &BlockHeader,
+        block_out_max: usize,
+        body: &[u8],
+        huf: &mut super::scratch::HuffmanScratch,
+        fse: &mut super::scratch::FSEScratch,
+        offset_hist: &mut [u32; 3],
+        literals_buffer: &mut Vec<u8>,
+        sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
+        out: &mut [u8],
+        written: &mut usize,
+        virt_base: usize,
+        view: crate::decoding::flat_buffer::FlatView,
+        headroom: bool,
+    ) -> Result<usize, DecompressBlockError> {
+        // Enforce the per-block output cap by bounding the executor's
+        // target: a block may never produce more than
+        // min(window, MAX_BLOCK_SIZE) bytes, so a sequence section claiming
+        // beyond that is stopped by the existing budget checks against the
+        // bounded slice. When the bounded slice was the binding bound (the
+        // real target had more room), a TargetTooSmall from below is the
+        // block cap, not a small caller buffer, and is reclassified below.
+        // HEADROOM chain, consumer side: `headroom` promises the backing
+        // allocation holds the block maximum plus wildcopy slack beyond the
+        // cursor (`FlatOut::ensure_block_space`'s true return, asserted at
+        // its checked entry), because the executor's HEADROOM instantiation
+        // wildcopies without a per-sequence slack check. Checked here, the
+        // one place that knows the block maximum.
+        debug_assert!(
+            !headroom || out.len() >= block_out_max + crate::decoding::flat_buffer::WILDCOPY_SLACK
+        );
+        let (seq_section, raw, literals_len, literals_direct) = Self::parse_sections_body(
+            header,
             huf,
             literals_buffer,
             block_out_max,
-            source,
+            body,
+            Some((&mut *out, *written)),
         )?;
 
         let real_out_len = out.len();
@@ -246,14 +336,20 @@ impl BlockDecoder {
                     },
                 ));
             }
-            let literals_len = literals_buffer.len();
-            if *written + literals_len > out.len() {
-                return Err(DecompressBlockError::ExecuteSequencesError(
-                    ExecuteSequencesError::TargetTooSmall,
-                ));
+            let literals_len = literals_len as usize;
+            if literals_direct {
+                // The literals were decoded straight into the target above;
+                // the fit was checked before the decode ran.
+                *written += literals_len;
+            } else {
+                if *written + literals_len > out.len() {
+                    return Err(DecompressBlockError::ExecuteSequencesError(
+                        ExecuteSequencesError::TargetTooSmall,
+                    ));
+                }
+                out[*written..*written + literals_len].copy_from_slice(literals_buffer);
+                *written += literals_len;
             }
-            out[*written..*written + literals_len].copy_from_slice(literals_buffer);
-            *written += literals_len;
             sequences.clear();
         }
         Ok(*written)
@@ -268,6 +364,7 @@ impl BlockDecoder {
     /// so the returned borrow coexists with further field borrows.
     /// `block_out_max` is the per-block output cap the literals section is
     /// validated against before its size is used for allocation.
+    #[allow(clippy::too_many_arguments)]
     fn parse_sections<'a>(
         header: &BlockHeader,
         block_content_buffer: &'a mut Vec<u8>,
@@ -275,18 +372,43 @@ impl BlockDecoder {
         literals_buffer: &mut Vec<u8>,
         block_out_max: usize,
         source: &mut impl Read,
-    ) -> Result<(SequencesHeader, &'a [u8]), DecompressBlockError> {
+        direct_out: Option<(&mut [u8], usize)>,
+    ) -> Result<(SequencesHeader, &'a [u8], u32, bool), DecompressBlockError> {
+        block_content_buffer.resize(header.content_size as usize, 0);
+        source.read_exact(block_content_buffer.as_mut_slice())?;
+        Self::parse_sections_body(
+            header,
+            huf,
+            literals_buffer,
+            block_out_max,
+            block_content_buffer,
+            direct_out,
+        )
+    }
+
+    /// Parsing half of a compressed block over an already fetched body:
+    /// the literals section (the pure-literals direct decode included) and
+    /// the sequence section header. Returns the sequence section header,
+    /// the raw sequence bytes (borrowed from `body`), the section's
+    /// literals length and whether the literals were decoded directly into
+    /// the caller's target.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_sections_body<'a>(
+        header: &BlockHeader,
+        huf: &mut super::scratch::HuffmanScratch,
+        literals_buffer: &mut Vec<u8>,
+        block_out_max: usize,
+        body: &'a [u8],
+        direct_out: Option<(&mut [u8], usize)>,
+    ) -> Result<(SequencesHeader, &'a [u8], u32, bool), DecompressBlockError> {
         // The stored (compressed) body is bounded by the same per-block cap
         // as the output (libzstd's header-stage `cBlockSize > blockSizeMax`
         // for every block type): a small-window frame cannot carry a block
-        // body larger than its window. Checked before the body is read.
+        // body larger than its window.
         if header.content_size as usize > block_out_max {
             return Err(DecompressBlockError::BlockOutputTooLarge { max: block_out_max });
         }
-        block_content_buffer.resize(header.content_size as usize, 0);
-
-        source.read_exact(block_content_buffer.as_mut_slice())?;
-        let raw: &'a [u8] = block_content_buffer.as_slice();
+        let raw: &'a [u8] = body;
 
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
@@ -324,21 +446,41 @@ impl BlockDecoder {
         let raw_literals = &raw[..upper_limit_for_literals];
         vprintln!("Slice for literals: {}", raw_literals.len());
 
-        literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
-        let bytes_used_in_literals_section =
-            decode_literals(&section, huf, raw_literals, literals_buffer)?;
-        assert!(
-            section.regenerated_size == literals_buffer.len() as u32,
-            "Wrong number of literals: {}, Should have been: {}",
-            literals_buffer.len(),
-            section.regenerated_size
-        );
-        assert_eq!(
-            bytes_used_in_literals_section,
-            upper_limit_for_literals as u32
-        );
-
+        // Pure-literals block fast path: a sequence section declaring zero
+        // sequences encodes its count as a single zero byte, so peeking
+        // that byte lets a flat caller receive its literals decoded
+        // straight into the output slice, and the staging buffer with its
+        // copy disappear. The peek only reads: every real parse error keeps
+        // its position after the literals decode, and a target too small
+        // falls back to staging, which reports the error where it always
+        // did.
         let raw = &raw[upper_limit_for_literals..];
+        let mut literals_direct = false;
+        if let Some((out, written)) = direct_out {
+            if Self::seq_count_is_zero(raw)
+                && section.regenerated_size as usize <= out.len() - written
+            {
+                let target = &mut out[written..][..section.regenerated_size as usize];
+                literals_direct = decode_literals_direct(&section, huf, raw_literals, target)?;
+            }
+        }
+
+        // all literals of the previous block must have been used in the sequence execution anyways.
+        // just be defensive here
+        literals_buffer.clear();
+        let bytes_used_in_literals_section = if literals_direct {
+            upper_limit_for_literals as u32
+        } else {
+            let bytes_used = decode_literals(&section, huf, raw_literals, literals_buffer)?;
+            assert!(
+                section.regenerated_size == literals_buffer.len() as u32,
+                "Wrong number of literals: {}, Should have been: {}",
+                literals_buffer.len(),
+                section.regenerated_size
+            );
+            assert_eq!(bytes_used, upper_limit_for_literals as u32);
+            bytes_used
+        };
         vprintln!("Slice for sequences with headers: {}", raw.len());
 
         let mut seq_section = SequencesHeader::new();
@@ -359,7 +501,16 @@ impl BlockDecoder {
         );
         vprintln!("Slice for sequences: {}", raw.len());
 
-        Ok((seq_section, raw))
+        Ok((seq_section, raw, section.regenerated_size, literals_direct))
+    }
+
+    /// Whether a sequence section's first byte encodes a zero sequence
+    /// count (the peek behind the pure-literals fast path in
+    /// [`Self::parse_sections`]). An empty section is not one: its
+    /// rejection lives in the sequence header parse, in its original
+    /// position.
+    fn seq_count_is_zero(seq_section: &[u8]) -> bool {
+        seq_section.first() == Some(&0)
     }
 
     /// Reads 3 bytes from the provided reader and returns

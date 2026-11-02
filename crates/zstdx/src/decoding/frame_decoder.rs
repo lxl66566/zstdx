@@ -800,10 +800,10 @@ impl FrameDecoder {
                     written += size;
                 },
                 BlockType::Compressed => {
-                    decoding::block_decoder::BlockDecoder::decompress_block_flat(
+                    decoding::block_decoder::BlockDecoder::decompress_block_flat_slice(
                         &block_header,
                         &mut state.decoder_scratch,
-                        &mut *source,
+                        source,
                         out,
                         &mut written,
                         0,
@@ -977,7 +977,7 @@ impl FrameDecoder {
                                 let mut written = 0usize;
                                 let view = state.flat.view();
                                 let block_start = state.flat.end_abs();
-                                decoding::block_decoder::BlockDecoder::decompress_block_flat(
+                                decoding::block_decoder::BlockDecoder::decompress_block_flat_slice(
                                     &block_header,
                                     &mut state.decoder_scratch,
                                     &mut mt_source,

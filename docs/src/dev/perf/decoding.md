@@ -8,6 +8,10 @@ The decoder has three output models. A hand-written ring buffer serves dictionar
 
 Dictionary-free slice decoding writes raw, RLE and compressed blocks directly into the caller's target buffer, bypassing the ring and drain copies, with a block-level budget check and a `TargetTooSmall` error variant. Slice decoding gained 13% to 35% across the board.
 
+The flat paths also peek the sequence section's first byte before decoding literals. A zero-sequence block's literals are its whole output, so they decode straight into the target at the write cursor and the staging buffer with its copy disappear. A target too small, a single-stream section or a 4-stream section outside the interleaved fast gate falls back to staging, so every error keeps the position and type the staging path reports.
+
+The one-shot slice entries also split each compressed block's body off the input slice and parse it in place, where the reader-based entries copy the body into a staging buffer first. The copy was 7% of skewed.zst1's decode and scales with the frame's compressed size, which is why the json and text bulk cells moved too.
+
 The streaming model ports libzstd's outBuff design. Steady-state capacity is `window + 2·block + 64`, and a two-generation virtual-mapping wrap through `FlatView{origin, prev_origin}` maintains a globally monotonic virtual address. There are zero sliding copies and a flush leaves no window behind. Large-window corpora with an 8 MB window gained 85% to 125%, and random and zeros overtake zstd's streaming decoder.
 
 ## Fused sequence loop
@@ -44,7 +48,7 @@ A single compare of the offset against the active generation's start guards the 
 
 The X2 double-symbol table ports libzstd's `HUF_decompress4X2` and adds an 80% pairing threshold: the pairable fraction of the code space is computed from the weights, and below the threshold the space is left empty and X1 is used. Skewed.zst1 gained 43% and skewed.zst3 15%.
 
-X1 and X2 stream-state pointerization folds the base into `ip` and `op` and reduces live values from 16 to 14, cutting inner-loop instructions 10%. The conclusion is that this sits at the practical floor: libzstd's hand-written assembly does three decoding-table loads, which is memory-port-bound at about 0.7 cycles per byte, while our one load plus two shifts is ALU-bound at about 0.75 cycles per byte, the same magnitude.
+X1 and X2 stream-state pointerization folds the base into `ip` and `op` and reduces live values from 16 to 14, cutting inner-loop instructions 10%. The X2 interleaved loop dispatches through the BMI2 tier with the sequence executor, so the per-lookup window shift compiles to one shlx without the `%cl` staging move. The conclusion is that this sits at the practical floor: libzstd's hand-written assembly does three decoding-table loads, which is memory-port-bound at about 0.7 cycles per byte, while our one load plus two shifts is ALU-bound at about 0.75 cycles per byte, the same magnitude.
 
 ## Parallel decode
 
@@ -66,4 +70,4 @@ Fixed-width copies with allowed overshoot go through `copy_bytes_overshooting`, 
 
 ## Residual
 
-After the libzstd-shaped loop, decode reads x0.91 to 1.03 bulk and x0.96 to 1.05 stream on json, text and skewed.zst3/9, and x1.03 to 1.13 on dll100. skewed.zst1 and skewed.zst19 bulk stay at x1.32, where our bulk path runs slower than our own stream path, so that residue sits on the literals side of the block decode. The dll100 branch-miss excess is attributed to the per-block table builds, led by the Huffman X1 fill's per-symbol scatter loop, with the measured decomposition in [dec-gap](../bench/dec-gap.md). The per-cell numbers and the remaining items are in [dec-gap](../bench/dec-gap.md) too.
+After the libzstd-shaped loop and the 2026-11-02 literals round, decode reads x0.90 to x1.00 bulk on json, text and skewed, with skewed.zst1 bulk at x1.09 and skewed.zst19 bulk at x1.27 on the X2 loop's per-lookup chain. Stream cells read x0.97 to x1.11, and dll100 reads x1.03 to x1.13 on both paths. The dll100 branch-miss excess is attributed to the per-block table builds, led by the Huffman X1 fill's per-symbol scatter loop, with the measured decomposition in [dec-gap](../bench/dec-gap.md). The per-cell numbers and the remaining items are in [dec-gap](../bench/dec-gap.md) too.

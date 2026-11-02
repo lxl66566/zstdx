@@ -61,7 +61,8 @@ Before 2026-11-01 the matrix bulk cell's zstd closure called `zstd::bulk::decomp
 
 ## What remains
 
-- skewed.zst1 and skewed.zst19 bulk read x1.32 and did not move with the loop. Our own bulk path runs slower than our stream path there, at 2346 against 2623 MiB/s on zst1, so the residue sits outside the sequence loop, on the literals side of the block decode.
+- skewed.zst1 bulk read x1.30 against libzstd and lost to our own stream path, because the frame is 246 pure-literals blocks of 256 with 13 sequences in 32 MiB: decode was the X2 Huffman loop at 69%, the staging-to-output literals copy at 17%, the block-body staging copy at 7% and xxh64 at 11%. A zero-sequence peek now decodes such a block's literals straight into the flat target, the X2 loop dispatches through the BMI2 tier, and the one-shot path parses block bodies in place off the input slice. The bulk cell reads x1.09, skewed.zst3 bulk x1.00, json.zst3 bulk x0.90 and text.zst1 bulk x0.90, and gungraun l1 skewed reads 6.359M against libzstd's 6.362M Ir, from 8.680M.
+- skewed.zst19 bulk stays at x1.27. Its blocks carry about 260 sequences each, so the literals still stage and the executor copies them, and the X2 loop is the residue at about 2.5 cycles per lookup against the amd64 asm loop's 2.2. The chain levers are falsified in [negative](../negative/decoding.md).
 - dll100 reads x1.03 to 1.13 on both paths, with branch misses still 1.17x the clang build's. The 2026-11-02 attribution sampled `prof dec bench/big/dll100.zst3` (40 iters, one sample per 4003 misses) and a solo one-shot loop over the same frame against the gcc-built libzstd at `/root/programs/fork/zstd/lib`, which reads 3.17M against 2.61M misses per decode on this machine, 1.22x. The excess of 0.56M per decode decomposes by sampled symbol, with shares of each side's own total:
 
 | miss source | zstdx | libzstd | excess |

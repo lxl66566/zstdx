@@ -68,6 +68,14 @@ Two forms were measured on the batched-read loop. Carrying the raw container, so
 
 ## Copy and hash kernels
 
+### BMI2 conversion of the X2 4-stream loop
+
+The premise was re-opened on 2026-11-02 because skewed.zst1 and skewed.zst19 decode is dominated by the X2 loop. The BMI2 instantiation cut the loop's instructions 9.9% on 1 MiB of skewed.zst1 literals, 6.90M to 6.22M Ir, by dropping the `%cl` staging move every lookup pays in the baseline form. Wall clock stayed flat within noise on every cell: the loop is bound by the four per-stream load-to-shift chains, and the staging move renames for free. The instruction cut stays landed, and further X2 instruction-diet work carries the same floor.
+
+### Three-load X2 entry form
+
+libzstd's huf_decompress_amd64.S reads each X2 entry as three loads, the u16 pair value, the shift byte and the length byte, so the shift feeds shlx straight off its load and the per-stream chain is one cycle shorter than the packed-u32 read with its extract shift. The port kept the loads split under LLVM, and the stream cells isolated the form because the in-place block body of the same build touches only the bulk path: skewed.zst19 stream lost 3.6% and skewed.zst1 stream 2.4%, so the two extra loads per lookup cost more than the cycle they save. Reverted; the one-load form with its longer chain is the faster Rust shape.
+
 ### BMI2 conversion of the X1 4-stream loop
 
 BMI2 conversion of the 4-stream X1 loop cut instructions 12.7% but cost json and skewed 2-3%. Front-end and code-layout effects eat the gains, and this loop at 1.42 cycles per symbol is at the theoretical limit.

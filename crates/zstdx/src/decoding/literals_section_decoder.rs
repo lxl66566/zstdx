@@ -40,6 +40,138 @@ pub fn decode_literals(
     }
 }
 
+/// Decode a literals section straight into `out`, which must be exactly
+/// `section.regenerated_size` bytes long. This serves blocks whose sequence
+/// section declares zero sequences: the literals are the block's whole
+/// output, so the interleaved loops write the caller's target directly and
+/// the staging buffer with its copy disappear. Returns `Ok(false)` when the
+/// section must take the staging path instead (a single stream, or the
+/// interleaved fast path's gate rejected it); the caller then decodes into
+/// its staging buffer, with error behavior identical to the pure-staging
+/// decoder because every check up to the gate ran in the same order here.
+pub fn decode_literals_direct(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    out: &mut [u8],
+) -> Result<bool, DecompressLiteralsError> {
+    use DecompressLiteralsError as err;
+
+    match section.ls_type {
+        LiteralsSectionType::Raw => {
+            out.copy_from_slice(&source[..section.regenerated_size as usize]);
+            Ok(true)
+        },
+        LiteralsSectionType::RLE => {
+            out.fill(source[0]);
+            Ok(true)
+        },
+        LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
+            let compressed_size =
+                section.compressed_size.ok_or(err::MissingCompressedSize)? as usize;
+            let num_streams = section.num_streams.ok_or(err::MissingNumStreams)?;
+            if num_streams != 4 {
+                return Ok(false);
+            }
+            let source = &source[..compressed_size];
+            let bytes_read = prepare_section_table(
+                section.ls_type,
+                section.regenerated_size as usize,
+                scratch,
+                source,
+            )?;
+            let source = &source[bytes_read as usize..];
+            let stream_bounds = parse_stream_bounds(section.regenerated_size as usize, source)?;
+            let total_out = section.regenerated_size as usize;
+            let segment = total_out.div_ceil(4);
+            if total_out <= 3 * segment
+                || !stream_bounds.iter().all(|&(s, e)| e - s >= 8)
+                || scratch.table.max_num_bits < 1
+            {
+                return Ok(false);
+            }
+            let res = if scratch.table.x2_table().is_empty() {
+                decompress_4streams_interleaved(&scratch.table, source, &stream_bounds, out)
+            } else {
+                decompress_4streams_interleaved_x2(&scratch.table, source, &stream_bounds, out)
+            };
+            res.map(|_| true)
+        },
+    }
+}
+
+/// Huffman table work shared by the staging and direct decode paths: builds
+/// the decode tables for a Compressed section (plus the X2 shape the cost
+/// model picks) and rejects a Treeless section with no table carried over
+/// from a previous block. `source` is the section body bounded to the
+/// declared compressed size. Returns the bytes the tree description
+/// consumed.
+fn prepare_section_table(
+    ls_type: LiteralsSectionType,
+    regenerated_size: usize,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+) -> Result<u32, DecompressLiteralsError> {
+    match ls_type {
+        LiteralsSectionType::Compressed => {
+            // read Huffman tree description
+            let bytes_read = scratch.table.build_decoder(source)?;
+
+            // pick the decoding table shape for this block's literals,
+            // mirroring libzstd's HUF_selectDecoder cost model
+            if select_x2_table(regenerated_size, source.len()) {
+                scratch.table.build_x2_table();
+            }
+            vprintln!("Built huffman table using {bytes_read} bytes");
+            Ok(bytes_read)
+        },
+        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
+            Err(DecompressLiteralsError::UninitializedHuffmanTable)
+        },
+
+        _ => Ok(0),
+    }
+}
+
+/// Jump-table parse and per-stream bounds shared by the staging and direct
+/// 4-stream paths. `source` is the section body with the tree description
+/// already skipped. The returned bounds index into `source`, jump-table
+/// offset included: the interleaved fast loops' tail reader floors at the
+/// jump table start (the reference's `ilowest`).
+fn parse_stream_bounds(
+    regenerated_size: usize,
+    source: &[u8],
+) -> Result<[(usize, usize); 4], DecompressLiteralsError> {
+    use DecompressLiteralsError as err;
+    // The quarter split needs a non-degenerate fourth segment (libzstd's
+    // MIN_LITERALS_FOR_4_STREAMS).
+    if regenerated_size < 6 {
+        return Err(err::LiteralsTooSmallFor4Streams {
+            got: regenerated_size,
+        });
+    }
+    // build jumptable
+    if source.len() < 6 {
+        return Err(err::MissingBytesForJumpHeader { got: source.len() });
+    }
+    let jump1 = source[0] as usize + ((source[1] as usize) << 8);
+    let jump2 = jump1 + source[2] as usize + ((source[3] as usize) << 8);
+    let jump3 = jump2 + source[4] as usize + ((source[5] as usize) << 8);
+    let streams_len = source.len() - 6;
+    if streams_len < jump3 {
+        return Err(err::MissingBytesForLiterals {
+            got: streams_len,
+            needed: jump3,
+        });
+    }
+    Ok([
+        (6, 6 + jump1),
+        (6 + jump1, 6 + jump2),
+        (6 + jump2, 6 + jump3),
+        (6 + jump3, source.len()),
+    ])
+}
+
 /// Decompress the provided literals section and source into the provided `target`.
 /// This function is used when the literals section is `Compressed` or `Treeless`
 ///
@@ -58,70 +190,23 @@ fn decompress_literals(
 
     target.reserve(section.regenerated_size as usize);
     let source = &source[0..compressed_size];
-    let mut bytes_read = 0;
-
-    match section.ls_type {
-        LiteralsSectionType::Compressed => {
-            // read Huffman tree description
-            bytes_read += scratch.table.build_decoder(source)?;
-
-            // pick the decoding table shape for this block's literals,
-            // mirroring libzstd's HUF_selectDecoder cost model
-            if select_x2_table(section.regenerated_size as usize, compressed_size) {
-                scratch.table.build_x2_table();
-            }
-            vprintln!("Built huffman table using {} bytes", bytes_read);
-        },
-        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
-            return Err(err::UninitializedHuffmanTable);
-        },
-
-        _ => { /* nothing to do, huffman tree has been provided by previous block */ },
-    }
+    let mut bytes_read = prepare_section_table(
+        section.ls_type,
+        section.regenerated_size as usize,
+        scratch,
+        source,
+    )?;
 
     let source = &source[bytes_read as usize..];
 
     if num_streams == 4 {
-        // The quarter split needs a non-degenerate fourth segment
-        // (libzstd's MIN_LITERALS_FOR_4_STREAMS).
-        if section.regenerated_size < 6 {
-            return Err(err::LiteralsTooSmallFor4Streams {
-                got: section.regenerated_size as usize,
-            });
-        }
-        // build jumptable
-        if source.len() < 6 {
-            return Err(err::MissingBytesForJumpHeader { got: source.len() });
-        }
-        let jump1 = source[0] as usize + ((source[1] as usize) << 8);
-        let jump2 = jump1 + source[2] as usize + ((source[3] as usize) << 8);
-        let jump3 = jump2 + source[4] as usize + ((source[5] as usize) << 8);
-        bytes_read += 6;
-        let streams = &source[6..];
-
-        if streams.len() < jump3 {
-            return Err(err::MissingBytesForLiterals {
-                got: streams.len(),
-                needed: jump3,
-            });
-        }
+        let stream_bounds = parse_stream_bounds(section.regenerated_size as usize, source)?;
 
         // decode 4 streams. The format splits the literals into four equal
         // parts (the fourth may be smaller), so stream k decodes exactly
         // `segment` bytes (the last stream the remainder).
         let total_out = section.regenerated_size as usize;
         let segment = total_out.div_ceil(4);
-        // The region handed to the fast path includes the 6 jump-table
-        // bytes: the reference's per-stream tail reader floors at
-        // `ilowest` (the jump table start), and an exhausted tail decodes
-        // rotations of the 8 bytes there, so the floor window must be
-        // byte-identical to the reference's.
-        let stream_bounds = [
-            (6, 6 + jump1),
-            (6 + jump1, 6 + jump2),
-            (6 + jump2, 6 + jump3),
-            (6 + jump3, source.len()),
-        ];
         let seg_end = [segment, 2 * segment, 3 * segment, total_out];
 
         // Fast interleaved path: needs one 8 byte window per stream and enough output
@@ -236,7 +321,7 @@ fn decompress_literals(
             }
         }
 
-        bytes_read += streams.len() as u32;
+        bytes_read += source.len() as u32;
     } else {
         // just decode the one stream
         assert_eq!(num_streams, 1);
@@ -587,8 +672,45 @@ fn select_x2_table(dst_size: usize, c_src_size: usize) -> bool {
 /// stream's territory. The final byte of each stream is written by the scalar
 /// finish loop. `out` holds exactly the section's regenerated size; every byte
 /// is written on success.
-#[allow(clippy::too_many_lines)]
+/// BMI2 dispatch for the X2 interleaved loop: the per-lookup `bits`
+/// shift is the loop's only variable shift, and `shlx` compiles it to one
+/// uop without the `%cl` staging `mov` the baseline `shl %cl` form pays on
+/// every one of the twenty lookups per iteration. The tier gate is shared
+/// with the sequence executor (see `simd_tier`).
 fn decompress_4streams_interleaved_x2(
+    table: &HuffmanTable,
+    region: &[u8],
+    stream_bounds: &[(usize, usize); 4],
+    out: &mut [u8],
+) -> Result<(), DecompressLiteralsError> {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if super::simd_tier::bmi2() {
+            // SAFETY: simd_tier::bmi2() ran the runtime detection (or a
+            // forced tier asserted it), so the BMI2 instantiation is
+            // executable.
+            return unsafe {
+                decompress_4streams_interleaved_x2_bmi2(table, region, stream_bounds, out)
+            };
+        }
+    }
+    decompress_4streams_interleaved_x2_impl(table, region, stream_bounds, out)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn decompress_4streams_interleaved_x2_bmi2(
+    table: &HuffmanTable,
+    region: &[u8],
+    stream_bounds: &[(usize, usize); 4],
+    out: &mut [u8],
+) -> Result<(), DecompressLiteralsError> {
+    decompress_4streams_interleaved_x2_impl(table, region, stream_bounds, out)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_lines)]
+fn decompress_4streams_interleaved_x2_impl(
     table: &HuffmanTable,
     region: &[u8],
     stream_bounds: &[(usize, usize); 4],
