@@ -446,6 +446,72 @@ impl HuffmanTable {
             self.decode.len()
         );
 
+        self.fill_decode_tables();
+
+        Ok(())
+    }
+
+    /// Fill `decode` and `packed` from `bits` and `bit_ranks` rank by rank,
+    /// the port of libzstd's `HUF_readDTableX1_wksp` fill: a counting sort
+    /// groups the symbols by code length, then each rank's spans are written
+    /// in symbol order with one constant-length fill per symbol. The layout
+    /// is what the `rank_indexes` sums define: rank `bits` owns the region
+    /// at `rank_indexes[bits]`, its symbols in ascending order. The previous
+    /// scatter form interleaved span lengths 1 and 2^10 between adjacent
+    /// symbols, and that interleaving was dll100's largest decode
+    /// branch-miss lump.
+    fn fill_decode_tables(&mut self) {
+        let max_bits = self.max_num_bits as usize;
+
+        // `sorted` buckets the symbols by code length; bucket 0 (absent
+        // symbols) is sorted along so the placement pass needs no branch.
+        let mut sorted = [0u8; 256];
+        let mut rank_begin = [0u16; 12];
+        let mut acc = 0usize;
+        for (bits, &count) in self.bit_ranks.iter().enumerate() {
+            rank_begin[bits] = acc as u16;
+            acc += count as usize;
+        }
+        debug_assert_eq!(acc, self.bits.len());
+        let mut rank_next = rank_begin;
+        for (symbol, &bits) in self.bits.iter().enumerate() {
+            let slot = &mut rank_next[bits as usize];
+            sorted[*slot as usize] = symbol as u8;
+            *slot += 1;
+        }
+
+        self.packed.clear();
+        self.packed.resize(self.decode.len(), 0);
+
+        // longest codes first: the regions grow from index 0 in this order,
+        // so one running cursor covers the whole table
+        let mut idx = 0usize;
+        for bits in (1..=max_bits).rev() {
+            let len = 1usize << (max_bits - bits);
+            let begin = rank_begin[bits] as usize;
+            let end = rank_next[bits] as usize;
+            for &symbol in &sorted[begin..end] {
+                let entry = Entry {
+                    symbol,
+                    num_bits: bits as u8,
+                };
+                self.decode[idx..idx + len].fill(entry);
+                // packed is the decode loops' one-load view: (symbol << 8) | num_bits
+                let packed = ((symbol as u16) << 8) | bits as u16;
+                self.packed[idx..idx + len].fill(packed);
+                idx += len;
+            }
+        }
+        debug_assert_eq!(idx, self.decode.len());
+    }
+
+    /// The per-symbol scatter fill this table used before the rank-grouped
+    /// port, kept as the equivalence reference for `fill_decode_tables`.
+    /// Consumes `rank_indexes`, so it must run against the initial region
+    /// starts that `build_table_from_weights` leaves in place.
+    #[cfg(test)]
+    fn fill_decode_tables_scatter(&mut self) {
+        let max_bits = self.max_num_bits;
         for symbol in 0..self.bits.len() {
             let bits_for_symbol = self.bits[symbol];
             if bits_for_symbol != 0 {
@@ -453,7 +519,7 @@ impl HuffmanTable {
                 // a code ignores all max_bits - bits[symbol] bits, so it gets
                 // a range that spans all of those in the decoding table
                 let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1 << (max_bits - bits_for_symbol);
+                let len = 1usize << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
                 for idx in 0..len {
                     self.decode[base_idx + idx].symbol = symbol as u8;
@@ -469,8 +535,6 @@ impl HuffmanTable {
                 .iter()
                 .map(|e| ((e.symbol as u16) << 8) | e.num_bits as u16),
         );
-
-        Ok(())
     }
 
     /// Build the double-symbol (X2) decoding table from the current weights.
@@ -635,7 +699,7 @@ impl Default for HuffmanTable {
 
 /// A single entry in the table contains the decoded symbol/literal and the
 /// size of the prefix code.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Entry {
     /// The byte that the prefix code replaces during encoding.
     symbol: u8,
@@ -704,6 +768,98 @@ mod tests {
         let src = raw_table(&[1]);
         assert_eq!(t.build_decoder(&src).unwrap(), src.len() as u32);
         assert_eq!(t.max_num_bits, 1);
+    }
+
+    /// Deterministic xorshift64 stream for the fill equivalence generator.
+    fn rng_next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// A random valid weight list built in the slot domain: the inferred
+    /// last symbol's span is reserved first, the remaining 2^max_bits slots
+    /// are split into random aligned spans, and the set is rejected unless
+    /// it satisfies the rank-one-even tree rule and the 255-symbol cap.
+    /// `tail` biases the walk towards weight 1 to 3 for long-tail shapes.
+    fn gen_weight_set(state: &mut u64, tail: bool) -> Option<Vec<u8>> {
+        let r = |state: &mut u64, n: u64| rng_next(state) % n;
+        let max_bits = 1 + r(state, 11);
+        let last_weight = 1 + r(state, max_bits);
+        let mut budget = (1u32 << max_bits) - (1u32 << (last_weight - 1));
+        let mut weights = Vec::new();
+        while budget > 0 {
+            if weights.len() >= 248 {
+                return None;
+            }
+            // 2^(hbs(budget)-1) <= budget, so any weight up to hbs(budget) fits
+            let top = (32 - budget.leading_zeros()) as u64;
+            let w = 1 + r(
+                state,
+                if tail {
+                    top.min(3)
+                } else {
+                    top
+                },
+            );
+            weights.push(w as u8);
+            budget -= 1 << (w - 1);
+        }
+        let ones = weights.iter().fold(0usize, |n, &w| n + usize::from(w == 1))
+            + usize::from(last_weight == 1);
+        if ones < 2 || !ones.is_multiple_of(2) {
+            return None;
+        }
+        // decorrelate symbol id from weight magnitude
+        for i in (1..weights.len()).rev() {
+            let j = (rng_next(state) as usize) % (i + 1);
+            weights.swap(i, j);
+        }
+        Some(weights)
+    }
+
+    /// The rank-grouped fill and the scatter reference must produce identical
+    /// `decode` and `packed` tables for every valid weight distribution: the
+    /// table is a pure function of the weights, and the fast fill may never
+    /// drift from the scatter semantics the format defines.
+    #[test]
+    fn rank_grouped_fill_matches_scatter() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut sets: Vec<Vec<u8>> = vec![vec![1], vec![1, 1, 1, 1]];
+        for mb in 1..=7u32 {
+            sets.push(vec![1; (1 << mb) - 1]);
+        }
+        let mut trials = 0;
+        while trials < 400 {
+            let tail = rng_next(&mut state) % 4 < 2;
+            if let Some(weights) = gen_weight_set(&mut state, tail) {
+                sets.push(weights);
+                trials += 1;
+            }
+        }
+        for (n, weights) in sets.iter().enumerate() {
+            // raw 4-bit descriptions cap at 128 weights; FSE-encode the wide
+            // ones and every sixteenth set to cover both weights-header paths
+            let src = if weights.len() <= 128 && (n % 16 != 0 || weights.len() < 4) {
+                raw_table(weights)
+            } else {
+                fse_table(weights)
+            };
+            let mut ranked = HuffmanTable::new();
+            assert_eq!(ranked.build_decoder(&src).unwrap() as usize, src.len());
+            let mut scattered = HuffmanTable::new();
+            scattered.build_decoder(&src).unwrap();
+            scattered.fill_decode_tables_scatter();
+            assert_eq!(
+                ranked.decode, scattered.decode,
+                "decode mismatch for {weights:?}"
+            );
+            assert_eq!(
+                ranked.packed, scattered.packed,
+                "packed mismatch for {weights:?}"
+            );
+        }
     }
 
     /// FSE-compressed weights description (the same pipeline

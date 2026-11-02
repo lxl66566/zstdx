@@ -444,7 +444,11 @@ fn calc_symbol_spread_info(num_states_total: u32, num_states_symbol: u32) -> Sym
 
     let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
     let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
-    let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
+    // num_state_slices is a power of two by construction (a pow2 symbol
+    // count rounds to itself, any other rounds up), so the slice width is a
+    // shift; the division held 7.8% of the FSE table build's samples in the
+    // dll100 decode attribution.
+    let slice_width = num_states_total >> num_state_slices.trailing_zeros(); //size of a single width slice of states
     let nb_s = (highest_bit_set(slice_width) - 1) as u8; //number of bits needed to read for one slice
 
     SymbolSpreadInfo {
@@ -455,5 +459,37 @@ fn calc_symbol_spread_info(num_states_total: u32, num_states_symbol: u32) -> Sym
         stride_s: slice_width,
         nb_d: nb_s + 1,
         nb_s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The slice width is derived as a shift over the power-of-two slice
+    /// count; pin every spread constant against a plain-division reference
+    /// for all (table size, probability) pairs the decoder can meet.
+    #[test]
+    fn spread_info_matches_division_reference() {
+        for &total in &[16u32, 32, 64, 128, 256, 512] {
+            for prob in 1..=total {
+                let info = calc_symbol_spread_info(total, prob);
+                let slices = if 1 << (highest_bit_set(prob) - 1) == prob {
+                    prob
+                } else {
+                    1 << highest_bit_set(prob)
+                };
+                let slice_width = total / slices;
+                let num_double = slices - prob;
+                let num_single = prob - num_double;
+                assert_eq!(info.num_double, num_double, "{total}/{prob}");
+                assert_eq!(info.base_d, num_single * slice_width, "{total}/{prob}");
+                assert_eq!(info.stride_d, slice_width * 2, "{total}/{prob}");
+                assert_eq!(info.base_s, (num_double * slice_width).wrapping_neg());
+                assert_eq!(info.stride_s, slice_width, "{total}/{prob}");
+                assert_eq!(info.nb_s as u32, highest_bit_set(slice_width) - 1);
+                assert_eq!(info.nb_d, info.nb_s + 1);
+            }
+        }
     }
 }

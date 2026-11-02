@@ -108,6 +108,8 @@ Further X2 and X1 Huffman loop optimization is closed. The loop runs at about 0.
 
 Further FSE table-build optimization is closed. After the build moved from 4.9% to 1.9%, every individual item is below 4%.
 
+The spread's shape was re-examined under the 2026-11-03 dll100 miss attribution, which left the FSE sequence builds at 0.26M misses per decode against libzstd's 0.17M for the same algorithm. The data-dependent trip counts are not a lever: the position sequence the spread walks is the wire format's own table layout, so any regrouping changes the decoded table. The low-probability arm's slice-width division, 7.8% of `build_decoding_table`'s samples, became a shift because `num_state_slices` is a power of two by construction, and a division-reference test pins every spread constant. The remaining excess is the wider store domain and the baseline pass: the spread stores one symbol byte into an 8-byte entry where libzstd writes a 4-byte one, and a second pass over the table computes the baselines the decode loop's multiply-add entry form consumes. Merging the passes or narrowing the entry would re-roll the sequence decode loops' contracts, the family the falsifications above close.
+
 ## Memory layout and allocation
 
 ### Writing literals directly into the flat output
