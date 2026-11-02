@@ -672,11 +672,11 @@ fn select_x2_table(dst_size: usize, c_src_size: usize) -> bool {
 /// stream's territory. The final byte of each stream is written by the scalar
 /// finish loop. `out` holds exactly the section's regenerated size; every byte
 /// is written on success.
-/// BMI2 dispatch for the X2 interleaved loop: the per-lookup `bits`
-/// shift is the loop's only variable shift, and `shlx` compiles it to one
-/// uop without the `%cl` staging `mov` the baseline `shl %cl` form pays on
-/// every one of the twenty lookups per iteration. The tier gate is shared
-/// with the sequence executor (see `simd_tier`).
+/// BMI2 dispatch for the X2 interleaved loop. The tier gate is shared with
+/// the sequence executor (see `simd_tier`); under BMI2 the hot stretch runs
+/// as the inline-asm block below, and the scalar tier keeps the pure-Rust
+/// body this file defines, where the per-lookup `bits` shift compiles to
+/// `shl %cl` with its staging `mov`.
 fn decompress_4streams_interleaved_x2(
     table: &HuffmanTable,
     region: &[u8],
@@ -706,6 +706,331 @@ unsafe fn decompress_4streams_interleaved_x2_bmi2(
     out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
     decompress_4streams_interleaved_x2_impl(table, region, stream_bounds, out)
+}
+
+/// One `iters`-long stretch of the X2 interleaved fast loop as inline
+/// assembly, in the shape of libzstd's amd64
+/// `HUF_decompress4X2_usingDTable_internal_fast_asm_loop`. Each lookup loads
+/// the entry's three fields as their own loads like the asm loop, so the
+/// count byte feeds `shlx` straight off its load with no extract shift on
+/// the load-to-shift chain, and the stretch carries no spill traffic: the
+/// twelve window/cursor values stay in registers, with the `ip[]` pointers
+/// in xmm slots that only their per-iteration reloads touch. The Rust loop
+/// LLVM emits for the same body runs 243 instructions per iteration against
+/// this block's 202, at equal per-lookup chain length, and the loop is
+/// issue-bound, so the instruction count is the lever.
+///
+/// The template is the loop unrolled by hand, because `concat!` cannot
+/// expand chunk macros. Per lookup: `a` holds the old window, then the
+/// 11-bit index, then the length byte; `b` carries the u16 sequence to its
+/// store; `c` carries the count byte into the window shift. Per reload: the
+/// consumed-bit count comes from `bsf` on the marked window, then the
+/// retreat, the 8-byte refill and the marker-preserving shift, with the
+/// stream's ip moved in from its xmm slot first and stored back after.
+///
+/// # Safety
+///
+/// `dt` must hold 2^11 u32 entries, and `ip`/`op`/`bits` must carry the
+/// per-stream window state bounded by the caller's stream bounds and
+/// segment ends. `iters` must be the value the caller derived from the
+/// `(ip[0] - base) / 7` and `(oend[s] - op[s]) / 10` bounds: every load,
+/// store and pointer retreat in the block stays inside that envelope, the
+/// same one the Rust stretch below relies on. BMI2 must be available,
+/// because the window shifts are `shlx`.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2")]
+#[allow(clippy::too_many_lines)]
+unsafe fn x2_inner_asm(
+    dt: *const u32,
+    ip: &mut [*const u8; 4],
+    op: &mut [*mut u8; 4],
+    bits: &mut [u64; 4],
+    iters: usize,
+) {
+    let (mut op0, mut op1, mut op2, mut op3) = (
+        op[0] as usize,
+        op[1] as usize,
+        op[2] as usize,
+        op[3] as usize,
+    );
+    let (mut bits0, mut bits1, mut bits2, mut bits3) = (bits[0], bits[1], bits[2], bits[3]);
+    let mut n = iters as u64;
+    // The ip[] pointers ride xmm slots; inout operands need assignable
+    // places. The inner loop touches an ip only in its reload, so the
+    // per-reload movq pair is the whole xmm cost.
+    let (mut ip0x, mut ip1x, mut ip2x, mut ip3x) =
+        (ip[0] as u64, ip[1] as u64, ip[2] as u64, ip[3] as u64);
+    // Scratch values exist to type the out slots: a wildcard `out(reg) _`
+    // operand defaults to i8, which shrinks the template's width modifiers.
+    let (mut a, mut b, mut c) = (0u64, 0u64, 0u64);
+
+    // SAFETY: see the function-level SAFETY contract.
+    unsafe {
+        core::arch::asm!(
+            concat!(
+                "2:\n",
+                "mov {a}, {bits0}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits0}, {bits0}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op0}], {b:x}
+add {op0}, {a}
+",
+                "mov {a}, {bits1}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits1}, {bits1}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op1}], {b:x}
+add {op1}, {a}
+",
+                "mov {a}, {bits2}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits2}, {bits2}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op2}], {b:x}
+add {op2}, {a}
+",
+                "mov {a}, {bits3}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits3}, {bits3}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op3}], {b:x}
+add {op3}, {a}
+",
+                "mov {a}, {bits0}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits0}, {bits0}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op0}], {b:x}
+add {op0}, {a}
+",
+                "mov {a}, {bits1}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits1}, {bits1}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op1}], {b:x}
+add {op1}, {a}
+",
+                "mov {a}, {bits2}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits2}, {bits2}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op2}], {b:x}
+add {op2}, {a}
+",
+                "mov {a}, {bits3}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits3}, {bits3}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op3}], {b:x}
+add {op3}, {a}
+",
+                "mov {a}, {bits0}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits0}, {bits0}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op0}], {b:x}
+add {op0}, {a}
+",
+                "mov {a}, {bits1}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits1}, {bits1}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op1}], {b:x}
+add {op1}, {a}
+",
+                "mov {a}, {bits2}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits2}, {bits2}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op2}], {b:x}
+add {op2}, {a}
+",
+                "mov {a}, {bits3}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits3}, {bits3}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op3}], {b:x}
+add {op3}, {a}
+",
+                "mov {a}, {bits0}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits0}, {bits0}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op0}], {b:x}
+add {op0}, {a}
+",
+                "mov {a}, {bits1}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits1}, {bits1}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op1}], {b:x}
+add {op1}, {a}
+",
+                "mov {a}, {bits2}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits2}, {bits2}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op2}], {b:x}
+add {op2}, {a}
+",
+                "mov {a}, {bits3}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits3}, {bits3}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op3}], {b:x}
+add {op3}, {a}
+",
+                "mov {a}, {bits0}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits0}, {bits0}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op0}], {b:x}
+add {op0}, {a}
+",
+                "mov {a}, {bits1}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits1}, {bits1}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op1}], {b:x}
+add {op1}, {a}
+",
+                "mov {a}, {bits2}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits2}, {bits2}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op2}], {b:x}
+add {op2}, {a}
+",
+                "mov {a}, {bits3}
+shr {a}, 53
+movzx {b:e}, word ptr [{dt} + {a}*4]
+movzx {c:e}, byte ptr [{dt} + {a}*4 + 2]
+shlx {bits3}, {bits3}, {c}
+movzx {a:e}, byte ptr [{dt} + {a}*4 + 3]
+mov [{op3}], {b:x}
+add {op3}, {a}
+",
+                "movq {a}, {ip0x}
+bsf {bits0}, {bits0}
+mov {c}, {bits0}
+shr {bits0}, 3
+and {c}, 7
+sub {a}, {bits0}
+mov {bits0}, qword ptr [{a}]
+or {bits0}, 1
+shlx {bits0}, {bits0}, {c}
+movq {ip0x}, {a}
+",
+                "movq {a}, {ip1x}
+bsf {bits1}, {bits1}
+mov {c}, {bits1}
+shr {bits1}, 3
+and {c}, 7
+sub {a}, {bits1}
+mov {bits1}, qword ptr [{a}]
+or {bits1}, 1
+shlx {bits1}, {bits1}, {c}
+movq {ip1x}, {a}
+",
+                "movq {a}, {ip2x}
+bsf {bits2}, {bits2}
+mov {c}, {bits2}
+shr {bits2}, 3
+and {c}, 7
+sub {a}, {bits2}
+mov {bits2}, qword ptr [{a}]
+or {bits2}, 1
+shlx {bits2}, {bits2}, {c}
+movq {ip2x}, {a}
+",
+                "movq {a}, {ip3x}
+bsf {bits3}, {bits3}
+mov {c}, {bits3}
+shr {bits3}, 3
+and {c}, 7
+sub {a}, {bits3}
+mov {bits3}, qword ptr [{a}]
+or {bits3}, 1
+shlx {bits3}, {bits3}, {c}
+movq {ip3x}, {a}
+",
+                "dec {n}\n",
+                "jnz 2b\n",
+            ),
+            dt = in(reg) dt as usize,
+            ip0x = inout(xmm_reg) ip0x,
+            ip1x = inout(xmm_reg) ip1x,
+            ip2x = inout(xmm_reg) ip2x,
+            ip3x = inout(xmm_reg) ip3x,
+            op0 = inout(reg) op0,
+            op1 = inout(reg) op1,
+            op2 = inout(reg) op2,
+            op3 = inout(reg) op3,
+            bits0 = inout(reg) bits0,
+            bits1 = inout(reg) bits1,
+            bits2 = inout(reg) bits2,
+            bits3 = inout(reg) bits3,
+            n = inout(reg) n,
+            a = out(reg) a,
+            b = out(reg) b,
+            c = out(reg) c,
+            options(nostack),
+        );
+    }
+
+    *ip = [
+        ip0x as usize as *const u8,
+        ip1x as usize as *const u8,
+        ip2x as usize as *const u8,
+        ip3x as usize as *const u8,
+    ];
+    *op = [
+        op0 as *mut u8,
+        op1 as *mut u8,
+        op2 as *mut u8,
+        op3 as *mut u8,
+    ];
+    *bits = [bits0, bits1, bits2, bits3];
+    let _ = (a, b, c, n);
 }
 
 #[inline(always)]
@@ -818,6 +1143,19 @@ fn decompress_4streams_interleaved_x2_impl(
                 read_til: 0,
                 expected: -(table.max_num_bits as isize),
             });
+        }
+        // BMI2 tier: run the stretch as the inline-asm loop (the amd64 asm
+        // loop's shape) for exactly `iters` iterations, then re-derive the
+        // bounds here. The scalar stretch below keeps the olimit early-exit;
+        // both consume the same `iters` safety envelope.
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if super::simd_tier::bmi2() {
+            // SAFETY: bmi2() ran the runtime detection (or a forced tier
+            // asserted it), and `iters` carries the same bounds the olimit
+            // form derives from, so every access in the block stays inside
+            // the envelope the SAFETY comments below document.
+            unsafe { x2_inner_asm(dt.as_ptr(), &mut ip, &mut op, &mut bits, iters) };
+            continue;
         }
         // each iteration advances op[3] by at least 5 bytes
         // SAFETY: `iters` is capped by every stream's `(oend[s] - op[s]) / 10`,

@@ -95,9 +95,9 @@ Two forms were measured on the batched-read loop. Carrying the raw container, so
 
 The premise was re-opened on 2026-11-02 because skewed.zst1 and skewed.zst19 decode is dominated by the X2 loop. The BMI2 instantiation cut the loop's instructions 9.9% on 1 MiB of skewed.zst1 literals, 6.90M to 6.22M Ir, by dropping the `%cl` staging move every lookup pays in the baseline form. Wall clock stayed flat within noise on every cell: the loop is bound by the four per-stream load-to-shift chains, and the staging move renames for free. The instruction cut stays landed, and further X2 instruction-diet work carries the same floor.
 
-### Three-load X2 entry form
+### Three-load X2 entry form under LLVM
 
-libzstd's huf_decompress_amd64.S reads each X2 entry as three loads, the u16 pair value, the shift byte and the length byte, so the shift feeds shlx straight off its load and the per-stream chain is one cycle shorter than the packed-u32 read with its extract shift. The port kept the loads split under LLVM, and the stream cells isolated the form because the in-place block body of the same build touches only the bulk path: skewed.zst19 stream lost 3.6% and skewed.zst1 stream 2.4%, so the two extra loads per lookup cost more than the cycle they save. Reverted; the one-load form with its longer chain is the faster Rust shape.
+libzstd's huf_decompress_amd64.S reads each X2 entry as three loads, the u16 pair value, the shift byte and the length byte, so the shift feeds shlx straight off its load and the per-stream chain is one cycle shorter than the packed-u32 read with its extract shift. The port kept the loads split under LLVM, and the stream cells isolated the form because the in-place block body of the same build touches only the bulk path: skewed.zst19 stream lost 3.6% and skewed.zst1 stream 2.4%, so the two extra loads per lookup cost more than the cycle they save. Reverted; the one-load form with its longer chain is the faster Rust shape. The verdict binds the compiler, not the shape: the 2026-11-04 decomposition showed the loop issue-bound at about 4.5 IPC, so the chain was never the lever, and the inline-asm stretch that later adopted the three-load shape won on instruction count, not chain length (see [perf/decoding](../perf/decoding.md)). The falsified part is asking LLVM for the three-load form.
 
 ### BMI2 conversion of the X1 4-stream loop
 
@@ -125,7 +125,7 @@ The long-match copy loop is bandwidth-bound at its ceiling, not latency or issue
 
 ### Further X2 and X1 Huffman loop work
 
-Further X2 and X1 Huffman loop optimization is closed. The loop runs at about 0.75 cycles per byte, the same order as libzstd's hand-written asm, and there is no conventional path for SIMD bit-serial Huffman.
+Further X2 and X1 Huffman loop optimization was declared closed at about 0.75 cycles per byte, the same order as libzstd's hand-written asm, with no conventional path for SIMD bit-serial Huffman. The closure overstated the floor: the Rust X2 body ran 243 instructions per iteration against the reference asm loop's about 200 at equal IPC, so the loop was issue-bound and the instruction count was a real lever. The 2026-11-04 inline-asm stretch cut skewed l1 Ir 14.5 percent and closed the loop's share of the skewed.zst19 bulk gap, as recorded in [dec-gap](../bench/dec-gap.md). The X1 half of the closure stands: the X1 loop's BMI2 conversion lost 2 to 3 percent below, and it holds 1.42 cycles per symbol at the theoretical limit.
 
 ### Further FSE table-build work
 
