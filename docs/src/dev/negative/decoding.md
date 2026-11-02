@@ -27,6 +27,27 @@ The attribution on skewed.zst9 mt8, a 4000 ms budget with per-iteration medians 
 
 The falsified premise is the pairing break, the same mechanism the flat-path entry under Memory layout records for single-thread decode: the staged literal copy is load-bearing as the wildcopy repair, and replacing it costs a per-sequence repair plus a parallel re-copy of the same bytes. The one variant left open, exact-tail match copies with no repair at all, buys clean placement at the 30 percent long-match copy tax the copy-kernel falsification already prices against text. Reopening needs a placement whose literal runs sit outside every wildcopy overshoot path.
 
+### MT in-dst zone staging
+
+The idea was the MT port of the ST in-dst literals staging: place each segment's staged literals inside the output buffer instead of the scratch staging vector, so stage B's literal copies read lines stage A just wrote and stage B's final writes for segment i+1 hit the lines segment i's zone warmed. The placement itself is sound, and the collision analysis that proved it is worth keeping: a zone for segment i sits at `anchor_i + 16` with `anchor_i` the sum of every predecessor's published exact span or its header bound plus this segment's own bound. The header bound, one `min(window, 128 KiB)` per compressed block, upper-bounds the span stage A later publishes by the same cap stage A itself enforces, so a worker can compute the anchor before any predecessor finishes, reading the published span when it is there and the bound otherwise. Folding the segment budget into the executor's wild limit makes every stage B store land below the next segment's cursor, which clears the zone above it, and a compare-and-swap watermark keeps concurrently reserved zones disjoint. The last segment, and every segment whose zone cannot fit the output region, falls back to scratch staging, the same tail fallback the ST gate has. The full implementation passed the paranoid, debug and release suites, mtcheck over corpus and big, the corrupt smoke and the 45078-case parity sweep with MT arms 2, 4 and 8, byte-identical by construction.
+
+Engagement and the wall shapes it met: json.zst3 mt8 places about 14 zones staging about 1.2 MB per 32 MiB, because json averages 0.63 literals per sequence and its MT staging round-trip is dominated by the staged sequence vector, so the literal half the placement moves is about 4 percent of the bytes. dll100.zst3 places about 34 zones staging about 53 MB per 100 MiB, over half its output. text.zst3 places none, its segments sit below the 16 KiB literals floor. skewed.zst19 places none for the capacity reason: its two 16 MiB segments each carry about 14 MiB of literals, which cannot fit above the cursor pad inside a content-sized slice.
+
+The locked interleaved A/B, four position-balanced rounds per side against base a64c38c0, read:
+
+| cell | base | zones | delta |
+|---|---:|---:|---:|
+| json.zst3 mt8 | 3158 | 3091 | -2.1% |
+| json.zst3 mt16 | 3208 | 3172 | -1.2% |
+| dll100.zst3 mt8 | 3049 | 3049 | 0.0% |
+| dll100.zst3 mt16 | 3123 | 3028 | -3.0% |
+| skewed.zst19 mt8, mt16 | 2920 | 2919 | -0.1% |
+| text.zst3 mt8, mt16 | 11818 to 11842 | 11753 to 11762 | -0.6 to -0.7% |
+
+The attribution splits three ways. text places no zone at all and still loses 0.6 to 0.7 percent, which isolates a code-shape tax on the serial executor: sourcing the literal pointers through a per-block match on the zone and folding the budget end into the wild limit re-rolled `execute_blocks`, the same re-roll class the ST port avoided with the out-of-line twin. dll100 carries the mechanism over half its output bytes and reads 3 percent slower at mt16 while staying flat at mt8, so beyond the tax the placement's own effect is worker-count dependent and negative where staging runs furthest ahead: the zone stores leave dirty lines in the staging workers' private caches, and stage B's writes then pay cross-core ownership transfers where the scratch path pays write-allocate fills into lines the pooled staging buffer, reused across segments and calls, had kept cheap and local. The zone also replaces one reused staging buffer per worker slot with a virgin region per segment. json never had the literal-byte disease to cure, and skewed, the one shape that does, cannot fit its zones at all.
+
+The falsified premise is the transfer of the ST mechanism: on ST the same core decodes the literals and then writes the output, so the staging warms exactly the lines the executor stores into. On MT the staging core and the executing core are different by design, and the warmth becomes a cross-core liability. Reopening needs the warmth to be same-core or cache-clean by construction, such as a stage A pinned to the consumer core, which the serial stage B design forbids, or a literal-byte-dominated wall with segments small enough to fit their zones, a combination the current corpus and the content-sized slice do not produce together.
+
 ### Fixed-offset ramp at job starts
 
 The idea was to suppress matches whose offset sits below a 4-64 KiB floor near MT job starts, so decode pieces never wait on near-boundary reads. The piece-pipeline ceiling stayed at about 1.0-1.14x at every floor. The binding constraint is a crossing read's depth below the cut, computed as `start - src`, and the offset does not matter. A piece can start a copy the moment its source range is published, and a deep source unblocks it regardless of the match's offset size. An offset floor suppresses the wrong set, namely large offsets whose sources are deep and harmless, and leaves shallow-depth reads untouched, where any offset with a source just below the cut qualifies. The depth-semantics ramp, where crossing reads must reach at least D below the job start, is what works. It is landed and env-gated, tracked in the [todo](../todo.md).
@@ -114,6 +135,12 @@ A hand-rolled `copy_inline` on the large-copy corpus moved memmove from 33% to 1
 ### AVX-512 xxhash core
 
 An AVX-512 vpmullq vector core for xxhash came out worse. The vpmullq latency of about 4 cycles breaks the serial chain, and twox's 4 chains already hug the scalar machine limit. The right answer is 8-chain scalar interleaving.
+
+### Literal chunk schedules for the ST executor
+
+The long-match falsification below binds about 112 KB tile matches at the about 10 B/c per-core L3 bandwidth ceiling. The ST executor's per-run literal copies on skewed.zst19 sit in another regime: 30.8K runs averaging 1084 B read 4.0 B/c on our loop against 14.2 B/c for libzstd's 16-byte chunk schedule at equal whole-decode instruction counts, so the binding resource was the output buffer's write-allocate fill stream, set up by staging literals in a separate buffer, and neither the loop schedule nor copy bandwidth could move it. A replay of the recorded run list put the landed 1x16 loop, libzstd's 2x16 wildcopy schedule, a capped 2x16 form, 32-byte chunk forms, memcpy fast paths and an AVX2 kernel all inside 44 to 59 ps/B. The tile-copy verdicts do not transfer to this site: no kernel can win while the fills bind. The falsified premise moved with the staging placement, which landed as in-dst staging through [dec-gap](../bench/dec-gap.md), and the fill-bound loop readings above predate it.
+
+A 2x16 per-iteration literal chunk schedule, with the 15-byte overshoot discipline kept, was then measured in situ on the fill-bound build: skewed.zst19 gained about 3 percent and json.zst3 lost 4.5 percent wall at plus 0.99G instructions per 30 rounds, about 15 instructions per sequence, because the changed loop body re-rolled the fused loop's register allocation. After the in-dst staging landed, the loop no longer binds on skewed-class frames and the 1x16 form stayed. Reopening the schedule needs a shape whose literal copy stays instruction-bound after the staging move.
 
 ### Long-match wide-copy kernels
 

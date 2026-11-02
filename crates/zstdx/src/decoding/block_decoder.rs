@@ -52,6 +52,79 @@ fn zero_wildcopy_tail(literals_buffer: &mut Vec<u8>) {
     literals_buffer.truncate(len);
 }
 
+/// Where a compressed block's literals landed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiteralsPlacement {
+    /// The scratch staging buffer (`literals_buffer`).
+    Staged,
+    /// Decoded straight to the output cursor (zero-sequence blocks).
+    DirectAtOp,
+    /// Staged inside the output buffer past the block's write limit, so
+    /// the executor's literal copies write lines the literals decode just
+    /// made cache-present instead of paying a write-allocate fill per line.
+    InDst,
+}
+
+/// Out-of-line execution twin for in-dst staged blocks: the staging gate
+/// implies the unclamped write limit, so the split hands the executor the
+/// same bounded target the scratch path truncates to, with the literals
+/// carved out of the output buffer above that limit. The `TargetTooSmall`
+/// reclassification mirrors the staged path.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn decompress_block_flat_indst(
+    seq_section: &SequencesHeader,
+    raw: &[u8],
+    literals_len: u32,
+    fse: &mut super::scratch::FSEScratch,
+    offset_hist: &mut [u32; 3],
+    out: &mut [u8],
+    written: &mut usize,
+    virt_base: usize,
+    view: crate::decoding::flat_buffer::FlatView,
+    headroom: bool,
+    block_out_max: usize,
+    block_limit: usize,
+    real_out_len: usize,
+) -> Result<usize, DecompressBlockError> {
+    debug_assert_eq!(block_limit, *written + block_out_max);
+    let (target, staging) = out.split_at_mut(block_limit);
+    let literals = &staging[IN_DST_PAD..IN_DST_PAD + literals_len as usize];
+    let mut dec = SeqDecoder::new(seq_section, raw, fse)?;
+    execute_decoded_flat(
+        &mut dec,
+        literals,
+        target,
+        written,
+        virt_base,
+        &view,
+        offset_hist,
+        headroom,
+    )
+    .map_err(|e| match e {
+        DecompressBlockError::ExecuteSequencesError(ExecuteSequencesError::TargetTooSmall)
+            if block_limit < real_out_len =>
+        {
+            DecompressBlockError::BlockOutputTooLarge { max: block_out_max }
+        },
+        other => other,
+    })?;
+    Ok(*written)
+}
+
+/// Gap between the flat executor's write limit and the in-dst staging
+/// region: wildcopy stores stop at most one byte short of `block_limit`,
+/// so 16 bytes above it are safe by construction.
+const IN_DST_PAD: usize = 16;
+/// Readable bytes the in-dst staging region must keep above the literals
+/// end: the executor over-reads at most 15 bytes past it.
+const IN_DST_TAIL: usize = 16;
+/// Literals a block must carry before in-dst staging engages: the
+/// fill-avoidance targets frames whose runs average hundreds of bytes, so
+/// at 128 KiB blocks only literal-dominated ones engage and short-run
+/// frames stay on the staged executor.
+const IN_DST_MIN_LITERALS: usize = 64 * 1024;
+
 impl BlockDecoder {
     pub fn decode_block_content(
         header: &BlockHeader,
@@ -290,21 +363,56 @@ impl BlockDecoder {
         debug_assert!(
             !headroom || out.len() >= block_out_max + crate::decoding::flat_buffer::WILDCOPY_SLACK
         );
-        let (seq_section, raw, literals_len, literals_direct) = Self::parse_sections_body(
+        // In-dst staging needs the frame's whole history in the target with
+        // no wrapped generations: the HEADROOM paths run the windowed
+        // streaming buffer, whose previous generation physically sits above
+        // the write cursor, where the staging region would, and wrapped
+        // match reads must not see staging bytes. libzstd refuses the same
+        // arrangement when streaming.
+        let in_dst_staging = if headroom {
+            None
+        } else {
+            Some((*written).saturating_add(block_out_max + IN_DST_PAD))
+        };
+        let (seq_section, raw, literals_len, placement) = Self::parse_sections_body(
             header,
             huf,
             literals_buffer,
             block_out_max,
             body,
             Some((&mut *out, *written)),
+            in_dst_staging,
         )?;
 
         let real_out_len = out.len();
         let block_limit = (*written).saturating_add(block_out_max).min(real_out_len);
+
+        // The in-dst twin holds its own executor body: keeping this
+        // literal source out of the code below preserves the staged call
+        // site's register allocation, which every short-run shape pays per
+        // sequence.
+        if placement == LiteralsPlacement::InDst && seq_section.num_sequences != 0 {
+            return decompress_block_flat_indst(
+                &seq_section,
+                raw,
+                literals_len,
+                fse,
+                offset_hist,
+                out,
+                written,
+                virt_base,
+                view,
+                headroom,
+                block_out_max,
+                block_limit,
+                real_out_len,
+            );
+        }
+
         let out = &mut out[..block_limit];
 
         if seq_section.num_sequences != 0 {
-            // The flat executor's `wildcopy_literals` reads up to 15 bytes
+            // The flat executor's literal copy reads up to 15 bytes
             // past the final literal; give the staging buffer its 16-byte
             // zeroed tail so the overread stays initialized (see
             // `zero_wildcopy_tail`).
@@ -337,7 +445,7 @@ impl BlockDecoder {
                 ));
             }
             let literals_len = literals_len as usize;
-            if literals_direct {
+            if placement == LiteralsPlacement::DirectAtOp {
                 // The literals were decoded straight into the target above;
                 // the fit was checked before the decode ran.
                 *written += literals_len;
@@ -373,7 +481,7 @@ impl BlockDecoder {
         block_out_max: usize,
         source: &mut impl Read,
         direct_out: Option<(&mut [u8], usize)>,
-    ) -> Result<(SequencesHeader, &'a [u8], u32, bool), DecompressBlockError> {
+    ) -> Result<(SequencesHeader, &'a [u8], u32, LiteralsPlacement), DecompressBlockError> {
         block_content_buffer.resize(header.content_size as usize, 0);
         source.read_exact(block_content_buffer.as_mut_slice())?;
         Self::parse_sections_body(
@@ -383,6 +491,7 @@ impl BlockDecoder {
             block_out_max,
             block_content_buffer,
             direct_out,
+            None,
         )
     }
 
@@ -393,6 +502,7 @@ impl BlockDecoder {
     /// literals length and whether the literals were decoded directly into
     /// the caller's target.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn parse_sections_body<'a>(
         header: &BlockHeader,
         huf: &mut super::scratch::HuffmanScratch,
@@ -400,7 +510,8 @@ impl BlockDecoder {
         block_out_max: usize,
         body: &'a [u8],
         direct_out: Option<(&mut [u8], usize)>,
-    ) -> Result<(SequencesHeader, &'a [u8], u32, bool), DecompressBlockError> {
+        in_dst_staging: Option<usize>,
+    ) -> Result<(SequencesHeader, &'a [u8], u32, LiteralsPlacement), DecompressBlockError> {
         // The stored (compressed) body is bounded by the same per-block cap
         // as the output (libzstd's header-stage `cBlockSize > blockSizeMax`
         // for every block type): a small-window frame cannot carry a block
@@ -455,20 +566,48 @@ impl BlockDecoder {
         // falls back to staging, which reports the error where it always
         // did.
         let raw = &raw[upper_limit_for_literals..];
-        let mut literals_direct = false;
+        let mut placement = LiteralsPlacement::Staged;
         if let Some((out, written)) = direct_out {
             if Self::seq_count_is_zero(raw)
                 && section.regenerated_size as usize <= out.len() - written
             {
                 let target = &mut out[written..][..section.regenerated_size as usize];
-                literals_direct = decode_literals_direct(&section, huf, raw_literals, target)?;
+                placement = if decode_literals_direct(&section, huf, raw_literals, target)? {
+                    LiteralsPlacement::DirectAtOp
+                } else {
+                    LiteralsPlacement::Staged
+                };
+            } else if let Some(base) = in_dst_staging {
+                // In-dst staging, the port of libzstd's ZSTD_in_dst
+                // arrangement: the literals decode writes the block's
+                // staging region inside the output buffer, past the write
+                // limit the executor can reach. The gate keeps the pad and
+                // the over-read tail inside the target; a declined gate or
+                // a section the direct decoder does not serve falls back to
+                // the scratch buffer with unchanged error behavior. The
+                // literals floor keeps short-run shapes on the staged
+                // inline executor: the in-dst twin is out of line, and its
+                // register allocation costs those shapes per sequence,
+                // while the fill-avoidance only pays when long literal
+                // runs dominate the block.
+                let lit = section.regenerated_size as usize;
+                if lit >= IN_DST_MIN_LITERALS
+                    && base
+                        .checked_add(lit + IN_DST_TAIL)
+                        .is_some_and(|end| end <= out.len())
+                {
+                    let target = &mut out[base..][..lit];
+                    if decode_literals_direct(&section, huf, raw_literals, target)? {
+                        placement = LiteralsPlacement::InDst;
+                    }
+                }
             }
         }
 
         // all literals of the previous block must have been used in the sequence execution anyways.
         // just be defensive here
         literals_buffer.clear();
-        let bytes_used_in_literals_section = if literals_direct {
+        let bytes_used_in_literals_section = if placement != LiteralsPlacement::Staged {
             upper_limit_for_literals as u32
         } else {
             let bytes_used = decode_literals(&section, huf, raw_literals, literals_buffer)?;
@@ -501,7 +640,7 @@ impl BlockDecoder {
         );
         vprintln!("Slice for sequences: {}", raw.len());
 
-        Ok((seq_section, raw, section.regenerated_size, literals_direct))
+        Ok((seq_section, raw, section.regenerated_size, placement))
     }
 
     /// Whether a sequence section's first byte encodes a zero sequence
