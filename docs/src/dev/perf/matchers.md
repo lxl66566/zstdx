@@ -392,6 +392,42 @@ The stub cost measured zero on long compares, the one analytical worry because d
 
 The transferable lesson extends the pitfall page's: any hot loop of 32 bytes or less is a one-in-four placement lottery per instantiation, and code-size growth in any caller above it re-rolls the dice silently, so a loop that has already lost this lottery once is a candidate for the two-copy stub at the next disturbance rather than after a full bisect.
 
+### PGO attribution of the walk floor
+
+The 2026-11-03 round ran the profile-guided build this tree had never carried, to split the deep-tier walk gap into a layout-and-scheduling share and a volume share. The bench binary came out of one commit three ways: plain release, a `-Cprofile-generate` build trained through `prof enc` on skewed and json at L13 and L19, and a `-Cprofile-use` build over the toolchain `llvm-profdata` merge of the training runs. The plain and PGO binaries emit md5-identical frames on skewed, json and text at l13, on json at l19, and on dll32 at l13 and l17, with equal sizes on dll100 at l13 and l17.
+
+The same session's perf stat decomposition, ours against the zstd CLI at level 13 on one pinned core, fixed the floor's shape first. Skewed reads 16.71G against 9.87G instructions per pass at 1.69x and 22.76G against 13.66G cycles at 1.67x, at IPC parity of 0.73 against 0.72: the machine retires both instruction streams at the same rate, so the cycle ratio tracks the instruction ratio and the walk's memory stalls sit inside both sides. Skewed's branch volume runs 2.09x at 1.13x misses, L1d misses 1.30x at 199M against 153M, and L2 misses 1.34x at 172M against 128M. Json reads 1.50x instructions at IPC 1.64 against 1.27, with branch and L2 misses at parity. The one axis ours dominates is dTLB, at 66K load misses per pass against the CLI's 64M on skewed, the hugepage-backed tables' standing win.
+
+The locked wall A/B held the bench lock over six position-alternating rounds per side. Medians per pass:
+
+| Cell | plain | PGO | zstd CLI | gap recovered |
+|---|---:|---:|---:|---:|
+| skewed l13 | 4.369 s | 4.211 s | 2.338 s | 7.8% |
+| json l13 | 1.153 s | 1.142 s | 0.995 s | 7.0% |
+| dll100 l17 | 7.097 s | 7.559 s | 9.771 s | -17.3% |
+
+PGO relaid the code massively and recovered little. `run_block_lazy`, which holds the whole inlined block loop and the fused search, shrank from 63.6 KB to 48.0 KB, a standalone 257-byte `count_from` outline appeared, `fill_to` gained per-instantiation outlines, and the outlined `find_best` copies grew about 6 percent. Per-pass instructions moved -0.5 percent on skewed and +2.6 percent on json at identical output, so the 3.6 percent skewed wall gain is a placement roll inside the documented lottery, and dll100 l17 paid the same lottery at a 6.5 percent regression. A shippable lever needed half the gap before layout earned the lever-class name, and the measured ceiling of the whole class sits below 8 percent on its most favorable cell.
+
+The verdict is volume-class. The walk floor is event volume times per-event codegen, with both sides retiring instructions at parity on the latency-bound shape, and the only reopening condition was the asm-descent class of per-event codegen itself, later built and falsified by the R93-F kernel prototype. The falsification record and the probe recipe are in the [matcher negative results](../negative/matchers.md).
+
+### The per-event lick table against libzstd
+
+The 2026-11-03 R93-D pass read the reopening condition literally and diffed one tree event instruction by instruction: our `DubtFinder<5>::find_best` sorted descent in the release bench binary against `ZSTD_DUBT_findBestMatch.constprop.0` inside the zstd 1.5.7 CLI, both at the non-improving, smaller-arm, first-word-mismatch path. Ours runs 67 instructions per event against C's 41, and the +26 decomposes as follows.
+
+| lick | ours | C | delta |
+|---|---|---|---:|
+| count entry: R32 phase stub (`lea`/`mov`/`and`/`add`/`jmp *r`) plus the `cap < 8` gate | 7 | room compare and branch, 2 | +5 |
+| count exit: mismatch test, branch, `add $-8` fixup | 3 | the 4/2/1 ladder resolves inline | +3 |
+| spills and reloads around the count call (candidate spill and reload, `idx`, `win_base`, a match-end register swap, `nb` as a stack decrement) | ~7 | none, the count is inline so there is no allocation boundary | +7 |
+| the u32 rebuild (`lea` pos, 32-bit sub, 64-bit sub) plus the span range check's sub before its compare | 4 + 3 | one `cmp windowLow` and branch | +4 |
+| the common-prefix pair's spill cycle, two loads plus a store per event | 3 | both live in registers | +3 |
+| `best_len` compared out of its stack slot | 1 | register | +1 |
+| register shuffles under the 20-plus live values | ~3 | none | +3 |
+
+The count machinery is half the excess, and it is not a lick in the removable sense. The stub is the R32 icache insurance whose removal is falsified at minus 10 percent wall on dll100, and the boundary spills are LLVM's response to `count_run`'s inline asm: an asm block clobbers every allocatable register, so every loop value live across it pays a spill and reload pair that C's plain inline ladder never has. The candidate-rebuild and range-check group is the falsified u32 idx-space class. The remainder, the commons cycle, `best_len` and the shuffles, is register pressure that only fewer live values or a fused kernel can remove, and the four Rust-level restructurings that tried are falsified in the [matcher negative results](../negative/matchers.md): the price arithmetic, the packed-candidate liveness, and two argmax-register forms each rolled json, skewed or text the wrong way at deterministic instruction counts. The improving-candidate path carries one further asymmetry, the `Found` return slot's Option tag test, score load and four stores per accepted candidate against C's single `offBase` load and store, and the register-resident argmax that removes it buys json -1.1 percent Ir at skewed +0.7 percent of pure pressure cost, the same trade every restructure took.
+
+The conclusion closes the door the PGO verdict left ajar. The per-event excess is real but each of its components is either load-bearing for a documented wall property, a falsified index-domain change, or register-allocation slack whose Rust-level removal re-rolls the finder's allocation and loses more than it saves on at least one flagship shape. The remaining form of the lever was a gated asm kernel fusing the count with the ordering byte and child load so the descent carries no allocation boundary at all. The R93-F prototype built that kernel, proved it byte-exact over captured real event streams, and measured its instruction saving as real while per-event cycles stayed within 2.5 percent, so the lever is spent; the falsification with the replay numbers is in the [matcher negative results](../negative/matchers.md).
+
 ## Optimal parser
 
 The opt tier is a full port of libzstd's `zstd_opt.c`. Match collection uses a lazily filled binary tree through `insertBt1` and `insertBtAndGetAllMatches` with epoch-tagged absolute positions, and the parse runs a forward dynamic program over stretches with fixed-point fractional bit prices at a scale of 256, using highbit plus linear interpolation to approximate `-log2(p)`. Cross-block frequency adaptation uses `rescaleFreqs` decay plus `updateStats`, btultra rechecks each match plus one literal, and two-pass first-block statistics seed the frame, with the epoch bump invalidating the pass-1 tree.

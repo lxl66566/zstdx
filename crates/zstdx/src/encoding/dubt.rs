@@ -223,6 +223,21 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
     /// position. Positions below the window floor can never resolve as
     /// candidates, so the fill starts at the floor.
     pub(crate) fn fill_to(&mut self, target_idx: usize) {
+        #[cfg(feature = "job_trace")]
+        {
+            let rec = super::job_trace::descent_capture::CallRecord::fill(
+                target_idx,
+                self.win_base,
+                *self.next_update,
+            );
+            self.fill_to_inner(target_idx);
+            super::job_trace::descent_capture::record(rec);
+        }
+        #[cfg(not(feature = "job_trace"))]
+        self.fill_to_inner(target_idx)
+    }
+
+    fn fill_to_inner(&mut self, target_idx: usize) {
         debug_assert!(target_idx + super::match_generator::HASH_READ <= self.block_end_idx);
         let target_abs = self.win_base + target_idx as u64;
         let fill_floor = target_abs.saturating_sub(self.max_window);
@@ -319,6 +334,61 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
     /// repcodes first, kept by longest length (their scores are strictly
     /// increasing in it). `length_to_beat` starts at `min_match`.
     pub(crate) fn find_best(
+        &mut self,
+        idx: usize,
+        rep: &[u32; 3],
+        ll0: u32,
+        length_to_beat: usize,
+        rep_gated: bool,
+        scale: i32,
+    ) -> Found {
+        #[cfg(feature = "job_trace")]
+        {
+            super::job_trace::descent_capture::maybe_arm(
+                self.win,
+                self.win_base,
+                self.table,
+                self.table_log,
+                self.bt,
+                self.bt_mask,
+                self.nb_compares,
+                self.min_match,
+                self.sufficient_len,
+                self.max_window,
+                self.block_end_idx,
+                *self.next_update,
+                self.win_base + idx as u64,
+            );
+            let mut rec = super::job_trace::descent_capture::CallRecord::find_best(
+                idx,
+                self.block_end_idx,
+                rep,
+                ll0,
+                rep_gated,
+                length_to_beat,
+                scale,
+                self.win_base,
+                *self.next_update,
+            );
+            let found = self.find_best_inner(idx, rep, ll0, length_to_beat, rep_gated, scale);
+            rec.nu_after = *self.next_update;
+            if let Some(m) = found.rep {
+                rec.rep_len = m.len;
+                rec.rep_off = m.off;
+            }
+            if let Some(c) = found.cand {
+                rec.cand_score = c.score;
+                rec.cand_off = c.m.off;
+                rec.cand_len = c.m.len;
+            }
+            super::job_trace::descent_capture::record(rec);
+            found
+        }
+        #[cfg(not(feature = "job_trace"))]
+        self.find_best_inner(idx, rep, ll0, length_to_beat, rep_gated, scale)
+    }
+
+    fn find_best_inner(
         &mut self,
         idx: usize,
         rep: &[u32; 3],

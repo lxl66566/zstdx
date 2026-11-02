@@ -388,3 +388,235 @@ pub fn bulk_claim(id: usize, start: usize, end: usize) {
 pub fn bulk_done(id: usize, started: Instant) {
     bulk_timeline::done(id, started);
 }
+
+/// Sorted-descent event-stream capture for out-of-tree kernel probes
+/// (`ZSTDX_DESCENT_CAPTURE=<path>,<pos_threshold>,<max_records>`). The
+/// first `find_best` call at or past `pos_threshold` snapshots the finder
+/// (window bytes, hash heads, tree ring, geometry, cursor), and every
+/// following `find_best`/`fill_to` call is recorded with its inputs and
+/// outputs. Replaying the records over the snapshot reproduces the exact
+/// call sequence over the exact evolving state, so two descent
+/// implementations can be diffed per call and per final state. Recording
+/// stops at `max_records` and the file is left for the probe.
+pub mod descent_capture {
+    use std::{
+        eprintln,
+        fs::File,
+        io::{BufWriter, Write},
+        string::String,
+        sync::{
+            Mutex,
+            atomic::{AtomicU8, Ordering},
+        },
+    };
+
+    const MAGIC: u32 = 0x53444b33;
+
+    #[repr(C)]
+    pub struct Header {
+        pub magic: u32,
+        pub table_len: u32,
+        pub bt_len: u32,
+        pub table_log: u32,
+        pub bt_mask: u32,
+        pub nb_compares: u32,
+        pub min_match: u32,
+        pub sufficient_len: u32,
+        pub max_window: u64,
+        pub win_len: u64,
+        pub win_base: u64,
+        pub next_update: u64,
+        pub block_end: u32,
+    }
+
+    /// One recorded call; `kind` 0 is `fill_to`, 1 is `find_best`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CallRecord {
+        pub kind: u8,
+        pub idx: u32,
+        pub target_idx: u32,
+        pub block_end: u32,
+        pub ll0: u8,
+        pub rep_gated: u8,
+        pub rep: [u32; 3],
+        pub ltb: u32,
+        pub scale: i32,
+        pub win_base: u64,
+        pub nu_before: u64,
+        pub nu_after: u64,
+        pub rep_len: u32,
+        pub rep_off: u32,
+        pub cand_score: i32,
+        pub cand_off: u32,
+        pub cand_len: u32,
+    }
+
+    impl CallRecord {
+        #[allow(clippy::too_many_arguments)]
+        pub fn find_best(
+            idx: usize,
+            block_end: usize,
+            rep: &[u32; 3],
+            ll0: u32,
+            gated: bool,
+            ltb: usize,
+            scale: i32,
+            win_base: u64,
+            nu: u64,
+        ) -> Self {
+            Self {
+                kind: 1,
+                idx: idx as u32,
+                target_idx: 0,
+                block_end: block_end as u32,
+                ll0: ll0 as u8,
+                rep_gated: gated as u8,
+                rep: *rep,
+                ltb: ltb as u32,
+                scale,
+                win_base,
+                nu_before: nu,
+                nu_after: nu,
+                rep_len: 0,
+                rep_off: 0,
+                cand_score: i32::MIN,
+                cand_off: 0,
+                cand_len: 0,
+            }
+        }
+
+        pub fn fill(target_idx: usize, win_base: u64, nu: u64) -> Self {
+            Self {
+                kind: 0,
+                idx: 0,
+                target_idx: target_idx as u32,
+                block_end: 0,
+                ll0: 0,
+                rep_gated: 0,
+                rep: [0; 3],
+                ltb: 0,
+                scale: 0,
+                win_base,
+                nu_before: nu,
+                nu_after: nu,
+                rep_len: 0,
+                rep_off: 0,
+                cand_score: i32::MIN,
+                cand_off: 0,
+                cand_len: 0,
+            }
+        }
+    }
+
+    // 0 idle, 1 disabled, 2 armed, 3 done (record budget spent).
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static WRITER: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+    static REMAINING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn env_cfg() -> Option<&'static (String, u64, u64)> {
+        static CFG: std::sync::OnceLock<Option<(String, u64, u64)>> = std::sync::OnceLock::new();
+        CFG.get_or_init(|| {
+            let v = std::env::var("ZSTDX_DESCENT_CAPTURE").ok()?;
+            let mut it = v.split(',');
+            let path = String::from(it.next()?);
+            let pos: u64 = it.next()?.parse().ok()?;
+            let max: u64 = it.next().unwrap_or("1000000000").parse().ok()?;
+            Some((path, pos, max))
+        })
+        .as_ref()
+    }
+
+    /// Arm at the first `find_best` at or past the configured position:
+    /// snapshot the finder state, then records flow. No-op without the env.
+    #[allow(clippy::too_many_arguments)]
+    pub fn maybe_arm(
+        win: &[u8],
+        win_base: u64,
+        table: &[u32],
+        table_log: u32,
+        bt: &[u32],
+        bt_mask: usize,
+        nb_compares: usize,
+        min_match: usize,
+        sufficient_len: usize,
+        max_window: u64,
+        block_end: usize,
+        next_update: u64,
+        pos: u64,
+    ) {
+        if STATE.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let Some((path, threshold, max)) = env_cfg() else {
+            STATE.store(1, Ordering::Relaxed);
+            return;
+        };
+        if pos < *threshold {
+            // Keep polling until the threshold is crossed (env cached).
+            return;
+        }
+        let file = File::create(path.as_str()).expect("descent capture: create");
+        let mut w = BufWriter::with_capacity(1 << 20, file);
+        let hdr = Header {
+            magic: MAGIC,
+            table_len: table.len() as u32,
+            bt_len: bt.len() as u32,
+            table_log,
+            bt_mask: bt_mask as u32,
+            nb_compares: nb_compares as u32,
+            min_match: min_match as u32,
+            sufficient_len: sufficient_len as u32,
+            max_window,
+            win_len: win.len() as u64,
+            win_base,
+            next_update,
+            block_end: block_end as u32,
+        };
+        w.write_all(hdr_as_bytes(&hdr)).unwrap();
+        w.write_all(win).unwrap();
+        w.write_all(slice_as_u8(table)).unwrap();
+        w.write_all(slice_as_u8(bt)).unwrap();
+        *WRITER.lock().unwrap() = Some(w);
+        REMAINING.store(*max, Ordering::Relaxed);
+        STATE.store(2, Ordering::Relaxed);
+        eprintln!("descent capture armed at pos {pos} -> {path}");
+    }
+
+    /// Record one call; a no-op until armed, ends the capture at budget.
+    pub fn record(rec: CallRecord) {
+        if STATE.load(Ordering::Relaxed) != 2 {
+            return;
+        }
+        let left = REMAINING.fetch_sub(1, Ordering::Relaxed);
+        if left == 0 {
+            if let Some(mut w) = WRITER.lock().unwrap().take() {
+                let _ = w.flush();
+            }
+            STATE.store(3, Ordering::Relaxed);
+            eprintln!("descent capture done");
+            return;
+        }
+        let mut guard = WRITER.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            w.write_all(rec_as_bytes(&rec)).unwrap();
+        }
+    }
+
+    fn hdr_as_bytes(h: &Header) -> &[u8] {
+        // SAFETY: Header is repr(C); read-only view.
+        unsafe { std::slice::from_raw_parts(std::ptr::addr_of!(*h).cast(), size_of::<Header>()) }
+    }
+
+    fn rec_as_bytes(r: &CallRecord) -> &[u8] {
+        // SAFETY: CallRecord is repr(C); read-only view.
+        unsafe {
+            std::slice::from_raw_parts(std::ptr::addr_of!(*r).cast(), size_of::<CallRecord>())
+        }
+    }
+
+    fn slice_as_u8(s: &[u32]) -> &[u8] {
+        // SAFETY: u32 slice reinterpreted as bytes; alignment of u8 is 1.
+        unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), s.len() * 4) }
+    }
+}
