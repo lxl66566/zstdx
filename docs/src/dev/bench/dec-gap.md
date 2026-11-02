@@ -62,6 +62,19 @@ Before 2026-11-01 the matrix bulk cell's zstd closure called `zstd::bulk::decomp
 ## What remains
 
 - skewed.zst1 and skewed.zst19 bulk read x1.32 and did not move with the loop. Our own bulk path runs slower than our stream path there, at 2346 against 2623 MiB/s on zst1, so the residue sits outside the sequence loop, on the literals side of the block decode.
-- dll100 reads x1.03 to 1.13 on both paths, with branch misses still 1.17x the clang build's.
+- dll100 reads x1.03 to 1.13 on both paths, with branch misses still 1.17x the clang build's. The 2026-11-02 attribution sampled `prof dec bench/big/dll100.zst3` (40 iters, one sample per 4003 misses) and a solo one-shot loop over the same frame against the gcc-built libzstd at `/root/programs/fork/zstd/lib`, which reads 3.17M against 2.61M misses per decode on this machine, 1.22x. The excess of 0.56M per decode decomposes by sampled symbol, with shares of each side's own total:
+
+| miss source | zstdx | libzstd | excess |
+|---|---:|---:|---:|
+| Huffman table build | 0.22M (6.9%) | 0.018M (0.7%) | +0.20M |
+| FSE sequence table builds | 0.27M (8.4%) | 0.18M (6.8%) | +0.09M |
+| match copy loops, 16-byte chunk plus overlap8 | 0.56M | 0.50M | +0.06M |
+| wrapped-generation streaming copy | 0.07M (2.3%) | none | +0.07M |
+
+The Huffman build is the one open lever and the largest lump. `HuffmanTable::build_decoder` fills the X1 table with a per-symbol scatter loop whose trip count is `2^(max_bits - bits)` (`crates/zstdx/src/huff0/huff0_decoder.rs`, the `for idx in 0..len` fill), with roughly 100 to 200 symbols per rebuilt table and a rebuild on most of the frame's about 800 blocks. Symbol order interleaves one-entry and thousand-entry spans, so every inner loop's entry and exit mispredict. Libzstd's `HUF_readDTableX1_wksp` fills rank by rank with memcpy doubling, whose copies are long and carry almost no branches: 0.43% of its misses against our 6.6%. A rank-grouped fill or a one-store-per-slot Entry write is not among the falsified families, which close the Huffman decode loops, not the table build.
+
+The FSE builds spread each symbol's probability mass through data-dependent trip counts, and the low-probability arm even divides, at 7.8% of `build_decoding_table`'s samples. This axis was not part of the earlier table-build closure, which is a time-share verdict, but the family was already worked once and the expected win is a third of the Huffman one.
+
+The copy loops hold the largest single executor lump, 18.4% of the executor's samples in the 16-byte match chunk loop against libzstd's 12.6%, with the offset-class split at 16 and the `ml mod 16` back-edge trip both data-dependent per sequence. The copy-kernel family is falsified as a whole, so no lever exists there. The wrapped-generation copy is the two-generation streaming model's own cost, which the reference's one-shot loop never pays. The sequence loop's decode-side branches no longer hold a top lump, which matches json.zst3 already reading 0.76M against 0.73M: the port closed the loop, and the residue moved to the per-block table builds. The remainder, about 0.14M, is diffuse executor traffic that sampling with skid cannot assign to one side.
 - The stream cells read x1.01 to 1.05 on json and text, where the bulk cells win. The difference is the streaming pair's drain copy, which both sides pay.
 - Text's long matches run the 16-byte copy loop at about 10 bytes per cycle, the per-core L3 bandwidth for its 2.3 MiB window. A trace replay of its 151 tile copies of about 112 KB each found no faster kernel: libzstd's 2x16 schedule read -3.5% copy-only, and AVX2, AVX-512, libc memcpy and non-temporal stores all lost.

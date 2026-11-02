@@ -50,12 +50,13 @@ use super::frame_checksum::{FrameBoundaries, StreamingChecksum};
 use super::{
     FrameDecoder,
     errors::{
-        DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, FrameDecoderError,
+        DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, ExecuteSequencesError,
+        FrameDecoderError,
     },
     frame,
     literals_section_decoder::decode_literals,
     scratch::{FSEScratch, HuffmanScratch},
-    sequence_execution::{do_offset_history, wildcopy_match},
+    sequence_execution::wildcopy_match,
     sequence_section_decoder::decode_sequences_into,
 };
 use crate::blocks::{
@@ -657,6 +658,10 @@ pub(super) fn decode_segment(
             BlockType::Reserved => unreachable!("scan rejects reserved blocks"),
         }
     }
+    // 16 zero tail bytes: stage B's unconditional 16-byte literal copies
+    // overread up to 15 bytes past a block's staged literals, which stays
+    // inside the segment buffer (the next block's literals, or this tail).
+    literals.extend_from_slice(&[0; 16]);
     Ok(DecodedSegment {
         literals,
         sequences,
@@ -700,13 +705,6 @@ impl OutRegion {
 
     pub(super) fn base(&self) -> *mut u8 {
         self.base.as_ptr()
-    }
-
-    /// Whether the copy ending at absolute `end` may take the wildcopy
-    /// path: its 16-byte overshoot stays inside both bounds.
-    #[inline(always)]
-    pub(super) fn wild_ok(&self, end: usize) -> bool {
-        end + 16 <= self.write_limit && end + 16 <= self.wild_cap
     }
 }
 
@@ -764,7 +762,6 @@ pub(super) unsafe fn execute_blocks(
     input: &[u8],
     offset_hist: &mut [u32; 3],
 ) -> Result<(), FrameDecoderError> {
-    use crate::decoding::errors::ExecuteSequencesError;
     let exec_err =
         |e: ExecuteSequencesError| block_body_err(DecompressBlockError::ExecuteSequencesError(e));
     // Saturating: same 32-bit wrap concern as stage A's out_size; the
@@ -796,98 +793,215 @@ pub(super) unsafe fn execute_blocks(
                 w += len;
             },
             BlockPlan::Compressed { lits, seqs, .. } => {
+                // The sequence loop ports the ST executor's libzstd shape
+                // (see `execute_decoded_flat_inner`): repcodes resolved in
+                // locals off the staged wire value, one combined check that
+                // sends every edge case to the out-of-line exact path, and
+                // unconditional 16-byte copies on the hot path.
                 // SAFETY: lits is a range of seg.literals
                 let lit_base = unsafe { seg.literals.as_ptr().add(lits.start) };
                 // SAFETY: as above, `lits.end` is inside `seg.literals`.
                 let lit_end = unsafe { seg.literals.as_ptr().add(lits.end) };
-                let mut lit = lit_base;
+                let mut lit = lit_base as usize;
+                // The repcode history lives in locals for the block run and
+                // is written back below; an error aborts the whole decode,
+                // so the skipped write-back on the error paths is
+                // unobservable.
+                let mut rep0 = offset_hist[0] as usize;
+                let mut rep1 = offset_hist[1] as usize;
+                let mut rep2 = offset_hist[2] as usize;
+                // Both wildcopy bounds (`OutRegion`'s write limit and wild
+                // cap) are loop-invariant, so their min minus the 16-byte
+                // overshoot is the hot path's single end check.
+                let oend_w = region.write_limit.min(region.wild_cap).saturating_sub(16);
+                // Stage A accounted the exact block budget; the cold path
+                // re-checks it (the hot check against `oend_w` covers the
+                // memory bounds, not the accounting).
+                let budget_end = start + cap;
+                let mut op = start + w;
                 for seq in &seg.sequences[seqs.clone()] {
                     let ll = seq.ll as usize;
                     let ml = seq.ml as usize;
-                    if w + ll + ml > cap {
-                        return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
+                    // Offset resolution in libzstd's decode order: wire
+                    // values above 3 are real offsets carrying the +3
+                    // repcode bias, 1..=3 are repcode selectors (the mapping
+                    // `do_offset_history` pins for its own callers).
+                    let of = seq.of as usize;
+                    let offset = if of > 3 {
+                        let actual = of - 3;
+                        rep2 = rep1;
+                        rep1 = rep0;
+                        rep0 = actual;
+                        actual
+                    } else if of == 1 {
+                        // Code 0: rep0, or rep1 when the sequence carries
+                        // no literals.
+                        let ll0 = usize::from(ll == 0);
+                        let temp = if ll0 != 0 {
+                            rep1
+                        } else {
+                            rep0
+                        };
+                        rep1 = if ll0 != 0 {
+                            rep0
+                        } else {
+                            rep1
+                        };
+                        rep0 = temp;
+                        temp
+                    } else {
+                        // Codes 1 (wire 2..3): the low bit extends the
+                        // selector to rep1, rep2 or the rep0-1 pseudo slot.
+                        let ll0 = usize::from(ll == 0);
+                        let idx = of - 1 + ll0;
+                        let temp = match idx {
+                            1 => rep1,
+                            2 => rep2,
+                            // A malformed dictionary can seed rep0 with 0;
+                            // saturate so this lands on the ZeroOffset
+                            // rejection below.
+                            _ => rep0.saturating_sub(1),
+                        };
+                        if idx != 1 {
+                            rep2 = rep1;
+                        }
+                        rep1 = rep0;
+                        rep0 = temp;
+                        temp
+                    };
+                    if offset == 0 {
+                        return Err(exec_err(ExecuteSequencesError::ZeroOffset));
                     }
-                    if lit as usize + ll > lit_end as usize {
-                        return Err(exec_err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                            wanted: (lit as usize - lit_base as usize) + ll,
-                            have: lits.end - lits.start,
-                        }));
+                    let o_lit_end = op + ll;
+                    let o_match_end = o_lit_end + ml;
+                    let i_lit_end = lit + ll;
+                    if i_lit_end > lit_end as usize || o_match_end > oend_w {
+                        // SAFETY: the region contract covers writes over
+                        // the block budget plus its 16-byte slack; the cold
+                        // path re-checks every bound before copying.
+                        op = unsafe {
+                            exec_staged_end(
+                                base,
+                                op,
+                                ll,
+                                ml,
+                                offset,
+                                &mut lit,
+                                lit_base as usize,
+                                lit_end as usize,
+                                budget_end,
+                                frame_base,
+                            )
+                        }
+                        .map_err(exec_err)?;
+                        continue;
                     }
-                    // Wildcopy when the 16-byte overshoot of both the
-                    // literal and the match copy stays inside the region
-                    // (`OutRegion::wild_ok` carries the slack arithmetic);
-                    // the literal side additionally needs its own 16-byte
-                    // overread to stay inside the staged literals.
-                    let end = start + w + ll + ml;
-                    let wild = region.wild_ok(end);
-                    // SAFETY: the budget check bounds every write (with the
-                    // overshoot gated by `wild`), the literal cursor was
-                    // checked against `lit_end`, and the offset check keeps
-                    // the match source inside the frame's committed output.
+                    // SAFETY: the combined check keeps every 16-byte
+                    // overshoot inside the region's bounds, and the staged
+                    // literals carry a 16-byte zero tail so the source
+                    // overread stays initialized (a zero-length run writes
+                    // garbage the match overwrites, in address order).
                     unsafe {
-                        let dst = base.add(start + w);
-                        if ll > 0 {
-                            if wild && lit.add(ll + 16) <= lit_end {
-                                copy16_chunks(dst, lit, ll);
-                            } else {
-                                core::ptr::copy_nonoverlapping(lit, dst, ll);
-                            }
-                            lit = lit.add(ll);
-                        }
-                        w += ll;
-                        let offset = do_offset_history(seq.of, seq.ll, offset_hist);
-                        if offset == 0 {
-                            return Err(exec_err(ExecuteSequencesError::ZeroOffset));
-                        }
-                        let offset = offset as usize;
-                        let cur = start + w;
-                        // Whole-frame history, one-shot semantics — but the
-                        // frame's own output only: a concatenated stream's
-                        // frames never share history.
-                        if offset > cur - frame_base {
-                            return Err(exec_err(ExecuteSequencesError::DecodebufferError(
-                                crate::decoding::errors::DecodeBufferError::OffsetTooBig {
-                                    offset,
-                                    buf_len: cur - frame_base,
-                                },
-                            )));
-                        }
-                        if ml > 0 {
-                            let dst = base.add(cur);
-                            let src = dst.sub(offset);
-                            if wild {
-                                wildcopy_match(dst, src, ml);
-                            } else {
-                                // Doubling chunks anchored at the match
-                                // source: after `copied` bytes the readable
-                                // span behind the anchor is `offset +
-                                // copied`, so reads never run ahead of the
-                                // write cursor.
-                                let mut copied = 0;
-                                while copied < ml {
-                                    let chunk = (offset + copied).min(ml - copied);
-                                    core::ptr::copy(src, dst.add(copied), chunk);
-                                    copied += chunk;
-                                }
-                            }
-                        }
-                        w += ml;
+                        copy16_chunks(base.add(op), lit as *const u8, ll);
                     }
+                    lit = i_lit_end;
+                    // Whole-frame history, one-shot semantics — but the
+                    // frame's own output only: a concatenated stream's
+                    // frames never share history.
+                    if offset > o_lit_end - frame_base {
+                        return Err(exec_err(ExecuteSequencesError::DecodebufferError(
+                            crate::decoding::errors::DecodeBufferError::OffsetTooBig {
+                                offset,
+                                buf_len: o_lit_end - frame_base,
+                            },
+                        )));
+                    }
+                    // SAFETY: the offset check keeps the match source inside
+                    // the frame's committed output, and the combined check
+                    // covers the wildcopy overshoot. `ml` is always at least
+                    // 3 (the staged match-length code floor), so the
+                    // sub-16-offset path's 8-byte writes stay inside it.
+                    unsafe {
+                        let dst = base.add(o_lit_end);
+                        wildcopy_match(dst, dst.sub(offset), ml);
+                    }
+                    op = o_match_end;
                 }
-                let rest = lit_end as usize - lit as usize;
-                if w + rest > cap {
+                offset_hist[0] = rep0 as u32;
+                offset_hist[1] = rep1 as u32;
+                offset_hist[2] = rep2 as u32;
+                let rest = lit_end as usize - lit;
+                if op + rest > budget_end {
                     return Err(exec_err(ExecuteSequencesError::TargetTooSmall));
                 }
-                // SAFETY: budget checked above
+                // SAFETY: budget checked above; plain copy, no overshoot
                 unsafe {
-                    core::ptr::copy_nonoverlapping(lit, base.add(start + w), rest);
+                    core::ptr::copy_nonoverlapping(lit as *const u8, base.add(op), rest);
                 }
-                w += rest;
+                op += rest;
+                w = op - start;
             },
         }
     }
     debug_assert_eq!(w, cap, "stage A size accounting must match execution");
     Ok(())
+}
+
+/// Slow path for staged sequences near the wildcopy limit or past their
+/// literals: exact copies with the bounds re-checked in the staged
+/// executor's order (the ST loop's `exec_sequence_end` shape). The offset
+/// arrives resolved and nonzero (the hot loop checked both).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn exec_staged_end(
+    base: *mut u8,
+    op: usize,
+    ll: usize,
+    ml: usize,
+    offset: usize,
+    lit: &mut usize,
+    lit_base: usize,
+    lit_end: usize,
+    budget_end: usize,
+    frame_base: usize,
+) -> Result<usize, ExecuteSequencesError> {
+    let o_lit_end = op + ll;
+    let o_match_end = o_lit_end + ml;
+    if o_match_end > budget_end {
+        return Err(ExecuteSequencesError::TargetTooSmall);
+    }
+    if *lit + ll > lit_end {
+        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: *lit - lit_base + ll,
+            have: lit_end - lit_base,
+        });
+    }
+    // SAFETY: both ranges were bounds-checked above
+    unsafe { core::ptr::copy_nonoverlapping(*lit as *const u8, base.add(op), ll) };
+    *lit += ll;
+    if offset > o_lit_end - frame_base {
+        return Err(ExecuteSequencesError::DecodebufferError(
+            crate::decoding::errors::DecodeBufferError::OffsetTooBig {
+                offset,
+                buf_len: o_lit_end - frame_base,
+            },
+        ));
+    }
+    // SAFETY: the source sits `offset` bytes behind the destination inside
+    // the frame's committed output; doubling chunks anchored at the match
+    // source keep reads behind the write cursor.
+    unsafe {
+        let dst = base.add(o_lit_end);
+        let src = dst.sub(offset);
+        let mut copied = 0;
+        while copied < ml {
+            let chunk = (offset + copied).min(ml - copied);
+            core::ptr::copy(src, dst.add(copied), chunk);
+            copied += chunk;
+        }
+    }
+    Ok(o_match_end)
 }
 
 /// Copy `len` bytes in 16-byte chunks, overshooting by up to 15 bytes (the

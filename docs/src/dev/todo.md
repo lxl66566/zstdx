@@ -8,7 +8,7 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 
 | # | Item | Expected gain | Blocker | Evidence |
 |---|---|---|---|---|
-| 1 | MT decode scaling | MT decode trails the libzstd-shaped ST loop on skewed.zst9 and barely beats it on json | Stage A's batched decode and stage B's executor predate the ST loop's structure; memory-bound verdict and execute walls; unpledged streams excluded | [decoding](perf/decoding.md), [mt-stream](perf/mt-stream.md), [negative](negative/mt-stream.md) |
+| 1 | MT decode scaling | Restart-poor frames such as skewed.zst9 hold near single-thread speed; json and dll100 scale to 1.6 and 1.9 times single-thread | Stage A's per-worker staging rate plus the frame's restart-point count; the stage-A decode body widening is falsified; unpledged streams excluded | [decoding](perf/decoding.md), [mt-stream](perf/mt-stream.md), [negative](negative/mt-stream.md) |
 | 3 | Fastest json scan | The mt8 x1.08 residue | Extend-event volume on the armed rows and the branch-mispredict budget | [matchers](perf/matchers.md) |
 | 4 | Small and mid payloads | The level-1 1K to 4K cells and text at 64K | Accepted ratio trade in the tiny dense bars | [matchers](perf/matchers.md) |
 | 17 | dll100 streaming-MT encode | Fastest 16% and ultra 14% to their own bulk ceilings; the Best rows' windowed LDM (R88) closed their restart loss at +4.7% mt-versus-st on dll100 | Whole-window LDM cold fills, content spread and the band-count falsification; the opt rows' restart loss needs the long-compare form in their finder first | [matrix](bench/matrix.md) encode streaming, [mt-stream](perf/mt-stream.md) |
@@ -18,6 +18,7 @@ Item numbers are stable labels. A falsified mechanism stays falsified, and chang
 | 22 | FFI parity coverage | Parity for the remaining FFI families | 46 symbols deliberately out with recorded reasons, and `destFull` needs a decode-ahead redesign | [ffiparity](review/ffiparity.md) |
 | 23 | Fuzz campaign for window-adoption edges | Coverage of beyond-window shapes | R74 structure mode synthesizes the shapes and both encode-family campaigns ran clean; exec/s near 25 per worker under the per-input constructors is the remaining cost | [fuzz Readme](../../../crates/zstdx-fuzz/Readme.md), [workflow](pitfalls/workflow.md) |
 | 24 | Hardening follow-ups | Safer hot-code types and two latent contracts | A/B-gated hot code and a caller-contract change | [hardening](review/hardening.md) |
+| 30 | Huffman X1 table-build fill | Up to about 0.8% dll100 decode wall plus the fill's own instructions | The build sits in the literals-side files under concurrent rewrite; the built table must stay byte-identical | [dec-gap](bench/dec-gap.md), [decloop](review/decloop.md) |
 
 ## Item notes
 
@@ -27,7 +28,9 @@ Per-job content-adaptive D is the remaining structural idea. Pieces fully unchai
 
 The landed walls cover the json mt8 verdict and execute stages, and they are memory-bound floors. No wall lever remains short of overlapping execute with the verdict, which is a falsified class. Details are in [mt-stream](perf/mt-stream.md) and [negative](negative/mt-stream.md).
 
-The 2026-11-02 libzstd-shaped ST loop moved the bar. On that build json.zst3 reads 1983 MiB/s single-thread against 1989, 2175 and 2231 at mt4, mt8 and mt16, skewed.zst9 reads 962 against about 770 at every worker count, and dll100.zst3 reads 1604 against 2292 at mt16. Stage B executes staged wire values through `do_offset_history` and the old executor shape, and stage A decodes through the batched `decode_step`, so neither stage carries the structure that won the ST loop.
+The 2026-11-02 libzstd-shaped ST loop moved the bar: on that build json.zst3 read 1983 MiB/s single-thread against 1989, 2175 and 2231 at mt4, mt8 and mt16, skewed.zst9 read 962 against about 770 at every worker count, and dll100.zst3 read 1604 against 2292 at mt16. A temporary stage-timing probe put the wall in serial stage-B execution on every shape, which ran at about the single-thread decode rate, so R90 (2026-11-02) ported the ST loop's structure into the staged executor: repcodes resolve in locals off the wire value, both wildcopy bounds fold into one end compare, one combined check sends every edge case to an out-of-line exact path, and literals copy unconditionally in 16-byte chunks behind a 16-byte zero tail appended to the staged literals. Execute time per segment dropped to 43 percent on skewed.zst9, 65 on json.zst3 and 70 on dll100.zst3, and one locked before/after pair moved json.zst3 mt16 from 2197 to 3222 MiB/s, dll100.zst3 from 2291 to 3086 and skewed.zst9 from 776 to 1043, the last above its 982 single-thread control for the first time.
+
+After the port, json and dll100 split their walls between the memory-bound stage-B execute, which reads every staged literal and sequence while writing the whole output, and stage-A production behind it. Skewed.zst9 carries only the two 16 MiB restart points its encoder emitted, so the first segment's staging latency dominates its wall and stage A's per-worker rate holds every restart-poor frame near single-thread speed; with the body-widening falsified, the decoder-side lever for such frames is spent.
 
 ### 3. Fastest json scan
 
@@ -132,6 +135,10 @@ The balanced json +0.44% Ir residue is placement-only. A 4x order-swapped interl
 The remaining compile-time menu holds A/B-gated refactors of hot code. The tree families' packed entries became their own `PackedPos` domain on 2026-10-31 and the chain, row and LDM resolve sites carry their admitted distances as `NonZero`, both recorded in [hardening](review/hardening.md). What remains: `WinPos`-versus-window-index threading for the chain/row scan helpers (their idx/abs argument pairs), `NonZero` on the `LdmSeq` offset and the repcode history (the fast/dfast consumers and the decoder-side offset history own those boundaries), and enum rep-bases over `Match::off`/`of_value` (the opt DP's matches array would double in width under a tagged enum, and `push_seq_packed` is shared with the fast/dfast scans). The `Option<Candidate>` arm landed on 2026-10-24 over the btlazy selection.
 
 The owned window's committed-length to staged-end carry zone is caller-live by the pre-split convention. Walling it needs a caller-contract change, which is not worth doing until a bug lands there. `parse_chain`'s `next - 512` wrap is flagged byte-load-bearing with a do-not-fix note in the tree.
+
+### 30. Huffman X1 table-build fill
+
+The X1 decode table fills through a per-symbol scatter loop whose trip count is `2^(max_bits - bits)`, with roughly 100 to 200 symbols per rebuilt table and a rebuild on most of the about 800 blocks of dll100.zst3. Symbol order interleaves one-entry and thousand-entry spans, so the inner loop's entry and exit mispredict, and the build holds 6.9% of dll100's decode-side branch misses: 0.22M per decode against libzstd's 0.018M, whose `HUF_readDTableX1_wksp` fills rank by rank with memcpy doubling. The lever is a rank-grouped fill or a one-store-per-slot Entry write, and the falsified Huffman entries close the decode loops, not the build, so the family is open. The miss saving bounds the wall gain at about 0.8%, and the fill's instruction savings ride on top. The decomposition is in [dec-gap](bench/dec-gap.md) and the round's review record in [decloop](review/decloop.md).
 
 ## Identified floors
 
