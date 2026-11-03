@@ -89,6 +89,21 @@ The mechanism, read jointly with the padding probe: staged bytes are causal, sin
 
 Reopening needs a form that cuts staged bytes with zero per-sequence ALU on the serial loop, such as a batched SIMD expansion of 9 B records into L1-local scratch that keeps the executor's aligned per-sequence loads and loop shape unchanged.
 
+That form was built on 2026-11-04 and falsified in three shapes against base 7a275c84, locked and position-alternating. The expansion is an AVX-512 VBMI pass over 32-record batches (five 64 B window loads, six `vpermi2b` with lane-uniform `vpsrlv` and AND fixups) filling a `Sequence` scratch the executor then walks at the flat form's own loop shape; its measured cost is 0.5 to 2 percent of cycles. Stage A kept the base staging loop's store shape into a 16 B-stride worker-local flat buffer, with the pack as a separate per-block pass, scalar or vector (two masked `vpermi2b` per 8 records, OR-merging the shared byte 6).
+
+The first readings, -11 to -17 percent on json and dll100 and -29 to -31 on skewed with flat single-thread controls, traced to an implementation pitfall rather than the mechanism: the packed staging entry called `SeqDecoder` without the BMI2 `target_feature` wrapper, so the staging loop compiled to the `%cl` shift form at +39 instructions per sequence. Any packed staging path must ride the same wrapper as `decode_sequences_into` did, and the wrapper needs `#[inline(always)]` on the body or it tail-jumps out of the feature context.
+
+The repaired build's fixed-work instruction count on the skewed mtcheck workload read +3.8 percent, exactly the pack pass's own arithmetic, and the locked A/B still loses every mt cell, the best shape (vector pack, per-block expansion, single executor loop) at three to four rounds per side:
+
+| cell | base | packed | delta |
+|---|---:|---:|---:|
+| json.zst3 mt4, mt8, mt16 | 2714-3188 | 2688-2886 | -0.9, -6.9, -9.5% |
+| json.zst9 mt4, mt8, mt16 | 2920-3358 | 2606-3000 | -10.6 to -10.8% |
+| skewed.zst9 mt4, mt8, mt16 | 1064-1066 | 904-918 | -13.9 to -15.0% |
+| dll100.zst3 mt4, mt8, mt16 | 2776-3059 | 2498-2779 | -9.2 to -10.0% |
+
+The single-thread controls held flat. The executor's inner loop disassembles to the same block structure as the flat form and its instruction count per decode is slightly below base, branch misses, dTLB and L1 misses are flat to better, and cycles per decode still rise about 50 percent on skewed: the loss is cycle-efficiency shaped, not instruction shaped. The bandwidth cut the padding probe priced never appears in any cell, stage A's flat write plus pack pass lengthens the staging phase restart-poor frames wait on, and no placement of the pack (in the decode sink, behind the loop, scalar, vector) and no expansion granularity (per 32, per block) recovered it. The representation side of the staged vector stays closed.
+
 ### Fixed-offset ramp at job starts
 
 The idea was to suppress matches whose offset sits below a 4-64 KiB floor near MT job starts, so decode pieces never wait on near-boundary reads. The piece-pipeline ceiling stayed at about 1.0-1.14x at every floor. The binding constraint is a crossing read's depth below the cut, computed as `start - src`, and the offset does not matter. A piece can start a copy the moment its source range is published, and a deep source unblocks it regardless of the match's offset size. An offset floor suppresses the wrong set, namely large offsets whose sources are deep and harmless, and leaves shallow-depth reads untouched, where any offset with a source just below the cut qualifies. The depth-semantics ramp, where crossing reads must reach at least D below the job start, is what works. It is landed and env-gated, tracked in the [todo](../todo.md).
