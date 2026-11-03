@@ -1214,46 +1214,7 @@ impl Finder<'_, '_> {
 
     /// Fill the tree with every position in `[next_update, target)`.
     pub(crate) fn update_tree(&mut self, target_idx: usize) {
-        debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
-        // Positions below the match window can never resolve as candidates
-        // (`resolve` rejects them) nor be threaded into the ring (`bt_low`
-        // drops them), so inserting them is pure waste. A block the
-        // incompressibility gate skipped leaves `next_update` behind by up
-        // to the whole streak; clamp the fill to the live window instead of
-        // re-indexing dead history once a later block parses again.
-        let target_abs = self.win_base + target_idx as u64;
-        let fill_floor = target_abs.saturating_sub(self.max_window);
-        let mut idx =
-            ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
-        #[cfg(feature = "job_trace")]
-        let trace = {
-            let from = idx;
-            super::job_trace::fill_start((target_idx - from) as u64).map(|start| {
-                // The opt rows' job fills start mid-window (the tail-half
-                // bound), so the strip/lag split is size-based.
-                let bytes = (target_idx - from) as u64;
-                (start, bytes >= super::job_trace::STRIP_MIN_BYTES, bytes)
-            })
-        };
-        while idx < target_idx {
-            // The strip admission's density floor: the frontier crossing
-            // the strip advances at least [`STRIP_ADMIT_STRIDE`] per
-            // insert, near the parse's own admitted density on twin-rich
-            // shapes. The whole strip still crosses inside this one call —
-            // ascending inserts only: the ring and the prefix carries
-            // require the sweep to finish before the parse's own inserts
-            // begin.
-            let forward = self
-                .insert_bt1::<false>(idx)
-                .max(self.admit_floor(self.win_base + idx as u64))
-                .max(1);
-            idx += forward;
-        }
-        #[cfg(feature = "job_trace")]
-        if let Some((start, at_base, bytes)) = trace {
-            super::job_trace::add_fill(start, at_base, bytes);
-        }
-        *self.next_update = self.win_base + target_idx as u64;
+        self.fill_sweep::<false>(target_idx);
     }
 
     /// The strip parse's crossing sweep, run ahead of the parse loop (see
@@ -1267,6 +1228,21 @@ impl Finder<'_, '_> {
     /// admission floor and count caps, and both compare forms are pure
     /// window functions.
     pub(crate) fn update_tree_strip(&mut self, target_idx: usize) {
+        self.fill_sweep::<true>(target_idx);
+    }
+
+    /// The one-sweep ascending fill both entries run: insert every
+    /// admitted position in `[next_update, target)` under
+    /// [`Self::admit_floor`], starting from the match window's floor —
+    /// positions below it can never resolve as candidates (`resolve`
+    /// rejects them) nor be threaded into the ring (`bt_low` drops them),
+    /// and a block the incompressibility gate skipped leaves
+    /// `next_update` behind by up to the whole streak. The sweep crosses
+    /// its whole span inside this one call — ascending inserts only: the
+    /// ring and the prefix carries require the sweep to finish before the
+    /// parse's own inserts begin. `LONG` selects the insert descents'
+    /// compare form (see [`count_from_long`]).
+    fn fill_sweep<const LONG: bool>(&mut self, target_idx: usize) {
         debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
         let target_abs = self.win_base + target_idx as u64;
         let fill_floor = target_abs.saturating_sub(self.max_window);
@@ -1283,8 +1259,10 @@ impl Finder<'_, '_> {
             })
         };
         while idx < target_idx {
+            // The admission density floor drops the positions between
+            // admitted nodes (see [`Self::admit_floor`]).
             let forward = self
-                .insert_bt1::<true>(idx)
+                .insert_bt1::<LONG>(idx)
                 .max(self.admit_floor(self.win_base + idx as u64))
                 .max(1);
             idx += forward;
@@ -2202,8 +2180,19 @@ mod tests {
         let split = 64 * 1024usize;
         let strip_top = split as u64;
         let target = 90 * 1024usize;
-        let mut results = [Vec::new(), Vec::new()];
-        for (i, split_sweep) in [false, true].into_iter().enumerate() {
+        // Two tier shapes: the strip tier alone, and the widened
+        // adoption's far tier below a mid-strip `strip_base`.
+        let far_base = 32 * 1024u64;
+        let mut results = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (i, (split_sweep, strip_base)) in [
+            (false, 0u64),
+            (false, far_base),
+            (true, 0),
+            (true, far_base),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut table = vec![0u32; 1 << table_log];
             let mut bt = vec![0u32; 2 << bt_log];
             let mut hash3 = [0u32; 0];
@@ -2227,7 +2216,7 @@ mod tests {
                 sufficient_len: 64,
                 next_update: &mut next_update,
                 strip_top,
-                strip_base: 0,
+                strip_base,
             };
             if split_sweep {
                 finder.update_tree_strip(split);
@@ -2238,7 +2227,13 @@ mod tests {
             results[i].push(next_update as u32);
             results[i].push((next_update >> 32) as u32);
         }
-        assert_eq!(results[0], results[1]);
+        // Per tier shape, the split sweep threads the identical tree and
+        // lands the identical cursor as one stock call; the far tier's
+        // sparser admission must move the tree against the strip tier, so
+        // the tier configuration is live and not a dead fixture.
+        assert_eq!(results[0], results[2]);
+        assert_eq!(results[1], results[3]);
+        assert_ne!(results[0], results[1]);
     }
 
     /// The integer weight form with the release wrap semantics, the
