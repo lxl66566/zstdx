@@ -1077,7 +1077,11 @@ impl Finder<'_, '_> {
     /// Insert position `idx` into the tree, threading its node among up to
     /// `nb_compares` candidates. Returns how many following positions the
     /// caller may skip (indexing the interior of long matches is redundant).
-    fn insert_bt1(&mut self, idx: usize) -> usize {
+    /// `LONG` selects the compare form (see [`count_from_long`]): the strip
+    /// crossing's descent budget runs at SIMD speed once a compare passes
+    /// the kernel's switch point, every other fill keeps the stock scalar
+    /// loop (both forms are pure window functions).
+    fn insert_bt1<const LONG: bool>(&mut self, idx: usize) -> usize {
         let pos = self.win_base + idx as u64;
         let floor = self.cand_floor(pos);
         let h = self.hash_main(idx);
@@ -1121,12 +1125,20 @@ impl Finder<'_, '_> {
             // default builds keep the plain call.
             #[cfg(feature = "job_trace")]
             {
-                ml = count_from(self.win, idx, cidx, ml, count_limit);
+                ml = if LONG {
+                    count_from_long(self.win, idx, cidx, ml, count_limit)
+                } else {
+                    count_from(self.win, idx, cidx, ml, count_limit)
+                };
                 super::job_trace::add_cmp(ml);
             }
             #[cfg(not(feature = "job_trace"))]
             {
-                ml = count_from(self.win, idx, cidx, ml, count_limit);
+                ml = if LONG {
+                    count_from_long(self.win, idx, cidx, ml, count_limit)
+                } else {
+                    count_from(self.win, idx, cidx, ml, count_limit)
+                };
             }
             if ml > best_len {
                 best_len = ml;
@@ -1207,7 +1219,46 @@ impl Finder<'_, '_> {
             // begin.
             let floor =
                 ((self.win_base + idx as u64) < self.strip_top) as usize * STRIP_ADMIT_STRIDE;
-            let forward = self.insert_bt1(idx).max(floor).max(1);
+            let forward = self.insert_bt1::<false>(idx).max(floor).max(1);
+            idx += forward;
+        }
+        #[cfg(feature = "job_trace")]
+        if let Some((start, at_base, bytes)) = trace {
+            super::job_trace::add_fill(start, at_base, bytes);
+        }
+        *self.next_update = self.win_base + target_idx as u64;
+    }
+
+    /// The strip parse's crossing sweep, run ahead of the parse loop (see
+    /// `run_once`'s arm): the same one-sweep fill [`Self::update_tree`]
+    /// would perform at the block's first search, with the insert
+    /// descents on the long compare form — a freshly filled, shallow tree
+    /// pays the multi-KiB twin compares of the strip's duplicated regions,
+    /// the regime the frame-continuous parse's prefix-bounded descents
+    /// never enter. Byte-identical to the stock crossing by construction:
+    /// the same inserts in the same ascending order under the same
+    /// admission floor and count caps, and both compare forms are pure
+    /// window functions.
+    pub(crate) fn update_tree_strip(&mut self, target_idx: usize) {
+        debug_assert!(target_idx + HASH_READ <= self.block_end_idx);
+        let target_abs = self.win_base + target_idx as u64;
+        let fill_floor = target_abs.saturating_sub(self.max_window);
+        let mut idx =
+            ((*self.next_update).max(self.win_base).max(fill_floor) - self.win_base) as usize;
+        #[cfg(feature = "job_trace")]
+        let trace = {
+            let from = idx;
+            super::job_trace::fill_start((target_idx - from) as u64).map(|start| {
+                // The opt rows' job fills start mid-window (the tail-half
+                // bound), so the strip/lag split is size-based.
+                let bytes = (target_idx - from) as u64;
+                (start, bytes >= super::job_trace::STRIP_MIN_BYTES, bytes)
+            })
+        };
+        while idx < target_idx {
+            let floor =
+                ((self.win_base + idx as u64) < self.strip_top) as usize * STRIP_ADMIT_STRIDE;
+            let forward = self.insert_bt1::<true>(idx).max(floor).max(1);
             idx += forward;
         }
         #[cfg(feature = "job_trace")]
@@ -1717,6 +1768,26 @@ fn run_once<const ULTRA: bool>(
         strip_top,
     };
     let mut next_update3 = *finder.next_update;
+    // The strip parse's crossing sweep: a job that adopted a strip crosses
+    // it in one fill at the first block's first search (the admission
+    // floor's contract), so run that sweep here, ahead of the loop, on the
+    // long compare form (see [`Finder::update_tree_strip`]). The arm keys
+    // on geometry alone — `strip_top` names a strip this job adopted, and
+    // the cursor sits below the block — so frame-continuous parses (and
+    // every steady block past the crossing) never take it and keep the
+    // stock scalar fill untouched. The window-floor guard keeps the split
+    // byte-exact: with the cursor at or above the floor of any target in
+    // this block, the stock first crossing would begin at the same cursor.
+    let strip_from = (*finder.next_update).max(win_base);
+    if strip_top > 0
+        && strip_from < block_start
+        // The sweep target keeps update_tree's HASH_READ margin (a short
+        // final block leaves the crossing to the parse's own calls).
+        && block_start + HASH_READ as u64 <= block_end
+        && strip_from >= (win_base + block_end).saturating_sub(max_window)
+    {
+        finder.update_tree_strip((block_start - win_base) as usize);
+    }
 
     // The very first frame position has nothing behind it.
     let mut pos = block_start + (block_start == 0) as u64;
@@ -2065,6 +2136,73 @@ mod tests {
         f.origin = f.origin.wrapping_add(1 << 30);
         assert_eq!(f.resolve(stale, 0, pos), None);
         assert_eq!(f.resolve(EMPTY, 0, pos), None);
+    }
+
+    /// The strip crossing's split sweep is the stock crossing: crossing
+    /// the same span through [`Finder::update_tree_strip`] up to the
+    /// block boundary and the stock [`Finder::update_tree`] beyond threads
+    /// the identical tree and lands the identical fill cursor as one stock
+    /// call over the whole span, admission floor included, on twin-rich
+    /// content that pays both compare forms past the kernel's switch
+    /// point.
+    #[test]
+    fn strip_crossing_split_matches_stock() {
+        use alloc::vec;
+        // Deterministic window: random base with two duplicated multi-KiB
+        // regions at far and near offsets.
+        let mut win = Vec::with_capacity(96 * 1024);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while win.len() < 96 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            win.extend_from_slice(&state.to_le_bytes());
+        }
+        let (base, tail) = win.split_at_mut(40 * 1024);
+        tail[..8 * 1024].copy_from_slice(&base[1024..8 * 1024 + 1024]);
+        let (base, tail) = win.split_at_mut(80 * 1024);
+        tail[..4 * 1024].copy_from_slice(&base[1024..4 * 1024 + 1024]);
+        let table_log = 12u32;
+        let bt_log = 13usize;
+        // The strip ends at the block boundary (the arm's own geometry:
+        // `strip_top` is the job's parse start).
+        let split = 64 * 1024usize;
+        let strip_top = split as u64;
+        let target = 90 * 1024usize;
+        let mut results = [Vec::new(), Vec::new()];
+        for (i, split_sweep) in [false, true].into_iter().enumerate() {
+            let mut table = vec![0u32; 1 << table_log];
+            let mut bt = vec![0u32; 2 << bt_log];
+            let mut hash3 = [0u32; 0];
+            let mut next_update = 0u64;
+            let mut finder = Finder {
+                win: &win,
+                win_base: 0,
+                block_end_idx: win.len(),
+                origin: 0,
+                max_window: 1 << 20,
+                table: &mut table,
+                table_log,
+                bt: &mut bt,
+                bt_mask: (1 << bt_log) - 1,
+                hash3: &mut hash3,
+                hash3_log: 0,
+                min_match: 3,
+                mls: 5,
+                nb_compares: 8,
+                insert_compares: 8,
+                sufficient_len: 64,
+                next_update: &mut next_update,
+                strip_top,
+            };
+            if split_sweep {
+                finder.update_tree_strip(split);
+            }
+            finder.update_tree(target);
+            results[i] = bt;
+            results[i].extend_from_slice(&table);
+            results[i].push(next_update as u32);
+            results[i].push((next_update >> 32) as u32);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     /// The integer weight form with the release wrap semantics, the
