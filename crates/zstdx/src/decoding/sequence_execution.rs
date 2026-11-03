@@ -455,8 +455,11 @@ fn execute_decoded_flat_inner<const NOWRAP: bool, const HEADROOM: bool>(
         // garbage the match overwrites, and a branch on it would mispredict
         // on every shape with short literal runs.
         // SAFETY: `o_match_end <= oend_w` keeps every 16-byte store inside
-        // the target or its slack, and the literal buffer's zeroed 16-byte
-        // tail covers the over-read up to `lit + 16`.
+        // the target or its slack. The 15-byte over-read past the literals
+        // end stays defined on both literal sources: the scratch staging
+        // buffer's zeroed tail (`zero_wildcopy_tail`), or the output
+        // buffer's own bytes past an in-dst staged region, which the
+        // placement's tail gate keeps readable.
         unsafe {
             copy16(op as *mut u8, lit as *const u8);
             if ll > 16 {

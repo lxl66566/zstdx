@@ -57,6 +57,7 @@
 - [Window semantics](dev/review/winsem.md)
 - [MT job machinery review](dev/review/mtjobs.md)
 - [R95 encode sprint review](dev/review/r95-sprint.md)
+- [R95 decode sprint review](dev/review/r95-dec-sprint.md)
 
 ## Remaining Improvements
 

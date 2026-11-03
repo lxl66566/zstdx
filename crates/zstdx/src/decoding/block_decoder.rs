@@ -53,7 +53,7 @@ fn zero_wildcopy_tail(literals_buffer: &mut Vec<u8>) {
 }
 
 /// Where a compressed block's literals landed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LiteralsPlacement {
     /// The scratch staging buffer (`literals_buffer`).
     Staged,
@@ -390,7 +390,12 @@ impl BlockDecoder {
         // The in-dst twin holds its own executor body: keeping this
         // literal source out of the code below preserves the staged call
         // site's register allocation, which every short-run shape pays per
-        // sequence.
+        // sequence. The `num_sequences != 0` half is load-bearing: the
+        // inline zero-sequence arm below copies `literals_buffer`, which
+        // stayed empty for a non-Staged placement. A zero-sequence block
+        // cannot reach `InDst`, because the in-dst gate implies the
+        // direct-at-cursor fit, so a zero-sequence block that passes it
+        // always took the direct-at-cursor branch in `parse_sections_body`.
         if placement == LiteralsPlacement::InDst && seq_section.num_sequences != 0 {
             return decompress_block_flat_indst(
                 &seq_section,
@@ -725,13 +730,20 @@ impl BlockDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::new;
+    use alloc::{vec, vec::Vec};
+
+    use super::{BlockDecoder, IN_DST_PAD, IN_DST_TAIL, LiteralsPlacement, new};
     use crate::{
-        blocks::block::BlockType,
-        decoding::errors::{BlockHeaderReadError, BlockSizeError},
+        blocks::block::{BlockHeader, BlockType},
+        decoding::{
+            FrameDecoder,
+            errors::{BlockHeaderReadError, BlockSizeError},
+            frame::read_frame_header,
+            scratch::DecoderScratch,
+        },
     };
 
-    fn read(bytes: &[u8]) -> Result<(crate::blocks::block::BlockHeader, u8), BlockHeaderReadError> {
+    fn read(bytes: &[u8]) -> Result<(BlockHeader, u8), BlockHeaderReadError> {
         new().read_block_header(bytes)
     }
 
@@ -780,5 +792,198 @@ mod tests {
     #[test]
     fn truncated_header_is_a_read_error() {
         assert!(read(&[0x01, 0x00]).is_err());
+    }
+
+    // In-dst staging gate pins. `parse_sections_body` is private, so the
+    // cells call it directly with the same (out, written) and base halves
+    // the flat decode computes. Every body is a crafted RLE literals
+    // section, which `decode_literals_direct` serves, so a cell that
+    // passes the gate decodes into the target and a declined cell falls
+    // back to the scratch buffer with the same bytes.
+
+    const BLOCK_MAX: usize = 128 * 1024;
+
+    /// A compressed-block body: an RLE literals section of `lit` bytes
+    /// followed by a one-sequence header with predefined modes and no
+    /// sequence payload. The pins stop at the section parse, which never
+    /// touches the sequence bitstream.
+    fn rle_body(lit: u32) -> Vec<u8> {
+        vec![
+            0x0d | (((lit as u8) & 0x0f) << 4), // RLE type, size format 3, 20-bit size
+            (lit >> 4) as u8,
+            (lit >> 12) as u8,
+            0x5a, // the repeated literal
+            0x01, // one sequence
+            0x00, // all four modes predefined
+        ]
+    }
+
+    /// Parse `lit` RLE literals at `written` = 0 into a zeroed target of
+    /// `out_len` bytes, with the production base (`block_out_max` plus
+    /// pad) or `None` for the HEADROOM shape. Returns the placement, the
+    /// target and the scratch staging buffer, so the pins assert where
+    /// the literals landed.
+    fn parse_rle(
+        lit: u32,
+        out_len: usize,
+        base: Option<usize>,
+    ) -> (LiteralsPlacement, Vec<u8>, Vec<u8>) {
+        let body = rle_body(lit);
+        let header = BlockHeader {
+            last_block: true,
+            block_type: BlockType::Compressed,
+            decompressed_size: 0,
+            content_size: body.len() as u32,
+        };
+        let block_out_max = crate::common::max_block_output(BLOCK_MAX);
+        let mut scratch = DecoderScratch::new(BLOCK_MAX);
+        let DecoderScratch {
+            huf,
+            literals_buffer,
+            ..
+        } = &mut scratch;
+        let mut out = vec![0u8; out_len];
+        let (seq_section, _raw, literals_len, placement) = BlockDecoder::parse_sections_body(
+            &header,
+            huf,
+            literals_buffer,
+            block_out_max,
+            &body,
+            Some((&mut out, 0)),
+            base,
+        )
+        .unwrap();
+        assert_eq!(seq_section.num_sequences, 1);
+        assert_eq!(literals_len, lit);
+        (placement, out, core::mem::take(literals_buffer))
+    }
+
+    /// The 64 KiB literals floor with room to spare beyond it: 65535
+    /// literals stay staged, 65536 engage the placement.
+    #[test]
+    fn in_dst_literals_floor() {
+        let base = crate::common::max_block_output(BLOCK_MAX) + IN_DST_PAD;
+        let room = base + 70 * 1024 + IN_DST_TAIL;
+        assert_eq!(
+            parse_rle(65535, room, Some(base)).0,
+            LiteralsPlacement::Staged
+        );
+        let (placement, out, _) = parse_rle(65536, room, Some(base));
+        assert_eq!(placement, LiteralsPlacement::InDst);
+        assert!(out[base..base + 65536].iter().all(|&b| b == 0x5a));
+    }
+
+    /// The room gate: the staging region plus the pad plus the over-read
+    /// tail must fit. Exactly the staging region (the pad missing)
+    /// refuses, one byte short of the tail refuses, the exact fit
+    /// accepts.
+    #[test]
+    fn in_dst_room_boundaries() {
+        let base = crate::common::max_block_output(BLOCK_MAX) + IN_DST_PAD;
+        let lit = 70 * 1024;
+        assert_eq!(
+            parse_rle(lit as u32, base + lit, Some(base)).0,
+            LiteralsPlacement::Staged
+        );
+        assert_eq!(
+            parse_rle(lit as u32, base + lit + IN_DST_TAIL - 1, Some(base)).0,
+            LiteralsPlacement::Staged
+        );
+        assert_eq!(
+            parse_rle(lit as u32, base + lit + IN_DST_TAIL, Some(base)).0,
+            LiteralsPlacement::InDst
+        );
+    }
+
+    /// The HEADROOM shape: the flat decode computes `None` before the
+    /// parse when headroom is set, so an otherwise-accepting geometry
+    /// stays staged on the identical target.
+    #[test]
+    fn in_dst_headroom_refusal() {
+        let base = crate::common::max_block_output(BLOCK_MAX) + IN_DST_PAD;
+        let lit = 70 * 1024;
+        let accept = base + lit + IN_DST_TAIL;
+        assert_eq!(
+            parse_rle(lit as u32, accept, Some(base)).0,
+            LiteralsPlacement::InDst
+        );
+        let (placement, _, staged) = parse_rle(lit as u32, accept, None);
+        assert_eq!(placement, LiteralsPlacement::Staged);
+        assert_eq!(staged.len(), lit);
+        assert!(staged.iter().all(|&b| b == 0x5a));
+    }
+
+    /// Acceptance on a real encoder frame: one 128 KiB block whose
+    /// literals section clears the floor, so the gate engages on the same
+    /// body decode_all runs. The placement's premises — the executor's
+    /// write limit at or below the staging base, and the staging plus
+    /// tail inside the target — are asserted from the same numbers, and
+    /// the frame roundtrips byte-exact at both the accepting geometry and
+    /// the declining exact-size target.
+    #[test]
+    fn in_dst_acceptance_fixture() {
+        const N: usize = 128 * 1024;
+        // 64-symbol random data keeps the literals at four-stream Huffman
+        // size while chance matches stay rare; the duplicated tail pins
+        // at least one real sequence.
+        let mut rng: u64 = 0x9e3779b97f4a7c15;
+        let mut payload = vec![0u8; N];
+        for b in &mut payload[..N - 4096] {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *b = ((rng >> 33) as u8) & 0x3f;
+        }
+        let (head, tail) = payload.split_at_mut(N - 4096);
+        tail.copy_from_slice(&head[..4096]);
+
+        let frame = crate::encoding::compress_to_vec(&mut &payload[..], crate::Level::Fastest);
+        let (fh, header_len) = read_frame_header(&mut &frame[..]).unwrap();
+        let header_len = header_len as usize;
+        // The payload block is the frame's first and only content block;
+        // the encoder's frame terminator is an empty Raw block after it.
+        let (block_header, _) = new().read_block_header(&mut &frame[header_len..]).unwrap();
+        assert_eq!(block_header.block_type, BlockType::Compressed);
+        let body_start = header_len + 3;
+        let body = &frame[body_start..body_start + block_header.content_size as usize];
+
+        let window = fh.window_size().unwrap() as usize;
+        let block_out_max = crate::common::max_block_output(window);
+        let base = block_out_max + IN_DST_PAD;
+        let slack = N + 2 * BLOCK_MAX + 2 * IN_DST_PAD;
+
+        let mut scratch = DecoderScratch::new(window);
+        let DecoderScratch {
+            huf,
+            literals_buffer,
+            ..
+        } = &mut scratch;
+        let mut out = vec![0u8; slack];
+        let (seq_section, _raw, literals_len, placement) = BlockDecoder::parse_sections_body(
+            &block_header,
+            huf,
+            literals_buffer,
+            block_out_max,
+            body,
+            Some((&mut out, 0)),
+            Some(base),
+        )
+        .unwrap();
+        assert_eq!(placement, LiteralsPlacement::InDst);
+        assert_ne!(seq_section.num_sequences, 0);
+        let lit = literals_len as usize;
+        assert!(lit >= super::IN_DST_MIN_LITERALS);
+        assert!(lit <= BLOCK_MAX);
+        assert!(block_out_max <= base);
+        assert!(base + lit + IN_DST_TAIL <= slack);
+
+        let mut big = vec![0u8; slack];
+        let written = FrameDecoder::new().decode_all(&frame, &mut big).unwrap();
+        assert_eq!(written, N);
+        assert_eq!(&big[..N], &payload[..]);
+        let mut exact = vec![0u8; N];
+        let written = FrameDecoder::new().decode_all(&frame, &mut exact).unwrap();
+        assert_eq!(written, N);
+        assert_eq!(&exact[..], &payload[..]);
     }
 }

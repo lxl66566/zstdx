@@ -75,7 +75,7 @@ The earlier commits fixed several contracts. Commit 4fdc4872 fixed `getFrameHead
 - 68395088 enforces the strict maxCode bound and keeps the raw gap codes
 - 136a2758 fixes the parameter bounds, the mid-frame `stage_wrong` gates, the wild-cursor checks and the mid-frame cParam whitelist
 - b28e8b68 fixes the one-shot bad-magic gating, null and truncated decode buffers, the `initDStream` return, the deprecated DStream init family and the no-forward-progress guard
-- 5047a631 ports the reference's `ZSTD_decompressStream` stage engine into the FFI streaming shim, closing the `destFull` call-count and hint deviations
+- dd4df0ac ports the reference's `ZSTD_decompressStream` stage engine into the FFI streaming shim, closing the `destFull` call-count and hint deviations
 - (this commit) pins the streaming surface with the transcript grid: 41 cells over embedded reference-built frames, 2248 calls compared cell by cell on both libraries
 
 ## Verification

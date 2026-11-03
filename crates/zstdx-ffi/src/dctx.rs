@@ -708,7 +708,7 @@ impl DStream {
                     continue;
                 },
                 Stage::BlockBody {
-                    wire,
+                    wire: _,
                     last,
                     size,
                     remaining,
@@ -729,7 +729,6 @@ impl DStream {
                     self.decode_block(header_pos, body_end, last)?;
                     self.cursor = body_end;
                     self.compact(0);
-                    let _ = wire;
                     if last {
                         if self.checksummed {
                             self.stage = Stage::Checksum;
