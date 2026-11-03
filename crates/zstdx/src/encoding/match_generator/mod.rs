@@ -190,6 +190,11 @@ pub struct MatchGeneratorDriver {
     /// parse. The fill crossing below it runs at the admission density
     /// floor (see `opt::Finder`).
     opt_strip_top: u64,
+    /// Far-window admission boundary for the opt rows: the fill bound an
+    /// MT job's strip prefill left in the cursor (set by
+    /// `prefill_job_strip`), zero everywhere else. The fill crossing
+    /// below it runs at the far-window density floor (see `opt::Finder`).
+    opt_strip_base: u64,
     /// Earliest absolute position not yet offered to the search tables
     /// (u64::MAX = none pending). An incompressibility-gated block opens
     /// the gap at its start; the next scanning block's dense catch-up
@@ -1188,6 +1193,7 @@ impl MatchGeneratorDriver {
             lazy_scratch: None,
             next_update: 0,
             opt_strip_top: 0,
+            opt_strip_base: 0,
             gap_start: u64::MAX,
             // Epoch 0 is the never-valid state of a zeroed table.
             opt_origin: 0,
@@ -1267,6 +1273,7 @@ impl MatchGeneratorDriver {
             lazy_scratch: None,
             next_update: 0,
             opt_strip_top: 0,
+            opt_strip_base: 0,
             gap_start: u64::MAX,
             opt_origin: 0,
             head_origin: 0,
@@ -2123,8 +2130,10 @@ impl MatchGeneratorDriver {
             let bound = base + (data.len() as u64).saturating_sub(tree_back);
             self.next_update = self.next_update.max(bound);
             // The strip crossing runs at the admission density floor from
-            // the first search on (see `opt::Finder::update_tree`). An
-            // empty strip (job zero) leaves the ceiling at zero.
+            // the first search on (see `opt::Finder::update_tree`), the
+            // far window below the fill bound at the coarser far floor.
+            // An empty strip (job zero) leaves both at zero.
+            self.opt_strip_base = self.next_update;
             self.opt_strip_top = base + data.len() as u64;
         }
     }
@@ -3323,6 +3332,7 @@ impl MatchGeneratorDriver {
         self.small_wide = None;
         self.small_wide_key = (0, 0);
         self.opt_strip_top = 0;
+        self.opt_strip_base = 0;
         self.ldm_seqs.clear();
         self.small_src_pending = None;
         self.row_attempts_pending = None;
@@ -3478,6 +3488,7 @@ impl Matcher for MatchGeneratorDriver {
         self.bal_store = BalancedStore::Chain;
         self.dict_prefix = false;
         self.opt_strip_top = 0;
+        self.opt_strip_base = 0;
         self.apply_level(level);
         // Stale opt-table entries from previous frames decode below the
         // window floor once the origin advances past them (read before the

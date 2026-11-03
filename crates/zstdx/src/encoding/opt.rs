@@ -52,6 +52,13 @@ const SEED_SPAN: u64 = crate::common::MAX_BLOCK_SIZE as u64;
 /// already read dll100 ultra +0.60% size.
 const STRIP_ADMIT_STRIDE: usize = 4;
 
+/// Density floor for the far-window admission, the widened adoption's
+/// span below the strip's own fill bound (see [`Finder::strip_base`]): a
+/// far twin region runs multi-KiB, so one admitted position per stride
+/// still indexes every bucket the region hits, while the insert descents
+/// the span pays are latency-bound per insert whatever the compare form.
+const FAR_ADMIT_STRIDE: usize = 256;
+
 /// A tree-table entry: a position in its stored form
 /// `(position + origin + POS_BIAS) mod 2^32`. Packing, resolving and the
 /// never-valid [`EMPTY`] live on the type, so a raw u32 cannot stand in
@@ -992,6 +999,13 @@ pub(crate) struct Finder<'a, 'b> {
     /// least [`STRIP_ADMIT_STRIDE`] per insert. Zero on every
     /// frame-continuous parse, so the stock law runs unchanged.
     pub(crate) strip_top: u64,
+    /// Admission boundary between the far-window and strip tiers of the
+    /// density floor: positions below this absolute position — the fill
+    /// bound an MT job's strip prefill left in the cursor, with the
+    /// widened adoption's window span below it — advance at least
+    /// [`FAR_ADMIT_STRIDE`] per insert. Zero keeps every admitted position
+    /// on the strip tier.
+    pub(crate) strip_base: u64,
 }
 
 impl Finder<'_, '_> {
@@ -999,6 +1013,18 @@ impl Finder<'_, '_> {
     #[inline]
     fn cand_floor(&self, pos: u64) -> u64 {
         pos.saturating_sub(self.max_window).max(self.win_base)
+    }
+
+    /// The admission floor at `pos`: the far-window tier below
+    /// [`Self::strip_base`], the strip tier below [`Self::strip_top`],
+    /// no floor above.
+    #[inline]
+    fn admit_floor(&self, pos: u64) -> usize {
+        if pos < self.strip_base {
+            FAR_ADMIT_STRIDE
+        } else {
+            ((pos < self.strip_top) as usize) * STRIP_ADMIT_STRIDE
+        }
     }
 
     /// Resolve a table entry to an absolute candidate position in
@@ -1217,9 +1243,10 @@ impl Finder<'_, '_> {
             // ascending inserts only: the ring and the prefix carries
             // require the sweep to finish before the parse's own inserts
             // begin.
-            let floor =
-                ((self.win_base + idx as u64) < self.strip_top) as usize * STRIP_ADMIT_STRIDE;
-            let forward = self.insert_bt1::<false>(idx).max(floor).max(1);
+            let forward = self
+                .insert_bt1::<false>(idx)
+                .max(self.admit_floor(self.win_base + idx as u64))
+                .max(1);
             idx += forward;
         }
         #[cfg(feature = "job_trace")]
@@ -1256,9 +1283,10 @@ impl Finder<'_, '_> {
             })
         };
         while idx < target_idx {
-            let floor =
-                ((self.win_base + idx as u64) < self.strip_top) as usize * STRIP_ADMIT_STRIDE;
-            let forward = self.insert_bt1::<true>(idx).max(floor).max(1);
+            let forward = self
+                .insert_bt1::<true>(idx)
+                .max(self.admit_floor(self.win_base + idx as u64))
+                .max(1);
             idx += forward;
         }
         #[cfg(feature = "job_trace")]
@@ -1507,6 +1535,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
     block_end: u64,
     max_window: u64,
     strip_top: u64,
+    strip_base: u64,
     ldm_seqs: &[LdmSeq],
     origin: &mut u64,
     table: &mut [u32],
@@ -1571,6 +1600,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
                 seed_end,
                 max_window,
                 seed_win_base,
+                seed_win_base,
                 ldm_seqs,
                 *origin,
                 table,
@@ -1614,6 +1644,7 @@ pub(crate) fn run_block<const ULTRA: bool>(
         block_end,
         max_window,
         strip_top,
+        strip_base,
         ldm_seqs,
         *origin,
         table,
@@ -1702,6 +1733,7 @@ pub(crate) fn seed_dict_tree(
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
         strip_top: 0,
+        strip_base: 0,
     };
     let fill_target = win.len().saturating_sub(OPT_NUM);
     finder.update_tree(fill_target);
@@ -1728,6 +1760,7 @@ fn run_once<const ULTRA: bool>(
     block_end: u64,
     max_window: u64,
     strip_top: u64,
+    strip_base: u64,
     ldm_seqs: &[LdmSeq],
     origin: u64,
     table: &mut [u32],
@@ -1766,6 +1799,7 @@ fn run_once<const ULTRA: bool>(
         sufficient_len: knobs.sufficient_len as usize,
         next_update,
         strip_top,
+        strip_base,
     };
     let mut next_update3 = *finder.next_update;
     // The strip parse's crossing sweep: a job that adopted a strip crosses
@@ -2125,6 +2159,7 @@ mod tests {
             sufficient_len: 64,
             next_update: &mut next_update,
             strip_top: 0,
+            strip_base: 0,
         };
         let pos = 1 << 22;
         for delta in [1u64, 64, 4096, 1 << 20] {
@@ -2192,6 +2227,7 @@ mod tests {
                 sufficient_len: 64,
                 next_update: &mut next_update,
                 strip_top,
+                strip_base: 0,
             };
             if split_sweep {
                 finder.update_tree_strip(split);

@@ -332,11 +332,18 @@ pub fn compress_slice_mt(
     } else {
         None
     };
-    // The feed window names the far candidates' reach and the gate
-    // replay's span alone: the opt consumer prices the stored span
-    // (generation verified it over the whole input), so the job keeps
-    // the stock strip window and the shallow tree the stock grid runs.
-    let job_overlap = deep_ldm.or(capture_window).map_or(overlap, |w| w as usize);
+    // The feed jobs adopt the row window as their match window (the R95
+    // widened adoption): the far tree candidate class the stock strip
+    // window holds out comes in through the window-span crossing sweep,
+    // which the strip crossing's long-compare form carries at SIMD speed
+    // (the scalar form's wall is the falsified windowed class, see
+    // dev/negative/mt-stream.md). The tree keeps its reach-tail strip and
+    // the feed keeps publishing the far candidates, exactly the deep
+    // band's split: wide window, narrow tree prefill.
+    let job_overlap = deep_ldm
+        .or(capture_window)
+        .or(opt_feed)
+        .map_or(overlap, |w| w as usize);
     let job_ldm = if spf.is_some() {
         LdmArming::JobPrefix
     } else {
