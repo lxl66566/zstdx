@@ -412,6 +412,27 @@ End-to-end against this round's locked enc-ST walls: text.best encodes 32 MiB in
 
 The MT premise fails on the same numbers. The per-job tree strip fills that a shared index would replace run at about 8 MiB/s inserts per worker and parallelize across workers, while the one-time build is serial at 37 to 41 MB/s with negative thread scaling, so the shared array costs more wall than the fills it removes. Peak RSS at dll100 measured 1307 MiB for text, SA, LCP and the PLCP-or-ISA buffer, the expected 12n bytes, viable at 100 MiB on this host and beyond reach at half-GiB inputs. Reopening needs a build-side change of algorithm class or a host with scaling memory bandwidth, plus a walk form that survives tiled data; the quality half is settled and cheap to re-verify.
 
+### The 2026-11-04 reopening probe on the skewed.best budget
+
+The reopening condition's walk half was measured at the operating point a tree replacement would serve, and the lone competitive cell closed. Three corrections to the original costing come first. The 0.5x to 0.6x cell costed the walk at parse density, 6.16M emitted sequences, while the finder answers 19.4M searches per pass, so the honest query load is 3.1x the probe's. The 8.5M to 15.9M q/s walk rates were measured at the whole-past window, where the walk reads 5.1 steps per query. The l13 tree domain is W22, 4 MiB of a 32 MiB input, and there SA order is lexicographic while the window constraint is positional, so the walk pays a future-position or window reject for most of every LCP interval level: 8.2 to 9.4 steps per query at mls 5, of which 7 to 8 are rejects. The same sparsity law showed its extreme form in a sanity walk at a 2 KiB window, where each best-ml increment cost about 4096 candidate visits.
+
+The probe rebuilt the index with libsais-rs 0.2.2 and took the current build's executed triples through the `seq_dump` hook: SA construction 0.90 to 1.09 s at 31 to 36 MB/s, PLCP plus the permute to LCP plus the ISA 1.0 to 1.2 s, 1.97 to 2.27 s single-threaded, 1.75 s at the floor without the ISA the PSV/NSV form needs, and 12n bytes of index plus the input at its full form. crates.io carries no newer sais-class crate as of 2026-11-04, so the build half of the reopening condition stays unmet. The PSV/NSV walk with an accumulated-min bound, verified byte-exact against brute force on a small window, reads 146 to 160 ns per query at cap 64 over both a stride-32 grid and the emitted positions, measured locked and quiet, with 158 to 206 ns the band under concurrent load. The binary-search form, the reopening premise's contiguous-access bet, is dominated: its rank search alone, 25 probes each paying an SA line at a converging mid plus a data compare at `SA[mid]+lcp`, exceeded 590 ns per query without finishing 100 K of them inside a 60 s budget, 3.5x the entire PSV/NSV query, before the interval walk both forms share.
+
+Quality is settled in the sharper direction too. The cap-64 walk at the 4 MiB domain reads 14 violations over 6.16M triples, all emitted matches with offsets beyond the domain that the tree itself cannot produce, at a mean gap of +0.03 B: the DUBT tree already returns the domain's oracle quality on this shape, so an SA finder buys no parse shortening against the 19.4M-search schedule either. The whole-past walk's +0.42 B mean gap lives in the LDM domain above 4 MiB. cap 16 reads 243,798 violations at a mean gap of -0.17 B, so the depth budget cannot trade below cap 64.
+
+| skewed.best budget, 32 MiB ST, build `5cba9ab1` | value | source |
+|---|---|---|
+| cell wall | 4.37 s | locked A/B, PGO round |
+| find share | 89.54% of cycles, 3.9 s | perf on the clean build |
+| searches per pass | 19.4M, with 79.8M count calls at 5 B/call | event table, `jobdecomp` |
+| DUBT per search | about 200 ns | 3.9 s over 19.4M |
+| SA build + LCP + ISA | 1.97 to 2.27 s | probe, libsais-rs 0.2.2 |
+| PSV/NSV walk at cap 64, win 4 MiB | 146 to 160 ns per query | probe, locked |
+| binary-search rank search alone | above 590 ns per query | probe, timeout bound |
+| SA path total | 4.8 to 5.1 s | build plus 19.4M queries |
+
+The budget closes at 4.8 to 5.1 s against the cell's 4.37 s wall, 1.10x to 1.16x slower. Break-even alone would need the walk at 100 ns per query, 35 percent under the best measured form, and break-even moves nothing, since the win starts only below it. On larger inputs the direction's two premises conflict outright, because the walk's cost scales with input size over window while the build amortizes over input size: dll100's 105 MB over the same 4 MiB tree domain is a sparsity of 26, so the walk loses by more exactly where the build wins by more. The reopening bar is now a build-side change of algorithm class plus a walk form under 100 ns per query at the tree domain.
+
 ### DUBT descent prefetch
 
 `prefetch_children` issued an early read of the child pair's ring line and the candidate's window line per descent step, before the ordering branch resolved, with a const-generic `PF` instantiation and a `ZSTDX_DUBT_PF` env override for single-binary A/B, on both `find_best`'s sorted walk and `insert_dubt1`'s batch sort. The result was byte-identical under the dump gate and a consistent loss: skewed l13 from 26.3 to 27.1 s per iteration, +3% over 3 rounds, json +0.9% and dll100 +4.7%. Perf stat on skewed read instructions +26%, from 29.6G to 37.2G per 2 iterations, while cycles moved only +3.8%, from 46.6G to 48.4G, so the 7.6G added instructions are nearly free and the machine has real issue slack on this walk.
