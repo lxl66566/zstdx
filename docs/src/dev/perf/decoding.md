@@ -68,6 +68,28 @@ The port cut stage B's execute time per segment to 43 percent on skewed.zst9, at
 
 Where the MT wall sits after the port: stage B's execute is memory-bound on the staging round-trip, reading every staged literal and sequence while writing the whole output, and stage A produces in parallel behind it, so json and dll100 split their walls between the two. Moving the literal half of that round-trip into stage A by placing runs at their final output positions was measured on 2026-11-03 and falsified: the staged literal copy doubles as the wildcopy repair of the previous match's overshoot, so placement pays a per-run repair tax plus a parallel re-copy of the same bytes, with the A/B in [negative](../negative/decoding.md). Keeping the executor's copy and moving only the staging buffer's location, as per-segment in-dst zones with a sound collision contract, was measured on 2026-11-04 and falsified as well: the serial executor pays a code-shape tax, the zone warmth crosses cores where the ST arrangement kept it same-core, json's round-trip is sequence-dominated and skewed cannot fit its zones, with the A/B and the split attribution in [negative](../negative/decoding.md). Skewed.zst9 carries only the two 16 MiB restart points its encoder emitted, so its wall is the first segment's staging latency plus two executes, and stage A's per-worker staging rate holds every restart-poor frame near single-thread speed. The restart points belong to the frame and the stage-A body widening is falsified, so restart-poor frames stay at this floor. Current cells and their spreads are in the [snapshot](../bench/snapshot.md).
 
+R94 (2026-11-04) validated the sequence-read half of that attribution with a traffic model and a padding probe. The model counts stage B's round-trip as the staged sequences read at 12 B each plus the staged literals read plus the whole output written; per-frame counts came from the `seq_dump` recording decoder, and the sum of ll plus ml equals the output on every shape, so raw and RLE blocks are absent and the staged literals are the ll bytes.
+
+| shape | sequences | staged sequences | staged literals | output | sequence share of stage-B traffic |
+|---|---:|---:|---:|---:|---:|
+| json.zst3 | 2.12M | 25.4 MB | 1.3 MB | 33.6 MB | 42% |
+| json.zst9 | 1.71M | 20.6 MB | 1.1 MB | 33.6 MB | 37% |
+| skewed.zst9 | 6.09M | 73.1 MB | 2.0 MB | 33.6 MB | 67% |
+| dll100.zst3 | 6.01M | 72.1 MB | 21.2 MB | 104.9 MB | 36% |
+
+The probe padded the staged element to 24 B per sequence, a zeroed field the executor never reads, byte-identical under mtcheck, and ran it against base 91191a7d in two locked interleaved rounds per side:
+
+| cell | base | padded | wall loss |
+|---|---:|---:|---:|
+| json.zst3 mt4, mt8, mt16 | 2998, 3172, 3190 | 2688, 2848, 2788 | 11.5, 11.4, 14.4% |
+| json.zst9 mt4, mt8, mt16 | 2904, 3282, 3365 | 2686, 3001, 3036 | 8.1, 9.4, 10.8% |
+| skewed.zst9 mt4, mt8, mt16 | 1043, 1063, 1063 | 968, 968, 970 | 7.7, 9.8, 9.6% |
+| dll100.zst3 mt4, mt8, mt16 | 2794, 3039, 3076 | 2594, 2657, 2731 | 7.7, 14.4, 12.7% |
+
+The single-thread controls held within 0.8 percent on json and dll100; skewed's controls read 981 and 884 against 970 to 978, one noisy round in four with its mt cells consistent across rounds. Causality holds on every mt cell. Dividing each wall loss by the sequence share of stage-B traffic gives the bandwidth-bound stage-B share of the mt wall: 0.21 to 0.40 on json and dll100, and 0.12 to 0.15 on restart-poor skewed, whose staging latency owns the wall. The staged Sequence vector is therefore causal, and shrinking the record to 8 B per sequence removes a third of the sequence stream, which prices that lever at about 3 to 4 percent on the same shares. A tail prefetch of the next segment's staging measured flat the same day and is falsified in [negative](../negative/decoding.md).
+
+The packed-record lever that pricing pointed at was measured the same day and closed. An 8 B record cannot hold the staged triple, because the staged offset needs the whole u32 under position-bounded offset validity, and the 9 B record that fits lost 2.4 to 6.2 percent on every mt cell: the per-sequence unpack on the serial executor costs more than the quarter-cut sequence stream buys back, the pack taxes stage A's staging rate, and the flat 12 B aligned triple stays. The width derivation and the A/B are in [negative](../negative/decoding.md).
+
 The worker pool and what it removed: a scope-based decode spawned and joined every stage-A worker per call, which costs 57, 93 and 192 us at four, eight and sixteen threads on this machine, against 8, 16 and 42 us for a slot handoff. The pool keeps each worker's entropy scratch alive as well, so a call stops re-allocating the FSE and Huffman tables and the zeroed `seq_packed` vector per worker. The spawn share alone sits near 0.5 to 2 percent of the call walls, but the measured interleaved A/B moved more than that because the retained scratch carries the same steady-thread warmth the encoder's pooled states carry; the single-thread controls stayed flat in the same runs.
 
 | File (32 MiB unless noted) | mt4 | mt8 | mt16 |

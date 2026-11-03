@@ -48,6 +48,47 @@ The attribution splits three ways. text places no zone at all and still loses 0.
 
 The falsified premise is the transfer of the ST mechanism: on ST the same core decodes the literals and then writes the output, so the staging warms exactly the lines the executor stores into. On MT the staging core and the executing core are different by design, and the warmth becomes a cross-core liability. Reopening needs the warmth to be same-core or cache-clean by construction, such as a stage A pinned to the consumer core, which the serial stage B design forbids, or a literal-byte-dominated wall with segments small enough to fit their zones, a combination the current corpus and the content-sized slice do not produce together.
 
+### Tail prefetch of the next segment's staging
+
+The idea was to overlap the consumer's first reads of segment i+1's staged streams with the executor's drain of segment i: entering each segment's final block fires a hook that peeks the next segment's slot without blocking and issues T0 prefetches over the first 16 KiB each of its staged sequences and literals. A peek at an empty slot skips, and a contended lock means a staging worker is still writing there. Correctness is free by construction, and mtcheck over corpus, the release and paranoid suites and clippy stayed green.
+
+The locked interleaved A/B, two rounds per side against base 91191a7d, read:
+
+| cell | base | prefetch | delta |
+|---|---:|---:|---:|
+| json.zst3 mt4 | 2941 | 3014 | +2.5% |
+| json.zst3 mt8, mt16 | 3154, 3188 | 3184, 3201 | +1.0, +0.4% |
+| json.zst9 mt4 to mt16 | 2909 to 3357 | 2912 to 3371 | within 0.5% |
+| skewed.zst9 mt4 to mt16 | 1060 to 1062 | 1059 to 1060 | flat |
+| dll100.zst3 mt4 to mt16 | 2840 to 3100 | 2854 to 3066 | +0.5 to -1.1% |
+
+The one cell past 2 percent, json.zst3 mt4, read +0.9 on its adjacent round pair and sits inside that cell's 2571 to 2969 historical spread, while the untouched single-thread json control itself moved +1.5 in the same runs. The lever stays below every landing bar.
+
+The falsified premise is a latency term in the stage-B wall that prefetch could hide. The padding probe the same day measured the wall as proportional to staged bytes moved (tables in [decoding](../perf/decoding.md)), and prefetch moves no bytes: the 16 KiB head warm-up covers 0.13 percent of json's 12.7 MB per-segment sequence stream, and the fill would draw on the same L3 bandwidth the executor and the staging workers already share. Reopening needs a staging source that sits in DRAM at consume time, so a real miss depth exists to pull forward; the current pool keeps staged segments one hop behind the consumer.
+
+### Packed staged-sequence records
+
+The idea was to shrink the staged record from the 12 B `Sequence` triple to 9 B, cutting the sequence stream the padding probe prices at 36 to 67 percent of stage B's round-trip by a quarter.
+
+An 8 B record is impossible before any measurement. The staged offset needs the whole u32: both stage-B executors validate an offset against the frame position and never the declared window (`execute_blocks` and `exec_staged_end` in decoding/mt.rs), so a frame with more than 4 GiB of output makes every wire value up to OF code 31's 2^32-1 resolve legally. The window bounds, the 2^27+1 default and the 2^31 absolute ceiling behind `set_max_window_size`, would allow a narrower field only if validity tracked the window. ll tops at 131071 and ml at 131074, the last entries of the LL and ML code tables in sequence_section_decoder.rs, so the three fields need 17+18+32 = 67 bits and no 64-bit layout holds them.
+
+The 9 B form packs of:32 | ll:17 | ml_lo:15 into one little-endian u64 and ml's top 3 bits into the ninth byte. Stage A pays the pack inside the staging decode loop, and the serial executor loop, the match-byte accounting and the piece validator unpack per record. The debug, release, no-default-features and paranoid suites, mtcheck over corpus and the full parity sweep stayed green, with wire-range checks on every pack under the paranoid profile's debug assertions.
+
+The locked interleaved A/B, two rounds per side against base 91191a7d, read:
+
+| cell | base | packed | delta |
+|---|---:|---:|---:|
+| json.zst3 mt4, mt8, mt16 | 2962, 3156, 3194 | 2871, 3022, 3028 | -3.1, -4.2, -5.2% |
+| json.zst9 mt4, mt8, mt16 | 2908, 3289, 3350 | 2825, 3188, 3238 | -2.8, -3.1, -3.4% |
+| skewed.zst9 mt4, mt8, mt16 | 1056, 1059, 1061 | 995, 998, 996 | -5.8, -5.8, -6.2% |
+| dll100.zst3 mt4, mt8, mt16 | 2841, 3046, 3086 | 2774, 2943, 2998 | -2.4, -3.4, -2.9% |
+
+The single-thread controls held within 0.7 percent, and a third packed-side round landed in the same band. Every mt cell loses beyond the 2 percent bar with both rounds consistent, so the record stays out of the tree.
+
+The mechanism, read jointly with the padding probe: staged bytes are causal, since padding 12 to 24 B costs 8 to 14 percent wall at the implied stage-B bandwidth shares, and the 9 B cut buys that term back at about 2 to 4 percent. The unpack pays against it on the serial executor's critical path, one unaligned u64 load plus a shift-mask chain plus the ninth-byte merge per sequence where the flat form reads three aligned u32 fields, and the pack taxes stage A's own staging rate, which owns skewed's wall. The ALU term exceeds the bandwidth term on every cell, and skewed, whose bandwidth share is 0.12 to 0.15, loses most. Among the tried forms the flat 12 B aligned u32 triple is Pareto-optimal.
+
+Reopening needs a form that cuts staged bytes with zero per-sequence ALU on the serial loop, such as a batched SIMD expansion of 9 B records into L1-local scratch that keeps the executor's aligned per-sequence loads and loop shape unchanged.
+
 ### Fixed-offset ramp at job starts
 
 The idea was to suppress matches whose offset sits below a 4-64 KiB floor near MT job starts, so decode pieces never wait on near-boundary reads. The piece-pipeline ceiling stayed at about 1.0-1.14x at every floor. The binding constraint is a crossing read's depth below the cut, computed as `start - src`, and the offset does not matter. A piece can start a copy the moment its source range is published, and a deep source unblocks it regardless of the match's offset size. An offset floor suppresses the wrong set, namely large offsets whose sources are deep and harmless, and leaves shallow-depth reads untouched, where any offset with a source just below the cut qualifies. The depth-semantics ramp, where crossing reads must reach at least D below the job start, is what works. It is landed and env-gated, tracked in the [todo](../todo.md).
