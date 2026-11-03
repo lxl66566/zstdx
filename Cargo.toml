@@ -5,12 +5,12 @@ members  = ["crates/*"]
 exclude  = ["crates/zstdx-fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 
 [workspace.dependencies]
 # The `version` key stays: `cargo publish` rewrites a path dep into a
 # registry requirement and rejects one without it.
-zstdx = { path = "crates/zstdx", version = "0.4.0" }
+zstdx = { path = "crates/zstdx", version = "0.4.1" }
 
 [workspace.lints.clippy]
 all                      = { level = "warn", priority = -1 }
