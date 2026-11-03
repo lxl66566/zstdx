@@ -163,6 +163,15 @@ The landed form uses two parallel donation tasks on owned head bytes, uncounted 
 
 ## Streaming buffer and pump
 
+### Side-thread pump pipelining
+
+A dedicated reader thread for the accumulate-buffer copy was closed by decomposition on 2026-11-04, before it was built. The `TL PUMP` counters (the caller's whole `pump_direct` span against the `source.read` memcpy inside it) read dll100 fastest stream-mt8's caller at 25.9 ms of pump time of which 24.7 ms is the read itself, 100 pulls of 1 MiB: the posting, assembly and bookkeeping between reads are 1.3 ms, 1.1% of the cell's 109 ms span. The read rate itself is the loaded memcpy floor, about 4 GB/s against 6-9 GB/s unloaded while the eight workers' LDM fills and parses consume the memory system, and a second thread cannot raise it. The lever's recoverable share sits under every round's land bar; reopening needs the copy itself to get cheaper, and the borrowed-window forms are falsified below.
+
+### Output-capacity promises at post time
+
+Mirroring the worker's own out sizing at the posting site, `span + 3 B per 1 KiB block` reserved into the caller's output Vec per post, was measured on 2026-11-04 and falsified. The mechanism diagnosis was right: the finish drain's delivery blockade stacks the blocked jobs' output concurrently, and the stack crossed the Vec's capacity at the last assembly (dll100 fastest's tail paid a 13.9 MB realloc copy after the straggler). The reserve fails on the promise arithmetic instead. A per-post `reserve` forgets earlier promises whenever delivery drains the length, so a watermark variant was measured too, and both regress the compressible corpus cells: json.fastest stream-mt8 lost 12% solo and the locked matrix read json -36% and text -63% over five invocations per side, because the raw worst-case bound over-promises 5 to 100 times the real emit ratio on these shapes and every growth step pays a copy of the live undelivered length. The stepped finish drain (see [mt-stream](../perf/mt-stream.md)) repairs the tail through scheduling alone: delivery during the straggler wait keeps the undelivered length near zero and the crossing never happens. A learned emit-ratio promise could tighten a reserve further, but the corpus cells' run-to-run bimodality, 7.4 to 12.2 GB/s on text.fastest solo, cannot resolve the single-percent effects it would trade, and it stays unbuilt.
+
+
 ### Reading into Read spare capacity
 
 Reading directly into `Read`'s spare capacity, beyond the read-pump double copy, was dropped. Handing uninitialized buffers to arbitrary `Read` implementations violates the trait contract.

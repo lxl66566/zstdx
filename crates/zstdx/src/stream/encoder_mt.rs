@@ -1094,6 +1094,18 @@ pub(crate) struct MtEncoderCore {
     out_read: usize,
     header_emitted: bool,
     finished: bool,
+    /// EOF seen and the tail posted: the finish drain is under way. The
+    /// read path steps it (see `finish_step`); the write path runs it out
+    /// inside `finish`.
+    finishing: bool,
+    /// The finish closes with an empty raw last block when everything fed
+    /// was already posted before EOF (see `finish_begin`).
+    close_empty: bool,
+    /// The finish's span start, for the job_trace decomposition (the
+    /// stepped drain spans caller deliveries, so the begin and end sites
+    /// live in different calls).
+    #[cfg(feature = "job_trace")]
+    fin_t0: std::time::Instant,
     /// Pool coordination state, shared with the leased worker threads.
     /// Workers are leased lazily at the first post; until then this is
     /// only the state pool.
@@ -1336,6 +1348,10 @@ impl MtEncoderCore {
             out_read: 0,
             header_emitted: false,
             finished: false,
+            finishing: false,
+            close_empty: false,
+            #[cfg(feature = "job_trace")]
+            fin_t0: std::time::Instant::now(),
             shared: Arc::new(QueueShared {
                 inner: Mutex::new(QueueInner {
                     shutdown: false,
@@ -1413,9 +1429,26 @@ impl MtEncoderCore {
     /// defer an epoch's post by the read's own span).
     #[cfg(feature = "std")]
     pub(crate) fn pump_direct(&mut self, source: &mut impl crate::io::Read) -> crate::Result<()> {
+        #[cfg(feature = "job_trace")]
+        let pump_t0 = std::time::Instant::now();
+        let out = self.pump_direct_inner(source);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_pump(pump_t0);
+        out
+    }
+
+    #[cfg(feature = "std")]
+    fn pump_direct_inner(&mut self, source: &mut impl crate::io::Read) -> crate::Result<()> {
         debug_assert!(!self.finished);
         #[cfg(debug_assertions)]
         vec_poison::assert(&self.output, "mt core output (pump entry)");
+        if self.finishing {
+            // Past EOF every pull advances the finish drain instead: the
+            // read loop re-enters the pump exactly when its last delivery
+            // drained the output, so the finish's remaining jobs wait out
+            // one completion per pull.
+            return self.finish_step(true);
+        }
         if self.buf.len() == self.buf.capacity() {
             // A positive want keeps the growth arm engaged for the nothing-
             // to-wrap case (an all-live buffer at the cap).
@@ -1441,9 +1474,18 @@ impl MtEncoderCore {
         };
         // Bound before the match: the spare borrow of the buffer must not
         // outlive the scrutinee into the arms below.
+        #[cfg(feature = "job_trace")]
+        let rd_t0 = std::time::Instant::now();
         let read = source.read(&mut spare[..want]).map_err(crate::Error::from);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_pump_read(rd_t0);
         match read {
-            Ok(0) => return self.finish(),
+            Ok(0) => {
+                if !self.finishing {
+                    self.finish_begin()?;
+                }
+                return self.finish_step(true);
+            },
             Ok(n) => {
                 // SAFETY: `read` wrote n initialized bytes into spare[..n].
                 unsafe { self.buf.set_len(len + n) };
@@ -1479,6 +1521,23 @@ impl MtEncoderCore {
         if self.finished {
             return Ok(());
         }
+        if !self.finishing {
+            self.finish_begin()?;
+        }
+        // The write side drains to completion inside one call: its caller
+        // has no delivery loop to hand control back to (the read path's
+        // step form is what overlaps delivery with the drain).
+        while !self.finished {
+            self.finish_step(false)?;
+        }
+        Ok(())
+    }
+
+    /// The finish's entry slice, run once at EOF or at an explicit finish:
+    /// the pledge gate, the tail posts and the closing-shape bookkeeping.
+    /// The drain itself belongs to [`Self::finish_step`].
+    fn finish_begin(&mut self) -> crate::Result<()> {
+        debug_assert!(!self.finishing && !self.finished);
         #[cfg(debug_assertions)]
         vec_poison::assert(&self.output, "mt core output (finish entry)");
         // `pos` is live from the writes themselves, so the check fires
@@ -1492,22 +1551,78 @@ impl MtEncoderCore {
             });
         }
         #[cfg(feature = "job_trace")]
-        let fin_t0 = std::time::Instant::now();
-        #[cfg(feature = "job_trace")]
-        timeline::tl!("TL FINISH begin at {}", timeline::rel_us());
+        {
+            self.fin_t0 = std::time::Instant::now();
+            timeline::tl!("TL FINISH begin at {}", timeline::rel_us());
+        }
         self.surface_poison();
         self.cancel_deep_staging();
         if self.pos > self.job_start {
             // Post the tail before waiting: posting first lets workers
             // claim tail jobs the moment earlier ones free them, instead
-            // of idling behind the last straggler of a pre-drain.
-            self.encode_jobs(self.pos, true);
+            // of idling behind the last straggler of a pre-drain. The
+            // drain runs stepped (`finish_step`), not here.
+            self.encode_jobs(self.pos, true, false);
+            self.close_empty = false;
         } else {
-            // Everything fed is already encoded (or nothing was fed):
-            // assemble whatever is still pending, then close with an empty
-            // raw last block (the shape the single-threaded path emits).
-            self.drain_all();
+            // Everything fed is already encoded (or nothing was fed): the
+            // pending drain closes with an empty raw last block (the
+            // shape the single-threaded path emits) once the jobs land.
             self.emit_header();
+            self.close_empty = true;
+        }
+        self.finishing = true;
+        Ok(())
+    }
+
+    /// One drain slice of the finish. Assembles whatever completed, then
+    /// either closes the frame (last pending job assembled) or returns
+    /// with the assembled output undelivered — the read path's caller
+    /// delivers between slices, so bytes flow during the straggler wait
+    /// instead of stacking behind it. A stacked wait is what used to make
+    /// the tail pay twice: the blocked jobs' assemblies plus their
+    /// delivery all landed after the makespan job, and the stacked
+    /// undelivered length forced the output Vec's last doubling there.
+    fn finish_step(&mut self, handoff: bool) -> crate::Result<()> {
+        debug_assert!(self.finishing && !self.finished);
+        // No entry assert: the calling pump's own entry check ran before
+        // `finish_begin`'s tail posts appended to the output, and the
+        // append sites re-arm on their exits (the handoff below and
+        // `finish_end`).
+        loop {
+            self.assemble_ready();
+            if self.pending.is_empty() {
+                // The drain's completion path mirrors `drain_all`: an
+                // aborted job assembles empty and drains like a
+                // completion, surfacing the poison here.
+                self.surface_poison();
+                self.finish_end()?;
+                return Ok(());
+            }
+            if handoff && !self.output.is_empty() {
+                // Handing undelivered bytes back: re-arm the wall the
+                // caller's next entry assert checks (the fill at the pump
+                // exit is bypassed by this early return).
+                #[cfg(debug_assertions)]
+                vec_poison::fill(&mut self.output);
+                return Ok(());
+            }
+            if self.quiescent() {
+                // Everything completed yet the pending prefix has an
+                // un-ready slot: only reachable through the poison abort
+                // path.
+                self.surface_poison();
+                continue;
+            }
+            self.wait_progress();
+        }
+    }
+
+    /// The finish's closing slice: the empty raw last block on a
+    /// nothing-left-to-post frame, the checksum and the finished mark.
+    fn finish_end(&mut self) -> crate::Result<()> {
+        debug_assert_eq!(self.hashed_end, self.pos);
+        if self.close_empty {
             BlockHeader {
                 last_block: true,
                 block_type: BlockType::Raw,
@@ -1515,7 +1630,6 @@ impl MtEncoderCore {
             }
             .serialize(&mut self.output);
         }
-        debug_assert_eq!(self.hashed_end, self.pos);
         if self.checksum {
             let checksum = self.hasher.finish32();
             self.output.extend_from_slice(&checksum.to_le_bytes());
@@ -1524,9 +1638,17 @@ impl MtEncoderCore {
         #[cfg(debug_assertions)]
         vec_poison::fill(&mut self.output);
         #[cfg(feature = "job_trace")]
-        timeline::tl!("TL FINISH end at {}", timeline::rel_us());
-        #[cfg(feature = "job_trace")]
-        crate::encoding::job_trace::add_fin(fin_t0);
+        {
+            timeline::tl!("TL FINISH end at {}", timeline::rel_us());
+            crate::encoding::job_trace::add_fin(self.fin_t0);
+            let s = crate::encoding::job_trace::snapshot();
+            timeline::tl!(
+                "TL PUMP total {:.2} ms  read {:.2} ms  calls {}",
+                s.pump_ns as f64 / 1e6,
+                s.pump_read_ns as f64 / 1e6,
+                s.pump_calls
+            );
+        }
         Ok(())
     }
 
@@ -1544,7 +1666,7 @@ impl MtEncoderCore {
         self.surface_poison();
         self.cancel_deep_staging();
         if self.pos > self.job_start {
-            self.encode_jobs(self.pos, false);
+            self.encode_jobs(self.pos, false, true);
         } else {
             self.drain_all();
         }
@@ -2423,7 +2545,7 @@ impl MtEncoderCore {
     /// flush/finish path, where the caller wants the bytes on return. A
     /// single short job on a pool-less core still runs inline (small inputs
     /// never spin up the pool).
-    fn encode_jobs(&mut self, hi: u64, last_frame_block: bool) {
+    fn encode_jobs(&mut self, hi: u64, last_frame_block: bool, drain: bool) {
         debug_assert!(self.job_start < hi && hi <= self.pos);
         // The finish tail's shared prefix fill builds before the probe
         // settles: the build (a full strip fill) runs on this thread while
@@ -2475,11 +2597,17 @@ impl MtEncoderCore {
             #[cfg(feature = "job_trace")]
             crate::encoding::job_trace::add_fin_post(post_t0);
             self.job_start = hi;
-            #[cfg(feature = "job_trace")]
-            let drain_t0 = std::time::Instant::now();
-            self.drain_all();
-            #[cfg(feature = "job_trace")]
-            crate::encoding::job_trace::add_fin_drain(drain_t0);
+            if drain {
+                // A flush promises visibility, so it drains inside the
+                // call; the finish posts undrained and steps the drain
+                // (`finish_step`) so the read path can deliver between
+                // completions.
+                #[cfg(feature = "job_trace")]
+                let drain_t0 = std::time::Instant::now();
+                self.drain_all();
+                #[cfg(feature = "job_trace")]
+                crate::encoding::job_trace::add_fin_drain(drain_t0);
+            }
         }
     }
 
@@ -2906,6 +3034,13 @@ impl MtEncoderCore {
             // before this read.
             #[cfg(debug_assertions)]
             vec_poison::assert(&bytes, "mt job out (assembly)");
+            #[cfg(feature = "job_trace")]
+            timeline::tl!(
+                "TL ASM bytes {} len {} cap {}",
+                bytes.len(),
+                self.output.len(),
+                self.output.capacity()
+            );
             self.output.extend_from_slice(&bytes);
         }
     }

@@ -254,6 +254,9 @@ mod trace {
     fn accumulate(acc: &mut job_trace::Snapshot, s: &job_trace::Snapshot) {
         let job_trace::Snapshot {
             jobs,
+            pump_ns,
+            pump_read_ns,
+            pump_calls,
             job_ns,
             prefill_ns,
             reset_ns,
@@ -287,6 +290,9 @@ mod trace {
             cmp_bytes,
         } = s;
         acc.jobs += jobs;
+        acc.pump_ns += pump_ns;
+        acc.pump_read_ns += pump_read_ns;
+        acc.pump_calls += pump_calls;
         acc.job_ns += job_ns;
         acc.spf_build_ns += spf_build_ns;
         acc.probe_ns += probe_ns;

@@ -29,6 +29,11 @@ pub const STRIP_MIN_BYTES: u64 = 1024 * 1024;
 pub struct Snapshot {
     /// Jobs run (`compress_job_blocks` calls).
     pub jobs: u64,
+    /// Whole `pump_direct` spans (read plus posting), caller-thread time.
+    pub pump_ns: u64,
+    /// The `source.read` memcpy spans inside them.
+    pub pump_read_ns: u64,
+    pub pump_calls: u64,
     /// Summed job wall time — exceeds the stream wall clock because jobs
     /// run in parallel; component shares are taken against it.
     pub job_ns: u64,
@@ -132,6 +137,9 @@ macro_rules! counters {
 
 counters! {
     jobs,
+    pump_ns,
+    pump_read_ns,
+    pump_calls,
     spf_ldm_ns,
     spf_chain_ns,
     adopt_ldm_ns,
@@ -257,6 +265,19 @@ pub fn add_adopt_chain(started: Instant) {
 #[inline]
 pub fn add_fin(started: Instant) {
     add_ns(&C.fin_ns, started.elapsed());
+}
+
+/// Record one whole `pump_direct` span (read plus posting), one
+/// `source.read` span inside it, and the call count.
+#[inline]
+pub fn add_pump(started: Instant) {
+    add_ns(&C.pump_ns, started.elapsed());
+    C.pump_calls.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn add_pump_read(started: Instant) {
+    add_ns(&C.pump_read_ns, started.elapsed());
 }
 
 /// Record one finish-path `settle_probe` span.
