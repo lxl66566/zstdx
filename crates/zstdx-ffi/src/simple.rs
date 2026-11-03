@@ -250,7 +250,7 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(
         Ok(Some(total)) => total,
         // A frame without a declared size makes the whole series unknown.
         Ok(None) => CONTENTSIZE_UNKNOWN,
-        Err(()) => CONTENTSIZE_ERROR,
+        Err(_) => CONTENTSIZE_ERROR,
     }
 }
 

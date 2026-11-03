@@ -1087,6 +1087,8 @@ pub(super) struct StageAJob {
 // the leasing `decode_parallel` returns, inside the caller's borrow. The
 // mutexes, atomics and condvar are thread-safe by construction.
 unsafe impl Send for StageAJob {}
+// SAFETY: Sync follows Send here: the frozen slices are read-only past
+// construction, and every mutable field is a mutex, atomic or condvar.
 unsafe impl Sync for StageAJob {}
 
 /// Test injection: the input base address and segment id whose stage-A
@@ -1111,6 +1113,7 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
     // SAFETY: this thread serves the job's lease, so the frozen slices are
     // live for the whole call.
     let input: &[u8] = unsafe { &*job.input };
+    // SAFETY: same lease discipline as the input slice above.
     let segments: &[SegmentPlan] = unsafe { &*job.segments };
     loop {
         if job.abort.load(Ordering::Relaxed) || job.poison.lock().unwrap().is_some() {
@@ -2006,9 +2009,9 @@ mod tests {
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut out = vec![0u8; data.len()];
-        let _inject = INJECT_LOCK.lock().unwrap();
+        let inject_guard = INJECT_LOCK.lock().unwrap();
         super::STAGE_PANIC_INPUT.store(
-            compressed.as_ptr() as *mut u8,
+            compressed.as_ptr().cast_mut(),
             core::sync::atomic::Ordering::Relaxed,
         );
         super::STAGE_PANIC_AT.store(3, core::sync::atomic::Ordering::Relaxed);
@@ -2018,16 +2021,16 @@ mod tests {
         super::STAGE_PANIC_AT.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
         super::STAGE_PANIC_INPUT
             .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
-        drop(_inject);
+        drop(inject_guard);
         let payload = blew.expect_err("the worker panic must surface");
         let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
             payload
                 .downcast_ref::<alloc::string::String>()
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
         });
         assert_eq!(msg, Some("injected stage-A panic"));
 
-        out.iter_mut().for_each(|b| *b = 0);
+        out.fill(0);
         let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
         assert_eq!(&out[..n], &data[..]);
     }
@@ -2041,9 +2044,9 @@ mod tests {
         let data = textish(6 * 1024 * 1024);
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
-        let _inject = INJECT_LOCK.lock().unwrap();
+        let inject_guard = INJECT_LOCK.lock().unwrap();
         super::STAGE_PANIC_INPUT.store(
-            compressed.as_ptr() as *mut u8,
+            compressed.as_ptr().cast_mut(),
             core::sync::atomic::Ordering::Relaxed,
         );
         super::STAGE_PANIC_LAST.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -2058,12 +2061,12 @@ mod tests {
         super::STAGE_PANIC_LAST.store(false, core::sync::atomic::Ordering::Relaxed);
         super::STAGE_PANIC_INPUT
             .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
-        drop(_inject);
+        drop(inject_guard);
         let payload = blew.expect_err("the worker panic must surface");
         let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
             payload
                 .downcast_ref::<alloc::string::String>()
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
         });
         assert_eq!(msg, Some("injected stage-A panic"));
     }
@@ -2138,22 +2141,19 @@ mod tests {
                 expect.extend_from_slice(&alphabet[lit..lit + ll as usize]);
                 lit += ll as usize;
                 let o_lit_end = expect.len();
-                match do_offset_history(of, ll, &mut ref_hist) {
-                    Some(r) => {
-                        let r = r.get() as usize;
-                        assert!(
-                            r <= o_lit_end,
-                            "case must keep sources inside the frame: r={r} end={o_lit_end}"
-                        );
-                        for _ in 0..ml {
-                            let b = expect[expect.len() - r];
-                            expect.push(b);
-                        }
-                    },
-                    None => {
-                        expect_err = true;
-                        break;
-                    },
+                if let Some(r) = do_offset_history(of, ll, &mut ref_hist) {
+                    let r = r.get() as usize;
+                    assert!(
+                        r <= o_lit_end,
+                        "case must keep sources inside the frame: r={r} end={o_lit_end}"
+                    );
+                    for _ in 0..ml {
+                        let b = expect[expect.len() - r];
+                        expect.push(b);
+                    }
+                } else {
+                    expect_err = true;
+                    break;
                 }
             }
 

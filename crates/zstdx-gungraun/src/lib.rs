@@ -77,17 +77,14 @@ pub fn raw_slice(shape: Shape) -> Vec<u8> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // The dll shape reads the big corpus (`bench/gen_big.sh`), whose head
     // is the same ELF mix the wall matrix's dll100 runs on.
-    let script = match shape {
-        Shape::Dll => {
-            path.push("../../bench/big");
-            path.push("dll100.raw");
-            "bench/gen_big.sh"
-        },
-        _ => {
-            path.push("../../bench/corpus");
-            path.push(format!("{}.raw", shape.raw_name()));
-            "bench/gen_corpus.sh"
-        },
+    let script = if shape == Shape::Dll {
+        path.push("../../bench/big");
+        path.push("dll100.raw");
+        "bench/gen_big.sh"
+    } else {
+        path.push("../../bench/corpus");
+        path.push(format!("{}.raw", shape.raw_name()));
+        "bench/gen_corpus.sh"
     };
     let raw = fs::read(&path).unwrap_or_else(|e| {
         panic!(

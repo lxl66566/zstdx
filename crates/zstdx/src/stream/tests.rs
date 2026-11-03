@@ -2624,8 +2624,8 @@ mod mt_dict {
     /// stock growing-grid model whatever the switch says.
     #[test]
     fn deep_rows_windowed_ldm_open_stream_arms_at_the_staging_span() {
-        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         const MIB: usize = 1024 * 1024;
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let total = 17 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
         let mut state = 0x0123_4567_89ab_cdefu64;
@@ -2785,8 +2785,8 @@ mod mt_dict {
     /// dead fixture.
     #[test]
     fn forced_small_window_keeps_the_stock_deep_grid() {
-        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         const MIB: usize = 1024 * 1024;
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
         let encode = |shape: crate::InputShape| {
             let mut sink = Vec::new();
@@ -2841,8 +2841,8 @@ mod mt_dict {
     /// roundtrip-clean through both decoders at a second worker count.
     #[test]
     fn deep_band_open_stream_past_the_buffer_cap() {
-        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         const MIB: usize = 1024 * 1024;
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(264 * MIB, 5 * MIB);
         let encode = |workers: u32| {
             let mut sink = Vec::new();

@@ -86,7 +86,10 @@ fn with_checksum(mut frame: Vec<u8>, payload: &[u8]) -> Vec<u8> {
         frame.extend_from_slice(&(hash.finish() as u32).to_le_bytes());
     }
     #[cfg(not(feature = "hash"))]
-    frame.extend_from_slice(&[0u8; 4]);
+    {
+        let _ = payload;
+        frame.extend_from_slice(&[0u8; 4]);
+    }
     frame
 }
 

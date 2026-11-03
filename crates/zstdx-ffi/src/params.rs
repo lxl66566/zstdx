@@ -12,7 +12,7 @@
 //! allocations (the `initStatic*` family that would consume them is not
 //! exported).
 
-use core::ffi::c_int;
+use core::{cmp::Ordering, ffi::c_int};
 
 use crate::{
     ZSTD_CCtx, ZSTD_DCtx,
@@ -112,7 +112,7 @@ const fn align_up(size: usize, align: usize) -> usize {
 
 /// `ZSTD_highbit32`: index of the highest set bit (0 for 1, 63 for 2^31).
 const fn highbit32(value: u32) -> u32 {
-    31 - value.leading_zeros()
+    value.ilog2()
 }
 
 /// `BOUNDED(min, val, max)`.
@@ -526,12 +526,10 @@ fn get_cparams_internal(
     let table_id = usize::from(r_size <= 256 * 1024)
         + usize::from(r_size <= 128 * 1024)
         + usize::from(r_size <= 16 * 1024);
-    let row = if compression_level == 0 {
-        3 // ZSTD_CLEVEL_DEFAULT
-    } else if compression_level < 0 {
-        0 // the negative-level baseline row
-    } else {
-        compression_level.min(crate::MAX_CLEVEL) as usize
+    let row = match compression_level.cmp(&0) {
+        Ordering::Equal => 3, // ZSTD_CLEVEL_DEFAULT
+        Ordering::Less => 0,  // the negative-level baseline row
+        Ordering::Greater => compression_level.min(crate::MAX_CLEVEL) as usize,
     };
     let mut cp = CLEVELS[table_id][row];
     if compression_level < 0 {
@@ -563,10 +561,10 @@ fn resolve_row_match_finder_mode(
     mode: ParamSwitch,
     cp: &ZSTD_compressionParameters,
 ) -> ParamSwitch {
+    const WINDOW_LOG_LOWER_BOUND: u32 = 14;
     if mode != ParamSwitch::Auto {
         return mode;
     }
-    const WINDOW_LOG_LOWER_BOUND: u32 = 14;
     if !row_match_finder_supported(cp.strategy) {
         return ParamSwitch::Disable;
     }
@@ -999,6 +997,9 @@ impl CParamId {
     }
 
     /// `ZSTD_cParam_getBounds` for this id (the non-multithread build).
+    // The arms stay grouped by the reference's parameter families, so the
+    // equal-body groups stay separate on purpose.
+    #[allow(clippy::match_same_arms)]
     fn bounds(self) -> ZSTD_bounds {
         use ZSTD_bounds as b;
         match self {

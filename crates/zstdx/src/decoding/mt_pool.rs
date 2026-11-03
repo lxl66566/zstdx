@@ -140,7 +140,7 @@ pub(super) fn lease_workers(n: usize, job: &Arc<StageAJob>) -> Vec<Arc<WorkerSlo
                 .name("zstdx-dec-pool".into())
                 .spawn({
                     let slot = slot.clone();
-                    move || pool_thread(slot)
+                    move || pool_thread(&slot)
                 }) {
                 Ok(_) => slot,
                 Err(e) => {
@@ -176,14 +176,14 @@ pub(super) fn retire_all_for_test() {
 /// Pool thread body: one leased job at a time, parking between leases.
 // The spawn body must own its slot ('static); it stays alive after the
 // guarded inner loop so the panic path can retire the slot.
-fn pool_thread(slot: Arc<WorkerSlot>) {
+fn pool_thread(slot: &Arc<WorkerSlot>) {
     let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool_thread_inner(&slot)));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool_thread_inner(slot)));
     if let Err(payload) = outcome {
         // The lease machinery itself panicked (job panics are caught in
         // `serve_stagea`): withdraw the slot so no waiter blocks on a dead
         // thread and no future lease lands on it.
-        unpark_self(&slot);
+        unpark_self(slot);
         {
             let mut state = slot.state.lock().unwrap();
             *state = WorkerSlotState::Retiring;

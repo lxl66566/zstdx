@@ -852,7 +852,7 @@ fn no_content_size_omits_header_size() {
     let row = listing.lines().nth(1).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
     assert_eq!(cells[cells.len() - 2], "XXH64", "{listing}");
-    assert!(!row.contains("%"), "{listing}");
+    assert!(!row.contains('%'), "{listing}");
     let detail = String::from_utf8_lossy(
         &run(&["-l", "-v", scratch.path("data.bin.zst").to_str().unwrap()]).stdout,
     )

@@ -95,7 +95,7 @@ pub fn decode_literals_direct(
             } else {
                 decompress_4streams_interleaved_x2(&scratch.table, source, &stream_bounds, out)
             };
-            res.map(|_| true)
+            res.map(|()| true)
         },
     }
 }

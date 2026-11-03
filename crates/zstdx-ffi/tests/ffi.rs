@@ -2094,12 +2094,12 @@ fn no_forward_progress_guard() {
 // ---------------------------------------------------------------------------
 
 fn bounds_c(param: c_int) -> (i64, i32, i32) {
-    let b = unsafe { zstd::ZSTD_cParam_getBounds(param) };
+    let b = zstd::ZSTD_cParam_getBounds(param);
     (b.error as i64, b.lowerBound, b.upperBound)
 }
 
 fn bounds_d(param: c_int) -> (i64, i32, i32) {
-    let b = unsafe { zstd::ZSTD_dParam_getBounds(param) };
+    let b = zstd::ZSTD_dParam_getBounds(param);
     (b.error as i64, b.lowerBound, b.upperBound)
 }
 
@@ -2159,7 +2159,7 @@ fn param_bounds_matrix() {
 
 #[test]
 fn cparams_helpers_match_reference_rows() {
-    let cp = unsafe { zstd::ZSTD_getCParams(3, 0, 0) };
+    let cp = zstd::ZSTD_getCParams(3, 0, 0);
     assert_eq!(
         (
             cp.windowLog,
@@ -2173,28 +2173,28 @@ fn cparams_helpers_match_reference_rows() {
     );
     assert_eq!(cp.strategy, zstd::ZSTD_strategy::ZSTD_dfast);
     // The small-source rows downsize through the adjust chain.
-    let cp = unsafe { zstd::ZSTD_getCParams(3, 16 * 1024, 0) };
+    let cp = zstd::ZSTD_getCParams(3, 16 * 1024, 0);
     assert_eq!(cp.windowLog, 14);
-    let cp = unsafe { zstd::ZSTD_getCParams(3, 16 * 1024 + 1, 0) };
+    let cp = zstd::ZSTD_getCParams(3, 16 * 1024 + 1, 0);
     assert_eq!(
         (cp.windowLog, cp.chainLog, cp.hashLog, cp.searchLog),
         (15, 15, 16, 2)
     );
     // Negative levels ride row 0 with the acceleration target length.
-    let cp = unsafe { zstd::ZSTD_getCParams(-7, 0, 0) };
+    let cp = zstd::ZSTD_getCParams(-7, 0, 0);
     assert_eq!(
         (cp.windowLog, cp.targetLength, cp.strategy),
         (19, 7, zstd::ZSTD_strategy::ZSTD_fast)
     );
-    let cp = unsafe { zstd::ZSTD_getCParams(-131_072, 0, 0) };
+    let cp = zstd::ZSTD_getCParams(-131_072, 0, 0);
     assert_eq!(cp.targetLength, 131_072);
-    let cp = unsafe { zstd::ZSTD_getCParams(100, 0, 0) };
+    let cp = zstd::ZSTD_getCParams(100, 0, 0);
     assert_eq!(
         (cp.windowLog, cp.strategy),
         (27, zstd::ZSTD_strategy::ZSTD_btultra2)
     );
     // getParams adds the default frame flags.
-    let p = unsafe { zstd::ZSTD_getParams(1, 1 << 20, 4096) };
+    let p = zstd::ZSTD_getParams(1, 1 << 20, 4096);
     assert_eq!(
         (
             p.fParams.contentSizeFlag,
@@ -2215,9 +2215,9 @@ fn cparams_helpers_match_reference_rows() {
         targetLength: 999_999,
         strategy: zstd::ZSTD_strategy(12),
     };
-    let r = unsafe { zstd::ZSTD_checkCParams(wild) };
+    let r = zstd::ZSTD_checkCParams(wild);
     assert_eq!(error_code(r), 42); // parameter_outOfBound
-    let adj = unsafe { zstd::ZSTD_adjustCParams(wild, 1 << 17, 0) };
+    let adj = zstd::ZSTD_adjustCParams(wild, 1 << 17, 0);
     assert_eq!(
         (
             adj.windowLog,
@@ -2230,31 +2230,29 @@ fn cparams_helpers_match_reference_rows() {
         ),
         (17, 6, 18, 1, 3, 131_072, zstd::ZSTD_strategy::ZSTD_btultra2)
     );
-    let row = unsafe { zstd::ZSTD_getCParams(12, 0, 0) };
-    assert_eq!(unsafe { zstd::ZSTD_checkCParams(row) }, 0);
+    let row = zstd::ZSTD_getCParams(12, 0, 0);
+    assert_eq!(zstd::ZSTD_checkCParams(row), 0);
     // srcSize 0 adjusts as unknown; a known size shrinks the window.
-    let adj =
-        unsafe { zstd::ZSTD_adjustCParams(unsafe { zstd::ZSTD_getCParams(19, 0, 0) }, 8192, 0) };
+    let adj = zstd::ZSTD_adjustCParams(zstd::ZSTD_getCParams(19, 0, 0), 8192, 0);
     assert_eq!(adj.windowLog, 13);
 }
 
 #[test]
 fn estimates_match_reference_numbers() {
     // Reference-object constants of the tracked build (see docs/dev/ffi.md).
-    assert_eq!(unsafe { zstd::ZSTD_estimateDCtxSize() }, 95_976);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(-1) }, 549_912);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(1) }, 582_680);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(3) }, 1_303_576);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(19) }, 85_196_950);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(22) }, 739_590_294);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCCtxSize(100) }, unsafe {
+    assert_eq!(zstd::ZSTD_estimateDCtxSize(), 95_976);
+    assert_eq!(zstd::ZSTD_estimateCCtxSize(-1), 549_912);
+    assert_eq!(zstd::ZSTD_estimateCCtxSize(1), 582_680);
+    assert_eq!(zstd::ZSTD_estimateCCtxSize(3), 1_303_576);
+    assert_eq!(zstd::ZSTD_estimateCCtxSize(19), 85_196_950);
+    assert_eq!(zstd::ZSTD_estimateCCtxSize(22), 739_590_294);
+    assert_eq!(
+        zstd::ZSTD_estimateCCtxSize(100),
         zstd::ZSTD_estimateCCtxSize(22)
-    });
-    assert_eq!(unsafe { zstd::ZSTD_estimateCStreamSize(1) }, 1_369_625);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCStreamSize(22) }, 874_070_679);
-    assert!(
-        unsafe { zstd::ZSTD_estimateCStreamSize(1) } > unsafe { zstd::ZSTD_estimateCCtxSize(1) }
     );
+    assert_eq!(zstd::ZSTD_estimateCStreamSize(1), 1_369_625);
+    assert_eq!(zstd::ZSTD_estimateCStreamSize(22), 874_070_679);
+    assert!(zstd::ZSTD_estimateCStreamSize(1) > zstd::ZSTD_estimateCCtxSize(1));
     let fast = zstd::ZSTD_compressionParameters {
         windowLog: 10,
         chainLog: 10,
@@ -2264,10 +2262,7 @@ fn estimates_match_reference_numbers() {
         targetLength: 0,
         strategy: zstd::ZSTD_strategy::ZSTD_fast,
     };
-    assert_eq!(
-        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(fast) },
-        553_752
-    );
+    assert_eq!(zstd::ZSTD_estimateCCtxSize_usingCParams(fast), 553_752);
     let lazy2 = zstd::ZSTD_compressionParameters {
         windowLog: 21,
         chainLog: 21,
@@ -2277,46 +2272,38 @@ fn estimates_match_reference_numbers() {
         targetLength: 16,
         strategy: zstd::ZSTD_strategy::ZSTD_lazy2,
     };
+    assert_eq!(zstd::ZSTD_estimateCCtxSize_usingCParams(lazy2), 26_327_446);
     assert_eq!(
-        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(lazy2) },
-        26_327_446
-    );
-    assert_eq!(
-        unsafe { zstd::ZSTD_estimateCStreamSize_usingCParams(lazy2) },
+        zstd::ZSTD_estimateCStreamSize_usingCParams(lazy2),
         28_687_255
     );
-    assert_eq!(unsafe { zstd::ZSTD_estimateCDictSize(0, 3) }, 801_344);
-    assert_eq!(unsafe { zstd::ZSTD_estimateCDictSize(4096, 3) }, 117_312);
+    assert_eq!(zstd::ZSTD_estimateCDictSize(0, 3), 801_344);
+    assert_eq!(zstd::ZSTD_estimateCDictSize(4096, 3), 117_312);
     assert_eq!(
-        unsafe {
-            zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByReference)
-        },
+        zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByReference),
         543_296
     );
     assert_eq!(
-        unsafe { zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByCopy) },
+        zstd::ZSTD_estimateCDictSize_advanced(4096, fast, zstd::DictLoadMethod::ByCopy),
         547_392
     );
     assert_eq!(
-        unsafe { zstd::ZSTD_estimateDDictSize(0, zstd::DictLoadMethod::ByReference) },
+        zstd::ZSTD_estimateDDictSize(0, zstd::DictLoadMethod::ByReference),
         27_352
     );
     assert_eq!(
-        unsafe { zstd::ZSTD_estimateDDictSize(1000, zstd::DictLoadMethod::ByCopy) },
+        zstd::ZSTD_estimateDDictSize(1000, zstd::DictLoadMethod::ByCopy),
         28_352
     );
-    assert_eq!(unsafe { zstd::ZSTD_estimateDStreamSize(0) }, 96_040);
-    assert_eq!(unsafe { zstd::ZSTD_estimateDStreamSize(131_072) }, 620_328);
-    assert_eq!(unsafe { zstd::ZSTD_sequenceBound(0) }, 2);
-    assert_eq!(unsafe { zstd::ZSTD_sequenceBound(131_072) }, 43_820);
+    assert_eq!(zstd::ZSTD_estimateDStreamSize(0), 96_040);
+    assert_eq!(zstd::ZSTD_estimateDStreamSize(131_072), 620_328);
+    assert_eq!(zstd::ZSTD_sequenceBound(0), 2);
+    assert_eq!(zstd::ZSTD_sequenceBound(131_072), 43_820);
     assert_eq!(
-        unsafe { zstd::ZSTD_decodingBufferSize_min(1 << 20, u64::MAX) },
+        zstd::ZSTD_decodingBufferSize_min(1 << 20, u64::MAX),
         (1 << 20) + 2 * 131_072 + 64
     );
-    assert_eq!(
-        unsafe { zstd::ZSTD_decodingBufferSize_min(1 << 20, 100) },
-        100
-    );
+    assert_eq!(zstd::ZSTD_decodingBufferSize_min(1 << 20, 100), 100);
     // LDM-heavy rows grow through the LDM tables.
     let ultra = zstd::ZSTD_compressionParameters {
         windowLog: 27,
@@ -2328,8 +2315,8 @@ fn estimates_match_reference_numbers() {
         strategy: zstd::ZSTD_strategy::ZSTD_btultra2,
     };
     assert!(
-        unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(ultra) }
-            > unsafe { zstd::ZSTD_estimateCCtxSize_usingCParams(fast) }
+        zstd::ZSTD_estimateCCtxSize_usingCParams(ultra)
+            > zstd::ZSTD_estimateCCtxSize_usingCParams(fast)
     );
 }
 
@@ -2352,7 +2339,7 @@ fn frame_walk_entries() {
     let window = unsafe { zstd::ZSTD_getFrameContentSize(frame.as_ptr().cast(), c) } as usize;
     assert_eq!(
         unsafe { zstd::ZSTD_estimateDStreamSize_fromFrame(frame.as_ptr().cast(), c) },
-        unsafe { zstd::ZSTD_estimateDStreamSize(window) }
+        zstd::ZSTD_estimateDStreamSize(window)
     );
     // Error cells match the reference codes.
     assert_eq!(
@@ -2478,7 +2465,7 @@ fn skippable_payload_roundtrip() {
         unsafe { zstd::ZSTD_isSkippableFrame(src.as_ptr().cast(), src.len()) },
         0
     );
-    assert_eq!(unsafe { zstd::ZSTD_isDeterministicBuild() }, 1);
+    assert_eq!(zstd::ZSTD_isDeterministicBuild(), 1);
 }
 
 #[test]
@@ -2753,11 +2740,11 @@ fn prefix_family_roundtrip_and_single_use() {
     unsafe { zstd::ZSTD_freeDCtx(dctx) };
 }
 
-/// Round 92 streaming-transcript pins: the frames are the reference
-/// library's own compressed output, so every cell is the reference's exact
-/// call-by-call (ret, input.pos, output.pos, error-code) record for one
-/// input chunking and output capacity. The same record, over the whole
-/// shape matrix, is byte-diffed against libzstd by the C harness.
+// Round 92 streaming-transcript pins: the frames are the reference
+// library's own compressed output, so every cell is the reference's exact
+// call-by-call (ret, input.pos, output.pos, error-code) record for one
+// input chunking and output capacity. The same record, over the whole
+// shape matrix, is byte-diffed against libzstd by the C harness.
 
 /// 4096-byte corpus slice, one-shot level 5 with checksum.
 const T_F_CK: &[u8] = &[
@@ -3236,9 +3223,18 @@ fn drive_transcript(
     }
 }
 
+/// (name, frame, input chunk, output capacity, expected call records)
+type TranscriptCell = (
+    &'static str,
+    &'static [u8],
+    usize,
+    usize,
+    &'static [(usize, usize, usize, i32)],
+);
+
 #[test]
 fn streaming_transcript_pins() {
-    let cells: &[(&str, &[u8], usize, usize, &[(usize, usize, usize, i32)])] = &[
+    let cells: &[TranscriptCell] = &[
         ("ck-out50", T_F_CK, 0, 50, &X_CK_OUT50),
         ("ck-out0", T_F_CK, 0, 0, &X_CK_OUT0),
         ("nc-out0", T_F_NC, 0, 0, &X_NC_OUT0),

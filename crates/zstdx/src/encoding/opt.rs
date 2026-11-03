@@ -385,7 +385,7 @@ fn weights_bulk<const ULTRA: bool>(stats: &[u32], out: &mut [u32]) {
         // hold there, so the arithmetic is inline.
         for (weight_out, &stat) in out.iter_mut().zip(stats) {
             let stat = stat.wrapping_add(1);
-            let hb = 31 - (stat | 1).leading_zeros();
+            let hb = (stat | 1).ilog2();
             *weight_out = if ULTRA {
                 (hb * BITCOST_MULTIPLIER).wrapping_add((stat << 8) >> hb)
             } else {
@@ -451,20 +451,20 @@ impl OptState {
                 (LL_META[code].1 as u32 * BITCOST_MULTIPLIER).wrapping_sub(weight_of[code]);
         }
         weights_bulk::<ULTRA>(&self.match_length_freq, &mut weight_of[..53]);
-        for code in 0..self.match_length_freq.len() {
+        for (code, &w) in weight_of[..self.match_length_freq.len()].iter().enumerate() {
             self.ml_price[code] = (ML_META[code].1 as u32 * BITCOST_MULTIPLIER)
-                .wrapping_sub(weight_of[code])
+                .wrapping_sub(w)
                 .wrapping_add(BITCOST_MULTIPLIER / 5);
         }
         weights_bulk::<ULTRA>(&self.off_code_freq, &mut weight_of[..32]);
-        for code in 0..self.off_code_freq.len() {
+        for (code, &w) in weight_of[..self.off_code_freq.len()].iter().enumerate() {
             let handicap = if !ULTRA && code >= 20 {
                 (code as u32 - 19) * 2 * BITCOST_MULTIPLIER
             } else {
                 0
             };
             self.off_price[code] = (code as u32 * BITCOST_MULTIPLIER)
-                .wrapping_sub(weight_of[code])
+                .wrapping_sub(w)
                 .wrapping_add(handicap);
         }
     }
@@ -2071,7 +2071,7 @@ mod tests {
     /// reference for statistics past `frac_weight`'s debug bound.
     fn weight_u32<const ULTRA: bool>(stat: u32) -> u32 {
         let stat = stat.wrapping_add(1);
-        let hb = 31 - (stat | 1).leading_zeros();
+        let hb = (stat | 1).ilog2();
         if ULTRA {
             (hb * BITCOST_MULTIPLIER).wrapping_add((stat << 8) >> hb)
         } else {

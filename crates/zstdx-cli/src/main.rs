@@ -1794,13 +1794,14 @@ fn compress(
     // and any bytes read ride ahead of the stream through
     // [`PrefixReader`].
     if known_size.is_none() {
-        let mut first = [0u8; 64 * 1024];
+        let mut first = vec![0u8; 64 * 1024];
         let n = reader.read(&mut first)?;
         if n == 0 {
             known_size = Some(0);
         } else {
+            first.truncate(n);
             reader = Box::new(PrefixReader {
-                prefix: first[..n].to_vec(),
+                prefix: first,
                 pos: 0,
                 inner: reader,
             });

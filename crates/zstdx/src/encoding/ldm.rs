@@ -1032,7 +1032,7 @@ impl LdmState {
                     // The admission compare left the distance in
                     // [1, window] and the row window log clamps at
                     // 27, so the u32 narrowing is lossless.
-                    debug_assert!(dist.get() <= u32::MAX as u64);
+                    debug_assert!(u32::try_from(dist.get()).is_ok());
                     out.push(LdmSeq {
                         split,
                         // SAFETY: nonzero by the admission compare and

@@ -1048,7 +1048,7 @@ impl MatchGeneratorDriver {
 
     /// The current reach verdict; reads the pooled-residue contract in
     /// tests (see `stream::encoder_core`'s pool round-trip test).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) const fn reach_choice(&self) -> ReachChoice {
         self.reach_choice
     }
@@ -1103,7 +1103,9 @@ impl MatchGeneratorDriver {
     fn long_compare_for(arming: LdmArming) -> LongCompare {
         match arming {
             LdmArming::Frame | LdmArming::FrameScreened => LongCompare::Short,
-            _ => LongCompare::Long,
+            LdmArming::ProbeKeep => LongCompare::Long,
+            #[cfg(feature = "std")]
+            LdmArming::Job | LdmArming::JobPrefix | LdmArming::FarDead => LongCompare::Long,
         }
     }
 

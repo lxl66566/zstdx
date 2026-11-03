@@ -341,10 +341,15 @@ pub fn frame_compressed_size(src: &[u8]) -> Result<usize, ParseError> {
     }
 }
 
+/// The input is not an exact series of complete frames: a truncated frame
+/// or bytes after the last frame's end.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NotExactSeries;
+
 /// `ZSTD_findDecompressedSize` walk: the summed FCS of every frame in the
 /// series, `None` when any frame's size is unknown, `Err` when the input is
 /// not an exact series of complete frames.
-pub fn find_decompressed_size(src: &[u8]) -> Result<Option<u64>, ()> {
+pub fn find_decompressed_size(src: &[u8]) -> Result<Option<u64>, NotExactSeries> {
     let mut total = 0_u64;
     let mut rest = src;
     loop {
@@ -352,192 +357,31 @@ pub fn find_decompressed_size(src: &[u8]) -> Result<Option<u64>, ()> {
             return if rest.is_empty() {
                 Ok(Some(total))
             } else {
-                Err(())
+                Err(NotExactSeries)
             };
         }
-        let Header::Zstd(info) = parse_header(rest).map_err(|_| ())? else {
+        let Header::Zstd(info) = parse_header(rest).map_err(|_| NotExactSeries)? else {
             // Skippable frames contribute nothing and are skipped whole.
-            let Header::Skippable { total: whole } = parse_header(rest).map_err(|_| ())? else {
+            let Header::Skippable { total: whole } =
+                parse_header(rest).map_err(|_| NotExactSeries)?
+            else {
                 unreachable!("narrowed above");
             };
             if rest.len() < whole {
-                return Err(());
+                return Err(NotExactSeries);
             }
             rest = &rest[whole..];
             continue;
         };
         if rest.len() < info.header_len {
-            return Err(());
+            return Err(NotExactSeries);
         }
         let Some(fcs) = info.content_size else {
             return Ok(None); // an unknown-sized frame makes the series unknown
         };
-        total = total.checked_add(fcs).ok_or(())?;
-        let whole = frame_compressed_size(rest).map_err(|_| ())?;
+        total = total.checked_add(fcs).ok_or(NotExactSeries)?;
+        let whole = frame_compressed_size(rest).map_err(|_| NotExactSeries)?;
         rest = &rest[whole..];
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn compress_default() -> Vec<u8> {
-        // A real frame with checksum and pledged size (the FFI one-shot
-        // shape).
-        let opts = zstdx::EncoderOptions::new(zstdx::Level::Fastest)
-            .checksum(true)
-            .pledged_size(Some(7));
-        let mut sink = Vec::new();
-        {
-            use std::io::Write as _;
-            let mut enc = zstdx::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
-            enc.write_all(b"payload").unwrap();
-            enc.do_finish().unwrap();
-        }
-        sink
-    }
-
-    #[test]
-    fn walks_real_frame() {
-        let frame = compress_default();
-        let header = match parse_header(&frame).unwrap() {
-            Header::Zstd(h) => h,
-            other @ Header::Skippable { .. } => {
-                panic!("unexpected {other:?}")
-            },
-        };
-        assert_eq!(header.content_size, Some(7));
-        assert!(header.checksum);
-        assert_eq!(frame_compressed_size(&frame).unwrap(), frame.len());
-        let full = match parse_full_header(&frame).unwrap() {
-            HeaderParse::Complete(h) => h,
-            other @ HeaderParse::Wanted(_) => {
-                panic!("unexpected {other:?}")
-            },
-        };
-        assert_eq!(full.frame_type, FrameType::Zstd);
-        // 7-byte single-segment frame: window == FCS == block max.
-        assert_eq!(full.window_size, 7);
-        assert_eq!(full.block_size_max, 7);
-        assert_eq!(full.header_size, header.header_len);
-        assert_eq!(full.content_size, Some(7));
-        assert_eq!(full.dict_id, 0);
-    }
-
-    #[test]
-    fn skippable_and_bad_magic() {
-        let skip = [0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
-        assert_eq!(parse_header(&skip).unwrap(), Header::Skippable {
-            total: 12
-        });
-        assert_eq!(frame_compressed_size(&skip).unwrap(), 12);
-        let full = match parse_full_header(&skip).unwrap() {
-            HeaderParse::Complete(h) => h,
-            other @ HeaderParse::Wanted(_) => {
-                panic!("unexpected {other:?}")
-            },
-        };
-        assert_eq!(full.frame_type, FrameType::Skippable);
-        assert_eq!(full.content_size, Some(4));
-        assert_eq!(full.header_size, 8);
-        assert_eq!(full.dict_id, 0);
-        assert_eq!(
-            parse_header(&[0u8, 1, 2, 3]).unwrap_err(),
-            ParseError::BadMagic
-        );
-        assert_eq!(parse_header(&[0u8, 1]).unwrap_err(), ParseError::NeedMore);
-        // libzstd's getFrameHeader: short input with a mismatching prefix
-        // is an error, with a matching prefix it wants 5.
-        assert_eq!(
-            parse_full_header(&[1u8, 2, 3]).unwrap_err(),
-            ParseError::BadMagic
-        );
-        assert_eq!(
-            parse_full_header(&[0x28u8, 0xb5]).unwrap(),
-            HeaderParse::Wanted(5)
-        );
-        assert_eq!(parse_full_header(&[]).unwrap(), HeaderParse::Wanted(5));
-    }
-
-    #[test]
-    fn truncated_walk_needs_more() {
-        let frame = compress_default();
-        for cut in 1..frame.len() {
-            match frame_compressed_size(&frame[..cut]) {
-                Ok(n) => assert_eq!(n, cut, "only the exact prefix can satisfy the walk"),
-                Err(ParseError::NeedMore | ParseError::Malformed) => {},
-                Err(e) => panic!("unexpected {e:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn header_size_formula_matches_descriptor_parse() {
-        // For zstd frames the formula must agree with the parsed length.
-        let frame = compress_default();
-        let header = match parse_header(&frame).unwrap() {
-            Header::Zstd(h) => h,
-            other @ Header::Skippable { .. } => {
-                panic!("unexpected {other:?}")
-            },
-        };
-        assert_eq!(header_size_formula(frame[4]), header.header_len);
-        // A windowed frame (pledge off, streaming shape): 4+1+1.
-        assert_eq!(header_size_formula(0x00), 6);
-        // Single segment, no FCS flag: the 1-byte FCS form.
-        assert_eq!(header_size_formula(0x20), 6);
-        // Single segment, 8-byte FCS, 4-byte dictID: 5+0+4+8.
-        assert_eq!(header_size_formula(0xe3), 17);
-        // Skippable parity with libzstd: the formula applies to src[4]
-        // unverified (probe: magic 0x184D2A50 + size 4 -> 6).
-        assert_eq!(header_size_formula(4), 6);
-    }
-
-    #[test]
-    fn find_size_sums_and_propagates_unknown() {
-        let frame = compress_default();
-        let skip = [0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
-        let mut series = frame.clone();
-        series.extend_from_slice(&skip);
-        assert_eq!(find_decompressed_size(&series), Ok(Some(7)));
-        assert_eq!(find_decompressed_size(&[]), Ok(Some(0)));
-        // Trailing bytes below the prefix length are an error.
-        let mut trailing = frame.clone();
-        trailing.extend_from_slice(&[1, 2]);
-        assert_eq!(find_decompressed_size(&trailing), Err(()));
-        // Truncated frame is an error.
-        assert_eq!(find_decompressed_size(&frame[..frame.len() - 1]), Err(()));
-    }
-
-    #[test]
-    fn reserved_bit_and_window_ceiling() {
-        // Reserved descriptor bit 0x08 (header long enough to be judged).
-        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x08, 0x00];
-        assert_eq!(parse_header(&frame).unwrap_err(), ParseError::ReservedBit);
-        // Window exponent beyond the format ceiling (log 10+31 > 31).
-        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xff];
-        assert_eq!(
-            parse_header(&frame).unwrap_err(),
-            ParseError::WindowTooLarge
-        );
-        // log 10+20 = 30 is inside.
-        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xa0];
-        assert!(parse_header(&frame).is_ok());
-        // Truncated reserved-bit input still wants more, as in libzstd.
-        assert_eq!(
-            parse_full_header(&[0x28, 0xb5, 0x2f, 0xfd, 0x08]).unwrap(),
-            HeaderParse::Wanted(6)
-        );
-    }
-
-    #[test]
-    fn window_descriptor_values() {
-        // RFC 8878: exponent 0 mantissa 0 -> 1<<10.
-        assert_eq!(window_from_descriptor(0x00), 1024);
-        // exponent 1, mantissa 4 (half the base fraction): 2048 + 1024.
-        assert_eq!(window_from_descriptor(0x0c), 3072);
-        assert_eq!(window_from_descriptor(0xa0), 1 << 30);
     }
 }
 
@@ -717,14 +561,11 @@ pub unsafe extern "C" fn ZSTD_decompressionMargin(
         // The reference consults getFrameHeader before the walk: a header
         // that fails to parse passes its own code through, while any walk
         // failure behind a parseable header answers corruption_detected.
-        let info = match frame_size_info(rest) {
-            Ok(info) => info,
-            Err(_) => {
-                return match parse_full_header(rest) {
-                    Err(e) => code(parse_error_code(e)),
-                    Ok(_) => code(ErrorCode::CorruptionDetected),
-                }
-            },
+        let Ok(info) = frame_size_info(rest) else {
+            return match parse_full_header(rest) {
+                Err(e) => code(parse_error_code(e)),
+                Ok(_) => code(ErrorCode::CorruptionDetected),
+            };
         };
         if info.skippable {
             margin += info.compressed_size;
@@ -853,4 +694,170 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_isDeterministicBuild() -> core::ffi::c_uint {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compress_default() -> Vec<u8> {
+        // A real frame with checksum and pledged size (the FFI one-shot
+        // shape).
+        let opts = zstdx::EncoderOptions::new(zstdx::Level::Fastest)
+            .checksum(true)
+            .pledged_size(Some(7));
+        let mut sink = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut enc = zstdx::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
+            enc.write_all(b"payload").unwrap();
+            enc.do_finish().unwrap();
+        }
+        sink
+    }
+
+    #[test]
+    fn walks_real_frame() {
+        let frame = compress_default();
+        let header = match parse_header(&frame).unwrap() {
+            Header::Zstd(h) => h,
+            other @ Header::Skippable { .. } => {
+                panic!("unexpected {other:?}")
+            },
+        };
+        assert_eq!(header.content_size, Some(7));
+        assert!(header.checksum);
+        assert_eq!(frame_compressed_size(&frame).unwrap(), frame.len());
+        let full = match parse_full_header(&frame).unwrap() {
+            HeaderParse::Complete(h) => h,
+            other @ HeaderParse::Wanted(_) => {
+                panic!("unexpected {other:?}")
+            },
+        };
+        assert_eq!(full.frame_type, FrameType::Zstd);
+        // 7-byte single-segment frame: window == FCS == block max.
+        assert_eq!(full.window_size, 7);
+        assert_eq!(full.block_size_max, 7);
+        assert_eq!(full.header_size, header.header_len);
+        assert_eq!(full.content_size, Some(7));
+        assert_eq!(full.dict_id, 0);
+    }
+
+    #[test]
+    fn skippable_and_bad_magic() {
+        let skip = [0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+        assert_eq!(parse_header(&skip).unwrap(), Header::Skippable {
+            total: 12
+        });
+        assert_eq!(frame_compressed_size(&skip).unwrap(), 12);
+        let full = match parse_full_header(&skip).unwrap() {
+            HeaderParse::Complete(h) => h,
+            other @ HeaderParse::Wanted(_) => {
+                panic!("unexpected {other:?}")
+            },
+        };
+        assert_eq!(full.frame_type, FrameType::Skippable);
+        assert_eq!(full.content_size, Some(4));
+        assert_eq!(full.header_size, 8);
+        assert_eq!(full.dict_id, 0);
+        assert_eq!(
+            parse_header(&[0u8, 1, 2, 3]).unwrap_err(),
+            ParseError::BadMagic
+        );
+        assert_eq!(parse_header(&[0u8, 1]).unwrap_err(), ParseError::NeedMore);
+        // libzstd's getFrameHeader: short input with a mismatching prefix
+        // is an error, with a matching prefix it wants 5.
+        assert_eq!(
+            parse_full_header(&[1u8, 2, 3]).unwrap_err(),
+            ParseError::BadMagic
+        );
+        assert_eq!(
+            parse_full_header(&[0x28u8, 0xb5]).unwrap(),
+            HeaderParse::Wanted(5)
+        );
+        assert_eq!(parse_full_header(&[]).unwrap(), HeaderParse::Wanted(5));
+    }
+
+    #[test]
+    fn truncated_walk_needs_more() {
+        let frame = compress_default();
+        for cut in 1..frame.len() {
+            match frame_compressed_size(&frame[..cut]) {
+                Ok(n) => assert_eq!(n, cut, "only the exact prefix can satisfy the walk"),
+                Err(ParseError::NeedMore | ParseError::Malformed) => {},
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn header_size_formula_matches_descriptor_parse() {
+        // For zstd frames the formula must agree with the parsed length.
+        let frame = compress_default();
+        let header = match parse_header(&frame).unwrap() {
+            Header::Zstd(h) => h,
+            other @ Header::Skippable { .. } => {
+                panic!("unexpected {other:?}")
+            },
+        };
+        assert_eq!(header_size_formula(frame[4]), header.header_len);
+        // A windowed frame (pledge off, streaming shape): 4+1+1.
+        assert_eq!(header_size_formula(0x00), 6);
+        // Single segment, no FCS flag: the 1-byte FCS form.
+        assert_eq!(header_size_formula(0x20), 6);
+        // Single segment, 8-byte FCS, 4-byte dictID: 5+0+4+8.
+        assert_eq!(header_size_formula(0xe3), 17);
+        // Skippable parity with libzstd: the formula applies to src[4]
+        // unverified (probe: magic 0x184D2A50 + size 4 -> 6).
+        assert_eq!(header_size_formula(4), 6);
+    }
+
+    #[test]
+    fn find_size_sums_and_propagates_unknown() {
+        let frame = compress_default();
+        let skip = [0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+        let mut series = frame.clone();
+        series.extend_from_slice(&skip);
+        assert_eq!(find_decompressed_size(&series), Ok(Some(7)));
+        assert_eq!(find_decompressed_size(&[]), Ok(Some(0)));
+        // Trailing bytes below the prefix length are an error.
+        let mut trailing = frame.clone();
+        trailing.extend_from_slice(&[1, 2]);
+        assert_eq!(find_decompressed_size(&trailing), Err(NotExactSeries));
+        // Truncated frame is an error.
+        assert_eq!(
+            find_decompressed_size(&frame[..frame.len() - 1]),
+            Err(NotExactSeries)
+        );
+    }
+
+    #[test]
+    fn reserved_bit_and_window_ceiling() {
+        // Reserved descriptor bit 0x08 (header long enough to be judged).
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x08, 0x00];
+        assert_eq!(parse_header(&frame).unwrap_err(), ParseError::ReservedBit);
+        // Window exponent beyond the format ceiling (log 10+31 > 31).
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xff];
+        assert_eq!(
+            parse_header(&frame).unwrap_err(),
+            ParseError::WindowTooLarge
+        );
+        // log 10+20 = 30 is inside.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xa0];
+        assert!(parse_header(&frame).is_ok());
+        // Truncated reserved-bit input still wants more, as in libzstd.
+        assert_eq!(
+            parse_full_header(&[0x28, 0xb5, 0x2f, 0xfd, 0x08]).unwrap(),
+            HeaderParse::Wanted(6)
+        );
+    }
+
+    #[test]
+    fn window_descriptor_values() {
+        // RFC 8878: exponent 0 mantissa 0 -> 1<<10.
+        assert_eq!(window_from_descriptor(0x00), 1024);
+        // exponent 1, mantissa 4 (half the base fraction): 2048 + 1024.
+        assert_eq!(window_from_descriptor(0x0c), 3072);
+        assert_eq!(window_from_descriptor(0xa0), 1 << 30);
+    }
 }

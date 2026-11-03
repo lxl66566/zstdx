@@ -607,9 +607,7 @@ impl BlockDecoder {
         // all literals of the previous block must have been used in the sequence execution anyways.
         // just be defensive here
         literals_buffer.clear();
-        let bytes_used_in_literals_section = if placement != LiteralsPlacement::Staged {
-            upper_limit_for_literals as u32
-        } else {
+        let bytes_used_in_literals_section = if placement == LiteralsPlacement::Staged {
             let bytes_used = decode_literals(&section, huf, raw_literals, literals_buffer)?;
             assert!(
                 section.regenerated_size == literals_buffer.len() as u32,
@@ -619,6 +617,8 @@ impl BlockDecoder {
             );
             assert_eq!(bytes_used, upper_limit_for_literals as u32);
             bytes_used
+        } else {
+            upper_limit_for_literals as u32
         };
         vprintln!("Slice for sequences with headers: {}", raw.len());
 

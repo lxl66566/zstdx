@@ -246,6 +246,11 @@ pub fn want<T: PartialEq>(selected: &[T], v: &T) -> bool {
     selected.is_empty() || selected.contains(v)
 }
 
+#[inline(never)]
+pub fn black_box<T>(v: T) -> T {
+    std::hint::black_box(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,9 +276,4 @@ mod tests {
         assert_eq!(s.max, 10.0);
         assert_eq!(s.median, 5.0);
     }
-}
-
-#[inline(never)]
-pub fn black_box<T>(v: T) -> T {
-    std::hint::black_box(v)
 }

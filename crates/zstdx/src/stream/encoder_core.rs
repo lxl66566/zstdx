@@ -1091,7 +1091,7 @@ impl FrameEncoderCore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod reach_residue_tests {
     use super::*;
     use crate::EncoderOptions;

@@ -234,7 +234,7 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
             super::job_trace::descent_capture::record(rec);
         }
         #[cfg(not(feature = "job_trace"))]
-        self.fill_to_inner(target_idx)
+        self.fill_to_inner(target_idx);
     }
 
     fn fill_to_inner(&mut self, target_idx: usize) {

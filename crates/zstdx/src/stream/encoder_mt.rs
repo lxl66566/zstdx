@@ -3187,6 +3187,9 @@ fn advise_hugepages(buf: &Vec<u8>) {
     let lo = (buf.as_ptr() as usize) & !0xfff;
     let hi = buf.as_ptr() as usize + buf.capacity();
     if hi > lo {
+        // SAFETY: lo..hi spans the pages backing the buffer's capacity,
+        // and madvise is advisory — a failing call leaves the mapping
+        // untouched.
         unsafe { madvise(lo as *mut u8, hi - lo, MADV_HUGEPAGE) };
     }
 }

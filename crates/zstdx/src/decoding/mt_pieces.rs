@@ -224,9 +224,7 @@ fn validate_piece(segs: &[Arc<DecodedSegment>], piece: &Piece) -> Option<usize> 
                     for seq in &seg.sequences[seqs.clone()] {
                         pos += seq.ll as usize;
                         lits_used += seq.ll as usize;
-                        let Some(off) = do_offset_history(seq.of, seq.ll, &mut hist) else {
-                            return None;
-                        };
+                        let off = do_offset_history(seq.of, seq.ll, &mut hist)?;
                         if off.get() as usize > pos {
                             return None;
                         }

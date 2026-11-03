@@ -301,24 +301,22 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool>(
                 // an LDM-class offset — leaves a band the search floors
                 // away but this probe, bounded at the window base, accepts.
                 let covered = searched && probe == pos && rep[0] as u64 <= finder.max_window;
-                if !covered {
-                    if let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0]) {
-                        let v = scale_value(
-                            lit_scale(win, (probe - win_base) as usize, &lit_clamp),
-                            ml,
-                        );
-                        // An empty incumbent prices 0 — the baseline the rep
-                        // probe must beat.
-                        if v > best.map_or(0, |b| b.score) {
-                            best = Some(Scored {
-                                m: Match {
-                                    off: 1,
-                                    len: ml as u32,
-                                },
-                                score: v,
-                            });
-                            pos = probe;
-                        }
+                if !covered
+                    && let Some(ml) = rep_probe::<LONG>(win, win_base, end_idx, probe, rep[0])
+                {
+                    let v =
+                        scale_value(lit_scale(win, (probe - win_base) as usize, &lit_clamp), ml);
+                    // An empty incumbent prices 0 — the baseline the rep
+                    // probe must beat.
+                    if v > best.map_or(0, |b| b.score) {
+                        best = Some(Scored {
+                            m: Match {
+                                off: 1,
+                                len: ml as u32,
+                            },
+                            score: v,
+                        });
+                        pos = probe;
                     }
                 }
             }

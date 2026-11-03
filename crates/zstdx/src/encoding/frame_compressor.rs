@@ -4,6 +4,8 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 #[cfg(feature = "std")]
+use super::ldm::LdmSeq;
+#[cfg(feature = "std")]
 use super::match_generator::{LdmPrefixSnapshot, StripSnapshot};
 use super::{
     Matcher,
@@ -12,7 +14,6 @@ use super::{
     checksum::{BlockChecksum, FrameHasher, SliceChecksum},
     far_screen,
     frame_header::FrameHeader,
-    ldm::LdmSeq,
     levels::*,
     match_generator::{
         BALANCED_STORE_HEAD_SPAN, BalancedStore, LdmArming, MatchGeneratorDriver, balanced_store,

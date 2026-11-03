@@ -163,6 +163,9 @@ pub fn mt_job_size_for(
 /// window raise) and disarms LDM in every job including the dictionary
 /// seed; `Enable` rides the window the caller raised and forces the far
 /// source on in every job, the capture classes keeping their own bars.
+// One dispatch entry over the full parameter matrix; the mode arms read
+// clearer inline than split behind helpers.
+#[allow(clippy::too_many_lines)]
 pub fn compress_slice_mt(
     src: &[u8],
     level: Level,
@@ -407,20 +410,20 @@ pub fn compress_slice_mt(
                     // byte-invariant in the snapshot's boundary, so which
                     // one lands is pure scheduling).
                     let snapshot = if let Some(gate) = &feed_gate {
-                        match take_feed_span(gate, &ready, start as u64, end as u64, overlap as u64)
+                        if let Some(span) =
+                            take_feed_span(gate, &ready, start as u64, end as u64, overlap as u64)
                         {
-                            Some(span) => JobSpfOwned::Feed {
+                            JobSpfOwned::Feed {
                                 span,
                                 window: feed_window,
-                            },
-                            None => {
-                                // The feed panicked: release the slot so
-                                // the ordered assembly drains before the
-                                // panic resumes below.
-                                *slots[id].lock().unwrap() = Some(Vec::new());
-                                ready.notify_all();
-                                break;
-                            },
+                            }
+                        } else {
+                            // The feed panicked: release the slot so
+                            // the ordered assembly drains before the
+                            // panic resumes below.
+                            *slots[id].lock().unwrap() = Some(Vec::new());
+                            ready.notify_all();
+                            break;
                         }
                     } else if deep_ldm.is_some() {
                         // The deep rows' no-build windowed schedule: every
@@ -1301,10 +1304,10 @@ fn run_ldm_feed(
     #[cfg(feature = "job_trace")]
     super::job_trace::add_spf_build(trace_feed);
     if result.is_err() {
-        if let Ok(mut p) = poison.lock() {
-            if p.is_none() {
-                *p = result.err();
-            }
+        if let Ok(mut p) = poison.lock()
+            && p.is_none()
+        {
+            *p = result.err();
         }
         gate.lock().unwrap().panicked = true;
         ready.notify_all();
@@ -2852,7 +2855,7 @@ mod tests {
                 crate::LdmMode::Auto,
             )
         };
-        let st = encode(1);
+        let _st = encode(1);
         let mt8 = encode(8);
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();

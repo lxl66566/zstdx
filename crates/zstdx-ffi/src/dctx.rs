@@ -219,9 +219,9 @@ fn chained_byte(staged: &[u8], rest: &[u8], pos: usize) -> Option<u8> {
 /// this call's input start, so a frame that began in an earlier call has
 /// its start bytes invisible here, fails the walk and loses the shortcut.
 fn chained_frame_size(staged: &[u8], rest: &[u8]) -> Option<usize> {
-    let full = match crate::frame::parse_full_header(staged) {
-        Ok(crate::frame::HeaderParse::Complete(full)) => full,
-        _ => return None,
+    let Ok(crate::frame::HeaderParse::Complete(full)) = crate::frame::parse_full_header(staged)
+    else {
+        return None;
     };
     let total = staged.len() + rest.len();
     let mut pos = full.header_size;
@@ -266,6 +266,9 @@ fn chained_frame_size(staged: &[u8], rest: &[u8]) -> Option<usize> {
 /// A flush round that cannot empty the pending buffer ends the call, and a
 /// frame whose output is still pending at its end holds back one input
 /// byte (the reference's hostage) until the flush completes.
+// The bool set is the stage engine's own state flags, one field per
+// documented transition; folding them would hide the port's shape.
+#[allow(clippy::struct_excessive_bools)]
 struct DStream {
     inner: FrameDecoder,
     /// Input claimed from the caller but not yet processed; `cursor` is
@@ -456,6 +459,10 @@ impl DStream {
     /// flush rounds and input pieces. Positions are the caller's cursors,
     /// committed by the caller only on success.
     #[allow(clippy::too_many_arguments)]
+    // One function per stage transition would lose the reference's
+    // single-loop stage machine, which this port keeps shape-parallel to
+    // `ZSTD_decompressStream`'s internal loop.
+    #[allow(clippy::too_many_lines)]
     fn advance(
         &mut self,
         settings: &Settings,
@@ -471,6 +478,9 @@ impl DStream {
         // shortcut measures from it, so a header that began in an earlier
         // call cannot shortcut.
         let call_start = self.staging.len();
+        // Every stage arm ends its iteration with an explicit `continue`,
+        // mirroring the reference's per-stage flow.
+        #[allow(clippy::needless_continue)]
         loop {
             // Flush round: pending output to the caller; a round that
             // cannot empty the pending buffer ends the call.
@@ -504,36 +514,34 @@ impl DStream {
                                     // buffer and arrives whole in this call
                                     // decodes in one step, straight into
                                     // the caller's output.
-                                    if let Some(fcs) = full.content_size {
-                                        if (out.len() - *out_pos) as u64 >= fcs {
-                                            let have = self.staging.len() - call_start;
-                                            // SAFETY: remaining is the
-                                            // input's unread span.
-                                            let rest =
-                                                unsafe { input.slice_at(*in_pos, remaining) };
-                                            if let Some(csize) = chained_frame_size(
-                                                &self.staging[call_start..],
-                                                rest,
-                                            ) {
-                                                if csize >= have && csize - have <= remaining {
-                                                    // SAFETY: csize - have <= remaining.
-                                                    unsafe {
-                                                        self.claim(input, in_pos, csize - have)
-                                                    };
-                                                    let frame_end = call_start + csize;
-                                                    let written = decompress_oneshot(
-                                                        settings,
-                                                        dict,
-                                                        &self.staging[call_start..frame_end],
-                                                        &mut out[*out_pos..],
-                                                    )?;
-                                                    *out_pos += written;
-                                                    self.staging.truncate(call_start);
-                                                    self.cursor = call_start;
-                                                    self.finish_frame();
-                                                    continue;
-                                                }
-                                            }
+                                    if let Some(fcs) = full.content_size
+                                        && (out.len() - *out_pos) as u64 >= fcs
+                                    {
+                                        let have = self.staging.len() - call_start;
+                                        // SAFETY: remaining is the
+                                        // input's unread span.
+                                        let rest = unsafe { input.slice_at(*in_pos, remaining) };
+                                        if let Some(csize) =
+                                            chained_frame_size(&self.staging[call_start..], rest)
+                                            && csize >= have
+                                            && csize - have <= remaining
+                                        {
+                                            // SAFETY: csize - have <= remaining.
+                                            unsafe {
+                                                self.claim(input, in_pos, csize - have);
+                                            };
+                                            let frame_end = call_start + csize;
+                                            let written = decompress_oneshot(
+                                                settings,
+                                                dict,
+                                                &self.staging[call_start..frame_end],
+                                                &mut out[*out_pos..],
+                                            )?;
+                                            *out_pos += written;
+                                            self.staging.truncate(call_start);
+                                            self.cursor = call_start;
+                                            self.finish_frame();
+                                            continue;
                                         }
                                     }
                                     // The per-frame dictionary consult: a
@@ -922,8 +930,8 @@ impl DCtx {
         }
         let parsed = match dict {
             Some(bytes) => Some(Arc::new(
-                self.parse_dict(bytes, content_type)
-                    .map_err(|_| ErrorCode::DictionaryCorrupted)?,
+                Self::parse_dict(bytes, content_type)
+                    .map_err(|()| ErrorCode::DictionaryCorrupted)?,
             )),
             None => None,
         };
@@ -932,7 +940,6 @@ impl DCtx {
     }
 
     fn parse_dict(
-        &self,
         bytes: &[u8],
         content_type: crate::params::DictContentType,
     ) -> Result<zstdx::decoding::Dictionary, ()> {
@@ -994,7 +1001,7 @@ impl DCtx {
         }
         // Stored as the log (highbit32 of the byte limit, the value
         // getParameter reports); the 2^10..=2^31 range maps losslessly.
-        self.settings.window_log_max = Some(31 - (max_window_size as u32).leading_zeros());
+        self.settings.window_log_max = Some((max_window_size as u32).ilog2());
         Ok(())
     }
 
@@ -1156,11 +1163,11 @@ impl DCtx {
     /// Complete a call whose frame consumed the use-once prefix: the
     /// context slot clears before the answer goes out.
     pub fn settle_use_once(&mut self) {
-        if let Some(stream) = self.stream.as_mut() {
-            if stream.use_once_consumed {
-                stream.use_once_consumed = false;
-                self.consume_use_once();
-            }
+        if let Some(stream) = self.stream.as_mut()
+            && stream.use_once_consumed
+        {
+            stream.use_once_consumed = false;
+            self.consume_use_once();
         }
     }
 

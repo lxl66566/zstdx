@@ -184,14 +184,11 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     }
     // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
     // contract.
-    let bytes = match unsafe { dict_bytes(dict_buffer, dict_size) } {
-        Some(bytes) => bytes,
-        None => {
-            return Box::into_raw(Box::new(DDict {
-                dict: Arc::new(zstdx::decoding::Dictionary::raw_content(&[])),
-            }))
-            .cast()
-        },
+    let Some(bytes) = (unsafe { dict_bytes(dict_buffer, dict_size) }) else {
+        return Box::into_raw(Box::new(DDict {
+            dict: Arc::new(zstdx::decoding::Dictionary::raw_content(&[])),
+        }))
+        .cast();
     };
     let parsed = match dict_content_type {
         crate::params::DictContentType::Auto => zstdx::decoding::Dictionary::load(bytes),
