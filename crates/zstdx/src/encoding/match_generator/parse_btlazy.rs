@@ -42,6 +42,7 @@ impl MatchGeneratorDriver {
         // Compare-form verdict (see `LongCompare`): jobs start long,
         // frame rows arm it by the parse feedback below.
         let long_compare = matches!(self.long_compare, LongCompare::Long);
+        let full_reps = matches!(self.rep_probes, RepProbes::Full);
         let seq_mark = seqs.len();
         // Disjoint field borrows: the window (win/ext) against the tables.
         let ldm_won = crate::encoding::btlazy::run_block_lazy(
@@ -49,6 +50,7 @@ impl MatchGeneratorDriver {
             tree_mls,
             step,
             long_compare,
+            full_reps,
             win,
             self.win_base,
             self.block_start,
@@ -69,6 +71,23 @@ impl MatchGeneratorDriver {
         self.anchor = self.block_end;
         self.rep = rep;
         self.rep_pending = rep_pending;
+        // Repcode-probe verdict (see `btlazy::RepProbes`): the repcode
+        // share of the block's emitted sequences is the direct price of
+        // the probe set, and the `Rep0` form keeps emitting rep0
+        // sequences, so a frame whose rep field comes alive re-arms one
+        // block later. Wire off-codes 0 and 1 are the three repcodes.
+        let all_seqs = (seqs.len() - seq_mark) as u64;
+        if all_seqs >= REP_PROBE_MIN {
+            let rep_seqs = seqs[seq_mark..]
+                .iter()
+                .filter(|s| (s.codes >> 16) <= 1)
+                .count() as u64;
+            self.rep_probes = if rep_seqs * REP_PROBE_RATE < all_seqs {
+                RepProbes::Rep0
+            } else {
+                RepProbes::Full
+            };
+        }
         // The arming evidence: one emitted match of LONG_COMPARE_ML bytes
         // or more means a compare verified that length, which is the SIMD
         // kernel's regime. The scan short-circuits early on such shapes.

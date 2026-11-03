@@ -56,6 +56,7 @@
 - [Optimal parser review](dev/review/opt.md)
 - [Window semantics](dev/review/winsem.md)
 - [MT job machinery review](dev/review/mtjobs.md)
+- [R95 encode sprint review](dev/review/r95-sprint.md)
 
 ## Remaining Improvements
 

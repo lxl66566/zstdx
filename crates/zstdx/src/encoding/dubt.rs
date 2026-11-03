@@ -164,7 +164,17 @@ impl PackedPos {
 /// machinery instantiates `true` (the per-job re-sorted shallow trees pay
 /// multi-KiB twin compares), the frame-continuous rows `false` (their
 /// compares are prefix-bounded short and keep the stock scalar loop).
-pub(crate) struct DubtFinder<'a, 'b, const MLS: usize, const LONG: bool = false> {
+/// `REPS` selects the repcode-probe set (see [`super::btlazy::RepProbes`]):
+/// `true` probes all three codes, `false` rep0 alone at ll0-0 searches and
+/// nothing at ll0-1. The dead form compiles the rep loop's bound to one,
+/// leaving every other path of this body source-identical.
+pub(crate) struct DubtFinder<
+    'a,
+    'b,
+    const MLS: usize,
+    const LONG: bool = false,
+    const REPS: bool = true,
+> {
     pub(crate) win: &'a [u8],
     pub(crate) win_base: u64,
     pub(crate) block_end_idx: usize,
@@ -179,7 +189,7 @@ pub(crate) struct DubtFinder<'a, 'b, const MLS: usize, const LONG: bool = false>
     pub(crate) next_update: &'b mut u64,
 }
 
-impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
+impl<const MLS: usize, const LONG: bool, const REPS: bool> DubtFinder<'_, '_, MLS, LONG, REPS> {
     /// The compare proper, in the instantiation's form.
     #[inline(always)]
     fn count(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
@@ -422,7 +432,11 @@ impl<const MLS: usize, const LONG: bool> DubtFinder<'_, '_, MLS, LONG> {
         // Repeated-offset candidates (the cheapest offsets to encode) —
         // same contract as the optimal parser's collection walk.
         if !rep_gated {
-            for rep_code in ll0..3 + ll0 {
+            for rep_code in ll0..if REPS {
+                3 + ll0
+            } else {
+                1
+            } {
                 let rep_offset = if rep_code == 3 {
                     rep[0].saturating_sub(1)
                 } else {

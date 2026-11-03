@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use super::block_enc::compressed::LitStreams;
 use super::{
     Matcher, SeqWord, Sequence,
-    btlazy::{LazyScratch, LazyStep, LongCompare},
+    btlazy::{LazyScratch, LazyStep, LongCompare, REP_PROBE_MIN, REP_PROBE_RATE, RepProbes},
     hugepage::HugeBuf,
     ldm::{LdmSeq, LdmState},
     opt::{OptKnobs, OptScratch, OptState},
@@ -364,6 +364,10 @@ pub struct MatchGeneratorDriver {
     /// arming context; never shapes output (both compare forms are pure
     /// window functions).
     long_compare: LongCompare,
+    /// The btlazy rows' repcode-probe verdict (see [`btlazy::RepProbes`]):
+    /// starts `Full` per frame, flips on the per-block evidence the
+    /// bridge folds below.
+    rep_probes: RepProbes,
     /// Live reach-probe accumulator while a donating entry point runs the
     /// frame's own keep-side blocks as the probe's keep measurement (see
     /// [`super::reach_probe`]); `None` on every other path, so the
@@ -655,6 +659,7 @@ pub struct DriverSeedImage {
     bt_step: BtStepPhase,
 
     long_compare: LongCompare,
+    rep_probes: RepProbes,
     dubt_stale: bool,
     ldm_quiet: u8,
     ldm_dead: bool,
@@ -1213,6 +1218,7 @@ impl MatchGeneratorDriver {
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
             long_compare: LongCompare::Short,
+            rep_probes: RepProbes::Full,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -1292,6 +1298,7 @@ impl MatchGeneratorDriver {
             dubt_head: HeadPhase::Off,
             bt_step: BtStepPhase::Off,
             long_compare: LongCompare::Short,
+            rep_probes: RepProbes::Full,
             probe_stats: None,
             dubt_stale: false,
             ldm: None,
@@ -3097,6 +3104,7 @@ impl MatchGeneratorDriver {
             dubt_head: self.dubt_head,
             bt_step: self.bt_step,
             long_compare: self.long_compare,
+            rep_probes: self.rep_probes,
             dubt_stale: self.dubt_stale,
             ldm_quiet: self.ldm_quiet,
             ldm_dead: self.ldm_dead,
@@ -3313,6 +3321,7 @@ impl MatchGeneratorDriver {
         self.dubt_head = image.dubt_head;
         self.bt_step = image.bt_step;
         self.long_compare = image.long_compare;
+        self.rep_probes = image.rep_probes;
         self.dubt_stale = image.dubt_stale;
         self.ldm_quiet = image.ldm_quiet;
         self.ldm_dead = image.ldm_dead;
@@ -3538,6 +3547,10 @@ impl Matcher for MatchGeneratorDriver {
         // Matches the decoder's per-frame offset_hist reset.
         self.rep = [1, 4, 8];
         self.rep_pending = 0;
+        // The repcode-probe verdict is per-frame evidence (see
+        // `btlazy::RepProbes`): a pooled driver must not carry a dead
+        // verdict into a frame whose head may be repcode-live.
+        self.rep_probes = RepProbes::Full;
         self.lit_lens = DEFAULT_LIT_LENS;
         self.seed_offset = 0;
         self.seed_hits = 0;
@@ -4732,6 +4745,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && a.dubt_head == b.dubt_head
         && a.bt_step == b.bt_step
         && a.long_compare == b.long_compare
+        && a.rep_probes == b.rep_probes
         && a.dubt_stale == b.dubt_stale
         && a.ldm_quiet == b.ldm_quiet
         && a.ldm_dead == b.ldm_dead

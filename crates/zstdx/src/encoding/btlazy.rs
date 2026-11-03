@@ -91,6 +91,35 @@ pub(crate) enum LazyStep {
     Dense,
 }
 
+/// The btlazy rows' repcode-probe set per search (see [`DubtFinder`]'s
+/// `REPS`). The port inherited the optimal parser's candidate set — three
+/// repcode probes per search — which is alive on json-class shapes (a
+/// rep1/rep2 candidate wins at one in 26 searches on text, one in 13 on
+/// json) and dead on narrow-alphabet shapes: skewed's 16 symbols keep the
+/// repeated-offset history permanently pointing at non-matching bytes, so
+/// 58M probes per 32 MiB produce 681 hits, each probe a candidate load
+/// through the miss stream the tree walk waits on. `Full` is the stock
+/// set; `Rep0` probes rep0 alone at ll0-0 searches (the one code that
+/// lives on every shape, and the re-arm evidence) and nothing at ll0-1.
+/// The driver holds the verdict and re-derives it per block from the
+/// parse's own evidence (see [`REP_PROBE_MIN`], [`REP_PROBE_RATE`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum RepProbes {
+    Full,
+    Rep0,
+}
+
+/// Verdict floors: a block emitting at least this many sequences is big
+/// enough to judge. Sparse blocks (text runs about a hundred sequences
+/// per block) leave the verdict untouched, keeping `Full` by default.
+pub(crate) const REP_PROBE_MIN: u64 = 256;
+
+/// Verdict bar: repcode sequences below one sequence in this many is a
+/// dead rep field. The emitted shares read 11 percent on json and 34 on
+/// dll32 against 0.004 on skewed, so the bar sits a factor seven below
+/// the nearest dense shape and a factor 350 above skewed.
+pub(crate) const REP_PROBE_RATE: u64 = 64;
+
 /// The btlazy rows' compare-form verdict (see [`DubtFinder`]'s `LONG`).
 /// Job machinery is always [`LongCompare::Long`]; frame-continuous rows
 /// arm it by parse feedback — a block that emits a match of
@@ -138,6 +167,7 @@ pub(crate) fn run_block_lazy(
     tree_mls: usize,
     step: LazyStep,
     long_compare: bool,
+    full_reps: bool,
     win: &[u8],
     win_base: u64,
     block_start: u64,
@@ -158,8 +188,8 @@ pub(crate) fn run_block_lazy(
     let table_log = table.len().trailing_zeros();
     let bt_mask = bt.len() / 2 - 1;
     macro_rules! go {
-        ($m:literal, $l:literal) => {{
-            let mut finder: DubtFinder<'_, '_, $m, $l> = DubtFinder {
+        ($m:literal, $l:literal, $r:literal) => {{
+            let mut finder: DubtFinder<'_, '_, $m, $l, $r> = DubtFinder {
                 win,
                 win_base,
                 block_end_idx,
@@ -173,7 +203,7 @@ pub(crate) fn run_block_lazy(
                 min_match: knobs.min_match as usize,
                 sufficient_len: knobs.sufficient_len as usize,
             };
-            block_lazy_segments::<$m, $l>(
+            block_lazy_segments::<$m, $l, $r>(
                 step,
                 &mut finder,
                 lit_lens,
@@ -196,22 +226,28 @@ pub(crate) fn run_block_lazy(
     // the constprop libzstd gets from its `ZSTD_BtFindBestMatch_noDict_5`
     // template instantiations. `long_compare` monomorphizes the compare
     // form (see [`DubtFinder`]'s `LONG`).
-    match (tree_mls, long_compare) {
-        (3, false) => go!(3, false),
-        (3, true) => go!(3, true),
-        (4, false) => go!(4, false),
-        (4, true) => go!(4, true),
-        (_, false) => go!(5, false),
-        (_, true) => go!(5, true),
+    match (tree_mls, long_compare, full_reps) {
+        (3, false, false) => go!(3, false, false),
+        (3, false, true) => go!(3, false, true),
+        (3, true, false) => go!(3, true, false),
+        (3, true, true) => go!(3, true, true),
+        (4, false, false) => go!(4, false, false),
+        (4, false, true) => go!(4, false, true),
+        (4, true, false) => go!(4, true, false),
+        (4, true, true) => go!(4, true, true),
+        (_, false, false) => go!(5, false, false),
+        (_, false, true) => go!(5, false, true),
+        (_, true, false) => go!(5, true, false),
+        (_, true, true) => go!(5, true, true),
     }
 }
 
 /// The block loop proper, monomorphized over the tree hash width and the
 /// compare form.
 #[allow(clippy::too_many_arguments)]
-fn block_lazy_segments<const MLS: usize, const LONG: bool>(
+fn block_lazy_segments<const MLS: usize, const LONG: bool, const REPS: bool>(
     step: LazyStep,
-    finder: &mut DubtFinder<'_, '_, MLS, LONG>,
+    finder: &mut DubtFinder<'_, '_, MLS, LONG, REPS>,
     lit_lens: &[u8; 256],
     ldm_seqs: &[LdmSeq],
     block_start: u64,
