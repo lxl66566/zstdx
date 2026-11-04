@@ -8,7 +8,7 @@ Each commit was read against the HEAD state, its perf and negative doc sections 
 
 ## Findings
 
-### 1. Medium — the split sweep's window-floor guard disarms the long compare on the late ultra jobs
+### 1. Medium — the split sweep's window-floor guard disarms the long compare on the late ultra jobs (fixed)
 
 `run_once`'s arm (the guard at `opt.rs:1799`, above the `update_tree_strip` call) requires `strip_from >= (win_base + block_end).saturating_sub(max_window)`. `block_end` is an absolute position and the floor of an absolute fill target is `target - max_window`, so the `win_base +` term mixes the window-base coordinate into an absolute one and makes the guard stricter than its proof needs. The byte-exactness condition is that the cursor sits at or above the floor of the parse's first search target, which is `block_start - max_window`: a strip job's first search targets exactly `block_start`, and the split sweep then starts where the stock first fill would.
 
@@ -17,6 +17,8 @@ The widened adoption's ultra jobs hold that condition with equality, because the
 Bytes are unaffected either way, since the split sweep is byte-identical to the stock crossing by construction; the loss is silent. Two doc claims overstate the kernel's reach as landed: `perf/matchers.md`'s R95 section names the widened window class as the kernel's buyer, and `perf/mt-stream.md`'s R95 section lists the long-compare kernel as one of the two levers the widened adoption rests on. The far window is indexed either way; on the disarmed jobs the insert descents pay the scalar compare.
 
 The fix is a behavior-affecting change on the hottest path (compare-form selection, a wall question rather than a byte question) and needs its own round: compare against `block_start.saturating_sub(max_window)`, then gate with the dump ladders plus an interleaved Ir and wall A/B on dll100 ultra.
+
+Fixed in the R1 follow-up round: the guard now floors the sweep against `block_start.saturating_sub(max_window)`, the floor of the sweep's own target (the block's first search position), so the seed-rewound cursor every bulk ultra job presents at its first block arms with equality. The relaxation is one-directional — the old floor dominates the new one, so the arm set can only grow — and instrumented runs pinned the growth: on dll100 the fix adds exactly six arm sites, the five seed-rewound first blocks of the bulk path's ultra jobs 8-12 plus the stream path's job-one crossing on its stock 8 MiB domain (an LDM-unarmed shape), with every other fire identical. The opt rows hold the arm on dll100 as well, their strip-prefill cursor clearing even the over-floored guard, and the stream jobs' first blocks never present the seed-rewound cursor. Gates: both dump ladders and the dll100/dll32 opt and ultra emitframes (bulk and pledged stream, w4 and w8) byte-identical across the two builds, the suites green, and a locked interleaved wall A/B (dll100 and dll32, opt and ultra, stream-mt8 with the bulk-mt8 ceiling) reading the late ultra bulk jobs faster at the mt8 ceiling (29-31 to 30-33 MiB/s on dll100), the stream-mt8 cells and dll32 flat, the single-threaded controls flat or faster.
 
 ### 2. Low — `run_ldm_feed`'s panic handling is open to a lock-held panic
 
@@ -52,4 +54,4 @@ After the far tier landed, the two fills differed only in the `insert_bt1` insta
 
 ## Doc consistency
 
-`perf/mt-stream.md`'s R91, R92 and R93 sections and `negative/mt-stream.md`'s R92 and R95 entries match the code, checked item by item (admission ceiling at the parse start, feed engagement keys, staging span arithmetic, cancel rule, far-tier boundary at the prefill's fill bound). The two R95 kernel-carriage claims named in finding 1 are the only mismatches; they should be re-worded or the guard fixed, whichever round picks the finding up first.
+`perf/mt-stream.md`'s R91, R92 and R93 sections and `negative/mt-stream.md`'s R92 and R95 entries match the code, checked item by item (admission ceiling at the parse start, feed engagement keys, staging span arithmetic, cancel rule, far-tier boundary at the prefill's fill bound). The two R95 kernel-carriage claims named in finding 1 were the only mismatches; the R1 follow-up fixed the guard and re-worded both claims against the post-fix measurements.

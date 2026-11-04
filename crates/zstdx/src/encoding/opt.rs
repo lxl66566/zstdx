@@ -1788,15 +1788,17 @@ fn run_once<const ULTRA: bool>(
     // the cursor sits below the block — so frame-continuous parses (and
     // every steady block past the crossing) never take it and keep the
     // stock scalar fill untouched. The window-floor guard keeps the split
-    // byte-exact: with the cursor at or above the floor of any target in
-    // this block, the stock first crossing would begin at the same cursor.
+    // byte-exact: the sweep's target is the block's first search position
+    // (`block_start`), so the floor is `block_start - max_window`, and a
+    // cursor at or above it starts the sweep exactly where the stock first
+    // crossing would.
     let strip_from = (*finder.next_update).max(win_base);
     if strip_top > 0
         && strip_from < block_start
         // The sweep target keeps update_tree's HASH_READ margin (a short
         // final block leaves the crossing to the parse's own calls).
         && block_start + HASH_READ as u64 <= block_end
-        && strip_from >= (win_base + block_end).saturating_sub(max_window)
+        && strip_from >= block_start.saturating_sub(max_window)
     {
         finder.update_tree_strip((block_start - win_base) as usize);
     }
