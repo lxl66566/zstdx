@@ -2889,4 +2889,219 @@ mod mt_dict {
         zstd::stream::copy_decode(stock.as_slice(), &mut reference).unwrap();
         assert_eq!(reference, data, "reference decode of the wrapped frame");
     }
+
+    /// The opt family's serial LDM feed on the pledged stream (R92's
+    /// stream arm): the posting thread's incremental pass publishes the
+    /// same candidates the bulk feed thread publishes over the same
+    /// absolute chunk lattice, so the armed pledged stream is
+    /// byte-identical to the bulk mt frame at every worker count and
+    /// write chunking, and stays fixed across encoders (the pooled
+    /// states must not carry another frame's candidates). The unpledged
+    /// twin keeps the growing grid's stock bytes whatever the switch
+    /// says (the R89 map's exclusion), a single-job pledge never arms,
+    /// and the armed frame beats the stock per-job model on the far
+    /// fixture.
+    #[test]
+    fn opt_serial_ldm_feed_pledged_stream_matches_bulk() {
+        const MIB: usize = 1024 * 1024;
+        let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
+        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let opts = |level: Level, workers: u32| {
+            EncoderOptions::new(level)
+                .workers(workers)
+                .checksum(true)
+                .pledged_size(Some(data.len() as u64))
+        };
+        let stream = |level: Level, workers: u32, chunk: usize| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts(level, workers)).unwrap();
+            for piece in data.chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        for (level, workers, chunk) in [
+            (Level::Opt, 2u32, usize::MAX),
+            (Level::Opt, 4, MIB),
+            // A cadence off the block lattice is the discriminator: the
+            // publication must park at chunk boundaries whatever the
+            // write sizes leave buffered at a post.
+            (Level::Opt, 4, 7 * 1024),
+            (Level::Opt, 8, 999_983),
+            (Level::Ultra, 2, usize::MAX),
+            (Level::Ultra, 4, 7 * 1024),
+        ] {
+            let frame = stream(level, workers, chunk);
+            let bulk = bulk::compress_with(&data, &opts(level, workers)).unwrap();
+            assert_eq!(
+                frame, bulk,
+                "{level:?} workers {workers} chunk {chunk}: the armed stream equals the bulk feed \
+                 frame"
+            );
+            let back = bulk::decompress_with(&frame, 0, &crate::DecoderOptions::new()).unwrap();
+            assert_eq!(back, data, "{level:?} workers {workers} chunk {chunk}");
+            let mut reference = Vec::new();
+            zstd::stream::copy_decode(frame.as_slice(), &mut reference).unwrap();
+            assert_eq!(reference, data, "{level:?} workers {workers} chunk {chunk}");
+        }
+        assert_eq!(
+            stream(Level::Opt, 4, MIB),
+            stream(Level::Opt, 4, MIB),
+            "frame determinism across encoders"
+        );
+        // The stock per-job model is the reference the stream arm must
+        // beat, and the unpledged twin never arms: its bytes are the
+        // growing grid's stock ones with the switch on or off.
+        encoding::set_ldm_feed_for_tests(false);
+        let stock = stream(Level::Opt, 4, MIB);
+        let open = {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Opt).workers(4).checksum(true),
+            )
+            .unwrap();
+            for piece in data.chunks(MIB) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        encoding::set_ldm_feed_for_tests(true);
+        let armed = stream(Level::Opt, 4, MIB);
+        assert_ne!(stock, armed, "the stream arm must move the armed cells");
+        assert!(
+            armed.len() < stock.len(),
+            "the far class must pay: armed {} vs stock {}",
+            armed.len(),
+            stock.len()
+        );
+        let open_armed = {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Opt).workers(4).checksum(true),
+            )
+            .unwrap();
+            for piece in data.chunks(MIB) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        assert_eq!(
+            open, open_armed,
+            "an unpledged stream keeps the per-job model"
+        );
+        // A pledge below one job never arms (job zero already runs the
+        // frame-continuous LDM of a frame start): the bytes stay stock.
+        let short = &data[..512 * 1024];
+        let short_frame = |feed_on: bool| {
+            encoding::set_ldm_feed_for_tests(feed_on);
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Opt)
+                    .workers(4)
+                    .checksum(true)
+                    .pledged_size(Some(short.len() as u64)),
+            )
+            .unwrap();
+            enc.write_all(short).unwrap();
+            enc.finish().unwrap();
+            sink
+        };
+        let on = short_frame(true);
+        let off = short_frame(false);
+        assert_eq!(on, off, "a single-job pledge never arms");
+        let back = bulk::decompress_with(&on, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, short);
+    }
+
+    /// A flush cuts jobs off the fixed grid, so the armed stream departs
+    /// from the bulk frame there by design (a flush block is a semantic
+    /// boundary); the feed's spans then end at the lattice point below the
+    /// flush cut, a pure function of the cadence. The pins are the
+    /// roundtrip through both decoders and the frame's repeatability
+    /// across encoders, at a cut off the block lattice.
+    #[test]
+    fn opt_serial_ldm_feed_pledged_stream_flush_cadence() {
+        const MIB: usize = 1024 * 1024;
+        let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
+        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let flushed = || {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(
+                &mut sink,
+                EncoderOptions::new(Level::Opt)
+                    .workers(4)
+                    .checksum(true)
+                    .pledged_size(Some(data.len() as u64)),
+            )
+            .unwrap();
+            for piece in data.chunks(3 * MIB + 7 * 1024) {
+                enc.write_all(piece).unwrap();
+                enc.flush().unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        let a = flushed();
+        let b = flushed();
+        assert_eq!(a, b, "flush-cadence frame determinism across encoders");
+        let back = bulk::decompress_with(&a, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data, "our decoder roundtrips the flushed frame");
+        let mut reference = Vec::new();
+        zstd::stream::copy_decode(a.as_slice(), &mut reference).unwrap();
+        assert_eq!(reference, data, "reference decoder roundtrips");
+    }
+
+    /// A job starting past the feed window borrows a frozen view whose
+    /// base sits past zero, so the published splits must arrive re-based
+    /// into the view's coordinates (the consumer's matcher runs
+    /// view-relative): absolute splits would offset every candidate by
+    /// the view base and the job would parse its region against the
+    /// candidates of a region one base earlier — the dll100 scale gap
+    /// this class produced. A forced window at the mid-size bar keeps
+    /// the crossing inside a 41 MiB fixture (the stock row window would
+    /// need a pledge past 72 MiB before any job start exceeds it).
+    #[test]
+    fn opt_serial_ldm_feed_pledged_stream_matches_bulk_past_the_window() {
+        const MIB: usize = 1024 * 1024;
+        let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
+        let data = deep_band_far_fixture(41 * MIB + 123 * 1024, 5 * MIB);
+        let shape = crate::InputShape::default().with_window_log(25);
+        let opts = |level: Level, workers: u32| {
+            EncoderOptions::new(level)
+                .workers(workers)
+                .checksum(true)
+                .with_input_shape(shape)
+                .pledged_size(Some(data.len() as u64))
+        };
+        for (level, workers, chunk) in [
+            (Level::Opt, 4u32, MIB),
+            // A cadence off the block lattice, so the posting-side re-base
+            // is exercised at whatever buffer state a post lands on.
+            (Level::Ultra, 4, 999_983),
+        ] {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts(level, workers)).unwrap();
+            for piece in data.chunks(chunk) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            let bulk = bulk::compress_with(&data, &opts(level, workers)).unwrap();
+            assert_eq!(
+                sink, bulk,
+                "{level:?} workers {workers}: a job past the window keeps matching the bulk feed \
+                 frame"
+            );
+            let back = bulk::decompress_with(&sink, 0, &crate::DecoderOptions::new()).unwrap();
+            assert_eq!(back, data, "{level:?} workers {workers}");
+            let mut reference = Vec::new();
+            zstd::stream::copy_decode(sink.as_slice(), &mut reference).unwrap();
+            assert_eq!(reference, data, "{level:?} workers {workers}");
+        }
+    }
 }

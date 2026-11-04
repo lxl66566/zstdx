@@ -125,14 +125,16 @@ use crate::{
             CompressState, JobSpf, compress_job_blocks_inner, reset_slice_state_mode,
         },
         frame_header::FrameHeader,
+        ldm::LdmSeq,
         match_generator::{
             LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX,
             SPF_SEG, StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
-            CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, btlazy_job_size, capture_band,
-            capture_job_size, deep_ldm_band, donate_keep_span, fast_capture_schedule,
-            head_predicts_keep, job_size_for, job_size_for_level, prepare_job_state, run_job_with,
+            CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, SerialLdmFeed, btlazy_job_size,
+            capture_band, capture_job_size, deep_ldm_band, donate_keep_span, fast_capture_schedule,
+            head_predicts_keep, job_size_for, job_size_for_level, opt_ldm_feed_band,
+            prepare_job_state, run_job_with,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -219,6 +221,21 @@ enum DeepLdm {
     Engaged,
     /// A non-class frame, a cancelled staging, or a resolution site that
     /// could not read the head: the stock per-job strip model stands.
+    Off,
+}
+
+/// The opt family's serial-LDM feed schedule state (see
+/// `mt::opt_ldm_feed_band` and [`MtEncoderCore::resolve_opt_feed`]):
+/// pledged only — the open frame's growing grid keeps the per-job model,
+/// its tail re-slice keyed on the worker count (the R89 map's stance).
+enum OptFeed {
+    /// The resolution has not run yet: the first post resolves it.
+    Pending,
+    /// The frame engaged: this thread runs the frame-continuous feed and
+    /// every job consumes its published far-candidate span.
+    Engaged,
+    /// A non-class frame, a single-job pledge, a dictionary frame or a
+    /// pledge past the buffer cap: the per-job strip model stands.
     Off,
 }
 
@@ -359,6 +376,12 @@ enum JobSpfStream {
     /// [`JobSpf::Windowed`] with no snapshot: `windowed_ldm_prefill`
     /// fills `[start - window, start)` from zero.
     Windowed,
+    /// The serial LDM feed's published span for this job (the opt rows'
+    /// far class, see [`MtEncoderCore::resolve_opt_feed`]): computed on
+    /// the posting thread at post time, so the worker consumes it
+    /// without waiting. `window` is the feed's reach (the gate replay's
+    /// span and the job's adopted match window).
+    Feed(Arc<Vec<LdmSeq>>, u64),
 }
 
 impl Clone for JobSpfStream {
@@ -367,6 +390,7 @@ impl Clone for JobSpfStream {
             Self::None => Self::None,
             Self::Whole(snap) => Self::Whole(snap.clone()),
             Self::Windowed => Self::Windowed,
+            Self::Feed(seqs, window) => Self::Feed(seqs.clone(), *window),
         }
     }
 }
@@ -887,6 +911,22 @@ fn run_claimed_job(
                         },
                         job.ldm_mode,
                     ),
+                    // The serial feed's job (the opt rows' far class): the
+                    // posted span replaces the driver's own LDM, the
+                    // window arg is the adopted row window.
+                    JobSpfStream::Feed(seqs, window) => run_job_with(
+                        state,
+                        src,
+                        *first..frozen.end,
+                        *overlap,
+                        *last_frame_block,
+                        job.level,
+                        job.shape,
+                        job.choice,
+                        *ldm,
+                        JobSpf::Feed(seqs.as_slice(), window),
+                        job.ldm_mode,
+                    ),
                 }
             };
             // Arm the job-bytes wall: the assembly checkpoint (the next
@@ -1028,6 +1068,18 @@ pub(crate) struct MtEncoderCore {
     /// prefill — the bulk schedule for the same frame, keeping the
     /// pledged-equals-bulk contract on the class.
     deep_ldm: DeepLdm,
+    /// The opt family's serial-LDM feed engagement (see
+    /// `mt::opt_ldm_feed_band`): resolved once at the first post (see
+    /// [`Self::resolve_opt_feed`]) on a pledged fixed-grid frame,
+    /// widening `overlap` to the row window — the bulk schedule's own
+    /// widened adoption — and handing each job its published
+    /// far-candidate span, keeping the pledged-equals-bulk contract on
+    /// the class.
+    opt_feed: OptFeed,
+    /// The engaged frame's feed state, advanced on this thread (the
+    /// posting thread is the pump, the bulk feed's scope thread
+    /// restructured as an incremental pass over the buffered bytes).
+    feed: Option<SerialLdmFeed>,
     /// The fast rows' far-class capture (see [`FastCapture`]): the
     /// pledged fast row's staging state, then its engaged schedule.
     fast_capture: FastCapture,
@@ -1318,6 +1370,8 @@ impl MtEncoderCore {
                 FarClass::Pending
             },
             deep_ldm: DeepLdm::Pending,
+            opt_feed: OptFeed::Pending,
+            feed: None,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             // Pledged dictionary frames alone: the open-ended twin keeps
@@ -2211,6 +2265,92 @@ impl MtEncoderCore {
         self.reserve_decided();
     }
 
+    /// Resolve the opt family's serial-LDM feed once per frame (see
+    /// `mt::opt_ldm_feed_band`): the pledged twin of the bulk dispatch's
+    /// arming, resolved at the same first-post site the deep band uses,
+    /// so the head block the predicate screens is long since buffered
+    /// and the verdict is a pure function of the input. The bars mirror
+    /// the bulk side's — more than one job (a single job already runs
+    /// the frame-continuous LDM of a frame start) and no dictionary (its
+    /// job zero is the seed job) — plus the stream's own two: the fixed
+    /// grid the constructor cut is the bulk one, and the pledge must fit
+    /// the accumulate buffer's cap, because the feed's window view is
+    /// the buffer itself (a wrapping stream loses the head the bulk gate
+    /// keeps, and which span a wrap keeps is a recycling-timing
+    /// function). The engagement widens `overlap` to the row window (the
+    /// R95 widened adoption) and the jobs' published spans replace the
+    /// per-job LDM restart, so the pledged stream keeps matching the
+    /// bulk frame byte for byte on the class.
+    fn resolve_opt_feed(&mut self) {
+        if !matches!(self.opt_feed, OptFeed::Pending) {
+            return;
+        }
+        let Some(n) = self.pledged else {
+            self.opt_feed = OptFeed::Off;
+            return;
+        };
+        // The whole stream must stay resident: the decided reserve covers
+        // a pledge at or below the cap with no recycle point left.
+        if n.saturating_add(64 * 1024) > BUF_CAP_MAX as u64 {
+            self.opt_feed = OptFeed::Off;
+            return;
+        }
+        let JobGrid::Fixed(size) = self.grid else {
+            self.opt_feed = OptFeed::Off;
+            return;
+        };
+        if self.dict.is_some()
+            || self.job_start != 0
+            || self.buf_base != 0
+            || n.div_ceil(size as u64) <= 1
+        {
+            self.opt_feed = OptFeed::Off;
+            return;
+        }
+        // The head screen must read the frame's whole first block exactly
+        // as the bulk planner's does: resolving off a short buffer would
+        // screen a different sample. An armed frame is multi-job, so the
+        // block is long since smaller than the pledge; staying `Pending`
+        // off a short buffer is fine, the resolving sites run again.
+        if self.buf.len() < MAX_BLOCK_SIZE as usize {
+            return;
+        }
+        self.opt_feed = OptFeed::Off;
+        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let Some(window) =
+            opt_ldm_feed_band(self.level, self.shape, self.choice, head, self.ldm_mode)
+        else {
+            return;
+        };
+        // The retain's bar is the stock strip — the same reach the bulk
+        // gate filters with — captured before the widening below.
+        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
+        self.feed = Some(SerialLdmFeed::new(window, reach, n));
+        self.overlap = window as usize;
+        self.opt_feed = OptFeed::Engaged;
+        self.reserve_decided();
+    }
+
+    /// Advance the engaged feed over the buffered bytes before any post
+    /// reads a span: jobs post only once their bytes are complete, so
+    /// the publication always covers the job being posted and a worker
+    /// never waits on the feed.
+    fn advance_feed(&mut self) {
+        if self.feed.is_none() {
+            return;
+        }
+        #[cfg(feature = "job_trace")]
+        let trace_feed = std::time::Instant::now();
+        debug_assert_eq!(self.buf_base, 0);
+        let pos = self.pos;
+        // Disjoint field borrows: the state mutates while the buffer
+        // only reads.
+        let feed = self.feed.as_mut().expect("checked above");
+        feed.advance(&self.buf, pos);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_spf_build(trace_feed);
+    }
+
     /// The far-class screens over the live buffer: the head engagement
     /// pass, then far-repeat dominance over the first job's span. Pure
     /// buffer functions of `(buf, overlap, reach)` — the verdict
@@ -2417,6 +2557,12 @@ impl MtEncoderCore {
             self.resolve_deep_ldm();
         }
         self.settle_dict_capture();
+        // The feed's engagement resolves ahead of the posting gate below:
+        // `post_due` must know the frame runs the feed to hold a job whose
+        // covering lattice chunk is still short (the publication parks at
+        // chunk boundaries). The resolve itself waits for the head block,
+        // so an early call off a short buffer is a no-op.
+        self.resolve_opt_feed();
         loop {
             // A verdict that already landed is consumed for free here (the
             // finish path then never waits on it); a pending one is only
@@ -2452,6 +2598,15 @@ impl MtEncoderCore {
         }
     }
 
+    /// The input extent the feed must have published before the job
+    /// ending at `end` may post: the whole lattice chunk covering `end`
+    /// (the final chunk truncates at the pledge, so the capped `min`
+    /// covers a `finish`-tail job too).
+    fn feed_cover(&self, end: u64) -> u64 {
+        let mbs = MAX_BLOCK_SIZE as u64;
+        (end.div_ceil(mbs) * mbs).min(self.pledged.unwrap_or(u64::MAX))
+    }
+
     /// Whether the job starting at `job_start` (ending at `end`) may post
     /// now. The fixed grid's boundaries never depend on the posting cadence
     /// (its build_bounds never re-slices), so each job posts the moment it
@@ -2473,6 +2628,14 @@ impl MtEncoderCore {
                     && end >= n
                     && self.pos <= n
                 {
+                    return false;
+                }
+                // The feed publishes whole block-lattice chunks: a job may
+                // post only once the chunk covering its end is buffered,
+                // or its span would miss the splits near the boundary. The
+                // wait stays under one block of stream, so it never holds
+                // the pump behind the pledge.
+                if self.feed.is_some() && self.pos < self.feed_cover(end) {
                     return false;
                 }
                 true
@@ -2843,6 +3006,8 @@ impl MtEncoderCore {
         debug_assert!(self.donation.is_none() || !self.pool_threads.is_empty());
         self.resolve_far_class();
         self.resolve_deep_ldm();
+        self.resolve_opt_feed();
+        self.advance_feed();
         let strip = self.strip_span();
         let strip_lo = self.job_start.saturating_sub(strip as u64);
         debug_assert!(self.buf_base <= strip_lo);
@@ -2884,7 +3049,17 @@ impl MtEncoderCore {
         // posted before, so the pool exists and this arm stays cold), and
         // the deep rows' engaged schedule takes every job windowed the
         // same way.
-        let spf = if matches!(self.deep_ldm, DeepLdm::Engaged) {
+        // The engaged feed's span is final here like any post's (the
+        // advance above covers the buffered bytes this inline job reads).
+        // A belt arm: an engaged frame has posted before, so the pool
+        // exists and the inline path stays cold on it.
+        let feed_span = self
+            .feed
+            .as_ref()
+            .map(|f| (f.span_for(self.job_start, hi, strip_lo), f.window()));
+        let spf = if let Some((span, window)) = &feed_span {
+            JobSpf::Feed(span, *window)
+        } else if matches!(self.deep_ldm, DeepLdm::Engaged) {
             JobSpf::Windowed(None)
         } else {
             match &self.fast_capture {
@@ -2930,6 +3105,8 @@ impl MtEncoderCore {
         // of the strip this very job's view borrows.
         self.resolve_far_class();
         self.resolve_deep_ldm();
+        self.resolve_opt_feed();
+        self.advance_feed();
         // The post cadence is also the assembly and panic-surfacing cadence:
         // per-write calls would burn millions of polls on the pump path.
         self.surface_poison();
@@ -2971,16 +3148,20 @@ impl MtEncoderCore {
         // rows) or the engaged fast capture's SelfFill split — the two
         // never coexist (the tail build is growing-grid-only, the capture
         // fixed-grid-only), and both are pure functions of the job start.
-        let spf = match spf {
-            Some(snap) => JobSpfStream::Whole(snap),
-            // The deep rows' engaged windowed schedule: every job owns its
-            // whole-window LDM fill (job zero's empty span folds to the
-            // stock job-start state).
-            None if matches!(self.deep_ldm, DeepLdm::Engaged) => JobSpfStream::Windowed,
-            None => match &self.fast_capture {
-                FastCapture::Engaged { med } if start > *med => JobSpfStream::Windowed,
-                _ => JobSpfStream::None,
-            },
+        let spf = if let Some(feed) = &self.feed {
+            JobSpfStream::Feed(Arc::new(feed.span_for(start, end, strip_lo)), feed.window())
+        } else {
+            match spf {
+                Some(snap) => JobSpfStream::Whole(snap),
+                // The deep rows' engaged windowed schedule: every job owns
+                // its whole-window LDM fill (job zero's empty span folds
+                // to the stock job-start state).
+                None if matches!(self.deep_ldm, DeepLdm::Engaged) => JobSpfStream::Windowed,
+                None => match &self.fast_capture {
+                    FastCapture::Engaged { med } if start > *med => JobSpfStream::Windowed,
+                    _ => JobSpfStream::None,
+                },
+            }
         };
         let job = Arc::new(Job {
             level: self.level,
@@ -3434,6 +3615,48 @@ mod tests {
         out
     }
 
+    /// The feed's stream-side arming bars at the core level: a multi-job
+    /// pledge inside the buffer cap engages (the head long since staged),
+    /// while a pledge past the cap stays on the per-job model — a wrap
+    /// would recycle the frame head the feed's window view needs, and
+    /// which span a wrap keeps is a recycling-timing function.
+    #[test]
+    fn opt_feed_arming_caps_at_the_buffer() {
+        let mib = 1024 * 1024u64;
+        let mut head = Vec::new();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let patterns: Vec<_> = (0..96)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                state.to_le_bytes()
+            })
+            .collect();
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < mib as usize {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        let armed = &EncoderOptions::new(Level::Opt)
+            .workers(4)
+            .pledged_size(Some(33 * mib + 1));
+        let mut core = MtEncoderCore::new(armed);
+        core.write(&head).unwrap();
+        assert!(matches!(core.opt_feed, OptFeed::Engaged));
+        // The engagement widens the strip to the feed's own window (the
+        // R95 widened adoption): 33 MiB clamps the row window at 2^26.
+        let window = core.feed.as_ref().expect("engaged").window();
+        assert_eq!(window, 1 << 26);
+        assert_eq!(core.overlap, window as usize);
+
+        let capped = &EncoderOptions::new(Level::Opt)
+            .workers(4)
+            .pledged_size(Some(BUF_CAP_MAX as u64));
+        let mut core = MtEncoderCore::new(capped);
+        core.write(&head).unwrap();
+        assert!(matches!(core.opt_feed, OptFeed::Off));
+        assert!(core.feed.is_none());
+    }
+
     /// The unpledged schedule keeps a burst's jobs equal while a pledged one
     /// keeps the fixed bulk grid.
     #[test]
@@ -3765,6 +3988,91 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let n = decoder.decode_all(&core.output, &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// The stepped drain's handoff contract: past EOF every pump pull
+    /// advances one `finish_step(true)` slice, and a slice must be able to
+    /// return with assembled output undelivered while a later job is still
+    /// pending — the read path delivers between slices, so bytes flow
+    /// during the straggler wait instead of stacking behind it. A pull
+    /// that returns while `finishing && !finished` can only have taken the
+    /// handoff arm (the step blocks otherwise), so the state itself is the
+    /// pin. The fixture needs the straggler window in every profile: the
+    /// tail's textish parse runs orders of magnitude slower than the
+    /// pump's memcpy even in release, so the last job is still running
+    /// when the EOF pull steps the drain and the random-head jobs'
+    /// assemblies land while it runs. A random-only fixture collapses
+    /// that margin under the assemble cost in release and the pin goes
+    /// racy.
+    #[test]
+    fn finish_step_hands_off_undelivered_output() {
+        // The read loop's own shape: pull, deliver through `split_output`
+        // (the wall-maintaining consumer), pull again.
+        fn deliver(core: &mut MtEncoderCore, delivered: &mut Vec<u8>) {
+            while core.pending_output() > 0 {
+                let mut chunk = vec![0u8; core.pending_output()];
+                let n = core.split_output(&mut chunk);
+                delivered.extend_from_slice(&chunk[..n]);
+            }
+        }
+        // A random head (free of the long-match skips that make fully
+        // compressible fixtures finish inside a feed pull) plus a slow
+        // textish tail carrying the straggler job.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut data = (0..8 * 1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 33) as u8
+            })
+            .collect::<Vec<_>>();
+        data.extend_from_slice(&textish(4 * 1024 * 1024));
+        let mut core = MtEncoderCore::new(
+            &EncoderOptions::new(Level::Opt)
+                .workers(2)
+                .pledged_size(Some(data.len() as u64)),
+        );
+        let mut src = &data[..];
+        let mut delivered = Vec::new();
+        let mut handed_off = false;
+        while !core.is_finished() {
+            core.pump_direct(&mut src).unwrap();
+            if core.finishing && !core.finished {
+                handed_off = true;
+            }
+            deliver(&mut core, &mut delivered);
+        }
+        deliver(&mut core, &mut delivered);
+        assert!(
+            handed_off,
+            "some finish step must hand off undelivered output"
+        );
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&delivered, &mut out).unwrap();
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
+    }
+
+    /// `close_empty`'s closing shape: a stream that fed nothing closes
+    /// through the read path's own steps — the single EOF pull runs
+    /// `finish_begin` and the first `finish_step`, which finds no pending
+    /// job and closes through `finish_end`'s empty raw last block — the
+    /// single-threaded path's own closer, not a dedicated empty-frame arm.
+    #[test]
+    fn empty_stream_closes_through_the_step_path() {
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(2));
+        let mut src = &b""[..];
+        core.pump_direct(&mut src).unwrap();
+        assert!(core.is_finished(), "the empty close needs no second pull");
+        assert!(core.close_empty);
+        // The frame ends with the empty raw last block (a 3-byte header:
+        // last-block bit set, raw type, size 0), behind the checksum the
+        // `hash` feature's default appends.
+        let cksum = cfg!(feature = "hash") as usize * 4;
+        let tail = &core.output[core.output.len() - cksum - 3..core.output.len() - cksum];
+        assert_eq!(tail, &[1, 0, 0], "the closer is the empty raw last block");
+        let mut decoder = FrameDecoder::new();
+        let n = decoder.decode_all(&core.output, &mut []).unwrap();
+        assert_eq!(n, 0);
     }
 
     /// Scripted writer: each scripted call accepts n bytes (or errors); past

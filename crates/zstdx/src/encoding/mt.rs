@@ -873,6 +873,12 @@ static RAMP_TEST_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Test-only serial-feed override (see `set_ldm_feed_for_tests`).
 static FEED_TEST_OVERRIDE: AtomicBool = AtomicBool::new(true);
 
+/// Serializes the tests that flip the process-global feed switch: the
+/// bulk feed test and the pledged-stream feed test both hold the stock
+/// bytes as their reference through it.
+#[cfg(test)]
+pub(crate) static FEED_TEST_SWITCH: Mutex<()> = Mutex::new(());
+
 /// Test-only ramp override (env parsing is process-global; tests must not
 /// race other tests' encodes through `set_var`). Hidden: not API-stable.
 #[doc(hidden)]
@@ -1276,6 +1282,14 @@ struct LdmFeedGate {
     panicked: bool,
 }
 
+/// Test injection: the input base address whose serial LDM feed panics
+/// instead of running (null disables). Keyed to one input's address so a
+/// concurrently running test's encode never trips it in the shared-process
+/// test harness. Compiled out of non-test builds.
+#[cfg(test)]
+static FEED_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 /// One frame-continuous LDM generation pass over the whole declared input
 /// (the serial feed, R89 map): chunk-bounded forward counts like the
 /// frame-continuous parse's own block-bounded generation, publishing after
@@ -1292,6 +1306,15 @@ fn run_ldm_feed(
     #[cfg(feature = "job_trace")]
     let trace_feed = std::time::Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Test injection (see `FEED_PANIC_INPUT`): fires before the first
+        // publish, so parked waiters exercise the lost-wakeup arm of the
+        // panic protocol.
+        #[cfg(test)]
+        if !FEED_PANIC_INPUT.load(Ordering::Relaxed).is_null()
+            && FEED_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == src.as_ptr()
+        {
+            panic!("injected ldm feed panic");
+        }
         let window = gate.lock().unwrap().window;
         let mut ldm = LdmState::new(window.ilog2(), window);
         let mut chunk = Vec::new();
@@ -1349,6 +1372,107 @@ fn take_feed_span(
             .copied()
             .collect(),
     )
+}
+
+/// The streaming core's serial LDM feed (the pledged arm of the opt
+/// rows' feed, see `opt_ldm_feed_band`): the frame-continuous
+/// `LdmState` lives on the posting thread — the pump, the one thread
+/// that already sees every byte before any job can — and advances as
+/// the pump buffers bytes, walking the same absolute block-chunk lattice
+/// the bulk feed thread walks, so the publication is bit-identical to
+/// the bulk gate's over the same input. Spans are taken at post time (a
+/// job posts only once its bytes are buffered and the advance covers
+/// them first), so no consumer ever waits.
+pub(crate) struct SerialLdmFeed {
+    state: LdmState,
+    /// Published candidates, split-ascending (generation appends them in
+    /// input order).
+    seqs: Vec<LdmSeq>,
+    /// Input extent whose candidates are published.
+    published: u64,
+    /// The row window: the jobs' adopted match window (the R95 widened
+    /// adoption) and the gate replay's span.
+    window: u64,
+    /// The beyond-reach retain's bar (the stock strip) — the same filter
+    /// `take_feed_span` applies on the bulk side.
+    reach: u64,
+    /// The pledge: the one lattice boundary besides the block multiples
+    /// (the bulk walk's own final chunk truncates there).
+    frame_end: u64,
+}
+
+impl SerialLdmFeed {
+    pub(crate) fn new(window: u64, reach: u64, frame_end: u64) -> Self {
+        Self {
+            state: LdmState::new(window.ilog2(), window),
+            seqs: Vec::new(),
+            published: 0,
+            window,
+            reach,
+            frame_end,
+        }
+    }
+
+    /// The jobs' adopted match window (see [`JobSpf::Feed`]).
+    pub(crate) const fn window(&self) -> u64 {
+        self.window
+    }
+
+    /// Advance the generation over the resident stream up to `upto`,
+    /// publishing whole lattice chunks only: `run_ldm_feed`'s boundaries
+    /// are the multiples of `MAX_BLOCK_SIZE` from offset zero plus the
+    /// frame end, and `generate` is boundary-sensitive (a forward match
+    /// stops at the passed window's end, and the anchor it sets gates the
+    /// later splits of its chunk), so a truncation at any other point
+    /// would publish a different sequence set than the bulk gate. An
+    /// `upto` short of the next boundary parks the walk there; the posts
+    /// hold their jobs until the covering chunk is complete (see
+    /// `post_due`), so a span taken at post time is always final. The
+    /// armed class fits the accumulate buffer by construction (the pledge
+    /// sits at or below the buffer cap and the decided reserve covers it
+    /// whole), so the frame never wraps and offset zero stays the
+    /// buffer's own.
+    pub(crate) fn advance(&mut self, buf: &[u8], upto: u64) {
+        let mut chunk = Vec::new();
+        while self.published < upto {
+            let next = (self.published / MAX_BLOCK_SIZE as u64 + 1) * MAX_BLOCK_SIZE as u64;
+            let end = next.min(self.frame_end);
+            if end > upto {
+                break;
+            }
+            chunk.clear();
+            self.state
+                .generate(&mut chunk, &buf[..end as usize], 0, self.published, end);
+            self.seqs.extend_from_slice(&chunk);
+            self.published = end;
+        }
+    }
+
+    /// One job's published span: the candidates whose split lands inside
+    /// the job, with the beyond-reach retain applied, re-based into the
+    /// job view's coordinates. `view_base` is the frozen view's first
+    /// absolute offset: the consumer runs in view coordinates (the
+    /// matcher's block positions index the view, and `ldm_generate`
+    /// partitions the span by them), while the publication's splits are
+    /// frame-absolute. A job starting past the window borrows a view
+    /// whose base sits past zero — handing it absolute splits would
+    /// offset every candidate by the base, so the posted job would parse
+    /// its own region against the candidates of a region one base
+    /// earlier. The bulk side's view is the whole input, so its base is
+    /// zero and the re-base is the identity there.
+    pub(crate) fn span_for(&self, start: u64, end: u64, view_base: u64) -> Vec<LdmSeq> {
+        let lo = self.seqs.partition_point(|s| s.split < start);
+        let hi = self.seqs.partition_point(|s| s.split < end);
+        self.seqs[lo..hi]
+            .iter()
+            .filter(|s| s.offset.get() as u64 > self.reach)
+            .map(|s| LdmSeq {
+                split: s.split - view_base,
+                offset: s.offset,
+                len: s.len,
+            })
+            .collect()
+    }
 }
 
 /// The capture grid's job size for a source of `len` bytes at a chain
@@ -1929,6 +2053,7 @@ pub(crate) fn run_job(
 #[cfg(test)]
 mod tests {
     use alloc::{string::String, vec, vec::Vec};
+    use std::sync::Mutex;
 
     use super::{
         CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
@@ -2800,6 +2925,7 @@ mod tests {
     #[test]
     fn opt_serial_ldm_feed_carries_far_repeats() {
         const MIB: usize = 1024 * 1024;
+        let _switch = super::FEED_TEST_SWITCH.lock().unwrap();
         let total = 33 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
         let mut unit = lcg(unit_len);
@@ -2892,9 +3018,11 @@ mod tests {
         // The stock per-job bytes are the reference the feed must beat on
         // this fixture (its exact-copy units keep a paying far class
         // while the row's job-boundary resets cost the stock row).
+        let feed_guard = INJECT_LOCK.lock().unwrap();
         super::set_ldm_feed_for_tests(false);
         let stock = encode(8);
         super::set_ldm_feed_for_tests(true);
+        drop(feed_guard);
         assert_ne!(stock, mt8, "the feed must move the armed cells' bytes");
         assert!(
             mt8.len() <= stock.len() - stock.len() / 10,
@@ -2902,6 +3030,68 @@ mod tests {
             mt8.len(),
             stock.len()
         );
+    }
+
+    /// Serializes every process-global feed switch (the injection key and
+    /// `set_ldm_feed_for_tests`): a store re-keying another test's encode
+    /// is the stage-A injection race (`3010952c`), and a feed stood down
+    /// under this test's encode would park the panic unparked.
+    static INJECT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A panic inside the feed thread must surface to the encode caller:
+    /// the payload parks in the poison slot, the waiters that see
+    /// `panicked` release their slots as empty, the assembly drains, and
+    /// the scope end resumes the unwind — a lost notify on the panic arm
+    /// would park the caller instead. The retired workers' pooled states
+    /// must not stall the next encode: a fresh frame on the same thread
+    /// round-trips byte-exact.
+    #[test]
+    fn ldm_feed_panic_surfaces_and_pool_recovers() {
+        const MIB: usize = 1024 * 1024;
+        let total = 33 * MIB + 123 * 1024;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        unit[..head_len].copy_from_slice(&pattern_head(head_len));
+        let mut data = Vec::with_capacity(total);
+        while data.len() < total {
+            let take = unit.len().min(total - data.len());
+            data.extend_from_slice(&unit[..take]);
+        }
+        let encode = || {
+            compress_slice_mt(
+                &data,
+                Level::Ultra,
+                true,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let inject_guard = INJECT_LOCK.lock().unwrap();
+        super::FEED_PANIC_INPUT.store(
+            data.as_ptr().cast_mut(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode));
+        super::FEED_PANIC_INPUT.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        drop(inject_guard);
+        let payload = blew.expect_err("the feed panic must surface to the caller");
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(msg, Some("injected ldm feed panic"));
+
+        let frame = encode();
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&frame, &mut out)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
     /// Text-like data: repeating vocabulary with variation, so matches,
