@@ -1902,6 +1902,192 @@ mod mt {
         }
     }
 
+    /// One frame from the zero-copy entry over `source`, at the same options
+    /// the read-side reference runs.
+    pub(super) fn owned_frame(source: read::OwnedSource, options: EncoderOptions) -> Vec<u8> {
+        let mut enc = read::OwnedEncoder::with_options(source, options).expect("owned entry");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("owned read");
+        enc.finish().expect("owned finish");
+        comp
+    }
+
+    /// One frame from the read-side pump over the same bytes, the owned
+    /// entry's reference.
+    pub(super) fn read_frame(raw: &[u8], options: EncoderOptions) -> Vec<u8> {
+        let mut enc = read::Encoder::with_options(raw, options).expect("read encoder");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("read");
+        enc.finish().expect("finish");
+        comp
+    }
+
+    /// The zero-copy entry's byte contract: the owned feed's frame equals
+    /// the read pump's over the same bytes at the same options. The job
+    /// schedule is a pure function of the stream offset and the feed's
+    /// cadence is not an input, so the whole-source feed in one step must
+    /// land on the frame the 1 MiB pump pulls produce. Covers the
+    /// single-threaded demotion (workers 0), the growing and fixed grids
+    /// (open and pledged), the probe rows (Balanced), the fast-row
+    /// capture staging (Fastest over the 4 MiB span) and the checksum
+    /// absorb reading the owned source.
+    #[test]
+    fn owned_entry_matches_read_encoder_bytes() {
+        for (name, data) in shapes() {
+            for level in [Level::Fastest, Level::Balanced] {
+                for workers in [0u32, 2, 4] {
+                    for pledged in [false, true] {
+                        let label = format!("{name}/{level:?}/w{workers}/pledged{pledged}");
+                        let options = || {
+                            EncoderOptions::new(level)
+                                .workers(workers)
+                                .checksum(true)
+                                .pledged_size(pledged.then_some(data.len() as u64))
+                        };
+                        let reference = read_frame(&data, options());
+                        let frame = owned_frame(data.clone().into(), options());
+                        assert_eq!(frame, reference, "{label}: owned feed diverged");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every `OwnedSource` arm must produce the same frame: the core holds
+    /// a raw view of whichever arm's bytes, so a move or a shared handle
+    /// must be invisible to the encode. The static arm exercises the
+    /// `'static` feed, the shared arm a borrowed-behind-`Arc` one.
+    #[test]
+    fn owned_source_arms_agree() {
+        let data = textish(2 * 1024 * 1024 + 31);
+        let options = || {
+            EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .checksum(true)
+        };
+        let reference = owned_frame(data.clone().into(), options());
+        let shared: alloc::sync::Arc<[u8]> = data.as_slice().into();
+        assert_eq!(
+            owned_frame(shared.into(), options()),
+            reference,
+            "shared arm"
+        );
+        let leaked: &'static [u8] = data.clone().leak();
+        assert_eq!(
+            owned_frame(leaked.into(), options()),
+            reference,
+            "static arm"
+        );
+        let boxed: alloc::boxed::Box<[u8]> = data.clone().into_boxed_slice();
+        assert_eq!(owned_frame(boxed.into(), options()), reference, "box arm");
+    }
+
+    /// A mid-stream flush stays the write path's documented rebase: the
+    /// owned entry keeps the unflushed stream's bytes (equal to the write
+    /// path fed without a flush, the chunking-independent form), while a
+    /// write-path flush re-grids early and its bytes diverge. The owned
+    /// feed adds no flush semantics of its own.
+    #[test]
+    fn owned_entry_and_the_write_path_flush_rebase() {
+        let a = textish(3 * 1024 * 1024 + 77);
+        let b = lcg(1 * 1024 * 1024);
+        let mut expect = a.clone();
+        expect.extend_from_slice(&b);
+        let options = || {
+            EncoderOptions::new(Level::Fastest)
+                .workers(4)
+                .checksum(false)
+        };
+        let reference = read_frame(&expect, options());
+        let owned = owned_frame(expect.clone().into(), options());
+        assert_eq!(
+            owned, reference,
+            "owned equals the read pump over the concatenation"
+        );
+
+        let no_flush = encode_write(&expect, 64 * 1024, Level::Fastest, 4, false, None);
+        assert_eq!(
+            no_flush, reference,
+            "the unflushed write path keeps the chunking-independent frame"
+        );
+
+        let mut flushed = Vec::new();
+        let mut enc = write::Encoder::with_options(&mut flushed, options()).unwrap();
+        enc.write_all(&a).unwrap();
+        enc.flush().unwrap();
+        enc.write_all(&b).unwrap();
+        enc.finish().unwrap();
+        assert_both_decoders(&flushed, &expect, "flush-interleaved");
+        assert_ne!(
+            flushed, reference,
+            "a write-path mid-stream flush re-grids and must diverge (the documented rebase)"
+        );
+    }
+
+    /// The error contract mirrors the read encoder's: a pledge the source
+    /// does not match fails the first read (the whole source feeds in one
+    /// step, so both mismatch directions surface there), and the source
+    /// comes back with the error either way.
+    #[test]
+    fn owned_entry_pledge_mismatch_errors_the_first_read() {
+        let data = textish(700 * 1024);
+        for pledged in [data.len() as u64 - 1024, data.len() as u64 + 1024] {
+            let options = || {
+                EncoderOptions::new(Level::Fastest)
+                    .workers(4)
+                    .pledged_size(Some(pledged))
+            };
+            let mut enc = read::OwnedEncoder::with_options(data.clone().into(), options()).unwrap();
+            let mut sink = vec![0u8; 256];
+            // The read path crosses the io::Error boundary, so the check
+            // matches the Display text the umbrella error carries (the
+            // read encoder's own mismatch test runs the same shape).
+            let err = crate::io::Read::read(&mut enc, &mut sink).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(
+                msg.contains(&format!("pledged content size {pledged} does not match")),
+                "{err}"
+            );
+            let (err, source) = enc.try_finish().unwrap_err();
+            match err {
+                crate::Error::PledgedSizeMismatch { pledged: p, .. } => assert_eq!(p, pledged),
+                other => panic!("expected PledgedSizeMismatch, got {other:?}"),
+            }
+            assert_eq!(source.as_slice(), data);
+        }
+    }
+
+    /// Finishing before the output drained refuses with `UnreadOutput` and
+    /// hands the source back, mirroring the read encoder's contract.
+    #[test]
+    fn owned_entry_finish_requires_drained_output() {
+        let data = textish(1 * 1024 * 1024 + 5);
+        let mut enc = read::OwnedEncoder::new(data.clone().into(), Level::Fastest).unwrap();
+        let mut sink = vec![0u8; 64];
+        let n = enc.read(&mut sink).unwrap();
+        assert!(n > 0);
+        let (err, source) = enc.try_finish().unwrap_err();
+        assert!(matches!(err, crate::Error::UnreadOutput { .. }));
+        assert_eq!(source.as_slice(), data);
+    }
+
+    /// The degenerate sources: an empty frame closes over an empty source
+    /// in every arm, and roundtrips.
+    #[test]
+    fn owned_entry_empty_source_roundtrips() {
+        for source in [
+            read::OwnedSource::from(Vec::new()),
+            read::OwnedSource::Static(&[]),
+        ] {
+            let mut enc = read::OwnedEncoder::new(source, Level::Balanced).unwrap();
+            let mut comp = Vec::new();
+            enc.read_to_end(&mut comp).expect("empty read");
+            let source = enc.finish().unwrap();
+            assert!(source.as_slice().is_empty());
+            assert_both_decoders(&comp, b"", "owned empty source");
+        }
+    }
+
     /// A flush makes the pending bytes visible early at the cost of a
     /// re-gridded job boundary; the reassembled stream must still decode.
     #[test]
@@ -2729,6 +2915,19 @@ mod mt_dict {
         assert_eq!(back, &data[..16 * MIB], "below-span open deep band");
     }
 
+    /// The owned frame and the read-pump reference over the same bytes at
+    /// the same options: the armed-band parity tests' pair.
+    fn owned_vs_read_frame(
+        data: &[u8],
+        source: read::OwnedSource,
+        options: impl Fn() -> EncoderOptions,
+    ) -> (Vec<u8>, Vec<u8>) {
+        (
+            mt::owned_frame(source, options()),
+            mt::read_frame(data, options()),
+        )
+    }
+
     /// Serializes the tests that flip the process-global unpledged
     /// deep-band switch (`set_stream_deep_band_for_tests`).
     static DEEP_BAND_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3103,5 +3302,53 @@ mod mt_dict {
             zstd::stream::copy_decode(sink.as_slice(), &mut reference).unwrap();
             assert_eq!(reference, data, "{level:?} workers {workers}");
         }
+    }
+
+    /// The engaged deep band reads its staging evidence and the finish tail's
+    /// shared prefix fill off the input: the windowed prefill, the spf
+    /// build's segment fill and the far-class screens all borrow input spans,
+    /// and under the zero-copy feed those are the owned source's bytes.
+    /// Pledged and open (the staging-span arm) both pin.
+    #[test]
+    fn owned_entry_matches_read_encoder_deep_band() {
+        const MIB: usize = 1024 * 1024;
+        let _switch = DEEP_BAND_SWITCH.lock().unwrap();
+        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        for pledged in [false, true] {
+            let options = || {
+                EncoderOptions::new(Level::Best)
+                    .workers(4)
+                    .checksum(false)
+                    .pledged_size(pledged.then_some(data.len() as u64))
+            };
+            let (owned, reference) = owned_vs_read_frame(&data, data.clone().into(), options);
+            assert_eq!(
+                owned, reference,
+                "deep band pledged {pledged}: owned feed diverged"
+            );
+            let back = bulk::decompress(&owned, 0).unwrap();
+            assert_eq!(back, data, "owned deep band roundtrip");
+        }
+    }
+
+    /// The opt family's engaged serial-LDM feed advances over the buffered
+    /// bytes on the posting thread; under the zero-copy feed that walk
+    /// reads the owned source directly, and the posted spans must stay
+    /// identical to the read pump's publication.
+    #[test]
+    fn owned_entry_matches_read_encoder_opt_feed() {
+        const MIB: usize = 1024 * 1024;
+        let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
+        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let options = || {
+            EncoderOptions::new(Level::Opt)
+                .workers(4)
+                .checksum(true)
+                .pledged_size(Some(data.len() as u64))
+        };
+        let (owned, reference) = owned_vs_read_frame(&data, data.clone().into(), options);
+        assert_eq!(owned, reference, "opt feed: owned feed diverged");
+        let back = bulk::decompress(&owned, 0).unwrap();
+        assert_eq!(back, data, "owned opt feed roundtrip");
     }
 }

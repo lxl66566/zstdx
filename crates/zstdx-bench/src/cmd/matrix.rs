@@ -116,6 +116,13 @@ pub struct Args {
     /// cells loop over these; the default is the historical 64 KiB.
     #[arg(long, value_delimiter = ',', value_parser = parse_pull, default_value = "64k")]
     pub pull: Vec<usize>,
+    /// Drive the enc-stream MT section's zstdx side through the owned
+    /// in-memory source entry (`read::OwnedEncoder`, the zero-copy feed)
+    /// instead of the Read pump. Frames must stay identical to the read
+    /// cells (the section self-gates the parity), so the wall delta is
+    /// the feed's own. The ST section keeps its pull-size loop.
+    #[arg(long)]
+    pub owned: bool,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
@@ -848,23 +855,70 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             // deterministic, so they are roundtripped after the measurement.
             let mut comp = Vec::new();
             let mut zcomp = Vec::new();
+            // The owned entry's frame must equal the read pump's, so the
+            // owned switch self-gates: the reference frame comes from one
+            // untimed read-path encode and the measured frame is compared
+            // against it after the rounds.
+            let read_frame = if args.owned {
+                let mut frame = Vec::new();
+                let mut enc = zstdx::stream::read::Encoder::with_options(
+                    &raw[..],
+                    EncoderOptions::new(level).checksum(false).workers(mt),
+                )
+                .unwrap();
+                let mut sink = vec![0u8; 64 * 1024];
+                loop {
+                    let n = enc.read(&mut sink).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    frame.extend_from_slice(&sink[..n]);
+                }
+                enc.finish().unwrap();
+                Some(frame)
+            } else {
+                None
+            };
+            // Moved in and out of the encoder every round (finish reclaims
+            // it), so no copy rides the timed loop.
+            let mut owned_src = zstdx::stream::read::OwnedSource::from(raw.to_vec());
             let report = ab.measure(
                 || {
                     comp.clear();
-                    let mut enc = zstdx::stream::read::Encoder::with_options(
-                        &raw[..],
-                        EncoderOptions::new(level).checksum(false).workers(mt),
-                    )
-                    .unwrap();
-                    let mut sink = vec![0u8; 64 * 1024];
-                    loop {
-                        let n = enc.read(&mut sink).unwrap();
-                        if n == 0 {
-                            break;
+                    if args.owned {
+                        let mut enc = zstdx::stream::read::OwnedEncoder::with_options(
+                            std::mem::replace(
+                                &mut owned_src,
+                                zstdx::stream::read::OwnedSource::Static(&[]),
+                            ),
+                            EncoderOptions::new(level).checksum(false).workers(mt),
+                        )
+                        .unwrap();
+                        let mut sink = vec![0u8; 64 * 1024];
+                        loop {
+                            let n = enc.read(&mut sink).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            comp.extend_from_slice(&sink[..n]);
                         }
-                        comp.extend_from_slice(&sink[..n]);
+                        owned_src = enc.finish().unwrap();
+                    } else {
+                        let mut enc = zstdx::stream::read::Encoder::with_options(
+                            &raw[..],
+                            EncoderOptions::new(level).checksum(false).workers(mt),
+                        )
+                        .unwrap();
+                        let mut sink = vec![0u8; 64 * 1024];
+                        loop {
+                            let n = enc.read(&mut sink).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            comp.extend_from_slice(&sink[..n]);
+                        }
+                        enc.finish().unwrap();
                     }
-                    enc.finish().unwrap();
                 },
                 || {
                     zcomp.clear();
@@ -881,6 +935,9 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                     enc.finish();
                 },
             );
+            if let Some(frame) = &read_frame {
+                assert_eq!(&comp, frame, "{name}.{label} owned-entry frame diverged");
+            }
             assert_roundtrip(&comp, raw, &label);
             assert_roundtrip(&zcomp, raw, &label);
             println!(

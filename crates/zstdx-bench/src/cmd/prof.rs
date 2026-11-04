@@ -158,33 +158,63 @@ fn run_enc_stream_read(rest: &[String]) {
     let workers: u32 = rest
         .get(3)
         .map_or(1, |w| w.parse().expect("workers must be a number"));
+    // `owned` as the fifth rest arg swaps the Read pump for the zero-copy
+    // in-memory feed (`read::OwnedEncoder`); the loop shape is unchanged.
+    let owned = rest.get(4).is_some_and(|w| w == "owned");
     let raw = fs::read(path).unwrap();
     let mut sink = vec![0u8; 64 * 1024];
+    // Built fresh per round: the entries take the options by value.
+    let options = || {
+        zstdx::EncoderOptions::new(level)
+            .checksum(false)
+            .workers(workers)
+    };
+    // The owned feed's source moves in and out of the encoder each round
+    // (finish reclaims it); its one materialization sits outside timing.
+    let mut src = owned.then(|| zstdx::stream::read::OwnedSource::from(raw.clone()));
     let t0 = Instant::now();
     let mut total_out = 0usize;
     for _ in 0..iters {
-        let mut enc = zstdx::stream::read::Encoder::with_options(
-            &raw[..],
-            zstdx::EncoderOptions::new(level)
-                .checksum(false)
-                .workers(workers),
-        )
-        .unwrap();
-        let mut acc = 0u64;
-        loop {
-            let n = enc.read(&mut sink).unwrap();
-            if n == 0 {
-                break;
+        if let Some(src) = src.as_mut() {
+            let mut enc = zstdx::stream::read::OwnedEncoder::with_options(
+                std::mem::replace(src, zstdx::stream::read::OwnedSource::Static(&[])),
+                options(),
+            )
+            .unwrap();
+            let mut acc = 0u64;
+            loop {
+                let n = enc.read(&mut sink).unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc += n as u64;
             }
-            acc += n as u64;
+            *src = enc.finish().unwrap();
+            total_out = acc as usize;
+            std::hint::black_box((acc, src));
+        } else {
+            let mut enc = zstdx::stream::read::Encoder::with_options(&raw[..], options()).unwrap();
+            let mut acc = 0u64;
+            loop {
+                let n = enc.read(&mut sink).unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc += n as u64;
+            }
+            enc.finish().unwrap();
+            total_out = acc as usize;
+            std::hint::black_box(acc);
         }
-        enc.finish().unwrap();
-        total_out = acc as usize;
-        std::hint::black_box(acc);
     }
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "{path} L{level:?} w{workers}: {iters} iters, out={total_out} bytes, {:.0} MiB/s",
+        "{path} L{level:?} w{workers}{}: {iters} iters, out={total_out} bytes, {:.0} MiB/s",
+        if owned {
+            " owned"
+        } else {
+            ""
+        },
         iters as f64 * raw.len() as f64 / dt / (1 << 20) as f64
     );
 }

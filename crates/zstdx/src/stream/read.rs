@@ -128,6 +128,205 @@ impl<R: Read> Read for Encoder<R> {
     }
 }
 
+/// An in-memory source an [`OwnedEncoder`] owns for the stream's lifetime:
+/// the accepted forms of the zero-copy feed. Whichever arm holds the bytes,
+/// they stay at one address from construction until the encoder drops, so
+/// the encoder's jobs can borrow absolute ranges of them directly.
+///
+/// ```rust
+/// use zstdx::stream::read::{OwnedEncoder, OwnedSource};
+///
+/// let source = OwnedSource::from(b"the quick brown fox".to_vec());
+/// let mut enc = OwnedEncoder::new(source, zstdx::Level::Fastest).unwrap();
+/// let mut compressed = Vec::new();
+/// use zstdx::io::Read as _;
+/// enc.read_to_end(&mut compressed).unwrap();
+/// let source = enc.finish().unwrap();
+/// assert_eq!(source.as_slice(), b"the quick brown fox");
+/// ```
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub enum OwnedSource {
+    /// An owned buffer, handed back by [`OwnedEncoder::finish`].
+    Vec(alloc::vec::Vec<u8>),
+    /// A shared slice: the encoder holds one handle, the caller may keep
+    /// others.
+    Shared(alloc::sync::Arc<[u8]>),
+    /// Bytes with a static lifetime.
+    Static(&'static [u8]),
+}
+
+#[cfg(feature = "std")]
+impl OwnedSource {
+    /// The source bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Vec(v) => v,
+            Self::Shared(s) => s,
+            Self::Static(s) => s,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<alloc::vec::Vec<u8>> for OwnedSource {
+    fn from(v: alloc::vec::Vec<u8>) -> Self {
+        Self::Vec(v)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<alloc::boxed::Box<[u8]>> for OwnedSource {
+    // `into_vec` keeps the boxed slice's allocation: a boxed slice's length
+    // already equals its capacity.
+    fn from(b: alloc::boxed::Box<[u8]>) -> Self {
+        Self::Vec(b.into_vec())
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<alloc::sync::Arc<[u8]>> for OwnedSource {
+    fn from(s: alloc::sync::Arc<[u8]>) -> Self {
+        Self::Shared(s)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<&'static [u8]> for OwnedSource {
+    fn from(s: &'static [u8]) -> Self {
+        Self::Static(s)
+    }
+}
+
+/// Compress an owned in-memory source through [`Read`]: the zero-copy
+/// multithreaded feed.
+///
+/// With more than one worker (and a compressing level on a multi-core
+/// machine) the encoder borrows the source's bytes directly — every job
+/// reads its absolute range of [`OwnedSource`] and its match window is the
+/// source's own bytes below the job's start — so the serial input copy the
+/// Read-trait pump pays is gone. The frame bytes are identical to
+/// [`Encoder`] over the same source at the same options: the job schedule
+/// is a pure function of the stream offset, and the feed's cadence is not
+/// an input. The source's length is not declared for you: set
+/// [`EncoderOptions::pledged_size`] or an input shape explicitly to get
+/// the same header and schedule shapes the Read encoder would produce with
+/// them.
+///
+/// The engagement demotions mirror [`Encoder`]'s: raw-block levels and
+/// single-core machines run the single-threaded core, which stages the
+/// source through one copy (the copy hides behind that core's encode
+/// span). Reading works exactly like [`Encoder`]: pull until a read
+/// returns `Ok(0)`, then [`OwnedEncoder::finish`] hands the source back.
+///
+/// ```rust
+/// use zstdx::{Level, io::Read as _, stream::read::OwnedEncoder};
+///
+/// let data = b"abcabcabc".to_vec();
+/// let mut enc = OwnedEncoder::with_options(
+///     data.into(),
+///     zstdx::EncoderOptions::new(Level::Fastest).workers(4),
+/// )
+/// .unwrap();
+/// let mut compressed = Vec::new();
+/// enc.read_to_end(&mut compressed).unwrap();
+/// let source = enc.finish().unwrap();
+/// assert_eq!(
+///     zstdx::stream::decode_all(&compressed[..]).unwrap(),
+///     source.as_slice()
+/// );
+/// ```
+#[cfg(feature = "std")]
+pub struct OwnedEncoder {
+    /// Declared before `source`: the multithreaded core's job views borrow
+    /// the source's bytes, and fields drop in declaration order, so the
+    /// core's `Drop` — which joins every worker — runs before the source
+    /// frees.
+    core: FrameEncoderCore,
+    source: OwnedSource,
+    /// The single-threaded demotion's feed cursor: the chunked 16 KiB
+    /// cadence keeps that core's consumer-dependent closing shape equal to
+    /// the Read encoder's (see `FrameEncoderCore::pump_owned`). The
+    /// multithreaded core feeds in one step and never reads it.
+    st_fed: usize,
+}
+
+#[cfg(feature = "std")]
+impl OwnedEncoder {
+    /// Create an encoder with default options.
+    pub fn new(source: OwnedSource, level: Level) -> Result<Self> {
+        Self::with_options(source, EncoderOptions::new(level))
+    }
+
+    /// Create an encoder from a builder option set.
+    // options are consumed builder data; by value keeps the chaining API
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_options(source: OwnedSource, options: EncoderOptions) -> Result<Self> {
+        Self::try_with_options(source, &options).map_err(|(_, err)| err)
+    }
+
+    /// Like [`OwnedEncoder::with_options`], but hands the source back when
+    /// the options fail to materialize, so callers keep ownership of it.
+    pub(crate) fn try_with_options(
+        source: OwnedSource,
+        options: &EncoderOptions,
+    ) -> Result<Self, (OwnedSource, crate::Error)> {
+        match FrameEncoderCore::new_owned(options, source.as_slice()) {
+            Ok(core) => Ok(Self {
+                core,
+                source,
+                st_fed: 0,
+            }),
+            Err(err) => Err((source, err)),
+        }
+    }
+
+    /// Reclaim the source. The frame is closed over the whole source; the
+    /// encoder must be read to end of stream first (the final [`Read`]
+    /// call returns `Ok(0)`): the pending encoded bytes carry the frame's
+    /// closing block, so finishing before that fails with
+    /// [`Error::UnreadOutput`][crate::Error::UnreadOutput] instead of
+    /// silently truncating everything already read. Fails with
+    /// [`Error::PledgedSizeMismatch`][crate::Error::PledgedSizeMismatch]
+    /// when a pledged content size was not met by the source, at the first
+    /// read (the whole source is fed in one step, so a mismatch surfaces
+    /// where a Read-path stream discovers it: the offending read).
+    pub fn finish(self) -> Result<OwnedSource> {
+        self.try_finish().map_err(|(err, _)| err)
+    }
+
+    /// Finish the stream, reclaiming the source even on failure.
+    ///
+    /// [`OwnedEncoder::finish`] drops the source together with the error;
+    /// this hands both back, so a caller abandoning the output keeps the
+    /// source for whatever comes after it. The undelivered encoded bytes
+    /// are dropped, truncating the frame the encoder already emitted.
+    #[allow(clippy::result_large_err)]
+    pub fn try_finish(mut self) -> Result<OwnedSource, (crate::Error, OwnedSource)> {
+        match self.core.finish() {
+            Ok(()) => match self.core.pending_output() {
+                0 => Ok(self.source),
+                pending => Err((crate::Error::UnreadOutput { bytes: pending }, self.source)),
+            },
+            Err(err) => Err((err, self.source)),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Read for OwnedEncoder {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        while !self.core.has_output() && !self.core.is_finished() {
+            // The source's end is the stream's EOF: the multithreaded core
+            // feeds in one step on the first pull, the single-threaded one
+            // a chunk at a time (see `pump_owned`).
+            self.core
+                .pump_owned(self.source.as_slice(), &mut self.st_fed)?;
+        }
+        Ok(self.core.split_output(buf))
+    }
+}
+
 /// Decompress a zstd stream while reading from it.
 ///
 /// Like [`crate::decoding::StreamingDecoder`], this decoder is transparent

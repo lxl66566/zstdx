@@ -20,6 +20,16 @@
 //! therefore stalls on the workers only when it has lapped the buffer's
 //! live data, which the epoch-scale sizing bounds to once per epoch.
 //!
+//! The zero-copy feed (see `stream::read::OwnedEncoder`) deletes the buffer
+//! for fully-resident sources: the encoder owns the input in memory, jobs
+//! borrow absolute ranges of it directly (the window strip below each
+//! job's start is the source's own bytes), and `pos` jumps to the source's
+//! length at the first pump. Every input read goes to the owned view
+//! instead of `buf` (see `MtEncoderCore::input`), and the schedule — a
+//! pure function of absolute offsets — reaches the exact job set the Read
+//! pump produces at its EOF, so the frame bytes stay identical to the Read
+//! encoder's over the same source and options.
+//!
 //! A reach-probe-eligible frame (see [`reach_probe`]: the Balanced row with
 //! its stock reach) donates the probe's keep side to a pool worker at the
 //! staging gate (see `post_donation`): the worker runs job zero's first
@@ -579,6 +589,37 @@ impl FrozenSrc {
     }
 }
 
+/// The zero-copy feed's resident source: the whole in-memory input an
+/// owned-source encoder hands the core (see `stream::read::OwnedEncoder`).
+/// The bytes live in the enclosing encoder's `OwnedSource`, whose field
+/// drops after the core — the core's `Drop` joins every worker lease — so
+/// the view stays valid for the core's lifetime and for every job view
+/// frozen out of it, the same stability contract `FrozenSrc` runs under.
+/// Unlike the accumulate buffer, these bytes can never move or relocate:
+/// no wrap and no growth ever touch them.
+#[derive(Clone, Copy)]
+pub(super) struct OwnedView {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl OwnedView {
+    /// The view over the resident source slice the enclosing encoder owns.
+    pub(super) fn new(src: &[u8]) -> Self {
+        Self {
+            ptr: src.as_ptr(),
+            len: src.len(),
+        }
+    }
+}
+
+// SAFETY: the pointed bytes are owned by the enclosing encoder and stable
+// for the core's lifetime (see the type docs); job views frozen out of
+// them ride `FrozenSrc`'s own contract.
+unsafe impl Send for OwnedView {}
+// SAFETY: same contract; no mutation ever goes through the view.
+unsafe impl Sync for OwnedView {}
+
 // Reusable accumulate buffers: a fresh encoder mapping its multi-megabyte
 // buffer pays the whole first-touch fault+zero cost again, which on a
 // THP=madvise machine with fragmented physical memory falls back to 4 KiB
@@ -1130,6 +1171,15 @@ pub(crate) struct MtEncoderCore {
     /// offset.
     buf: Vec<u8>,
     buf_base: u64,
+    /// The zero-copy feed's resident source (see [`OwnedView`]): when set,
+    /// the whole input is in memory and every input read — head screens,
+    /// the feed advance, job views, the checksum — comes from this view
+    /// instead of `buf`. The accumulate buffer stays empty, `buf_base`
+    /// stays zero and recycling is gone: no wrap, no growth, no quiesce
+    /// wait. `pos` jumps to the source's length at the first pump, and
+    /// the schedule — a pure function of absolute offsets — reaches the
+    /// exact job set the Read pump's many pulls produce at its EOF.
+    owned: Option<OwnedView>,
     /// Ever-initialized extent of `buf` ([0, init_len) all initialized):
     /// the direct pump hands out only previously-written bytes (the Read
     /// contract forbids uninitialized buffers). Monotone under wraps;
@@ -1189,6 +1239,35 @@ impl MtEncoderCore {
         }
     }
 
+    /// The owned view's bytes as a slice — the one unsafe read on the view.
+    fn view_bytes(view: &OwnedView) -> &[u8] {
+        // SAFETY: the enclosing encoder owns the source for this core's
+        // lifetime (see `OwnedView`), and the bytes never move or free
+        // before the core's `Drop` joins the workers.
+        unsafe { slice::from_raw_parts(view.ptr, view.len) }
+    }
+
+    /// The live input bytes the core reads: the accumulate buffer under the
+    /// Read/write feeds, the owned source under the zero-copy feed. Both
+    /// carry the absolute span `[buf_base, pos)`. Callers must not hold the
+    /// borrow across a `&mut self` call.
+    fn input(&self) -> &[u8] {
+        match &self.owned {
+            Some(view) => Self::view_bytes(view),
+            None => &self.buf,
+        }
+    }
+
+    /// The live input extent: [`Self::input`]'s length, in `buf_base`-
+    /// relative coordinates (absolute under the owned feed, whose
+    /// `buf_base` stays zero).
+    fn input_len(&self) -> usize {
+        match &self.owned {
+            Some(view) => view.len,
+            None => self.buf.len(),
+        }
+    }
+
     /// The plain-frame constructor (tests and the streaming router's
     /// no-dictionary arm).
     pub(crate) fn new(options: &EncoderOptions) -> Self {
@@ -1201,6 +1280,28 @@ impl MtEncoderCore {
     pub(crate) fn new_with_dictionary(
         options: &EncoderOptions,
         dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
+    ) -> Self {
+        Self::build(options, dict, None)
+    }
+
+    /// The zero-copy feed's constructor (see [`OwnedView`]): the whole
+    /// source is resident, so the accumulate buffer stays empty and the
+    /// pooled-buffer machinery never runs.
+    pub(super) fn new_owned_source(
+        options: &EncoderOptions,
+        dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
+        owned: OwnedView,
+    ) -> Self {
+        Self::build(options, dict, Some(owned))
+    }
+
+    /// The constructor body shared by both feeds: everything below is
+    /// feed-independent schedule and header state; only the accumulate
+    /// buffer's reserve is owned-gated.
+    fn build(
+        options: &EncoderOptions,
+        dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
+        owned: Option<OwnedView>,
     ) -> Self {
         #[cfg(feature = "job_trace")]
         timeline::mark();
@@ -1336,14 +1437,21 @@ impl MtEncoderCore {
         let dict_capture_pending = dict.is_some()
             && matches!(grid, JobGrid::Fixed(_))
             && ldm_mode != crate::LdmMode::Disable;
-        let (mut buf, mut init_len) = take_pooled_buf(want);
-        if buf.capacity() < want {
-            buf.reserve_exact(want - buf.len());
-            advise_hugepages(&buf);
-            // A realloc copies only the live bytes: the new tail starts
-            // uninitialized.
-            init_len = buf.len();
-        }
+        // No appends ever land in the accumulate buffer under the owned
+        // feed, so no pooled reserve is taken: the source is the buffer.
+        let (buf, init_len) = if owned.is_none() {
+            let (mut buf, mut init_len) = take_pooled_buf(want);
+            if buf.capacity() < want {
+                buf.reserve_exact(want - buf.len());
+                advise_hugepages(&buf);
+                // A realloc copies only the live bytes: the new tail
+                // starts uninitialized.
+                init_len = buf.len();
+            }
+            (buf, init_len)
+        } else {
+            (Vec::new(), 0)
+        };
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut core = Self {
             level: options.level,
@@ -1395,6 +1503,7 @@ impl MtEncoderCore {
             header: serialized,
             buf,
             buf_base: 0,
+            owned,
             init_len,
             pos: 0,
             hashed_end: 0,
@@ -1436,6 +1545,10 @@ impl MtEncoderCore {
     /// error surfaces from the offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
+        // The owned feed's source is the whole input; no caller may append
+        // to it (the zero-copy entry is the only owned-fed core, and it
+        // pumps instead).
+        debug_assert!(self.owned.is_none(), "the owned feed never appends");
         #[cfg(debug_assertions)]
         vec_poison::assert(&self.output, "mt core output (write entry)");
         if let Some(pledged) = self.pledged
@@ -1561,6 +1674,49 @@ impl MtEncoderCore {
         #[cfg(debug_assertions)]
         vec_poison::fill(&mut self.output);
         Ok(())
+    }
+
+    /// The zero-copy feed's pump: the whole source is resident, so the
+    /// first call declares it fed in one step — every staging gate's span is
+    /// either already resident or the source is short of it, and the
+    /// schedule is a pure function of absolute offsets, so this single
+    /// pass posts exactly the job set the Read pump's many pulls reach at
+    /// its EOF — then closes the frame at the source's end. Later calls
+    /// step the finish drain exactly like the Read pump past EOF: one
+    /// completion slice per pull, so the caller's deliveries flow during
+    /// the straggler wait instead of stacking behind it.
+    pub(crate) fn pump_owned(&mut self, src: &[u8]) -> crate::Result<()> {
+        debug_assert!(!self.finished);
+        #[cfg(debug_assertions)]
+        vec_poison::assert(&self.output, "mt core output (owned pump entry)");
+        let owned = self
+            .owned
+            .expect("the owned pump runs on an owned-fed core only");
+        // The core holds the view it was constructed with; the caller hands
+        // the same source back every pull, so a mismatch means the
+        // enclosing encoder moved or replaced its source out from under
+        // the workers' views.
+        debug_assert_eq!(owned.ptr, src.as_ptr(), "the owned feed's source moved");
+        debug_assert_eq!(
+            owned.len,
+            src.len(),
+            "the owned feed's source changed length"
+        );
+        if !self.finishing {
+            // One whole-source feed step: posting, staging gates and
+            // donations all resolve here in the same fixed order the Read
+            // pump walks them, over the same input prefixes, so every
+            // verdict lands identically.
+            self.pos = owned.len as u64;
+            self.post_ready();
+            // The wall boundary the Read pump gets for free: its posts
+            // re-arm at every pull's exit, while this one call runs them
+            // back to back with the finish's entry assert.
+            #[cfg(debug_assertions)]
+            vec_poison::fill(&mut self.output);
+            self.finish_begin()?;
+        }
+        self.finish_step(true)
     }
 
     /// Close the frame: the pending jobs (or an empty block) become the last
@@ -1812,7 +1968,7 @@ impl MtEncoderCore {
         debug_assert_eq!(self.job_start, 0);
         debug_assert_eq!(self.buf_base, 0);
         debug_assert!(self.pos >= reach_probe::PROBE_SPAN as u64);
-        if head_predicts_keep(&self.buf[..reach_probe::PROBE_SPAN]) {
+        if head_predicts_keep(&self.input()[..reach_probe::PROBE_SPAN]) {
             self.engage_midsize_capture();
             self.reserve_decided();
             return;
@@ -1840,7 +1996,7 @@ impl MtEncoderCore {
         // would stall the pump behind the very work the donation was meant
         // to hide).
         let head: Arc<[u8]> = Arc::from(
-            self.buf[..reach_probe::PROBE_SPAN]
+            self.input()[..reach_probe::PROBE_SPAN]
                 .to_vec()
                 .into_boxed_slice(),
         );
@@ -1997,7 +2153,7 @@ impl MtEncoderCore {
         let choice = reach_probe::decide_donated(
             keep.keep_bits,
             shrink,
-            &self.buf[..reach_probe::PROBE_SPAN],
+            &self.input()[..reach_probe::PROBE_SPAN],
             self.level,
             self.shape,
         );
@@ -2050,7 +2206,7 @@ impl MtEncoderCore {
         // An explicit Disable stands the capture lattice down inside the
         // canonical predicate (the bulk dispatch's own stance): the stock
         // grid and `Job` arming stay.
-        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let head = &self.input()[..self.input_len().min(MAX_BLOCK_SIZE as usize)];
         let Some(window) = midsize_capture_window(self.level, self.shape, head, self.ldm_mode)
         else {
             return;
@@ -2096,11 +2252,11 @@ impl MtEncoderCore {
         // capture grid's collision screen (the pledged mid band's own
         // exemption — the twin evidence is strictly stronger).
         let window = match self.fast_capture {
-            FastCapture::Screen { open: true } => (far_screen::frame_arming(&self.buf[..span])
+            FastCapture::Screen { open: true } => (far_screen::frame_arming(&self.input()[..span])
                 == LdmArming::FrameScreened)
                 .then_some(LDM_FULL_WINDOW as u64),
             FastCapture::Screen { open: false } => {
-                far_screen::mt_capture_window(self.level, self.shape, &self.buf[..span])
+                far_screen::mt_capture_window(self.level, self.shape, &self.input()[..span])
             },
             _ => far_screen::mt_capture_window(self.level, self.shape, &[]),
         };
@@ -2110,7 +2266,7 @@ impl MtEncoderCore {
         };
         let (grid, med) = match self.pledged {
             Some(n) => {
-                let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+                let head = &self.input()[..self.input_len().min(MAX_BLOCK_SIZE as usize)];
                 let Some((job_size, med)) = fast_capture_schedule(
                     n,
                     self.level,
@@ -2238,7 +2394,7 @@ impl MtEncoderCore {
         if self.job_start != 0 || self.buf_base != 0 {
             return;
         }
-        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let head = &self.input()[..self.input_len().min(MAX_BLOCK_SIZE as usize)];
         let Some(window) = deep_ldm_band(self.level, self.shape, self.choice, head, self.ldm_mode)
         else {
             return;
@@ -2312,11 +2468,11 @@ impl MtEncoderCore {
         // screen a different sample. An armed frame is multi-job, so the
         // block is long since smaller than the pledge; staying `Pending`
         // off a short buffer is fine, the resolving sites run again.
-        if self.buf.len() < MAX_BLOCK_SIZE as usize {
+        if self.input_len() < MAX_BLOCK_SIZE as usize {
             return;
         }
         self.opt_feed = OptFeed::Off;
-        let head = &self.buf[..self.buf.len().min(MAX_BLOCK_SIZE as usize)];
+        let head = &self.input()[..self.input_len().min(MAX_BLOCK_SIZE as usize)];
         let Some(window) =
             opt_ldm_feed_band(self.level, self.shape, self.choice, head, self.ldm_mode)
         else {
@@ -2343,10 +2499,17 @@ impl MtEncoderCore {
         let trace_feed = std::time::Instant::now();
         debug_assert_eq!(self.buf_base, 0);
         let pos = self.pos;
-        // Disjoint field borrows: the state mutates while the buffer
+        // Disjoint field borrows: the state mutates while the input
         // only reads.
-        let feed = self.feed.as_mut().expect("checked above");
-        feed.advance(&self.buf, pos);
+        let Self {
+            feed, owned, buf, ..
+        } = self;
+        let feed = feed.as_mut().expect("checked above");
+        let input = match owned {
+            Some(view) => Self::view_bytes(view),
+            None => buf,
+        };
+        feed.advance(input, pos);
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_spf_build(trace_feed);
     }
@@ -2361,13 +2524,13 @@ impl MtEncoderCore {
     fn far_screens_dead(&self, choice: ReachChoice) -> bool {
         let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, choice) as usize;
         if self.overlap <= reach
-            || self.buf.len() < reach_probe::PROBE_SPAN
-            || ldm_head_parses(&self.buf[..reach_probe::PROBE_SPAN])
+            || self.input_len() < reach_probe::PROBE_SPAN
+            || ldm_head_parses(&self.input()[..reach_probe::PROBE_SPAN])
         {
             return false;
         }
-        let span = self.buf.len().min(self.job_end(0) as usize);
-        !far_repeat_dominant(&self.buf[..span], reach)
+        let span = self.input_len().min(self.job_end(0) as usize);
+        !far_repeat_dominant(&self.input()[..span], reach)
     }
 
     /// The strip each job borrows and indexes: the level's overlap, capped
@@ -2402,6 +2565,10 @@ impl MtEncoderCore {
     /// untouched tail costs address space only, and past it the wrap
     /// recycle stands as before.
     fn reserve_decided(&mut self) {
+        // The owned feed holds its whole source: nothing to reserve.
+        if self.owned.is_some() {
+            return;
+        }
         // `saturating_add`: a u64::MAX-class pledge (compat's absurd
         // declarations) must not wrap the reserve to a near-zero want.
         let want = match (&self.grid, self.pledged) {
@@ -2880,7 +3047,7 @@ impl MtEncoderCore {
         #[cfg(feature = "job_trace")]
         let trace_spf = std::time::Instant::now();
         state.matcher.prefill_window(&[], 0);
-        let cap = (s_max + SPF_SEG).min(self.buf.len() as u64);
+        let cap = (s_max + SPF_SEG).min(self.input_len() as u64);
         // Publication gate: a Dead verdict drops the whole plan, so
         // clones published before the verdict resolves are pure waste —
         // and their table copies ride the donation window's critical
@@ -2955,7 +3122,7 @@ impl MtEncoderCore {
             let Some(freeze) =
                 state
                     .matcher
-                    .strip_fill_segment(&self.buf[..cap as usize], 0, upto, soft)
+                    .strip_fill_segment(&self.input()[..cap as usize], 0, upto, soft)
             else {
                 // No freeze before the cap: not a shape the snapshot can
                 // be cut at; the tail jobs keep their stock fills (any
@@ -3030,7 +3197,7 @@ impl MtEncoderCore {
             // (a single short job): the seeded runner needs no lease
             // state — it stages through its own owned-window kit state.
             let bytes = crate::encoding::mt::run_dict_job_zero(
-                &self.buf[src_lo..src_hi],
+                &self.input()[src_lo..src_hi],
                 first..first + last_len,
                 last_frame_block,
                 self.level,
@@ -3069,7 +3236,7 @@ impl MtEncoderCore {
         };
         let bytes = run_job_with(
             &mut state,
-            &self.buf[src_lo..src_hi],
+            &self.input()[src_lo..src_hi],
             first..first + last_len,
             strip,
             last_frame_block,
@@ -3143,7 +3310,7 @@ impl MtEncoderCore {
         }
         // The view is the buffer's [strip_lo, end), so `first` indexes from
         // its head; `freeze` pins the span inside the live extent.
-        let frozen = FrozenSrc::freeze(&self.buf, (strip_lo - self.buf_base) as usize, len);
+        let frozen = FrozenSrc::freeze(self.input(), (strip_lo - self.buf_base) as usize, len);
         // The job's prefix-fill share: the finish tail's snapshot (chain
         // rows) or the engaged fast capture's SelfFill split — the two
         // never coexist (the tail build is growing-grid-only, the capture
@@ -3337,6 +3504,12 @@ impl MtEncoderCore {
     /// run out first. With the buffer sized per epoch this stalls the pump
     /// at most once per epoch, behind the jobs it just fed.
     fn make_space(&mut self, want: usize) {
+        // Nothing ever appends under the owned feed, so nothing recycles;
+        // a latent call must not grow an accumulator the input never uses.
+        if self.owned.is_some() {
+            debug_assert!(self.buf.is_empty());
+            return;
+        }
         while !self.quiescent() {
             if self.shared.poisoned.load(Ordering::Acquire) {
                 // In-flight jobs still complete under poison; the unwind
@@ -3375,7 +3548,16 @@ impl MtEncoderCore {
     fn hash_to(&mut self, end: u64) {
         debug_assert!(self.hashed_end <= end && end <= self.pos);
         let range = (self.hashed_end - self.buf_base) as usize..(end - self.buf_base) as usize;
-        self.hasher.hash_tail(&self.buf[range]);
+        // Disjoint field borrows: the hasher mutates while the input
+        // only reads.
+        let Self {
+            hasher, owned, buf, ..
+        } = self;
+        let input = match owned {
+            Some(view) => Self::view_bytes(view),
+            None => buf,
+        };
+        hasher.hash_tail(&input[range]);
         self.hashed_end = end;
     }
 

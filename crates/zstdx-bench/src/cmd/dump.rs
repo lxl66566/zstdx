@@ -48,6 +48,13 @@ pub struct Args {
     /// never diff them across --workers values.
     #[arg(long)]
     pub stream: bool,
+    /// With `--stream`: drive the cells through the owned in-memory source
+    /// entry (`read::OwnedEncoder`, the zero-copy feed) under the same
+    /// tags. Diffing an `--owned` dump against a plain one is the
+    /// entry's byte-parity gate: the frames must be identical, because
+    /// the job schedule is a pure function of the stream offset.
+    #[arg(long, requires = "stream")]
+    pub owned: bool,
     /// Maximum frames emitted at once, bounded by a built-in memory budget
     /// over the payload size; 0 = one per logical core, 1 = serial emission
     #[arg(long, default_value_t = DEFAULT_MAX_WIDTH)]
@@ -119,13 +126,26 @@ impl StreamCell {
 
 /// Drive the read-side streaming core exactly as `matrix --mode enc-stream`
 /// does (one `read_to_end` over the whole source, no flush — output is
-/// chunk-independent), returning the closed frame.
-fn stream_frame(raw: &[u8], options: EncoderOptions) -> Vec<u8> {
-    let mut enc = zstdx::stream::read::Encoder::with_options(raw, options).expect("stream encoder");
-    let mut comp = Vec::new();
-    enc.read_to_end(&mut comp).expect("stream read");
-    enc.finish().expect("stream finish");
-    comp
+/// chunk-independent), returning the closed frame. `owned` swaps the Read
+/// pump for the zero-copy in-memory feed; the tags stay the same, so a
+/// plain dump and an owned dump of the same build must be byte-identical.
+fn stream_frame(raw: &[u8], options: EncoderOptions, owned: bool) -> Vec<u8> {
+    if owned {
+        let source = zstdx::stream::read::OwnedSource::from(raw.to_vec());
+        let mut enc = zstdx::stream::read::OwnedEncoder::with_options(source, options)
+            .expect("owned encoder");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("owned stream read");
+        enc.finish().expect("owned stream finish");
+        comp
+    } else {
+        let mut enc =
+            zstdx::stream::read::Encoder::with_options(raw, options).expect("stream encoder");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("stream read");
+        enc.finish().expect("stream finish");
+        comp
+    }
 }
 
 /// Write one frame after gating it: both in-process decoders must
@@ -189,10 +209,11 @@ pub fn run(args: &Args) {
             // copies, not borrows: the boxed closures outlive the loops
             let level = *level;
             if let Some(cells) = &cells {
+                let owned = args.owned;
                 for &cell in cells {
                     let file = format!("{name}.{}{suffix}.zst", cell.tag());
                     let job = Box::new(move |raw: &[u8]| {
-                        stream_frame(raw, cell.options(level.pair().0, raw))
+                        stream_frame(raw, cell.options(level.pair().0, raw), owned)
                     });
                     jobs.push((file, Arc::clone(raw), job));
                 }

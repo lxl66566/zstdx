@@ -68,6 +68,28 @@ dec.read_to_end(&mut original)?;
 
 `read::Encoder::finish` requires reading the encoder to end of stream first. It refuses with `UnreadOutput` instead of truncating. `try_finish` is the abandon path and hands the reader back together with the error, so a caller dropping a half-read frame keeps the source.
 
+### Owned in-memory sources
+
+An in-memory source the encoder can hold for the stream's lifetime goes through `read::OwnedEncoder`, the zero-copy multithreaded feed:
+
+```rust
+use std::io::Read;
+use zstdx::{EncoderOptions, Level, stream::read::{OwnedEncoder, OwnedSource}};
+
+let data: Vec<u8> = load_source();
+let mut enc = OwnedEncoder::with_options(
+    OwnedSource::from(data),                          // Vec, Box<[u8]>, Arc<[u8]> or &'static [u8]
+    EncoderOptions::new(Level::Fastest).workers(8),
+)?;
+let mut compressed = Vec::new();
+enc.read_to_end(&mut compressed)?;                   // Read-shaped: pulls on demand
+let source = enc.finish()?;                          // hands the source back
+```
+
+With more than one worker on a multi-core machine, every job borrows its absolute range of the source directly and the match window below a job's start is the source's own bytes, so the serial input copy the Read-trait pump pays is gone and the multithreaded cells run at their bulk ceilings. Raw-block levels and single-core machines demote to the single-threaded core, which stages the source through one copy in the Read pump's 16 KiB cadence, keeping its closing shape equal to the Read encoder's. The frames are byte-identical to `read::Encoder` over the same source at the same options, and the source's length stays undeclared the way an opaque reader's does: set `pledged_size` or an `InputShape` to get the same declared-length header and schedule the Read encoder would produce. The contracts carry over unchanged, so `finish` keeps the `UnreadOutput` refusal, a `pledged_size` that disagrees with the source errors the first read with `PledgedSizeMismatch`, and `try_finish` hands the source back on error.
+
+Flush is a writer concept and the entry takes none: a mid-stream flush on the write path re-grids the job boundaries and moves the frame bytes, so an owned-source stream documents the unflushed shape. For a source whose bytes arrive over time, or one behind an opaque `Read`, keep `read::Encoder`.
+
 ## Porting from the zstd crate
 
 `compat` mirrors the libzstd-bindings crate, `zstd` on crates.io, with numeric `i32` levels, `io::Result`, the same module layout and the same type names. Replace `zstd::` with `zstdx::compat::`:

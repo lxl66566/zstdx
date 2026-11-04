@@ -918,6 +918,25 @@ impl FrameEncoderCore {
     // Fallible for an invalid dictionary, and — without std — for any
     // worker count above one (no core can serve it there).
     pub(crate) fn new(options: &EncoderOptions) -> Result<Self> {
+        Self::new_inner(options, None)
+    }
+
+    /// The zero-copy entry over a fully-resident source (see
+    /// `stream::read::OwnedEncoder`): the multithreaded core holds the
+    /// source's bytes and its jobs borrow them directly, deleting the read
+    /// pump's serial input copy. Routing and the single-threaded demotions
+    /// mirror `new` exactly — raw-block levels and single-core processes
+    /// run the single-threaded core, which stages the source through one
+    /// whole-source `write` (a chunking-independent shape).
+    #[cfg(feature = "std")]
+    pub(crate) fn new_owned(options: &EncoderOptions, src: &[u8]) -> Result<Self> {
+        Self::new_inner(options, Some(src))
+    }
+
+    /// The shared routing body: dictionary resolution, the multithreaded
+    /// engagement gates and the single-threaded arms. `owned` is the
+    /// zero-copy feed's resident source, `None` for the Read/write feeds.
+    fn new_inner(options: &EncoderOptions, owned: Option<&[u8]>) -> Result<Self> {
         // The dictionary resolves once (the parsed form shares, the raw
         // bytes parse fallibly here) and routes every arm below: the
         // multithreaded core seeds the frame's first job from it, the
@@ -937,11 +956,21 @@ impl FrameEncoderCore {
             if options.level != Level::Uncompressed
                 && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2)
             {
-                return Ok(Self::Mt(match dict {
-                    Some(dict) => {
+                return Ok(Self::Mt(match (dict, owned) {
+                    (Some(dict), Some(src)) => super::encoder_mt::MtEncoderCore::new_owned_source(
+                        options,
+                        Some(dict),
+                        super::encoder_mt::OwnedView::new(src),
+                    ),
+                    (Some(dict), None) => {
                         super::encoder_mt::MtEncoderCore::new_with_dictionary(options, Some(dict))
                     },
-                    None => super::encoder_mt::MtEncoderCore::new(options),
+                    (None, Some(src)) => super::encoder_mt::MtEncoderCore::new_owned_source(
+                        options,
+                        None,
+                        super::encoder_mt::OwnedView::new(src),
+                    ),
+                    (None, None) => super::encoder_mt::MtEncoderCore::new(options),
                 }));
             }
             #[cfg(feature = "std")]
@@ -955,7 +984,7 @@ impl FrameEncoderCore {
             }
             #[cfg(not(feature = "std"))]
             {
-                let _ = dict;
+                let _ = (dict, owned);
                 return Err(Error::Unsupported {
                     feature: crate::Feature::Multithread,
                 });
@@ -1067,6 +1096,39 @@ impl FrameEncoderCore {
             Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// The owned feed's pump. The multithreaded core holds the source's
+    /// bytes since construction: the first call declares them fed whole and
+    /// closes the frame at the source's end, and later calls step the
+    /// finish drain like the Read pump past EOF. The single-threaded
+    /// demotion mirrors the Read pump's cadence instead — one 16 KiB
+    /// chunk per pull with the read loop draining between — because that
+    /// core's closing shape depends on the consumer's drain cadence (the
+    /// in-place last-block patch of `FrameEncoderCoreSt::finish`), so the
+    /// chunks keep the entry's bytes identical to the Read encoder's.
+    /// `src` is the same slice every call (the mt core pins it against
+    /// its construction view); `fed` is the single-threaded arm's cursor.
+    #[cfg(feature = "std")]
+    pub(crate) fn pump_owned(&mut self, src: &[u8], fed: &mut usize) -> Result<()> {
+        // The shared guard: a finished core re-enters nothing.
+        if self.is_finished() {
+            return Ok(());
+        }
+        match self {
+            Self::Single(core) => {
+                if *fed < src.len() {
+                    let n = (16 * 1024).min(src.len() - *fed);
+                    core.write(&src[*fed..*fed + n])?;
+                    *fed += n;
+                    Ok(())
+                } else {
+                    core.finish()
+                }
+            },
+            #[cfg(feature = "std")]
+            Self::Mt(core) => core.pump_owned(src),
+        }
     }
 
     /// Hand the encoded bytes to `w`, keeping the output buffer's allocation.
