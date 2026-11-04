@@ -5,7 +5,7 @@ This page indexes the directions that measurement has falsified, so they are not
 Every entry is backed by A/B data. A change in premises, such as the table structure, the window, the corpus or the CPU, allows re-evaluation, but new decomposition evidence must come first. The differential-testing discipline is in [benchmarking methodology](bench/methodology.md).
 
 - [Decoding](negative/decoding.md): decode and execute splits such as batch loops and the ring pipeline, the staging loops' register budget, wide-copy kernels, stage-A direct literal placement, and X1, huffman, FSE and xxhash loop attempts.
-- [Encoding · Matchers](negative/matchers.md): hash4 and rep probing revivals, window, lazy and insertion variants, DUBT and LDM ports and knobs, scan-loop and emit-path restructures, and the global SA/LCP candidate index.
+- [Encoding · Matchers](negative/matchers.md): hash4 and rep probing revivals, window, lazy and insertion variants, DUBT and LDM ports and knobs, ring-resident descent keys, scan-loop and emit-path restructures, and the global SA/LCP candidate index.
 - [Encoding · Entropy / Checksum / Misc](negative/entropy.md): raw pre-gates, bit-writer and histogram forms, package-merge, PGO, and AVX-512 insertion loops.
 - [Dictionary Trainer](negative/dict.md): k-sweep metric level and form variants, grid geometries, bucket hashing, C-side table construction, and stats level and sample-set choices.
 - [MT / Streaming](negative/mt-stream.md): frame-per-job, overlap, prefill and seeding, stage-B parallelization, the piece-decode hybrid overlap, and checksum absorb placements.

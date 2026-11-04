@@ -13,6 +13,7 @@
 # Development Records
 
 - [Status overview](dev/status.md)
+- [Research map](dev/research.md)
 
 ## Performance Comparisons
 

@@ -1,0 +1,129 @@
+# Research map
+
+Ranked map of the structural levers that stay unfalsified at the R95 state of the tree, for the next optimization rounds. No new measurement backs this page: every wall, share and cell value cites its page, and every expected gain is arithmetic on recorded numbers. Each proposal names the falsifications it must dodge, by entry, so a build round can check them before starting. The x notation is our time divided by the reference time, so below 1 means faster. Machine, corpus and pass facts are those of [snapshot](bench/snapshot.md), and the exactness classes follow the repo's gate discipline: byte-identical by construction, decode- or schedule-internal with output bytes unable to move, gated with the dump ladders and the 120-cell sweep; gated with size bars, bytes moving by design and named bars pricing them; and ratio trades, a size axis spent to buy speed.
+
+MT decode is this crate's exclusive territory, since libzstd exposes no MT decode API, and none of the sub-structures below has an external reference implementation, so every cost model here is built from the recorded walls alone.
+
+## Ranked shortlist
+
+| # | Lever | Open row | Exactness | Expected |
+|---|---|---|---|---|
+| 1 | Mid-epoch stage-A segmentation | todo 1 | byte-identical | skewed.zst9-class mt cells from about 1040-1066 to about 1680-1850 MiB/s, ceiling about x1.85 to 1.9 single-thread |
+| 2 | Owned-slice zero-copy MT stream entry | todo 17 | byte-identical | dll100 fastest stream-mt8 about -9 to -13% wall, landing on its bulk-mt8 ceiling; needs an API-surface decision |
+| 3 | NT-store copy kernel through an opt-in reader | todo 17 | byte-identical | about -3 to -5% on the same cell; the fallback if proposal 2 is rejected |
+| 4 | Parallel pump copies through an opt-in reader | todo 17 | byte-identical | about -4 to -6%, bounded by worker steal and bandwidth headroom; second fallback |
+| 5 | Level-1 small-band per-call cost decomposition | todo 4 | byte-identical until a lever falls out | json l1 1K-4K sit at x1.21 to x1.66 with two unmeasured per-call suspects; a decomposition precedes any lever |
+
+## Restart-poor MT decode, todo 1
+
+### The stage-A staging-rate wall, re-derived
+
+skewed.zst9 carries 33.6 MB of output, 6.09M sequences and a staged stream of 73.1 MB of sequences plus 2.0 MB of literals, behind two restart points at 16 MiB; the traffic table is in [decoding](perf/decoding.md). Current mt8 and mt16 cells read about 1040-1066 MiB/s, walls of 31.5 to 32.3 ms, against a 982 MiB/s single-thread control. Stage B's execute after the R90 port runs 7.8 ms per 16 MiB segment, 15.6 ms for the frame, so the first segment's staging holds about 16.6 ms of the 32.2 ms wall. The single-thread path decodes the same frame in 34.2 ms, of which about 18.6 ms is the entropy-decode share, 9.3 ms per segment, so one staging worker runs a 16 MiB segment at about 1.0 GB/s of output against the single-thread path's about 1.8 GB/s: the staging body keeps wire offsets, so repcodes stay unresolved until stage B, and the segment writes 36.5 MB of staged sequences. With two segments the wall is one 16 MiB staging plus two executes, and worker count changes neither term. The restart points belong to the frame, the per-worker staging rate is the falsified body-widening territory, and every representation lever on the staged set is measured and closed, so restart-poor frames hold about x1.06 single-thread.
+
+The wall has one unpriced degree of freedom left: staging starts are confined to restart points, and a restart point is only where every table re-describes. A restart point is the sufficient condition for a cold start, which the scan enforces because a cold worker needs no carried state. It is a stronger condition than staging requires, and the gap between the two is proposal 1.
+
+### Proposal 1: mid-epoch stage-A segmentation
+
+Mechanism. Between two restart points, the only state stage A carries across block boundaries is the entropy tables. Literal Huffman streams, FSE descriptions and sequence bitstreams are per block, repcode history never touches stage A, and the pre-scan already parses every block's literals and sequence headers through `probe_restart`, so every block boundary is a known input offset with known section modes. Define the table epoch of a block as the fold of table transitions since the last full restart: a Compressed-literals block re-establishes the Huffman table while its FSE modes may stay Repeat, so Huffman and FSE state must fold separately. A sub-segment may start at any block boundary whose table state the worker holds. One snapshot per table state, a few KiB of FSE scratch plus Huffman table, is built once from the descriptions and cloned per staging lease, so the priming cost per sub-segment is a clone, and the description replay runs at header-parse rate.
+
+The planner keeps its current target multiples and snaps a segment start to the first restart point past the target when one exists within 1.5x of it, and to the nearest block boundary otherwise. Restart-dense frames keep today's segmentation exactly, and only restart-poor epochs split. Segment bookkeeping, the staged-literal zero tail, the per-segment wild cap and the inline checksum absorb all work per segment unchanged, so stage B sees the same machinery at a finer granularity.
+
+Target cells. skewed.zst9 mt8 and mt16 at about 1040-1066 MiB/s, about x1.06 of the 982 MiB/s single-thread control; skewed.zst19 mt8 and mt16 at about 2920 against a single-thread bulk cell at 2629-2855, the other restart-poor frame, whose two 16 MiB segments each stage about 14 MiB of literals. json.zst3, dll100.zst3 and text.zst3 mt cells are the no-regression controls, at about 1.5, 1.8 and 0.98 times single-thread respectively.
+
+Exactness: byte-identical by construction. Decode output is untouched, staging is internal, and stage B stays segment-serial.
+
+Expected gain with arithmetic. Splitting each 16 MiB epoch into eight 2 MiB block-aligned sub-segments puts the staging latency at two waves of about 2.1 ms per worker at mt8, about 4.5 ms with lease handoff, against today's 16.6 ms. The wall becomes about 4.5 plus 15.6 ms of serial execute, about 20 ms, so about 1680 MiB/s, x1.7 of single-thread; at mt16 one wave lands the wall near 18 ms, about 1850 MiB/s, and the ceiling is the 15.6 ms execute plus handoff, about x1.85 to 1.9 single-thread. At mt4, four rounds of staging keep the wall near 24 ms, about 1400 MiB/s, a third over the cell. The aggregate staging traffic, 73 MB of staged writes inside about 4 ms, about 18 GB/s beside stage B's round trip, must not collapse under contention; the R94 padding probe put skewed's bandwidth-bound stage-B wall share at only 0.12 to 0.15, so the headroom exists on paper and the A/B must confirm it.
+
+Gate recipe. Extend the `probe_restart` unit tests with the fold classes: a Compressed-literals block mid-epoch with all-Repeat FSE, partial FSE rebuilds with a single explicit mode, Treeless chains across Raw and RLE literals blocks, and zero-sequence blocks. Add a debug-mode equivalence test that stages every candidate sub-segmentation and compares against whole-segment staging on the corpus plus crafted frames. Then the dump ladders `dump --all-levels` and `dump --stream --all-levels` diff-empty, mtcheck over corpus, big and corrupt, the 45k-case parity sweep with MT arms 2, 4 and 8, and the paranoid, debug, release and no-default-features suites. The perf gate is a locked position-balanced interleaved A/B, five or more rounds per side, on skewed.zst9 and skewed.zst19 at mt4, mt8 and mt16, with json.zst3, dll100.zst3 and text.zst3 mt8 and every single-thread control flat within 1 to 2 percent.
+
+Kill conditions. Any control cell regresses more than 2 percent; the equivalence test finds a fold divergence; mt16 loses to today's build, which would mean the staging write burst contends with the execute beyond the R94 shares.
+
+Falsifications to dodge. The stage-A body widening, the direct literal placement, the in-dst zone staging, the packed staged-record family including the SIMD-expansion reopen, and the tail prefetch in [negative decoding](negative/decoding.md) all stay dodged because stage A's decode body, the staged representation and the executor are untouched. The piece-watermarks falsification in the same file, whose data serializes stage B, stays dodged by keeping stage B segment-serial. Restart-position grid discovery in [negative MT](negative/mt-stream.md) falsified the restart lattice as a *job-grid signal* for the piece executor; proposal 1 uses block boundaries as staging starts and inherits none of that premise. The in-dst-zones reopen condition, cache-clean staging warmth, is untouched because the staging buffers stay pooled scratch.
+
+### Stage-B floor for the same frames
+
+Below the staging latency sits the 15.6 ms serial execute, and its levers are spent: the executor runs the libzstd-shaped loop, the copy levers and representation levers are falsified, and piece-parallel execution needs the encoder's deep-offset ramp, which demands a D under the shape's dominant match period. skewed.zst9's crossing reads reach to a 4.1 MiB p50 deepest read and shallow first reads co-occur at every cut, the piece-watermarks data, so no D prices on this shape. The ramp family stays landed and env-gated for the level-3-class frames it wins on, `mt_pieces` in [decoding](perf/decoding.md), and restart-poor level-9 and level-19 frames keep the serial execute as their floor once proposal 1 lands.
+
+## dll100 streaming-MT fastest encode, todo 17
+
+### The pump wall, restated
+
+The R95 decomposition in [mt-stream](perf/mt-stream.md) reads dll100 fastest stream-mt8 at a 109 ms span: the makespan job covering 52-68 MiB claims at t+15 ms, the moment the pump has fed its 68 MiB end at about 4 GB/s under the eight workers' memory traffic, then runs 84 ms; the caller's pump is 25.9 ms, of which 24.7 ms is the read itself, 100 pulls of 1 MiB, so the pump is about 95% memcpy at the loaded rate and its recoverable serialization is 1.1% of wall. The landed stepped finish drain moved the cell to 958-967 MiB/s against a 1059-1075 bulk-mt8 ceiling, so the remaining gap, about 15 ms, matches the feed latency of the makespan job's span. The wall is the copy rate itself, and the side-thread falsification in [negative MT](negative/mt-stream.md) names the reopen condition: the copy must get cheaper, and the borrowed-window forms are falsified below it.
+
+The 2.12x against libzstd-mt8 on this cell is a non-iso-ratio comparison: zstd's 1971 MiB/s buys 48 MB of output against our 24 MB, recorded in [matrix](bench/matrix.md), so the row's own-ceiling distance is the honest target and the four levers below price it.
+
+### The four feed levers, cost-modeled
+
+The accumulate buffer's hugepage wiring is landed: `MADV_HUGEPAGE` scoped to the stream-mt buffer since 2026-09-12, saving about 3 ms per 32 MiB of first-touch faults, per [negative decoding](negative/decoding.md), and the same advice on the opt tables is falsified in [negative MT](negative/mt-stream.md). No hugepage lever remains on the pump path.
+
+Non-temporal stores in the copy. The 1 MiB pulls sit under glibc's non-temporal threshold, so the copy runs temporal `rep movsb`: each 100 MB of appends costs a source read plus a destination read-for-ownership plus the write, about 300 MB of memory traffic, and NT stores cut it to about 200 MB. If the loaded rate is RFO-bound, the rate moves from about 4 to about 5.5-6 GB/s, the makespan job's feed latency falls from about 15-17 to about 11-13 ms, and the wall reads about 103 ms, about -5%. Reachability is the design question: the memcpy runs inside the caller's `Read` implementation, and the internal-specialization route is the falsified zero-copy slice entry in [negative MT](negative/mt-stream.md). The sanctioned form is an opt-in reader the crate ships, whose `read` runs an NT-store kernel into the caller-provided buffer; byte-identical by construction, since posting stays pos-based. Gates: `dump --stream --all-levels` diff-empty, the 120-cell sweep, then the locked 5v5 matrix on dll100 fastest stream-mt8 with json, text and skewed fastest controls flat.
+
+Parallel pump copies. The loaded 4 GB/s is a single-stream rate under latency; two or three copy threads reach about 7-8 GB/s if the memory system has aggregate headroom, which the probe must verify first, halving the feed latency for a wall near 100 ms, about -6%. The cost is a core during the ramp: the fast-row LDM prefix chain in [negative MT](negative/mt-stream.md) lost 8-10% through its builder holding the eighth worker, so the copies must run off the encode pool and the A/B must show no worker starvation. Reachability shares the opt-in reader form with the NT kernel, and the two compose. Same gates as the NT kernel.
+
+Owned-slice zero-copy entry. The remaining distance, the 15 ms feed latency, is the entire copy, and the copy deletes for in-memory sources when the encoder owns the buffer: jobs borrow absolute ranges of the source directly, the window strip is the source's own bytes below each job's start, and the accumulate buffer keeps only the posting bookkeeping. This is the borrowed-window stream the input-copy-chain falsification in [negative MT](negative/mt-stream.md) names as the remaining 60%: it closes the direction on the healthy-state bound, one copy buys nothing, and records that the zero-copy form needs caller memory contiguous with the history, which an owned in-memory source is. The internal-specialization falsification, zero-copy slice source in the same file, stays dodged because the entry is explicit API surface, a boxed or shared in-memory source handed to the stream encoder, and the `Read` trait's spare-capacity contract stays untouched. The Growing grid's quantization derives from the stream offset alone and flush stays a documented rebase, so bytes stay identical to today's stream output: gate on the stream dump ladders at w4 and w8, the 120-cell sweep size-identical, and the locked 5v5 matrix on dll100 fastest stream-mt8 plus the corpus fastest controls. Expected: the feed latency falls to posting latency, the wall lands on the 94.4 ms bulk ceiling, about -9 to -13%, and the same mechanism serves every pump-bound stream cell. The open decision is API surface, and that belongs to the supervisor before a round starts.
+
+### Floors on the same row
+
+The makespan job's own 84 ms parse plus the 19 ms serial LDM state at 52 MiB bound every fill-sharing schedule: the prefix chain, the CDC index and the speculative strip prefill falsifications in [negative MT](negative/mt-stream.md) cover the sharing forms, and a parallel builder's best case stays near a 105 ms wall. The Growing grid's last-epoch posting and the stream-end tail re-slice are byte-load-bearing, the incremental-posting falsification in the same file, so ultra's finish-tail residue is a schedule floor. The fastest-versus-libzstd gap is non-iso-ratio semantics, the row trading half the output size for density.
+
+
+## Level-1 small-band per-call costs, todo 4
+
+### Proposal 5: the small-band per-call decomposition
+
+Mechanism. A throwaway decomposition build, in the `jobdecomp` lineage, that times each per-call component on the 1K, 2K and 4K level-1 cells against the CLI at the same level: the small-frame entropy tails, the exact histogram pass, table builds and per-frame fixed costs, and the mid-band pre-header far-class screen, the two attribution candidates the 2026-09-27 small-payload pass recorded when the band inverted. The probe must isolate them per component, since the band's walls are microsecond-scale and a share cannot be read off end-to-end deltas.
+
+Target cells. json, text and dll at l1 1K to 4K inside the x1.21 to x1.66 slide band, plus the json 2K and 4K cells that sit 12 and 27 B over the reference from literal volume.
+
+Exactness: byte-identical by construction; the build measures and changes nothing.
+
+Expected gain with arithmetic. Unknown until the split lands, bounded by the slide itself: 20 to 60 percent of microsecond-scale walls. A component priced above 10 percent of a cell is a lever and carries its own dump gates; the sampled-entropy falsification in [negative entropy](negative/entropy.md) blocks the obvious cut on the exact pass, so the surviving candidates are scheduling-side: standing the far-class screen down on the small band it can never arm on, and a per-frame fixed-cost diet.
+
+Gate recipe. No output gates for the probe. Any lever that falls out takes the small-payload A/B plus the 120-cell sweep, with the head screens' cost held at O(head sample), the landed screens' own rule.
+
+Kill condition. The split attributes the band to the fast row's per-event floor, item 3's class, in which case the cells are floor with the rest of the row.
+
+Falsifications to dodge. The sampled-entropy decision and the cheaper-exact-binning entry in [negative entropy](negative/entropy.md) close the entropy side's cheap cuts before they are tried, and the pre-horizon fill-only and content-latch entries in [negative matchers](negative/matchers.md) close screen-shape changes that move bytes.
+
+## Open rows, lever against floor
+
+Fastest json scan, todo 3. The mt8 residue rides the single-thread deficit through workers, and the single-thread loop is issue and serialization bound at IPC 3.88 with dispatch utilization 64: the remaining excess is spill traffic and the pair-fixed prep block, both register-budget-bound, and every asm, PGO and placement form re-rolls the saturated allocation, falsified at prototype and recorded in [matchers](perf/matchers.md) and [negative matchers](negative/matchers.md). The sanctioned dense-mode form is harvested to its 6th-byte pre-validation. Floor. The registered reopening condition is an event-side rethink that cuts the 2.25x per-event volume without moving the register allocation, and no unfalsified candidate exists.
+
+Small and mid payloads, todo 4. The level-9 band is closed as a deliberate per-class trade behind the sampled-distinct verdict. The level-1 slide at 1K to 4K and on text at 64K splits three ways after the tiny-frame dense-bar join and the alphabet screen landed: text at 64K pays the dense bars' per-position density that buys its ratio, an accepted trade; json and dll above 8 KiB keep stock bars through the alphabet screen and carry the fast row's per-event floor, item 3's class, at dll l1 8K and 16K a verified +4.2 and +2.9 percent; the 1K to 4K cells carry two recorded but unmeasured attribution candidates, the small-frame entropy tails and the mid-band pre-header far-class screen, both per-call costs. Proposal 5 is the decomposition that prices them. The 1M cells belong to the bulk tier.
+
+Greedy -4 dictionary row, todo 6. The remaining shape is the exact-once insert discipline: fill the rep-advance holes and never re-insert a head, following the catch-up discipline the frontier-skip falsification in [negative matchers](negative/matchers.md) names. It is worth 13 to 96 B per seed on dictionary rows, bytes moving, and sits below the shortlist on value.
+
+compat `set_target_cblock_size`, todo 18. Superblock splitting loses ratio on every measured shape, [negative entropy](negative/entropy.md). Floor unless an explicit transport-chunk API appears.
+
+Dictionary-frame parse residuals, todo 19. The level-9 54 µs per-call tax is the dictionary's dense twin field through the x8 chain walk, priced against libzstd's 40 µs and judged not tractable; the 13 and 15 residue is the swapped row's parse. Floor.
+
+FFI parity and the fuzz campaign, todos 22 and 23. Work items, not performance rows. The fuzz exec/s residue is the only cost lever and it buys coverage.
+
+Single-thread bulk rows. json.fast at x1.02 is near closed on latency-bound tails; the balanced, best, opt and ultra rows on dll100 run at instruction parity or ahead with the gap priced as the far-class density's event volume times per-event codegen, the walk latency floor at about 66 cycles per step and the distributed 2-3-instruction licks, [enc-dll-gap](bench/enc-dll-gap.md) and [matchers](perf/matchers.md). Floor short of an event-side rethink, the same condition as todo 3.
+
+## Cross-cutting overlap map
+
+The encode pipeline's overlaps are all built or falsified, and the record is complete enough to state the map:
+
+- pump copy against worker parse: landed through the posted-job queue; the residue is the copy rate, priced above;
+- checksum against workers: the slice path offloads through the sidecar thread at 256 KiB and up on std+hash builds, and the stream path keeps the caller absorb, with the four stream-side offload placements falsified in [negative MT](negative/mt-stream.md);
+- finish drain against the straggler: landed as the stepped drain; the capacity-promise forms are falsified;
+- LDM split pass against workers: landed as the ahead-of-time serial feed for the opt rows; the fast-row sharing forms, prefix chain, CDC index and speculative prefill, are falsified, and the btlazy windowed-adoption geometry is falsified;
+- stage-A staging against stage-B execute: landed; the checksum absorb is inline in stage B with the thread and post-pass forms falsified in [negative decoding](negative/decoding.md);
+- the Growing grid's last epoch and the stream-end tail: byte-load-bearing, the incremental-posting falsification.
+
+The untried overlaps that remain are proposal 1, which parallelizes stage A inside an epoch, and the feed levers of todo 17. Every other serialized span is a measured floor or a byte-load-bearing schedule.
+
+## Wildcards
+
+Encoder-emitted restart density. An opt-in knob that makes the encoder re-describe all tables every N MiB on single-thread frames would give the decoder restart points without any decoder change: each added restart costs one description set, hundreds of bytes, so a 16-to-32-way density increase costs on the order of 10 KB, well under half a percent on a multi-megabyte frame, and the staging split comes out at today's segment machinery. It is dominated by proposal 1, which buys the same staging parallelism at zero size cost and without touching the parse, and it survives only as the fallback if proposal 1's table-fold gates fail. Probe-worthy as a fallback only; dead on arrival otherwise.
+
+Same-CCD staging affinity. The in-dst-zones falsification in [negative decoding](negative/decoding.md) lost through cross-core ownership transfers and names cache-clean warmth as a reopen condition. An adjacent unmeasured form places the staging workers on the executor's own CCD, where Zen4 shares one L3 among eight cores: json.zst3's staged set, 26.7 MB, fits a 32 MiB per-CCD L3, and the bandwidth-bound stage-B share of 0.21 to 0.40 prices the read-side saving at up to a quarter of the json wall if the lines survive the concurrent staging writes. dll100's 93 MB staged set does not fit, so the lever is json-class only. A codec library should not pin threads, so the shape needs an opt-in placement knob and the pool is shared with the encode side, which doubles the policy cost. Probe-worthy at low priority, behind an explicit knob.
+
+Multi-frame parallel decode. Concatenated-frame streams decode with independent state per frame, so frame-granular parallelism is sound by construction and composes with the per-frame two-stage machine. No bench payload measures concatenated frames today, so the lever has no cell: it needs a corpus payload first, then the wall is the largest frame's decode plus assembly. Bench-first, probe-worthy only with that payload.
+
+NT-store staged writes above L3 scale. The staged set is write-once, read-once, a pure streaming pattern, so NT stores on stage A's staged writes delete the RFO half of their traffic when the set exceeds L3: skewed.zst9's 73.1 MB and dll100.zst3's 93.3 MB qualify, json.zst3's 26.7 MB fits the L3 and must keep temporal stores so the executor reads stay cached. Gain is bounded by the staging-latency share, about -10 to -20% of staging, worth about -5 to -9% of skewed's mt wall on today's segmentation and shrinking under proposal 1; carry it as a rider probe on proposal 1's build. Probe-worthy as a rider.
+
+Decode-side hugepages. Falsified by data: the page-dispersity probe in [negative decoding](negative/decoding.md) shows decode insensitive to PFN layout at steady dTLB miss rates, and the MADV entry records the accumulate buffer as the only load-bearing scope. Dead on arrival.
+
+Structure-of-arrays staged sequences. Splitting the 12 B record into three streams reads the same bytes with more loads and loses the single-record locality; the R94 traffic model prices width alone, and the pack and expansion forms are measured losses. Dead on arrival.

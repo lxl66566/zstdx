@@ -224,6 +224,10 @@ All worktrees of this repository push onto one `refs/stash`, so a `git stash pop
 
 Before popping, verify the top entry's content with `git stash show --stat`. On a wrong pop the dropped commit usually still exists, and `git stash store <sha>` re-registers it exactly. For worktree-local parking, prefer scratch commits on the branch with `git add -A && git commit -m wip` and reset later.
 
+### Gitignored AGENTS.md is absent from fresh worktrees
+
+`AGENTS.md` is ignored and untracked, so a worktree checked out for the first time carries no copy. An agent session that starts with reading it dies on the first step. Copy the main checkout's file into a new worktree before handing it over; the ignore rule keeps the worktree clean.
+
 ### Per-package cargo binaries
 
 `cargo build -p zstdx` does not refresh `target/release/zstdx-bench`, so rebuild the bench binary after every edit. A ratio run once showed byte-identical output because it was a stale binary.
