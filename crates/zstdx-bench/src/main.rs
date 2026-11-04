@@ -76,6 +76,11 @@ enum Command {
     /// `zstd -dcq`, accept/reject and output compared per case; nonzero
     /// exit on divergence.
     Parity(cmd::parity::Args),
+    /// Forced-tier decode differential: re-exec under
+    /// `ZSTDX_DEC_SIMD_TIER=scalar` and `=bmi2` and compare every cell's
+    /// output hash, so the asm stretch and the scalar body run on the same
+    /// inputs; nonzero exit on divergence.
+    Tierdiff(cmd::tierdiff::Args),
 }
 
 fn main() {
@@ -96,5 +101,6 @@ fn main() {
         Command::Train(args) => cmd::train::run(&args),
         Command::Dictmt(args) => cmd::dictmt::run(&args),
         Command::Parity(args) => cmd::parity::run(&args),
+        Command::Tierdiff(args) => cmd::tierdiff::run(&args),
     }
 }

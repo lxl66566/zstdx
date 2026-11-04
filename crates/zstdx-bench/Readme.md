@@ -7,7 +7,7 @@ This page answers how to run each benchmark, which flags select corpus shapes an
 - Build and run with `cargo run --release -p zstdx-bench -- <subcommand> [flags]`. Always use `--release`, because debug builds measure nothing.
 - The corpus prerequisite is one run of `bash bench/gen_corpus.sh`. It writes 32 MiB files for five shapes: `json`, `text`, `skewed`, `random` and `zeros`. It also writes `.zst1/3/9` variants, plus `.zst19` for json, text and skewed.
 - Timing subcommands share an interleaved A/B harness in `src/common.rs`. Both sides alternate round by round and the per-round ratio is the primary verdict, which is resistant to clock drift. Each side gets a time budget from `--budget-ms`, default 500 ms, or from the `BENCH_BUDGET_MS` environment variable. A side that is far faster than its counterpart stops at one eighth of the budget once the slow side spent the full budget, because every further round costs a full slow-side round for a handful of fast-side samples; this bounds asymmetric cells such as the deep-level random rows, where the libzstd side runs seconds per round.
-- `ZSTDX_DEC_SIMD_TIER=scalar|bmi2` is a library environment override. Unset means runtime detection, and an invalid value panics. It forces the decode SIMD tier, so running the decode subcommands `files`, `mtcheck`, `corrupt` and `prof dec` under it gates the forced tiers on any machine.
+- `ZSTDX_DEC_SIMD_TIER=scalar|bmi2` is a library environment override. Unset means runtime detection, and an invalid value panics. It forces the decode SIMD tier, so running the decode subcommands `files`, `mtcheck`, `corrupt` and `prof dec` under it gates the forced tiers on any machine; `tierdiff` runs both forced tiers itself and compares them cell by cell.
 - Deterministic, instruction-count based benchmarks under valgrind live in the sibling crate [`zstdx-gungraun`](../zstdx-gungraun/Readme.md).
 
 Level vocabulary is the same everywhere. The six ladder levels are `fastest`, `fast`, `balanced`, `best`, `opt` and `ultra`, paired in benchmarks with libzstd at numeric levels 1, 3, 9, 13, 17 and 19. `--shape` selects corpus shapes and `--level` selects levels from a comma-separated list. Omit either flag to mean all values. `matrix --level` also accepts numeric levels from 1 to 22.
@@ -165,6 +165,15 @@ cargo run --release -p zstdx-bench -- parity --dict bench/dict-json
 ```
 
 `--seed` reseeds the payload RNG. `--cases N` stride-samples to an approximate budget and always keeps clean replays. `--dict <path>` attaches the dictionary to both decoders and encodes the real seeds with it, and the dict-frame sweep itself is todo 21a. `--mt` selects the worker-count arms and defaults to `4`, and with `--dict` they run the sequential dictionary path. `--dump <dir>` writes every divergent case's bytes for offline replay. `--decode <file>` prints one file's verdicts from zstdx, libzstd one-shot and the CLI, for replaying a dumped case.
+
+### `tierdiff`: forced-tier decode differential
+
+Runs the decode hot loops' SIMD tiers against each other on the same inputs. The tier resolves once per process, so the subcommand re-execs itself under `ZSTDX_DEC_SIMD_TIER=scalar` and again under `=bmi2`, and compares every cell's output length plus FNV-1a hash. Each file runs through three cells: `stream` (StreamingDecoder), `flat` (`decode_all` into an exact-size target, the staged executor) and `indst` (`decode_all` into a target with room for one block maximum plus its pad, one block maximum of literals and the over-read tail beyond the frame's output, so the in-dst staging gate can engage). A length or hash divergence, a failed child or a cell that stops emitting lines exits nonzero.
+
+```bash
+cargo run --release -p zstdx-bench -- tierdiff
+cargo run --release -p zstdx-bench -- tierdiff frames/*.zst3
+```
 
 ### `seqstats`: matcher sequence statistics
 
