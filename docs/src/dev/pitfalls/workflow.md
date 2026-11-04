@@ -347,6 +347,10 @@ Every fixture access goes through `fixture_entries` and `fixture_bytes`, for cor
 - The Edit tool matches by text. Identical tail context in the X1 and X2 functions once caused edits to the wrong function, so when editing similar functions the old string must carry an identifier unique to each.
 - Match-arm edits should contain only the target arm. One edit copied the next arm wholesale into the new string and produced a duplicate arm exposed only by clippy's unreachable-pattern lint, with behavior that happened to stay correct but redundant.
 
+### Never git-checkout a file carrying uncommitted work
+
+`git checkout -- <path>` restores the index copy, so in a fresh worktree it silently discards uncommitted implementation work. Take a /tmp snapshot of every modified file before any restore, verify it by hash, and restore working files from the snapshot instead of the index; keep it until the work is committed.
+
 ### Verify batch restores with git diff
 
 A Python replace missed one site because `replace(pat, 2)` hits only the first two, and json.fastest size drifted by 101 B, caught only through deterministic size comparison. Diff first after every change, because deterministic sizes are a free regression probe.

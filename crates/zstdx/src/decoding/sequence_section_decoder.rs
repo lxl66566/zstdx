@@ -794,7 +794,11 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
-fn maybe_update_fse_tables(
+/// Apply one block's sequence-section modes to the scratch tables without
+/// touching its bitstream. Besides the decode entry points this serves the
+/// MT pre-scan, which replays the last explicit description of each FSE
+/// stream to prime a mid-epoch segment start.
+pub(crate) fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,

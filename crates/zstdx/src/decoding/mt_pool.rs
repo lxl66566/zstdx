@@ -195,9 +195,8 @@ fn pool_thread(slot: &Arc<WorkerSlot>) {
 
 fn pool_thread_inner(slot: &Arc<WorkerSlot>) {
     // Worker-local stage-A scratch, carried across leases (the entropy
-    // tables are the expensive part; every segment starts at a restart
-    // point, so `decode_segment`'s per-segment reset re-initializes all
-    // state a job reads).
+    // tables are the expensive part; `decode_segment`'s per-segment reset
+    // and mid-epoch prime re-initialize all state a job reads).
     let mut scratch: Option<SegmentScratch> = None;
     while let Some(job) = wait_lease(slot) {
         let retire = serve_stagea(&job, &mut scratch);

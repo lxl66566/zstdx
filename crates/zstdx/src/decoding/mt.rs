@@ -1,13 +1,22 @@
 //! Parallel decoding of complete in-memory inputs.
 //!
-//! A cheap pre-scan walks the block headers (3 bytes per block) and finds
-//! *restart points*: blocks where stage A's fresh entropy tables provably
-//! suffice — every FSE stream out of Repeat mode, and literals that rebuild
-//! the Huffman table (Compressed mode) or ignore it entirely (Raw/RLE, only
-//! while no Treeless block precedes the next table rebuild). Encoders with
-//! jobs (libzstd's `-T` mode, this crate's [`crate::encoding::mt`]) emit
-//! such blocks at every job boundary, and every frame start is one by
-//! definition.
+//! A cheap pre-scan walks the block headers (3 bytes per block) and splits
+//! the input into *segments* — units stage A stages in parallel and stage B
+//! consumes one at a time. A segment start needs the entropy tables its
+//! staging runs on. A *restart point* — every FSE stream out of Repeat
+//! mode, and literals that rebuild the Huffman table (Compressed mode) or
+//! ignore it entirely (Raw/RLE, only while no Treeless block precedes the
+//! next table rebuild) — makes fresh tables provably suffice, and encoders
+//! with jobs (libzstd's `-T` mode, this crate's [`crate::encoding::mt`])
+//! emit such blocks at every job boundary. Any other block boundary works
+//! as a start too, provided staging first re-establishes the *table
+//! epoch*: the tables the last restart point's epoch carries there,
+//! rebuilt from the description the pre-scan records per axis (see
+//! [`TablePrime`]). The planner prefers restart points — a segment start
+//! snaps to the first restart point past each target multiple when one
+//! lies within 1.5x of it — so restart-dense frames segment exactly as a
+//! restart-only scan would, and only restart-poor epochs (the shapes one
+//! long staging step serializes on) split at block boundaries.
 //!
 //! Between two restart points the compressed bytes decode independently of
 //! everything before them except the *output* history: literals Huffman
@@ -26,7 +35,7 @@
 //! Segment output sizes are only known after stage A, so the output buffer
 //! is checked (or grown) segment by segment as stage B reaches them.
 //! Dictionary frames, small inputs (unless the pledge routes them to the
-//! piece executor), inputs without a second restart point and single-core
+//! piece executor), inputs without a second segment and single-core
 //! processes fall back to the sequential decoder.
 //!
 //! Checksummed frames are verified inline in stage B: the pre-scan collects
@@ -87,7 +96,7 @@ pub(super) struct ScannedBlock {
     pub(super) body: Range<usize>,
 }
 
-/// A run of blocks between two restart points (or frame boundaries).
+/// A run of blocks between two segment starts.
 pub(super) struct SegmentPlan {
     pub(super) blocks: Vec<ScannedBlock>,
     /// This segment starts a frame: execution resets the repcode history
@@ -97,6 +106,30 @@ pub(super) struct SegmentPlan {
     /// `min(window, MAX_BLOCK_SIZE)` so a hostile claim cannot size the
     /// output buffer (same cap the sequential paths enforce).
     pub(super) window_size: usize,
+    /// The table epoch a start inside a restart point's epoch primes stage
+    /// A from. `None` at restart points and frame starts, where fresh
+    /// tables are correct.
+    pub(super) prime: Option<TablePrime>,
+}
+
+/// Carried entropy tables for a mid-epoch segment start: the input body
+/// range of the block that last described each table axis since the last
+/// restart point. A staging lease replays those descriptions — a table
+/// build per axis at header-parse rate — and holds exactly the tables the
+/// whole-epoch decode would carry at that boundary. `None` on an axis is
+/// the restart point's fresh state: a Treeless or Repeat use inside the
+/// segment then fails where the whole-epoch decode fails, with the same
+/// error.
+#[derive(Clone, Default)]
+pub(super) struct TablePrime {
+    /// Last block whose literals section is Compressed (rebuilds the
+    /// Huffman table).
+    huffman: Option<Range<usize>>,
+    /// Last blocks whose sequence sections explicitly describe each FSE
+    /// stream (Predefined, RLE or FSE_Compressed; Repeat carries).
+    ll: Option<Range<usize>>,
+    of: Option<Range<usize>>,
+    ml: Option<Range<usize>>,
 }
 
 /// Scan output: the segment plans plus the expected content checksum per
@@ -118,7 +151,7 @@ pub(super) struct ScanPlan {
 
 /// How stage B walks a block whose stage A staging is done. Every variant
 /// carries the block's exact output size (stage A accounting), which the
-/// piece planner uses to map restart points to output positions.
+/// piece planner uses to map segment starts to output positions.
 pub(super) enum BlockPlan {
     Raw {
         body: Range<usize>,
@@ -217,8 +250,8 @@ impl Drop for DecodedSegment {
     }
 }
 
-/// Reusable per-worker entropy state; reset between segments (every
-/// segment starts at a restart point, so fresh tables are correct).
+/// Reusable per-worker entropy state; reset between segments and then
+/// primed from the segment's [`TablePrime`] when it starts mid-epoch.
 pub(super) struct SegmentScratch {
     huf: HuffmanScratch,
     fse: FSEScratch,
@@ -268,60 +301,86 @@ enum HuffmanState {
     Ignore,
 }
 
-/// Per-block entropy-state classification from the pre-scan. A segment may
-/// only start where stage A's fresh tables provably suffice.
+/// Per-block entropy-state classification from the pre-scan: how the block
+/// treats each carried table axis. A restart point needs every axis
+/// re-established (or ignored); a mid-epoch cut instead replays the
+/// recorded descriptions.
 struct RestartProbe {
     huffman: HuffmanState,
+    /// Whether the block's sequence section explicitly describes each FSE
+    /// stream (Predefined, RLE or FSE_Compressed). Repeat streams carry
+    /// state across a cut; a zero-sequence block touches no stream.
+    ll_explicit: bool,
+    of_explicit: bool,
+    ml_explicit: bool,
+}
+
+impl RestartProbe {
     /// Every FSE stream leaves Repeat mode (explicit table or the block
-    /// carries none at all). Malformed blocks report `false`: the scan
-    /// defers to the sequential path's proper errors.
-    fse_rebuilt: bool,
+    /// carries none at all): a restart point's FSE axis.
+    fn fse_rebuilt(&self) -> bool {
+        self.ll_explicit && self.of_explicit && self.ml_explicit
+    }
+
+    /// A malformed block carries every axis: never a restart candidate,
+    /// never a fold update, and the staging path reports the real error at
+    /// the block itself.
+    fn carried() -> Self {
+        RestartProbe {
+            huffman: HuffmanState::Reuse,
+            ll_explicit: false,
+            of_explicit: false,
+            ml_explicit: false,
+        }
+    }
+}
+
+/// Payload bytes of a literals section: the tree description plus coded
+/// streams, the single RLE byte, or the raw bytes themselves.
+fn literals_payload_len(section: &LiteralsSection) -> usize {
+    match section.compressed_size {
+        Some(c) => c as usize,
+        None => match section.ls_type {
+            LiteralsSectionType::RLE => 1,
+            _ => section.regenerated_size as usize,
+        },
+    }
 }
 
 /// Classify a compressed block's body for the restart-point scan.
 fn probe_restart(body: &[u8]) -> RestartProbe {
     let mut section = LiteralsSection::new();
     let Ok(header_len) = section.parse_from_header(body) else {
-        return RestartProbe {
-            huffman: HuffmanState::Reuse,
-            fse_rebuilt: false,
-        };
+        return RestartProbe::carried();
     };
-    let literals_len = match section.compressed_size {
-        Some(c) => c as usize,
-        None => match section.ls_type {
-            LiteralsSectionType::RLE => 1,
-            _ => section.regenerated_size as usize,
-        },
-    };
-    let Some(seq_raw) = body.get(header_len as usize + literals_len..) else {
-        return RestartProbe {
-            huffman: HuffmanState::Reuse,
-            fse_rebuilt: false,
-        };
+    let Some(seq_raw) = body.get(header_len as usize + literals_payload_len(&section)..) else {
+        return RestartProbe::carried();
     };
     let mut seq_header = SequencesHeader::new();
     if seq_header.parse_from_header(seq_raw).is_err() {
-        return RestartProbe {
-            huffman: HuffmanState::Reuse,
-            fse_rebuilt: false,
-        };
+        return RestartProbe::carried();
     }
     let huffman = match section.ls_type {
         LiteralsSectionType::Compressed => HuffmanState::Rebuild,
         LiteralsSectionType::Treeless => HuffmanState::Reuse,
         LiteralsSectionType::Raw | LiteralsSectionType::RLE => HuffmanState::Ignore,
     };
-    // A zero-sequence block leaves the FSE tables untouched, so the next
-    // block could legally use Repeat; only explicit tables re-establish it.
-    let fse_rebuilt = seq_header.modes.is_some_and(|modes| {
-        !matches!(modes.ll_mode(), ModeType::Repeat)
-            && !matches!(modes.ml_mode(), ModeType::Repeat)
-            && !matches!(modes.of_mode(), ModeType::Repeat)
-    });
+    let (ll_explicit, of_explicit, ml_explicit) = match seq_header.modes {
+        // A zero-sequence block leaves the FSE tables untouched, so the
+        // next block could legally use Repeat; only explicit modes
+        // re-establish a stream.
+        None => (false, false, false),
+        Some(modes) => (
+            !matches!(modes.ll_mode(), ModeType::Repeat),
+            !matches!(modes.of_mode(), ModeType::Repeat),
+            !matches!(modes.ml_mode(), ModeType::Repeat),
+        ),
+    };
     RestartProbe {
         huffman,
-        fse_rebuilt,
+        ll_explicit,
+        of_explicit,
+        ml_explicit,
     }
 }
 
@@ -345,7 +404,7 @@ fn restart_candidates(probes: &[RestartProbe]) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|&(i, p)| {
-            p.fse_rebuilt
+            p.fse_rebuilt()
                 && match p.huffman {
                     HuffmanState::Rebuild => true,
                     HuffmanState::Ignore => cut_ok[i],
@@ -356,10 +415,179 @@ fn restart_candidates(probes: &[RestartProbe]) -> Vec<usize> {
         .collect()
 }
 
+/// Segment-start block indices for one frame, ascending. For each target
+/// multiple of the segment size: the first restart point past the target
+/// wins when it lies within 1.5x of the target, otherwise the cut lands on
+/// the block boundary nearest the target and staging primes from the
+/// carried table epoch. Restart-dense frames therefore keep the
+/// restart-point segmentation exactly; only restart-poor epochs split.
+fn plan_frame_cuts(
+    blocks: &[ScannedBlock],
+    restarts: &[usize],
+    target: usize,
+    frame_input_len: usize,
+    blocks_start: usize,
+) -> Vec<usize> {
+    let boundary_input = |i: usize| blocks[i].body.start - blocks_start;
+    let mut cuts = Vec::new();
+    let mut seg_start = 0usize;
+    let mut next_target = target;
+    let mut ri = 0usize;
+    while next_target < frame_input_len {
+        while ri < restarts.len() && boundary_input(restarts[ri]) < next_target {
+            ri += 1;
+        }
+        if let Some(&r) = restarts.get(ri) {
+            if r > seg_start && boundary_input(r) - next_target <= next_target / 2 {
+                cuts.push(r);
+                seg_start = r;
+                ri += 1;
+                next_target += target;
+                continue;
+            }
+        }
+        // A restart snap can overshoot this target by up to half of it;
+        // skip targets the current start already covers instead of cutting
+        // a one-block segment behind it.
+        if next_target <= boundary_input(seg_start) {
+            next_target += target;
+            continue;
+        }
+        // Blocks are input-ordered, so the boundaries straddling the target
+        // are the partition point and its predecessor; keep the earlier one
+        // on a tie so the plan is input-determined.
+        let pos = blocks.partition_point(|b| b.body.start - blocks_start < next_target);
+        let mut cut = None;
+        for cand in [pos.wrapping_sub(1), pos] {
+            if cand < blocks.len()
+                && cand > seg_start
+                && cut.is_none_or(|c| {
+                    boundary_input(cand).abs_diff(next_target)
+                        < boundary_input(c).abs_diff(next_target)
+                })
+            {
+                cut = Some(cand);
+            }
+        }
+        let Some(c) = cut else { break };
+        cuts.push(c);
+        seg_start = c;
+        next_target += target;
+    }
+    cuts
+}
+
+/// Which block last described each entropy axis since the last restart
+/// point: the table epoch a mid-epoch segment start primes from.
+#[derive(Default)]
+struct EpochFold {
+    huffman: Option<usize>,
+    ll: Option<usize>,
+    of: Option<usize>,
+    ml: Option<usize>,
+}
+
+impl EpochFold {
+    /// A restart point re-describes every axis, so the fold after one is
+    /// fresh; an axis with no description since is legally usable only in
+    /// explicit mode (its Repeat or Treeless uses fail identically in the
+    /// whole-epoch decode).
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(&mut self, i: usize, probe: &RestartProbe) {
+        if probe.huffman == HuffmanState::Rebuild {
+            self.huffman = Some(i);
+        }
+        if probe.ll_explicit {
+            self.ll = Some(i);
+        }
+        if probe.of_explicit {
+            self.of = Some(i);
+        }
+        if probe.ml_explicit {
+            self.ml = Some(i);
+        }
+    }
+
+    fn snapshot(&self, blocks: &[ScannedBlock]) -> TablePrime {
+        let body = |slot: Option<usize>| slot.map(|i| blocks[i].body.clone());
+        TablePrime {
+            huffman: body(self.huffman),
+            ll: body(self.ll),
+            of: body(self.of),
+            ml: body(self.ml),
+        }
+    }
+}
+
+/// Walk one frame's blocks from `blocks_start`: the scanned blocks and
+/// their entropy probes. `None` on malformed structure — the sequential
+/// path reports those properly.
+fn scan_frame_blocks(
+    input: &[u8],
+    window_size: usize,
+    blocks_start: usize,
+) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>)> {
+    let mut blocks: Vec<ScannedBlock> = Vec::new();
+    let mut probes: Vec<RestartProbe> = Vec::new();
+    let mut scan_cur = blocks_start;
+    loop {
+        let head = input.get(scan_cur..scan_cur + 3)?;
+        let raw = u32::from_le_bytes([head[0], head[1], head[2], 0]);
+        let last = raw & 1 == 1;
+        let btype = match (raw >> 1) & 0x3 {
+            0 => BlockType::Raw,
+            1 => BlockType::RLE,
+            2 => BlockType::Compressed,
+            _ => return None, // reserved block
+        };
+        let size = raw >> 3;
+        // Every block's stored size is bounded by min(window, 128K)
+        // (libzstd's header-stage blockSizeMax); a violation falls back
+        // to the sequential path, which reports it.
+        if size as usize > crate::common::max_block_output(window_size) {
+            return None;
+        }
+        let body_len = match btype {
+            BlockType::Raw | BlockType::Compressed => size as usize,
+            BlockType::RLE => 1,
+            BlockType::Reserved => unreachable!(),
+        };
+        let body_end = (scan_cur + 3).checked_add(body_len)?;
+        if body_end > input.len() {
+            return None;
+        }
+        probes.push(if btype == BlockType::Compressed {
+            probe_restart(&input[scan_cur + 3..body_end])
+        } else {
+            // Raw/RLE blocks touch no entropy state.
+            RestartProbe {
+                huffman: HuffmanState::Ignore,
+                ll_explicit: false,
+                of_explicit: false,
+                ml_explicit: false,
+            }
+        });
+        blocks.push(ScannedBlock {
+            btype,
+            raw_size: size,
+            body: scan_cur + 3..body_end,
+        });
+        scan_cur = body_end;
+        if last {
+            break;
+        }
+    }
+    Some((blocks, probes))
+}
+
 /// Walk the input, validating the frame structure and splitting frames
-/// into segments at restart points. `None` means "do not parallelize":
-/// dictionary frames, malformed or truncated input (the sequential path
-/// reports those properly), or too few segments to be worth it.
+/// into segments at restart points and mid-epoch block boundaries. `None`
+/// means "do not parallelize": dictionary frames, malformed or truncated
+/// input (the sequential path reports those properly), or too few
+/// segments to be worth it.
 fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     let target_segment = (input.len() / (workers as usize * 2)).max(MIN_SEGMENT_INPUT);
     let mut segments: Vec<SegmentPlan> = Vec::new();
@@ -406,99 +634,68 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         let checksummed = frame_header.descriptor.content_checksum_flag();
         let blocks_start = input.len() - reader.len();
 
-        let mut blocks: Vec<ScannedBlock> = Vec::new();
-        let mut probes: Vec<RestartProbe> = Vec::new();
-        let mut scan_cur = blocks_start;
-        loop {
-            let head = input.get(scan_cur..scan_cur + 3)?;
-            let raw = u32::from_le_bytes([head[0], head[1], head[2], 0]);
-            let last = raw & 1 == 1;
-            let btype = match (raw >> 1) & 0x3 {
-                0 => BlockType::Raw,
-                1 => BlockType::RLE,
-                2 => BlockType::Compressed,
-                _ => return None, // reserved block
-            };
-            let size = raw >> 3;
-            // Every block's stored size is bounded by min(window, 128K)
-            // (libzstd's header-stage blockSizeMax); a violation falls back
-            // to the sequential path, which reports it.
-            if size as usize > crate::common::max_block_output(window_size) {
-                return None;
-            }
-            let body_len = match btype {
-                BlockType::Raw | BlockType::Compressed => size as usize,
-                BlockType::RLE => 1,
-                BlockType::Reserved => unreachable!(),
-            };
-            let body_end = (scan_cur + 3).checked_add(body_len)?;
-            if body_end > input.len() {
-                return None;
-            }
-            probes.push(if btype == BlockType::Compressed {
-                probe_restart(&input[scan_cur + 3..body_end])
-            } else {
-                // Raw/RLE blocks touch no entropy state.
-                RestartProbe {
-                    huffman: HuffmanState::Ignore,
-                    fse_rebuilt: false,
-                }
-            });
-            blocks.push(ScannedBlock {
-                btype,
-                raw_size: size,
-                body: scan_cur + 3..body_end,
-            });
-            scan_cur = body_end;
-            if last {
-                break;
-            }
-        }
+        let (blocks, probes) = scan_frame_blocks(input, window_size, blocks_start)?;
         let restarts = restart_candidates(&probes);
+        let frame_end = blocks.last()?.body.end;
         if checksummed {
-            let trailer_end = scan_cur.checked_add(4)?;
+            let trailer_end = frame_end.checked_add(4)?;
             if trailer_end > input.len() {
                 return None;
             }
             #[cfg(feature = "hash")]
             checksums.push(Some(u32::from_le_bytes([
-                input[scan_cur],
-                input[scan_cur + 1],
-                input[scan_cur + 2],
-                input[scan_cur + 3],
+                input[frame_end],
+                input[frame_end + 1],
+                input[frame_end + 2],
+                input[frame_end + 3],
             ])));
-            scan_cur = trailer_end;
+            cursor = trailer_end;
         } else {
             #[cfg(feature = "hash")]
             checksums.push(None);
+            cursor = frame_end;
         }
 
-        // Close a segment at the first restart point past each target
-        // multiple of the segment size; whatever trails the last restart
-        // extends the frame's final segment.
-        let mut seg_start = 0usize;
-        let mut next_target = target_segment;
-        for &r in &restarts {
-            if r == 0 {
-                continue; // the frame start is already a segment start
+        // One fold walk serves the whole frame: the tracked table epoch
+        // resets at restart points, updates per block, and snapshots into
+        // every cut boundary that is not itself a restart point.
+        let cuts = plan_frame_cuts(
+            &blocks,
+            &restarts,
+            target_segment,
+            frame_end - blocks_start,
+            blocks_start,
+        );
+        let mut fold = EpochFold::default();
+        let mut open_start = 0usize;
+        let mut open_prime: Option<TablePrime> = None;
+        let mut cuts_iter = cuts.iter().copied();
+        let mut next_cut = cuts_iter.next();
+        for i in 0..blocks.len() {
+            if i > 0 && restarts.binary_search(&i).is_ok() {
+                fold.reset();
             }
-            let restart_input = blocks[r].body.start - blocks_start;
-            if restart_input >= next_target {
+            if next_cut == Some(i) {
                 segments.push(SegmentPlan {
-                    blocks: blocks[seg_start..r].to_vec(),
-                    frame_start: seg_start == 0,
+                    blocks: blocks[open_start..i].to_vec(),
+                    frame_start: open_start == 0,
                     window_size,
+                    prime: open_prime.take(),
                 });
-                seg_start = r;
-                next_target += target_segment;
+                open_start = i;
+                // A restart cut starts fresh; a mid-epoch cut carries the
+                // fold snapshot as of this boundary (blocks before i).
+                open_prime = (restarts.binary_search(&i).is_err()).then(|| fold.snapshot(&blocks));
+                next_cut = cuts_iter.next();
             }
+            fold.observe(i, &probes[i]);
         }
         segments.push(SegmentPlan {
-            blocks: blocks[seg_start..].to_vec(),
-            frame_start: seg_start == 0,
+            blocks: blocks[open_start..].to_vec(),
+            frame_start: open_start == 0,
             window_size,
+            prime: open_prime,
         });
-        cursor = scan_cur;
     }
     let plan = ScanPlan {
         segments,
@@ -522,6 +719,71 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     }
 }
 
+/// Re-establish the carried tables a mid-epoch start needs. The Huffman
+/// axis replays one Compressed-literals description: the build is a pure
+/// function of the description bytes and the describing block's own sizes
+/// (which fix the X1/X2 shape), so it reproduces the in-sequence state
+/// exactly. The FSE axes replay the last explicit description per stream,
+/// in block order: a replayed block's other streams are carried (Repeat
+/// is a no-op) or hold an older description that a later replay
+/// overwrites, leaving each stream at its own last description. Every
+/// replayed block belongs to an earlier segment whose staging decodes the
+/// same bytes through the same functions, so a malformed description
+/// errors that earlier segment first in the ordered consumer and the
+/// primed segment's error is never observed.
+fn prime_tables(
+    input: &[u8],
+    prime: &TablePrime,
+    scratch: &mut SegmentScratch,
+) -> Result<(), FrameDecoderError> {
+    if let Some(body) = &prime.huffman {
+        let body = &input[body.clone()];
+        let mut section = LiteralsSection::new();
+        let header_len = section
+            .parse_from_header(body)
+            .map_err(DecompressBlockError::from)
+            .map_err(block_body_err)? as usize;
+        let literals_len = literals_payload_len(&section);
+        super::literals_section_decoder::prepare_section_table(
+            LiteralsSectionType::Compressed,
+            section.regenerated_size as usize,
+            &mut scratch.huf,
+            &body[header_len..header_len + literals_len],
+        )
+        .map_err(DecompressBlockError::from)
+        .map_err(block_body_err)?;
+    }
+    let mut fse = [prime.ll.clone(), prime.of.clone(), prime.ml.clone()];
+    fse.sort_unstable_by_key(|r| r.as_ref().map_or(0, |r| r.start));
+    let mut replayed = usize::MAX;
+    for body in fse.into_iter().flatten() {
+        if body.start == replayed {
+            continue; // one block can describe several streams
+        }
+        replayed = body.start;
+        let body = &input[body];
+        let mut section = LiteralsSection::new();
+        let header_len = section
+            .parse_from_header(body)
+            .map_err(DecompressBlockError::from)
+            .map_err(block_body_err)? as usize;
+        let seq_raw_all = &body[header_len + literals_payload_len(&section)..];
+        let mut seq_header = SequencesHeader::new();
+        let seq_header_len = seq_header
+            .parse_from_header(seq_raw_all)
+            .map_err(DecompressBlockError::from)
+            .map_err(block_body_err)? as usize;
+        super::sequence_section_decoder::maybe_update_fse_tables(
+            &seq_header,
+            &seq_raw_all[seq_header_len..],
+            &mut scratch.fse,
+        )
+        .map_err(DecompressBlockError::from)
+        .map_err(block_body_err)?;
+    }
+    Ok(())
+}
+
 /// Stage A: decode one segment's literals and sequences into staging.
 pub(super) fn decode_segment(
     input: &[u8],
@@ -529,6 +791,9 @@ pub(super) fn decode_segment(
     scratch: &mut SegmentScratch,
 ) -> Result<DecodedSegment, FrameDecoderError> {
     scratch.reset_tables();
+    if let Some(prime) = &plan.prime {
+        prime_tables(input, prime, scratch)?;
+    }
     let staging = staging_take();
     let (mut literals, mut sequences) = (staging.literals, staging.sequences);
     // Same per-block output cap the sequential paths enforce (libzstd
@@ -579,13 +844,7 @@ pub(super) fn decode_segment(
                     // 1 MiB from one payload byte).
                     return Err(output_too_large());
                 }
-                let literals_len = match section.compressed_size {
-                    Some(c) => c as usize,
-                    None => match section.ls_type {
-                        LiteralsSectionType::RLE => 1,
-                        _ => section.regenerated_size as usize,
-                    },
-                };
+                let literals_len = literals_payload_len(&section);
                 if body.len() < header_len + literals_len {
                     return Err(block_body_err(
                         DecompressBlockError::MalformedSectionHeader {
@@ -1335,7 +1594,7 @@ pub fn mt_decode_to_vec_for_tests(
 /// Parallel [`FrameDecoder::decode_all`]: decode a complete multi-frame
 /// input into the caller's buffer with a worker pool. Falls back to the
 /// sequential decoder for small inputs, dictionary frames, single-core
-/// processes and inputs without a second restart point.
+/// processes and inputs without a second segment.
 pub fn decode_all_mt(
     input: &[u8],
     output: &mut [u8],
@@ -1667,7 +1926,7 @@ mod tests {
     }
 
     /// Too-small output must be reported, and inputs without a second
-    /// restart point (single small frame) fall back byte-exact.
+    /// segment (single small frame) fall back byte-exact.
     #[test]
     fn slice_too_small_and_fallback() {
         let data = textish(4 * 1024 * 1024);
@@ -1727,7 +1986,12 @@ mod tests {
         assert_eq!(&out[prefix.len()..], &data[..]);
     }
 
-    use super::{HuffmanState, RestartProbe, probe_restart, restart_candidates};
+    use super::{
+        BlockPlan, DecodedSegment, HuffmanState, RestartProbe, ScannedBlock, SegmentPlan,
+        SegmentScratch, TablePrime, decode_segment, plan_frame_cuts, probe_restart,
+        restart_candidates, scan, scan_frame_blocks,
+    };
+    use crate::blocks::block::BlockType;
 
     /// A single frame carrying its declared content size (the one-shot
     /// compressors emit no FCS field).
@@ -1810,55 +2074,107 @@ mod tests {
     /// literals, of code 0 = offset 1, ml code 0 = match 3): explicit tables
     /// without Repeat, empty bitstream carrying only the mandatory end
     /// marker.
+    /// One sequence with all three FSE streams in RLE mode (ll code 4 = 4
+    /// literals, of code 0 = offset 1, ml code 0 = match 3): explicit tables
+    /// without Repeat, empty bitstream carrying only the mandatory end
+    /// marker.
     fn rle_seq_body() -> Vec<u8> {
         vec![0x01, 0x54, 0x04, 0x00, 0x00, 0x01]
     }
 
-    fn probe(huffman: HuffmanState, fse_rebuilt: bool) -> RestartProbe {
+    /// One sequence with `modes` and the RLE description bytes `descs`,
+    /// carrying only the mandatory end marker (the carried or described
+    /// tables read zero add bits). `modes` packs LL/OF/ML as 2-bit fields
+    /// high to low with the reserved low bits zero.
+    fn seq_body(modes: u8, descs: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x01, modes];
+        b.extend_from_slice(descs);
+        b.push(0x01);
+        b
+    }
+
+    fn probe(huffman: HuffmanState, ll: bool, of: bool, ml: bool) -> RestartProbe {
         RestartProbe {
             huffman,
-            fse_rebuilt,
+            ll_explicit: ll,
+            of_explicit: of,
+            ml_explicit: ml,
         }
     }
 
     /// The pre-scan must classify literals sections by how they treat the
-    /// Huffman table, and only call FSE state rebuilt when no stream is in
-    /// Repeat mode.
+    /// Huffman table and record per-stream FSE explicitness: a Repeat
+    /// stream carries state across a cut, and a zero-sequence block leaves
+    /// every stream untouched. These four axes are the table-epoch fold.
     #[test]
     fn probe_restart_classifies_entropy_state() {
         // Compressed literals (direct weights [1, 1]) rebuild the table.
         let mut compressed = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
         compressed.extend_from_slice(&rle_seq_body());
         let p = probe_restart(&compressed);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Rebuild, true));
+        assert_eq!(p.huffman, HuffmanState::Rebuild);
+        assert!(p.fse_rebuilt() && p.ll_explicit && p.of_explicit && p.ml_explicit);
 
         // Raw literals ignore the table but leave it intact.
         let mut raw = vec![0x20, 0x30, 0x31, 0x32, 0x33];
         raw.extend_from_slice(&rle_seq_body());
         let p = probe_restart(&raw);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, true));
+        assert_eq!(p.huffman, HuffmanState::Ignore);
+        assert!(p.fse_rebuilt());
 
         // RLE literals: same.
         let mut rle = vec![0x21, 0xaa];
         rle.extend_from_slice(&rle_seq_body());
         let p = probe_restart(&rle);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, true));
+        assert_eq!(p.huffman, HuffmanState::Ignore);
+        assert!(p.fse_rebuilt());
 
         // Treeless literals decode through the carried table.
         let mut treeless = vec![0x43, 0x40, 0x00, 0x1f];
         treeless.extend_from_slice(&rle_seq_body());
         let p = probe_restart(&treeless);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Reuse, true));
+        assert_eq!((p.huffman, p.fse_rebuilt()), (HuffmanState::Reuse, true));
 
-        // Any Repeat FSE stream carries state across (modes 0xFC: all three
-        // Repeat, reserved bits zero).
-        let repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x01, 0xfc];
+        // Compressed literals mid-epoch with all-Repeat FSE: the Huffman
+        // axis re-establishes while every FSE stream carries (modes 0xFC).
+        let mut repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
+        repeat.extend_from_slice(&seq_body(0xfc, &[]));
         let p = probe_restart(&repeat);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Rebuild, false));
+        assert_eq!(p.huffman, HuffmanState::Rebuild);
+        assert!(!p.ll_explicit && !p.of_explicit && !p.ml_explicit);
+        assert!(!p.fse_rebuilt());
 
-        // A zero-sequence block leaves the FSE tables untouched.
+        // Partial FSE rebuilds: a single explicit stream per block (LL-only
+        // 0x7C, OF-only 0xDC, ML-only 0xF4), each re-described through one
+        // RLE byte while the other two carry.
+        let ll_only = seq_body(0x7c, &[0x04]);
+        let of_only = seq_body(0xdc, &[0x00]);
+        let ml_only = seq_body(0xf4, &[0x00]);
+        for (body, stream) in [(&ll_only[..], 0), (&of_only[..], 1), (&ml_only[..], 2)] {
+            let mut blk = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
+            blk.extend_from_slice(body);
+            let p = probe_restart(&blk);
+            assert_eq!(p.huffman, HuffmanState::Rebuild);
+            assert_eq!(
+                (p.ll_explicit, p.of_explicit, p.ml_explicit),
+                match stream {
+                    0 => (true, false, false),
+                    1 => (false, true, false),
+                    _ => (false, false, true),
+                }
+            );
+        }
+
+        // A zero-sequence block leaves the FSE tables untouched, even
+        // with Compressed literals rebuilding the Huffman table (the
+        // trailing 0x00 is the whole sequence section: zero sequences).
+        let zseq = [0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x00];
+        let p = probe_restart(&zseq);
+        assert_eq!(p.huffman, HuffmanState::Rebuild);
+        assert!(!p.fse_rebuilt());
         let p = probe_restart(&[0x20, 0x30, 0x31, 0x32, 0x33, 0x00]);
-        assert_eq!((p.huffman, p.fse_rebuilt), (HuffmanState::Ignore, false));
+        assert_eq!(p.huffman, HuffmanState::Ignore);
+        assert!(!p.fse_rebuilt());
     }
 
     /// A Raw/RLE-literals cut is legal only while no Treeless block precedes
@@ -1871,19 +2187,19 @@ mod tests {
 
         // Everything rebuilt: cut anywhere explicit.
         let probes = [
-            probe(Rebuild, true),
-            probe(Ignore, false),
-            probe(Ignore, true),
+            probe(Rebuild, true, true, true),
+            probe(Ignore, false, false, false),
+            probe(Ignore, true, true, true),
         ];
         assert_eq!(restart_candidates(&probes), vec![0, 2]);
 
         // Review's failing shape: Raw-literals candidate followed by a
         // Treeless block before any rebuild - no cut allowed at 1.
         let probes = [
-            probe(Rebuild, true),
-            probe(Ignore, false),
-            probe(Ignore, true),
-            probe(Reuse, true),
+            probe(Rebuild, true, true, true),
+            probe(Ignore, false, false, false),
+            probe(Ignore, true, true, true),
+            probe(Reuse, true, true, true),
         ];
         assert_eq!(restart_candidates(&probes), vec![0]);
 
@@ -1891,10 +2207,10 @@ mod tests {
         // after the Treeless block is legal again (it sits in the previous
         // segment).
         let probes = [
-            probe(Ignore, true),
-            probe(Rebuild, true),
-            probe(Reuse, true),
-            probe(Ignore, true),
+            probe(Ignore, true, true, true),
+            probe(Rebuild, true, true, true),
+            probe(Reuse, true, true, true),
+            probe(Ignore, true, true, true),
         ];
         assert_eq!(restart_candidates(&probes), vec![0, 1, 3]);
 
@@ -1905,7 +2221,11 @@ mod tests {
         // decodes as a whole frame from frame-start state, where a legal
         // frame's Treeless block is preceded by its rebuild anyway and an
         // illegal one fails identically in both paths.
-        let probes = [probe(Ignore, true), probe(Reuse, true), probe(Ignore, true)];
+        let probes = [
+            probe(Ignore, true, true, true),
+            probe(Reuse, true, true, true),
+            probe(Ignore, true, true, true),
+        ];
         assert_eq!(restart_candidates(&probes), vec![2]);
     }
 
@@ -1975,6 +2295,390 @@ mod tests {
             decode_to_vec_mt(&frame, &mut vec_out, workers, MAX_WINDOW).unwrap();
             assert_eq!(vec_out, expect, "{workers}");
         }
+    }
+
+    /// Synthetic blocks at a fixed input stride, for the planner rules.
+    fn synth_blocks(n: usize, stride: usize, blocks_start: usize) -> Vec<ScannedBlock> {
+        (0..n)
+            .map(|i| {
+                let start = blocks_start + i * stride;
+                ScannedBlock {
+                    btype: BlockType::Raw,
+                    raw_size: (stride - 3) as u32,
+                    body: start..start + stride - 3,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_cuts_snap_to_restart_within_one_and_a_half() {
+        let bs = 1000usize;
+        let blocks = synth_blocks(20, 100, bs);
+        let frame_len = 20 * 100;
+
+        // Restart-dense: the snap keeps exactly the restart-point
+        // segmentation a restart-only planner produces (first restart at
+        // or past each target).
+        let restarts: Vec<usize> = (0..20).collect();
+        let target = 250usize;
+        let mut expect = Vec::new();
+        let mut t = target;
+        while t < frame_len {
+            expect.push(restarts.iter().copied().find(|&r| r * 100 >= t).unwrap());
+            t += target;
+        }
+        assert_eq!(
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            expect
+        );
+
+        // Restart-poor: no restart past the target, so cuts land on the
+        // nearest block boundary, ties to the earlier one.
+        let restarts = vec![0usize];
+        assert_eq!(
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            vec![2, 5, 7, 10, 12, 15, 17]
+        );
+
+        // A restart past 1.5x of the target loses to the boundary; the
+        // same restart wins once the target comes within 1.5x of it
+        // (block 10 at input 1000 against t=750), and later targets go
+        // back to the nearest boundary.
+        let restarts = vec![0usize, 10];
+        assert_eq!(
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            vec![2, 5, 10, 12, 15, 17]
+        );
+
+        // A restart at exactly 1.5x of the target still wins (inclusive
+        // edge), and beats an equally near boundary.
+        let blocks6 = synth_blocks(6, 100, bs);
+        let restarts = vec![0usize, 3];
+        assert_eq!(
+            plan_frame_cuts(&blocks6, &restarts, 200, 6 * 100, bs),
+            vec![3, 4]
+        );
+    }
+
+    /// Craft one frame: the class-block bodies interleaved with Raw pads
+    /// past the MT floor, so the parallel path engages and the planner cuts
+    /// mid-epoch inside the layout.
+    fn craft_frame(bodies: &[&[u8]], pad_len: usize) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+        frame.push(0x00); // no FCS, no checksum, no dictionary id
+        frame.push(0x50); // window descriptor: 1 MiB
+        let pad = vec![0x5au8; pad_len];
+        let push = |frame: &mut Vec<u8>, last: bool, btype: u32, body: &[u8]| {
+            let raw = ((body.len() as u32) << 3) | (btype << 1) | u32::from(last);
+            frame.extend_from_slice(&raw.to_le_bytes()[..3]);
+            frame.extend_from_slice(body);
+        };
+        for body in bodies {
+            push(&mut frame, false, 2, body);
+            push(&mut frame, false, 0, &pad);
+        }
+        push(&mut frame, true, 0, &pad);
+        frame
+    }
+
+    /// Crafted frames over the fold classes. The shared table-rebuilding
+    /// block (Compressed literals over direct weights [1, 1], every FSE
+    /// stream in explicit RLE mode) establishes an epoch's tables; the
+    /// other blocks carry (all-Repeat FSE, Treeless literals), re-describe
+    /// one axis on a later block, or drop the sequence section entirely.
+    /// `raw_explicit` is a Raw-literals restart, the class whose first
+    /// mid-epoch cuts carry no Huffman description at all.
+    fn fold_class_frames() -> Vec<(&'static str, Vec<u8>)> {
+        let compressed = [0x82u8, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
+        let treeless = [0x43u8, 0x40, 0x00, 0x1f];
+        let raw = [0x20u8, 0x30, 0x31, 0x32, 0x33];
+        let rle = [0x21u8, 0xaa];
+        let lits_seq = |lits: &[u8], seq: &[u8]| {
+            let mut b = lits.to_vec();
+            b.extend_from_slice(seq);
+            b
+        };
+        let rebuild = lits_seq(&compressed, &rle_seq_body());
+        let raw_explicit = lits_seq(&raw, &rle_seq_body());
+        let all_rep = seq_body(0xfc, &[]);
+        let comp_rep = lits_seq(&compressed, &all_rep);
+        let treeless_rep = lits_seq(&treeless, &all_rep);
+        let raw_rep = lits_seq(&raw, &all_rep);
+        let rle_rep = lits_seq(&rle, &all_rep);
+        let ll_only = lits_seq(&raw, &seq_body(0x7c, &[0x04]));
+        let of_only = lits_seq(&raw, &seq_body(0xdc, &[0x00]));
+        let ml_only = lits_seq(&raw, &seq_body(0xf4, &[0x00]));
+        let treeless_of = lits_seq(&treeless, &seq_body(0xdc, &[0x00]));
+        let zero_seq_raw = lits_seq(&raw, &[0x00]);
+        let zero_seq_compressed = lits_seq(&compressed, &[0x00]);
+
+        let build = |bodies: &[Vec<u8>]| -> Vec<u8> {
+            craft_frame(
+                &bodies.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+                96 * 1024,
+            )
+        };
+        vec![
+            (
+                "all_repeat_chain",
+                build(&[
+                    rebuild.clone(),
+                    comp_rep.clone(),
+                    comp_rep.clone(),
+                    treeless_rep.clone(),
+                    treeless_rep.clone(),
+                    raw_rep.clone(),
+                    rle_rep.clone(),
+                    treeless_rep.clone(),
+                ]),
+            ),
+            (
+                "partial_fse",
+                build(&[
+                    rebuild.clone(),
+                    ll_only.clone(),
+                    of_only.clone(),
+                    ml_only.clone(),
+                    comp_rep.clone(),
+                    treeless_of.clone(),
+                    ml_only.clone(),
+                    treeless_rep.clone(),
+                ]),
+            ),
+            (
+                "zero_seq",
+                build(&[
+                    rebuild.clone(),
+                    zero_seq_raw.clone(),
+                    zero_seq_compressed.clone(),
+                    treeless_rep.clone(),
+                    zero_seq_raw.clone(),
+                    comp_rep.clone(),
+                ]),
+            ),
+            (
+                "raw_restart_epoch",
+                build(&[
+                    raw_explicit.clone(),
+                    comp_rep.clone(),
+                    treeless_rep.clone(),
+                    rebuild.clone(),
+                    treeless_rep.clone(),
+                ]),
+            ),
+        ]
+    }
+
+    /// The crafted fold-class frames must decode byte-identically through
+    /// the parallel path, and the planner must actually route them through
+    /// primed mid-epoch segments (else the test would pass through the
+    /// sequential fallback without exercising the fold).
+    #[test]
+    fn mid_epoch_segments_decode_identically() {
+        for (name, frame) in fold_class_frames() {
+            let expect = bulk::decompress(&frame, 0).unwrap();
+            assert!(!expect.is_empty());
+            for workers in [2u32, 4, 8] {
+                let plan = scan(&frame, workers, MAX_WINDOW).expect("frame must scan");
+                assert!(
+                    plan.segments.iter().any(|s| s.prime.is_some()),
+                    "{name}: no mid-epoch segment at {workers} workers"
+                );
+                let mut out = Vec::new();
+                decode_to_vec_mt(&frame, &mut out, workers, MAX_WINDOW).unwrap();
+                assert_eq!(out, expect, "{name} at {workers} workers");
+                let mut placed = vec![0u8; expect.len()];
+                let n = decode_all_mt(&frame, &mut placed, workers, MAX_WINDOW).unwrap();
+                assert_eq!(&placed[..n], &expect[..], "{name} at {workers} workers");
+            }
+        }
+    }
+
+    /// Scan one frame's blocks and probes (single-frame inputs).
+    fn frame_blocks(input: &[u8]) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>)> {
+        let mut reader = input;
+        let (header, _) = crate::decoding::frame::read_frame_header(&mut reader).ok()?;
+        let blocks_start = input.len() - reader.len();
+        let window = header.window_size().ok()? as usize;
+        scan_frame_blocks(input, window, blocks_start)
+    }
+
+    /// The table epoch at boundary `b` of the epoch `[e0, ..)`, folded
+    /// independently of the scan's tracking: the last block describing each
+    /// axis since the epoch start.
+    fn boundary_prime(
+        blocks: &[ScannedBlock],
+        probes: &[RestartProbe],
+        e0: usize,
+        b: usize,
+    ) -> TablePrime {
+        let mut huf = None;
+        let mut ll = None;
+        let mut of = None;
+        let mut ml = None;
+        for j in e0..b {
+            if probes[j].huffman == HuffmanState::Rebuild {
+                huf = Some(j);
+            }
+            if probes[j].ll_explicit {
+                ll = Some(j);
+            }
+            if probes[j].of_explicit {
+                of = Some(j);
+            }
+            if probes[j].ml_explicit {
+                ml = Some(j);
+            }
+        }
+        let body = |slot: Option<usize>| slot.map(|j| blocks[j].body.clone());
+        TablePrime {
+            huffman: body(huf),
+            ll: body(ll),
+            of: body(of),
+            ml: body(ml),
+        }
+    }
+
+    fn assert_staged_suffix(whole: &DecodedSegment, skip: usize, part: &DecodedSegment, ctx: &str) {
+        assert_eq!(
+            whole.plan.len() - skip,
+            part.plan.len(),
+            "{ctx}: plan length"
+        );
+        let prefix_out: usize = whole.plan[..skip].iter().map(BlockPlan::out).sum();
+        assert_eq!(
+            whole.out_size - prefix_out,
+            part.out_size,
+            "{ctx}: out size"
+        );
+        for (k, (wp, pp)) in whole.plan[skip..].iter().zip(&part.plan).enumerate() {
+            match (wp, pp) {
+                (BlockPlan::Raw { body: wb, out: wo }, BlockPlan::Raw { body: pb, out: po }) => {
+                    assert_eq!((wb.clone(), *wo), (pb.clone(), *po), "{ctx}: raw block {k}");
+                },
+                (BlockPlan::Rle { byte: wb, len: wl }, BlockPlan::Rle { byte: pb, len: pl }) => {
+                    assert_eq!((*wb, *wl), (*pb, *pl), "{ctx}: rle block {k}");
+                },
+                (
+                    BlockPlan::Compressed {
+                        lits: wl,
+                        seqs: ws,
+                        out: wo,
+                    },
+                    BlockPlan::Compressed {
+                        lits: pl,
+                        seqs: ps,
+                        out: po,
+                    },
+                ) => {
+                    assert_eq!(*wo, *po, "{ctx}: block {k} out");
+                    assert_eq!(
+                        &whole.literals[wl.clone()],
+                        &part.literals[pl.clone()],
+                        "{ctx}: block {k} literals"
+                    );
+                    let want = &whole.sequences[ws.clone()];
+                    let got = &part.sequences[ps.clone()];
+                    assert_eq!(want.len(), got.len(), "{ctx}: block {k} sequence count");
+                    for (a, b) in want.iter().zip(got) {
+                        assert_eq!((a.ll, a.ml, a.of), (b.ll, b.ml, b.of), "{ctx}: block {k}");
+                    }
+                },
+                _ => panic!("{ctx}: block {k} plan kind mismatch"),
+            }
+        }
+    }
+
+    /// Every candidate sub-segment start inside every restart epoch must
+    /// stage byte-identically to the whole-epoch staging: the recorded
+    /// table epoch reproduces, at each boundary, exactly the tables the
+    /// epoch-start decode carries there. Crafted frames cover the fold
+    /// classes with deep epochs; real encoder frames add whatever classes
+    /// the encoders emit in the wild.
+    #[test]
+    fn subsegment_staging_matches_whole_epoch() {
+        let mut frames: Vec<(&'static str, Vec<u8>)> = fold_class_frames();
+        frames.push((
+            "ours_lvl9",
+            bulk::compress(&textish(1024 * 1024), Level::from_zstd(9)),
+        ));
+        let mut state = 12345u64;
+        let mut data = Vec::with_capacity(1024 * 1024);
+        let mut id = 0u64;
+        while data.len() < 1024 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let user = (state >> 33) % 5000;
+            data.extend_from_slice(
+                format!(
+                    "{{\"id\":{id},\"user\":\"user_{user}\",\"ts\":{}}}",
+                    1700000000 + id
+                )
+                .as_bytes(),
+            );
+            id += 1;
+        }
+        frames.push(("zstd_lvl3", zstd::bulk::compress(&data, 3).unwrap()));
+        let mut alphabet = Vec::with_capacity(512 * 1024);
+        let table: Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        state = 7u64;
+        while alphabet.len() < 512 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            alphabet.push(table[((state >> 33) as usize) % 16]);
+        }
+        frames.push((
+            "ours_zero_seq",
+            bulk::compress_with(
+                &alphabet,
+                &EncoderOptions::new(Level::from_zstd(9)).workers(4),
+            )
+            .unwrap(),
+        ));
+
+        let mut compared = 0usize;
+        for (name, frame) in &frames {
+            let Some((blocks, probes)) = frame_blocks(frame) else {
+                panic!("{name}: frame must scan");
+            };
+            let restarts = restart_candidates(&probes);
+            let mut starts = vec![0usize];
+            starts.extend(restarts.iter().copied().filter(|&r| r > 0));
+            for (w, &e0) in starts.iter().enumerate() {
+                let e1 = starts.get(w + 1).copied().unwrap_or(blocks.len());
+                if e1 - e0 < 2 {
+                    continue;
+                }
+                let whole_plan = SegmentPlan {
+                    blocks: blocks[e0..e1].to_vec(),
+                    frame_start: e0 == 0,
+                    window_size: 128 * 1024,
+                    prime: None,
+                };
+                let mut scratch = SegmentScratch::new();
+                let whole = decode_segment(frame, &whole_plan, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{name}: whole epoch {e0} failed: {e}"));
+                for b in e0 + 1..e1 {
+                    let part_plan = SegmentPlan {
+                        blocks: blocks[b..e1].to_vec(),
+                        frame_start: false,
+                        window_size: 128 * 1024,
+                        prime: Some(boundary_prime(&blocks, &probes, e0, b)),
+                    };
+                    let mut scratch = SegmentScratch::new();
+                    let part = decode_segment(frame, &part_plan, &mut scratch)
+                        .unwrap_or_else(|e| panic!("{name}: boundary {b} failed: {e}"));
+                    assert_staged_suffix(&whole, b - e0, &part, &format!("{name} boundary {b}"));
+                    compared += 1;
+                }
+            }
+        }
+        assert!(
+            compared > 40,
+            "expected a meaningful boundary sample, got {compared}"
+        );
     }
 
     /// Repeated decodes over alternating inputs must stay byte-exact: the

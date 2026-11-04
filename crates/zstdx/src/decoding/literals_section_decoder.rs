@@ -105,8 +105,9 @@ pub fn decode_literals_direct(
 /// model picks) and rejects a Treeless section with no table carried over
 /// from a previous block. `source` is the section body bounded to the
 /// declared compressed size. Returns the bytes the tree description
-/// consumed.
-fn prepare_section_table(
+/// consumed. Also serves the MT pre-scan, which re-establishes the table a
+/// mid-epoch segment start carries without decoding the section's streams.
+pub(crate) fn prepare_section_table(
     ls_type: LiteralsSectionType,
     regenerated_size: usize,
     scratch: &mut HuffmanScratch,

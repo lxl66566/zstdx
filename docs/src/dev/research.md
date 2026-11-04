@@ -8,7 +8,7 @@ MT decode is this crate's exclusive territory, since libzstd exposes no MT decod
 
 | # | Lever | Open row | Exactness | Expected |
 |---|---|---|---|---|
-| 1 | Mid-epoch stage-A segmentation | todo 1 | byte-identical | skewed.zst9-class mt cells from about 1040-1066 to about 1680-1850 MiB/s, ceiling about x1.85 to 1.9 single-thread |
+| 1 | Mid-epoch stage-A segmentation | landed R96, [decoding](perf/decoding.md) | byte-identical | measured skewed.zst9 mt8 +63 and skewed.zst19 mt16 +123 percent, controls flat, ceiling x1.78 single-thread |
 | 2 | Owned-slice zero-copy MT stream entry | todo 17 | byte-identical | dll100 fastest stream-mt8 about -9 to -13% wall, landing on its bulk-mt8 ceiling; needs an API-surface decision |
 | 3 | NT-store copy kernel through an opt-in reader | todo 17 | byte-identical | about -3 to -5% on the same cell; the fallback if proposal 2 is rejected |
 | 4 | Parallel pump copies through an opt-in reader | todo 17 | byte-identical | about -4 to -6%, bounded by worker steal and bandwidth headroom; second fallback |
@@ -40,9 +40,11 @@ Kill conditions. Any control cell regresses more than 2 percent; the equivalence
 
 Falsifications to dodge. The stage-A body widening, the direct literal placement, the in-dst zone staging, the packed staged-record family including the SIMD-expansion reopen, and the tail prefetch in [negative decoding](negative/decoding.md) all stay dodged because stage A's decode body, the staged representation and the executor are untouched. The piece-watermarks falsification in the same file, whose data serializes stage B, stays dodged by keeping stage B segment-serial. Restart-position grid discovery in [negative MT](negative/mt-stream.md) falsified the restart lattice as a *job-grid signal* for the piece executor; proposal 1 uses block boundaries as staging starts and inherits none of that premise. The in-dst-zones reopen condition, cache-clean staging warmth, is untouched because the staging buffers stay pooled scratch.
 
+Landed R96 (2026-11-04). The locked interleaved A/B measured skewed.zst9 mt8 at 1061 to 1725 MiB/s and mt16 at 1062 to 1746, skewed.zst19 mt8 at 2914 to 6374 and mt16 at 2914 to 6500, with the json, dll100 and text controls flat and the single-thread controls inside 0.2 percent. The probe splits the skewed.zst9 mt8 wall at 13.7 ms of serial execute against the predicted 15.6, plus a 3 to 4.5 ms first-batch tail, so the ceiling landed at x1.78 of single-thread, at the low end of the predicted 1.85 to 1.9 band, and mt16 sits on mt8 because the 256 KiB input floor prices the grid at 15 segments either way. The numbers live in [decoding](perf/decoding.md).
+
 ### Stage-B floor for the same frames
 
-Below the staging latency sits the 15.6 ms serial execute, and its levers are spent: the executor runs the libzstd-shaped loop, the copy levers and representation levers are falsified, and piece-parallel execution needs the encoder's deep-offset ramp, which demands a D under the shape's dominant match period. skewed.zst9's crossing reads reach to a 4.1 MiB p50 deepest read and shallow first reads co-occur at every cut, the piece-watermarks data, so no D prices on this shape. The ramp family stays landed and env-gated for the level-3-class frames it wins on, `mt_pieces` in [decoding](perf/decoding.md), and restart-poor level-9 and level-19 frames keep the serial execute as their floor once proposal 1 lands.
+Below the staging latency sits the 15.6 ms serial execute, and its levers are spent: the executor runs the libzstd-shaped loop, the copy levers and representation levers are falsified, and piece-parallel execution needs the encoder's deep-offset ramp, which demands a D under the shape's dominant match period. skewed.zst9's crossing reads reach to a 4.1 MiB p50 deepest read and shallow first reads co-occur at every cut, the piece-watermarks data, so no D prices on this shape. The ramp family stays landed and env-gated for the level-3-class frames it wins on, `mt_pieces` in [decoding](perf/decoding.md), and restart-poor level-9 and level-19 frames keep the serial execute as their floor after proposal 1 landed in R96.
 
 ## dll100 streaming-MT fastest encode, todo 17
 
@@ -112,7 +114,7 @@ The encode pipeline's overlaps are all built or falsified, and the record is com
 - stage-A staging against stage-B execute: landed; the checksum absorb is inline in stage B with the thread and post-pass forms falsified in [negative decoding](negative/decoding.md);
 - the Growing grid's last epoch and the stream-end tail: byte-load-bearing, the incremental-posting falsification.
 
-The untried overlaps that remain are proposal 1, which parallelizes stage A inside an epoch, and the feed levers of todo 17. Every other serialized span is a measured floor or a byte-load-bearing schedule.
+The untried overlaps that remain are the feed levers of todo 17. Every other serialized span is a measured floor or a byte-load-bearing schedule.
 
 ## Wildcards
 
