@@ -530,6 +530,34 @@ Result, locked six-round position-alternating medians: skewed l13 moved 4.369 to
 
 Falsified: layout and scheduling as a lever class for the walk gaps. The paired perf stat read IPC parity on skewed at 0.73 against 0.72 with the cycle ratio tracking the instruction ratio, 1.67x beside 1.69x, so the floor is event volume times per-event codegen. A library crate ships source, so the shippable form of any PGO win is a source-side imitation through branch-probability shaping, cold outlining or inline hints, and that chases the same sub-8-percent band with the register re-roll priced in. The asm-descent class is the only reopening condition. Re-running the probe on single cells buys nothing, because the training profile covered the whole encoder and the verdict bounds the class. The decomposition table sits with the walk floor in [matchers](../perf/matchers.md).
 
+### The search walk's dead block-end break
+
+Premise: the port's search walk carries an unconditional guard the C loop does not — after the save block, `idx + best_len >= block_end_idx` breaks the descent — so removing it with an entry assertion restating the invariant is an exact, byte-identical simplification.
+
+Probe: thread-local step counters over json, text, skewed and dll100 at levels 17 and 19 tagged the guard's live hits at zero in every cell. The guard tests the just-updated best length, so an improving candidate counting to the block end has already taken the save block's own break one instruction earlier, and a non-improving candidate leaves the guard testing the same value it tested false the previous round. The guard has no live inputs.
+
+Result: the removal dumped byte-identical on the full ladder and both stream ladders, but gungraun read the ultra json cell at +0.387% Ir while the other ten cells improved (opt skewed -0.57%, opt dll -0.23%, opt json -0.03%, ultra text -0.14%, ultra skewed -0.21%), and a per-hunk bisect isolated the roll to the dead-break removal alone: the deleted branch re-rolls the surrounding loop's codegen and register allocation, not a semantic cost.
+
+Falsified: the removal as a shippable form, in the mixed-sign re-roll class with the first-word peel. The guard stays, documented dead rather than load-bearing.
+
+### The sufficient_len descent tail
+
+Premise: a search that saves a match below sufficient_len keeps walking the full 32-compare budget; cutting the descent at the first save past sufficient_len would shave steps without touching the saved set, since the tail only hunts candidates an already-sufficient match supersedes.
+
+Probe: the same counters tagged every search step taken after a save past the row's sufficient_len, 48 at row 16 and 64 at row 17, with the ultra rows at 999 never qualifying. The pool read zero steps on json, text and skewed at 17, and 89,627 steps over 2,801 qualifying saves on dll100 at 17 against 208.9M total search steps, 0.043%.
+
+Result: no volume exists in the class. The save block's sufficient_len break, at exact C parity, is the only sufficient-length cut the walk carries.
+
+Falsified: the descent-tail cut as a lever.
+
+### Branch-and-bound over the opt price table
+
+Premise: a search is needed only where the DP could move, so a price-side upper bound — the incumbent price at a position against the best any skipped search could carry — would cut whole searches the way the price table already prunes literal-run stretches.
+
+Result: the structure forbids the bound, three ways and independently. A search reaching past the DP frontier writes real prices into the MAX_PRICE sentinel slots holding positions beyond last_pos, so even a price-losing search changes the table by extending what the DP can reach. The immediate-encoding jump triggers on length alone — `longest > sufficient_len` and block-end proximity — with no price in the condition, so the bound cannot rule out a length only the search can reveal. And the longest match at a position is knowable only through the walk that would be skipped: the tree carries candidates, not lengths, so the bound would have to assume away the quantity it bounds.
+
+Falsified: the class, on structure rather than measurement.
+
 ## LDM integration
 
 ### Distance-keyed extension memoization

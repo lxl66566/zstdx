@@ -554,6 +554,26 @@ pub(super) enum BtStepPhase {
     Off,
 }
 
+/// The opt rows' fill budget, one compare below the search depth. The fill
+/// threads the positions the parser itself skips (price-skip gaps, emission
+/// advances, jump interiors), and a shallower threading of exactly those
+/// positions trades candidate depth for wall at the opt tier's product
+/// point. The ladder keeps the search-depth fill elsewhere: the ultra rows'
+/// fills are a percent-class share of their walk volume and the tier's
+/// identity is density, and the small-source and dictionary rows keep C's
+/// own geometry.
+const fn fill_knobs(
+    search_log: u32,
+    sufficient_len: u32,
+    min_match: u32,
+    bt_log: u32,
+    ultra: bool,
+) -> OptKnobs {
+    let mut k = knobs(search_log, sufficient_len, min_match, bt_log, ultra);
+    k.insert_log = search_log - 1;
+    k
+}
+
 const fn knobs(
     search_log: u32,
     sufficient_len: u32,
@@ -663,13 +683,13 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     // search domain at the stock row window via `chain_reach`; LDM carries
     // the distance classes beyond the domain.
     with_ldm(with_chain_reach(
-        opt(22, 1 << 26, knobs(5, 48, 4, 22, false)),
+        opt(22, 1 << 26, fill_knobs(5, 48, 4, 22, false)),
         1 << 22,
     )),
     // 17: the Opt tier; libzstd's L17 row with the ring capped one below
     // its C23 (shorter candidate walks: json −18% time for +0.16% dll).
     with_ldm(with_chain_reach(
-        opt(22, 1 << 26, knobs(5, 64, 4, 22, false)),
+        opt(22, 1 << 26, fill_knobs(5, 64, 4, 22, false)),
         1 << 23,
     )),
     // 18: btultra: fractional-bit prices, mls 3 (hash3 at H17).
