@@ -84,6 +84,12 @@ const MIN_MT_INPUT: usize = 512 * 1024;
 /// Segment-size floor: below it the staging buffers and hand-offs cost
 /// more than the parallelism saves.
 const MIN_SEGMENT_INPUT: usize = 256 * 1024;
+/// Head floor of the ramped grid: the first cuts of a literal-dominated
+/// frame double from here up to the regular target, cutting the consumer's
+/// first wait behind staging.
+const RAMP_HEAD_INPUT: usize = 128 * 1024;
+/// The staged sequence record: the flat 12 B `Sequence` triple.
+const SEQUENCE_RECORD_BYTES: u64 = 12;
 
 /// One scanned block: enough to route stage A and locate the body bytes.
 #[derive(Clone)]
@@ -347,18 +353,54 @@ fn literals_payload_len(section: &LiteralsSection) -> usize {
     }
 }
 
+/// Staged-volume accounting for one compressed block, off the same header
+/// parse as the entropy probe: the literals the block stages (its
+/// regenerated size) and its sequence count. Raw and RLE blocks stage
+/// nothing, so they contribute no volume.
+struct BlockVolumes {
+    literals: u64,
+    sequences: u32,
+}
+
+/// Per-frame staged-volume totals from the pre-scan: the literals bytes
+/// staging writes and the sequence records at 12 B each.
+struct FrameVolumes {
+    literals: u64,
+    sequences: u64,
+    /// False when any compressed block's headers failed to parse: the
+    /// totals then under-count and the ramp gate must not arm.
+    complete: bool,
+}
+
+impl FrameVolumes {
+    /// The head-ramp gate. A frame arms when its staged literals at least
+    /// equal its staged sequence records, a literals share of one half:
+    /// on such frames the consumer's exec runs ahead of staging and
+    /// earlier first cuts pay, while sequence-dominated frames are
+    /// exec-bound and a finer grid only adds wait. Frames at or below the
+    /// MT floor and single-worker scans keep the target grid, and a
+    /// block that failed to parse disarms the frame (its staging reports
+    /// the real error).
+    fn ramp_eligible(&self, workers: u32, frame_input_len: usize) -> bool {
+        self.complete
+            && workers > 1
+            && frame_input_len > MIN_MT_INPUT
+            && self.literals >= SEQUENCE_RECORD_BYTES * self.sequences
+    }
+}
+
 /// Classify a compressed block's body for the restart-point scan.
-fn probe_restart(body: &[u8]) -> RestartProbe {
+fn probe_restart(body: &[u8]) -> (RestartProbe, Option<BlockVolumes>) {
     let mut section = LiteralsSection::new();
     let Ok(header_len) = section.parse_from_header(body) else {
-        return RestartProbe::carried();
+        return (RestartProbe::carried(), None);
     };
     let Some(seq_raw) = body.get(header_len as usize + literals_payload_len(&section)..) else {
-        return RestartProbe::carried();
+        return (RestartProbe::carried(), None);
     };
     let mut seq_header = SequencesHeader::new();
     if seq_header.parse_from_header(seq_raw).is_err() {
-        return RestartProbe::carried();
+        return (RestartProbe::carried(), None);
     }
     let huffman = match section.ls_type {
         LiteralsSectionType::Compressed => HuffmanState::Rebuild,
@@ -376,12 +418,18 @@ fn probe_restart(body: &[u8]) -> RestartProbe {
             !matches!(modes.ml_mode(), ModeType::Repeat),
         ),
     };
-    RestartProbe {
-        huffman,
-        ll_explicit,
-        of_explicit,
-        ml_explicit,
-    }
+    (
+        RestartProbe {
+            huffman,
+            ll_explicit,
+            of_explicit,
+            ml_explicit,
+        },
+        Some(BlockVolumes {
+            literals: section.regenerated_size as u64,
+            sequences: seq_header.num_sequences,
+        }),
+    )
 }
 
 /// The block indices a segment may start at. Besides blocks that rebuild
@@ -421,17 +469,25 @@ fn restart_candidates(probes: &[RestartProbe]) -> Vec<usize> {
 /// the block boundary nearest the target and staging primes from the
 /// carried table epoch. Restart-dense frames therefore keep the
 /// restart-point segmentation exactly; only restart-poor epochs split.
+/// `ramp` starts the target ladder at [`RAMP_HEAD_INPUT`] doubling up to
+/// the regular target (see [`FrameVolumes::ramp_eligible`]); with `ramp`
+/// off the ladder is the plain target stride.
 fn plan_frame_cuts(
     blocks: &[ScannedBlock],
     restarts: &[usize],
     target: usize,
     frame_input_len: usize,
     blocks_start: usize,
+    ramp: bool,
 ) -> Vec<usize> {
     let boundary_input = |i: usize| blocks[i].body.start - blocks_start;
     let mut cuts = Vec::new();
     let mut seg_start = 0usize;
-    let mut next_target = target;
+    let mut next_target = if ramp {
+        RAMP_HEAD_INPUT.min(target)
+    } else {
+        target
+    };
     let mut ri = 0usize;
     while next_target < frame_input_len {
         while ri < restarts.len() && boundary_input(restarts[ri]) < next_target {
@@ -442,7 +498,7 @@ fn plan_frame_cuts(
                 cuts.push(r);
                 seg_start = r;
                 ri += 1;
-                next_target += target;
+                next_target = advance_target(next_target, target);
                 continue;
             }
         }
@@ -450,7 +506,7 @@ fn plan_frame_cuts(
         // skip targets the current start already covers instead of cutting
         // a one-block segment behind it.
         if next_target <= boundary_input(seg_start) {
-            next_target += target;
+            next_target = advance_target(next_target, target);
             continue;
         }
         // Blocks are input-ordered, so the boundaries straddling the target
@@ -472,9 +528,19 @@ fn plan_frame_cuts(
         let Some(c) = cut else { break };
         cuts.push(c);
         seg_start = c;
-        next_target += target;
+        next_target = advance_target(next_target, target);
     }
     cuts
+}
+
+/// Next rung of the target ladder: the ramped head doubles up to the
+/// regular target, which then keeps its stride.
+fn advance_target(next_target: usize, target: usize) -> usize {
+    if next_target < target {
+        next_target.saturating_mul(2).min(target)
+    } else {
+        next_target + target
+    }
 }
 
 /// Which block last described each entropy axis since the last restart
@@ -522,16 +588,21 @@ impl EpochFold {
     }
 }
 
-/// Walk one frame's blocks from `blocks_start`: the scanned blocks and
-/// their entropy probes. `None` on malformed structure — the sequential
-/// path reports those properly.
+/// Walk one frame's blocks from `blocks_start`: the scanned blocks, their
+/// entropy probes and the frame's staged-volume totals. `None` on
+/// malformed structure — the sequential path reports those properly.
 fn scan_frame_blocks(
     input: &[u8],
     window_size: usize,
     blocks_start: usize,
-) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>)> {
+) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>, FrameVolumes)> {
     let mut blocks: Vec<ScannedBlock> = Vec::new();
     let mut probes: Vec<RestartProbe> = Vec::new();
+    let mut volumes = FrameVolumes {
+        literals: 0,
+        sequences: 0,
+        complete: true,
+    };
     let mut scan_cur = blocks_start;
     loop {
         let head = input.get(scan_cur..scan_cur + 3)?;
@@ -559,17 +630,24 @@ fn scan_frame_blocks(
         if body_end > input.len() {
             return None;
         }
-        probes.push(if btype == BlockType::Compressed {
-            probe_restart(&input[scan_cur + 3..body_end])
+        if btype == BlockType::Compressed {
+            let (probe, staged) = probe_restart(&input[scan_cur + 3..body_end]);
+            if let Some(v) = staged {
+                volumes.literals += v.literals;
+                volumes.sequences += v.sequences as u64;
+            } else {
+                volumes.complete = false;
+            }
+            probes.push(probe);
         } else {
             // Raw/RLE blocks touch no entropy state.
-            RestartProbe {
+            probes.push(RestartProbe {
                 huffman: HuffmanState::Ignore,
                 ll_explicit: false,
                 of_explicit: false,
                 ml_explicit: false,
-            }
-        });
+            });
+        }
         blocks.push(ScannedBlock {
             btype,
             raw_size: size,
@@ -580,7 +658,7 @@ fn scan_frame_blocks(
             break;
         }
     }
-    Some((blocks, probes))
+    Some((blocks, probes, volumes))
 }
 
 /// Walk the input, validating the frame structure and splitting frames
@@ -634,9 +712,10 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         let checksummed = frame_header.descriptor.content_checksum_flag();
         let blocks_start = input.len() - reader.len();
 
-        let (blocks, probes) = scan_frame_blocks(input, window_size, blocks_start)?;
+        let (blocks, probes, volumes) = scan_frame_blocks(input, window_size, blocks_start)?;
         let restarts = restart_candidates(&probes);
         let frame_end = blocks.last()?.body.end;
+        let ramp = volumes.ramp_eligible(workers, frame_end - blocks_start);
         if checksummed {
             let trailer_end = frame_end.checked_add(4)?;
             if trailer_end > input.len() {
@@ -665,6 +744,7 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
             target_segment,
             frame_end - blocks_start,
             blocks_start,
+            ramp,
         );
         let mut fold = EpochFold::default();
         let mut open_start = 0usize;
@@ -2105,9 +2185,9 @@ mod tests {
     }
 
     use super::{
-        BlockPlan, DecodedSegment, HuffmanState, RestartProbe, ScannedBlock, SegmentPlan,
-        SegmentScratch, TablePrime, decode_segment, plan_frame_cuts, probe_restart,
-        restart_candidates, scan, scan_frame_blocks,
+        BlockPlan, DecodedSegment, FrameVolumes, HuffmanState, RAMP_HEAD_INPUT, RestartProbe,
+        ScannedBlock, SegmentPlan, SegmentScratch, TablePrime, decode_segment, plan_frame_cuts,
+        probe_restart, restart_candidates, scan, scan_frame_blocks,
     };
     use crate::blocks::block::BlockType;
 
@@ -2229,35 +2309,37 @@ mod tests {
         // Compressed literals (direct weights [1, 1]) rebuild the table.
         let mut compressed = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
         compressed.extend_from_slice(&rle_seq_body());
-        let p = probe_restart(&compressed);
+        let (p, staged) = probe_restart(&compressed);
         assert_eq!(p.huffman, HuffmanState::Rebuild);
         assert!(p.fse_rebuilt() && p.ll_explicit && p.of_explicit && p.ml_explicit);
+        assert_eq!(staged.map(|v| (v.literals, v.sequences)), Some((8, 1)));
 
         // Raw literals ignore the table but leave it intact.
         let mut raw = vec![0x20, 0x30, 0x31, 0x32, 0x33];
         raw.extend_from_slice(&rle_seq_body());
-        let p = probe_restart(&raw);
+        let (p, staged) = probe_restart(&raw);
         assert_eq!(p.huffman, HuffmanState::Ignore);
         assert!(p.fse_rebuilt());
+        assert_eq!(staged.map(|v| (v.literals, v.sequences)), Some((4, 1)));
 
         // RLE literals: same.
         let mut rle = vec![0x21, 0xaa];
         rle.extend_from_slice(&rle_seq_body());
-        let p = probe_restart(&rle);
+        let (p, _) = probe_restart(&rle);
         assert_eq!(p.huffman, HuffmanState::Ignore);
         assert!(p.fse_rebuilt());
 
         // Treeless literals decode through the carried table.
         let mut treeless = vec![0x43, 0x40, 0x00, 0x1f];
         treeless.extend_from_slice(&rle_seq_body());
-        let p = probe_restart(&treeless);
+        let (p, _) = probe_restart(&treeless);
         assert_eq!((p.huffman, p.fse_rebuilt()), (HuffmanState::Reuse, true));
 
         // Compressed literals mid-epoch with all-Repeat FSE: the Huffman
         // axis re-establishes while every FSE stream carries (modes 0xFC).
         let mut repeat = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
         repeat.extend_from_slice(&seq_body(0xfc, &[]));
-        let p = probe_restart(&repeat);
+        let (p, _) = probe_restart(&repeat);
         assert_eq!(p.huffman, HuffmanState::Rebuild);
         assert!(!p.ll_explicit && !p.of_explicit && !p.ml_explicit);
         assert!(!p.fse_rebuilt());
@@ -2271,7 +2353,7 @@ mod tests {
         for (body, stream) in [(&ll_only[..], 0), (&of_only[..], 1), (&ml_only[..], 2)] {
             let mut blk = vec![0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01];
             blk.extend_from_slice(body);
-            let p = probe_restart(&blk);
+            let (p, _) = probe_restart(&blk);
             assert_eq!(p.huffman, HuffmanState::Rebuild);
             assert_eq!(
                 (p.ll_explicit, p.of_explicit, p.ml_explicit),
@@ -2287,12 +2369,13 @@ mod tests {
         // with Compressed literals rebuilding the Huffman table (the
         // trailing 0x00 is the whole sequence section: zero sequences).
         let zseq = [0x82, 0x00, 0x01, 0x81, 0x11, 0xff, 0x01, 0x00];
-        let p = probe_restart(&zseq);
+        let (p, _) = probe_restart(&zseq);
         assert_eq!(p.huffman, HuffmanState::Rebuild);
         assert!(!p.fse_rebuilt());
-        let p = probe_restart(&[0x20, 0x30, 0x31, 0x32, 0x33, 0x00]);
+        let (p, staged) = probe_restart(&[0x20, 0x30, 0x31, 0x32, 0x33, 0x00]);
         assert_eq!(p.huffman, HuffmanState::Ignore);
         assert!(!p.fse_rebuilt());
+        assert_eq!(staged.map(|v| (v.literals, v.sequences)), Some((4, 0)));
     }
 
     /// A Raw/RLE-literals cut is legal only while no Treeless block precedes
@@ -2447,7 +2530,7 @@ mod tests {
             t += target;
         }
         assert_eq!(
-            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs, false),
             expect
         );
 
@@ -2455,7 +2538,7 @@ mod tests {
         // nearest block boundary, ties to the earlier one.
         let restarts = vec![0usize];
         assert_eq!(
-            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs, false),
             vec![2, 5, 7, 10, 12, 15, 17]
         );
 
@@ -2465,7 +2548,7 @@ mod tests {
         // back to the nearest boundary.
         let restarts = vec![0usize, 10];
         assert_eq!(
-            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs),
+            plan_frame_cuts(&blocks, &restarts, target, frame_len, bs, false),
             vec![2, 5, 10, 12, 15, 17]
         );
 
@@ -2474,8 +2557,48 @@ mod tests {
         let blocks6 = synth_blocks(6, 100, bs);
         let restarts = vec![0usize, 3];
         assert_eq!(
-            plan_frame_cuts(&blocks6, &restarts, 200, 6 * 100, bs),
+            plan_frame_cuts(&blocks6, &restarts, 200, 6 * 100, bs, false),
             vec![3, 4]
+        );
+    }
+
+    /// The ramped ladder doubles from the head floor to the target and
+    /// keeps the target stride after it; with the ramp off, or a target
+    /// at or below the head floor, the grid is the plain target stride.
+    /// A restart snaps inside 1.5x of the ramped target, so an early
+    /// restart point can take the head cut over the boundary.
+    #[test]
+    fn plan_cuts_ramp_doubles_head_until_target() {
+        const K64: usize = 64 * 1024;
+        let bs = 1000usize;
+        let blocks = synth_blocks(16, K64, bs);
+        let frame_len = 16 * K64;
+        let target = 6 * K64;
+
+        // Head 128 KiB, then 256 KiB, then the 384 KiB target, then the
+        // target stride: blocks 2, 4, 6, 12.
+        assert_eq!(
+            plan_frame_cuts(&blocks, &[0], target, frame_len, bs, true),
+            vec![2, 4, 6, 12]
+        );
+        assert_eq!(
+            plan_frame_cuts(&blocks, &[0], target, frame_len, bs, false),
+            vec![6, 12]
+        );
+
+        // A target at or below the head floor leaves the grid untouched.
+        assert_eq!(
+            plan_frame_cuts(&blocks, &[0], RAMP_HEAD_INPUT, frame_len, bs, true),
+            plan_frame_cuts(&blocks, &[0], RAMP_HEAD_INPUT, frame_len, bs, false)
+        );
+
+        // The snap window prices the ramped target: restart at block 3
+        // (input 192 KiB) lies within 1.5x of the 128 KiB head, so the
+        // head cut snaps to it ahead of the nearer block boundary, and the
+        // next ramped target lands on block 4's exact boundary.
+        assert_eq!(
+            plan_frame_cuts(&blocks, &[0, 3], target, frame_len, bs, true),
+            vec![3, 4, 6, 12]
         );
     }
 
@@ -2614,6 +2737,79 @@ mod tests {
         }
     }
 
+    /// The head-ramp gate's terms: the literals share of the staged
+    /// volume arms at exactly one half, and the worker count, the MT floor
+    /// and a block that failed to parse all disarm.
+    #[test]
+    fn ramp_gate_terms() {
+        let floor = super::MIN_MT_INPUT;
+        let armed = |literals: u64, sequences: u64, complete: bool| FrameVolumes {
+            literals,
+            sequences,
+            complete,
+        };
+        assert!(armed(12_000, 1_000, true).ramp_eligible(4, floor + 1));
+        assert!(!armed(11_999, 1_000, true).ramp_eligible(4, floor + 1));
+        assert!(!armed(12_000, 1_000, true).ramp_eligible(1, floor + 1));
+        assert!(!armed(12_000, 1_000, true).ramp_eligible(4, floor));
+        assert!(!armed(12_000, 1_000, false).ramp_eligible(4, floor + 1));
+    }
+
+    /// Scan-level wiring of the head ramp: a literal-dominated frame above
+    /// the MT floor starts its grid on the head floor at two workers,
+    /// while the same shape with sequence-dominated blocks, a one-worker
+    /// scan, or an unparseable block keeps the target grid.
+    #[test]
+    fn head_ramp_arms_on_staged_volumes() {
+        // 1024 raw literals plus one sequence: 1024 B staged literals
+        // against a 12 B record, a 0.988 share.
+        let big_lits = {
+            let mut b = vec![0x04, 0x40];
+            b.extend(std::iter::repeat_n(0x61, 1024));
+            b.extend_from_slice(&rle_seq_body());
+            b
+        };
+        // 4 raw literals against 100 declared sequences: a 0.003 share.
+        let seq_heavy = vec![0x20, 0x30, 0x31, 0x32, 0x33, 0x64, 0x54];
+        // Raw-literals header claiming a 20-bit size in a 1-byte body:
+        // the pre-scan cannot parse it, so the frame disarms.
+        let unparseable = vec![0x0c];
+
+        let craft = |bodies: &[Vec<u8>]| {
+            craft_frame(
+                &bodies.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+                120 * 1024,
+            )
+        };
+        let first_seg_blocks = |frame: &[u8], workers: u32, name: &str| {
+            let plan = scan(frame, workers, MAX_WINDOW)
+                .unwrap_or_else(|| panic!("{name} must scan at {workers} workers"));
+            assert!(
+                plan.segments.len() >= 2,
+                "{name} must segment at {workers} workers"
+            );
+            plan.segments[0].blocks.len()
+        };
+
+        let armed = craft(&vec![big_lits.clone(); 4]);
+        // The head cut lands three blocks in, just past the 128 KiB head
+        // on the nearest boundary.
+        assert_eq!(first_seg_blocks(&armed, 2, "armed"), 3);
+        // One worker never ramps.
+        assert!(first_seg_blocks(&armed, 1, "armed-1w") > 2);
+        // A sequence-dominated shape of the same craft keeps the target grid.
+        let gated = craft(&vec![seq_heavy.clone(); 4]);
+        assert!(first_seg_blocks(&gated, 2, "gated") > 2);
+        // An unparseable block disarms the frame.
+        let broken = craft(&vec![
+            big_lits.clone(),
+            unparseable,
+            big_lits.clone(),
+            big_lits,
+        ]);
+        assert!(first_seg_blocks(&broken, 2, "broken") > 2);
+    }
+
     /// The committed decode_mt fuzz seed compresses `semi_structured_records`
     /// at libzstd -9 and parks the frame once per process; this pins that
     /// the constructed class actually routes through primed mid-epoch
@@ -2638,8 +2834,9 @@ mod tests {
         assert_eq!(out, data);
     }
 
-    /// Scan one frame's blocks and probes (single-frame inputs).
-    fn frame_blocks(input: &[u8]) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>)> {
+    /// Scan one frame's blocks, probes and staged volumes (single-frame
+    /// inputs).
+    fn frame_blocks(input: &[u8]) -> Option<(Vec<ScannedBlock>, Vec<RestartProbe>, FrameVolumes)> {
         let mut reader = input;
         let (header, _) = crate::decoding::frame::read_frame_header(&mut reader).ok()?;
         let blocks_start = input.len() - reader.len();
@@ -2782,7 +2979,7 @@ mod tests {
 
         let mut compared = 0usize;
         for (name, frame) in &frames {
-            let Some((blocks, probes)) = frame_blocks(frame) else {
+            let Some((blocks, probes, _volumes)) = frame_blocks(frame) else {
                 panic!("{name}: frame must scan");
             };
             let restarts = restart_candidates(&probes);
