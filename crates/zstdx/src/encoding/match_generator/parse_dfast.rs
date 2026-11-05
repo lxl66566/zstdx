@@ -484,13 +484,17 @@ impl MatchGeneratorDriver {
             self.ldm_i += 1;
             debug_assert_eq!(seq.split - shift, win_base + seg_end as u64);
             // The 4-byte guard only defends a stale candidate (generate
-            // verified the whole span at fill time); a failure drops it and
-            // re-opens the split as gap bytes of the next segment, the
-            // pending literals still attached.
+            // verified the whole span at fill time); the ramp check keeps
+            // the depth guarantee — a candidate whose source sits in the
+            // band below the job start cannot emit wholesale. Either
+            // failure drops the candidate and re-opens the split as gap
+            // bytes of the next segment, the pending literals still
+            // attached.
             let cand_abs = (win_base + seg_end as u64).checked_sub(seq.offset.get() as u64);
             let valid = match cand_abs {
                 Some(c) if c >= win_base && seq.len as usize >= MIN_MATCH => {
                     read4(win, (c - win_base) as usize) == read4(win, seg_end)
+                        && !ramp_blocks::<RAMPED>(ramp, win_base + seg_end as u64, c)
                 },
                 _ => false,
             };

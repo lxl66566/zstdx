@@ -128,8 +128,10 @@ pub(crate) struct BlockScratch {
     pub(super) seqs: Vec<crate::encoding::SeqWord>,
     /// Sticky heuristic: the previous block's literals cleared the exact
     /// entropy bound, so the strided gate below is skipped until a block
-    /// proves otherwise. Pure cost hint; every outcome stays reachable.
-    pub(super) literals_gate_hold: bool,
+    /// proves otherwise. Frame state — cleared by the entropy reset
+    /// (`frame_compressor::reset_entropy_state`), so a pooled state's
+    /// previous frame or job cannot steer this one's first block.
+    pub(crate) literals_gate_hold: bool,
     /// Recycled FSE transition buffers (per-block table builds).
     pub(crate) fse: FseBuildScratch,
     /// Recycled Huffman build buffers (per-block table builds).

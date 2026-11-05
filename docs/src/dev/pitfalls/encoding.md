@@ -201,6 +201,14 @@ The u32 entry's baseline keeps only 9 bits, which covers tables of at most 512 s
 
 The layout is now 12+4+12, `optimal_table_log` already clamps to 5 to 12, and `build_table_from_counts` clamps to 12 with a `build_table_from_probabilities` debug assert as double insurance. Implicit limits in bitfield packing must be enforced at the construction entry, because parameter ranges that production never uses will be stepped on by fuzz or later extensions.
 
+### Pooled scratch state reaches the bytes
+
+`BlockScratch::literals_gate_hold` is a sticky skip flag: once one block's literals pass the sampled entropy gate, later blocks skip the sample. The flag lived in the pooled scratch and no reset entry cleared it — the comment at the fallthrough even said "or the frame resets the scratch", a reset that did not exist. A pooled state reused across MT jobs carried the previous job's hold into the next job's first literals block, which then skipped the sampled reject and took the huffman path when the exact compare won. Ramp-gated dll-class frames keyed their bytes on the worker count: 4786591 bytes at mt4 against 4786978 at mt8 and mt16, identical sequence streams, one job-boundary block flipped between raw and huffman literals.
+
+`frame_compressor::reset_entropy_state` is the documented single reset entry every multi-frame CompressState reuse passes through, so the clear belongs there, and the dictionary path's inline duplicate reset folded into the same entry. The regression test needs a fixture that both pins the level-3 capture grid (recurring 64-byte windows through the far screen, at the 32 MiB mid band) and lands literals in the sampler's flip window — entropy near 7.9 bits per byte, where the sampled reject raws a fresh state's block while the exact huffman compare wins a carried hold's — because a plain pattern head leaves the job grid worker-scaled and a uniform-entropy one never flips, and the equality assert asserts nothing either way.
+
+Sticky decision flags in pooled scratch carry frame provenance into the next frame or job. Size-keyed gates stay green on them, since each worker count is internally consistent; a cross-worker byte-identity assert is the gate that sees the divergence.
+
 ## Memory safety
 
 ### Reserve against len, not pos

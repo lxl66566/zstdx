@@ -165,12 +165,8 @@ pub(crate) fn reset_with_dictionary_mode<M: Matcher>(
     if let Some((huff, ll, ml, of)) = dict.entropy_tables() {
         state.matcher.seed_opt_prices_from_dict(huff, ll, ml, of);
     }
-    state.last_huff_table = None;
-    state.fse_tables.ll_previous = None;
-    state.fse_tables.ml_previous = None;
-    state.fse_tables.of_previous = None;
+    super::frame_compressor::reset_entropy_state(state);
     state.dict_entropy = DictEntropy::default();
-    state.split = super::pre_split::FrameSavings::new();
     if dict.id != 0 {
         state.last_huff_table.clone_from(&dict.huff);
         state.fse_tables.ll_previous.clone_from(&dict.ll);

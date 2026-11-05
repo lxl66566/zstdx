@@ -110,6 +110,94 @@ fn strip_snapshot_adopt_is_exact() {
     );
 }
 
+/// The armed ramp's depth guarantee holds on the prefix-LDM path: a
+/// long-distance candidate whose source sits inside the band below the job
+/// start must drop at its split (its wholesale emission would be a shallow
+/// crossing read), while a twin deep enough below the start still emits.
+/// Regression: the wholesale-emission gate used to check only the 4-byte
+/// guard, so dll-class far twins leaked band crossings.
+#[cfg(feature = "std")]
+#[test]
+fn ramp_gates_ldm_candidates() {
+    // Far twins over the row's stock scan domain (2 MiB at the level-3
+    // dfast row), one sourced deep below the job start, one inside the
+    // ramp band. The forced 8-MiB window plays the far domain LDM
+    // indexes, the Enable switch keeps the scan domain at the stock
+    // window (the same split the capture lattice makes). The deep source
+    // sits past the strip's head: the fill's floor gate skips the first
+    // bytes, so a source hugging position 0 stays unindexed.
+    let blob = |seed: u64, len: usize| -> Vec<u8> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect()
+    };
+    const K: usize = 1024;
+    let (job, depth) = (3 * 1024 * K, 1024 * K);
+    let deep = blob(0x1234_5678_9abc_def0, 64 * K);
+    let banded = blob(0x0fed_cba9_8765_4321, 64 * K);
+    let mut data = blob(0x1111_2222_3333_4444, 512 * K);
+    data.extend_from_slice(&deep);
+    data.extend(blob(0x5555_6666_7777_8888, job - 512 * K - 576 * K));
+    data.extend_from_slice(&banded);
+    data.extend(blob(0x9999_aaaa_bbbb_cccc, 512 * K));
+    data.extend_from_slice(&deep);
+    data.extend(blob(0xdddd_eeee_ffff_0000, 2 * 1024 * K - 128 * K));
+    data.extend_from_slice(&banded);
+    data.extend(blob(0x0f0f_1e1e_2d2d_3c3c, 128 * K));
+    assert_eq!(data.len(), job + 2 * 1024 * K + 192 * K);
+
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.set_ldm_arming(LdmArming::Job);
+    driver.set_ldm_mode(crate::LdmMode::Enable);
+    driver.set_input_shape(crate::InputShape {
+        len: Some(data.len() as u64),
+        window_log: Some(23),
+    });
+    driver.reset(crate::Level::from_zstd(3));
+    driver.arm_ramp(job as u64, depth as u64);
+    driver.adopt_window(&data, 0);
+    driver.prefill_job_strip(&data[..job], 0);
+    driver.set_block(job as u64, data.len() as u64);
+    let mut pos = job as u64;
+    let mut violations = Vec::new();
+    let mut far_emitted = 0usize;
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => pos += literals.len() as u64,
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            pos += literals.len() as u64;
+            if offset > 3 {
+                let dist = offset as u64 - 3;
+                let src = pos.checked_sub(dist).expect("offset inside output");
+                if src < job as u64 && job as u64 - src < depth as u64 {
+                    violations.push((pos, dist, match_len as u64));
+                }
+                if dist > (2u64 << 20) {
+                    far_emitted += 1;
+                }
+            }
+            pos += match_len as u64;
+        },
+    });
+    assert!(
+        violations.is_empty(),
+        "shallow band crossings: {violations:?}"
+    );
+    assert!(
+        far_emitted > 0,
+        "the deep twin must still emit through the LDM path"
+    );
+}
+
 #[test]
 fn ldm_arming_bars() {
     // The midsize bar arms one step under the row window, for frames and

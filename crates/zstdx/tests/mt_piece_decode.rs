@@ -145,6 +145,82 @@ fn ramp_frames_decode_byte_exact() {
     set_piece_decode_for_tests(false);
 }
 
+/// dll-class payload at the mid-size capture band (the dll32 shape): a
+/// pseudo-random 256 KiB base block repeated to fill 32 MiB, each copy
+/// re-seeding a 64 KiB region with fresh bytes at a varying offset. The
+/// recurring unmutated spans give the far screen its twin density (what
+/// pins the level-3 capture grid at 4 MiB jobs, worker-independent), and
+/// the base's wide alphabet clears the screen's symbol bar. The re-seeded
+/// bytes mix one hot byte value into the random stream at two depths: the
+/// copies opening a job (every 16th, one per 4 MiB grid cell) hold their
+/// literals near 7.9 bits/byte — the literals gate's sampled reject raws
+/// such a block on a fresh state while the exact huffman compare wins it
+/// once a carried hold skips the sample — and the mid-job copies sit near
+/// 7.2, passing the sample and setting the hold a reused state then
+/// carries across the job boundary.
+fn dll_class_head() -> Vec<u8> {
+    const BLOCK: usize = 256 * 1024;
+    const SEED: usize = 64 * 1024;
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut step = |state: &mut u64| {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*state >> 33) as u8
+    };
+    let base = (0..BLOCK).map(|_| step(&mut state)).collect::<Vec<u8>>();
+    let mut head = Vec::with_capacity(128 * BLOCK);
+    for copy in 0..128 {
+        head.extend_from_slice(&base);
+        // One in 64 bytes hot on the job-opening copies, one in 8 on the
+        // mid-job ones.
+        let hot = copy % 16 == 0;
+        let at = (copy * SEED) % (BLOCK - SEED);
+        for b in &mut head[copy * BLOCK + at..][..SEED] {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = if hot && state & 63 == 0 || !hot && state & 7 == 0 {
+                0xa5
+            } else {
+                (state >> 33) as u8
+            };
+        }
+    }
+    head
+}
+
+/// Ramped MT frames are worker-count invariant: with the per-job entropy
+/// reset dropping the literals gate's sticky hold, a job that runs on a
+/// reused pooled state (worker count below the job count) encodes exactly
+/// like one on a fresh state. Regression: the hold survived the reset, so
+/// a dll-class job-boundary block steered between raw and huffman
+/// literals and the ramped frame bytes keyed on the worker count.
+#[test]
+fn ramp_frames_are_worker_invariant() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    // 32 MiB on the level-3 dfast row pins the capture grid at 4 MiB
+    // jobs (8 of them): worker 2 and 4 reuse pooled states across the
+    // jobs, 8 and 16 run every job on a fresh one. This row and band is
+    // where the dll-class leak fired.
+    let src = dll_class_head();
+    let mut frames = Vec::new();
+    for workers in [2u32, 4, 8, 16] {
+        frames.push(
+            bulk::compress_with(
+                &src,
+                &EncoderOptions::new(Level::from_zstd(3))
+                    .workers(workers)
+                    .checksum(true),
+            )
+            .unwrap(),
+        );
+    }
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    for f in &frames[1..] {
+        assert_eq!(f, &frames[0], "ramped frame keyed on worker count");
+    }
+    let out = bulk::decompress(&frames[0], src.len()).unwrap();
+    assert_eq!(out, src);
+}
+
 /// Non-ramp frames (encoder override off, router still on) must never
 /// engage and stay byte-exact — the serial stage B through the piece
 /// driver's fallback or the stock path, indistinguishable either way.

@@ -222,13 +222,16 @@ pub(crate) fn reset_slice_state_mode(
     reset_entropy_state(state);
 }
 
-/// Zero the frame-scoped entropy state: the pre-split savings restart and
-/// the previous frame's huffman/FSE tables retire, returning their buffers
-/// to the block scratch. Every multi-frame reuse of a `CompressState` must
-/// pass through here — leftover frame-1 statistics would steer frame 2's
-/// split and table-repeat decisions.
+/// Zero the frame-scoped entropy state: the pre-split savings restart, the
+/// previous frame's huffman/FSE tables retire (returning their buffers to
+/// the block scratch), and the literals gate's sticky hold drops — a
+/// carried hold would steer the new frame's first literals decision, keying
+/// the bytes on whatever ran on the pooled state before. Every multi-frame
+/// reuse of a `CompressState` must pass through here — leftover frame-1
+/// statistics would steer frame 2's split and table-repeat decisions.
 pub(crate) fn reset_entropy_state<M: Matcher>(state: &mut CompressState<M>) {
     state.split = pre_split::FrameSavings::new();
+    state.scratch.literals_gate_hold = false;
     if let Some(table) = state.last_huff_table.take() {
         table.recycle_aligned(&mut state.scratch.huff);
     }
