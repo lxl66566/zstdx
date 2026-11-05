@@ -647,6 +647,64 @@ mod tests {
         .unwrap()
     }
 
+    /// Deterministic xorshift for the randomized multi-frame property.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Semi-structured records: a second content class for the property
+    /// streams (literal runs with matches).
+    fn records(rng: &mut Rng, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut id = 0u64;
+        while out.len() < len {
+            let state = rng.next();
+            let user = (state >> 33) % 5000;
+            let event = match (state >> 45) % 5 {
+                0 => "click",
+                1 => "view",
+                2 => "purchase",
+                3 => "error",
+                _ => "login",
+            };
+            out.extend_from_slice(
+                format!(
+                    "{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{}}}",
+                    1700000000 + id
+                )
+                .as_bytes(),
+            );
+            id += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Pseudo-random bytes: incompressible, so the frame stays near raw
+    /// size and clears the parallel floor cheaply.
+    fn noise(rng: &mut Rng, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        for chunk in out.chunks_mut(8) {
+            chunk.copy_from_slice(&rng.next().to_le_bytes()[..chunk.len()]);
+        }
+        out
+    }
+
+    /// Append a skippable frame: magic 0x184D2A50 + LE length + payload.
+    fn push_skippable(stream: &mut Vec<u8>, fill: u8, len: usize) {
+        stream.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18]);
+        stream.extend_from_slice(&(len as u32).to_le_bytes());
+        stream.resize(stream.len() + len, fill);
+    }
+
     /// A multi-frame stream large enough to engage the parallel decoder.
     /// Frame 2 carries no checksum, the others do. Returns the stream, the
     /// raw outputs and each frame's byte range in the stream.
@@ -802,10 +860,7 @@ mod tests {
         for (i, raw) in raws.iter().enumerate() {
             stream.extend_from_slice(&compress(raw, Level::Fastest, true, 1));
             if i == 3 {
-                // A skippable frame: magic 0x184D2A50 + LE length + payload.
-                stream.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18]);
-                stream.extend_from_slice(&64u32.to_le_bytes());
-                stream.extend_from_slice(&[0xab; 64]);
+                push_skippable(&mut stream, 0xab, 64);
             }
         }
         let expect = expected_output(&raws);
@@ -862,5 +917,316 @@ mod tests {
             specs.iter().map(|s| s.segs.clone()).collect::<Vec<_>>(),
             vec![0..3, 3..7, 7..9, 9..12, 12..14]
         );
+    }
+
+    /// Deterministic property: streams of 1..=16 frames — empty and
+    /// sub-floor sizes up to 256 KiB, textish and records content,
+    /// per-frame checksum, level and encoder workers, skippable frames
+    /// interleaved, a noise frame anchoring sub-floor streams above the
+    /// parallel floor — decode byte-equal through the sequential decoder
+    /// and the MT entry at 2/4/8/16 workers, placed and appending. The
+    /// seed is fixed, so every failure reproduces.
+    #[test]
+    fn multiframe_property_st_mt_byte_equality() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..6 {
+            let n_frames = 1 + (rng.next() % 16) as usize;
+            const SIZES: [usize; 4] = [0, 4096, 64 * 1024, 256 * 1024];
+            const BUDGET: usize = 1024 * 1024;
+            let mut spent = 0usize;
+            let mut stream = Vec::new();
+            let mut raws = Vec::new();
+            for _ in 0..n_frames {
+                if rng.next() & 7 == 0 {
+                    push_skippable(&mut stream, 0xab, 16 + (rng.next() >> 40) as usize % 48);
+                }
+                let len = if spent < BUDGET {
+                    SIZES[(rng.next() >> 36) as usize % SIZES.len()].min(BUDGET - spent)
+                } else {
+                    0
+                };
+                spent += len;
+                let raw = if rng.next() & 1 == 0 {
+                    textish(rng.next() | 1, len)
+                } else {
+                    records(&mut rng, len)
+                };
+                stream.extend_from_slice(&compress(
+                    &raw,
+                    Level::from_zstd(1 + (rng.next() >> 36) as i32 % 4),
+                    rng.next() & 1 == 0,
+                    1 + (rng.next() >> 40) as u32 % 3,
+                ));
+                raws.push(raw);
+            }
+            // The noise anchor keeps multi-frame cases above the 512-KiB
+            // parallel floor, so the frame-lane path engages everywhere.
+            if raws.len() >= 2 && stream.len() < 600 * 1024 {
+                let raw = noise(&mut rng, 600 * 1024 - stream.len() + 4096);
+                stream.extend_from_slice(&compress(&raw, Level::Fastest, false, 1));
+                raws.push(raw);
+            }
+            let expect = expected_output(&raws);
+
+            let mut seq = vec![0u8; expect.len()];
+            let n = FrameDecoder::new().decode_all(&stream, &mut seq).unwrap();
+            assert_eq!(&seq[..n], &expect[..], "case {case}: sequential");
+
+            let before = frame_lane_engagements();
+            for workers in [2u32, 4, 8, 16] {
+                let mut placed = vec![0u8; expect.len()];
+                let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+                assert_eq!(&placed[..n], &expect[..], "case {case}: mt{workers}");
+                let mut appended = Vec::new();
+                decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+                assert_eq!(appended, expect, "case {case}: mt{workers} appended");
+            }
+            assert!(
+                raws.len() < 2 || stream.len() < 600 * 1024 || frame_lane_engagements() > before,
+                "case {case}: the multi-frame stream must engage the lane executor"
+            );
+        }
+    }
+
+    /// Staged decode error inside a non-first frame of a stream that
+    /// outnumbers the worker budget: the minimum failing segment id — the
+    /// serial decoder's error — wins over a later lane's checksum
+    /// mismatch, at grouped and ungrouped worker counts.
+    #[test]
+    fn multiframe_grouped_error_precedence() {
+        // Six frames; at mt2 the lanes group frames 0-2 and 3-5. Frame 1
+        // carries no checksum, so its deep corruption is a decode error;
+        // frame 4 carries one, so only its trailer flips.
+        let mut stream = Vec::new();
+        let mut parts = Vec::new();
+        for i in 0..6u64 {
+            let raw = textish(0xd00 + i, 2 * 1024 * 1024);
+            let start = stream.len();
+            stream.extend_from_slice(&compress(&raw, Level::Fastest, i != 1, 4));
+            parts.push(start..stream.len());
+        }
+
+        // A staged error inside frame 4 — the second lane group at mt2 —
+        // rejects through both entries wherever the sequential decoder
+        // rejects. The variant is the staged parse's own (stage A
+        // pre-parses sequence sections, so the failing read can differ
+        // from the sequential decoder's fused loop); the contract is the
+        // accept/reject symmetry, not variant equality.
+        let mut corrupt = stream.clone();
+        let at = parts[4].start + 900;
+        corrupt[at] ^= 0xff;
+        corrupt[at + 1] ^= 0xff;
+        let mut seq = vec![0u8; 12 * 1024 * 1024];
+        let seq_err = FrameDecoder::new()
+            .decode_all(&corrupt, &mut seq)
+            .unwrap_err();
+        assert!(
+            !matches!(seq_err, FrameDecoderError::ChecksumMismatch { .. }),
+            "{seq_err:?}"
+        );
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; 12 * 1024 * 1024];
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            assert!(
+                !matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+                "mt{workers}: {err:?}"
+            );
+            let mut appended = Vec::new();
+            decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+        }
+
+        // Min-failing-id precedence: frame 1 corrupts deep while frame
+        // 4's checksum trailer flips. Frame 4's block data is intact, so
+        // any decode error can only come from frame 1 — the reported
+        // error must be frame 1's alone, and the later lane's checksum
+        // mismatch must lose against it.
+        let mut only_f1 = stream.clone();
+        let at = parts[1].start + 900;
+        only_f1[at] ^= 0xff;
+        only_f1[at + 1] ^= 0xff;
+        let mut both = only_f1.clone();
+        both[parts[4].end - 1] ^= 0xff;
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; 12 * 1024 * 1024];
+            let err_f1 = decode_all_mt(&only_f1, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let mut placed = vec![0u8; 12 * 1024 * 1024];
+            let err_both = decode_all_mt(&both, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(
+                format!("{err_both:?}"),
+                format!("{err_f1:?}"),
+                "mt{workers}: the earlier frame's decode error must win"
+            );
+            assert!(
+                !matches!(err_both, FrameDecoderError::ChecksumMismatch { .. }),
+                "mt{workers}: the later lane's checksum mismatch must lose"
+            );
+        }
+    }
+
+    /// A checksum mismatch in a middle frame of a stream that outnumbers
+    /// the worker budget surfaces from the checksumming frame's own
+    /// trailer, grouped or not, with the append vector unchanged.
+    #[test]
+    fn multiframe_middle_frame_checksum_grouped() {
+        // Five checksummed frames; frame 2 is lane 1's first frame at mt2
+        // (lanes 0-1 and 2-4) and lane 0's group completes clean.
+        let mut stream = Vec::new();
+        let mut parts = Vec::new();
+        for i in 0..5u64 {
+            let raw = textish(0xe00 + i, 2 * 1024 * 1024);
+            let start = stream.len();
+            stream.extend_from_slice(&compress(&raw, Level::Fastest, true, 4));
+            parts.push(start..stream.len());
+        }
+        let mut corrupt = stream.clone();
+        corrupt[parts[2].end - 1] ^= 0xff;
+        let mut seq = vec![0u8; 10 * 1024 * 1024];
+        let seq_err = FrameDecoder::new()
+            .decode_all(&corrupt, &mut seq)
+            .unwrap_err();
+        assert!(
+            matches!(seq_err, FrameDecoderError::ChecksumMismatch { .. }),
+            "{seq_err:?}"
+        );
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; 10 * 1024 * 1024];
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
+            let mut appended = b"prefix".to_vec();
+            let err = decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            assert!(
+                matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+                "mt{workers}: {err:?}"
+            );
+            assert_eq!(appended.len(), b"prefix".len(), "mt{workers}");
+        }
+    }
+
+    /// An empty frame in the tail: the last lane's segment covers zero
+    /// output bytes, and the decode stays byte-equal through every worker
+    /// count and both entries.
+    #[test]
+    fn multiframe_empty_frame_tail() {
+        let (mut stream, raws, _) = multiframe_stream();
+        stream.extend_from_slice(&compress(&[], Level::Fastest, true, 1));
+        let expect = expected_output(&raws);
+        for workers in [2u32, 4, 8] {
+            let mut placed = vec![0u8; expect.len()];
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            assert_eq!(&placed[..n], &expect[..], "mt{workers}");
+            let mut appended = Vec::new();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            assert_eq!(appended, expect, "mt{workers}");
+        }
+    }
+
+    /// Seventeen frames at 2/4/12 workers: frames outnumber every worker
+    /// count, so the lanes group consecutive frames — across empty frames
+    /// and skippable interleave — and every grouping stays byte-equal.
+    #[test]
+    fn multiframe_frames_outnumber_workers() {
+        let mut rng = Rng(0xabcdef);
+        let mut stream = Vec::new();
+        let mut raws = Vec::new();
+        for i in 0..16u64 {
+            if i == 5 || i == 11 {
+                push_skippable(&mut stream, 0x5a, 32);
+            }
+            let raw = textish(
+                0x600 + i,
+                if i % 4 == 0 {
+                    0
+                } else {
+                    8 * 1024
+                },
+            );
+            stream.extend_from_slice(&compress(&raw, Level::Fastest, i & 1 == 0, 1));
+            raws.push(raw);
+        }
+        // The 16 tiny frames stay far below the floor; the noise anchor
+        // carries the stream above it.
+        let raw = noise(&mut rng, 600 * 1024);
+        stream.extend_from_slice(&compress(&raw, Level::Fastest, true, 1));
+        raws.push(raw);
+        let expect = expected_output(&raws);
+        let before = frame_lane_engagements();
+        for workers in [2u32, 4, 12] {
+            let mut placed = vec![0u8; expect.len()];
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            assert_eq!(&placed[..n], &expect[..], "mt{workers}");
+            let mut appended = Vec::new();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            assert_eq!(appended, expect, "mt{workers}");
+        }
+        assert!(frame_lane_engagements() > before);
+    }
+
+    /// A dictID-carrying frame inside a multi-frame stream: the scan
+    /// refuses dictionary state, so both MT entries fall back to the
+    /// sequential decoder — the dict-less decode of a frame that matched
+    /// into the dictionary reports the sequential decoder's own error
+    /// (here `OffsetTooBig`, not the registry's `DictNotProvided`, which
+    /// the bulk path never consults), byte-for-byte the same through MT.
+    #[test]
+    fn multiframe_dictid_frame_matches_sequential() {
+        let dict = textish(0x99, 64 * 1024);
+        let mut stream = Vec::new();
+        let raw0 = textish(0xa1, 2 * 1024 * 1024);
+        stream.extend_from_slice(&compress(&raw0, Level::Fastest, true, 4));
+        // A frame stamped with the dictionary's id (mismatched against
+        // the dict-less decode), between two plain frames. Its content
+        // shares the dict's word stream, so the encoder matched into the
+        // dictionary and the dict-less decode must fail.
+        let raw1 = textish(0x99, 2 * 1024 * 1024);
+        stream.extend_from_slice(
+            &bulk::compress_with(
+                &raw1,
+                &EncoderOptions::new(Level::Fastest).dictionary(&dict),
+            )
+            .unwrap(),
+        );
+        let raw2 = textish(0xa3, 2 * 1024 * 1024);
+        stream.extend_from_slice(&compress(&raw2, Level::Fastest, true, 4));
+
+        let mut seq = vec![0u8; 6 * 1024 * 1024];
+        let seq_err = FrameDecoder::new()
+            .decode_all(&stream, &mut seq)
+            .unwrap_err();
+        assert!(
+            !matches!(seq_err, FrameDecoderError::ChecksumMismatch { .. }),
+            "{seq_err:?}"
+        );
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; 6 * 1024 * 1024];
+            let err = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
+            let mut appended = Vec::new();
+            let err = decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
+        }
+    }
+
+    /// A skippable-only stream decodes to empty through the MT entries and
+    /// never engages the lane executor: the scan sees no real frame, so
+    /// the sequential fallback owns the stream even above the floor.
+    #[test]
+    fn skippable_only_stream_decodes_empty() {
+        let mut stream = Vec::new();
+        push_skippable(&mut stream, 0x5a, 16);
+        push_skippable(&mut stream, 0x5a, 1024);
+        push_skippable(&mut stream, 0x5a, 700 * 1024);
+        let mut seq = Vec::new();
+        let n = FrameDecoder::new().decode_all(&stream, &mut seq).unwrap();
+        assert_eq!(n, 0);
+        let before = frame_lane_engagements();
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; 0];
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            assert_eq!(n, 0, "mt{workers}");
+            let mut appended = b"prefix".to_vec();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            assert_eq!(appended, b"prefix", "mt{workers}");
+        }
+        assert_eq!(frame_lane_engagements(), before);
     }
 }
