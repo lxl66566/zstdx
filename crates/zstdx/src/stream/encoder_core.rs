@@ -30,6 +30,13 @@ use crate::{
     },
 };
 
+/// The single-threaded streaming pull size: the read encoder's staging
+/// chunk and the owned feed's single-threaded demotion both pull at this
+/// cadence, so the demotion's closing shape tracks the read encoder's
+/// over the same source (the measured granularity — see the read
+/// encoder's staging chunk).
+pub(crate) const ST_PULL: usize = 16 * 1024;
+
 /// Debug poison wall over a `Vec`'s spare capacity — the ASAN-blind zone
 /// past a buffer's logical length but inside its allocation. [`vec_poison::fill`]
 /// arms the first [`vec_poison::WALL`] spare bytes past the current length
@@ -1118,7 +1125,7 @@ impl FrameEncoderCore {
         match self {
             Self::Single(core) => {
                 if *fed < src.len() {
-                    let n = (16 * 1024).min(src.len() - *fed);
+                    let n = ST_PULL.min(src.len() - *fed);
                     core.write(&src[*fed..*fed + n])?;
                     *fed += n;
                     Ok(())

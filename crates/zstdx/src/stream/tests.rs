@@ -1902,6 +1902,17 @@ mod mt {
         }
     }
 
+    /// One frame from the NT-store source reader over the same bytes, at
+    /// the same options the read-side reference runs.
+    pub(super) fn nt_frame(raw: &[u8], options: EncoderOptions) -> Vec<u8> {
+        let mut enc = read::Encoder::with_options(read::NtSource::new(raw), options)
+            .expect("nt source encoder");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("nt read");
+        enc.finish().expect("nt finish");
+        comp
+    }
+
     /// One frame from the zero-copy entry over `source`, at the same options
     /// the read-side reference runs.
     pub(super) fn owned_frame(source: read::OwnedSource, options: EncoderOptions) -> Vec<u8> {
@@ -1951,6 +1962,69 @@ mod mt {
                 }
             }
         }
+    }
+
+    /// The NT-source reader's byte contract: the frame equals the plain
+    /// slice source's over the same bytes at the same options. The reader
+    /// is a copy into the same pump-handed buffer, and the job schedule
+    /// keys on the stream offset alone, so the kernel path (pulls at and
+    /// above `NT_MIN`) and the plain path below it must both land on the
+    /// slice reader's frame.
+    #[test]
+    fn nt_source_matches_plain_slice_bytes() {
+        for (name, data) in shapes() {
+            for level in [Level::Fastest, Level::Balanced] {
+                for workers in [0u32, 2, 4] {
+                    for pledged in [false, true] {
+                        let label = format!("{name}/{level:?}/w{workers}/pledged{pledged}");
+                        let options = || {
+                            EncoderOptions::new(level)
+                                .workers(workers)
+                                .checksum(true)
+                                .pledged_size(pledged.then_some(data.len() as u64))
+                        };
+                        let reference = read_frame(&data, options());
+                        assert_eq!(nt_frame(&data, options()), reference, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reader's own `Read` contract: it fills up to the requested span,
+    /// serves the source's end as `Ok(0)`, and copies the same bytes on
+    /// both sides of `NT_MIN` (a spanning pull that shrinks below the bar
+    /// mid-source keeps the plain path).
+    #[test]
+    fn nt_source_read_semantics() {
+        let data = textish(700 * 1024);
+        let mut src = read::NtSource::new(&data);
+        let mut probe = [0u8; 4096];
+        assert_eq!(src.read(&mut probe).unwrap(), 4096);
+        assert_eq!(&probe, &data[..4096]);
+        // A pull larger than the source drains it in one step.
+        let mut big = alloc::vec![0u8; data.len() * 2];
+        let n = src.read(&mut big).unwrap();
+        assert_eq!(n, data.len() - 4096);
+        assert_eq!(&big[..n], &data[4096..]);
+        // Past the end: `Ok(0)`, the plain source's EOF signal.
+        assert_eq!(src.read(&mut probe).unwrap(), 0);
+        // The reader does not consume the source: it borrows it.
+        assert_eq!(data.len(), 700 * 1024);
+        let nt_min = crate::common::nt_copy::NT_MIN;
+        // A pull exactly at the threshold takes the kernel path; a
+        // shrinking remainder below it keeps the plain copy — both
+        // reproduce the source bytes.
+        let mut tail = read::NtSource::new(&data[4096..]);
+        let mut at_bar = alloc::vec![0u8; nt_min];
+        assert_eq!(tail.read(&mut at_bar).unwrap(), nt_min);
+        assert_eq!(&at_bar, &data[4096..4096 + nt_min]);
+        let mut rest = alloc::vec![0u8; data.len()];
+        let n = tail.read(&mut rest).unwrap();
+        assert_eq!(n, data.len() - 4096 - nt_min);
+        assert_eq!(&rest[..n], &data[4096 + nt_min..]);
+        let mut empty = [0u8; 0];
+        assert_eq!(tail.read(&mut empty).unwrap(), 0);
     }
 
     /// Every `OwnedSource` arm must produce the same frame: the core holds

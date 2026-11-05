@@ -27,6 +27,10 @@ use crate::{
     pool::{DEFAULT_MAX_WIDTH, run_cells},
 };
 
+// Four independent drive flags, each with its own emission path (bulk,
+// stream, the owned feed, the NT reader); folding them into an enum would
+// obscure the paths for no checked invariant.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args)]
 pub struct Args {
     /// Output directory for the compressed snapshots
@@ -53,8 +57,16 @@ pub struct Args {
     /// tags. Diffing an `--owned` dump against a plain one is the
     /// entry's byte-parity gate: the frames must be identical, because
     /// the job schedule is a pure function of the stream offset.
-    #[arg(long, requires = "stream")]
+    #[arg(long, requires = "stream", conflicts_with = "nt_read")]
     pub owned: bool,
+    /// With `--stream`: drive the cells through the NT-store source
+    /// reader (`read::NtSource`, the feed-copy kernel) under the same
+    /// tags. Diffing an `--nt-read` dump against a plain one is the
+    /// reader's byte-parity gate: the frames must be identical, because
+    /// the reader is a copy and the job schedule is a pure function of
+    /// the stream offset.
+    #[arg(long, requires = "stream")]
+    pub nt_read: bool,
     /// Maximum frames emitted at once, bounded by a built-in memory budget
     /// over the payload size; 0 = one per logical core, 1 = serial emission
     #[arg(long, default_value_t = DEFAULT_MAX_WIDTH)]
@@ -127,10 +139,21 @@ impl StreamCell {
 /// Drive the read-side streaming core exactly as `matrix --mode enc-stream`
 /// does (one `read_to_end` over the whole source, no flush — output is
 /// chunk-independent), returning the closed frame. `owned` swaps the Read
-/// pump for the zero-copy in-memory feed; the tags stay the same, so a
-/// plain dump and an owned dump of the same build must be byte-identical.
-fn stream_frame(raw: &[u8], options: EncoderOptions, owned: bool) -> Vec<u8> {
-    if owned {
+/// pump for the zero-copy in-memory feed and `nt_read` for the NT-store
+/// source reader; the tags stay the same, so a plain dump and either
+/// variant dump of the same build must be byte-identical.
+fn stream_frame(raw: &[u8], options: EncoderOptions, owned: bool, nt_read: bool) -> Vec<u8> {
+    if nt_read {
+        let mut enc = zstdx::stream::read::Encoder::with_options(
+            zstdx::stream::read::NtSource::new(raw),
+            options,
+        )
+        .expect("nt source encoder");
+        let mut comp = Vec::new();
+        enc.read_to_end(&mut comp).expect("nt stream read");
+        enc.finish().expect("nt stream finish");
+        comp
+    } else if owned {
         let source = zstdx::stream::read::OwnedSource::from(raw.to_vec());
         let mut enc = zstdx::stream::read::OwnedEncoder::with_options(source, options)
             .expect("owned encoder");
@@ -210,10 +233,11 @@ pub fn run(args: &Args) {
             let level = *level;
             if let Some(cells) = &cells {
                 let owned = args.owned;
+                let nt_read = args.nt_read;
                 for &cell in cells {
                     let file = format!("{name}.{}{suffix}.zst", cell.tag());
                     let job = Box::new(move |raw: &[u8]| {
-                        stream_frame(raw, cell.options(level.pair().0, raw), owned)
+                        stream_frame(raw, cell.options(level.pair().0, raw), owned, nt_read)
                     });
                     jobs.push((file, Arc::clone(raw), job));
                 }

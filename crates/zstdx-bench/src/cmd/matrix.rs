@@ -121,8 +121,16 @@ pub struct Args {
     /// instead of the Read pump. Frames must stay identical to the read
     /// cells (the section self-gates the parity), so the wall delta is
     /// the feed's own. The ST section keeps its pull-size loop.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "nt_read")]
     pub owned: bool,
+    /// Drive the enc-stream MT section's zstdx side through the NT-store
+    /// source reader (`read::NtSource`) instead of the plain slice: the
+    /// multithreaded pump's 1 MiB pulls copy through non-temporal stores
+    /// (the feed-copy kernel), opt-in API surface the plain Read path
+    /// cannot reach. Frames stay identical to the read cells (the section
+    /// self-gates the parity), so the wall delta is the kernel's own.
+    #[arg(long)]
+    pub nt_read: bool,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
@@ -855,11 +863,11 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
             // deterministic, so they are roundtripped after the measurement.
             let mut comp = Vec::new();
             let mut zcomp = Vec::new();
-            // The owned entry's frame must equal the read pump's, so the
-            // owned switch self-gates: the reference frame comes from one
-            // untimed read-path encode and the measured frame is compared
-            // against it after the rounds.
-            let read_frame = if args.owned {
+            // The owned entry's and the NT reader's frames must equal
+            // the read pump's, so either switch self-gates: the reference
+            // frame comes from one untimed read-path encode and the
+            // measured frame is compared against it after the rounds.
+            let read_frame = if args.owned || args.nt_read {
                 let mut frame = Vec::new();
                 let mut enc = zstdx::stream::read::Encoder::with_options(
                     &raw[..],
@@ -903,6 +911,21 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                             comp.extend_from_slice(&sink[..n]);
                         }
                         owned_src = enc.finish().unwrap();
+                    } else if args.nt_read {
+                        let mut enc = zstdx::stream::read::Encoder::with_options(
+                            zstdx::stream::read::NtSource::new(&raw[..]),
+                            EncoderOptions::new(level).checksum(false).workers(mt),
+                        )
+                        .unwrap();
+                        let mut sink = vec![0u8; 64 * 1024];
+                        loop {
+                            let n = enc.read(&mut sink).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            comp.extend_from_slice(&sink[..n]);
+                        }
+                        enc.finish().unwrap();
                     } else {
                         let mut enc = zstdx::stream::read::Encoder::with_options(
                             &raw[..],
@@ -936,7 +959,12 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
                 },
             );
             if let Some(frame) = &read_frame {
-                assert_eq!(&comp, frame, "{name}.{label} owned-entry frame diverged");
+                let entry = if args.owned {
+                    "owned-entry"
+                } else {
+                    "nt-source"
+                };
+                assert_eq!(&comp, frame, "{name}.{label} {entry} frame diverged");
             }
             assert_roundtrip(&comp, raw, &label);
             assert_roundtrip(&zcomp, raw, &label);

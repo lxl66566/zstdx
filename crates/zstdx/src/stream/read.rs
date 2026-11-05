@@ -1,6 +1,6 @@
 //! io::Read-shaped streaming types.
 
-use super::encoder_core::FrameEncoderCore;
+use super::encoder_core::{FrameEncoderCore, ST_PULL};
 use crate::{
     DecoderOptions, EncoderOptions, Level, Result,
     decoding::{BlockDecodingStrategy, FrameDecoder, frame_source},
@@ -59,7 +59,7 @@ impl<R: Read> Encoder<R> {
             Ok(core) => Ok(Self {
                 source: Some(source),
                 core,
-                chunk: alloc::vec![0u8; 16 * 1024],
+                chunk: alloc::vec![0u8; ST_PULL],
             }),
             Err(err) => Err((source, err)),
         }
@@ -125,6 +125,66 @@ impl<R: Read> Read for Encoder<R> {
                 .pump(self.source.as_mut().unwrap(), &mut self.chunk)?;
         }
         Ok(self.core.split_output(buf))
+    }
+}
+
+/// An in-memory source whose [`Read`] implementation copies through
+/// non-temporal stores: the stream encoders' opt-in streaming feed.
+///
+/// [`Encoder`] over an opaque in-memory source pays one temporal copy per
+/// fed byte inside the source's own `read` (the crate cannot specialize
+/// the `Read` trait to reach it), and the multithreaded core's read pump
+/// pulls in 1 MiB steps — under glibc's non-temporal threshold, so beside
+/// the eight workers' traffic each 100 MB of feed moves about 300 MB of
+/// memory. Wrapping the source in `NtSource` puts those pulls on the
+/// crate's NT-store kernel, which skips the destination read-for-ownership
+/// half (see `common::nt_copy`). The frame bytes are identical to the
+/// plain slice source's at the same options: a copy cannot change the
+/// stream, and the job schedule keys on the stream offset alone.
+///
+/// The gain is a loaded-machine effect on the multithreaded feed (the
+/// dll-class fastest rows read about +5% at 8 workers); the
+/// single-threaded core's 16 KiB staging pulls stay under the kernel's
+/// span threshold and keep the plain copy. Non-x86_64 targets, no-std
+/// builds and a forced scalar tier fall back to the temporal copy —
+/// byte-identical, just not faster.
+///
+/// ```rust
+/// use zstdx::{
+///     io::Read as _,
+///     stream::read::{Encoder, NtSource},
+/// };
+///
+/// let data = b"the quick brown fox".to_vec();
+/// let mut enc = Encoder::new(NtSource::new(&data), zstdx::Level::Fastest).unwrap();
+/// let mut compressed = Vec::new();
+/// enc.read_to_end(&mut compressed).unwrap();
+/// enc.finish().unwrap();
+/// assert_eq!(zstdx::stream::decode_all(&compressed[..]).unwrap(), data);
+/// ```
+pub struct NtSource<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> NtSource<'a> {
+    /// Wrap a borrowed in-memory source (a slice behind a `Vec`, `Box`,
+    /// `Arc` or plain array — whichever outlives the encoder).
+    pub fn new(src: &'a [u8]) -> Self {
+        Self { src, pos: 0 }
+    }
+}
+
+impl Read for NtSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let remaining = &self.src[self.pos..];
+        let n = remaining.len().min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        crate::common::nt_copy::copy(&remaining[..n], &mut buf[..n]);
+        self.pos += n;
+        Ok(n)
     }
 }
 
