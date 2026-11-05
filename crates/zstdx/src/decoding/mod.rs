@@ -27,6 +27,8 @@ pub(crate) mod literals_section_decoder;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
 #[cfg(feature = "std")]
+pub(crate) mod mt_frames;
+#[cfg(feature = "std")]
 pub(crate) mod mt_pieces;
 #[cfg(feature = "std")]
 pub(crate) mod mt_pool;

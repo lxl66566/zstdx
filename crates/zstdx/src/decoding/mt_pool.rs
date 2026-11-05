@@ -14,7 +14,18 @@ use std::{
     time::Duration,
 };
 
-use super::mt::{SegmentScratch, StageAJob, serve_stagea};
+use super::{
+    mt::{SegmentScratch, StageAJob, serve_stagea},
+    mt_frames::{LaneJob, serve_frame_lane},
+};
+
+/// What a leased pool thread runs: stage-A staging, or one stage-B lane of
+/// the multi-frame executor (see `mt_frames`). The lease Arc doubles as
+/// the slot-identity token `wait_leave` compares.
+pub(super) enum LeaseJob {
+    StageA(Arc<StageAJob>),
+    FrameLane(Arc<LaneJob>),
+}
 
 /// One parked pool thread's handoff slot: the thread parks here between
 /// decode leases, and the next `decode_parallel` wakes it with a lease on
@@ -28,7 +39,7 @@ pub(super) enum WorkerSlotState {
     /// Parked in the pool, waiting for the next lease.
     Parked,
     /// Serving the leased job.
-    Serving(Arc<StageAJob>),
+    Serving(Arc<LeaseJob>),
     /// The thread is exiting: its lease panicked, the pool was full at
     /// repark, or the idle timeout fired.
     Retiring,
@@ -83,7 +94,7 @@ fn unpark_self(slot: &Arc<WorkerSlot>) -> bool {
 /// Hand a lease to a parked slot. Only slots exclusively owned by the
 /// leasing caller are assignable, so the slot is necessarily `Parked`
 /// here.
-pub(super) fn assign_lease(slot: &Arc<WorkerSlot>, job: Arc<StageAJob>) {
+pub(super) fn assign_lease(slot: &Arc<WorkerSlot>, job: Arc<LeaseJob>) {
     {
         let mut state = slot.state.lock().unwrap();
         debug_assert!(matches!(&*state, WorkerSlotState::Parked));
@@ -111,9 +122,9 @@ pub(super) fn leave_lease(slot: &Arc<WorkerSlot>, retire: bool) {
 /// decode's frozen input or segment plans. A recycled slot may already
 /// serve a later decode by then, hence the pointer check. The bounded wait
 /// re-checks its predicate, so a lost wakeup cannot hang the caller.
-pub(super) fn wait_leave(slot: &Arc<WorkerSlot>, job: &Arc<StageAJob>) {
+pub(super) fn wait_leave(slot: &Arc<WorkerSlot>, job: &LeaseJob) {
     let mut state = slot.state.lock().unwrap();
-    while matches!(&*state, WorkerSlotState::Serving(s) if Arc::ptr_eq(s, job)) {
+    while matches!(&*state, WorkerSlotState::Serving(s) if lease_eq(s, job)) {
         let (guard, _) = slot
             .wake
             .wait_timeout(state, Duration::from_millis(100))
@@ -128,7 +139,7 @@ pub(super) fn wait_leave(slot: &Arc<WorkerSlot>, job: &Arc<StageAJob>) {
 /// every slot exists. A spawn failure retires the already-secured slots
 /// (their threads exit at the flag) and panics, mirroring `scope.spawn`'s
 /// behavior.
-pub(super) fn lease_workers(n: usize, job: &Arc<StageAJob>) -> Vec<Arc<WorkerSlot>> {
+pub(super) fn lease_workers(n: usize, job: &Arc<LeaseJob>) -> Vec<Arc<WorkerSlot>> {
     let mut slots = Vec::with_capacity(n);
     for _ in 0..n {
         let slot = take_parked_slot().unwrap_or_else(|| {
@@ -199,7 +210,10 @@ fn pool_thread_inner(slot: &Arc<WorkerSlot>) {
     // and mid-epoch prime re-initialize all state a job reads).
     let mut scratch: Option<SegmentScratch> = None;
     while let Some(job) = wait_lease(slot) {
-        let retire = serve_stagea(&job, &mut scratch);
+        let retire = match job.as_ref() {
+            LeaseJob::StageA(job) => serve_stagea(job, &mut scratch),
+            LeaseJob::FrameLane(lane) => serve_frame_lane(lane),
+        };
         leave_lease(slot, retire);
         if retire {
             // A job panicked on this thread: never reuse a thread that has
@@ -217,7 +231,16 @@ fn pool_thread_inner(slot: &Arc<WorkerSlot>) {
 }
 
 /// Wait for the next lease. None retires the thread.
-fn wait_lease(slot: &Arc<WorkerSlot>) -> Option<Arc<StageAJob>> {
+/// Pointer identity of the served lease against `job`.
+fn lease_eq(serving: &LeaseJob, job: &LeaseJob) -> bool {
+    match (serving, job) {
+        (LeaseJob::StageA(a), LeaseJob::StageA(b)) => Arc::ptr_eq(a, b),
+        (LeaseJob::FrameLane(a), LeaseJob::FrameLane(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn wait_lease(slot: &Arc<WorkerSlot>) -> Option<Arc<LeaseJob>> {
     let mut state = slot.state.lock().unwrap();
     loop {
         if let WorkerSlotState::Serving(job) = &*state {

@@ -1076,8 +1076,11 @@ pub(super) unsafe fn execute_blocks(
                 let oend_w = region.write_limit.min(region.wild_cap).saturating_sub(16);
                 // Stage A accounted the exact block budget; the cold path
                 // re-checks it (the hot check against `oend_w` covers the
-                // memory bounds, not the accounting).
-                let budget_end = start + cap;
+                // memory bounds, not the accounting). The region's write
+                // limit folds in for executors that do not `place` each
+                // segment (the frame lanes): every serial and piece caller
+                // has write_limit >= budget, so this changes nothing there.
+                let budget_end = (start + cap).min(region.write_limit);
                 let mut op = start + w;
                 for seq in &seg.sequences[seqs.clone()] {
                     let ll = seq.ll as usize;
@@ -1332,13 +1335,53 @@ pub(super) struct StageAJob {
     /// Leased worker count: the staging backpressure bound, so staging
     /// memory stays proportional to the worker count, not the input.
     threads: usize,
-    slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>>,
-    ready: Condvar,
+    pub(super) slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>>,
+    pub(super) ready: Condvar,
     next_job: AtomicUsize,
     consumed: AtomicUsize,
-    abort: AtomicBool,
+    /// Executed-segment count (any lane), the lane mode's backpressure
+    /// bound: lanes consume out of input order, so the prefix counter above
+    /// does not describe them.
+    pub(super) consumed_count: AtomicUsize,
+    /// `Some(window)` in lane mode: stage at most `window` segments beyond
+    /// the executed count. `None` keeps the serial prefix bound.
+    lane_window: Option<usize>,
+    pub(super) abort: AtomicBool,
     /// Worker panic payload; doubles as the backpressure sleep token.
-    poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+    pub(super) poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+    /// Published per-segment outcome for the frame lanes (lane mode only):
+    /// 0 = not staged, `out_size + 1` = staged, `usize::MAX` = stage error.
+    /// The lanes read their predecessors' sizes off this array because a
+    /// consumed slot cannot be distinguished from an unstaged one.
+    pub(super) seg_sizes: Vec<AtomicUsize>,
+}
+
+impl StageAJob {
+    /// Build the job for the multi-frame lane executor: same fields as
+    /// `decode_parallel`'s, plus the lane-mode backpressure window and the
+    /// size-publish array.
+    pub(super) fn for_lanes(
+        input: &[u8],
+        segments: &[SegmentPlan],
+        threads: usize,
+        window: usize,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(StageAJob {
+            input,
+            segments,
+            n_segments: segments.len(),
+            threads,
+            slots: (0..segments.len()).map(|_| Mutex::new(None)).collect(),
+            ready: Condvar::new(),
+            next_job: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            consumed_count: AtomicUsize::new(0),
+            lane_window: Some(window),
+            abort: AtomicBool::new(false),
+            poison: Mutex::new(None),
+            seg_sizes: segments.iter().map(|_| AtomicUsize::new(0)).collect(),
+        })
+    }
 }
 
 // SAFETY: the frozen slices are dereferenced only by a thread serving the
@@ -1383,9 +1426,14 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
             return false;
         }
         // Backpressure sleep while this segment runs too far ahead of the
-        // ordered consumer. The poison mutex is only the sleep token; the
-        // predicate (consumed) is atomic.
-        while id > job.consumed.load(Ordering::Acquire) + job.threads {
+        // consumer: beyond the consumed prefix in serial mode, beyond the
+        // executed count in lane mode (lanes consume out of input order).
+        // The poison mutex is only the sleep token; the predicate is atomic.
+        let ahead = || match job.lane_window {
+            Some(window) => id > job.consumed_count.load(Ordering::Acquire) + window,
+            None => id > job.consumed.load(Ordering::Acquire) + job.threads,
+        };
+        while ahead() {
             if job.abort.load(Ordering::Relaxed) {
                 break;
             }
@@ -1417,7 +1465,16 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
         // segment completes (review 2026-11-03).
         let mut retire = false;
         match attempt {
-            Ok(res) => *job.slots[id].lock().unwrap() = Some(res),
+            Ok(res) => {
+                if job.lane_window.is_some() {
+                    let published = match &res {
+                        Ok(seg) => seg.out_size.wrapping_add(1),
+                        Err(_) => usize::MAX,
+                    };
+                    job.seg_sizes[id].store(published, Ordering::Release);
+                }
+                *job.slots[id].lock().unwrap() = Some(res);
+            },
             Err(payload) => {
                 *job.poison.lock().unwrap() = Some(payload);
                 // Release the slot so the ordered consumer can run to
@@ -1442,17 +1499,20 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
 /// exit path — stage B error, caller panic, worker panic resume — aborts
 /// the workers and waits every lease out, so no worker can touch the frozen
 /// input or segment plans after the borrows end.
-struct LeaseOut<'a> {
-    job: &'a std::sync::Arc<StageAJob>,
-    slots: &'a [std::sync::Arc<super::mt_pool::WorkerSlot>],
+pub(super) struct LeaseOut<'a> {
+    pub(super) job: &'a StageAJob,
+    pub(super) slots: &'a [(
+        std::sync::Arc<super::mt_pool::WorkerSlot>,
+        std::sync::Arc<super::mt_pool::LeaseJob>,
+    )],
 }
 
 impl Drop for LeaseOut<'_> {
     fn drop(&mut self) {
         self.job.abort.store(true, Ordering::Release);
         self.job.ready.notify_all();
-        for slot in self.slots {
-            super::mt_pool::wait_leave(slot, self.job);
+        for (slot, lease) in self.slots {
+            super::mt_pool::wait_leave(slot, lease);
         }
     }
 }
@@ -1482,10 +1542,17 @@ fn decode_parallel(
         ready: Condvar::new(),
         next_job: AtomicUsize::new(0),
         consumed: AtomicUsize::new(0),
+        consumed_count: AtomicUsize::new(0),
+        lane_window: None,
         abort: AtomicBool::new(false),
         poison: Mutex::new(None),
+        seg_sizes: Vec::new(),
     });
-    let leased = super::mt_pool::lease_workers(threads, &job);
+    let lease = std::sync::Arc::new(super::mt_pool::LeaseJob::StageA(job.clone()));
+    let leased: Vec<_> = super::mt_pool::lease_workers(threads, &lease)
+        .into_iter()
+        .map(|s| (s, lease.clone()))
+        .collect();
     let out_guard = LeaseOut {
         job: &job,
         slots: &leased,
@@ -1613,6 +1680,25 @@ pub fn decode_all_mt(
                 };
             return super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place);
         }
+        // Multi-frame input: stage B runs one lane per frame (grouped when
+        // frames outnumber the worker budget) on the same pool. The fixed
+        // buffer is valid for its whole length up front, so one place call
+        // covers every lane and staging overlaps execution as before.
+        let n_frames = plan.segments.iter().filter(|s| s.frame_start).count();
+        if n_frames >= 2 {
+            // The fixed-slice `place` accepts any end within the buffer, so
+            // one call with the full length covers every lane; a too-small
+            // target surfaces from the executor's own write-limit checks.
+            let out_len = output.len();
+            let written = super::mt_frames::decode_frames_fixed(
+                input,
+                workers,
+                &plan,
+                output.as_mut_ptr(),
+                out_len,
+            )?;
+            return Ok(written);
+        }
         let out_len = output.len();
         let mut place =
             |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
@@ -1689,6 +1775,29 @@ pub fn decode_to_vec_mt(
             let written = super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place)?;
             // SAFETY: every byte in [start_len, start_len + written) was
             // written by the piece executor.
+            unsafe { output.set_len(start_len + written) };
+            return Ok(());
+        }
+        // Multi-frame input: the growing vector's base may move on growth,
+        // so staging completes first and one place call covers the total
+        // before any lane writes (the piece executor's staging model).
+        let n_frames = plan.segments.iter().filter(|s| s.frame_start).count();
+        if n_frames >= 2 {
+            let start_len = output.len();
+            let mut place =
+                |_start: usize, end: usize| -> Result<(*mut u8, usize), FrameDecoderError> {
+                    output.reserve(end);
+                    // SAFETY: in-bounds pointer one past the existing
+                    // contents, inside the vector's allocation.
+                    Ok((
+                        unsafe { output.as_mut_ptr().add(start_len) },
+                        output.capacity() - start_len,
+                    ))
+                };
+            let written =
+                super::mt_frames::decode_frames_growing(input, workers, &plan, &mut place)?;
+            // SAFETY: every byte in [start_len, start_len + written) was
+            // written by the lanes.
             unsafe { output.set_len(start_len + written) };
             return Ok(());
         }

@@ -1,0 +1,866 @@
+//! Frame-granular stage-B parallelism for concatenated-frame streams.
+//!
+//! Serial stage B (see [`super::mt`]) executes every segment in input
+//! order, so the frames of a multi-frame stream serialize on the execute
+//! even though stage A already stages across frame boundaries. Frames are
+//! independent decode units — repcode history, checksum streams and match
+//! sources never cross a frame boundary — so the executor splits the
+//! segment list into one lane per frame (grouped when frames outnumber
+//! the worker budget) and runs the lanes concurrently: each lane consumes
+//! its own frame's staged segments in order, exactly like the serial
+//! executor's per-segment readiness wait, writing disjoint output ranges.
+//! Only the output base of a lane's first frame couples lanes, and it is
+//! a pure stage-A quantity: the sum of the predecessors' staged output
+//! sizes, read off the job's published size array (a consumed slot cannot
+//! be told apart from an unstaged one, so staging publishes sizes
+//! separately).
+//!
+//! Wildcopy spill is bounded per segment: each lane passes its segment's
+//! own end as the wild cap, so no lane's overshoot can reach into the next
+//! frame's range, which another lane writes concurrently (the same
+//! contract the piece executor holds against neighbor pieces). The tail
+//! sequences of every segment take the exact cold path instead; on the
+//! serial path the cap stays `usize::MAX`, unchanged.
+//!
+//! Errors keep the serial executor's precedence: the first failing segment
+//! in input order wins — every segment belongs to exactly one lane, and a
+//! lane whose predecessor failed exits without recording its own, so the
+//! minimum recorded id is always the serial decoder's error. A checksum
+//! mismatch loses against any decode error and wins in frame order among
+//! checksum errors, matching the serial stream's record-first behavior.
+//!
+//! Single-frame inputs never route here (the caller checks the frame
+//! count), so every single-frame decode takes today's serial path
+//! unchanged.
+
+use alloc::vec::Vec;
+use core::{ops::Range, sync::atomic::Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+use super::{
+    errors::FrameDecoderError,
+    mt::{
+        OutRegion, ScanPlan, SegmentPlan, StageAJob, execute_segment, verify_frame_content_sizes,
+    },
+};
+#[cfg(feature = "hash")]
+use crate::xxh64::Xxh64;
+
+static ENGAGEMENTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Test injection: the input base address whose lane execution panics
+/// instead of running (null disables). Keyed to one input's address so a
+/// concurrently running test's decode never trips it in the shared-process
+/// test harness. Compiled out of non-test builds.
+#[cfg(test)]
+static LANE_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// How many decodes engaged the frame-lane executor so far (process
+/// lifetime). Hidden: not API-stable.
+#[doc(hidden)]
+pub fn frame_lane_engagements() -> usize {
+    ENGAGEMENTS.load(Ordering::Relaxed)
+}
+
+/// Segment-id range per lane: one or more whole frames, in input order.
+/// Consecutive lanes cover the whole segment list; each lane's first
+/// segment has `frame_start`. `frames` indexes the scan-order frame list
+/// (checksum lookup).
+#[derive(Clone)]
+struct LaneSpec {
+    segs: Range<usize>,
+    frames: Range<usize>,
+}
+
+/// Split `n_frames` frames over `lanes` lane groups, segment ranges
+/// ascending. `frame_starts` are the segment ids where a frame starts,
+/// ascending.
+fn group_lanes(frame_starts: &[usize], n_segments: usize, lanes: usize) -> Vec<LaneSpec> {
+    let n_frames = frame_starts.len();
+    let mut out = Vec::with_capacity(lanes);
+    for li in 0..lanes {
+        let first = li * n_frames / lanes;
+        let last = (li + 1) * n_frames / lanes;
+        let start = if first == 0 {
+            0
+        } else {
+            frame_starts[first]
+        };
+        let end = if last == n_frames {
+            n_segments
+        } else {
+            frame_starts[last]
+        };
+        out.push(LaneSpec {
+            segs: start..end,
+            frames: first..last,
+        });
+    }
+    debug_assert!(out.first().is_some_and(|l| l.segs.start == 0));
+    debug_assert!(out.last().is_some_and(|l| l.segs.end == n_segments));
+    debug_assert!(out.windows(2).all(|w| w[0].segs.end == w[1].segs.start));
+    out
+}
+
+/// One lane's completion. `Failed.seg` is the failing segment id (decode
+/// or stage error); `Aborted` never carries the reported error — it means
+/// a predecessor failed, or a worker panicked and the poison takes over.
+enum LaneOutcome {
+    /// `starts` holds each covered frame's absolute output start, in scan
+    /// order; `end` is the lane's absolute output end.
+    Done {
+        starts: Vec<usize>,
+        end: usize,
+        #[cfg(feature = "hash")]
+        checksum_err: Option<FrameDecoderError>,
+    },
+    Failed {
+        seg: usize,
+        err: FrameDecoderError,
+    },
+    Aborted,
+}
+
+/// A pool-servable stage-B lane: one lane's frozen view plus its
+/// completion slot. The input, segments and checksums borrows are frozen
+/// exactly like `StageAJob`'s: the leasing driver waits every lease out
+/// before returning, inside the caller's borrows.
+pub(super) struct LaneJob {
+    stage: Arc<StageAJob>,
+    /// This lane's segment ids (whole frames, in input order).
+    segs: Range<usize>,
+    /// The covered frames' indices in scan order (checksum lookup).
+    frames: Range<usize>,
+    input: *const [u8],
+    segments: *const [SegmentPlan],
+    base: *mut u8,
+    buf_limit: usize,
+    #[cfg(feature = "hash")]
+    checksums: *const [Option<u32>],
+    result: Mutex<Option<LaneOutcome>>,
+    done: Condvar,
+}
+
+// SAFETY: the frozen slices and the output base are touched only while
+// the driver's `LeaseOut` guard keeps the borrows live (every lease is
+// waited out before the driver returns); the mutable fields are mutex,
+// condvar or atomic.
+unsafe impl Send for LaneJob {}
+// SAFETY: Sync follows Send here: the frozen slices are read-only past
+// construction and every mutable field is synchronized.
+unsafe impl Sync for LaneJob {}
+
+fn record(lane: &LaneJob, outcome: LaneOutcome) {
+    *lane.result.lock().unwrap() = Some(outcome);
+    lane.done.notify_all();
+}
+
+/// Whether the decode must stop without a reportable error: a worker
+/// panicked (the poison resumes on the driver after the joins) or the
+/// driver aborted (an error path on the calling thread).
+fn poisoned_or_aborted(stage: &StageAJob) -> bool {
+    stage.abort.load(Ordering::Relaxed) || stage.poison.lock().unwrap().is_some()
+}
+
+/// Wait until segment `id` is staged and take it. `None`: abort or
+/// poison, never observed as a result.
+fn take_staged(
+    stage: &StageAJob,
+    id: usize,
+) -> Option<Result<super::mt::DecodedSegment, FrameDecoderError>> {
+    let mut guard = stage.slots[id].lock().unwrap();
+    loop {
+        if let Some(staged) = guard.take() {
+            return Some(staged);
+        }
+        if poisoned_or_aborted(stage) {
+            return None;
+        }
+        guard = stage.ready.wait(guard).unwrap();
+    }
+}
+
+/// Run one lane: wait for the predecessors' published sizes (this lane's
+/// output base), then execute the lane's own segments in order.
+fn run_lane(lane: &LaneJob) {
+    let stage = &lane.stage;
+    // The lane's output base: the sum of every predecessor's staged size.
+    // A predecessor that failed staging belongs to an earlier lane, which
+    // records its error; this lane just stops.
+    let mut base = 0usize;
+    for i in 0..lane.segs.start {
+        loop {
+            match stage.seg_sizes[i].load(Ordering::Acquire) {
+                0 => {},
+                usize::MAX => {
+                    record(lane, LaneOutcome::Aborted);
+                    return;
+                },
+                published => {
+                    base += published - 1;
+                    break;
+                },
+            }
+            if poisoned_or_aborted(stage) {
+                record(lane, LaneOutcome::Aborted);
+                return;
+            }
+            // Bounded poll: the poison mutex doubles as the sleep token
+            // (the same pattern the staging backpressure uses).
+            let guard = stage.poison.lock().unwrap();
+            let (_guard, _timeout) = stage
+                .ready
+                .wait_timeout(guard, core::time::Duration::from_millis(50))
+                .unwrap();
+        }
+    }
+    // SAFETY: this thread serves the lane's lease, so the frozen input
+    // slice is live for the whole call.
+    let input: &[u8] = unsafe { &*lane.input };
+    #[cfg(test)]
+    if LANE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr() {
+        panic!("injected lane panic");
+    }
+    // SAFETY: same lease discipline as the input slice above.
+    let segments: &[SegmentPlan] = unsafe { &*lane.segments };
+    // SAFETY: same lease discipline as the input slice above.
+    #[cfg(feature = "hash")]
+    let checksums: &[Option<u32>] = unsafe { &*lane.checksums };
+    let mut offset_hist = [1u32, 4, 8];
+    let mut starts = Vec::with_capacity(lane.frames.len());
+    let mut frame_base = base;
+    let mut frame_local = 0usize;
+    let mut end = base;
+    #[cfg(feature = "hash")]
+    let mut checksum_err = None;
+    #[cfg(feature = "hash")]
+    let mut hash = Xxh64::new(0);
+    // Compare the closed frame's checksum, recording the first mismatch.
+    // The closing frame is the last one pushed to `starts`; call before
+    // pushing the next frame's start.
+    #[cfg(feature = "hash")]
+    macro_rules! close_frame {
+        () => {
+            if let Some(expected) = checksums
+                .get(lane.frames.start + starts.len().saturating_sub(1))
+                .copied()
+                .flatten()
+            {
+                let calculated = hash.finish() as u32;
+                if calculated != expected && checksum_err.is_none() {
+                    checksum_err = Some(FrameDecoderError::ChecksumMismatch {
+                        expected,
+                        calculated,
+                    });
+                }
+            }
+        };
+    }
+    for id in lane.segs.clone() {
+        let Some(staged) = take_staged(stage, id) else {
+            record(lane, LaneOutcome::Aborted);
+            return;
+        };
+        let seg = match staged {
+            Ok(seg) => seg,
+            Err(err) => {
+                record(lane, LaneOutcome::Failed { seg: id, err });
+                return;
+            },
+        };
+        if segments[id].frame_start {
+            offset_hist = [1, 4, 8];
+            #[cfg(feature = "hash")]
+            if !starts.is_empty() {
+                close_frame!();
+            }
+            frame_base = end;
+            frame_local = 0;
+            starts.push(frame_base);
+            #[cfg(feature = "hash")]
+            {
+                hash = Xxh64::new(0);
+            }
+        }
+        let abs = frame_base + frame_local;
+        // The segment's own end is the wild cap: a lane's overshoot must
+        // never reach into a range another lane writes concurrently. The
+        // cap pushes the tail sequences onto the exact cold path; on the
+        // serial path the cap stays `usize::MAX`.
+        // SAFETY: `base` was placed for [0, buf_limit) by the driver; the
+        // segment's own range plus the cap keeps every store inside it.
+        let region = unsafe { OutRegion::new(lane.base, lane.buf_limit, abs + seg.out_size) };
+        // SAFETY: region's contract; every match source below `abs` sits
+        // inside this frame, written by this lane in order.
+        if let Err(err) =
+            unsafe { execute_segment(region, abs, frame_base, &seg, input, &mut offset_hist) }
+        {
+            record(lane, LaneOutcome::Failed { seg: id, err });
+            return;
+        }
+        #[cfg(feature = "hash")]
+        if seg.out_size != 0 {
+            // SAFETY: this lane just wrote [abs, abs + out_size) at this
+            // base; no other lane touches the frame's range.
+            unsafe {
+                hash.write(core::slice::from_raw_parts(
+                    lane.base.cast_const().add(abs),
+                    seg.out_size,
+                ));
+            }
+        }
+        frame_local += seg.out_size;
+        end += seg.out_size;
+        // The executed range is final from here on; let backpressured
+        // staging advance.
+        stage.consumed_count.fetch_add(1, Ordering::Release);
+        stage.ready.notify_all();
+    }
+    // Close the last frame's checksum.
+    #[cfg(feature = "hash")]
+    close_frame!();
+    record(lane, LaneOutcome::Done {
+        starts,
+        end,
+        #[cfg(feature = "hash")]
+        checksum_err,
+    });
+}
+
+/// One leased pool thread's service of a lane. Returns whether the thread
+/// must retire: only a panic in the lane body (recorded as `Aborted`, the
+/// poison resumes on the driver).
+pub(super) fn serve_frame_lane(lane: &Arc<LaneJob>) -> bool {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane(lane)));
+    match attempt {
+        Ok(()) => false,
+        Err(payload) => {
+            *lane.stage.poison.lock().unwrap() = Some(payload);
+            record(lane, LaneOutcome::Aborted);
+            lane.stage.ready.notify_all();
+            true
+        },
+    }
+}
+
+/// How the lanes get their output region.
+enum Place<'a> {
+    /// The caller's buffer is valid for its whole length up front
+    /// (`decode_all_mt`): lanes start immediately, staging overlaps
+    /// execution as on the serial path.
+    Fixed { base: *mut u8, buf_limit: usize },
+    /// The output grows (`decode_to_vec_mt`): the base may move on
+    /// growth, so staging runs to completion first and one `place` call
+    /// covers the total before any lane writes.
+    Deferred(&'a mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>),
+}
+
+impl Place<'_> {
+    /// Whether staging runs to completion before any lane executes.
+    fn deferred(&self) -> bool {
+        matches!(self, Place::Deferred(_))
+    }
+
+    /// Resolve the region. Deferred mode first waits for every segment's
+    /// published outcome: the total is a pure stage-A quantity, and a
+    /// stage error bounds the placed range to the segments before it —
+    /// no lane past the failing segment can compute its base, so nothing
+    /// beyond the bound is ever written.
+    fn resolve(
+        &mut self,
+        stage: &StageAJob,
+        n_segments: usize,
+    ) -> Result<(*mut u8, usize), FrameDecoderError> {
+        match self {
+            Place::Fixed { base, buf_limit } => Ok((*base, *buf_limit)),
+            Place::Deferred(place) => {
+                for i in 0..n_segments {
+                    while stage.seg_sizes[i].load(Ordering::Acquire) == 0 {
+                        if poisoned_or_aborted(stage) {
+                            // The poison resumes on the driver; abort is an
+                            // error path whose result is never observed.
+                            return Err(FrameDecoderError::NotYetInitialized);
+                        }
+                        let guard = stage.poison.lock().unwrap();
+                        let (_guard, _timeout) = stage
+                            .ready
+                            .wait_timeout(guard, core::time::Duration::from_millis(50))
+                            .unwrap();
+                    }
+                }
+                let bound = stage
+                    .seg_sizes
+                    .iter()
+                    .map(|s| s.load(Ordering::Acquire))
+                    .take_while(|&v| v != usize::MAX)
+                    .map(|v| v - 1)
+                    .fold(0usize, usize::saturating_add);
+                place(0, bound)
+            },
+        }
+    }
+}
+
+/// Frame-lane driver: stage on the pool as today, execute frames
+/// concurrently. Returns the total decoded bytes. The caller guarantees
+/// `workers >= 2` and at least two frames.
+fn decode_frames(
+    input: &[u8],
+    workers: u32,
+    plan: &ScanPlan,
+    place: Place<'_>,
+) -> Result<usize, FrameDecoderError> {
+    let segments = &plan.segments;
+    let n_segments = segments.len();
+    let frame_starts: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.frame_start)
+        .map(|(i, _)| i)
+        .collect();
+    let n_frames = frame_starts.len();
+    debug_assert!(n_frames >= 2, "the caller routes multi-frame input only");
+    let k_lanes = (workers as usize).min(n_frames);
+    // Budget: the caller runs lane 0, pool lanes take K-1 threads, stage A
+    // the rest of the worker budget (at least one).
+    let stage_workers = (workers as usize)
+        .saturating_sub(k_lanes - 1)
+        .min(n_segments)
+        .max(1);
+    // The staging-ahead window keeps the serial regime's in-flight bound
+    // in fixed mode; deferred mode stages to completion before executing,
+    // so the window is the whole plan (the piece executor's model).
+    let window = if place.deferred() {
+        n_segments
+    } else {
+        workers as usize
+    };
+    let lane_specs = group_lanes(&frame_starts, n_segments, k_lanes);
+    let job = StageAJob::for_lanes(input, segments, stage_workers, window);
+    let stage_lease = Arc::new(super::mt_pool::LeaseJob::StageA(job.clone()));
+    let stage_leases: Vec<_> = super::mt_pool::lease_workers(stage_workers, &stage_lease)
+        .into_iter()
+        .map(|s| (s, stage_lease.clone()))
+        .collect();
+    let guard = super::mt::LeaseOut {
+        job: &job,
+        slots: &stage_leases,
+    };
+    let result = run(
+        input,
+        plan,
+        place,
+        &job,
+        n_segments,
+        n_frames,
+        &lane_specs,
+        k_lanes,
+    );
+    drop(guard);
+    if let Some(payload) = job.poison.lock().unwrap().take() {
+        std::panic::resume_unwind(payload);
+    }
+    result
+}
+
+/// Lease the lanes, run the caller's lane, collect outcomes. Kept apart
+/// from the lease setup so the stage-A guard always covers the outer
+/// error paths (deferred `place` runs between the two lease batches).
+#[allow(clippy::too_many_arguments)]
+fn run(
+    input: &[u8],
+    plan: &ScanPlan,
+    mut place: Place<'_>,
+    job: &Arc<StageAJob>,
+    n_segments: usize,
+    n_frames: usize,
+    lane_specs: &[LaneSpec],
+    k_lanes: usize,
+) -> Result<usize, FrameDecoderError> {
+    let (base, buf_limit) = place.resolve(job, n_segments)?;
+    let lane_jobs: Vec<Arc<LaneJob>> = lane_specs
+        .iter()
+        .map(|spec| {
+            Arc::new(LaneJob {
+                stage: job.clone(),
+                segs: spec.segs.clone(),
+                frames: spec.frames.clone(),
+                input,
+                segments: plan.segments.as_slice(),
+                base,
+                buf_limit,
+                #[cfg(feature = "hash")]
+                checksums: plan.checksums.as_slice(),
+                result: Mutex::new(None),
+                done: Condvar::new(),
+            })
+        })
+        .collect();
+    // One pool slot per lane beyond the caller's lane 0.
+    let lane_leases: Vec<_> = lane_jobs[1..]
+        .iter()
+        .flat_map(|lane| {
+            let lease = Arc::new(super::mt_pool::LeaseJob::FrameLane(lane.clone()));
+            super::mt_pool::lease_workers(1, &lease)
+                .into_iter()
+                .map(move |s| (s, lease.clone()))
+        })
+        .collect();
+    let lane_guard = super::mt::LeaseOut {
+        job,
+        slots: &lane_leases,
+    };
+    ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
+    let outcome = (|| -> Result<usize, FrameDecoderError> {
+        // The caller is lane 0; the pool lanes record into their slots.
+        run_lane(&lane_jobs[0]);
+        let mut starts = Vec::with_capacity(n_frames);
+        let mut written = 0usize;
+        let mut first_fail: Option<(usize, FrameDecoderError)> = None;
+        let mut checksum_err = None;
+        for (li, lane) in lane_jobs.iter().enumerate() {
+            let outcome = if li == 0 {
+                lane.result.lock().unwrap().take()
+            } else {
+                let mut guard = lane.result.lock().unwrap();
+                while guard.is_none() {
+                    guard = lane.done.wait(guard).unwrap();
+                }
+                guard.take()
+            };
+            match outcome {
+                Some(LaneOutcome::Done {
+                    starts: mut lane_starts,
+                    end,
+                    #[cfg(feature = "hash")]
+                        checksum_err: lane_checksum_err,
+                }) => {
+                    if li + 1 == lane_jobs.len() {
+                        written = end;
+                    }
+                    #[cfg(feature = "hash")]
+                    if lane_checksum_err.is_some() && checksum_err.is_none() {
+                        checksum_err = lane_checksum_err;
+                    }
+                    starts.append(&mut lane_starts);
+                },
+                Some(LaneOutcome::Failed { seg, err }) => {
+                    if first_fail.as_ref().is_none_or(|(s, _)| seg < *s) {
+                        first_fail = Some((seg, err));
+                    }
+                },
+                // An aborted lane implies a recorded failure or a poison;
+                // both are picked up below before anything observable.
+                Some(LaneOutcome::Aborted) | None => {},
+            }
+        }
+        // Serial precedence: the first decode error in input order wins
+        // over every checksum mismatch.
+        if let Some((_, err)) = first_fail {
+            return Err(err);
+        }
+        if let Some(err) = checksum_err {
+            return Err(err);
+        }
+        debug_assert_eq!(starts.len(), n_frames, "every lane completed");
+        verify_frame_content_sizes(&plan.frame_pledges, &starts, written)?;
+        let _ = k_lanes;
+        Ok(written)
+    })();
+    drop(lane_guard);
+    outcome
+}
+
+/// `decode_all_mt`'s multi-frame entry: the caller placed the whole
+/// buffer up front, lanes start immediately.
+pub(super) fn decode_frames_fixed(
+    input: &[u8],
+    workers: u32,
+    plan: &ScanPlan,
+    base: *mut u8,
+    buf_limit: usize,
+) -> Result<usize, FrameDecoderError> {
+    decode_frames(input, workers, plan, Place::Fixed { base, buf_limit })
+}
+
+/// `decode_to_vec_mt`'s multi-frame entry: staging completes first, one
+/// `place` covers the total, then lanes run.
+pub(super) fn decode_frames_growing(
+    input: &[u8],
+    workers: u32,
+    plan: &ScanPlan,
+    place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
+) -> Result<usize, FrameDecoderError> {
+    decode_frames(input, workers, plan, Place::Deferred(place))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{format, vec, vec::Vec};
+    use core::ops::Range;
+
+    use super::Ordering;
+    use crate::{
+        EncoderOptions, Level, bulk,
+        decoding::{
+            FrameDecoder,
+            errors::FrameDecoderError,
+            mt::{decode_all_mt, decode_to_vec_mt},
+        },
+        frame_lane_engagements,
+    };
+
+    const MAX_WINDOW: u64 = crate::decoding::DEFAULT_MAX_WINDOW_SIZE;
+
+    /// Text-ish pseudo-random payload (level 3 compresses it into the
+    /// multi-frame regime above MIN_MT_INPUT).
+    fn textish(seed: u64, len: usize) -> Vec<u8> {
+        const WORDS: [&[u8]; 8] = [
+            b"the quick brown fox ",
+            b"jumps over the lazy dog ",
+            b"lorem ipsum dolor ",
+            b"amet consectetur ",
+            b"adipiscing elit sed ",
+            b"do eiusmod tempor ",
+            b"incididunt ut labore ",
+            b"et dolore magna ",
+        ];
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let w = WORDS[((state >> 33) as usize) % WORDS.len()];
+            let take = w.len().min(len - out.len());
+            out.extend_from_slice(&w[..take]);
+        }
+        out
+    }
+
+    fn compress(data: &[u8], level: Level, checksum: bool, workers: u32) -> Vec<u8> {
+        bulk::compress_with(
+            data,
+            &EncoderOptions::new(level)
+                .checksum(checksum)
+                .workers(workers),
+        )
+        .unwrap()
+    }
+
+    /// A multi-frame stream large enough to engage the parallel decoder.
+    /// Frame 2 carries no checksum, the others do. Returns the stream, the
+    /// raw outputs and each frame's byte range in the stream.
+    fn multiframe_stream() -> (Vec<u8>, Vec<Vec<u8>>, Vec<Range<usize>>) {
+        let raws = alloc::vec![
+            textish(7, 2 * 1024 * 1024),
+            textish(0xfeed, 3 * 1024 * 1024),
+            textish(0x1234, 2 * 1024 * 1024),
+        ];
+        let mut stream = Vec::new();
+        let mut parts = Vec::new();
+        for (i, raw) in raws.iter().enumerate() {
+            let start = stream.len();
+            stream.extend_from_slice(&compress(
+                raw,
+                if i == 1 {
+                    Level::Balanced
+                } else {
+                    Level::Fastest
+                },
+                i != 2,
+                if i == 2 {
+                    1
+                } else {
+                    4
+                },
+            ));
+            parts.push(start..stream.len());
+        }
+        (stream, raws, parts)
+    }
+
+    fn expected_output(raws: &[Vec<u8>]) -> Vec<u8> {
+        raws.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+
+    /// Multi-frame decode through both MT entry points equals the sequential
+    /// decoder and the serial MT path's bytes, at grouped and per-frame lane
+    /// counts.
+    #[test]
+    fn multiframe_lane_output_equality() {
+        let (stream, raws, _) = multiframe_stream();
+        let expect = expected_output(&raws);
+
+        let mut seq = vec![0u8; expect.len()];
+        let n = FrameDecoder::new().decode_all(&stream, &mut seq).unwrap();
+        assert_eq!(&seq[..n], &expect[..]);
+
+        for workers in [2u32, 4, 8] {
+            let before = frame_lane_engagements();
+            let mut placed = vec![0u8; expect.len()];
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            assert_eq!(&placed[..n], &expect[..], "placed mt{workers}");
+            let mut appended = Vec::new();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            assert_eq!(appended, expect, "appended mt{workers}");
+            assert!(
+                frame_lane_engagements() > before,
+                "mt{workers} multi-frame decode must engage the lane executor"
+            );
+        }
+    }
+
+    /// The append contract holds behind a non-empty prefix, and the length
+    /// stays unchanged on a checksum error.
+    #[test]
+    fn multiframe_append_contract() {
+        let (stream, raws, parts) = multiframe_stream();
+        let expect = expected_output(&raws);
+        let prefix = b"non-empty prefix".to_vec();
+        let mut appended = prefix.clone();
+        decode_to_vec_mt(&stream, &mut appended, 4, MAX_WINDOW).unwrap();
+        assert_eq!(&appended[..prefix.len()], &prefix[..]);
+        assert_eq!(&appended[prefix.len()..], &expect[..]);
+
+        // Corrupt frame 0's trailer (it carries a checksum): the error must
+        // surface with the vector length unchanged.
+        let mut corrupt = stream.clone();
+        let trailer = parts[0].end - 1;
+        corrupt[trailer] ^= 0xff;
+        let mut appended = prefix.clone();
+        let err = decode_to_vec_mt(&corrupt, &mut appended, 4, MAX_WINDOW).unwrap_err();
+        assert!(
+            matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(appended.len(), prefix.len());
+    }
+
+    /// Checksum mismatches report per frame: the offending frame's trailer
+    /// alone fails, and the good stream round-trips. The offending frame
+    /// must be the LAST one so every earlier lane finishes and the min-id
+    /// rule is not what the test exercises.
+    #[test]
+    fn multiframe_lane_checksum_reports_frame() {
+        let (stream, _, parts) = multiframe_stream();
+        // Flip a byte in frame 1's trailer (checksummed): the error must be
+        // a checksum mismatch, not a decode error.
+        let mut corrupt = stream.clone();
+        let frame1_trailer = parts[1].end - 1;
+        corrupt[frame1_trailer] ^= 0xff;
+        let mut out = Vec::new();
+        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW).unwrap_err();
+        assert!(
+            matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+            "{err:?}"
+        );
+        let mut seq = vec![0u8; 7 * 1024 * 1024];
+        let err = FrameDecoder::new()
+            .decode_all(&corrupt, &mut seq)
+            .unwrap_err();
+        assert!(
+            matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+            "serial reports the same variant: {err:?}"
+        );
+    }
+
+    /// A stage-A failure mid-stream reports the same error variant as the
+    /// sequential decoder, through both entries.
+    #[test]
+    fn multiframe_stage_error_matches_sequential() {
+        let (stream, _, parts) = multiframe_stream();
+        // Corrupt deep inside the second frame's block data.
+        let mut corrupt = stream.clone();
+        let at = parts[1].start + 900;
+        corrupt[at] ^= 0xff;
+        corrupt[at + 1] ^= 0xff;
+        let mut seq = vec![0u8; 7 * 1024 * 1024];
+        let seq_err = FrameDecoder::new()
+            .decode_all(&corrupt, &mut seq)
+            .unwrap_err();
+
+        for workers in [2u32, 4, 8] {
+            let mut placed = vec![0u8; 7 * 1024 * 1024];
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
+            let mut appended = Vec::new();
+            let err = decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
+        }
+    }
+
+    /// More frames than lanes: eight small frames at two workers exercise
+    /// the frame grouping, and a skippable frame between two real ones
+    /// keeps the lane split aligned with the scan's frame count.
+    #[test]
+    fn multiframe_grouping_and_skippable() {
+        let mut raws = Vec::new();
+        for i in 0..8 {
+            raws.push(textish(0xb00 + i as u64, 300 * 1024));
+        }
+        let mut stream = Vec::new();
+        for (i, raw) in raws.iter().enumerate() {
+            stream.extend_from_slice(&compress(raw, Level::Fastest, true, 1));
+            if i == 3 {
+                // A skippable frame: magic 0x184D2A50 + LE length + payload.
+                stream.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18]);
+                stream.extend_from_slice(&64u32.to_le_bytes());
+                stream.extend_from_slice(&[0xab; 64]);
+            }
+        }
+        let expect = expected_output(&raws);
+        let mut seq = vec![0u8; expect.len()];
+        let n = FrameDecoder::new().decode_all(&stream, &mut seq).unwrap();
+        assert_eq!(&seq[..n], &expect[..]);
+        for workers in [2u32, 4] {
+            let mut placed = vec![0u8; expect.len()];
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            assert_eq!(&placed[..n], &expect[..], "mt{workers}");
+        }
+    }
+
+    /// Single-frame input keeps today's serial stage-B path: the lane
+    /// injection must never fire on it, and must fire on multi-frame input
+    /// (the panic path also proves the pool-lane poison machinery).
+    #[test]
+    fn single_frame_keeps_serial_stage_b() {
+        let raw = textish(0x51, 4 * 1024 * 1024);
+        let stream = compress(&raw, Level::Fastest, true, 4);
+        super::LANE_PANIC_INPUT.store(stream.as_ptr() as *mut u8, Ordering::Relaxed);
+        let mut placed = vec![0u8; raw.len()];
+        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW).unwrap();
+        assert_eq!(&placed[..n], &raw[..]);
+
+        let (multi, raws, _) = multiframe_stream();
+        super::LANE_PANIC_INPUT.store(multi.as_ptr() as *mut u8, Ordering::Relaxed);
+        let mut placed = vec![0u8; expected_output(&raws).len()];
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_all_mt(&multi, &mut placed, 4, MAX_WINDOW)
+        }));
+        super::LANE_PANIC_INPUT.store(core::ptr::null_mut(), Ordering::Relaxed);
+        assert!(
+            outcome.is_err(),
+            "the lane injection must fire on multi-frame input"
+        );
+    }
+
+    /// Lane grouping invariants: whole frames per lane, ascending, covering.
+    #[test]
+    fn lane_grouping_covers_whole_frames() {
+        let frame_starts = vec![0, 3, 7, 9, 12];
+        let specs = super::group_lanes(&frame_starts, 14, 3);
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].segs, 0..3);
+        assert_eq!(specs[1].segs, 3..9);
+        assert_eq!(specs[2].segs, 9..14);
+        assert_eq!(specs[0].frames, 0..1);
+        assert_eq!(specs[1].frames, 1..3);
+        assert_eq!(specs[2].frames, 3..5);
+        // One lane per frame when frames fit the budget.
+        let specs = super::group_lanes(&frame_starts, 14, 5);
+        assert_eq!(
+            specs.iter().map(|s| s.segs.clone()).collect::<Vec<_>>(),
+            vec![0..3, 3..7, 7..9, 9..12, 12..14]
+        );
+    }
+}

@@ -64,6 +64,9 @@ pub use bulk::{compress, decompress};
 /// integration-test process). Hidden: not API-stable.
 #[cfg(feature = "std")]
 #[doc(hidden)]
+pub use decoding::mt_frames::frame_lane_engagements;
+#[cfg(feature = "std")]
+#[doc(hidden)]
 pub use decoding::mt_pieces::{piece_engagements, set_piece_decode_for_tests};
 pub use encoding::EncoderDictionary;
 #[cfg(feature = "std")]
