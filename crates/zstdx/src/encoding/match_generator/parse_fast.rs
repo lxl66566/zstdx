@@ -132,6 +132,7 @@ impl MatchGeneratorDriver {
             // The fast strategy's tables never advance the origin (see
             // `head_origin`); zero keeps its emit math on plain pack_pos.
             origin: 0,
+            exact_once: false,
         };
         // Armed frames keep the stock scan domain through `chain_reach`
         // (the widened window is the far domain); stock frames have none.

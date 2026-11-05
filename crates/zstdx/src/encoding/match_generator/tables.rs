@@ -773,6 +773,11 @@ pub(super) struct TableEmit<'a> {
     /// only the chain emit paths read it — the fast strategy's tables
     /// never advance it.
     pub(super) origin: u64,
+    /// The covered fill starts at the scan's insert frontier (the
+    /// dictionary-armed greedy row's exact-once discipline: every
+    /// position enters the tables exactly once, in its own bucket).
+    /// Only the chain emission reads it.
+    pub(super) exact_once: bool,
 }
 
 impl TableEmit<'_> {
@@ -885,6 +890,7 @@ impl TableEmit<'_> {
         match_len: usize,
         of_value: u32,
         rep: &mut [u32; 3],
+        filled_from: u64,
     ) -> u64 {
         let (_ll, match_end) = push_seq_packed(
             win,
@@ -911,7 +917,19 @@ impl TableEmit<'_> {
             4
         }) as u64;
         let end_abs = (self.win_base + match_end as u64).min(self.insert_max);
-        let mut p = self.win_base + start as u64;
+        // The greedy dictionary row's fill starts at the scan's insert
+        // frontier: its emission start is the scan-inserted position itself,
+        // and re-inserting it links the slot to the head it had just become
+        // (a self-reference that severs the bucket's older history — the
+        // dictionary twins behind a hot 4-gram). Every position below the
+        // frontier is already in its own bucket exactly once, and a rep
+        // hit's advanced start position rides this fill as its first insert.
+        let from_abs = if self.exact_once {
+            (self.win_base + start as u64).max(filled_from)
+        } else {
+            self.win_base + start as u64
+        };
+        let mut p = from_abs;
         while p < end_abs {
             let i = (p - self.win_base) as usize;
             let h = hash_at_width(win, i, hash_log, self.width);

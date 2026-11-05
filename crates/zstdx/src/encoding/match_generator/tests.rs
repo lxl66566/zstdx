@@ -1713,6 +1713,88 @@ fn dict_row_span_key_rules_the_small_payload_swap() {
     );
 }
 
+/// The dictionary-armed greedy row's exact-once insert: a depth-0 rep hit
+/// advances the scan position one byte past the hashed position, and the
+/// scan must insert the SEARCHED position — the advanced position rides
+/// the emission's covered fill as its first insert. Keying the insert to
+/// the advanced position plants a phantom bucket entry whose link the
+/// covered fill then overwrites, severing the bucket: a later duplicate
+/// of the searched position's window finds no candidate and the whole
+/// tail parses as literals. The duplicate shares only the window: its
+/// match cannot backward-extend over the phantom's twin, which would
+/// otherwise reconstitute the exact-once parse.
+#[test]
+fn greedy_dict_rep_advance_inserts_the_searched_position() {
+    let s = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    // A pseudo-random body ending with the rep0=8 source `s[1..]`: the
+    // rep candidate at the block's first probed position reads the tail.
+    let mut dict = Vec::with_capacity(1024);
+    let mut x = 0x1234_5678u32;
+    while dict.len() < 1024 - 7 {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        dict.push((x >> 24) as u8);
+    }
+    dict.extend_from_slice(&s[1..]);
+    // The searched position's region, a gap, a later duplicate of the
+    // searched window that cannot extend backward, a tail.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&s);
+    payload.extend_from_slice(&[0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6]);
+    payload.extend_from_slice(&s[..4]);
+    payload.extend_from_slice(&[0xc7, 0xc8, 0xd1, 0xd2, 0xd3, 0xd4]);
+    // The fixture must stay self-contained: no dictionary window may
+    // shortcut the searched position's bucket or the gap positions'
+    // buckets (the tail supplies the rep source by design).
+    assert!(
+        dict.windows(4).all(|d| d != &s[..4]),
+        "the dict must not carry the searched position's window"
+    );
+    for i in 8..14 {
+        assert!(
+            dict.windows(4).all(|d| d != &payload[i..i + 4]),
+            "the dict must not carry a scanned gap position's window"
+        );
+    }
+
+    let level = crate::Level::from_zstd(4);
+    let mut driver = MatchGeneratorDriver::new(payload.len());
+    driver.set_input_shape(crate::InputShape {
+        len: Some((dict.len() + payload.len()) as u64),
+        window_log: None,
+    });
+    driver.reset(level);
+    driver.load_dictionary(&dict, [8, 4, 8], level);
+    assert!(
+        driver.dict_row,
+        "the 24-byte payload arms the small-dict row"
+    );
+    assert_eq!(driver.params.lazy_depth, 0);
+
+    driver.block_tail().copy_from_slice(&payload);
+    driver.commit_block(payload.len());
+    let mut triples = Vec::new();
+    let mut tail = Vec::new();
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => tail.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => triples.push((literals.len(), offset, match_len)),
+    });
+    // The rep ride emits one literal, wire repcode 1, seven bytes. The
+    // duplicate then finds the searched position through its own bucket
+    // entry: six pending literals, wire offset 17 (distance 14 plus 3),
+    // four bytes. The phantom form severed the walk and emitted the
+    // whole tail as literals instead.
+    assert_eq!(
+        triples,
+        &[(1, 1, 7), (6, 17, 4)],
+        "the duplicate of the searched position must find it"
+    );
+    assert_eq!(tail, &[0xc7, 0xc8, 0xd1, 0xd2, 0xd3, 0xd4]);
+}
+
 /// The small-src class swap's band (R76, `small_src_class_row`): every
 /// level 5-17 takes a swap row under the default verdict at a known
 /// length <= 128 KiB, and the stock verdict keeps the ladder row. Levels

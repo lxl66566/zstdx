@@ -42,6 +42,12 @@ impl MatchGeneratorDriver {
         let min_match = self.params.min_match as usize;
         let dict_row = self.dict_row;
         let width = ChainHashWidth::of(dict_row);
+        // The dictionary-armed greedy row (lazy_depth 0) runs the exact-once
+        // insert discipline: its emission start is the scan-inserted position
+        // itself, so the covered fill must not re-insert it (a self-reference
+        // severs the bucket's older history), and a rep hit's advance must
+        // not plant the advanced position under the searched position's hash.
+        let greedy_once = dict_row && lazy_depth == 0;
         let max_window = self.params.chain_reach.unwrap_or(self.params.window) as u64;
         // The span end is trivially at/after its start; tiny first blocks
         // never reach an emit, so the bound is never consulted when
@@ -69,6 +75,7 @@ impl MatchGeneratorDriver {
             },
             width,
             origin,
+            exact_once: greedy_once,
         };
         let hash_read = HASH_READ as u64;
         // Catch-up cursor (dictionary rows only; see `chain_filled`) —
@@ -278,10 +285,17 @@ impl MatchGeneratorDriver {
             // absolute position — what the walk resolves candidates with.
             // The head value is the one read before the search (kept out of
             // the linked-insert's re-read): nothing has written the table
-            // since.
-            links.put_abs(pos, entry);
-            heads.put(h, pack_head(pos, origin));
-            next_ins = pos + 1;
+            // since. The greedy dictionary row keys the insert to the
+            // SEARCHED position: a rep hit advanced `pos` one byte past
+            // `idx` while the hash `h` and head `entry` belong to `idx` —
+            // inserting the advanced position plants a phantom bucket entry
+            // and the searched position never enters the tables. The
+            // advanced position rides the emission's covered fill instead,
+            // so `next_ins` claims only through the searched position.
+            let insert_pos = if greedy_once { win_base + idx as u64 } else { pos };
+            links.put_abs(insert_pos, entry);
+            heads.put(h, pack_head(insert_pos, origin));
+            next_ins = insert_pos + 1;
 
             // Resolve the pipelined head for the lazy walk below: the
             // insert above wrote table[h], so a pre-read of that very slot
@@ -502,7 +516,17 @@ impl MatchGeneratorDriver {
             } else {
                 (start - cand + 3) as u32
             };
-            anchor = emit.emit_chain(win, links, hash_log, anchor, start, ml, of_value, &mut rep);
+            anchor = emit.emit_chain(
+                win,
+                links,
+                hash_log,
+                anchor,
+                start,
+                ml,
+                of_value,
+                &mut rep,
+                next_ins,
+            );
             if $gated && rep_pending != 0 && of_value > 3 {
                 rep_pending -= 1;
             }
