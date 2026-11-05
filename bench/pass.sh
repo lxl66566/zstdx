@@ -45,14 +45,16 @@ fi
 DEC_FILES=()
 ENC_FILES=()
 DLL_ZST3=""
-MULTI_ZST3=""
+MULTI_FILES=()
 for f in bench/big/dll100.zst1 bench/big/dll100.zst3 bench/big/dll100.zst9 bench/big/dll100.zst19; do
     [ -f "$f" ] && DEC_FILES+=(--file "$f")
 done
 [ -f bench/big/multi.zst3 ] && DEC_FILES+=(--file bench/big/multi.zst3)
 [ -f bench/big/dll100.raw ] && ENC_FILES+=(--file bench/big/dll100.raw)
 [ -f bench/big/dll100.zst3 ] && DLL_ZST3=bench/big/dll100.zst3
-[ -f bench/big/multi.zst3 ] && MULTI_ZST3=bench/big/multi.zst3
+for f in bench/big/multi.zst3 bench/big/multi_small.zst3 bench/big/multi_balanced.zst3 bench/big/multi_twodom.zst3; do
+    [ -f "$f" ] && MULTI_FILES+=("$f")
+done
 
 mkdir -p "$out"
 echo "== building (release, one build for every section) =="
@@ -68,8 +70,8 @@ run_section() {
             [ -n "$DLL_ZST3" ] || return 2
             "$BIN" files --threads 2,4,8,16 "$DLL_ZST3" ;;
         files-multi)
-            [ -n "$MULTI_ZST3" ] || return 2
-            "$BIN" files --threads 2,4,8,16 "$MULTI_ZST3" ;;
+            [ ${#MULTI_FILES[@]} -ge 1 ] || return 2
+            "$BIN" files --threads 2,4,8,16 "${MULTI_FILES[@]}" ;;
         enc-st)     "$BIN" matrix --mode enc-st "${ENC_FILES[@]}" ;;
         enc-mt8)    "$BIN" matrix --mode enc-mt --workers 8 --mt-workers 8 ;;
         enc-mt16)   "$BIN" matrix --mode enc-mt --workers 16 --mt-workers 16 ;;
