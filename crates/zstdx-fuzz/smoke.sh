@@ -31,10 +31,11 @@ bin=$fuzzdir/target/x86_64-unknown-linux-gnu/release/$target
 
 cargo fuzz build --fuzz-dir "$fuzzdir" -s address -O >/dev/null
 
-# Hold the bench flock: W ASAN workers saturate the box and would perturb
-# any concurrently running matrix/ratio/wall A/B bench.
+# Hold the bench flock shared: the W ASAN workers saturate the box and
+# must not run beside a matrix/ratio/wall A/B bench (which takes the lock
+# exclusive), while other fuzz/test/build work shares it.
 exec 9>/root/programs/fork/zstd-bench.lock
-flock 9
+flock -s 9
 
 scratch=$(mktemp -d /tmp/zstdx-fuzz-smoke.XXXXXX)
 tmp=$fuzzdir/corpus/.smoke-tmp.$$   # same device as the corpus: hardlinks

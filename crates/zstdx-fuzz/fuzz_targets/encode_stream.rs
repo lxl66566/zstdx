@@ -10,8 +10,18 @@
 //! tri-state), `k` with bit 7 clear = length-prefixed chunks ahead of a
 //! final remainder chunk covering all of `rest`; bit 7 set switches
 //! `rest` to structure mode, a small program expanded into one large
-//! payload (see `encode.rs::expand_program`, duplicated here — `ph` bit
-//! 6 picks the streaming core).
+//! payload (see `encode.rs::expand_program`, duplicated here — `ph`
+//! bits 5..6 pick the streaming core and, on the read core, its feed
+//! entry).
+//!
+//! The feed surface rides two derived fields: the level byte's spare
+//! high bits set the worker count (`level % 23` consumes the low bits;
+//! `1 + level / 23` gives the single-threaded core and every mt count
+//! up to 12), and the read core's feed entry alternates between the
+//! plain slice, the NT-store `NtSource` and the zero-copy
+//! `OwnedEncoder` — so the campaign reaches the mt stream core, its
+//! stepped finish drain and both zero-copy feed entries, not only the
+//! single-threaded core the fixed layout used to drive.
 //!
 //! Each chunk drives the read-side streaming core (one `read_to_end`
 //! pull, the `matrix --mode enc-stream` / `dump --stream` drive). The
@@ -86,12 +96,34 @@ fuzz_target!(|data: &[u8]| {
             2 => zstdx::LdmMode::Disable,
             _ => zstdx::LdmMode::Auto,
         };
-        opts = opts.long_distance_matching(ldm);
+        opts = opts
+            .long_distance_matching(ldm)
+            .workers(workers_of(level_byte));
 
-        let mut enc = zstdx::stream::read::Encoder::with_options(chunk, opts).unwrap();
         let mut comp = Vec::new();
-        enc.read_to_end(&mut comp).unwrap();
-        enc.finish().unwrap();
+        match entry_of(rest) {
+            Entry::Plain => {
+                let mut enc = zstdx::stream::read::Encoder::with_options(chunk, opts).unwrap();
+                enc.read_to_end(&mut comp).unwrap();
+                enc.finish().unwrap();
+            },
+            Entry::Nt => {
+                let mut enc = zstdx::stream::read::Encoder::with_options(
+                    zstdx::stream::read::NtSource::new(chunk),
+                    opts,
+                )
+                .unwrap();
+                enc.read_to_end(&mut comp).unwrap();
+                enc.finish().unwrap();
+            },
+            Entry::Owned => {
+                let mut enc =
+                    zstdx::stream::read::OwnedEncoder::with_options(chunk.to_vec().into(), opts)
+                        .unwrap();
+                enc.read_to_end(&mut comp).unwrap();
+                enc.finish().unwrap();
+            },
+        }
 
         let mut back = Vec::with_capacity(chunk.len() + 16);
         zstdx::decoding::FrameDecoder::new()
@@ -104,6 +136,28 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(&zback[..], chunk, "zstd decode of streamed output differs");
     }
 });
+
+/// Worker count from the level byte's spare high bits: `level % 23`
+/// consumes the low ones, so the drive sweeps the single-threaded core
+/// and the mt counts 2..=12 alongside the levels.
+fn workers_of(level_byte: u8) -> u32 {
+    1 + u32::from(level_byte) / 23
+}
+
+/// The chunked walk's read-core feed entry, off `rest`'s first byte.
+enum Entry {
+    Plain,
+    Nt,
+    Owned,
+}
+
+fn entry_of(rest: &[u8]) -> Entry {
+    match rest.first().copied().unwrap_or(0) % 3 {
+        1 => Entry::Nt,
+        2 => Entry::Owned,
+        _ => Entry::Plain,
+    }
+}
 
 /// Deterministic xorshift64 source, seeded from the fuzz bytes.
 struct Rng(u64);
@@ -264,11 +318,9 @@ const EXPAND_CAP: usize = 256 * 1024;
 
 /// FNV-1a over the program bytes; `| 1` keeps the xorshift state nonzero.
 fn program_seed(prog: &[u8]) -> u64 {
-    prog.iter()
-        .fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-        | 1
+    prog.iter().fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    }) | 1
 }
 
 /// Operand readers; bytes past the program end read as zero, so truncated
@@ -359,11 +411,12 @@ fn expand_program(prog: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     (out, dict)
 }
 
-/// One structure-mode roundtrip through the streaming cores: `ph` bit 6
-/// picks the write core in 7 KiB pieces (the chunking machinery plus the
-/// owned-window adoption a large payload drives) or the read core. The
-/// dictionary rides the options into the stream encoder; both decoders
-/// get it attached on the way back.
+/// One structure-mode roundtrip through the streaming cores: `ph` bits
+/// 5..6 pick the write core in 7 KiB pieces (the chunking machinery plus
+/// the owned-window adoption a large payload drives) or the read core
+/// through one of its three feed entries. The dictionary rides the
+/// options into the stream encoder; both decoders get it attached on
+/// the way back.
 fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
     let (payload, dict) = expand_program(prog);
     let level = Level::from_zstd(i32::from(level_byte) % 23);
@@ -373,37 +426,65 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
     }
     let window = (opt_byte >> 2) & 0x0f;
     if window != 0 {
-        opts = opts.with_input_shape(
-            zstdx::InputShape::default().with_window_log(u32::from(window) + 9),
-        );
+        opts = opts
+            .with_input_shape(zstdx::InputShape::default().with_window_log(u32::from(window) + 9));
     }
     let ldm = match (opt_byte >> 6) & 3 {
         1 => zstdx::LdmMode::Enable,
         2 => zstdx::LdmMode::Disable,
         _ => zstdx::LdmMode::Auto,
     };
-    opts = opts.long_distance_matching(ldm);
+    opts = opts
+        .long_distance_matching(ldm)
+        .workers(workers_of(level_byte));
     if let Some(d) = dict.as_deref() {
         opts = opts.dictionary(d);
     }
 
-    let comp = if prog.first().copied().unwrap_or(0) & 0x40 != 0 {
-        let mut comp = Vec::new();
-        let mut enc = zstdx::stream::read::Encoder::with_options(payload.as_slice(), opts).unwrap();
-        enc.read_to_end(&mut comp).unwrap();
-        enc.finish().unwrap();
-        comp
-    } else {
-        let mut sink = Vec::new();
-        {
-            use std::io::Write;
-            let mut enc = zstdx::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
-            for piece in payload.chunks(7_000) {
-                enc.write_all(piece).unwrap();
-            }
+    // `ph` bits 5..6 pick the core and feed: 0 the write core, 1..3 the
+    // read core through the plain slice, the NT reader and the owned
+    // source (bit 6 used to be the read/write pick alone; bit 5 unused).
+    let comp = match (prog.first().copied().unwrap_or(0) >> 5) & 3 {
+        1 => {
+            let mut comp = Vec::new();
+            let mut enc =
+                zstdx::stream::read::Encoder::with_options(payload.as_slice(), opts).unwrap();
+            enc.read_to_end(&mut comp).unwrap();
             enc.finish().unwrap();
-        }
-        sink
+            comp
+        },
+        2 => {
+            let mut comp = Vec::new();
+            let mut enc = zstdx::stream::read::Encoder::with_options(
+                zstdx::stream::read::NtSource::new(&payload),
+                opts,
+            )
+            .unwrap();
+            enc.read_to_end(&mut comp).unwrap();
+            enc.finish().unwrap();
+            comp
+        },
+        3 => {
+            let mut comp = Vec::new();
+            let mut enc =
+                zstdx::stream::read::OwnedEncoder::with_options(payload.to_vec().into(), opts)
+                    .unwrap();
+            enc.read_to_end(&mut comp).unwrap();
+            enc.finish().unwrap();
+            comp
+        },
+        _ => {
+            let mut sink = Vec::new();
+            {
+                use std::io::Write;
+                let mut enc = zstdx::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
+                for piece in payload.chunks(7_000) {
+                    enc.write_all(piece).unwrap();
+                }
+                enc.finish().unwrap();
+            }
+            sink
+        },
     };
 
     let back = match dict.as_deref() {
@@ -420,7 +501,8 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
         },
     };
     assert_eq!(
-        &back[..], &payload[..],
+        &back[..],
+        &payload[..],
         "zstdx decode of structured stream differs"
     );
 
@@ -432,11 +514,13 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
                 .decompress_to_buffer(&comp, &mut rbuf)
                 .unwrap();
             assert_eq!(
-                n, payload.len(),
+                n,
+                payload.len(),
                 "zstd decode of structured stream length differs"
             );
             assert_eq!(
-                &rbuf[..n], &payload[..],
+                &rbuf[..n],
+                &payload[..],
                 "zstd decode of structured stream differs"
             );
         },
@@ -444,7 +528,8 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
             let mut zback = Vec::new();
             zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
             assert_eq!(
-                &zback[..], &payload[..],
+                &zback[..],
+                &payload[..],
                 "zstd decode of structured stream differs"
             );
         },
@@ -487,9 +572,9 @@ fn structured_seed(data: &[u8]) {
     } else {
         prog.push(0);
     }
-    if byte(9) & 0x40 != 0 {
-        prog[0] |= 0x40; // read core; the write core is the default
-    }
+    // Core and feed: 0 the write core, 1..3 the read core's plain,
+    // NT-store and owned entries, so the constructor sweeps all four.
+    prog[0] |= (byte(9) & 3) << 5;
     let litn = 8 + byte(4) as usize % 57;
     prog.push(litn as u8 - 1);
     prog.extend((0..litn).map(|j| byte(j + 8)));

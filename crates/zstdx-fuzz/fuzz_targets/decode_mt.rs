@@ -84,9 +84,11 @@ fn textish(rng: &mut Rng, len: usize) -> Vec<u8> {
 
 /// Deterministic MT-frame seeds (R66 constructor pattern): frames from our
 /// own MT encoder, so the segment scan sees job-boundary restart cuts at
-/// varying alignments. The ramp override arms the deep-offset job guarantee
-/// once per process, letting the piece planner validate real job grids
-/// (pledged high-ratio shapes below the 512-KiB compressed floor).
+/// varying alignments, plus libzstd -9 restart-poor frames, so the
+/// planner also cuts mid-epoch and primes leases from the folded table
+/// epoch. The ramp override arms the deep-offset job guarantee once per
+/// process, letting the piece planner validate real job grids (pledged
+/// high-ratio shapes below the 512-KiB compressed floor).
 fn mt_frames_seed(data: &[u8]) {
     let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
     let mut rng = Rng(u64::from(byte(1)) | 0x0123_4567_89ab_cdef);
@@ -123,6 +125,17 @@ fn mt_frames_seed(data: &[u8]) {
                 .pledged_size(Some(len as u64)),
         )
         .unwrap();
+        check(&frame);
+    }
+
+    // Restart-poor epoch class: libzstd -9 emits table-carrying epochs
+    // far longer than the segment target, so the planner cuts mid-epoch
+    // and every later lease primes its scratch from the recorded table
+    // epoch.
+    if byte(0) & 7 == 0 {
+        let len = 288 * 1024 + byte(8) as usize % 4096;
+        let payload = textish(&mut rng, len);
+        let frame = zstd::bulk::compress(&payload, 9).unwrap();
         check(&frame);
     }
 

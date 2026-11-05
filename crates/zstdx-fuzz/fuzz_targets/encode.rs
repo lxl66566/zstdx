@@ -14,14 +14,14 @@
 //!   length), bits 2..5 a window nibble (0 keeps the row's window, 1..=15 force window log nibble+9
 //!   — sub-block windows included, offsets must stay inside whatever window the frame declares),
 //!   bits 6..7 the LDM tri-state (0/3 Auto, 1 Enable, 2 Disable).
-//! - `k` with bit 7 clear: number of length-prefixed chunks ahead of a final remainder chunk.
-//!   `pos = 0`; for `i in 0..=k`: when `i < k` and at least two bytes of `rest` remain, a `u16` LE
+//! - `k` with bit 7 clear: number of length-prefixed chunks ahead of a final remainder chunk. `pos
+//!   = 0`; for `i in 0..=k`: when `i < k` and at least two bytes of `rest` remain, a `u16` LE
 //!   length prefix at `rest[pos..]` picks `chunk = rest[pos+2 .. pos+2+len]` (clamped to the
 //!   available bytes) and advances `pos` past it; otherwise the chunk is the whole remainder — so
 //!   ALL of `rest` is covered. Inputs shorter than the header bytes degrade to a single empty
 //!   payload. Bit 7 set switches `rest` to structure mode: a small program expanded
-//!   deterministically into one large payload (see [`expand_program`]), the R74
-//!   lever for the multi-KiB-period structure mutation never builds.
+//!   deterministically into one large payload (see [`expand_program`]), the R74 lever for the
+//!   multi-KiB-period structure mutation never builds.
 //!
 //! Every chunk's frame must decode back to that chunk through both our
 //! decoder and the reference implementation.
@@ -254,11 +254,9 @@ const EXPAND_CAP: usize = 256 * 1024;
 
 /// FNV-1a over the program bytes; `| 1` keeps the xorshift state nonzero.
 fn program_seed(prog: &[u8]) -> u64 {
-    prog.iter()
-        .fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-        | 1
+    prog.iter().fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    }) | 1
 }
 
 /// Operand readers; bytes past the program end read as zero, so truncated
@@ -285,11 +283,10 @@ fn u24_field(prog: &[u8], i: usize) -> usize {
 /// bits 1..4 set its log size `1 << (4 + v)`, bits 5..7 are ignored
 /// here). Each event tag is `op << 6`:
 /// - 0 LIT: `n = (tag & 0x3f) + 1` verbatim bytes follow;
-/// - 1 REP: `dist = u24 + 1`, `len = u16 + 1`, `flips = u8 & 0x0f`; copies
-///   `len` bytes from `dist` back in the virtual history (dictionary
-///   content, then output), so a distance past the output echoes the
-///   dictionary; `flips` pseudo-random bytes inside the copied span are
-///   replaced — the mutated-copy class;
+/// - 1 REP: `dist = u24 + 1`, `len = u16 + 1`, `flips = u8 & 0x0f`; copies `len` bytes from `dist`
+///   back in the virtual history (dictionary content, then output), so a distance past the output
+///   echoes the dictionary; `flips` pseudo-random bytes inside the copied span are replaced — the
+///   mutated-copy class;
 /// - 2 NOISE: `n = u24 + 1` pseudo-random bytes;
 /// - 3 PAD: `n = u24 + 1` copies of the next byte — long RLE spans.
 ///
@@ -380,9 +377,8 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
     }
     let window = (opt_byte >> 2) & 0x0f;
     if window != 0 {
-        opts = opts.with_input_shape(
-            zstdx::InputShape::default().with_window_log(u32::from(window) + 9),
-        );
+        opts = opts
+            .with_input_shape(zstdx::InputShape::default().with_window_log(u32::from(window) + 9));
     }
     let ldm = match (opt_byte >> 6) & 3 {
         1 => zstdx::LdmMode::Enable,
@@ -410,7 +406,8 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
         },
     };
     assert_eq!(
-        &back[..], &payload[..],
+        &back[..],
+        &payload[..],
         "zstdx decode of structured payload differs"
     );
 
@@ -422,11 +419,13 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
                 .decompress_to_buffer(&comp, &mut rbuf)
                 .unwrap();
             assert_eq!(
-                n, payload.len(),
+                n,
+                payload.len(),
                 "zstd decode of structured payload length differs"
             );
             assert_eq!(
-                &rbuf[..n], &payload[..],
+                &rbuf[..n],
+                &payload[..],
                 "zstd decode of structured payload differs"
             );
         },
@@ -434,7 +433,8 @@ fn structured_roundtrip(level_byte: u8, opt_byte: u8, prog: &[u8]) {
             let mut zback = Vec::new();
             zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
             assert_eq!(
-                &zback[..], &payload[..],
+                &zback[..],
+                &payload[..],
                 "zstd decode of structured payload differs"
             );
         },
