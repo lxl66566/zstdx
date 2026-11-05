@@ -63,6 +63,9 @@ enum Command {
     /// Piece-pipeline critical-path analysis for parallel stage-B
     /// execution on one frame (seq_dump decode hook).
     Piecepipe(cmd::piecepipe::Args),
+    /// Match-offset spectrum and ramp-band damage predictor for one
+    /// frame (seq_dump decode hook).
+    Offhist(cmd::offhist::Args),
     /// Micro-benchmark of the matcher's `prefill_window` per strategy.
     Prefill(cmd::prefill::Args),
     /// Train a raw-content dictionary with the in-tree trainer, or extract
@@ -97,6 +100,7 @@ fn main() {
         Command::Mtcheck(args) => cmd::mtcheck::run(&args),
         Command::Seqstats(args) => cmd::seqstats::run(&args),
         Command::Piecepipe(args) => cmd::piecepipe::run(&args),
+        Command::Offhist(args) => cmd::offhist::run(&args),
         Command::Prefill(args) => cmd::prefill::run(&args),
         Command::Train(args) => cmd::train::run(&args),
         Command::Dictmt(args) => cmd::dictmt::run(&args),

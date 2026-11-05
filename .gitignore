@@ -8,6 +8,7 @@ fuzz_decodecorpus
 perf.data*
 crates/zstdx/fuzz/corpus
 /bench/corpus
+/bench/shapes
 .idea
 /docs/book
 /bench/big

@@ -22,6 +22,7 @@
 - [Benchmark methodology](dev/bench/methodology.md)
 - [Decode gap against libzstd](dev/bench/dec-gap.md)
 - [Encode dll100 gap against libzstd](dev/bench/enc-dll-gap.md)
+- [Shape taxonomy validation for the encode-side ramp](dev/bench/shapes.md)
 
 ## Upstream Comparison
 

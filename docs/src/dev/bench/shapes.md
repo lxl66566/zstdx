@@ -1,0 +1,60 @@
+# Shape Taxonomy Validation for the Encode-Side Ramp
+
+This page grounds proposal 9's arming screens (research map) on shapes outside the 6-corpus calibration set. Eight new 32 MiB shapes (`bench/gen_shapes.sh`, recipes in its header: a real source tarball `src`, an HTML crawl `html`, a markdown/prose mix `md`, CSV records `csv`, fasta reads `fasta`, a periodic binary-snapshot stream `snapshot`, and the mixed payloads `mixed` 24 MiB json + 8 MiB prose and `mixed_text` 22 MiB json + 10 MiB tiled text) were measured against the six calibration shapes. Sizes come from `emitframe` bulk-mt4 with checksummed frames at levels 3, 5 and 8, stock against `ZSTDX_MT_RAMP_BYTES` at D = 512 KiB, 1 MiB, 2 MiB; every calibration number reproduces exactly (json -0.72 percent at D=2 MiB, text +1.27 percent at D=512 KiB and +403.08 percent at D=2 MiB, zeros and random +0.00 percent). The `offhist` subcommand (seq_dump) supplies the match-offset spectra and the band-damage predictions on the stock level-3 frames; the distinct-density bar is the small-band head verdict's own `sampled_distinct` idiom, stride 5 over the first 8 KiB, replicated exactly.
+
+## The cost law, measured
+
+A position at distance x above a job start loses matches whose source lies within D bytes below that start, i.e. matches at offset in (x, x+D]. A content twin at offset o is therefore lost on the band x in (max(0, o-D), min(o, J)) of every job, J the job size: width min(o, J) when o is at or below D, and min(J-o+D, D) when o is above D, zero once o reaches D+J. The dangerous distance reach is (0, D+J], not (0, D] — twins above D still pay when the job reaches back for them. The realized damage is the lost mass times the fraction of it the parse cannot recover from surviving alternatives, which the round measured as two structures: a twin ladder (text at D=512 KiB keeps the 2x-period twin for x below 2P-D and reads +1.27 percent, while at D=2 MiB every ladder rung below x+D dies for the whole first period and the cell reads +403 percent) and an alternative-decaying ladder (snapshot's mutated twins halve in quality per period step, so killing the best rung degrades the parse progressively, +468 percent at D=2 MiB).
+
+## Level-3 size table
+
+Level 3, workers 4, job size 4 MiB on the 32 MiB inputs (4194316 on json's slightly longer file). Delta percent of the stock frame at each D.
+
+| shape | bar (8 KiB distinct) | stock B | +512K | +1M | +2M | dominant offsets |
+|---|---:|---:|---:|---:|---:|---|
+| json | 39 | 6333603 | -0.214 | -0.445 | -0.719 | 2 B (dense near-repeats to ~1 MiB, diffuse) |
+| text | 69 | 100775 | +1.263 | +58.496 | +403.078 | 441226 B, 97.4 percent of matched mass |
+| skewed | 16 | 17472901 | -0.085 | -0.139 | -0.163 | 801 B and structural spread to ~512 KiB |
+| zeros | 1 | 1038 | +0.000 | +0.000 | +0.000 | none |
+| random | 256 | 33555214 | +0.000 | +0.000 | +0.000 | none |
+| dll32 | 145 | 4607550 | +0.845 | +1.657 | +3.886 | diffuse 0.5-16 MiB, LDM far twins at 3.3/5.1/6.8 MiB |
+| src | 97 | 6767519 | +0.256 | +0.341 | +0.445 | 2 B and a smooth decay to ~1 MiB |
+| html | 53 | 6366510 | +0.287 | +0.277 | +0.234 | 8 B plus diffuse spread to ~1 MiB |
+| md | 61 | 7680309 | +0.275 | +0.305 | +0.304 | 31-33 B sentence/word twins |
+| csv | 43 | 10600018 | -0.010 | -0.071 | -0.123 | 8 B and the ~143 B record period |
+| fasta | 16 | 5760836 | +0.137 | +0.159 | +0.172 | 24 B motif twins, 61 B line period |
+| snapshot | 255 | 1525174 | +3.349 | +7.069 | +468.405 | 1048576 B, 99.9 percent of matched mass |
+| mixed | 39 | 6280873 | -0.122 | -0.294 | -0.494 | json-like, prose tail benign |
+| mixed_text | 39 | 4460615 | -0.198 | +0.392 | +3.846 | json head, 441226 B spike at 22 MiB in |
+
+The rejected-share predictor (offhist on the stock frames, matches whose source lies within D below a multiple of the job size) separates the classes: every shape at or under 3.1 percent of matched mass reads within 0.9 percent size at D=2 MiB and mostly negative (json 3.08, skewed 1.69, src 2.39, html 2.17, md 1.54, csv 2.01, fasta 1.94, mixed 2.21), mixed_text reads 5.39 with its damage localized, dll32 reads 7.56, and the catastrophic pair reads 11.87 (text, whose 441226 twin carries 97.4 percent of the mass) and 22.57 (snapshot). Rejected share alone does not price the jump from +3.9 to +403 percent — the fallback structure does: a spike spectrum (one offset carrying all the mass, ladder dead under D) reads catastrophic, a diffuse spectrum (dll32's far twins spread over 1-16 MiB with per-distance alternatives) reads bounded.
+
+## The bar-gap verdict
+
+No new shape lands inside the recorded 102-108 gap: the closest is src at 97, inside the text band itself and benign at +0.45 percent. The gap is not where the screen fails. The screen fails because sampled distinct density does not predict ramp cost in either direction: snapshot reads 255 — squarely in the armed class, above dll32's 145 — and pays +468 percent at D=2 MiB and +3.35 percent even at D=512 KiB, the exact risk class the operator named (dominant period 1 MiB inside D, no alternative sources better than a decay ladder), here with a binary alphabet the density bar trusts. And the benign interior of the text band (src 97, md 61, csv 43, html 53) shows the bar's held class is not a cost class at all. On today's binaries the dll-class bar itself fails: dll32 regenerated from the current store reads +0.845 percent at D=512 KiB and +3.886 percent at D=2 MiB at level 3 mt4, against the recorded +0.00 percent bar that the proposal's +0.05 percent build gate is priced from. dll100 at its original scale and a 12.5 MiB job lattice reads +0.094 and +0.443 percent — the recorded number is a property of one store snapshot and one lattice, not of the class. A size gate of +0.05 percent rejects today's dll32 at every D.
+
+## The mixed-payload verdict
+
+The frame-head screen is defeated by construction: both mixed payloads sample json at the head (bar 39) and arm under the json rule, while mixed_text carries a text-class region whose local damage the global number hides. At D=512 KiB mixed_text reads -0.198 percent — negative — while 10 MiB of its tail is paying the text class's local +1.27 percent; at D=2 MiB the frame reads +3.846 percent with the offhist region table localizing the damage to the text regions (rejected mass 511 KB in each of regions 6 and 7 against ~140 KB per json region). Per-job strip sampling contains but does not remove this: at the 4 MiB lattice the region boundary at 22 MiB falls mid-job, so job 5 samples json at its strip head (own-head 39, incoming strip 38) while its last 2 MiB parse text ramped, and only jobs 6 and 7 sample text (61-68) and would hold. A pre-parse screen can never see content behind its own job's strip; the residual is one job wide. The benign mixed payload confirms the positive case: the prose tail rejects only 11 KB of matched mass at D=2 MiB against the json regions' ~140 KB — tiny-offset prose is safer under the ramp than the json that arms it, and the whole frame reads -0.49 percent.
+
+## The taxonomy verdict
+
+The cost law holds with one refinement. Tiny-offset shapes (md, csv, fasta, html, src) all read within 0.5 percent at level 3 and under 1 percent at levels 5 and 8 — class ~0 cost, sometimes negative (csv -0.12, fasta -2.1 percent at level 5, where the ramp suppresses weak crossing candidates the row matcher was accepting). Dense redundancy (json, skewed, mixed) reads small negative everywhere. Period inside D with no surviving alternatives is catastrophic (text +403, snapshot +468), and the law's "period at or below D" edge sharpens to "period ladder below D+J": the second rung's survival is what keeps text at +1.27 percent when D stays under 2P. The one class the derived law got wrong is "sparse/period>D sources ~0": dll32's far twins sit at 3.3-6.8 MiB, above D=2 MiB, yet pay +3.9 percent because the band reaches D+J back and the 2^21-2^22 buckets hold a third of the frame's matched mass inside that reach. Above D+J the law holds — dll100's deeper twins and 12.5 MiB lattice read +0.44 percent. Levels 5-8 are not arming candidates for any far-mass shape: without LDM their window is 2 MiB, D equals the window, and dll32 reads +47.8 and +49.3 percent at level 5 and 8 (snapshot +473, text +392); the armed class is level 3's dfast row alone unless D scales down per row.
+
+## Findings the proposal round must carry
+
+Two dll32-only defects in the ramped path surfaced with this corpus, both in the mid-size prefix-LDM machinery the dll-class frames engage. First, the depth guarantee is false on dll32 today: `piecepipe --depth 2097152` on the ramped frame at the emitframe lattice reads 214 violations of 23656 crossings (offsets 2.2-5.1 MiB at depths 0.3-1.7 MiB below the cut, long LDM-fed candidates), where every other shape audits clean at 0. The violations do not break this frame's piece engagement (o_min 2176536 clears the 3/8-of-job bar) and the recorded 2026-09-15 zero-violation audit predates this content, but any reasoning keyed on D holding exactly must stop doing so. Second, ramped dll32 frames are worker-count-keyed while stock frames are not: 4786591 bytes at mt4 against 4786978 at mt8 and mt16 with byte-identical stock frames, the same printed job size, identical sequence streams per piecepipe, and a 387-byte entropy-level difference — deterministic per worker count. Both belong to the proposal's identity-gate decision point.
+
+## Probe recommendation for the arming gate
+
+Drop the distinct-density bar; it is not a cost predictor. The arming gate should be a per-job twin-distance spectrum over the incoming history span, built from the far_screen machinery the encoder already runs there: content-aligned gear-hash triggers (never a lag grid — a stride-128 lag probe misses text's 441226 period entirely), fingerprint twins with the twin's position stored beside its tag, distances bucketed per power of two, a per-window entropy gate (uniform windows twin at every distance and flooded 80 percent of dll32's raw twin count from zero padding), and an arming bar on the twin mass inside the (0, D+J] band. This round's table is the calibration set: the benign shapes read at most a few percent of spread mass in-band (json's 64-byte windows twin only 3 times in 8 MiB, so it arms on an empty band and pays -0.72 percent), the catastrophic shapes read 93-99 percent of their twin mass concentrated in one bucket inside the band, and the dll class reads 12-20 percent spread across 1-4 MiB, which on today's binaries must hold at D=2 MiB (a +3.9 percent size breach) and becomes a priced decision at D=512 KiB (+0.85 percent). The probe runs per MT job over the strip the LDM indexer already ingests, so the placement contains mixed-payload dilution to the one-job residual measured above; the frame-head variant is defeated by construction and must not ship. Tiny-lag mass (at or under ~1 KiB) stays outside the bar: it is in-job after the first kilobyte of every job and is where fasta, md and csv win. Before any of this arms, the two dll32-class defects above need fixes, and the level axis must stay at level 3 unless D scales per row.
+
+## Reproduction
+
+```bash
+bash bench/gen_shapes.sh
+cargo build --release -p zstdx-bench --features seq_dump
+target/release/zstdx-bench emitframe bench/shapes/snapshot.raw /tmp/s.zst3 --level 3 --workers 4
+ZSTDX_MT_RAMP_BYTES=2097152 target/release/zstdx-bench emitframe bench/shapes/snapshot.raw /tmp/s.d2M --level 3 --workers 4
+target/release/zstdx-bench offhist /tmp/s.zst3 --job-size <emitframe job_size> --depth 524288,1048576,2097152
+```

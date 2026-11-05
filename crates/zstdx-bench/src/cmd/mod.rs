@@ -6,6 +6,7 @@ pub mod files;
 pub mod jobdecomp;
 pub mod matrix;
 pub mod mtcheck;
+pub mod offhist;
 pub mod parity;
 pub mod piecepipe;
 pub mod prefill;
