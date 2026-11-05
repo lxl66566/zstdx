@@ -104,6 +104,49 @@ The repaired build's fixed-work instruction count on the skewed mtcheck workload
 
 The single-thread controls held flat. The executor's inner loop disassembles to the same block structure as the flat form and its instruction count per decode is slightly below base, branch misses, dTLB and L1 misses are flat to better, and cycles per decode still rise about 50 percent on skewed: the loss is cycle-efficiency shaped, not instruction shaped. The bandwidth cut the padding probe priced never appears in any cell, stage A's flat write plus pack pass lengthens the staging phase restart-poor frames wait on, and no placement of the pack (in the decode sink, behind the loop, scalar, vector) and no expansion granularity (per 32, per block) recovered it. The representation side of the staged vector stays closed.
 
+### NT-store staged writes above L3 scale
+
+The idea was the research map's rider probe on the mid-epoch build: the staged set is write-once and read once by another core, so once it exceeds cache scale every temporal staged store pays a read-for-ownership nobody will ever read, and non-temporal stores delete that half of the write traffic. skewed.zst9's 75.1 MB and dll100.zst3's 93.3 MB staged sets clear a 32 MiB per-CCD L3, json.zst3's 26.7 MB fits and must keep temporal stores so the executor's reads stay cached.
+
+The form measured on 2026-11-05: the pre-scan estimates each frame's staged set for free off the block headers it already parses (every compressed block's regenerated literals plus one 12 B record per sequence), a per-frame threshold arms the staged record stores above 32 MiB, and `ZSTDX_DEC_NT_STAGED=on|off` forces either arm for the A/B. The store form is three 4-byte `movnti` per record inside the staging decode loop, with an `sfence` on every segment exit including unwinds. Byte-identical by construction, since the store policy moves no byte and the fence drains the WC buffers before the slot publish: the paranoid, debug, release and no-default-features suites, mtcheck over corpus and big under both forced arms, a 200-round corrupt smoke on json and skewed under both arms, and the 45078-case parity sweep with MT arms 2, 4 and 8 under the forced and auto arms all ran clean, and a scan-estimate unit test pinned the estimate against exactly what staging wrote.
+
+Two locked position-balanced interleaved A/B sessions, five rounds per side each at a 1000 ms per-cell budget, read medians of MiB/s:
+
+| cell | temporal (s1 / s2) | nt (s1 / s2) | delta s1 / s2 |
+|---|---:|---:|---:|
+| skewed.zst9 mt8 | 1700 / 1688 | 1684 / 1683 | -0.9 / -0.3% |
+| skewed.zst9 mt16 | 1727 / 1685 | 1680 / 1686 | -2.7 / +0.1% |
+| dll100.zst3 mt8 | 3007 / 3049 | 2981 / 2990 | -0.9 / -1.9% |
+| json.zst3 mt8 (forced off-threshold) | 3105 / 3155 | 3052 / 3082 | -1.7 / -2.3% |
+| text.zst3 mt8 | 11697 / 11639 | 11679 / 11725 | -0.2 / +0.7% |
+| skewed.zst19 mt8, mt16 | 6543, 6545 / 6495, 6523 | 6541, 6534 / 6512, 6514 | flat |
+
+The single-thread controls held within 1.4 percent in the first session and 0.6 in the second. A third session that ran beside unlocked co-tenant build load (off medians depressed about 10 percent, spreads to 5.6) read the same direction larger on skewed, -2.6 and -5.6 percent, and is excluded from the table as a load artifact. No cell gained in any session: the qualifying skewed.zst9 read flat under both arms, the other qualifying cell dll100.zst3 lost 1 to 2 percent in both sessions, and the forced arm lost 1.7 to 2.3 percent on the L3-fitting json — the threshold's population belongs on temporal stores. The kill condition, no skewed gain under either arm, is met in both sessions, and the record stores stay temporal in the tree.
+
+The mechanism, on the R96 wall attribution: skewed.zst9's mt8 wall is 70 percent serial execute plus a 3 to 4.5 ms first-batch staging tail, and the NT form pays on both terms. Temporal staged stores absorb into the writer's L1/L2 and leave dirty lines the execute reads back from the CCD's shared L3 — the same cross-core warmth the in-dst-zones entry priced, where the pooled scratch buffer's write-allocate fills stay cheap and local. NT stores bypass that absorption, so the staging tail's write stream runs at WC rate inside the critical path, and the execute then reads every staged byte from DRAM instead of the L3 window a backpressure-bounded set of recent segments occupies. The RFO the stores delete was mostly L3-served on the reused pooled buffer, so the saving never covers either cost. Reopening needs a form that keeps the execute's staged reads cache-served while cutting only true DRAM ownership traffic — the same cache-clean staging warmth edge the in-dst-zones entry names.
+
+### Head-ramp segmentation for the first-batch staging tail
+
+The idea was the R98 map's proposal 6. The R96 probe left the restart-poor mt walls with a first-batch staging tail, 1.9 to 4.5 ms of consumer wait behind the first lease's staging, and nothing prices the first cut at the target multiple, so the planner ramped its head: the first cut targeted a 128 KiB input floor, the target doubled per cut up to the regular segment size, every cut stayed on a block boundary with the mid-epoch priming handling each start, restart snaps kept their 1.5x rule against every ramped target, and sub-MT-floor inputs kept the plain grid so the piece-regime fallbacks never flipped engagement. The unit tests covered the ramped ladders, the snap edge cases and the fold-class priming, and staging stayed byte-identical by construction.
+
+The probe ran first and named the mechanism the map predicted: the first-lease wait is staging latency. At skewed.zst9 mt8 the warm first-lease wait read 2358 µs at the 1.14 MiB first cut, 589 µs at a 256 KiB head and 214 µs at a 128 KiB head, with the pool component at 0 to 4 µs and the handoff at 2 to 6 µs, linear in staged bytes. Pool pre-warming had nothing to clear.
+
+The kill came from what the wait does after the head. The consumer executes skewed.zst9 at about 2.4 GB/s of output, the recorded 13.7 ms execute sum, against a per-worker staging rate of about 1.0 GB/s, so it drains the ramped head in under half the time staging needs for the next regular segment and the wait relocates: at mt8 the per-call consumer wait stayed in the 1.0 to 2.7 ms band across both probe sessions against 2.4 to 2.5 ms unramped, distributed behind the first regular segments, and at mt16 the median wait sum grew from 1868 to 4084 µs, with the restart-snapped 3.4 MiB segment alone waiting a 3412 µs median against under 300 µs unramped. The head also moves the consumer's exec start from t+2.4 ms to t+0.3 ms, so the whole frame's execute runs under the staging workers' write traffic, and the ramped grid adds up to four segments of fixed machinery per wave. skewed.zst19, whose consumer executes at memcpy rate off literal-dominated staged bytes, never catches up and keeps the whole head saving: no ramped segment's median wait exceeds 300 µs, the first-lease wait fell from 895 to 336 µs at mt8 and the exec sum rose only 0.36 ms.
+
+The locked position-balanced interleaved A/B, eight rounds per side at a 1000 ms per-cell budget against base 2cb271d2, read:
+
+| cell | base | ramped | delta |
+|---|---:|---:|---:|
+| skewed.zst9 mt4, mt8, mt16 | 1645, 1727, 1709 | 1450, 1631, 1492 | -11.9, -5.6, -12.7% |
+| skewed.zst19 mt4, mt8, mt16 | 6112, 6530, 6540 | 6394, 6741, 6632 | +4.6, +3.2, +1.4% |
+| json.zst3 mt8 | 3135 | 3116 | -0.6% |
+| dll100.zst3 mt8 | 3011 | 2985 | -0.9% |
+| text.zst3 mt8 | 11692 | 11700 | +0.1% |
+
+The json, dll100 and text controls held flat, and the single-thread controls held inside their bands, json, dll100 and text at +1.1, +1.3 and +0.3 percent, the skewed st cells reading the known bimodal drift whose base-side skewed.zst9 rounds spanned 901 to 979 MiB/s. The map's kill conditions fired together: mt16 loses to mt8 on the ramped grid, 1492 against 1631, and the skewed.zst9 cells lose far past the two percent bar at every worker count. The ramp was reverted; the probe build and the A/B binaries stayed throwaway.
+
+The falsified premise is the first-lease reading of the tail. The tail is a first-wave rate term: it persists until the consumer's exec clock falls behind the staging pipeline's, so a head cut pays only on staging-latency-bound shapes, skewed.zst19's class, and converts to staging-write contention on exec-bound shapes, skewed.zst9's sequence-dominated traffic. Reopening needs a head that keeps the consumer from catching up, such as a mix- or worker-scaled ramp with its own probe, or a grid whose first regular segments shrink to the exec-staging crossover.
+
 ### Fixed-offset ramp at job starts
 
 The idea was to suppress matches whose offset sits below a 4-64 KiB floor near MT job starts, so decode pieces never wait on near-boundary reads. The piece-pipeline ceiling stayed at about 1.0-1.14x at every floor. The binding constraint is a crossing read's depth below the cut, computed as `start - src`, and the offset does not matter. A piece can start a copy the moment its source range is published, and a deep source unblocks it regardless of the match's offset size. An offset floor suppresses the wrong set, namely large offsets whose sources are deep and harmless, and leaves shallow-depth reads untouched, where any offset with a source just below the cut qualifies. The depth-semantics ramp, where crossing reads must reach at least D below the job start, is what works. It is landed and env-gated, tracked in the [todo](../todo.md).
