@@ -870,8 +870,10 @@ fn st_fallback(
 /// parse unconstrained; see `match_generator::RampGate` for the semantics.
 static RAMP_TEST_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Test-only serial-feed override (see `set_ldm_feed_for_tests`).
-static FEED_TEST_OVERRIDE: AtomicBool = AtomicBool::new(true);
+/// Whether the opt rows' serial-LDM feed is armed (the production
+/// default); tests stand it down to hold the stock per-job bytes as their
+/// reference (see `set_ldm_feed_for_tests`).
+static OPT_FEED_ARMED: AtomicBool = AtomicBool::new(true);
 
 /// Serializes the tests that flip the process-global feed switch: the
 /// bulk feed test and the pledged-stream feed test both hold the stock
@@ -891,7 +893,7 @@ pub fn set_mt_ramp_depth_for_tests(depth: u64) {
 /// Hidden: not API-stable.
 #[doc(hidden)]
 pub fn set_ldm_feed_for_tests(enabled: bool) {
-    FEED_TEST_OVERRIDE.store(enabled, Ordering::Relaxed);
+    OPT_FEED_ARMED.store(enabled, Ordering::Relaxed);
 }
 
 fn ramp_depth_from_env() -> u64 {
@@ -1623,7 +1625,7 @@ pub(crate) fn opt_ldm_feed_band(
     head: &[u8],
     ldm_mode: crate::LdmMode,
 ) -> Option<u64> {
-    if ldm_mode == crate::LdmMode::Disable || !FEED_TEST_OVERRIDE.load(Ordering::Relaxed) {
+    if ldm_mode == crate::LdmMode::Disable || !OPT_FEED_ARMED.load(Ordering::Relaxed) {
         return None;
     }
     let window = MatchGeneratorDriver::opt_ldm_feed_window(level, shape, choice)?;

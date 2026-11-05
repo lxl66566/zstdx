@@ -257,7 +257,9 @@ enum OptFeed {
 /// grid's stock bytes.
 const DEEP_LDM_STAGE_SPAN: u64 = LDM_MIDSIZE_WINDOW as u64 / 2 + 1;
 
-/// Test-only unpledged-arm switch (see `set_stream_deep_band_for_tests`).
+/// Whether the open stream's deep-band staging is armed (the production
+/// default); tests stand it down to hold the stock growing-grid bytes as
+/// their reference (see `set_stream_deep_band_for_tests`).
 static UNPLEDGED_DEEP_BAND: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 

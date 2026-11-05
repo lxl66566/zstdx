@@ -60,6 +60,7 @@
 - [R95 encode sprint review](dev/review/r95-sprint.md)
 - [R95 decode sprint review](dev/review/r95-dec-sprint.md)
 - [R98 review: NT feed, owned source, stepped drain, mid-epoch staging](dev/review/r98-review.md)
+- [R100 MT/streaming machinery review](dev/review/r100-mt-review.md)
 
 ## Remaining Improvements
 

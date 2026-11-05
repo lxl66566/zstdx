@@ -56,6 +56,14 @@ static ENGAGEMENTS: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 static LANE_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// Test injection: like [`LANE_PANIC_INPUT`], but armed only on pool
+/// lanes (a lane whose segment range starts past zero), so a test can
+/// panic the executor's worker side while the caller's lane 0 runs to
+/// completion. Compiled out of non-test builds.
+#[cfg(test)]
+static LANE_PANIC_POOL_INPUT: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 /// How many decodes engaged the frame-lane executor so far (process
 /// lifetime). Hidden: not API-stable.
 #[doc(hidden)]
@@ -219,7 +227,10 @@ fn run_lane(lane: &LaneJob) {
     // slice is live for the whole call.
     let input: &[u8] = unsafe { &*lane.input };
     #[cfg(test)]
-    if LANE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr() {
+    if LANE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr()
+        || (lane.segs.start != 0
+            && LANE_PANIC_POOL_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr())
+    {
         panic!("injected lane panic");
     }
     // SAFETY: same lease discipline as the input slice above.
@@ -519,6 +530,7 @@ fn run(
         let mut written = 0usize;
         let mut first_fail: Option<(usize, FrameDecoderError)> = None;
         let mut checksum_err = None;
+        let mut aborted = false;
         for (li, lane) in lane_jobs.iter().enumerate() {
             let outcome = if li == 0 {
                 lane.result.lock().unwrap().take()
@@ -550,9 +562,7 @@ fn run(
                         first_fail = Some((seg, err));
                     }
                 },
-                // An aborted lane implies a recorded failure or a poison;
-                // both are picked up below before anything observable.
-                Some(LaneOutcome::Aborted) | None => {},
+                Some(LaneOutcome::Aborted) | None => aborted = true,
             }
         }
         // Serial precedence: the first decode error in input order wins
@@ -562,6 +572,17 @@ fn run(
         }
         if let Some(err) = checksum_err {
             return Err(err);
+        }
+        // An aborted lane without a recorded failure implies the pool
+        // poison, which the driver resumes after the leases leave, so
+        // this sentinel is never observed (the piece executor's own
+        // pattern). Returning ahead of the invariants below keeps them
+        // on the every-lane-completed path: an aborted lane publishes
+        // no frame starts and leaves the total at zero, so the assert
+        // and the pledge verification would both run on incomplete data
+        // and misreport the worker's panic as their own breach.
+        if aborted {
+            return Err(FrameDecoderError::NotYetInitialized);
         }
         debug_assert_eq!(starts.len(), n_frames, "every lane completed");
         verify_frame_content_sizes(&plan.frame_pledges, &starts, written)?;
@@ -899,6 +920,63 @@ mod tests {
         );
     }
 
+    /// One frame carrying its pledged content size (the one-shot bulk
+    /// entries omit the field; the pledge verification reads it).
+    fn pledged_frame(raw: &[u8]) -> Vec<u8> {
+        use crate::io::Write as _;
+        let mut sink = Vec::new();
+        let mut enc = crate::stream::write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::Fastest).pledged_size(Some(raw.len() as u64)),
+        )
+        .unwrap();
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap();
+        sink
+    }
+
+    /// A pool lane worker's panic must surface as its own payload: an
+    /// aborted lane without any recorded failure means the driver resumes
+    /// the poison after the leases leave, and the outcome collection's
+    /// all-Done invariants (the frame-start assert, the pledge
+    /// verification) must not fire first — an aborted lane publishes no
+    /// frame starts, so both would misreport the worker's panic as their
+    /// own invariant breach. Every frame pledges its content size so the
+    /// verification walks the missing lane's frame starts.
+    #[test]
+    fn pool_lane_panic_surfaces_the_payload() {
+        let mut stream = Vec::new();
+        let mut expect = Vec::new();
+        for i in 0..3u64 {
+            let raw = textish(0x700 + i, 2 * 1024 * 1024);
+            stream.extend_from_slice(&pledged_frame(&raw));
+            expect.extend_from_slice(&raw);
+        }
+        // Control: the stream engages the lane executor and decodes clean.
+        let before = frame_lane_engagements();
+        let mut placed = vec![0u8; expect.len()];
+        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW).unwrap();
+        assert_eq!(&placed[..n], &expect[..]);
+        assert!(frame_lane_engagements() > before);
+
+        // mt2 groups three frames into lanes [0] and [1, 2]: the pool
+        // lane panics at its first segment while the caller's lane 0
+        // completes, and the driver must resume the worker's payload.
+        super::LANE_PANIC_POOL_INPUT.store(stream.as_ptr() as *mut u8, Ordering::Relaxed);
+        let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut placed = vec![0u8; expect.len()];
+            let _ = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW);
+        }));
+        super::LANE_PANIC_POOL_INPUT.store(core::ptr::null_mut(), Ordering::Relaxed);
+        let payload = blew.expect_err("the pool lane's panic must surface");
+        let msg = payload.downcast_ref::<&str>().copied().or_else(|| {
+            payload
+                .downcast_ref::<alloc::string::String>()
+                .map(std::string::String::as_str)
+        });
+        assert_eq!(msg, Some("injected lane panic"));
+    }
+
     /// Lane grouping invariants: whole frames per lane, ascending, covering.
     #[test]
     fn lane_grouping_covers_whole_frames() {
@@ -1218,7 +1296,6 @@ mod tests {
         let mut seq = Vec::new();
         let n = FrameDecoder::new().decode_all(&stream, &mut seq).unwrap();
         assert_eq!(n, 0);
-        let before = frame_lane_engagements();
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 0];
             let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
@@ -1227,6 +1304,13 @@ mod tests {
             decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
             assert_eq!(appended, b"prefix", "mt{workers}");
         }
-        assert_eq!(frame_lane_engagements(), before);
+        // The engagement pin is the clean decode itself. The counter is
+        // process-global and parallel lane tests move it inside any
+        // snapshot window, so an exact-equality check on it races (it
+        // fired under the paranoid profile once this suite's lane
+        // population grew). A skippable-only scan yields no segments, so
+        // the parallel path never routes the stream — and an engaged
+        // lane run would have no lane 0 to execute, panicking on the
+        // empty lane list rather than decoding empty.
     }
 }

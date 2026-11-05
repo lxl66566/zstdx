@@ -1762,13 +1762,12 @@ pub fn decode_all_mt(
         }
         // Multi-frame input: stage B runs one lane per frame (grouped when
         // frames outnumber the worker budget) on the same pool. The fixed
-        // buffer is valid for its whole length up front, so one place call
-        // covers every lane and staging overlaps execution as before.
+        // buffer is valid for its whole length up front, so the lanes start
+        // immediately and staging overlaps execution as before.
         let n_frames = plan.segments.iter().filter(|s| s.frame_start).count();
         if n_frames >= 2 {
-            // The fixed-slice `place` accepts any end within the buffer, so
-            // one call with the full length covers every lane; a too-small
-            // target surfaces from the executor's own write-limit checks.
+            // A too-small target surfaces from the executor's own
+            // write-limit checks.
             let out_len = output.len();
             let written = super::mt_frames::decode_frames_fixed(
                 input,
