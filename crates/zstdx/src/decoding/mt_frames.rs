@@ -6,14 +6,17 @@
 //! independent decode units — repcode history, checksum streams and match
 //! sources never cross a frame boundary — so the executor splits the
 //! segment list into one lane per frame (grouped when frames outnumber
-//! the worker budget) and runs the lanes concurrently: each lane consumes
+//! the lane budget) and runs the lanes concurrently: each lane consumes
 //! its own frame's staged segments in order, exactly like the serial
 //! executor's per-segment readiness wait, writing disjoint output ranges.
 //! Only the output base of a lane's first frame couples lanes, and it is
 //! a pure stage-A quantity: the sum of the predecessors' staged output
 //! sizes, read off the job's published size array (a consumed slot cannot
 //! be told apart from an unstaged one, so staging publishes sizes
-//! separately).
+//! separately). The lane count, the frame packing and the staging-ahead
+//! window all come from the plan-time [`super::lane_budget`] when the
+//! payload's frames pledge their sizes, and from the stock layout
+//! otherwise.
 //!
 //! Wildcopy spill is bounded per segment: each lane passes its segment's
 //! own end as the wild cap, so no lane's overshoot can reach into the next
@@ -34,11 +37,12 @@
 //! unchanged.
 
 use alloc::vec::Vec;
-use core::{ops::Range, sync::atomic::Ordering};
+use core::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
     errors::FrameDecoderError,
+    lane_budget::{self, FramePlan, LaneBudget, LaneSpec},
     mt::{
         OutRegion, ScanPlan, SegmentPlan, StageAJob, execute_segment, verify_frame_content_sizes,
     },
@@ -57,7 +61,7 @@ static LANE_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Test injection: like [`LANE_PANIC_INPUT`], but armed only on pool
-/// lanes (a lane whose segment range starts past zero), so a test can
+/// lanes (a lane whose frame list starts past the first frame), so a test can
 /// panic the executor's worker side while the caller's lane 0 runs to
 /// completion. Compiled out of non-test builds.
 #[cfg(test)]
@@ -71,57 +75,17 @@ pub fn frame_lane_engagements() -> usize {
     ENGAGEMENTS.load(Ordering::Relaxed)
 }
 
-/// Segment-id range per lane: one or more whole frames, in input order.
-/// Consecutive lanes cover the whole segment list; each lane's first
-/// segment has `frame_start`. `frames` indexes the scan-order frame list
-/// (checksum lookup).
-#[derive(Clone)]
-struct LaneSpec {
-    segs: Range<usize>,
-    frames: Range<usize>,
-}
-
-/// Split `n_frames` frames over `lanes` lane groups, segment ranges
-/// ascending. `frame_starts` are the segment ids where a frame starts,
-/// ascending.
-fn group_lanes(frame_starts: &[usize], n_segments: usize, lanes: usize) -> Vec<LaneSpec> {
-    let n_frames = frame_starts.len();
-    let mut out = Vec::with_capacity(lanes);
-    for li in 0..lanes {
-        let first = li * n_frames / lanes;
-        let last = (li + 1) * n_frames / lanes;
-        let start = if first == 0 {
-            0
-        } else {
-            frame_starts[first]
-        };
-        let end = if last == n_frames {
-            n_segments
-        } else {
-            frame_starts[last]
-        };
-        out.push(LaneSpec {
-            segs: start..end,
-            frames: first..last,
-        });
-    }
-    debug_assert!(out.first().is_some_and(|l| l.segs.start == 0));
-    debug_assert!(out.last().is_some_and(|l| l.segs.end == n_segments));
-    debug_assert!(out.windows(2).all(|w| w[0].segs.end == w[1].segs.start));
-    out
-}
-
 /// One lane's completion. `Failed.seg` is the failing segment id (decode
 /// or stage error); `Aborted` never carries the reported error — it means
 /// a predecessor failed, or a worker panicked and the poison takes over.
 enum LaneOutcome {
-    /// `starts` holds each covered frame's absolute output start, in scan
-    /// order; `end` is the lane's absolute output end.
+    /// `starts` holds each covered frame's (frame index, absolute output
+    /// start) in lane order; `end` is the lane's absolute output end.
     Done {
-        starts: Vec<usize>,
+        starts: Vec<(usize, usize)>,
         end: usize,
         #[cfg(feature = "hash")]
-        checksum_err: Option<FrameDecoderError>,
+        checksum_err: Option<(usize, FrameDecoderError)>,
     },
     Failed {
         seg: usize,
@@ -136,10 +100,11 @@ enum LaneOutcome {
 /// before returning, inside the caller's borrows.
 pub(super) struct LaneJob {
     stage: Arc<StageAJob>,
-    /// This lane's segment ids (whole frames, in input order).
-    segs: Range<usize>,
-    /// The covered frames' indices in scan order (checksum lookup).
-    frames: Range<usize>,
+    /// This lane's segment ids, ascending (whole frames, any frame set).
+    segs: Vec<usize>,
+    /// The covered frames' indices in scan order, aligned with the
+    /// frame-start segments of `segs`.
+    frames: Vec<usize>,
     input: *const [u8],
     segments: *const [SegmentPlan],
     base: *mut u8,
@@ -152,8 +117,8 @@ pub(super) struct LaneJob {
 
 // SAFETY: the frozen slices and the output base are touched only while
 // the driver's `LeaseOut` guard keeps the borrows live (every lease is
-// waited out before the driver returns); the mutable fields are mutex,
-// condvar or atomic.
+// waited out before the driver returns, inside the caller's borrows);
+// the mutable fields are mutex, condvar or atomic.
 unsafe impl Send for LaneJob {}
 // SAFETY: Sync follows Send here: the frozen slices are read-only past
 // construction and every mutable field is synchronized.
@@ -193,11 +158,14 @@ fn take_staged(
 /// output base), then execute the lane's own segments in order.
 fn run_lane(lane: &LaneJob) {
     let stage = &lane.stage;
-    // The lane's output base: the sum of every predecessor's staged size.
-    // A predecessor that failed staging belongs to an earlier lane, which
-    // records its error; this lane just stops.
+    // The lane's output base: the sum of every predecessor segment's
+    // staged size — all segments before the lane's first one, which is
+    // its first frame's first segment. A predecessor that failed staging
+    // belongs to an earlier lane, which records its error; this lane just
+    // stops.
+    let first_seg = lane.segs.first().copied().unwrap_or(0);
     let mut base = 0usize;
-    for i in 0..lane.segs.start {
+    for i in 0..first_seg {
         loop {
             match stage.seg_sizes[i].load(Ordering::Acquire) {
                 0 => {},
@@ -228,7 +196,7 @@ fn run_lane(lane: &LaneJob) {
     let input: &[u8] = unsafe { &*lane.input };
     #[cfg(test)]
     if LANE_PANIC_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr()
-        || (lane.segs.start != 0
+        || (lane.frames.first().is_some_and(|&f| f != 0)
             && LANE_PANIC_POOL_INPUT.load(Ordering::Relaxed).cast_const() == input.as_ptr())
     {
         panic!("injected lane panic");
@@ -243,32 +211,31 @@ fn run_lane(lane: &LaneJob) {
     let mut frame_base = base;
     let mut frame_local = 0usize;
     let mut end = base;
+    let mut frame_at = 0usize;
     #[cfg(feature = "hash")]
     let mut checksum_err = None;
     #[cfg(feature = "hash")]
     let mut hash = Xxh64::new(0);
     // Compare the closed frame's checksum, recording the first mismatch.
-    // The closing frame is the last one pushed to `starts`; call before
-    // pushing the next frame's start.
+    // The closing frame is `lane.frames[frame_at - 1]`.
     #[cfg(feature = "hash")]
     macro_rules! close_frame {
         () => {
-            if let Some(expected) = checksums
-                .get(lane.frames.start + starts.len().saturating_sub(1))
-                .copied()
-                .flatten()
-            {
+            if let Some(expected) = checksums.get(lane.frames[frame_at - 1]).copied().flatten() {
                 let calculated = hash.finish() as u32;
                 if calculated != expected && checksum_err.is_none() {
-                    checksum_err = Some(FrameDecoderError::ChecksumMismatch {
-                        expected,
-                        calculated,
-                    });
+                    checksum_err = Some((
+                        lane.frames[frame_at - 1],
+                        FrameDecoderError::ChecksumMismatch {
+                            expected,
+                            calculated,
+                        },
+                    ));
                 }
             }
         };
     }
-    for id in lane.segs.clone() {
+    for &id in &lane.segs {
         let Some(staged) = take_staged(stage, id) else {
             record(lane, LaneOutcome::Aborted);
             return;
@@ -283,12 +250,13 @@ fn run_lane(lane: &LaneJob) {
         if segments[id].frame_start {
             offset_hist = [1, 4, 8];
             #[cfg(feature = "hash")]
-            if !starts.is_empty() {
+            if frame_at > 0 {
                 close_frame!();
             }
             frame_base = end;
             frame_local = 0;
-            starts.push(frame_base);
+            starts.push((lane.frames[frame_at], frame_base));
+            frame_at += 1;
             #[cfg(feature = "hash")]
             {
                 hash = Xxh64::new(0);
@@ -330,7 +298,9 @@ fn run_lane(lane: &LaneJob) {
     }
     // Close the last frame's checksum.
     #[cfg(feature = "hash")]
-    close_frame!();
+    if frame_at > 0 {
+        close_frame!();
+    }
     record(lane, LaneOutcome::Done {
         starts,
         end,
@@ -413,6 +383,19 @@ impl Place<'_> {
     }
 }
 
+/// Per-frame pricing inputs for the lane budget: pledged output bytes and
+/// staged volume, both plan-time. A frame whose block headers failed to
+/// parse contributes no staged volume, matching the head-ramp gate's
+/// convention for under-counted totals.
+fn frame_plans(plan: &ScanPlan) -> Vec<FramePlan> {
+    (0..plan.frame_pledges.len())
+        .map(|f| FramePlan {
+            out: plan.frame_pledges.get(f).copied().flatten().unwrap_or(0),
+            staged: plan.frame_staged.get(f).copied().flatten().unwrap_or(0),
+        })
+        .collect()
+}
+
 /// Frame-lane driver: stage on the pool as today, execute frames
 /// concurrently. Returns the total decoded bytes. The caller guarantees
 /// `workers >= 2` and at least two frames.
@@ -432,7 +415,25 @@ fn decode_frames(
         .collect();
     let n_frames = frame_starts.len();
     debug_assert!(n_frames >= 2, "the caller routes multi-frame input only");
-    let k_lanes = (workers as usize).min(n_frames);
+    // The lane budget: a payload whose frames all pledge their output
+    // trades lanes for staging workers per the plan-time walk; anything
+    // else keeps the stock layout, `min(workers, frames)` consecutive
+    // lanes with the per-worker staging window.
+    let plans = frame_plans(plan);
+    let budget: Option<LaneBudget> = if plan.frame_pledges.iter().all(|p| p.is_some()) {
+        lane_budget::plan(&plans, workers)
+    } else {
+        None
+    };
+    let k_lanes = budget
+        .as_ref()
+        .map_or_else(|| (workers as usize).min(n_frames), |b| b.lanes);
+    let lane_specs: Vec<LaneSpec> = if budget.as_ref().is_some_and(|b| b.lpt) {
+        let weights: Vec<u64> = plans.iter().map(|p| p.out).collect();
+        lane_budget::group_lpt(&weights, k_lanes)
+    } else {
+        lane_budget::group_consecutive(n_frames, k_lanes)
+    };
     // Budget: the caller runs lane 0, pool lanes take K-1 threads, stage A
     // the rest of the worker budget (at least one).
     let stage_workers = (workers as usize)
@@ -441,13 +442,15 @@ fn decode_frames(
         .max(1);
     // The staging-ahead window keeps the serial regime's in-flight bound
     // in fixed mode; deferred mode stages to completion before executing,
-    // so the window is the whole plan (the piece executor's model).
-    let window = if place.deferred() {
-        n_segments
-    } else {
-        workers as usize
+    // so the window is the whole plan (the piece executor's model). The
+    // budget may free the fixed-mode window: with fewer lanes than
+    // workers, base settlement needs staging far ahead of execution,
+    // bounded by the plan's total staged volume.
+    let window = match (place.deferred(), budget.as_ref().map(|b| b.free_window)) {
+        (true, _) => n_segments,
+        (false, Some(true)) => n_segments,
+        (false, _) => workers as usize,
     };
-    let lane_specs = group_lanes(&frame_starts, n_segments, k_lanes);
     let job = StageAJob::for_lanes(input, segments, stage_workers, window);
     let stage_lease = Arc::new(super::mt_pool::LeaseJob::StageA(job.clone()));
     let stage_leases: Vec<_> = super::mt_pool::lease_workers(stage_workers, &stage_lease)
@@ -465,8 +468,8 @@ fn decode_frames(
         &job,
         n_segments,
         n_frames,
+        &frame_starts,
         &lane_specs,
-        k_lanes,
     );
     drop(guard);
     if let Some(payload) = job.poison.lock().unwrap().take() {
@@ -486,16 +489,24 @@ fn run(
     job: &Arc<StageAJob>,
     n_segments: usize,
     n_frames: usize,
+    frame_starts: &[usize],
     lane_specs: &[LaneSpec],
-    k_lanes: usize,
 ) -> Result<usize, FrameDecoderError> {
     let (base, buf_limit) = place.resolve(job, n_segments)?;
     let lane_jobs: Vec<Arc<LaneJob>> = lane_specs
         .iter()
         .map(|spec| {
+            // The lane's segment list: each covered frame's own segments,
+            // ascending, whole frames only.
+            let mut segs = Vec::new();
+            for &f in &spec.frames {
+                let start = frame_starts[f];
+                let end = frame_starts.get(f + 1).copied().unwrap_or(n_segments);
+                segs.extend(start..end);
+            }
             Arc::new(LaneJob {
                 stage: job.clone(),
-                segs: spec.segs.clone(),
+                segs,
                 frames: spec.frames.clone(),
                 input,
                 segments: plan.segments.as_slice(),
@@ -526,10 +537,13 @@ fn run(
     let outcome = (|| -> Result<usize, FrameDecoderError> {
         // The caller is lane 0; the pool lanes record into their slots.
         run_lane(&lane_jobs[0]);
-        let mut starts = Vec::with_capacity(n_frames);
+        let mut starts_by_frame = Vec::with_capacity(n_frames);
+        starts_by_frame.resize(n_frames, None);
         let mut written = 0usize;
         let mut first_fail: Option<(usize, FrameDecoderError)> = None;
-        let mut checksum_err = None;
+        // Frame order among checksum errors, matching the serial stream.
+        #[cfg(feature = "hash")]
+        let mut checksum_err: Option<(usize, FrameDecoderError)> = None;
         let mut aborted = false;
         for (li, lane) in lane_jobs.iter().enumerate() {
             let outcome = if li == 0 {
@@ -543,19 +557,22 @@ fn run(
             };
             match outcome {
                 Some(LaneOutcome::Done {
-                    starts: mut lane_starts,
+                    starts,
                     end,
                     #[cfg(feature = "hash")]
                         checksum_err: lane_checksum_err,
                 }) => {
-                    if li + 1 == lane_jobs.len() {
-                        written = end;
+                    written = written.max(end);
+                    for (f, start) in starts {
+                        debug_assert!(starts_by_frame[f].is_none(), "one lane per frame");
+                        starts_by_frame[f] = Some(start);
                     }
                     #[cfg(feature = "hash")]
-                    if lane_checksum_err.is_some() && checksum_err.is_none() {
-                        checksum_err = lane_checksum_err;
+                    if let Some((f, err)) = lane_checksum_err {
+                        if checksum_err.as_ref().is_none_or(|(cf, _)| f < *cf) {
+                            checksum_err = Some((f, err));
+                        }
                     }
-                    starts.append(&mut lane_starts);
                 },
                 Some(LaneOutcome::Failed { seg, err }) => {
                     if first_fail.as_ref().is_none_or(|(s, _)| seg < *s) {
@@ -570,7 +587,8 @@ fn run(
         if let Some((_, err)) = first_fail {
             return Err(err);
         }
-        if let Some(err) = checksum_err {
+        #[cfg(feature = "hash")]
+        if let Some((_, err)) = checksum_err {
             return Err(err);
         }
         // An aborted lane without a recorded failure implies the pool
@@ -584,9 +602,11 @@ fn run(
         if aborted {
             return Err(FrameDecoderError::NotYetInitialized);
         }
-        debug_assert_eq!(starts.len(), n_frames, "every lane completed");
+        let starts: Vec<usize> = starts_by_frame
+            .into_iter()
+            .map(|s| s.expect("every lane completed"))
+            .collect();
         verify_frame_content_sizes(&plan.frame_pledges, &starts, written)?;
-        let _ = k_lanes;
         Ok(written)
     })();
     drop(lane_guard);
@@ -664,6 +684,19 @@ mod tests {
             &EncoderOptions::new(level)
                 .checksum(checksum)
                 .workers(workers),
+        )
+        .unwrap()
+    }
+
+    /// A compressed frame whose header declares its content size: the
+    /// lane budget prices the walk from the pledges.
+    fn compress_pledged(data: &[u8], level: Level, checksum: bool, workers: u32) -> Vec<u8> {
+        bulk::compress_with(
+            data,
+            &EncoderOptions::new(level)
+                .checksum(checksum)
+                .workers(workers)
+                .pledged_size(Some(data.len() as u64)),
         )
         .unwrap()
     }
@@ -791,6 +824,38 @@ mod tests {
 
     /// The append contract holds behind a non-empty prefix, and the length
     /// stays unchanged on a checksum error.
+    /// A pledged multi-frame stream takes a plan-time budget on the MT
+    /// path. The counter never false-fails under the shared-process test
+    /// harness: a concurrent test's decode can only add engagements.
+    #[test]
+    fn multiframe_decode_takes_lane_budget() {
+        // Small textish frames over a noise anchor: the frames pledge
+        // their sizes and the anchor carries the stream past the parallel
+        // floor.
+        let mut rng = Rng(0x1a2e);
+        let mut stream = Vec::new();
+        let mut raws = Vec::new();
+        // Pledged frames: the budget prices the walk from the pledges,
+        // so every frame declares its content size.
+        for i in 0..5u64 {
+            let raw = textish(0x700 + i, 96 * 1024);
+            stream.extend_from_slice(&compress_pledged(&raw, Level::Fastest, true, 1));
+            raws.push(raw);
+        }
+        let raw = noise(&mut rng, 600 * 1024);
+        stream.extend_from_slice(&compress_pledged(&raw, Level::Fastest, true, 1));
+        raws.push(raw);
+        let expect = expected_output(&raws);
+        let before = super::super::lane_budget::engagements();
+        let mut placed = vec![0u8; expect.len()];
+        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW).unwrap();
+        assert_eq!(&placed[..n], &expect[..]);
+        assert!(
+            super::super::lane_budget::engagements() > before,
+            "the lane budget must engage on pledged multi-frame input"
+        );
+    }
+
     #[test]
     fn multiframe_append_contract() {
         let (stream, raws, parts) = multiframe_stream();
@@ -975,26 +1040,6 @@ mod tests {
                 .map(std::string::String::as_str)
         });
         assert_eq!(msg, Some("injected lane panic"));
-    }
-
-    /// Lane grouping invariants: whole frames per lane, ascending, covering.
-    #[test]
-    fn lane_grouping_covers_whole_frames() {
-        let frame_starts = vec![0, 3, 7, 9, 12];
-        let specs = super::group_lanes(&frame_starts, 14, 3);
-        assert_eq!(specs.len(), 3);
-        assert_eq!(specs[0].segs, 0..3);
-        assert_eq!(specs[1].segs, 3..9);
-        assert_eq!(specs[2].segs, 9..14);
-        assert_eq!(specs[0].frames, 0..1);
-        assert_eq!(specs[1].frames, 1..3);
-        assert_eq!(specs[2].frames, 3..5);
-        // One lane per frame when frames fit the budget.
-        let specs = super::group_lanes(&frame_starts, 14, 5);
-        assert_eq!(
-            specs.iter().map(|s| s.segs.clone()).collect::<Vec<_>>(),
-            vec![0..3, 3..7, 7..9, 9..12, 12..14]
-        );
     }
 
     /// Deterministic property: streams of 1..=16 frames — empty and

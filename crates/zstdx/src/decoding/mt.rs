@@ -153,6 +153,11 @@ pub(super) struct ScanPlan {
     /// carrying it (`None` for multi-frame/skippable inputs or frames
     /// without a size pledge). The piece-parallel executor needs it.
     pub(super) pledged_single: Option<u64>,
+    /// Per-frame staged volume, the literals bytes plus sequence records
+    /// at 12 B each, `None` when a block's headers failed to parse so the
+    /// totals under-count. Plan-time pricing input for the frame-lane
+    /// budget; nothing on the decode path reads it.
+    pub(super) frame_staged: Vec<Option<u64>>,
 }
 
 /// How stage B walks a block whose stage A staging is done. Every variant
@@ -672,6 +677,8 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
     #[cfg(feature = "hash")]
     let mut checksums: Vec<Option<u32>> = Vec::new();
     let mut frame_pledges: Vec<Option<u64>> = Vec::new();
+    #[cfg(feature = "std")]
+    let mut frame_staged_acc: Vec<Option<u64>> = Vec::new();
     let mut n_frames = 0usize;
     let mut saw_skip = false;
     let mut pledged_single: Option<u64> = None;
@@ -693,6 +700,8 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
             Err(_) => return None,
         };
         n_frames += 1;
+        #[cfg(feature = "std")]
+        frame_staged_acc.push(None);
         let fcs_present = frame_header.descriptor.frame_content_size_flag() != 0
             || frame_header.descriptor.single_segment_flag();
         frame_pledges.push(fcs_present.then(|| frame_header.frame_content_size()));
@@ -716,6 +725,12 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         let restarts = restart_candidates(&probes);
         let frame_end = blocks.last()?.body.end;
         let ramp = volumes.ramp_eligible(workers, frame_end - blocks_start);
+        #[cfg(feature = "std")]
+        {
+            let idx = frame_staged_acc.len() - 1;
+            frame_staged_acc[idx] = (volumes.complete)
+                .then(|| volumes.literals + SEQUENCE_RECORD_BYTES * volumes.sequences);
+        }
         if checksummed {
             let trailer_end = frame_end.checked_add(4)?;
             if trailer_end > input.len() {
@@ -783,6 +798,8 @@ fn scan(input: &[u8], workers: u32, max_window_size: u64) -> Option<ScanPlan> {
         checksums,
         frame_pledges,
         pledged_single,
+        #[cfg(feature = "std")]
+        frame_staged: frame_staged_acc,
     };
     // A high-ratio frame (compressed input under the MT floor, pledge in
     // the piece regime) legitimately yields a single segment: stage A on a

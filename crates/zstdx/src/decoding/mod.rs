@@ -23,6 +23,8 @@ pub(crate) mod flat_buffer;
 /// inspect frames without decoding them (the CLI's `--list`).
 pub mod frame;
 pub(crate) mod frame_source;
+#[cfg(feature = "std")]
+pub(crate) mod lane_budget;
 pub(crate) mod literals_section_decoder;
 #[cfg(feature = "std")]
 pub(crate) mod mt;
