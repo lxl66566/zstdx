@@ -7,12 +7,14 @@
 # Usage:
 #   bench/pass.sh [--out DIR] [section ...]
 #
-# Sections default to the daily set: dec-st dec-mt files-dll enc-st enc-mt8
-# enc-mt16 enc-stream small ratio. The name "all" replaces the list with
-# the daily set plus the full numeric ladder per shape, the release gate.
-# Each section's output lands in <out>/<section>.log; a summary table with
-# per-section walls prints at the end. dll100 payloads join automatically
-# when bench/big carries them; generate with bench/gen_big.sh.
+# Sections default to the daily set: dec-st dec-mt files-dll files-multi
+# enc-st enc-mt8 enc-mt16 enc-stream small ratio. The name "all" replaces
+# the list with the daily set plus the full numeric ladder per shape, the
+# release gate. Each section's output lands in <out>/<section>.log; a
+# summary table with per-section walls prints at the end. dll100 payloads
+# join automatically when bench/big carries them; generate with
+# bench/gen_big.sh, and the multi-frame payload joins likewise through
+# bench/gen_multiframe.sh.
 #
 # The output directory defaults under bench/scratch/, which is gitignored;
 # pass --out to place it elsewhere.
@@ -32,7 +34,7 @@ while [ $# -gt 0 ]; do
         *) sections+=("$1"); shift ;;
     esac
 done
-DAILY=(dec-st dec-mt files-dll enc-st enc-mt8 enc-mt16 enc-stream small ratio)
+DAILY=(dec-st dec-mt files-dll files-multi enc-st enc-mt8 enc-mt16 enc-stream small ratio)
 if [ ${#sections[@]} -eq 0 ]; then
     sections=("${DAILY[@]}")
 elif [ "${sections[0]}" = "all" ]; then
@@ -43,11 +45,14 @@ fi
 DEC_FILES=()
 ENC_FILES=()
 DLL_ZST3=""
+MULTI_ZST3=""
 for f in bench/big/dll100.zst1 bench/big/dll100.zst3 bench/big/dll100.zst9 bench/big/dll100.zst19; do
     [ -f "$f" ] && DEC_FILES+=(--file "$f")
 done
+[ -f bench/big/multi.zst3 ] && DEC_FILES+=(--file bench/big/multi.zst3)
 [ -f bench/big/dll100.raw ] && ENC_FILES+=(--file bench/big/dll100.raw)
 [ -f bench/big/dll100.zst3 ] && DLL_ZST3=bench/big/dll100.zst3
+[ -f bench/big/multi.zst3 ] && MULTI_ZST3=bench/big/multi.zst3
 
 mkdir -p "$out"
 echo "== building (release, one build for every section) =="
@@ -62,6 +67,9 @@ run_section() {
         files-dll)
             [ -n "$DLL_ZST3" ] || return 2
             "$BIN" files --threads 2,4,8,16 "$DLL_ZST3" ;;
+        files-multi)
+            [ -n "$MULTI_ZST3" ] || return 2
+            "$BIN" files --threads 2,4,8,16 "$MULTI_ZST3" ;;
         enc-st)     "$BIN" matrix --mode enc-st "${ENC_FILES[@]}" ;;
         enc-mt8)    "$BIN" matrix --mode enc-mt --workers 8 --mt-workers 8 ;;
         enc-mt16)   "$BIN" matrix --mode enc-mt --workers 16 --mt-workers 16 ;;

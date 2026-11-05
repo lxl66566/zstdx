@@ -61,6 +61,10 @@ cargo run --release -p zstdx-bench -- matrix --mode dec-st \
     --file bench/big/dll100.zst3 --file bench/big/dll100.zst9
 ```
 
+### Multi-frame decode payload
+
+`bash bench/gen_multiframe.sh` concatenates six independent level-3 frames over mixed corpus shapes into `bench/big/multi.zst3` — 32 MiB of output, one dominant 16 MiB frame — plus the raw concatenation `bench/big/multi.raw` as its verification counterpart. It needs `bench/gen_corpus.sh` first. The payload gives the multi-frame parallel-decode lever its wall cell: `files --threads` measures today's whole-stream wall at st and every worker count, where stage A already stages across frame boundaries and stage B executes every frame's segments in input order (see `docs/src/dev/research.md`, Wildcards).
+
 ### `small`: small-payload encode
 
 Measures per-call encode throughput for 1 KiB to 1 MiB payloads, including allocator effects, with zstdx against libzstd at the same numeric level. `--level` defaults to `fastest` and accepts tier names or numeric levels from 1 to 22. The timed zstdx side runs checksum-off, which matches the default of `zstd::bulk::compress`. The crate's `hash`-feature default of checksummed frames plus a sidecar thread above 256 KiB is a real user cost and not a fair A/B. `--size` and `--impl zstdx|zstd` pin one size or implementation for profiler attribution.
@@ -77,6 +81,7 @@ Decodes the given `.zst` files under a time budget and verifies against the raw 
 ```bash
 cargo run --release -p zstdx-bench -- files bench/corpus/*.zst3
 cargo run --release -p zstdx-bench -- files --threads 4,8,16 frames/*.zst3
+cargo run --release -p zstdx-bench -- files --threads 4,8,16 bench/big/multi.zst3
 ```
 
 ### `emitframe`: emit one corpus file as a frame
@@ -208,4 +213,4 @@ cargo run --release -p zstdx-bench -- train bench/dict_files --out dict.bin --si
 
 ## `bench/pass.sh`: full-pass driver
 
-`bash bench/pass.sh` builds the release binary once and then runs every section of a daily pass against the prebuilt binary under the shared machine lock, with per-section wall times in a summary table and each section's output in `<out>/<section>.log` (default under `bench/scratch/`). Sections default to `dec-st dec-mt files-dll enc-st enc-mt8 enc-mt16 enc-stream small ratio`; `bash bench/pass.sh all` adds the per-shape full numeric ladders, the release gate. Name sections explicitly to run a subset, and `--out DIR` relocates the logs. dll100 payloads join automatically when `bench/big` carries them, so run `bash bench/gen_big.sh` once beforehand.
+`bash bench/pass.sh` builds the release binary once and then runs every section of a daily pass against the prebuilt binary under the shared machine lock, with per-section wall times in a summary table and each section's output in `<out>/<section>.log` (default under `bench/scratch/`). Sections default to `dec-st dec-mt files-dll files-multi enc-st enc-mt8 enc-mt16 enc-stream small ratio`; `bash bench/pass.sh all` adds the per-shape full numeric ladders, the release gate. Name sections explicitly to run a subset, and `--out DIR` relocates the logs. dll100 payloads join automatically when `bench/big` carries them, so run `bash bench/gen_big.sh` once beforehand; the multi-frame payload joins the same way through `bash bench/gen_multiframe.sh`.
