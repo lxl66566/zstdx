@@ -43,6 +43,46 @@ fn check(data: &[u8]) {
     }
 }
 
+/// One committed restart-poor frame per process: libzstd -9 over
+/// semi-structured records emits table-carrying epochs far longer than
+/// the segment target, so the planner cuts mid-epoch and every later
+/// lease primes its scratch from the recorded table epoch — the class
+/// the mid-epoch equivalence tests pin in-process. The -9 build over
+/// 8 MiB (a frame around 830 KiB, safely above the parallel floor) is
+/// too expensive per input, so it parks in a process-wide OnceLock.
+fn restart_poor_frame() -> &'static [u8] {
+    static FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    FRAME.get_or_init(|| {
+        let mut state = 12345u64;
+        let mut data = Vec::with_capacity(8 * 1024 * 1024);
+        let mut id = 0u64;
+        while data.len() < 8 * 1024 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let user = (state >> 33) % 5000;
+            let event = match (state >> 45) % 5 {
+                0 => "click",
+                1 => "view",
+                2 => "purchase",
+                3 => "error",
+                _ => "login",
+            };
+            let payload_len = ((state >> 25) % 24) as usize;
+            data.extend_from_slice(
+                format!(
+                    "{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"\
+                     payload\":\"",
+                    1700000000 + id
+                )
+                .as_bytes(),
+            );
+            data.resize(data.len() + payload_len, b'x');
+            data.extend_from_slice(b"\",\"score\":0.5}\n");
+            id += 1;
+        }
+        zstd::bulk::compress(&data, 9).unwrap()
+    })
+}
+
 /// Minimal xorshift for deterministic payloads.
 struct Rng(u64);
 impl Rng {
@@ -128,15 +168,12 @@ fn mt_frames_seed(data: &[u8]) {
         check(&frame);
     }
 
-    // Restart-poor epoch class: libzstd -9 emits table-carrying epochs
-    // far longer than the segment target, so the planner cuts mid-epoch
-    // and every later lease primes its scratch from the recorded table
-    // epoch.
+    // Restart-poor epoch class (the mid-epoch table priming): the frame
+    // parks per process, and every qualifying input re-decodes it through
+    // both entry points — the re-decode probes the staging pool's residue
+    // reuse, the class's own hazard.
     if byte(0) & 7 == 0 {
-        let len = 288 * 1024 + byte(8) as usize % 4096;
-        let payload = textish(&mut rng, len);
-        let frame = zstd::bulk::compress(&payload, 9).unwrap();
-        check(&frame);
+        check(restart_poor_frame());
     }
 
     // Fallback regime: a small frame under the MT floor must decode

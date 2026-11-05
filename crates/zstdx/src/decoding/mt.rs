@@ -1973,12 +1973,13 @@ mod tests {
         assert_eq!(out, data);
     }
 
-    /// Semi-structured records make libzstd emit Huffman-coded literals in
-    /// back-to-back blocks, so segments stage several Huffman sections into
-    /// one accumulated literals buffer (the absolute-length check in
-    /// `decompress_literals` used to reject the second one).
-    #[test]
-    fn zstd_crate_output_decodes_semi_structured() {
+    /// Eight MiB of semi-structured records: libzstd emits Huffman-coded
+    /// literals in back-to-back blocks, so segments stage several Huffman
+    /// sections into one accumulated literals buffer (the absolute-length
+    /// check in `decompress_literals` used to reject the second one), and
+    /// the -9 frame carries table epochs far longer than the segment
+    /// target (the mid-epoch priming class).
+    fn semi_structured_records() -> Vec<u8> {
         let mut state = 12345u64;
         let mut data = Vec::with_capacity(8 * 1024 * 1024);
         let mut id = 0u64;
@@ -2005,6 +2006,14 @@ mod tests {
             data.extend_from_slice(b"\",\"score\":0.5}\n");
             id += 1;
         }
+        data
+    }
+
+    /// The records frame decodes byte-exact through both parallel entry
+    /// points at every level.
+    #[test]
+    fn zstd_crate_output_decodes_semi_structured() {
+        let data = semi_structured_records();
         for level in [1, 3, 9] {
             let compressed = zstd::bulk::compress(&data, level).unwrap();
             let mut out = Vec::new();
@@ -2603,6 +2612,30 @@ mod tests {
                 assert_eq!(&placed[..n], &expect[..], "{name} at {workers} workers");
             }
         }
+    }
+
+    /// The committed decode_mt fuzz seed compresses `semi_structured_records`
+    /// at libzstd -9 and parks the frame once per process; this pins that
+    /// the constructed class actually routes through primed mid-epoch
+    /// segments (a restart-poor frame above the MT floor whose cuts land
+    /// inside table-carrying epochs) instead of falling back to the
+    /// sequential path.
+    #[test]
+    fn libzstd_nine_records_route_through_primed_segments() {
+        let data = semi_structured_records();
+        let frame = zstd::bulk::compress(&data, 9).unwrap();
+        let plan = scan(&frame, 4, MAX_WINDOW).expect("the records frame must scan");
+        assert!(
+            plan.segments.len() >= 2,
+            "the -9 records frame must segment"
+        );
+        assert!(
+            plan.segments.iter().any(|s| s.prime.is_some()),
+            "the -9 records class must cut mid-epoch"
+        );
+        let mut out = Vec::new();
+        decode_to_vec_mt(&frame, &mut out, 4, MAX_WINDOW).unwrap();
+        assert_eq!(out, data);
     }
 
     /// Scan one frame's blocks and probes (single-frame inputs).
