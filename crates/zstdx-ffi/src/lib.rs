@@ -20,7 +20,7 @@ mod frame;
 mod params;
 mod simple;
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 
 // The C symbols live at the crate root, as on the C side.
 pub use dict::*;
@@ -49,6 +49,13 @@ pub struct ZSTD_CDict {
 }
 #[repr(C)]
 pub struct ZSTD_DDict {
+    _opaque: [u8; 0],
+}
+
+/// Opaque `ZSTD_CCtx_params` handle: the real state is
+/// `params::CCtxParams` behind the pointer.
+#[repr(C)]
+pub struct ZSTD_CCtx_params {
     _opaque: [u8; 0],
 }
 
@@ -99,7 +106,7 @@ pub enum ZSTD_ResetDirective {
 impl ZSTD_ResetDirective {
     /// The directive for a raw C value, `None` for anything else.
     #[must_use]
-    pub fn from_raw(raw: core::ffi::c_int) -> Option<Self> {
+    pub fn from_raw(raw: c_int) -> Option<Self> {
         match raw {
             1 => Some(Self::SessionOnly),
             2 => Some(Self::Parameters),
@@ -117,7 +124,7 @@ pub struct ZSTD_FrameHeader {
     pub window_size: u64,
     pub block_size_max: core::ffi::c_uint,
     /// `ZSTD_frame` (0) or `ZSTD_skippableFrame` (1).
-    pub frame_type: core::ffi::c_int,
+    pub frame_type: c_int,
     pub header_size: core::ffi::c_uint,
     /// For skippable frames the magic variant 0..=15.
     pub dict_id: core::ffi::c_uint,
@@ -128,9 +135,9 @@ pub struct ZSTD_FrameHeader {
 
 /// `ZSTD_FrameType_e` values (the C names are the ABI).
 #[allow(non_upper_case_globals)]
-pub const ZSTD_frame: core::ffi::c_int = 0;
+pub const ZSTD_frame: c_int = 0;
 #[allow(non_upper_case_globals)]
-pub const ZSTD_skippableFrame: core::ffi::c_int = 1;
+pub const ZSTD_skippableFrame: c_int = 1;
 
 // libzstd naming is the ABI contract; the crate keeps it verbatim.
 #[allow(non_camel_case_types)]
@@ -324,8 +331,8 @@ unsafe fn dctx_mut<'a>(ptr: *mut ZSTD_DCtx) -> &'a mut dctx::DCtx {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
     cctx: *mut ZSTD_CCtx,
-    param: core::ffi::c_int,
-    value: core::ffi::c_int,
+    param: c_int,
+    value: c_int,
 ) -> usize {
     if cctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -343,8 +350,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
     dctx: *mut ZSTD_DCtx,
-    param: core::ffi::c_int,
-    value: core::ffi::c_int,
+    param: c_int,
+    value: c_int,
 ) -> usize {
     if dctx.is_null() {
         return ret(ErrorCode::Generic);
@@ -375,7 +382,7 @@ pub unsafe extern "C" fn ZSTD_CCtx_setPledgedSrcSize(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: core::ffi::c_int) -> usize {
+pub unsafe extern "C" fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: c_int) -> usize {
     let Some(directive) = ZSTD_ResetDirective::from_raw(reset) else {
         // libzstd's fall-through: an unknown directive resets nothing and
         // still reports success.
@@ -393,7 +400,7 @@ pub unsafe extern "C" fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: core::ffi:
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_DCtx_reset(dctx: *mut ZSTD_DCtx, reset: core::ffi::c_int) -> usize {
+pub unsafe extern "C" fn ZSTD_DCtx_reset(dctx: *mut ZSTD_DCtx, reset: c_int) -> usize {
     let Some(directive) = ZSTD_ResetDirective::from_raw(reset) else {
         return 0;
     };
@@ -626,6 +633,83 @@ pub unsafe extern "C" fn ZSTD_CCtx_refCDict(
     }
 }
 
+/// `ZSTD_CCtx_setCParams`: the bounds check, then the window knob alone;
+/// the remaining knobs have no engine counterpart and any non-zero value
+/// is refused with `parameter_unsupported` instead of silently ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setCParams(
+    cctx: *mut ZSTD_CCtx,
+    c_params: ZSTD_compressionParameters,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    match unsafe { cctx_mut(cctx) }.set_c_params(c_params) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_CCtx_setFParams`: the three frame flags.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setFParams(
+    cctx: *mut ZSTD_CCtx,
+    f_params: ZSTD_frameParameters,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    match unsafe { cctx_mut(cctx) }.set_f_params(f_params) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_CCtx_setParams`: cParams plus fParams, applied all-or-none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setParams(
+    cctx: *mut ZSTD_CCtx,
+    zstd_params: ZSTD_parameters,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    match unsafe { cctx_mut(cctx) }.set_zstd_params(zstd_params) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_CCtx_setParametersUsingCCtxParams`: adopt the bag. Refused
+/// mid-frame and with a CDict attached (the reference refuses the
+/// override too), and refused when any knob the engine cannot honor is
+/// set to a non-default value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setParametersUsingCCtxParams(
+    cctx: *mut ZSTD_CCtx,
+    params: *const ZSTD_CCtx_params,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    if params.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // SAFETY: the handles came from their creates' box round-trips and are
+    // still live.
+    let bag = unsafe { &*params.cast::<CCtxParams>() };
+    match unsafe { cctx_mut(cctx) }.set_parameters_using(bag) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
 /// `ZSTD_DCtx_refPrefix`: the raw-content prefix for the next frame only
 /// (`use_once`).
 #[unsafe(no_mangle)]
@@ -718,7 +802,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     dst_capacity: usize,
     src: *const c_void,
     src_size: usize,
-    compression_level: core::ffi::c_int,
+    compression_level: c_int,
 ) -> usize {
     // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
     // contract.
@@ -784,7 +868,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     src_size: usize,
     dict: *const c_void,
     dict_size: usize,
-    compression_level: core::ffi::c_int,
+    compression_level: c_int,
 ) -> usize {
     // SAFETY: the caller-validated (src, src_size) read pair, per as_slice's
     // contract.
@@ -903,7 +987,7 @@ pub extern "C" fn ZSTD_CStreamOutSize() -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_initCStream(
     zcs: *mut ZSTD_CStream,
-    compression_level: core::ffi::c_int,
+    compression_level: c_int,
 ) -> usize {
     if zcs.is_null() {
         return ret(ErrorCode::Generic);
@@ -919,7 +1003,7 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     cctx: *mut ZSTD_CCtx,
     output: *mut ZSTD_outBuffer,
     input: *mut ZSTD_inBuffer,
-    end_op: core::ffi::c_int,
+    end_op: c_int,
 ) -> usize {
     if cctx.is_null() || output.is_null() || input.is_null() {
         return ret(ErrorCode::Generic);

@@ -94,6 +94,123 @@ pub unsafe extern "C" fn ZSTD_createCDict_byReference(
 
 crate::handle_free!(ZSTD_freeCDict, ZSTD_CDict, CDict);
 
+/// The shared CDict build: the content-type load rules, plus the level
+/// and LDM mode the handle carries.
+///
+/// SAFETY-helper note: `bytes` is the caller-validated dictionary read
+/// pair per `dict_bytes`'s contract.
+unsafe fn build_cdict(
+    bytes: Option<&[u8]>,
+    dict_content_type: crate::params::DictContentType,
+    level: core::ffi::c_int,
+    ldm: zstdx::LdmMode,
+) -> Option<CDict> {
+    let bytes = bytes.unwrap_or(&[]);
+    let parsed = match dict_content_type {
+        crate::params::DictContentType::Auto => zstdx::EncoderDictionary::parse(bytes),
+        crate::params::DictContentType::RawContent => {
+            Ok(zstdx::EncoderDictionary::raw_content(bytes))
+        },
+        crate::params::DictContentType::FullDict => {
+            if bytes.len() < 8 || bytes.first_chunk::<4>() != Some(&crate::params::DICT_MAGIC) {
+                return None;
+            }
+            zstdx::EncoderDictionary::parse(bytes)
+        },
+    };
+    let dict = match parsed {
+        Ok(dict) => (!bytes.is_empty()).then_some(dict),
+        Err(_) => return None,
+    };
+    Some(CDict {
+        dict,
+        level,
+        ldm,
+        raw_len: bytes.len(),
+    })
+}
+
+/// `ZSTD_createCDict_advanced`: custom allocators are refused (the
+/// null-default `customMem` only, as `createDDict_advanced` records),
+/// and explicit cParams are refused with NULL when any knob is
+/// non-zero: this codec exposes no per-knob tuning, so adopting one
+/// could only silently ignore it. Zeroed knobs take the level-default
+/// row (the reference resolves `ZSTD_CLEVEL_DEFAULT`), so an all-zero
+/// cParams CDict equals `createCDict` at level 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_createCDict_advanced(
+    dict_buffer: *const core::ffi::c_void,
+    dict_size: usize,
+    dict_load_method: crate::params::DictLoadMethod,
+    dict_content_type: crate::params::DictContentType,
+    c_params: crate::params::ZSTD_compressionParameters,
+    custom_mem: crate::ZSTD_customMem,
+) -> *mut ZSTD_CDict {
+    let _ = dict_load_method;
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    if c_params.hashLog != 0
+        || c_params.chainLog != 0
+        || c_params.searchLog != 0
+        || c_params.minMatch != 0
+        || c_params.targetLength != 0
+        || c_params.strategy.0 != 0
+        || c_params.windowLog != 0
+    {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
+    let bytes = unsafe { dict_bytes(dict_buffer, dict_size) };
+    unsafe {
+        build_cdict(
+            bytes,
+            dict_content_type,
+            crate::DEFAULT_CLEVEL,
+            zstdx::LdmMode::Auto,
+        )
+    }
+    .map(|c| Box::into_raw(Box::new(c)).cast())
+    .unwrap_or_else(core::ptr::null_mut)
+}
+
+/// `ZSTD_createCDict_advanced2`: the bag-based constructor. The null-
+/// default `customMem` only, and the same knob refusal as the bag apply
+/// path (`CCtxParams::unsupported_requests`): the level and the LDM
+/// switch are honored, everything else must sit at its default.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_createCDict_advanced2(
+    dict_buffer: *const core::ffi::c_void,
+    dict_size: usize,
+    dict_load_method: crate::params::DictLoadMethod,
+    dict_content_type: crate::params::DictContentType,
+    cctx_params: *const crate::ZSTD_CCtx_params,
+    custom_mem: crate::ZSTD_customMem,
+) -> *mut ZSTD_CDict {
+    let _ = dict_load_method;
+    if !custom_mem.is_default() || cctx_params.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the caller-provided bag, live per its create's contract.
+    let bag = unsafe { &*cctx_params.cast::<crate::params::CCtxParams>() };
+    if bag.unsupported_requests() || bag.c_params_window_log() != 0 {
+        return core::ptr::null_mut();
+    }
+    let ldm = match bag.ldm_switch() {
+        1 => zstdx::LdmMode::Enable,
+        2 => zstdx::LdmMode::Disable,
+        _ => zstdx::LdmMode::Auto,
+    };
+    // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
+    // contract.
+    let bytes = unsafe { dict_bytes(dict_buffer, dict_size) };
+    let level = bag.compression_level_for_context();
+    unsafe { build_cdict(bytes, dict_content_type, level, ldm) }
+        .map(|c| Box::into_raw(Box::new(c)).cast())
+        .unwrap_or_else(core::ptr::null_mut)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_getDictID_fromCDict(cdict: *const ZSTD_CDict) -> core::ffi::c_uint {
     // SAFETY: the caller-provided handle, live per the create's box

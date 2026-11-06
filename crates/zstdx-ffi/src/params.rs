@@ -1177,6 +1177,26 @@ pub extern "C" fn ZSTD_adjustCParams(
     )
 }
 
+/// `ZSTD_checkCParams` core: every knob inside its cParam bounds.
+pub(crate) fn check_c_params(c_params: ZSTD_compressionParameters) -> Result<(), ErrorCode> {
+    use CParamId as id;
+    let fields = [
+        (id::WindowLog, c_params.windowLog as i64),
+        (id::ChainLog, c_params.chainLog as i64),
+        (id::HashLog, c_params.hashLog as i64),
+        (id::SearchLog, c_params.searchLog as i64),
+        (id::MinMatch, c_params.minMatch as i64),
+        (id::TargetLength, c_params.targetLength as i64),
+        (id::Strategy, i64::from(c_params.strategy.raw())),
+    ];
+    for &(param, value) in &fields {
+        if !param.within_bounds(value as i32) {
+            return Err(ErrorCode::ParameterOutOfBound);
+        }
+    }
+    Ok(())
+}
+
 /// `ZSTD_checkCParams`: every knob inside its cParam bounds.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_checkCParams(c_params: ZSTD_compressionParameters) -> usize {
@@ -1302,6 +1322,641 @@ pub extern "C" fn ZSTD_estimateCDictSize(dict_size: usize, compression_level: c_
         CParamMode::CreateCDict,
     );
     ZSTD_estimateCDictSize_advanced(dict_size, c_params, DictLoadMethod::ByCopy)
+}
+
+// ---------------------------------------------------------------------------
+// The ZSTD_CCtx_params bag
+// ---------------------------------------------------------------------------
+
+/// The `ZSTD_CCtx_params` object: the reference's parameter bag, storage
+/// and readback only. Compression through a context adopts it wholesale
+/// (see `CCtx::set_parameters_using`); the bag itself stores every id the
+/// reference build's setter accepts, bounds-checked the same way, so
+/// setParameter/getParameter answer exactly as the reference build does.
+/// The worker knobs stay at their non-multithread-build behavior: a
+/// non-zero nbWorkers, jobSize, overlapLog or rsyncable answers
+/// `parameter_unsupported`, as the pinned reference library does.
+pub struct CCtxParams {
+    compression_level: i32,
+    c_params: ZSTD_compressionParameters,
+    f_params: ZSTD_frameParameters,
+    ldm: LdmParams,
+    nb_workers: i32,
+    // The worker knobs refuse every non-default value (the non-MT
+    // reference build), so their storage stays at zero; kept for the
+    // readback contract.
+    #[allow(dead_code)]
+    job_size: usize,
+    #[allow(dead_code)]
+    overlap_log: i32,
+    #[allow(dead_code)]
+    rsyncable: i32,
+    src_size_hint: i32,
+    max_block_size: usize,
+    format: i32,
+    force_window: bool,
+    attach_dict_pref: i32,
+    literal_compression_mode: ParamSwitch,
+    use_row_match_finder: ParamSwitch,
+    validate_sequences: i32,
+    post_block_splitter: ParamSwitch,
+    block_splitter_level: i32,
+    in_buffer_mode: i32,
+    out_buffer_mode: i32,
+    block_delimiters: i32,
+    enable_dedicated_dict_search: bool,
+    deterministic_ref_prefix: bool,
+    prefetch_cdict_tables: ParamSwitch,
+    enable_match_finder_fallback: i32,
+    repcode_resolution: ParamSwitch,
+}
+
+impl Default for CCtxParams {
+    fn default() -> Self {
+        Self {
+            compression_level: 0,
+            c_params: ZSTD_compressionParameters {
+                windowLog: 0,
+                chainLog: 0,
+                hashLog: 0,
+                searchLog: 0,
+                minMatch: 0,
+                targetLength: 0,
+                strategy: ZSTD_strategy(0),
+            },
+            f_params: ZSTD_frameParameters {
+                contentSizeFlag: 0,
+                checksumFlag: 0,
+                noDictIDFlag: 0,
+            },
+            ldm: LdmParams::default_disabled(),
+            nb_workers: 0,
+            job_size: 0,
+            overlap_log: 0,
+            rsyncable: 0,
+            src_size_hint: 0,
+            max_block_size: 0,
+            format: 0,
+            force_window: false,
+            attach_dict_pref: 0,
+            literal_compression_mode: ParamSwitch::Auto,
+            use_row_match_finder: ParamSwitch::Auto,
+            validate_sequences: 0,
+            post_block_splitter: ParamSwitch::Auto,
+            block_splitter_level: 0,
+            in_buffer_mode: 0,
+            out_buffer_mode: 0,
+            block_delimiters: 0,
+            enable_dedicated_dict_search: false,
+            deterministic_ref_prefix: false,
+            prefetch_cdict_tables: ParamSwitch::Auto,
+            enable_match_finder_fallback: 0,
+            repcode_resolution: ParamSwitch::Auto,
+        }
+    }
+}
+
+impl CCtxParams {
+    /// `ZSTD_CCtxParams_init`: zeroed storage, the level, content size on.
+    pub fn init(level: i32) -> Self {
+        let mut params = Self::default();
+        params.compression_level = level;
+        params.f_params.contentSizeFlag = 1;
+        params
+    }
+
+    /// `ZSTD_CCtxParams_init_internal` (`_init_advanced`): the validated
+    /// cParams/fParams plus the resolved auto switches, with the level
+    /// kept at `ZSTD_NO_CLEVEL`.
+    fn init_from_zstd_params(params: ZSTD_parameters) -> Self {
+        let mut bag = Self::default();
+        bag.c_params = params.cParams;
+        bag.f_params = params.fParams;
+        bag.use_row_match_finder =
+            resolve_row_match_finder_mode(ParamSwitch::Auto, &params.cParams);
+        bag.post_block_splitter = resolve_block_splitter_mode(ParamSwitch::Auto, &params.cParams);
+        bag.ldm.enable = resolve_enable_ldm(ParamSwitch::Auto, &params.cParams);
+        bag.max_block_size = resolve_max_block_size(0);
+        // resolveExternalRepcodeSearch: disable below level 10, the
+        // advanced bag's level being `ZSTD_NO_CLEVEL` (0).
+        bag.repcode_resolution = ParamSwitch::Disable;
+        bag
+    }
+
+    /// `ZSTD_CCtxParams_setParameter`: bounds-check via the shared cParam
+    /// table and store. The return mirrors the reference's applied value.
+    pub fn set_parameter(&mut self, id: CParamId, value: i32) -> Result<usize, ErrorCode> {
+        // The bounds discipline of the reference setter: a few ids skip
+        // the check (the level clamps instead, the worker knobs refuse
+        // directly, the boolean-like pairs just store), and the
+        // 0-means-auto knobs only check a non-zero request.
+        let checked = match id {
+            CParamId::CompressionLevel
+            | CParamId::NbWorkers
+            | CParamId::JobSize
+            | CParamId::OverlapLog
+            | CParamId::Rsyncable
+            | CParamId::ForceMaxWindow
+            | CParamId::EnableDedicatedDictSearch => false,
+            CParamId::WindowLog
+            | CParamId::HashLog
+            | CParamId::ChainLog
+            | CParamId::SearchLog
+            | CParamId::MinMatch
+            | CParamId::Strategy
+            | CParamId::LdmHashLog
+            | CParamId::LdmMinMatch
+            | CParamId::LdmBucketSizeLog
+            | CParamId::LdmHashRateLog
+            | CParamId::SrcSizeHint
+            | CParamId::MaxBlockSize => value != 0,
+            _ => true,
+        };
+        if checked && !id.within_bounds(value) {
+            return Err(ErrorCode::ParameterOutOfBound);
+        }
+        match id {
+            CParamId::Format => {
+                self.format = value;
+                Ok(value as usize)
+            },
+            CParamId::CompressionLevel => {
+                let applied = value.clamp(crate::MIN_CLEVEL, crate::MAX_CLEVEL);
+                // 0 selects the default, as in the reference bag.
+                self.compression_level = if applied == 0 {
+                    crate::DEFAULT_CLEVEL
+                } else {
+                    applied
+                };
+                Ok(usize::from(self.compression_level >= 0) * self.compression_level as usize)
+            },
+            CParamId::WindowLog => {
+                self.c_params.windowLog = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::HashLog => {
+                self.c_params.hashLog = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::ChainLog => {
+                self.c_params.chainLog = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::SearchLog => {
+                self.c_params.searchLog = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::MinMatch => {
+                self.c_params.minMatch = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::TargetLength => {
+                self.c_params.targetLength = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::Strategy => {
+                self.c_params.strategy = ZSTD_strategy(value);
+                Ok(value.max(0) as usize)
+            },
+            CParamId::ContentSizeFlag => {
+                self.f_params.contentSizeFlag = i32::from(value != 0);
+                Ok(usize::from(value != 0))
+            },
+            CParamId::ChecksumFlag => {
+                self.f_params.checksumFlag = i32::from(value != 0);
+                Ok(usize::from(value != 0))
+            },
+            CParamId::DictIDFlag => {
+                self.f_params.noDictIDFlag = i32::from(value == 0);
+                Ok(usize::from(value != 0))
+            },
+            CParamId::ForceMaxWindow => {
+                self.force_window = value != 0;
+                Ok(usize::from(value != 0))
+            },
+            CParamId::ForceAttachDict => {
+                self.attach_dict_pref = value;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::LiteralCompressionMode
+            | CParamId::EnableLongDistanceMatching
+            | CParamId::SplitAfterSequences
+            | CParamId::UseRowMatchFinder
+            | CParamId::PrefetchCDictTables
+            | CParamId::RepcodeResolution => {
+                let switch = match value {
+                    0 => ParamSwitch::Auto,
+                    1 => ParamSwitch::Enable,
+                    _ => ParamSwitch::Disable,
+                };
+                match id {
+                    CParamId::LiteralCompressionMode => {
+                        self.literal_compression_mode = switch;
+                    },
+                    CParamId::EnableLongDistanceMatching => self.ldm.enable = switch,
+                    CParamId::SplitAfterSequences => self.post_block_splitter = switch,
+                    CParamId::UseRowMatchFinder => self.use_row_match_finder = switch,
+                    CParamId::PrefetchCDictTables => self.prefetch_cdict_tables = switch,
+                    _ => self.repcode_resolution = switch,
+                }
+                Ok(value as usize)
+            },
+            // The pinned reference build carries no ZSTD_MULTITHREAD: the
+            // worker knobs answer unsupported for any non-default value.
+            CParamId::NbWorkers
+            | CParamId::JobSize
+            | CParamId::OverlapLog
+            | CParamId::Rsyncable => {
+                if value != 0 {
+                    return Err(ErrorCode::ParameterUnsupported);
+                }
+                Ok(0)
+            },
+            CParamId::EnableDedicatedDictSearch => {
+                self.enable_dedicated_dict_search = value != 0;
+                Ok(usize::from(value != 0))
+            },
+            CParamId::LdmHashLog => {
+                self.ldm.hash_log = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::LdmMinMatch => {
+                self.ldm.min_match_length = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::LdmBucketSizeLog => {
+                self.ldm.bucket_size_log = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::LdmHashRateLog => {
+                self.ldm.hash_rate_log = value as u32;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::SrcSizeHint => {
+                self.src_size_hint = value;
+                Ok(value.max(0) as usize)
+            },
+            CParamId::StableInBuffer => {
+                self.in_buffer_mode = value;
+                Ok(value as usize)
+            },
+            CParamId::StableOutBuffer => {
+                self.out_buffer_mode = value;
+                Ok(value as usize)
+            },
+            CParamId::BlockDelimiters => {
+                self.block_delimiters = value;
+                Ok(value as usize)
+            },
+            CParamId::ValidateSequences => {
+                self.validate_sequences = value;
+                Ok(value as usize)
+            },
+            CParamId::BlockSplitterLevel => {
+                self.block_splitter_level = value;
+                Ok(value as usize)
+            },
+            CParamId::DeterministicRefPrefix => {
+                self.deterministic_ref_prefix = value != 0;
+                Ok(usize::from(value != 0))
+            },
+            CParamId::EnableSeqProducerFallback => {
+                self.enable_match_finder_fallback = value;
+                Ok(value as usize)
+            },
+            CParamId::MaxBlockSize => {
+                self.max_block_size = value as usize;
+                Ok(value.max(0) as usize)
+            },
+        }
+    }
+
+    /// `ZSTD_CCtxParams_getParameter`.
+    pub fn get_parameter(&self, id: CParamId) -> Result<i32, ErrorCode> {
+        Ok(match id {
+            CParamId::Format => self.format,
+            CParamId::CompressionLevel => self.compression_level,
+            CParamId::WindowLog => self.c_params.windowLog as i32,
+            CParamId::HashLog => self.c_params.hashLog as i32,
+            CParamId::ChainLog => self.c_params.chainLog as i32,
+            CParamId::SearchLog => self.c_params.searchLog as i32,
+            CParamId::MinMatch => self.c_params.minMatch as i32,
+            CParamId::TargetLength => self.c_params.targetLength as i32,
+            CParamId::Strategy => self.c_params.strategy.raw(),
+            CParamId::ContentSizeFlag => self.f_params.contentSizeFlag,
+            CParamId::ChecksumFlag => self.f_params.checksumFlag,
+            CParamId::DictIDFlag => i32::from(self.f_params.noDictIDFlag == 0),
+            CParamId::ForceMaxWindow => i32::from(self.force_window),
+            CParamId::ForceAttachDict => self.attach_dict_pref,
+            CParamId::LiteralCompressionMode => self.literal_compression_mode.raw(),
+            CParamId::NbWorkers => self.nb_workers,
+            CParamId::JobSize | CParamId::OverlapLog | CParamId::Rsyncable => {
+                // The pinned reference build refuses these reads too.
+                return Err(ErrorCode::ParameterUnsupported);
+            },
+            CParamId::EnableDedicatedDictSearch => i32::from(self.enable_dedicated_dict_search),
+            CParamId::EnableLongDistanceMatching => self.ldm.enable.raw(),
+            CParamId::LdmHashLog => self.ldm.hash_log as i32,
+            CParamId::LdmMinMatch => self.ldm.min_match_length as i32,
+            CParamId::LdmBucketSizeLog => self.ldm.bucket_size_log as i32,
+            CParamId::LdmHashRateLog => self.ldm.hash_rate_log as i32,
+            CParamId::SrcSizeHint => self.src_size_hint,
+            CParamId::StableInBuffer => self.in_buffer_mode,
+            CParamId::StableOutBuffer => self.out_buffer_mode,
+            CParamId::BlockDelimiters => self.block_delimiters,
+            CParamId::ValidateSequences => self.validate_sequences,
+            CParamId::SplitAfterSequences => self.post_block_splitter.raw(),
+            CParamId::BlockSplitterLevel => self.block_splitter_level,
+            CParamId::UseRowMatchFinder => self.use_row_match_finder.raw(),
+            CParamId::DeterministicRefPrefix => i32::from(self.deterministic_ref_prefix),
+            CParamId::PrefetchCDictTables => self.prefetch_cdict_tables.raw(),
+            CParamId::EnableSeqProducerFallback => self.enable_match_finder_fallback,
+            CParamId::RepcodeResolution => self.repcode_resolution.raw(),
+            CParamId::MaxBlockSize => self.max_block_size as i32,
+        })
+    }
+
+    /// `ZSTD_getCParamsFromCCtxParams` over this bag: the level row, the
+    /// LDM window override, the non-zero knob overrides, then the adjust
+    /// chain under the bag's row-finder mode.
+    fn resolved_c_params(
+        &self,
+        src_size_hint: u64,
+        dict_size: usize,
+        mode: CParamMode,
+    ) -> ZSTD_compressionParameters {
+        let src = if src_size_hint == u64::MAX && self.src_size_hint > 0 {
+            self.src_size_hint as u64
+        } else {
+            src_size_hint
+        };
+        let mut cp = get_cparams_internal(self.compression_level, src, dict_size, mode);
+        if self.ldm.enable == ParamSwitch::Enable {
+            cp.windowLog = WINDOWLOG_LIMIT_DEFAULT;
+        }
+        override_cparams(&mut cp, &self.c_params);
+        adjust_cparams_internal(cp, src, dict_size, mode, self.use_row_match_finder)
+    }
+
+    /// The windowLog override (0 = default), shared by the context apply
+    /// path and the advanced CDict constructor.
+    pub(crate) fn c_params_window_log(&self) -> i32 {
+        self.c_params.windowLog as i32
+    }
+
+    pub(crate) fn content_size_flag(&self) -> i32 {
+        self.f_params.contentSizeFlag
+    }
+
+    pub(crate) fn checksum_flag(&self) -> i32 {
+        self.f_params.checksumFlag
+    }
+
+    pub(crate) fn f_params_dict_id_flag(&self) -> i32 {
+        i32::from(self.f_params.noDictIDFlag == 0)
+    }
+
+    pub(crate) fn ldm_switch(&self) -> i32 {
+        self.ldm.enable.raw()
+    }
+
+    /// The level the context stores: the bag keeps it raw, and the
+    /// context setter already maps 0 to the default.
+    pub(crate) fn compression_level_for_context(&self) -> i32 {
+        self.compression_level
+    }
+
+    /// The knobs and switches the engine cannot honor: any non-default
+    /// value here answers `parameter_unsupported` when the bag is
+    /// adopted, instead of being silently ignored. The frame-byte-neutral
+    /// fields (buffer stability promises, sequence-API knobs, dedicated
+    /// dict search, prefetch, deterministic prefix) stay accepted.
+    pub fn unsupported_requests(&self) -> bool {
+        let c = &self.c_params;
+        c.hashLog != 0
+            || c.chainLog != 0
+            || c.searchLog != 0
+            || c.minMatch != 0
+            || c.targetLength != 0
+            || c.strategy.0 != 0
+            || self.ldm.hash_log != 0
+            || self.ldm.min_match_length != 0
+            || self.ldm.bucket_size_log != 0
+            || self.ldm.hash_rate_log != 0
+            || self.src_size_hint > 0
+            || self.max_block_size != 0
+            || self.format != 0
+            || self.force_window
+            || self.attach_dict_pref != 0
+            || self.literal_compression_mode != ParamSwitch::Auto
+            || self.use_row_match_finder != ParamSwitch::Auto
+            || self.post_block_splitter != ParamSwitch::Auto
+            || self.block_splitter_level != 0
+            || self.repcode_resolution != ParamSwitch::Auto
+            || self.enable_match_finder_fallback != 0
+    }
+
+    /// `ZSTD_estimateCCtxSize_usingCCtxParams`.
+    pub fn estimate_cctx_size(&self) -> Result<usize, ErrorCode> {
+        if self.nb_workers > 0 {
+            return Err(ErrorCode::Generic);
+        }
+        let cp = self.resolved_c_params(u64::MAX, 0, CParamMode::NoAttachDict);
+        let mut ldm = self.ldm;
+        if ldm.enable == ParamSwitch::Enable {
+            ldm_adjust_parameters(&mut ldm, &cp);
+        }
+        Ok(estimate_using_params_internal(
+            &cp,
+            &ldm,
+            true,
+            resolve_row_match_finder_mode(self.use_row_match_finder, &cp),
+            0,
+            0,
+            u64::MAX,
+            self.max_block_size,
+        ))
+    }
+
+    /// `ZSTD_estimateCStreamSize_usingCCtxParams`.
+    pub fn estimate_cstream_size(&self) -> Result<usize, ErrorCode> {
+        if self.nb_workers > 0 {
+            return Err(ErrorCode::Generic);
+        }
+        let cp = self.resolved_c_params(u64::MAX, 0, CParamMode::NoAttachDict);
+        let block_size = resolve_max_block_size(self.max_block_size).min(1_usize << cp.windowLog);
+        // The default buffer modes are `bm_buffered` (0); stable buffers
+        // need none.
+        let in_buff = if self.in_buffer_mode == 0 {
+            (1_usize << cp.windowLog) + block_size
+        } else {
+            0
+        };
+        let out_buff = if self.out_buffer_mode == 0 {
+            crate::compress_bound(block_size) + 1
+        } else {
+            0
+        };
+        let mut ldm = self.ldm;
+        if ldm.enable == ParamSwitch::Enable {
+            ldm_adjust_parameters(&mut ldm, &cp);
+        }
+        Ok(estimate_using_params_internal(
+            &cp,
+            &ldm,
+            true,
+            resolve_row_match_finder_mode(self.use_row_match_finder, &cp),
+            in_buff,
+            out_buff,
+            u64::MAX,
+            self.max_block_size,
+        ))
+    }
+}
+
+/// `ZSTD_resolveBlockSplitterMode`: auto enables from btopt at windowLog
+/// 17 up.
+fn resolve_block_splitter_mode(mode: ParamSwitch, cp: &ZSTD_compressionParameters) -> ParamSwitch {
+    if mode != ParamSwitch::Auto {
+        return mode;
+    }
+    if cp.strategy.raw() >= ZSTD_strategy::ZSTD_btopt.raw() && cp.windowLog >= 17 {
+        ParamSwitch::Enable
+    } else {
+        ParamSwitch::Disable
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCCtxParams() -> *mut crate::ZSTD_CCtx_params {
+    Box::into_raw(Box::new(CCtxParams::init(crate::DEFAULT_CLEVEL))).cast()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_freeCCtxParams(params: *mut crate::ZSTD_CCtx_params) -> usize {
+    // The null free is a no-op, as in libzstd.
+    if params.is_null() {
+        return 0;
+    }
+    // SAFETY: the handle came from the create's box round-trip and is
+    // still live.
+    drop(unsafe { Box::from_raw(params.cast::<CCtxParams>()) });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_init(
+    params: *mut crate::ZSTD_CCtx_params,
+    compression_level: c_int,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag = unsafe { &mut *params.cast::<CCtxParams>() };
+    *bag = CCtxParams::init(compression_level);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_init_advanced(
+    params: *mut crate::ZSTD_CCtx_params,
+    zstd_params: ZSTD_parameters,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    let check = ZSTD_checkCParams(zstd_params.cParams);
+    if check != 0 {
+        return check;
+    }
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag = unsafe { &mut *params.cast::<CCtxParams>() };
+    *bag = CCtxParams::init_from_zstd_params(zstd_params);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_reset(params: *mut crate::ZSTD_CCtx_params) -> usize {
+    // SAFETY-equivalent: reset is init at the default level; the null bag
+    // answers like the reference's null check.
+    unsafe { ZSTD_CCtxParams_init(params, crate::DEFAULT_CLEVEL) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_setParameter(
+    params: *mut crate::ZSTD_CCtx_params,
+    param: c_int,
+    value: c_int,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    let Some(id) = CParamId::from_raw(param) else {
+        return code(ErrorCode::ParameterUnsupported);
+    };
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag = unsafe { &mut *params.cast::<CCtxParams>() };
+    match bag.set_parameter(id, value) {
+        Ok(applied) => applied,
+        Err(e) => code(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_getParameter(
+    params: *const crate::ZSTD_CCtx_params,
+    param: c_int,
+    value: *mut c_int,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    let Some(id) = CParamId::from_raw(param) else {
+        return code(ErrorCode::ParameterUnsupported);
+    };
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag = unsafe { &*params.cast::<CCtxParams>() };
+    match bag.get_parameter(id) {
+        Ok(v) => {
+            // SAFETY: the caller-provided output slot.
+            if !value.is_null() {
+                unsafe { *value = v };
+            }
+            0
+        },
+        Err(e) => code(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_estimateCCtxSize_usingCCtxParams(
+    params: *const crate::ZSTD_CCtx_params,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag: &CCtxParams = unsafe { &*params.cast() };
+    match bag.estimate_cctx_size() {
+        Ok(size) => size,
+        Err(e) => code(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_estimateCStreamSize_usingCCtxParams(
+    params: *const crate::ZSTD_CCtx_params,
+) -> usize {
+    if params.is_null() {
+        return code(ErrorCode::Generic);
+    }
+    // SAFETY: the caller-provided handle, live per the create's contract.
+    let bag: &CCtxParams = unsafe { &*params.cast() };
+    match bag.estimate_cstream_size() {
+        Ok(size) => size,
+        Err(e) => code(e),
+    }
 }
 
 /// `ZSTD_dictLoadMethod_e`.

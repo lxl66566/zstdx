@@ -8055,6 +8055,130 @@ static void test_advanced_constructors_refcdict(void) {
     ZSTD_freeDStream(zds);
 }
 
+static void test_cctx_params_and_cdict_advanced(void) {
+    static unsigned char buf[1 << 17];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)('a' + (i % 23));
+
+    /* the bag: storage, bounds and readback, all identical to the
+     * reference build (probed on libzstd.a) */
+    ZSTD_CCtx_params *p = ZSTD_createCCtxParams();
+    CHECK(p != NULL, "createCCtxParams");
+    ZSTD_CCtxParams_init(p, 3);
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 1303576, "l3 cctx estimate");
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 3663385, "l3 cstream estimate");
+    ZSTD_CCtxParams_init(p, 19);
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 85196950, "l19 cctx estimate");
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 93848215, "l19 cstream estimate");
+    ZSTD_CCtxParams_init(p, 3);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_windowLog, 20);
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 1303576, "w20 cctx estimate");
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 2614809, "w20 cstream estimate");
+    ZSTD_CCtxParams_init(p, 3);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_enableLongDistanceMatching, 1);
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 9782296, "ldm cctx estimate");
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 144262681, "ldm cstream estimate");
+    ZSTD_CCtxParams_init(p, 3);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_srcSizeHint, 1000000);
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 2614809, "hint cstream estimate");
+    ZSTD_CCtxParams_init(p, -5);
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 549912, "neg5 cctx estimate");
+    ZSTD_CCtxParams_init(p, 3);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_useRowMatchFinder, 2);
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 3663385, "rowoff cstream estimate");
+    ZSTD_CCtxParams_init(p, 3);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_stableInBuffer, 1);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_stableOutBuffer, 1);
+    CHECK(ZSTD_estimateCStreamSize_usingCCtxParams(p) == 1303576, "stable cstream estimate");
+
+    /* setter/readback contracts and the worker-knob refusals */
+    ZSTD_CCtxParams_init(p, 3);
+    CHECK(ZSTD_CCtxParams_setParameter(p, ZSTD_c_compressionLevel, -7) == 0, "set level -7");
+    int v = -1;
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_compressionLevel, &v) == 0 && v == -7, "read level -7");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_setParameter(p, ZSTD_c_hashLog, 99)) == ZSTD_error_parameter_outOfBound, "hashLog bounds");
+    CHECK(ZSTD_CCtxParams_setParameter(p, ZSTD_c_hashLog, 25) == 25, "set hashLog 25");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_hashLog, &v) == 0 && v == 25, "read hashLog 25");
+    CHECK(ZSTD_CCtxParams_setParameter(p, ZSTD_c_ldmHashRateLog, 8) == 8, "set ldmHashRateLog");
+    CHECK(ZSTD_CCtxParams_setParameter(p, ZSTD_c_srcSizeHint, 0) == 0, "set hint 0");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_setParameter(p, ZSTD_c_srcSizeHint, -1)) == ZSTD_error_parameter_outOfBound, "hint bounds");
+    CHECK(ZSTD_CCtxParams_setParameter(p, ZSTD_c_nbWorkers, 0) == 0, "set nbWorkers 0");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_setParameter(p, ZSTD_c_nbWorkers, 1)) == ZSTD_error_parameter_unsupported, "nbWorkers refused");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_setParameter(p, ZSTD_c_jobSize, 5)) == ZSTD_error_parameter_unsupported, "jobSize refused");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_getParameter(p, ZSTD_c_jobSize, &v)) == ZSTD_error_parameter_unsupported, "jobSize read refused");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_validateSequences, &v) == 0 && v == 0, "validate read");
+    CHECK(ZSTD_CCtxParams_reset(p) == 0, "reset");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_compressionLevel, &v) == 0 && v == 3, "reset level");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_contentSizeFlag, &v) == 0 && v == 1, "reset contentSize");
+
+    ZSTD_parameters zp = { ZSTD_getCParams(9, 0, 0), { 1, 0, 0 } };
+    CHECK(ZSTD_CCtxParams_init_advanced(p, zp) == 0, "init_advanced l9");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_compressionLevel, &v) == 0 && v == 0, "advanced level 0");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_windowLog, &v) == 0 && v == 22, "advanced windowLog");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_useRowMatchFinder, &v) == 0 && v == 1, "advanced row resolved");
+    CHECK(ZSTD_CCtxParams_getParameter(p, ZSTD_c_minMatch, &v) == 0 && v == 5, "advanced minMatch");
+    CHECK(ZSTD_estimateCCtxSize_usingCCtxParams(p) == 11002904, "advanced l9 cctx estimate");
+    ZSTD_parameters zero = { { 0, 0, 0, 0, 0, 0, 0 }, { 1, 0, 0 } };
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtxParams_init_advanced(p, zero)) == ZSTD_error_parameter_outOfBound, "advanced zeros refused");
+
+    /* the bag applies onto a context and the frames follow it */
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    ZSTD_CCtxParams_init(p, 19);
+    ZSTD_CCtxParams_setParameter(p, ZSTD_c_checksumFlag, 1);
+    CHECK(ZSTD_CCtx_setParametersUsingCCtxParams(cctx, p) == 0, "apply bag");
+    static unsigned char c1[1 << 19], c2[1 << 19];
+    size_t n1 = ZSTD_compress2(cctx, c1, sizeof c1, buf, sizeof buf);
+    ZSTD_CCtx *fresh = ZSTD_createCCtx();
+    ZSTD_CCtx_setParameter(fresh, ZSTD_c_compressionLevel, 19);
+    ZSTD_CCtx_setParameter(fresh, ZSTD_c_checksumFlag, 1);
+    size_t n2 = ZSTD_compress2(fresh, c2, sizeof c2, buf, sizeof buf);
+    CHECK(n1 == n2 && memcmp(c1, c2, n1) == 0, "bag19ck == sticky19ck (%zu vs %zu)", n1, n2);
+    /* frame flags ride the setFParams path */
+    ZSTD_frameParameters fp = { 1, 1, 0 };
+    CHECK(ZSTD_CCtx_setFParams(cctx, fp) == 0, "setFParams");
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_inBuffer ib = { buf, sizeof buf, 0 };
+    ZSTD_outBuffer ob = { c1, sizeof c1, 0 };
+    ZSTD_compressStream2(cctx, &ob, &ib, ZSTD_e_continue);
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_setParametersUsingCCtxParams(cctx, p)) == ZSTD_error_stage_wrong, "apply mid-frame");
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_setFParams(cctx, fp)) == ZSTD_error_stage_wrong, "setFParams mid-frame");
+    ZSTD_inBuffer ib2 = { buf, 0, 0 };
+    ZSTD_compressStream2(cctx, &ob, &ib2, ZSTD_e_end);
+    /* with a CDict attached the bag cannot override */
+    ZSTD_CDict *cd = ZSTD_createCDict(buf, 1 << 16, 3);
+    ZSTD_CCtx_refCDict(cctx, cd);
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_setParametersUsingCCtxParams(cctx, p)) == ZSTD_error_stage_wrong, "apply with cdict");
+    ZSTD_CCtx_refCDict(cctx, NULL);
+    ZSTD_freeCDict(cd);
+
+    /* advanced CDict constructors */
+    ZSTD_customMem def = { NULL, NULL, NULL };
+    ZSTD_CDict *adv = ZSTD_createCDict_advanced(buf, 1 << 16, ZSTD_dlm_byCopy, ZSTD_dct_auto,
+                                                (ZSTD_compressionParameters){ 0 }, def);
+    ZSTD_CDict *lvl3 = ZSTD_createCDict(buf, 1 << 16, 3);
+    CHECK(adv != NULL && lvl3 != NULL, "advanced CDict handles");
+    size_t na = ZSTD_compress_usingCDict(fresh, c1, sizeof c1, buf, sizeof buf, adv);
+    size_t nb = ZSTD_compress_usingCDict(fresh, c2, sizeof c2, buf, sizeof buf, lvl3);
+    CHECK(na == nb && memcmp(c1, c2, na) == 0, "advanced zeros == level 3 (%zu vs %zu)", na, nb);
+    ZSTD_CDict *full = ZSTD_createCDict_advanced(buf, 1 << 16, ZSTD_dlm_byCopy, ZSTD_dct_fullDict,
+                                                (ZSTD_compressionParameters){ 0 }, def);
+    CHECK(full == NULL, "fullDict on plain content");
+    ZSTD_CCtxParams_init(p, 19);
+    ZSTD_CDict *bagdict = ZSTD_createCDict_advanced2(buf, 1 << 16, ZSTD_dlm_byCopy, ZSTD_dct_auto, p, def);
+    CHECK(bagdict != NULL, "advanced2 handle");
+    ZSTD_CDict *lvl19 = ZSTD_createCDict(buf, 1 << 16, 19);
+    size_t nd = ZSTD_compress_usingCDict(fresh, c1, sizeof c1, buf, sizeof buf, bagdict);
+    size_t ne = ZSTD_compress_usingCDict(fresh, c2, sizeof c2, buf, sizeof buf, lvl19);
+    CHECK(nd == ne && memcmp(c1, c2, nd) == 0, "advanced2 bag19 == createCDict 19 (%zu vs %zu)", nd, ne);
+    ZSTD_freeCDict(lvl19);
+
+    ZSTD_freeCDict(adv);
+    ZSTD_freeCDict(lvl3);
+    ZSTD_freeCDict(bagdict);
+    ZSTD_freeCCtx(cctx);
+    ZSTD_freeCCtx(fresh);
+    ZSTD_freeCCtxParams(p);
+}
+
 static void test_stream_transcripts(void) {
     static TCall got[T_MAX_CALLS];
     for (size_t ci = 0; ci < sizeof tcells / sizeof tcells[0]; ci++) {
@@ -8158,6 +8282,7 @@ int main(int argc, char **argv) {
     test_parameter_readback();
     test_prefix_family();
     test_advanced_constructors_refcdict();
+    test_cctx_params_and_cdict_advanced();
     test_stream_transcripts();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;

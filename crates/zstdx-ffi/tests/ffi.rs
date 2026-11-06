@@ -3870,3 +3870,119 @@ fn advanced_constructors_and_refcdict() {
         zstd::ZSTD_freeDStream(zds);
     }
 }
+
+/// The params-bag refusals this layer adds on top of the reference
+/// contract: a knob the engine cannot honor fails loudly at apply time
+/// (`parameter_unsupported`) instead of being silently ignored, and the
+/// advanced CDict constructors refuse an explicit knob set with NULL.
+/// The bag's own storage, bounds and readback are reference-exact and
+/// pinned by the C harness.
+#[test]
+fn cctx_params_refusal_deviations() {
+    let buf: Vec<u8> = (0..(1u32 << 16))
+        .map(|i| b'a' + (i % 23) as u8 + (i % 11 < 7) as u8 * 5)
+        .collect();
+    let def = zstd::ZSTD_customMem {
+        customAlloc: None,
+        customFree: None,
+        opaque: core::ptr::null_mut(),
+    };
+
+    let bag = zstd::ZSTD_createCCtxParams();
+    assert!(!bag.is_null());
+    assert_eq!(0, unsafe { zstd::ZSTD_CCtxParams_init(bag, 3) });
+    assert_eq!(25, unsafe {
+        zstd::ZSTD_CCtxParams_setParameter(bag, 102, 25)
+    });
+    // The bag stores the knob, but no context can adopt it.
+    let cctx = zstd::ZSTD_createCCtx();
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_CCtx_setParametersUsingCCtxParams(cctx, bag) }),
+        40
+    );
+    // The zeroed knobs fail the reference bounds check first (0 is out
+    // of the chainLog range, as in libzstd).
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_CCtx_setCParams(cctx, zstd::ZSTD_compressionParameters {
+                windowLog: 20,
+                chainLog: 0,
+                hashLog: 0,
+                searchLog: 0,
+                minMatch: 0,
+                targetLength: 0,
+                strategy: zstd::ZSTD_strategy(0),
+            })
+        }),
+        42
+    );
+    // The zeroed knobs fail the reference bounds check first (0 is out
+    // of the chainLog range, as in libzstd).
+    // A fully valid knob set (the level row) passes the bounds check and
+    // then hits the refusal: this engine exposes no per-knob tuning.
+    let row = unsafe { zstd::ZSTD_getCParams(3, 0, 0) };
+    assert_eq!(
+        error_code(unsafe { zstd::ZSTD_CCtx_setCParams(cctx, row) }),
+        40
+    );
+    // A bounds failure comes back as the reference's out-of-bound error.
+    assert_eq!(
+        error_code(unsafe {
+            zstd::ZSTD_CCtx_setCParams(cctx, zstd::ZSTD_compressionParameters {
+                windowLog: 99,
+                chainLog: 0,
+                hashLog: 0,
+                searchLog: 0,
+                minMatch: 0,
+                targetLength: 0,
+                strategy: zstd::ZSTD_strategy(0),
+            })
+        }),
+        42
+    );
+
+    // The advanced CDict constructors refuse an explicit knob set.
+    assert!(
+        unsafe {
+            zstd::ZSTD_createCDict_advanced(
+                buf.as_ptr().cast(),
+                buf.len(),
+                zstd::DictLoadMethod::ByCopy,
+                zstd::DictContentType::Auto,
+                zstd::ZSTD_compressionParameters {
+                    windowLog: 0,
+                    chainLog: 0,
+                    hashLog: 22,
+                    searchLog: 0,
+                    minMatch: 0,
+                    targetLength: 0,
+                    strategy: zstd::ZSTD_strategy(0),
+                },
+                def,
+            )
+        }
+        .is_null()
+    );
+    assert_eq!(0, unsafe { zstd::ZSTD_CCtxParams_init(bag, 3) });
+    assert_eq!(20, unsafe {
+        zstd::ZSTD_CCtxParams_setParameter(bag, 101, 20)
+    });
+    assert!(
+        unsafe {
+            zstd::ZSTD_createCDict_advanced2(
+                buf.as_ptr().cast(),
+                buf.len(),
+                zstd::DictLoadMethod::ByCopy,
+                zstd::DictContentType::Auto,
+                bag,
+                def,
+            )
+        }
+        .is_null()
+    );
+
+    unsafe {
+        zstd::ZSTD_freeCCtxParams(bag);
+        zstd::ZSTD_freeCCtx(cctx);
+    }
+}

@@ -451,6 +451,100 @@ impl CCtx {
         Ok(())
     }
 
+    /// `ZSTD_CCtx_setParametersUsingCCtxParams`: adopt the bag. The
+    /// reference copies it wholesale; this layer applies the knobs the
+    /// engine can honor and refuses the bag outright when any knob it
+    /// cannot honor is set to a non-default value (loudly, never
+    /// silently), the same refusal list the advanced CDict constructors
+    /// use. Parameters cannot be overridden with a dictionary attached.
+    pub fn set_parameters_using(
+        &mut self,
+        bag: &crate::params::CCtxParams,
+    ) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        if self.cdict.is_some() {
+            return Err(ErrorCode::StageWrong);
+        }
+        if bag.unsupported_requests() {
+            return Err(ErrorCode::ParameterUnsupported);
+        }
+        let level = bag.compression_level_for_context();
+        self.settings
+            .set_parameter(ZSTD_cParameter::CompressionLevel, level)?;
+        self.settings
+            .set_parameter(ZSTD_cParameter::WindowLog, bag.c_params_window_log())?;
+        self.settings
+            .set_parameter(ZSTD_cParameter::ContentSizeFlag, bag.content_size_flag())?;
+        self.settings
+            .set_parameter(ZSTD_cParameter::ChecksumFlag, bag.checksum_flag())?;
+        self.settings
+            .set_parameter(ZSTD_cParameter::DictIDFlag, bag.f_params_dict_id_flag())?;
+        self.settings.set_parameter(
+            ZSTD_cParameter::EnableLongDistanceMatching,
+            bag.ldm_switch(),
+        )?;
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_setCParams`: the bounds check first, then the window
+    /// knob alone; the rest of the knobs have no engine counterpart, so
+    /// any non-zero request is refused with `parameter_unsupported`
+    /// instead of silently ignored.
+    pub fn set_c_params(
+        &mut self,
+        c_params: crate::params::ZSTD_compressionParameters,
+    ) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        crate::params::check_c_params(c_params)?;
+        if c_params.hashLog != 0
+            || c_params.chainLog != 0
+            || c_params.searchLog != 0
+            || c_params.minMatch != 0
+            || c_params.targetLength != 0
+            || c_params.strategy.0 != 0
+        {
+            return Err(ErrorCode::ParameterUnsupported);
+        }
+        self.settings
+            .set_parameter(ZSTD_cParameter::WindowLog, c_params.windowLog as i32)?;
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_setFParams`: the three frame flags.
+    pub fn set_f_params(
+        &mut self,
+        f_params: crate::params::ZSTD_frameParameters,
+    ) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.settings
+            .set_parameter(ZSTD_cParameter::ContentSizeFlag, f_params.contentSizeFlag)?;
+        self.settings
+            .set_parameter(ZSTD_cParameter::ChecksumFlag, f_params.checksumFlag)?;
+        self.settings.set_parameter(
+            ZSTD_cParameter::DictIDFlag,
+            i32::from(f_params.noDictIDFlag == 0),
+        )?;
+        Ok(())
+    }
+
+    /// `ZSTD_CCtx_setParams`: check the cParams, apply the frame flags,
+    /// then the cParams (the reference's all-or-none ordering).
+    pub fn set_zstd_params(
+        &mut self,
+        params: crate::params::ZSTD_parameters,
+    ) -> Result<(), ErrorCode> {
+        crate::params::check_c_params(params.cParams)?;
+        self.set_f_params(params.fParams)?;
+        self.set_c_params(params.cParams)?;
+        Ok(())
+    }
+
     /// `ZSTD_CCtx_refCDict`: attach the handle's dictionary to every
     /// following frame. A null handle clears the slot and any loaded
     /// dictionary (the reference's clear-then-assign).
