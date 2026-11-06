@@ -7957,6 +7957,104 @@ static const TCell tcells[] = {
 
 #define T_MAX_CALLS 1024
 
+static void test_advanced_constructors_refcdict(void) {
+    static unsigned char buf[1 << 19];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)('a' + (i % 23));
+    static unsigned char cmpbuf[4 << 20];
+    static unsigned char out[1 << 20];
+    ZSTD_customMem def = { NULL, NULL, NULL };
+    ZSTD_customMem half = { NULL, (ZSTD_freeFunction)1, NULL };
+
+    /* null-default customMem works; the XOR rule refuses a half pair, and
+     * this layer also refuses a matched allocator pair (caller allocation
+     * has no hook here). */
+    ZSTD_CCtx *cctx = ZSTD_createCCtx_advanced(def);
+    CHECK(cctx != NULL, "createCCtx_advanced default");
+    CHECK(ZSTD_createCCtx_advanced(half) == NULL, "createCCtx_advanced half pair");
+    ZSTD_DCtx *dctx = ZSTD_createDCtx_advanced(def);
+    CHECK(dctx != NULL, "createDCtx_advanced default");
+    CHECK(ZSTD_createDCtx_advanced(half) == NULL, "createDCtx_advanced half pair");
+    ZSTD_CStream *zcs = ZSTD_createCStream_advanced(def);
+    ZSTD_DStream *zds = ZSTD_createDStream_advanced(def);
+    CHECK(zcs != NULL && zds != NULL, "advanced stream constructors");
+    CHECK(ZSTD_createCStream_advanced(half) == NULL, "createCStream_advanced half pair");
+    CHECK(ZSTD_createDStream_advanced(half) == NULL, "createDStream_advanced half pair");
+
+    /* the advanced streams are real objects: endStream and decode a frame */
+    ZSTD_CCtx_reset((ZSTD_CCtx*)zcs, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_setParameter((ZSTD_CCtx*)zcs, ZSTD_c_compressionLevel, 3);
+    ZSTD_outBuffer ob = { cmpbuf, sizeof(cmpbuf), 0 };
+    ZSTD_inBuffer ib = { buf, 1 << 18, 0 };
+    size_t h = ZSTD_compressStream2((ZSTD_CCtx*)zcs, &ob, &ib, ZSTD_e_end);
+    CHECK(!ZSTD_isError(h) && ob.pos > 0, "advanced CStream compresses");
+    ZSTD_inBuffer dib = { cmpbuf, ob.pos, 0 };
+    ZSTD_outBuffer dob = { out, sizeof(out), 0 };
+    h = ZSTD_decompressStream((ZSTD_DCtx*)zds, &dob, &dib);
+    CHECK(!ZSTD_isError(h) && dob.pos == (1 << 18), "advanced DStream decodes");
+    CHECK(memcmp(out, buf, 1 << 18) == 0, "advanced DStream bytes");
+
+    /* refCDict: the handle's params carry the frames */
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 1);
+    ZSTD_CDict *cdict = ZSTD_createCDict(buf, 1 << 16, 19);
+    CHECK(cdict != NULL, "createCDict");
+    size_t r = ZSTD_CCtx_refCDict(cctx, cdict);
+    CHECK(!ZSTD_isError(r), "refCDict ok");
+    size_t c1 = ZSTD_compress2(cctx, cmpbuf, sizeof(cmpbuf), buf + (1 << 16), 1 << 16);
+    CHECK(!ZSTD_isError(c1), "refCDict compress2");
+    /* same relation as usingCDict: both run the handle's params over a
+     * declared-size frame */
+    ZSTD_CCtx *plain = ZSTD_createCCtx();
+    size_t c2 = ZSTD_compress_usingCDict(plain, cmpbuf + c1, sizeof(cmpbuf) - c1,
+                                         buf + (1 << 16), 1 << 16, cdict);
+    CHECK(!ZSTD_isError(c2) && c1 == c2 && memcmp(cmpbuf, cmpbuf + c1, c1) == 0,
+          "refCDict frame == usingCDict frame (%zu vs %zu)", c1, c2);
+    ZSTD_freeCCtx(plain);
+
+    /* refCDict(NULL) clears the slot; the next frame is plain again */
+    ZSTD_CCtx_refCDict(cctx, NULL);
+    size_t c3 = ZSTD_compress2(cctx, out, sizeof(out), buf + (1 << 16), 1 << 16);
+    ZSTD_CCtx *plain2 = ZSTD_createCCtx();
+    ZSTD_CCtx_setParameter(plain2, ZSTD_c_compressionLevel, 1);
+    size_t c4 = ZSTD_compress2(plain2, cmpbuf, sizeof(cmpbuf), buf + (1 << 16), 1 << 16);
+    CHECK(c3 == c4 && memcmp(out, cmpbuf, c3) == 0, "refCDict(NULL) clears (%zu vs %zu)", c3, c4);
+    ZSTD_freeCCtx(plain2);
+
+    /* a loadDictionary after the attach overrides it */
+    ZSTD_CCtx_refCDict(cctx, cdict);
+    ZSTD_CCtx_loadDictionary(cctx, buf, 1 << 15);
+    size_t c5 = ZSTD_compress2(cctx, out, sizeof(out), buf + (1 << 16), 1 << 16);
+    CHECK(!ZSTD_isError(c5), "load overrides cdict");
+    /* streaming through the attach decodes against the same dictionary */
+    ZSTD_CCtx_refCDict(cctx, cdict);
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_outBuffer ob2 = { cmpbuf, sizeof(cmpbuf), 0 };
+    ZSTD_inBuffer ib2 = { buf + (1 << 16), 1 << 16, 0 };
+    h = ZSTD_compressStream2(cctx, &ob2, &ib2, ZSTD_e_continue);
+    CHECK(!ZSTD_isError(h), "streaming with cdict starts");
+    /* refCDict mid-frame is stage_wrong */
+    CHECK(ZSTD_getErrorCode(ZSTD_CCtx_refCDict(cctx, cdict)) == ZSTD_error_stage_wrong,
+          "refCDict mid-frame");
+    h = ZSTD_compressStream2(cctx, &ob2, &ib2, ZSTD_e_end);
+    CHECK(!ZSTD_isError(h), "streaming with cdict ends");
+    /* the streaming frame decodes with the dictionary attached */
+    ZSTD_DDict *ddict = ZSTD_createDDict(buf, 1 << 16);
+    ZSTD_DCtx_refDDict(dctx, ddict);
+    ZSTD_inBuffer dib2 = { cmpbuf, ob2.pos, 0 };
+    ZSTD_outBuffer dob2 = { out, sizeof(out), 0 };
+    h = ZSTD_decompressStream(dctx, &dob2, &dib2);
+    CHECK(!ZSTD_isError(h) && dob2.pos == (1 << 16), "streaming cdict decode");
+    CHECK(memcmp(out, buf + (1 << 16), 1 << 16) == 0, "streaming cdict bytes");
+    ZSTD_DCtx_refDDict(dctx, NULL);
+    ZSTD_freeDDict(ddict);
+    ZSTD_freeCDict(cdict);
+
+    ZSTD_freeCCtx(cctx);
+    ZSTD_freeDCtx(dctx);
+    ZSTD_freeCStream(zcs);
+    ZSTD_freeDStream(zds);
+}
+
 static void test_stream_transcripts(void) {
     static TCall got[T_MAX_CALLS];
     for (size_t ci = 0; ci < sizeof tcells / sizeof tcells[0]; ci++) {
@@ -8059,6 +8157,7 @@ int main(int argc, char **argv) {
     test_frame_walk();
     test_parameter_readback();
     test_prefix_family();
+    test_advanced_constructors_refcdict();
     test_stream_transcripts();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;

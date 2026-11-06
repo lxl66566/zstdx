@@ -182,6 +182,28 @@ pub enum LoadedDict {
     Invalid,
 }
 
+/// The `ZSTD_CCtx_refCDict` attachment: the handle's parsed dictionary,
+/// its creation level and LDM mode, and the raw byte length the frame
+/// window sizing consults. The dictionary is owned by an Arc clone, so
+/// the handle's lifetime does not bind the context.
+pub struct AttachedCDict {
+    pub dict: Option<zstdx::EncoderDictionary>,
+    pub level: i32,
+    pub ldm: zstdx::LdmMode,
+    pub raw_len: usize,
+}
+
+impl AttachedCDict {
+    fn new(cdict: &crate::dict::CDict) -> Self {
+        Self {
+            dict: cdict.dict.clone(),
+            level: cdict.level,
+            ldm: cdict.ldm,
+            raw_len: cdict.raw_len,
+        }
+    }
+}
+
 /// One-shot compression of `src` into `dst`; returns the written length.
 /// `dict` overrides the settings' dictionary for this call only.
 ///
@@ -298,6 +320,9 @@ pub struct CCtx {
     /// `refPrefix` dictionaries are single-use (libzstd's `prefixDict` is
     /// consumed when the next frame opens).
     dict_use_once: bool,
+    /// The `ZSTD_CCtx_refCDict` attachment; cleared by any dictionary
+    /// load, as the reference's `ZSTD_clearAllDicts`.
+    cdict: Option<AttachedCDict>,
     /// The running frame's block size (`ZSTD_getBlockSize`), 0 before any
     /// frame opens. It survives the frame and a session reset, like the
     /// reference's `appliedParams`.
@@ -317,6 +342,7 @@ impl CCtx {
             settings: Settings::default(),
             dict: None,
             dict_use_once: false,
+            cdict: None,
             applied_block_size: 0,
             pledged: None,
             stream: None,
@@ -383,6 +409,7 @@ impl CCtx {
             return Err(ErrorCode::StageWrong);
         }
         self.dict_use_once = false;
+        self.cdict = None;
         self.dict = match dict {
             Some(bytes) => {
                 let parse = match content_type {
@@ -424,14 +451,41 @@ impl CCtx {
         Ok(())
     }
 
+    /// `ZSTD_CCtx_refCDict`: attach the handle's dictionary to every
+    /// following frame. A null handle clears the slot and any loaded
+    /// dictionary (the reference's clear-then-assign).
+    pub fn ref_cdict(&mut self, cdict: Option<&crate::dict::CDict>) -> Result<(), ErrorCode> {
+        if self.stream.as_ref().is_some_and(|s| !s.finished) {
+            return Err(ErrorCode::StageWrong);
+        }
+        self.dict = None;
+        self.dict_use_once = false;
+        self.cdict = cdict.map(AttachedCDict::new);
+        Ok(())
+    }
+
     /// The frame's block size for `ZSTD_getBlockSize` (the reference's
     /// appliedParams snapshot).
     fn applied_block_size_snapshot(&self, pledged: Option<u64>) -> usize {
-        let dict_len = match &self.dict {
-            Some(LoadedDict::Parsed(_, len)) => *len,
-            _ => 0,
+        let dict_len = match &self.cdict {
+            Some(cdict) => cdict.raw_len,
+            None => match &self.dict {
+                Some(LoadedDict::Parsed(_, len)) => *len,
+                _ => 0,
+            },
         };
-        crate::params::applied_block_size(&self.settings, pledged, dict_len)
+        let settings = match &self.cdict {
+            // The attached handle's creation params win over the sticky
+            // level and LDM mode, as the reference's cdict precedence.
+            Some(cdict) => {
+                let mut settings = self.settings.clone();
+                settings.level = cdict.level;
+                settings.ldm = cdict.ldm;
+                settings
+            },
+            None => self.settings.clone(),
+        };
+        crate::params::applied_block_size(&settings, pledged, dict_len)
     }
 
     /// Consume a single-use dictionary at frame open and snapshot the
@@ -476,6 +530,7 @@ impl CCtx {
         }
         self.settings = Settings::default();
         self.dict = None;
+        self.cdict = None;
         Ok(())
     }
 
@@ -494,9 +549,20 @@ impl CCtx {
     /// override in libzstd's init).
     pub fn compress2(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, ErrorCode> {
         self.reset_session();
-        let settings = self.settings.clone();
+        let settings = match &self.cdict {
+            Some(cdict) => {
+                let mut settings = self.settings.clone();
+                settings.level = cdict.level;
+                settings.ldm = cdict.ldm;
+                settings
+            },
+            None => self.settings.clone(),
+        };
         let applied = self.applied_block_size_snapshot(Some(src.len() as u64));
-        let dict = self.dict()?.cloned();
+        let dict = match &self.cdict {
+            Some(cdict) => cdict.dict.clone(),
+            None => self.dict()?.cloned(),
+        };
         self.applied_block_size = applied;
         // A refPrefix dictionary retires with the frame it opened.
         if self.dict_use_once {
@@ -539,8 +605,16 @@ impl CCtx {
             } else {
                 self.pledged
             };
-            let dict = self.dict()?;
-            match StreamState::new(&self.settings, dict, pledged) {
+            let (settings, dict) = match &self.cdict {
+                Some(cdict) => {
+                    let mut settings = self.settings.clone();
+                    settings.level = cdict.level;
+                    settings.ldm = cdict.ldm;
+                    (settings, cdict.dict.as_ref())
+                },
+                None => (self.settings.clone(), self.dict()?),
+            };
+            match StreamState::new(&settings, dict, pledged) {
                 Ok(state) => self.stream = Some(state),
                 Err(e) => {
                     self.sticky = Some(e);

@@ -3760,3 +3760,113 @@ fn streaming_transcript_dict_and_wlogmax_pins() {
     assert_eq!(record, vec![(0, 14, 1, 0), (8, 15, 0, 0), (0, 0, 0, 16)]);
     unsafe { zstd::ZSTD_freeDStream(zds) };
 }
+
+/// The advanced context constructors and `refCDict`: the null-default
+/// `customMem` shape works, anything else is refused (the recorded
+/// deviation where the reference honors a matched allocator pair), and
+/// the attached handle's creation params carry every following frame.
+#[test]
+fn advanced_constructors_and_refcdict() {
+    let def = zstd::ZSTD_customMem {
+        customAlloc: None,
+        customFree: None,
+        opaque: core::ptr::null_mut(),
+    };
+    unsafe extern "C" fn nop_free(_: *mut core::ffi::c_void) {}
+    let half = zstd::ZSTD_customMem {
+        customAlloc: None,
+        customFree: Some(nop_free),
+        opaque: core::ptr::null_mut(),
+    };
+
+    let cctx = unsafe { zstd::ZSTD_createCCtx_advanced(def) };
+    assert!(!cctx.is_null());
+    assert!(unsafe { zstd::ZSTD_createCCtx_advanced(half) }.is_null());
+    let dctx = unsafe { zstd::ZSTD_createDCtx_advanced(def) };
+    assert!(!dctx.is_null());
+    assert!(unsafe { zstd::ZSTD_createDCtx_advanced(half) }.is_null());
+    let zcs = unsafe { zstd::ZSTD_createCStream_advanced(def) };
+    let zds = unsafe { zstd::ZSTD_createDStream_advanced(def) };
+    assert!(!zcs.is_null() && !zds.is_null());
+    assert!(unsafe { zstd::ZSTD_createCStream_advanced(half) }.is_null());
+    assert!(unsafe { zstd::ZSTD_createDStream_advanced(half) }.is_null());
+
+    let buf: Vec<u8> = (0..(1u32 << 17))
+        .map(|i| b'a' + (i % 23) as u8 + (i % 11 < 7) as u8 * 5)
+        .collect();
+    let cap = compress_bound(buf.len());
+    let mut cmp = vec![0u8; cap * 2];
+    let mut out = vec![0u8; buf.len()];
+
+    // The attached handle's level (19) wins over the context's (1): the
+    // frame bytes match usingCDict on a fresh context.
+    let cdict = unsafe { zstd::ZSTD_createCDict(buf.as_ptr().cast(), 1 << 16, 19) };
+    assert!(!cdict.is_null());
+    assert_eq!(1, unsafe { zstd::ZSTD_CCtx_setParameter(cctx, 100, 1) });
+    assert_eq!(0, unsafe { zstd::ZSTD_CCtx_refCDict(cctx, cdict) });
+    let c1 = unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            cmp.as_mut_ptr().cast(),
+            cmp.len(),
+            buf.as_ptr().cast(),
+            buf.len(),
+        )
+    };
+    assert!(!is_error(c1));
+    let mut via = vec![0u8; cap];
+    let c2 = unsafe {
+        zstd::ZSTD_compress_usingCDict(
+            zstd::ZSTD_createCCtx(),
+            via.as_mut_ptr().cast(),
+            via.len(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            cdict,
+        )
+    };
+    assert_eq!(c1, c2);
+    assert_eq!(&cmp[..c1], &via[..c2]);
+    let frame1 = cmp[..c1].to_vec();
+
+    // The handle's content is the frame's history: decode needs it.
+    let ddict = unsafe { zstd::ZSTD_createDDict(buf.as_ptr().cast(), 1 << 16) };
+    assert_eq!(0, unsafe { zstd::ZSTD_DCtx_refDDict(dctx, ddict) });
+    let d = unsafe {
+        zstd::ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            frame1.as_ptr().cast(),
+            frame1.len(),
+        )
+    };
+    assert_eq!(d, buf.len());
+    assert_eq!(&out[..buf.len()], &buf);
+    unsafe { zstd::ZSTD_freeDDict(ddict) };
+
+    // refCDict(NULL) clears the slot: the next frame runs the sticky
+    // level again.
+    assert_eq!(0, unsafe {
+        zstd::ZSTD_CCtx_refCDict(cctx, core::ptr::null())
+    });
+    let c3 = unsafe {
+        zstd::ZSTD_compress2(
+            cctx,
+            cmp.as_mut_ptr().cast(),
+            cmp.len(),
+            buf.as_ptr().cast(),
+            buf.len(),
+        )
+    };
+    assert!(!is_error(c3));
+    assert_ne!(c1, c3);
+
+    unsafe {
+        zstd::ZSTD_freeCDict(cdict);
+        zstd::ZSTD_freeCCtx(cctx);
+        zstd::ZSTD_freeDCtx(dctx);
+        zstd::ZSTD_freeCStream(zcs);
+        zstd::ZSTD_freeDStream(zds);
+    }
+}

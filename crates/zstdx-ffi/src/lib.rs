@@ -482,6 +482,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary(
 /// `ZSTD_customMem` (only the null-default shape is honored; custom
 /// allocators are a static-workspace concern this layer does not carry).
 #[allow(non_snake_case)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ZSTD_customMem {
     pub customAlloc: Option<unsafe extern "C" fn(core::ffi::c_uint) -> *mut c_void>,
@@ -597,6 +598,29 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix_advanced(
     // SAFETY: the handle came from handle_pair's box round-trip and is still
     // live.
     match unsafe { cctx_mut(cctx) }.ref_prefix(bytes, dict_content_type) {
+        Ok(()) => 0,
+        Err(e) => ret(e),
+    }
+}
+
+/// `ZSTD_CCtx_refCDict`: attach the handle's dictionary to every
+/// following frame; a null handle clears the slot and any loaded
+/// dictionary. The attachment's lifetime is Arc-strengthened: the handle
+/// cannot dangle, where the reference keeps a caller-owned pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_refCDict(
+    cctx: *mut ZSTD_CCtx,
+    cdict: *const ZSTD_CDict,
+) -> usize {
+    if cctx.is_null() {
+        return ret(ErrorCode::Generic);
+    }
+    // SAFETY: the handle came from the create's box round-trip; null
+    // excluded by the guard.
+    let attach = (!cdict.is_null()).then(|| unsafe { &*cdict.cast::<CDict>() });
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    match unsafe { cctx_mut(cctx) }.ref_cdict(attach) {
         Ok(()) => 0,
         Err(e) => ret(e),
     }
@@ -857,6 +881,14 @@ crate::handle_pair!(
     cctx::CCtx
 );
 
+/// `ZSTD_createCStream_advanced`: the null-default `customMem` only (see
+/// `ZSTD_createCCtx_advanced`).
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCStream_advanced(custom_mem: ZSTD_customMem) -> *mut ZSTD_CStream {
+    // SAFETY-equivalent: a CStream *is* its CCtx here, as in libzstd.
+    ZSTD_createCCtx_advanced(custom_mem).cast()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_CStreamInSize() -> usize {
     128 * 1024
@@ -974,6 +1006,14 @@ crate::handle_pair!(
     ZSTD_DStream,
     dctx::DCtx
 );
+
+/// `ZSTD_createDStream_advanced`: the null-default `customMem` only (see
+/// `ZSTD_createCCtx_advanced`).
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createDStream_advanced(custom_mem: ZSTD_customMem) -> *mut ZSTD_DStream {
+    // A DStream *is* its DCtx here, as in libzstd.
+    ZSTD_createDCtx_advanced(custom_mem).cast()
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_DStreamInSize() -> usize {

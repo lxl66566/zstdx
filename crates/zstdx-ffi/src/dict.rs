@@ -17,6 +17,12 @@ use crate::{ZSTD_CDict, ZSTD_DDict, cctx, dctx, error::ErrorCode, simple::ret};
 pub struct CDict {
     pub dict: Option<zstdx::EncoderDictionary>,
     pub level: i32,
+    /// The LDM mode decided at creation (the level-based constructors
+    /// leave it `Auto`); `refCDict` and `usingCDict` take it with the
+    /// level.
+    pub ldm: zstdx::LdmMode,
+    /// The raw byte length, for the frame window sizing consults.
+    pub raw_len: usize,
 }
 
 /// The `ZSTD_DDict` object: the dictionary parsed once, shared with every
@@ -65,6 +71,8 @@ pub unsafe extern "C" fn ZSTD_createCDict(
         Ok(dict) => Box::into_raw(Box::new(CDict {
             dict: (!bytes.is_empty()).then_some(dict),
             level: compression_level,
+            ldm: zstdx::LdmMode::Auto,
+            raw_len: bytes.len(),
         }))
         .cast(),
         Err(_) => core::ptr::null_mut(),
@@ -131,7 +139,8 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
     // Frame parameters come from the handle: the level decided at creation
     // plus libzstd's hardcoded frame set (contentSize=yes, checksum=no,
     // dictID=yes); the context's sticky parameters do not apply.
-    let settings = cctx::Settings::one_shot(cdict.level);
+    let mut settings = cctx::Settings::one_shot(cdict.level);
+    settings.ldm = cdict.ldm;
     match cctx::compress_oneshot(&settings, cdict.dict.as_ref(), src, dst) {
         Ok(written) => written,
         Err(e) => ret(e),
