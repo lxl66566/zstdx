@@ -199,25 +199,19 @@ def plot_encode_mt() -> None:
             v = vals[payload]
             ax.plot(v, y + jitter[payload], marker="o", ms=7, color=color,
                     zorder=3)
-            # label on the side away from the parity line; very small dots
-            # label to their right so the text stays inside the axis
-            if v < 0.5:
-                x, ha = v * 1.3, "left"
-            elif v < 1.0:
-                x, ha = v * 0.82, "right"
-            else:
-                x, ha = v * 1.2, "left"
-            ax.text(x, y + jitter[payload], f"{v:.2f}", va="center",
-                    ha=ha, fontsize=7.5, color="#374151")
+            # label sits just past the dot, on the side away from parity
+            dx = -7 if v < 1.0 else 7
+            ax.annotate(f"{v:.2f}", (v, y + jitter[payload]),
+                        xytext=(dx, 0), textcoords="offset points",
+                        va="center", ha="right" if dx < 0 else "left",
+                        fontsize=7.5, color="#374151")
     ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.2, zorder=1)
-    ax.set_xscale("log")
-    ax.set_xlim(0.045, 9)
-    ax.set_xticks([0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8],
-                  ["0.05", "0.1", "0.25", "0.5", "1", "2", "4", "8"], fontsize=8.5)
+    ax.set_xlim(0, 5.75)
+    ax.set_xticks(range(6), [str(i) for i in range(6)], fontsize=8.5)
     ax.set_ylim(0.2, n + 0.9)
     ax.set_yticks(ys, list(ENCODE_MT.keys()), fontsize=9.5)
     ax.tick_params(axis="y", length=0)
-    ax.set_xlabel("streaming-encode throughput, ours/libzstd (×; 1.0 = parity, log)", fontsize=9.5)
+    ax.set_xlabel("streaming-encode throughput, ours/libzstd (×; 1.0 = parity)", fontsize=9.5)
     ax.grid(axis="x", alpha=0.3, lw=0.5)
     ax.spines[["top", "right", "left"]].set_visible(False)
     ax.text(0.97, n + 0.45, "libzstd faster ←", ha="right", fontsize=9,
@@ -265,7 +259,13 @@ def plot_decode() -> None:
             ax.text(lo - 0.015, y, f"{v64:.2f}×", va="center", ha="right",
                     fontsize=8.5, color="#111827")
     ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.2, zorder=1)
-    ax.set_xlim(0.68, 1.42)
+    # markers clip silently when xlim outruns the data, so derive the right
+    # edge from the widest value on the chart (MT 1.78x this pass)
+    xmax = max(
+        max(vals[2] for _, vals, mt in DECODE if mt is None),
+        max(vals[1] for _, vals, mt in DECODE if mt is not None),
+    )
+    ax.set_xlim(0.68, xmax * 1.05 + 0.02)
     ax.set_ylim(0.1, n + 1.0)
     ax.set_yticks(ys, [r[0] for r in DECODE], fontsize=9)
     ax.tick_params(axis="y", length=0)
