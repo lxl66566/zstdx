@@ -10,7 +10,7 @@ The streaming decode family is pinned by a transcript grid: embedded reference-b
 
 ## Symbol coverage
 
-The layer covers 106 of the 152 `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` symbols that the reference header declares. Coverage was probed with `nm` on both builds and diffed against the `ZSTDLIB_*_API` declarations in `zstd.h`.
+The layer exports 135 symbols covering 132 of the 175 functions the reference header declares under `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` (the three extras are the version helpers the header declares as static inline). Coverage is probed with `nm` on both builds and diffed against the declarations in `zstd.h`. The earlier ledger of 152 counted only the same-line prototypes and its 46-symbol remainder was the subtraction 152-106 rather than a diff; the full declared set puts the then-uncovered count at 50, of which 29 have since landed.
 
 - Version and metadata: complete for what consumers call, with `versionNumber/String/Major/Minor/Release`, `maxCLevel/minCLevel/defaultCLevel`, `compressBound`, `getFrameContentSize`, `getDecompressedSize`, `findDecompressedSize`, `findFrameCompressedSize`, `frameHeaderSize`, `getFrameHeader` and `isFrame`.
 - One-shot: `compress`, `decompress`, and the context and dictionary variants `compressCCtx`, `decompressDCtx`, `compress_usingDict/decompress_usingDict`, `compress_usingCDict/decompress_usingDDict` and `compress2`.
@@ -23,17 +23,21 @@ The layer covers 106 of the 152 `ZSTDLIB_API` and `ZSTDLIB_STATIC_API` symbols t
 - Estimates: the ten `estimate*` entries over the level rows and raw cParams, plus `decodingBufferSize_min` and `sequenceBound`.
 - Frame walk and skippable payload: `decompressBound`, `decompressionMargin`, `writeSkippableFrame`, `readSkippableFrame`, `isSkippableFrame`, `isDeterministicBuild` and `getFrameHeader_advanced` for the `zstd1` format.
 - Prefix and dictionary references: `CCtx_refPrefix`/`_advanced`, `DCtx_refPrefix`/`_advanced`, `DCtx_refDDict`, the `loadDictionary_byReference`/`_advanced` variants on both sides and the `createCDict_byReference`/`createDDict_byReference`/`createDDict_advanced` constructors.
+- Advanced constructors and dictionary reference: `createCCtx_advanced`, `createDCtx_advanced`, `createCStream_advanced` and `createDStream_advanced` (the null-default `customMem` only), `createCDict_advanced` (zeroed cParams only, the level-default row) and `createCDict_advanced2` (the bag's level and LDM switch), plus `CCtx_refCDict`, the handle's creation params carrying every frame until a dictionary load or a null re-attach clears it.
+- The `ZSTD_CCtx_params` bag: `createCCtxParams`/`freeCCtxParams`, `init`/`init_advanced`/`reset`, `setParameter`/`getParameter`, the context adopters `CCtx_setParametersUsingCCtxParams`/`setCParams`/`setFParams`/`setParams`, and the bag estimate users `estimateCCtxSize_usingCCtxParams`/`estimateCStreamSize_usingCCtxParams`.
+- Introspection: `getFrameProgression`, `toFlushNow` and the six `sizeof_*` entries.
+- Sequence utilities: the `ZSTD_Sequence` struct and `mergeBlockDelimiters`.
 
-The remainder, 46 symbols, is deliberately uncovered:
-- The `initStatic*` family (6): the contexts are heap objects; there is no caller-provided workspace to init into.
-- The legacy push API (11: `compressBegin` and kin, `decompressBegin`/`decompressContinue`, `nextInputType`, `nextSrcSizeToDecompress`): a second streaming engine around the same core.
-- The `ZSTD_CCtx_params` bag and its users (12: `createCCtxParams`, `freeCCtxParams`, the `CCtxParams_*` setters, `CCtx_setParams`/`setCParams`/`setFParams`/`setParametersUsingCCtxParams`, `estimateCCtxSize_usingCCtxParams`, `estimateCStreamSize_usingCCtxParams`): the bag accepts engine knobs (hashLog through strategy, the LDM set) that the codec does not expose, so adopting one could only silently ignore it and change the frame bytes against the reference.
-- Constructors with explicit cParams, params or custom allocators (6: `createCCtx_advanced`, `createCDict_advanced`, `createCDict_advanced2`, the `*_advanced` stream constructors): the same knob problem; `createDDict_advanced` is in and refuses a non-default `customMem`, since caller allocation has no hook here.
-- `CCtx_refCDict` and the thread pool (4): the attach-dict parameter precedence and worker-pool plumbing have no engine counterpart.
-- Block-level decode (2: `decompressBlock`, `mergeBlockDelimiters`) and introspection (8: `getFrameProgression`, `toFlushNow`, the six `sizeof_*`): the first need sequence-store level access; the introspection entries report the reference's object sizes, which are not this implementation's.
-- `copyDCtx` (1): a deprecated field-range copy between reference-layout objects.
+The remainder, 43 declared functions, stays uncovered with recorded verdicts:
 
-Each family needs its own parity round if a consumer calls it, and none is reachable through the stable `zstd` crate bindings.
+- Static workspace (6: the `initStatic*` family): the contexts, dictionaries and streams are heap-boxed Rust objects, so init-into-caller-memory has no engine counterpart. Blocked on an engine change, not a layer decision.
+- The legacy push API (13: `compressBegin` with its `_usingDict`/`_usingCDict`/`_advanced` forms, `compressContinue`, `compressEnd`, `decompressBegin` with its two forms, `decompressContinue`, `nextInputType`, `nextSrcSizeToDecompress`): implementable through this crate alone now that the stage engines exist, as a shim port, but it is a full second streaming-engine parity round and stays out.
+- Thread pool (3: `createThreadPool`, `freeThreadPool`, `CCtx_refThreadPool`): a persistent pool shared across contexts has no engine counterpart; the engine spawns per-frame workers. Blocked on an engine change.
+- Block-level I/O (3: `compressBlock`, `decompressBlock`, `insertBlock`): block-level decode with per-context entropy continuity needs engine-level block API exposure; the decode core is frame-shaped. Blocked on an engine change.
+- Deprecated upstream (8: the `initCStream_srcSize`/`_usingDict`/`_usingCDict`/`_usingCDict_advanced`/`_advanced` family, `resetCStream`, `copyCCtx`, `copyDCtx`): every one has a documented equivalent through the reset, parameter and ref entries. Out on policy.
+- The sequence-producer and experimental I/O family (10: `registerSequenceProducer`, `CCtxParams_registerSequenceProducer`, `generateSequences`, `compressSequences`, `compressSequencesAndLiterals`, `compress_advanced`, `compress_usingCDict_advanced`, `DCtx_setFormat`, the two `*_simpleArgs` aliases): the engine exposes no external sequence producer and no per-block I/O, so the family is blocked; the simpleArgs aliases are mechanical and ride whenever the entries they alias land.
+
+The bag's own answers are reference-exact: storage, bounds and readback were probed against the pinned reference build and are byte-identical, including the worker knobs refusing every non-default value the way the non-multithread build does, and the bag estimates reproduce the reference cwksp sizing to the byte (the pinned numbers live in the harness). The deviations sit at adoption: a context applying a bag, or an explicit-cParams CDict constructor, refuses with `parameter_unsupported` when any knob the engine cannot honor sits at a non-default value - loudly, never silently - where the reference would have accepted it. The `sizeof_*` entries report this implementation's own object footprint (the state struct plus the loaded dictionary's bytes on the compression side), deliberately not the reference's numbers; only the structural contract (null answers 0, the stream handles alias their contexts) is pinned. `toFlushNow` answers the non-multithread build's constant 0. `refCDict` Arc-clones the handle's dictionary, so the attachment cannot dangle where the reference keeps a caller-owned pointer. `mergeBlockDelimiters` adds a null-array guard the reference does not carry (it derefs).
 
 ## Divergences fixed
 
@@ -58,12 +62,13 @@ The earlier commits fixed several contracts. Commit 4fdc4872 fixed `getFrameHead
 - One-shot compress accepts an exact-fit capacity. The reference's `ZSTD_compress` refuses a `dstCapacity` in `[used, used+8)` with `dstSize_tooSmall` even though the output fits. A probe with used=276 accepted the first capacity at 284, an internal workspace-margin artifact. This layer accepts the exact fit. The earlier "noise-cap anomaly" is this case, now boundary-pinned.
 - The wild-cursor clamp is fixed. `compressStream2` and `decompressStream` now answer `dstSize_tooSmall` and `srcSize_wrong` for `pos > size` in the reference's check order. The earlier behavior was a silent clamp, and the fix is in 136a2758.
 - `initDStream_usingDDict` has a strengthened lifetime. The handle's dictionary is Arc-cloned into the context, where the reference keeps a caller-owned pointer that dangles if freed early. This layer cannot dangle.
+- `refCDict` has the same strengthened lifetime, for the same reason: the attachment owns an Arc clone of the handle's parsed dictionary. The matched-`customMem` advanced constructors are refused with NULL where the reference honors the allocator pair, the refusal `createDDict_advanced` already records.
 - Pre-existing behavior, documented in `ffi.md`: negative levels clamp to 1, windowLog above 27 is engine-capped, nbWorkers semantics apply, and one-shot variants use fresh settings.
 - Also pre-existing and documented in `ffi.md`: a failed stream replays its error where the reference has UB, `setParameter` level mid-frame applies to the next frame where the reference retunes the running one, and sub-8-byte dictionaries mean no dictionary on both sides.
 
 ## Unprobed remainder
 
-- The deliberately uncovered symbol families above, namely estimate, static, advanced, ref, block-level and push-API entries, have no behavior probes. Their coverage is a named gap, not a verified one.
+- The uncovered families above - static-workspace, push-API, thread-pool, block-level, the deprecated entries and the sequence-producer family - have no behavior probes. Their coverage is a named gap, not a verified one.
 - `ZSTD_decompressContinue`'s own no-forward-progress counter, `dctx->noForwardProgress`, is moot while the push API is unimplemented.
 - Legacy-format frames on the `ZSTD_isLegacy` paths are unsupported by this codec, and no probe exercised legacy magic on the decode entries.
 
@@ -77,7 +82,11 @@ The earlier commits fixed several contracts. Commit 4fdc4872 fixed `getFrameHead
 - b28e8b68 fixes the one-shot bad-magic gating, null and truncated decode buffers, the `initDStream` return, the deprecated DStream init family and the no-forward-progress guard
 - dd4df0ac ports the reference's `ZSTD_decompressStream` stage engine into the FFI streaming shim, closing the `destFull` call-count and hint deviations
 - 2caa7259 pins the streaming surface with the transcript grid: 41 cells over embedded reference-built frames, 2248 calls compared cell by cell on both libraries
-- (this commit) adds the dictionary-streaming and windowLogMax cells: 3 cells, 298 calls, dict re-arm at the frame boundary and the streaming window clamp's consult error compared cell by cell on both libraries
+- 44efe412 adds the dictionary-streaming and windowLogMax cells: 3 cells, 298 calls, dict re-arm at the frame boundary and the streaming window clamp's consult error compared cell by cell on both libraries
+
+- b6a5e0ac adds the advanced context constructors and `ZSTD_CCtx_refCDict`, with the handle's params carrying every attached frame
+- d395a07e adds the `ZSTD_CCtx_params` bag, its estimate users and the advanced CDict constructors; every bag probe answer is byte-identical to the reference build, and the adoption refusals are pinned on the Rust side only, where the reference would succeed
+- (this commit) adds the introspection family (`getFrameProgression`, `toFlushNow`, the six `sizeof_*`) and `ZSTD_mergeBlockDelimiters`
 
 ## Verification
 

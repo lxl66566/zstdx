@@ -783,6 +783,120 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
     }
 }
 
+/// `ZSTD_frameProgression`: the counters `ZSTD_getFrameProgression`
+/// reports. `currentJobID` and `nbActiveWorkers` stay 0, the
+/// single-threaded shape of the pinned reference build.
+#[allow(non_snake_case)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZSTD_frameProgression {
+    pub ingested: u64,
+    pub consumed: u64,
+    pub produced: u64,
+    pub flushed: u64,
+    pub currentJobID: core::ffi::c_uint,
+    pub nbActiveWorkers: core::ffi::c_uint,
+}
+
+/// `ZSTD_getFrameProgression`: the running frame's byte counters. The
+/// reference's single-threaded branch counts ingested with its internal
+/// staged input (which this layer never holds, so ingested equals
+/// consumed) and answers produced == flushed; the counters zero when no
+/// frame is open.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_getFrameProgression(cctx: *const ZSTD_CCtx) -> ZSTD_frameProgression {
+    let zero = ZSTD_frameProgression {
+        ingested: 0,
+        consumed: 0,
+        produced: 0,
+        flushed: 0,
+        currentJobID: 0,
+        nbActiveWorkers: 0,
+    };
+    if cctx.is_null() {
+        return zero;
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    let (ingested, consumed, produced, flushed) =
+        unsafe { &*cctx.cast::<cctx::CCtx>() }.frame_progression();
+    ZSTD_frameProgression {
+        ingested,
+        consumed,
+        produced,
+        flushed,
+        ..zero
+    }
+}
+
+/// `ZSTD_toFlushNow`: the pinned reference build carries no
+/// `ZSTD_MULTITHREAD`, so its branch is the constant 0 this layer
+/// mirrors, whatever the internal buffer holds.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_toFlushNow(_cctx: *mut ZSTD_CCtx) -> usize {
+    0
+}
+
+/// The `ZSTD_sizeof_*` family: this implementation's own object
+/// footprint, not the reference's. A null handle answers 0 ("support
+/// sizeof on NULL"), and the compression-side counts add the loaded
+/// dictionary's bytes, the reference's `localDict` term. The numbers are
+/// advisory for this layer only and deliberately not parity-pinned
+/// against the reference build.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
+    if cctx.is_null() {
+        return 0;
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    unsafe { &*cctx.cast::<cctx::CCtx>() }.footprint()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
+    if dctx.is_null() {
+        return 0;
+    }
+    // SAFETY: the handle came from handle_pair's box round-trip and is still
+    // live.
+    unsafe { &*dctx.cast::<dctx::DCtx>() }.footprint()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_CStream(zcs: *const ZSTD_CStream) -> usize {
+    // A CStream *is* its CCtx, as in libzstd.
+    unsafe { ZSTD_sizeof_CCtx(zcs.cast()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_DStream(zds: *const ZSTD_DStream) -> usize {
+    // A DStream *is* its DCtx, as in libzstd.
+    unsafe { ZSTD_sizeof_DCtx(zds.cast()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_CDict(cdict: *const ZSTD_CDict) -> usize {
+    if cdict.is_null() {
+        return 0;
+    }
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
+    let handle = unsafe { &*cdict.cast::<dict::CDict>() };
+    core::mem::size_of_val(handle) + handle.raw_len
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_DDict(ddict: *const ZSTD_DDict) -> usize {
+    if ddict.is_null() {
+        return 0;
+    }
+    // SAFETY: the handle came from the create's box round-trip and is still
+    // live.
+    let handle = unsafe { &*ddict.cast::<dict::DDict>() };
+    core::mem::size_of_val(handle) + handle.dict.dict_content.len()
+}
+
 /// `ZSTD_getBlockSize`: the running (or last) frame's block size; 0
 /// before any frame opened, as the reference's zeroed `appliedParams`.
 #[unsafe(no_mangle)]

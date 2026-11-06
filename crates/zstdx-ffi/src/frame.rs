@@ -696,6 +696,47 @@ pub extern "C" fn ZSTD_isDeterministicBuild() -> core::ffi::c_uint {
     1
 }
 
+/// `ZSTD_Sequence`: one entry of the external-sequence arrays the
+/// sequence-producer API carries (offset 0 with matchLength 0 marks the
+/// final literal run of a block).
+#[allow(non_snake_case)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZSTD_Sequence {
+    pub offset: u32,
+    pub litLength: u32,
+    pub matchLength: u32,
+    pub rep: u32,
+}
+
+/// `ZSTD_mergeBlockDelimiters`: fold the block-delimiter sequences away
+/// by merging each marker's literal run into the next sequence, in place
+/// and in one pass, exactly the reference's loop. The return is the
+/// number of sequences left.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_mergeBlockDelimiters(
+    sequences: *mut ZSTD_Sequence,
+    seqs_size: usize,
+) -> usize {
+    if sequences.is_null() || seqs_size == 0 {
+        return 0;
+    }
+    // SAFETY: the caller-validated sequence array of `seqs_size` entries.
+    let sequences = unsafe { core::slice::from_raw_parts_mut(sequences, seqs_size) };
+    let mut out = 0;
+    for i in 0..seqs_size {
+        if sequences[i].offset == 0 && sequences[i].matchLength == 0 {
+            if i != seqs_size - 1 {
+                sequences[i + 1].litLength += sequences[i].litLength;
+            }
+        } else {
+            sequences[out] = sequences[i];
+            out += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

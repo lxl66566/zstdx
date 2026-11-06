@@ -3986,3 +3986,117 @@ fn cctx_params_refusal_deviations() {
         zstd::ZSTD_freeCCtx(cctx);
     }
 }
+
+/// The introspection family: frame progression follows the reference's
+/// single-threaded counters (accumulating across calls, produced ==
+/// flushed, surviving the finished frame), toFlushNow answers the
+/// non-multithread build's constant 0, sizeof reports this layer's own
+/// footprint (with the loaded-dictionary term on the compression side),
+/// and mergeBlockDelimiters folds markers in place.
+#[test]
+fn introspection_family() {
+    let buf: Vec<u8> = (0..(1u32 << 17))
+        .map(|i| b'a' + (i % 23) as u8 + (i % 11 < 7) as u8 * 5)
+        .collect();
+    let cctx = zstd::ZSTD_createCCtx();
+    let mut cmp = vec![0u8; 1 << 20];
+
+    let mut ob = zstd::ZSTD_outBuffer {
+        dst: cmp.as_mut_ptr().cast(),
+        size: 4096,
+        pos: 0,
+    };
+    let mut ib = zstd::ZSTD_inBuffer {
+        src: buf.as_ptr().cast(),
+        size: buf.len(),
+        pos: 0,
+    };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob, &mut ib, 0) };
+    let first_flush = ob.pos;
+    let mut ob2 = zstd::ZSTD_outBuffer {
+        dst: unsafe { cmp.as_mut_ptr().add(4096) }.cast(),
+        size: cmp.len() - 4096,
+        pos: 0,
+    };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob2, &mut ib, 0) };
+    let fp = unsafe { zstd::ZSTD_getFrameProgression(cctx) };
+    assert_eq!(fp.consumed, buf.len() as u64);
+    assert_eq!(fp.ingested, fp.consumed);
+    assert_eq!(fp.flushed, (first_flush + ob2.pos) as u64);
+    assert_eq!(fp.produced, fp.flushed);
+    assert_eq!(fp.currentJobID, 0);
+    assert_eq!(fp.nbActiveWorkers, 0);
+    assert_eq!(0, unsafe { zstd::ZSTD_toFlushNow(cctx) });
+    // finish and drain: the counters survive the finished frame
+    let mut empty = zstd::ZSTD_inBuffer {
+        src: buf.as_ptr().cast(),
+        size: 0,
+        pos: 0,
+    };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob2, &mut empty, 2) };
+    let fp = unsafe { zstd::ZSTD_getFrameProgression(cctx) };
+    assert_eq!(fp.consumed, buf.len() as u64);
+
+    // sizeof: the stream handles alias their contexts; the dictionary
+    // content rides the compression-side count; NULL answers 0.
+    assert_eq!(0, unsafe { zstd::ZSTD_sizeof_CCtx(core::ptr::null()) });
+    let sc = unsafe { zstd::ZSTD_sizeof_CCtx(cctx) };
+    assert!(sc > 0);
+    assert_eq!(sc, unsafe {
+        zstd::ZSTD_sizeof_CStream(cctx.cast::<zstd::ZSTD_CStream>().cast())
+    });
+    let dctx = zstd::ZSTD_createDCtx();
+    assert_eq!(unsafe { zstd::ZSTD_sizeof_DCtx(dctx) }, unsafe {
+        zstd::ZSTD_sizeof_DStream(dctx.cast::<zstd::ZSTD_DStream>().cast())
+    });
+    let cd_full = unsafe { zstd::ZSTD_createCDict(buf.as_ptr().cast(), buf.len(), 3) };
+    let cd_empty = unsafe { zstd::ZSTD_createCDict(core::ptr::null(), 0, 3) };
+    assert_eq!(
+        unsafe { zstd::ZSTD_sizeof_CDict(cd_full) },
+        unsafe { zstd::ZSTD_sizeof_CDict(cd_empty) } + buf.len()
+    );
+
+    // mergeBlockDelimiters: the in-place fold, plus the null-array guard
+    // the reference does not carry.
+    let mut seqs = [
+        zstd::ZSTD_Sequence {
+            offset: 10,
+            litLength: 4,
+            matchLength: 5,
+            rep: 0,
+        },
+        zstd::ZSTD_Sequence {
+            offset: 0,
+            litLength: 6,
+            matchLength: 0,
+            rep: 0,
+        },
+        zstd::ZSTD_Sequence {
+            offset: 12,
+            litLength: 3,
+            matchLength: 4,
+            rep: 0,
+        },
+        zstd::ZSTD_Sequence {
+            offset: 0,
+            litLength: 5,
+            matchLength: 0,
+            rep: 0,
+        },
+    ];
+    let left = unsafe { zstd::ZSTD_mergeBlockDelimiters(seqs.as_mut_ptr(), seqs.len()) };
+    assert_eq!(left, 2);
+    assert_eq!(seqs[0].litLength, 4);
+    assert_eq!(seqs[1].offset, 12);
+    assert_eq!(seqs[1].litLength, 9);
+    assert_eq!(0, unsafe {
+        zstd::ZSTD_mergeBlockDelimiters(core::ptr::null_mut(), 5)
+    });
+
+    unsafe {
+        zstd::ZSTD_freeCCtx(cctx);
+        zstd::ZSTD_freeDCtx(dctx);
+        zstd::ZSTD_freeCDict(cd_full);
+        zstd::ZSTD_freeCDict(cd_empty);
+    }
+}

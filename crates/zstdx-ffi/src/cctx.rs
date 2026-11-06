@@ -266,6 +266,11 @@ struct StreamState {
     encoder: zstdx::stream::write::Encoder<Vec<u8>>,
     /// Bytes of `encoder`'s sink already handed to the caller.
     delivered: usize,
+    /// `ZSTD_getFrameProgression` counters for the running frame: the
+    /// input bytes accepted (this layer stages no input of its own, so
+    /// ingested equals consumed) and the output bytes delivered.
+    ingested: u64,
+    flushed: u64,
     /// `do_finish` ran: only draining may follow for this frame.
     frame_closed: bool,
     /// The frame is closed and fully drained; the next call opens a new one.
@@ -287,6 +292,8 @@ impl StreamState {
         Ok(Self {
             encoder,
             delivered: 0,
+            ingested: 0,
+            flushed: 0,
             frame_closed: false,
             finished: false,
         })
@@ -331,6 +338,9 @@ pub struct CCtx {
     /// consumed when that frame completes.
     pledged: Option<u64>,
     stream: Option<StreamState>,
+    /// The finished frame's counters, until the next frame opens (the
+    /// reference resets them at its next frame's init, not at completion).
+    last_progression: (u64, u64),
     /// libzstd leaves a failed context in an undefined state; this layer
     /// keeps replaying the first error until a reset.
     sticky: Option<ErrorCode>,
@@ -346,6 +356,7 @@ impl CCtx {
             applied_block_size: 0,
             pledged: None,
             stream: None,
+            last_progression: (0, 0),
             sticky: None,
         }
     }
@@ -718,6 +729,7 @@ impl CCtx {
             self.frame_opened(pledged);
         }
         let state = self.stream.as_mut().expect("just ensured");
+        let (in_start, out_start) = (input.pos, output.pos);
 
         // SAFETY: output.dst[..output.size] is the caller-validated write
         // pair from the C entry.
@@ -754,15 +766,44 @@ impl CCtx {
         }
         state.deliver(out, &mut output.pos);
         input.pos = in_pos;
+        state.ingested += (input.pos - in_start) as u64;
+        state.flushed += (output.pos - out_start) as u64;
         let pending = state.pending();
         if mode == ZSTD_EndDirective::End && pending == 0 {
             state.finished = true;
+            self.last_progression = (state.ingested, state.flushed);
         }
         Ok(pending)
     }
 
+    /// `ZSTD_sizeof_CCtx`: the state struct plus the loaded dictionary's
+    /// bytes (the reference's `localDict` term).
+    pub fn footprint(&self) -> usize {
+        core::mem::size_of_val(self)
+            + match &self.cdict {
+                Some(attached) => attached.raw_len,
+                None => match &self.dict {
+                    Some(LoadedDict::Parsed(_, len)) => *len,
+                    _ => 0,
+                },
+            }
+    }
+
     pub fn record_error(&mut self, code: ErrorCode) {
         self.sticky = Some(code);
+    }
+
+    /// `ZSTD_getFrameProgression`: the running frame's counters, or zeros
+    /// when no frame is open (the reference resets them with the session).
+    /// The single-threaded reference answers produced == flushed (its
+    /// simplification), so this layer reports the delivered count for
+    /// both.
+    pub fn frame_progression(&self) -> (u64, u64, u64, u64) {
+        let (ingested, flushed) = match &self.stream {
+            Some(state) if !state.finished => (state.ingested, state.flushed),
+            _ => self.last_progression,
+        };
+        (ingested, ingested, flushed, flushed)
     }
 }
 

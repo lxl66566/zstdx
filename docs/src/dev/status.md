@@ -117,7 +117,7 @@ LDM arms on row 9, with W26, reach W22 and 9.75% smaller dll100 output. It also 
 
 The superblock layout handles small-frame literals through `LitStreams`. Known-length frames of 64 KiB or less emit one-stream huffman literals sections, which measured 2026-10-01 saves 7 to 9 B on the small-payload 1K and 4K cells and lands several bytes ahead of libzstd, including its `--target-compressed-block-size` form. 32 MiB outputs stay byte-identical. Sub-block splitting was falsified for ratio, as recorded in [negative](negative/entropy.md) and [encoding](perf/encoding.md). preSplit is a screened port on the balanced chain row.
 
-`crates/zstdx-ffi` builds `libzstd.so` and `libzstd.a` with the simple, context, streaming, reset, pledged, compress2, CDict, DDict, loadDictionary, getDictID, metadata, bounds, parameter-readback, cParams-helper, estimate, frame-walk, skippable and prefix-ref entries. That is 106 of the 152 header symbols, with libzstd interop in both directions and a golden-grid parity gate. The C harness doubles as a reference-parity gate. See [ffi](ffi.md).
+`crates/zstdx-ffi` builds `libzstd.so` and `libzstd.a` with the simple, context, streaming, reset, pledged, compress2, CDict, DDict, loadDictionary, getDictID, metadata, bounds, parameter-readback, cParams-helper, estimate, frame-walk, skippable, prefix-ref, advanced-constructor, `CCtx_params`-bag, refCDict and introspection entries. That is 132 of the 175 functions the header declares (135 exported symbols), with libzstd interop in both directions and a golden-grid parity gate. The C harness doubles as a reference-parity gate. See [ffi](ffi.md).
 
 ## Completeness against libzstd
 
@@ -128,10 +128,10 @@ These are subjective estimates used for targeting.
 |---|---|---|
 | decode features and correctness | ~90% | Spec compliance, dictionary decode, and corpus plus fuzz coverage. Parity rounds on 2026-10-23 swept entropy headers, sequence execution, literals tails and dictionary paths against libzstd. Decode window semantics match libzstd: streaming enforces the buffer generation model, one-shot decodes the whole history by design, and probes pin each decode path. See the [parity review](review/parity.md) and [window semantics review](review/winsem.md). |
 | decode performance | at parity or ahead on json, text and skewed, dll100 about 95% | The 2026-11-03 release pass carries the sequence loop and the literals-side rounds: x0.92 to 1.03 bulk and 0.93 to 1.05 stream on json, text and skewed, and x1.02 to 1.08 on dll100. See [dec-gap](bench/dec-gap.md). |
-| encode features | ~90% | The full 1-22 ladder, dictionary encode on ST and MT, formatted-dictionary training and emission, adjustable window, LDM, MT, streaming, preSplit on the chain row, small-frame superblock literals, and the 106-symbol C FFI. |
+| encode features | ~90% | The full 1-22 ladder, dictionary encode on ST and MT, formatted-dictionary training and emission, adjustable window, LDM, MT, streaming, preSplit on the chain row, small-frame superblock literals, and the 135-symbol C FFI. |
 | encode speed | wins and losses split by tier | The ladder speed curve and the current per-tier x are below. |
 | encode ratio | matched at every tier | The full-corpus ratio sweep measured 2026-10-30 is below. |
-| API and ecosystem | ~85% | Bulk, streaming, the full non-experimental compat surface, and the CLI's zstd 1.5.7 core surface. The C FFI ships 106 of the 152 `libzstd` symbols. The missing entries are the static-workspace, push-API, `CCtx_params`-bag and introspection families, deliberately, and language bindings. |
+| API and ecosystem | ~85% | Bulk, streaming, the full non-experimental compat surface, and the CLI's zstd 1.5.7 core surface. The C FFI ships 132 of the 175 functions `libzstd` declares. The missing entries are the static-workspace, push-API, thread-pool, block-level, deprecated and sequence-producer families, with recorded verdicts, and language bindings. |
 
 ### Encode speed measurements
 

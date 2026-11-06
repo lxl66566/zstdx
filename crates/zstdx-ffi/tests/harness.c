@@ -8179,6 +8179,83 @@ static void test_cctx_params_and_cdict_advanced(void) {
     ZSTD_freeCCtxParams(p);
 }
 
+static void test_introspection(void) {
+    static unsigned char buf[1 << 19];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)('a' + (i % 23) + (i % 7 < 3) * 5);
+
+    /* toFlushNow: the non-MT reference build's constant 0 */
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    ZSTD_outBuffer ob = { buf, 4096, 0 };
+    ZSTD_inBuffer ib = { buf, 1 << 18, 0 };
+    ZSTD_compressStream2(cctx, &ob, &ib, ZSTD_e_continue);
+    size_t first_flush = ob.pos;
+    CHECK(ZSTD_toFlushNow(cctx) == 0, "toFlushNow single-threaded");
+
+    /* frame progression: the running counters advance by the call's
+     * input and output deltas, produced == flushed (the reference's
+     * simplification), and everything zeros once no frame is open */
+    ZSTD_outBuffer ob2 = { buf, 1 << 20, 0 };
+    ZSTD_inBuffer ib2 = { buf, 1 << 18, 0 };
+    size_t h = ZSTD_compressStream2(cctx, &ob2, &ib2, ZSTD_e_continue);
+    CHECK(!ZSTD_isError(h), "progression feed");
+    size_t flushed_now = ob2.pos;
+    ZSTD_frameProgression fp = ZSTD_getFrameProgression(cctx);
+    CHECK(fp.consumed == ib.pos + ib2.pos, "consumed accumulates across calls (%llu vs %zu)",
+          (unsigned long long)fp.consumed, ib.pos + ib2.pos);
+    CHECK(fp.ingested >= fp.consumed, "ingested covers consumed");
+    CHECK(fp.flushed == first_flush + flushed_now, "flushed accumulates across calls (%llu vs %zu)",
+          (unsigned long long)fp.flushed, first_flush + flushed_now);
+    CHECK(fp.produced == fp.flushed, "produced == flushed");
+    CHECK(fp.currentJobID == 0 && fp.nbActiveWorkers == 0, "single-threaded shape");
+    ZSTD_inBuffer ib3 = { buf, 0, 0 };
+    ZSTD_compressStream2(cctx, &ob2, &ib3, ZSTD_e_end);
+    fp = ZSTD_getFrameProgression(cctx);
+    CHECK(fp.consumed >= ib.pos + ib2.pos && fp.flushed >= flushed_now,
+          "counters survive the finished frame");
+
+    /* sizeof: this layer's own footprint; only the structural contract
+     * is pinned (null, and the stream == context identities) */
+    CHECK(ZSTD_sizeof_CCtx(NULL) == 0, "sizeof_CCtx(NULL)");
+    CHECK(ZSTD_sizeof_CStream(NULL) == 0, "sizeof_CStream(NULL)");
+    CHECK(ZSTD_sizeof_DCtx(NULL) == 0, "sizeof_DCtx(NULL)");
+    CHECK(ZSTD_sizeof_DDict(NULL) == 0, "sizeof_DDict(NULL)");
+    size_t sc = ZSTD_sizeof_CCtx(cctx);
+    CHECK(sc > 0, "sizeof_CCtx nonzero");
+    ZSTD_CStream *zcs = ZSTD_createCStream();
+    CHECK(ZSTD_sizeof_CStream((ZSTD_CStream*)cctx) == sc,
+          "sizeof_CStream == sizeof_CCtx");
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    CHECK(ZSTD_sizeof_DCtx(dctx) > 0 && ZSTD_sizeof_DStream((ZSTD_DStream*)dctx) == ZSTD_sizeof_DCtx(dctx),
+          "sizeof_DStream == sizeof_DCtx");
+    ZSTD_CDict *cd = ZSTD_createCDict(buf, 1 << 16, 3);
+    ZSTD_CDict *empty = ZSTD_createCDict(NULL, 0, 3);
+    CHECK(ZSTD_sizeof_CDict(cd) > 0 && ZSTD_sizeof_CDict(empty) > 0, "sizeof_CDict nonzero");
+    ZSTD_DDict *dd = ZSTD_createDDict(buf, 1 << 16);
+    CHECK(ZSTD_sizeof_DDict(dd) > 0, "sizeof_DDict nonzero");
+
+    /* mergeBlockDelimiters: the reference's in-place fold, exact */
+    ZSTD_Sequence seqs[8] = {
+        {10, 4, 5, 0}, {0, 6, 0, 0}, {12, 3, 4, 0}, {0, 2, 0, 0},
+        {0, 7, 0, 0}, {14, 1, 2, 0}, {9, 8, 3, 0}, {0, 5, 0, 0},
+    };
+    size_t left = ZSTD_mergeBlockDelimiters(seqs, 8);
+    CHECK(left == 4, "merged count %zu", left);
+    CHECK(seqs[0].offset == 10 && seqs[0].litLength == 4, "seq0 untouched");
+    CHECK(seqs[1].offset == 12 && seqs[1].litLength == 9, "seq1 merged literals %u", seqs[1].litLength);
+    CHECK(seqs[2].offset == 14 && seqs[2].litLength == 10, "seq2 merged tail %u", seqs[2].litLength);
+    CHECK(seqs[3].offset == 9 && seqs[3].litLength == 8, "seq3 survives");
+    /* a single trailing marker folds into nothing */
+    ZSTD_Sequence one[1] = { {0, 5, 0, 0} };
+    CHECK(ZSTD_mergeBlockDelimiters(one, 1) == 0, "lone marker");
+
+    ZSTD_freeCDict(cd);
+    ZSTD_freeCDict(empty);
+    ZSTD_freeDDict(dd);
+    ZSTD_freeCStream(zcs);
+    ZSTD_freeCCtx(cctx);
+    ZSTD_freeDCtx(dctx);
+}
+
 static void test_stream_transcripts(void) {
     static TCall got[T_MAX_CALLS];
     for (size_t ci = 0; ci < sizeof tcells / sizeof tcells[0]; ci++) {
@@ -8283,6 +8360,7 @@ int main(int argc, char **argv) {
     test_prefix_family();
     test_advanced_constructors_refcdict();
     test_cctx_params_and_cdict_advanced();
+    test_introspection();
     test_stream_transcripts();
     printf(failures ? "SELF-TESTS FAILED (%d)\n" : "self-tests OK (%d failures)\n", failures);
     return failures ? 1 : 0;
