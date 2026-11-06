@@ -6,14 +6,23 @@
 //! or byte divergence is a crash artifact. Committed seed classes cover
 //! the machinery mutations cannot assemble: multi-frame streams for the
 //! frame-lane executor, job-grid and piece shapes for the segment
-//! executor, and the restart-poor libzstd -9 epoch class.
+//! executor, and the restart-poor libzstd -9 epoch class. The piece-regime
+//! frames ride the encoder's ramp D lattice, decode at several worker
+//! counts and pin the piece engagement per qualifying frame.
 
 use libfuzzer_sys::fuzz_target;
 use zstdx::{
     DecoderOptions, EncoderOptions, Level, bulk,
     decoding::{FrameDecoder, errors::FrameDecoderError},
-    frame_lane_engagements, set_mt_ramp_depth_for_tests, set_piece_decode_for_tests,
+    frame_lane_engagements, piece_engagements, set_mt_ramp_depth_for_tests,
+    set_piece_decode_for_tests,
 };
+
+/// The encoder ramp D lattice for the seeded frames: 512 KiB sits on the
+/// piece validator's lag bar at the 1 MiB job floor with margin (the bar
+/// reads 375 KiB), and the larger values block every crossing read, so
+/// every D validates the job grids the pieces cut.
+const RAMP_DEPTHS: [u64; 3] = [512 * 1024, 1024 * 1024, 2 * 1024 * 1024];
 
 fn check_with(data: &[u8], workers: u32) {
     let mt = bulk::decompress_with(data, 1 << 20, &DecoderOptions::new().threads(workers));
@@ -150,15 +159,13 @@ fn noise(rng: &mut Rng, len: usize) -> Vec<u8> {
 /// own MT encoder, so the segment scan sees job-boundary restart cuts at
 /// varying alignments, plus libzstd -9 restart-poor frames, so the
 /// planner also cuts mid-epoch and primes leases from the folded table
-/// epoch. The ramp override arms the deep-offset job guarantee once per
-/// process, letting the piece planner validate real job grids (pledged
-/// high-ratio shapes below the 512-KiB compressed floor).
+/// epoch. The ramp override arms the deep-offset job guarantee per input
+/// at one D of the lattice, letting the piece planner validate real job
+/// grids (pledged high-ratio shapes below the 512-KiB compressed floor).
 fn mt_frames_seed(data: &[u8]) {
     let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
     let mut rng = Rng(u64::from(byte(1)) | 0x0123_4567_89ab_cdef);
-    // 512 KiB clears the piece validator's 3/8-of-job-size lag bar for
-    // every candidate job size at or under ~1.3 MiB.
-    set_mt_ramp_depth_for_tests(512 * 1024);
+    set_mt_ramp_depth_for_tests(RAMP_DEPTHS[byte(11) as usize % RAMP_DEPTHS.len()]);
 
     // Segment-parallel regime: 600 KiB of mixed text over the MT floor.
     let len = 600 * 1024 + byte(2) as usize % 4096;
@@ -173,7 +180,11 @@ fn mt_frames_seed(data: &[u8]) {
     check(&frame);
 
     // Piece regime (1/4 of inputs): a pledged high-ratio frame below the
-    // compressed floor, ramp-armed so job grids carry the guarantee.
+    // compressed floor, ramp-armed so job grids carry the guarantee. The
+    // Fastest row's strip keeps the true job at the 1 MiB floor where
+    // every D of the lattice clears the validator's 3/8 lag bar; a deeper
+    // row's strip floors its jobs past the bar and the frame would
+    // legitimately fall back to the serial path.
     if byte(0) & 3 == 0 {
         let len = 2 * 1024 * 1024 + byte(5) as usize * 8192;
         let tile = textish(&mut rng, 128 * 1024);
@@ -189,7 +200,17 @@ fn mt_frames_seed(data: &[u8]) {
                 .pledged_size(Some(len as u64)),
         )
         .unwrap();
-        check(&frame);
+        // The decode worker count rides a byte, so the pieces execute at
+        // several depths; the engagement counter pins the piece executor,
+        // never the serial fallback, taking the frame — a ramp frame
+        // whose validation fails is an encoder guarantee violation.
+        let workers = [2u32, 4, 8, 12][byte(13) as usize & 3];
+        let before = piece_engagements();
+        check_with(&frame, workers);
+        assert!(
+            piece_engagements() > before,
+            "a ramp-armed pledged frame in the piece regime must engage the piece executor"
+        );
     }
 
     // Restart-poor epoch class (the mid-epoch table priming): the frame

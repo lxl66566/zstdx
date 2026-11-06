@@ -41,16 +41,20 @@
 //! path the todo-26 encoder bug lived on. The payload builder is
 //! duplicated in `encode.rs` (separate functions, same families).
 //! `structured_seed` (R74) does the same through the program grammar at
-//! block-crossing scale.
+//! block-crossing scale. `ramp_seed` compresses one
+//! ramp-armed level-3-class stream frame per input (pledged fixed grid or
+//! open growing grid) plus plain workers-0/1 controls, the in-process ramp
+//! class the env-gated production arming keeps out of every campaign.
 
 use std::io::Read;
 
 use libfuzzer_sys::fuzz_target;
-use zstdx::Level;
+use zstdx::{Level, set_mt_ramp_depth_for_tests};
 
 fuzz_target!(|data: &[u8]| {
     cross_window_seed(data);
     structured_seed(data);
+    ramp_seed(data);
 
     let (level_byte, opt_byte, k, rest) = match data {
         [l, o, k, rest @ ..] => (*l, *o, *k, rest),
@@ -605,4 +609,162 @@ fn structured_seed(data: &[u8]) {
     };
     let opt_byte = (byte(1) & 3) | (nibble << 2);
     structured_roundtrip(level_byte, opt_byte, &prog);
+}
+
+/// The ramp D lattice for the committed ramp frames: 512 KiB and 1 MiB
+/// leave crossing reads legal at and past their band, and 2 MiB equals
+/// the forced window log 21, so a crossing source always sits inside D
+/// and every job start reads only in-job sources. Mirrored in
+/// `encode.rs` (same lattice, same payload builder).
+const RAMP_DEPTHS: [u64; 3] = [512 * 1024, 1024 * 1024, 2 * 1024 * 1024];
+
+/// Rows that read the ramp gate, one per scan family: Fast (dfast),
+/// Fastest (fast), level 5 (the row matcher) and Balanced (the chain).
+/// The tree rows refuse `arm_ramp`, so the lattice stays inside the scan
+/// rows and the override never reaches the plain walk's deep-level
+/// stream chunks.
+const RAMP_LEVELS: [Level; 4] = [
+    Level::Fast,
+    Level::Fastest,
+    Level::from_zstd(5),
+    Level::Balanced,
+];
+
+/// Alias span for the ramp payloads: an echoed head puts crossing reads
+/// at every multiple of the alias below a job start, so each D in the
+/// lattice has both a blocked and a legal crossing class.
+const RAMP_ALIAS: usize = 256 * 1024;
+
+const RAMP_WORDS: [&[u8]; 8] = [
+    b"ramp ", b"piece ", b"depth ", b"window ", b"lane ", b"grid ", b"job ", b"raster ",
+];
+
+/// One ramp payload: a word-mix head for shallow crossing reads at every
+/// job start, then that head echoed back at alias distance with a few
+/// flipped bytes per copy, so near-twin crossing reads need their
+/// extend/verify path. Mirrored in `encode.rs` (duplicated builder).
+fn ramp_payload(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < RAMP_ALIAS.min(len) {
+        let w = RAMP_WORDS[(rng.next() >> 33) as usize % RAMP_WORDS.len()];
+        out.extend_from_slice(w);
+    }
+    out.truncate(RAMP_ALIAS.min(len));
+    while out.len() < len {
+        let from = out.len() - RAMP_ALIAS;
+        let take = RAMP_ALIAS.min(len - out.len());
+        let echo: Vec<u8> = out[from..from + take].to_vec();
+        let start = out.len();
+        out.extend_from_slice(&echo);
+        for _ in 0..4 {
+            let p = start + rng.next() as usize % take;
+            out[p] = rng.byte();
+        }
+    }
+    out
+}
+
+/// Committed ramp seed constructor on the streaming cores: the armed
+/// frame runs the mt stream grid (pledged runs the fixed pipelined grid,
+/// open the growing grid — the two job schedules the pledge dimension
+/// actually forks here) through the write core in 7 KiB pieces or the
+/// read core's plain entry, then two plain stream controls run at
+/// workers 0 and 1 through the same thread, one pledged and one open.
+/// The armed jobs return to the shared state pool with the gate live, so
+/// the next take must reset it; `arm_ramp` refuses the tree rows, so the
+/// override is stored around the armed frame and restored before the
+/// plain walk's deep-level stream chunks run.
+fn ramp_seed(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0x5a);
+    // Half the inputs run the class: the armed frame is a multi-MiB MT
+    // encode on top of the existing constructors, and every campaign
+    // process still cycles thousands of armed frames through the pool.
+    if byte(6) & 1 != 0 {
+        return;
+    }
+    let depth = RAMP_DEPTHS[byte(0) as usize % RAMP_DEPTHS.len()];
+    let level = RAMP_LEVELS[byte(1) as usize % RAMP_LEVELS.len()];
+    let pledged = byte(2) & 1 == 0;
+    // The payload clears the row's strip by the smallest margin that
+    // still cuts a second job, where the gate arms: the strip is the
+    // forced 2 MiB window on the fast/dfast/row rows and the 4 MiB chain
+    // reach on Balanced.
+    let len = if level == Level::Balanced {
+        9
+    } else {
+        5
+    } * 512
+        * 1024;
+    let seed = u64::from(byte(4)) | (u64::from(byte(5)) << 8) | 0x9e37_79b9_7f4a_7c15;
+    let payload = ramp_payload(&mut Rng(seed), len);
+    let shape = zstdx::InputShape::default().with_window_log(21);
+
+    set_mt_ramp_depth_for_tests(depth);
+    let opts = zstdx::EncoderOptions::new(level)
+        .checksum(byte(3) & 1 == 0)
+        .with_input_shape(shape)
+        .pledged_size(pledged.then_some(len as u64))
+        .workers(4);
+    let armed = if byte(3) & 2 != 0 {
+        let mut sink = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = zstdx::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
+            for piece in payload.chunks(7_000) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        sink
+    } else {
+        let mut comp = Vec::new();
+        let mut enc = zstdx::stream::read::Encoder::with_options(payload.as_slice(), opts).unwrap();
+        enc.read_to_end(&mut comp).unwrap();
+        enc.finish().unwrap();
+        comp
+    };
+    set_mt_ramp_depth_for_tests(u64::MAX);
+
+    let mut back = Vec::with_capacity(len + 16);
+    zstdx::decoding::FrameDecoder::new()
+        .decode_all_to_vec(&armed, &mut back)
+        .unwrap();
+    assert_eq!(
+        &back[..],
+        &payload[..],
+        "zstdx decode of the ramp stream frame differs"
+    );
+
+    let mut zback = Vec::new();
+    zstd::stream::copy_decode(armed.as_slice(), &mut zback).unwrap();
+    assert_eq!(
+        &zback[..],
+        &payload[..],
+        "zstd decode of the ramp stream frame differs"
+    );
+
+    // Plain stream controls at workers 0 and 1, one pledged and one
+    // open, through the read core's plain entry.
+    let ctrl = &payload[..32 * 1024];
+    for (workers, pledge) in [(0u32, pledged), (1, !pledged)] {
+        let opts = zstdx::EncoderOptions::new(level)
+            .checksum(byte(3) & 1 == 0)
+            .with_input_shape(shape)
+            .pledged_size(pledge.then_some(ctrl.len() as u64))
+            .workers(workers);
+        let mut comp = Vec::new();
+        let mut enc = zstdx::stream::read::Encoder::with_options(ctrl, opts).unwrap();
+        enc.read_to_end(&mut comp).unwrap();
+        enc.finish().unwrap();
+
+        let mut back = Vec::with_capacity(ctrl.len() + 16);
+        zstdx::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&comp, &mut back)
+            .unwrap();
+        assert_eq!(&back[..], ctrl, "zstdx decode of the ramp control differs");
+
+        let mut zback = Vec::new();
+        zstd::stream::copy_decode(comp.as_slice(), &mut zback).unwrap();
+        assert_eq!(&zback[..], ctrl, "zstd decode of the ramp control differs");
+    }
 }
