@@ -162,7 +162,7 @@ fn dll_class_head() -> Vec<u8> {
     const BLOCK: usize = 256 * 1024;
     const SEED: usize = 64 * 1024;
     let mut state = 0x243f_6a88_85a3_08d3u64;
-    let mut step = |state: &mut u64| {
+    let step = |state: &mut u64| {
         *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (*state >> 33) as u8
     };
@@ -176,7 +176,7 @@ fn dll_class_head() -> Vec<u8> {
         let at = (copy * SEED) % (BLOCK - SEED);
         for b in &mut head[copy * BLOCK + at..][..SEED] {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = if hot && state & 63 == 0 || !hot && state & 7 == 0 {
+            *b = if hot && state.trailing_zeros() >= 6 || !hot && state.trailing_zeros() >= 3 {
                 0xa5
             } else {
                 (state >> 33) as u8

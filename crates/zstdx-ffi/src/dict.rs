@@ -163,6 +163,7 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
     // SAFETY: the caller-validated dictionary read pair, per dict_bytes's
     // contract.
     let bytes = unsafe { dict_bytes(dict_buffer, dict_size) };
+    // SAFETY: `bytes` carries the validated read pair contract.
     unsafe {
         build_cdict(
             bytes,
@@ -171,8 +172,7 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
             zstdx::LdmMode::Auto,
         )
     }
-    .map(|c| Box::into_raw(Box::new(c)).cast())
-    .unwrap_or_else(core::ptr::null_mut)
+    .map_or_else(core::ptr::null_mut, |c| Box::into_raw(Box::new(c)).cast())
 }
 
 /// `ZSTD_createCDict_advanced2`: the bag-based constructor. The null-
@@ -206,9 +206,9 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced2(
     // contract.
     let bytes = unsafe { dict_bytes(dict_buffer, dict_size) };
     let level = bag.compression_level_for_context();
+    // SAFETY: `bytes` carries the validated read pair contract.
     unsafe { build_cdict(bytes, dict_content_type, level, ldm) }
-        .map(|c| Box::into_raw(Box::new(c)).cast())
-        .unwrap_or_else(core::ptr::null_mut)
+        .map_or_else(core::ptr::null_mut, |c| Box::into_raw(Box::new(c)).cast())
 }
 
 #[unsafe(no_mangle)]

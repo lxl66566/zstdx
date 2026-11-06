@@ -153,7 +153,7 @@ mod tests {
     fn nt_copy_reproduces_bytes() {
         let mut src = alloc::vec![0u8; NT_MIN + 128];
         let mut x = 0x1234_5678_9abc_def0u64;
-        for b in src.iter_mut() {
+        for b in &mut src {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
@@ -195,7 +195,7 @@ mod tests {
     fn nt_kernels_reproduce_bytes_individually() {
         let mut src = alloc::vec![0u8; NT_MIN + 130];
         let mut x = 0x1234_5678_9abc_def0u64;
-        for b in src.iter_mut() {
+        for b in &mut src {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;

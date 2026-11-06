@@ -444,20 +444,22 @@ crate::handle_pair!(ZSTD_createDCtx, ZSTD_freeDCtx, crate::ZSTD_DCtx, DCtx);
 pub extern "C" fn ZSTD_createCCtx_advanced(
     custom_mem: crate::ZSTD_customMem,
 ) -> *mut crate::ZSTD_CCtx {
-    custom_mem
-        .is_default()
-        .then(|| Box::into_raw(Box::new(CCtx::new())).cast::<crate::ZSTD_CCtx>())
-        .unwrap_or_else(core::ptr::null_mut)
+    if custom_mem.is_default() {
+        Box::into_raw(Box::new(CCtx::new())).cast::<crate::ZSTD_CCtx>()
+    } else {
+        core::ptr::null_mut()
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_createDCtx_advanced(
     custom_mem: crate::ZSTD_customMem,
 ) -> *mut crate::ZSTD_DCtx {
-    custom_mem
-        .is_default()
-        .then(|| Box::into_raw(Box::new(DCtx::new())).cast::<crate::ZSTD_DCtx>())
-        .unwrap_or_else(core::ptr::null_mut)
+    if custom_mem.is_default() {
+        Box::into_raw(Box::new(DCtx::new())).cast::<crate::ZSTD_DCtx>()
+    } else {
+        core::ptr::null_mut()
+    }
 }
 
 #[cfg(test)]

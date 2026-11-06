@@ -2064,7 +2064,7 @@ mod mt {
     #[test]
     fn owned_entry_and_the_write_path_flush_rebase() {
         let a = textish(3 * 1024 * 1024 + 77);
-        let b = lcg(1 * 1024 * 1024);
+        let b = lcg(1024 * 1024);
         let mut expect = a.clone();
         expect.extend_from_slice(&b);
         let options = || {
@@ -2135,7 +2135,7 @@ mod mt {
     /// hands the source back, mirroring the read encoder's contract.
     #[test]
     fn owned_entry_finish_requires_drained_output() {
-        let data = textish(1 * 1024 * 1024 + 5);
+        let data = textish(1024 * 1024 + 5);
         let mut enc = read::OwnedEncoder::new(data.clone().into(), Level::Fastest).unwrap();
         let mut sink = vec![0u8; 64];
         let n = enc.read(&mut sink).unwrap();

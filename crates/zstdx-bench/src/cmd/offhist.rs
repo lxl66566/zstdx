@@ -39,6 +39,7 @@ pub struct Args {
 /// Whether a match at distance `x` above its job start, reading at offset
 /// `off`, falls in the rejected band: source in `(job - D, job)`, i.e.
 /// `off` in `(x, x + D)`.
+#[cfg(feature = "seq_dump")]
 fn rejected(off: u64, x: u64, depth: u64) -> bool {
     off > x && off < x + depth
 }
@@ -128,8 +129,8 @@ fn run_dump(args: &Args) {
             if rejected(off, x, depth) {
                 rej += ml as u64;
                 rej_seq += 1;
-                if args.region > 0 {
-                    *regions.entry(pos / args.region).or_insert(0) += ml as u64;
+                if let Some(region) = pos.checked_div(args.region) {
+                    *regions.entry(region).or_insert(0) += ml as u64;
                 }
             }
         }
@@ -162,7 +163,7 @@ pub fn run(args: &Args) {
     run_dump(args);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "seq_dump"))]
 mod tests {
     use super::rejected;
 

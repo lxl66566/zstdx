@@ -202,6 +202,10 @@ mod tests {
 
     use super::*;
 
+    /// A payload shape paired with its probe's picks: (workers, lanes, lpt)
+    /// per worker count.
+    type ShapePicks<'a> = (&'a [(u64, u64)], &'a [(u32, usize, bool)]);
+
     /// Payload shapes from the 2026-11-05 probe, (out KiB, staged KiB)
     /// per frame, with the lane counts the walk picked there.
     #[test]
@@ -269,7 +273,7 @@ mod tests {
                 .collect()
         };
         // (workers, lanes, lpt) per payload, the probe's picks.
-        let expect: [(&[(u64, u64)], &[(u32, usize, bool)]); 4] = [
+        let expect: [ShapePicks<'_>; 4] = [
             (multi.as_slice(), &[
                 (4, 3, false),
                 (8, 6, false),

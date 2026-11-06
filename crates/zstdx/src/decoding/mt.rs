@@ -498,14 +498,15 @@ fn plan_frame_cuts(
         while ri < restarts.len() && boundary_input(restarts[ri]) < next_target {
             ri += 1;
         }
-        if let Some(&r) = restarts.get(ri) {
-            if r > seg_start && boundary_input(r) - next_target <= next_target / 2 {
-                cuts.push(r);
-                seg_start = r;
-                ri += 1;
-                next_target = advance_target(next_target, target);
-                continue;
-            }
+        if let Some(&r) = restarts.get(ri)
+            && r > seg_start
+            && boundary_input(r) - next_target <= next_target / 2
+        {
+            cuts.push(r);
+            seg_start = r;
+            ri += 1;
+            next_target = advance_target(next_target, target);
+            continue;
         }
         // A restart snap can overshoot this target by up to half of it;
         // skip targets the current start already covers instead of cutting
@@ -2307,7 +2308,9 @@ mod tests {
         b
     }
 
-    fn probe(huffman: HuffmanState, ll: bool, of: bool, ml: bool) -> RestartProbe {
+    /// `fse_explicit` is [LL, OF, ML].
+    fn probe(huffman: HuffmanState, fse_explicit: [bool; 3]) -> RestartProbe {
+        let [ll, of, ml] = fse_explicit;
         RestartProbe {
             huffman,
             ll_explicit: ll,
@@ -2404,19 +2407,19 @@ mod tests {
 
         // Everything rebuilt: cut anywhere explicit.
         let probes = [
-            probe(Rebuild, true, true, true),
-            probe(Ignore, false, false, false),
-            probe(Ignore, true, true, true),
+            probe(Rebuild, [true; 3]),
+            probe(Ignore, [false; 3]),
+            probe(Ignore, [true; 3]),
         ];
         assert_eq!(restart_candidates(&probes), vec![0, 2]);
 
         // Review's failing shape: Raw-literals candidate followed by a
         // Treeless block before any rebuild - no cut allowed at 1.
         let probes = [
-            probe(Rebuild, true, true, true),
-            probe(Ignore, false, false, false),
-            probe(Ignore, true, true, true),
-            probe(Reuse, true, true, true),
+            probe(Rebuild, [true; 3]),
+            probe(Ignore, [false; 3]),
+            probe(Ignore, [true; 3]),
+            probe(Reuse, [true; 3]),
         ];
         assert_eq!(restart_candidates(&probes), vec![0]);
 
@@ -2424,10 +2427,10 @@ mod tests {
         // after the Treeless block is legal again (it sits in the previous
         // segment).
         let probes = [
-            probe(Ignore, true, true, true),
-            probe(Rebuild, true, true, true),
-            probe(Reuse, true, true, true),
-            probe(Ignore, true, true, true),
+            probe(Ignore, [true; 3]),
+            probe(Rebuild, [true; 3]),
+            probe(Reuse, [true; 3]),
+            probe(Ignore, [true; 3]),
         ];
         assert_eq!(restart_candidates(&probes), vec![0, 1, 3]);
 
@@ -2439,9 +2442,9 @@ mod tests {
         // frame's Treeless block is preceded by its rebuild anyway and an
         // illegal one fails identically in both paths.
         let probes = [
-            probe(Ignore, true, true, true),
-            probe(Reuse, true, true, true),
-            probe(Ignore, true, true, true),
+            probe(Ignore, [true; 3]),
+            probe(Reuse, [true; 3]),
+            probe(Ignore, [true; 3]),
         ];
         assert_eq!(restart_candidates(&probes), vec![2]);
     }
@@ -2673,7 +2676,7 @@ mod tests {
 
         let build = |bodies: &[Vec<u8>]| -> Vec<u8> {
             craft_frame(
-                &bodies.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+                &bodies.iter().map(Vec::as_slice).collect::<Vec<_>>(),
                 96 * 1024,
             )
         };
@@ -2793,7 +2796,7 @@ mod tests {
 
         let craft = |bodies: &[Vec<u8>]| {
             craft_frame(
-                &bodies.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+                &bodies.iter().map(Vec::as_slice).collect::<Vec<_>>(),
                 120 * 1024,
             )
         };
@@ -2817,12 +2820,7 @@ mod tests {
         let gated = craft(&vec![seq_heavy.clone(); 4]);
         assert!(first_seg_blocks(&gated, 2, "gated") > 2);
         // An unparseable block disarms the frame.
-        let broken = craft(&vec![
-            big_lits.clone(),
-            unparseable,
-            big_lits.clone(),
-            big_lits,
-        ]);
+        let broken = craft(&[big_lits.clone(), unparseable, big_lits.clone(), big_lits]);
         assert!(first_seg_blocks(&broken, 2, "broken") > 2);
     }
 
@@ -2873,17 +2871,17 @@ mod tests {
         let mut ll = None;
         let mut of = None;
         let mut ml = None;
-        for j in e0..b {
-            if probes[j].huffman == HuffmanState::Rebuild {
+        for (j, probe) in probes.iter().enumerate().take(b).skip(e0) {
+            if probe.huffman == HuffmanState::Rebuild {
                 huf = Some(j);
             }
-            if probes[j].ll_explicit {
+            if probe.ll_explicit {
                 ll = Some(j);
             }
-            if probes[j].of_explicit {
+            if probe.of_explicit {
                 of = Some(j);
             }
-            if probes[j].ml_explicit {
+            if probe.ml_explicit {
                 ml = Some(j);
             }
         }

@@ -704,7 +704,10 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParametersUsingCCtxParams(
     // SAFETY: the handles came from their creates' box round-trips and are
     // still live.
     let bag = unsafe { &*params.cast::<CCtxParams>() };
-    match unsafe { cctx_mut(cctx) }.set_parameters_using(bag) {
+    // SAFETY: the cctx handle came from its create's box round-trip and is
+    // still live.
+    let cctx = unsafe { cctx_mut(cctx) };
+    match cctx.set_parameters_using(bag) {
         Ok(()) => 0,
         Err(e) => ret(e),
     }
@@ -866,12 +869,14 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_sizeof_CStream(zcs: *const ZSTD_CStream) -> usize {
     // A CStream *is* its CCtx, as in libzstd.
+    // SAFETY: forwarding the CCtx handle contract to `ZSTD_sizeof_CCtx`.
     unsafe { ZSTD_sizeof_CCtx(zcs.cast()) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_sizeof_DStream(zds: *const ZSTD_DStream) -> usize {
     // A DStream *is* its DCtx, as in libzstd.
+    // SAFETY: forwarding the DCtx handle contract to `ZSTD_sizeof_DCtx`.
     unsafe { ZSTD_sizeof_DCtx(zds.cast()) }
 }
 
@@ -882,8 +887,8 @@ pub unsafe extern "C" fn ZSTD_sizeof_CDict(cdict: *const ZSTD_CDict) -> usize {
     }
     // SAFETY: the handle came from the create's box round-trip and is still
     // live.
-    let handle = unsafe { &*cdict.cast::<dict::CDict>() };
-    core::mem::size_of_val(handle) + handle.raw_len
+    let handle = unsafe { &*cdict.cast::<CDict>() };
+    size_of_val(handle) + handle.raw_len
 }
 
 #[unsafe(no_mangle)]
@@ -893,8 +898,8 @@ pub unsafe extern "C" fn ZSTD_sizeof_DDict(ddict: *const ZSTD_DDict) -> usize {
     }
     // SAFETY: the handle came from the create's box round-trip and is still
     // live.
-    let handle = unsafe { &*ddict.cast::<dict::DDict>() };
-    core::mem::size_of_val(handle) + handle.dict.dict_content.len()
+    let handle = unsafe { &*ddict.cast::<DDict>() };
+    size_of_val(handle) + handle.dict.dict_content.len()
 }
 
 /// `ZSTD_getBlockSize`: the running (or last) frame's block size; 0

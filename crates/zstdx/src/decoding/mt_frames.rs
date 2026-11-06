@@ -272,9 +272,9 @@ fn run_lane(lane: &LaneJob) {
         let region = unsafe { OutRegion::new(lane.base, lane.buf_limit, abs + seg.out_size) };
         // SAFETY: region's contract; every match source below `abs` sits
         // inside this frame, written by this lane in order.
-        if let Err(err) =
-            unsafe { execute_segment(region, abs, frame_base, &seg, input, &mut offset_hist) }
-        {
+        let executed =
+            unsafe { execute_segment(region, abs, frame_base, &seg, input, &mut offset_hist) };
+        if let Err(err) = executed {
             record(lane, LaneOutcome::Failed { seg: id, err });
             return;
         }
@@ -420,7 +420,7 @@ fn decode_frames(
     // else keeps the stock layout, `min(workers, frames)` consecutive
     // lanes with the per-worker staging window.
     let plans = frame_plans(plan);
-    let budget: Option<LaneBudget> = if plan.frame_pledges.iter().all(|p| p.is_some()) {
+    let budget: Option<LaneBudget> = if plan.frame_pledges.iter().all(Option::is_some) {
         lane_budget::plan(&plans, workers)
     } else {
         None
@@ -447,8 +447,7 @@ fn decode_frames(
     // workers, base settlement needs staging far ahead of execution,
     // bounded by the plan's total staged volume.
     let window = match (place.deferred(), budget.as_ref().map(|b| b.free_window)) {
-        (true, _) => n_segments,
-        (false, Some(true)) => n_segments,
+        (true, _) | (false, Some(true)) => n_segments,
         (false, _) => workers as usize,
     };
     let job = StageAJob::for_lanes(input, segments, stage_workers, window);
@@ -568,10 +567,10 @@ fn run(
                         starts_by_frame[f] = Some(start);
                     }
                     #[cfg(feature = "hash")]
-                    if let Some((f, err)) = lane_checksum_err {
-                        if checksum_err.as_ref().is_none_or(|(cf, _)| f < *cf) {
-                            checksum_err = Some((f, err));
-                        }
+                    if let Some((f, err)) = lane_checksum_err
+                        && checksum_err.as_ref().is_none_or(|(cf, _)| f < *cf)
+                    {
+                        checksum_err = Some((f, err));
                     }
                 },
                 Some(LaneOutcome::Failed { seg, err }) => {
@@ -967,13 +966,13 @@ mod tests {
     fn single_frame_keeps_serial_stage_b() {
         let raw = textish(0x51, 4 * 1024 * 1024);
         let stream = compress(&raw, Level::Fastest, true, 4);
-        super::LANE_PANIC_INPUT.store(stream.as_ptr() as *mut u8, Ordering::Relaxed);
+        super::LANE_PANIC_INPUT.store(stream.as_ptr().cast_mut(), Ordering::Relaxed);
         let mut placed = vec![0u8; raw.len()];
         let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW).unwrap();
         assert_eq!(&placed[..n], &raw[..]);
 
         let (multi, raws, _) = multiframe_stream();
-        super::LANE_PANIC_INPUT.store(multi.as_ptr() as *mut u8, Ordering::Relaxed);
+        super::LANE_PANIC_INPUT.store(multi.as_ptr().cast_mut(), Ordering::Relaxed);
         let mut placed = vec![0u8; expected_output(&raws).len()];
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             decode_all_mt(&multi, &mut placed, 4, MAX_WINDOW)
@@ -1027,7 +1026,7 @@ mod tests {
         // mt2 groups three frames into lanes [0] and [1, 2]: the pool
         // lane panics at its first segment while the caller's lane 0
         // completes, and the driver must resume the worker's payload.
-        super::LANE_PANIC_POOL_INPUT.store(stream.as_ptr() as *mut u8, Ordering::Relaxed);
+        super::LANE_PANIC_POOL_INPUT.store(stream.as_ptr().cast_mut(), Ordering::Relaxed);
         let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut placed = vec![0u8; expect.len()];
             let _ = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW);
@@ -1051,16 +1050,16 @@ mod tests {
     /// seed is fixed, so every failure reproduces.
     #[test]
     fn multiframe_property_st_mt_byte_equality() {
+        const SIZES: [usize; 4] = [0, 4096, 64 * 1024, 256 * 1024];
+        const BUDGET: usize = 1024 * 1024;
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for case in 0..6 {
             let n_frames = 1 + (rng.next() % 16) as usize;
-            const SIZES: [usize; 4] = [0, 4096, 64 * 1024, 256 * 1024];
-            const BUDGET: usize = 1024 * 1024;
             let mut spent = 0usize;
             let mut stream = Vec::new();
             let mut raws = Vec::new();
             for _ in 0..n_frames {
-                if rng.next() & 7 == 0 {
+                if rng.next().trailing_zeros() >= 3 {
                     push_skippable(&mut stream, 0xab, 16 + (rng.next() >> 40) as usize % 48);
                 }
                 let len = if spent < BUDGET {

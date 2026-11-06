@@ -126,6 +126,7 @@ fn ramp_gates_ldm_candidates() {
     // window (the same split the capture lattice makes). The deep source
     // sits past the strip's head: the fill's floor gate skips the first
     // bytes, so a source hugging position 0 stays unindexed.
+    const K: usize = 1024;
     let blob = |seed: u64, len: usize| -> Vec<u8> {
         let mut s = seed;
         (0..len)
@@ -137,7 +138,6 @@ fn ramp_gates_ldm_candidates() {
             })
             .collect()
     };
-    const K: usize = 1024;
     let (job, depth) = (3 * 1024 * K, 1024 * K);
     let deep = blob(0x1234_5678_9abc_def0, 64 * K);
     let banded = blob(0x0fed_cba9_8765_4321, 64 * K);
@@ -2093,7 +2093,7 @@ fn small_src_class_swap_band_rows() {
 fn dict_frames_keep_ladder_rows_in_the_class_band() {
     use super::Strategy;
     let load = |level: i32| {
-        super::params_for_row(
+        params_for_row(
             crate::Level::from_zstd(level),
             crate::InputShape {
                 len: Some(20 * 1024),
@@ -2101,11 +2101,11 @@ fn dict_frames_keep_ladder_rows_in_the_class_band() {
             },
             // `load_dictionary`'s stock resolution of the extended band.
             if super::small_src_class_plain_only(level) {
-                super::SmallSrcRow::Stock
+                SmallSrcRow::Stock
             } else {
-                super::SmallSrcRow::Btlazy
+                SmallSrcRow::Btlazy
             },
-            super::RowAttempts::Stock,
+            RowAttempts::Stock,
             BalancedStore::Chain,
         )
         .strategy

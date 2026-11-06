@@ -1419,8 +1419,10 @@ impl Default for CCtxParams {
 impl CCtxParams {
     /// `ZSTD_CCtxParams_init`: zeroed storage, the level, content size on.
     pub fn init(level: i32) -> Self {
-        let mut params = Self::default();
-        params.compression_level = level;
+        let mut params = Self {
+            compression_level: level,
+            ..Self::default()
+        };
         params.f_params.contentSizeFlag = 1;
         params
     }
@@ -1429,18 +1431,22 @@ impl CCtxParams {
     /// cParams/fParams plus the resolved auto switches, with the level
     /// kept at `ZSTD_NO_CLEVEL`.
     fn init_from_zstd_params(params: ZSTD_parameters) -> Self {
-        let mut bag = Self::default();
-        bag.c_params = params.cParams;
-        bag.f_params = params.fParams;
-        bag.use_row_match_finder =
-            resolve_row_match_finder_mode(ParamSwitch::Auto, &params.cParams);
-        bag.post_block_splitter = resolve_block_splitter_mode(ParamSwitch::Auto, &params.cParams);
-        bag.ldm.enable = resolve_enable_ldm(ParamSwitch::Auto, &params.cParams);
-        bag.max_block_size = resolve_max_block_size(0);
-        // resolveExternalRepcodeSearch: disable below level 10, the
-        // advanced bag's level being `ZSTD_NO_CLEVEL` (0).
-        bag.repcode_resolution = ParamSwitch::Disable;
-        bag
+        let base = Self::default();
+        Self {
+            c_params: params.cParams,
+            f_params: params.fParams,
+            use_row_match_finder: resolve_row_match_finder_mode(ParamSwitch::Auto, &params.cParams),
+            post_block_splitter: resolve_block_splitter_mode(ParamSwitch::Auto, &params.cParams),
+            ldm: LdmParams {
+                enable: resolve_enable_ldm(ParamSwitch::Auto, &params.cParams),
+                ..base.ldm
+            },
+            max_block_size: resolve_max_block_size(0),
+            // resolveExternalRepcodeSearch: disable below level 10, the
+            // advanced bag's level being `ZSTD_NO_CLEVEL` (0).
+            repcode_resolution: ParamSwitch::Disable,
+            ..base
+        }
     }
 
     /// `ZSTD_CCtxParams_setParameter`: bounds-check via the shared cParam
@@ -1878,8 +1884,10 @@ pub unsafe extern "C" fn ZSTD_CCtxParams_init_advanced(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_CCtxParams_reset(params: *mut crate::ZSTD_CCtx_params) -> usize {
-    // SAFETY-equivalent: reset is init at the default level; the null bag
-    // answers like the reference's null check.
+    // Reset is init at the default level; the null bag answers like the
+    // reference's null check.
+    // SAFETY: forwarding the caller's handle to `ZSTD_CCtxParams_init`,
+    // which applies its own null-bag contract.
     unsafe { ZSTD_CCtxParams_init(params, crate::DEFAULT_CLEVEL) }
 }
 
@@ -1919,8 +1927,8 @@ pub unsafe extern "C" fn ZSTD_CCtxParams_getParameter(
     let bag = unsafe { &*params.cast::<CCtxParams>() };
     match bag.get_parameter(id) {
         Ok(v) => {
-            // SAFETY: the caller-provided output slot.
             if !value.is_null() {
+                // SAFETY: `value` is the caller-provided output slot.
                 unsafe { *value = v };
             }
             0

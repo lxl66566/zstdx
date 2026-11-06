@@ -961,7 +961,7 @@ impl DCtx {
     /// `ZSTD_sizeof_DCtx`: the state struct plus the attached
     /// dictionary's content bytes (the reference's `ddictLocal` term).
     pub fn footprint(&self) -> usize {
-        core::mem::size_of_val(self) + self.dict.as_ref().map_or(0, |d| d.dict_content.len())
+        size_of_val(self) + self.dict.as_ref().map_or(0, |d| d.dict_content.len())
     }
 
     /// `ZSTD_DCtx_refPrefix`: the prefix dictionary for exactly the next

@@ -3767,29 +3767,29 @@ fn streaming_transcript_dict_and_wlogmax_pins() {
 /// the attached handle's creation params carry every following frame.
 #[test]
 fn advanced_constructors_and_refcdict() {
+    unsafe extern "C" fn nop_free(_: *mut core::ffi::c_void) {}
     let def = zstd::ZSTD_customMem {
         customAlloc: None,
         customFree: None,
         opaque: core::ptr::null_mut(),
     };
-    unsafe extern "C" fn nop_free(_: *mut core::ffi::c_void) {}
     let half = zstd::ZSTD_customMem {
         customAlloc: None,
         customFree: Some(nop_free),
         opaque: core::ptr::null_mut(),
     };
 
-    let cctx = unsafe { zstd::ZSTD_createCCtx_advanced(def) };
+    let cctx = zstd::ZSTD_createCCtx_advanced(def);
     assert!(!cctx.is_null());
-    assert!(unsafe { zstd::ZSTD_createCCtx_advanced(half) }.is_null());
-    let dctx = unsafe { zstd::ZSTD_createDCtx_advanced(def) };
+    assert!(zstd::ZSTD_createCCtx_advanced(half).is_null());
+    let dctx = zstd::ZSTD_createDCtx_advanced(def);
     assert!(!dctx.is_null());
-    assert!(unsafe { zstd::ZSTD_createDCtx_advanced(half) }.is_null());
-    let zcs = unsafe { zstd::ZSTD_createCStream_advanced(def) };
-    let zds = unsafe { zstd::ZSTD_createDStream_advanced(def) };
+    assert!(zstd::ZSTD_createDCtx_advanced(half).is_null());
+    let zcs = zstd::ZSTD_createCStream_advanced(def);
+    let zds = zstd::ZSTD_createDStream_advanced(def);
     assert!(!zcs.is_null() && !zds.is_null());
-    assert!(unsafe { zstd::ZSTD_createCStream_advanced(half) }.is_null());
-    assert!(unsafe { zstd::ZSTD_createDStream_advanced(half) }.is_null());
+    assert!(zstd::ZSTD_createCStream_advanced(half).is_null());
+    assert!(zstd::ZSTD_createDStream_advanced(half).is_null());
 
     let buf: Vec<u8> = (0..(1u32 << 17))
         .map(|i| b'a' + (i % 23) as u8 + (i % 11 < 7) as u8 * 5)
@@ -3920,7 +3920,7 @@ fn cctx_params_refusal_deviations() {
     // of the chainLog range, as in libzstd).
     // A fully valid knob set (the level row) passes the bounds check and
     // then hits the refusal: this engine exposes no per-knob tuning.
-    let row = unsafe { zstd::ZSTD_getCParams(3, 0, 0) };
+    let row = zstd::ZSTD_getCParams(3, 0, 0);
     assert_eq!(
         error_code(unsafe { zstd::ZSTD_CCtx_setCParams(cctx, row) }),
         40
@@ -4011,30 +4011,30 @@ fn introspection_family() {
         size: buf.len(),
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob, &mut ib, 0) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut ob, &raw mut ib, 0) };
     let first_flush = ob.pos;
     let mut ob2 = zstd::ZSTD_outBuffer {
         dst: unsafe { cmp.as_mut_ptr().add(4096) }.cast(),
         size: cmp.len() - 4096,
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob2, &mut ib, 0) };
-    let fp = unsafe { zstd::ZSTD_getFrameProgression(cctx) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut ob2, &raw mut ib, 0) };
+    let fp = zstd::ZSTD_getFrameProgression(cctx);
     assert_eq!(fp.consumed, buf.len() as u64);
     assert_eq!(fp.ingested, fp.consumed);
     assert_eq!(fp.flushed, (first_flush + ob2.pos) as u64);
     assert_eq!(fp.produced, fp.flushed);
     assert_eq!(fp.currentJobID, 0);
     assert_eq!(fp.nbActiveWorkers, 0);
-    assert_eq!(0, unsafe { zstd::ZSTD_toFlushNow(cctx) });
+    assert_eq!(0, zstd::ZSTD_toFlushNow(cctx));
     // finish and drain: the counters survive the finished frame
     let mut empty = zstd::ZSTD_inBuffer {
         src: buf.as_ptr().cast(),
         size: 0,
         pos: 0,
     };
-    unsafe { zstd::ZSTD_compressStream2(cctx, &mut ob2, &mut empty, 2) };
-    let fp = unsafe { zstd::ZSTD_getFrameProgression(cctx) };
+    unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut ob2, &raw mut empty, 2) };
+    let fp = zstd::ZSTD_getFrameProgression(cctx);
     assert_eq!(fp.consumed, buf.len() as u64);
 
     // sizeof: the stream handles alias their contexts; the dictionary

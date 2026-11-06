@@ -779,7 +779,7 @@ impl CCtx {
     /// `ZSTD_sizeof_CCtx`: the state struct plus the loaded dictionary's
     /// bytes (the reference's `localDict` term).
     pub fn footprint(&self) -> usize {
-        core::mem::size_of_val(self)
+        size_of_val(self)
             + match &self.cdict {
                 Some(attached) => attached.raw_len,
                 None => match &self.dict {

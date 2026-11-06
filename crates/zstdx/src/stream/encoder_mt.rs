@@ -1808,7 +1808,7 @@ impl MtEncoderCore {
                 // aborted job assembles empty and drains like a
                 // completion, surfacing the poison here.
                 self.surface_poison();
-                self.finish_end()?;
+                self.finish_end();
                 return Ok(());
             }
             if handoff && !self.output.is_empty() {
@@ -1832,7 +1832,7 @@ impl MtEncoderCore {
 
     /// The finish's closing slice: the empty raw last block on a
     /// nothing-left-to-post frame, the checksum and the finished mark.
-    fn finish_end(&mut self) -> crate::Result<()> {
+    fn finish_end(&mut self) {
         debug_assert_eq!(self.hashed_end, self.pos);
         if self.close_empty {
             BlockHeader {
@@ -1861,7 +1861,6 @@ impl MtEncoderCore {
                 s.pump_calls
             );
         }
-        Ok(())
     }
 
     /// Emit the pending bytes early as non-last jobs. A no-op when nothing
