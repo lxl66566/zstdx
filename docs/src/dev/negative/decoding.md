@@ -208,6 +208,37 @@ The data serializes stage B. A piece's progress at x needs every source of its e
 
 The premise was spent on 2026-09-16. The ramp landed, and the piece-parallel stage B landed with it under the env pair `ZSTDX_MT_RAMP_BYTES` with measured engagement, reaching json.lvl3 mt8 3.2x serial-B as recorded in [mt-stream](../perf/mt-stream.md). This entry's mechanism of arbitrary cuts with live per-sequence gating stays falsified for ramp-less frames. Staging-buffer pooling landed in `3c850d3`, the zero-sequence block fix in `6fdc531`, and wildcopy staged execution in `65e4b98`.
 
+### Ramp-armed piece decode as the shipped default
+
+The idea was the R100 map's proposal 9: default-arm the deep-offset ramp on the level-3-class rows at D equal to the row window behind the head-class distinct-bar screens — a bar between 102 and 108 arming dll and holding text, json arming on its own measured bar — so the idle piece executor engages by default through its own measured validation and every zstdx level-3-class frame decodes piece-parallel. The row carried the operator's st-mt byte-identity decision, the frame-continuous `arm_ramp` extension ramping bulk ST and the pledged streams at the virtual job lattice the size or pledge derives; it was never built, because the row died on its own gates by arithmetic on the base tree, measured on 2026-11-06 at 8fadcf9d with the env-paired machinery and no lever build.
+
+The dll size bar was recorded against a corpus and a gate both superseded. The recorded +0.00 percent dll cell at D=2 MiB predates the dll32 regeneration from the current store and the prefix-LDM depth leak the R101 chain fixed, which had let ramp-band LDM candidates through and priced the old dll cost near zero, [shapes](../bench/shapes.md). The stock-versus-`ZSTDX_MT_RAMP_BYTES` ladder re-measured at level 3 mt4, D equal to the 2 MiB row window, checksummed frames:
+
+| shape | stock B | ramped B | delta |
+|---|---:|---:|---:|
+| dll32 | 4,607,550 | 5,224,071 | +13.381% |
+| dll100 | 21,112,417 | 21,283,062 | +0.808% |
+| json | 6,333,603 | 6,288,045 | -0.719% |
+| text | 100,775 | 506,977 | +403.078% |
+| skewed | 17,472,901 | 17,444,473 | -0.163% |
+
+The row's +0.05 percent build gate rejects dll32 at every depth, the shapes ladder reading +0.962 percent at D=512 KiB, [shapes](../bench/shapes.md), so the dll arm has no D to land at. Bars a future map cites must come from the tree the row will run on.
+
+The distinct-density screen arms the catastrophic classes it was meant to exclude. The shape taxonomy reads snapshot at 255 distinct symbols — above dll32's 145 and every candidate bar — at +468.405 percent at D=2 MiB, the one-offset period-in-band class with no surviving alternatives; mixed_text reads 39 at the head, arms under json's own bar, and its -0.198 percent global localizes to a text-class tail at +3.846; and the held text band's interior, src 97, md 61, csv 43 and html 53, reads within 0.5 percent at every depth, so the bar predicts cost in neither direction, [shapes](../bench/shapes.md). The recorded replacement is the per-job twin-distance spectrum over the incoming history span with an arming bar on the twin mass inside the (0, D+J] band.
+
+The decode-gain gate no longer prices the win. The armed json frame, level 3 mt4-produced at D=2 MiB and the default arm's own output class, decoded on the current tree, serial-B against the env-paired piece executor:
+
+| cell | serial-B | pieces | ratio |
+|---|---:|---:|---:|
+| mt4 | 2960 | 3605 | 1.218x |
+| mt8 | 3008 | 4318 | 1.435x |
+| mt16 | 3069 | 5028 | 1.639x |
+
+A five-round alternating re-check at mt4 read serial medians 2909 to 2959, one 2567 outlier, against piece medians 3433 to 3548, a 1.20x median ratio, under the row's 1.4x-at-every-arm bar. The September margins, mt4 at 2.4x and mt8 at 3.2x serial-B, collapsed under the R90 execute port and the R96/R99 planner gains, which landed on the serial-B side while the piece cell's staging-to-completion phase holds it at its September absolute of about 3600 MiB/s: the piece lever gains only what the serial floor has not already taken.
+
+The decode-side routing half cannot be content-blind. The piece machinery runs stage A to completion before any execute, the serial path's lost A/B overlap, and mis-routed stock frames pay it: measured under the env override on stock frames at mt8, text.zst3 read 11771 to 8600 MiB/s, -27 percent, and skewed.zst3 read 3032 to 2038, -33 percent. A wire-side screen separates the corpus classes — the union of the literals Huffman tables' covered symbols over the first four Compressed-literals blocks reads json 40, text 102, skewed 16 and dll 256, with zeros and random carrying no Compressed-literals block at all — but the wire cannot identify producer arming, and same-content stock frames, json.zst9 or the libzstd-produced json.zst3 that the corpus and the matrix dec-mt cells decode, would route and pay the barrier.
+
+Row closed. Reopening needs the recorded twin-distance spectrum as the screen, the size bars re-priced against the current dll32 at every D, and the decode-gain gate re-measured against the landing tree's serial-B cells, this page's ratio table the baseline.
 ### Checksum on a concurrent hasher thread
 
 The idea was a dedicated hasher thread, with stage B submitting each executed segment range to it through a queue, condvar and lag cap, plus a drain before vector growth reallocs and an unwind guard. On json.zst3 mt4 at 32 MiB solo, the times were 15.4 ms with no hash, 16.9 ms with a serial post-pass and 21-23.5 ms with the concurrent hasher. Instructions were identical, cycles rose 14% and task-clock rose 15%. Skewed went from 46-49 to 43-46, and text was unchanged because the work hides fully. A sync-only variant with queue handoff and no byte reads matched no-hash exactly.
