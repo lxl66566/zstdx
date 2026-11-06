@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use super::{
-    LdmArming, MatchGeneratorDriver, ScanDensity, ldm_min_window, pack_pos, params::BalancedStore,
-    unpack_pos,
+    LdmArming, MatchGeneratorDriver, RowAttempts, ScanDensity, SmallSrcRow, ldm_min_window,
+    pack_pos, params::BalancedStore, params_for_row, unpack_pos,
 };
 use crate::encoding::{Matcher, Sequence, reach_probe::ReachChoice};
 
@@ -1473,6 +1473,13 @@ fn balanced_row_substitutes_wide_heads() {
     assert!(matches!(driver.params.strategy, super::Strategy::Row(_)));
     assert_eq!(driver.params.chain_reach, Some(1 << 24));
     assert_eq!(driver.params.window, 1 << 26);
+    // The dll class's attempts diet: the wide head resolves Light and the
+    // twin takes the reduced budget.
+    assert_eq!(driver.row_attempts, RowAttempts::Light);
+    assert_eq!(
+        driver.params.search_depth,
+        super::params::BALANCED_ROW_LIGHT_ATTEMPTS
+    );
     driver.adopt_window(&frame, 0);
     driver.set_block(0, frame.len() as u64);
     let mut reconstructed = Vec::new();
@@ -1530,6 +1537,95 @@ fn row_to_chain_table_transition_rebuilds() {
     assert!(
         heads.iter().all(|&e| e == 0),
         "chain heads must be rebuilt zeroed off a row buffer"
+    );
+}
+
+/// The dll class's attempts diet resolves per class from the same head
+/// sample the storage verdict reads: the bare-row class takes
+/// [`RowAttempts::Light`] with the twin's reduced budget, the text-class
+/// head keeps the stock budget behind its cold-start head, and the
+/// narrow class keeps the stock chain row and stock state.
+#[test]
+fn balanced_row_diet_separates_head_classes() {
+    let (narrow, textish, wide) = balanced_store_heads();
+    let level = crate::Level::from_zstd(9);
+    let mut driver = MatchGeneratorDriver::new_direct();
+
+    driver.reset(level);
+    driver.consider_balanced_store(&wide, level);
+    assert!(matches!(driver.params.strategy, super::Strategy::Row(_)));
+    assert_eq!(driver.row_attempts, RowAttempts::Light);
+    assert_eq!(
+        driver.params.search_depth,
+        super::params::BALANCED_ROW_LIGHT_ATTEMPTS
+    );
+
+    driver.reset(level);
+    driver.consider_balanced_store(&textish, level);
+    assert!(matches!(driver.params.strategy, super::Strategy::Row(_)));
+    assert_eq!(driver.row_attempts, RowAttempts::Stock);
+    assert_eq!(
+        driver.params.search_depth, 16,
+        "the text class keeps the stock budget"
+    );
+
+    driver.reset(level);
+    driver.consider_balanced_store(&narrow, level);
+    assert!(matches!(driver.params.strategy, super::Strategy::Chain(_)));
+    assert_eq!(driver.row_attempts, RowAttempts::Stock);
+}
+
+/// The diet's resolved state is per-frame: a later frame starts stock,
+/// so a text-class or narrow frame after a dieted dll frame parses on
+/// its own verdict, and the stock chain row 9 is immune to a stray
+/// Light (the twin's diet applies only inside the storage substitution,
+/// never to the plain chain row the narrow class keeps).
+#[test]
+fn balanced_row_diet_state_is_per_frame() {
+    let (narrow, _textish, wide) = balanced_store_heads();
+    let level = crate::Level::from_zstd(9);
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(level);
+    driver.consider_balanced_store(&wide, level);
+    assert_eq!(driver.row_attempts, RowAttempts::Light);
+    driver.reset(level);
+    assert_eq!(driver.row_attempts, RowAttempts::Stock);
+    assert_eq!(driver.bal_store, BalancedStore::Chain);
+    driver.consider_balanced_store(&narrow, level);
+    assert!(matches!(driver.params.strategy, super::Strategy::Chain(_)));
+    assert_eq!(driver.row_attempts, RowAttempts::Stock);
+    let shape = crate::InputShape {
+        len: Some(32 * 1024 * 1024),
+        window_log: None,
+    };
+    let stock_chain = params_for_row(
+        level,
+        shape,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Stock,
+        BalancedStore::Chain,
+    );
+    let light_chain = params_for_row(
+        level,
+        shape,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Light,
+        BalancedStore::Chain,
+    );
+    assert_eq!(
+        light_chain.search_depth, stock_chain.search_depth,
+        "a stray Light must not diet the stock chain row"
+    );
+    let light_twin = params_for_row(
+        level,
+        shape,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Light,
+        BalancedStore::Row,
+    );
+    assert_eq!(
+        light_twin.search_depth,
+        super::params::BALANCED_ROW_LIGHT_ATTEMPTS
     );
 }
 

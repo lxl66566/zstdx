@@ -791,7 +791,9 @@ pub(crate) enum RowAttempts {
     #[default]
     Stock,
     /// The reduced candidate budget for narrow-alphabet frame heads
-    /// (see [`row_light_search_depth`]).
+    /// (see [`row_light_search_depth`]), and for the balanced twin's dll
+    /// class (see [`BalancedStore::Row`] and
+    /// [`BALANCED_ROW_LIGHT_ATTEMPTS`]).
     Light,
 }
 
@@ -903,6 +905,22 @@ const fn balanced_row_params(store: BalancedStore) -> LevelParams {
         _ => p,
     }
 }
+
+/// The dll class's attempts budget inside the storage verdict (see
+/// [`BalancedStore::Row`]): the twin's stock budget of 16 candidates (15
+/// at the width-minus-one cap) pays 15 verifies per search over rows whose
+/// density the LDM far classes already own — the 31-attempt refusal's own
+/// finding — so the dieted class resolves [`RowAttempts::Light`] and
+/// takes this budget instead. Calibrated on dll100 and dll32 balanced
+/// bulk single-thread against the stock 15: 8 keeps both size bars with
+/// wide margins at +0.36 and +0.24 percent size for +10 percent wall,
+/// while 12 buys half the wall and 4 spends +1.03 percent size on dll100
+/// for a far worse marginal rate (the calibration table is in the
+/// matchers record). A static per-frame verdict only: the R79 per-block
+/// oracle bound found no live search statistic predicting the profitable
+/// budget (0.01-0.41 correlation), and the blanket halving of every row
+/// stays refused.
+pub(crate) const BALANCED_ROW_LIGHT_ATTEMPTS: u32 = 8;
 
 /// Whether a level's small-src frames adopt a class-swap row behind the
 /// head verdict (see [`small_src_class_row`]): libzstd's srcSize-keyed
@@ -1036,6 +1054,12 @@ pub(super) const fn params_for_row(
         && matches!(p.chain_reach, Some(KEEP_REACH))
     {
         let mut swapped = balanced_row_params(store);
+        // The dll class's attempts diet: a resolved Light verdict takes the
+        // twin's reduced candidate budget (see [`BALANCED_ROW_LIGHT_ATTEMPTS`]);
+        // the text class resolves Stock and keeps the stock budget.
+        if let RowAttempts::Light = attempts {
+            swapped.search_depth = BALANCED_ROW_LIGHT_ATTEMPTS;
+        }
         if let Some(wl) = shape.window_log {
             swapped.window = 1usize << clamp_u32(wl, 10, 27);
         }
@@ -1254,7 +1278,7 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 /// a ladder edit that adds or removes a collision fails the build and
 /// forces a re-verification of the lockstep branch.
 const fn prove_ladder_geometry() -> usize {
-    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore); 8] = [
+    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore); 10] = [
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
@@ -1269,6 +1293,8 @@ const fn prove_ladder_geometry() -> usize {
         (SmallSrcRow::Stock, RowAttempts::Light, BalancedStore::Chain),
         (SmallSrcRow::Btlazy, RowAttempts::Stock, BalancedStore::Row),
         (SmallSrcRow::Stock, RowAttempts::Stock, BalancedStore::Row),
+        (SmallSrcRow::Btlazy, RowAttempts::Light, BalancedStore::Row),
+        (SmallSrcRow::Stock, RowAttempts::Light, BalancedStore::Row),
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
@@ -1386,8 +1412,12 @@ const fn prove_ladder_geometry() -> usize {
 /// rehead branch. A ladder edit that moves this number fails the build —
 /// re-verify the lockstep branch in `resize_tables` (the R68 bug #3
 /// precondition: same row count at different hash logs).
+// The verdict axes grew to ten cells (the dll-class attempts diet added
+// the reachable Light x Row states), pushing the full-grid walk past the
+// lint's step budget; the proof itself is finite and completes.
+#[allow(long_running_const_eval)]
 const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
 const _: () = assert!(
-    LADDER_ROW_COLLISIONS == 3228,
+    LADDER_ROW_COLLISIONS == 4148,
     "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
 );

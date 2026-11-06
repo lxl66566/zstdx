@@ -1796,13 +1796,25 @@ impl MatchGeneratorDriver {
     /// verdict engages on. A [`BalancedStore::Chain`] sample on an
     /// already-stock driver is a no-op, so narrow frames keep the probe's
     /// bytes end to end.
+    ///
+    /// The dll class's attempts diet resolves from the same sample: the
+    /// bare-row class takes [`RowAttempts::Light`] (the twin's reduced
+    /// budget, applied by `params_for_row`), every other class resolves
+    /// Stock, and the resolved Light keeps the pending row-band verdict
+    /// from re-arming on the twin's first matching entry.
     pub(crate) fn consider_balanced_store(&mut self, head: &[u8], level: Level) {
         let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
         let store = balanced_store(&head[..span]);
-        if store == self.bal_store {
+        let attempts = if store == BalancedStore::Row {
+            RowAttempts::Light
+        } else {
+            RowAttempts::Stock
+        };
+        if store == self.bal_store && attempts == self.row_attempts {
             return;
         }
         self.bal_store = store;
+        self.row_attempts = attempts;
         self.apply_level(level);
         self.strategy_phase_reset();
     }
