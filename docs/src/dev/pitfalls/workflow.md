@@ -36,6 +36,12 @@ The 09-28 pass reproduced the collapse with the machine otherwise idle, at 5163 
 
 The trigger is a best or L13 row as the pooled ST core's predecessor. json.best is verified, text.best is untestable because the fixed cell order never puts it first, and a fastest or fast predecessor leaves the cell healthy.
 
+### MT cells whose makespan is one job read a single core's placement
+
+The 2026-11-07 pass read dll100.balanced.stream-mt8 at 128 MiB/s against R94's 174 at byte-identical output, which priced as a regression until the same-day A/B. The cell runs 8 jobs of 12.5 MiB on 8 workers posted within 0.4 ms, so its wall is the single slowest job at about 500 ms against a 60 ms fastest, with six workers idle after 470 ms: the cell measures one core's speed. On the two-CCD host the scheduler packs the pool onto the pump's CCD, and the identical binary reads about 160 MiB/s packed against about 200 MiB/s split across both L3 domains, at identical instruction counts and bytes. The same-day A/B of the pre-R94 tree against HEAD read 155 against 159 with HEAD at 1.74 percent fewer instructions, so both passes sampled the same placement band.
+
+A makespan-shaped mt cell needs a same-day A/B plus `perf stat` instruction counts before any regression verdict, and a fixed CPU mask across passes would pin the band.
+
 ### Physical-page layout transition
 
 The L13 to L3 `resize_tables` transition frees the 36.7 MiB DUBT table and reallocates the 32 MiB L3 hash table onto physically scattered pages. Pagemap read a contiguous-PFN-pair ratio of 0.29 against 0.51 healthy and a PFN span of 333x against 97x. dTLB misses per iteration rose 62%, and the 128 KiB staged-to-win block copies ate 38.8% of cycles against about 10% healthy. The layout stayed frozen for the whole cell because the pooled core was reused with zero per-iteration allocation syscalls, confirmed by strace and gdb breakpoints on `resize_tables` and `apply_level`.
