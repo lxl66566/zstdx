@@ -350,6 +350,12 @@ The 2026-11-05 and 2026-11-07 workspace runs died about half a second into the z
 
 A sweep that calls a `#[target_feature]` kernel directly must gate each kernel on the same runtime detection the dispatch uses; a tier the host lacks stays covered by the hosts that report it. Reproduce locally without dedicated hardware via `qemu-x86_64 -cpu EPYC-Milan <test-binary> <filter>`, which replays the exact SIGILL.
 
+### Tests reading a process-global switch must hold its serializer
+
+The 2026-11-07 paranoid run failed `opt_feed_arming_caps_at_the_buffer` on the assertion that the feed engages, while every dev box passed. The verdict reads `OPT_FEED_ARMED`, a process-global switch that `opt_serial_ldm_feed_pledged_stream_matches_bulk` stands down and back up under `FEED_TEST_SWITCH` while compressing a 17 MiB fixture. The arming test took no lock, and on the 4-vCPU runner the switch-off window covers the quick arming write, so the resolve read the stood-down state.
+
+Any test whose expectation depends on a test-global's value takes the same mutex the mutating tests use, for its whole body. The mutex exists precisely because the default harness runs tests in parallel threads of one process.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.

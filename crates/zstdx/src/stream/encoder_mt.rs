@@ -3805,6 +3805,9 @@ mod tests {
     /// which span a wrap keeps is a recycling-timing function.
     #[test]
     fn opt_feed_arming_caps_at_the_buffer() {
+        // The engagement reads the process-global feed switch; serialize
+        // against the tests that stand it down under this lock.
+        let _switch = crate::encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let mib = 1024 * 1024u64;
         let mut head = Vec::new();
         let mut state = 0x243f_6a88_85a3_08d3u64;
