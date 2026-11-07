@@ -189,7 +189,10 @@ mod tests {
     /// the dispatch's OnceLock picks one per process, so the copy test
     /// pins only the tier this host selects — the avx2 and temporal
     /// bodies (a different alignment width) would never run in-process
-    /// without this sweep.
+    /// without this sweep. Each kernel executes its own tier's
+    /// instructions, so the sweep covers only the tiers this host
+    /// reports: calling an absent tier SIGILLs on the CI fleet's
+    /// AVX-512-less runners.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn nt_kernels_reproduce_bytes_individually() {
@@ -201,7 +204,10 @@ mod tests {
             x ^= x << 17;
             *b = x as u8;
         }
-        let kernels: [super::Kernel; 3] = [super::nt_avx512, super::nt_avx2, super::temporal];
+        let avx2: Option<super::Kernel> =
+            std::is_x86_feature_detected!("avx2").then_some(super::nt_avx2);
+        let avx512: Option<super::Kernel> =
+            std::is_x86_feature_detected!("avx512f").then_some(super::nt_avx512);
         for len in [
             0,
             1,
@@ -215,7 +221,8 @@ mod tests {
         ] {
             let mut dst = alloc::vec![0u8; len + 64];
             for off in [0, 3, 64] {
-                for &kernel in &kernels {
+                let kernels: [Option<super::Kernel>; 3] = [Some(super::temporal), avx2, avx512];
+                for kernel in kernels.into_iter().flatten() {
                     dst.fill(0);
                     // SAFETY: equal, initialized, disjoint `len` spans —
                     // the kernel's own contract.

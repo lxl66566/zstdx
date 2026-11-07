@@ -344,6 +344,12 @@ The 2026-11-02 ffi-c run failed all ten compress-side estimate checks against th
 
 `tests/run-c.sh` therefore builds the reference static lib itself, from the pinned tree at `MOREFLAGS=-march=x86-64`, and the workflow no longer builds a ref lib step. Trusting a prebuilt `libzstd.a` couples the parity gate to whatever the local toolchain's default target happens to be, and the failure then reads as an expectations drift instead of a configuration mismatch.
 
+### Kernel sweep tests must gate on host detection
+
+The 2026-11-05 and 2026-11-07 workspace runs died about half a second into the zstdx lib suite with `signal: 4, SIGILL: illegal instruction` and no failing test named. `nt_kernels_reproduce_bytes_individually` swept every compiled NT-copy kernel directly, `nt_avx512` included, with no `is_x86_feature_detected!` gate: the AVX-512 dev host executed it fine, while the fleet's AMD EPYC runners (x86-64-v3) trap on the first EVEX instruction. The mixed runner fleet makes it a coin flip per run, and a SIGILL reads as a process crash, so the log shows only the last completed tests around the alphabetical frontier.
+
+A sweep that calls a `#[target_feature]` kernel directly must gate each kernel on the same runtime detection the dispatch uses; a tier the host lacks stays covered by the hosts that report it. Reproduce locally without dedicated hardware via `qemu-x86_64 -cpu EPYC-Milan <test-binary> <filter>`, which replays the exact SIGILL.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.
