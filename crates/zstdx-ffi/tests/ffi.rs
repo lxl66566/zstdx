@@ -626,6 +626,208 @@ fn stream_decode_error_and_wait_paths() {
     unsafe { zstd::ZSTD_freeDStream(dctx) };
 }
 
+/// Whole-frame streaming decode of `frame`: one `ZSTD_decompressStream`
+/// call per iteration offering the next `in_chunk` input bytes (0: the
+/// whole frame) into an `out_chunk`-sized output buffer (0: one
+/// frame-sized buffer). A frame end (ret 0) with input remaining opens
+/// the next frame, exactly as a whole-stream consumer drives it.
+fn stream_decode_split(
+    frame: &[u8],
+    expect_len: usize,
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Vec<u8> {
+    let dctx = dctx_with(0);
+    unsafe { zstd::ZSTD_initDStream(dctx) };
+    let out_len = if out_chunk == 0 {
+        expect_len.max(1)
+    } else {
+        out_chunk
+    };
+    let mut out = vec![0u8; out_len];
+    let mut decoded = Vec::new();
+    let mut in_pos = 0usize;
+    let mut hint = 1usize;
+    while in_pos < frame.len() || hint != 0 {
+        let take = if in_chunk == 0 {
+            frame.len() - in_pos
+        } else {
+            in_chunk.min(frame.len() - in_pos)
+        };
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: frame[in_pos..in_pos + take].as_ptr().cast(),
+            size: take,
+            pos: 0,
+        };
+        let mut zout = zstd::ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
+        assert!(
+            !is_error(r),
+            "decode failed (in_chunk {in_chunk}, out_chunk {out_chunk}): {}",
+            error_name(r)
+        );
+        decoded.extend_from_slice(&out[..zout.pos]);
+        in_pos += zin.pos;
+        hint = r;
+        assert!(
+            decoded.len() <= expect_len,
+            "decoder produced {} > {} bytes",
+            decoded.len(),
+            expect_len
+        );
+    }
+    unsafe { zstd::ZSTD_freeDStream(dctx) };
+    decoded
+}
+
+/// Drive a whole-frame decode that must end in an error and return its
+/// code (same call shape as `stream_decode_split`).
+fn stream_decode_split_error(frame: &[u8], in_chunk: usize) -> u32 {
+    let dctx = dctx_with(0);
+    unsafe { zstd::ZSTD_initDStream(dctx) };
+    let mut out = vec![0u8; 1024 * 1024];
+    let mut in_pos = 0usize;
+    loop {
+        let take = if in_chunk == 0 {
+            frame.len() - in_pos
+        } else {
+            in_chunk.min(frame.len() - in_pos)
+        };
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: frame[in_pos..in_pos + take].as_ptr().cast(),
+            size: take,
+            pos: 0,
+        };
+        let mut zout = zstd::ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let r = unsafe { zstd::ZSTD_decompressStream(dctx, &raw mut zout, &raw mut zin) };
+        if is_error(r) {
+            unsafe { zstd::ZSTD_freeDStream(dctx) };
+            return error_code(r);
+        }
+        in_pos += zin.pos;
+        assert!(
+            in_pos < frame.len() || r == 0,
+            "decode completed without the expected error"
+        );
+    }
+}
+
+/// A checksummed streaming encode of `input` (no pledged size, so the
+/// frame header carries no content size and the staged decode machine
+/// runs instead of the single-pass shortcut).
+fn checksummed_frame(input: &[u8], level: c_int) -> Vec<u8> {
+    let cctx = cctx_with(level, 1);
+    let frame = stream_compress_ctx(cctx, input, 8 * 1024);
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+    // The trailer is really there: the same encode without the flag is
+    // exactly 4 bytes shorter.
+    let plain_cctx = cctx_with(level, 0);
+    let plain = stream_compress_ctx(plain_cctx, input, 8 * 1024);
+    unsafe { zstd::ZSTD_freeCCtx(plain_cctx) };
+    assert_eq!(
+        frame.len(),
+        plain.len() + 4,
+        "checksum flag changed the body"
+    );
+    frame
+}
+
+/// todo 40 regression: streaming decode of frames encoded with
+/// `ZSTD_c_checksumFlag=1`. Every last-block shape must feed the engine
+/// so the checksum trailer is served as its own piece — in particular
+/// the empty last block an exact block multiple ends with (128 KiB of
+/// zeros at level 19: one RLE block plus a 3-byte empty last block),
+/// which the machine used to skip, leaving the frame open and the
+/// trailer bytes parsed as the next block header.
+#[test]
+fn stream_decode_checksummed_frames() {
+    let text: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let cases: Vec<(&str, Vec<u8>, c_int)> = vec![
+        ("empty", Vec::new(), 3),
+        (
+            "zeros exact block (empty last block)",
+            vec![0u8; 128 * 1024],
+            19,
+        ),
+        ("zeros one past the block", vec![0u8; 128 * 1024 + 1], 19),
+        ("zeros single rle block", vec![0u8; 65_536], 19),
+        ("text compressed last block", text, 9),
+    ];
+    for (name, input, level) in &cases {
+        let frame = checksummed_frame(input, *level);
+        for (in_chunk, out_chunk) in [
+            (0usize, 0usize),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (3, 0),
+            // input ending mid-checksum-trailer: the call boundary sits
+            // two bytes into the last piece
+            (frame.len().saturating_sub(2).max(1), 0),
+        ] {
+            let decoded = stream_decode_split(&frame, input.len(), in_chunk, out_chunk);
+            assert_eq!(&decoded, input, "case {name} in {in_chunk}/{out_chunk}");
+        }
+    }
+}
+
+/// A multi-frame stream with mixed checksum flags decodes frame by frame.
+#[test]
+fn stream_decode_multiframe_mixed_checksum() {
+    let a: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let b: Vec<u8> = vec![0u8; 128 * 1024]; // empty last block, checksummed
+    let mut both = a.clone();
+    both.extend_from_slice(&b);
+    let ck_a = checksummed_frame(&a, 5);
+    let ck_b = checksummed_frame(&b, 19);
+    let plain_cctx = cctx_with(5, 0);
+    let nock_a = stream_compress_ctx(plain_cctx, &a, 8 * 1024);
+    unsafe { zstd::ZSTD_freeCCtx(plain_cctx) };
+    for stream in [
+        [ck_a.clone(), ck_b.clone()].concat(),
+        [nock_a.clone(), ck_b].concat(),
+    ] {
+        for (in_chunk, out_chunk) in [(0usize, 0usize), (1, 0), (0, 1)] {
+            let decoded = stream_decode_split(&stream, both.len(), in_chunk, out_chunk);
+            assert_eq!(&decoded, &both, "in {in_chunk}/{out_chunk}");
+        }
+    }
+}
+
+/// The trailer is verified on the streaming path: a flipped checksum
+/// byte fails with checksum_wrong on every last-block shape, including
+/// the empty last block (whose corrupt trailer used to be parsed as a
+/// block and fail as generic corruption instead).
+#[test]
+fn stream_decode_checksum_trailer_mismatch() {
+    let text: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+    let empty_last: Vec<u8> = vec![0u8; 128 * 1024];
+    for frame in [
+        checksummed_frame(&text, 9),
+        checksummed_frame(&empty_last, 19),
+    ] {
+        let mut corrupt = frame.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        for in_chunk in [0usize, 1] {
+            let code = stream_decode_split_error(&corrupt, in_chunk);
+            assert_eq!(
+                code,
+                zstd::ErrorCode::ChecksumWrong as u32,
+                "in_chunk {in_chunk}"
+            );
+        }
+    }
+}
+
 #[test]
 fn context_one_shot_and_parameter_bounds() {
     let input: Vec<u8> = (0..200 * 1024u32).map(|i| (i % 251) as u8).collect();

@@ -644,9 +644,13 @@ impl DStream {
                     self.compact(3);
                     if c_size == 0 {
                         // An empty block carries no body piece and produces
-                        // no output: straight to the next header or the
-                        // trailer.
+                        // no output: straight to the next header. The last
+                        // block still goes through the engine, which must
+                        // see it to finish the frame and reach its
+                        // missing-checksum state; skipping it once left the
+                        // trailer bytes parsed as a block header.
                         if last {
+                            self.decode_block(self.cursor - 3, self.cursor, last)?;
                             if self.checksummed {
                                 self.stage = Stage::Checksum;
                             } else {

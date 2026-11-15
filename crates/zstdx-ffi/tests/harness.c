@@ -365,6 +365,157 @@ static void test_streaming(void) {
     free(ref);
 }
 
+/* ---- checksummed streaming decode (todo 40) ---- */
+
+/* Streaming encode with the checksum flag and no pledged size, so the
+ * frame carries no content size and the staged decode machine runs. */
+static unsigned char *ck_stream_frame(const unsigned char *src, size_t n, int level,
+                                      size_t *flen) {
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level)),
+          "set level");
+    CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1)), "set checksum");
+    size_t cap = ZSTD_compressBound(n) + 1024;
+    unsigned char *frame = malloc(cap);
+    ZSTD_outBuffer ob = {frame, cap, 0};
+    size_t fed = 0;
+    while (fed < n) {
+        size_t chunk = n - fed < 8192 ? n - fed : 8192;
+        ZSTD_inBuffer in = {src + fed, chunk, 0};
+        while (in.pos < in.size) {
+            size_t r = ZSTD_compressStream2(cctx, &ob, &in, ZSTD_e_continue);
+            CHECK(!ZSTD_isError(r), "ck encode: %s", ZSTD_getErrorName(r));
+        }
+        fed += chunk;
+    }
+    for (;;) {
+        ZSTD_inBuffer in = {NULL, 0, 0};
+        size_t r = ZSTD_compressStream2(cctx, &ob, &in, ZSTD_e_end);
+        CHECK(!ZSTD_isError(r), "ck encode end: %s", ZSTD_getErrorName(r));
+        if (r == 0) break;
+    }
+    ZSTD_freeCCtx(cctx);
+    *flen = ob.pos;
+    return frame;
+}
+
+/* Whole-frame decompressStream consumer: in_chunk-sized input rounds
+ * (0: whole frame) into out_chunk-sized output buffers (0: n-sized).
+ * Returns 0 on a clean byte-exact roundtrip. */
+static int dstream_roundtrip(const unsigned char *frame, size_t flen,
+                             const unsigned char *src, size_t n,
+                             size_t in_chunk, size_t out_chunk) {
+    ZSTD_DStream *zds = ZSTD_createDStream();
+    ZSTD_initDStream(zds);
+    size_t outcap = out_chunk ? out_chunk : n;
+    unsigned char *out = malloc(outcap ? outcap : 1);
+    unsigned char *dec = malloc(n ? n : 1);
+    size_t decoded = 0, fed = 0, hint = 1, guard = 0;
+    int ok = 0;
+    while (fed < flen || hint != 0) {
+        size_t take = in_chunk ? in_chunk : flen;
+        if (take > flen - fed) take = flen - fed;
+        ZSTD_inBuffer in = {frame + fed, take, 0};
+        ZSTD_outBuffer ob = {out, outcap, 0};
+        size_t r = ZSTD_decompressStream(zds, &ob, &in);
+        if (ZSTD_isError(r)) {
+            printf("FAIL dstream in=%zu out=%zu: %s\n", in_chunk, out_chunk,
+                   ZSTD_getErrorName(r));
+            failures++;
+            goto out;
+        }
+        memcpy(dec + decoded, out, ob.pos);
+        decoded += ob.pos;
+        fed += in.pos;
+        hint = r;
+        if (++guard > 10000000) {
+            printf("FAIL dstream in=%zu out=%zu: no completion\n", in_chunk, out_chunk);
+            failures++;
+            goto out;
+        }
+    }
+    ok = decoded == n && (n == 0 || memcmp(dec, src, n) == 0);
+    CHECK(ok, "dstream roundtrip in=%zu out=%zu (%zu vs %zu bytes)", in_chunk, out_chunk,
+          decoded, n);
+out:
+    ZSTD_freeDStream(zds);
+    free(out);
+    free(dec);
+    return ok;
+}
+
+/* Drive the consumer until it errors; returns the error code (or 0 when
+ * the decode completed clean, which callers treat as failure). */
+static ZSTD_ErrorCode dstream_error(const unsigned char *frame, size_t flen, size_t in_chunk) {
+    ZSTD_DStream *zds = ZSTD_createDStream();
+    ZSTD_initDStream(zds);
+    unsigned char out[4096];
+    size_t fed = 0, guard = 0;
+    ZSTD_ErrorCode code = 0;
+    while (fed < flen) {
+        size_t take = in_chunk ? in_chunk : flen;
+        if (take > flen - fed) take = flen - fed;
+        ZSTD_inBuffer in = {frame + fed, take, 0};
+        ZSTD_outBuffer ob = {out, sizeof(out), 0};
+        size_t r = ZSTD_decompressStream(zds, &ob, &in);
+        if (ZSTD_isError(r)) {
+            code = ZSTD_getErrorCode(r);
+            break;
+        }
+        fed += in.pos;
+        if (++guard > 10000000) break;
+    }
+    ZSTD_freeDStream(zds);
+    return code;
+}
+
+/* Checksummed frames through decompressStream: the exact block multiple
+ * ends its frame with an empty last block, so the checksum trailer is
+ * the piece right after it; a flipped trailer byte must report
+ * checksum_wrong on every split. */
+static void test_streaming_checksum(void) {
+    struct {
+        size_t n;
+        int level, zeros;
+    } shapes[] = {
+        {0, 3, 1},
+        {65536, 19, 1},
+        {128 * 1024, 19, 1}, /* empty last block */
+        {128 * 1024 + 1, 19, 1},
+        {50000, 9, 0},
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        size_t n = shapes[i].n;
+        unsigned char *src = malloc(n ? n : 1);
+        if (shapes[i].zeros) {
+            memset(src, 0, n);
+        } else {
+            for (size_t j = 0; j < n; j++) src[j] = (unsigned char)('a' + (j % 23));
+        }
+        size_t flen = 0;
+        unsigned char *frame = ck_stream_frame(src, n, shapes[i].level, &flen);
+        CHECK(frame[4] & 0x4, "shape %zu: checksum flag not set in the header", i);
+        dstream_roundtrip(frame, flen, src, n, 0, 0);
+        dstream_roundtrip(frame, flen, src, n, 1, 0); /* trailer split per byte */
+        dstream_roundtrip(frame, flen, src, n, 0, 1);
+        dstream_roundtrip(frame, flen, src, n, flen > 2 ? flen - 2 : 1, 0); /* mid-trailer */
+        free(src);
+        free(frame);
+    }
+    /* flipped trailer byte: checksum_wrong, whole-input and byte-split */
+    {
+        size_t n = 128 * 1024;
+        unsigned char *src = calloc(1, n);
+        size_t flen = 0;
+        unsigned char *frame = ck_stream_frame(src, n, 19, &flen);
+        frame[flen - 1] ^= 0xff;
+        CHECK(dstream_error(frame, flen, 0) == ZSTD_error_checksum_wrong, "cksum mismatch whole");
+        CHECK(dstream_error(frame, flen, 1) == ZSTD_error_checksum_wrong, "cksum mismatch split");
+        free(src);
+        free(frame);
+    }
+}
+
 /* ---- file interop modes ---- */
 
 static unsigned char *read_file(const char *path, size_t *len) {
@@ -8348,6 +8499,7 @@ int main(int argc, char **argv) {
     test_errors();
     test_contexts();
     test_streaming();
+    test_streaming_checksum();
     test_reset_compress2();
     test_dicts();
     test_dctx_reset_and_metadata();
