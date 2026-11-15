@@ -6,7 +6,7 @@ use std::{fs, io::Write, path::PathBuf};
 
 use zstdx::{
     Level,
-    encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, Sequence},
+    encoding::{EncodedSequence, MatchGeneratorDriver, Matcher, RepcodeState, Sequence},
 };
 
 /// Delegating matcher that records every emitted sequence.
@@ -76,12 +76,12 @@ impl Matcher for RecordingMatcher {
         self.inner.window_size()
     }
 
-    fn repcode_snapshot(&self) -> [u32; 3] {
+    fn repcode_snapshot(&self) -> RepcodeState {
         self.inner.repcode_snapshot()
     }
 
-    fn restore_repcode(&mut self, rep: [u32; 3]) {
-        self.inner.restore_repcode(rep);
+    fn restore_repcode(&mut self, state: RepcodeState) {
+        self.inner.restore_repcode(state);
     }
 
     fn load_dictionary(&mut self, content: &[u8], rep: [u32; 3], level: Level) {

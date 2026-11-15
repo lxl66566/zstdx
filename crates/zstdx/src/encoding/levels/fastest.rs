@@ -62,6 +62,11 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         header.serialize(output);
         hasher.raw_out(output, state.matcher.get_last_space(), hashed);
     } else {
+        // The snapshot carries the job-start gate's remaining count with the
+        // history: a raw fallback rolls both back, because this block's
+        // emissions never reach the decoder (a counter drained by the
+        // rolled-back parse would open repcode references against history
+        // the decoder does not hold — the mt job boundary's corruption).
         let rep = state.matcher.repcode_snapshot();
         // Take the reusable entropy tables out of the state by value: the
         // block encoder then can't touch them, so a raw fallback simply puts

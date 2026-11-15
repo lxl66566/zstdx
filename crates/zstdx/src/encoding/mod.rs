@@ -291,6 +291,22 @@ pub struct SeqWord {
     pub(crate) add_nb: u8,
 }
 
+/// The repcode state the encoder's raw-block fallback rolls back: the
+/// repeated-offset history plus the job-start gate's remaining
+/// literal-offset count. Emissions inside a block that ends up raw never
+/// reach the decoder, so both restore together — a gate counter drained by
+/// the rolled-back parse would let a later repcode emission resolve
+/// against history the decoder does not hold (the multithreaded job
+/// boundary's corruption class).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepcodeState {
+    /// The three repeated offsets the decoder's running history holds.
+    pub rep: [u32; 3],
+    /// The job-start gate's remaining literal-offset count (0 = the gate
+    /// is open); matchers without a job-start gate stay at 0.
+    pub gate_pending: u8,
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own
 /// algorithm making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -491,14 +507,18 @@ pub trait Matcher {
     fn block_size(&self) -> usize {
         crate::common::MAX_BLOCK_SIZE as usize
     }
-    /// Snapshot the repeated-offset history maintained by the matcher
+    /// Snapshot the repcode state maintained by the matcher: the
+    /// repeated-offset history plus the job-start gate's remaining
+    /// literal-offset count (see [`RepcodeState`]).
     ///
     /// A block whose generated sequences are ultimately not emitted (raw block
     /// fallback) must restore this snapshot: the decoder only updates its own
-    /// history for sequences it actually decodes.
-    fn repcode_snapshot(&self) -> [u32; 3];
+    /// history for sequences it actually decodes, and a gate counter drained
+    /// by the rolled-back parse would open repcode references against history
+    /// the decoder does not hold.
+    fn repcode_snapshot(&self) -> RepcodeState;
     /// Restore a snapshot taken by [`Matcher::repcode_snapshot`]
-    fn restore_repcode(&mut self, rep: [u32; 3]);
+    fn restore_repcode(&mut self, state: RepcodeState);
     /// Pre-match incompressibility gate: sample the last committed block and,
     /// when it is near-certainly raw (max-entropy bytes and no sampled
     /// repeat anywhere in the frame's history), skip matching it and return

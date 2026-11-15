@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use super::block_enc::compressed::LitStreams;
 use super::{
-    Matcher, SeqWord, Sequence,
+    Matcher, RepcodeState, SeqWord, Sequence,
     btlazy::{LazyScratch, LazyStep, LongCompare, REP_PROBE_MIN, REP_PROBE_RATE, RepProbes},
     hugepage::HugeBuf,
     ldm::{LdmSeq, LdmState},
@@ -3611,12 +3611,16 @@ impl Matcher for MatchGeneratorDriver {
         self.params.window as u64
     }
 
-    fn repcode_snapshot(&self) -> [u32; 3] {
-        self.rep
+    fn repcode_snapshot(&self) -> RepcodeState {
+        RepcodeState {
+            rep: self.rep,
+            gate_pending: self.rep_pending,
+        }
     }
 
-    fn restore_repcode(&mut self, rep: [u32; 3]) {
-        self.rep = rep;
+    fn restore_repcode(&mut self, state: RepcodeState) {
+        self.rep = state.rep;
+        self.rep_pending = state.gate_pending;
     }
 
     fn note_literal_costs(&mut self, lengths: &[u8; 256]) {

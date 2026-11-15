@@ -88,6 +88,8 @@ The fix clears the head table per job like C does. Chain lists may stay uncleare
 
 A raw-block fallback must reconcile cross-block state with what the decoder received. Any reused encoder state, repcodes and reused entropy tables included, has to roll back when a block falls back to raw. Otherwise the next block's Treeless or Repeat reference names a table the decoder never received.
 
+The rollback set is the full repcode state, not just the three offsets. A multithreaded job after the first gates repcode references until three literal-offset sequences have shipped (`gate_repcodes` counts them down in the parse). The compressed attempt of a raw-fallback block emits those sequences, so its parse drains the counter; restoring only the offset array left the gate open against a decoder that had received nothing. The next repcode emission then resolved against the decoder's own history and the frame decoded wrong, four bytes deep in an otherwise clean 457 MB stream (level 1 and level 3, 16 workers, the fast rows' far-window capture). The snapshot is [`RepcodeState`][crate::encoding::RepcodeState]: the offsets plus the counter, restored together in `compress_fastest`'s raw arm.
+
 ### Matcher scratch geometry
 
 Avoid the `ip1_idx - anchor_idx` subtraction. The new anchor returned by emit can move past `ip1`, which is silent in release, while the debug panic interrupts an MT worker and the join waits forever. Use an exact predicate with no subtraction.
