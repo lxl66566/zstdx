@@ -8,7 +8,7 @@
 //! reported. The libzstd reference side can be skipped with `--no-ref`.
 //!
 //! Cells are independent and only sizes are measured, so the sweep runs
-//! cells concurrently on a rayon pool (`--parallel`, default 8; each cell
+//! cells concurrently on a rayon pool (`--parallel`, default 16; each cell
 //! transiently holds a few 32 MiB-scale buffers, keep the width within
 //! RAM). Single-threaded cells still exercise the single-threaded encoder
 //! — the pool only runs many of them at once. MT modes engage per-call
@@ -87,7 +87,7 @@ pub struct Args {
     pub mt_workers: u32,
     /// Concurrent cells in the sweep (0 = one per logical core); bounded by
     /// RAM, see the module docs
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     pub parallel: usize,
     /// Skip the libzstd reference side (sizes only, no Δ column)
     #[arg(long)]

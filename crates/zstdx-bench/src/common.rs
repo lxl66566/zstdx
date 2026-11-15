@@ -10,7 +10,10 @@
 //!   with `--budget-ms` or the `BENCH_BUDGET_MS` env var), so the total wall time is bounded
 //!   without fixing an iteration count. A side that is far faster than its counterpart only needs
 //!   `FAST_SIDE_BUDGET_FRAC` of the budget once the slow side is done, because every extra round
-//!   then buys one full slow-side round for a handful of fast-side samples.
+//!   then buys one full slow-side round for a handful of fast-side samples. Cells whose warmup
+//!   round pair already costs `TWO_PAIR_BUDGET_MULT` times the budget runs two pairs instead, so
+//!   the deep-level cells do not pay the full floor in multi-second pairs; cheaper cells keep the
+//!   fixed floor.
 //! - **Robust stats**: median/min/max plus the median absolute deviation of the ratios; medians
 //!   absorb spikes, min approximates the noise floor.
 //!
@@ -24,7 +27,20 @@ use std::time::Instant;
 /// asymmetric cell (deep-level random rows, where the libzstd side runs
 /// seconds per round and ours runs milliseconds): once the slow side spent
 /// its full budget, the fast side stops at this fraction.
-const FAST_SIDE_BUDGET_FRAC: f64 = 0.125;
+const FAST_SIDE_BUDGET_FRAC: f64 = 0.0625;
+
+/// A warmup round pair at least this expensive against the per-side budget
+/// carries a stable reading, so two pairs suffice: the pairs spend a large
+/// multiple of the budget on real work, more pairs add wall time faster
+/// than they add confidence, and the warmup pair already counts as the
+/// first sample through the slow-round rule. The two-sample median still
+/// absorbs a wandering first pair. Derived from the budget, so `--budget-ms`
+/// moves the floor together with it.
+const TWO_PAIR_BUDGET_MULT: f64 = 8.0;
+
+/// A solo round at least this expensive against the budget is its own
+/// reading, for the same reason as the two-pair floor on the A/B side.
+const SOLO_ROUND_BUDGET_MULT: f64 = 16.0;
 
 /// A round at least this slow is kept as the first sample instead of being
 /// discarded as warmup. Below this bound the payload plausibly stays in a
@@ -169,6 +185,7 @@ impl Ab {
     {
         let mut a_times = Vec::new();
         let mut b_times = Vec::new();
+        let mut pair_cost = 0.0;
         for _ in 0..self.warmup_rounds {
             let t = Instant::now();
             a();
@@ -176,6 +193,7 @@ impl Ab {
             let t = Instant::now();
             b();
             let tb = t.elapsed().as_secs_f64();
+            pair_cost = ta + tb;
             // A round this slow cannot warm anything the next round reads,
             // so it counts as a sample; fast rounds are the warmup discard.
             let slow =
@@ -185,21 +203,22 @@ impl Ab {
                 b_times.push(tb);
             }
         }
+        // Adaptive sample floor: an expensive pair already carries a
+        // stable reading, so the fixed minimum would only inflate wall
+        // time on the deep-level cells where one pair runs seconds.
+        let min_rounds = if pair_cost >= self.min_secs * TWO_PAIR_BUDGET_MULT {
+            2
+        } else {
+            self.min_rounds
+        };
         let fast_secs = self.min_secs * FAST_SIDE_BUDGET_FRAC;
         let mut rounds = a_times.len();
+        let mut a_total: f64 = a_times.iter().sum();
+        let mut b_total: f64 = b_times.iter().sum();
         loop {
-            let t = Instant::now();
-            a();
-            a_times.push(t.elapsed().as_secs_f64());
-            let t = Instant::now();
-            b();
-            b_times.push(t.elapsed().as_secs_f64());
-            rounds += 1;
-            let a_total: f64 = a_times.iter().sum();
-            let b_total: f64 = b_times.iter().sum();
             // both sides at the full budget, or one side at the full budget
             // and the other clearly the fast side of an asymmetric cell
-            let done = rounds >= self.min_rounds
+            let done = rounds >= min_rounds
                 && ((a_total >= self.min_secs
                     && (b_total >= self.min_secs || b_total >= fast_secs))
                     || (b_total >= self.min_secs && a_total >= fast_secs));
@@ -208,6 +227,17 @@ impl Ab {
             if done || rounds >= 100_000 {
                 break;
             }
+            let t = Instant::now();
+            a();
+            let ta = t.elapsed().as_secs_f64();
+            a_times.push(ta);
+            a_total += ta;
+            let t = Instant::now();
+            b();
+            let tb = t.elapsed().as_secs_f64();
+            b_times.push(tb);
+            b_total += tb;
+            rounds += 1;
         }
         let ratios: Vec<f64> = a_times
             .iter()
@@ -232,7 +262,13 @@ pub fn measure_solo<F: FnMut()>(mut f: F) -> Stats {
     loop {
         let t = Instant::now();
         f();
-        times.push(t.elapsed().as_secs_f64());
+        let elapsed = t.elapsed().as_secs_f64();
+        times.push(elapsed);
+        // a multi-second round is its own reading; the budget rule would
+        // only pile on more of them
+        if elapsed >= budget * SOLO_ROUND_BUDGET_MULT {
+            break;
+        }
         let done = times.len() >= 3 && times.iter().sum::<f64>() >= budget;
         if done || times.len() >= 100_000 {
             break;
