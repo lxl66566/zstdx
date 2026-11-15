@@ -12,7 +12,7 @@ use crate::{
         OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
     },
     decoding::errors::DecodeSequenceError,
-    fse::FSETable,
+    fse::{FSETable, next_position},
 };
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
@@ -219,16 +219,70 @@ impl EntryRef {
     }
 }
 
-/// Pack a sequence decoding table into its fixed slot, one [`pack_entry`]
-/// per FSE state. Slot entries beyond the table's real size stay stale —
-/// states provably never reach them (every transition stays below
-/// 1 << accuracy_log).
-fn pack_seq_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
-    for (dst, e) in out.iter_mut().zip(&table.decode) {
-        let sym = e.symbol as usize;
-        let (base, add) = codes[sym];
-        *dst = pack_entry(base, add, e.base_line as u16, e.num_bits);
+/// Stage one FSE state's symbol for the build's second pass: the symbol sits
+/// in the entry's `base` field, which pass two overwrites. libzstd's
+/// `ZSTD_buildFSETable` stages it in `baseValue` the same way.
+const fn staged_symbol(symbol: u8) -> u64 {
+    (symbol as u64) << 32
+}
+
+/// Build one packed sequence decoding table straight into its slot in the
+/// reference's two passes (`ZSTD_buildFSETable`): the first spreads each
+/// state's symbol into the slot's staging field along the table's own position
+/// walk, the second walks the slots, reads the symbol back out of the field it
+/// just wrote, and completes the entry from the hoisted spread constants plus
+/// the symbol's `(base, add-bits)` pair. Folding the two passes costs the fill
+/// pass the code lookup, the spread multiply-adds and a 64-bit store per entry,
+/// 29 percent more Ir per entry than the spread alone, and the deleted pack pass
+/// was exactly what that work belongs to (docs/src/dev/negative/decoding.md).
+///
+/// Slot entries beyond the table's real size stay stale — states provably never
+/// reach them (every transition stays below 1 << accuracy_log).
+fn build_packed_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
+    let table_size = 1usize << table.accuracy_log;
+    let slots = &mut out[..table_size];
+
+    // Pass one: lay down each state's symbol. Low-probability (`-1`) symbols
+    // own one state each and take the top of the table in descending symbol
+    // order; the rest spread from the bottom, skipping that tail.
+    let mut negative_idx = table_size;
+    for (symbol, &prob) in table.symbol_probabilities.iter().enumerate() {
+        if prob == -1 {
+            negative_idx -= 1;
+            slots[negative_idx] = staged_symbol(symbol as u8);
+        }
     }
+    let mut position = 0;
+    for (symbol, &prob) in table.symbol_probabilities.iter().enumerate() {
+        if prob <= 0 {
+            continue;
+        }
+        // for each probability point the symbol gets on slot
+        for _ in 0..prob {
+            slots[position] = staged_symbol(symbol as u8);
+
+            position = next_position(position, table_size);
+            while position >= negative_idx {
+                position = next_position(position, table_size);
+                // everything above negative_idx is already taken
+            }
+        }
+    }
+
+    // Pass two: the symbol comes back out of its staging field, and the code
+    // pair and the baseline complete the entry with a single store. The baselines
+    // count occurrences in state order, so the per-symbol counter is what this
+    // pass owns; it is 256 wide so the byte-wide symbol indexes it unchecked.
+    let mut counter = [0u16; 256];
+    for slot in slots.iter_mut() {
+        let symbol = (entry_base(*slot) & 0xff) as usize;
+        let count = counter[symbol];
+        counter[symbol] = count + 1;
+        let (base, add) = codes[symbol];
+        let (base_line, nb_bits) = table.occurrence(symbol as u8, count as u32);
+        *slot = pack_entry(base, add, base_line as u16, nb_bits);
+    }
+
     // Factory proof over the packed entries: the decode loop computes its
     // next state as `next_state_base + add_bits` and indexes the slot with
     // it, so the raw table's transition theorem must survive the bit
@@ -237,12 +291,11 @@ fn pack_seq_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
     // tail beyond the real table length is unreachable exactly while every
     // packed entry keeps its transition below that length.
     #[cfg(debug_assertions)]
-    for (i, &p) in out[..table.decode.len()].iter().enumerate() {
+    for (i, &p) in slots.iter().enumerate() {
         let (base_t, nb_t) = (entry_next_state(p) as usize, entry_nb_bits(p));
         debug_assert!(
-            base_t + (1usize << nb_t) <= table.decode.len(),
-            "packed seq entry {i} transitions past the table: {base_t} + 2^{nb_t} > {}",
-            table.decode.len(),
+            base_t + (1usize << nb_t) <= table_size,
+            "packed seq entry {i} transitions past the table: {base_t} + 2^{nb_t} > {table_size}",
         );
     }
 }
@@ -357,15 +410,16 @@ const fn of_codes() -> [(u32, u8); 32] {
 const OF_CODES: [(u32, u8); 32] = of_codes();
 
 /// Rebuild the packed table slots whose source tables changed since the last
-/// block. RLE streams get a one-state fake table in slot 0: the entry carries
-/// the code's (base, add-bits) with a zero transition, so the decode loop
-/// stays in state 0 forever and needs no RLE special cases at all (zero
-/// accuracy-log bits at the initial state read).
+/// block, straight from each table's distribution and spread constants. RLE
+/// streams get a one-state fake table in slot 0: the entry carries the code's
+/// (base, add-bits) with a zero transition, so the decode loop stays in state 0
+/// forever and needs no RLE special cases at all (zero accuracy-log bits at the
+/// initial state read).
 fn pack_tables(scratch: &mut FSEScratch) {
     if !scratch.ll_seq_valid {
         match scratch.ll_rle {
             Some(c) => pack_rle_entry(LL_CODES[c as usize], &mut scratch.seq_packed[LL_SLOT]),
-            None => pack_seq_table(
+            None => build_packed_table(
                 &scratch.literal_lengths,
                 &LL_CODES,
                 &mut scratch.seq_packed[LL_SLOT..ML_SLOT],
@@ -376,7 +430,7 @@ fn pack_tables(scratch: &mut FSEScratch) {
     if !scratch.ml_seq_valid {
         match scratch.ml_rle {
             Some(c) => pack_rle_entry(ML_CODES[c as usize], &mut scratch.seq_packed[ML_SLOT]),
-            None => pack_seq_table(
+            None => build_packed_table(
                 &scratch.match_lengths,
                 &ML_CODES,
                 &mut scratch.seq_packed[ML_SLOT..OF_SLOT],
@@ -387,7 +441,7 @@ fn pack_tables(scratch: &mut FSEScratch) {
     if !scratch.of_seq_valid {
         match scratch.of_rle {
             Some(c) => pack_rle_entry(OF_CODES[c as usize], &mut scratch.seq_packed[OF_SLOT]),
-            None => pack_seq_table(
+            None => build_packed_table(
                 &scratch.offsets,
                 &OF_CODES,
                 &mut scratch.seq_packed[OF_SLOT..],
@@ -811,7 +865,9 @@ pub(crate) fn maybe_update_fse_tables(
 
     match modes.ll_mode() {
         ModeType::FSECompressed => {
-            let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
+            let bytes = scratch
+                .literal_lengths
+                .read_description(source, LL_MAX_LOG)?;
             bytes_read += bytes;
 
             vprintln!("Updating ll table");
@@ -845,7 +901,7 @@ pub(crate) fn maybe_update_fse_tables(
             if !scratch.ll_predefined {
                 scratch
                     .literal_lengths
-                    .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LL_DEFAULT_DISTRIBUTION)?;
+                    .set_distribution(LL_DEFAULT_ACC_LOG, &LL_DEFAULT_DISTRIBUTION)?;
                 scratch.ll_predefined = true;
                 scratch.ll_seq_valid = false;
             }
@@ -862,7 +918,7 @@ pub(crate) fn maybe_update_fse_tables(
 
     match modes.of_mode() {
         ModeType::FSECompressed => {
-            let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
+            let bytes = scratch.offsets.read_description(of_source, OF_MAX_LOG)?;
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
@@ -891,7 +947,7 @@ pub(crate) fn maybe_update_fse_tables(
             if !scratch.of_predefined {
                 scratch
                     .offsets
-                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OF_DEFAULT_DISTRIBUTION)?;
+                    .set_distribution(OF_DEFAULT_ACC_LOG, &OF_DEFAULT_DISTRIBUTION)?;
                 scratch.of_predefined = true;
                 scratch.of_seq_valid = false;
             }
@@ -908,7 +964,9 @@ pub(crate) fn maybe_update_fse_tables(
 
     match modes.ml_mode() {
         ModeType::FSECompressed => {
-            let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
+            let bytes = scratch
+                .match_lengths
+                .read_description(ml_source, ML_MAX_LOG)?;
             bytes_read += bytes;
             vprintln!("Updating ml table");
             vprintln!("Used bytes: {}", bytes);
@@ -937,7 +995,7 @@ pub(crate) fn maybe_update_fse_tables(
             if !scratch.ml_predefined {
                 scratch
                     .match_lengths
-                    .build_from_probabilities(ML_DEFAULT_ACC_LOG, &ML_DEFAULT_DISTRIBUTION)?;
+                    .set_distribution(ML_DEFAULT_ACC_LOG, &ML_DEFAULT_DISTRIBUTION)?;
                 scratch.ml_predefined = true;
                 scratch.ml_seq_valid = false;
             }
@@ -993,6 +1051,216 @@ fn test_ll_default() {
     assert_eq!(table.decode[59].symbol, 24);
     assert_eq!(table.decode[59].num_bits, 5);
     assert_eq!(table.decode[59].base_line, 32);
+}
+
+/// The two-stage build the packed slots replaced, kept as the test reference:
+/// the `Entry` walk followed by a per-entry pack pass.
+#[cfg(test)]
+fn entry_walk_packed(table: &FSETable, codes: &[(u32, u8)]) -> Vec<u64> {
+    table
+        .decode
+        .iter()
+        .map(|e| {
+            let (base, add) = codes[e.symbol as usize];
+            pack_entry(base, add, e.base_line as u16, e.num_bits)
+        })
+        .collect()
+}
+
+/// Synthetic `(base value, additional bits)` pairs wide enough for any symbol a
+/// 255-symbol table holds; the pack fold is code-table independent.
+#[cfg(test)]
+fn synthetic_codes() -> [(u32, u8); 256] {
+    let mut codes = [(0u32, 0u8); 256];
+    for (symbol, code) in codes.iter_mut().enumerate() {
+        *code = ((symbol * 7 + 1) as u32, (symbol % 17) as u8);
+    }
+    codes
+}
+
+/// Build one distribution every way the decoder does and require the packed
+/// slots byte-identical to the two-stage form's: from the probabilities alone
+/// with its `Entry` view (the test reference), from the probabilities alone
+/// without one (the predefined path), and parsed back off its `write_ncount`
+/// description (the FSE path). `codes` sizes the alphabet, so `probs` must not
+/// outrun it.
+#[cfg(test)]
+fn check_packed_distribution(acc_log: u8, probs: &[i32], codes: &[(u32, u8)], what: &str) {
+    use crate::{bit_io::BitWriter, fse::fse_encoder::write_ncount};
+
+    let table_size = 1usize << acc_log;
+    let states: i32 = probs
+        .iter()
+        .map(|&p| {
+            if p == -1 {
+                1
+            } else {
+                p
+            }
+        })
+        .sum();
+    assert_eq!(states, table_size as i32, "{what}: distribution sums");
+    let max_symbol = (codes.len() - 1) as u8;
+
+    let mut entries = FSETable::new(max_symbol);
+    entries.build_from_probabilities(acc_log, probs).unwrap();
+    let reference = entry_walk_packed(&entries, codes);
+
+    let mut packed = alloc::vec![0u64; table_size];
+    build_packed_table(&entries, codes, &mut packed);
+    assert_eq!(packed, reference, "{what}: entry-view table");
+
+    let mut probs_only = FSETable::new(max_symbol);
+    probs_only.set_distribution(acc_log, probs).unwrap();
+    assert!(probs_only.decode.is_empty(), "{what}: Entry view built");
+    let mut packed = alloc::vec![0u64; table_size];
+    build_packed_table(&probs_only, codes, &mut packed);
+    assert_eq!(packed, reference, "{what}: probabilities");
+
+    let mut writer = BitWriter::new();
+    write_ncount(probs, acc_log, &mut writer);
+    let bytes = writer.dump();
+    let mut parsed = FSETable::new(max_symbol);
+    let used = parsed.read_description(&bytes, 12).unwrap();
+    assert_eq!(used, bytes.len(), "{what}: consumed bytes");
+    assert_eq!(parsed.accuracy_log, acc_log, "{what}: accuracy log");
+    assert!(parsed.decode.is_empty(), "{what}: Entry view built");
+    let mut packed = alloc::vec![0u64; table_size];
+    build_packed_table(&parsed, codes, &mut packed);
+    assert_eq!(packed, reference, "{what}: description");
+}
+
+/// The packed slots are what the decode loops read, so the two-pass build must
+/// reproduce the `Entry` walk plus pack pass byte for byte.
+#[test]
+fn packed_table_matches_entry_walk() {
+    use crate::fse::ACC_LOG_OFFSET;
+
+    let codes = synthetic_codes();
+
+    // Pseudo-random normalized distributions over the serializable accuracy
+    // range, live-symbol counts and low-probability mixes.
+    let mut seed = 0x243f_6a88_85a3_08d3u64;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for case in 0..150u32 {
+        let acc_log = ACC_LOG_OFFSET + (rand() % 8) as u8;
+        let table_size = 1i32 << acc_log;
+        let nsym = 2 + (rand() % 200) as usize;
+        let mut probs = alloc::vec![0i32; nsym];
+        let mut budget = table_size;
+        let mut has_positive = false;
+        for prob in probs.iter_mut() {
+            let r = rand();
+            if budget <= 1 || r % 3 == 0 {
+                continue; // dead symbol
+            }
+            budget -= 1;
+            if r % 7 == 0 {
+                *prob = -1;
+            } else {
+                *prob = 1;
+                has_positive = true;
+            }
+        }
+        if !has_positive {
+            // The pour below needs a positive sink. Promoting a dead slot costs
+            // one of the states left over; if every slot is live, promoting one
+            // of the single-state symbols costs none.
+            match probs.iter().position(|&p| p == 0) {
+                Some(i) => {
+                    probs[i] = 1;
+                    budget -= 1;
+                },
+                None => {
+                    let i = probs.iter().position(|&p| p == -1).unwrap();
+                    probs[i] = 1;
+                },
+            }
+        }
+        // Pour the remaining states onto the live positives in random chunks so
+        // the sum lands exactly on the table size.
+        while budget > 0 {
+            let idx = (rand() as usize) % nsym;
+            if probs[idx] > 0 {
+                let add = (1 + rand() % budget as u64) as i32;
+                probs[idx] += add;
+                budget -= add;
+            }
+        }
+        check_packed_distribution(
+            acc_log,
+            &probs,
+            &codes,
+            &alloc::format!("random case {case}"),
+        );
+    }
+
+    // Hand-built spread shapes, the distribution extremes a random draw covers
+    // thinly.
+    let mut wide = alloc::vec![0i32; 200];
+    for (i, prob) in wide.iter_mut().enumerate() {
+        *prob = match i % 7 {
+            0 => -1,
+            1 | 4 => 0,
+            2 | 5 => 2,
+            _ => 4,
+        };
+    }
+    let placed: i32 = wide
+        .iter()
+        .map(|&p| {
+            if p == -1 {
+                1
+            } else {
+                p
+            }
+        })
+        .sum();
+    wide[3] += (1 << 9) - placed;
+    let classes: [(&str, u8, &[i32]); 6] = [
+        // One symbol owns every state.
+        ("single symbol", 6, &[64]),
+        // A power-of-two split: every symbol a double-width slice.
+        ("power-of-two split", 6, &[16, 16, 16, 16]),
+        // Low-probability symbols at both ends of the alphabet.
+        ("-1 symbols at both ends", 6, &[-1, -1, 20, 20, 20, -1, -1]),
+        // Dead symbols between the live ones.
+        ("interior dead symbols", 6, &[
+            8, 0, 0, 0, 8, 8, 0, 0, 8, 8, 0, 24,
+        ]),
+        // Every state its own single-state symbol, no mass left to spread.
+        ("full single-state alphabet", 5, &[1; 32]),
+        ("wide alphabet", 9, &wide),
+    ];
+    for (what, acc_log, probs) in classes {
+        check_packed_distribution(acc_log, probs, &codes, what);
+    }
+
+    // The three RFC default tables, from their distributions and off their wire
+    // descriptions.
+    check_packed_distribution(
+        LL_DEFAULT_ACC_LOG,
+        &LL_DEFAULT_DISTRIBUTION,
+        &LL_CODES,
+        "ll default",
+    );
+    check_packed_distribution(
+        ML_DEFAULT_ACC_LOG,
+        &ML_DEFAULT_DISTRIBUTION,
+        &ML_CODES,
+        "ml default",
+    );
+    check_packed_distribution(
+        OF_DEFAULT_ACC_LOG,
+        &OF_DEFAULT_DISTRIBUTION,
+        &OF_CODES,
+        "of default",
+    );
 }
 
 /// The flat executor's per-field loads and the staging decoder's shifts read

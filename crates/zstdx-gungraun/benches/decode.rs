@@ -67,6 +67,34 @@ macro_rules! decode_group {
     };
 }
 
+/// The dll100 decode band: one interop frame per level off the big
+/// corpus's head, the shape the sequence-table builds dominate. Level 19 is
+/// the tier beyond the six-level corpus ladder.
+macro_rules! decode_dll_group {
+    ($group:ident, $zx:ident, $zc:ident, $frame:ident) => {
+        #[library_benchmark]
+        #[bench::l1($frame(Shape::Dll, 1))]
+        #[bench::l3($frame(Shape::Dll, 3))]
+        #[bench::l9($frame(Shape::Dll, 9))]
+        #[bench::l19($frame(Shape::Dll, 19))]
+        fn $zx(case: DecodeCase) -> usize {
+            decode_zstdx(case)
+        }
+
+        #[library_benchmark]
+        #[bench::l1($frame(Shape::Dll, 1))]
+        #[bench::l3($frame(Shape::Dll, 3))]
+        #[bench::l9($frame(Shape::Dll, 9))]
+        #[bench::l19($frame(Shape::Dll, 19))]
+        fn $zc(case: DecodeCase) -> usize {
+            decode_zstd(case)
+        }
+
+        library_benchmark_group!(name = $group, compare_by_id = true, benchmarks = [$zx, $zc]);
+    };
+}
+
+decode_dll_group!(dll, zx_dll, zc_dll, zstd_frame);
 decode_group!(l1, zx_l1, zc_l1, zstd_frame, 1);
 decode_group!(l3, zx_l3, zc_l3, zstd_frame, 3);
 decode_group!(l9, zx_l9, zc_l9, zstd_frame, 9);
@@ -94,4 +122,4 @@ decode_group!(
 
 // Invoked at item position: the macro expands to the `fn main` itself. A
 // `fn main() { main!(...) }` wrapper compiles but silently does nothing.
-main!(library_benchmark_groups = [l1, l3, l9, own_fastest, own_balanced, own_ultra]);
+main!(library_benchmark_groups = [dll, l1, l3, l9, own_fastest, own_balanced, own_ultra]);

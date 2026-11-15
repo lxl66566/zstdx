@@ -78,8 +78,40 @@ The locked matrix batch, four position-balanced invocations per side against bas
 
 The Huffman lump closed the same round: `build_table_from_weights` now fills rank by rank, the port of libzstd's `HUF_readDTableX1_wksp` fill, and the build's own misses dropped from about 270 to 35 per rebuild over the frame's about 800 rebuilds, with the structure and the equivalence gate on the [decoding](../perf/decoding.md) page. The dll100 bulk cells moved from x1.03-1.07 to x1.02-1.03 and the stream cells from x1.05-1.07 to x1.04-1.05. The item is closed as [todo 30](../todo.md).
 
-The FSE builds keep a +0.09M excess on the same algorithm. The spread's data-dependent trip counts are the wire format's own position sequence, so no regrouping exists, and the low-probability arm's slice-width division became a shift on 2026-11-03 because `num_state_slices` is a power of two by construction, pinned by a division-reference test. The residue is structural: the spread stores symbols one byte at a time into an 8-byte entry where libzstd writes a 4-byte one, and a second pass over the table computes the baselines the decode loop's multiply-add entry form consumes. Merging the passes or narrowing the entry would re-roll the sequence decode loops' contracts, and that family is falsified in [negative](../negative/decoding.md).
+The FSE builds keep a +0.09M excess on the same algorithm. The spread's data-dependent trip counts are the wire format's own position sequence, so no regrouping exists, and the low-probability arm's slice-width division became a shift on 2026-11-03 because `num_state_slices` is a power of two by construction, pinned by a division-reference test. The residue was structural: the spread wrote symbols one field at a time into an 8-byte `Entry` where libzstd writes a 4-byte one, and a second pass behind it computed the baselines the decode loop's multiply-add entry form consumes, with a third pass packing the entries into the slots. The reference's two-pass build landed on 2026-11-08 and deletes the `Entry` table, its zero fill and the pack pass: the spread stages each state's symbol in the packed slot's own `base` field and the second pass reads it back, computes the baseline and folds the code pair in. A full `dll100.zst3` decode reads 2,781,496,177 against 2,742,330,731 Ir, −1.41 percent, with the sequence-table chain 167.0M to 137.9M: `build_packed_table` 110.08M plus the outlined `hoist_spread_info` 12.15M against the base's 107.87M build pass, the pack pass and `SeqDecoder::new`'s glue 43.81M to 0.56M, and `__memset_avx2_unaligned_erms` 48.50M to 35.01M. The single-pass fusion that carried the code fold in the spread is the falsified shape above it, and the attribution and the equivalence gate are in [negative](../negative/decoding.md).
 
 The copy loops hold the largest single executor lump, 18.4% of the executor's samples in the 16-byte match chunk loop against libzstd's 12.6%, with the offset-class split at 16 and the `ml mod 16` back-edge trip both data-dependent per sequence. The copy-kernel family is falsified as a whole, so no lever exists there. The wrapped-generation copy is the two-generation streaming model's own cost, which the reference's one-shot loop never pays. The sequence loop's decode-side branches no longer hold a top lump, which matches json.zst3 already reading 0.76M against 0.73M: the port closed the loop, and the residue moved to the per-block table builds. The remainder, about 0.14M, is diffuse executor traffic that sampling with skid cannot assign to one side.
 - The stream cells read x1.01 to 1.05 on json and text, where the bulk cells win. The difference is the streaming pair's drain copy, which both sides pay.
 - Text's long matches run the 16-byte copy loop at about 10 bytes per cycle, the per-core L3 bandwidth for its 2.3 MiB window. A trace replay of its 151 tile copies of about 112 KB each found no faster kernel: libzstd's 2x16 schedule read -3.5% copy-only, and AVX2, AVX-512, libc memcpy and non-temporal stores all lost.
+
+## The per-block entropy table census
+
+The table machinery prices at about 5.5 percent of the dll100 decode wall, and one dll100.zst3 decode pays about 3.9K sequence-table and 1.2K X1 Huffman rebuilds, so a per-decoder cache of built tables keyed on the description bytes looked like it could cut repeated work. A throwaway build instrumented every rebuild site of the one-shot single-threaded path, hashed the description bytes each rebuild consumed together with the table kind and its accuracy log or table log, and counted per frame how many rebuilds receive a description byte-identical to an earlier one of the same kind. The share is 3 percent of the sequence rebuilds and 0.4 percent of the Huffman rebuilds: the descriptions are per-block unique work, and the cache's whole ceiling is 0.20 percent of the frame's instructions, about 0.1 percent of its wall.
+
+| frame | blocks | seq rebuilds | seq repeats | X1 rebuilds | X1 repeats | weights FSE rebuilds | weights FSE repeats |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dll100.zst1 | 1171 | 3487 | 111 (3.2%) | 1146 | 18 (1.6%) | 1146 | 465 (40.6%) |
+| dll100.zst3 | 1756 | 4028 | 123 (3.1%) | 1178 | 5 (0.4%) | 1178 | 289 (24.5%) |
+| dll100.zst9 | 1883 | 3289 | 100 (3.0%) | 1057 | 0 (0.0%) | 1057 | 185 (17.5%) |
+| dll100.zst19 | 2494 | 5352 | 142 (2.7%) | 1138 | 0 (0.0%) | 1138 | 449 (39.5%) |
+| json.zst3 | 257 | 771 | 1 (0.1%) | 229 | 27 (11.8%) | 229 | 200 (87.3%) |
+| json.zst9 | 257 | 478 | 6 (1.3%) | 222 | 3 (1.4%) | 222 | 185 (83.3%) |
+| text.zst3 | 257 | 33 | 6 (18.2%) | 8 | 0 (0.0%) | 8 | 0 (0.0%) |
+| skewed.zst3 | 256 | 768 | 180 (23.4%) | 4 | 3 (75.0%) | 4 | 3 (75.0%) |
+| skewed.zst9 | 256 | 768 | 302 (39.3%) | 2 | 1 (50.0%) | 2 | 1 (50.0%) |
+| random.zst3 | 256 | 0 | 0 | 0 | 0 | 0 | 0 |
+| zeros.zst3 | 256 | 3 | 0 (0.0%) | 0 | 0 | 0 | 0 |
+
+dll100.zst3 holds 1756 blocks over its 104.9 MB of output, not the about 800 the 128 KiB block cap suggests, because entropy-coded blocks average 60 KB; the census counts 3928 explicit descriptions plus 100 predefined installs, where the R106 mapping recorded 3,903 for this side and 3,928 for libzstd, so the census reproduces the mapping's second column exactly and the repeat share holds either way. Every dll100.zst3 block re-describes all three sequence tables, with no Repeat-mode stream in the frame at all; dll100.zst9 and zst19 do carry the wire's own reuse, 91/139/145 and 86/184/129 Repeat-mode streams, and still repeat only 3.0 and 2.7 percent of their explicit descriptions. The dll100.zst3 repeats split 51 of 1339 LL, 32 of 1350 OF and 40 of 1339 ML, and they sit far apart: an LRU of 32 entries catches 26, 12 and 26 of them, and most land 64 or more blocks after their twin, so even the recurring descriptions are not recent.
+
+The one class with a large repeat share is the weights FSE table that decodes a Huffman description, 289 of 1178 on dll100.zst3 and 200 of 229 on json.zst3. It is the table of at most 64 entries that the weights header builds, about 3K Ir per build and 0.3 percent of the frame, so its 289 repeats buy 0.07 percent; the Huffman description that owns it repeats 5 times.
+
+Priced on the three frames the build was profiled on, callgrind Ir split by function: dll100.zst3 reads 17.9K Ir per sequence rebuild and 44.1K per Huffman rebuild of 1187.1M total, json.zst3 22.6K and 11.4K of 329.3M, skewed.zst3 21.4K of 387.2M.
+
+| frame | seq repeats | X1 repeats | ceiling Ir | share of the frame's Ir |
+|---|---:|---:|---:|---:|
+| dll100.zst3 | 123 | 5 | 2.42M | 0.20% |
+| json.zst3 | 1 | 27 | 0.33M | 0.10% |
+| skewed.zst3 | 180 | 3 | 3.85M | 1.00% |
+
+skewed is the best shape the census found, its 180 ML repeats giving 23.4 percent of the sequence rebuilds, and it prices at 1.0 percent of the frame's instructions on a shape outside the dll band. The wire's own reuse already costs nothing: a Repeat-mode stream skips the rebuild, and the predefined installs collapse to 100 builds per dll100.zst3 frame behind the existing flag. What the census leaves is the per-block build itself, 3928 distinct descriptions over 1756 blocks, which no cache can remove. The falsification and its reopening condition are on the [negative](../negative/decoding.md) page.

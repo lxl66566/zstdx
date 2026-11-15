@@ -64,7 +64,9 @@ pub struct FSETable {
     /// + 1.
     max_symbol: u8,
     /// The actual table containing the decoded symbol and the compression data
-    /// connected to that symbol.
+    /// connected to that symbol. Built by `build_decoding_table` for the symbol
+    /// decoders; the sequence streams build their packed slots from
+    /// `symbol_info` instead (see `sequence_section_decoder::build_packed_table`).
     pub decode: Vec<Entry>, // used to decode symbols, and calculate the next state
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
@@ -154,6 +156,69 @@ impl FSETable {
         self.build_decoding_table()
     }
 
+    /// Read a table description and hoist the per-symbol spread constants
+    /// without materialising the `Entry` view. The packed sequence-table build
+    /// reads the distribution and the spread constants straight off this state.
+    /// Returns the number of bytes the description consumed.
+    pub fn read_description(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
+        let bytes_read = self.read_probabilities(source, max_log)?;
+        self.hoist_spread_info();
+        Ok(bytes_read)
+    }
+
+    /// Install one already-normalized distribution (a predefined table) for the
+    /// packed sequence-table build; `build_from_probabilities` is the same for
+    /// the `Entry` view.
+    pub fn set_distribution(&mut self, acc_log: u8, probs: &[i32]) -> Result<(), FSETableError> {
+        if acc_log == 0 {
+            return Err(FSETableError::AccLogIsZero);
+        }
+        if probs.len() > self.max_symbol as usize + 1 {
+            return Err(FSETableError::TooManySymbols { got: probs.len() });
+        }
+        self.symbol_probabilities.clear();
+        self.symbol_probabilities.extend_from_slice(probs);
+        self.accuracy_log = acc_log;
+        self.hoist_spread_info();
+        Ok(())
+    }
+
+    /// `(base_line, num_bits)` of the `count`-th state spread to `symbol`, from
+    /// the constants `hoist_spread_info` derived.
+    pub(crate) fn occurrence(&self, symbol: u8, count: u32) -> (u32, u8) {
+        let info = self.symbol_info[symbol as usize];
+        if count < info.num_double {
+            (info.base_d + count * info.stride_d, info.nb_d)
+        } else {
+            // base_s wraps so the single path is also a plain multiply-add;
+            // count >= num_double here so the true baseline is non-negative.
+            (info.base_s.wrapping_add(count * info.stride_s), info.nb_s)
+        }
+    }
+
+    /// Hoist the per-symbol slice math (highest_bit_set + division) out of the
+    /// per-entry loops: every entry baseline is a counter plus a multiply-add on
+    /// `symbol_info`. Only indices up to the distribution's length are live; the
+    /// tail keeps its previous content and is never consulted.
+    fn hoist_spread_info(&mut self) {
+        let table_size = 1u32 << self.accuracy_log;
+        let low_prob = SymbolSpreadInfo::low_prob(self.accuracy_log);
+        for (idx, &prob) in self.symbol_probabilities.iter().enumerate() {
+            self.symbol_info[idx] = if prob > 0 {
+                let info = calc_symbol_spread_info(table_size, prob as u32);
+                // nb_d is only reachable through double-width slices; a power-of-two
+                // probability can leave nb_d = acc + 1 with num_double == 0 (unused).
+                assert!(info.num_double == 0 || info.nb_d <= self.accuracy_log);
+                assert!(info.nb_s <= self.accuracy_log);
+                info
+            } else if prob == -1 {
+                low_prob
+            } else {
+                SymbolSpreadInfo::DEFAULT
+            };
+        }
+    }
+
     /// Build the actual decoding table after probabilities have been read into the table.
     /// After this function is called, the decoding process can begin.
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
@@ -212,40 +277,19 @@ impl FSETable {
         }
 
         // baselines and num_bits can only be calculated when all symbols have been spread.
-        // the per-symbol slice math (highest_bit_set + division) is hoisted out of the
-        // per-entry loop into symbol_info; the loop is left with counter + cmp + multiply-add.
-        for (idx, &prob) in self.symbol_probabilities.iter().enumerate() {
-            self.symbol_info[idx] = if prob > 0 {
-                let info = calc_symbol_spread_info(table_size as u32, prob as u32);
-                // nb_d is only reachable through double-width slices; a power-of-two
-                // probability can leave nb_d = acc + 1 with num_double == 0 (unused).
-                assert!(info.num_double == 0 || info.nb_d <= self.accuracy_log);
-                assert!(info.nb_s <= self.accuracy_log);
-                info
-            } else {
-                SymbolSpreadInfo::DEFAULT
-            };
-        }
+        // The per-entry loop below is left with counter + cmp + multiply-add.
+        self.hoist_spread_info();
 
         self.symbol_counter.clear();
         self.symbol_counter
             .resize(self.symbol_probabilities.len(), 0);
         for idx in 0..negative_idx {
+            let symbol = self.decode[idx].symbol;
+            let count = self.symbol_counter[symbol as usize];
+            self.symbol_counter[symbol as usize] = count + 1;
+            let (bl, nb) = self.occurrence(symbol, count);
+
             let entry = &mut self.decode[idx];
-            let symbol = entry.symbol as usize;
-
-            let count = self.symbol_counter[symbol];
-            self.symbol_counter[symbol] = count + 1;
-
-            let info = self.symbol_info[symbol];
-            let (bl, nb) = if count < info.num_double {
-                (info.base_d + count * info.stride_d, info.nb_d)
-            } else {
-                // base_s wraps so the single path is also a plain multiply-add;
-                // count >= num_double here so the true baseline is non-negative.
-                (info.base_s.wrapping_add(count * info.stride_s), info.nb_s)
-            };
-
             entry.base_line = bl;
             entry.num_bits = nb;
         }
@@ -398,7 +442,7 @@ fn highest_bit_set(x: u32) -> u32 {
 // utility functions for building the decoding table from probabilities
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
-fn next_position(mut p: usize, table_size: usize) -> usize {
+pub(crate) fn next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
     p &= table_size - 1;
     p
@@ -430,6 +474,17 @@ impl SymbolSpreadInfo {
         nb_d: 0,
         nb_s: 0,
     };
+
+    /// A `-1` symbol owns exactly one state, in the table's top slice, and reads
+    /// the whole accuracy log: the baseline pair the spread places for it,
+    /// expressed so the single-occurrence counter path yields it.
+    const fn low_prob(accuracy_log: u8) -> SymbolSpreadInfo {
+        SymbolSpreadInfo {
+            nb_d: accuracy_log,
+            nb_s: accuracy_log,
+            ..SymbolSpreadInfo::DEFAULT
+        }
+    }
 }
 
 /// Precompute the spread constants for one symbol with `num_states_symbol > 0`
