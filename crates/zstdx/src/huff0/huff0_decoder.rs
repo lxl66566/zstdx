@@ -26,7 +26,7 @@ impl<'t> HuffmanDecoder<'t> {
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
     pub fn decode_symbol(&mut self) -> u8 {
-        self.table.decode[self.state as usize].symbol
+        (self.table.packed[self.state as usize] >> 8) as u8
     }
 
     /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
@@ -44,12 +44,12 @@ impl<'t> HuffmanDecoder<'t> {
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be
         // indexed via this state, telling you how many bits identify the current symbol.
-        let num_bits = self.table.decode[self.state as usize].num_bits;
+        let num_bits = (self.table.packed[self.state as usize] & 0x3f) as u8;
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
         // Shift and mask out the bits that identify the current symbol
         self.state <<= num_bits;
-        self.state &= self.table.decode.len() as u64 - 1;
+        self.state &= self.table.packed.len() as u64 - 1;
         // The new bits are appended at the end of the current state.
         self.state |= new_bits;
         num_bits
@@ -73,9 +73,8 @@ impl<'t> HuffmanDecoder<'t> {
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
-    decode: Vec<Entry>,
-    /// Same table as `decode`, but each entry packed into a u16:
-    /// high 8 bits = symbol, low 6 bits = code length. Enables a single load per symbol.
+    /// One entry per lookup slot, packed into a u16: high 8 bits = symbol,
+    /// low 6 bits = code length. Enables a single load per decoded symbol.
     packed: Vec<u16>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
@@ -89,7 +88,6 @@ pub struct HuffmanTable {
     pub max_num_bits: u8,
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
-    rank_indexes: Vec<usize>,
     /// Double-symbol (X2) decoding table: 2^11 u32 entries, mirroring libzstd's
     /// HUF_DEltX2 packed layout: bits 0..16 = one or two output symbols
     /// (little-endian, first symbol in the low byte), bits 16..22 = total bits
@@ -104,14 +102,12 @@ impl HuffmanTable {
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {
-            decode: Vec::new(),
             packed: Vec::new(),
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
-            rank_indexes: Vec::with_capacity(11),
             x2: Vec::new(),
             // The weight alphabet is 0..=11, not the u8 range: libzstd sizes
             // HUF_readStats' FSE workspace at
@@ -143,12 +139,11 @@ impl HuffmanTable {
     }
 
     /// Completely empty the table then repopulate as a replica
-    /// of `other`. `bit_ranks` and `rank_indexes` stay empty: both are
-    /// fill scratch rebuilt at the top of every table fill from `bits`
-    /// (`build_table_from_weights`), never read between fills.
+    /// of `other`. `bit_ranks` stays empty: it is fill scratch rebuilt at the
+    /// top of every table fill from `bits` (`build_table_from_weights`),
+    /// never read between fills.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        self.decode.extend_from_slice(&other.decode);
         self.packed.extend_from_slice(&other.packed);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
@@ -159,13 +154,11 @@ impl HuffmanTable {
 
     /// Completely empty the table of all data.
     pub fn reset(&mut self) {
-        self.decode.clear();
         self.packed.clear();
         self.weights.clear();
         self.max_num_bits = 0;
         self.bits.clear();
         self.bit_ranks.clear();
-        self.rank_indexes.clear();
         self.x2.clear();
         self.fse_table.reset();
     }
@@ -174,7 +167,6 @@ impl HuffmanTable {
     ///
     /// Returns the number of bytes read.
     pub fn build_decoder(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
-        self.decode.clear();
         self.packed.clear();
 
         let bytes_used = self.read_weights(source)?;
@@ -423,43 +415,19 @@ impl HuffmanTable {
             self.bit_ranks[(*num_bits) as usize] += 1;
         }
 
-        // fill with dummy symbols
-        self.decode.resize(1 << self.max_num_bits, Entry {
-            symbol: 0,
-            num_bits: 0,
-        });
-
-        // starting codes for each rank
-        self.rank_indexes.clear();
-        self.rank_indexes.resize((max_bits + 1) as usize, 0);
-
-        self.rank_indexes[max_bits as usize] = 0;
-        for bits in (1..self.rank_indexes.len() as u8).rev() {
-            self.rank_indexes[bits as usize - 1] = self.rank_indexes[bits as usize]
-                + self.bit_ranks[bits as usize] as usize * (1 << (max_bits - bits));
-        }
-
-        assert!(
-            self.rank_indexes[0] == self.decode.len(),
-            "rank_idx[0]: {} should be: {}",
-            self.rank_indexes[0],
-            self.decode.len()
-        );
-
         self.fill_decode_tables();
 
         Ok(())
     }
 
-    /// Fill `decode` and `packed` from `bits` and `bit_ranks` rank by rank,
-    /// the port of libzstd's `HUF_readDTableX1_wksp` fill: a counting sort
-    /// groups the symbols by code length, then each rank's spans are written
-    /// in symbol order with one constant-length fill per symbol. The layout
-    /// is what the `rank_indexes` sums define: rank `bits` owns the region
-    /// at `rank_indexes[bits]`, its symbols in ascending order. The previous
-    /// scatter form interleaved span lengths 1 and 2^10 between adjacent
-    /// symbols, and that interleaving was dll100's largest decode
-    /// branch-miss lump.
+    /// Fill `packed` from `bits` and `bit_ranks` rank by rank, the port of
+    /// libzstd's `HUF_readDTableX1_wksp` fill: a counting sort groups the
+    /// symbols by code length, then each rank's spans are written in symbol
+    /// order with one constant-length fill per symbol. The layout is the rank
+    /// offsets' sum: rank `bits` owns its symbols' spans in ascending symbol
+    /// order. The previous scatter form interleaved span lengths 1 and 2^10
+    /// between adjacent symbols, and that interleaving was dll100's largest
+    /// decode branch-miss lump.
     fn fill_decode_tables(&mut self) {
         let max_bits = self.max_num_bits as usize;
 
@@ -481,7 +449,10 @@ impl HuffmanTable {
         }
 
         self.packed.clear();
-        self.packed.resize(self.decode.len(), 0);
+        self.packed.reserve(1 << max_bits);
+        // Every slot is written by the rank spans below: their lengths sum to
+        // 1 << max_bits by the Kraft equality, so the table needs no pre-fill.
+        unsafe { self.packed.set_len(1 << max_bits) };
 
         // longest codes first: the regions grow from index 0 in this order,
         // so one running cursor covers the whole table
@@ -491,50 +462,45 @@ impl HuffmanTable {
             let begin = rank_begin[bits] as usize;
             let end = rank_next[bits] as usize;
             for &symbol in &sorted[begin..end] {
-                let entry = Entry {
-                    symbol,
-                    num_bits: bits as u8,
-                };
-                self.decode[idx..idx + len].fill(entry);
-                // packed is the decode loops' one-load view: (symbol << 8) | num_bits
+                // the decode loops' one-load view: (symbol << 8) | num_bits
                 let packed = ((symbol as u16) << 8) | bits as u16;
                 self.packed[idx..idx + len].fill(packed);
                 idx += len;
             }
         }
-        debug_assert_eq!(idx, self.decode.len());
+        debug_assert_eq!(idx, 1 << max_bits);
     }
 
     /// The per-symbol scatter fill this table used before the rank-grouped
     /// port, kept as the equivalence reference for `fill_decode_tables`.
-    /// Consumes `rank_indexes`, so it must run against the initial region
-    /// starts that `build_table_from_weights` leaves in place.
+    /// Derives the region starts from `bit_ranks` itself, so it runs as a
+    /// standalone rebuild over a cleared `packed`.
     #[cfg(test)]
     fn fill_decode_tables_scatter(&mut self) {
-        let max_bits = self.max_num_bits;
+        let max_bits = self.max_num_bits as usize;
+        let mut rank_indexes = [0usize; 12];
+        rank_indexes[max_bits] = 0;
+        for bits in (1..=max_bits).rev() {
+            rank_indexes[bits - 1] =
+                rank_indexes[bits] + self.bit_ranks[bits] as usize * (1 << (max_bits - bits));
+        }
+
+        self.packed.clear();
+        self.packed.resize(1 << max_bits, 0);
         for symbol in 0..self.bits.len() {
-            let bits_for_symbol = self.bits[symbol];
+            let bits_for_symbol = self.bits[symbol] as usize;
             if bits_for_symbol != 0 {
                 // allocate code for the symbol and set in the table
                 // a code ignores all max_bits - bits[symbol] bits, so it gets
                 // a range that spans all of those in the decoding table
-                let base_idx = self.rank_indexes[bits_for_symbol as usize];
+                let base_idx = rank_indexes[bits_for_symbol];
                 let len = 1usize << (max_bits - bits_for_symbol);
-                self.rank_indexes[bits_for_symbol as usize] += len;
+                rank_indexes[bits_for_symbol] += len;
                 for idx in 0..len {
-                    self.decode[base_idx + idx].symbol = symbol as u8;
-                    self.decode[base_idx + idx].num_bits = bits_for_symbol;
+                    self.packed[base_idx + idx] = ((symbol as u16) << 8) | bits_for_symbol as u16;
                 }
             }
         }
-
-        // build the packed view of the same table
-        self.packed.clear();
-        self.packed.extend(
-            self.decode
-                .iter()
-                .map(|e| ((e.symbol as u16) << 8) | e.num_bits as u16),
-        );
     }
 
     /// Build the double-symbol (X2) decoding table from the current weights.
@@ -697,16 +663,6 @@ impl Default for HuffmanTable {
     }
 }
 
-/// A single entry in the table contains the decoded symbol/literal and the
-/// size of the prefix code.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Entry {
-    /// The byte that the prefix code replaces during encoding.
-    symbol: u8,
-    /// The number of bits the prefix code occupies.
-    num_bits: u8,
-}
-
 /// Assert that the provided value is greater than zero, and returns the
 /// 32 - the number of leading zeros
 fn highest_bit_set(x: u32) -> u32 {
@@ -851,10 +807,6 @@ mod tests {
             let mut scattered = HuffmanTable::new();
             scattered.build_decoder(&src).unwrap();
             scattered.fill_decode_tables_scatter();
-            assert_eq!(
-                ranked.decode, scattered.decode,
-                "decode mismatch for {weights:?}"
-            );
             assert_eq!(
                 ranked.packed, scattered.packed,
                 "packed mismatch for {weights:?}"

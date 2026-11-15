@@ -30,7 +30,7 @@ The X2 table build is a line-by-line port of `HUF_readDTableX2_wksp` and `HUF_fi
 
 ### X1 table fill
 
-The X1 fill computes `tableLog = highbit32(weightTotal)+1`, which matches `highest_bit_set`. `rank_indexes` holds the prefix sums. The `rank_idx[0] == table.len` assert pins Kraft exactness. Rejecting a weight above 11 has the same net effect as libzstd's weight at most 12 plus tableLog at most 11, because a weight of 12 forces tableLog to at least 12, which the max-bits check kills.
+The X1 fill computes `tableLog = highbit32(weightTotal)+1`, which matches `highest_bit_set`. The rank spans' region starts accumulate inside the fill, and `build_table_from_weights`' leftover power-of-two and weight-one checks pin Kraft exactness before the fill sizes the packed view. Rejecting a weight above 11 has the same net effect as libzstd's weight at most 12 plus tableLog at most 11, because a weight of 12 forces tableLog to at least 12, which the max-bits check kills.
 
 ### Weight parsing
 
