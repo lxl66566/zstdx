@@ -1128,6 +1128,13 @@ pub(super) unsafe fn execute_blocks(
         .iter()
         .map(BlockPlan::out)
         .fold(0usize, usize::saturating_add);
+    // Entry bound for every branch: the raw and rle arms write their full
+    // output unconditionally, so rejection must precede the first
+    // out-of-range store, not wait for the sequence arms' own checks. Same
+    // error class the sequential one-shot paths report for a short target.
+    if start.saturating_add(cap) > region.write_limit {
+        return Err(FrameDecoderError::TargetTooSmall);
+    }
     let base = region.base();
     let mut w = 0usize;
     for block in &seg.plan[blocks] {
@@ -1174,11 +1181,9 @@ pub(super) unsafe fn execute_blocks(
                 let oend_w = region.write_limit.min(region.wild_cap).saturating_sub(16);
                 // Stage A accounted the exact block budget; the cold path
                 // re-checks it (the hot check against `oend_w` covers the
-                // memory bounds, not the accounting). The region's write
-                // limit folds in for executors that do not `place` each
-                // segment (the frame lanes): every serial and piece caller
-                // has write_limit >= budget, so this changes nothing there.
-                let budget_end = (start + cap).min(region.write_limit);
+                // memory bounds, not the accounting). The entry check proved
+                // write_limit >= start + cap.
+                let budget_end = start + cap;
                 let mut op = start + w;
                 for seq in &seg.sequences[seqs.clone()] {
                     let ll = seq.ll as usize;

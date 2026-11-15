@@ -1328,6 +1328,70 @@ mod tests {
         }
     }
 
+    /// A short caller buffer must fail with the sequential decoder's own
+    /// `TargetTooSmall`, and no store may land past the target: the lanes
+    /// write frames concurrently with the region's write limit as the only
+    /// memory bound, so the bound is enforced at the executor entry, before
+    /// the raw/rle arms' unconditional copies. The sentinel tail behind the
+    /// short slice is the OOB detector.
+    #[test]
+    fn multiframe_short_target_rejects_in_bounds() {
+        let mut rng = Rng(0x5eed);
+        let raws = [
+            noise(&mut rng, 1024 * 1024 + 41),
+            noise(&mut rng, 1024 * 1024 + 7),
+            textish(0x31, 2 * 1024 * 1024 + 3),
+        ];
+        let mut stream = Vec::new();
+        for raw in &raws {
+            stream.extend_from_slice(&compress_pledged(raw, Level::Fastest, true, 2));
+        }
+        let total: usize = raws.iter().map(|r| r.len()).sum();
+        let expect = expected_output(&raws);
+
+        // Exactly-sized target: full decode through the lane executor.
+        let mut placed = vec![0u8; total];
+        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW).unwrap();
+        assert_eq!(&placed[..n], &expect[..]);
+
+        for short in [total - 1, total - 100_000, total / 2] {
+            // Sequential control: the same rejection class.
+            let mut dst = vec![0u8; short];
+            let seq_err = FrameDecoder::new()
+                .decode_all(&stream, &mut dst)
+                .unwrap_err();
+            assert!(
+                matches!(seq_err, FrameDecoderError::TargetTooSmall),
+                "sequential short {short}: {seq_err:?}"
+            );
+            for workers in [2u32, 4] {
+                let mut big = vec![0xeeu8; total + 64];
+                let err =
+                    decode_all_mt(&stream, &mut big[..short], workers, MAX_WINDOW).unwrap_err();
+                assert!(
+                    matches!(err, FrameDecoderError::TargetTooSmall),
+                    "mt{workers} short {short}: {err:?}"
+                );
+                let past = (short..total + 64).filter(|&i| big[i] != 0xee).count();
+                assert_eq!(past, 0, "mt{workers} short {short}: stores past the target");
+            }
+        }
+
+        // The public bulk entry routes the same shape.
+        let mut big = vec![0xeeu8; total + 64];
+        let err = bulk::decompress_to_buffer_with(
+            &stream,
+            &mut big[..total - 1],
+            &crate::DecoderOptions::new().threads(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Frame(FrameDecoderError::TargetTooSmall)),
+            "{err:?}"
+        );
+        assert!(big[total - 1..].iter().all(|&b| b == 0xee));
+    }
+
     /// A skippable-only stream decodes to empty through the MT entries and
     /// never engages the lane executor: the scan sees no real frame, so
     /// the sequential fallback owns the stream even above the floor.

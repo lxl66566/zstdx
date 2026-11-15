@@ -160,6 +160,10 @@ A skippable-only stream died at `StreamingDecoder::new` with `MagicNumberReadErr
 
 ## MT decoding
 
+### The write limit binds every block arm
+
+The frame lanes hand the caller's buffer bound to `OutRegion::write_limit`, but only the sequence arms consulted it: the Raw and Rle arms copied unconditionally, so a short target on a multi-frame MT decode wrote up to a whole block past the caller's slice and returned `Ok` with a passing checksum. The bound belongs at the executor entry, checked once against the whole block range's output before the first store, so every arm and every executor (lanes, pieces, serial) rejects with the sequential decoder's `TargetTooSmall` instead.
+
 ### Piece grids must be fully cut
 
 The incremental piece-cutting loop had no `n_pieces` bound, so after the last piece, where `end` is clamped to the FCS, `end` stayed at the FCS forever. The loop spun pushing empty pieces while holding the driver mutex, and every thread then contended at 0% CPU.
