@@ -733,24 +733,25 @@ impl LdmState {
         (n, count)
     }
 
-    /// Fingerprint a split's 64-byte window: eight multiply-xor lanes
-    /// read from byte offsets 0..8, so the fold covers the window's
-    /// first 15 bytes, plus one avalanche step. A checksum hit becomes
-    /// a candidate only through `extend_match`'s byte-level
-    /// verification, and a true 64-byte match checksums equal under any
-    /// fold, so the prefix coverage only prices the verification of
-    /// false hits. Independent of the gear state (a fingerprint
-    /// correlated with the trigger condition shifts with the split
-    /// placement — the fold-derived candidate measured a dll100
-    /// no-latch size regression while this form tracks a fresh XXH64 of
-    /// the window to within noise, at a fraction of its serial-multiply
-    /// latency). Quality on dll-class data: false checksum matches
-    /// 0.17/kilo-split vs XXH64's 0.015 (both noise), twin retention
-    /// equal.
+    /// Fingerprint a split's 64-byte window: eight multiply-xor lanes,
+    /// one per 8-byte tile, so the fold covers the whole window, plus
+    /// one avalanche step. A checksum hit becomes a candidate only
+    /// through `extend_match`'s byte-level verification, and a true
+    /// 64-byte match checksums equal. The tile lanes make the
+    /// fingerprint a function of all 64 bytes, so structured records
+    /// sharing a short prefix stay distinct and the table keeps real
+    /// twins. Independent of the gear state (a fingerprint correlated
+    /// with the trigger condition shifts with the split placement —
+    /// the fold-derived candidate measured a dll100 no-latch size
+    /// regression while this form tracks a fresh XXH64 of the window
+    /// to within noise, at a fraction of its serial-multiply latency).
+    /// Quality on dll-class data: false checksum matches read 0.02
+    /// per kilo-split on dll32 and 0.17 on dll100, twin retention
+    /// equal or better.
     #[inline(always)]
     fn split_fp(win: &[u8], idx: usize) -> u64 {
         let w = &win[idx..idx + MIN_MATCH_LENGTH];
-        let lane = |k: usize| u64::from_le_bytes(w[k..k + 8].try_into().unwrap());
+        let lane = |k: usize| u64::from_le_bytes(w[k * 8..k * 8 + 8].try_into().unwrap());
         let acc = lane(0).wrapping_mul(0xa076_1d64_78bd_642f)
             ^ lane(1).wrapping_mul(0xe703_7ed1_a0b4_28db)
             ^ lane(2).wrapping_mul(0x8ebc_6af0_9c88_c6e3)
@@ -1594,5 +1595,36 @@ mod tests {
         data.extend_from_slice(&w1);
         let idx = data.len() - MIN_MATCH_LENGTH;
         assert_eq!(st.window_hash(&w1, 0), st.window_hash(&data, idx));
+    }
+
+    /// Two windows sharing their first 15 bytes but differing past them
+    /// checksum apart, and a whole-window twin keeps its checksum
+    /// wherever it sits. The tuple feeds bucket selection and the
+    /// checksum scan, so this is what keeps skeleton payloads out of
+    /// each other's verification and eviction.
+    #[test]
+    fn skeleton_sharing_windows_checksum_apart() {
+        let a = rand_bytes(MIN_MATCH_LENGTH, 0x5a5a);
+        let mut b = a.clone();
+        for i in 15..MIN_MATCH_LENGTH {
+            b[i] = b[i].wrapping_add(1);
+        }
+        let st = LdmState::new(10, 1 << 10);
+        assert_ne!(st.window_hash(&a, 0), st.window_hash(&b, 0));
+        for i in 0..MIN_MATCH_LENGTH {
+            let mut c = a.clone();
+            c[i] ^= 0x5a;
+            assert_ne!(
+                st.window_hash(&a, 0),
+                st.window_hash(&c, 0),
+                "single-byte difference at {i} checksums equal"
+            );
+        }
+        let data = rand_bytes(3 * MIN_MATCH_LENGTH, 0x1337);
+        let twin = data[MIN_MATCH_LENGTH..2 * MIN_MATCH_LENGTH].to_vec();
+        assert_eq!(
+            st.window_hash(&twin, 0),
+            st.window_hash(&data, MIN_MATCH_LENGTH)
+        );
     }
 }

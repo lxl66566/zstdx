@@ -239,6 +239,19 @@ A five-round alternating re-check at mt4 read serial medians 2909 to 2959, one 2
 The decode-side routing half cannot be content-blind. The piece machinery runs stage A to completion before any execute, the serial path's lost A/B overlap, and mis-routed stock frames pay it: measured under the env override on stock frames at mt8, text.zst3 read 11771 to 8600 MiB/s, -27 percent, and skewed.zst3 read 3032 to 2038, -33 percent. A wire-side screen separates the corpus classes — the union of the literals Huffman tables' covered symbols over the first four Compressed-literals blocks reads json 40, text 102, skewed 16 and dll 256, with zeros and random carrying no Compressed-literals block at all — but the wire cannot identify producer arming, and same-content stock frames, json.zst9 or the libzstd-produced json.zst3 that the corpus and the matrix dec-mt cells decode, would route and pay the barrier.
 
 Row closed. Reopening needs the recorded twin-distance spectrum as the screen, the size bars re-priced against the current dll32 at every D, and the decode-gain gate re-measured against the landing tree's serial-B cells, this page's ratio table the baseline.
+
+R105 (2026-11-08) ran the reopen checklist's items at fd3c6741 and the row keeps its closed verdict. The screen landed as the twinspect probe, the per-job twin-distance spectrum with a 1.0 percent damage-share arming bar calibrated over the 14 shapes plus dll100, every measured verdict matching the recorded size table, [shapes](../bench/shapes.md). The dll ladder re-read dll32 at +0.962, +1.733 and +13.381 percent at D=512 KiB, 1 MiB and 2 MiB, the stock frame at 4,607,550 B reproducing exactly, and dll100 on its 12.5 MiB lattice at +0.128 and +0.808 percent, byte-exact against the table above; the +0.094 and +0.443 the shapes calibration records is the earlier store snapshot's property, [shapes](../bench/shapes.md). The +0.05 percent gate rejects the dll class at every depth.
+
+The decode gate re-read the armed json frame over two rounds, both decode paths in the R102 measurement's frequency band: the frame reproduces at 6,288,045 B, the -0.719 percent stock delta, the piece engagement counter confirms the armed frame engages while stock frames stay serial, and the single-thread control is flat.
+
+| cell | round 1 | round 2 | R102 baseline |
+|---|---:|---:|---:|
+| mt4 | 1.209x | 1.207x | 1.218x |
+| mt8 | 1.436x | 1.453x | 1.435x |
+| mt16 | 1.623x | 1.628x | 1.639x |
+
+The two rounds agree within 1.5 percent on every cell. The gate's verdict holds: mt4 reads about 14 percent under the 1.4x-at-every-arm bar, mt8 sits marginal at 1.44 to 1.45 and mt16 clears, so the mt4 arm is the binding failure, outside the noise band and stable across the rounds. Reopening now needs a mechanism that lifts the mt4 arm to the gate plus the operator's ratio decision on the st-mt byte-identity choice, neither with a recorded candidate, [research](../research.md).
+
 ### Checksum on a concurrent hasher thread
 
 The idea was a dedicated hasher thread, with stage B submitting each executed segment range to it through a queue, condvar and lag cap, plus a drain before vector growth reallocs and an unwind guard. On json.zst3 mt4 at 32 MiB solo, the times were 15.4 ms with no hash, 16.9 ms with a serial post-pass and 21-23.5 ms with the concurrent hasher. Instructions were identical, cycles rose 14% and task-clock rose 15%. Skewed went from 46-49 to 43-46, and text was unchanged because the work hides fully. A sync-only variant with queue handoff and no byte reads matched no-hash exactly.
