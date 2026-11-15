@@ -35,6 +35,13 @@ Run this after every encoder change that may alter output sizes. Use `dump` belo
 
 This is the heavyweight tool. Narrow it with `--mode` and filters instead of running `all` while iterating. Sections are `dec-st` for bulk and streaming decode, `dec-mt` for our parallel decode scaling where libzstd has no MT decode, `enc-st` for all ladder levels with size and ratio per cell, `enc-mt` for equal worker counts plus a zstd warm-pool reference, and `enc-stream` for streaming encode ST and MT against libzstd plus the bulk-MT ceiling; enc-stream takes `--owned` to drive its MT cells' zstdx side through `read::OwnedEncoder` instead of the Read pump, and `--nt-read` to drive them through `read::NtSource` (the NT-store feed-copy reader), each self-gating frame parity per round. Every timed encode cell is gated on its own last round's frame: the frames are deterministic, so the cell roundtrips that frame through both decoders after the measurement instead of encoding a separate gate pass.
 
+`enc-feed` reproduces the 7-Zip/FFI caller shape (see `docs/src/dev/bench/ffi-stream-gap.md`): both sides write-fed through a 128 KiB write pump with a srcSizeHint (`ZSTD_c_srcSizeHint` on the reference, `InputShape::with_len` with no pledge on ours), workers 8/16, levels 1/3/9/19. Payloads are the `mixed` corpus cell (json+text+skewed concatenated, or the `--shape` selection) plus raw `--file` entries such as `bench/big/dll100.raw`, each tiled `--repeat` times; a repeat past the 64 MiB full-band window adds no match structure, so `--repeat 4` is the cheap field-scale cell (about 400 MB) where the growing-grid ramp and the reserve behavior show. The section stays serial like the other mt sections.
+
+```bash
+cargo run --release -p zstdx-bench -- matrix --mode enc-feed --file bench/big/dll100.raw
+cargo run --release -p zstdx-bench -- matrix --mode enc-feed --file bench/big/dll100.raw --repeat 4 --workers 16
+```
+
 `--parallel N` bounds the cells running at once in `enc-st` (tier and `--full-ladder` axes) and the `enc-stream` ST section, capped by a built-in memory budget over the payload size. Each cell keeps its interleaved A/B on one thread, so the per-round ratio stays the verdict, but cells share the machine: the default 2 held the calibrated json cells within 5 percent of their serial x, width 3 read json.ultra at x1.65 against 1.03 serial, and `--parallel 1` is the old serial behavior. Cells in the 10 GB/s class inflate further under pairing, with text.fastest reading x0.90 at width 2 against 0.80 serial, so a verdict on such a cell needs a serial rerun. `dec-st` and the mt sections never parallelize; decode cells are bandwidth-bound and the bulk pair reads x-inflated under sharing.
 
 ```bash

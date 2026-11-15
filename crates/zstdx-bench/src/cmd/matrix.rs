@@ -28,6 +28,10 @@
 //!   (`--mt-workers`, default 8) zstdx vs zstd interleaved at 64 KiB, each followed by our bulk mt
 //!   path over the same bytes as the ceiling reference. Raw `--file` payloads (e.g.
 //!   `bench/big/dll100.raw`) join the ST section.
+//! - `enc-feed` reproduces the 7-Zip/FFI caller shape on both sides: write-feed streaming with a
+//!   srcSizeHint, no pledge, 128 KiB continue writes, workers 8/16 (see `t6_enc_feed`). The payload
+//!   set is the mixed corpus cell (json+text+skewed concatenated) plus raw `--file` entries, each
+//!   tiled `--repeat` times for field-scale streams.
 
 use std::{
     fs,
@@ -81,6 +85,9 @@ pub enum MatrixMode {
     EncSt,
     EncMt,
     EncStream,
+    /// The 7-Zip/FFI caller shape: write-feed streaming with a srcSizeHint
+    /// and no pledge (see `t6_enc_feed`).
+    EncFeed,
 }
 
 #[derive(clap::Args)]
@@ -105,6 +112,12 @@ pub struct Args {
     /// extremely heavy (release-gate only, never for daily iteration)
     #[arg(long)]
     pub full_ladder: bool,
+    /// Tile each enc-feed payload N times (default 1): field-scale streams
+    /// (hundreds of MB) are what the growing-grid ramp and the reserve
+    /// behavior respond to, and a tiled payload carries no new match
+    /// structure once a tile exceeds the 64 MiB full-band window.
+    #[arg(long, default_value_t = 1)]
+    pub repeat: usize,
     /// Extra payload files outside the corpus (repeatable): a `.zst*` file
     /// adds dec-st cells (verified against the raw counterpart found next
     /// to it), any other file adds raw-input cells to enc-st and enc-stream.
@@ -236,7 +249,7 @@ fn validate_files(args: &Args) {
         let dec_section = matches!(args.mode, MatrixMode::All | MatrixMode::DecSt);
         let raw_section = matches!(
             args.mode,
-            MatrixMode::All | MatrixMode::EncSt | MatrixMode::EncStream
+            MatrixMode::All | MatrixMode::EncSt | MatrixMode::EncStream | MatrixMode::EncFeed
         );
         if is_zst_payload(p) {
             assert!(
@@ -247,7 +260,7 @@ fn validate_files(args: &Args) {
         } else {
             assert!(
                 raw_section,
-                "--file {}: raw payloads run in --mode enc-st/enc-stream",
+                "--file {}: raw payloads run in --mode enc-st/enc-stream/enc-feed",
                 p.display()
             );
         }
@@ -1006,6 +1019,163 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
     }
 }
 
+// ---------- encode, the FFI write-feed shape ----------
+
+/// The enc-feed ladder: the field-report tiers (1/3/9/19). The deep-tier
+/// cells are slow on field-scale payloads, so narrow with `--level`.
+const FEED_LADDER: [LevelName; 4] = [
+    LevelName::Fastest,
+    LevelName::Fast,
+    LevelName::Balanced,
+    LevelName::Ultra,
+];
+
+/// Feed chunk of the 7-Zip/FFI caller (`FEED_CHUNK` in zstdx-ffi's cctx):
+/// every input write lands in 128 KiB slices, the `ZSTD_CStreamInSize`
+/// cadence `ZSTD_compressStream2` sees from `ZSTD_e_continue` callers.
+const FEED_CHUNK: usize = 128 * 1024;
+
+/// The mixed corpus payload: the selected shapes concatenated (the field
+/// corpora's mixed solid-block shape). Empty `--shape` keeps the default
+/// json+text+skewed mix; an explicit selection builds exactly that mix.
+fn feed_mix(args: &Args) -> Option<Arc<Vec<u8>>> {
+    let shapes = if args.shape.is_empty() {
+        vec![Shape::Json, Shape::Text, Shape::Skewed]
+    } else {
+        shapes_selected(args)
+    };
+    if shapes.is_empty() {
+        return None;
+    }
+    let mut mixed = Vec::new();
+    for shape in shapes {
+        mixed.extend_from_slice(&load_raw(shape));
+    }
+    Some(Arc::new(mixed))
+}
+
+/// enc-feed payloads: the mixed corpus cell plus every raw `--file` entry
+/// (dll100 is the shape the field report ran on), each tiled `--repeat`
+/// times. The tiles are materialized once and shared by every cell.
+fn t6_payloads(args: &Args) -> Vec<(String, Arc<Vec<u8>>)> {
+    let mut v = Vec::new();
+    if let Some(mixed) = feed_mix(args) {
+        v.push(("mixed".to_owned(), mixed));
+    }
+    for path in args.file.iter().filter(|p| !is_zst_payload(p)) {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        let raw = fs::read(path).unwrap();
+        v.push((stem.to_owned(), Arc::new(raw)));
+    }
+    if args.repeat <= 1 {
+        return v;
+    }
+    v.into_iter()
+        .map(|(name, raw)| {
+            let mut tiled = Vec::with_capacity(raw.len() * args.repeat);
+            for _ in 0..args.repeat {
+                tiled.extend_from_slice(&raw);
+            }
+            (name, Arc::new(tiled))
+        })
+        .collect()
+}
+
+/// Feed one encoder 128 KiB writes over the whole payload: the caller shape
+/// both sides see (the reference through libzstd's compressStream2 continue
+/// path, ours through the write pump the FFI drives the same way).
+fn feed_128k<W: std::io::Write>(enc: &mut W, raw: &[u8]) {
+    for chunk in raw.chunks(FEED_CHUNK) {
+        enc.write_all(chunk).unwrap();
+    }
+}
+
+/// One enc-feed cell: both sides write-fed with a srcSizeHint and no pledge
+/// (7-Zip-zstd's exact parameter shape), interleaved A/B, the last round's
+/// deterministic frame gated after the measurement like the stream cells.
+fn enc_feed_cell(
+    ab: &Ab,
+    raw: &[u8],
+    name: &str,
+    label: &str,
+    level: Level,
+    z: i32,
+    workers: u32,
+) -> Vec<String> {
+    let bytes = raw.len() as u64;
+    let cell = format!("{name}.{label}.feed-mt{workers}");
+    let mut comp = Vec::new();
+    let mut zcomp = Vec::new();
+    let report = ab.measure(
+        || {
+            comp.clear();
+            let opts = EncoderOptions::new(level)
+                .checksum(false)
+                .workers(workers)
+                .with_input_shape(zstdx::InputShape::default().with_len(bytes));
+            let mut enc = zstdx::stream::write::Encoder::with_options(Vec::new(), opts).unwrap();
+            feed_128k(&mut enc, raw);
+            comp = enc.finish().unwrap();
+        },
+        || {
+            zcomp.clear();
+            let mut cctx = zstd::stream::raw::Encoder::new(z).unwrap();
+            cctx.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(workers))
+                .unwrap();
+            // 7-Zip clamps the hint to INT_MAX; u32 carries that exactly.
+            cctx.set_parameter(zstd::zstd_safe::CParameter::SrcSizeHint(
+                bytes.min(u32::MAX as u64) as u32,
+            ))
+            .unwrap();
+            let mut enc = zstd::stream::write::Encoder::with_encoder(Vec::new(), cctx);
+            feed_128k(&mut enc, raw);
+            zcomp = enc.finish().unwrap();
+        },
+    );
+    assert_roundtrip(&comp, raw, &cell);
+    assert_roundtrip(&zcomp, raw, &cell);
+    vec![
+        format!("sizes {cell}  ruz {}   zstd {}", comp.len(), zcomp.len()),
+        report.line(&pad(&cell), bytes),
+    ]
+}
+
+/// The write-feed section (see the module docs): stream encoders driven the
+/// way 7-Zip-zstd drives `ZSTD_compressStream2` — a srcSizeHint, no pledge,
+/// 128 KiB continue writes, one end marker — at the field worker counts.
+/// Serial like the other mt sections.
+fn t6_enc_feed(ab: &Ab, args: &Args) {
+    let workers: Vec<u32> = if args.workers.is_empty() {
+        vec![8, 16]
+    } else {
+        args.workers.clone()
+    };
+    println!(
+        "== T6 encode write-feed hinted/unpledged, checksums off (interleaved A/B; 128 KiB \
+         writes, workers {}, hint = payload length) ==",
+        workers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let levels = ladder_axis(args, &FEED_LADDER);
+    if levels.is_empty() {
+        println!("-- no level of the feed ladder selected (tiers: fastest/fast/balanced/ultra)");
+        return;
+    }
+    for (name, raw) in t6_payloads(args) {
+        for w in &workers {
+            for (label, level, z) in &levels {
+                let lines = enc_feed_cell(ab, &raw, &name, label, *level, *z, *w);
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+}
+
 pub fn run(args: &Args) {
     apply_budget(args.budget_ms);
     validate_levels(args);
@@ -1025,6 +1195,7 @@ pub fn run(args: &Args) {
         MatrixMode::EncSt => t3_enc_st(&ab, args),
         MatrixMode::EncMt => t4_enc_mt(&ab, args),
         MatrixMode::EncStream => t5_enc_stream(&ab, args),
+        MatrixMode::EncFeed => t6_enc_feed(&ab, args),
         MatrixMode::All => {
             t1_dec_st(&ab, args);
             println!();
@@ -1035,6 +1206,8 @@ pub fn run(args: &Args) {
             t4_enc_mt(&ab, args);
             println!();
             t5_enc_stream(&ab, args);
+            println!();
+            t6_enc_feed(&ab, args);
         },
     }
 }

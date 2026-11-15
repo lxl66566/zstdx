@@ -80,7 +80,7 @@ The FFI boundary copies the data twice: input arrives in 128 KiB `FEED_CHUNK` sl
 
 ### Memory anatomy
 
-The unpledged decided stream reserves straight to the 256 MiB `BUF_CAP_MAX` (`reserve_decided`, `stream/encoder_mt.rs:2568-2588`), the thread-local buffer pool retains up to two cap-sized buffers per thread (`encoder_mt.rs:628-644`), the worker-state pool holds depth 32 (`frame_compressor.rs:262-291`) and the thread pool parks workers for 5 s idle (`stream/mt_pool.rs:66-68`). Together with the 8 MiB per-worker LDM tables this is level-independent, which is why l1 commits 1.3 GB where libzstd's l1 needs ~70 MB total, while l19 lands at rough parity (2.88 GB against 2.54 GB) because both sides are window-and-table bound there.
+The unpledged decided stream reserves straight to the 256 MiB `BUF_CAP_MAX` (`reserve_decided`, `stream/encoder_mt.rs:2568-2588`), the thread-local buffer pool retains up to two cap-sized buffers per thread (`encoder_mt.rs:628-644`), the worker-state pool holds depth 32 (`frame_compressor.rs:262-291`) and the thread pool parks workers for 5 s idle (`stream/mt_pool.rs:66-68`). Together with the 8 MiB per-worker LDM tables this is level-independent, which is why l1 commits 1.3 GB where libzstd's l1 needs ~70 MB total, while l19 lands at rough parity (2.88 GB against 2.54 GB) because both sides are window-and-table bound there. Measured 2026-11-14: the cap reserve itself costs address space only on Linux (the untouched tail never faults; a hint-extent reserve measured as an RSS no-op, see the [negative results](../negative/mt-stream.md)), so the l1 footprint to attribute is touched per-worker state, not the reserve.
 
 ## Why libzstd pays almost none of this in the same shape
 
@@ -88,11 +88,11 @@ With jobSize unset, zstdmt derives the job size from the level alone: `2^MAX(20,
 
 ## Directions
 
-1. Seed the Growing grid from the hint: start the first epoch at `job_size_for_level(hint)` clamped by the cap, keeping the doubling schedule for stream-past-hint. Kills the ramp for light rows, costs nothing on heavy rows that already start at the cap.
-2. Reserve by hint in `reserve_decided` when a hint exists (`min(hint + 64 KiB, BUF_CAP_MAX)`), and bound the worker-side retention that makes l1 commit level-independent.
-3. Landed 2026-11-14: the per-job refill was confirmed and the chain grid floored at the reach tail (byte-identical, see the imbalance section above). The strip's LDM ingest and seed scan still run per job over the whole window.
-4. Make the LDM per-job clear lazy or epoch-tagged so a table touch after a restart does not rewrite 8 MiB.
+1. Closed 2026-11-14 on both forms: the seed regressed every light cell at field scale, and the finish-tail split already exists as the growing grid's tail rule (`build_bounds` re-slices the unposted remainder into `burst_jobs`-filling jobs), measured wall-optimal under the per-job strip cost — a 16 MiB l9 w16 tail bursts sixteen 1 MiB jobs for 191 ms, about 10% of the cell's wall (see the [negative results](../negative/mt-stream.md)).
+2. Measured a no-op 2026-11-14: a hint-extent reserve moves no RSS (the cap reserve's tail is address space only) and the field's solid-block hints sit at or above the cap. The open memory work is attributing the touched per-worker state behind the l1 ~1.3 GB commit.
+3. The per-job far machinery, quantified 2026-11-14 at l9 w16 on dll400: 149 ms of fixed cost per 12 MiB job of 484 ms — LDM ingest 84.5 ms over the 64 MiB strip, chain grid 36.1 after the reach-tail floor, gate 21.9, seed 6.9 — table-traffic into the strip-scale tables and invariant to the job span. It is the steady-state form of the finish-tail burst (direction 1) and the main body of the zero-tail l9 gap (250 MB/s against libzstd's 479). The chain-grid floor landed byte-identical (see the imbalance section above); every remaining form shares or shrinks the strip, whose falsified map the [negative results](../negative/mt-stream.md) carry.
+4. Demoted 2026-11-14: the LDM per-job clear measured at ~1M u64 stores per restart, an order below the strip's seed scan (the stripfill bench), so it is not the next lever; the per-job LDM ingest and the O(strip) seed scan are.
 5. Carry entropy tables across job boundaries with Repeat_Mode (format-legal, libzstd does not do it) as the structural density fix; the cheap interim is a larger minimum job on unpledged streams.
 6. Deliver FFI output write-through instead of through the sink Vec.
-7. Add a bench section reproducing this caller shape (128 KiB continue feed, hint set, no pledge, w8/w16, mixed and far-alive corpora) so the write-feed path stops being unmeasured.
+7. Landed 2026-11-14: the `enc-feed` bench section reproduces this caller shape (128 KiB continue feed, hint set, no pledge, mt8/mt16, the mixed shapes and `--file` payloads).
 8. Consider a libzstd-parity level mapping switch for the FFI compat layer, since drop-in callers expect `-mx9` to anchor near libzstd 9 on the speed and density axes.
