@@ -24,6 +24,8 @@ RFC 8878 sets Block_Maximum_Size to `min(window, 128K)`. The srcSize adjustment 
 
 Every emission path now reads `Matcher::block_size`, and any new window-shaping knob needs a grep of `MAX_BLOCK_SIZE` in the emission paths first. The pre-split detector's decision window re-hit this. It sized its window by the format's 128K instead of `block_size()`, so tiny-window frames carried over-window blocks and our decoder reported `BlockOutputTooLarge`. A decision input is not exempt from the emission cap.
 
+The read-side `FrameCompressor<M>` loop re-hit it a third way. `block_size` existed as an inherent method on `MatchGeneratorDriver` and the trait impl never overrode it, so the generic loop resolved the `Matcher` default of 128K while every concrete-typed caller got the clamp. A method that exists as both an inherent twin and a trait default must be overridden in the trait impl. Otherwise generic contexts silently keep the default.
+
 ### Staged-tail anchor
 
 The Read-path pre-split decision asked the matcher for the staged span through `win[idx_of(block_start)..+read]`, but `commit_block` leaves `block_start` pointing at the block it just committed. The staged bytes sit one block later, so every decision after a block read the previous block's bytes.

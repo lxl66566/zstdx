@@ -1271,9 +1271,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         loop {
             // Read a single block's worth of uncompressed data straight into
             // the tail of the matcher's window (no intermediate buffer copy).
-            // A window below 128 KiB caps the block size with it.
+            // A window below 128 KiB caps the block size with it, and a
+            // custom matcher may stage a shorter tail than its own cap.
             let cap = self.state.matcher.block_size();
-            let tail = &mut self.state.matcher.block_tail()[..cap];
+            let tail = {
+                let tail = self.state.matcher.block_tail();
+                let cap = cap.min(tail.len());
+                &mut tail[..cap]
+            };
             let mut read_bytes = carry;
             let last_block;
             'read_loop: loop {

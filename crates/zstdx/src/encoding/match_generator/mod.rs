@@ -3647,6 +3647,13 @@ impl Matcher for MatchGeneratorDriver {
         self.params.window as u64
     }
 
+    /// The inherent window-clamped value, routed through the trait so
+    /// generic `Matcher` contexts (e.g. `FrameCompressor<M>`) see the RFC
+    /// 8878 cap instead of the 128 KiB default.
+    fn block_size(&self) -> usize {
+        MatchGeneratorDriver::block_size(self)
+    }
+
     fn repcode_snapshot(&self) -> RepcodeState {
         RepcodeState {
             rep: self.rep,
