@@ -88,9 +88,11 @@ pub fn compress_to_vec<R: Read>(source: R, level: Level) -> Vec<u8> {
 }
 
 /// [`compress_to_vec`] with a caller-declared input shape: the matcher
-/// sizes its window and tables accordingly, and a bare known length makes
-/// the output match [`compress_slice_to_vec`] on the same data byte for
-/// byte.
+/// sizes its window and tables accordingly. The declared length is a
+/// non-binding hint ([`InputShape::len`]): the frame ends at EOF, so the
+/// output matches [`compress_slice_to_vec`] byte for byte except on a
+/// grid-exact source, which closes with the empty last block where the
+/// slice path flags the real final block.
 pub fn compress_to_vec_shaped<R: Read>(
     source: R,
     level: Level,
@@ -229,27 +231,31 @@ mod tests {
             inputs.push((0..len).map(|i| (i % 61) as u8).collect());
         }
         for input in &inputs {
-            assert_eq!(
-                compress_slice_to_vec(input, Level::Fastest),
-                super::compress_to_vec_shaped(
-                    input.as_slice(),
-                    Level::Fastest,
-                    crate::InputShape::default().with_len(input.len() as u64)
-                ),
-                "mismatch at len {}",
-                input.len()
-            );
-            // The unshaped streaming leg cannot know EOF until a read
-            // returns zero, so a grid-exact length closes with the empty
+            // Both streaming legs close at EOF — the exact-length hint is
+            // non-binding (`InputShape::len`) and never certifies the
+            // final block — so a grid-exact length closes with the empty
             // last block (3 bytes) where the slice path marks the real
             // final block: identical content, one documented frame shape
             // apart.
+            let grid_exact = !input.is_empty() && input.len().is_multiple_of(128 * 1024);
+            let sliced = compress_slice_to_vec(input, Level::Fastest);
+            let shaped = super::compress_to_vec_shaped(
+                input.as_slice(),
+                Level::Fastest,
+                crate::InputShape::default().with_len(input.len() as u64),
+            );
+            if grid_exact {
+                assert_eq!(shaped.len(), sliced.len() + 3, "shaped len {}", input.len());
+                assert_eq!(
+                    crate::bulk::decompress(&shaped, input.len()).unwrap(),
+                    *input
+                );
+            } else {
+                assert_eq!(shaped, sliced, "shaped mismatch at len {}", input.len());
+            }
             let sliced = compress_slice_to_vec(input, Level::Uncompressed);
             let streamed = compress_to_vec(input.as_slice(), Level::Uncompressed);
-            if !input.is_empty() && input.len().is_multiple_of(128 * 1024) {
-                // Grid-exact: the streaming frame differs in the final
-                // block's last-block bit plus the 3-byte empty closing
-                // block; the content is identical.
+            if grid_exact {
                 assert_eq!(streamed.len(), sliced.len() + 3, "len {}", input.len());
                 assert_eq!(
                     crate::bulk::decompress(&streamed, input.len()).unwrap(),

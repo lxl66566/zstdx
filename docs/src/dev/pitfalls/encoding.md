@@ -349,6 +349,8 @@ The fix follows libzstd's split. The first write whose bytes push the fed total 
 
 The surfaced failure is a truncated, unclosed frame, which is the expected outcome. The first version of the fix claimed byte-level prevention, which must not be re-claimed. Anything written into a frame header as fact must be verified at the earliest boundary that can observe the lie, which is the write that crosses it, not only the finish that closes it.
 
+The read-side core held the mirror-image bug for hints. `FrameCompressor::compress` ended the frame once the fed total reached `InputShape::len`, so a hint below the real input silently dropped the tail while the header declared nothing. The hint now sizes the row only. The frame ends at EOF, and a grid-exact source closes with the 3-byte empty last block like the unshaped Read path always did. Only a pledge may close a frame early.
+
 ### Windowed one-byte FCS class
 
 Flag 0 means the Frame_Content_Size field is absent unless the single-segment flag is set, but the header serializer mapped every width-1 size from 0 to 255 to flag 0 and appended the 1-byte field anyway. Any pledged stream or bulk-mt input below 256 bytes, and the CLI pledges every non-empty file's stat size, serialized a stray byte that shifted the first block header. Both this crate's decoder and libzstd rejected the frame as an incomplete frame or data corruption. All boundary classes at 256 and above worked, so every ordinary roundtrip test passed.

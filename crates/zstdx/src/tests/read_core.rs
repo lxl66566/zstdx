@@ -51,3 +51,32 @@ fn small_slice_matcher_does_not_panic() {
     assert_eq!(zstd::stream::decode_all(sink.as_slice()).unwrap(), data);
     assert_eq!(crate::bulk::decompress(&sink, data.len()).unwrap(), data);
 }
+
+/// `InputShape::len` is a non-binding hint (the stream cores'
+/// `input_shape_len_is_a_hint_not_a_pledge` contract): the read-side core
+/// once ended the frame at the declared length, silently dropping every
+/// byte past a hint that landed on the block grid.
+#[test]
+fn input_hint_never_truncates_the_frame() {
+    let data = periodic();
+    // 128 KiB: the hint lands on the block grid, where the truncation cut.
+    let hint = crate::InputShape::default().with_len(128 * 1024);
+    let frame =
+        crate::encoding::compress_to_vec_shaped(data.as_slice(), crate::Level::Fastest, hint);
+    let decoded = zstd::stream::decode_all(frame.as_slice()).expect("frame decodes");
+    assert_eq!(decoded, data);
+    assert_eq!(crate::bulk::decompress(&frame, data.len()).unwrap(), data);
+    // The hint sizes the row, never the header promise: no FCS field.
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+        None
+    );
+
+    // An oversized hint must stay a valid frame too: it sized the window
+    // around input that never arrives, never the frame's end.
+    let over = crate::InputShape::default().with_len(1 << 20);
+    let frame =
+        crate::encoding::compress_to_vec_shaped(data.as_slice(), crate::Level::Fastest, over);
+    assert_eq!(zstd::stream::decode_all(frame.as_slice()).unwrap(), data);
+    assert_eq!(crate::bulk::decompress(&frame, data.len()).unwrap(), data);
+}

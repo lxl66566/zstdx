@@ -1250,15 +1250,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `staged_read` tracks the probe's staged head replay across
         // blocks (it spans sixteen of them).
         let mut staged_read = 0usize;
-        // Content bytes fed so far, against the declared input length (the
-        // dictionary's content excluded — `shape.len` was widened by it):
-        // a caller-declared length certifies the block that exactly fills
-        // it as final, avoiding the empty closing block on grid-exact
-        // inputs (the reader itself cannot see EOF until a read returns
-        // zero). A wrong declaration ends the frame at the declared size.
-        let dict_len = dict.as_ref().map_or(0, |d| d.content.len()) as u64;
-        let declared = self.input_shape.len.map(|n| n.saturating_sub(dict_len));
-        let mut fed: u64 = 0;
         // Staged remainder after a pre-split cut, in bytes: the fill stages
         // a whole block's tail, the detector may emit only the first cut of
         // it, and the rest stays physically at the head of the next
@@ -1298,13 +1289,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     read_bytes += new_bytes;
                 }
                 if read_bytes == tail.len() {
-                    // The staged span (carried remainder included) ends at
-                    // `fed` plus this fill's fresh bytes.
-                    last_block = Some(fed + (read_bytes - carry) as u64) == declared;
+                    // A full tail is never final on its own: the declared
+                    // length is a non-binding hint (it sized the row
+                    // through `set_input_shape`), so only EOF — a read
+                    // returning zero — ends the frame, and a grid-exact
+                    // source closes with the empty last block.
+                    last_block = false;
                     break 'read_loop;
                 }
             }
-            fed += (read_bytes - carry) as u64;
             // The staged span decides its own block boundary: the raw-block
             // level and sub-128 KiB tails always emit whole (the slice
             // path's decisions agree — the detector only ever reads the

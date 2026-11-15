@@ -30,7 +30,9 @@ pub struct InputShape {
     /// to the source (libzstd's `ZSTD_adjustCParams`). The streaming
     /// encoders treat it as a non-binding hint when no
     /// [`pledged_size`][EncoderOptions::pledged_size] is set (libzstd's
-    /// `srcSizeHint`): it sizes the row, never the header promise.
+    /// `srcSizeHint`): it sizes the row, never the header promise. Declare
+    /// the source length only — with a dictionary attached the encoder
+    /// folds the dictionary content length in itself.
     pub len: Option<u64>,
     /// Forced window log (clamped to 10..=27), overriding the level's row
     /// before the length adjustment (a known smaller length still clamps
