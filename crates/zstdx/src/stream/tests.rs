@@ -6,7 +6,7 @@ use alloc::{collections::VecDeque, vec, vec::Vec};
 use crate::{
     EncoderOptions, Level, bulk, encoding,
     io::Write as _,
-    stream::{read, write},
+    stream::{raw, read, write},
 };
 
 #[cfg(test)]
@@ -68,6 +68,70 @@ fn read_encoder_matches_oneshot_bytes() {
         let mut out = Vec::new();
         crate::io::Read::read_to_end(&mut enc, &mut out).unwrap();
         assert_eq!(out, reference, "len {}", input.len());
+    }
+}
+
+/// Deliver everything the raw encoder holds: partial `split`-sized
+/// deliveries first, the remainder through the writer entry.
+fn deliver_raw_all(enc: &mut raw::Encoder, out: &mut Vec<u8>, split: usize) {
+    let mut buf = vec![0u8; split.max(1)];
+    while enc.pending_output() > 0 {
+        let n = enc.split_output(&mut buf);
+        out.extend_from_slice(&buf[..n]);
+    }
+    enc.write_output_to(out).unwrap();
+}
+
+/// The write cadence — deliver everything after every write and before
+/// flush and finish — must produce the `write::Encoder` bytes exactly:
+/// the FFI boundary drives the raw encoder on that cadence, so a drift
+/// here would move its frames.
+#[test]
+fn raw_encoder_matches_write_encoder_bytes() {
+    #[cfg(feature = "std")]
+    let workers = [1u32, 4];
+    #[cfg(not(feature = "std"))]
+    let workers = [1u32];
+    for input in shapes() {
+        for level in [Level::Uncompressed, Level::Fastest] {
+            for w in workers {
+                for chunk in [7 * 1024, 128 * 1024] {
+                    for split in [1, 977, 128 * 1024] {
+                        let options = EncoderOptions::new(level).workers(w);
+                        let mut reference = Vec::new();
+                        {
+                            let mut enc =
+                                write::Encoder::with_options(&mut reference, options.clone())
+                                    .unwrap();
+                            for (i, piece) in input.chunks(chunk).enumerate() {
+                                enc.write_all(piece).unwrap();
+                                if i == 1 {
+                                    enc.flush().unwrap();
+                                }
+                            }
+                            enc.do_finish().unwrap();
+                        }
+                        let mut got = Vec::new();
+                        let mut enc = raw::Encoder::with_options(options).unwrap();
+                        for (i, piece) in input.chunks(chunk).enumerate() {
+                            enc.write(piece).unwrap();
+                            if i == 1 {
+                                enc.flush();
+                            }
+                            deliver_raw_all(&mut enc, &mut got, split);
+                        }
+                        enc.finish().unwrap();
+                        deliver_raw_all(&mut enc, &mut got, split);
+                        assert_eq!(
+                            got,
+                            reference,
+                            "len {} level {level:?} workers {w} chunk {chunk} split {split}",
+                            input.len()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -345,6 +345,100 @@ fn metadata_entries() {
     assert_eq!(fcs, zstd::CONTENTSIZE_UNKNOWN);
 }
 
+/// `stream_compress` with `e_flush` after every input chunk instead of
+/// `e_continue`.
+fn stream_compress_flushy(input: &[u8], level: c_int, in_size: usize, out_size: usize) -> Vec<u8> {
+    let cctx = cctx_with(level, 0);
+    let mut out_buf = vec![0u8; out_size.max(1)];
+    let mut produced = Vec::new();
+    let mut in_pos = 0usize;
+    while in_pos < input.len() {
+        let take = (input.len() - in_pos).min(in_size);
+        let mut zin = zstd::ZSTD_inBuffer {
+            src: input[in_pos..].as_ptr().cast(),
+            size: take,
+            pos: 0,
+        };
+        in_pos += take;
+        let end = if in_pos == input.len() {
+            2
+        } else {
+            1
+        };
+        loop {
+            let mut zout = zstd::ZSTD_outBuffer {
+                dst: out_buf.as_mut_ptr().cast(),
+                size: out_buf.len(),
+                pos: 0,
+            };
+            let r = unsafe { zstd::ZSTD_compressStream2(cctx, &raw mut zout, &raw mut zin, end) };
+            assert!(!is_error(r));
+            produced.extend_from_slice(&out_buf[..zout.pos]);
+            if zin.pos == zin.size && r == 0 {
+                break;
+            }
+        }
+    }
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+    produced
+}
+
+#[test]
+fn delivery_slicing_never_moves_bytes() {
+    // Mixed compressibility alternates block outputs across any out size,
+    // so the sink staging and the direct delivery interleave. The frame
+    // must stay the one an eager caller (a single covering slice)
+    // receives: the caller's buffer geometry is delivery-only, never
+    // frame-shaping. The sweep crosses the raw-block output size
+    // (128 KiB + header) where the interleaving flips. Flushed streams
+    // are exempt by design: a flush emits whatever input arrived before
+    // it, and the out size paces that arrival.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut input = Vec::new();
+    for round in 0..6 {
+        match round % 3 {
+            // Raw-scale blocks, dense blocks and a semi-random middle so
+            // block outputs land across the whole sweep band.
+            0 => input.extend((0..128 * 1024u32).map(|_| (rand() & 0xff) as u8)),
+            1 => input.extend((0..128 * 1024u32).map(|i| (i % 251) as u8)),
+            _ => input.extend((0..128 * 1024u32).map(|i| {
+                if i % 4 == 0 {
+                    (rand() & 0xff) as u8
+                } else {
+                    (i % 251) as u8
+                }
+            })),
+        }
+    }
+    let covering = input.len() + 1024 * 1024;
+    for level in [1, 3] {
+        let reference = stream_compress(&input, level, 128 * 1024, covering);
+        let mut sizes = vec![1, 13, 7 * 1024, 140_000, 262_150, covering];
+        // A dense band across the raw-block output size, where the sink
+        // tail and a mid-scale block output interleave.
+        sizes.extend((65_000..=135_000).step_by(5_000));
+        for out_size in sizes {
+            let frame = stream_compress(&input, level, 128 * 1024, out_size);
+            assert_eq!(
+                frame, reference,
+                "level {level} out {out_size}: the delivery geometry moved the frame bytes"
+            );
+        }
+        for out_size in [977, 131_075] {
+            let frame = stream_compress_flushy(&input, level, 7 * 1024, out_size);
+            let mut plain = vec![0u8; input.len()];
+            assert_eq!(decompress(&mut plain, &frame), input.len());
+            assert_eq!(plain, input, "level {level} flushy out {out_size}");
+        }
+    }
+}
+
 #[test]
 fn streaming_roundtrip_tiny_buffers() {
     let big: Vec<u8> = (0..700 * 1024u32).map(|i| (i % 61) as u8).collect();

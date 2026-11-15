@@ -4,6 +4,8 @@
 //!   ([`write::Decoder`] decodes into one)
 //! - [`read::Encoder`] exposes compressed bytes through `std::io::Read` ([`read::Decoder`]
 //!   decompresses while reading, transparently over concatenated frames)
+//! - [`raw::Encoder`] takes pushed input and serves the encoded bytes on demand (the caller owns
+//!   the delivery cadence)
 //!
 //! One-shot conveniences over the same machinery: [`encode_all`],
 //! [`decode_all`], [`copy_encode`] and [`copy_decode`].
@@ -13,6 +15,7 @@ pub(crate) mod encoder_core;
 pub(crate) mod encoder_mt;
 #[cfg(feature = "std")]
 pub(crate) mod mt_pool;
+pub mod raw;
 pub mod read;
 pub mod write;
 

@@ -4,8 +4,9 @@
 //! The context owns zstdx-side state objects and never touches codec
 //! internals: one-shot compression rides the zero-copy bulk slice core with
 //! the source size declared (the streaming entries' byte-identical frame
-//! without the input staging), and the streaming entries reuse one encoder
-//! across calls with a delivered-cursor sink.
+//! without the input staging), and the streaming entries reuse one pull
+//! encoder across calls, delivering its output straight into the caller's
+//! buffer and staging the overflow a short slice cannot take.
 //!
 //! libzstd's parameter model splits in two: the sticky parameters (level,
 //! window, frame flags, workers) apply to `compress2` and the streaming
@@ -284,8 +285,14 @@ fn map_io(error: &std::io::Error) -> ErrorCode {
 
 /// Live streaming-encoder state inside a CCtx.
 struct StreamState {
-    encoder: zstdx::stream::write::Encoder<Vec<u8>>,
-    /// Bytes of `encoder`'s sink already handed to the caller.
+    encoder: zstdx::stream::raw::Encoder,
+    /// Output the caller's slice could not take yet. The write-through
+    /// delivers the core's pending bytes straight into the caller's
+    /// buffer, so this stays empty whenever the slice covers the output;
+    /// the overflow lands here, ahead of the core's later bytes in
+    /// stream order.
+    sink: Vec<u8>,
+    /// Bytes of `sink` already handed to the caller.
     delivered: usize,
     /// `ZSTD_getFrameProgression` counters for the running frame: the
     /// input bytes accepted (this layer stages no input of its own, so
@@ -308,10 +315,11 @@ impl StreamState {
         if let Some(dict) = dict {
             options = options.parsed_dictionary(dict);
         }
-        let encoder = zstdx::stream::write::Encoder::with_options(Vec::new(), options)
-            .map_err(|e| map_encode(&e))?;
+        let encoder =
+            zstdx::stream::raw::Encoder::with_options(options).map_err(|e| map_encode(&e))?;
         Ok(Self {
             encoder,
+            sink: Vec::new(),
             delivered: 0,
             ingested: 0,
             flushed: 0,
@@ -321,21 +329,56 @@ impl StreamState {
     }
 
     fn pending(&self) -> usize {
-        self.encoder.get_ref().len() - self.delivered
+        self.sink.len() - self.delivered + self.encoder.pending_output()
     }
 
-    /// Copy staged output into the caller's buffer, dropping the sink
-    /// allocation once it fully drains.
+    /// Deliver pending output to the caller. The sink's staged overflow
+    /// drains first (it precedes the core's bytes in stream order); once
+    /// it is gone, a core span the slice's remainder covers goes straight
+    /// into it — the write-through that skips the sink round-trip — while
+    /// a larger burst (a multithreaded job's output) stages through the
+    /// sink and the slice takes its head. Whatever the caller cannot take
+    /// this call ends in the sink: the core holds no output between
+    /// calls, the drain cadence the frame bytes are pinned to (the
+    /// single-threaded core's closing shape reads it).
     fn deliver(&mut self, out: &mut [u8], pos: &mut usize) {
-        let sink = self.encoder.get_ref();
-        let take = self.pending().min(out.len() - *pos);
-        out[*pos..*pos + take].copy_from_slice(&sink[self.delivered..self.delivered + take]);
+        let room = out.len() - *pos;
+        let take = self.serve_from_sink(out, pos, room);
+        if self.delivered < self.sink.len() {
+            // Older bytes still hold the slice; the core's newer bytes
+            // stage behind them.
+            self.spill_core_to_sink();
+            return;
+        }
+        if self.encoder.pending_output() > room - take {
+            self.spill_core_to_sink();
+            self.serve_from_sink(out, pos, room - take);
+        } else {
+            let n = self.encoder.split_output(&mut out[*pos..]);
+            *pos += n;
+        }
+    }
+
+    /// Copy up to `room` staged bytes into the caller's slice; returns
+    /// the copied length.
+    fn serve_from_sink(&mut self, out: &mut [u8], pos: &mut usize, room: usize) -> usize {
+        let take = (self.sink.len() - self.delivered).min(room);
+        out[*pos..*pos + take].copy_from_slice(&self.sink[self.delivered..self.delivered + take]);
         *pos += take;
         self.delivered += take;
-        if self.delivered == sink.len() {
-            self.encoder.get_mut().clear();
+        if self.delivered == self.sink.len() {
+            self.sink.clear();
             self.delivered = 0;
         }
+        take
+    }
+
+    /// Move every pending core byte into the sink, keeping the core's
+    /// next entry state empty.
+    fn spill_core_to_sink(&mut self) {
+        // The Vec writer accepts everything; the error type cannot occur.
+        let sink = &mut self.sink;
+        let _ = self.encoder.write_output_to(sink);
     }
 }
 
@@ -766,8 +809,8 @@ impl CCtx {
                 .encoder
                 // SAFETY: take <= input.size - in_pos, so src[in_pos..in_pos+take]
                 // stays inside the caller's read buffer.
-                .write_all(unsafe { input.slice_at(in_pos, take) })
-                .map_err(|e| map_io(&e))?;
+                .write(unsafe { input.slice_at(in_pos, take) })
+                .map_err(|e| map_encode(&e))?;
             in_pos += take;
             input.pos = in_pos;
         }
@@ -776,11 +819,11 @@ impl CCtx {
             ZSTD_EndDirective::Flush => {
                 // Emit the staged bytes as a non-last block; idempotent
                 // across the calls it takes to drain the output.
-                state.encoder.flush().map_err(|e| map_io(&e))?;
+                state.encoder.flush();
             },
             ZSTD_EndDirective::End => {
                 if !state.frame_closed {
-                    state.encoder.do_finish().map_err(|e| map_encode(&e))?;
+                    state.encoder.finish().map_err(|e| map_encode(&e))?;
                     state.frame_closed = true;
                 }
             },
