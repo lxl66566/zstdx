@@ -84,6 +84,11 @@ enum Command {
     /// output hash, so the asm stretch and the scalar body run on the same
     /// inputs; nonzero exit on divergence.
     Tierdiff(cmd::tierdiff::Args),
+    /// Twin-distance spectrum probe over a raw input: prices the
+    /// deep-offset ramp's damage class per MT job and per depth before
+    /// any ramped encode exists (the arming-gate spec in
+    /// docs/src/dev/bench/shapes.md).
+    Twinspect(cmd::twinspect::Args),
 }
 
 fn main() {
@@ -106,5 +111,6 @@ fn main() {
         Command::Dictmt(args) => cmd::dictmt::run(&args),
         Command::Parity(args) => cmd::parity::run(&args),
         Command::Tierdiff(args) => cmd::tierdiff::run(&args),
+        Command::Twinspect(args) => cmd::twinspect::run(&args),
     }
 }

@@ -16,3 +16,4 @@ pub mod seqstats;
 pub mod small;
 pub mod tierdiff;
 pub mod train;
+pub mod twinspect;
