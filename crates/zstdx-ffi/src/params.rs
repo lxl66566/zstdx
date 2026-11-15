@@ -2080,6 +2080,9 @@ pub unsafe extern "C" fn ZSTD_CCtx_getParameter(
         id::ChecksumFlag => i32::from(settings.checksum),
         id::DictIDFlag => i32::from(settings.dict_id_flag),
         id::NbWorkers => settings.workers as i32,
+        // The setter only stores values inside {0, INT_MAX}, so the u32
+        // rides back losslessly.
+        id::SrcSizeHint => settings.src_size_hint.map_or(0, |hint| hint as i32),
         // The reference build without ZSTD_MULTITHREAD answers these.
         id::JobSize | id::OverlapLog | id::Rsyncable => {
             return code(ErrorCode::ParameterUnsupported)

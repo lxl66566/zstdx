@@ -2538,6 +2538,47 @@ fn parameter_readback_and_block_size() {
     unsafe { zstd::ZSTD_freeDCtx(dctx) };
 }
 
+/// `ZSTD_c_srcSizeHint` stores, reads back, clears and refuses out-of-range
+/// values; a hint set on the streaming path stays a row-sizing hint, so the
+/// frame still decodes and (with content size on but no pledge) keeps its
+/// header free of a declared size.
+#[test]
+fn src_size_hint_roundtrip() {
+    let cctx = zstd::ZSTD_createCCtx();
+    assert!(!cctx.is_null());
+    let read = |param: c_int| -> (usize, i32) {
+        let mut v = -7777;
+        let r = unsafe { zstd::ZSTD_CCtx_getParameter(cctx, param, &raw mut v) };
+        (r, v)
+    };
+    assert_eq!(read(1004), (0, 0));
+    assert_eq!(500_000, set_param(cctx, 1004, 500_000));
+    assert_eq!(read(1004), (0, 500_000));
+    assert!(is_error(set_raw(cctx, 1004, -1)));
+    assert_eq!(read(1004), (0, 500_000));
+    assert_eq!(0, set_param(cctx, 1004, 0));
+    assert_eq!(read(1004), (0, 0));
+
+    let payload = shapes().pop().expect("shapes");
+    assert_eq!(
+        payload.len(),
+        set_param(cctx, 1004, payload.len() as c_int) as usize
+    );
+    let frame = stream_compress_ctx(cctx, &payload, 64 * 1024);
+    unsafe { zstd::ZSTD_freeCCtx(cctx) };
+
+    let mut out = vec![0u8; payload.len() + 1];
+    let written = decompress(&mut out, &frame);
+    assert!(!is_error(written));
+    assert_eq!(&out[..written], &payload[..]);
+}
+
+/// setParameter without the success contract: the raw return for negative
+/// srcSizeHint must be an error, not an applied value.
+fn set_raw(cctx: *mut zstd::ZSTD_CCtx, param: c_int, value: c_int) -> usize {
+    unsafe { zstd::ZSTD_CCtx_setParameter(cctx, param, value) }
+}
+
 #[test]
 fn prefix_family_roundtrip_and_single_use() {
     let buf: Vec<u8> = (0..(1u32 << 19))

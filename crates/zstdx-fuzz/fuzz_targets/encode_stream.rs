@@ -21,7 +21,11 @@
 //! plain slice, the NT-store `NtSource` and the zero-copy
 //! `OwnedEncoder` — so the campaign reaches the mt stream core, its
 //! stepped finish drain and both zero-copy feed entries, not only the
-//! single-threaded core the fixed layout used to drive.
+//! single-threaded core the fixed layout used to drive. Unpledged
+//! chunks additionally carry a length-hint mode off `rest[0]`'s top
+//! bits — none, accurate, 3x over and 1/3 under — so the srcSizeHint
+//! plumbing and the buffer growth past an over/undersized hint's
+//! reserve run under the campaign too.
 //!
 //! Each chunk drives the read-side streaming core (one `read_to_end`
 //! pull, the `matrix --mode enc-stream` / `dump --stream` drive). The
@@ -90,10 +94,26 @@ fuzz_target!(|data: &[u8]| {
         // 0 keeps the row's window; 1..=15 force window log 10..=24 (the
         // format floor is 10, the engine cap 27).
         let window = (opt_byte >> 2) & 0x0f;
+        let mut shape = zstdx::InputShape::default();
         if window != 0 {
-            opts = opts.with_input_shape(
-                zstdx::InputShape::default().with_window_log(u32::from(window) + 9),
-            );
+            shape = shape.with_window_log(u32::from(window) + 9);
+        }
+        // The unpledged hint mode (rest[0] bits 6..7, the byte whose low
+        // bits already pick the feed entry): mode 1 declares the chunk's
+        // own length — the 7-Zip srcSizeHint shape — and modes 2/3 pin
+        // over- and undersized hints, exercising the hint-keyed geometry
+        // and the growth past the reserved hint extent. A pledge
+        // swallows the hint by construction, so mode 0 stands there.
+        if opt_byte & 2 == 0 {
+            shape = match hint_mode_of(rest) {
+                HintMode::Accurate => shape.with_len(chunk.len() as u64),
+                HintMode::Overshoot => shape.with_len(chunk.len() as u64 * 3),
+                HintMode::Undershoot => shape.with_len((chunk.len() as u64 / 3).max(1)),
+                HintMode::None => shape,
+            };
+        }
+        if shape != zstdx::InputShape::default() {
+            opts = opts.with_input_shape(shape);
         }
         let ldm = match (opt_byte >> 6) & 3 {
             1 => zstdx::LdmMode::Enable,
@@ -146,6 +166,24 @@ fuzz_target!(|data: &[u8]| {
 /// and the mt counts 2..=12 alongside the levels.
 fn workers_of(level_byte: u8) -> u32 {
     1 + u32::from(level_byte) / 23
+}
+
+/// The unpledged length-hint mode, off `rest[0]`'s top bits (the low bits
+/// feed `entry_of`; stream-only, so the bulk walker stays untouched).
+enum HintMode {
+    None,
+    Accurate,
+    Overshoot,
+    Undershoot,
+}
+
+fn hint_mode_of(rest: &[u8]) -> HintMode {
+    match rest.first().copied().unwrap_or(0) >> 6 {
+        1 => HintMode::Accurate,
+        2 => HintMode::Overshoot,
+        3 => HintMode::Undershoot,
+        _ => HintMode::None,
+    }
 }
 
 /// The chunked walk's read-core feed entry, off `rest`'s first byte.

@@ -44,6 +44,9 @@ pub struct Settings {
     /// ZSTD_c_enableLongDistanceMatching: 0 auto / 1 enable / 2 disable,
     /// libzstd's `ZSTD_ParamSwitch_e` (default: auto).
     pub ldm: zstdx::LdmMode,
+    /// ZSTD_c_srcSizeHint (libzstd default: 0 = unset). A non-binding row
+    /// sizing hint, never a header promise.
+    pub src_size_hint: Option<u32>,
 }
 
 impl Default for Settings {
@@ -58,6 +61,7 @@ impl Default for Settings {
             workers: 0,
             dict_id_flag: true,
             ldm: zstdx::LdmMode::Auto,
+            src_size_hint: None,
         }
     }
 }
@@ -94,9 +98,17 @@ impl Settings {
             .long_distance_matching(self.ldm)
             .pledged_size(self.content_size.then_some(pledged).flatten())
             .workers(self.workers);
+        // The input shape folds the forced window and the srcSizeHint row
+        // hint; the shape rides along only when either is set.
+        let mut shape = zstdx::InputShape::default();
         if let Some(window_log) = self.window_log {
-            options =
-                options.with_input_shape(zstdx::InputShape::default().with_window_log(window_log));
+            shape = shape.with_window_log(window_log);
+        }
+        if let Some(hint) = self.src_size_hint {
+            shape = shape.with_len(u64::from(hint));
+        }
+        if shape != zstdx::InputShape::default() {
+            options = options.with_input_shape(shape);
         }
         options
     }
@@ -167,6 +179,15 @@ impl Settings {
                 // rides the single-threaded core (documented engine limit).
                 self.workers = u32::try_from(value).expect("bounds checked");
                 Ok(value.max(0) as usize)
+            },
+            ZSTD_cParameter::SrcSizeHint => {
+                // The reference bounds are {0, INT_MAX}; 0 clears the hint
+                // (the default), negatives refuse.
+                if value < 0 {
+                    return Err(ErrorCode::ParameterOutOfBound);
+                }
+                self.src_size_hint = u32::try_from(value).ok().filter(|hint| *hint != 0);
+                Ok(value as usize)
             },
         }
     }

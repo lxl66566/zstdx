@@ -190,6 +190,7 @@ pub enum ZSTD_cParameter {
     ChecksumFlag = 201,
     DictIDFlag = 202,
     NbWorkers = 400,
+    SrcSizeHint = 1004,
 }
 
 impl ZSTD_cParameter {
@@ -202,6 +203,7 @@ impl ZSTD_cParameter {
             201 => Some(Self::ChecksumFlag),
             202 => Some(Self::DictIDFlag),
             400 => Some(Self::NbWorkers),
+            1004 => Some(Self::SrcSizeHint),
             _ => None,
         }
     }
