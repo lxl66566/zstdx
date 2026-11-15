@@ -134,14 +134,16 @@ const WIN: usize = 64;
 /// on random content (LDM's `HASH_RATE_LOG`).
 const TRIGGER_MASK: u64 = u64::MAX << 58;
 
-/// 64-byte window fingerprint: an 8-lane multiply-xor fold with a
-/// splitmix-style finalizer (screen-local; LDM's own `split_fp` differs,
-/// which costs nothing — the screen only ever compares its own
-/// fingerprints).
+/// 64-byte window fingerprint: an 8-lane multiply-xor fold, one lane
+/// per 8-byte tile of the window, with a splitmix-style finalizer
+/// (screen-local; LDM's own `split_fp` differs, which costs nothing —
+/// the screen only ever compares its own fingerprints). The tile fold
+/// keeps a twin a whole-window property: a prefix fold twins structured
+/// records that differ past the shared prefix wholesale.
 #[inline(always)]
 fn window_fp(win: &[u8]) -> u64 {
     debug_assert_eq!(win.len(), WIN);
-    let lane = |k: usize| u64::from_le_bytes(win[k..k + 8].try_into().unwrap());
+    let lane = |k: usize| u64::from_le_bytes(win[k * 8..k * 8 + 8].try_into().unwrap());
     let acc = lane(0).wrapping_mul(0xa076_1d64_78bd_642f)
         ^ lane(1).wrapping_mul(0xe703_7ed1_a0b4_28db)
         ^ lane(2).wrapping_mul(0x8ebc_6af0_9c88_c6e3)
@@ -326,5 +328,36 @@ mod tests {
             *b = (i * 31 % 256) as u8;
         }
         assert_eq!(strided_distinct(&head), 8);
+    }
+
+    /// Two windows sharing their first 15 bytes but differing past them
+    /// fingerprint apart. The overlapping-lane fold this replaced keyed
+    /// on exactly those 15 bytes, so skeleton-sharing records collided
+    /// as twins; the tile fold pins twin equality to the whole window.
+    #[test]
+    fn skeleton_sharing_windows_fingerprint_apart() {
+        let mut a = [0u8; WIN];
+        let mut b = [0u8; WIN];
+        for i in 0..15 {
+            a[i] = mix64(i as u64) as u8;
+            b[i] = a[i];
+        }
+        for i in 15..WIN {
+            a[i] = mix64(0x100 + i as u64) as u8;
+            b[i] = mix64(0x200 + i as u64) as u8;
+        }
+        assert_ne!(window_fp(&a), window_fp(&b));
+    }
+
+    /// Identical windows fingerprint equal: the twin pass compares
+    /// fingerprints alone, never bytes.
+    #[test]
+    fn identical_windows_fingerprint_equal() {
+        let mut a = [0u8; WIN];
+        for (i, b) in a.iter_mut().enumerate() {
+            *b = mix64(i as u64 ^ 0xa5) as u8;
+        }
+        let b = a;
+        assert_eq!(window_fp(&a), window_fp(&b));
     }
 }

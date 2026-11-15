@@ -84,14 +84,12 @@ fn gear4(tab: &[u64; 256], w: &[u8], h: u64) -> (u64, u64, u64, u64) {
 }
 
 /// 64-byte window fingerprint: an 8-lane multiply-xor fold, one lane
-/// per 8-byte tile of the window, with a splitmix-style finalizer. The
-/// fold must cover the whole window: the encoder's far screen folds
-/// overlapping lanes from byte offsets 0..8, so its fingerprint reads
-/// only the first 15 bytes and structured records that share a 15-byte
-/// skeleton (csv and json field templates) collide on it wholesale.
-/// For the screen's accept-only twin count that stayed inside its 50x
-/// margins; a distance spectrum built on it would drown in skeleton
-/// twins.
+/// per 8-byte tile of the window, with a splitmix-style finalizer, the
+/// same fold the encoder's far screen uses. The tile fold makes a twin
+/// a whole-window property: a prefix fold twins structured records
+/// that share a 15-byte skeleton (csv and json field templates)
+/// wholesale, and a distance spectrum built on it would drown in
+/// skeleton twins.
 fn window_fp(win: &[u8]) -> u64 {
     debug_assert_eq!(win.len(), WIN);
     let lane = |k: usize| u64::from_le_bytes(win[k * 8..k * 8 + 8].try_into().unwrap());

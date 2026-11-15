@@ -733,8 +733,13 @@ impl LdmState {
         (n, count)
     }
 
-    /// Fingerprint a split's 64-byte window: eight multiply-xor lanes and
-    /// one avalanche step. Independent of the gear state (a fingerprint
+    /// Fingerprint a split's 64-byte window: eight multiply-xor lanes
+    /// read from byte offsets 0..8, so the fold covers the window's
+    /// first 15 bytes, plus one avalanche step. A checksum hit becomes
+    /// a candidate only through `extend_match`'s byte-level
+    /// verification, and a true 64-byte match checksums equal under any
+    /// fold, so the prefix coverage only prices the verification of
+    /// false hits. Independent of the gear state (a fingerprint
     /// correlated with the trigger condition shifts with the split
     /// placement — the fold-derived candidate measured a dll100
     /// no-latch size regression while this form tracks a fresh XXH64 of
