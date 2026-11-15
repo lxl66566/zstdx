@@ -396,12 +396,13 @@ impl FrameDecoder {
         if state.flat_active {
             // Mid-frame dict takeover cannot prefill history the flat
             // buffer would have to re-derive, so the ring path takes over
-            // (it holds the dict content directly).
+            // (it holds the dict content directly). The ring's window-sized
+            // reserve lives here — its activation point — so a reset that
+            // never leaves the flat path allocates nothing for the ring.
             state.flat_active = false;
-            state.flat.reset(
-                state.decoder_scratch.buffer.window_size,
-                state.declared_fcs(),
-            );
+            let window = state.decoder_scratch.buffer.window_size;
+            state.decoder_scratch.buffer.reserve(window);
+            state.flat.reset(window, state.declared_fcs());
         }
 
         Ok(())

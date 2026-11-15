@@ -108,6 +108,10 @@ The fix reports `DictionaryDecodeError::InvalidRepeatOffset`. The real `--train`
 
 `reset` now restores `flat_active = true`, and `FrameDecoder::reset` re-disables it right after when the next frame carries a dictionary, so the ordering keeps both paths correct.
 
+### The ring reserves at activation
+
+The same reset eagerly reserved the ring for the frame's declared window. With the flat path owning every dictionary-free decode, a reused decoder peaked at the window size before the decode even started: a 9-byte frame with a 2^27 window descriptor made the second frame on the decoder allocate ~134 MB. The reserve belongs where the ring actually activates, the `force_dict` takeover branch; every append reserves per block anyway, so the ring's behavior is unchanged once active.
+
 ### Retired bits on no-reload paths
 
 Refactoring the bitstream reader so the read's shift count absorbs the consumed offset split "read n bits" from "advance the accounting". The paths that skip the reload, which are the block's last sequence in both the plain and wide forms, then forgot the advance, and every frame failed `finish` with `ExtraBits{n}`.

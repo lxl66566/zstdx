@@ -53,8 +53,12 @@ impl DecodeBuffer {
 
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
+        // No capacity reserve here: after the flat-window rework the ring
+        // is only used once a dictionary takes over mid-frame (force_dict),
+        // and that takeover point owns the window-sized reserve. Appends
+        // reserve per block regardless, so the ring stays correct without
+        // it.
         self.buffer.clear();
-        self.buffer.reserve(self.window_size);
         self.dict_content.clear();
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]
