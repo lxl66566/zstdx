@@ -1248,6 +1248,20 @@ impl FrameEncoderCore {
         self.pending_output() != 0
     }
 
+    /// Whether the caller may leave output pending in the core across
+    /// calls without moving its frame bytes: the multithreaded queue arm
+    /// holds partial deliveries natively. The single-threaded core's
+    /// closing shape reads the delivery cadence (the in-place last-block
+    /// patch keys on `out_read`), so its callers drain it empty between
+    /// calls.
+    pub(crate) fn keeps_pending_output(&self) -> bool {
+        match self {
+            Self::Single(_) => false,
+            #[cfg(feature = "std")]
+            Self::Mt(core) => core.keeps_pending_output(),
+        }
+    }
+
     /// Encoded bytes not yet consumed by the enclosing encoder.
     pub(crate) fn pending_output(&self) -> usize {
         match self {

@@ -89,6 +89,16 @@ impl Encoder {
         self.core.pending_output()
     }
 
+    /// Whether partial deliveries may span calls with bytes left pending
+    /// in the encoder without moving its frame bytes: the multithreaded
+    /// core's delivery queue holds them natively, while the
+    /// single-threaded core's closing shape reads the delivery cadence —
+    /// a caller of that core keeps it empty between calls (the drain
+    /// cadence the FFI layer pins its single-threaded bytes to).
+    pub fn keeps_pending_output(&self) -> bool {
+        self.core.keeps_pending_output()
+    }
+
     /// Deliver encoded bytes into `buf`, without an intermediate copy,
     /// returning the delivered length. Partial deliveries resume where
     /// the previous one stopped; the buffer's allocation is kept.

@@ -289,8 +289,9 @@ struct StreamState {
     /// Output the caller's slice could not take yet. The write-through
     /// delivers the core's pending bytes straight into the caller's
     /// buffer, so this stays empty whenever the slice covers the output;
-    /// the overflow lands here, ahead of the core's later bytes in
-    /// stream order.
+    /// an overflow lands here only from a core that must hold no output
+    /// between calls (the single-threaded closing shape) — the
+    /// multithreaded delivery queue keeps its own remainder.
     sink: Vec<u8>,
     /// Bytes of `sink` already handed to the caller.
     delivered: usize,
@@ -335,12 +336,13 @@ impl StreamState {
     /// Deliver pending output to the caller. The sink's staged overflow
     /// drains first (it precedes the core's bytes in stream order); once
     /// it is gone, a core span the slice's remainder covers goes straight
-    /// into it — the write-through that skips the sink round-trip — while
-    /// a larger burst (a multithreaded job's output) stages through the
-    /// sink and the slice takes its head. Whatever the caller cannot take
-    /// this call ends in the sink: the core holds no output between
-    /// calls, the drain cadence the frame bytes are pinned to (the
-    /// single-threaded core's closing shape reads it).
+    /// into it — the write-through that skips the sink round-trip. A
+    /// larger burst the slice cannot take splits by the core's own
+    /// capability: the multithreaded delivery queue serves the slice off
+    /// its head and holds the remainder for the following calls, while a
+    /// core whose closing shape reads the delivery cadence (the
+    /// single-threaded one) stages the whole burst into the sink so it
+    /// holds no output between calls.
     fn deliver(&mut self, out: &mut [u8], pos: &mut usize) {
         let room = out.len() - *pos;
         let take = self.serve_from_sink(out, pos, room);
@@ -350,9 +352,10 @@ impl StreamState {
             self.spill_core_to_sink();
             return;
         }
-        if self.encoder.pending_output() > room - take {
+        let room = room - take;
+        if self.encoder.pending_output() > room && !self.encoder.keeps_pending_output() {
             self.spill_core_to_sink();
-            self.serve_from_sink(out, pos, room - take);
+            self.serve_from_sink(out, pos, room);
         } else {
             let n = self.encoder.split_output(&mut out[*pos..]);
             *pos += n;

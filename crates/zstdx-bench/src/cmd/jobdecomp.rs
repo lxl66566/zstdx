@@ -50,6 +50,11 @@ pub struct JobDecompArgs {
     /// shape; bulk-grid jobs, the reach probe staging at the head).
     #[arg(long)]
     pub pledge: bool,
+    /// Drive the stream-mt cells through the FFI caller shape instead of the
+    /// Read pump: write encoder, 128 KiB continue writes, the payload length
+    /// as a srcSizeHint, no pledge (see the matrix enc-feed section).
+    #[arg(long)]
+    pub hint: bool,
 }
 
 pub fn run(args: &JobDecompArgs) {
@@ -66,7 +71,11 @@ pub fn run(args: &JobDecompArgs) {
 
 #[cfg(feature = "job_trace")]
 mod trace {
-    use std::{fs, io::Read as _, time::Instant};
+    use std::{
+        fs,
+        io::{Read as _, Write as _},
+        time::Instant,
+    };
 
     use zstdx::{EncoderOptions, Level, encoding::job_trace};
 
@@ -89,10 +98,21 @@ mod trace {
         .unwrap()
     }
 
-    fn encode_stream(raw: &[u8], level: Level, workers: u32, pledge: bool) -> Vec<u8> {
+    fn encode_stream(raw: &[u8], level: Level, workers: u32, pledge: bool, hint: bool) -> Vec<u8> {
         let mut opts = EncoderOptions::new(level).checksum(false).workers(workers);
         if pledge {
             opts = opts.pledged_size(Some(raw.len() as u64));
+        }
+        if hint {
+            // The FFI caller shape: unpledged, the length only as a hint,
+            // 128 KiB continue writes (matrix t6_enc_feed's exact form).
+            let opts =
+                opts.with_input_shape(zstdx::InputShape::default().with_len(raw.len() as u64));
+            let mut enc = zstdx::stream::write::Encoder::with_options(Vec::new(), opts).unwrap();
+            for chunk in raw.chunks(128 * 1024) {
+                enc.write_all(chunk).unwrap();
+            }
+            return enc.finish().unwrap();
         }
         let mut enc = zstdx::stream::read::Encoder::with_options(raw, opts).unwrap();
         let mut out = Vec::with_capacity(raw.len() / 4);
@@ -351,11 +371,11 @@ mod trace {
                         );
                     },
                     DecompMode::StreamMt => {
-                        let pledge = args.pledge;
+                        let (pledge, hint) = (args.pledge, args.hint);
                         run_cell(
                             &label,
                             &raw,
-                            &mut || encode_stream(&raw, level, workers, pledge),
+                            &mut || encode_stream(&raw, level, workers, pledge, hint),
                             args.iters,
                         );
                     },

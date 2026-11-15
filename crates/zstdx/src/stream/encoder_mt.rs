@@ -1193,9 +1193,18 @@ pub(crate) struct MtEncoderCore {
     pos: u64,
     /// Checksum absorbed up to this absolute offset.
     hashed_end: u64,
-    output: Vec<u8>,
-    /// Consumed prefix of `output` (see the ST core's field).
-    out_read: usize,
+    /// In-order delivery segments: the jobs' own output buffers in post
+    /// order, framed by the header segment ahead and the closing tail
+    /// segment behind. Concatenated, the segments are exactly the frame
+    /// bytes; every frame-shaping decision runs before a segment exists,
+    /// so partial deliveries across calls cannot move the bytes (the MT
+    /// schedule is a pure function of absolute offsets) — the jobs'
+    /// buffers reach the consumer without a staging copy.
+    out_queue: VecDeque<Vec<u8>>,
+    /// Consumed prefix of the queue's head segment.
+    queue_read: usize,
+    /// Total undelivered bytes across the queue (O(1) `pending_output`).
+    out_bytes: usize,
     header_emitted: bool,
     finished: bool,
     /// EOF seen and the tail posted: the finish drain is under way. The
@@ -1455,7 +1464,7 @@ impl MtEncoderCore {
             (Vec::new(), 0)
         };
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-        let mut core = Self {
+        let core = Self {
             level: options.level,
             checksum,
             workers: options.workers,
@@ -1509,8 +1518,9 @@ impl MtEncoderCore {
             init_len,
             pos: 0,
             hashed_end: 0,
-            output: Vec::with_capacity(initial_job + 64),
-            out_read: 0,
+            out_queue: VecDeque::new(),
+            queue_read: 0,
+            out_bytes: 0,
             header_emitted: false,
             finished: false,
             finishing: false,
@@ -1532,11 +1542,6 @@ impl MtEncoderCore {
             pool_threads: Vec::new(),
             pending: VecDeque::new(),
         };
-        // Arm the output wall from construction (a fresh Vec's spare is
-        // uninitialized); every later re-arm rides the public methods'
-        // exits, exactly like the st core's `configure`.
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut core.output);
         core
     }
 
@@ -1552,7 +1557,7 @@ impl MtEncoderCore {
         // pumps instead).
         debug_assert!(self.owned.is_none(), "the owned feed never appends");
         #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (write entry)");
+        self.out_gate("mt core output (write entry)");
         if let Some(pledged) = self.pledged
             && self.pos + data.len() as u64 > pledged
         {
@@ -1580,8 +1585,6 @@ impl MtEncoderCore {
             self.pos += n as u64;
             self.post_ready();
         }
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
         Ok(())
     }
 
@@ -1610,7 +1613,7 @@ impl MtEncoderCore {
     fn pump_direct_inner(&mut self, source: &mut impl crate::io::Read) -> crate::Result<()> {
         debug_assert!(!self.finished);
         #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (pump entry)");
+        self.out_gate("mt core output (pump entry)");
         if self.finishing {
             // Past EOF every pull advances the finish drain instead: the
             // read loop re-enters the pump exactly when its last delivery
@@ -1673,8 +1676,6 @@ impl MtEncoderCore {
             },
             Err(e) => return Err(e),
         }
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
         Ok(())
     }
 
@@ -1690,7 +1691,7 @@ impl MtEncoderCore {
     pub(crate) fn pump_owned(&mut self, src: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
         #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (owned pump entry)");
+        self.out_gate("mt core output (owned pump entry)");
         let owned = self
             .owned
             .expect("the owned pump runs on an owned-fed core only");
@@ -1711,11 +1712,6 @@ impl MtEncoderCore {
             // verdict lands identically.
             self.pos = owned.len as u64;
             self.post_ready();
-            // The wall boundary the Read pump gets for free: its posts
-            // re-arm at every pull's exit, while this one call runs them
-            // back to back with the finish's entry assert.
-            #[cfg(debug_assertions)]
-            vec_poison::fill(&mut self.output);
             self.finish_begin()?;
         }
         self.finish_step(true)
@@ -1751,7 +1747,7 @@ impl MtEncoderCore {
     fn finish_begin(&mut self) -> crate::Result<()> {
         debug_assert!(!self.finishing && !self.finished);
         #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (finish entry)");
+        self.out_gate("mt core output (finish entry)");
         // `pos` is live from the writes themselves, so the check fires
         // before the drain below could discover it.
         if let Some(pledged) = self.pledged
@@ -1793,14 +1789,13 @@ impl MtEncoderCore {
     /// delivers between slices, so bytes flow during the straggler wait
     /// instead of stacking behind it. A stacked wait is what used to make
     /// the tail pay twice: the blocked jobs' assemblies plus their
-    /// delivery all landed after the makespan job, and the stacked
-    /// undelivered length forced the output Vec's last doubling there.
+    /// delivery all landed after the makespan job, with the whole
+    /// undelivered span resident until then.
     fn finish_step(&mut self, handoff: bool) -> crate::Result<()> {
         debug_assert!(self.finishing && !self.finished);
-        // No entry assert: the calling pump's own entry check ran before
-        // `finish_begin`'s tail posts appended to the output, and the
-        // append sites re-arm on their exits (the handoff below and
-        // `finish_end`).
+        // No entry gate: the calling pump's own entry check already ran,
+        // and the drain below only pushes armed segments at the queue's
+        // back — the head the gate would check cannot change in between.
         loop {
             self.assemble_ready();
             if self.pending.is_empty() {
@@ -1811,12 +1806,7 @@ impl MtEncoderCore {
                 self.finish_end();
                 return Ok(());
             }
-            if handoff && !self.output.is_empty() {
-                // Handing undelivered bytes back: re-arm the wall the
-                // caller's next entry assert checks (the fill at the pump
-                // exit is bypassed by this early return).
-                #[cfg(debug_assertions)]
-                vec_poison::fill(&mut self.output);
+            if handoff && self.pending_output() > 0 {
                 return Ok(());
             }
             if self.quiescent() {
@@ -1834,21 +1824,22 @@ impl MtEncoderCore {
     /// nothing-left-to-post frame, the checksum and the finished mark.
     fn finish_end(&mut self) {
         debug_assert_eq!(self.hashed_end, self.pos);
+        // The closing tail as one segment: the empty last block's header
+        // then the checksum, the frame's final bytes in stream order.
+        let mut tail = Vec::with_capacity(7);
         if self.close_empty {
             BlockHeader {
                 last_block: true,
                 block_type: BlockType::Raw,
                 block_size: 0,
             }
-            .serialize(&mut self.output);
+            .serialize(&mut tail);
         }
         if self.checksum {
-            let checksum = self.hasher.finish32();
-            self.output.extend_from_slice(&checksum.to_le_bytes());
+            tail.extend_from_slice(&self.hasher.finish32().to_le_bytes());
         }
+        self.push_out_segment(tail);
         self.finished = true;
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
         #[cfg(feature = "job_trace")]
         {
             timeline::tl!("TL FINISH end at {}", timeline::rel_us());
@@ -1870,7 +1861,7 @@ impl MtEncoderCore {
     pub(crate) fn flush_block(&mut self) {
         debug_assert!(!self.finished);
         #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (flush entry)");
+        self.out_gate("mt core output (flush entry)");
         // A flush promises visibility: every posted job's blocks belong to
         // the output before it returns (encode_jobs drains everything it
         // posts; with nothing new pending, the drain below covers them).
@@ -1881,53 +1872,95 @@ impl MtEncoderCore {
         } else {
             self.drain_all();
         }
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
     }
 
-    /// Encoded bytes not yet consumed by the enclosing encoder.
-    pub(crate) fn pending_output(&self) -> usize {
-        self.output.len() - self.out_read
+    /// Whether partial deliveries may span calls with bytes left pending
+    /// in the core: the queue holds them natively and no frame-shaping
+    /// decision reads the delivery state (the schedule keys on absolute
+    /// offsets alone).
+    pub(crate) fn keeps_pending_output(&self) -> bool {
+        true
     }
 
-    /// Hand the encoded bytes to `w`, keeping the output buffer's
-    /// allocation. A failed write keeps the undelivered tail for the
-    /// caller's retry (see [`write_pending_output`]).
+    /// Append one delivered span to the queue. Empty spans never queue:
+    /// an aborted job's empty slot must not occupy an assembly order it
+    /// did not encode for.
+    fn push_out_segment(&mut self, mut bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Arm the segment's wall here (the poison protocol's lifecycle
+        // rule): a fresh Vec's spare is uninitialized, and the worker arms
+        // only its own publications — this covers the inline and tail
+        // segments and re-arms a worker segment idempotently. Segment
+        // lengths never move again, so no later re-arm is needed.
+        #[cfg(debug_assertions)]
+        vec_poison::fill(&mut bytes);
+        self.out_bytes += bytes.len();
+        self.out_queue.push_back(bytes);
+    }
+
+    /// Entry-side wall check over the queue's head (the bytes the caller
+    /// is about to read). Producers arm at push; segment lengths never
+    /// move again, so no exit-side re-arm exists.
+    #[cfg(debug_assertions)]
+    fn out_gate(&self, ctx: &str) {
+        if let Some(head) = self.out_queue.front() {
+            vec_poison::assert(head, ctx);
+        }
+    }
+
+    /// Encoded bytes not yet consumed by the enclosing encoder.
+    pub(crate) fn pending_output(&self) -> usize {
+        self.out_bytes
+    }
+
+    /// Hand the encoded bytes to `w`, one queue segment per write batch. A
+    /// failed write keeps the undelivered tail for the caller's retry (see
+    /// [`write_pending_output`]).
     pub(crate) fn write_output_to(
         &mut self,
         w: &mut impl crate::io::Write,
     ) -> Result<(), crate::io::Error> {
-        #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (drain entry)");
-        let res = write_pending_output(&self.output, &mut self.out_read, w);
-        if res.is_ok() {
-            self.output.clear();
-            self.out_read = 0;
+        while let Some(head) = self.out_queue.front() {
+            #[cfg(debug_assertions)]
+            vec_poison::assert(head, "mt out head (drain entry)");
+            let len = head.len();
+            write_pending_output(head, &mut self.queue_read, w)?;
+            self.out_queue.pop_front();
+            self.queue_read = 0;
+            self.out_bytes -= len;
         }
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
-        res
+        Ok(())
     }
 
-    /// Serve encoded bytes without deallocating the output buffer.
+    /// Serve encoded bytes, filling `buf` across as many head segments as
+    /// it covers — a short caller slice takes part of the head and the
+    /// remainder waits in the queue (no staging copy anywhere).
     pub(crate) fn split_output(&mut self, buf: &mut [u8]) -> usize {
-        #[cfg(debug_assertions)]
-        vec_poison::assert(&self.output, "mt core output (split entry)");
-        let pending = &self.output[self.out_read..];
-        let n = buf.len().min(pending.len());
-        buf[..n].copy_from_slice(&pending[..n]);
-        self.out_read += n;
-        if self.out_read == self.output.len() {
-            self.output.clear();
-            self.out_read = 0;
+        let mut taken = 0;
+        while taken < buf.len() {
+            let Some(head) = self.out_queue.front() else {
+                break;
+            };
+            #[cfg(debug_assertions)]
+            vec_poison::assert(head, "mt out head (split entry)");
+            let n = (head.len() - self.queue_read).min(buf.len() - taken);
+            let src = &head[self.queue_read..self.queue_read + n];
+            buf[taken..taken + n].copy_from_slice(src);
+            taken += n;
+            self.queue_read += n;
+            self.out_bytes -= n;
+            if self.queue_read == head.len() {
+                self.out_queue.pop_front();
+                self.queue_read = 0;
+            }
         }
-        #[cfg(debug_assertions)]
-        vec_poison::fill(&mut self.output);
-        n
+        taken
     }
 
     /// The probe decision's staging gate (see [`reach_probe`]): a pledged
@@ -3215,7 +3248,7 @@ impl MtEncoderCore {
                 self.job_ldm,
                 self.ldm_mode,
             );
-            self.output.extend_from_slice(&bytes);
+            self.push_out_segment(bytes);
             self.job_start = hi;
             return;
         }
@@ -3257,7 +3290,7 @@ impl MtEncoderCore {
             self.ldm_mode,
         );
         return_pooled_state(state);
-        self.output.extend_from_slice(&bytes);
+        self.push_out_segment(bytes);
         self.job_start = hi;
     }
 
@@ -3393,12 +3426,12 @@ impl MtEncoderCore {
             vec_poison::assert(&bytes, "mt job out (assembly)");
             #[cfg(feature = "job_trace")]
             timeline::tl!(
-                "TL ASM bytes {} len {} cap {}",
+                "TL ASM bytes {} pending {} segs {}",
                 bytes.len(),
-                self.output.len(),
-                self.output.capacity()
+                self.pending_output(),
+                self.out_queue.len()
             );
-            self.output.extend_from_slice(&bytes);
+            self.push_out_segment(bytes);
         }
     }
 
@@ -3649,7 +3682,11 @@ impl MtEncoderCore {
 
     fn emit_header(&mut self) {
         if !self.header_emitted {
-            self.output.extend_from_slice(&self.header);
+            // The header precedes every job segment by construction: the
+            // first post runs this before anything can assemble, and the
+            // flush/finish paths emit it ahead of their own posts.
+            let header = self.header.clone();
+            self.push_out_segment(header);
             self.header_emitted = true;
         }
     }
@@ -3811,6 +3848,20 @@ mod tests {
     /// while a pledge past the cap stays on the per-job model — a wrap
     /// would recycle the frame head the feed's window view needs, and
     /// which span a wrap keeps is a recycling-timing function.
+    /// The queue's undelivered bytes, concatenated: the frame a staged,
+    /// undelivered core holds (the tests read finished cores).
+    fn undelivered(core: &MtEncoderCore) -> Vec<u8> {
+        let mut out = Vec::with_capacity(core.pending_output());
+        for (i, seg) in core.out_queue.iter().enumerate() {
+            out.extend_from_slice(if i == 0 {
+                &seg[core.queue_read..]
+            } else {
+                seg
+            });
+        }
+        out
+    }
+
     #[test]
     fn opt_feed_arming_caps_at_the_buffer() {
         // The engagement reads the process-global feed switch; serialize
@@ -3947,7 +3998,7 @@ mod tests {
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
 
         // Narrow twin: a 16-symbol tile repeated at a near-local lag
@@ -3978,7 +4029,7 @@ mod tests {
         core.finish().unwrap();
         let mut out = vec![0u8; narrow.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (narrow.len(), &narrow[..]));
     }
 
@@ -4033,7 +4084,7 @@ mod tests {
             );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]), "total {total}");
         }
     }
@@ -4101,9 +4152,9 @@ mod tests {
             match &reference {
                 Some((prev_keys, prev_frame)) => {
                     assert_eq!(&keys, prev_keys);
-                    assert_eq!(&core.output, prev_frame);
+                    assert_eq!(&undelivered(&core), prev_frame);
                 },
-                None => reference = Some((keys, core.output.clone())),
+                None => reference = Some((keys, undelivered(&core))),
             }
             let (_, frame) = reference.as_ref().unwrap();
             let mut out = vec![0u8; data.len()];
@@ -4170,7 +4221,7 @@ mod tests {
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
 
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
@@ -4180,7 +4231,7 @@ mod tests {
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
@@ -4262,10 +4313,11 @@ mod tests {
         // last-block bit set, raw type, size 0), behind the checksum the
         // `hash` feature's default appends.
         let cksum = cfg!(feature = "hash") as usize * 4;
-        let tail = &core.output[core.output.len() - cksum - 3..core.output.len() - cksum];
+        let frame = undelivered(&core);
+        let tail = &frame[frame.len() - cksum - 3..frame.len() - cksum];
         assert_eq!(tail, &[1, 0, 0], "the closer is the empty raw last block");
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut []).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut []).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -4341,8 +4393,8 @@ mod tests {
             core.write(&data).unwrap();
             core.finish().unwrap();
             match &reference {
-                Some(bytes) => assert_eq!(&core.output, bytes, "sequential reuse"),
-                None => reference = Some(core.output.clone()),
+                Some(bytes) => assert_eq!(&undelivered(&core), bytes, "sequential reuse"),
+                None => reference = Some(undelivered(&core)),
             }
         }
         let reference = reference.unwrap();
@@ -4355,7 +4407,7 @@ mod tests {
                     let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
                     core.write(&data).unwrap();
                     core.finish().unwrap();
-                    assert_eq!(core.output, reference, "concurrent lease {t}");
+                    assert_eq!(undelivered(&core), reference, "concurrent lease {t}");
                 }
             }));
         }
@@ -4381,7 +4433,7 @@ mod tests {
         core.finish().unwrap();
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
@@ -4400,11 +4452,11 @@ mod tests {
             core.finish().unwrap();
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]), "chunk {chunk}");
             match &reference {
-                Some(bytes) => assert_eq!(&core.output, bytes, "chunk {chunk}"),
-                None => reference = Some(core.output.clone()),
+                Some(bytes) => assert_eq!(&undelivered(&core), bytes, "chunk {chunk}"),
+                None => reference = Some(undelivered(&core)),
             }
         }
     }
@@ -4425,7 +4477,7 @@ mod tests {
             "single huge write grew the reserve to {cap}"
         );
         core.finish().unwrap();
-        let output = core.output.clone();
+        let output = undelivered(&core);
         drop(core);
         let mut out = vec![1u8; len];
         let mut decoder = FrameDecoder::new();
@@ -4645,21 +4697,21 @@ mod tests {
             core.write(&data).unwrap();
             core.finish().unwrap();
             assert_eq!(
-                header_window_log(&core.output),
+                header_window_log(&undelivered(&core)),
                 26,
                 "w{workers} armed header"
             );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
             assert_eq!(
                 (n, &out[..n]),
                 (data.len(), &data[..]),
                 "w{workers} roundtrip"
             );
             match &reference {
-                Some(bytes) => assert_eq!(&core.output, bytes, "w{workers} bytes"),
-                None => reference = Some(core.output.clone()),
+                Some(bytes) => assert_eq!(&undelivered(&core), bytes, "w{workers} bytes"),
+                None => reference = Some(undelivered(&core)),
             }
         }
         // Chunk-pattern invariance without a flush: ragged writes and 64
@@ -4677,7 +4729,11 @@ mod tests {
                 off += n;
             }
             core.finish().unwrap();
-            assert_eq!(&core.output, reference.as_ref().unwrap(), "chunk {chunk}");
+            assert_eq!(
+                &undelivered(&core),
+                reference.as_ref().unwrap(),
+                "chunk {chunk}"
+            );
         }
         // The armed ST body (the same screen, frame-continuous) bounds the
         // mt frame's split cost.
@@ -4708,16 +4764,16 @@ mod tests {
             core.write(&data[3 * 1024 * 1024..]).unwrap();
             core.finish().unwrap();
             assert!(
-                header_window_log(&core.output) < 25,
+                header_window_log(&undelivered(&core)) < 25,
                 "a flush below the gate must keep the stock window"
             );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]));
             match &reference {
-                Some(bytes) => assert_eq!(&core.output, bytes),
-                None => reference = Some(core.output.clone()),
+                Some(bytes) => assert_eq!(&undelivered(&core), bytes),
+                None => reference = Some(undelivered(&core)),
             }
         }
     }
@@ -4731,12 +4787,12 @@ mod tests {
         core.write(&data).unwrap();
         core.finish().unwrap();
         assert!(
-            header_window_log(&core.output) < 25,
+            header_window_log(&undelivered(&core)) < 25,
             "no arming below the gate"
         );
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
@@ -4753,10 +4809,13 @@ mod tests {
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fast).workers(4));
         core.write(&data).unwrap();
         core.finish().unwrap();
-        assert!(header_window_log(&core.output) < 25, "random stays stock");
+        assert!(
+            header_window_log(&undelivered(&core)) < 25,
+            "random stays stock"
+        );
         let mut out = vec![0u8; data.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decoder.decode_all(&core.output, &mut out).unwrap();
+        let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
         assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
@@ -4773,14 +4832,18 @@ mod tests {
             core.flush_block();
             core.write(&data[10 * 1024 * 1024..]).unwrap();
             core.finish().unwrap();
-            assert_eq!(header_window_log(&core.output), 26, "engaged stays armed");
+            assert_eq!(
+                header_window_log(&undelivered(&core)),
+                26,
+                "engaged stays armed"
+            );
             let mut out = vec![0u8; data.len()];
             let mut decoder = FrameDecoder::new();
-            let n = decoder.decode_all(&core.output, &mut out).unwrap();
+            let n = decoder.decode_all(&undelivered(&core), &mut out).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]));
             match &reference {
-                Some(bytes) => assert_eq!(&core.output, bytes),
-                None => reference = Some(core.output.clone()),
+                Some(bytes) => assert_eq!(&undelivered(&core), bytes),
+                None => reference = Some(undelivered(&core)),
             }
         }
     }
