@@ -201,6 +201,12 @@ pub(crate) struct FrameEncoderCoreSt {
     /// Consumed prefix of [`Self::staged`]: `staged[staged_start..]` is the
     /// un-emitted input.
     staged_start: usize,
+    /// Whether blocks feed straight into the matcher window's tail instead
+    /// of through `staged`: rows without a pre-split detector, once no head
+    /// gate is pending (see [`FrameEncoderCoreSt::feed_blocks`]).
+    window_feed: bool,
+    /// Bytes fed into the open window tail. Zero between blocks.
+    feed: usize,
     /// Whether the frame's reach probe (see [`reach_probe`]) is still
     /// pending: the first [`reach_probe::PROBE_SPAN`] bytes stage as one
     /// contiguous unit before the first block is matched.
@@ -331,6 +337,8 @@ impl FrameEncoderCoreSt {
             tail: BlockTail::None,
             staged: Vec::with_capacity(MAX_BLOCK_SIZE as usize),
             staged_start: 0,
+            window_feed: false,
+            feed: 0,
             probe_pending: false,
             screen_pending: false,
             open_probe_pending: false,
@@ -507,6 +515,13 @@ impl FrameEncoderCoreSt {
         self.tail = BlockTail::None;
         self.staged.clear();
         self.staged_start = 0;
+        // A row without a pre-split detector feeds the window tail directly;
+        // a pending head gate defers that until it resolves.
+        self.window_feed = !probe_pending
+            && !screen_pending
+            && !open_probe_pending
+            && self.state.matcher.pre_split_effort() == u8::MAX;
+        self.feed = 0;
         self.probe_pending = probe_pending;
         self.screen_pending = screen_pending;
         self.open_probe_pending = open_probe_pending;
@@ -560,6 +575,11 @@ impl FrameEncoderCoreSt {
         self.pos += data.len() as u64;
         let mut data = data;
         while !data.is_empty() {
+            if self.window_feed {
+                self.hand_over_staged_head(!data.is_empty());
+                self.feed_blocks(data);
+                break;
+            }
             // While a staging gate is pending (see reach_probe,
             // far_screen), the frame's bytes hold as one contiguous unit
             // past the block grid before any block is matched: the
@@ -597,6 +617,11 @@ impl FrameEncoderCoreSt {
                     self.drain_full_blocks();
                     self.compact_staged();
                 }
+                // The head is resolved: a row without a pre-split detector
+                // feeds the window tail directly from here on, carrying the
+                // drained head's partial block over (see `feed_blocks`).
+                self.window_feed =
+                    self.window_feed || self.state.matcher.pre_split_effort() == u8::MAX;
             }
             // The pledge is met and every fed byte is staged: the staging
             // loop's emissions cannot know a block is final while `data`
@@ -775,13 +800,19 @@ impl FrameEncoderCoreSt {
         self.screen_pending = false;
         self.drain_full_blocks();
         self.compact_staged();
+        // A window-fed frame's un-emitted bytes sit in the open tail.
+        let pending = if self.window_feed {
+            self.feed
+        } else {
+            self.staged.len() - self.staged_start
+        };
         match self.tail {
             // The pledged grid's final block already carries the last
             // flag.
             BlockTail::Closed => {},
             BlockTail::Open(off)
                 if !staged_head
-                    && self.staged_start == self.staged.len()
+                    && pending == 0
                     && self.blocks > 0
                     && off < self.output.len()
                     && off >= self.out_read =>
@@ -789,9 +820,17 @@ impl FrameEncoderCoreSt {
                 self.output[off] |= 1;
             },
             BlockTail::None | BlockTail::Open(_) => {
-                self.encode_block(true);
+                if self.window_feed {
+                    let n = self.feed;
+                    self.feed = 0;
+                    self.close_tail_block(n, true);
+                } else {
+                    self.encode_block(true);
+                }
             },
         }
+        // The frame is closed: no open tail may outlive it.
+        debug_assert_eq!(self.feed, 0);
         if self.checksum {
             let checksum = self.hasher.finish32();
             self.output.extend_from_slice(&checksum.to_le_bytes());
@@ -823,6 +862,13 @@ impl FrameEncoderCoreSt {
             self.encode_block(false);
         }
         self.compact_staged();
+        if self.feed > 0 {
+            // A window-fed block's un-emitted bytes flush as a short
+            // non-last block, like the staging path's partial tail.
+            let n = self.feed;
+            self.feed = 0;
+            self.close_tail_block(n, false);
+        }
         #[cfg(debug_assertions)]
         {
             vec_poison::fill(&mut self.staged);
@@ -900,6 +946,103 @@ impl FrameEncoderCoreSt {
         tail[..n].copy_from_slice(&self.staged[self.staged_start..self.staged_start + n]);
         self.state.matcher.commit_block(n);
         self.staged_start += n;
+        self.emit_block(n, last);
+    }
+
+    /// Feed `data` straight into the matcher window's block tail, closing
+    /// blocks as they fill: the staging copy and the staging buffer's
+    /// growth and compaction leave the per-block path.
+    ///
+    /// The two closers agree by construction: both take their block length
+    /// from `next_block_len` over `block_size`-wide windows and both commit
+    /// through `commit_block`, so the emitted block is identical and only
+    /// the closing flag differs (the block that consumes the frame's last
+    /// input bytes carries it). `feed` counts the open tail's bytes and
+    /// `staged`/`staged_start` count the staging path's: a frame uses one
+    /// of the two exclusively, never both.
+    fn feed_blocks(&mut self, data: &[u8]) {
+        debug_assert!(self.feed <= self.block_size);
+        let mut data = data;
+        while !data.is_empty() {
+            if self.feed == 0 {
+                let _ = self.state.matcher.block_tail();
+            }
+            let n = (self.block_size - self.feed).min(data.len());
+            let fed = self.feed;
+            {
+                let tail = self.state.matcher.block_tail_open();
+                tail[fed..fed + n].copy_from_slice(&data[..n]);
+            }
+            self.feed += n;
+            data = &data[n..];
+            if self.feed == self.block_size {
+                // The last-block flag belongs to the block that completes
+                // the pledged content, which is the one the frame ends on.
+                let last = self.pledged == Some(self.pos) && data.is_empty();
+                self.close_fed_block(last);
+            }
+        }
+    }
+
+    /// Move a resolved head gate's staged bytes into the window tail, then
+    /// drop the staging buffer: the frame feeds directly from here on.
+    /// `more` marks input the caller still holds, which keeps the closing
+    /// flag off a block that is not the frame's last.
+    fn hand_over_staged_head(&mut self, more: bool) {
+        debug_assert!(self.feed <= self.block_size);
+        while self.staged_start < self.staged.len() {
+            let pending = self.staged.len() - self.staged_start;
+            let n = self
+                .next_block_len()
+                .min(pending)
+                .min(self.block_size - self.feed);
+            if self.feed == 0 {
+                let _ = self.state.matcher.block_tail();
+            }
+            let fed = self.feed;
+            {
+                let tail = self.state.matcher.block_tail_open();
+                let staged = &self.staged[self.staged_start..self.staged_start + n];
+                tail[fed..fed + n].copy_from_slice(staged);
+            }
+            self.staged_start += n;
+            self.feed += n;
+            if self.feed == self.block_size {
+                let last = self.pledged == Some(self.pos)
+                    && !more
+                    && self.staged_start == self.staged.len();
+                self.close_fed_block(last);
+            }
+        }
+        self.compact_staged();
+    }
+
+    /// Close the window tail's full block: commit it and emit it, carrying
+    /// the last-block flag when it completes the pledged content (the
+    /// staging path's closing rule).
+    fn close_fed_block(&mut self, last: bool) {
+        let n = self.feed;
+        self.feed = 0;
+        self.close_tail_block(n, last);
+        if last {
+            self.tail = BlockTail::Closed;
+        }
+    }
+
+    /// Commit `n` bytes written into the open window tail and emit the block.
+    fn close_tail_block(&mut self, n: usize, last: bool) {
+        if n == 0 {
+            // A frame with no input still emits one empty raw block, which
+            // reads the committed space: reserve it like any block's.
+            let _ = self.state.matcher.block_tail();
+        }
+        self.state.matcher.commit_block(n);
+        self.emit_block(n, last);
+    }
+
+    /// Emit the committed `n`-byte block: the whole tail of
+    /// [`Self::encode_block`] past its commit.
+    fn emit_block(&mut self, n: usize, last: bool) {
         if self.blocks == 0 {
             self.output.extend_from_slice(&self.header);
         }

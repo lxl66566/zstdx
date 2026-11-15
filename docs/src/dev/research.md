@@ -453,7 +453,7 @@ Falsifications to dodge. The X2 and X1 loop closures stand, no decode loop moves
 
 ### Follow-up audit
 
-The named follow-ups across the perf and pitfall pages were audited against the negative records. The pitfall page's two-step lever, removing the staged-to-win copies and a persistent hugepage-aligned table slab for the pooled matcher, stays truly open: HugeBuf covers per-allocation TLB backing only, the slab targets the resize_tables transition's physical-frame ecology, and the in-pass collapse reproduced for the eleventh consecutive pass, [workflow](pitfalls/workflow.md). The ZSTDMT serial-state feed, the R89 map's fill levers and the dll-class attempts diet all carry their landed or falsified verdicts and stay closed; the dated mentions that still read open, the whole-loop kernel line in [matchers](perf/matchers.md), the dictionary tree fill in [encoding](perf/encoding.md) and the opt-family swap in the same file, are superseded by their landings and stay as history. The stale session numbers on todo 3 are refreshed to the 2026-11-07 pass this round.
+The named follow-ups across the perf and pitfall pages were audited against the negative records. The pitfall page's two-step lever has its first step landed and its second still open: the staged-to-win block copies leave the fast rows' path, HugeBuf covers per-allocation TLB backing only, so a persistent hugepage-aligned table slab for the pooled matcher stays open, and the in-pass collapse reproduced for the eleventh consecutive pass, [workflow](pitfalls/workflow.md). The ZSTDMT serial-state feed, the R89 map's fill levers and the dll-class attempts diet all carry their landed or falsified verdicts and stay closed; the dated mentions that still read open, the whole-loop kernel line in [matchers](perf/matchers.md), the dictionary tree fill in [encoding](perf/encoding.md) and the opt-family swap in the same file, are superseded by their landings and stay as history. The stale session numbers on todo 3 are refreshed to the 2026-11-07 pass this round.
 
 ## R107 round map
 
@@ -466,3 +466,20 @@ The census table covers dll100 at all four levels and every corpus control, and 
 ### The two-pass packed sequence-table build, landed
 
 Proposal 13's reopening, a packed slot the spread can stage the symbol in without a second store, landed on 2026-11-08 in the reference's own two-pass split. `build_packed_table` spreads each FSE state's symbol into the packed slot's `base` field along the table's position walk, then a second pass reads it back, computes `base_line` and `num_bits` from the hoisted spread constants, folds the code pair in and completes the entry with one store. The `Entry` table, its zero fill and the pack pass leave the sequence path behind `FSETable::read_description` and `set_distribution`, and no `FSEScratch` or `FrameDecoderState` field moved. A full `dll100.zst3` streaming decode reads 2,781,496,177 against 2,742,330,731 Ir, −1.41 percent, the sequence-table chain 167.0M against 137.9M, and the gungraun decode cells read −1.96/−1.83/−1.51/−1.40 percent at dll l1/l3/l9/l19 with random exactly unchanged and zeros −0.11 percent. The two-pass shape pays 2 to 3 percent per entry over the base's build pass where the falsified single-pass fusion paid 29, which is the whole mechanism of the reference's split. The residue is the outlined `hoist_spread_info`, 12.15M Ir the base paid inside its own spread loop; folding it back into the spread loop or staging what it produces in registers is the next reopening. The numbers and the equivalence gate are in [negative decoding](negative/decoding.md).
+
+## R108 round map
+
+### The staged-to-win block copies, landed
+
+The pooled single-threaded streaming core staged each write into `staged` and copied the decided block into the matcher window's tail, up to 128 KiB per block, which the post-transition layout made a 2.95x dearer copy. The core now feeds the window tail directly on every row without a pre-split detector (the fast, dfast, btlazy and opt levels), one copy per input byte instead of two, with a resolved head gate handing its drained head over once and the row and chain rows keeping the staging path whose carry a cut block needs. Byte-identical on the committed tree: the full-ladder bulk dump (30 frames), the full-ladder streaming dump (120 frames) and the 120-cell ratio sweep all diff empty against 22fa6d3e, `mtcheck` over the corpus and the big amp set is ALL OK, 64 corrupt rounds on json.zst3 stay clean, the parity sweep passes at MT 2, 4 and 8, and the debug (549), release (544), paranoid (549) and no-default-features (298) suites are green.
+
+The locked position-alternating A/B on the out-of-tree cell-sequence reproducer, medians of six rounds per arm:
+
+| arm | base 22fa6d3e | r107-d | delta |
+|---|---|---|---|
+| predecessor best/L13, solo | 5252 | 5614 | +6.9 percent |
+| predecessor best/L13, right after the best frame | 4804 | 5026 | +4.6 percent |
+| predecessor fast/L3 (control), solo | 7085 | 7762 | +9.6 percent |
+| predecessor fast/L3 (control), right after | 7064 | 7665 | +8.5 percent |
+
+The control gains as much as the transition arm, so the win is the removed copy and not the transition; the layout penalty itself is unchanged at -27.7 percent against -25.9, and the within-process order effect widens from -8.5 to -11.0 percent. The recorded -23 percent in-pass collapse therefore does not reproduce on this tree, and the out-of-tree reproducer's -8.0 percent same-process reading is the current one; the input copies are gone from the fast row, so the persistent hugepage-aligned table slab is the open lever for that residual. The record is in [encoding](perf/encoding.md); the pitfall row is in [workflow](pitfalls/workflow.md).

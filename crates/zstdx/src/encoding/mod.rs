@@ -310,6 +310,12 @@ pub trait Matcher {
     /// writable slice of the maximum block size. The caller fills in input
     /// data, then hands the filled byte count to [`Matcher::commit_block`].
     fn block_tail(&mut self) -> &mut [u8];
+    /// The tail [`Matcher::block_tail`] reserved, without reserving it
+    /// again: the streaming core fills one block across several calls.
+    /// Owned-window drivers only; the default hands back nothing.
+    fn block_tail_open(&mut self) -> &mut [u8] {
+        &mut []
+    }
     /// Get a reference to the last commited space
     fn get_last_space(&mut self) -> &[u8];
     /// Commit `read` bytes written into the tail from [`Matcher::block_tail`]

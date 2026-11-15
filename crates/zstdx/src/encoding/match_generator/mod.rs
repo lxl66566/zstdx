@@ -3671,6 +3671,15 @@ impl Matcher for MatchGeneratorDriver {
         &mut self.win[old..]
     }
 
+    fn block_tail_open(&mut self) -> &mut [u8] {
+        debug_assert!(self.ext.is_none(), "block_tail is owned-window only");
+        // The reservation contract: a preceding `block_tail` opened this
+        // block's tail and `commit_block` closes it.
+        debug_assert!(self.win.len() >= self.slice_size, "block tail is closed");
+        let old = self.win.len() - self.slice_size;
+        &mut self.win[old..]
+    }
+
     fn get_last_space(&mut self) -> &[u8] {
         &window_slice(&self.win, self.ext.as_ref())[self.idx_of(self.block_start)..]
     }
