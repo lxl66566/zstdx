@@ -33,6 +33,11 @@ harness = false
 name    = "small"
 test    = false
 
+[[bench]]
+harness = false
+name    = "stripfill"
+test    = false
+
 [dependencies]
 # Reference implementation every benchmark compares against; also used by
 # the setup helpers to build interop frames and gate roundtrips.

@@ -3108,10 +3108,18 @@ impl MtEncoderCore {
             // per-start clones stay table-sized either way.
             // At most one publication per lookahead window: the clones
             // are table-sized, so a denser cadence only multiplies memcpy.
+            // Never at `upto == 0`: the builder's LDM state is still
+            // `stale` there (the empty `prefill_window` above restarted
+            // it and no segment has filled since), so a zero-point clone
+            // would capture the pooled predecessor's table — and an
+            // adopter's `restore` swaps that content in without a clear.
+            // A snapshot covering no span shares nothing anyway: the job
+            // that would adopt it takes the stock cold fill instead.
             let fresh = snapshots
                 .last()
                 .is_none_or(|(u, _)| upto - u >= SPF_PUBLISH_LOOK);
             if publish
+                && upto > 0
                 && fresh
                 && starts
                     .iter()

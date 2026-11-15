@@ -2537,6 +2537,94 @@ fn open_balanced_armed_frame_leaves_no_residue_on_the_pooled_core() {
     assert_eq!(again, armed);
 }
 
+/// The far-alive unpledged stream's strip floor (the chain row's
+/// `chain_strip_floor` in the match generator): a hinted l9 stream keeps
+/// its whole-window job strips while the strip's chain grid fill covers
+/// only the reach tail, so the beyond-reach grid positions the fill skips
+/// must stay unobservable through the worker-state pool — the second
+/// in-process encode runs on pooled drivers whose links still hold the
+/// first encode's below-floor slots, and the origin advance must kill
+/// them there exactly as it does within one frame. The fixture keeps the
+/// far class alive (a wide-alphabet head that parses, unit twins at a
+/// 5 MiB lag — beyond the 4 MiB chain reach, so only the strip-riding
+/// LDM can serve them): the far-dead frame must lose those twins and
+/// land larger, which pins that the floor left the LDM ingestion whole.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn far_alive_strip_floor_pool_sequence_roundtrips() {
+    let mib = 1024 * 1024;
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut random = |len: usize| (0..len).map(|_| (rand() & 0xff) as u8).collect::<Vec<_>>();
+    // Head: four mutated copies of a wide-alphabet random span (the
+    // 256 KiB-lag repeats make the head parse, keeping the far class
+    // alive), then five mutated copies of a 5 MiB unit (the beyond-reach
+    // twin class). One mutated byte per 4 KiB keeps every twin real for
+    // the LDM split pass while no copy is byte-exact.
+    let head = random(256 * 1024);
+    let unit = random(5 * mib);
+    let mut data = Vec::with_capacity(4 * head.len() + 5 * unit.len());
+    for (src, copies) in [(&head, 4u32), (&unit, 5u32)] {
+        for copy in 0..copies {
+            for (i, &b) in src.iter().enumerate() {
+                data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+    }
+    let hint = crate::InputShape {
+        len: Some(data.len() as u64),
+        window_log: None,
+    };
+    let encode = |ldm: crate::LdmMode| {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(
+            &mut sink,
+            EncoderOptions::new(Level::from_zstd(9))
+                .workers(16)
+                .with_input_shape(hint)
+                .long_distance_matching(ldm),
+        )
+        .unwrap();
+        write_in_chunks(&data, 128 * 1024, &mut enc);
+        enc.finish().unwrap();
+        sink
+    };
+    // The 26 MiB stream grids into 14 MiB Growing jobs at 16 workers, so
+    // the tail job's strip spans ~14 MiB — well past the 4 MiB reach the
+    // floor rests on, and the finish tail's shared-prefix build runs the
+    // floored continuation fills on the same frame.
+    let alive = encode(crate::LdmMode::Auto);
+    let pooled = encode(crate::LdmMode::Auto);
+    assert_eq!(
+        alive, pooled,
+        "the pooled second encode must repeat the bytes"
+    );
+    assert_eq!(bulk::decompress(&alive, data.len()).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(alive.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data, "libzstd must decode the floored-strip frame");
+    }
+    let dead = encode(crate::LdmMode::Disable);
+    assert_eq!(bulk::decompress(&dead, data.len()).unwrap(), data);
+    assert!(
+        dead.len() > alive.len() + data.len() / 16,
+        "the far-dead frame must lose the beyond-reach twins: {} vs {}",
+        dead.len(),
+        alive.len()
+    );
+}
+
 /// Single-threaded streaming dictionary shape (R50): the unpledged dict
 /// stream keeps the unknown-length row like libzstd's CONTENTSIZE_UNKNOWN
 /// (see the test).

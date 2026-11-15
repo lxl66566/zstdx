@@ -2367,7 +2367,10 @@ impl MatchGeneratorDriver {
     /// The chain row's stride-3 grid fill over `[resume, last)` (see
     /// `prefill_window`'s Chain arm — the same loop, entry point split so
     /// a continuation resumes at the aligned stride position the
-    /// from-scratch pass would next take).
+    /// from-scratch pass would next take). The fill's extent is capped at
+    /// the reach tail below its own end (see [`Self::chain_strip_floor`]):
+    /// a continuation whose resume point already sits inside the tail
+    /// fills only the tail remainder.
     #[cfg(feature = "std")]
     fn chain_grid_fill(&mut self, data: &[u8], base: u64, from: u64, last: usize) {
         let hash_log = self.params.hash_log;
@@ -2379,6 +2382,7 @@ impl MatchGeneratorDriver {
             .saturating_sub(HASH_READ)
             .div_ceil(PREFILL_STRIDE)
             * PREFILL_STRIDE;
+        idx = idx.max(self.chain_strip_floor(last));
         let origin = self.head_origin;
         while idx < last {
             // The grid keeps the stock 5-byte head hash (hash_at_log's
@@ -2398,6 +2402,28 @@ impl MatchGeneratorDriver {
         // adopters run fills without scanning): fold its extent into the
         // origin's write mark.
         self.strip_mark = self.strip_mark.max(base + last as u64);
+    }
+
+    /// The stride-aligned start index below which a chain-row strip fill
+    /// skips grid positions: the walk admits a candidate only within
+    /// `chain_reach` of the scan position (`chain_search`'s `reach`, the
+    /// same bound the far-dead strip cap rests on), and heads are
+    /// newest-wins, so positions further below the fill's end than the
+    /// reach are unobservable — a head there breaks the walk at its first
+    /// distance check exactly like the stale or empty slot the tail fill
+    /// leaves behind, and a tail entry's link into the skipped region
+    /// resolves against one more dead candidate before the same break
+    /// (stale slots die absolutely: `dist >= pos + 2` past the origin
+    /// advance). The observable table state — heads and within-reach
+    /// chains over the tail — is bit-identical to the full-strip fill's,
+    /// so the parse bytes cannot move. `last` is the fill's insert bound
+    /// (the job start's HASH_READ margin, or a builder segment's freeze),
+    /// keeping the cap local to each fill: a segment or adopter
+    /// continuation shorter than the reach fills whole, and any job's
+    /// within-reach span is always covered by its own fill's tail.
+    fn chain_strip_floor(&self, last: usize) -> usize {
+        let reach = self.params.chain_reach.unwrap_or(self.params.window);
+        last.saturating_sub(reach).div_ceil(PREFILL_STRIDE) * PREFILL_STRIDE
     }
 
     pub fn prefill_window(&mut self, data: &[u8], base: u64) {
@@ -2828,7 +2854,17 @@ impl MatchGeneratorDriver {
                     }
                     heads.put(h0, pack_head(newest, origin));
                 } else {
-                    let mut idx = 0;
+                    // Strip grids start at the reach tail
+                    // (`chain_strip_floor`): the whole-window streaming
+                    // strip's beyond-reach positions are unobservable, so
+                    // the fill skips them. Dictionary grids keep every
+                    // position (dense links, stride 1) — a small payload's
+                    // parse rides the chain walk through the content.
+                    let mut idx = if grid == FillGrid::Strip {
+                        self.chain_strip_floor(last)
+                    } else {
+                        0
+                    };
                     while idx < last {
                         insert_linked_at(
                             data,

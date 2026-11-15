@@ -299,6 +299,12 @@ ST 流核心 finish 的 `BlockTail::Open(off)` 补丁分支只检查了 `off < s
 
 ## Checksums and streaming
 
+### Snapshots must capture filled state
+
+`build_spf`'s first publication could fire at `upto == 0`, before any `strip_fill_segment` had run. The builder's opening `prefill_window(&[], 0)` only restarts the LDM state — `stale = true`, no fill, table content still the pooled predecessor's — and `LdmState::snapshot` clones that table wholesale. An adopter's `restore` then swaps the stale content in and clears the `stale` flag, so the job's LDM table carried another frame's entries with no clear ever running. The debug assert on `snapshot` caught it once a far-alive regression test produced a finish tail whose first prefix job started inside the publication lookahead; release builds ran the same path silently, and whether the stale entries died by the offset filters was an accident of content.
+
+The rule: a snapshot is only legal over a state that has actually filled past the point it claims. Publication now requires `upto > 0`, which is also the honest schedule — a zero-point snapshot shares no filled span, and the job that would have adopted it takes the stock cold fill, whose restart clear is the only provably residue-free base.
+
 ### Single-producer rings
 
 "Single producer" means single thread, not single frame. Nested and overlapping frames, from reentrant compression or two-frame same-thread tests, interleave into the same ring. Any scheme that caches the next sequence starting point at frame creation lets two live frames claim the same sequence and overwrite each other, and the inner reset gets clobbered, the worker panics out of bounds, and the main thread spins forever in `FinishCell` while pegging all cores.
