@@ -107,6 +107,10 @@ struct FrameDecoderState {
     /// dictionary takes over mid-frame (force_dict), whose pending bytes
     /// are dropped along with the decoder state.
     flat_active: bool,
+    /// Frame output the flat path produced before a force_dict takeover:
+    /// the ring's own counter starts at zero, so the frame-level size and
+    /// checksum checks must add this baseline.
+    ring_output_baseline: u64,
     frame_finished: bool,
     block_counter: usize,
     bytes_read_counter: u64,
@@ -154,6 +158,7 @@ impl FrameDecoderState {
             decoder_scratch: DecoderScratch::new(window_size as usize),
             flat: FlatOut::new(),
             flat_active: true,
+            ring_output_baseline: 0,
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
@@ -179,6 +184,7 @@ impl FrameDecoderState {
         // `reset()`'s caller re-establishes the dict prefill when the next
         // frame carries a dictionary.
         self.flat_active = true;
+        self.ring_output_baseline = 0;
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
@@ -196,6 +202,18 @@ impl FrameDecoderState {
             .descriptor
             .declares_content_size()
             .then(|| self.frame_header.frame_content_size())
+    }
+
+    /// The frame's decoded output so far on the active path. The ring path
+    /// adds the flat bytes a force_dict takeover orphaned, which the ring's
+    /// counter never saw; without the baseline a pledged frame would be
+    /// falsely rejected at the FCS check.
+    fn produced_output(&self) -> u64 {
+        if self.flat_active {
+            self.flat.produced() as u64
+        } else {
+            self.ring_output_baseline + self.decoder_scratch.buffer.total_output()
+        }
     }
 
     /// Route a dictionary frame through the flat buffer: the dict's raw
@@ -399,6 +417,10 @@ impl FrameDecoder {
             // (it holds the dict content directly). The ring's window-sized
             // reserve lives here — its activation point — so a reset that
             // never leaves the flat path allocates nothing for the ring.
+            // The flat bytes already produced stay counted for the frame's
+            // size and checksum checks via the baseline; the ring's own
+            // counter starts at zero.
+            state.ring_output_baseline = state.flat.produced() as u64;
             state.flat_active = false;
             let window = state.decoder_scratch.buffer.window_size;
             state.decoder_scratch.buffer.reserve(window);
@@ -513,7 +535,7 @@ impl FrameDecoder {
 
             if block_header.last_block {
                 state.frame_finished = true;
-                state.verify_content_size(state.decoder_scratch.buffer.total_output())?;
+                state.verify_content_size(state.produced_output())?;
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     source
@@ -645,7 +667,7 @@ impl FrameDecoder {
 
             if block_header.last_block {
                 state.frame_finished = true;
-                state.verify_content_size(state.flat.produced() as u64)?;
+                state.verify_content_size(state.produced_output())?;
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     source
@@ -1012,7 +1034,7 @@ impl FrameDecoder {
 
                         if block_header.last_block {
                             state.frame_finished = true;
-                            state.verify_content_size(state.flat.produced() as u64)?;
+                            state.verify_content_size(state.produced_output())?;
                             if state.frame_header.descriptor.content_checksum_flag()
                                 && mt_source.len() >= 4
                             {
@@ -1065,8 +1087,7 @@ impl FrameDecoder {
 
                         if block_header.last_block {
                             state.frame_finished = true;
-                            state
-                                .verify_content_size(state.decoder_scratch.buffer.total_output())?;
+                            state.verify_content_size(state.produced_output())?;
                             if state.frame_header.descriptor.content_checksum_flag() {
                                 // if there are enough bytes handle this here. Else the block at the
                                 // start of this function will handle it at the next call
@@ -1278,6 +1299,116 @@ mod tests {
             .unwrap();
         assert!(dec.is_finished());
         assert!(dec.collect().unwrap().is_empty());
+    }
+
+    /// A pledged frame split by a mid-frame `force_dict` takeover: the flat
+    /// bytes produced before the takeover must stay counted, so the frame's
+    /// FCS check passes once the ring path finishes the rest. The blocks
+    /// after the takeover point carry no match sources, which the empty
+    /// ring cannot serve (an inherent takeover limitation, out of scope
+    /// here).
+    #[test]
+    fn mid_frame_takeover_counts_flat_output_for_fcs() {
+        use std::io::Cursor;
+
+        const PLEDGED: usize = 300_000;
+        let raw: Vec<u8> = (0..PLEDGED).map(|i| (i % 251) as u8).collect();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0xfd2f_b528u32.to_le_bytes());
+        frame.push(0x80); // 4-byte FCS, no single segment / checksum / dict
+        frame.push(0x38); // window log 17
+        frame.extend_from_slice(&(PLEDGED as u32).to_le_bytes());
+        let raw_block = |out: &mut Vec<u8>, body: &[u8], last: bool| {
+            let header = ((body.len() as u32) << 3) | u32::from(last);
+            out.extend_from_slice(&header.to_le_bytes()[..3]);
+            out.extend_from_slice(body);
+        };
+        raw_block(&mut frame, &raw[..131_072], false);
+        // RLE block (type 1) for 500 bytes.
+        let header = (500u32 << 3) | (1 << 1);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.push(0x77);
+        // Raw blocks cap at 128 KiB: split the 168428-byte tail.
+        raw_block(&mut frame, &raw[131_572..262_644], false);
+        raw_block(&mut frame, &raw[262_644..], true);
+
+        // The payload this frame represents: the RLE block stands in for
+        // its own 500 bytes.
+        let mut payload = raw[..131_072].to_vec();
+        payload.extend_from_slice(&[0x77u8; 500]);
+        payload.extend_from_slice(&raw[131_572..]);
+        assert_eq!(payload.len(), PLEDGED);
+
+        // Control: without a takeover the whole frame decodes flat.
+        let mut dec = FrameDecoder::new();
+        let mut src = Cursor::new(frame.clone());
+        dec.reset(&mut src).unwrap();
+        assert!(
+            dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+                .unwrap()
+        );
+        assert_eq!(dec.collect().unwrap(), payload);
+
+        // Takeover after the first block: flat produced 131072, the ring
+        // finishes the rest, and the pledged size must verify.
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(dict_with_id()).unwrap();
+        let mut src = Cursor::new(frame);
+        dec.reset(&mut src).unwrap();
+        dec.decode_blocks(&mut src, BlockDecodingStrategy::UptoBlocks(1))
+            .unwrap();
+        dec.force_dict(0x42).unwrap();
+        assert!(
+            dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+                .unwrap(),
+            "the frame must finish past the takeover"
+        );
+        assert!(dec.is_finished());
+    }
+
+    /// The takeover's dropped history surfaces as a decode or checksum
+    /// error, never as a false `Frame_Content_Size` mismatch: the size
+    /// check counts the flat baseline plus the ring output.
+    #[test]
+    fn mid_frame_takeover_never_blames_the_pledge() {
+        use std::io::Cursor;
+
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let frame = crate::bulk::compress_with(
+            &payload,
+            &crate::EncoderOptions::new(crate::Level::Fastest)
+                .pledged_size(Some(payload.len() as u64)),
+        )
+        .unwrap();
+
+        // Control: intact frame, no takeover.
+        let mut dec = FrameDecoder::new();
+        let mut src = Cursor::new(frame.clone());
+        dec.reset(&mut src).unwrap();
+        assert!(
+            dec.decode_blocks(&mut src, BlockDecodingStrategy::All)
+                .unwrap()
+        );
+        assert_eq!(dec.collect().unwrap(), payload);
+
+        // Takeover after the first block: matches into the dropped history
+        // may corrupt or fail, but the pledged size itself must not be
+        // blamed for them.
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(dict_with_id()).unwrap();
+        let mut src: &[u8] = &frame;
+        dec.reset(&mut src).unwrap();
+        dec.decode_blocks(&mut src, BlockDecodingStrategy::UptoBlocks(1))
+            .unwrap();
+        dec.force_dict(0x42).unwrap();
+        let err = dec
+            .decode_blocks(&mut src, BlockDecodingStrategy::All)
+            .unwrap_err();
+        let text = alloc::format!("{err}");
+        assert!(
+            !text.contains("Frame_Content_Size"),
+            "the pledge must not be blamed: {text}"
+        );
     }
 
     /// The FHD reserved bit (bit 3) is rejected with libzstd parity, while

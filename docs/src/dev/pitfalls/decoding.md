@@ -275,6 +275,8 @@ Every frame-finish point now verifies its output count against the declared size
 
 The MT executor never sees a frame tail, so `scan` records every frame's pledge in `ScanPlan::frame_pledges`, and both executors verify each frame's executed span after execution. The piece winner path is exact by construction, because its pieces tile the pledge and a mismatched pledge kills every grid before the fallback. The pledge check runs before the checksum comparison to preserve the sequential paths' error precedence.
 
+The count also has to survive a mid-frame path switch: a `force_dict` takeover moves the frame from the flat counter to the ring counter, and the ring starts at zero. Without recording the flat bytes as a baseline at the takeover, an intact pledged frame was rejected with the full pledge missing exactly the pre-takeover output.
+
 ### Streaming generation shortcut
 
 With a known FCS, the whole frame already in the input and enough output room, libzstd's streaming call becomes a one-shot pass through `zdss_loadHeader` and `ZSTD_decompress_usingDDict`, and it accepts out-of-window offsets. `pledged_w10_f60015_o50000` accepts under a 64 KiB-out streaming call and rejects under a 4 KiB-out call.
