@@ -2400,9 +2400,10 @@ fn reach_probe_stream_roundtrips() {
             assert_eq!(decoded, data, "{label}: libzstd must decode");
         }
     }
-    // Unpledged and unflushed: the probe never engages (no staged head),
-    // the stream still must roundtrip; an explicit flush mid-head cancels
-    // the pending probe the same way.
+    // Unpledged and unflushed: the open gate fires at PROBE_MIN_FRAME
+    // streamed bytes and the verdicts run, so the stream must roundtrip
+    // whichever way they land; an explicit flush mid-head cancels the
+    // pending gate the same way.
     let mut sink = Vec::new();
     let mut enc =
         write::Encoder::with_options(&mut sink, EncoderOptions::new(Level::Balanced)).unwrap();
@@ -2420,6 +2421,120 @@ fn reach_probe_stream_roundtrips() {
     write_in_chunks(&data[1024 * 1024..], 512 * 1024, &mut enc);
     enc.finish().unwrap();
     assert_eq!(bulk::decompress(&sink, len).unwrap(), data);
+}
+
+/// The balanced row's head verdicts on the open single-threaded stream
+/// core (see `encoding::reach_probe`): a hint-less stream holds its
+/// staged blocks until the probe's minimum frame has streamed, then
+/// resolves both verdicts over the staged head. The frame bytes stay a
+/// pure function of the input whichever way the verdicts land, however
+/// the writes are chunked across the gate.
+#[test]
+fn open_balanced_head_verdicts_are_chunk_independent() {
+    let gate = encoding::reach_probe::PROBE_MIN_FRAME as usize;
+    let data = near_local(gate + 1024 * 1024);
+    let mut sink = Vec::new();
+    let mut enc = write::Encoder::new(&mut sink, Level::Balanced).unwrap();
+    enc.write_all(&data).unwrap();
+    enc.finish().unwrap();
+    let reference = sink;
+    for chunk in [64 * 1024, 333 * 1024 + 7, 3 * 1024 * 1024] {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::new(&mut sink, Level::Balanced).unwrap();
+        write_in_chunks(&data, chunk, &mut enc);
+        enc.finish().unwrap();
+        assert_eq!(sink, reference, "chunk {chunk}");
+    }
+    assert_eq!(bulk::decompress(&reference, data.len()).unwrap(), data);
+}
+
+/// A stream ending below the open gate keeps the stock bytes: the gate
+/// deferred the whole frame's emissions to finish, and the closing shape
+/// must still match the one-shot's, both the exact block grid's empty
+/// closing block and the ragged tail's partial last block.
+#[test]
+fn open_balanced_finish_before_gate_keeps_stock_bytes() {
+    let mib = 1024 * 1024;
+    for len in [4 * mib, 4 * mib + 123 * 1024] {
+        let data = near_local(len);
+        let stock = encoding::compress_to_vec(data.as_slice(), Level::Balanced);
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::new(&mut sink, Level::Balanced).unwrap();
+        write_in_chunks(&data, 128 * 1024, &mut enc);
+        enc.finish().unwrap();
+        assert_eq!(sink, stock, "len {len}");
+    }
+}
+
+/// A flush before the open gate cancels both verdicts: the staged prefix
+/// drains at the stock reach and the frame keeps the one-shot stock
+/// bytes. The fixture's narrow alphabet skips the pre-split detector, so
+/// a flush landing on the block grid keeps the stock block grid. Unflushed
+/// past the gate, the verdicts move the frame off the stock bytes, which
+/// is the pin that the flush is what kept them.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn open_balanced_flush_before_gate_keeps_stock_bytes() {
+    let gate = encoding::reach_probe::PROBE_MIN_FRAME as usize;
+    let data = jsonish(gate + 123 * 1024);
+    let stock = encoding::compress_to_vec(data.as_slice(), Level::Balanced);
+    let mib = 1024 * 1024;
+    let mut sink = Vec::new();
+    let mut enc = write::Encoder::new(&mut sink, Level::Balanced).unwrap();
+    write_in_chunks(&data[..4 * mib], 128 * 1024, &mut enc);
+    enc.flush().unwrap();
+    write_in_chunks(&data[4 * mib..], 333 * 1024 + 7, &mut enc);
+    enc.finish().unwrap();
+    assert_eq!(sink, stock);
+    let mut sink = Vec::new();
+    let mut enc = write::Encoder::new(&mut sink, Level::Balanced).unwrap();
+    write_in_chunks(&data, 333 * 1024 + 7, &mut enc);
+    enc.finish().unwrap();
+    assert_ne!(sink, stock, "the armed frame must leave the stock bytes");
+    assert_eq!(bulk::decompress(&sink, data.len()).unwrap(), data);
+}
+
+/// The armed open frame's pooled-core residue contract: the probe's
+/// verdict must not carry onto a later frame on the pooled
+/// single-threaded core — a Shrink off an armed open frame would collapse
+/// a later best-tier frame's tree domain (the shrink-residue class), and
+/// a verdict leaking onto a later open stream is the dump-stream
+/// nondeterminism class. A spawned thread's fresh pool is the reference.
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn open_balanced_armed_frame_leaves_no_residue_on_the_pooled_core() {
+    let gate = encoding::reach_probe::PROBE_MIN_FRAME as usize;
+    let shrink = jsonish(gate + 512 * 1024);
+    let open = |data: &[u8], level: Level| {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::new(&mut sink, level).unwrap();
+        write_in_chunks(data, 256 * 1024, &mut enc);
+        enc.finish().unwrap();
+        sink
+    };
+    // The armed frame: the gate fired and the probe moved the frame off
+    // the stock parse (the shrink class).
+    let armed = open(&shrink, Level::Balanced);
+    let stock = encoding::compress_to_vec(shrink.as_slice(), Level::Balanced);
+    assert_ne!(armed, stock);
+    // The core sat in the thread-local pool at the closure's drop. The
+    // later best-tier frame must parse exactly as a fresh core's, and so
+    // must a later open balanced frame on the same pooled core.
+    let best = jsonish(512 * 1024 + 123);
+    let pooled_best = open(&best, Level::Best);
+    let fresh_best = std::thread::spawn(move || open(&best, Level::Best))
+        .join()
+        .unwrap();
+    assert_eq!(
+        pooled_best, fresh_best,
+        "a best-tier frame after an armed frame"
+    );
+    let again = open(&shrink, Level::Balanced);
+    let fresh_again = std::thread::spawn(move || open(&shrink, Level::Balanced))
+        .join()
+        .unwrap();
+    assert_eq!(again, fresh_again, "an open frame after an armed frame");
+    assert_eq!(again, armed);
 }
 
 /// Single-threaded streaming dictionary shape (R50): the unpledged dict

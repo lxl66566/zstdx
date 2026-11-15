@@ -402,6 +402,13 @@ pub trait Matcher {
     /// first block is matched, with at least the probe's span of head bytes
     /// staged. The default keeps the level's stock reach.
     fn consider_reach_probe(&mut self, _head: &[u8], _level: Level) {}
+    /// [`Matcher::consider_reach_probe`] on a frame the caller already
+    /// cleared through the probe's size gate (see
+    /// `match_generator::reach_probe::probe_staged`): an open stream's
+    /// core reaches the probe's span only after the frame's own minimum
+    /// size has streamed, so no declared length exists to re-check. The
+    /// default keeps the level's stock reach.
+    fn consider_reach_probe_staged(&mut self, _head: &[u8], _level: Level) {}
     /// Donation-mode hooks for [`Matcher::consider_reach_probe`]'s frame
     /// (see `reach_probe`): `begin_probe_stats` arms a cost accumulation
     /// fed by the matcher's own parses, `take_probe_cost` returns the

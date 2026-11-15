@@ -5,8 +5,12 @@
 //! instead of pulling from a [`Read`]: [`FrameEncoderCore::write`] stages
 //! bytes, full blocks are committed and encoded as they fill, and
 //! [`FrameEncoderCore::finish`] emits the last block plus checksum. With no
-//! intermediate flushes the output is byte-identical to
-//! [`encoding::compress`] over the same bytes.
+//! intermediate flushes the output matches [`encoding::compress`] over the
+//! same bytes, and the one divergence class is a hint-less balanced-row
+//! stream that clears [`reach_probe::PROBE_MIN_FRAME`] streamed bytes: the
+//! core then runs the row's head verdicts (see
+//! [`FrameEncoderCoreSt::resolve_head_verdicts`]) and the frame carries
+//! their bytes while the one-shot keeps the stock parse.
 
 use alloc::vec::Vec;
 
@@ -207,6 +211,13 @@ pub(crate) struct FrameEncoderCoreSt {
     /// screen's verdict re-derives the frame's arming (and header) before
     /// the first block emits.
     screen_pending: bool,
+    /// Whether the balanced row's open-stream gate (see [`reach_probe`])
+    /// is still pending: a hint-less stream holds its staged blocks until
+    /// [`reach_probe::PROBE_MIN_FRAME`] bytes have streamed — the mt
+    /// core's own holding rule — then resolves the row's head verdicts
+    /// over the staged head and drains. A flush or finish below the gate
+    /// cancels it back to the stock parse.
+    open_probe_pending: bool,
     /// Encoded bytes not yet consumed by the enclosing encoder, starting
     /// with the frame header before the first block. `out_read` is the
     /// consumed prefix: serving reads advances the cursor instead of
@@ -322,6 +333,7 @@ impl FrameEncoderCoreSt {
             staged_start: 0,
             probe_pending: false,
             screen_pending: false,
+            open_probe_pending: false,
             output: Vec::with_capacity(MAX_BLOCK_SIZE as usize + 64),
             out_read: 0,
             blocks: 0,
@@ -450,6 +462,20 @@ impl FrameEncoderCoreSt {
             && reach_probe::eligible(options.level, crate::InputShape { len, window_log });
         let screen_pending = dict.is_none()
             && fast_row_screen_pending(options.level, crate::InputShape { len, window_log });
+        // The open hint-less stream's own gate: no declared length exists
+        // to clear the probe's size bar, so the frame holds its staged
+        // blocks until [`reach_probe::PROBE_MIN_FRAME`] bytes have streamed
+        // (the mt core's own rule) and the row's head verdicts resolve over
+        // the staged head then, a stream ending or flushing below the gate
+        // keeping the stock bytes. A hinted stream of the bar or above
+        // arms through `eligible` above instead, and a smaller hint never
+        // arms at all.
+        let open_probe_pending = dict.is_none()
+            && len.is_none()
+            && MatchGeneratorDriver::reach_probe_eligible(options.level, crate::InputShape {
+                len,
+                window_log,
+            });
         // libzstd's frame-header shape: a pledged size the window already
         // covers drops the window descriptor for the single-segment form
         // (ZSTD_writeFrameHeader's `contentSizeFlag && windowSize >=
@@ -483,6 +509,7 @@ impl FrameEncoderCoreSt {
         self.staged_start = 0;
         self.probe_pending = probe_pending;
         self.screen_pending = screen_pending;
+        self.open_probe_pending = open_probe_pending;
         // A pending gate stages its whole span through `staged` before the
         // first block emits; reserving the span up front keeps the
         // amortized growth's realloc copies (about the span itself per
@@ -493,6 +520,8 @@ impl FrameEncoderCoreSt {
             self.staged.reserve(far_screen::SCREEN_SPAN);
         } else if probe_pending {
             self.staged.reserve(reach_probe::PROBE_SPAN);
+        } else if open_probe_pending {
+            self.staged.reserve(reach_probe::PROBE_MIN_FRAME as usize);
         }
         self.output.clear();
         self.out_read = 0;
@@ -531,11 +560,15 @@ impl FrameEncoderCoreSt {
         self.pos += data.len() as u64;
         let mut data = data;
         while !data.is_empty() {
-            // While the reach probe is pending (see reach_probe), the
-            // frame's first PROBE_SPAN bytes stage as one contiguous unit —
-            // the probe parses them as a whole before any block is matched.
+            // While a staging gate is pending (see reach_probe,
+            // far_screen), the frame's bytes hold as one contiguous unit
+            // past the block grid before any block is matched: the
+            // probe's head span, the screen's span, or the open stream's
+            // own gate at PROBE_MIN_FRAME streamed bytes.
             let limit = if self.probe_pending {
                 reach_probe::PROBE_SPAN
+            } else if self.open_probe_pending {
+                reach_probe::PROBE_MIN_FRAME as usize
             } else if self.screen_pending {
                 far_screen::SCREEN_SPAN
             } else {
@@ -546,35 +579,10 @@ impl FrameEncoderCoreSt {
             self.staged.extend_from_slice(&data[..n]);
             data = &data[n..];
             if self.staged.len() - self.staged_start == limit {
-                if self.probe_pending {
-                    let head = &self.staged[self.staged_start..];
-                    // The probe's staging gate doubles as the storage
-                    // verdict's window: a wide level-9 head behind the
-                    // probe's size bar takes the row twin and skips the
-                    // reach probe (a chain-row experiment) outright.
-                    let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
-                    let bal_row = self.level.as_i32() == 9
-                        && matches!(self.pledged, Some(n) if n >= reach_probe::PROBE_MIN_FRAME)
-                        && balanced_store(&head[..span]) != BalancedStore::Chain;
-                    if bal_row {
-                        // A substituted frame keeps the stock reach, and
-                        // it must re-declare it: the pooled core carries
-                        // `reach_choice` across frames (the probe's own
-                        // contract), so skipping the probe would hand the
-                        // next chain frame whatever verdict an earlier
-                        // frame left (a json Shrink collapses a later
-                        // skewed frame's domain). The row twin ignores the
-                        // choice in its own apply, so the order is free.
-                        self.state
-                            .matcher
-                            .set_reach_choice(reach_probe::ReachChoice::Keep);
-                        self.state
-                            .matcher
-                            .consider_balanced_store(&head[..span], self.level);
-                    } else {
-                        self.state.matcher.consider_reach_probe(head, self.level);
-                    }
+                if self.probe_pending || self.open_probe_pending {
+                    self.resolve_head_verdicts(self.open_probe_pending);
                     self.probe_pending = false;
+                    self.open_probe_pending = false;
                 }
                 if self.screen_pending {
                     self.resolve_far_screen();
@@ -631,6 +639,52 @@ impl FrameEncoderCoreSt {
         if self.staged_start > 0 {
             self.staged.drain(..self.staged_start);
             self.staged_start = 0;
+        }
+    }
+
+    /// The balanced row's staging gate fired (the frame's head sits
+    /// staged whole at `staged`'s start): resolve the row's two head
+    /// verdicts over it exactly as the bulk slice path does. The frame's
+    /// first [`reach_probe::PROBE_SPAN`] bytes are the head both verdicts
+    /// read — the declared-length gate stages exactly that span, and the
+    /// open gate holds the streamed minimum whose first span it is.
+    /// `streamed` marks the open gate, whose size bar is the streamed
+    /// span itself rather than a declaration: the storage verdict's bar
+    /// clears with it, and the probe runs the caller-size-gated entry
+    /// because the frame's shape carries no length.
+    fn resolve_head_verdicts(&mut self, streamed: bool) {
+        debug_assert!(self.staged.len() - self.staged_start >= reach_probe::PROBE_SPAN);
+        let head = &self.staged[self.staged_start..self.staged_start + reach_probe::PROBE_SPAN];
+        // The probe's staging gate doubles as the storage verdict's
+        // window: a wide level-9 head behind the probe's size bar takes
+        // the row twin and skips the reach probe (a chain-row experiment)
+        // outright.
+        let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
+        let size_bar =
+            streamed || matches!(self.pledged, Some(n) if n >= reach_probe::PROBE_MIN_FRAME);
+        let bal_row = self.level.as_i32() == 9
+            && size_bar
+            && balanced_store(&head[..span]) != BalancedStore::Chain;
+        if bal_row {
+            // A substituted frame keeps the stock reach, and it must
+            // re-declare it: the pooled core carries `reach_choice`
+            // across frames (the probe's own contract), so skipping the
+            // probe would hand the next chain frame whatever verdict an
+            // earlier frame left (a json Shrink collapses a later skewed
+            // frame's domain). The row twin ignores the choice in its own
+            // apply, so the order is free.
+            self.state
+                .matcher
+                .set_reach_choice(reach_probe::ReachChoice::Keep);
+            self.state
+                .matcher
+                .consider_balanced_store(&head[..span], self.level);
+        } else if streamed {
+            self.state
+                .matcher
+                .consider_reach_probe_staged(head, self.level);
+        } else {
+            self.state.matcher.consider_reach_probe(head, self.level);
         }
     }
 
@@ -708,15 +762,16 @@ impl FrameEncoderCoreSt {
         // shorter); an eagerly drained consumer that already took those
         // bytes keeps the empty-block form.
         //
-        // A still-pending probe or screen means the frame never staged its
+        // A still-pending staging gate means the frame never staged its
         // head (a short input or an early finish): the stock frame stays,
         // in the eagerly drained closing form too — the staging window
         // deferred this frame's emissions to finish, but the one-shot Vec
         // output an unpledged stream must match carries the empty closing
         // block on the exact grid multiple, so the in-place patch is not
         // taken (below the gate the stream is byte-identical to stock).
-        let staged_head = self.probe_pending || self.screen_pending;
+        let staged_head = self.probe_pending || self.open_probe_pending || self.screen_pending;
         self.probe_pending = false;
+        self.open_probe_pending = false;
         self.screen_pending = false;
         self.drain_full_blocks();
         self.compact_staged();
@@ -759,10 +814,10 @@ impl FrameEncoderCoreSt {
             vec_poison::assert(&self.staged, "st core staged (flush entry)");
             vec_poison::assert(&self.output, "st core output (flush entry)");
         }
-        // A flush inside the probe's or the screen's staging window cancels
-        // it (the stock reach/frame stays) and emits the staged head block
-        // by block.
+        // A flush inside a staging window cancels it (the stock
+        // reach/frame stays) and emits the staged head block by block.
         self.probe_pending = false;
+        self.open_probe_pending = false;
         self.screen_pending = false;
         while self.staged_start < self.staged.len() {
             self.encode_block(false);

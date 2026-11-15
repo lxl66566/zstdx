@@ -1056,6 +1056,22 @@ impl MatchGeneratorDriver {
         self.reach_choice = choice;
     }
 
+    /// Apply a reach verdict taken before the frame's first block: no
+    /// block has been matched yet, so re-deriving the params is the whole
+    /// state change, and the tables' sizes are reach-independent. A
+    /// shrunk frame disarms the cold-start head here too (the reset path
+    /// checks the same condition at arm time).
+    fn apply_reach_choice(&mut self, choice: ReachChoice, level: Level) {
+        if choice == self.reach_choice {
+            return;
+        }
+        self.reach_choice = choice;
+        self.apply_level(level);
+        if choice == ReachChoice::Shrink && self.dubt_head == HeadPhase::Armed {
+            self.dubt_head = HeadPhase::Off;
+        }
+    }
+
     /// The current reach verdict; reads the pooled-residue contract in
     /// tests (see `stream::encoder_core`'s pool round-trip test).
     #[cfg(all(test, feature = "std"))]
@@ -3430,17 +3446,17 @@ impl Matcher for MatchGeneratorDriver {
 
     fn consider_reach_probe(&mut self, head: &[u8], level: Level) {
         let choice = super::reach_probe::probe_reach_choice(head, level, self.shape);
-        if choice != self.reach_choice {
-            self.reach_choice = choice;
-            // No block has been matched yet, so re-deriving the params is
-            // the whole state change; the tables' sizes are
-            // reach-independent. A shrunk frame disarms the head here too
-            // (the reset path checks the same condition at arm time).
-            self.apply_level(level);
-            if choice == ReachChoice::Shrink && self.dubt_head == HeadPhase::Armed {
-                self.dubt_head = HeadPhase::Off;
-            }
-        }
+        self.apply_reach_choice(choice, level);
+    }
+
+    /// [`Self::consider_reach_probe`] on a frame the caller already
+    /// cleared through the probe's size gate (see
+    /// `reach_probe::probe_staged`): an open stream's core reaches the
+    /// probe's span only after the frame's own minimum size has streamed,
+    /// so no declared length exists to re-check.
+    fn consider_reach_probe_staged(&mut self, head: &[u8], level: Level) {
+        let choice = super::reach_probe::probe_staged(head, level, self.shape);
+        self.apply_reach_choice(choice, level);
     }
 
     /// See the inherent [`MatchGeneratorDriver::load_dictionary`] — the

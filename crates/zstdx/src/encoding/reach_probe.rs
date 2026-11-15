@@ -30,10 +30,13 @@
 //! worker at its gate (a pledge gates at construction, an open-ended
 //! stream at [`PROBE_MIN_FRAME`] streamed bytes; a stream that ends or
 //! flushes before the gate keeps the stock reach). The single-threaded
-//! stream cores keep the stock throwaway probe or none (unpledged blocks
-//! flow at block size — staging a head there withholds output from
-//! small-pull consumers); dictionary frames probe nothing (their history
-//! needs the reach it has).
+//! stream cores run the stock throwaway probe on a staged head: the
+//! pledged or hinted core stages the head at [`PROBE_SPAN`], and the open
+//! hint-less core holds its staged blocks until [`PROBE_MIN_FRAME`] bytes
+//! have streamed (the mt core's own rule) before staging the head, a
+//! stream ending or flushing below the gate keeping the stock bytes.
+//! Dictionary frames probe nothing (their history needs the reach it
+//! has).
 
 use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "std")]
@@ -355,10 +358,11 @@ pub(crate) fn probe_reach_choice(head: &[u8], level: Level, shape: InputShape) -
 }
 
 /// [`probe_reach_choice`] on a frame the caller already size-gated: the
-/// stream-mt core stages its own head (a pledge clears the size gate at
+/// stream cores stage their own heads (a pledge clears the size gate at
 /// construction, an open-ended stream at [`PROBE_MIN_FRAME`] streamed
-/// bytes — see its notes), so only the span check remains. A head below
-/// the span keeps the stock reach.
+/// bytes — the mt core's holding rule and the single-threaded core's
+/// open gate), so only the span check remains. A head below the span
+/// keeps the stock reach.
 pub(crate) fn probe_staged(head: &[u8], level: Level, shape: InputShape) -> ReachChoice {
     if head.len() < PROBE_SPAN {
         return ReachChoice::Keep;
