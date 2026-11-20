@@ -544,13 +544,15 @@ pub(crate) struct StripSnapshot {
 /// population of [`MatchGeneratorDriver::prefix_ldm_window`]): the LDM
 /// table after a sequential fill of `[0, upto)` stopped at a batch-freeze
 /// point. A windowed job adopts it and continues the fill to its own
-/// start — and the adoption is byte-invariant in `upto`: a freeze-point
-/// continuation is exact, so restoring any snapshot with `upto <= start`
-/// and filling the remainder produces the same usable candidates as the
-/// from-scratch fill of `[0, start)` (entries older than the job's window
-/// die on the distance filter, and the round-robin bucket holds the
-/// newest inserts either way). Which snapshot a job gets is therefore
-/// pure scheduling, never output.
+/// start — and the adoption is byte-invariant in `upto` while `upto` sits
+/// at or above the job's window base: a freeze-point continuation is
+/// exact, so restoring any covering snapshot and filling the remainder
+/// produces the same table as the from-scratch fill of `[0, start)`. An
+/// adoption below the window base re-arms there, and the re-armed
+/// buckets' insert phase then depends on `upto` (see
+/// [`MatchGeneratorDriver::windowed_ldm_prefill`]), so the adopter side
+/// pins each job to a snapshot that covers its base — which one is a
+/// lattice pick, never claim timing.
 #[cfg(feature = "std")]
 pub(crate) struct LdmPrefixSnapshot {
     pub(super) ldm: LdmSnapshot,
@@ -2568,9 +2570,11 @@ impl MatchGeneratorDriver {
     /// equal-length bucket hits the first-longest tie-break takes — a
     /// bounded per-job perturbation, not a candidate loss) or by adopting
     /// a snapshot and continuing the fill from its freeze point
-    /// (byte-invariant in `upto`; a snapshot older than `ldm_base`
-    /// re-arms there — the byte-derived rolling state equals the
-    /// continuous one).
+    /// (byte-invariant in `upto` while `upto >= ldm_base` — the mt
+    /// adopter only hands covering snapshots here; a snapshot older than
+    /// `ldm_base` re-arms there with the byte-derived rolling state,
+    /// though its bucket phase stays `upto`-dependent, see
+    /// [`LdmPrefixSnapshot`]).
     #[cfg(feature = "std")]
     pub(crate) fn windowed_ldm_prefill(
         &mut self,

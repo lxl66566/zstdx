@@ -384,3 +384,7 @@ A Python replace missed one site because `replace(pat, 2)` hits only the first t
 ### Keep /tmp headroom before a ratio sweep
 
 `ratio --parallel 16` transiently holds several 32 MiB buffers per cell on both sides; on a 13 GB box with dump directories still in the /tmp RAMDisk the sweep was SIGTERM'd at cell 105 of 120, and stdout is block-buffered so the completed rows were lost with it. Diff and delete dump directories right after the gate, and drop to `--parallel 8` when free RAM is under half the total.
+
+### Share payloads across parallel agents on the /tmp RAMDisk
+
+Two runtime OOM kills in one round came from parallel worktree agents each materializing private dll-class payload copies on /tmp (a 400 MiB file per agent) beside their dump-gate trees, pushing the tmpfs past 80 percent with swap exhausted. Agents probing the same payload hardlink one canonical copy into their own /tmp directories instead of copying, dump trees are deleted the moment their cmp passes, and a cleanup pass between arms keeps the RAMDisk under half.

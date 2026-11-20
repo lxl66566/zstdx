@@ -527,10 +527,12 @@ pub fn compress_slice_mt(
                     // thread's build (it runs while the workers encode
                     // the below-boundary jobs); a start the build's
                     // freeze overshot keeps the stock whole-prefix fill,
-                    // and the windowed band takes the newest LDM snapshot
-                    // at or below its start (the adoption is
-                    // byte-invariant in the snapshot's boundary, so which
-                    // one lands is pure scheduling).
+                    // and the windowed band takes the first LDM snapshot
+                    // covering its window base (the adoption is
+                    // byte-invariant in the snapshot's boundary there;
+                    // a below-base snapshot's re-arm is phase-visible, so
+                    // the pick is pinned to the publish lattice, never
+                    // to which snapshot the claim race found).
                     let snapshot = if let Some(gate) = &feed_gate {
                         if let Some(span) =
                             take_feed_span(gate, &ready, start as u64, end as u64, strip as u64)
@@ -574,7 +576,15 @@ pub fn compress_slice_mt(
                                     }
                                 },
                                 PrefixPlan::Windowed(w) => {
-                                    match wait_ldm_snapshot(w, &ready, &poison, start as u64) {
+                                    let win_base =
+                                        (start as u64).saturating_sub(job_overlap as u64);
+                                    match wait_ldm_snapshot(
+                                        w,
+                                        &ready,
+                                        &poison,
+                                        start as u64,
+                                        win_base,
+                                    ) {
                                         Some(snap) => JobSpfOwned::Windowed(Some(snap)),
                                         None if poison.lock().unwrap().is_some() => {
                                             *slots[id].lock().unwrap() = Some(Vec::new());
@@ -1349,8 +1359,9 @@ struct WindowPlan {
 
 /// The windowed build's published state. The snapshot list is never
 /// pruned: the cadence spans `med..stop` in at most ~13 steps, and every
-/// adopter (start > med) must always find an entry at or below its start
-/// whatever the build's progress when its worker arrives.
+/// adopter (start > med) waits for the first entry covering its window
+/// base, `start - window`, which `stop` (the last adopter's start) always
+/// bounds.
 struct WindowShare {
     publishes: Vec<Arc<LdmPrefixSnapshot>>,
     done: bool,
@@ -1983,25 +1994,42 @@ fn wait_prefix_build(
     }
 }
 
-/// The windowed band's adopter wait: the newest published LDM snapshot at
-/// or below `start` (which one lands is pure scheduling — the adoption's
-/// bytes are invariant in the snapshot's boundary, see
-/// `LdmPrefixSnapshot`; the newest just minimizes this job's own
-/// remainder fill). `None` once the build is done without a usable
-/// publish (a build that found no freeze — the job then fills its whole
-/// prefix from zero, byte-equal to an adoption) or the pool is poisoned.
+/// The windowed band's adopter wait: the first published LDM snapshot at
+/// or above `win_base`, the job's LDM window base. A snapshot below the
+/// base re-arms the fill there, and the re-armed table's bucket phase
+/// (which slots the window-span inserts land in) depends on how far the
+/// snapshot reached — so a mid-stream job's pick among below-base
+/// snapshots reaches the bytes. At or above the base the adoption is a
+/// plain continuation and byte-invariant in the boundary (see
+/// `LdmPrefixSnapshot`), so pinning every adopter to the first covering
+/// publish — a fixed element of the deterministic publish list — keeps
+/// the frame bytes free of claim timing while the remainder fill stays
+/// bounded by the window. `None` once the build is done without a usable
+/// publish (a build whose freezes never reached `win_base` falls back to
+/// the newest publish at or below `start`, or the from-zero fill when it
+/// published nothing — both final in the done list, so still
+/// timing-free) or the pool is poisoned.
 fn wait_ldm_snapshot(
     plan: &WindowPlan,
     ready: &Condvar,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
     start: u64,
+    win_base: u64,
 ) -> Option<Arc<LdmPrefixSnapshot>> {
     let mut guard = plan.share.lock().unwrap();
     loop {
-        if let Some(snap) = guard.publishes.iter().rev().find(|s| s.upto <= start) {
+        if let Some(snap) = guard.publishes.iter().find(|s| s.upto >= win_base) {
             return Some(Arc::clone(snap));
         }
-        if guard.done || poison.lock().unwrap().is_some() {
+        if guard.done {
+            return guard
+                .publishes
+                .iter()
+                .rev()
+                .find(|s| s.upto <= start)
+                .cloned();
+        }
+        if poison.lock().unwrap().is_some() {
             return None;
         }
         guard = ready.wait(guard).unwrap();
@@ -3538,29 +3566,20 @@ mod tests {
         );
     }
 
-    /// The windowed capture band (window at the full W26 bar): a wide-
-    /// alphabet keep-class frame larger than the window grids pinned
-    /// capture jobs whose LDM history spans the whole window — the far
-    /// class beyond the chain reach survives the job split at every
-    /// worker count, including the mid-stream jobs whose window strips
-    /// reach back past the frame prefix (start > window). 76 MiB grids
-    /// eight 9.5 MiB jobs, the last starting at 66.5 MiB.
-    #[test]
-    fn mt_windowed_ldm_capture_is_worker_independent() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
+    /// The windowed band's far-class fixture: a 5 MiB unit tiled with
+    /// per-copy mutations. The unit-to-unit copies sit at 5 MiB periods —
+    /// beyond the row's W22 chain reach, exactly LDM's class — and the
+    /// flipped byte per 4 KiB keeps every 64-byte window intact while no
+    /// copy is exact. A 1 MiB re-copy of the wide-alphabet head inside
+    /// the unit is a near repeat the stock W22 reach finds, so the
+    /// probe's keep parse wins and the frame keeps its LDM (a shrink
+    /// verdict abandons the far class).
+    fn windowed_far_tiles(total: usize) -> Vec<u8> {
         const MIB: usize = 1024 * 1024;
-        let total = 76 * MIB;
-        // A 5 MiB unit tiled with per-copy mutations: the unit-to-unit
-        // copies sit at 5 MiB periods — beyond the row's W22 chain reach,
-        // exactly LDM's class — and the flipped byte per 4 KiB keeps
-        // every 64-byte window intact while no copy is exact.
         let unit_len = 5 * MIB;
         let mut unit = lcg(unit_len);
         let head_len = 256 * 1024;
         unit[..head_len].copy_from_slice(&pattern_head(head_len));
-        // A 1 MiB re-copy of the head inside the unit: a near repeat the
-        // stock W22 reach finds, so the probe's keep parse wins and the
-        // frame keeps its LDM (a shrink verdict abandons the far class).
         let head_copy = unit[..head_len].to_vec();
         unit[MIB..MIB + head_len].copy_from_slice(&head_copy);
         let mut data = Vec::with_capacity(total);
@@ -3578,6 +3597,21 @@ mod tests {
                 });
             }
         }
+        data
+    }
+
+    /// The windowed capture band (window at the full W26 bar): a wide-
+    /// alphabet keep-class frame larger than the window grids pinned
+    /// capture jobs whose LDM history spans the whole window — the far
+    /// class beyond the chain reach survives the job split at every
+    /// worker count, including the mid-stream jobs whose window strips
+    /// reach back past the frame prefix (start > window). 76 MiB grids
+    /// eight 9.5 MiB jobs, the last starting at 66.5 MiB.
+    #[test]
+    fn mt_windowed_ldm_capture_is_worker_independent() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
+        const MIB: usize = 1024 * 1024;
+        let data = windowed_far_tiles(76 * MIB);
         let st = compress_slice_mt(
             &data,
             Level::Balanced,
@@ -3648,6 +3682,47 @@ mod tests {
             mt4.len(),
             st.len()
         );
+    }
+
+    /// The mid-stream windowed adopters — jobs starting past the window,
+    /// so their LDM window base sits above the build's first publish —
+    /// must read their snapshot off the publish lattice, never off which
+    /// publish the claim race found: worker counts and repeat runs read
+    /// one size (R120 closed a ±1 KB run-to-run wobble here). 148 MiB
+    /// grids ten 16 MiB jobs over the W26 window: med sits at 48 MiB and
+    /// jobs 8-9 start at 128/144 MiB with window bases 64/80 MiB, past
+    /// the first publish — the racy shape.
+    #[test]
+    fn mt_windowed_midstream_adoption_is_timing_free() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
+        const MIB: usize = 1024 * 1024;
+        let data = windowed_far_tiles(148 * MIB);
+        let enc = |threads| {
+            compress_slice_mt(
+                &data,
+                Level::Balanced,
+                true,
+                threads,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        // Sixteen workers claim every job up front (the all-first-publish
+        // wave); eight and four spread the mid-stream adopters across the
+        // build's progress (the claim-race waves). The lattice pin reads
+        // one size over all of them and over repeat runs.
+        let mt16 = enc(16);
+        assert_eq!(mt16, enc(16), "repeat w16 run diverged");
+        assert_eq!(mt16, enc(8), "w16 vs w8 diverged");
+        assert_eq!(mt16, enc(4), "w16 vs w4 diverged");
+        let mut out = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        let n = decoder
+            .decode_all(&mt16, &mut out)
+            .unwrap_or_else(|e| panic!("midstream decode: {e}"));
+        assert_eq!((n, &out[..n]), (data.len(), &data[..]));
     }
 
     /// Inputs below the engagement threshold must fall back to the
