@@ -12,7 +12,7 @@ use crate::{
         OF_DEFAULT_ACC_LOG, OF_DEFAULT_DISTRIBUTION,
     },
     decoding::errors::DecodeSequenceError,
-    fse::{FSETable, next_position},
+    fse::{FSETable, next_position, occurrence_from_state},
 };
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
@@ -230,8 +230,8 @@ const fn staged_symbol(symbol: u8) -> u64 {
 /// reference's two passes (`ZSTD_buildFSETable`): the first spreads each
 /// state's symbol into the slot's staging field along the table's own position
 /// walk, the second walks the slots, reads the symbol back out of the field it
-/// just wrote, and completes the entry from the hoisted spread constants plus
-/// the symbol's `(base, add-bits)` pair. Folding the two passes costs the fill
+/// just wrote, and completes the entry from the distribution itself plus the
+/// symbol's `(base, add-bits)` pair. Folding the two passes costs the fill
 /// pass the code lookup, the spread multiply-adds and a 64-bit store per entry,
 /// 29 percent more Ir per entry than the spread alone, and the deleted pack pass
 /// was exactly what that work belongs to (docs/src/dev/negative/decoding.md).
@@ -244,12 +244,16 @@ fn build_packed_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
 
     // Pass one: lay down each state's symbol. Low-probability (`-1`) symbols
     // own one state each and take the top of the table in descending symbol
-    // order; the rest spread from the bottom, skipping that tail.
+    // order; the rest spread from the bottom, skipping that tail. `state`
+    // starts each live symbol's running FSE state at its probability (one
+    // for `-1`), the value pass two increments per occurrence.
+    let mut state = [0u16; 256];
     let mut negative_idx = table_size;
     for (symbol, &prob) in table.symbol_probabilities.iter().enumerate() {
         if prob == -1 {
             negative_idx -= 1;
             slots[negative_idx] = staged_symbol(symbol as u8);
+            state[symbol] = 1;
         }
     }
     let mut position = 0;
@@ -257,6 +261,7 @@ fn build_packed_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
         if prob <= 0 {
             continue;
         }
+        state[symbol] = prob as u16;
         // for each probability point the symbol gets on slot
         for _ in 0..prob {
             slots[position] = staged_symbol(symbol as u8);
@@ -270,16 +275,18 @@ fn build_packed_table(table: &FSETable, codes: &[(u32, u8)], out: &mut [u64]) {
     }
 
     // Pass two: the symbol comes back out of its staging field, and the code
-    // pair and the baseline complete the entry with a single store. The baselines
-    // count occurrences in state order, so the per-symbol counter is what this
-    // pass owns; it is 256 wide so the byte-wide symbol indexes it unchecked.
-    let mut counter = [0u16; 256];
+    // pair and the baseline complete the entry with a single store. The
+    // running state the counter carries fixes both baseline fields through
+    // `occurrence_from_state` — the reference's per-slot form — so no hoisted
+    // per-symbol constants sit between the two passes. The counter is 256
+    // wide so the byte-wide symbol indexes it unchecked; only live symbols
+    // are read, which pass one initialized.
     for slot in slots.iter_mut() {
         let symbol = (entry_base(*slot) & 0xff) as usize;
-        let count = counter[symbol];
-        counter[symbol] = count + 1;
+        let running = state[symbol];
+        state[symbol] = running + 1;
         let (base, add) = codes[symbol];
-        let (base_line, nb_bits) = table.occurrence(symbol as u8, count as u32);
+        let (base_line, nb_bits) = occurrence_from_state(running as u32, table.accuracy_log);
         *slot = pack_entry(base, add, base_line as u16, nb_bits);
     }
 
@@ -1282,6 +1289,38 @@ fn packed_table_matches_entry_walk() {
         &OF_CODES,
         "of default",
     );
+}
+
+/// The packed build keeps no per-table fill state on the description path: a
+/// pooled `FSETable` reused across shrinking and growing wire descriptions
+/// must produce exactly the slots of a fresh table.
+#[test]
+fn packed_table_survives_table_reuse() {
+    use crate::{bit_io::BitWriter, fse::fse_encoder::write_ncount};
+
+    let codes = synthetic_codes();
+    // All sum to 64 (accuracy log 6); zero-probability gaps keep the live
+    // range shorter than the previous table's.
+    let long = [0i32, 0, -1, 3, 2, 2, 0, 0, 10, 15, 0, 31];
+    let short = [0, 33, 0, 31];
+
+    let mut reused = FSETable::new(255);
+    for probs in [&long[..], &short[..], &long[..], &short[..]] {
+        let mut writer = BitWriter::new();
+        write_ncount(probs, 6, &mut writer);
+        let bytes = writer.dump();
+
+        let mut fresh = FSETable::new(255);
+        fresh.read_description(&bytes, 9).unwrap();
+        reused.reset();
+        reused.read_description(&bytes, 9).unwrap();
+
+        let mut reference = alloc::vec![0u64; 1 << 6];
+        build_packed_table(&fresh, &codes, &mut reference);
+        let mut packed = alloc::vec![0u64; 1 << 6];
+        build_packed_table(&reused, &codes, &mut packed);
+        assert_eq!(packed, reference);
+    }
 }
 
 /// The flat executor's per-field loads and the staging decoder's shifts read

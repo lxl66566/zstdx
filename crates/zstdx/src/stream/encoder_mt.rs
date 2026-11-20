@@ -1582,6 +1582,15 @@ impl MtEncoderCore {
     /// first overrun), before anything is buffered or any job posted — the
     /// error surfaces from the offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
+        #[cfg(feature = "job_trace")]
+        let w_t0 = std::time::Instant::now();
+        let out = self.write_inner(data);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_wloop_write(w_t0);
+        out
+    }
+
+    fn write_inner(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
         // The owned feed's source is the whole input; no caller may append
         // to it (the zero-copy entry is the only owned-fed core, and it
@@ -1611,7 +1620,11 @@ impl MtEncoderCore {
                 continue;
             }
             let n = space.min(data.len());
+            #[cfg(feature = "job_trace")]
+            let c_t0 = std::time::Instant::now();
             self.buf.extend_from_slice(&data[..n]);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_chunk(c_t0, n);
             data = &data[n..];
             self.pos += n as u64;
             self.post_ready();
@@ -2661,8 +2674,13 @@ impl MtEncoderCore {
         .min(BUF_CAP_MAX);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            let live = self.buf.len();
+            #[cfg(feature = "job_trace")]
+            let g_t0 = std::time::Instant::now();
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_grow(g_t0, live);
             // A realloc copies only the live bytes: the new tail starts
             // uninitialized.
             self.init_len = self.buf.len();
@@ -3614,7 +3632,11 @@ impl MtEncoderCore {
             debug_assert!(self.buf.is_empty());
             return;
         }
+        #[cfg(feature = "job_trace")]
+        let q_t0 = std::time::Instant::now();
+        let mut waited = false;
         while !self.quiescent() {
+            waited = true;
             if self.shared.poisoned.load(Ordering::Acquire) {
                 // In-flight jobs still complete under poison; the unwind
                 // resumes from there and never returns here.
@@ -3622,14 +3644,22 @@ impl MtEncoderCore {
             }
             self.wait_progress();
         }
+        #[cfg(feature = "job_trace")]
+        if waited {
+            crate::encoding::job_trace::add_wloop_quiesce(q_t0);
+        }
         let keep = self.movable_lo();
         debug_assert!(self.buf_base <= keep);
         let drop_n = (keep - self.buf_base) as usize;
         if drop_n > 0 {
+            #[cfg(feature = "job_trace")]
+            let r_t0 = std::time::Instant::now();
             self.buf.copy_within(drop_n.., 0);
             let live = self.buf.len() - drop_n;
             self.buf.truncate(live);
             self.buf_base = keep;
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_recycle(r_t0, live);
         }
         if self.buf.len() + want > self.buf.capacity() || self.buf.capacity() < BUF_CAP_MAX {
             // Doubling below the cap at every recycle point: an epoch-sized
@@ -3640,8 +3670,13 @@ impl MtEncoderCore {
             // need.
             let target =
                 (self.buf.len() + want + 64 * 1024).max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            let live = self.buf.len();
+            #[cfg(feature = "job_trace")]
+            let g_t0 = std::time::Instant::now();
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_grow(g_t0, live);
             // A realloc copies only the live bytes: the new tail starts
             // uninitialized.
             self.init_len = self.buf.len();

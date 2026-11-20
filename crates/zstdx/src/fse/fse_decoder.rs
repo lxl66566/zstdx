@@ -65,8 +65,9 @@ pub struct FSETable {
     max_symbol: u8,
     /// The actual table containing the decoded symbol and the compression data
     /// connected to that symbol. Built by `build_decoding_table` for the symbol
-    /// decoders; the sequence streams build their packed slots from
-    /// `symbol_info` instead (see `sequence_section_decoder::build_packed_table`).
+    /// decoders; the sequence streams build their packed slots straight from
+    /// the distribution instead (see
+    /// `sequence_section_decoder::build_packed_table`).
     pub decode: Vec<Entry>, // used to decode symbols, and calculate the next state
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
@@ -86,9 +87,12 @@ pub struct FSETable {
     /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1)
     /// and so on up until the highest possible symbol (255).
     symbol_counter: Vec<u32>,
-    /// Per-symbol spread constants for the entry fill pass, parallel to
-    /// `symbol_probabilities`. Only indices with a positive probability are
-    /// ever consulted; the rest stay at `SymbolSpreadInfo::DEFAULT`.
+    /// Per-symbol spread constants for the `Entry` view's fill pass
+    /// (`build_decoding_table`), parallel to `symbol_probabilities`. Only
+    /// indices with a positive probability are ever consulted; the rest stay
+    /// at `SymbolSpreadInfo::DEFAULT`. The packed sequence-table build derives
+    /// its baselines straight from the distribution
+    /// (`occurrence_from_state`) and never reads this array.
     symbol_info: [SymbolSpreadInfo; 256],
 }
 
@@ -156,14 +160,12 @@ impl FSETable {
         self.build_decoding_table()
     }
 
-    /// Read a table description and hoist the per-symbol spread constants
-    /// without materialising the `Entry` view. The packed sequence-table build
-    /// reads the distribution and the spread constants straight off this state.
-    /// Returns the number of bytes the description consumed.
+    /// Read a table description without materialising the `Entry` view. The
+    /// packed sequence-table build derives everything it needs from the
+    /// distribution this leaves behind. Returns the number of bytes the
+    /// description consumed.
     pub fn read_description(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
-        let bytes_read = self.read_probabilities(source, max_log)?;
-        self.hoist_spread_info();
-        Ok(bytes_read)
+        self.read_probabilities(source, max_log)
     }
 
     /// Install one already-normalized distribution (a predefined table) for the
@@ -179,12 +181,13 @@ impl FSETable {
         self.symbol_probabilities.clear();
         self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
-        self.hoist_spread_info();
         Ok(())
     }
 
     /// `(base_line, num_bits)` of the `count`-th state spread to `symbol`, from
-    /// the constants `hoist_spread_info` derived.
+    /// the constants `hoist_spread_info` derived. Only the `Entry` view's fill
+    /// pass goes through here; the packed sequence-table build reads
+    /// [`occurrence_from_state`] instead.
     pub(crate) fn occurrence(&self, symbol: u8, count: u32) -> (u32, u8) {
         let info = self.symbol_info[symbol as usize];
         if count < info.num_double {
@@ -197,9 +200,10 @@ impl FSETable {
     }
 
     /// Hoist the per-symbol slice math (highest_bit_set + division) out of the
-    /// per-entry loops: every entry baseline is a counter plus a multiply-add on
-    /// `symbol_info`. Only indices up to the distribution's length are live; the
-    /// tail keeps its previous content and is never consulted.
+    /// `Entry` view's fill loop: every entry baseline is a counter plus a
+    /// multiply-add on `symbol_info`. Only indices up to the distribution's
+    /// length are live; the tail keeps its previous content and is never
+    /// consulted.
     fn hoist_spread_info(&mut self) {
         let table_size = 1u32 << self.accuracy_log;
         let low_prob = SymbolSpreadInfo::low_prob(self.accuracy_log);
@@ -517,6 +521,22 @@ fn calc_symbol_spread_info(num_states_total: u32, num_states_symbol: u32) -> Sym
     }
 }
 
+/// `(base_line, num_bits)` of the occurrence behind a symbol's running FSE
+/// state in a table of `1 << accuracy_log` states, the reference's per-slot
+/// form (`ZSTD_buildFSETable`): the running state `prob + count` fixes both
+/// fields through one `highest_bit_set`, with no per-symbol constants to
+/// hoist. A `-1` probability owns one state, running state 1. Equivalent to
+/// the `calc_symbol_spread_info` constants `occurrence` reads, pinned by
+/// test.
+pub(crate) fn occurrence_from_state(state: u32, accuracy_log: u8) -> (u32, u8) {
+    debug_assert!(state > 0);
+    // The running state stays inside prob..2*prob, so at most one bit above
+    // the accuracy log is set and both fields fall inside the table.
+    let nb_bits = accuracy_log + 1 - highest_bit_set(state) as u8;
+    let base_line = (state << nb_bits) - (1u32 << accuracy_log);
+    (base_line, nb_bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,9 +570,11 @@ mod tests {
 
     /// `reset` leaves `symbol_info` (fill scratch) behind on purpose: every
     /// rebuild rewrites the live symbol range before any read. Pin that
-    /// promise — a table reused across shrinking and growing distributions,
-    /// through both `build_from_probabilities` and the wire `read_description`
-    /// path, must produce exactly the entries of a fresh build.
+    /// promise — a table reused across shrinking and growing distributions
+    /// through `build_from_probabilities` must produce exactly the entries of
+    /// a fresh build. The wire `read_description` path carries no fill scratch
+    /// anymore (the packed build derives from the distribution); its reuse
+    /// safety is pinned by `packed_table_survives_table_reuse`.
     #[test]
     fn reused_table_matches_fresh_builds_across_distributions() {
         // All sum to 64 (accuracy log 6); zero-probability gaps keep the
@@ -572,7 +594,9 @@ mod tests {
         }
 
         // Same reuse through the serialized wire form: the packed sequence
-        // tables read descriptions into pooled tables frame after frame.
+        // tables read descriptions into pooled tables frame after frame, and
+        // the distribution this leaves behind is the whole state that side
+        // keeps.
         let wire = |probs: &[i32]| {
             let mut writer = crate::bit_io::BitWriter::new();
             crate::fse::fse_encoder::write_ncount(probs, 6, &mut writer);
@@ -586,18 +610,35 @@ mod tests {
             reused.read_description(&bytes, 9).unwrap();
             assert_eq!(reused.accuracy_log, fresh.accuracy_log);
             assert_eq!(reused.symbol_probabilities, fresh.symbol_probabilities);
-            for (symbol, &prob) in probs.iter().enumerate() {
-                if prob == 0 {
-                    continue;
-                }
-                for count in 0..prob.unsigned_abs() {
+        }
+    }
+
+    /// `occurrence_from_state` and the `calc_symbol_spread_info` constants
+    /// `occurrence` reads are two derivations of the same (baseline, num_bits)
+    /// pair — the packed sequence tables use the former, the `Entry` view the
+    /// latter. Pin them equal over every (table size, probability, count)
+    /// triple the decoder can meet, `-1` probabilities included.
+    #[test]
+    fn occurrence_from_state_matches_constants() {
+        for &log in &[5u8, 6, 7, 8, 9] {
+            let total = 1u32 << log;
+            for prob in 1..=total {
+                let info = calc_symbol_spread_info(total, prob);
+                for count in 0..prob {
+                    let want = if count < info.num_double {
+                        (info.base_d + count * info.stride_d, info.nb_d)
+                    } else {
+                        (info.base_s.wrapping_add(count * info.stride_s), info.nb_s)
+                    };
                     assert_eq!(
-                        reused.occurrence(symbol as u8, count),
-                        fresh.occurrence(symbol as u8, count),
-                        "symbol {symbol} count {count}"
+                        occurrence_from_state(prob + count, log),
+                        want,
+                        "log {log} prob {prob} count {count}"
                     );
                 }
             }
+            // A `-1` symbol owns one state reading the whole accuracy log.
+            assert_eq!(occurrence_from_state(1, log), (0, log));
         }
     }
 }

@@ -258,6 +258,8 @@ With `cargo test | tail`, the cargo failure is swallowed by the `&&` chain while
 
 A green release suite does not mean a bug-free tree. If the suite seems hung, first suspect that a panic poisoned the thread pool, because an MT worker panic makes the join wait forever, which once meant 17 minutes of zero output. Localize with `--test-threads 1` and by running the test binary directly.
 
+A suite that dies on `signal: 15, SIGTERM` with every visible result ok and no failing test named is the host's earlyoom, not the code: this box runs `earlyoom -m5,3`, which SIGTERMs the largest process the moment free memory crosses 5 percent, and the paranoid profile's parallel MT tests (each pooling 256 MiB accumulate buffers) are the usual victim. The 2026-11-18 run died three times at different tests this way. Rerun with `-- --test-threads=1`, which bounds the concurrent buffers and finished the whole 570-test lib suite in 68 s.
+
 - Running the test binary directly requires the crate root, because 13 corpus tests use relative paths.
 - The bench corpus is not in git, being an untracked generated artifact, so copy it before benching in a worktree.
 - Delete debug panic and eprintln instrumentation before committing. One was once left behind, and an eprintln under `#[cfg(feature="std")]` compiles into release with the default feature.
