@@ -1053,6 +1053,12 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// The row's clamped match window: what the trait's `window_size`
+    /// returns for a live driver at this level and shape.
+    pub(crate) fn window_size_for(level: Level, shape: InputShape) -> u64 {
+        params_for(level, shape).window as u64
+    }
+
     /// Declare the frame's reach probe result (see [`super::reach_probe`])
     /// before `reset`; the choice survives resets until changed.
     pub(crate) fn set_reach_choice(&mut self, choice: ReachChoice) {

@@ -4,6 +4,7 @@ pub mod dump;
 pub mod emitframe;
 pub mod files;
 pub mod jobdecomp;
+pub mod jobrestart;
 pub mod matrix;
 pub mod mtcheck;
 pub mod offhist;

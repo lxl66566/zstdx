@@ -144,6 +144,92 @@ pub fn mt_job_size_for(
     .unwrap_or_else(|| job_size_for_level(level, len, workers.max(2), strip))
 }
 
+/// The encoder's exact MT job overlap for an input (the history span below
+/// its start a job's matcher may reference): the stock strip, or the
+/// widened window of the capture/deep-LDM/opt-feed classes. Mirrors
+/// `compress_slice_mt`'s `job_overlap` derivation for the no-dictionary,
+/// `LdmMode::Auto` frame the analysis tools model — like
+/// [`mt_job_size_for`], dev tooling must not re-derive the schedule.
+/// `head` is the whole input (the screens clamp their own spans).
+/// Hidden: not API-stable.
+#[doc(hidden)]
+pub fn mt_job_overlap_for(
+    len: u64,
+    workers: u32,
+    level: Level,
+    shape: crate::InputShape,
+    head: &[u8],
+) -> usize {
+    let choice = if head_predicts_keep(head) {
+        reach_probe::ReachChoice::Keep
+    } else {
+        reach_probe::probe_reach_choice(head, level, shape)
+    };
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    let fast_window = far_screen::mt_capture_window(level, shape, head);
+    let job_size = capture_grid(
+        len,
+        level,
+        shape,
+        choice,
+        head,
+        fast_window,
+        crate::LdmMode::Auto,
+    )
+    .unwrap_or_else(|| job_size_for_level(level, len, workers.max(2), strip));
+    let n_jobs = len.div_ceil(job_size as u64) as usize;
+    let spf = choice == reach_probe::ReachChoice::Keep
+        && plan_prefix_ldm(
+            head,
+            level,
+            shape,
+            choice,
+            job_size,
+            n_jobs,
+            fast_window,
+            crate::LdmMode::Auto,
+        )
+        .is_some();
+    let capture_window = spf
+        .then(|| MatchGeneratorDriver::prefix_ldm_window(level, shape, choice).or(fast_window))
+        .flatten();
+    let deep_ldm = deep_ldm_band(level, shape, choice, head, crate::LdmMode::Auto);
+    let opt_feed = if n_jobs > 1 {
+        opt_ldm_feed_band(level, shape, choice, head, crate::LdmMode::Auto)
+    } else {
+        None
+    };
+    deep_ldm
+        .or(capture_window)
+        .or(opt_feed)
+        .map_or(strip, |w| w as usize)
+}
+
+/// The frame-continuous match window for a frame (the row's clamped
+/// window, `MatchGeneratorDriver`'s `window_size`): the reach a
+/// single-threaded frame's matcher has below any position, as opposed to
+/// an MT job's [`mt_job_overlap_for`] domain. Hidden: not API-stable.
+#[doc(hidden)]
+pub fn mt_frame_window_for(level: Level, shape: crate::InputShape) -> u64 {
+    MatchGeneratorDriver::window_size_for(level, shape)
+}
+
+/// The frame's dense search strip (`MatchGeneratorDriver::strip_for_choice`
+/// under the frame's own reach-probe verdict): the span a frame-continuous
+/// encoder indexes densely below any position. Wider matches exist only
+/// through the LDM's sparse twin screen, which a dense probe cannot price.
+/// `head` is the whole input (the screens clamp their own spans).
+/// Hidden: not API-stable.
+#[doc(hidden)]
+pub fn mt_frame_strip_for(level: Level, shape: crate::InputShape, head: &[u8]) -> u64 {
+    let choice = if head_predicts_keep(head) {
+        reach_probe::ReachChoice::Keep
+    } else {
+        reach_probe::probe_reach_choice(head, level, shape)
+    };
+    MatchGeneratorDriver::strip_for_choice(level, shape, choice)
+}
+
 /// Compress `src` into one frame using up to `workers` threads.
 ///
 /// Falls back to the single-threaded slice path (byte-identical to

@@ -216,6 +216,15 @@ Reports sequence statistics and the entropy lower bound of our matcher on one co
 cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...
 ```
 
+### `jobrestart`: MT job-boundary parse-restart loss probes
+
+Prices the two parse-side state restarts at MT job boundaries on one raw input, encoded through the bulk-mt path (byte-identical to the pledged stream grid) at each `--level` x `--workers` cell. Probe A replays the frame's wire sequences with the continuous decoder repcode triple and re-codes each job against its predecessor's carried terminal triple, split at the repcode gate (the job's first three full-offset sequences — the only span a boundary carry can re-code) from the post-gate upper bound. Probe B re-searches every job's first `--head` bytes with a hash chain bounded once to the job's own domain and once to the frame's dense strip, and reports the recoverable match bytes and offset bits. The subcommand needs `--features seq_dump`, like `offhist`.
+
+```bash
+cargo run --release -p zstdx-bench --features seq_dump -- jobrestart \
+    bench/big/dll100.raw --level 1,3,9,19 --workers 8,16
+```
+
 ### `prefill`: `prefill_window` micro-benchmark
 
 Times the matcher's window prefill per strategy on window-sized corpus strips. `--shape` defaults to `random,text,json`, and `--level` selects strategies.

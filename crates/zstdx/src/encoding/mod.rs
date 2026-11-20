@@ -45,7 +45,7 @@ pub(crate) use levels::compress_fastest;
 pub use match_generator::MatchGeneratorDriver;
 #[cfg(feature = "std")]
 #[doc(hidden)]
-pub use mt::mt_job_size_for;
+pub use mt::{mt_frame_strip_for, mt_frame_window_for, mt_job_overlap_for, mt_job_size_for};
 #[cfg(feature = "std")]
 #[doc(hidden)]
 pub use mt::{set_ldm_feed_for_tests, set_mt_ramp_depth_for_tests};

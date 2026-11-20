@@ -89,6 +89,9 @@ enum Command {
     /// any ramped encode exists (the arming-gate spec in
     /// docs/src/dev/bench/shapes.md).
     Twinspect(cmd::twinspect::Args),
+    /// MT job-boundary parse-restart loss probes (seq_dump decode hook):
+    /// prices the repcode carry and the match-reach loss at job heads.
+    Jobrestart(cmd::jobrestart::Args),
 }
 
 fn main() {
@@ -112,5 +115,6 @@ fn main() {
         Command::Parity(args) => cmd::parity::run(&args),
         Command::Tierdiff(args) => cmd::tierdiff::run(&args),
         Command::Twinspect(args) => cmd::twinspect::run(&args),
+        Command::Jobrestart(args) => cmd::jobrestart::run(&args),
     }
 }
