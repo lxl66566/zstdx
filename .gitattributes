@@ -1,0 +1,19 @@
+# Fixture data must round-trip byte-identically on every platform. Git's
+# text auto-detection plus core.autocrlf=true (GitHub Windows runners default)
+# inflates text-detected fixtures with CRLF on checkout, so byte comparisons
+# against their binary-detected .zst counterparts fail (decodecorpus WrongSize
+# on Windows CI). Rules are grouped per fixture family; extend the group when
+# a family gains a directory instead of adding one-off entries.
+
+# Decode/encode corpus: originals and compressed frames.
+crates/zstdx/decodecorpus_files/** binary
+crates/zstdx/test_fixtures/** binary
+
+# Dictionary fixtures: the trained dictionary and its training corpus.
+crates/zstdx/dict_tests/** binary
+
+# Fuzz regression artifacts: arbitrary-byte crash inputs, some text-detected.
+crates/zstdx-fuzz/artifacts/** binary
+
+# Compressed frames also land outside the fixture directories.
+*.zst binary
