@@ -1162,7 +1162,10 @@ pub(crate) fn run_dict_job_zero(
         .set_reach_choice(reach_probe::ReachChoice::Keep);
     state.matcher.set_ldm_arming(dict_job_arming(job_ldm));
     let dict_shape = crate::InputShape {
-        len: shape.len.map(|len| len + dict.content.len() as u64),
+        // Caller hint: saturate the dict fold.
+        len: shape
+            .len
+            .map(|len| len.saturating_add(dict.content.len() as u64)),
         window_log: shape.window_log,
     };
     super::dictionary::reset_with_dictionary_mode(&mut state, dict, level, dict_shape, ldm_mode);

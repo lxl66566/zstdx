@@ -1412,3 +1412,65 @@ fn dict_opt_rows_stay_in_the_reference_class() {
         assert_eq!(&zout[..n], &payload[..], "libzstd decode at level {level}");
     }
 }
+
+/// Regression: every shape fold that adds the dictionary length to a
+/// caller size hint used plain `+`, so an absurd hint (u64::MAX) panicked
+/// under overflow checks (debug/paranoid) and wrapped to a tiny value in
+/// release (u64::MAX - 8 + dict_len), clamping the window to ~1 KiB while
+/// the frame still decoded. The folds saturate now: an absurd dict hint
+/// keeps the unknown/huge shape, declaring the same window a merely-large
+/// hint gets on the same path.
+#[cfg(feature = "std")]
+#[test]
+fn dictionary_absurd_hint_saturates_the_shape_fold() {
+    use alloc::vec::Vec;
+
+    let dict: Vec<u8> = (0..4 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
+    for level in [
+        crate::Level::Fastest,
+        crate::Level::Balanced,
+        crate::Level::Ultra,
+    ] {
+        // The huge-shape reference per path (bulk ST/MT jobs, stream ST/MT
+        // core — every path folds the hint its own way): a hint no addition
+        // can overflow (1 << 40).
+        for (workers, stream) in [(0, false), (4, false), (0, true), (4, true)] {
+            let mut reference = None;
+            for hint in [1u64 << 40, u64::MAX - 8, u64::MAX] {
+                let opts = crate::EncoderOptions::new(level)
+                    .workers(workers)
+                    .dictionary(&dict)
+                    .with_input_shape(crate::InputShape {
+                        len: Some(hint),
+                        window_log: None,
+                    });
+                let frame = if stream {
+                    let mut sink = Vec::new();
+                    let mut enc =
+                        crate::stream::write::Encoder::with_options(&mut sink, opts).unwrap();
+                    crate::io::Write::write_all(&mut enc, &data).unwrap();
+                    enc.finish().unwrap();
+                    sink
+                } else {
+                    crate::bulk::compress_with(&data, &opts).unwrap()
+                };
+                let window = crate::decoding::frame::read_frame_header(&mut frame.as_slice())
+                    .unwrap()
+                    .0
+                    .window_size()
+                    .unwrap();
+                match reference {
+                    None => reference = Some(window),
+                    Some(w) => assert_eq!(
+                        window, w,
+                        "{level:?} workers {workers} stream {stream} hint {hint}"
+                    ),
+                }
+                let got = crate::bulk::decompress_with(&frame, 0, &dec_opts).unwrap();
+                assert_eq!(got, data, "{level:?} hint {hint}");
+            }
+        }
+    }
+}

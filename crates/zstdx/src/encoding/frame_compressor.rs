@@ -820,7 +820,13 @@ pub(crate) fn compress_slice_with_dictionary(
     declared: Option<u64>,
 ) -> Vec<u8> {
     let mut shape = shape;
-    let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
+    // The shape's length is a caller hint: saturate the dict fold so an
+    // absurd hint stays the unknown/huge shape instead of wrapping.
+    let len = shape
+        .len
+        .unwrap_or(0)
+        .max(src.len() as u64)
+        .saturating_add(dict.content.len() as u64);
     shape.len = Some(len);
     let mut state = new_owned_state();
     super::dictionary::reset_with_dictionary_mode(
@@ -847,7 +853,13 @@ pub(crate) fn compress_slice_with_dictionary_id(
     ldm_mode: crate::LdmMode,
 ) -> Vec<u8> {
     let mut shape = shape;
-    let len = shape.len.unwrap_or(0).max(src.len() as u64) + dict.content.len() as u64;
+    // The shape's length is a caller hint: saturate the dict fold so an
+    // absurd hint stays the unknown/huge shape instead of wrapping.
+    let len = shape
+        .len
+        .unwrap_or(0)
+        .max(src.len() as u64)
+        .saturating_add(dict.content.len() as u64);
     shape.len = Some(len);
     // The pooled, image-cached seeding (std); without std there is no
     // pool to keep an image warm in, so every call seeds a fresh state.
@@ -1189,8 +1201,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // content size; an unpledged source keeps the unknown length
             // (the stream core's own fold rule — a dict-sized span here
             // clamped the window to the dictionary while the source still
-            // streams arbitrary input past it).
-            shape.len = shape.len.map(|len| len + dict.content.len() as u64);
+            // streams arbitrary input past it). The hint is caller data,
+            // so the fold saturates.
+            shape.len = shape
+                .len
+                .map(|len| len.saturating_add(dict.content.len() as u64));
             #[cfg(feature = "std")]
             super::dictionary::seed_with_cache(
                 &mut self.state,

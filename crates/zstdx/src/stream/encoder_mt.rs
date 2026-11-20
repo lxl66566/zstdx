@@ -1243,7 +1243,10 @@ impl MtEncoderCore {
     ) -> u64 {
         match dict {
             Some(dict) => MatchGeneratorDriver::window_for_level(level, crate::InputShape {
-                len: shape.len.map(|len| len + dict.content.len() as u64),
+                // Caller hint: saturate the dict fold.
+                len: shape
+                    .len
+                    .map(|len| len.saturating_add(dict.content.len() as u64)),
                 window_log: shape.window_log,
             }),
             None => MatchGeneratorDriver::window_for_level(level, shape),

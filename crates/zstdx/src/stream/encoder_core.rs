@@ -428,8 +428,10 @@ impl FrameEncoderCoreSt {
             // CONTENTSIZE_UNKNOWN, so `ZSTD_adjustCParams_internal` skips
             // its window clamp and the frame keeps the row's full window
             // (the mt core folds the same way). Folding `unwrap_or(0)`
-            // here clamped such streams to a dict-sized window.
-            shape.len = len.map(|len| len + dict.content.len() as u64);
+            // here clamped such streams to a dict-sized window. The hint
+            // is caller data, so the fold saturates (u64::MAX stays
+            // u64::MAX — the unknown/huge shape, like the no-dict hint).
+            shape.len = len.map(|len| len.saturating_add(dict.content.len() as u64));
             #[cfg(feature = "std")]
             crate::encoding::dictionary::seed_with_cache(
                 &mut self.state,
