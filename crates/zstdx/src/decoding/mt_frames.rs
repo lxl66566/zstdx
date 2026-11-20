@@ -38,7 +38,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use super::{
     errors::FrameDecoderError,
@@ -47,6 +47,7 @@ use super::{
         OutRegion, ScanPlan, SegmentPlan, StageAJob, execute_segment, verify_frame_content_sizes,
     },
 };
+use crate::common::monitor::Monitor;
 #[cfg(feature = "hash")]
 use crate::xxh64::Xxh64;
 
@@ -115,8 +116,7 @@ pub(super) struct LaneJob {
     verify_checksum: bool,
     #[cfg(feature = "hash")]
     checksums: *const [Option<u32>],
-    result: Mutex<Option<LaneOutcome>>,
-    done: Condvar,
+    result: Monitor<Option<LaneOutcome>>,
 }
 
 // SAFETY: the frozen slices and the output base are touched only while
@@ -129,15 +129,15 @@ unsafe impl Send for LaneJob {}
 unsafe impl Sync for LaneJob {}
 
 fn record(lane: &LaneJob, outcome: LaneOutcome) {
-    *lane.result.lock().unwrap() = Some(outcome);
-    lane.done.notify_all();
+    *lane.result.lock() = Some(outcome);
+    lane.result.notify_all();
 }
 
 /// Whether the decode must stop without a reportable error: a worker
 /// panicked (the poison resumes on the driver after the joins) or the
 /// driver aborted (an error path on the calling thread).
 fn poisoned_or_aborted(stage: &StageAJob) -> bool {
-    stage.abort.load(Ordering::Relaxed) || stage.poison.lock().unwrap().is_some()
+    stage.abort.load(Ordering::Relaxed) || stage.poison.lock().is_some()
 }
 
 /// Wait until segment `id` is staged and take it. `None`: abort or
@@ -146,7 +146,7 @@ fn take_staged(
     stage: &StageAJob,
     id: usize,
 ) -> Option<Result<super::mt::DecodedSegment, FrameDecoderError>> {
-    let mut guard = stage.slots[id].lock().unwrap();
+    let mut guard = stage.slots[id].lock();
     loop {
         if let Some(staged) = guard.take() {
             return Some(staged);
@@ -154,7 +154,7 @@ fn take_staged(
         if poisoned_or_aborted(stage) {
             return None;
         }
-        guard = stage.ready.wait(guard).unwrap();
+        guard = stage.slots[id].wait(guard);
     }
 }
 
@@ -186,13 +186,13 @@ fn run_lane(lane: &LaneJob) {
                 record(lane, LaneOutcome::Aborted);
                 return;
             }
-            // Bounded poll: the poison mutex doubles as the sleep token
-            // (the same pattern the staging backpressure uses).
-            let guard = stage.poison.lock().unwrap();
+            // Bounded poll: the poison monitor's condvar doubles as the
+            // sleep token (the same pattern the staging backpressure
+            // uses).
+            let guard = stage.poison.lock();
             let (_guard, _timeout) = stage
-                .ready
-                .wait_timeout(guard, core::time::Duration::from_millis(50))
-                .unwrap();
+                .poison
+                .wait_timeout(guard, core::time::Duration::from_millis(50));
         }
     }
     // SAFETY: this thread serves the lane's lease, so the frozen input
@@ -301,7 +301,7 @@ fn run_lane(lane: &LaneJob) {
         // The executed range is final from here on; let backpressured
         // staging advance.
         stage.consumed_count.fetch_add(1, Ordering::Release);
-        stage.ready.notify_all();
+        stage.poison.notify_all();
     }
     // Close the last frame's checksum.
     #[cfg(feature = "hash")]
@@ -324,9 +324,9 @@ pub(super) fn serve_frame_lane(lane: &Arc<LaneJob>) -> bool {
     match attempt {
         Ok(()) => false,
         Err(payload) => {
-            *lane.stage.poison.lock().unwrap() = Some(payload);
+            *lane.stage.poison.lock() = Some(payload);
             record(lane, LaneOutcome::Aborted);
-            lane.stage.ready.notify_all();
+            lane.stage.broadcast();
             true
         },
     }
@@ -370,11 +370,10 @@ impl Place<'_> {
                             // error path whose result is never observed.
                             return Err(FrameDecoderError::NotYetInitialized);
                         }
-                        let guard = stage.poison.lock().unwrap();
+                        let guard = stage.poison.lock();
                         let (_guard, _timeout) = stage
-                            .ready
-                            .wait_timeout(guard, core::time::Duration::from_millis(50))
-                            .unwrap();
+                            .poison
+                            .wait_timeout(guard, core::time::Duration::from_millis(50));
                     }
                 }
                 let bound = stage
@@ -480,7 +479,7 @@ fn decode_frames(
         verify_checksum,
     );
     drop(guard);
-    if let Some(payload) = job.poison.lock().unwrap().take() {
+    if let Some(payload) = job.poison.lock().take() {
         std::panic::resume_unwind(payload);
     }
     result
@@ -527,8 +526,7 @@ fn run(
                 verify_checksum,
                 #[cfg(feature = "hash")]
                 checksums: plan.checksums.as_slice(),
-                result: Mutex::new(None),
-                done: Condvar::new(),
+                result: Monitor::new(None),
             })
         })
         .collect();
@@ -560,11 +558,11 @@ fn run(
         let mut aborted = false;
         for (li, lane) in lane_jobs.iter().enumerate() {
             let outcome = if li == 0 {
-                lane.result.lock().unwrap().take()
+                lane.result.lock().take()
             } else {
-                let mut guard = lane.result.lock().unwrap();
+                let mut guard = lane.result.lock();
                 while guard.is_none() {
-                    guard = lane.done.wait(guard).unwrap();
+                    guard = lane.result.wait(guard);
                 }
                 guard.take()
             };

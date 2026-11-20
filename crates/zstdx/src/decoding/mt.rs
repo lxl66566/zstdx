@@ -53,7 +53,7 @@ use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 
 #[cfg(feature = "hash")]
 use super::frame_checksum::{FrameBoundaries, StreamingChecksum};
@@ -69,10 +69,13 @@ use super::{
     sequence_execution::wildcopy_match,
     sequence_section_decoder::decode_sequences_into,
 };
-use crate::blocks::{
-    block::BlockType,
-    literals_section::{LiteralsSection, LiteralsSectionType},
-    sequence_section::{ModeType, Sequence, SequencesHeader},
+use crate::{
+    blocks::{
+        block::BlockType,
+        literals_section::{LiteralsSection, LiteralsSectionType},
+        sequence_section::{ModeType, Sequence, SequencesHeader},
+    },
+    common::monitor::Monitor,
 };
 
 /// Below this (compressed) input size the scan, spawn and hand-off overhead
@@ -1438,8 +1441,7 @@ pub(super) struct StageAJob {
     /// Leased worker count: the staging backpressure bound, so staging
     /// memory stays proportional to the worker count, not the input.
     threads: usize,
-    pub(super) slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>>,
-    pub(super) ready: Condvar,
+    pub(super) slots: Vec<Monitor<Option<Result<DecodedSegment, FrameDecoderError>>>>,
     next_job: AtomicUsize,
     consumed: AtomicUsize,
     /// Executed-segment count (any lane), the lane mode's backpressure
@@ -1450,8 +1452,10 @@ pub(super) struct StageAJob {
     /// the executed count. `None` keeps the serial prefix bound.
     lane_window: Option<usize>,
     pub(super) abort: AtomicBool,
-    /// Worker panic payload; doubles as the backpressure sleep token.
-    pub(super) poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+    /// Worker panic payload; its monitor's condvar doubles as the
+    /// backpressure and lane-poll sleep token (every waiter on it
+    /// re-checks atomics, never the guarded payload).
+    pub(super) poison: Monitor<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
     /// Published per-segment outcome for the frame lanes (lane mode only):
     /// 0 = not staged, `out_size + 1` = staged, `usize::MAX` = stage error.
     /// The lanes read their predecessors' sizes off this array because a
@@ -1474,16 +1478,27 @@ impl StageAJob {
             segments,
             n_segments: segments.len(),
             threads,
-            slots: (0..segments.len()).map(|_| Mutex::new(None)).collect(),
-            ready: Condvar::new(),
+            slots: (0..segments.len()).map(|_| Monitor::new(None)).collect(),
             next_job: AtomicUsize::new(0),
             consumed: AtomicUsize::new(0),
             consumed_count: AtomicUsize::new(0),
             lane_window: Some(window),
             abort: AtomicBool::new(false),
-            poison: Mutex::new(None),
+            poison: Monitor::new(None),
             seg_sizes: segments.iter().map(|_| AtomicUsize::new(0)).collect(),
         })
+    }
+
+    /// Wake every waiter class. A poison publish or an abort changes state
+    /// that each monitor's waiters re-check between waits (the slot waits
+    /// check poison/abort, the backpressure and lane polls their atomics),
+    /// and after the per-monitor split no single notify covers them all —
+    /// a skipped slot would park its consumer or lane forever.
+    pub(super) fn broadcast(&self) {
+        for slot in &self.slots {
+            slot.notify_all();
+        }
+        self.poison.notify_all();
     }
 }
 
@@ -1521,7 +1536,7 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
     // SAFETY: same lease discipline as the input slice above.
     let segments: &[SegmentPlan] = unsafe { &*job.segments };
     loop {
-        if job.abort.load(Ordering::Relaxed) || job.poison.lock().unwrap().is_some() {
+        if job.abort.load(Ordering::Relaxed) || job.poison.lock().is_some() {
             return false;
         }
         let id = job.next_job.fetch_add(1, Ordering::Relaxed);
@@ -1531,7 +1546,8 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
         // Backpressure sleep while this segment runs too far ahead of the
         // consumer: beyond the consumed prefix in serial mode, beyond the
         // executed count in lane mode (lanes consume out of input order).
-        // The poison mutex is only the sleep token; the predicate is atomic.
+        // The poison monitor's condvar is only the sleep token; the
+        // predicate is atomic.
         let ahead = || match job.lane_window {
             Some(window) => id > job.consumed_count.load(Ordering::Acquire) + window,
             None => id > job.consumed.load(Ordering::Acquire) + job.threads,
@@ -1540,11 +1556,10 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
             if job.abort.load(Ordering::Relaxed) {
                 break;
             }
-            let guard = job.poison.lock().unwrap();
+            let guard = job.poison.lock();
             let (_guard, _timeout) = job
-                .ready
-                .wait_timeout(guard, core::time::Duration::from_millis(50))
-                .unwrap();
+                .poison
+                .wait_timeout(guard, core::time::Duration::from_millis(50));
         }
         if job.abort.load(Ordering::Relaxed) {
             return false;
@@ -1565,7 +1580,11 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
         // Every filled slot must wake the ordered consumer on the way out
         // of this match, so no fill arm may return past the notify: a
         // poison fill without one parks the consumer forever once no later
-        // segment completes (review 2026-11-03).
+        // segment completes (review 2026-11-03). The poison monitor wake
+        // carries the lane polls (their seg_sizes predicate) and the
+        // backpressure sleepers; a poison fill broadcasts to every slot as
+        // well, since the other lanes' take_staged waiters drain on the
+        // poison they re-check.
         let mut retire = false;
         match attempt {
             Ok(res) => {
@@ -1576,22 +1595,24 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
                     };
                     job.seg_sizes[id].store(published, Ordering::Release);
                 }
-                *job.slots[id].lock().unwrap() = Some(res);
+                *job.slots[id].lock() = Some(res);
+                job.slots[id].notify_all();
+                job.poison.notify_all();
             },
             Err(payload) => {
-                *job.poison.lock().unwrap() = Some(payload);
+                *job.poison.lock() = Some(payload);
                 // Release the slot so the ordered consumer can run to
                 // completion; this error is never observed (resume_unwind
                 // replaces it after the leases are waited out).
-                *job.slots[id].lock().unwrap() = Some(Err(FrameDecoderError::NotYetInitialized));
+                *job.slots[id].lock() = Some(Err(FrameDecoderError::NotYetInitialized));
                 // The scratch may be mid-decode garbage: drop it rather
                 // than reuse, and retire this thread (never reuse a thread
                 // that has seen an unwind).
                 *scratch = None;
                 retire = true;
+                job.broadcast();
             },
         }
-        job.ready.notify_all();
         if retire {
             return true;
         }
@@ -1613,7 +1634,7 @@ pub(super) struct LeaseOut<'a> {
 impl Drop for LeaseOut<'_> {
     fn drop(&mut self) {
         self.job.abort.store(true, Ordering::Release);
-        self.job.ready.notify_all();
+        self.job.broadcast();
         for (slot, lease) in self.slots {
             super::mt_pool::wait_leave(slot, lease);
         }
@@ -1641,14 +1662,13 @@ fn decode_parallel(
         segments,
         n_segments,
         threads,
-        slots: (0..n_segments).map(|_| Mutex::new(None)).collect(),
-        ready: Condvar::new(),
+        slots: (0..n_segments).map(|_| Monitor::new(None)).collect(),
         next_job: AtomicUsize::new(0),
         consumed: AtomicUsize::new(0),
         consumed_count: AtomicUsize::new(0),
         lane_window: None,
         abort: AtomicBool::new(false),
-        poison: Mutex::new(None),
+        poison: Monitor::new(None),
         seg_sizes: Vec::new(),
     });
     let lease = std::sync::Arc::new(super::mt_pool::LeaseJob::StageA(job.clone()));
@@ -1669,9 +1689,9 @@ fn decode_parallel(
         let mut frame_base = 0usize;
         for (id, seg_plan) in segments.iter().enumerate() {
             let staged = {
-                let mut guard = job.slots[id].lock().unwrap();
+                let mut guard = job.slots[id].lock();
                 while guard.is_none() {
-                    guard = job.ready.wait(guard).unwrap();
+                    guard = job.slots[id].wait(guard);
                 }
                 guard.take().unwrap()
             };
@@ -1697,7 +1717,7 @@ fn decode_parallel(
             #[cfg(feature = "hash")]
             after_segment(region.base().cast_const(), seg_out_start..written);
             job.consumed.store(id + 1, Ordering::Release);
-            job.ready.notify_all();
+            job.poison.notify_all();
         }
         verify_frame_content_sizes(frame_pledges, &frame_starts, written)?;
         Ok(written)
@@ -1705,7 +1725,7 @@ fn decode_parallel(
     // The guard is the scope-join equivalent: workers stop touching the
     // frozen input and segment plans before any panic resumes.
     drop(out_guard);
-    if let Some(payload) = job.poison.lock().unwrap().take() {
+    if let Some(payload) = job.poison.lock().take() {
         std::panic::resume_unwind(payload);
     }
     exec_result

@@ -176,6 +176,12 @@ A skippable-only stream died at `StreamingDecoder::new` with `MagicNumberReadErr
 
 ## MT decoding
 
+### One condvar pairs with one mutex
+
+`StageAJob`'s single `ready` condvar was waited with each slot's own mutex by the consumer and the lanes, and with the poison mutex by the backpressure and lane-poll sleepers, and those waits overlap in real runs (decpool finding 2). POSIX requires one condvar to be waited on with exactly one mutex. glibc tracks no mutex identity, so Linux ran green, while macOS pthread aborts from inside `Condvar::wait` on the second mutex, which is the macOS-only CI failure this class produced. The encode-side bulk pool carried the same shape with four waiter classes (see the encoding page's entry under Checksums and streaming).
+
+Every waited mutex now carries its own condvar through `common::monitor::Monitor`: each slot is a monitor, and the poison mutex's own condvar is the sleep token. A fill notifies the filled slot's monitor plus the poison monitor (the lane polls watch the `seg_sizes` atomics it publishes), the consumer's advance notifies the poison monitor alone, and a poison publish or an abort broadcasts to every monitor so each slot waiter and each poller re-checks and drains. Lane results pair the same way inside `LaneJob`.
+
 ### The write limit binds every block arm
 
 The frame lanes hand the caller's buffer bound to `OutRegion::write_limit`, but only the sequence arms consulted it: the Raw and Rle arms copied unconditionally, so a short target on a multi-frame MT decode wrote up to a whole block past the caller's slice and returned `Ok` with a passing checksum. The bound belongs at the executor entry, checked once against the whole block range's output before the first store, so every arm and every executor (lanes, pieces, serial) rejects with the sequential decoder's `TargetTooSmall` instead.

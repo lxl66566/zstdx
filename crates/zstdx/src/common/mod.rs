@@ -68,5 +68,7 @@ pub const fn streaming_buffer_cap(window_size: usize, fcs: Option<u64>) -> usize
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub(crate) mod simd;
 
+#[cfg(feature = "std")]
+pub(crate) mod monitor;
 pub(crate) mod nt_copy;
 pub(crate) mod overrun;
