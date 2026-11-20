@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use super::{super::blocks::sequence_section::Sequence, decode_buffer::DecodeBuffer};
 use crate::{
     blocks::sequence_section::{MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE},
-    decoding::dictionary::Dictionary,
+    decoding::dictionary::{Dictionary, EntropyProvenance},
     fse::FSETable,
     huff0::HuffmanTable,
 };
@@ -69,7 +69,7 @@ impl DecoderScratch {
     }
 
     pub fn init_from_dict(&mut self, dict: &Dictionary) {
-        self.fse.reinit_from(&dict.fse);
+        self.fse.reinit_from(&dict.fse, dict.provenance);
         self.huf.table.reinit_from(&dict.huf.table);
         self.offset_hist = dict.offset_hist;
         self.buffer.dict_content.clear();
@@ -159,7 +159,7 @@ impl FSEScratch {
         }
     }
 
-    pub fn reinit_from(&mut self, other: &Self) {
+    pub fn reinit_from(&mut self, other: &Self, provenance: EntropyProvenance) {
         self.offsets.reinit_from(&other.offsets);
         self.literal_lengths.reinit_from(&other.literal_lengths);
         self.match_lengths.reinit_from(&other.match_lengths);
@@ -172,11 +172,14 @@ impl FSEScratch {
         self.ll_seq_valid = false;
         self.ml_seq_valid = false;
         self.of_seq_valid = false;
-        // The dictionary's tables are fully established; a first block may
-        // legally reference them through Repeat mode.
-        self.ll_ready = true;
-        self.of_ready = true;
-        self.ml_ready = true;
+        // Only a formatted dictionary's parsed tables are established; a
+        // raw-content dictionary leaves every stream not ready, so a first
+        // block's Repeat mode is rejected instead of decoding pooled
+        // residue through a one-slot pseudo table.
+        let ready = provenance == EntropyProvenance::Formatted;
+        self.ll_ready = ready;
+        self.of_ready = ready;
+        self.ml_ready = ready;
     }
 }
 

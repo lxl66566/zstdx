@@ -1474,3 +1474,43 @@ fn dictionary_absurd_hint_saturates_the_shape_fold() {
         }
     }
 }
+/// A formatted dictionary's parsed tables stay Repeat-ready across frames:
+/// reference frames decoded consecutively on one decoder keep decoding (the
+/// raw-content dictionary's not-ready marks must not leak here).
+#[cfg(all(test, feature = "std"))]
+#[test]
+fn formatted_dictionary_frames_decode_in_sequence_on_one_decoder() {
+    extern crate std;
+    use alloc::vec;
+
+    use crate::decoding::{FrameDecoder, dictionary::Dictionary};
+
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    // Corpus-like unit text: small and dict-shaped, so both encoders open
+    // the frame's first block in Repeat mode over the dictionary's tables.
+    let payload = b"[Unit]\nDescription=entropy table reuse service\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\n\n[Install]\nWantedBy=multi-user.target\n";
+
+    let mut stream = vec![];
+    let mut zenc = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    stream.extend(zenc.compress(payload).unwrap());
+    let oenc = crate::bulk::compress_with(
+        payload,
+        &crate::EncoderOptions::new(crate::Level::from_zstd(3)).dictionary(&dict),
+    )
+    .unwrap();
+    stream.extend(oenc);
+
+    let mut dec = FrameDecoder::new();
+    dec.add_dict(Dictionary::decode_dict(&dict).unwrap())
+        .unwrap();
+
+    // One decoder, the reference frame and our own back to back.
+    let mut out = vec![0u8; payload.len() * 2];
+    let n = dec.decode_all(&stream, &mut out).unwrap();
+    assert_eq!(n, payload.len() * 2);
+    let mut expected = payload.to_vec();
+    expected.extend_from_slice(payload);
+    assert_eq!(&out[..n], &expected[..]);
+}

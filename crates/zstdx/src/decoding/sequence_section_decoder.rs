@@ -409,14 +409,34 @@ const fn of_codes() -> [(u32, u8); 32] {
 }
 const OF_CODES: [(u32, u8); 32] = of_codes();
 
+/// Whether a stream's table was ever established: an RLE code, or a read
+/// distribution (every read path sets accuracy log >= 5; a virgin table has
+/// accuracy log 0 with empty probabilities).
+fn table_established(table: &FSETable, rle: Option<u8>) -> bool {
+    rle.is_some() || table.accuracy_log != 0 || !table.symbol_probabilities.is_empty()
+}
+
+/// Corruption-class rejection for a stream whose table was never
+/// established (Repeat mode with nothing to repeat).
+fn unestablished_table() -> DecodeSequenceError {
+    DecodeSequenceError::FSEDecoderError(
+        crate::decoding::errors::FSEDecoderError::TableIsUninitialized,
+    )
+}
+
 /// Rebuild the packed table slots whose source tables changed since the last
 /// block, straight from each table's distribution and spread constants. RLE
 /// streams get a one-state fake table in slot 0: the entry carries the code's
 /// (base, add-bits) with a zero transition, so the decode loop stays in state 0
 /// forever and needs no RLE special cases at all (zero accuracy-log bits at the
 /// initial state read).
-fn pack_tables(scratch: &mut FSEScratch) {
+fn pack_tables(scratch: &mut FSEScratch) -> Result<(), DecodeSequenceError> {
     if !scratch.ll_seq_valid {
+        if !table_established(&scratch.literal_lengths, scratch.ll_rle) {
+            // A 1-slot pseudo table from an empty distribution would decode
+            // pooled residue as table content; reject instead.
+            return Err(unestablished_table());
+        }
         match scratch.ll_rle {
             Some(c) => pack_rle_entry(LL_CODES[c as usize], &mut scratch.seq_packed[LL_SLOT]),
             None => build_packed_table(
@@ -428,6 +448,9 @@ fn pack_tables(scratch: &mut FSEScratch) {
         scratch.ll_seq_valid = true;
     }
     if !scratch.ml_seq_valid {
+        if !table_established(&scratch.match_lengths, scratch.ml_rle) {
+            return Err(unestablished_table());
+        }
         match scratch.ml_rle {
             Some(c) => pack_rle_entry(ML_CODES[c as usize], &mut scratch.seq_packed[ML_SLOT]),
             None => build_packed_table(
@@ -439,6 +462,9 @@ fn pack_tables(scratch: &mut FSEScratch) {
         scratch.ml_seq_valid = true;
     }
     if !scratch.of_seq_valid {
+        if !table_established(&scratch.offsets, scratch.of_rle) {
+            return Err(unestablished_table());
+        }
         match scratch.of_rle {
             Some(c) => pack_rle_entry(OF_CODES[c as usize], &mut scratch.seq_packed[OF_SLOT]),
             None => build_packed_table(
@@ -449,6 +475,7 @@ fn pack_tables(scratch: &mut FSEScratch) {
         }
         scratch.of_seq_valid = true;
     }
+    Ok(())
 }
 
 /// Write the self-transitioning entry an RLE stream decodes through.
@@ -500,18 +527,15 @@ impl SeqDecoder {
 
         let bit_stream = &source[bytes_read..];
         let br = SeqBitReader::new(bit_stream)?;
-        pack_tables(scratch);
 
-        let uninit = || {
-            DecodeSequenceError::FSEDecoderError(
-                crate::decoding::errors::FSEDecoderError::TableIsUninitialized,
-            )
-        };
         if !scratch.ll_ready || !scratch.of_ready || !scratch.ml_ready {
             // Repeat mode with no table ever established (RLE streams count:
-            // their one-state fake table lives in the packed slot)
-            return Err(uninit());
+            // their one-state fake table lives in the packed slot). Checked
+            // before packing so the mode-level cause wins over the build's
+            // own guard below.
+            return Err(unestablished_table());
         }
+        pack_tables(scratch)?;
 
         // SAFETY: seq_packed is not reallocated between here and the last
         // next() call (the tables only change through maybe_update_fse_tables)

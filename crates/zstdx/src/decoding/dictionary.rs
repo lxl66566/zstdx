@@ -6,6 +6,18 @@ use crate::decoding::{
     scratch::{FSEScratch, HuffmanScratch},
 };
 
+/// Whether loading the dictionary established entropy tables, mirroring
+/// libzstd's `dctx->fseEntropy` (set only by `ZSTD_loadDEntropy`): only a
+/// formatted dictionary's parsed tables may back a first block's Repeat
+/// modes, a raw-content dictionary establishes none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntropyProvenance {
+    /// `decode_dict` parsed the header's huffman and FSE tables.
+    Formatted,
+    /// Raw content: match history only.
+    RawContent,
+}
+
 /// Zstandard includes support for "raw content" dictionaries, that store bytes optionally used
 /// during sequence execution.
 ///
@@ -14,6 +26,8 @@ pub struct Dictionary {
     /// A 4 byte value used by decoders to check if they can use
     /// the correct dictionary. This value must not be zero.
     pub id: u32,
+    /// How the entropy state below was established.
+    pub provenance: EntropyProvenance,
     /// A dictionary can contain an entropy table, either FSE or
     /// Huffman.
     pub fse: FSEScratch,
@@ -57,6 +71,7 @@ impl Dictionary {
     pub fn raw_content(content: &[u8]) -> Dictionary {
         Dictionary {
             id: 0,
+            provenance: EntropyProvenance::RawContent,
             fse: FSEScratch::new(),
             huf: HuffmanScratch::new(),
             dict_content: content.to_vec(),
@@ -75,6 +90,7 @@ impl Dictionary {
         if raw.len() < 8 || raw.first_chunk::<4>() != Some(&MAGIC_NUM) {
             return Ok(Dictionary {
                 id: 0,
+                provenance: EntropyProvenance::RawContent,
                 fse: FSEScratch::new(),
                 huf: HuffmanScratch::new(),
                 dict_content: raw.to_vec(),
@@ -93,6 +109,7 @@ impl Dictionary {
 
         let mut new_dict = Dictionary {
             id: 0,
+            provenance: EntropyProvenance::Formatted,
             fse: FSEScratch::new(),
             huf: HuffmanScratch::new(),
             dict_content: Vec::new(),
@@ -302,5 +319,37 @@ fn repeat_offsets_must_reference_dict_content() {
             }) => assert_eq!(got_index, index),
             other => panic!("reps {reps:?}: expected InvalidRepeatOffset, got {other:?}"),
         }
+    }
+}
+
+#[test]
+fn provenance_marks_entropy_carrying_dictionaries() {
+    use crate::decoding::scratch::FSEScratch;
+
+    // A formatted dictionary's parse established its tables, so the scratch
+    // reinitialized from it starts Repeat-ready.
+    let raw = fixture_dict([1, 2, 4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let dict = Dictionary::decode_dict(&raw).unwrap();
+    assert_eq!(dict.provenance, EntropyProvenance::Formatted);
+    let mut fse = FSEScratch::new();
+    fse.reinit_from(&dict.fse, dict.provenance);
+    assert!(fse.ll_ready && fse.of_ready && fse.ml_ready);
+
+    // Raw content (including magic-prefixed short inputs) established
+    // nothing: every stream stays not ready.
+    for raw in [
+        &b""[..],
+        &b"x"[..],
+        &MAGIC_NUM[..],
+        b"raw dictionary content",
+    ] {
+        let dict = Dictionary::load(raw).unwrap();
+        assert_eq!(dict.provenance, EntropyProvenance::RawContent, "{raw:?}");
+        let mut fse = FSEScratch::new();
+        fse.reinit_from(&dict.fse, dict.provenance);
+        assert!(
+            !(fse.ll_ready || fse.of_ready || fse.ml_ready),
+            "raw content left a stream ready: {raw:?}"
+        );
     }
 }

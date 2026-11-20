@@ -9,14 +9,15 @@ use alloc::{vec, vec::Vec};
 
 use crate::decoding::{
     FrameDecoder,
+    dictionary::Dictionary,
     errors::{
-        DecodeBlockContentError, DecompressBlockError, FrameDecoderError, ReadFrameHeaderError,
-        SequencesHeaderParseError,
+        DecodeBlockContentError, DecodeSequenceError, DecompressBlockError, FSEDecoderError,
+        FrameDecoderError, ReadFrameHeaderError, SequencesHeaderParseError,
     },
 };
 // The handcrafted shapes live in the shared parity module so the bench
 // differential replays the exact bytes these tests pin.
-use crate::parity::{BlockWireType, one_sequence_frame, push_block};
+use crate::parity::{BlockWireType, SeqSpec, one_sequence_frame, push_block, seq_frame};
 
 fn decode(data: &[u8]) -> Result<Vec<u8>, FrameDecoderError> {
     let mut decoder = FrameDecoder::new();
@@ -208,4 +209,81 @@ fn single_stream_leftover_bits_are_rejected() {
         ),
         "got {err:?}"
     );
+}
+
+/// The corruption-class rejection every raw-content-dict Repeat scenario
+/// must produce: the sequence decoder found a stream whose table no mode or
+/// dictionary ever established.
+fn assert_unestablished_repeat(err: &FrameDecoderError) {
+    assert!(
+        matches!(
+            err,
+            FrameDecoderError::FailedToReadBlockBody(
+                DecodeBlockContentError::DecompressBlockError(
+                    DecompressBlockError::DecodeSequenceError(
+                        DecodeSequenceError::FSEDecoderError(FSEDecoderError::TableIsUninitialized,)
+                    ),
+                ),
+            )
+        ),
+        "got {err:?}"
+    );
+}
+
+/// A raw-content dictionary establishes no entropy tables (libzstd's
+/// `ZSTD_dct_rawContent`), so a first block with all three sequence streams
+/// in Repeat mode references tables that were never defined: libzstd rejects
+/// the frame as corruption. zstdx used to mark the tables ready for every
+/// dictionary and decoded the block through a one-slot pseudo table whose
+/// content was pooled residue. Both a fresh decoder and one whose pooled
+/// tables still hold a real frame's state must reject it the same way.
+#[test]
+fn repeat_modes_with_raw_content_dict_are_rejected() {
+    let dict: &[u8] = b"raw dictionary content";
+    let pseudo = seq_frame(&SeqSpec {
+        literals: b"abcd".to_vec(),
+        nb_seq: vec![1],
+        modes: 0xfc, // LL/OF/ML all Repeat
+        rle_tables: Vec::new(),
+        bitstream: vec![0x01],
+    });
+
+    // The reference rejects the pseudo frame with the dictionary attached.
+    assert!(
+        zstd::bulk::Decompressor::with_dictionary(dict)
+            .unwrap()
+            .decompress(&pseudo, 4096)
+            .is_err()
+    );
+
+    // (a) Fresh decoder: the dictionary left every stream not ready.
+    let mut fresh = FrameDecoder::new();
+    fresh.add_dict(Dictionary::load(dict).unwrap()).unwrap();
+    let mut out = vec![0u8; 1 << 16];
+    let err = fresh
+        .decode_all(&pseudo, &mut out)
+        .expect_err("pseudo frame must be rejected");
+    assert_unestablished_repeat(&err);
+
+    // (b) Reused decoder: one legal raw-dict frame fills the pooled tables
+    // first, then the same pseudo frame must still be rejected instead of
+    // decoding the previous frame's residue through the pseudo table.
+    let payload = b"raw dictionary content, then some more raw dictionary \
+                    content, and again raw dictionary content to match into";
+    let real = zstd::bulk::Compressor::with_dictionary(3, dict)
+        .unwrap()
+        .compress(payload)
+        .unwrap();
+    let mut reused = FrameDecoder::new();
+    reused.add_dict(Dictionary::load(dict).unwrap()).unwrap();
+    let mut sequence = real.clone();
+    sequence.extend_from_slice(&pseudo);
+    let err = reused
+        .decode_all(&sequence, &mut out)
+        .expect_err("pseudo frame after a real frame must be rejected");
+    assert_unestablished_repeat(&err);
+
+    // The legal frame alone still decodes on the same reused decoder.
+    let n = reused.decode_all(&real, &mut out).unwrap();
+    assert_eq!(&out[..n], &payload[..], "legal raw-dict frame decodes");
 }

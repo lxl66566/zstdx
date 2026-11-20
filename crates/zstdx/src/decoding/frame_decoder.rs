@@ -1243,7 +1243,7 @@ mod tests {
 
     use super::{BlockDecodingStrategy, FrameDecoder};
     use crate::decoding::{
-        dictionary::Dictionary,
+        dictionary::{Dictionary, EntropyProvenance},
         scratch::{FSEScratch, HuffmanScratch},
     };
 
@@ -1262,6 +1262,7 @@ mod tests {
     fn dict_with_id() -> Dictionary {
         Dictionary {
             id: 0x42,
+            provenance: EntropyProvenance::RawContent,
             fse: FSEScratch::new(),
             huf: HuffmanScratch::new(),
             dict_content: Vec::from(&[0xab; 16][..]),
