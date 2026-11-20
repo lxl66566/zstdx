@@ -62,6 +62,9 @@ pub enum ParseError {
     /// The window descriptor exceeds the format's window ceiling
     /// (`frameParameter_windowTooLarge`).
     WindowTooLarge,
+    /// A skippable frame's 32-bit size field wraps past itself
+    /// (`frameParameter_unsupported`, `readSkippableFrameSize`'s wrap check).
+    SkippableSizeWrap,
 }
 
 /// The zstd frame header at the start of `src`: descriptor, optional window
@@ -132,8 +135,14 @@ fn parse_zstd_header(src: &[u8]) -> Result<HeaderInfo, ParseError> {
 }
 
 /// Parse the frame header at the start of `src` (skippable frames included).
+/// Below four bytes the visible magic prefix is validated, exactly as
+/// libzstd's `ZSTD_getFrameHeader_advanced` does on short inputs: a prefix
+/// matching neither magic family is `BadMagic`, not a size request.
 pub fn parse_header(src: &[u8]) -> Result<Header, ParseError> {
     if src.len() < 4 {
+        if !src.is_empty() && !magic_prefix_ok(src) {
+            return Err(ParseError::BadMagic);
+        }
         return Err(ParseError::NeedMore);
     }
     let magic = u32::from_le_bytes(src[..4].try_into().expect("4 bytes checked"));
@@ -289,14 +298,22 @@ pub fn header_size_formula(descriptor: u8) -> usize {
 
 /// Walk the blocks of the first frame in `src` and return its whole
 /// serialized size (header, blocks, checksum). Skippable frames return
-/// their total size.
+/// their total size. The walk mirrors the reference: block sizes are taken
+/// from the headers at face value — the 128 KiB ceiling is a decode-time
+/// check, not walk-time — and a skippable frame's errors are
+/// `readSkippableFrameSize`'s own codes.
 pub fn frame_compressed_size(src: &[u8]) -> Result<usize, ParseError> {
     let header = match parse_header(src)? {
-        Header::Skippable { total } => {
-            return if src.len() >= total {
-                Ok(total)
-            } else {
-                Err(ParseError::NeedMore)
+        Header::Skippable { .. } => {
+            return match skippable_frame_size(src) {
+                Ok(total) => Ok(total),
+                Err(crate::error::ErrorCode::FrameParameterUnsupported) => {
+                    Err(ParseError::SkippableSizeWrap)
+                },
+                // Short of the 8-byte head or an overrun of the input: the
+                // callers map NeedMore to srcSize_wrong, the reference's
+                // other readSkippableFrameSize answer.
+                Err(_) => Err(ParseError::NeedMore),
             };
         },
         Header::Zstd(header) => header,
@@ -314,12 +331,9 @@ pub fn frame_compressed_size(src: &[u8]) -> Result<usize, ParseError> {
         let block_type = (b0 >> 1) & 3;
         let size = (usize::from(b0) >> 3) | (usize::from(b1) << 5) | (usize::from(b2) << 13);
         let body = match block_type {
-            0 | 2 => {
-                if size > MAX_BLOCK_CONTENT {
-                    return Err(ParseError::Malformed);
-                }
-                size
-            },
+            // Raw / Compressed carry `size` wire bytes, whatever the header
+            // claims (the format's 128 KiB cap is enforced at decode time).
+            0 | 2 => size,
             // RLE blocks carry one content byte; `size` is the regenerated
             // length and is bounded at decode time by the window.
             1 => 1,
@@ -396,7 +410,9 @@ pub fn parse_error_code(error: ParseError) -> crate::error::ErrorCode {
         ParseError::NeedMore | ParseError::BadMagic | ParseError::Malformed => {
             ErrorCode::PrefixUnknown
         },
-        ParseError::ReservedBit => ErrorCode::FrameParameterUnsupported,
+        ParseError::ReservedBit | ParseError::SkippableSizeWrap => {
+            ErrorCode::FrameParameterUnsupported
+        },
         ParseError::WindowTooLarge => ErrorCode::FrameParameterWindowTooLarge,
     }
 }
@@ -419,6 +435,12 @@ pub struct FrameSizeInfo {
     pub block_size_max: u64,
 }
 
+/// `readSkippableFrameSize`'s wrap check: the 32-bit content size plus the
+/// skippable header overflows the size field itself.
+pub(crate) fn skippable_size_wraps(content: u32) -> bool {
+    content.wrapping_add(SKIPPABLE_HEADER as u32) < content
+}
+
 /// `readSkippableFrameSize`: the serialized size of a skippable frame.
 fn skippable_frame_size(src: &[u8]) -> Result<usize, crate::error::ErrorCode> {
     use crate::error::ErrorCode;
@@ -427,8 +449,8 @@ fn skippable_frame_size(src: &[u8]) -> Result<usize, crate::error::ErrorCode> {
         return Err(ErrorCode::SrcSizeWrong);
     }
     let content = u32::from_le_bytes(src[4..8].try_into().expect("8 bytes checked"));
-    if content.wrapping_add(SKIPPABLE_HEADER as u32) < content {
-        // The 32-bit size field would wrap the frame past addressable input.
+    if skippable_size_wraps(content) {
+        // The size field would wrap the frame past addressable input.
         return Err(ErrorCode::FrameParameterUnsupported);
     }
     let total = SKIPPABLE_HEADER + content as usize;
@@ -438,7 +460,7 @@ fn skippable_frame_size(src: &[u8]) -> Result<usize, crate::error::ErrorCode> {
     Ok(total)
 }
 
-fn is_skippable_magic(src: &[u8]) -> bool {
+pub(crate) fn is_skippable_magic(src: &[u8]) -> bool {
     if src.len() < 4 {
         return false;
     }
@@ -662,9 +684,13 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
     if !is_skippable_magic(bytes) {
         return code(ErrorCode::FrameParameterUnsupported);
     }
+    // The reference computes readSkippableFrameSize but never checks its
+    // error return, re-judging the value as a plain size_t: every failure
+    // of the helper (the 32-bit wrap included, whose wrapped error value
+    // sits far above srcSize) answers srcSize_wrong here.
     let total = match skippable_frame_size(bytes) {
         Ok(total) => total,
-        Err(e) => return code(e),
+        Err(_) => return code(ErrorCode::SrcSizeWrong),
     };
     let content = total - 8;
     if content > dst_capacity {
@@ -805,7 +831,17 @@ mod tests {
             parse_header(&[0u8, 1, 2, 3]).unwrap_err(),
             ParseError::BadMagic
         );
-        assert_eq!(parse_header(&[0u8, 1]).unwrap_err(), ParseError::NeedMore);
+        // Short inputs validate the visible magic prefix: a mismatching one
+        // is an error, a matching one still wants more.
+        assert_eq!(parse_header(&[0u8, 1]).unwrap_err(), ParseError::BadMagic);
+        assert_eq!(
+            parse_header(&[0x28u8, 0xb5]).unwrap_err(),
+            ParseError::NeedMore
+        );
+        assert_eq!(
+            parse_header(&[0x50u8, 0x2a]).unwrap_err(),
+            ParseError::NeedMore
+        );
         // libzstd's getFrameHeader: short input with a mismatching prefix
         // is an error, with a matching prefix it wants 5.
         assert_eq!(

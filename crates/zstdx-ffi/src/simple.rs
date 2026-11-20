@@ -341,9 +341,18 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader(
         Ok(crate::frame::HeaderParse::Wanted(wanted)) => wanted,
         Err(crate::frame::ParseError::NeedMore) => crate::frame::HEADER_PREFIX,
         Err(crate::frame::ParseError::BadMagic) => ret(ErrorCode::PrefixUnknown),
-        Err(crate::frame::ParseError::ReservedBit) => ret(ErrorCode::FrameParameterUnsupported),
+        // The reference writes headerSize at its size gate, before the
+        // descriptor checks: these two error paths still expose it.
+        Err(crate::frame::ParseError::ReservedBit) => {
+            zfh.header_size = crate::frame::header_size_formula(src[4]) as core::ffi::c_uint;
+            ret(ErrorCode::FrameParameterUnsupported)
+        },
         Err(crate::frame::ParseError::WindowTooLarge) => {
+            zfh.header_size = crate::frame::header_size_formula(src[4]) as core::ffi::c_uint;
             ret(ErrorCode::FrameParameterWindowTooLarge)
+        },
+        Err(crate::frame::ParseError::SkippableSizeWrap) => {
+            ret(ErrorCode::FrameParameterUnsupported)
         },
         Err(crate::frame::ParseError::Malformed) => ret(ErrorCode::CorruptionDetected),
     }
@@ -402,6 +411,11 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(
         Err(crate::frame::ParseError::NeedMore) => ret(ErrorCode::SrcSizeWrong),
         Err(crate::frame::ParseError::Malformed) => ret(ErrorCode::CorruptionDetected),
         Err(crate::frame::ParseError::ReservedBit) => ret(ErrorCode::FrameParameterUnsupported),
+        // readSkippableFrameSize's wrap answer, forwarded by the reference
+        // walk (findFrameSizeInfo).
+        Err(crate::frame::ParseError::SkippableSizeWrap) => {
+            ret(ErrorCode::FrameParameterUnsupported)
+        },
         Err(crate::frame::ParseError::WindowTooLarge) => {
             ret(ErrorCode::FrameParameterWindowTooLarge)
         },

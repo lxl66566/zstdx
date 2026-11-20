@@ -345,6 +345,160 @@ fn metadata_entries() {
     assert_eq!(fcs, zstd::CONTENTSIZE_UNKNOWN);
 }
 
+/// `ZSTD_getFrameHeader` writes `headerSize` at its size gate, before the
+/// descriptor checks: the reserved-bit and window-ceiling error paths still
+/// expose the measured header length (the rest of the struct stays zeroed).
+#[test]
+fn frame_header_error_paths_expose_header_size() {
+    let reserved = [0x28u8, 0xb5, 0x2f, 0xfd, 0x08, 0x00];
+    let window = [0x28u8, 0xb5, 0x2f, 0xfd, 0x00, 0xff];
+    for (src, want_code, want_header) in [
+        (reserved, zstd::ErrorCode::FrameParameterUnsupported, 6u32),
+        (window, zstd::ErrorCode::FrameParameterWindowTooLarge, 6),
+    ] {
+        let mut zfh = dirty_frame_header();
+        let r = unsafe { zstd::ZSTD_getFrameHeader(&raw mut zfh, src.as_ptr().cast(), src.len()) };
+        assert_eq!(error_code(r), want_code as u32);
+        assert_eq!(zfh.header_size, want_header, "error path keeps headerSize");
+        // Only the size gate's field is written; the rest stays zeroed.
+        assert_eq!(zfh.frame_type, 0);
+        assert_eq!(zfh.window_size, 0);
+    }
+}
+
+/// The header struct prefilled with sentinels, so a test proves which
+/// fields the entry actually wrote.
+fn dirty_frame_header() -> zstd::ZSTD_FrameHeader {
+    zstd::ZSTD_FrameHeader {
+        frame_content_size: u64::MAX,
+        window_size: u64::MAX,
+        block_size_max: 0xab,
+        frame_type: -1,
+        header_size: 0xab,
+        dict_id: 0xab,
+        checksum_flag: 0xab,
+        reserved1: 0xab,
+        reserved2: 0xab,
+    }
+}
+
+/// `ZSTD_findFrameCompressedSize` on short inputs: the reference validates
+/// the visible magic prefix through `getFrameHeader` and answers
+/// prefix_unknown for mismatching bytes, srcSize_wrong for every valid
+/// prefix (its wanted-size answer folded into the walk's error).
+#[test]
+fn find_frame_compressed_size_short_input_error_codes() {
+    for n in 1..=3usize {
+        let src = &[0xaau8, 0xbb, 0xcc][..n];
+        let r = unsafe { zstd::ZSTD_findFrameCompressedSize(src.as_ptr().cast(), src.len()) };
+        assert_eq!(error_code(r), 10, "n={n} garbage is prefix_unknown");
+    }
+    // Valid prefixes of either magic family want their header, which the
+    // walk reports as srcSize_wrong - including a complete 4-byte skippable
+    // magic, which wants 5 (not 8) below the prefix size.
+    for (src, code) in [
+        (&[0x28u8, 0xb5][..], 72u32),
+        (&[0x28u8, 0xb5, 0x2f, 0xfd][..], 72),
+        (&[0x50u8, 0x2a][..], 72),
+        (&[0x50u8, 0x2a, 0x4d, 0x18][..], 72),
+        (&[0x50u8, 0x2a, 0x4d, 0x18, 1, 2][..], 72),
+    ] {
+        let r = unsafe { zstd::ZSTD_findFrameCompressedSize(src.as_ptr().cast(), src.len()) };
+        assert_eq!(error_code(r), code, "{} bytes", src.len());
+    }
+}
+
+/// The frame walk takes block-header sizes at face value: the 128 KiB
+/// ceiling is a decode-time check, so a malformed-but-walkable frame with
+/// an oversized raw block still measures its serialized size.
+#[test]
+fn frame_walk_accepts_block_over_128k() {
+    let mut big = vec![0x41u8; 6 + 3 + 200_000];
+    big[..6].copy_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00]);
+    let hdr: u32 = 1 | (200_000u32 << 3);
+    big[6..9].copy_from_slice(&hdr.to_le_bytes()[..3]);
+    let r = unsafe { zstd::ZSTD_findFrameCompressedSize(big.as_ptr().cast(), big.len()) };
+    assert_eq!(r, big.len());
+    // The single-segment header declares FCS 0, so the series sums to 0.
+    let fds = unsafe { zstd::ZSTD_findDecompressedSize(big.as_ptr().cast(), big.len()) };
+    assert_eq!(fds, 0);
+}
+
+/// A skippable frame whose 32-bit size field wraps past itself: the walk
+/// entries forward `readSkippableFrameSize`'s frameParameter_unsupported,
+/// while `ZSTD_readSkippableFrame` - which never checks that helper's error
+/// return and re-judges its wrapped value as a size_t - answers
+/// srcSize_wrong.
+#[test]
+fn skippable_size_wrap_error_codes() {
+    let src = [0x50u8, 0x2a, 0x4d, 0x18, 0xff, 0xff, 0xff, 0xff];
+    let ffcs = unsafe { zstd::ZSTD_findFrameCompressedSize(src.as_ptr().cast(), src.len()) };
+    assert_eq!(error_code(ffcs), 14);
+    // The other walk entries fold the failure into their own error shape.
+    assert_eq!(
+        unsafe { zstd::ZSTD_findDecompressedSize(src.as_ptr().cast(), src.len()) },
+        zstd::CONTENTSIZE_ERROR
+    );
+    assert_eq!(
+        unsafe { zstd::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) },
+        0
+    );
+    let mut payload = [0u8; 64];
+    let mut variant = 0xdead_beefu32;
+    let r = unsafe {
+        zstd::ZSTD_readSkippableFrame(
+            payload.as_mut_ptr().cast(),
+            payload.len(),
+            &raw mut variant,
+            src.as_ptr().cast(),
+            src.len(),
+        )
+    };
+    assert_eq!(error_code(r), 72);
+}
+
+/// One-shot `ZSTD_decompress` on a skippable frame whose size field leaves
+/// the input (or wraps past 32 bits): the reference loop forwards
+/// `readSkippableFrameSize` - srcSize_wrong for the overrun,
+/// frameParameter_unsupported for the wrap - also behind a decoded frame.
+#[test]
+fn decompress_skippable_size_out_of_range() {
+    let overrun = [0x50u8, 0x2a, 0x4d, 0x18, 0xb0, 0xfd, 0x75, 0x56];
+    let wrap = [0x50u8, 0x2a, 0x4d, 0x18, 0xff, 0xff, 0xff, 0xff];
+    let mut out = vec![0u8; 65536];
+    let r = unsafe {
+        zstd::ZSTD_decompress(
+            out.as_mut_ptr().cast(),
+            out.len(),
+            overrun.as_ptr().cast(),
+            8,
+        )
+    };
+    assert_eq!(error_code(r), 72);
+    let r = unsafe {
+        zstd::ZSTD_decompress(out.as_mut_ptr().cast(), out.len(), wrap.as_ptr().cast(), 8)
+    };
+    assert_eq!(error_code(r), 14);
+
+    // Behind a decoded frame the same tails answer through the loop's
+    // skippable skip.
+    let input = b"payload payload payload";
+    let frame = stream_compress(input, 3, 128 * 1024, 128 * 1024);
+    for (tail, code) in [(overrun, 72u32), (wrap, 14)] {
+        let mut series = frame.clone();
+        series.extend_from_slice(&tail);
+        let r = unsafe {
+            zstd::ZSTD_decompress(
+                out.as_mut_ptr().cast(),
+                out.len(),
+                series.as_ptr().cast(),
+                series.len(),
+            )
+        };
+        assert_eq!(error_code(r), code);
+    }
+}
+
 /// `stream_compress` with `e_flush` after every input chunk instead of
 /// `e_continue`.
 fn stream_compress_flushy(input: &[u8], level: c_int, in_size: usize, out_size: usize) -> Vec<u8> {

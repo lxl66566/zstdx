@@ -84,6 +84,14 @@ pub fn decompress_oneshot(
         if src.len() < crate::frame::HEADER_PREFIX {
             return ErrorCode::SrcSizeWrong;
         }
+        if let zstdx::Error::Frame(zstdx::decoding::errors::FrameDecoderError::FailedToSkipFrame) =
+            &e
+        {
+            // The reference loop forwards readSkippableFrameSize from its
+            // skippable skip; this layer's engine only reports that the
+            // skip ran out of input.
+            return skippable_skip_code(src);
+        }
         if let zstdx::Error::Frame(
             zstdx::decoding::errors::FrameDecoderError::ReadFrameHeaderError(header_error),
         ) = &e
@@ -108,6 +116,23 @@ pub fn decompress_oneshot(
         }
         error::decode(&e, DecodeSite::OneShot)
     })
+}
+
+/// `readSkippableFrameSize`'s answer for the skippable frame the series
+/// walk stops on (where the engine's skip ran out of input): the 32-bit
+/// size wrap is `frameParameter_unsupported`, an overrun of the remaining
+/// input `srcSize_wrong`. `ZSTD_decompressMultiFrame` forwards the code.
+fn skippable_skip_code(src: &[u8]) -> ErrorCode {
+    let (tail, _) = frame_series_walk(src);
+    if tail.len() >= 8
+        && crate::frame::is_skippable_magic(tail)
+        && crate::frame::skippable_size_wraps(u32::from_le_bytes(
+            tail[4..8].try_into().expect("8 bytes checked"),
+        ))
+    {
+        return ErrorCode::FrameParameterUnsupported;
+    }
+    ErrorCode::SrcSizeWrong
 }
 
 /// Walk every complete frame of a series (skippable ones included) and
