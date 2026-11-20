@@ -123,6 +123,10 @@ pub(super) fn ramp_ext_floor<const RAMPED: bool>(
 /// [`Matcher::skip_if_incompressible`]). 32K tag slots keep the overwrite
 /// rate of a block's ~2000 samples negligible.
 pub(super) const GATE_PROBE_LOG: u32 = 15;
+/// The gate's content hash: 8 bytes folded through multiply-shift, slot in
+/// the top bits, tag in the low 32 (the shared constant of the block sample
+/// pass and the strip replay so both derive identical (slot, tag) pairs).
+pub(super) const GATE_HASH_MUL: u64 = 0xcf1b_bcdc_b7a5_6463;
 /// Blocks below this pay little enough in the matcher that the gate's
 /// sample pass is not worth its own cost.
 pub(super) const GATE_MIN_BLOCK: usize = 16384;

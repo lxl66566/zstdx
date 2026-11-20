@@ -23,6 +23,8 @@
 
 use alloc::vec::Vec;
 use core::num::NonZero;
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // Only the portable `gear_run` fallback scans in `gear4` groups; on x86-64
 // the whole-loop asm below took over the scan.
@@ -790,7 +792,9 @@ impl LdmState {
         #[cfg(feature = "std")]
         {
             let lanes = parallel_fill_lanes();
-            if end - base >= PARALLEL_FILL_MIN && lanes > 1 {
+            if end - base >= PARALLEL_FILL_MIN && lanes > 1 && lease_fill_lanes() {
+                // The guard releases the lease on every exit, panic included.
+                let _held = LaneLeaseHeld;
                 self.fill_parallel(win, win_base, base, end, lanes);
                 return;
             }
@@ -833,7 +837,8 @@ impl LdmState {
     /// in the input alone: no lane interleaving reaches the table.
     /// `lanes` is the caller's scheduling choice (the lane count cannot
     /// move the output); only callers past the parallelism threshold
-    /// may pass more than one.
+    /// may pass more than one, and [`Self::fill`] hands them out through
+    /// the capped [`PARALLEL_FILLS`] lease (see its comment).
     #[cfg(feature = "std")]
     fn fill_parallel(&mut self, win: &[u8], win_base: u64, base: u64, end: u64, lanes: usize) {
         debug_assert!(end - base >= MIN_MATCH_LENGTH as u64);
@@ -1248,6 +1253,55 @@ fn prefetch_hit(table: &[u64], offsets: &[u8], hash: usize) {
     let _ = (table, offsets, hash);
 }
 
+/// Count of multi-lane fills in flight; [`LdmState::fill`] leases the
+/// lanes to at most [`PARALLEL_FILL_CAP`] of them at a time. The
+/// streaming steady state refills a whole-window strip per job with
+/// every pool worker filling at once (w16 l9 on this box: 16 joiners
+/// spawning 2 helpers each = 48 scanners on 32 cores), where the helpers
+/// displace the other jobs' own fills instead of using idle cores.
+/// Scheduling only: the lane count cannot move the output, so the
+/// lease's race picks a lane count, never a byte.
+#[cfg(feature = "std")]
+static PARALLEL_FILLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Cap on concurrent multi-lane fills: one. Measured same-binary on the
+/// FFI caller shape (dll400 l9 w16, 2026-11-19): the stock always-lane
+/// fill reads 1759.8 ms medians against 1683.8 at this cap, -4.3
+/// percent frame wall, with caps 0 and 2 inside noise of it and bulk w4
+/// and w2 flat across every cap — the win is entirely the burst
+/// oversubscription standing down, while a lone large-span fill (a
+/// dictionary load, a low-concurrency stream) keeps its lanes.
+#[cfg(feature = "std")]
+const PARALLEL_FILL_CAP: usize = 1;
+
+/// Lease the helper lanes for one fill; `false` means the cap is held
+/// and this fill runs serial. Relaxed both ways: the counter publishes
+/// no memory, it only shapes the lane decision, and a racing overshoot
+/// rolls back so the count never leaks.
+#[cfg(feature = "std")]
+fn lease_fill_lanes() -> bool {
+    if PARALLEL_FILLS.fetch_add(1, Ordering::Relaxed) < PARALLEL_FILL_CAP {
+        return true;
+    }
+    PARALLEL_FILLS.fetch_sub(1, Ordering::Relaxed);
+    false
+}
+
+/// The held lane lease: dropping releases it, so an unwind out of
+/// `fill_parallel` cannot leave the lanes leased forever. Must be bound
+/// (`let _held = ...`) — an unbound temporary would release at the
+/// statement's semicolon, before the fill it guards runs.
+#[cfg(feature = "std")]
+#[must_use]
+struct LaneLeaseHeld;
+
+#[cfg(feature = "std")]
+impl Drop for LaneLeaseHeld {
+    fn drop(&mut self) {
+        PARALLEL_FILLS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Lanes a parallel fill spreads its scan over: three while the box has
 /// cores to spare (a captured frame's workers fill at job start, leaving
 /// the encode idle — the scan lanes take the idle half), one otherwise.
@@ -1566,6 +1620,78 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The lease-gated dispatch of [`LdmState::fill`] (the streaming
+    /// jobs' entry) leaves bit-identical tables whichever way the lease
+    /// resolves the lane decision: taken by other fills (this one must
+    /// run serial) and free (this one may take the lanes) both equal a
+    /// continuing [`LdmState::fill_serial`] reference. Both the restart
+    /// entry and the continuation entry span past [`PARALLEL_FILL_MIN`],
+    /// so the lease is queried at each; the continuation is a call
+    /// boundary the segmentation falsification already bounds, and both
+    /// sides take the same boundary, so the comparison is
+    /// like-for-like. The lease state is reached and released only
+    /// through `lease_fill_lanes` and the guard's Drop — a raw counter
+    /// write could erase or wrap a concurrently-running test's lease —
+    /// and nothing asserts the counter's value, which those tests move
+    /// freely.
+    #[cfg(feature = "std")]
+    #[test]
+    fn gated_fill_matches_serial_whatever_the_lease() {
+        // Two gate-passing fills plus the window margins below `base`
+        // and an unaligned tail.
+        let mut data = rand_bytes(2 * PARALLEL_FILL_MIN as usize + 256 * 1024, 0x1a7e_5eed);
+        for (i, b) in data.iter_mut().enumerate() {
+            if i % 64 < 4 {
+                *b ^= ((i >> 6) & 0xff) as u8;
+            }
+        }
+        let (win_base, base) = (32768u64, 65536u64);
+        let win = &data[win_base as usize..];
+        let end = base + PARALLEL_FILL_MIN;
+        let end2 = end + PARALLEL_FILL_MIN + 123;
+        for held in [true, false] {
+            let mut gated = LdmState::new(20, 1 << 20);
+            gated.restart(base);
+            let mut ser = LdmState::new(20, 1 << 20);
+            ser.restart(base);
+            // Top the lease up to the cap through the sanctioned API:
+            // the loop's terminal `false` is the proof the cap is held,
+            // and every guard below releases exactly what it took.
+            let mut held_guard = Vec::new();
+            if held {
+                while lease_fill_lanes() {
+                    held_guard.push(LaneLeaseHeld);
+                }
+            }
+            gated.fill(win, win_base, base, end);
+            drop(held_guard);
+            ser.fill_serial(win, win_base, base, end);
+            assert!(
+                gated.snapshot().same_as(&ser.snapshot()),
+                "restart entry diverged (lease held: {held})"
+            );
+            // Continuation entry: `fed == end`, the non-restart path a
+            // mid-stream job's second fill takes, spanning past the
+            // gate as well. Both states take the same call boundary
+            // before the compare.
+            let mut held_guard = Vec::new();
+            if held {
+                while lease_fill_lanes() {
+                    held_guard.push(LaneLeaseHeld);
+                }
+            }
+            gated.fill(win, win_base, end, end2);
+            drop(held_guard);
+            ser.fill_serial(win, win_base, end, end2);
+            assert!(
+                gated.snapshot().same_as(&ser.snapshot()),
+                "continuation diverged (lease held: {held})"
+            );
+            assert_eq!(gated.fed, ser.fed);
+            assert_eq!(gated.rolling, ser.rolling);
         }
     }
 

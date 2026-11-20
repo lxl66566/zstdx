@@ -2674,6 +2674,7 @@ impl MtEncoderCore {
         .min(BUF_CAP_MAX);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            #[cfg(feature = "job_trace")]
             let live = self.buf.len();
             #[cfg(feature = "job_trace")]
             let g_t0 = std::time::Instant::now();
@@ -3634,9 +3635,13 @@ impl MtEncoderCore {
         }
         #[cfg(feature = "job_trace")]
         let q_t0 = std::time::Instant::now();
+        #[cfg(feature = "job_trace")]
         let mut waited = false;
         while !self.quiescent() {
-            waited = true;
+            #[cfg(feature = "job_trace")]
+            {
+                waited = true;
+            }
             if self.shared.poisoned.load(Ordering::Acquire) {
                 // In-flight jobs still complete under poison; the unwind
                 // resumes from there and never returns here.
@@ -3670,6 +3675,7 @@ impl MtEncoderCore {
             // need.
             let target =
                 (self.buf.len() + want + 64 * 1024).max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            #[cfg(feature = "job_trace")]
             let live = self.buf.len();
             #[cfg(feature = "job_trace")]
             let g_t0 = std::time::Instant::now();

@@ -2360,26 +2360,59 @@ impl MatchGeneratorDriver {
             // Every sample of a uniform strip hashes to one slot with one
             // tag: the walk's final table is the clear plus a single
             // store (any position reads the same 8 bytes).
-            let h = read8(data, 0).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            let h = read8(data, 0).wrapping_mul(GATE_HASH_MUL);
             self.probe[(h >> (64 - GATE_PROBE_LOG)) as usize] = h as u32;
             return;
         }
         #[cfg(feature = "job_trace")]
         let trace_gate = std::time::Instant::now();
         let block = self.block_size();
-        let mut off = 0;
-        while off < data.len() {
+        // Last-writer-wins replay, walked backward: a slot's final content
+        // is the tag of its last forward sample, which is exactly its first
+        // backward visit, so once every slot is visited the samples below
+        // cannot change the table and the walk stops. Coupon-collector over
+        // 32K slots expects ~slots * H(slots) ≈ 0.35M samples; the field
+        // strips' measured stops sit at ~0.40M of a 64 MiB strip's ~1.03M
+        // (a 2.6x cut), and the strip bytes below the stop never load.
+        // Degenerate strips (fewer distinct sample hashes than slots) never
+        // stop early and pay the bitmap test over the same enumeration the
+        // forward pass would, same final table.
+        debug_assert_eq!(self.probe.len(), 1 << GATE_PROBE_LOG);
+        let mut decided = [0u64; (1 << GATE_PROBE_LOG) / 64];
+        let mut undecided = 1usize << GATE_PROBE_LOG;
+        // Segment starts are the multiples of `block` (every non-final
+        // segment is exactly `block`), the final one holds the remainder.
+        let mut off = ((data.len() - 1) / block) * block;
+        'segs: loop {
             let seg = (data.len() - off).min(block);
             if seg >= GATE_MIN_BLOCK {
                 let stride = (seg >> 11) | 1;
-                let mut i = off;
-                while i + HASH_READ <= off + seg {
-                    let h = read8(data, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
-                    self.probe[(h >> (64 - GATE_PROBE_LOG)) as usize] = h as u32;
-                    i += stride;
+                // The forward pass sampled off, off+stride, ... while
+                // i + HASH_READ <= off + seg; this is that grid's last
+                // sample, and the loop below walks it back to `off`.
+                let mut i = off + (seg - HASH_READ) / stride * stride;
+                loop {
+                    let h = read8(data, i).wrapping_mul(GATE_HASH_MUL);
+                    let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
+                    let bit = 1u64 << (slot % 64);
+                    if decided[slot / 64] & bit == 0 {
+                        decided[slot / 64] |= bit;
+                        self.probe[slot] = h as u32;
+                        undecided -= 1;
+                        if undecided == 0 {
+                            break 'segs;
+                        }
+                    }
+                    if i == off {
+                        break;
+                    }
+                    i -= stride;
                 }
             }
-            off += seg;
+            if off == 0 {
+                break;
+            }
+            off -= block;
         }
         #[cfg(feature = "job_trace")]
         super::job_trace::add_gate(trace_gate);
@@ -3861,7 +3894,7 @@ impl Matcher for MatchGeneratorDriver {
         // screens cannot mis-gate.
         let (mut screen1, mut screen2) = (64 * stride, 512 * stride);
         while i + HASH_READ <= total {
-            let h = read8(block, i).wrapping_mul(0xcf1b_bcdc_b7a5_6463);
+            let h = read8(block, i).wrapping_mul(GATE_HASH_MUL);
             let slot = (h >> (64 - GATE_PROBE_LOG)) as usize;
             let tag = h as u32;
             if probe[slot] == tag {
