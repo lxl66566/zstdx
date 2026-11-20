@@ -48,6 +48,12 @@ The MT-heavy subset for iteration:
 cargo nextest run -p zstdx -E 'test(mt) or test(pool) or test(thread) or test(worker) or binary(mt_piece_decode)'
 ```
 
+### Paranoid-gate memory shape
+
+Under libtest's default parallelism the whole lib suite shares one process, and the memory-heavy tail — cap-scale stream rows, raised-window LDM grids, ladder sequences — holds hundreds of MiB live per test while the process-wide pools (the pump's retained buffers, the worker-state pool) pin what a finished test touched. The unbounded peak sat near 5.4 GiB, and on this 13.7 GiB host (zram swap, earlyoom at 5 percent free) any co-tenant holding a few GiB turned the gate into an earlyoom kill of the gate binary. The R115 round's "parallel stall" resolved to exactly that: the earlyoom journal for that window records five kills of the paranoid lib binary at 4.1-4.3 GiB RSS with swap full, and the same suite passed green in 26 s once the box went quiet. A stall report on this gate is a memory condition until the journal says otherwise; the watchdog tests bound the known pool bugs into failures.
+
+`tests::mem_gate` bounds that shape now. A test whose measured solo peak crosses 100 MiB takes an admission lease — `let _mem = heavy_mem(HeavyMem::Mid);` as its first statement, one of four shares; past 400 MiB `HeavyMem::CapScale`, the whole gate, so the row runs alone. The lease's drop returns this thread's retained pump buffers and clears the worker-state pool, so a finished test pins nothing past its run. Measure a new test's solo peak by running it alone and sampling `VmRSS` (`<test binary> -- --exact <full test name>`); past either threshold it joins the gate. Suite peak and floor went from 5.2-5.4 GiB to 2.7-3.1 GiB, wall 26 s to about 30 s. The remaining floor is the idle pool workers' retained states plus malloc arenas, bounded and returned as the workers retire.
+
 ## Flake policy
 
 A seven-run hunt on 2026-11-17 (five passes over the 177-test MT/thread subset above, two full 802-test workspace runs) produced zero intermittent failures.
@@ -55,6 +61,8 @@ A seven-run hunt on 2026-11-17 (five passes over the 177-test MT/thread subset a
 Retries are reserved for environmental flakes only: temp-dir races, port or cwd assumptions, runner starvation. A failure caused by a product bug must stay a failure, so no profile in `.config/nextest.toml` sets `retries` above zero. A future flake gets a scoped `[[profile.default.overrides]]` block naming the environmental cause, never a blanket count.
 
 The one known product race is the poison-drain livelock ([todo 39](todo.md), observed twice on 2026-11-15, not reproduced since): a worker panic that leaves a posted job unclaimed spins `wait_progress` forever. It manifests as a hang, which the 600 s termination bound converts into a reported termination, so a run surfaces it instead of stalling silently. Do not add retries for it.
+
+The 2026-11-20 admission gate also flushed out an order-dependent leave-behind that the old parallel scheduling almost always dodged: `opt_serial_ldm_feed_pledged_stream_matches_bulk` exited with the process-global feed flag stood down, so any armed-feed assert scheduled after it failed. The test's tail restores the flag now, and the feed stand-down inside `ldm_feed_panic_surfaces_and_pool_recovers` rides under the feed switch like every other flipper (`FEED_TEST_SWITCH` first, then `INJECT_LOCK`, matching the gate-then-switch order every guarded test already follows).
 
 ## Slow tests
 

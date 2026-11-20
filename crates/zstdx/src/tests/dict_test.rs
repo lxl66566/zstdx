@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "std"))]
+use crate::tests::mem_gate::{HeavyMem, heavy_mem};
 #[test]
 fn test_dict_parsing() {
     use alloc::vec;
@@ -1423,6 +1425,7 @@ fn dict_opt_rows_stay_in_the_reference_class() {
 #[cfg(feature = "std")]
 #[test]
 fn dictionary_absurd_hint_saturates_the_shape_fold() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     use alloc::vec::Vec;
 
     let dict: Vec<u8> = (0..4 * 1024u32).map(|i| (i % 251) as u8).collect();

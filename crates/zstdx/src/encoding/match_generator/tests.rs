@@ -4,7 +4,10 @@ use super::{
     LdmArming, MatchGeneratorDriver, RowAttempts, ScanDensity, SmallSrcRow, ldm_min_window,
     pack_pos, params::BalancedStore, params_for_row, unpack_pos,
 };
-use crate::encoding::{Matcher, Sequence, reach_probe::ReachChoice};
+use crate::{
+    encoding::{Matcher, Sequence, reach_probe::ReachChoice},
+    tests::mem_gate::{HeavyMem, heavy_mem},
+};
 
 /// The 64 KiB unit both LDM far-class tests duplicate.
 const UNIT: usize = 64 * 1024;
@@ -505,6 +508,7 @@ fn ldm_row_covers_beyond_chain_reach() {
 #[test]
 #[cfg(feature = "std")]
 fn ldm_dll_roundtrip() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     for name in ["bench/big/dll100.raw", "bench/big/dll32.raw"] {
         let Ok(raw) = std::fs::read(name) else {
             continue;
@@ -522,6 +526,7 @@ fn ldm_dll_roundtrip() {
 /// rows' 4-8 MiB domains.
 #[test]
 fn ldm_high_rows_cover_beyond_tree_domain() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     let mut state = 0x0123_4567_89ab_cdefu64;
     let mut rand = move || {
         state ^= state << 13;

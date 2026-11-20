@@ -2078,6 +2078,7 @@ mod tests {
             match_generator::{LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver},
             reach_probe::ReachChoice,
         },
+        tests::mem_gate::{HeavyMem, heavy_mem},
     };
 
     /// Wide-alphabet head built from a 96-pattern pool: 8-byte windows
@@ -2363,6 +2364,7 @@ mod tests {
     /// from the single-threaded path by their whole cost.
     #[test]
     fn donated_job_zero_resolves_intra_job_far_twin() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut rand = move || {
@@ -2449,6 +2451,7 @@ mod tests {
     /// single-threaded one (the workers-1 fallback runs the same screen).
     #[test]
     fn fast_row_midband_capture_arms_and_random_stays_stock() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let mib = 1024 * 1024;
         let head = lcg(256 * 1024);
         let unit = lcg(3 * mib);
@@ -2750,6 +2753,7 @@ mod tests {
     /// of the frame-continuous armed parse.
     #[test]
     fn fast_row_fullband_capture_self_fills_midstream_jobs() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let total = 76 * MIB;
         let unit_len = 5 * MIB;
@@ -2847,6 +2851,7 @@ mod tests {
     /// job-split noise of the frame-continuous parse.
     #[test]
     fn deep_rows_windowed_ldm_carries_far_repeats() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
         let total = 17 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
@@ -2934,6 +2939,7 @@ mod tests {
     /// feed arms on; a head that does not parse keeps the per-job model.
     #[test]
     fn opt_serial_ldm_feed_carries_far_repeats() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let _switch = super::FEED_TEST_SWITCH.lock().unwrap();
         let total = 33 * MIB + 123 * 1024;
@@ -3057,6 +3063,12 @@ mod tests {
     /// round-trips byte-exact.
     #[test]
     fn ldm_feed_panic_surfaces_and_pool_recovers() {
+        let _mem = heavy_mem(HeavyMem::Mid);
+        // The feed stand-down below rekeys the process-global arm flag, so
+        // the whole window rides under the feed switch like every other
+        // flipper; `INJECT_LOCK` alone leaves the switch-holding tests free
+        // to read the flag stood down mid-encode.
+        let _feed = super::FEED_TEST_SWITCH.lock().unwrap();
         const MIB: usize = 1024 * 1024;
         let total = 33 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
@@ -3301,6 +3313,7 @@ mod tests {
     /// at 5 MiB periods: beyond the row's W22 reach, exactly LDM's class.
     #[test]
     fn mt_midsize_prefix_ldm_keeps_far_repeats() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let unit_len = 5 * 1024 * 1024;
         let mut unit = lcg(unit_len);
         // A code-like 256 KiB head — instructions drawn from a 96-pattern
@@ -3417,6 +3430,7 @@ mod tests {
     /// eight 9.5 MiB jobs, the last starting at 66.5 MiB.
     #[test]
     fn mt_windowed_ldm_capture_is_worker_independent() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let total = 76 * MIB;
         // A 5 MiB unit tiled with per-copy mutations: the unit-to-unit

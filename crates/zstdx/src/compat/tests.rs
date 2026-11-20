@@ -8,7 +8,10 @@ use std::{
     vec::Vec,
 };
 
-use crate::compat;
+use crate::{
+    compat,
+    tests::mem_gate::{HeavyMem, heavy_mem},
+};
 
 fn payload() -> Vec<u8> {
     (0..300 * 1024).map(|i| (i % 251) as u8).collect()
@@ -1367,6 +1370,7 @@ fn include_dictid_parity() {
 /// explicit disable. Both engines' frames decode on either side.
 #[test]
 fn long_distance_matching_parity() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read as _;
 
     // 4 MiB of a 1 MiB tile: repeats beyond the stock fast window.

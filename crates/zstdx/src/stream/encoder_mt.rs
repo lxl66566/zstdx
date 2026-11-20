@@ -717,6 +717,14 @@ fn return_pooled_buf(buf: Vec<u8>) {
     });
 }
 
+/// Test-support half of the buffer pool: drop this thread's retained
+/// accumulate buffers so a finished heavy test pins nothing past its lease
+/// (see `tests::mem_gate`).
+#[cfg(test)]
+pub(crate) fn release_retained_buf_for_tests() {
+    BUF_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
 struct QueueInner {
     shutdown: bool,
     /// Unclaimed posted jobs, in post order (workers claim from the front,
@@ -3849,7 +3857,11 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
-    use crate::{InputShape, decoding::FrameDecoder};
+    use crate::{
+        InputShape,
+        decoding::FrameDecoder,
+        tests::mem_gate::{HeavyMem, heavy_mem},
+    };
 
     /// The mid-size capture's engagement predicate at its boundaries. The
     /// same decision arms the donation (see `post_donation`) and flips the
@@ -4149,6 +4161,7 @@ mod tests {
     /// an input dimension.
     #[test]
     fn donated_span_survives_the_growing_tail_reslice() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let mib = 1024 * 1024usize;
         let mut unit = Vec::with_capacity(mib);
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -4205,6 +4218,7 @@ mod tests {
     /// freedom out of the bytes.
     #[test]
     fn spf_finish_tail_adoption_is_pinned() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let data = spfish(16 * 1024 * 1024);
         let mib = 1024 * 1024u64;
         let mut reference: Option<(Vec<u64>, Vec<u8>)> = None;
@@ -4571,6 +4585,7 @@ mod tests {
     /// wrap.
     #[test]
     fn huge_single_write_bounds_reserve() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let len = BUF_CAP_MAX + BUF_CAP_MAX / 4;
         let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(4));
         core.write(&vec![0u8; len]).unwrap();
@@ -4868,6 +4883,7 @@ mod tests {
     /// are identical across worker counts and write chunkings.
     #[test]
     fn open_capture_arms_deterministically() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let data = dllish(20 * 1024 * 1024);
         let mut reference = None;
         for workers in [2u32, 4, 8, 16] {

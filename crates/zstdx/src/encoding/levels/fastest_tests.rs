@@ -3,6 +3,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::Write as _;
 
+#[cfg(feature = "std")]
+use crate::tests::mem_gate::{HeavyMem, heavy_mem};
 use crate::{Level, encoding::compress_to_vec};
 
 #[test]
@@ -37,6 +39,7 @@ fn assert_fastest_does_not_exceed_raw(len: usize) {
 #[cfg(feature = "std")]
 #[test]
 fn fast_rows_far_repeats_ride_ldm_at_full_window() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     let unit_len = 16 * 1024 * 1024;
     let unit = xorshift(unit_len);
     let mut data = Vec::with_capacity(4 * unit_len);
@@ -99,6 +102,7 @@ fn fast_rows_far_repeats_ride_ldm_at_full_window() {
 #[cfg(feature = "std")]
 #[test]
 fn fast_rows_midband_screen_arms_and_random_stays_stock() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     // The head block repeats from byte zero (the dll class's near-field
     // twins clear the screen's cheap-reject bar inside the first MiB),
     // and the 3 MiB units put the copy distance past both rows' stock

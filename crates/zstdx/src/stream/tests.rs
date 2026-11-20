@@ -7,6 +7,7 @@ use crate::{
     EncoderOptions, Level, bulk, encoding,
     io::Write as _,
     stream::{raw, read, write},
+    tests::mem_gate::{HeavyMem, heavy_mem},
 };
 
 #[cfg(test)]
@@ -1141,7 +1142,10 @@ mod mt {
     use alloc::format;
 
     use super::*;
-    use crate::io::Read as _;
+    use crate::{
+        io::Read as _,
+        tests::mem_gate::{HeavyMem, heavy_mem},
+    };
 
     fn lcg(len: usize) -> Vec<u8> {
         let mut state = 0x1234_5678_9abc_def0u64;
@@ -1368,6 +1372,7 @@ mod mt {
     /// steps; it must neither stall nor corrupt the frame.
     #[test]
     fn single_write_all_roundtrip() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let data = textish(32 * 1024 * 1024);
         let comp = encode_write(&data, usize::MAX, Level::Fastest, 4, true, None);
         assert_both_decoders(&comp, &data, "32MiB single write");
@@ -1380,6 +1385,7 @@ mod mt {
     /// lands and however the writes are chunked.
     #[test]
     fn reach_probe_unpledged_mt_write_independent() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let gate = encoding::reach_probe::PROBE_MIN_FRAME as usize;
         for (name, data) in [
             ("jsonish", jsonish(gate + 1024 * 1024)),
@@ -1419,6 +1425,7 @@ mod mt {
     /// job flags), so the outputs must be byte-identical.
     #[test]
     fn pledged_stream_matches_bulk_mt() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let data = textish(7 * 1024 * 1024 + 999);
         for workers in [2u32, 4] {
             for checksum in [true, false] {
@@ -1498,6 +1505,7 @@ mod mt {
     /// bytes from the second job's start.
     #[test]
     fn pledged_stream_grid_rides_the_bulk_strip() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         // jsonish below the probe's 8 MiB size gate: the stock Keep verdict
         // with no capture (the 8 MiB window sits under the mid-size bar),
         // the plain band where the floors once split. 4 MiB + 13 is the
@@ -1653,6 +1661,7 @@ mod mt {
     /// class).
     #[test]
     fn pledged_midsize_capture_matches_bulk() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let unit_len = 5 * 1024 * 1024;
         let mut unit = lcg(unit_len);
         let head_len = 256 * 1024;
@@ -1748,6 +1757,7 @@ mod mt {
     /// a hard pledge, so this very stream errored at finish.
     #[test]
     fn fast_row_midband_hint_streams_like_open() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let (data, _) = midband_fixture_with_random_twin();
         let frame = stream_frame(
             &data,
@@ -1780,6 +1790,7 @@ mod mt {
     /// the staging span cancels the capture back to the stock schedule.
     #[test]
     fn fast_row_midband_stream_capture_arms_and_random_stays_stock() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let mib = 1024 * 1024;
         let head = lcg(256 * 1024);
         let unit = lcg(3 * mib);
@@ -1920,6 +1931,7 @@ mod mt {
     /// bulk `Enable` dispatch's own, byte-identical there too.
     #[test]
     fn ldm_mode_stream_mt_tri_state_midband() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let (data, random) = midband_fixture_with_random_twin();
         let stream = |data: &[u8], mode: crate::LdmMode, workers: u32| {
             stream_frame(data, Level::Fastest, mode, workers, true, None)
@@ -1987,6 +1999,7 @@ mod mt {
     /// and the open capture never arms under it (the screen is off).
     #[test]
     fn ldm_mode_stream_mt_unpledged_tri_state() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let (data, random) = midband_fixture_with_random_twin();
         let open = |data: &[u8], mode: crate::LdmMode| {
             stream_frame(data, Level::Fastest, mode, 4, false, None)
@@ -2032,6 +2045,7 @@ mod mt {
     /// complete and decode.
     #[test]
     fn ldm_mode_stream_mt_raised_window_capture_grid() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let (data, _) = midband_fixture_with_random_twin();
         let raised = crate::InputShape::default().with_window_log(25);
 
@@ -2095,6 +2109,7 @@ mod mt {
     /// stay deterministic and decode.
     #[test]
     fn ldm_mode_stream_mt_chain_row_probe() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let data = textish(9 * 1024 * 1024 + 123 * 1024);
         let stream =
             |mode: crate::LdmMode| stream_frame(&data, Level::Balanced, mode, 4, true, None);
@@ -2123,6 +2138,7 @@ mod mt {
     /// and stays worker-independent and run-to-run deterministic.
     #[test]
     fn fast_row_fullband_stream_capture_self_fills_midstream_jobs() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let total = 76 * MIB;
         let unit_len = 5 * MIB;
@@ -2345,6 +2361,7 @@ mod mt {
     /// absorb reading the owned source.
     #[test]
     fn owned_and_nt_entries_match_read_encoder_bytes() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         for (name, data) in shapes() {
             for level in [Level::Fastest, Level::Balanced] {
                 for workers in [0u32, 2, 4] {
@@ -2742,6 +2759,7 @@ fn jsonish(len: usize) -> Vec<u8> {
 /// frame whichever way the decision lands.
 #[test]
 fn reach_probe_stream_roundtrips() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     let len = encoding::reach_probe::PROBE_MIN_FRAME as usize + 123 * 1024;
     let data = near_local(len);
     // The mt leg needs the std-gated worker paths.
@@ -2927,6 +2945,7 @@ fn open_balanced_armed_frame_leaves_no_residue_on_the_pooled_core() {
 #[cfg(all(test, feature = "std"))]
 #[test]
 fn far_alive_strip_floor_pool_sequence_roundtrips() {
+    let _mem = heavy_mem(HeavyMem::CapScale);
     let mib = 1024 * 1024;
     let mut state = 0x1234_5678_9abc_def0u64;
     let mut rand = move || {
@@ -3079,7 +3098,10 @@ mod st_dict {
 #[cfg(feature = "std")]
 mod mt_dict {
     use super::*;
-    use crate::io::Read as _;
+    use crate::{
+        io::Read as _,
+        tests::mem_gate::{HeavyMem, heavy_mem},
+    };
 
     fn dict_fixture() -> Option<(Vec<u8>, Vec<u8>)> {
         let raw = std::fs::read("./dict_tests/dictionary").ok()?;
@@ -3444,6 +3466,7 @@ mod mt_dict {
     /// chunking and the worker count.
     #[test]
     fn deep_rows_windowed_ldm_pledged_stream_matches_bulk() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
         let total = 17 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
@@ -3512,6 +3535,7 @@ mod mt_dict {
     /// stock growing-grid model whatever the switch says.
     #[test]
     fn deep_rows_windowed_ldm_open_stream_arms_at_the_staging_span() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         // The deep-band far fixture itself (R88's inline form: the same
@@ -3658,6 +3682,7 @@ mod mt_dict {
     /// dead fixture.
     #[test]
     fn forced_small_window_keeps_the_stock_deep_grid() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
@@ -3714,6 +3739,7 @@ mod mt_dict {
     /// roundtrip-clean through both decoders at a second worker count.
     #[test]
     fn deep_band_open_stream_past_the_buffer_cap() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(264 * MIB, 5 * MIB);
@@ -3776,6 +3802,7 @@ mod mt_dict {
     /// fixture.
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_matches_bulk() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
@@ -3887,6 +3914,9 @@ mod mt_dict {
         };
         let on = short_frame(true);
         let off = short_frame(false);
+        // The stand-down was the fixture's own; leave the process-global
+        // feed armed for the next switch holder.
+        encoding::set_ldm_feed_for_tests(true);
         assert_eq!(on, off, "a single-job pledge never arms");
         let back = bulk::decompress_with(&on, 0, &crate::DecoderOptions::new()).unwrap();
         assert_eq!(back, short);
@@ -3900,6 +3930,7 @@ mod mt_dict {
     /// across encoders, at a cut off the block lattice.
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_flush_cadence() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
@@ -3941,6 +3972,7 @@ mod mt_dict {
     /// need a pledge past 72 MiB before any job start exceeds it).
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_matches_bulk_past_the_window() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(41 * MIB + 123 * 1024, 5 * MIB);
@@ -3985,6 +4017,7 @@ mod mt_dict {
     /// Pledged and open (the staging-span arm) both pin.
     #[test]
     fn owned_entry_matches_read_encoder_deep_band() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
         for pledged in [false, true] {
@@ -4010,6 +4043,7 @@ mod mt_dict {
     /// identical to the read pump's publication.
     #[test]
     fn owned_entry_matches_read_encoder_opt_feed() {
+        let _mem = heavy_mem(HeavyMem::Mid);
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
         let options = || {

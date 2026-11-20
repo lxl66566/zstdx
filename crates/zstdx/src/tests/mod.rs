@@ -4,6 +4,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(test)]
+use crate::tests::mem_gate::{HeavyMem, heavy_mem};
+
+#[cfg(test)]
 extern crate std;
 
 #[cfg(all(test, not(feature = "std")))]
@@ -293,6 +296,7 @@ fn decode_from_to_leaves_trailing_bytes() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read;
 
     let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
@@ -681,6 +685,7 @@ fn test_large_window_rejected_on_first_and_later_frames() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming_decoder_max_window_size() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read;
 
     use crate::decoding::{StreamingDecoder, errors::FrameDecoderError};
@@ -918,6 +923,7 @@ fn ldm_text_tile() -> Vec<u8> {
 /// and `Auto` (the default) leaves every default frame byte-identical.
 #[test]
 fn long_distance_matching_override() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     // 6 MiB of a 2 MiB text tile: repeats sit at 2-4 MiB distances, past
     // the Fastest row's 1 MiB stock window and inside the raised one.
     let tile = ldm_text_tile();
@@ -1006,6 +1012,7 @@ fn long_distance_matching_override() {
 /// Disable must stand the split pass down and keep the stock window.
 #[test]
 fn long_distance_matching_disable_overrides_auto_arming() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     // Exactly 2^26: the Frame bar is `declared >= LDM_FULL_WINDOW`, and
     // the stock window the clamp leaves (1 MiB) sits far below it.
     let tile = ldm_text_tile();
@@ -1059,6 +1066,7 @@ fn long_distance_matching_disable_overrides_auto_arming() {
 #[cfg(feature = "std")]
 #[test]
 fn forced_window_caps_the_far_class_lift() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     use crate::io::Write as _;
     // The far-class mt fixture (32 MiB): its 768 KiB-period opening pair
     // clears the screen's cheap-reject gate (twins inside the first MiB)
@@ -1215,6 +1223,7 @@ fn ldm_mode_mt_fallback_keeps_the_mode() {
 #[cfg(feature = "std")]
 #[test]
 fn ldm_mode_mt_disable_stands_the_capture_down() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     let data = far_class_mt_source();
     let frame = |mode: crate::LdmMode, workers: u32| {
         crate::bulk::compress_with(
@@ -1282,6 +1291,7 @@ fn ldm_mode_mt_disable_stands_the_capture_down() {
 #[cfg(feature = "std")]
 #[test]
 fn ldm_mode_mt_full_band() {
+    let _mem = heavy_mem(HeavyMem::Mid);
     let tile = ldm_text_tile();
     let mut data = Vec::with_capacity(64 << 20);
     for _ in 0..32 {
@@ -1420,6 +1430,8 @@ pub mod encode_corpus;
 #[cfg(test)]
 pub mod encode_edges;
 pub mod fuzz_regressions;
+#[cfg(test)]
+pub mod mem_gate;
 pub mod multi_frame;
 pub mod parity;
 #[cfg(test)]

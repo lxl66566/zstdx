@@ -290,6 +290,19 @@ pub(crate) fn push_state_pool(state: alloc::boxed::Box<CompressState<MatchGenera
     }
 }
 
+/// Test-support half of the state pool: drop the parked states so a
+/// finished heavy test's table footprint does not pin past its lease (see
+/// `tests::mem_gate`). The next taker re-pays the tables' first touch,
+/// milliseconds.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn clear_state_pool_for_tests() {
+    if let Some(pool) = STATE_POOL.get() {
+        pool.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 /// Take a state for a caller whose worker threads do not outlive the
 /// call (the bulk path's `thread::scope` jobs): the cross-thread pool
 /// above, falling back to a fresh state, reset for a fresh frame at
