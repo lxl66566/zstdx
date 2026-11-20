@@ -361,9 +361,14 @@ fn long_sets_window_log() {
     );
     assert_eq!(frame[5], 17 << 3);
 
-    // a compression option must not ride a decode run
+    // --long rides a decode run like zstd's (memLimit = 2^N); the raw
+    // payload is not a frame, so the failure is the decode itself
     let (output, _) = run_piped(&["-d", "-q", "--long=20"], &data);
     assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported format"),
+        "{output:?}"
+    );
 }
 
 /// `--[no-]check` toggles the frame checksum: the trailer comes and goes,
@@ -1262,4 +1267,324 @@ fn suppressed_stream_size_still_binds() {
     );
     assert!(output.status.success(), "{output:?}");
     assert!(stdout.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]), "{stdout:?}");
+}
+
+/// A compression input must not be the dictionary itself (fileio.c's
+/// UTIL_isSameFileStat guard): the input is declined with zstd's line and
+/// kept on disk, other inputs still process, and hard links match by
+/// dev+ino. Decode modes have no guard (zstd has none there).
+#[test]
+fn dict_input_is_refused() {
+    let scratch = Scratch::new("dict-selfref");
+    let input = scratch.path("a.txt");
+    fs::write(&input, b"hello world\n".repeat(64)).unwrap();
+
+    for dict_flag in ["-D", "--patch-from"] {
+        let output = run(&[
+            "--rm",
+            dict_flag,
+            input.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{dict_flag}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!(
+                "zstdx: cannot use {} as an input file and dictionary \n",
+                input.display()
+            ),
+            "{dict_flag}"
+        );
+        assert!(input.exists(), "{dict_flag}: the input must stay");
+        assert!(
+            !scratch.path("a.txt.zst").exists(),
+            "{dict_flag}: no output may be written"
+        );
+    }
+
+    // a hard link to the dictionary matches by identity, not just name
+    let dict = scratch.path("d.dict");
+    fs::write(&dict, b"dictionary body, at least eight bytes").unwrap();
+    let linked = scratch.path("linked.txt");
+    fs::hard_link(&dict, &linked).unwrap();
+    let output = run(&["-D", dict.to_str().unwrap(), linked.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot use"),
+        "{output:?}"
+    );
+
+    // one refused input does not stop the others
+    let other = scratch.path("other.txt");
+    fs::write(&other, b"plain payload").unwrap();
+    let output = run(&[
+        "-q",
+        "-f",
+        "-D",
+        input.to_str().unwrap(),
+        input.to_str().unwrap(),
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        scratch.path("other.txt.zst").exists(),
+        "the good input processed"
+    );
+
+    // the guard line is a display-level-1 diagnostic: -qq hides it
+    let output = run(&[
+        "-qq",
+        "-D",
+        input.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    // decode modes have no guard: the dict is read before the loop, so
+    // an input that is its own dictionary still decodes
+    let frame = scratch.path("a.zst");
+    assert!(
+        run(&[
+            "-q",
+            "-f",
+            input.to_str().unwrap(),
+            "-o",
+            frame.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let output = run(&[
+        "-q",
+        "-f",
+        "-d",
+        "-D",
+        frame.to_str().unwrap(),
+        frame.to_str().unwrap(),
+        "-o",
+        scratch.path("out.bin").to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(scratch.path("out.bin")).unwrap(),
+        b"hello world\n".repeat(64)
+    );
+}
+
+/// clap value errors never leak the usage block: flag-shaped values get
+/// one `Incorrect parameter` line naming the word as spelled, size-flag
+/// values get zstd's numeric-suffix line, both exit 1.
+#[test]
+fn clap_value_errors_one_line() {
+    for (args, line) in [
+        (
+            vec!["--adapt=bogus"],
+            "Incorrect parameter: --adapt=bogus \n",
+        ),
+        (
+            vec!["--adapt=min=9,max=2"],
+            "Incorrect parameter: --adapt=min=9,max=2 \n",
+        ),
+        (vec!["--fast=abc"], "Incorrect parameter: --fast=abc \n"),
+        (
+            vec!["--auto-threads=hybrid"],
+            "Incorrect parameter: --auto-threads=hybrid \n",
+        ),
+        (
+            vec!["--stream-size=bogus"],
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \
+             \n",
+        ),
+        (
+            vec!["--memory=abc"],
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \
+             \n",
+        ),
+        (
+            vec!["--memlimit=abc"],
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \
+             \n",
+        ),
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), line, "{args:?}");
+    }
+}
+
+/// `--long` past libzstd's 64-bit window-log ceiling is the engine's
+/// parameter error (exit 11) in every mode; within the ceiling the value
+/// compresses silently; `--long=0` is unset; decode modes take the value
+/// as the 2^N memory limit, so a window above it fails with the help
+/// block.
+#[test]
+fn long_window_log_bounds() {
+    let data = payload();
+    for n in [32, 99] {
+        let (output, _) = run_piped(&["-q", &format!("--long={n}")], &data);
+        assert_eq!(output.status.code(), Some(11), "{n}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "zstdx: error 11 : Parameter is out of bound \n",
+            "{n}"
+        );
+    }
+    // 28..31 sit above the engine ceiling but inside libzstd's range:
+    // silent clamp, success (byte-identical to the ceiling output)
+    let (output, high) = run_piped(&["-q", "--long=31"], &data);
+    assert!(output.status.success(), "{output:?}");
+    let (output, ceiling) = run_piped(&["-q", "--long=27"], &data);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(high, ceiling);
+    // 0 is zstdcli.c's "unset": no window forcing at all
+    let (output, zero) = run_piped(&["-q", "--long=0"], &data);
+    assert!(output.status.success(), "{output:?}");
+    let (_, none) = run_piped(&["-q"], &data);
+    assert_eq!(zero, none, "--long=0 must not change the frame");
+
+    // decode modes validate the same bound and cap the window at 2^N
+    let (output, frame) = run_piped(&["-q", "--long=27"], &data);
+    assert!(output.status.success());
+    let (output, _) = run_piped(&["-q", "-d", "--long=32", "-c"], &frame);
+    assert_eq!(output.status.code(), Some(11), "{output:?}");
+    let (output, _) = run_piped(&["-q", "-d", "--long=10", "-c"], &frame);
+    assert!(!output.status.success(), "the 128 MiB window exceeds 1 KiB");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // the unpledged stdin frame declared a 2^27 window: the help block
+    // names that window, exactly like the reference
+    assert!(
+        stderr.contains("Frame requires too much memory for decoding")
+            && stderr.contains("Window size larger than maximum : 134217728 > 1024")
+            && stderr.contains("Use --long=27 or --memory=128MB"),
+        "{stderr}"
+    );
+}
+
+/// Diagnostics on piped stderr carry no ANSI escapes.
+#[test]
+fn piped_stderr_is_plain_text() {
+    let scratch = Scratch::new("plain-stderr");
+    let input = scratch.path("data.bin");
+    fs::write(&input, payload()).unwrap();
+    assert!(run(&[input.to_str().unwrap()]).status.success());
+    let garbage = scratch.path("garbage.zst");
+    fs::write(&garbage, b"not a frame").unwrap();
+    for args in [
+        vec!["-t", garbage.to_str().unwrap()],
+        vec!["-d", garbage.to_str().unwrap()],
+        vec![input.to_str().unwrap()],
+    ] {
+        let output = run(&args);
+        assert!(
+            !output.stderr.contains(&0x1b),
+            "no ESC byte may appear: {args:?}"
+        );
+    }
+}
+
+/// A bare `-b` carries the default bench level and frees the next entry
+/// to be a file or `-d`, like zstd's inline-only `-b` parsing.
+#[test]
+fn bare_bench_flag_forms() {
+    let scratch = Scratch::new("bare-b");
+    let input = scratch.path("data.bin");
+    fs::write(&input, vec![7u8; 64 * 1024]).unwrap();
+    // -b as the last argument: the synthetic-corpus bench runs
+    let output = run(&["-b", "-i0"]);
+    assert!(output.status.success(), "{output:?}");
+    // -b FILE: the file is the bench corpus, not a level
+    let output = run(&["-b", "-i0", input.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    // an attached bad value is one Incorrect-parameter line
+    let output = run(&["-b3x", input.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Incorrect parameter: -b3x \n"
+    );
+}
+
+/// Stdin yields its bytes once: a second stdin input fails with the
+/// reference's read error (exit 37) after the first pass wrote its frame.
+#[test]
+fn stdin_twice_is_a_read_error() {
+    let (_, one_frame) = run_piped(&["-q"], b"payload");
+    let (output, stdout) = run_piped(&["-", "-"], b"payload");
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "zstdx: error 37 : Read error \n"
+    );
+    assert_eq!(stdout, one_frame, "exactly the one frame of the first pass");
+
+    // an exhausted stdin hits the same error on the second pass
+    let (output, stdout) = run_piped(&["-", "-"], b"");
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(stdout.len(), 13, "the empty frame only");
+
+    // -qq hides the line, the exit status stays
+    let (output, _) = run_piped(&["-qq", "-", "-"], b"");
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+/// The same-file refusal prints its message, not a format placeholder.
+#[test]
+fn same_file_refusal_message() {
+    let scratch = Scratch::new("same-file");
+    let input = scratch.path("data.bin");
+    fs::write(&input, b"payload").unwrap();
+    let output = run(&["-f", input.to_str().unwrap(), "-o", input.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to open an output file which will overwrite the input file"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("{PREFIX}"), "{stderr}");
+}
+
+/// The collection diagnostics are display-level-1 lines: -qq silences
+/// them, -q keeps them, and the exit status is 1 either way.
+#[test]
+fn qq_silences_collection_diagnostics() {
+    let scratch = Scratch::new("qq-stat");
+    let missing = scratch.path("missing.txt");
+    let output = run(&["-qq", missing.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    let output = run(&["-q", missing.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "zstdx: can't stat {} : No such file or directory -- ignored \n",
+            missing.display()
+        )
+    );
+}
+
+/// `-o` onto a directory is the open failure ("Is a directory"), never
+/// the overwrite-prompt flow.
+#[test]
+fn output_directory_is_an_open_failure() {
+    let scratch = Scratch::new("o-dir");
+    let input = scratch.path("data.bin");
+    fs::write(&input, b"payload").unwrap();
+    let dir = scratch.0.to_str().unwrap();
+    for force in ["-f", ""] {
+        let mut args: Vec<&str> = vec!["-q"];
+        if !force.is_empty() {
+            args.push(force);
+        }
+        args.extend([input.to_str().unwrap(), "-o", dir]);
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(1), "{force:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("zstdx: {dir}: Is a directory\n"),
+            "{force:?}"
+        );
+    }
 }

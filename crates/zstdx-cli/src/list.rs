@@ -8,24 +8,26 @@
 
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, IsTerminal, Read},
+    io::{self, BufReader, IsTerminal, Read, Seek, SeekFrom},
     path::Path,
 };
 
-use zstdx::decoding::{
-    errors::ReadFrameHeaderError,
-    frame::{FrameHeader, read_frame_header},
-};
+use zstdx::decoding::frame::{FrameHeader, read_frame_header};
 
-use crate::{Cli, Input, PREFIX, collect_input, read_filelist};
+use crate::{Cli, Input, PREFIX, ZSTD_MAGIC, collect_input, read_filelist};
 
 /// The short-mode table header, byte-identical to zstd's.
 const HEADER_ROW: &str = "Frames  Skips  Compressed  Uncompressed  Ratio  Check  Filename";
 /// The grouped-total separator: 65 dashes and a trailing space, zstd's.
 const TOTAL_RULE: &str = "----------------------------------------------------------------- ";
-/// The shortest tail that can still start a frame (magic + descriptor);
-/// anything less at EOF makes the file "not compressed by zstd".
-const FRAME_HEADER_MIN: usize = 5;
+/// The frame-header window the reference reads each iteration
+/// (`ZSTD_FRAMEHEADERSIZE_MAX`).
+const FRAME_HEADER_MAX: usize = 18;
+/// The shortest input that can still hold a frame header
+/// (`ZSTD_FRAMEHEADERSIZE_MIN(ZSTD_f_zstd1)`): magic, descriptor, and one
+/// more field byte. Anything less at EOF makes the file "not compressed by
+/// zstd".
+const FRAME_HEADER_MIN: usize = 6;
 /// The space zstd leaves for the Uncompressed and Ratio columns when the
 /// content size is unknown (2 + 8 + 4 + 2 + 5 + 2).
 const UNKNOWN_SIZE_GAP: &str = "                       ";
@@ -219,6 +221,7 @@ pub fn run(cli: &Cli) -> bool {
             &mut inputs,
             &mut ok,
             crate::InputGathering::Raw,
+            cli.quiet,
         );
     }
     if no_files || inputs.iter().any(|i| matches!(i, Input::Stdin)) {
@@ -394,73 +397,84 @@ fn analyze_file(path: &Path) -> Analyzed {
     }
 }
 
-/// Walk every frame in `reader`, accumulating `info`. Mirrors libzstd's
-/// `FIO_analyzeFrames`: header parse, FCS/dictID/window bookkeeping, block
-/// walk, checksum read.
+/// Walk every frame in the file, accumulating `info`. Mirrors libzstd's
+/// `FIO_analyzeFrames`: each iteration reads a frame-header window (up to
+/// 18 bytes), parses the header from it, then fseek()s over the frame --
+/// a seek may land past EOF, and the landing position (not the bytes
+/// actually available) decides the next branch, so the walk tracks `pos`
+/// itself.
 fn analyze(
     reader: &mut BufReader<File>,
     info: &mut FileInfo,
     compressed: u64,
 ) -> Result<(), WalkError> {
+    let mut pos = 0u64;
     loop {
-        // A peek, not a read: read_frame_header consumes the magic itself.
-        let available = match reader.fill_buf() {
-            Ok(buf) => buf.len(),
-            Err(_) => return Err(WalkError::Frame(NO_MORE_FRAMES)),
-        };
-        if available == 0 {
-            // zstd only accepts the clean end on a nonempty file: an empty
-            // file reports "reached end of file with incomplete frame" and
-            // is not compressed data.
-            return if compressed == 0 {
-                Err(WalkError::NotZstd {
-                    incomplete_tail: true,
-                })
-            } else {
-                Ok(())
-            };
-        }
-        if available < FRAME_HEADER_MIN {
+        let mut window = [0u8; FRAME_HEADER_MAX];
+        let n = read_window(reader, &mut window)?;
+        if n < FRAME_HEADER_MIN {
+            if n == 0 && compressed > 0 {
+                // A clean end needs the read to start exactly at EOF; an
+                // overshooting seek left pos past the size instead.
+                if pos != compressed {
+                    return Err(WalkError::Truncated {
+                        position: pos,
+                        size: compressed,
+                    });
+                }
+                return Ok(());
+            }
+            // 1-5 bytes cannot hold a frame header; an empty file never
+            // held one either.
             return Err(WalkError::NotZstd {
                 incomplete_tail: true,
             });
         }
-        // `read_frame_header` takes `impl Read` by value; reborrows keep
-        // the caller's handle for the block walk that follows.
-        match read_frame_header(&mut *reader) {
-            Ok((header, _)) => analyze_frame(reader, info, &header)?,
-            Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
-                // The magic and size fields are already consumed; a payload
-                // skip landing short of the length means the file was
-                // truncated inside the skippable frame.
-                let skipped = io::copy(&mut reader.take(u64::from(length)), &mut io::sink())
-                    .map_err(|_| WalkError::Frame(NO_MORE_FRAMES))?;
-                if skipped < u64::from(length) {
-                    // zstd's fseek lands at 8 + length regardless of the
-                    // bytes that exist, and reports that position.
-                    return Err(WalkError::Truncated {
-                        position: 8 + u64::from(length),
-                        size: compressed,
-                    });
+        let magic = u32::from_le_bytes([window[0], window[1], window[2], window[3]]);
+        if magic == u32::from_le_bytes(ZSTD_MAGIC) {
+            // ZSTD_getFrameContentSize runs before the header is
+            // validated: a header that fails to parse still blanks the
+            // Uncompressed and Ratio columns.
+            let Ok((header, header_size)) = read_frame_header(&mut &window[..n]) else {
+                info.decompressed_known = false;
+                return Err(WalkError::Frame(BAD_HEADER));
+            };
+            note_frame_header(info, &header)?;
+            // The window consumed n bytes; continue at the frame's first
+            // block header.
+            let blocks_at = pos + u64::from(header_size);
+            seek_to(reader, &mut pos, blocks_at)?;
+            walk_blocks(reader, &mut pos)?;
+            if header.descriptor.content_checksum_flag() {
+                // uses_check is set before the read: a truncated checksum
+                // still lists XXH64, like zstd.
+                info.uses_check = true;
+                let mut checksum = [0u8; 4];
+                if reader.read_exact(&mut checksum).is_err() {
+                    return Err(WalkError::Frame(BAD_CHECKSUM));
                 }
-                info.skips += 1;
-            },
-            Err(ReadFrameHeaderError::BadMagicNumber(_)) => {
-                return Err(WalkError::NotZstd {
-                    incomplete_tail: false,
-                });
-            },
-            Err(_) => return Err(WalkError::Frame(BAD_HEADER)),
+                info.checksum = checksum;
+                pos += 4;
+            }
+            info.frames += 1;
+        } else if magic & 0xffff_fff0 == 0x184d_2a50 {
+            // A skippable frame: magic and size field sit inside the
+            // window; the payload is seeked over, however far that lands.
+            let length = u32::from_le_bytes([window[4], window[5], window[6], window[7]]);
+            let end = pos + 8 + u64::from(length);
+            seek_to(reader, &mut pos, end)?;
+            info.skips += 1;
+        } else {
+            return Err(WalkError::NotZstd {
+                incomplete_tail: false,
+            });
         }
     }
 }
 
-/// Bookkeeping and boundary walk for one parsed frame header.
-fn analyze_frame(
-    reader: &mut BufReader<File>,
-    info: &mut FileInfo,
-    header: &FrameHeader,
-) -> Result<(), WalkError> {
+/// Bookkeeping for one parsed frame header; the boundary walk itself lives
+/// in the caller, which owns the position cursor.
+fn note_frame_header(info: &mut FileInfo, header: &FrameHeader) -> Result<(), WalkError> {
     if header.descriptor.declares_content_size() {
         info.decompressed += header.frame_content_size();
     } else {
@@ -483,27 +497,20 @@ fn analyze_frame(
     info.window_size = header
         .window_size()
         .map_err(|_| WalkError::Frame(BAD_HEADER))?;
-    walk_blocks(reader)?;
-    if header.descriptor.content_checksum_flag() {
-        let mut checksum = [0u8; 4];
-        reader
-            .read_exact(&mut checksum)
-            .map_err(|_| WalkError::Frame(BAD_CHECKSUM))?;
-        info.checksum = checksum;
-        info.uses_check = true;
-    }
-    info.frames += 1;
     Ok(())
 }
 
 /// Hop the 3-byte block headers until the frame's last block, so the next
-/// frame's magic is next in the reader.
-fn walk_blocks(reader: &mut BufReader<File>) -> Result<(), WalkError> {
+/// frame's magic is next in the reader. Block bodies are seeked over: the
+/// seek may land past EOF, and any failure comes from the next header or
+/// checksum read, like the reference's fseek.
+fn walk_blocks(reader: &mut BufReader<File>, pos: &mut u64) -> Result<(), WalkError> {
     loop {
         let mut header = [0u8; 3];
         reader
             .read_exact(&mut header)
             .map_err(|_| WalkError::Frame(BAD_BLOCK_HEADER))?;
+        *pos += 3;
         let block = u32::from(header[0]) | u32::from(header[1]) << 8 | u32::from(header[2]) << 16;
         let last = block & 1 == 1;
         let block_type = (block >> 1) & 0x3;
@@ -516,15 +523,37 @@ fn walk_blocks(reader: &mut BufReader<File>) -> Result<(), WalkError> {
         } else {
             u64::from(block >> 3)
         };
-        let skipped = io::copy(&mut reader.take(size), &mut io::sink())
-            .map_err(|_| WalkError::Frame(BAD_BLOCK_HEADER))?;
-        if skipped < size {
-            return Err(WalkError::Frame(BAD_BLOCK_HEADER));
-        }
+        seek_to(reader, pos, *pos + size)?;
         if last {
             return Ok(());
         }
     }
+}
+
+/// Move the reader to an absolute file position (fseek semantics: landing
+/// past EOF is fine, the next read reports it) and take the cursor along.
+fn seek_to(reader: &mut BufReader<File>, pos: &mut u64, target: u64) -> Result<(), WalkError> {
+    reader
+        .seek(SeekFrom::Start(target))
+        .map_err(|_| WalkError::Frame(NO_MORE_FRAMES))?;
+    *pos = target;
+    Ok(())
+}
+
+/// fread semantics for the header window: everything the buffer asks for,
+/// fewer bytes only at EOF; read errors land in the reference's
+/// out-of-frames category.
+fn read_window(reader: &mut BufReader<File>, window: &mut [u8]) -> Result<usize, WalkError> {
+    let mut filled = 0;
+    while filled < window.len() {
+        match reader.read(&mut window[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
+            Err(_) => return Err(WalkError::Frame(NO_MORE_FRAMES)),
+        }
+    }
+    Ok(filled)
 }
 
 /// One file's output: the short table row, or the verbose field block.

@@ -43,6 +43,10 @@ const MAX_WINDOW_LOG: u32 = 27;
 /// libzstd's format-level window log ceiling (`ZSTD_WINDOWLOG_MAX`), which
 /// gates the extra `--long=`/`--memory=` hint line.
 const ZSTD_WINDOWLOG_MAX: u32 = 30;
+/// libzstd's parameter ceiling for a forced window log on 64-bit targets
+/// (`ZSTD_WINDOWLOG_MAX_64`): `--long` past it is the engine's
+/// parameter-out-of-bound error, never a silent clamp.
+const MAX_LONG_WINDOW_LOG: u32 = 31;
 /// Smallest window a frame may request, in bytes: `-M` values below it
 /// reject every frame (libzstd's out-of-bound parameter error).
 const MIN_WINDOW_BYTES: u64 = 1 << MIN_WINDOW_LOG;
@@ -390,7 +394,8 @@ struct Cli {
 
     /// Enable long-distance matching by forcing the window log to N
     /// (default 27, the maximum; 10-27). A known source size still shrinks
-    /// the window to the source, as zstd does
+    /// the window to the source, as zstd does. Decode modes take it as the
+    /// memory limit instead (2^N bytes), like zstd
     ///
     /// Note: unlike zstd, this flag alone does not force the long-distance
     /// matcher on -- the engine arms LDM by level row once the effective
@@ -400,8 +405,7 @@ struct Cli {
         value_name = "N",
         num_args = 0..=1,
         default_missing_value = "27",
-        require_equals = true,
-        conflicts_with_all = ["decompress", "test"]
+        require_equals = true
     )]
     long: Option<u32>,
 
@@ -661,6 +665,51 @@ enum Input {
     File(PathBuf),
 }
 
+/// A dictionary (or --patch-from reference) plus the identity of its
+/// source file, so the per-input guard can refuse a compression input
+/// that is the dictionary itself (fileio.c's UTIL_isSameFileStat check).
+struct LoadedDict {
+    bytes: Vec<u8>,
+    path: PathBuf,
+    /// (dev, ino) of the dictionary file: hard links share it, so a
+    /// renamed input still matches.
+    id: Option<(u64, u64)>,
+}
+
+impl LoadedDict {
+    fn new(bytes: Vec<u8>, path: &Path) -> Self {
+        let id = fs::metadata(path).ok().as_ref().and_then(file_id);
+        Self {
+            bytes,
+            path: path.to_path_buf(),
+            id,
+        }
+    }
+
+    /// Whether an input path is this dictionary: the same path, or the
+    /// same file by identity.
+    fn is_source(&self, path: &Path) -> bool {
+        path == self.path.as_path()
+            || self
+                .id
+                .is_some_and(|id| fs::metadata(path).ok().as_ref().and_then(file_id) == Some(id))
+    }
+}
+
+/// The stat identity POSIX compares files by; None where the platform has
+/// no equivalent (path comparison alone remains).
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // the non-unix twin returns None
+fn file_id(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 /// zstd's display name for an input source (`stdinmark` for stdin).
 fn input_name(input: &Input) -> String {
     match input {
@@ -691,27 +740,22 @@ fn main() -> ExitCode {
     // zstdcli.c assigns `removeSrcFile` per occurrence of --rm / -k/--keep:
     // the flag that appears last wins, so `--rm -k` keeps the input.
     let rm = rm_flag_last_wins(&args);
+    let spelled = args.clone();
     let command = Cli::command();
     let matches = match command.try_get_matches_from(args) {
         Ok(matches) => matches,
-        // zstdcli.c's parser: an unknown flag is `Incorrect parameter` and
-        // exit 1, never clap's usage block (the usage text differs from
-        // zstd's either way; zstd prints its own only at -v and up).
-        Err(err) if err.kind() == clap::error::ErrorKind::UnknownArgument => {
-            let arg = err
-                .get(clap::error::ContextKind::InvalidArg)
-                .and_then(|value| match value {
-                    clap::error::ContextValue::String(text) => Some(text.clone()),
-                    clap::error::ContextValue::Strings(list) => list.first().cloned(),
-                    _ => None,
-                });
-            eprintln!(
-                "Incorrect parameter: {} ",
-                arg.as_deref().unwrap_or_default()
-            );
-            return ExitCode::FAILURE;
+        // zstdcli.c's parser answers every bad flag -- an unknown word, a
+        // bad value, a conflicting flag -- with one diagnostic line and
+        // exit 1, never clap's exit-2 usage block (the usage text differs
+        // from zstd's either way; zstd prints its own block only at its
+        // default display level, which -q already lowers).
+        Err(err) => {
+            if let Some(line) = clap_diagnostic(&err, &spelled) {
+                eprintln!("{line}");
+                return ExitCode::FAILURE;
+            }
+            err.exit()
         },
-        Err(err) => err.exit(),
     };
     let cli = Cli::from_arg_matches(&matches).expect("try_get_matches validated the args");
     init_logging(&cli);
@@ -739,6 +783,218 @@ fn rm_flag_last_wins(args: &[OsString]) -> bool {
         }
     }
     rm
+}
+
+/// Flags zstdcli.c parses as a number plus a size suffix (the
+/// NEXT_UINT32/NEXT_TSIZE/readU32FromChar family): a value that is not
+/// digits with an optional K/M/G decoration gets this line instead of the
+/// badUsage form.
+const NUMERIC_VALUE_FLAGS: &[&str] = &[
+    "--stream-size",
+    "--size-hint",
+    "--memory",
+    "--memlimit",
+    "--memlimit-decompress",
+    "--maxdict",
+    "--target-compressed-block-size",
+    "--threads",
+    "--dictID",
+    "-M",
+    "-B",
+    "-T",
+];
+
+/// Render a clap parse failure as zstd's own parser diagnostics: one line,
+/// exit 1. Value errors on the numeric-flag family take zstd's suffix-rule
+/// line, everything else the `Incorrect parameter` form carrying the
+/// offending word as spelled. None keeps clap's own exit for the kinds
+/// that are not parser rejections (help/version, which the argv pre-scan
+/// normally intercepts first).
+fn clap_diagnostic(err: &clap::Error, args: &[OsString]) -> Option<String> {
+    use clap::error::ErrorKind;
+
+    fn context_string(err: &clap::Error, kind: clap::error::ContextKind) -> Option<String> {
+        match err.get(kind) {
+            Some(clap::error::ContextValue::String(text)) => Some(text.clone()),
+            Some(clap::error::ContextValue::Strings(list)) => list.first().cloned(),
+            _ => None,
+        }
+    }
+
+    if !matches!(
+        err.kind(),
+        ErrorKind::UnknownArgument
+            | ErrorKind::NoEquals
+            | ErrorKind::InvalidValue
+            | ErrorKind::ValueValidation
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::TooFewValues
+            | ErrorKind::InvalidUtf8
+    ) {
+        return None;
+    }
+    // clap's canonical spelling ("--memory <N>", "--adapt[=<PARAMS>]"):
+    // the flag name is the first word without the value bracket. A
+    // conflict may name either side; InvalidArg first.
+    let flag = context_string(err, clap::error::ContextKind::InvalidArg)
+        .or_else(|| context_string(err, clap::error::ContextKind::PriorArg))
+        .map(|text| {
+            text.split([' ', '['])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })?;
+    if matches!(
+        err.kind(),
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+    ) && NUMERIC_VALUE_FLAGS.contains(&flag.as_str())
+    {
+        return Some(String::from(
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed ",
+        ));
+    }
+    // badUsage's parameter is the offending argv word as spelled: an
+    // `=`-attached value rides along (`--adapt=bogus`), a short flag keeps
+    // its inline tail (`-b3x`), a bare flag stands alone.
+    let short = flag.starts_with('-') && !flag.starts_with("--");
+    let as_spelled = |arg: &str| -> bool {
+        arg == flag || arg.starts_with(&format!("{flag}=")) || short && arg.starts_with(&flag)
+    };
+    let word = args
+        .iter()
+        .skip(1)
+        .find_map(|arg| arg.to_str().filter(|arg| as_spelled(arg)))
+        .unwrap_or(&flag);
+    Some(format!("Incorrect parameter: {word} "))
+}
+
+/// What the per-input pre-checks decided for one input.
+enum Precheck {
+    Process,
+    /// This input is declined with a diagnostic; the rest still process.
+    Skip,
+    /// The whole run aborts with this status, like fileio's EXM_THROW.
+    Abort(Exit),
+}
+
+/// fileio's guards ahead of processing one input: stdin yields its bytes
+/// once, so a second stdin input cannot rewind the stream and the read
+/// pool answers its error 37, which aborts the whole run. And a
+/// compression input must not be the dictionary file itself
+/// (fileio.c:2303), which declines this input only.
+fn precheck_input(
+    input: &Input,
+    mode: Mode,
+    dict: Option<&LoadedDict>,
+    cli: &Cli,
+    stdin_done: &mut bool,
+) -> Precheck {
+    if matches!(input, Input::Stdin) {
+        if *stdin_done {
+            if cli.quiet < 2 {
+                eprintln!("{PREFIX}error 37 : Read error ");
+            }
+            return Precheck::Abort(Exit::Error(37));
+        }
+        *stdin_done = true;
+    }
+    if mode == Mode::Compress
+        && let Some(dict) = dict
+        && let Input::File(path) = input
+        && dict.is_source(path)
+    {
+        if cli.quiet < 2 {
+            eprintln!(
+                "{PREFIX}cannot use {} as an input file and dictionary ",
+                path.display()
+            );
+        }
+        return Precheck::Skip;
+    }
+    Precheck::Process
+}
+
+/// Report one input's failure: Diagnostic lines verbatim, everything else
+/// under the input-name prefix; -qq hides both. Returns the
+/// EXM_THROW-class exit code a Diagnostic carries (the caller keeps the
+/// first).
+fn report_input_failure(
+    input: &Input,
+    err: &(dyn std::error::Error + 'static),
+    cli: &Cli,
+) -> Option<u8> {
+    let diagnostic = err.downcast_ref::<Diagnostic>();
+    if cli.quiet < 2 {
+        if let Some(diagnostic) = diagnostic {
+            for line in &diagnostic.lines {
+                eprintln!("{line}");
+            }
+        } else {
+            eprintln!("{PREFIX}{}: {err}", input_name(input));
+        }
+    }
+    diagnostic
+        .map(|diagnostic| diagnostic.code)
+        .filter(|code| *code != 0)
+}
+
+/// The -T resolution: -T1 and --single-thread stay on the calling thread;
+/// -T0 counts cores (physical by default, logical with
+/// --auto-threads=logical, announced at display level 3).
+fn resolve_threads(cli: &Cli) -> u32 {
+    if cli.single_thread || cli.threads == 1 {
+        return 1;
+    }
+    if cli.threads != 0 {
+        return cli.threads;
+    }
+    let physical = cli.auto_threads.as_deref() != Some("logical");
+    let count = if physical {
+        count_physical_cores()
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+    };
+    if cli.verbose >= 1 {
+        info!(
+            "Note: {count} {} core(s) detected ",
+            if physical {
+                "physical"
+            } else {
+                "logical"
+            }
+        );
+    }
+    count
+}
+
+/// The effective compression level: --fast/--level carry it, levels above
+/// 19 reduce with a warning unless --ultra or --patch-from (which implies
+/// it), and --adapt clamps the starting level into its bounds (zstdcli.c
+/// applies the same two clamps after the ultra reduction).
+fn resolve_level(cli: &Cli, mode: Mode) -> i32 {
+    let mut level = cli.fast.map_or_else(
+        || cli.level.unwrap_or(DEFAULT_LEVEL),
+        |acceleration| -acceleration,
+    );
+    if mode == Mode::Compress
+        && level > MAX_LEVEL_WITHOUT_ULTRA
+        && !cli.ultra
+        && cli.patch_from.is_none()
+    {
+        info!(
+            "Warning: compression level higher than max, reduced to {MAX_LEVEL_WITHOUT_ULTRA}              (use --ultra to allow 20-22) "
+        );
+        level = MAX_LEVEL_WITHOUT_ULTRA;
+    }
+    if let Some(range) = &cli.adapt {
+        if range.min > level {
+            level = range.min;
+        }
+        if range.max < level {
+            level = range.max;
+        }
+    }
+    level
 }
 
 /// The process exit status: `Exit::Error` where zstd's EXM_THROW exits
@@ -844,78 +1100,36 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         return Exit::Failure;
     }
     let window_log = match cli.long {
-        None => None,
-        // Below the format minimum zstd rejects with the engine parameter
-        // error and its exit code.
-        Some(log) if log < MIN_WINDOW_LOG => {
+        // 0 is zstdcli.c's "not set": readU32FromChar leaves the variable
+        // at zero and the flag does nothing.
+        None | Some(0) => None,
+        // Below the format minimum and past libzstd's 64-bit parameter
+        // ceiling zstd rejects with the engine parameter error and its
+        // exit code (ZSTD_c_windowLog / ZSTD_d_maxWindowSize bounds).
+        Some(log) if !(MIN_WINDOW_LOG..=MAX_LONG_WINDOW_LOG).contains(&log) => {
             eprintln!("{PREFIX}error 11 : Parameter is out of bound ");
             return Exit::Error(11);
         },
-        // Above the maximum zstd clamps silently (to its 30); the engine
-        // ceiling here is lower, still clamped silently.
+        // Within libzstd's range but above the engine's ceiling: clamped
+        // silently (zstd itself compresses with windows up to 2^31).
         Some(log) if log > MAX_WINDOW_LOG => Some(MAX_WINDOW_LOG),
         log => log,
     };
-
-    let threads = if cli.single_thread || cli.threads == 1 {
-        1
-    } else if cli.threads == 0 {
-        // zstd's -T0: physical cores by default, --auto-threads=logical
-        // switches the basis, announced at display level 3.
-        let physical = cli.auto_threads.as_deref() != Some("logical");
-        let count = if physical {
-            count_physical_cores()
-        } else {
-            std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
-        };
-        if cli.verbose >= 1 {
-            info!(
-                "Note: {count} {} core(s) detected ",
-                if physical {
-                    "physical"
-                } else {
-                    "logical"
-                }
-            );
-        }
-        count
-    } else {
-        cli.threads
+    // In decode modes --long is zstdcli.c's memLimit derivation: without
+    // -M, the limit becomes 2^N bytes (the -M flag keeps precedence).
+    let long_decode_cap = match (mode, cli.long) {
+        (Mode::Decompress | Mode::Test, Some(log)) if log != 0 => Some(1u64 << log),
+        _ => None,
     };
 
-    let mut level = cli.fast.map_or_else(
-        || cli.level.unwrap_or(DEFAULT_LEVEL),
-        |acceleration| -acceleration,
-    );
-    // --patch-from implies --ultra (zstdcli.c sets it with the flag).
-    if mode == Mode::Compress
-        && level > MAX_LEVEL_WITHOUT_ULTRA
-        && !cli.ultra
-        && cli.patch_from.is_none()
-    {
-        info!(
-            "Warning: compression level higher than max, reduced to {MAX_LEVEL_WITHOUT_ULTRA} \
-             (use --ultra to allow 20-22) "
-        );
-        level = MAX_LEVEL_WITHOUT_ULTRA;
-    }
-
-    // --adapt clamps the starting level into its bounds (zstdcli.c applies
-    // the same two clamps after the ultra reduction).
-    if let Some(range) = &cli.adapt {
-        if range.min > level {
-            level = range.min;
-        }
-        if range.max < level {
-            level = range.max;
-        }
-    }
+    let threads = resolve_threads(cli);
+    let level = resolve_level(cli, mode);
 
     // --patch-from loads its reference through the same raw-dictionary
     // path as -D (the flags conflict, so at most one is set).
     let dict = match cli.dict.as_ref().or(cli.patch_from.as_ref()) {
         Some(path) => match fs::read(path) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => Some(LoadedDict::new(bytes, path)),
             Err(err) => {
                 eprintln!(
                     "{PREFIX}error 31 : Stat failed on dictionary file {}: {} ",
@@ -950,6 +1164,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
                 &mut inputs,
                 &mut ok,
                 InputGathering::Stat,
+                cli.quiet,
             );
         }
     }
@@ -993,7 +1208,12 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     // --patch-from derives its own window (overriding --long) and decode
     // bound; the reference's exact rules live in patch.rs.
     let (patch_window_log, patch_max_window) = match &cli.patch_from {
-        Some(_) => match patch::adjust(cli, mode, &inputs, dict.as_deref()) {
+        Some(_) => match patch::adjust(
+            cli,
+            mode,
+            &inputs,
+            dict.as_ref().map(|dict| dict.bytes.as_slice()),
+        ) {
             Ok(adjustments) => (adjustments.window_log, adjustments.max_window),
             Err(msg) => {
                 eprintln!("{PREFIX}{msg}");
@@ -1011,7 +1231,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         window_log: patch_window_log.or(window_log),
         stream_size: cli.stream_size,
         size_hint: cli.size_hint,
-        max_window: patch_max_window.or(cli.memory),
+        max_window: patch_max_window.or(cli.memory).or(long_decode_cap),
         content_size: !cli.no_content_size,
         include_dictid: !cli.no_dict_id,
     };
@@ -1023,25 +1243,25 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     }
 
     let mut exit_code: Option<u8> = None;
+    let mut stdin_done = false;
     for input in &inputs {
-        if let Err(err) = process(input, cli, mode, &settings, dict.as_deref(), rm) {
-            let diagnostic = err.downcast_ref::<Diagnostic>();
-            if cli.quiet < 2 {
-                if let Some(diagnostic) = diagnostic {
-                    for line in &diagnostic.lines {
-                        eprintln!("{line}");
-                    }
-                } else {
-                    eprintln!("{PREFIX}{}: {err}", input_name(input));
-                }
-            }
-            // EXM_THROW-class failures decide the exit status even when
-            // their lines are -qq-hidden; the first one wins (zstd exits
-            // at the first).
-            if let Some(code) = diagnostic
-                .map(|diagnostic| diagnostic.code)
-                .filter(|c| *c != 0)
-            {
+        match precheck_input(input, mode, dict.as_ref(), cli, &mut stdin_done) {
+            Precheck::Abort(exit) => return exit,
+            Precheck::Skip => {
+                ok = false;
+                continue;
+            },
+            Precheck::Process => {},
+        }
+        if let Err(err) = process(
+            input,
+            cli,
+            mode,
+            &settings,
+            dict.as_ref().map(|dict| dict.bytes.as_slice()),
+            rm,
+        ) {
+            if let Some(code) = report_input_failure(input, err.as_ref(), cli) {
                 exit_code.get_or_insert(code);
             }
             ok = false;
@@ -1261,12 +1481,15 @@ enum InputGathering {
 }
 
 /// Gather the file list, expanding directories when `recursive` is set.
+/// `quiet` is the -q count: the collection diagnostics are display-level-1
+/// lines, which -qq silences.
 fn collect_input(
     path: &Path,
     recursive: bool,
     inputs: &mut Vec<Input>,
     ok: &mut bool,
     gather: InputGathering,
+    quiet: u8,
 ) {
     if path.as_os_str() == "-" {
         inputs.push(Input::Stdin);
@@ -1274,7 +1497,7 @@ fn collect_input(
     }
     if gather == InputGathering::Raw {
         if path.is_dir() && recursive {
-            expand_dir(path, inputs, ok);
+            expand_dir(path, inputs, ok, quiet);
         } else {
             inputs.push(Input::File(path.to_path_buf()));
         }
@@ -1282,53 +1505,61 @@ fn collect_input(
     }
     match fs::metadata(path) {
         Err(err) => {
-            eprintln!(
-                "{PREFIX}can't stat {} : {} -- ignored ",
-                path.display(),
-                strerror(&err)
-            );
+            if quiet < 2 {
+                eprintln!(
+                    "{PREFIX}can't stat {} : {} -- ignored ",
+                    path.display(),
+                    strerror(&err)
+                );
+            }
             *ok = false;
         },
         Ok(meta) if meta.is_dir() => {
             if !recursive {
-                eprintln!("{PREFIX}{} is a directory -- ignored ", path.display());
+                if quiet < 2 {
+                    eprintln!("{PREFIX}{} is a directory -- ignored ", path.display());
+                }
                 *ok = false;
                 return;
             }
-            expand_dir(path, inputs, ok);
+            expand_dir(path, inputs, ok, quiet);
         },
         // zstd accepts regular files and FIFOs as inputs; anything else
         // (sockets, devices) is skipped with this diagnostic.
         Ok(meta) if !meta.is_file() && !is_fifo(&meta) => {
-            eprintln!(
-                "{PREFIX}{} is not a regular file -- ignored ",
-                path.display()
-            );
+            if quiet < 2 {
+                eprintln!(
+                    "{PREFIX}{} is not a regular file -- ignored ",
+                    path.display()
+                );
+            }
             *ok = false;
         },
         Ok(_) => inputs.push(Input::File(path.to_path_buf())),
     }
 }
 
-/// Walk a directory tree, collecting every non-directory entry.
-fn expand_dir(path: &Path, inputs: &mut Vec<Input>, ok: &mut bool) {
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        match fs::read_dir(&dir) {
-            Ok(entries) => {
-                for entry in entries.filter_map(Result::ok) {
-                    let entry_path = entry.path();
-                    if entry_path.is_dir() {
-                        stack.push(entry_path);
-                    } else {
-                        inputs.push(Input::File(entry_path));
-                    }
-                }
-            },
-            Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", dir.display());
-                *ok = false;
-            },
+/// Walk a directory tree in readdir order, pre-order depth-first like
+/// zstd's UTIL_prepareFileList: a subdirectory's entries process at the
+/// subdirectory's own position, not after the whole level (the previous
+/// stack walk reversed the subdirectory order).
+fn expand_dir(path: &Path, inputs: &mut Vec<Input>, ok: &mut bool, quiet: u8) {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            if quiet < 2 {
+                eprintln!("{PREFIX}{}: {err}", path.display());
+            }
+            *ok = false;
+            return;
+        },
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            expand_dir(&entry_path, inputs, ok, quiet);
+        } else {
+            inputs.push(Input::File(entry_path));
         }
     }
 }
@@ -1407,9 +1638,9 @@ fn process(
     if let (Input::File(in_path), Output::File(out_path)) = (input, &output)
         && in_path == out_path
     {
-        return Err(Diagnostic::plain(vec![
-            "{PREFIX}Refusing to open an output file which will overwrite the input file ".into(),
-        ])
+        return Err(Diagnostic::plain(vec![format!(
+            "{PREFIX}Refusing to open an output file which will overwrite the input file "
+        )])
         .into());
     }
     // The overwrite check guards every file output, no matter where the
@@ -1535,7 +1766,10 @@ fn default_output_name(input: &Path, mode: Mode) -> AnyResult<PathBuf> {
 /// stdin is input data that must not be consumed as an answer. Without a
 /// terminal there is nobody to ask, so the file is not overwritten.
 fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
-    if cli.force || !path.exists() {
+    // FIO_openDstFile prompts only for an existing regular file; other
+    // existing paths (directories, devices) go straight to the open, which
+    // reports them ("Is a directory").
+    if cli.force || !path.is_file() {
         return Ok(());
     }
     // zstd's displayLevel<=1 path: no interaction is possible, so the file
@@ -2215,7 +2449,12 @@ fn remove_partial_output(output: &Output) {
 }
 
 fn init_logging(cli: &Cli) {
-    let to_stdout = cli.stdout || cli.files.is_empty() && cli.filelist.is_none();
+    // zstd suppresses its summary lines when the destination is the
+    // stdout mark: the -c flag, an inputless run, or an explicit `-` input
+    // (which streams to stdout).
+    let to_stdout = cli.stdout
+        || cli.files.is_empty() && cli.filelist.is_none()
+        || cli.files.iter().any(|file| file.as_os_str() == "-");
     let effective_quiet = cli.quiet + u8::from(to_stdout && cli.verbose == 0);
     let filter = match (effective_quiet, cli.verbose) {
         (2.., _) => tracing::level_filters::LevelFilter::ERROR,
@@ -2230,6 +2469,9 @@ fn init_logging(cli: &Cli) {
             tracing_subscriber::fmt::layer()
                 .with_writer(indicatif_layer.get_stderr_writer())
                 .without_time()
+                // Piped/captured stderr gets plain text: zstd's diagnostics
+                // never carry color codes.
+                .with_ansi(io::stderr().is_terminal())
                 .with_filter(filter),
         )
         .with(indicatif_layer)
@@ -2238,9 +2480,10 @@ fn init_logging(cli: &Cli) {
 
 /// Flags whose value zstd takes as a separate argv entry through its
 /// NEXT_FIELD macro: a following entry starting with `-` (the stdin mark
-/// included) is a hard parse error there, never a value.
+/// included) is a hard parse error there, never a value. `-b` is absent:
+/// zstd's own parser reads its level inline only, so a bare `-b` carries
+/// the default level and the next entry stays free (a file, or `-d`).
 const SEPARATE_VALUE_FLAGS: &[&str] = &[
-    "-b",
     "-e",
     "-i",
     "-B",
@@ -3401,5 +3644,169 @@ mod tests {
             "the smoke benchmark must succeed"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// clap parse failures render as zstd's one-line parser diagnostics:
+    /// the badUsage form carrying the word as spelled, the numeric-suffix
+    /// line for the size-flag family, and the plain flag for conflicts
+    /// and unknown words.
+    #[test]
+    fn clap_diagnostics_match_zstd_forms() {
+        use clap::CommandFactory as _;
+
+        use crate::clap_diagnostic;
+
+        let line_of = |args: &[&str]| -> String {
+            let spelled: Vec<OsString> = std::iter::once("zstdx")
+                .chain(args.iter().copied())
+                .map(OsString::from)
+                .collect();
+            let err = Cli::command()
+                .try_get_matches_from(spelled.iter())
+                .expect_err("these arguments must fail to parse");
+            clap_diagnostic(&err, &spelled).expect("the kind must translate")
+        };
+
+        assert_eq!(
+            line_of(&["--adapt=bogus", "f"]),
+            "Incorrect parameter: --adapt=bogus "
+        );
+        assert_eq!(
+            line_of(&["--fast=abc", "f"]),
+            "Incorrect parameter: --fast=abc "
+        );
+        assert_eq!(
+            line_of(&["--long=abc", "f"]),
+            "Incorrect parameter: --long=abc "
+        );
+        assert_eq!(
+            line_of(&["--stream-size=bogus", "f"]),
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed "
+        );
+        assert_eq!(
+            line_of(&["--memlimit=abc", "f"]),
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed "
+        );
+        // a conflict names the conflicting flag; an unknown word is itself
+        assert_eq!(line_of(&["-l", "-d", "f"]), "Incorrect parameter: --list ");
+        assert_eq!(line_of(&["--file", "f"]), "Incorrect parameter: --file ");
+    }
+
+    /// A bare `-b` is not a separated-value flag: it carries the default
+    /// level and leaves the next entry free, at the end or not.
+    #[test]
+    fn bare_bench_flag_frees_next_argument() {
+        let normalize = |args: &[&str]| {
+            normalize_args(
+                std::iter::once("zstdx")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(normalize(&["-b"]), [OsString::from("-b3")]);
+        assert_eq!(normalize(&["-b", "-d"]), [
+            OsString::from("-b3"),
+            OsString::from("-d")
+        ]);
+        assert_eq!(normalize(&["-b", "file"]), [
+            OsString::from("-b3"),
+            OsString::from("file")
+        ]);
+    }
+
+    /// --long parses in every mode (the decode conflict is gone); the
+    /// bound check happens in run, not the parser.
+    #[test]
+    fn long_parses_in_decode_modes() {
+        assert!(Cli::try_parse_from(["zstdx", "-d", "--long=20", "f.zst"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "-t", "--long=20", "f.zst"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "--long=32", "f"]).is_ok());
+        assert!(Cli::try_parse_from(["zstdx", "--long=0", "f"]).is_ok());
+    }
+
+    /// The recursive walk is pre-order depth-first in readdir order, like
+    /// zstd's UTIL_prepareFileList: each entry's position holds -- a
+    /// subdirectory's files land where the subdirectory itself sits, and
+    /// two subdirectories keep their readdir order. (A stack walk defers
+    /// subdirectory files to the end and reverses their order.) The
+    /// assertions are pairwise over the observed readdir order, so they
+    /// hold for any order the file system hands back.
+    #[test]
+    fn recursive_walk_is_preorder() {
+        let root = std::env::temp_dir().join(format!(
+            "zstdx-cli-preorder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("d1")).unwrap();
+        std::fs::create_dir_all(root.join("d2")).unwrap();
+        std::fs::write(root.join("f1"), b"first").unwrap();
+        std::fs::write(root.join("d1/g1"), b"second").unwrap();
+        std::fs::write(root.join("d2/g2"), b"third").unwrap();
+        std::fs::write(root.join("f2"), b"fourth").unwrap();
+
+        // readdir order of the root, as entry paths
+        let entries: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        let rank = |path: &Path| entries.iter().position(|e| e == path).unwrap();
+
+        let mut inputs = Vec::new();
+        let mut ok = true;
+        crate::expand_dir(&root, &mut inputs, &mut ok, 0);
+        assert!(ok);
+        let walked: Vec<PathBuf> = inputs
+            .into_iter()
+            .map(|input| match input {
+                Input::File(path) => path,
+                Input::Stdin => unreachable!("a walk never yields stdin"),
+            })
+            .collect();
+        let position = |path: &Path| walked.iter().position(|w| w == path).unwrap();
+
+        // a subdirectory's files sit at its own entry position: before
+        // every root file that follows it, after every root file that
+        // precedes it
+        for (dir, child) in [
+            (root.join("d1"), root.join("d1/g1")),
+            (root.join("d2"), root.join("d2/g2")),
+        ] {
+            let dir_rank = rank(&dir);
+            for file in [root.join("f1"), root.join("f2")] {
+                if dir_rank < rank(&file) {
+                    assert!(
+                        position(&child) < position(&file),
+                        "{} before {}",
+                        child.display(),
+                        file.display()
+                    );
+                } else {
+                    assert!(
+                        position(&child) > position(&file),
+                        "{} after {}",
+                        child.display(),
+                        file.display()
+                    );
+                }
+            }
+        }
+        // the two subdirectories keep their readdir order
+        let (first, second) = if rank(&root.join("d1")) < rank(&root.join("d2")) {
+            (root.join("d1/g1"), root.join("d2/g2"))
+        } else {
+            (root.join("d2/g2"), root.join("d1/g1"))
+        };
+        assert!(position(&first) < position(&second));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

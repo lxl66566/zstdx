@@ -391,7 +391,10 @@ fn stdin_is_rejected() {
     assert!(stderr_of(&out).contains("standard input"), "{out:?}");
 }
 
-/// -l refuses the (de)compression modes, outputs, and --train.
+/// -l refuses the (de)compression modes, outputs, and --train: one
+/// `Incorrect parameter` line naming the conflicting flag, exit 1 (the
+/// conflict is this build's own mode-exclusivity rule; the reference has
+/// none, and which side gets named depends on flag order).
 #[test]
 fn mode_conflicts() {
     let scratch = Scratch::new("conflicts");
@@ -406,11 +409,10 @@ fn mode_conflicts() {
         vec!["-l", "-o", "out", name],
     ] {
         let out = run(&args);
-        assert!(!out.status.success(), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
-            "{args:?}"
-        );
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let stderr = stderr_of(&out);
+        assert!(stderr.starts_with("Incorrect parameter: "), "{args:?}");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}");
     }
     // --maxdict is a --train knob.
     let out = run(&["-l", "--maxdict", "1K", name]);
@@ -466,4 +468,93 @@ fn rle_block_frame_lists() {
     let out = run(&["-l", frame.to_str().unwrap()]);
     assert!(out.status.success(), "{out:?}");
     assert_parity(&["-l"], &[frame]);
+}
+
+/// Truncated frames take the reference's categories: a 5-byte tail is
+/// not-zstd with no row, a header that cannot complete blanks the size
+/// columns, a truncated checksum still shows XXH64, and a truncated last
+/// block without checksum reports the seeked position.
+#[test]
+fn truncated_frames_match_reference_categories() {
+    let scratch = Scratch::new("truncframes");
+    let frame = make_frame(&scratch, "data", &payload());
+    let bytes = fs::read(&frame).unwrap();
+    // a checksum-free twin of the same payload
+    let mut child = Command::new(BIN)
+        .args(["-q", "--no-check"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&payload()).unwrap();
+    let no_check = child.wait_with_output().unwrap();
+    assert!(no_check.status.success());
+
+    let cut = |tag: &str, source: &[u8], n: usize| -> PathBuf {
+        let path = scratch.path(format!("cut-{tag}-{n}.zst"));
+        fs::write(&path, &source[..n]).unwrap();
+        path
+    };
+
+    // 5 bytes cannot hold a frame header: no row, the incomplete-frame
+    // note on stderr, and the not-zstd line on stdout
+    let five = cut("ck", &bytes, 5);
+    let out = run(&["-l", five.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(stdout_of(&out).lines().count(), 2, "header + message only");
+    assert!(
+        stdout_of(&out).contains("not compressed by zstd"),
+        "{out:?}"
+    );
+    assert!(
+        stderr_of(&out).contains("reached end of file with incomplete frame"),
+        "{out:?}"
+    );
+
+    // a header that starts but cannot complete (FCS cut off): the row
+    // keeps blank Uncompressed and Ratio columns
+    let six = cut("ck", &bytes, 6);
+    let out = run(&["-l", six.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = stdout_of(&out);
+    let row = stdout.lines().nth(1).unwrap();
+    assert!(row.contains("                       None"), "{row}");
+    assert!(
+        stderr_of(&out).contains("could not decode frame header"),
+        "{out:?}"
+    );
+
+    // a checksum truncated mid-read: usesCheck is already set, so the row
+    // shows XXH64 while stderr reports the checksum read
+    let mid = cut("ck", &bytes, bytes.len() - 8);
+    let out = run(&["-l", mid.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = stdout_of(&out);
+    let row = stdout.lines().nth(1).unwrap();
+    assert!(row.contains("XXH64"), "{row}");
+    assert!(
+        stderr_of(&out).contains("could not read checksum"),
+        "{out:?}"
+    );
+
+    // the same truncation without a checksum: the block skip overshot,
+    // so the file is truncated at the seek position
+    let nc = no_check.stdout.as_slice();
+    let short = cut("nc", nc, nc.len() - 8);
+    let out = run(&["-l", short.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout_of(&out).contains(&format!("File \"{}\" is truncated ", short.display())));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("Error: seeked to position") && stderr.contains("beyond file size"),
+        "{stderr}"
+    );
+
+    // parity with the reference for all of the above, at several cuts
+    for n in [5usize, 6, 7, 10, 14, bytes.len() - 8] {
+        assert_parity(&["-l"], std::slice::from_ref(&cut("ck", &bytes, n)));
+    }
+    for n in [7usize, 10, nc.len() - 8] {
+        assert_parity(&["-l"], std::slice::from_ref(&cut("nc", nc, n)));
+    }
 }

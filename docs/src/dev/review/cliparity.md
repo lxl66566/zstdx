@@ -12,7 +12,7 @@ The harness ran two case sets: 57 compression, decompression and flag cases, and
 
 `--rm` and `-k` follow last-flag-wins through a raw-argv scan, because clap occurrence indices count default values. `--ignore-errors` is a hard parser rejection in 1.5.7. `--filelist -` has no stdin form, so a separated value is an error and `=-` is a literal path. Value flags reject a following `-` entry with `command cannot be separated...` or `missing command argument`.
 
-An unknown flag now prints `Incorrect parameter: <arg> ` and exits 1 like zstd. clap used to print its usage block and exit 2, so `UnknownArgument` is intercepted in main.
+Every clap parse failure now answers with one zstd-style line and exit 1: unknown words, bad values, a missing `=` and flag conflicts alike. clap used to print its usage block and exit 2 for all but `UnknownArgument`. The interceptor is `clap_diagnostic` in main: a value error on the NEXT_UINT32/NEXT_TSIZE family (size, threads, maxdict, dictID flags) answers with zstd's suffix-rule line `error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed `, everything else with `Incorrect parameter: <word as spelled>` (`--adapt=bogus` verbatim, the bare flag for conflicts).
 
 Only `-B` exists in zstd 1.5.7, and `--split=64K` is an unknown argument there. The long alias is removed, so the argument falls into the `Incorrect parameter` path, with the first line and the exit code byte-matching.
 
@@ -22,11 +22,17 @@ A missing dictionary or a missing patch reference matched the message but exited
 
 A pledged-size mismatch now reports `error 11 : Src size is incorrect ` and exits 11. The previous behavior was a long engine-flavored message and exit 1. `Error::PledgedSizeMismatch` maps both error-chain shapes to a code-11 `Diagnostic`.
 
-`--long=9` now reports `error 11 : Parameter is out of bound ` and exits 11, because zstd rejects values below ZSTD_WINDOWLOG_MIN. For `--long=31`, zstd clamps silently, so the clamp warning was removed.
+A compression input that is the dictionary itself is declined per input with `cannot use X as an input file and dictionary `, exit 1: path equality or dev+ino identity (hard links), compression only, exactly fileio.c's UTIL_isSameFileStat guard. Other inputs still process; decode modes have no guard, like zstd.
+
+Stdin yields its bytes once: a second stdin input cannot rewind the stream, and fileio's read pool answers `error 37 : Read error ` with exit 37 after the first pass wrote its frame. Summary suppression now also keys on an explicit `-` input, which streams to stdout, so `zstdx - -` prints only the error line.
+
+`--long` below 10 and above 31 (`ZSTD_WINDOWLOG_MAX_64`) now reports `error 11 : Parameter is out of bound ` and exits 11 in every mode; the earlier silent clamp of `--long=32+` produced rc 0. Values 28..31 sit inside libzstd's range but above this engine's ceiling, so they still clamp to 27 silently. `--long=0` is zstdcli.c's unset and changes nothing. In decode modes `--long=N` is zstdcli.c's memLimit derivation: without `-M` the decode window cap becomes 2^N bytes, so `-d --long=20` parses and caps exactly like zstd.
 
 The stdin name in every diagnostic is the literal `/*stdin*\` from fileio's stdinmark. Zero bytes read gives `unexpected end of file`, and 1 to 3 bytes give `unknown header`. A `STDIN_NAME` const and a `CountingReader` feed `read_bytes` into `decode_failure_lines`, so files and stdin behave uniformly.
 
 Decode failures map to zstd error-name lines for checksum, content-size, dictionary mismatch, premature end and unsupported format, plus the FIO window help block. The diagnostics cover the dictionary stat line `error 31 : Stat failed...`, an unknown suffix, the overwrite prompt including the `-q` decline, the can't-stat, is-a-directory and not-regular-file collection diagnostics, and the `.tzst` to `.tar` name change.
+
+The `-l` frame walk now mirrors `FIO_analyzeFrames` structurally: a position cursor with fseek semantics over an 18-byte header window (`ZSTD_FRAMEHEADERSIZE_MAX`). A block-body skip may land past EOF, and the landing position decides the category -- the next block-header read fails as `Error while reading block header`, a truncated checksum read fails as `Error: could not read checksum` with `usesCheck` already set (the row shows XXH64), and a frame that ends past EOF without checksum reports `File ... is truncated` at the seeked position. The header window must hold 6 bytes (`ZSTD_FRAMEHEADERSIZE_MIN`); a shorter tail is the not-zstd incomplete-frame path, and a header that cannot complete blanks the Uncompressed and Ratio columns because `ZSTD_getFrameContentSize` runs before validation. The fabricated zero-size rows on truncated inputs are gone.
 
 ## Self-contained modes
 
@@ -102,6 +108,12 @@ Each parses and then rejects with `zstdx: <flag> is not supported: <reason>`, ex
 
 One pre-existing engine observation surfaced during the audit interop pass: at small source sizes with a dictionary attached, our frame header picks single-segment off while libzstd picks it on, so dict frames differ in header layout at those sizes (plain and `--no-content-size` frames are byte-identical on the same corpus). Both forms decode identically in both directions. Byte-pinning the dict-frame header is engine work under item 21a's dictionary surface, not a CLI defect.
 
+## Collection and console parity
+
+The `-r` walk is now pre-order depth-first in readdir order like `UTIL_prepareFileList`: a subdirectory's files process at the subdirectory's own entry position, in subdirectory readdir order. The previous stack walk deferred every subdirectory to the end of its level and reversed their order.
+
+The collection diagnostics (`can't stat`, `is a directory`, `is not a regular file`, directory read errors) are display-level-1 lines and vanish at `-qq`, keeping exit 1. The overwrite prompt runs only for an existing regular file, so `-o <dir>` falls through to the open failure `zstdx: <dir>: Is a directory` like `FIO_openDstFile`. The same-file refusal line prints through a format! (the `{PREFIX}` placeholder used to reach stderr literally). A bare `-b` carries the default level and frees the next entry (a file or `-d`), because zstd reads `-b`'s value inline only; `-b` left the separated-value flag list. The tracing fmt layer disables ANSI when stderr is not a terminal, so piped diagnostics are plain text.
+
 ## Accepted deviations
 
 - `-l` with `-v` or `-vv` would print zstd's banner `*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***`, and at `-vv` the line `Compressing with N worker threads` with a machine-dependent N. Printing zstd's banner from zstdx would claim false provenance, and the thread line depends on the MT configuration.
@@ -113,7 +125,7 @@ The final differential before the closeout landed at cases1 57/57 and cases2 50/
 
 ## Tests
 
-`cargo test -p zstdx-cli` is green with 116 tests, 48 unit and 68 integration. The train suite is now active in the default build, where the feature gate previously left it at zero. Pins were updated for the long9, long28 and stream-size exit codes and messages, the `--split` rejection, the partial-magic `unknown header`, the bench smoke `Exit::Success`, and train's dibio-shaped report. `cargo test -p zstdx` in debug is green. The closeout adds a pass-through unit test for copy-through, frame plus garbage, skippable positions, a truncated skippable frame and the foreign-format lines, and a small-corpus warning test for both lines and the `-q` and `-qq` layering. Decode walls are unchanged in a CLI A/B of old against new on json, text and skewed at zst3 and zst19, within 1 ms. The `parity --cases 4000` differential stays clean.
+`cargo test -p zstdx-cli` is green with 131 tests, 52 unit and 79 integration. The train suite is now active in the default build, where the feature gate previously left it at zero. Pins were updated for the long9, long28 and stream-size exit codes and messages, the `--split` rejection, the partial-magic `unknown header`, the bench smoke `Exit::Success`, and train's dibio-shaped report. `cargo test -p zstdx` in debug is green. The closeout adds a pass-through unit test for copy-through, frame plus garbage, skippable positions, a truncated skippable frame and the foreign-format lines, and a small-corpus warning test for both lines and the `-q` and `-qq` layering. Decode walls are unchanged in a CLI A/B of old against new on json, text and skewed at zst3 and zst19, within 1 ms. The `parity --cases 4000` differential stays clean.
 
 ## Commits
 

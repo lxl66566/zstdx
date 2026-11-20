@@ -66,6 +66,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
             &mut inputs,
             &mut ok,
             crate::InputGathering::Raw,
+            cli.quiet,
         );
     }
     if inputs.iter().any(|i| matches!(i, Input::Stdin)) {
