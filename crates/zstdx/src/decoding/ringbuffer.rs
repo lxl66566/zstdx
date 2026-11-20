@@ -735,6 +735,8 @@ unsafe fn copy_bytes_overshooting(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::RingBuffer;
 
     #[test]
@@ -877,5 +879,78 @@ mod tests {
         rb.extend_from_within(0, 4);
         assert_eq!(b"11", rb.as_slices().0);
         assert_eq!(b"111111", rb.as_slices().1);
+    }
+
+    /// `extend_from_within` must agree with a flat `Vec` model for every
+    /// cursor geometry, source start and length a 16-byte ring admits: the
+    /// checked entry drives the same wrap-cut core
+    /// (`extend_from_within_unchecked`) the match copiers use, so any
+    /// asymmetry between the read-side and write-side cut branches shows up
+    /// as a content mismatch. Copies that do not fit the free space go
+    /// through the reserve path and must match the model just the same.
+    #[test]
+    fn extend_from_within_matches_model_across_wrap_edges() {
+        let mut rb = RingBuffer::new();
+        rb.reserve(15);
+        assert_eq!(16, rb.cap);
+
+        // Fresh, never-repeating byte values: a copy taken from the wrong
+        // ring position can never match the model.
+        let mut stamp = 0u8;
+        let mut fresh = |n: usize| {
+            let out: Vec<u8> = (0..n)
+                .map(|_| {
+                    let b = stamp;
+                    stamp = stamp.wrapping_add(1);
+                    b
+                })
+                .collect();
+            out
+        };
+
+        for fill0 in 1..=9usize {
+            for drop in 0..=fill0 {
+                for refill in 0..=(14 - (fill0 - drop)) {
+                    rb.clear();
+                    let mut model = Vec::new();
+                    let d = fresh(fill0);
+                    rb.extend(&d);
+                    model.extend_from_slice(&d);
+                    rb.drop_first_n(drop);
+                    model.drain(..drop);
+                    let d = fresh(refill);
+                    rb.extend(&d);
+                    model.extend_from_slice(&d);
+
+                    let cur_len = model.len();
+                    let max_copy = cur_len.min((15 - cur_len) + 4);
+                    for start in 0..cur_len {
+                        for len in 1..=(cur_len - start).min(max_copy) {
+                            let expect = model[start..start + len].to_vec();
+                            let len_before = rb.len();
+                            let cap_before = rb.cap;
+                            rb.extend_from_within(start, len);
+                            model.extend_from_slice(&expect);
+                            let got: Vec<u8> = rb
+                                .as_slices()
+                                .0
+                                .iter()
+                                .chain(rb.as_slices().1)
+                                .copied()
+                                .collect();
+                            assert_eq!(
+                                got, model,
+                                "fill0 {fill0} drop {drop} refill {refill} start {start} len {len}"
+                            );
+                            // A copy that fit the free space (cap - 1 - len)
+                            // must not grow the ring.
+                            if cap_before - 1 - len_before >= len {
+                                assert_eq!(rb.cap, cap_before, "start {start} len {len}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

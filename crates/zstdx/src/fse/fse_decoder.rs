@@ -547,4 +547,57 @@ mod tests {
             }
         }
     }
+
+    /// `reset` leaves `symbol_info` (fill scratch) behind on purpose: every
+    /// rebuild rewrites the live symbol range before any read. Pin that
+    /// promise — a table reused across shrinking and growing distributions,
+    /// through both `build_from_probabilities` and the wire `read_description`
+    /// path, must produce exactly the entries of a fresh build.
+    #[test]
+    fn reused_table_matches_fresh_builds_across_distributions() {
+        // All sum to 64 (accuracy log 6); zero-probability gaps keep the
+        // live range shorter than the previous table's.
+        let long = [0i32, 0, -1, 3, 2, 2, 0, 0, 10, 15, 0, 31];
+        let short = [0, 33, 0, 31];
+        let other = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 9];
+
+        let mut reused = FSETable::new(255);
+        for probs in [&long[..], &short[..], &other[..], &short[..]] {
+            reused.reset();
+            reused.build_from_probabilities(6, probs).unwrap();
+            let mut fresh = FSETable::new(255);
+            fresh.build_from_probabilities(6, probs).unwrap();
+            assert_eq!(reused.decode, fresh.decode);
+            assert_eq!(reused.occurrence(0, 0), fresh.occurrence(0, 0));
+        }
+
+        // Same reuse through the serialized wire form: the packed sequence
+        // tables read descriptions into pooled tables frame after frame.
+        let wire = |probs: &[i32]| {
+            let mut writer = crate::bit_io::BitWriter::new();
+            crate::fse::fse_encoder::write_ncount(probs, 6, &mut writer);
+            writer.dump()
+        };
+        for probs in [&long[..], &short[..]] {
+            let bytes = wire(probs);
+            let mut fresh = FSETable::new(255);
+            fresh.read_description(&bytes, 9).unwrap();
+            reused.reset();
+            reused.read_description(&bytes, 9).unwrap();
+            assert_eq!(reused.accuracy_log, fresh.accuracy_log);
+            assert_eq!(reused.symbol_probabilities, fresh.symbol_probabilities);
+            for (symbol, &prob) in probs.iter().enumerate() {
+                if prob == 0 {
+                    continue;
+                }
+                for count in 0..prob.unsigned_abs() {
+                    assert_eq!(
+                        reused.occurrence(symbol as u8, count),
+                        fresh.occurrence(symbol as u8, count),
+                        "symbol {symbol} count {count}"
+                    );
+                }
+            }
+        }
+    }
 }

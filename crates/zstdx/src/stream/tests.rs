@@ -43,11 +43,18 @@ fn write_encoder_matches_oneshot_bytes() {
         for level in [Level::Uncompressed, Level::Fastest] {
             let reference = encoding::compress_to_vec(input.as_slice(), level);
             // one big write, byte-sized writes and block-sized writes must
-            // all produce the identical frame
-            for chunk in [usize::MAX, 1, 7 * 1024, 128 * 1024] {
+            // all produce the identical frame; the byte cadence only runs
+            // on the small shapes (it exercises the same sub-block
+            // accumulation as the 7 KiB cadence, at per-write cost)
+            let chunks: &[usize] = if input.len() <= 8 * 1024 {
+                &[usize::MAX, 1, 7 * 1024, 128 * 1024]
+            } else {
+                &[usize::MAX, 7 * 1024, 128 * 1024]
+            };
+            for chunk in chunks {
                 let mut sink = Vec::new();
                 let mut enc = write::Encoder::new(&mut sink, level).unwrap();
-                write_in_chunks(&input, chunk, &mut enc);
+                write_in_chunks(&input, *chunk, &mut enc);
                 enc.finish().unwrap();
                 assert_eq!(
                     sink,
@@ -96,7 +103,15 @@ fn raw_encoder_matches_write_encoder_bytes() {
         for level in [Level::Uncompressed, Level::Fastest] {
             for w in workers {
                 for chunk in [7 * 1024, 128 * 1024] {
-                    for split in [1, 977, 128 * 1024] {
+                    // The one-byte split cadence only runs on the small
+                    // shapes: it exercises the same partial-delivery
+                    // accounting as the 977-byte one, at per-take cost.
+                    let splits: &[usize] = if input.len() <= 8 * 1024 {
+                        &[1, 977, 128 * 1024]
+                    } else {
+                        &[977, 128 * 1024]
+                    };
+                    for split in splits {
                         let options = EncoderOptions::new(level).workers(w);
                         let mut reference = Vec::new();
                         {
@@ -118,10 +133,10 @@ fn raw_encoder_matches_write_encoder_bytes() {
                             if i == 1 {
                                 enc.flush();
                             }
-                            deliver_raw_all(&mut enc, &mut got, split);
+                            deliver_raw_all(&mut enc, &mut got, *split);
                         }
                         enc.finish().unwrap();
-                        deliver_raw_all(&mut enc, &mut got, split);
+                        deliver_raw_all(&mut enc, &mut got, *split);
                         assert_eq!(
                             got,
                             reference,
@@ -882,6 +897,50 @@ fn stalled_drain_finish_flags_split_last_fragment() {
     {
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(writer.received.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+}
+
+/// A mid-stream `flush` closes the staged block (and its split fragments)
+/// without the last flag, so the frame still needs finish's closing block.
+/// The two delivery cadences around that interleaving must produce the same
+/// bytes: flush hands the output over eagerly, but a consumer that keeps
+/// everything undelivered until after finish must land on the identical
+/// frame — the same cadence-independence the unflushed stream keeps, with
+/// the last-block patch running while a flushed block's fragments sit in
+/// the pending tail.
+#[test]
+fn flush_then_finish_keeps_cadence_independent_bytes() {
+    let data = entropy_shift_block(0x1717);
+    let level = Level::Ultra;
+    let (head, tail) = data.split_at(96 * 1024);
+
+    // Eager: deliver after every step. The flush closes the head's block.
+    let mut eager = raw::Encoder::new(level).unwrap();
+    eager.write(head).unwrap();
+    eager.flush();
+    let mut eager_out = Vec::new();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+    eager.write(tail).unwrap();
+    eager.finish().unwrap();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+
+    // Lagging: same write/flush schedule, nothing delivered until after
+    // finish.
+    let mut lag = raw::Encoder::new(level).unwrap();
+    lag.write(head).unwrap();
+    lag.flush();
+    lag.write(tail).unwrap();
+    lag.finish().unwrap();
+    let mut lag_out = Vec::new();
+    deliver_raw_all(&mut lag, &mut lag_out, 977);
+
+    assert_eq!(lag_out, eager_out);
+    assert_eq!(bulk::decompress(&lag_out, 0).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(lag_out.as_slice(), &mut decoded).unwrap();
         assert_eq!(decoded, data);
     }
 }
@@ -2266,17 +2325,20 @@ mod mt {
         comp
     }
 
-    /// The zero-copy entry's byte contract: the owned feed's frame equals
-    /// the read pump's over the same bytes at the same options. The job
-    /// schedule is a pure function of the stream offset and the feed's
-    /// cadence is not an input, so the whole-source feed in one step must
-    /// land on the frame the 1 MiB pump pulls produce. Covers the
+    /// The read-side entry points' byte contracts over one shared sweep:
+    /// the zero-copy owned feed and the NT-source reader must both equal
+    /// the plain read pump's frame over the same bytes at the same options.
+    /// The job schedule is a pure function of the stream offset, so the
+    /// feed's cadence is not an input: the owned source feeds in one step
+    /// where the 1 MiB pump pulls produce the frame, and the NT reader's
+    /// kernel path (pulls at and above `NT_MIN`) plus the plain copy below
+    /// it must both land on the slice reader's bytes. Covers the
     /// single-threaded demotion (workers 0), the growing and fixed grids
     /// (open and pledged), the probe rows (Balanced), the fast-row
     /// capture staging (Fastest over the 4 MiB span) and the checksum
     /// absorb reading the owned source.
     #[test]
-    fn owned_entry_matches_read_encoder_bytes() {
+    fn owned_and_nt_entries_match_read_encoder_bytes() {
         for (name, data) in shapes() {
             for level in [Level::Fastest, Level::Balanced] {
                 for workers in [0u32, 2, 4] {
@@ -2291,33 +2353,7 @@ mod mt {
                         let reference = read_frame(&data, options());
                         let frame = owned_frame(data.clone().into(), options());
                         assert_eq!(frame, reference, "{label}: owned feed diverged");
-                    }
-                }
-            }
-        }
-    }
-
-    /// The NT-source reader's byte contract: the frame equals the plain
-    /// slice source's over the same bytes at the same options. The reader
-    /// is a copy into the same pump-handed buffer, and the job schedule
-    /// keys on the stream offset alone, so the kernel path (pulls at and
-    /// above `NT_MIN`) and the plain path below it must both land on the
-    /// slice reader's frame.
-    #[test]
-    fn nt_source_matches_plain_slice_bytes() {
-        for (name, data) in shapes() {
-            for level in [Level::Fastest, Level::Balanced] {
-                for workers in [0u32, 2, 4] {
-                    for pledged in [false, true] {
-                        let label = format!("{name}/{level:?}/w{workers}/pledged{pledged}");
-                        let options = || {
-                            EncoderOptions::new(level)
-                                .workers(workers)
-                                .checksum(true)
-                                .pledged_size(pledged.then_some(data.len() as u64))
-                        };
-                        let reference = read_frame(&data, options());
-                        assert_eq!(nt_frame(&data, options()), reference, "{label}");
+                        assert_eq!(nt_frame(&data, options()), reference, "{label}: nt source");
                     }
                 }
             }
@@ -3343,6 +3379,56 @@ mod mt_dict {
         }
     }
 
+    /// The dictionary frames' pooled residue dimension: the mt stream core
+    /// returns its worker states and the thread's accumulate buffers to
+    /// pools a prior dict frame filled, so a dict stream encoded after
+    /// another one on the same thread must keep the fresh frame's bytes —
+    /// the dict seed and the plain (dict-less) burn both leave state
+    /// behind, and neither may shape the next frame. In-process sequence,
+    /// per the pooling invariants (a fresh-process artifact cannot see it).
+    #[test]
+    fn dict_mt_pooled_reuse_is_output_neutral() {
+        let Some((raw, data)) = dict_fixture() else {
+            return;
+        };
+        let plain = mt::textish(data.len());
+        let opts = |dict: bool| {
+            let mut o = EncoderOptions::new(Level::Balanced)
+                .workers(4)
+                .checksum(false)
+                .pledged_size(Some(data.len() as u64));
+            if dict {
+                o = o.dictionary(&raw);
+            }
+            o
+        };
+        let encode = |data: &[u8], dict: bool| {
+            let mut sink = Vec::new();
+            let mut enc = write::Encoder::with_options(&mut sink, opts(dict)).unwrap();
+            for piece in data.chunks(700 * 1024) {
+                enc.write_all(piece).unwrap();
+            }
+            enc.finish().unwrap();
+            sink
+        };
+        let fresh = encode(&data, true);
+        // A dict frame, then a plain frame, then the dict frame again: the
+        // pool saw both shapes between the two runs of the same payload.
+        let _ = encode(&plain, false);
+        assert_eq!(
+            encode(&data, true),
+            fresh,
+            "a plain burn must not shape the pooled dict frame"
+        );
+        let _ = encode(&data, true);
+        assert_eq!(
+            encode(&data, true),
+            fresh,
+            "a dict burn must not shape the pooled dict frame"
+        );
+        assert_eq!(decode_with_dict(&fresh, &raw), data);
+    }
+
     /// The deep rows' windowed-LDM class (R88, `mt::deep_ldm_band`): a
     /// pledged Best-tier frame whose far repeats sit beyond the tree
     /// domain engages the windowed schedule at its first post, and the
@@ -3422,43 +3508,9 @@ mod mt_dict {
     fn deep_rows_windowed_ldm_open_stream_arms_at_the_staging_span() {
         const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
-        let total = 17 * MIB + 123 * 1024;
-        let unit_len = 5 * MIB;
-        let mut state = 0x0123_4567_89ab_cdefu64;
-        let mut rand = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut unit: Vec<u8> = (0..unit_len).map(|_| (rand() & 0xff) as u8).collect();
-        let head_len = 256 * 1024;
-        let blocks: Vec<Vec<u8>> = (0..96)
-            .map(|_| (0..64).map(|_| (rand() & 0xff) as u8).collect())
-            .collect();
-        let mut pick = 0x0dd_ba11_5eedu64;
-        let mut i = 0;
-        while i + 64 <= head_len {
-            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let block = &blocks[(pick >> 33) as usize % 96];
-            unit[i..i + 64].copy_from_slice(block);
-            i += 64;
-        }
-        let mut data = Vec::with_capacity(total);
-        for copy in 0..u32::MAX {
-            if data.len() >= total {
-                break;
-            }
-            let take = unit.len().min(total - data.len());
-            let flip = (copy as usize * 1024) % 4096;
-            for (i, &b) in unit[..take].iter().enumerate() {
-                data.push(if i % 4096 == flip {
-                    b ^ 0x5a
-                } else {
-                    b
-                });
-            }
-        }
+        // The deep-band far fixture itself (R88's inline form: the same
+        // bytes DEEP_BAND_FAR generates).
+        let data = &DEEP_BAND_FAR[..];
         let encode = |data: &[u8], workers: u32, chunk: usize| {
             let mut sink = Vec::new();
             let mut enc = write::Encoder::with_options(
@@ -3585,6 +3637,12 @@ mod mt_dict {
         data
     }
 
+    /// The deep-band stream tests' shared subject: five tests in this
+    /// module encode the same 17 MiB bytes, so the generator runs once.
+    static DEEP_BAND_FAR: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        deep_band_far_fixture(17 * 1024 * 1024 + 123 * 1024, 5 * 1024 * 1024)
+    });
+
     /// A forced `window_log` below the mid-size bar keeps an open deep-row
     /// stream on the stock growing grid by construction: the subject check
     /// keys on the row window, so the staging gate never holds a post and
@@ -3596,7 +3654,7 @@ mod mt_dict {
     fn forced_small_window_keeps_the_stock_deep_grid() {
         const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
-        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let data = &DEEP_BAND_FAR[..];
         let encode = |shape: crate::InputShape| {
             let mut sink = Vec::new();
             let mut enc = write::Encoder::with_options(
@@ -3714,7 +3772,7 @@ mod mt_dict {
     fn opt_serial_ldm_feed_pledged_stream_matches_bulk() {
         const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
-        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let data = &DEEP_BAND_FAR[..];
         let opts = |level: Level, workers: u32| {
             EncoderOptions::new(level)
                 .workers(workers)
@@ -3838,7 +3896,7 @@ mod mt_dict {
     fn opt_serial_ldm_feed_pledged_stream_flush_cadence() {
         const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
-        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let data = &DEEP_BAND_FAR[..];
         let flushed = || {
             let mut sink = Vec::new();
             let mut enc = write::Encoder::with_options(
@@ -3921,9 +3979,8 @@ mod mt_dict {
     /// Pledged and open (the staging-span arm) both pin.
     #[test]
     fn owned_entry_matches_read_encoder_deep_band() {
-        const MIB: usize = 1024 * 1024;
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
-        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let data = &DEEP_BAND_FAR[..];
         for pledged in [false, true] {
             let options = || {
                 EncoderOptions::new(Level::Best)
@@ -3931,7 +3988,7 @@ mod mt_dict {
                     .checksum(false)
                     .pledged_size(pledged.then_some(data.len() as u64))
             };
-            let (owned, reference) = owned_vs_read_frame(&data, data.clone().into(), options);
+            let (owned, reference) = owned_vs_read_frame(&data, data.to_vec().into(), options);
             assert_eq!(
                 owned, reference,
                 "deep band pledged {pledged}: owned feed diverged"
@@ -3947,16 +4004,15 @@ mod mt_dict {
     /// identical to the read pump's publication.
     #[test]
     fn owned_entry_matches_read_encoder_opt_feed() {
-        const MIB: usize = 1024 * 1024;
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
-        let data = deep_band_far_fixture(17 * MIB + 123 * 1024, 5 * MIB);
+        let data = &DEEP_BAND_FAR[..];
         let options = || {
             EncoderOptions::new(Level::Opt)
                 .workers(4)
                 .checksum(true)
                 .pledged_size(Some(data.len() as u64))
         };
-        let (owned, reference) = owned_vs_read_frame(&data, data.clone().into(), options);
+        let (owned, reference) = owned_vs_read_frame(&data, data.to_vec().into(), options);
         assert_eq!(owned, reference, "opt feed: owned feed diverged");
         let back = bulk::decompress(&owned, 0).unwrap();
         assert_eq!(back, data, "owned opt feed roundtrip");

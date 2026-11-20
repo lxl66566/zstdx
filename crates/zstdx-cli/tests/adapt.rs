@@ -5,85 +5,12 @@
 
 use std::{
     fs,
-    io::Write,
-    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
+mod common;
 
-/// A scratch directory that removes itself on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zstdx-cli-adapt-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-/// Pipe `input` through the CLI, returning the captured stdout.
-fn run_piped(args: &[&str], input: &[u8]) -> (std::process::Output, Vec<u8>) {
-    let mut child = Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // A child may exit early on purpose (a rejected flag): feeding it the
-    // rest of `input` then hits EPIPE, which is the child decision to
-    // report, not a harness failure.
-    if let Err(err) = child.stdin.take().unwrap().write_all(input) {
-        assert!(
-            err.kind() == std::io::ErrorKind::BrokenPipe,
-            "feeding {args:?}: {err}"
-        );
-    }
-    let output = child.wait_with_output().unwrap();
-    (output.clone(), output.stdout)
-}
-
-/// The reference zstd, when the environment provides one.
-fn system_zstd() -> bool {
-    Command::new("zstd")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-fn stderr_of(out: &std::process::Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+use common::{Scratch, run, run_piped, stderr_of, system_zstd};
 
 /// Count frame magic occurrences: the chunk-frame structure of `--adapt`.
 fn frame_count(bytes: &[u8]) -> usize {
@@ -108,7 +35,7 @@ fn payload(mib: usize) -> Vec<u8> {
 /// through our own decoder.
 #[test]
 fn adapt_roundtrip_multi_frame() {
-    let scratch = Scratch::new("roundtrip");
+    let scratch = Scratch::new("adapt", "roundtrip");
     let data = payload(9);
     let src = scratch.path("src.bin");
     fs::write(&src, &data).unwrap();
@@ -139,7 +66,7 @@ fn adapt_output_decodes_with_system_zstd() {
         eprintln!("skipping: system zstd not found");
         return;
     }
-    let scratch = Scratch::new("interop");
+    let scratch = Scratch::new("adapt", "interop");
     let data = payload(9);
     let zst = scratch.path("a.zst");
     let (out, compressed) = run_piped(&["--adapt=max=3", "-c"], &data);

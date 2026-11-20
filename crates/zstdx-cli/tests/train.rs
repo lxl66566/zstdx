@@ -6,47 +6,13 @@
 
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
+mod common;
 
-/// A scratch directory that removes itself on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zstdx-cli-train-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
+use common::{BIN, Scratch, run, system_zstd};
 
 /// Run in `dir` (the default output name lands in the CWD).
 fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -56,16 +22,6 @@ fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
         .stdin(Stdio::null())
         .output()
         .unwrap()
-}
-
-fn system_zstd() -> bool {
-    Command::new("zstd")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .is_ok_and(|out| out.status.success())
 }
 
 /// Deterministic shared-boilerplate samples with a per-file varying tail.
@@ -91,7 +47,7 @@ fn write_samples(dir: &Path, count: usize) -> Vec<Vec<u8>> {
 /// result on stderr.
 #[test]
 fn trains_formatted_dictionary() {
-    let scratch = Scratch::new("basic");
+    let scratch = Scratch::new("train", "basic");
     write_samples(&scratch.path("samples"), 24);
     let sample_dir = scratch.path("samples");
     let dict = scratch.path("out.dict");
@@ -129,7 +85,7 @@ fn trains_formatted_dictionary() {
 /// hides both.
 #[test]
 fn small_corpus_warns_like_zstd() {
-    let scratch = Scratch::new("small-warn");
+    let scratch = Scratch::new("train", "small-warn");
     write_samples(&scratch.path("samples"), 8);
     let samples = scratch.path("samples").display().to_string();
     let dict = scratch.path("d.dict").display().to_string();
@@ -160,9 +116,9 @@ fn small_corpus_warns_like_zstd() {
 /// zstd's default output name is `dictionary` in the working directory.
 #[test]
 fn default_output_name_is_dictionary() {
-    let scratch = Scratch::new("default-name");
+    let scratch = Scratch::new("train", "default-name");
     write_samples(&scratch.path("samples"), 16);
-    let out = run_in(&scratch.0, &["--train", "-r", "samples"]);
+    let out = run_in(scratch.root(), &["--train", "-r", "samples"]);
     assert!(out.status.success(), "{out:?}");
     assert!(scratch.path("dictionary").exists());
 }
@@ -170,7 +126,7 @@ fn default_output_name_is_dictionary() {
 /// `--maxdict` accepts zstd's size suffixes and caps the dictionary.
 #[test]
 fn maxdict_suffixes_cap() {
-    let scratch = Scratch::new("maxdict");
+    let scratch = Scratch::new("train", "maxdict");
     write_samples(&scratch.path("samples"), 24);
     let sample_dir = scratch.path("samples").display().to_string();
     for (spec, bound) in [("4096", 4096u64), ("16K", 16384), ("1M", 1 << 20)] {
@@ -202,7 +158,7 @@ fn maxdict_suffixes_cap() {
 /// Knobs the trainer does not expose are rejected loudly, not ignored.
 #[test]
 fn unsupported_knobs_rejected() {
-    let scratch = Scratch::new("reject");
+    let scratch = Scratch::new("train", "reject");
     write_samples(&scratch.path("samples"), 8);
     let samples = scratch.path("samples").display().to_string();
     for args in [
@@ -254,7 +210,7 @@ fn roundtrips_with_system_zstd() {
     if !system_zstd() {
         return;
     }
-    let scratch = Scratch::new("interop");
+    let scratch = Scratch::new("train", "interop");
     let mut samples = write_samples(&scratch.path("samples"), 24);
     let sample_dir = scratch.path("samples").display().to_string();
     let holdout = samples.pop().unwrap();
@@ -367,7 +323,7 @@ fn roundtrips_with_system_zstd() {
 /// Training is deterministic: the same samples yield the same dictionary.
 #[test]
 fn training_is_deterministic() {
-    let scratch = Scratch::new("deterministic");
+    let scratch = Scratch::new("train", "deterministic");
     write_samples(&scratch.path("samples"), 16);
     let sample_dir = scratch.path("samples").display().to_string();
     let a = scratch.path("a.dict");

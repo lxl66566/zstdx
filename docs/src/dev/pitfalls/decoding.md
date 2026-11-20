@@ -68,6 +68,10 @@ The wrap branch runs only after the cursor gate `end + bs + 16 > buf.len()` fail
 
 The wrap condition now states its own requirement as `end >= window + bs + WILDCOPY_SLACK`, with a test pinning the wrap point. When a safety property is implied by a coupling of unrelated constants, encode it at the site that needs it.
 
+### Ring wrap copies cannot overlap
+
+A review suspected an overlap-cut asymmetry between the read-side and write-side split branches of `RingBuffer::extend_from_within_unchecked`. The suspicion is unfounded: with `start + len <= len()` the source stays inside the wrapped readable set, the destination fills the free region, and neither destination chunk can re-enter the source's physical span, so every split copy is non-overlapping. LZ-style overlap never reaches this core either, because `repeat_in_chunks` anchors its doubling chunks so each source ends exactly where its destination begins. `ringbuffer::tests::extend_from_within_matches_model_across_wrap_edges` sweeps every 16-byte-ring geometry against a flat `Vec` model to keep it that way.
+
 ### HEADROOM keeps the budget check
 
 The headroom instantiation skipped the per-sequence `op + ll + ml <= out_end` budget check along with the wildcopy constant-ization, while `ensure_block_space` guarantees only a 128 KiB plus slack mapping. A corrupted sequence segment whose total output exceeds the block maximum then wrote past the allocation and hit SIGSEGV. Nightly's `copy_nonoverlapping` precondition check flagged it as overlap first, and the artifacts test crashed the test process.

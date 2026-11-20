@@ -3,7 +3,7 @@
 //! `FrameCompressor::new_with_matcher`) across forced small windows and
 //! custom matchers, gated through both decoders.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec::Vec};
 
 /// Period-61 payload, 300 KiB: matches cross every block boundary a
 /// forced small window produces.
@@ -179,4 +179,125 @@ fn carry_compaction_threshold_sweep() {
             "own decoder decodes a wrong payload at {len} bytes"
         );
     }
+}
+
+/// A dictionary echo (the dictionary's own content, then a near-twin at a
+/// window-spanning distance) followed by fresh text: matches into the seed
+/// and past it, on the read core's dictionary path.
+fn dict_echo_payload(dict: &[u8], len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        let take = dict.len().min(len - data.len());
+        data.extend_from_slice(&dict[..take]);
+        data.extend_from_slice(b"interlude with fresh vocabulary, ");
+    }
+    data
+}
+
+/// The generic `FrameCompressor` loop with a dictionary attached and a
+/// forced window: the dictionary seeds the matcher's owned window, so the
+/// blocks must still respect the declared window and the frame must decode
+/// through both decoders with the dictionary — the read core's own dict
+/// arm, which the bulk/stream dictionary grids do not drive.
+#[test]
+fn dictionary_attach_honors_a_forced_window() {
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    let data = dict_echo_payload(&dict, 300 * 1024);
+    for window_log in [10u32, 12] {
+        for level in [crate::Level::Fastest, crate::Level::from_zstd(9)] {
+            let mut sink = Vec::new();
+            let mut enc = crate::encoding::FrameCompressor::new(level);
+            enc.set_dictionary(&dict);
+            enc.set_input_shape(crate::InputShape::default().with_window_log(window_log));
+            enc.set_source(data.as_slice());
+            enc.set_drain(&mut sink);
+            enc.compress();
+            let label = format!("wl{window_log}/{level:?}");
+            assert_eq!(
+                zstd::bulk::Decompressor::with_dictionary(&dict)
+                    .unwrap()
+                    .decompress(&sink, data.len())
+                    .unwrap(),
+                data,
+                "{label}: reference rejects the dict frame"
+            );
+            let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
+            assert_eq!(
+                crate::bulk::decompress_with(&sink, data.len(), &dec_opts).unwrap(),
+                data,
+                "{label}: own decoder rejects the dict frame"
+            );
+        }
+    }
+}
+
+/// The raw and parsed dictionary attachments must be one dictionary: the
+/// raw form parses at compress time, the parsed one is shared, and the
+/// frames they produce are byte-identical.
+#[test]
+fn parsed_dictionary_matches_the_raw_form() {
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    let data = dict_echo_payload(&dict, 128 * 1024);
+    let mut raw_sink = Vec::new();
+    let mut enc = crate::encoding::FrameCompressor::new(crate::Level::Fastest);
+    enc.set_dictionary(&dict);
+    enc.set_source(data.as_slice());
+    enc.set_drain(&mut raw_sink);
+    enc.compress();
+    let mut parsed_sink = Vec::new();
+    let mut enc = crate::encoding::FrameCompressor::new(crate::Level::Fastest);
+    enc.set_parsed_dictionary(&crate::EncoderDictionary::parse(&dict).unwrap());
+    enc.set_source(data.as_slice());
+    enc.set_drain(&mut parsed_sink);
+    enc.compress();
+    assert_eq!(raw_sink, parsed_sink);
+    let header_id = crate::EncoderDictionary::parse(&dict).unwrap().header_id();
+    assert_eq!(
+        zstd::zstd_safe::get_dict_id_from_frame(&raw_sink).map(|id| id.get()),
+        header_id
+    );
+}
+
+/// The read core's dictionary fold adds the dictionary content length to
+/// the caller's size hint (the `compress`-time arm of the saturating fix
+/// the bulk and stream grids pin): an absurd hint must keep the huge
+/// shape, declaring the same window a merely-large hint gets, instead of
+/// panicking under overflow checks or wrapping to a dict-clamped window.
+#[test]
+fn dictionary_absurd_hint_saturates_the_read_core_fold() {
+    let Some(dict) = super::fixture_bytes("./dict_tests/dictionary") else {
+        return;
+    };
+    let data = dict_echo_payload(&dict, 100 * 1024);
+    let mut windows = Vec::new();
+    for hint in [1u64 << 40, u64::MAX - 8, u64::MAX] {
+        let mut sink = Vec::new();
+        let mut enc = crate::encoding::FrameCompressor::new(crate::Level::Fastest);
+        enc.set_dictionary(&dict);
+        enc.set_input_shape(crate::InputShape {
+            len: Some(hint),
+            window_log: None,
+        });
+        enc.set_source(data.as_slice());
+        enc.set_drain(&mut sink);
+        enc.compress();
+        let window = crate::decoding::frame::read_frame_header(&mut sink.as_slice())
+            .unwrap()
+            .0
+            .window_size()
+            .unwrap();
+        windows.push(window);
+        let dec_opts = crate::DecoderOptions::new().dictionary(&dict);
+        assert_eq!(
+            crate::bulk::decompress_with(&sink, data.len(), &dec_opts).unwrap(),
+            data,
+            "hint {hint}"
+        );
+    }
+    assert_eq!(windows[0], windows[1], "u64::MAX - 8 must not wrap");
+    assert_eq!(windows[0], windows[2], "u64::MAX must saturate");
 }

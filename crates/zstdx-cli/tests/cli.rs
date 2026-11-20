@@ -4,70 +4,12 @@
 
 use std::{
     fs,
-    io::Write,
-    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
+mod common;
 
-/// A scratch directory that removes itself on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zstdx-cli-test-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-/// Pipe `input` through the CLI, returning the captured stdout.
-fn run_piped(args: &[&str], input: &[u8]) -> (std::process::Output, Vec<u8>) {
-    let mut child = Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // A child may exit early on purpose (a rejected flag, a pledge
-    // mismatch): feeding it the rest of `input` then hits EPIPE, which is
-    // the child decision to report, not a harness failure.
-    if let Err(err) = child.stdin.take().unwrap().write_all(input) {
-        assert!(
-            err.kind() == std::io::ErrorKind::BrokenPipe,
-            "feeding {args:?}: {err}"
-        );
-    }
-    let output = child.wait_with_output().unwrap();
-    (output.clone(), output.stdout)
-}
+use common::{BIN, Scratch, run, run_piped};
 
 fn payload() -> Vec<u8> {
     // Repetitive enough to compress well, long enough to span blocks.
@@ -92,7 +34,7 @@ fn empty_sources_pledge_zero() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(stdout, EMPTY_FRAME);
 
-    let scratch = Scratch::new("empty-pledge");
+    let scratch = Scratch::new("cli", "empty-pledge");
     let input = scratch.path("empty.bin");
     fs::write(&input, b"").unwrap();
     let output = run(&["-q", "-1", "-c", input.to_str().unwrap()]);
@@ -111,7 +53,7 @@ fn empty_sources_pledge_zero() {
 
 #[test]
 fn file_roundtrip_default_names() {
-    let scratch = Scratch::new("roundtrip");
+    let scratch = Scratch::new("cli", "roundtrip");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
 
@@ -137,7 +79,7 @@ fn file_roundtrip_default_names() {
 
 #[test]
 fn force_overwrites() {
-    let scratch = Scratch::new("force");
+    let scratch = Scratch::new("cli", "force");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     run(&[input.to_str().unwrap()]);
@@ -150,7 +92,7 @@ fn force_overwrites() {
 /// file-to-file runs.
 #[test]
 fn stdin_output_refuses_overwrite() {
-    let scratch = Scratch::new("stdin-overwrite");
+    let scratch = Scratch::new("cli", "stdin-overwrite");
     let out = scratch.path("out.zst");
     fs::write(&out, b"existing content").unwrap();
 
@@ -185,7 +127,7 @@ fn stdin_stdout_streaming() {
 
 #[test]
 fn explicit_stdout_flag() {
-    let scratch = Scratch::new("stdout");
+    let scratch = Scratch::new("cli", "stdout");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
 
@@ -203,7 +145,7 @@ fn explicit_stdout_flag() {
 
 #[test]
 fn level_flags_and_fast() {
-    let scratch = Scratch::new("levels");
+    let scratch = Scratch::new("cli", "levels");
     for (name, args) in [
         ("l19", vec!["-19"]),
         ("l1", vec!["-1"]),
@@ -231,7 +173,7 @@ fn level_flags_and_fast() {
 
 #[test]
 fn decompress_requires_zst_suffix() {
-    let scratch = Scratch::new("suffix");
+    let scratch = Scratch::new("cli", "suffix");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["-d", input.to_str().unwrap()]);
@@ -241,7 +183,7 @@ fn decompress_requires_zst_suffix() {
 
 #[test]
 fn rm_removes_input() {
-    let scratch = Scratch::new("rm");
+    let scratch = Scratch::new("cli", "rm");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["--rm", input.to_str().unwrap()]);
@@ -254,7 +196,7 @@ fn rm_removes_input() {
 /// output on disk.
 #[test]
 fn failed_decompress_removes_partial_output() {
-    let scratch = Scratch::new("partial");
+    let scratch = Scratch::new("cli", "partial");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     run(&[input.to_str().unwrap()]);
@@ -272,7 +214,7 @@ fn failed_decompress_removes_partial_output() {
 
 #[test]
 fn test_mode() {
-    let scratch = Scratch::new("test");
+    let scratch = Scratch::new("cli", "test");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     run(&[input.to_str().unwrap()]);
@@ -287,7 +229,7 @@ fn test_mode() {
 /// `-t` must report the number of verified bytes, not a constant zero.
 #[test]
 fn test_mode_reports_decoded_bytes() {
-    let scratch = Scratch::new("test-stats");
+    let scratch = Scratch::new("cli", "test-stats");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     run(&[input.to_str().unwrap()]);
@@ -301,7 +243,7 @@ fn test_mode_reports_decoded_bytes() {
 
 #[test]
 fn directory_requires_recursive() {
-    let scratch = Scratch::new("recursive");
+    let scratch = Scratch::new("cli", "recursive");
     let dir = scratch.path("dir");
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("a.bin"), payload()).unwrap();
@@ -317,7 +259,7 @@ fn directory_requires_recursive() {
 
 #[test]
 fn threads_flag() {
-    let scratch = Scratch::new("threads");
+    let scratch = Scratch::new("cli", "threads");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["-T0", input.to_str().unwrap()]);
@@ -416,7 +358,7 @@ fn stream_size_pledges_and_enforces() {
         "zstd's parameter-class message"
     );
 
-    let scratch = Scratch::new("stream-size-file");
+    let scratch = Scratch::new("cli", "stream-size-file");
     let input = scratch.path("data.bin");
     fs::write(&input, &data).unwrap();
     let output = run(&["--stream-size=1000", input.to_str().unwrap()]);
@@ -438,7 +380,7 @@ fn size_hint_sizes_the_window() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(out, data, "a hint never affects content");
 
-    let scratch = Scratch::new("size-hint-file");
+    let scratch = Scratch::new("cli", "size-hint-file");
     let input = scratch.path("data.bin");
     fs::write(&input, &data).unwrap();
     let output = run(&["--size-hint=4096", input.to_str().unwrap()]);
@@ -472,7 +414,7 @@ fn memory_caps_decode_window() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("below"));
 
-    let scratch = Scratch::new("memory-compress");
+    let scratch = Scratch::new("cli", "memory-compress");
     let input = scratch.path("data.bin");
     fs::write(&input, &data).unwrap();
     let output = run(&["-q", "-M", "1M", input.to_str().unwrap()]);
@@ -485,7 +427,7 @@ fn memory_caps_decode_window() {
 /// and no `--file` alias in 1.5.7.
 #[test]
 fn filelist_reads_input_list() {
-    let scratch = Scratch::new("filelist");
+    let scratch = Scratch::new("cli", "filelist");
     let a = scratch.path("a.bin");
     let b = scratch.path("b.bin");
     fs::write(&a, payload()).unwrap();
@@ -549,7 +491,7 @@ fn filelist_reads_input_list() {
 /// conflict, not a silent last-wins.
 #[test]
 fn single_thread_alias() {
-    let scratch = Scratch::new("single-thread");
+    let scratch = Scratch::new("cli", "single-thread");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     assert!(
@@ -565,7 +507,7 @@ fn single_thread_alias() {
 /// incorrect parameter before any mode runs.
 #[test]
 fn ignore_errors_is_rejected() {
-    let scratch = Scratch::new("ignore-errors");
+    let scratch = Scratch::new("cli", "ignore-errors");
     let dir = scratch.path("dir");
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("bad.zst"), b"not a zstd frame").unwrap();
@@ -587,7 +529,7 @@ fn ignore_errors_is_rejected() {
 /// output, and saying so beats a generic unknown-argument error.
 #[test]
 fn sparse_is_rejected_loudly() {
-    let scratch = Scratch::new("sparse");
+    let scratch = Scratch::new("cli", "sparse");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     for flag in ["--sparse", "--no-sparse"] {
@@ -667,7 +609,7 @@ fn end_of_flags_treats_rest_as_files() {
 /// The progress override flags conflict; `--no-progress` still compresses.
 #[test]
 fn progress_flags() {
-    let scratch = Scratch::new("progress");
+    let scratch = Scratch::new("cli", "progress");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     assert!(
@@ -684,14 +626,14 @@ fn progress_flags() {
 /// --output-dir-flat, last-wins repeats, and the loud rejections.
 #[test]
 fn recursive_walk_rules() {
-    let scratch = Scratch::new("r75-recursive");
+    let scratch = Scratch::new("cli", "r75-recursive");
     fs::write(scratch.path("top.txt"), b"top\n").unwrap();
     fs::create_dir_all(scratch.path("a/b")).unwrap();
     fs::write(scratch.path("a/mid.txt"), b"mid\n").unwrap();
     fs::write(scratch.path("a/b/deep.txt"), b"deep\n").unwrap();
 
     // nested walk compresses every file under the root, and -r -d walks too
-    let output = run(&["-q", "-r", "-f", scratch.0.to_str().unwrap()]);
+    let output = run(&["-q", "-r", "-f", scratch.root().to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
     assert!(scratch.path("top.txt.zst").exists());
     assert!(scratch.path("a/mid.txt.zst").exists());
@@ -712,7 +654,7 @@ fn recursive_walk_rules() {
         "-q",
         "-r",
         "-f",
-        format!("{}/", scratch.0.to_str().unwrap()).as_str(),
+        format!("{}/", scratch.root().to_str().unwrap()).as_str(),
     ]);
     assert!(output.status.success(), "{output:?}");
     assert!(scratch.path("top.txt.zst").exists());
@@ -746,7 +688,7 @@ fn recursive_walk_rules() {
 /// applies (the frame decodes with -D), and `-l -v` reports DictID 0.
 #[test]
 fn no_dict_id_keeps_dictionary_effect() {
-    let scratch = Scratch::new("r75-nodictid");
+    let scratch = Scratch::new("cli", "r75-nodictid");
     let samples = scratch.path("samples");
     fs::create_dir_all(&samples).unwrap();
     let body: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
@@ -831,7 +773,7 @@ fn no_dict_id_keeps_dictionary_effect() {
 /// columns.
 #[test]
 fn no_content_size_omits_header_size() {
-    let scratch = Scratch::new("r75-nocs");
+    let scratch = Scratch::new("cli", "r75-nocs");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["-q", "-f", input.to_str().unwrap()]);
@@ -892,7 +834,7 @@ fn no_content_size_omits_header_size() {
 /// compress time, silently, without failing the run.
 #[test]
 fn exclude_compressed_skips_by_extension() {
-    let scratch = Scratch::new("r75-exclude");
+    let scratch = Scratch::new("cli", "r75-exclude");
     let plain = scratch.path("a.txt");
     fs::write(&plain, payload()).unwrap();
     let zst = scratch.path("b.zst");
@@ -914,7 +856,7 @@ fn exclude_compressed_skips_by_extension() {
         "-r",
         "-f",
         "--exclude-compressed",
-        scratch.0.to_str().unwrap(),
+        scratch.root().to_str().unwrap(),
     ]);
     assert!(output.status.success(), "{output:?}");
     assert!(scratch.path("a.txt.zst").exists(), "plain file compressed");
@@ -946,7 +888,7 @@ fn exclude_compressed_skips_by_extension() {
 /// decode identically.
 #[test]
 fn short_c_matches_check() {
-    let scratch = Scratch::new("r75-shortC");
+    let scratch = Scratch::new("cli", "r75-shortC");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["-q", "-f", "-C", input.to_str().unwrap()]);
@@ -961,7 +903,7 @@ fn short_c_matches_check() {
 /// `--memlimit` and `--memlimit-decompress` answer like `--memory`.
 #[test]
 fn memlimit_aliases_bound_decode() {
-    let scratch = Scratch::new("r75-memlimit");
+    let scratch = Scratch::new("cli", "r75-memlimit");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     assert!(run(&["-q", "-f", input.to_str().unwrap()]).status.success());
@@ -981,7 +923,7 @@ fn memlimit_aliases_bound_decode() {
 /// FIO_openDstFile.
 #[test]
 fn output_dir_flat_relocates_names() {
-    let scratch = Scratch::new("r75-flat");
+    let scratch = Scratch::new("cli", "r75-flat");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let out = scratch.path("out");
@@ -1033,7 +975,7 @@ fn output_dir_flat_relocates_names() {
 /// variable overwrites; `-D a -D missing` fails on the second dictionary.
 #[test]
 fn repeated_value_flags_last_wins_end_to_end() {
-    let scratch = Scratch::new("r75-lastwins");
+    let scratch = Scratch::new("cli", "r75-lastwins");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let good = scratch.path("good.dict");
@@ -1077,7 +1019,7 @@ fn repeated_value_flags_last_wins_end_to_end() {
 /// names them.
 #[test]
 fn unsupported_flags_reject_loudly() {
-    let scratch = Scratch::new("r75-reject");
+    let scratch = Scratch::new("cli", "r75-reject");
     let input = scratch.path("data.bin");
     fs::write(&input, b"x").unwrap();
     let path = input.to_str().unwrap();
@@ -1186,7 +1128,7 @@ fn unsupported_flags_reject_loudly() {
 /// flags, exactly like a zstd built without zlib/lzma/lz4.
 #[test]
 fn identity_flags_and_format_selector() {
-    let scratch = Scratch::new("r75-identity");
+    let scratch = Scratch::new("cli", "r75-identity");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let plain = run(&["-q", "-f", input.to_str().unwrap()]);
@@ -1233,7 +1175,7 @@ fn identity_flags_and_format_selector() {
 /// -v, like zstd's display-level-3 note.
 #[test]
 fn auto_threads_note_at_verbose() {
-    let scratch = Scratch::new("r75-t0");
+    let scratch = Scratch::new("cli", "r75-t0");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     let output = run(&["-q", "-T0", "-f", input.to_str().unwrap()]);
@@ -1275,7 +1217,7 @@ fn suppressed_stream_size_still_binds() {
 /// dev+ino. Decode modes have no guard (zstd has none there).
 #[test]
 fn dict_input_is_refused() {
-    let scratch = Scratch::new("dict-selfref");
+    let scratch = Scratch::new("cli", "dict-selfref");
     let input = scratch.path("a.txt");
     fs::write(&input, b"hello world\n".repeat(64)).unwrap();
 
@@ -1464,7 +1406,7 @@ fn long_window_log_bounds() {
 /// Diagnostics on piped stderr carry no ANSI escapes.
 #[test]
 fn piped_stderr_is_plain_text() {
-    let scratch = Scratch::new("plain-stderr");
+    let scratch = Scratch::new("cli", "plain-stderr");
     let input = scratch.path("data.bin");
     fs::write(&input, payload()).unwrap();
     assert!(run(&[input.to_str().unwrap()]).status.success());
@@ -1487,7 +1429,7 @@ fn piped_stderr_is_plain_text() {
 /// to be a file or `-d`, like zstd's inline-only `-b` parsing.
 #[test]
 fn bare_bench_flag_forms() {
-    let scratch = Scratch::new("bare-b");
+    let scratch = Scratch::new("cli", "bare-b");
     let input = scratch.path("data.bin");
     fs::write(&input, vec![7u8; 64 * 1024]).unwrap();
     // -b as the last argument: the synthetic-corpus bench runs
@@ -1532,7 +1474,7 @@ fn stdin_twice_is_a_read_error() {
 /// The same-file refusal prints its message, not a format placeholder.
 #[test]
 fn same_file_refusal_message() {
-    let scratch = Scratch::new("same-file");
+    let scratch = Scratch::new("cli", "same-file");
     let input = scratch.path("data.bin");
     fs::write(&input, b"payload").unwrap();
     let output = run(&["-f", input.to_str().unwrap(), "-o", input.to_str().unwrap()]);
@@ -1549,7 +1491,7 @@ fn same_file_refusal_message() {
 /// them, -q keeps them, and the exit status is 1 either way.
 #[test]
 fn qq_silences_collection_diagnostics() {
-    let scratch = Scratch::new("qq-stat");
+    let scratch = Scratch::new("cli", "qq-stat");
     let missing = scratch.path("missing.txt");
     let output = run(&["-qq", missing.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -1569,10 +1511,10 @@ fn qq_silences_collection_diagnostics() {
 /// the overwrite-prompt flow.
 #[test]
 fn output_directory_is_an_open_failure() {
-    let scratch = Scratch::new("o-dir");
+    let scratch = Scratch::new("cli", "o-dir");
     let input = scratch.path("data.bin");
     fs::write(&input, b"payload").unwrap();
-    let dir = scratch.0.to_str().unwrap();
+    let dir = scratch.root().to_str().unwrap();
     for force in ["-f", ""] {
         let mut args: Vec<&str> = vec!["-q"];
         if !force.is_empty() {

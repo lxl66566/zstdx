@@ -1516,17 +1516,6 @@ mod tests {
     }
 
     #[test]
-    fn very_simple_raw_compress() {
-        let mock_data = [1_u8, 2, 3].as_slice();
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(crate::Level::Uncompressed);
-        compressor.set_source(mock_data);
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-    }
-
-    #[test]
     fn very_simple_compress() {
         let mut mock_data = vec![0; 1 << 17];
         mock_data.extend(vec![1; (1 << 17) - 1]);

@@ -6,58 +6,13 @@
 use std::{
     fs,
     io::Write as _,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
+mod common;
 
-/// A scratch directory that removes itself on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zstdx-cli-list-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-/// The reference zstd, when the environment provides one.
-fn system_zstd() -> bool {
-    Command::new("zstd")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
+use common::{BIN, Scratch, run, system_zstd};
 
 /// zstd's ambient -v noise (version banner, worker-thread notes) that our
 /// CLI never prints; stripped before comparing stderr.
@@ -137,7 +92,7 @@ fn payload() -> Vec<u8> {
 /// all.
 #[test]
 fn single_frame_matches_zstd() {
-    let scratch = Scratch::new("single");
+    let scratch = Scratch::new("list", "single");
     let frame = make_frame(&scratch, "data", &payload());
     let out = run(&["-l", frame.to_str().unwrap()]);
     assert!(out.status.success(), "{out:?}");
@@ -161,7 +116,7 @@ fn single_frame_matches_zstd() {
 /// middle: counts, sizes, and ratio aggregated exactly like zstd.
 #[test]
 fn multi_frame_and_skippable_match_zstd() {
-    let scratch = Scratch::new("multi");
+    let scratch = Scratch::new("list", "multi");
     let data = payload();
     let a = make_frame(&scratch, "a", &data);
     let b = make_frame(&scratch, "b", &data[..data.len() / 2]);
@@ -199,7 +154,7 @@ fn multi_frame_and_skippable_match_zstd() {
 /// columns, exactly like zstd's `decompUnavailable` form.
 #[test]
 fn unknown_content_size_blanks_columns() {
-    let scratch = Scratch::new("nofcs");
+    let scratch = Scratch::new("list", "nofcs");
     let data = payload();
     let mut child = Command::new(BIN)
         .arg("-q")
@@ -225,7 +180,7 @@ fn unknown_content_size_blanks_columns() {
 /// Multiple files: per-file rows plus the separator and grouped total.
 #[test]
 fn grouped_total_matches_zstd() {
-    let scratch = Scratch::new("group");
+    let scratch = Scratch::new("list", "group");
     let a = make_frame(&scratch, "a", &payload());
     let b = make_frame(&scratch, "b", &payload()[..4096]);
     let out = run(&["-l", a.to_str().unwrap(), b.to_str().unwrap()]);
@@ -250,7 +205,7 @@ fn dict_id_frame_matches_zstd() {
     if !system_zstd() {
         return;
     }
-    let scratch = Scratch::new("dictid");
+    let scratch = Scratch::new("list", "dictid");
     let mut samples = Vec::new();
     for i in 0..24u32 {
         let mut sample = Vec::new();
@@ -297,7 +252,7 @@ fn dict_id_frame_matches_zstd() {
 /// block walk still shows the partial row.
 #[test]
 fn error_files_match_zstd() {
-    let scratch = Scratch::new("errors");
+    let scratch = Scratch::new("list", "errors");
     let frame = make_frame(&scratch, "data", &payload());
 
     let plain = scratch.path("plain.bin");
@@ -353,7 +308,7 @@ fn error_files_match_zstd() {
 /// row, like zstd.
 #[test]
 fn truncated_skippable_frame() {
-    let scratch = Scratch::new("truncskip");
+    let scratch = Scratch::new("list", "truncskip");
     // The size field promises 32 payload bytes; the file stops 4 short.
     let payload = skippable_frame(b"0123456789abcdef0123456789abcdef");
     let frame = scratch.path("cut.zst");
@@ -370,7 +325,7 @@ fn truncated_skippable_frame() {
 /// Missing files report zstd's "is not a file" and fail without a row.
 #[test]
 fn missing_file_fails() {
-    let scratch = Scratch::new("missing");
+    let scratch = Scratch::new("list", "missing");
     let absent = scratch.path("nosuch.zst");
     let out = run(&["-l", absent.to_str().unwrap()]);
     assert!(!out.status.success());
@@ -397,7 +352,7 @@ fn stdin_is_rejected() {
 /// none, and which side gets named depends on flag order).
 #[test]
 fn mode_conflicts() {
-    let scratch = Scratch::new("conflicts");
+    let scratch = Scratch::new("list", "conflicts");
     let frame = make_frame(&scratch, "data", &payload());
     let name = frame.to_str().unwrap();
     for args in [
@@ -427,7 +382,7 @@ fn mode_conflicts() {
 /// hides nothing on stdout.
 #[test]
 fn quiet_still_prints_rows() {
-    let scratch = Scratch::new("quiet");
+    let scratch = Scratch::new("list", "quiet");
     let frame = make_frame(&scratch, "data", &payload());
     for q in [["-l", "-q"], ["-l", "-qq"]] {
         let out = run(&[q[0], q[1], frame.to_str().unwrap()]);
@@ -449,7 +404,7 @@ fn quiet_still_prints_rows() {
 /// --filelist feeds -l like positional files.
 #[test]
 fn filelist_lists() {
-    let scratch = Scratch::new("filelist");
+    let scratch = Scratch::new("list", "filelist");
     let a = make_frame(&scratch, "a", &payload());
     let b = make_frame(&scratch, "b", &payload()[..4096]);
     let list = scratch.path("list.txt");
@@ -463,7 +418,7 @@ fn filelist_lists() {
 /// list, and match the reference byte for byte).
 #[test]
 fn rle_block_frame_lists() {
-    let scratch = Scratch::new("rle");
+    let scratch = Scratch::new("list", "rle");
     let frame = make_frame(&scratch, "zeros", &vec![0u8; 300 * 1024]);
     let out = run(&["-l", frame.to_str().unwrap()]);
     assert!(out.status.success(), "{out:?}");
@@ -476,7 +431,7 @@ fn rle_block_frame_lists() {
 /// block without checksum reports the seeked position.
 #[test]
 fn truncated_frames_match_reference_categories() {
-    let scratch = Scratch::new("truncframes");
+    let scratch = Scratch::new("list", "truncframes");
     let frame = make_frame(&scratch, "data", &payload());
     let bytes = fs::read(&frame).unwrap();
     // a checksum-free twin of the same payload

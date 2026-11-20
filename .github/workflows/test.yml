@@ -16,11 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
       # Covers every crate the paranoid gate skips: zstdx-ffi's Rust suite,
-      # zstdx-bench and the zstdx-cli end-to-end suite (gungraun benches are
-      # test = false and only run under cargo bench).
-      - run: cargo test --workspace
-      - run: cargo test -p zstdx --no-default-features
+      # zstdx-bench and the zstdx-cli end-to-end suite. zstdx-gungraun is
+      # excluded (its benches are test = false and only run under cargo
+      # bench). nextest isolates every test in its own process;
+      # .config/nextest.toml carries the slow-test/hang policy.
+      - run: cargo nextest run --workspace --exclude zstdx-gungraun
+      # nextest never runs doctests (the zstdx lib carries 25).
+      - run: cargo test --doc --workspace --exclude zstdx-gungraun
+      - run: cargo nextest run -p zstdx --no-default-features
 
   ffi-c:
     name: ffi c harness

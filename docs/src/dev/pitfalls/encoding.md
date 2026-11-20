@@ -628,3 +628,9 @@ The inline path then handed the runner a view offset by 1027 bytes and the job r
 The walls' contract is exit-fill and entry-assert: the producer poisons the slack past the logical length on its way out, and the consumer asserts it intact on its way in before the legitimate overwrite. A freshly constructed Vec's spare capacity is uninitialized, so the first entry-assert reads indeterminate bytes and trips on noise. The MT core's first test run was a false positive until the constructor learned to arm.
 
 Any buffer joining an entry-assert protocol gets `fill_margin` at allocation or reset, not just after the first write. The protocol covers only slack that nobody legitimately touches, so a span the read pump drains into, a bitwriter's deliberate past-end flush inside its reservation, or a caller-live carry zone such as the owned window's committed-length to staged-end span under the pre-split convention cannot be walled without changing that contract, and must be recorded as uncovered instead of silently skipped.
+
+### Byte-granularity cadences dominate debug sweeps
+
+The 2026-11-17 audit found `write_encoder_matches_oneshot_bytes` at 111 s and `raw_encoder_matches_write_encoder_bytes` at 22 s with the encodes themselves nearly free: the cost was the 1-byte arms — `chunks(1)` writes and 1-byte `split_output` takes over multi-hundred-KiB shapes, at roughly 40 µs per call in debug builds. Both dropped under 0.25 s once the byte cadence ran only on the small shapes, whose sub-block accumulation path it shares with any sub-block-sized cadence (7 KiB writes, 977-byte takes).
+
+A sweep dimension that multiplies per-call work (single-byte writes, one-byte deliveries) belongs on the smallest shape that exercises the accumulation state, never on the large ones; the large shapes keep the coarse cadences that reach the same code.

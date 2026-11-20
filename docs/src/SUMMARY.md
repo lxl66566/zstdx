@@ -14,6 +14,7 @@
 
 - [Status overview](dev/status.md)
 - [Research map](dev/research.md)
+- [Testing](dev/testing.md)
 
 ## Performance Comparisons
 

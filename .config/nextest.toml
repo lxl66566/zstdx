@@ -1,0 +1,25 @@
+# cargo-nextest defaults for this workspace.
+#
+# nextest runs every lib/bin/integration test but never doctests; pair a
+# workspace run with `cargo test --doc --workspace --exclude zstdx-fuzz
+# --exclude zstdx-gungraun` (the zstdx lib carries 25 doctests).
+#
+# The MT/stream suites have legitimate members in the tens of seconds, so
+# the default profile only reports slow tests; the terminate-after bound
+# exists so a hung test fails a run instead of stalling it forever.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# Retry policy: retries are for environmental flakes only (temp-dir races,
+# port/cwd assumptions, runner starvation). A failure caused by a product
+# bug must stay a failure - never add a blanket retries count to silence
+# an intermittent product race (e.g. the known MT poison-drain livelock):
+# fix the test's environment or the bug instead. No test in this workspace
+# currently qualifies, so no profile sets retries > 0; a future flake
+# gets a scoped override like
+#
+#   [[profile.default.overrides]]
+#   filter = "test::name_pattern"
+#   retries = { count = 1, backoff = "fixed" }
+#
+# together with a comment naming the environmental cause.

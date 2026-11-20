@@ -3,87 +3,11 @@
 //! directions) when the reference binary exists, plus the edge cases
 //! (stdin pledge, conflicts, missing/empty reference).
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+use std::{fs, process::Command};
 
-const BIN: &str = env!("CARGO_BIN_EXE_zstdx");
+mod common;
 
-/// A scratch directory that removes itself on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zstdx-cli-patch-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-/// Pipe `input` through the CLI, returning the captured stdout.
-fn run_piped(args: &[&str], input: &[u8]) -> (std::process::Output, Vec<u8>) {
-    let mut child = Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // A child may exit early on purpose (a rejected flag): feeding it the
-    // rest of `input` then hits EPIPE, which is the child decision to
-    // report, not a harness failure.
-    if let Err(err) = child.stdin.take().unwrap().write_all(input) {
-        assert!(
-            err.kind() == std::io::ErrorKind::BrokenPipe,
-            "feeding {args:?}: {err}"
-        );
-    }
-    let output = child.wait_with_output().unwrap();
-    (output.clone(), output.stdout)
-}
-
-/// The reference zstd, when the environment provides one.
-fn system_zstd() -> bool {
-    Command::new("zstd")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-fn stderr_of(out: &std::process::Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+use common::{Scratch, run, run_piped, stderr_of, system_zstd};
 
 /// A reference file and a near-copy target: a patch of the target against
 /// the reference must compress far below the reference-free size.
@@ -108,7 +32,7 @@ fn fixtures() -> (Vec<u8>, Vec<u8>) {
 /// reference actually pays: the patch stays far under a plain frame.
 #[test]
 fn patch_roundtrip_and_ratio() {
-    let scratch = Scratch::new("roundtrip");
+    let scratch = Scratch::new("patch", "roundtrip");
     let (reference, target) = fixtures();
     let ref_path = scratch.path("ref");
     let target_path = scratch.path("target");
@@ -158,7 +82,7 @@ fn libzstd_interop_both_directions() {
         eprintln!("zstd binary not found; skipping libzstd patch interop test");
         return;
     }
-    let scratch = Scratch::new("interop");
+    let scratch = Scratch::new("patch", "interop");
     let (reference, target) = fixtures();
     let ref_path = scratch.path("ref");
     fs::write(&ref_path, &reference).unwrap();
@@ -225,7 +149,7 @@ fn libzstd_interop_both_directions() {
 /// source); with the pledge the full roundtrip works through pipes.
 #[test]
 fn stdin_needs_stream_size() {
-    let scratch = Scratch::new("stdin");
+    let scratch = Scratch::new("patch", "stdin");
     let (reference, target) = fixtures();
     let ref_path = scratch.path("ref");
     fs::write(&ref_path, &reference).unwrap();
@@ -264,7 +188,7 @@ fn stdin_needs_stream_size() {
 /// patch without its REF fails.
 #[test]
 fn reference_edge_cases() {
-    let scratch = Scratch::new("edges");
+    let scratch = Scratch::new("patch", "edges");
     let (reference, target) = fixtures();
     let ref_path = scratch.path("ref");
     fs::write(&ref_path, &reference).unwrap();
@@ -330,7 +254,7 @@ fn reference_edge_cases() {
 /// does not apply (patch mode implies `--ultra`, as zstdcli.c sets it).
 #[test]
 fn flag_conflicts_and_ultra() {
-    let scratch = Scratch::new("conflicts");
+    let scratch = Scratch::new("patch", "conflicts");
     let (reference, target) = fixtures();
     let ref_path = scratch.path("ref");
     fs::write(&ref_path, &reference).unwrap();
