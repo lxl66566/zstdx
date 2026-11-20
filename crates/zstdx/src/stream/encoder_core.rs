@@ -152,7 +152,7 @@ impl BlockChecksum for StreamChecksum {
 }
 
 /// Where the block stream's tail sits, for [`FrameEncoderCoreSt::finish`]'s
-/// closing shape: the newest block's header stays patchable to the
+/// closing shape: the newest block's last wire header stays patchable to the
 /// last-block form until its bytes leave `output`, while a pledge closed
 /// at `write` time already marked the final block last.
 #[derive(Clone, Copy, Default)]
@@ -160,8 +160,9 @@ enum BlockTail {
     /// No block emitted yet.
     #[default]
     None,
-    /// The newest block's 3-byte header sits at this `output` offset,
-    /// still patchable in place to the last-block form.
+    /// The newest block's final wire header (the splitter's last fragment
+    /// when one input block became several wire blocks) sits at this
+    /// `output` offset, still patchable in place to the last-block form.
     Open(usize),
     /// The final block already carries the last-block flag (a pledged
     /// grid-close at `write` time); `finish` appends the checksum only.
@@ -779,13 +780,14 @@ impl FrameEncoderCoreSt {
         }
         // A frame needs at least one block: empty input, and an input that
         // is an exact multiple of the block size, encode one empty raw last
-        // block. When the last real block's header is still pending in the
-        // output buffer — not yet handed to the consumer (`off >=
-        // out_read`, so a partially drained output whose undelivered tail
-        // starts past the header keeps the empty-block form too) — set its
-        // last-block flag instead (libzstd's one-shot shape, 3 bytes
-        // shorter); an eagerly drained consumer that already took those
-        // bytes keeps the empty-block form.
+        // block. When the last real block's final wire header (the tail's
+        // offset — the splitter's last fragment when the block split) is
+        // still pending in the output buffer — not yet handed to the
+        // consumer (`off >= out_read`, so a partially drained output whose
+        // undelivered tail starts past the header keeps the empty-block
+        // form too) — set its last-block flag instead (libzstd's one-shot
+        // shape, 3 bytes shorter); an eagerly drained consumer that already
+        // took those bytes keeps the empty-block form.
         //
         // A still-pending staging gate means the frame never staged its
         // head (a short input or an early finish): the stock frame stays,
@@ -1046,22 +1048,15 @@ impl FrameEncoderCoreSt {
         if self.blocks == 0 {
             self.output.extend_from_slice(&self.header);
         }
-        // Offset of this block's 3-byte header inside `output`: every
-        // encode path (compress_fastest reserves it first, the raw/RLE
-        // fallbacks serialize it first) starts there, so `finish` can set
-        // the last-block flag in place when the buffer ends on the grid.
-        // The closing `encode_block(true)` call overwrites this with a
-        // header that already carries the flag; nothing reads the tail
-        // afterwards (`finish` is one-shot).
-        self.tail = BlockTail::Open(self.output.len());
         self.blocks += 1;
         // An empty block only occurs as the frame-closing block (empty
         // input or an exact block-size multiple) and is always raw; the
         // compressed path has never seen a zero-byte block.
         let before = self.output.len();
-        if self.level != Level::Uncompressed && n > 0 {
-            compress_fastest(&mut self.state, last, &mut self.output, &mut self.hasher);
+        let header_at = if self.level != Level::Uncompressed && n > 0 {
+            let at = compress_fastest(&mut self.state, last, &mut self.output, &mut self.hasher);
             self.state.split.note_block(n, self.output.len() - before);
+            at
         } else {
             let header = BlockHeader {
                 last_block: last,
@@ -1071,7 +1066,16 @@ impl FrameEncoderCoreSt {
             header.serialize(&mut self.output);
             self.hasher
                 .raw_out(&mut self.output, self.state.matcher.get_last_space(), 0);
-        }
+            before
+        };
+        // Record after the encode, at the LAST wire block's header: the opt
+        // rows' post-parse splitter emits one input block as several wire
+        // blocks and only the final fragment can take the last-block flag,
+        // so `finish`'s in-place patch must target that header. Callers
+        // that passed `last` overwrite this with `Closed` right after (the
+        // flag is already on the wire); nothing else reads the tail before
+        // the next emission overwrites it.
+        self.tail = BlockTail::Open(header_at);
     }
 }
 

@@ -675,6 +675,171 @@ fn finish_after_partial_drain_closes_the_frame() {
     }
 }
 
+/// One 128 KiB block: 64 KiB of wide random bytes then 64 KiB of word text,
+/// so the opt rows' post-parse splitter cuts the block at the entropy shift
+/// into several wire blocks (only the last of which may carry the frame's
+/// last-block flag).
+#[cfg(test)]
+fn entropy_shift_block(seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut out = Vec::with_capacity(128 * 1024);
+    while out.len() < 64 * 1024 {
+        out.push((rand() >> 33) as u8);
+    }
+    let words: [&[u8]; 6] = [b"alpha ", b"beta ", b"gamma ", b"delta ", b"eps ", b"zeta "];
+    while out.len() < 128 * 1024 {
+        let w = words[(rand() >> 40) as usize % words.len()];
+        out.extend_from_slice(w);
+    }
+    out.truncate(128 * 1024);
+    out
+}
+
+/// Walk a checksummed frame's wire blocks (3-byte headers, RLE bodies are
+/// one byte) and return their count, stopping at the first last-flagged
+/// header.
+#[cfg(test)]
+fn wire_blocks(frame: &[u8]) -> usize {
+    let desc = frame[4];
+    let single = (desc >> 5) & 1 == 1;
+    let mut pos = 5
+        + usize::from(!single)
+        + match desc & 3 {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => 0,
+        }
+        + if desc >> 6 == 0 {
+            usize::from(single)
+        } else {
+            1usize << (desc >> 6)
+        };
+    let mut n = 0;
+    while pos + 3 <= frame.len() {
+        let b0 = frame[pos];
+        let size = ((b0 >> 3) as usize)
+            | ((frame[pos + 1] as usize) << 5)
+            | ((frame[pos + 2] as usize) << 13);
+        let body = if (b0 >> 1) & 3 == 1 {
+            1
+        } else {
+            size
+        };
+        pos += 3 + body;
+        n += 1;
+        if b0 & 1 == 1 {
+            break;
+        }
+    }
+    n
+}
+
+/// Regression: `finish` with the output still undelivered must patch the
+/// last-block flag into the LAST wire fragment of a split final block. The
+/// tail recorded the block's first header offset, so the patch flagged the
+/// first fragment and every byte after it (the remaining fragments plus the
+/// checksum) became out-of-frame garbage: the raw encoder's documented
+/// cadence — write, finish, then deliver — shipped a frame both decoders
+/// rejected while the eagerly delivered cadence of the same input decoded.
+#[test]
+fn finish_with_undelivered_output_flags_split_last_fragment() {
+    let data = entropy_shift_block(0x1717);
+    let level = Level::Ultra;
+
+    // Eager cadence: deliver everything before finish. The closing header
+    // already left, so the frame ends with an empty last block.
+    let mut eager = raw::Encoder::new(level).unwrap();
+    eager.write(&data).unwrap();
+    let mut eager_out = Vec::new();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+    eager.finish().unwrap();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+    assert_eq!(bulk::decompress(&eager_out, 0).unwrap(), data);
+
+    // The documented lagging cadence: nothing delivered until after finish.
+    let mut lag = raw::Encoder::new(level).unwrap();
+    lag.write(&data).unwrap();
+    lag.finish().unwrap();
+    let mut lag_out = Vec::new();
+    deliver_raw_all(&mut lag, &mut lag_out, 977);
+
+    // The splitter really cut the block, and the lagging frame is the eager
+    // one with the last fragment flagged in place instead of an appended
+    // empty last block: one wire block fewer, 3 bytes shorter.
+    let (eager_blocks, lag_blocks) = (wire_blocks(&eager_out), wire_blocks(&lag_out));
+    assert!(lag_blocks >= 2, "the final block did not split");
+    assert_eq!(eager_blocks, lag_blocks + 1);
+    assert_eq!(lag_out.len() + 3, eager_out.len());
+    assert_eq!(bulk::decompress(&lag_out, 0).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(lag_out.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    // Pledged control: the final block closes at write time with the flag
+    // already on the wire, so the cadence cannot move the frame bytes.
+    let opts = EncoderOptions::new(level).pledged_size(Some(data.len() as u64));
+    let mut lag = raw::Encoder::with_options(opts.clone()).unwrap();
+    lag.write(&data).unwrap();
+    lag.finish().unwrap();
+    let mut lag_out = Vec::new();
+    deliver_raw_all(&mut lag, &mut lag_out, 977);
+    let mut eager = raw::Encoder::with_options(opts).unwrap();
+    eager.write(&data).unwrap();
+    let mut eager_out = Vec::new();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+    eager.finish().unwrap();
+    deliver_raw_all(&mut eager, &mut eager_out, 977);
+    assert_eq!(lag_out, eager_out);
+    assert_eq!(bulk::decompress(&lag_out, 0).unwrap(), data);
+}
+
+/// Regression: a `write::Encoder` drain that fails mid-stream keeps the
+/// undelivered tail, so `finish` runs with output pending and must still
+/// close a split final block on its last fragment (same patch arm as the
+/// raw encoder's lagging cadence above). The frame used to close on the
+/// first fragment and finish reported Ok over a broken stream.
+#[test]
+fn stalled_drain_finish_flags_split_last_fragment() {
+    let data = entropy_shift_block(0x1717);
+    let level = Level::Ultra;
+
+    let mut good = Vec::new();
+    {
+        let mut enc = write::Encoder::new(&mut good, level).unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+    }
+    assert_eq!(bulk::decompress(&good, 0).unwrap(), data);
+
+    // The sink accepts 3 bytes, fails once, then accepts everything: the
+    // drain stalls with the frame header still undelivered.
+    let mut writer = ScriptedWriter {
+        script: [Ok(3), Err(would_block())].into(),
+        received: Vec::new(),
+    };
+    let mut enc = write::Encoder::new(&mut writer, level).unwrap();
+    assert!(crate::io::Write::write(&mut enc, &data).is_err());
+    let writer = enc.finish().unwrap();
+    assert_eq!(writer.received.len() + 3, good.len());
+    assert_eq!(bulk::decompress(&writer.received, 0).unwrap(), data);
+    #[cfg(feature = "std")]
+    {
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(writer.received.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+}
+
 #[test]
 fn workers_option_routes() {
     // std builds accept workers > 1 (multithreaded core, or the

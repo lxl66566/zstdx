@@ -65,8 +65,13 @@ pub(crate) enum SplitOutcome {
     /// Partitions were emitted: every partition's block header is already
     /// final in `output` and each partition passed its own size guard, so
     /// the caller skips the single-block header patch and checks and only
-    /// adopts the returned tables.
-    Emitted(BlockTables),
+    /// adopts the returned tables. `last_header` is the offset of the
+    /// final partition's 3-byte header — the only fragment that can carry
+    /// the frame's last-block flag.
+    Emitted {
+        tables: BlockTables,
+        last_header: usize,
+    },
     /// No split paid (or the block staged too few sequences): the outcome
     /// and output are exactly the stock single-block path's.
     Single(BlockOutcome),
@@ -367,6 +372,9 @@ fn emit_partitions<M: Matcher>(
     let mut lit_base = 0usize;
     let mut src_base = 0usize;
     let mut prev_bound = 0usize;
+    // Header offset of the newest partition: the value returned to the
+    // caller once the last one is written.
+    let mut last_header = header_base;
     for (i, bound) in partitions
         .iter()
         .copied()
@@ -396,6 +404,7 @@ fn emit_partitions<M: Matcher>(
             output.extend_from_slice(&[0u8; 3]);
             output.len() - 3
         };
+        last_header = header_at;
         let before = output.len();
         let outcome = encode_staged_block(
             matcher,
@@ -503,19 +512,22 @@ fn emit_partitions<M: Matcher>(
         src_base += src_bytes;
     }
     debug_assert_eq!(src_base, block_size);
-    SplitOutcome::Emitted(BlockTables {
-        huff: if huff_written {
-            match cur_huff {
-                Rolling::Owned(Some(t)) => Some(t),
-                _ => None,
-            }
-        } else {
-            None
+    SplitOutcome::Emitted {
+        tables: BlockTables {
+            huff: if huff_written {
+                match cur_huff {
+                    Rolling::Owned(Some(t)) => Some(t),
+                    _ => None,
+                }
+            } else {
+                None
+            },
+            ll: net_prev(roll_ll),
+            ml: net_prev(roll_ml),
+            of: net_prev(roll_of),
         },
-        ll: net_prev(roll_ll),
-        ml: net_prev(roll_ml),
-        of: net_prev(roll_of),
-    })
+        last_header,
+    }
 }
 
 /// Net per-stream outcome against the block-start table: an owned

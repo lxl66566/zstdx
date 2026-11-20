@@ -299,6 +299,14 @@ ST 流核心 finish 的 `BlockTail::Open(off)` 补丁分支只检查了 `off < s
 
 修复是补丁分支的 guard 增加 `off >= self.out_read`，不满足时自然落到空闭合块分支，也就是 eagerly drained 消费者的既有形态。教训是：原地补丁只对仍然归编码器所有的字节有效，一旦存在 drain 游标，"位置在缓冲区内"必须收紧为"位置在未交付跨度内"。
 
+### finish 的 last-block 补丁打在 split 首分片上
+
+ST 流核心的 `emit_block` 在整块编码之前记录 `BlockTail::Open(self.output.len())`，语义是"这个块的头"的偏移。opt 行（level 不低于 17 且窗口不低于 2^17）的 post-parse splitter 会把一个 128 KiB 输入块写成多个 wire 块，每个分片各带 3 字节头，last_block 只落在最后一个分片上。"块的头"从此不再唯一，finish 的原地补丁把标志打进了第一个分片的头。第一个分片之后的字节（其余分片与 4 字节校验和）成为帧外垃圾，解码器以校验和不匹配拒绝该帧。
+
+触发面是两个公开用法。raw::Encoder 文档示例的节奏是 write、finish、再投递，finish 时 output 非空，补丁分支命中。write::Encoder 的 sink 报一次瞬时错误（例如 WouldBlock）后，未交付尾部留在核心里，用户调 finish 同样命中。同样的输入，投递节奏决定帧是否可解。pledged 流的最后一个块在 write 路径已带 last 标志离开，两种节奏都正确。
+
+修复让 `compress_fastest` 返回最后一个 wire 块头的偏移，split 路径经 `SplitOutcome::Emitted { last_header }` 透传，`emit_block` 在编码完成后记录该偏移。教训是：引入 post-hoc 分片后，指向"块头"的锚点必须写明是哪一个 wire 块的头，取 last-block 语义时只能是最后一个。
+
 ## Checksums and streaming
 
 ### Snapshots must capture filled state

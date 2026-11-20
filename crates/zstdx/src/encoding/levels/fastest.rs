@@ -18,6 +18,11 @@ use crate::{
 
 /// Compresses a single block at [`crate::Level::Fastest`].
 ///
+/// Returns the offset in `output` of the final wire block's 3-byte header:
+/// the opt rows' post-parse splitter may emit one input block as several
+/// wire blocks, and only the last of those can carry the frame's
+/// last-block flag, so in-place patchers must target the returned offset.
+///
 /// # Parameters
 /// - `state`: [`CompressState`] so the compressor can refer to data before the start of this block
 /// - `last_block`: Whether or not this block is going to be the last block in the frame (needed
@@ -33,7 +38,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
     last_block: bool,
     output: &mut Vec<u8>,
     hasher: &mut C,
-) {
+) -> usize {
     let block_size = state.matcher.get_last_space().len() as u32;
     // The uniform scan doubles as the checksum pass: RLE blocks come out
     // fully hashed, anything else resumes at the first mismatch (fused into
@@ -48,8 +53,10 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             block_size,
         };
         // Write the header, then the block
+        let at = output.len();
         header.serialize(output);
         output.push(rle_byte);
+        at
     } else if state.matcher.skip_if_incompressible() {
         // Incompressible gate (opt strategies): the block goes raw without
         // paying the match search; the checksum absorb fuses into the copy
@@ -59,8 +66,10 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             block_type: crate::blocks::block::BlockType::Raw,
             block_size,
         };
+        let at = output.len();
         header.serialize(output);
         hasher.raw_out(output, state.matcher.get_last_space(), hashed);
+        at
     } else {
         // The snapshot carries the job-start gate's remaining count with the
         // history: a raw fallback rolls both back, because this block's
@@ -102,7 +111,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         // already wrote every partition's header and ran the per-partition
         // size guards, so the single-block patch and checks below are
         // skipped.
-        let (outcome, headers_final) = if state.matcher.block_splitting_enabled() {
+        let (outcome, headers_final, last_header) = if state.matcher.block_splitting_enabled() {
             match split::compress_split_block(
                 &mut state.matcher,
                 last_block,
@@ -117,8 +126,11 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 dict_entropy,
                 &mut state.scratch,
             ) {
-                split::SplitOutcome::Emitted(tables) => (BlockOutcome::Encoded(tables), true),
-                split::SplitOutcome::Single(outcome) => (outcome, false),
+                split::SplitOutcome::Emitted {
+                    tables,
+                    last_header,
+                } => (BlockOutcome::Encoded(tables), true, last_header),
+                split::SplitOutcome::Single(outcome) => (outcome, false, start),
             }
         } else {
             (
@@ -136,6 +148,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                     &mut state.scratch,
                 ),
                 false,
+                start,
             )
         };
         let compressed_size = output.len() - start - 3;
@@ -192,6 +205,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
                 output[start..start + 3].copy_from_slice(&prefix);
             }
             hasher.hash_tail(&state.matcher.get_last_space()[hashed..]);
+            last_header
         } else {
             output.truncate(start);
             state.matcher.restore_repcode(rep);
@@ -220,6 +234,7 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             // Write the header, then the block (hashing as it goes)
             header.serialize(output);
             hasher.raw_out(output, state.matcher.get_last_space(), hashed);
+            start
         }
     }
 }
