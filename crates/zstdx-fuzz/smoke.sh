@@ -52,12 +52,14 @@ finish() {
 trap finish EXIT
 
 # Split the corpus into W same-device hardlink slices once; replay and fuzz
-# phases both consume them.
+# phases both consume them. All W slice dirs exist up front, so a corpus
+# smaller than W (or empty) leaves the tail slices empty instead of missing.
+shopt -s nullglob
 pick=$((RANDOM % workers)) n=0
+for i in $(seq 0 $((workers - 1))); do mkdir -p "$tmp/slice$i"; done
 for f in "$corpus"/*; do
   s=$((n % workers)); n=$((n + 1))
-  d=$tmp/slice$s; [[ -d $d ]] || mkdir -p "$d"
-  ln "$f" "$d/"
+  ln "$f" "$tmp/slice$s/"
 done
 
 t0=$SECONDS

@@ -212,6 +212,8 @@ The campaign must hold the bench flock, four workers is plenty, and per-worker R
 
 The current smokes run through `crates/zstdx-fuzz/smoke.sh`. It drives the built binary directly because `cargo fuzz run` silently appends `corpus/<target>` to the arguments, which collapses chunked parallel `-merge=1` into N full merges. It splits the seed replay over W single-shot `-runs=0` processes, because letting every `-jobs` child replay the whole corpus under contention drops per-worker execution 3x at 16 workers and `-max_total_time` never sees the replay at all. It then fuzzes W-wide from a rotating 1/W slice, holds the bench flock, and archives crashes to `artifacts/`.
 
+The split loop created slice directories per file, so a corpus with fewer files than workers left the tail slices missing and phase 2's seed directory failed to load; an empty corpus died earlier still, with the unmatched `"$corpus"/*` glob handed to `ln` literally under `set -e`. The R112 round hit both shapes bootstrapping `ldm_mt_parity`, the one target without a corpus. `smoke.sh` now creates all W slice dirs up front and sets `nullglob`, so an empty corpus is a valid smoke input.
+
 Corpora stay merged after campaigns, with encode going from 11653 to 4807 and encode_stream from 2518 to 1667. The recipe in the fuzz Readme needs hardlink splits on the corpus device, because a tmpfs `/tmp` cannot hardlink to it.
 
 ### fsmonitor swallows tool writes
