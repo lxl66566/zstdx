@@ -41,8 +41,9 @@
 //! from offset zero with the shrunk strip the bulk path uses, and a kept
 //! frame's job zero continues the donated state past the span (the
 //! continuation skips the strip prefill — it would clear the tables the
-//! donation built) while keeping the stream strip (see
-//! [`MatchGeneratorDriver::stream_overlap_for`] — the chain rows'
+//! donation built) while keeping the frame's own history span: the bulk
+//! strip on a pledged frame, the whole-window stream strip on an open one
+//! (see [`MatchGeneratorDriver::stream_overlap_for`] — the chain rows'
 //! cross-job LDM carrier, deliberately wider than the bulk strip). A
 //! pledge clears the probe's size gate at construction, so the head stages
 //! at [`reach_probe::PROBE_SPAN`]; an open-ended stream cannot know its
@@ -1091,7 +1092,10 @@ pub(crate) struct MtEncoderCore {
     job_start: u64,
     grid: JobGrid,
     /// History strip each job borrows (and fully indexes) as match window:
-    /// the level's whole window, like the bulk mt path.
+    /// the bulk strip on a pledged frame (the constructor's derivation,
+    /// widened back to the row window by the capture-class engagements),
+    /// the level's whole window on an open-ended one (see
+    /// `MatchGeneratorDriver::stream_overlap_for`).
     overlap: usize,
     /// The jobs' LDM arming context: flipped to [`LdmArming::JobPrefix`]
     /// when a pledged keep-class frame's verdict re-grids it onto the bulk
@@ -1337,22 +1341,32 @@ impl MtEncoderCore {
             window_log: options.ldm_window_log(),
         };
         let window = Self::header_window(options.level, shape, dict.as_deref());
-        // The job history rides the level's stream overlap rule (see
+        // A pledge runs the bulk schedule: the job grid's floor and the
+        // jobs' history span both take the search-domain strip the bulk
+        // jobs run (`strip_for_choice` at the stock Keep verdict — the
+        // probe re-grids a Shrink verdict, the capture classes re-pin the
+        // grid and widen the span on both paths alike), never the level's
+        // stream overlap rule. At the Balanced row the clamped window is
+        // up to twice the chain reach, and a window-floored grid would cut
+        // job boundaries the bulk frame does not have.
+        // An open-ended stream keeps the stream overlap rule (see
         // `stream_overlap_for`): the whole window where cross-job history
         // carries a far class, the search domain where the LDM restarts
-        // per job like the bulk path.
-        let overlap = MatchGeneratorDriver::stream_overlap_for(options.level, shape) as usize;
-        // A pledge sizes the grid like the bulk path (byte-identical output
-        // when the input matches the pledge); an open-ended stream grows
-        // its jobs along the stream (see JobGrid).
-        let grid = match options.pledged_size {
-            Some(n) => JobGrid::Fixed(job_size_for_level(
-                options.level,
-                n,
-                options.workers,
-                overlap,
-            )),
-            None => JobGrid::Growing,
+        // per job like the bulk path, and a growing grid keyed on it.
+        let (overlap, grid) = match options.pledged_size {
+            Some(n) => {
+                let strip =
+                    MatchGeneratorDriver::strip_for_choice(options.level, shape, ReachChoice::Keep)
+                        as usize;
+                (
+                    strip,
+                    JobGrid::Fixed(job_size_for_level(options.level, n, options.workers, strip)),
+                )
+            },
+            None => (
+                MatchGeneratorDriver::stream_overlap_for(options.level, shape) as usize,
+                JobGrid::Growing,
+            ),
         };
         // The reach probe (see reach_probe): a probe-eligible frame defers
         // its schedule until the probe's head is staged. A pledge clears
@@ -2253,10 +2267,10 @@ impl MtEncoderCore {
         else {
             return;
         };
-        debug_assert_eq!(
-            self.overlap as u64, window,
-            "the strip is the clamped window"
-        );
+        // The capture's jobs borrow whole frame prefixes as their strips:
+        // the span widens from the stock strip to the clamped window, the
+        // bulk dispatch's own `capture_window` fold of `job_overlap`.
+        self.overlap = window as usize;
         let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
         // The bulk capture's grid is pinned (see `mt::capture_grid`):
         // worker-independent, so the pledged stream re-grids onto the

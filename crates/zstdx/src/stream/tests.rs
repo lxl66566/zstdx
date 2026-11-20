@@ -1429,6 +1429,64 @@ mod mt {
         assert_eq!(streamed, bulk_mt);
     }
 
+    /// The pledged stream's fixed grid is the bulk job grid at every row.
+    /// The Balanced row is the one where the level's stream history span
+    /// (`stream_overlap_for`: the whole 8 MiB window on a source in the
+    /// 4..8 MiB band) and the bulk strip (`strip_for_choice`: the 4 MiB
+    /// chain reach) differ, so the grid floor must ride the strip: a
+    /// window-floored grid collapses the frame onto one job while bulk
+    /// cuts it at the reach, and the pledged stream drifts off the bulk
+    /// bytes from the second job's start.
+    #[test]
+    fn pledged_stream_grid_rides_the_bulk_strip() {
+        // jsonish below the probe's 8 MiB size gate: the stock Keep verdict
+        // with no capture (the 8 MiB window sits under the mid-size bar),
+        // the plain band where the floors once split. 4 MiB + 13 is the
+        // first divergent tail offset; 8 MiB is the probe gate boundary (a
+        // Shrink frame re-grids both paths alike).
+        for len in [5 * 1024 * 1024, 4 * 1024 * 1024 + 13, 8 * 1024 * 1024] {
+            let data = jsonish(len);
+            let bulk_mt = encoding::mt::compress_slice_mt(
+                &data,
+                Level::Balanced,
+                false,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let streamed = encode_write(
+                &data,
+                512 * 1024,
+                Level::Balanced,
+                4,
+                false,
+                Some(data.len() as u64),
+            );
+            assert_eq!(streamed, bulk_mt, "len {len}");
+            assert_both_decoders(&streamed, &data, "level9 len {len}");
+        }
+        // Rows that already agreed keep their equality: the strip and the
+        // stream overlap coincide there, and the fix must not move them.
+        let data = jsonish(5 * 1024 * 1024 + 7);
+        for level in [Level::Fast, Level::Ultra] {
+            let bulk_mt = encoding::mt::compress_slice_mt(
+                &data,
+                level,
+                false,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            );
+            let streamed =
+                encode_write(&data, 512 * 1024, level, 4, false, Some(data.len() as u64));
+            assert_eq!(streamed, bulk_mt, "{level:?}");
+        }
+    }
+
     /// A stream written exactly to its pledge and the bulk slice entry with
     /// the size declared produce byte-identical frames — the equivalence the
     /// FFI one-shot rides. Covers both header forms (single-segment below

@@ -914,12 +914,15 @@ impl MatchGeneratorDriver {
         p.chain_reach.unwrap_or(p.window) as u64
     }
 
-    /// The streaming-MT job's history strip: the level's whole window for
-    /// the chain rows (their LDM far class rides cross-job through the
-    /// adopted window), the search domain for the opt and btlazy2 rows
-    /// (their LDM restarts per job exactly like the bulk path, so a
-    /// full-window job floor would only serialize sub-window streams
-    /// without buying reach).
+    /// The open-ended streaming-MT job's history span: the level's whole
+    /// window for the chain rows (their LDM far class rides cross-job
+    /// through the adopted window), the search domain for the opt and
+    /// btlazy2 rows (their LDM restarts per job exactly like the bulk
+    /// path, so a full-window job floor would only serialize sub-window
+    /// streams without buying reach). A pledged stream core does not read
+    /// this: it runs the bulk strip ([`Self::strip_for_choice`]) for both
+    /// its grid floor and its history span, keeping the pledged bytes on
+    /// the bulk frame's.
     pub fn stream_overlap_for(level: Level, shape: InputShape) -> u64 {
         let p = params_for(level, shape);
         match p.strategy {

@@ -2,8 +2,8 @@
 //! overlap jobs.
 //!
 //! The input is split into jobs; each job compresses its byte range with the
-//! pooled slice machinery while borrowing an `overlap`-sized strip of the
-//! preceding job as match history (`adopt_window` plus `prefill_window`, so
+//! pooled slice machinery while borrowing a strip of the preceding job as
+//! match history (`adopt_window` plus `prefill_window`, so
 //! the strip's positions actually sit in the search tables), keeping the
 //! assembled output a single regular zstd frame. Two invariants make the
 //! jobs independent of each other (mirroring libzstd's zstdmt):
@@ -48,7 +48,7 @@ use crate::{Level, common::MAX_BLOCK_SIZE};
 /// Below this size the thread spawn and the ordered assembly cost more than
 /// the parallelism saves.
 const MIN_MT_INPUT: usize = 2 * 1024 * 1024;
-/// Job size floor: smaller jobs multiply the overlap duplication without
+/// Job size floor: smaller jobs multiply the strip duplication without
 /// improving load balance.
 pub(crate) const MIN_JOB_SIZE: usize = 1024 * 1024;
 /// Job size ceiling: a huge known input would otherwise scale the job size
@@ -63,14 +63,15 @@ pub(crate) const MAX_JOB_SIZE: usize = 1024 * 1024 * 1024;
 pub(crate) const CAPTURE_JOB_CAP: u64 = 16 * 1024 * 1024;
 
 /// Job size for an input of `len` bytes at `workers` threads: twice as many
-/// jobs as workers keeps the tail balanced, the floor keeps the overlap
-/// duplication negligible and scales with the level's overlap, and the
-/// ceiling bounds the buffering. The bulk and streaming mt paths share this
-/// so a pledged stream matches the bulk output byte for byte.
-pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
+/// jobs as workers keeps the tail balanced, the floor keeps the strip
+/// duplication negligible and scales with the level's strip (the search
+/// domain the jobs prefill — never a wider history span), and the ceiling
+/// bounds the buffering. The bulk and streaming mt paths share this so a
+/// pledged stream matches the bulk output byte for byte.
+pub(crate) fn job_size_for(len: u64, workers: u32, strip: usize) -> usize {
     debug_assert!(workers >= 2);
     len.div_ceil(workers as u64 * 2)
-        .max(MIN_JOB_SIZE.max(overlap) as u64)
+        .max(MIN_JOB_SIZE.max(strip) as u64)
         .min(MAX_JOB_SIZE as u64) as usize
 }
 
@@ -87,24 +88,24 @@ pub(crate) fn job_size_for(len: u64, workers: u32, overlap: usize) -> usize {
 /// grid found no cell dominating their baselines (dll100 ultra's wall
 /// winners cost +2.9% size, its size winners +13-26% wall; dll32's
 /// apparent overlap wins were the LDM-disarm defect showing through).
-pub(crate) fn btlazy_job_size(overlap: usize) -> usize {
-    (overlap * 4).clamp(MIN_JOB_SIZE, MAX_JOB_SIZE)
+pub(crate) fn btlazy_job_size(strip: usize) -> usize {
+    (strip * 4).clamp(MIN_JOB_SIZE, MAX_JOB_SIZE)
 }
 
 /// [`job_size_for`] with the btlazy rows' pinned grid (see
 /// [`btlazy_job_size`]): the level-keyed entry every plain job grid
 /// derivation goes through, so the bulk and pledged-stream paths stay
 /// byte-identical.
-pub(crate) fn job_size_for_level(level: Level, len: u64, workers: u32, overlap: usize) -> usize {
+pub(crate) fn job_size_for_level(level: Level, len: u64, workers: u32, strip: usize) -> usize {
     if MatchGeneratorDriver::btlazy_row(level) {
-        btlazy_job_size(overlap)
+        btlazy_job_size(strip)
     } else {
-        job_size_for(len, workers, overlap)
+        job_size_for(len, workers, strip)
     }
 }
 
-/// The encoder's exact MT job size for an input, with the overlap the
-/// level implies — dev tooling (`emitframe`/`piecepipe`) cuts its analysis
+/// The encoder's exact MT job size for an input, with the strip the level
+/// implies — dev tooling (`emitframe`/`piecepipe`) cuts its analysis
 /// pieces at these boundaries, so it must not re-derive the formula.
 /// Hidden: not API-stable.
 #[doc(hidden)]
@@ -124,7 +125,7 @@ pub fn mt_job_size_for(
     } else {
         reach_probe::probe_reach_choice(head, level, shape)
     };
-    let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     // Capture frames pin the grid at the reach floor (worker-independent
     // — see `capture_grid`); the analysis tools must cut at the grid the
     // encoder actually runs. `head` is the whole input (the screen clamps
@@ -140,7 +141,7 @@ pub fn mt_job_size_for(
         fast_window,
         crate::LdmMode::Auto,
     )
-    .unwrap_or_else(|| job_size_for_level(level, len, workers.max(2), overlap))
+    .unwrap_or_else(|| job_size_for_level(level, len, workers.max(2), strip))
 }
 
 /// Compress `src` into one frame using up to `workers` threads.
@@ -186,8 +187,8 @@ pub fn compress_slice_mt(
     }
 
     // Twice as many jobs as workers keeps the tail balanced; the floor keeps
-    // the overlap duplication negligible, and scales with the level's
-    // overlap so deep-search levels don't pay it per job.
+    // the strip duplication negligible, and scales with the level's strip
+    // so deep-search levels don't pay it per job.
     let shape = crate::InputShape {
         len: Some(src.len() as u64),
         window_log,
@@ -243,7 +244,11 @@ pub fn compress_slice_mt(
     );
 
     let donation = Mutex::new(donation);
-    let overlap = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    // The stock strip: the search domain the plain jobs prefill, the plain
+    // grid's floor and the fallback job history. The banded classes widen
+    // the history below (`job_overlap`); the grid stays the strip's or the
+    // capture lattice's own pin.
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
     let job_size = capture_grid(
         src.len() as u64,
         level,
@@ -253,7 +258,7 @@ pub fn compress_slice_mt(
         fast_window,
         ldm_mode,
     )
-    .unwrap_or_else(|| job_size_for_level(level, src.len() as u64, workers, overlap));
+    .unwrap_or_else(|| job_size_for_level(level, src.len() as u64, workers, strip));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -343,7 +348,7 @@ pub fn compress_slice_mt(
     let job_overlap = deep_ldm
         .or(capture_window)
         .or(opt_feed)
-        .map_or(overlap, |w| w as usize);
+        .map_or(strip, |w| w as usize);
     let job_ldm = if spf.is_some() {
         LdmArming::JobPrefix
     } else {
@@ -418,7 +423,7 @@ pub fn compress_slice_mt(
                     // one lands is pure scheduling).
                     let snapshot = if let Some(gate) = &feed_gate {
                         if let Some(span) =
-                            take_feed_span(gate, &ready, start as u64, end as u64, overlap as u64)
+                            take_feed_span(gate, &ready, start as u64, end as u64, strip as u64)
                         {
                             JobSpfOwned::Feed {
                                 span,
