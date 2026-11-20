@@ -1265,13 +1265,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `staged_read` tracks the probe's staged head replay across
         // blocks (it spans sixteen of them).
         let mut staged_read = 0usize;
-        // Staged remainder after a pre-split cut, in bytes: the fill stages
-        // a whole block's tail, the detector may emit only the first cut of
-        // it, and the rest stays physically at the head of the next
-        // `block_tail` (the commit shrinks the window past it without
-        // touching the bytes), so the next fill reads in behind it — no
-        // copy, on any frame.
-        let mut carry = 0usize;
+        // Staged remainder after a pre-split cut, owned by this compressor:
+        // the fill stages a whole block's tail and the detector may emit
+        // only the first cut of it. The remainder rides this frame-local
+        // buffer across the next `block_tail` reservation — the reservation
+        // may compact the window, and compaction moves only committed
+        // bytes, so bytes left in the uncommitted tail would turn stale
+        // (the stream core keeps the same ownership in its `staged`).
+        let mut carry: Vec<u8> = Vec::new();
         // Now compress block by block. `staged_read` tracks the probe's
         // staged head replay across blocks (it spans sixteen of them).
         loop {
@@ -1285,7 +1286,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 let cap = cap.min(tail.len());
                 &mut tail[..cap]
             };
-            let mut read_bytes = carry;
+            // Replay the last cut's remainder ahead of the fresh read: it
+            // rode the owned buffer across the reservation (see `carry`).
+            tail[..carry.len()].copy_from_slice(&carry);
+            let mut read_bytes = carry.len();
             let last_block;
             'read_loop: loop {
                 if staged_read < probe_staged.len() {
@@ -1326,7 +1330,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 self.state.split.block_size(&tail[..read_bytes], level)
             };
             let emit_last = last_block && decided == read_bytes;
-            carry = read_bytes - decided;
+            // Move the cut's remainder into the owned carry before the
+            // commit shrinks the window: the bytes live in the staged tail
+            // only until then.
+            carry.clear();
+            if read_bytes > decided {
+                carry.extend_from_slice(&self.state.matcher.staged_tail()[decided..read_bytes]);
+            }
             self.state.matcher.commit_block(decided);
             // Special handling is needed for compression of a totally empty file (why you'd want to
             // do that, I don't know)

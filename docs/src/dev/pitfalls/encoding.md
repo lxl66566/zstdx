@@ -32,6 +32,12 @@ The Read-path pre-split decision asked the matcher for the staged span through `
 
 Output stayed valid and boundaries were silently one block behind. The slice-versus-Read-stream identity test caught it only on inputs whose neighboring blocks decide differently. Any matcher helper over the fill in progress must use `win.len() - slice_size`, not the committed `block_start`.
 
+### Pre-split carry across window compaction
+
+The Read-path pre-split leftover once stayed physically in the matcher's uncommitted tail, and the next fill read its fresh bytes in behind it. That zero-copy contract only holds while the `block_tail` reservation leaves the window in place: past `2 * window + slice_size` committed bytes the reservation compacts the owned window, and the compaction's `copy_within` moves committed bytes only. The block staged right after a compaction spliced stale pre-compaction window bytes in front of its fresh ones. The frame stayed structurally valid with a self-consistent checksum over the wrong payload, so no decoder-side error can catch this class; only payload comparison can.
+
+The carry is encoder state and rides an encoder-owned buffer across the reservation, the same ownership the stream core's `staged` keeps. The invariant: nothing survives a `block_tail` reservation in the window's uncommitted tail. It needed a frame window below ~1.5 MiB plus input past the compaction trigger to surface (first firing at 1703936 committed bytes on the wl18 level-5 row), so the corpus-sized tests never crossed it.
+
 ### Wire-flag size classes
 
 The FCS flag mapping read `3 => 8` where `find_min_size` yields 1, 2, 4 and 8, and the intended arm was `8 => 3`. Every FCS at 2^32 or above hit the panic arm, which covers MT's fixed `frame_content_size: Some(src.len())` for inputs above 4 GiB-1 and a stream pledged at 2^32 or above. All smaller classes behaved, so every ordinary test passed.

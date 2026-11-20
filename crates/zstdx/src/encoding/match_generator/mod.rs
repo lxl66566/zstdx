@@ -4026,12 +4026,11 @@ impl MatchGeneratorDriver {
     /// stops at the logical length, so the helper widens the length to
     /// the capacity for the fill and shrinks it back. The wall always
     /// sits past the STAGED length, never past the committed one: the
-    /// streaming core's carry convention keeps tail bytes past a
-    /// committed block alive into the next staging round (the next fill
-    /// reads in behind them), so only the span no caller may touch —
-    /// beyond the full staged tail — is walled. A full-block commit
-    /// lands the wall directly past the block end, where every parse
-    /// overread crosses it.
+    /// streaming cores fill the staged tail across several calls (the
+    /// feed path's partial block, the read core's replayed carry), so
+    /// only the span no caller may touch — beyond the full staged tail —
+    /// is walled. A full-block commit lands the wall directly past the
+    /// block end, where every parse overread crosses it.
     #[cfg(debug_assertions)]
     fn win_poison_fill(&mut self) {
         let len = self.win.len();
