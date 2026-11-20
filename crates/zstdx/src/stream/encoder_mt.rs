@@ -1932,11 +1932,16 @@ impl MtEncoderCore {
         while let Some(head) = self.out_queue.front() {
             #[cfg(debug_assertions)]
             vec_poison::assert(head, "mt out head (drain entry)");
-            let len = head.len();
-            write_pending_output(head, &mut self.queue_read, w)?;
+            let before = self.queue_read;
+            let res = write_pending_output(head, &mut self.queue_read, w);
+            // Deduct the delivered prefix on both arms, like `split_output`
+            // does per take: the accounting must track real delivery (the
+            // `queue_read` cursor), so a mid-drain failure leaves
+            // `pending_output` counting exactly the undelivered bytes.
+            self.out_bytes -= self.queue_read - before;
+            res?;
             self.out_queue.pop_front();
             self.queue_read = 0;
-            self.out_bytes -= len;
         }
         Ok(())
     }

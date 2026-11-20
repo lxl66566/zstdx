@@ -337,6 +337,8 @@ The fix is an incremental `write` loop that advances the `out_read` cursor, whic
 
 `write::Encoder::write` still stages its input before the drain, so on `Err` the input may already be accepted. A caller retrying under the io::Write "Err means nothing written" contract would duplicate data. Closing that gap needs input deferral at one copy per write on the hot path, and until a caller needs retry-same-buffer semantics the divergence is documented at the implementation.
 
+The mt queue's `out_bytes` counter had the same class one layer up: it deducted per completed segment, not per delivered byte, so a drain that failed after an `Ok(n)` prefix left `pending_output` over-reporting by n. Any pending-bytes counter must be derived from the delivery cursor on both arms of the drain, the way `split_output` always did.
+
 ### Read-side finish and pending output
 
 `read::Encoder::finish` ran `core.finish()`, which emitted the last block and checksum into `core.output`, and then returned the inner reader, dropping `output` with it. The caller had already read only a prefix without the closing block, so the frame was truncated, and the read side has no later drain that could deliver the tail.

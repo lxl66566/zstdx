@@ -603,6 +603,52 @@ fn partial_write_then_error_keeps_pending_output() {
     }
 }
 
+/// Regression: the multithreaded core's `write_output_to` deducted
+/// `out_bytes` only after a fully drained queue segment, so a write that
+/// failed mid-drain (the writer accepted a prefix, then WouldBlock) left
+/// `pending_output` over-reporting by the delivered prefix — the undelivered
+/// count the retry contract is stated over. The deduction must follow the
+/// `queue_read` cursor on the failure path too, exactly like
+/// `split_output`'s per-take accounting.
+#[cfg(feature = "std")]
+#[test]
+fn mt_pending_output_survives_a_failed_drain() {
+    let data: Vec<u8> = (0..6 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+    let opts = EncoderOptions::new(Level::Balanced)
+        .workers(4)
+        .checksum(false)
+        .pledged_size(Some(data.len() as u64));
+    // The same options through the write encoder: the total frame bytes
+    // the raw encoder must deliver (the mt core's bytes never depend on
+    // the delivery cadence).
+    let reference = {
+        let mut sink = Vec::new();
+        let mut enc = write::Encoder::with_options(&mut sink, opts.clone()).unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish().unwrap();
+        sink
+    };
+    let mut enc = raw::Encoder::with_options(opts).unwrap();
+    enc.write(&data).unwrap();
+    enc.finish().unwrap();
+    // The sink accepts 5 bytes, fails once, then accepts everything.
+    let mut writer = ScriptedWriter {
+        script: [Ok(5), Err(would_block())].into(),
+        received: Vec::new(),
+    };
+    assert!(enc.write_output_to(&mut writer).is_err());
+    assert_eq!(
+        writer.received.len() + enc.pending_output(),
+        reference.len(),
+        "pending_output must count exactly the undelivered bytes"
+    );
+    // The retry completes the delivery and the assembled frame decodes.
+    enc.write_output_to(&mut writer).unwrap();
+    assert_eq!(enc.pending_output(), 0);
+    assert_eq!(writer.received, reference);
+    assert_eq!(bulk::decompress(&writer.received, 0).unwrap(), data);
+}
+
 /// Regression: `finish` after a partially drained output must not patch the
 /// last-block flag into bytes the writer already received. A failed drain
 /// leaves `out_read` inside the buffer with the block header delivered, and
