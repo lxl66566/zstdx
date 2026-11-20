@@ -1178,7 +1178,7 @@ fn packed_table_matches_entry_walk() {
         let mut probs = alloc::vec![0i32; nsym];
         let mut budget = table_size;
         let mut has_positive = false;
-        for prob in probs.iter_mut() {
+        for prob in &mut probs {
             let r = rand();
             if budget <= 1 || r % 3 == 0 {
                 continue; // dead symbol
@@ -1195,15 +1195,12 @@ fn packed_table_matches_entry_walk() {
             // The pour below needs a positive sink. Promoting a dead slot costs
             // one of the states left over; if every slot is live, promoting one
             // of the single-state symbols costs none.
-            match probs.iter().position(|&p| p == 0) {
-                Some(i) => {
-                    probs[i] = 1;
-                    budget -= 1;
-                },
-                None => {
-                    let i = probs.iter().position(|&p| p == -1).unwrap();
-                    probs[i] = 1;
-                },
+            if let Some(i) = probs.iter().position(|&p| p == 0) {
+                probs[i] = 1;
+                budget -= 1;
+            } else {
+                let i = probs.iter().position(|&p| p == -1).unwrap();
+                probs[i] = 1;
             }
         }
         // Pour the remaining states onto the live positives in random chunks so

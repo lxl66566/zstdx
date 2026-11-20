@@ -1899,7 +1899,7 @@ impl MtEncoderCore {
     /// in the core: the queue holds them natively and no frame-shaping
     /// decision reads the delivery state (the schedule keys on absolute
     /// offsets alone).
-    pub(crate) fn keeps_pending_output(&self) -> bool {
+    pub(crate) fn keeps_pending_output() -> bool {
         true
     }
 

@@ -1264,7 +1264,7 @@ impl FrameEncoderCore {
         match self {
             Self::Single(_) => false,
             #[cfg(feature = "std")]
-            Self::Mt(core) => core.keeps_pending_output(),
+            Self::Mt(_) => super::encoder_mt::MtEncoderCore::keeps_pending_output(),
         }
     }
 

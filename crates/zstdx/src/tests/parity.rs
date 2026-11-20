@@ -307,7 +307,7 @@ fn four_stream_jump_table_corruption_matches_libzstd_bytes() {
     // stream a full 650-byte segment.
     let mut payload = vec![0u8; 2600];
     let mut rng: u64 = 0x1234_5678_9abc_def0;
-    for b in payload.iter_mut() {
+    for b in &mut payload {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;

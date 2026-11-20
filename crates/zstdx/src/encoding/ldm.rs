@@ -1606,8 +1606,8 @@ mod tests {
     fn skeleton_sharing_windows_checksum_apart() {
         let a = rand_bytes(MIN_MATCH_LENGTH, 0x5a5a);
         let mut b = a.clone();
-        for i in 15..MIN_MATCH_LENGTH {
-            b[i] = b[i].wrapping_add(1);
+        for byte in &mut b[15..MIN_MATCH_LENGTH] {
+            *byte = byte.wrapping_add(1);
         }
         let st = LdmState::new(10, 1 << 10);
         assert_ne!(st.window_hash(&a, 0), st.window_hash(&b, 0));

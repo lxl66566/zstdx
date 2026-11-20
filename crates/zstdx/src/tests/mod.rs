@@ -1531,6 +1531,7 @@ pub mod multi_frame;
 pub mod parity;
 #[cfg(test)]
 pub mod poison;
+#[cfg(test)]
 pub mod read_core;
 
 #[cfg(feature = "std")]

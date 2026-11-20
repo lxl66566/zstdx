@@ -449,10 +449,9 @@ impl HuffmanTable {
         }
 
         self.packed.clear();
-        self.packed.reserve(1 << max_bits);
         // Every slot is written by the rank spans below: their lengths sum to
-        // 1 << max_bits by the Kraft equality, so the table needs no pre-fill.
-        unsafe { self.packed.set_len(1 << max_bits) };
+        // 1 << max_bits by the Kraft equality, so the zero pre-fill is inert.
+        self.packed.resize(1 << max_bits, 0);
 
         // longest codes first: the regions grow from index 0 in this order,
         // so one running cursor covers the whole table

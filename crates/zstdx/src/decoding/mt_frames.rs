@@ -1346,7 +1346,7 @@ mod tests {
         for raw in &raws {
             stream.extend_from_slice(&compress_pledged(raw, Level::Fastest, true, 2));
         }
-        let total: usize = raws.iter().map(|r| r.len()).sum();
+        let total: usize = raws.iter().map(Vec::len).sum();
         let expect = expected_output(&raws);
 
         // Exactly-sized target: full decode through the lane executor.

@@ -2,7 +2,7 @@
 
 This page states what the implementation can do today and how far it is from libzstd. It carries the capability table, the level ladder, the completeness estimates with their basis, the code layout, and the verification discipline each commit follows.
 
-The snapshot is as of the 2026-11-07 release pass at `3a05e92c`. The branch goal from `AGENTS.md` is feature parity with upstream zstd and performance beyond it. Upstreaming is out of scope, and arbitrary unsafe code, SIMD and new instruction sets are allowed.
+The snapshot is as of the 2026-11-16 release pass at `00b51bd0`. The branch goal from `AGENTS.md` is feature parity with upstream zstd and performance beyond it. Upstreaming is out of scope, and arbitrary unsafe code, SIMD and new instruction sets are allowed.
 
 ## Capability table
 

@@ -23,8 +23,11 @@ static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static TRACK: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: forwards every method to the System allocator unchanged; only the
+// counters observe the traffic.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        // SAFETY: plain delegation to the system allocator.
         let p = unsafe { System.alloc(l) };
         if !p.is_null() && TRACK.load(Ordering::Relaxed) != 0 {
             let size = l.size() as isize;
@@ -40,6 +43,7 @@ unsafe impl GlobalAlloc for Counting {
         if TRACK.load(Ordering::Relaxed) != 0 {
             LIVE.fetch_sub(l.size() as isize, Ordering::Relaxed);
         }
+        // SAFETY: plain delegation to the system allocator.
         unsafe { System.dealloc(p, l) }
     }
 }

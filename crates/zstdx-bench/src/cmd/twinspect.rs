@@ -382,9 +382,9 @@ fn parse_level(n: i32) -> Level {
 fn dlabel(d: u64) -> String {
     const K: u64 = 1024;
     const M: u64 = 1024 * 1024;
-    if d % M == 0 {
+    if d.is_multiple_of(M) {
         format!("{}M", d / M)
-    } else if d % K == 0 {
+    } else if d.is_multiple_of(K) {
         format!("{}K", d / K)
     } else {
         format!("{d}")

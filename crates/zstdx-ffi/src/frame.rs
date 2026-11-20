@@ -688,9 +688,8 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
     // error return, re-judging the value as a plain size_t: every failure
     // of the helper (the 32-bit wrap included, whose wrapped error value
     // sits far above srcSize) answers srcSize_wrong here.
-    let total = match skippable_frame_size(bytes) {
-        Ok(total) => total,
-        Err(_) => return code(ErrorCode::SrcSizeWrong),
+    let Ok(total) = skippable_frame_size(bytes) else {
+        return code(ErrorCode::SrcSizeWrong);
     };
     let content = total - 8;
     if content > dst_capacity {

@@ -4,12 +4,12 @@
 Streaming-first: real deployments stream (Read/Write), so the figures show
 the streaming paths; the bulk story lives in docs/src/dev/bench/. Data
 sources:
-- the 2026-11-07 release-pass sweep `matrix --mode dec-st --pull
+- the 2026-11-16 release-pass sweep `matrix --mode dec-st --pull
   4k,16k,64k,256k,1m` (+ the four dll100 .zst files) for the
   streaming-decode rows, and the release pass's dec-mt section +
   `files --threads` for the MT-decode rows (vs the zstd ST streaming
   reference)
-- the 2026-11-07 release pass for the encode figures:
+- the 2026-11-16 release pass for the encode figures:
   `matrix --mode enc-stream` (json/text, with the standalone-median rerun
   for text fastest/fast under the page-dispersity protocol) and
   `matrix --mode enc-stream --file bench/big/dll100.raw` for the
@@ -34,13 +34,15 @@ LEVELS = (1, 3, 9, 13, 17, 19)
 # tight clusters. Unknown-size streams on both sides: on text, libzstd's
 # fastest cell emits a 1.84 MB frame (ratio 18.3) vs our 108 KB (309.2) —
 # the panel is log-x to keep that dominated outlier honest. The text l1/l3
-# throughput cells carry the standalone medians (in-pass cells read 4668
-# and 4644 through the page-dispersity collapse, eleventh consecutive pass).
+# throughput cells carry the standalone medians (in-pass cells read 5394
+# and 5352 through the page-dispersity collapse, twelfth consecutive pass).
+# The balanced row's head verdicts arm on open streams since 2026-11-16, so
+# json l9 sits on the bulk-parity frame at ratio 7.20.
 ENCODE = {
     "json · 32 MiB": {
         "xlim": (4.95, 7.78), "ylim": (1.8, 1700),
-        "zstdx": {1: (6.413, 589), 3: (5.296, 460), 9: (7.128, 68), 13: (6.258, 19), 17: (7.479, 6), 19: (7.425, 2)},
-        "libzstd": {1: (6.106, 742), 3: (5.252, 437), 9: (5.950, 91), 13: (6.100, 26), 17: (7.487, 5), 19: (7.417, 2)},
+        "zstdx": {1: (6.413, 612), 3: (5.296, 457), 9: (7.199, 156), 13: (6.258, 21), 17: (7.478, 7), 19: (7.424, 3)},
+        "libzstd": {1: (6.106, 757), 3: (5.252, 437), 9: (5.950, 99), 13: (6.100, 25), 17: (7.486, 5), 19: (7.416, 3)},
         "off": {
             ("zstdx", 17): (9, 6), ("libzstd", 17): (-9, -7),
             ("zstdx", 19): (9, -8), ("libzstd", 19): (-9, 7),
@@ -48,8 +50,8 @@ ENCODE = {
     },
     "text · 32 MiB": {
         "xlim": (14, 1100), "ylim": (150, 9000), "xlog": True,
-        "zstdx": {1: (309.22, 6149), 3: (333.02, 5938), 9: (384.64, 1313), 13: (386.39, 901), 17: (408.81, 830), 19: (414.12, 401)},
-        "libzstd": {1: (18.25, 1696), 3: (332.90, 4871), 9: (378.20, 1604), 13: (385.63, 628), 17: (409.95, 418), 19: (413.86, 254)},
+        "zstdx": {1: (309.22, 6878), 3: (333.02, 6440), 9: (384.65, 1526), 13: (386.40, 1010), 17: (408.82, 841), 19: (414.11, 409)},
+        "libzstd": {1: (18.25, 1749), 3: (332.90, 4838), 9: (378.20, 1592), 13: (385.63, 630), 17: (410.00, 408), 19: (413.86, 245)},
         "off": {
             ("zstdx", 3): (8, 6), ("libzstd", 3): (-8, -8),
             ("zstdx", 9): (8, -2), ("libzstd", 9): (-8, 3),
@@ -57,8 +59,8 @@ ENCODE = {
     },
     "dll100 · 100 MB": {
         "xlim": (1.85, 6.8), "ylim": (5, 900),
-        "zstdx": {1: (4.344, 468), 3: (4.970, 412), 9: (5.311, 99), 13: (5.351, 25), 17: (6.025, 13), 19: (6.321, 7)},
-        "libzstd": {1: (2.188, 502), 3: (3.427, 391), 9: (4.592, 132), 13: (4.645, 30), 17: (5.054, 11), 19: (5.272, 8)},
+        "zstdx": {1: (4.357, 477), 3: (4.982, 434), 9: (5.358, 140), 13: (5.357, 28), 17: (6.027, 14), 19: (6.323, 8)},
+        "libzstd": {1: (2.188, 504), 3: (3.427, 391), 9: (4.592, 131), 13: (4.645, 30), 17: (5.054, 11), 19: (5.272, 8)},
         "off": {
             ("zstdx", 19): (8, 5), ("libzstd", 19): (-8, -8),
             ("zstdx", 17): (8, -7), ("libzstd", 17): (-8, 6),
@@ -69,16 +71,16 @@ ENCODE = {
 # Streaming-encode MT(8) speedup (ours/zstd throughput, both sides at 8
 # workers, 64 KiB pulls) per tier: payload -> (x at each of the 6 tiers).
 # Each value is the inverse of the harness's median per-round time ratio.
-# The dll100 cells trail libzstd's MT at three tiers and sit at 88-98% of
-# zstdx's own bulk-mt8 ceilings; balanced's low share this pass is a
-# placement reading of its single-slowest-job wall (todo 17).
+# The dll100 cells trail libzstd's MT at three tiers and sit at 89-95% of
+# zstdx's own bulk-mt8 ceilings; balanced's low share is a placement
+# reading of its single-slowest-job wall (todo 17).
 ENCODE_MT = {
-    "fastest": {"json": 1.79, "text": 2.05, "dll100": 0.49},
-    "fast": {"json": 5.38, "text": 3.80, "dll100": 1.95},
-    "balanced": {"json": 3.17, "text": 1.20, "dll100": 0.69},
-    "best": {"json": 1.52, "text": 2.28, "dll100": 0.63},
-    "opt": {"json": 4.41, "text": 1.73, "dll100": 2.00},
-    "ultra": {"json": 3.39, "text": 1.23, "dll100": 1.47},
+    "fastest": {"json": 1.72, "text": 1.93, "dll100": 0.54},
+    "fast": {"json": 5.68, "text": 3.55, "dll100": 2.17},
+    "balanced": {"json": 3.41, "text": 1.30, "dll100": 0.89},
+    "best": {"json": 1.48, "text": 2.92, "dll100": 0.62},
+    "opt": {"json": 4.44, "text": 1.93, "dll100": 2.11},
+    "ultra": {"json": 3.31, "text": 1.16, "dll100": 1.54},
 }
 
 # Streaming-decode speedup (libzstd_time/ours_time) per corpus cell:
@@ -86,26 +88,26 @@ ENCODE_MT = {
 # mt16-vs-zstd-stream or None). Both sides single-threaded; the reader loop
 # pulls `pull` bytes per read. >1 = zstdx faster.
 DECODE = [
-    ("json zst1", (0.964, 0.973, 0.975), None),
-    ("json zst3", (0.978, 0.981, 0.985), None),
-    ("json zst9", (0.991, 0.991, 0.994), None),
-    ("json zst19", (0.978, 0.978, 0.984), None),
-    ("text zst1", (0.962, 0.970, 0.985), None),
-    ("text zst3", (0.971, 0.981, 0.998), None),
-    ("text zst9", (0.969, 0.975, 0.993), None),
-    ("text zst19", (0.947, 0.953, 0.975), None),
-    ("skewed zst1", (1.071, 1.074, 1.091), None),
-    ("skewed zst3", (1.009, 1.009, 1.014), None),
-    ("skewed zst9", (1.034, 1.036, 1.036), None),
-    ("skewed zst19", (1.001, 1.005, 1.012), None),
-    ("random zst3", (1.229, 1.242, 1.312), None),
-    ("zeros zst3", (0.987, 0.997, 1.021), None),
-    ("dll100 zst1", (0.850, 0.935, 0.935), None),
-    ("dll100 zst3", (0.954, 0.959, 0.962), None),
-    ("dll100 zst9", (0.955, 0.956, 0.959), None),
-    ("dll100 zst19", (0.965, 0.965, 0.968), None),
-    ("json zst3 · 16 threads", (None, 1.70, None), True),
-    ("dll100 zst3 · 16 threads", (None, 1.78, None), True),
+    ("json zst1", (1.032, 1.041, 1.042), None),
+    ("json zst3", (1.064, 1.083, 1.087), None),
+    ("json zst9", (1.075, 1.076, 1.081), None),
+    ("json zst19", (1.028, 1.028, 1.037), None),
+    ("text zst1", (0.990, 0.997, 1.010), None),
+    ("text zst3", (0.970, 0.979, 1.004), None),
+    ("text zst9", (0.954, 0.961, 0.979), None),
+    ("text zst19", (0.953, 0.962, 0.977), None),
+    ("skewed zst1", (1.063, 1.063, 1.094), None),
+    ("skewed zst3", (1.081, 1.086, 1.086), None),
+    ("skewed zst9", (1.176, 1.176, 1.183), None),
+    ("skewed zst19", (1.021, 1.025, 1.029), None),
+    ("random zst3", (1.222, 1.244, 1.295), None),
+    ("zeros zst3", (0.990, 0.998, 1.029), None),
+    ("dll100 zst1", (0.978, 0.981, 0.984), None),
+    ("dll100 zst3", (1.021, 1.021, 1.032), None),
+    ("dll100 zst9", (1.011, 1.018, 1.029), None),
+    ("dll100 zst19", (1.021, 1.029, 1.032), None),
+    ("json zst3 · 16 threads", (None, 1.79, None), True),
+    ("dll100 zst3 · 16 threads", (None, 1.86, None), True),
 ]
 
 
@@ -260,7 +262,7 @@ def plot_decode() -> None:
                     fontsize=8.5, color="#111827")
     ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.2, zorder=1)
     # markers clip silently when xlim outruns the data, so derive the right
-    # edge from the widest value on the chart (MT 1.78x this pass)
+    # edge from the widest value on the chart (random 1.30x this pass)
     xmax = max(
         max(vals[2] for _, vals, mt in DECODE if mt is None),
         max(vals[1] for _, vals, mt in DECODE if mt is not None),
