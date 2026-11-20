@@ -51,6 +51,31 @@ fn empty_sources_pledge_zero() {
     );
 }
 
+/// A multithreaded compression of a regular file of 1 MiB or more feeds
+/// the encoder through the read-only mmap (zero-copy), while a stdin
+/// stream rides the reader pump. Both must emit the identical frame at
+/// the same options, with the stdin side pledging the size explicitly to
+/// match the file path's metadata pledge.
+#[test]
+fn mapped_file_feed_matches_reader_feed() {
+    let scratch = Scratch::new("cli", "mapped-feed");
+    let input = scratch.path("big.bin");
+    let data = payload().repeat(4);
+    assert!(data.len() >= 1 << 20);
+    fs::write(&input, &data).unwrap();
+
+    let file_out = run(&["-q", "-T4", "-3", "-c", input.to_str().unwrap()]);
+    assert!(file_out.status.success(), "{file_out:?}");
+    let size = data.len().to_string();
+    let (pipe_out, piped) = run_piped(&["-q", "-T4", "-3", "--stream-size", &size, "-c"], &data);
+    assert!(pipe_out.status.success(), "{pipe_out:?}");
+    assert_eq!(file_out.stdout, piped);
+
+    let (dec_out, decoded) = run_piped(&["-q", "-d", "-c"], &file_out.stdout);
+    assert!(dec_out.status.success(), "{dec_out:?}");
+    assert_eq!(decoded, data);
+}
+
 #[test]
 fn file_roundtrip_default_names() {
     let scratch = Scratch::new("cli", "roundtrip");

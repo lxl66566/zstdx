@@ -22,6 +22,10 @@ default = ["dict_builder"]
 # explains itself when missing.
 dict_builder = ["zstdx/dict_builder"]
 
+[target.'cfg(unix)'.dependencies]
+# Read-only input mapping for the zero-copy encode feed.
+libc = { version = "0.2", default-features = false }
+
 [dependencies]
 # Used for the command line binary only
 clap               = { version = "4.5.46", features = ["derive"] }

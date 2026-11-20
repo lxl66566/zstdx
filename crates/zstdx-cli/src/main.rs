@@ -1666,18 +1666,24 @@ fn process(
     };
 
     let written = match mode {
-        Mode::Compress => match compress(reader, &output, settings, source_size, dict) {
-            Ok(written) => written,
-            // A --stream-size pledge the input did not meet is zstd's
-            // parameter-class Src size error (and exit code).
-            Err(err) if pledged_size_mismatch(err.as_ref()) => {
-                return Err(Diagnostic {
-                    code: 11,
-                    lines: vec![format!("{PREFIX}error 11 : Src size is incorrect ")],
-                }
-                .into())
-            },
-            Err(err) => return Err(err),
+        Mode::Compress => {
+            let result = match compress_mapped(input, &output, settings, dict, show_progress) {
+                Some(result) => result,
+                None => compress(reader, &output, settings, source_size, dict),
+            };
+            match result {
+                Ok(written) => written,
+                // A --stream-size pledge the input did not meet is zstd's
+                // parameter-class Src size error (and exit code).
+                Err(err) if pledged_size_mismatch(err.as_ref()) => {
+                    return Err(Diagnostic {
+                        code: 11,
+                        lines: vec![format!("{PREFIX}error 11 : Src size is incorrect ")],
+                    }
+                    .into())
+                },
+                Err(err) => return Err(err),
+            }
         },
         // List and train are dispatched before per-input processing and
         // never reach this point.
@@ -2010,8 +2016,6 @@ fn compress(
     if settings.adapt.is_some() {
         return adapt::compress(reader, output, settings, dict);
     }
-    let mut options =
-        EncoderOptions::new(Level::from_zstd(settings.level)).checksum(settings.checksum);
     // A file input pledges its metadata size; a stdin stream pledges
     // --stream-size or nothing. --no-content-size keeps the size out of the
     // header while it still shapes the row through the hint.
@@ -2041,31 +2045,7 @@ fn compress(
             });
         }
     }
-    options = options.pledged_size(settings.content_size.then_some(known_size).flatten());
-    // --long forces the window, --size-hint sizes the row; a known pledge
-    // still shrinks the window to the source inside the engine, as zstd
-    // does.
-    let mut shape = InputShape::default();
-    if let Some(log) = settings.window_log {
-        shape = shape.with_window_log(log);
-    }
-    let hint = settings
-        .size_hint
-        .or((!settings.content_size).then_some(known_size).flatten());
-    if let Some(hint) = hint {
-        shape = shape.with_len(hint);
-    }
-    options = options.with_input_shape(shape);
-    // 0/1 worker runs on the calling thread; more engages the job pool.
-    if settings.threads > 1 {
-        options = options.workers(settings.threads);
-    }
-    if let Some(dict) = dict {
-        options = options.dictionary(dict);
-    }
-    if !settings.include_dictid {
-        options = options.include_dictid(false);
-    }
+    let options = encoder_options(settings, known_size, dict);
 
     // A suppressed --stream-size pledge still binds: the read byte count is
     // checked here, with the encoder's own mismatch diagnostic.
@@ -2100,6 +2080,175 @@ fn compress(
         remove_partial_output(output);
     }
     written
+}
+
+/// The encoder option set both compress feeds share, built from the
+/// settings and the known (or pledged) source size.
+fn encoder_options(
+    settings: &Settings,
+    known_size: Option<u64>,
+    dict: Option<&[u8]>,
+) -> EncoderOptions {
+    let mut options =
+        EncoderOptions::new(Level::from_zstd(settings.level)).checksum(settings.checksum);
+    options = options.pledged_size(settings.content_size.then_some(known_size).flatten());
+    // --long forces the window, --size-hint sizes the row; a known pledge
+    // still shrinks the window to the source inside the engine, as zstd
+    // does.
+    let mut shape = InputShape::default();
+    if let Some(log) = settings.window_log {
+        shape = shape.with_window_log(log);
+    }
+    let hint = settings
+        .size_hint
+        .or((!settings.content_size).then_some(known_size).flatten());
+    if let Some(hint) = hint {
+        shape = shape.with_len(hint);
+    }
+    options = options.with_input_shape(shape);
+    // 0/1 worker runs on the calling thread; more engages the job pool.
+    if settings.threads > 1 {
+        options = options.workers(settings.threads);
+    }
+    if let Some(dict) = dict {
+        options = options.dictionary(dict);
+    }
+    if !settings.include_dictid {
+        options = options.include_dictid(false);
+    }
+    options
+}
+
+/// Smallest regular-file input worth the mapped zero-copy feed: below it
+/// the pump copy the feed removes costs less than the mmap/munmap pair.
+#[cfg(unix)]
+const MAPPED_INPUT_FLOOR: u64 = 1 << 20;
+
+/// The zero-copy file feed: map a regular input file read-only and hand
+/// the mapping to the owned-source encoder, whose MT jobs borrow the
+/// mapped pages directly, so the input skips the read pump's staging
+/// copies. The frame bytes are the ones the reader path emits at the same
+/// options (a pledged stream's job schedule is a pure function of the
+/// stream offset).
+///
+/// Returns `None` — the caller's reader path then runs unchanged — for
+/// every shape the feed does not cover: non-file inputs, non-regular or
+/// small files, single-threaded and --adapt encodes, and visible progress
+/// (whose byte counter rides the reader). Open/map failures also decline:
+/// the reader path then surfaces the real diagnostic.
+#[cfg(unix)]
+fn compress_mapped(
+    input: &Input,
+    output: &Output,
+    settings: &Settings,
+    dict: Option<&[u8]>,
+    show_progress: bool,
+) -> Option<AnyResult<u64>> {
+    if settings.adapt.is_some() || settings.threads <= 1 || show_progress {
+        return None;
+    }
+    let Input::File(path) = input else {
+        return None;
+    };
+    let file = File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    if !meta.is_file() || len < MAPPED_INPUT_FLOOR {
+        return None;
+    }
+    let map = MappedFile::map(&file, len as usize).ok()?;
+    let options = encoder_options(settings, Some(len), dict);
+    let (writer, out_file) = match open_output(output) {
+        Ok(handles) => handles,
+        Err(err) => return Some(Err(err)),
+    };
+    // The whole write phase runs in a closure so the output handles are
+    // dropped before the partial output is removed on failure.
+    let written: AnyResult<u64> = (|| {
+        // SAFETY: the slice borrows the mapping; the encoder takes it as a
+        // `'static` source but is read to end, finished and dropped inside
+        // this closure, so no use outlives `map`.
+        let bytes: &'static [u8] = unsafe { map.as_slice() };
+        let mut encoder = zstdx::stream::read::OwnedEncoder::with_options(bytes.into(), options)?;
+        let mut writer = writer;
+        if let Some(file) = out_file {
+            io::copy(&mut encoder, &mut writer)?;
+            encoder.finish()?;
+            Ok(file.metadata()?.len())
+        } else {
+            // stdout and the test-mode sink have no file to stat; count the
+            // bytes pushed through the writer instead
+            let mut out = CountingWriter::new(writer);
+            io::copy(&mut encoder, &mut out)?;
+            encoder.finish()?;
+            Ok(out.count)
+        }
+    })();
+    if written.is_err() {
+        remove_partial_output(output);
+    }
+    Some(written)
+}
+
+/// Non-unix platforms keep the reader feed; see the unix twin.
+#[cfg(not(unix))]
+fn compress_mapped(
+    _input: &Input,
+    _output: &Output,
+    _settings: &Settings,
+    _dict: Option<&[u8]>,
+    _show_progress: bool,
+) -> Option<AnyResult<u64>> {
+    None
+}
+
+/// A read-only private mapping of one regular file; dropping unmaps. The
+/// mapping pins the file's size at map time: a concurrently grown file
+/// compresses to its original prefix, a truncated one faults (standard
+/// mmap semantics, as with any mmap-consuming tool).
+#[cfg(unix)]
+struct MappedFile {
+    ptr: *const libc::c_void,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl MappedFile {
+    fn map(file: &File, len: usize) -> io::Result<Self> {
+        // SAFETY: `file` is a live file open for reading and `len` its
+        // size, so the request is valid; failure reports as MAP_FAILED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(file),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+
+    /// The mapped bytes as a `'static` slice (the encoder's source handle
+    /// demands a static lifetime). The caller must guarantee every use of
+    /// the slice ends before the mapping is dropped.
+    unsafe fn as_slice(&self) -> &'static [u8] {
+        // SAFETY: forwarded from the caller; the mapping is live for `len`
+        // bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`len` name the live mapping this value owns.
+        unsafe { libc::munmap(self.ptr.cast_mut(), self.len) };
+    }
 }
 
 /// The counted tail of [`compress`] for a suppressed --stream-size pledge:
