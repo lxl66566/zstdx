@@ -338,9 +338,10 @@ fn long_sets_window_log() {
     );
 }
 
-/// `--[no-]check` toggles the frame checksum: the trailer comes and goes,
-/// both forms roundtrip, and decode mode rejects the flag loudly (zstd
-/// silently reinterprets it there; the engine always validates).
+/// `--[no-]check` toggles the frame checksum on encode: the trailer comes
+/// and goes, and both forms roundtrip. On decode `--no-check` skips the
+/// verification (zstd 1.5.7 semantics): a corrupted trailer decodes
+/// cleanly with it and fails the default run.
 #[test]
 fn check_flags_toggle_checksum() {
     let data = payload();
@@ -354,9 +355,21 @@ fn check_flags_toggle_checksum() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(out, data);
 
-    let (output, _) = run_piped(&["-d", "-q", "--check"], &checked);
+    // Decode-side `--no-check` skips the checksum verification: flip the
+    // trailer and decode with and without it (zstd 1.5.7 agrees).
+    let mut corrupt = checked.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    let (output, out) = run_piped(&["-d", "-q", "--no-check"], &corrupt);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(out, data);
+    let (output, _) = run_piped(&["-d", "-q"], &corrupt);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("compression only"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("doesn't match checksum"));
+    // `--check` on decode is the explicit default: accepted, still fails.
+    let (output, _) = run_piped(&["-d", "-q", "--check"], &corrupt);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("doesn't match checksum"));
 }
 
 /// `--stream-size` pledges the stdin stream: the promise lands in the

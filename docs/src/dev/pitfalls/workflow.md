@@ -380,3 +380,7 @@ Every fixture access goes through `fixture_entries` and `fixture_bytes`, for cor
 ### Verify batch restores with git diff
 
 A Python replace missed one site because `replace(pat, 2)` hits only the first two, and json.fastest size drifted by 101 B, caught only through deterministic size comparison. Diff first after every change, because deterministic sizes are a free regression probe.
+
+### Keep /tmp headroom before a ratio sweep
+
+`ratio --parallel 16` transiently holds several 32 MiB buffers per cell on both sides; on a 13 GB box with dump directories still in the /tmp RAMDisk the sweep was SIGTERM'd at cell 105 of 120, and stdout is block-buffered so the completed rows were lost with it. Diff and delete dump directories right after the gate, and drop to `--parallel 8` when free RAM is under half the total.

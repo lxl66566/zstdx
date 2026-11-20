@@ -90,6 +90,10 @@ pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
     dicts: BTreeMap<u32, alloc::sync::Arc<Dictionary>>,
     max_window_size: u64,
+    /// Verify a frame's content checksum against the decoded output
+    /// (default on; inert without the `hash` feature). `false` skips the
+    /// xxh64 computation and the trailer compare.
+    verify_checksum: bool,
     /// Bytes consumed from the source while hunting the next frame start
     /// ([frame_source]); kept across calls so a transient read error there
     /// resumes instead of corrupting the stream.
@@ -116,6 +120,10 @@ struct FrameDecoderState {
     bytes_read_counter: u64,
     check_sum: Option<u32>,
     using_dict: Option<u32>,
+    /// The owning decoder's verification switch: gates both the per-block
+    /// hashing setup and the trailer compare.
+    #[cfg(feature = "hash")]
+    verify_checksum: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -146,7 +154,10 @@ impl FrameDecoderState {
     fn new(
         source: impl Read,
         max_window_size: u64,
+        verify_checksum: bool,
     ) -> Result<FrameDecoderState, FrameDecoderError> {
+        #[cfg(not(feature = "hash"))]
+        let _ = verify_checksum;
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
@@ -162,16 +173,25 @@ impl FrameDecoderState {
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
+            #[cfg(feature = "hash")]
+            verify_checksum,
         };
         state.flat.reset(window_size as usize, state.declared_fcs());
         #[cfg(feature = "hash")]
         state
             .decoder_scratch
-            .set_checksum_enabled(state.frame_header.descriptor.content_checksum_flag());
+            .set_checksum_enabled(state.checksum_tracked());
         Ok(state)
     }
 
-    fn reset(&mut self, source: impl Read, max_window_size: u64) -> Result<(), FrameDecoderError> {
+    fn reset(
+        &mut self,
+        source: impl Read,
+        max_window_size: u64,
+        verify_checksum: bool,
+    ) -> Result<(), FrameDecoderError> {
+        #[cfg(not(feature = "hash"))]
+        let _ = verify_checksum;
         let (frame_header, header_size) = frame::read_frame_header(source)?;
         let window_size = frame_header.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
@@ -189,9 +209,19 @@ impl FrameDecoderState {
         self.check_sum = None;
         self.using_dict = None;
         #[cfg(feature = "hash")]
-        self.decoder_scratch
-            .set_checksum_enabled(self.frame_header.descriptor.content_checksum_flag());
+        {
+            self.verify_checksum = verify_checksum;
+            self.decoder_scratch
+                .set_checksum_enabled(self.checksum_tracked());
+        }
         Ok(())
+    }
+
+    /// Whether the frame's checksum must be computed while decoding: the
+    /// frame declares one and the decoder verifies it.
+    #[cfg(feature = "hash")]
+    fn checksum_tracked(&self) -> bool {
+        self.frame_header.descriptor.content_checksum_flag() && self.verify_checksum
     }
 
     /// The frame's declared Frame_Content_Size, when present: it caps the
@@ -255,9 +285,13 @@ impl FrameDecoderState {
     /// ring path hashes on drain, so any bytes it has not delivered yet are
     /// folded in here (the flat paths hash per block and the ring stays
     /// empty); hashing is then disabled so later drains don't fold them a
-    /// second time.
+    /// second time. With verification switched off nothing was hashed, so
+    /// there is nothing to compare.
     #[cfg(feature = "hash")]
     fn verify_frame_checksum(&mut self) -> Result<(), FrameDecoderError> {
+        if !self.verify_checksum {
+            return Ok(());
+        }
         let Some(expected) = self.check_sum else {
             return Ok(());
         };
@@ -290,8 +324,18 @@ impl FrameDecoder {
             state: None,
             dicts: BTreeMap::new(),
             max_window_size: DEFAULT_MAX_WINDOW_SIZE,
+            verify_checksum: true,
             next_frame_staging: NextFrameStaging::Idle,
         }
+    }
+
+    /// Switch frame checksum verification on or off (default on; inert
+    /// without the `hash` feature). Off skips the xxh64 computation over
+    /// the decoded output and the trailer compare, so a frame with a
+    /// corrupted checksum decodes without error; the trailer word is still
+    /// consumed. See [`DecoderOptions::verify_checksum`][crate::DecoderOptions::verify_checksum].
+    pub fn set_verify_checksum(&mut self, verify: bool) {
+        self.verify_checksum = verify;
     }
 
     /// Sets the maximum window size, in bytes, this decoder accepts. Frames
@@ -339,10 +383,14 @@ impl FrameDecoder {
         // so an in-flight hunt keeps its bytes.
         self.next_frame_staging = NextFrameStaging::Idle;
         let state = if let Some(s) = &mut self.state {
-            s.reset(source, self.max_window_size)?;
+            s.reset(source, self.max_window_size, self.verify_checksum)?;
             s
         } else {
-            self.state = Some(FrameDecoderState::new(source, self.max_window_size)?);
+            self.state = Some(FrameDecoderState::new(
+                source,
+                self.max_window_size,
+                self.verify_checksum,
+            )?);
             self.state.as_mut().expect("state was just inserted")
         };
         if let Some(dict_id) = state.frame_header.dictionary_id() {

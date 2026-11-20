@@ -127,9 +127,10 @@ impl StreamingChecksum {
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
+    use std::io::Read as _;
 
     use crate::{
-        EncoderOptions, Level, bulk,
+        DecoderOptions, EncoderOptions, Level, bulk,
         decoding::{
             FrameDecoder,
             errors::FrameDecoderError,
@@ -166,10 +167,10 @@ mod tests {
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut placed = vec![0u8; data.len()];
-        let n = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(&placed[..n], &data[..]);
         let mut appended = Vec::new();
-        decode_to_vec_mt(&compressed, &mut appended, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&compressed, &mut appended, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(appended, data);
     }
 
@@ -184,11 +185,11 @@ mod tests {
         compressed[trailer] ^= 0xff;
 
         let mut placed = vec![0u8; data.len()];
-        let err = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW, true).unwrap_err();
         assert!(mismatch(&err), "{err:?}");
 
         let mut appended = Vec::new();
-        let err = decode_to_vec_mt(&compressed, &mut appended, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&compressed, &mut appended, 4, MAX_WINDOW, true).unwrap_err();
         assert!(mismatch(&err), "{err:?}");
         // The append contract keeps the length unchanged on error.
         assert_eq!(appended.len(), 0);
@@ -220,7 +221,7 @@ mod tests {
         let mut two = plain.clone();
         two.extend_from_slice(&checksummed);
         let mut out = Vec::new();
-        decode_to_vec_mt(&two, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&two, &mut out, 4, MAX_WINDOW, true).unwrap();
         let mut expect = a.clone();
         expect.extend_from_slice(&b);
         assert_eq!(out, expect);
@@ -230,7 +231,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
         let mut out = Vec::new();
-        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW, true).unwrap_err();
         assert!(mismatch(&err), "{err:?}");
 
         // same input through the sequential decoder: same variant
@@ -246,7 +247,99 @@ mod tests {
         let trailer = checksummed.len() - 1;
         reversed_corrupt[trailer] ^= 0xff;
         let mut out = Vec::new();
-        let err = decode_to_vec_mt(&reversed_corrupt, &mut out, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&reversed_corrupt, &mut out, 4, MAX_WINDOW, true).unwrap_err();
+        assert!(mismatch(&err), "{err:?}");
+    }
+
+    /// `verify_checksum(false)` decodes a corrupted-checksum frame to the
+    /// correct bytes on every decode path, while the default (`true`)
+    /// reports the mismatch on the same paths.
+    #[test]
+    fn verify_checksum_off_decodes_corrupted_trailer() {
+        let data = textish(8 * 1024 * 1024);
+        let mut compressed =
+            bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+        let trailer = compressed.len() - 4;
+        compressed[trailer] ^= 0xff;
+
+        // Plumbing: the option defaults to verifying.
+        assert!(DecoderOptions::new().verify_checksum);
+        assert!(!DecoderOptions::new().verify_checksum(false).verify_checksum);
+
+        // Sequential decoder: the switch on the FrameDecoder itself.
+        let mut placed = vec![0u8; data.len()];
+        let mut decoder = FrameDecoder::new();
+        decoder.set_verify_checksum(false);
+        let n = decoder.decode_all(&compressed, &mut placed).unwrap();
+        assert_eq!(&placed[..n], &data[..]);
+
+        // Bulk with options, sequential arm.
+        let options = DecoderOptions::new().verify_checksum(false);
+        let out = bulk::decompress_with(&compressed, 0, &options).unwrap();
+        assert_eq!(out, data);
+        match bulk::decompress_with(&compressed, 0, &DecoderOptions::new()) {
+            Err(crate::Error::Frame(err)) => assert!(mismatch(&err), "{err:?}"),
+            other => panic!(
+                "expected ChecksumMismatch, got {:?}",
+                other.map(|v| v.len())
+            ),
+        }
+
+        // Streaming read decoder with options.
+        let mut out = Vec::new();
+        crate::stream::read::Decoder::with_options(&compressed[..], options.clone())
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, data);
+
+        // MT serial stage-B executor (single checksummed frame).
+        let mt = DecoderOptions::new().threads(4).verify_checksum(false);
+        let mut placed = vec![0u8; data.len()];
+        let n = bulk::decompress_to_buffer_with(&compressed, &mut placed, &mt).unwrap();
+        assert_eq!(&placed[..n], &data[..]);
+        let out = bulk::decompress_with(&compressed, 0, &mt).unwrap();
+        assert_eq!(out, data);
+
+        // The compat context exposes the same switch.
+        let mut compat = crate::compat::bulk::Decompressor::new().unwrap();
+        compat.verify_checksum(false).unwrap();
+        let out = compat.decompress(&compressed, 0).unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// The multi-frame lane executor honors the switch: a corrupted
+    /// trailer decodes to the right bytes with verification off and fails
+    /// with the default.
+    #[test]
+    fn multiframe_lanes_verify_checksum_off() {
+        let a = textish(4 * 1024 * 1024);
+        let b: Vec<u8> = (0..3u32 * 1024 * 1024).map(|i| (i % 61) as u8).collect();
+        let plain =
+            bulk::compress_with(&a, &EncoderOptions::new(Level::Fastest).checksum(false)).unwrap();
+        let checksummed = bulk::compress_with(
+            &b,
+            &EncoderOptions::new(Level::Fastest)
+                .checksum(true)
+                .workers(2),
+        )
+        .unwrap();
+        let mut corrupt = plain;
+        corrupt.extend_from_slice(&checksummed);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        let mut expect = a;
+        expect.extend_from_slice(&b);
+
+        let mut out = Vec::new();
+        decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW, false).unwrap();
+        assert_eq!(out, expect);
+        let mut placed = vec![0u8; expect.len()];
+        let n = decode_all_mt(&corrupt, &mut placed, 4, MAX_WINDOW, false).unwrap();
+        assert_eq!(&placed[..n], &expect[..]);
+
+        let mut out = Vec::new();
+        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW, true).unwrap_err();
         assert!(mismatch(&err), "{err:?}");
     }
 
@@ -261,6 +354,6 @@ mod tests {
         compressed[mid] ^= 0xff;
         compressed[mid + 1] ^= 0xff;
         let mut out = Vec::new();
-        let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW);
+        let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true);
     }
 }

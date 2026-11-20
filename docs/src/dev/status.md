@@ -75,7 +75,7 @@ A prepared (parsed) dictionary steers decode off the parallel fast path in the s
 
 ### Frame checksum
 
-The checksum is optional on encode and can offload to a sidecar thread. Decode verifies it on every path. ST folds the compare into the trailer read, and MT absorbs it inline in stage B over the hot just-executed ranges. A mismatch reports `ChecksumMismatch`, matching libzstd. See [decoding](perf/decoding.md) and [encoding](perf/encoding.md).
+The checksum is optional on encode and can offload to a sidecar thread. Decode verifies it on every path. ST folds the compare into the trailer read, and MT absorbs it inline in stage B over the hot just-executed ranges. A mismatch reports `ChecksumMismatch`, matching libzstd. `DecoderOptions::verify_checksum(false)` opts a decoder out of the verification on every decode path — the xxh64 is never computed, only the trailer word is consumed — where libzstd offers only the experimental `ZSTD_d_forceIgnoreChecksum`; the CLI mirrors `zstd -d --no-check`, and the compat `Decompressor` carries it as `verify_checksum(bool)`. See [decoding](perf/decoding.md) and [encoding](perf/encoding.md).
 
 ### Compatibility layer
 

@@ -102,6 +102,18 @@ impl Decompressor {
             .map_err(|e| io::Error::from(crate::Error::Frame(e)))
     }
 
+    /// Switch frame checksum verification on or off (default on). Off
+    /// skips the xxh64 computation over the decoded output and the
+    /// trailer compare, so a frame with a corrupted checksum decodes
+    /// without error. Affects future decompressions, like every other
+    /// parameter on this context. libzstd gates the same switch behind
+    /// its experimental API (`ZSTD_d_forceIgnoreChecksum`), so the
+    /// mirrored `zstd` crate has no counterpart for this method.
+    pub fn verify_checksum(&mut self, verify: bool) -> io::Result<()> {
+        self.inner.set_verify_checksum(verify);
+        Ok(())
+    }
+
     /// Sets the maximum window log distance as `2^log_distance` (the
     /// accepted range is libzstd's `ZSTD_d_windowLogMax` bounds, 10..=31).
     /// Frames needing a larger window fail to decode; affects future

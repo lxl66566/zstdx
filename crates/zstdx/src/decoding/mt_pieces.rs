@@ -754,14 +754,19 @@ fn take_stage_error(driver: &Mutex<Driver>) -> Option<FrameDecoderError> {
 /// ascending grid that fully validates with a deep-enough watermark lag),
 /// then execute pieces on the pool + caller. Validation failure runs the
 /// serial stage B over the same staged segments. `place` is called with
-/// the whole pledged range on this thread only.
+/// the whole pledged range on this thread only. `verify_checksum: false`
+/// skips the ordered absorb and the trailer compare (see
+/// [`DecoderOptions::verify_checksum`][crate::DecoderOptions::verify_checksum]).
 pub(super) fn decode_pieces(
     input: &[u8],
     workers: u32,
     plan: &ScanPlan,
     fcs: usize,
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
+    #[cfg(not(feature = "hash"))]
+    let _ = verify_checksum;
     let n_segments = plan.segments.len();
     let threads = (workers as usize).min(n_segments);
 
@@ -811,9 +816,14 @@ pub(super) fn decode_pieces(
         n_segments,
     };
 
-    // The expected trailer word of the single frame, if checksummed.
+    // The expected trailer word of the single frame, if checksummed and
+    // the decoder verifies it.
     #[cfg(feature = "hash")]
-    let expected = plan.checksums.first().copied().flatten();
+    let expected = if verify_checksum {
+        plan.checksums.first().copied().flatten()
+    } else {
+        None
+    };
 
     let result = std::thread::scope(|scope| -> Result<usize, FrameDecoderError> {
         for _ in 0..threads {

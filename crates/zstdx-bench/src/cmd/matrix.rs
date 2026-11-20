@@ -90,6 +90,8 @@ pub enum MatrixMode {
     EncFeed,
 }
 
+// clap flags arrive as independent bools
+#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args)]
 pub struct Args {
     /// Matrix section to run
@@ -144,6 +146,11 @@ pub struct Args {
     /// self-gates the parity), so the wall delta is the kernel's own.
     #[arg(long)]
     pub nt_read: bool,
+    /// Skip frame checksum verification on the dec-mt cells
+    /// (`DecoderOptions::verify_checksum(false)`), for measuring the
+    /// verification's wall share
+    #[arg(long)]
+    pub no_verify: bool,
     /// Per-side measurement budget in milliseconds
     #[arg(long)]
     pub budget_ms: Option<f64>,
@@ -473,18 +480,21 @@ fn t2_dec_mt(args: &Args) {
 
         for threads in &workers {
             let mut out = vec![0u8; raw.len()];
+            let options = DecoderOptions::new()
+                .threads(*threads)
+                .verify_checksum(!args.no_verify);
             let stats = measure_solo(|| {
-                zstdx::bulk::decompress_to_buffer_with(
-                    &comp,
-                    &mut out,
-                    &DecoderOptions::new().threads(*threads),
-                )
-                .unwrap();
+                zstdx::bulk::decompress_to_buffer_with(&comp, &mut out, &options).unwrap();
                 black_box(&out);
             });
+            let tag = if args.no_verify {
+                format!("{f}.mt{threads}.noverify")
+            } else {
+                format!("{f}.mt{threads}")
+            };
             println!(
                 "{:<24}{:>8.0}  ({:4.2}x ours ST, {:4.2}x zstd stream ST)",
-                format!("{f}.mt{threads}"),
+                tag,
                 stats.mibs(bytes),
                 st.median / stats.median,
                 stats.mibs(bytes) / zref_mibs,

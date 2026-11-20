@@ -28,6 +28,11 @@ pub struct Args {
     /// decode counterpart)
     #[arg(long, value_delimiter = ',')]
     pub threads: Vec<u32>,
+    /// Skip frame checksum verification on the timed zstdx decodes
+    /// (`DecoderOptions::verify_checksum(false)`), for measuring the
+    /// verification's wall share
+    #[arg(long)]
+    pub no_verify: bool,
 }
 
 /// decode_all_to_vec never grows the vector; retry with geometric growth.
@@ -49,6 +54,7 @@ fn decode_to_vec(fr: &mut FrameDecoder, compressed: &[u8]) -> Vec<u8> {
 pub fn run(args: &Args) {
     apply_budget(args.budget_ms);
     let mut fr = FrameDecoder::new();
+    fr.set_verify_checksum(!args.no_verify);
     for path in &args.files {
         let compressed = fs::read(path).unwrap();
         let reference = decode_to_vec(&mut fr, &compressed);
@@ -82,13 +88,11 @@ pub fn run(args: &Args) {
             reference.len() as f64 / (1024.0 * 1024.0) / stats.max,
         );
         for threads in &args.threads {
+            let options = zstdx::DecoderOptions::new()
+                .threads(*threads)
+                .verify_checksum(!args.no_verify);
             let stats = measure_solo(|| {
-                zstdx::bulk::decompress_to_buffer_with(
-                    &compressed,
-                    &mut out,
-                    &zstdx::DecoderOptions::new().threads(*threads),
-                )
-                .unwrap();
+                zstdx::bulk::decompress_to_buffer_with(&compressed, &mut out, &options).unwrap();
                 black_box(&out);
             });
             assert_eq!(&out[..], &reference[..], "mt decode mismatch");

@@ -240,6 +240,7 @@ pub struct DecoderOptions {
     /// supersedes the raw bytes when both are set.
     pub(crate) parsed_dictionary: Option<alloc::sync::Arc<crate::decoding::Dictionary>>,
     pub(crate) threads: u32,
+    pub(crate) verify_checksum: bool,
 }
 
 impl DecoderOptions {
@@ -249,6 +250,7 @@ impl DecoderOptions {
             dictionary: None,
             parsed_dictionary: None,
             threads: 0,
+            verify_checksum: true,
         }
     }
 
@@ -284,6 +286,19 @@ impl DecoderOptions {
     /// emit them; other inputs fall back to the sequential decoder).
     pub const fn threads(mut self, threads: u32) -> Self {
         self.threads = threads;
+        self
+    }
+
+    /// Verify a frame's content checksum against the decoded output
+    /// (default: on, mirroring libzstd; inert when the `hash` feature is
+    /// disabled). `false` skips the xxh64 computation entirely — the
+    /// trailer word is still consumed — so a frame with a corrupted
+    /// checksum decodes without error. libzstd gates the same switch
+    /// behind its experimental API (`ZSTD_d_forceIgnoreChecksum`, what
+    /// `zstd -d --no-check` sets); turn this off only for pipelines that
+    /// trust their input.
+    pub const fn verify_checksum(mut self, verify: bool) -> Self {
+        self.verify_checksum = verify;
         self
     }
 }

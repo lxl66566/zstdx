@@ -109,6 +109,10 @@ pub(super) struct LaneJob {
     segments: *const [SegmentPlan],
     base: *mut u8,
     buf_limit: usize,
+    /// The decoder's verification switch: `false` skips the per-segment
+    /// absorb and the frame-close compare.
+    #[cfg(feature = "hash")]
+    verify_checksum: bool,
     #[cfg(feature = "hash")]
     checksums: *const [Option<u32>],
     result: Mutex<Option<LaneOutcome>>,
@@ -217,11 +221,14 @@ fn run_lane(lane: &LaneJob) {
     #[cfg(feature = "hash")]
     let mut hash = Xxh64::new(0);
     // Compare the closed frame's checksum, recording the first mismatch.
-    // The closing frame is `lane.frames[frame_at - 1]`.
+    // The closing frame is `lane.frames[frame_at - 1]`. Verification off:
+    // nothing was absorbed, so there is nothing to compare.
     #[cfg(feature = "hash")]
     macro_rules! close_frame {
         () => {
-            if let Some(expected) = checksums.get(lane.frames[frame_at - 1]).copied().flatten() {
+            if lane.verify_checksum
+                && let Some(expected) = checksums.get(lane.frames[frame_at - 1]).copied().flatten()
+            {
                 let calculated = hash.finish() as u32;
                 if calculated != expected && checksum_err.is_none() {
                     checksum_err = Some((
@@ -279,7 +286,7 @@ fn run_lane(lane: &LaneJob) {
             return;
         }
         #[cfg(feature = "hash")]
-        if seg.out_size != 0 {
+        if lane.verify_checksum && seg.out_size != 0 {
             // SAFETY: this lane just wrote [abs, abs + out_size) at this
             // base; no other lane touches the frame's range.
             unsafe {
@@ -404,6 +411,7 @@ fn decode_frames(
     workers: u32,
     plan: &ScanPlan,
     place: Place<'_>,
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
     let segments = &plan.segments;
     let n_segments = segments.len();
@@ -469,6 +477,7 @@ fn decode_frames(
         n_frames,
         &frame_starts,
         &lane_specs,
+        verify_checksum,
     );
     drop(guard);
     if let Some(payload) = job.poison.lock().unwrap().take() {
@@ -490,7 +499,10 @@ fn run(
     n_frames: usize,
     frame_starts: &[usize],
     lane_specs: &[LaneSpec],
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
+    #[cfg(not(feature = "hash"))]
+    let _ = verify_checksum;
     let (base, buf_limit) = place.resolve(job, n_segments)?;
     let lane_jobs: Vec<Arc<LaneJob>> = lane_specs
         .iter()
@@ -511,6 +523,8 @@ fn run(
                 segments: plan.segments.as_slice(),
                 base,
                 buf_limit,
+                #[cfg(feature = "hash")]
+                verify_checksum,
                 #[cfg(feature = "hash")]
                 checksums: plan.checksums.as_slice(),
                 result: Mutex::new(None),
@@ -620,8 +634,15 @@ pub(super) fn decode_frames_fixed(
     plan: &ScanPlan,
     base: *mut u8,
     buf_limit: usize,
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
-    decode_frames(input, workers, plan, Place::Fixed { base, buf_limit })
+    decode_frames(
+        input,
+        workers,
+        plan,
+        Place::Fixed { base, buf_limit },
+        verify_checksum,
+    )
 }
 
 /// `decode_to_vec_mt`'s multi-frame entry: staging completes first, one
@@ -631,8 +652,15 @@ pub(super) fn decode_frames_growing(
     workers: u32,
     plan: &ScanPlan,
     place: &mut dyn FnMut(usize, usize) -> Result<(*mut u8, usize), FrameDecoderError>,
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
-    decode_frames(input, workers, plan, Place::Deferred(place))
+    decode_frames(
+        input,
+        workers,
+        plan,
+        Place::Deferred(place),
+        verify_checksum,
+    )
 }
 
 #[cfg(test)]
@@ -809,10 +837,10 @@ mod tests {
         for workers in [2u32, 4, 8] {
             let before = frame_lane_engagements();
             let mut placed = vec![0u8; expect.len()];
-            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(&placed[..n], &expect[..], "placed mt{workers}");
             let mut appended = Vec::new();
-            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(appended, expect, "appended mt{workers}");
             assert!(
                 frame_lane_engagements() > before,
@@ -847,7 +875,7 @@ mod tests {
         let expect = expected_output(&raws);
         let before = super::super::lane_budget::engagements();
         let mut placed = vec![0u8; expect.len()];
-        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW, true).unwrap();
         assert_eq!(&placed[..n], &expect[..]);
         assert!(
             super::super::lane_budget::engagements() > before,
@@ -861,7 +889,7 @@ mod tests {
         let expect = expected_output(&raws);
         let prefix = b"non-empty prefix".to_vec();
         let mut appended = prefix.clone();
-        decode_to_vec_mt(&stream, &mut appended, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&stream, &mut appended, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(&appended[..prefix.len()], &prefix[..]);
         assert_eq!(&appended[prefix.len()..], &expect[..]);
 
@@ -871,7 +899,7 @@ mod tests {
         let trailer = parts[0].end - 1;
         corrupt[trailer] ^= 0xff;
         let mut appended = prefix.clone();
-        let err = decode_to_vec_mt(&corrupt, &mut appended, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&corrupt, &mut appended, 4, MAX_WINDOW, true).unwrap_err();
         assert!(
             matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
             "{err:?}"
@@ -892,7 +920,7 @@ mod tests {
         let frame1_trailer = parts[1].end - 1;
         corrupt[frame1_trailer] ^= 0xff;
         let mut out = Vec::new();
-        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&corrupt, &mut out, 4, MAX_WINDOW, true).unwrap_err();
         assert!(
             matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
             "{err:?}"
@@ -924,10 +952,11 @@ mod tests {
 
         for workers in [2u32, 4, 8] {
             let mut placed = vec![0u8; 7 * 1024 * 1024];
-            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
             let mut appended = Vec::new();
-            let err = decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            let err =
+                decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
         }
     }
@@ -954,7 +983,7 @@ mod tests {
         assert_eq!(&seq[..n], &expect[..]);
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; expect.len()];
-            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(&placed[..n], &expect[..], "mt{workers}");
         }
     }
@@ -968,14 +997,14 @@ mod tests {
         let stream = compress(&raw, Level::Fastest, true, 4);
         super::LANE_PANIC_INPUT.store(stream.as_ptr().cast_mut(), Ordering::Relaxed);
         let mut placed = vec![0u8; raw.len()];
-        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&stream, &mut placed, 8, MAX_WINDOW, true).unwrap();
         assert_eq!(&placed[..n], &raw[..]);
 
         let (multi, raws, _) = multiframe_stream();
         super::LANE_PANIC_INPUT.store(multi.as_ptr().cast_mut(), Ordering::Relaxed);
         let mut placed = vec![0u8; expected_output(&raws).len()];
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_all_mt(&multi, &mut placed, 4, MAX_WINDOW)
+            decode_all_mt(&multi, &mut placed, 4, MAX_WINDOW, true)
         }));
         super::LANE_PANIC_INPUT.store(core::ptr::null_mut(), Ordering::Relaxed);
         assert!(
@@ -1019,7 +1048,7 @@ mod tests {
         // Control: the stream engages the lane executor and decodes clean.
         let before = frame_lane_engagements();
         let mut placed = vec![0u8; expect.len()];
-        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW, true).unwrap();
         assert_eq!(&placed[..n], &expect[..]);
         assert!(frame_lane_engagements() > before);
 
@@ -1029,7 +1058,7 @@ mod tests {
         super::LANE_PANIC_POOL_INPUT.store(stream.as_ptr().cast_mut(), Ordering::Relaxed);
         let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut placed = vec![0u8; expect.len()];
-            let _ = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW);
+            let _ = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW, true);
         }));
         super::LANE_PANIC_POOL_INPUT.store(core::ptr::null_mut(), Ordering::Relaxed);
         let payload = blew.expect_err("the pool lane's panic must surface");
@@ -1097,10 +1126,10 @@ mod tests {
             let before = frame_lane_engagements();
             for workers in [2u32, 4, 8, 16] {
                 let mut placed = vec![0u8; expect.len()];
-                let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+                let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
                 assert_eq!(&placed[..n], &expect[..], "case {case}: mt{workers}");
                 let mut appended = Vec::new();
-                decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+                decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap();
                 assert_eq!(appended, expect, "case {case}: mt{workers} appended");
             }
             assert!(
@@ -1148,13 +1177,13 @@ mod tests {
         );
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 12 * 1024 * 1024];
-            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             assert!(
                 !matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
                 "mt{workers}: {err:?}"
             );
             let mut appended = Vec::new();
-            decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW, true).unwrap_err();
         }
 
         // Min-failing-id precedence: frame 1 corrupts deep while frame
@@ -1170,9 +1199,11 @@ mod tests {
         both[parts[4].end - 1] ^= 0xff;
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 12 * 1024 * 1024];
-            let err_f1 = decode_all_mt(&only_f1, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err_f1 =
+                decode_all_mt(&only_f1, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             let mut placed = vec![0u8; 12 * 1024 * 1024];
-            let err_both = decode_all_mt(&both, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err_both =
+                decode_all_mt(&both, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(
                 format!("{err_both:?}"),
                 format!("{err_f1:?}"),
@@ -1212,10 +1243,11 @@ mod tests {
         );
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 10 * 1024 * 1024];
-            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err = decode_all_mt(&corrupt, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
             let mut appended = b"prefix".to_vec();
-            let err = decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            let err =
+                decode_to_vec_mt(&corrupt, &mut appended, workers, MAX_WINDOW, true).unwrap_err();
             assert!(
                 matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
                 "mt{workers}: {err:?}"
@@ -1234,10 +1266,10 @@ mod tests {
         let expect = expected_output(&raws);
         for workers in [2u32, 4, 8] {
             let mut placed = vec![0u8; expect.len()];
-            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(&placed[..n], &expect[..], "mt{workers}");
             let mut appended = Vec::new();
-            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(appended, expect, "mt{workers}");
         }
     }
@@ -1274,10 +1306,10 @@ mod tests {
         let before = frame_lane_engagements();
         for workers in [2u32, 4, 12] {
             let mut placed = vec![0u8; expect.len()];
-            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(&placed[..n], &expect[..], "mt{workers}");
             let mut appended = Vec::new();
-            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(appended, expect, "mt{workers}");
         }
         assert!(frame_lane_engagements() > before);
@@ -1320,10 +1352,11 @@ mod tests {
         );
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 6 * 1024 * 1024];
-            let err = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap_err();
+            let err = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
             let mut appended = Vec::new();
-            let err = decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap_err();
+            let err =
+                decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap_err();
             assert_eq!(format!("{err:?}"), format!("{seq_err:?}"), "mt{workers}");
         }
     }
@@ -1351,7 +1384,7 @@ mod tests {
 
         // Exactly-sized target: full decode through the lane executor.
         let mut placed = vec![0u8; total];
-        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&stream, &mut placed, 2, MAX_WINDOW, true).unwrap();
         assert_eq!(&placed[..n], &expect[..]);
 
         for short in [total - 1, total - 100_000, total / 2] {
@@ -1366,8 +1399,8 @@ mod tests {
             );
             for workers in [2u32, 4] {
                 let mut big = vec![0xeeu8; total + 64];
-                let err =
-                    decode_all_mt(&stream, &mut big[..short], workers, MAX_WINDOW).unwrap_err();
+                let err = decode_all_mt(&stream, &mut big[..short], workers, MAX_WINDOW, true)
+                    .unwrap_err();
                 assert!(
                     matches!(err, FrameDecoderError::TargetTooSmall),
                     "mt{workers} short {short}: {err:?}"
@@ -1406,10 +1439,10 @@ mod tests {
         assert_eq!(n, 0);
         for workers in [2u32, 4] {
             let mut placed = vec![0u8; 0];
-            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&stream, &mut placed, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(n, 0, "mt{workers}");
             let mut appended = b"prefix".to_vec();
-            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&stream, &mut appended, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(appended, b"prefix", "mt{workers}");
         }
         // The engagement pin is the clean decode itself. The counter is

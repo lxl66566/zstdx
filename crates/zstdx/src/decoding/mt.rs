@@ -1747,7 +1747,7 @@ pub fn mt_decode_all_for_tests(
     workers: u32,
     max_window_size: u64,
 ) -> Result<usize, FrameDecoderError> {
-    decode_all_mt(input, output, workers, max_window_size)
+    decode_all_mt(input, output, workers, max_window_size, true)
 }
 
 /// Hidden: not API-stable.
@@ -1758,18 +1758,21 @@ pub fn mt_decode_to_vec_for_tests(
     workers: u32,
     max_window_size: u64,
 ) -> Result<(), FrameDecoderError> {
-    decode_to_vec_mt(input, output, workers, max_window_size)
+    decode_to_vec_mt(input, output, workers, max_window_size, true)
 }
 
 /// Parallel [`FrameDecoder::decode_all`]: decode a complete multi-frame
 /// input into the caller's buffer with a worker pool. Falls back to the
 /// sequential decoder for small inputs, dictionary frames, single-core
-/// processes and inputs without a second segment.
+/// processes and inputs without a second segment. `verify_checksum: false`
+/// skips the stage-B xxh64 absorb and the trailer compare (see
+/// [`DecoderOptions::verify_checksum`][crate::DecoderOptions::verify_checksum]).
 pub fn decode_all_mt(
     input: &[u8],
     output: &mut [u8],
     workers: u32,
     max_window_size: u64,
+    verify_checksum: bool,
 ) -> Result<usize, FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
         if let Some(fcs) = super::mt_pieces::gate(&plan) {
@@ -1781,7 +1784,14 @@ pub fn decode_all_mt(
                     }
                     Ok((output.as_mut_ptr(), out_len))
                 };
-            return super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place);
+            return super::mt_pieces::decode_pieces(
+                input,
+                workers,
+                &plan,
+                fcs,
+                &mut place,
+                verify_checksum,
+            );
         }
         // Multi-frame input: stage B runs one lane per frame (grouped when
         // frames outnumber the worker budget) on the same pool. The fixed
@@ -1798,6 +1808,7 @@ pub fn decode_all_mt(
                 &plan,
                 output.as_mut_ptr(),
                 out_len,
+                verify_checksum,
             )?;
             return Ok(written);
         }
@@ -1810,7 +1821,11 @@ pub fn decode_all_mt(
                 Ok((output.as_mut_ptr(), out_len))
             };
         #[cfg(feature = "hash")]
-        let mut checksum = FrameBoundaries::new(&plan).map(StreamingChecksum::new);
+        let mut checksum = if verify_checksum {
+            FrameBoundaries::new(&plan).map(StreamingChecksum::new)
+        } else {
+            None
+        };
         #[cfg(feature = "hash")]
         let mut after_segment = |base: *const u8, range: Range<usize>| {
             // SAFETY: the range was just executed at this base by the same
@@ -1847,18 +1862,21 @@ pub fn decode_all_mt(
     } else {
         let mut decoder = FrameDecoder::new();
         decoder.set_max_window_size(max_window_size);
+        decoder.set_verify_checksum(verify_checksum);
         decoder.decode_all(input, output)
     }
 }
 
 /// Parallel [`FrameDecoder::decode_all_to_vec`]: appends the decoded bytes
 /// behind the vector's current length, growing it segment by segment
-/// (segment sizes become exact after their stage A).
+/// (segment sizes become exact after their stage A). `verify_checksum`
+/// behaves as in [`decode_all_mt`].
 pub fn decode_to_vec_mt(
     input: &[u8],
     output: &mut Vec<u8>,
     workers: u32,
     max_window_size: u64,
+    verify_checksum: bool,
 ) -> Result<(), FrameDecoderError> {
     if let Some(plan) = engage(input, workers, max_window_size) {
         if let Some(fcs) = super::mt_pieces::gate(&plan) {
@@ -1874,7 +1892,14 @@ pub fn decode_to_vec_mt(
                         output.capacity() - start_len,
                     ))
                 };
-            let written = super::mt_pieces::decode_pieces(input, workers, &plan, fcs, &mut place)?;
+            let written = super::mt_pieces::decode_pieces(
+                input,
+                workers,
+                &plan,
+                fcs,
+                &mut place,
+                verify_checksum,
+            )?;
             // SAFETY: every byte in [start_len, start_len + written) was
             // written by the piece executor.
             unsafe { output.set_len(start_len + written) };
@@ -1896,8 +1921,13 @@ pub fn decode_to_vec_mt(
                         output.capacity() - start_len,
                     ))
                 };
-            let written =
-                super::mt_frames::decode_frames_growing(input, workers, &plan, &mut place)?;
+            let written = super::mt_frames::decode_frames_growing(
+                input,
+                workers,
+                &plan,
+                &mut place,
+                verify_checksum,
+            )?;
             // SAFETY: every byte in [start_len, start_len + written) was
             // written by the lanes.
             unsafe { output.set_len(start_len + written) };
@@ -1925,7 +1955,11 @@ pub fn decode_to_vec_mt(
                 ))
             };
         #[cfg(feature = "hash")]
-        let mut checksum = FrameBoundaries::new(&plan).map(StreamingChecksum::new);
+        let mut checksum = if verify_checksum {
+            FrameBoundaries::new(&plan).map(StreamingChecksum::new)
+        } else {
+            None
+        };
         #[cfg(feature = "hash")]
         // SAFETY: same-thread absorb of just-executed bytes, before the next
         // `place` call may grow (and move) the vector.
@@ -1973,6 +2007,7 @@ pub fn decode_to_vec_mt(
         loop {
             let mut decoder = FrameDecoder::new();
             decoder.set_max_window_size(max_window_size);
+            decoder.set_verify_checksum(verify_checksum);
             match decoder.decode_all_to_vec(input, output) {
                 Ok(()) => return Ok(()),
                 Err(FrameDecoderError::TargetTooSmall) => {
@@ -2028,11 +2063,11 @@ mod tests {
                 bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(workers))
                     .unwrap();
             let mut out = vec![0u8; data.len()];
-            let n = decode_all_mt(&compressed, &mut out, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&compressed, &mut out, workers, MAX_WINDOW, true).unwrap();
             assert_eq!((n, &out[..n]), (data.len(), &data[..]));
 
             let mut vec_out = Vec::new();
-            decode_to_vec_mt(&compressed, &mut vec_out, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&compressed, &mut vec_out, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(vec_out, data);
 
             let mut seq = vec![0u8; data.len()];
@@ -2060,7 +2095,7 @@ mod tests {
         let mut expect = a.clone();
         expect.extend_from_slice(&b);
         let mut out = Vec::new();
-        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(out, expect);
     }
 
@@ -2071,7 +2106,7 @@ mod tests {
         let data = textish(6 * 1024 * 1024);
         let compressed = zstd::bulk::compress(&data, 3).unwrap();
         let mut out = Vec::new();
-        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(out, data);
     }
 
@@ -2119,10 +2154,10 @@ mod tests {
         for level in [1, 3, 9] {
             let compressed = zstd::bulk::compress(&data, level).unwrap();
             let mut out = Vec::new();
-            decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
             assert_eq!(out, data, "level {level}");
             let mut placed = vec![0u8; data.len()];
-            let n = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&compressed, &mut placed, 4, MAX_WINDOW, true).unwrap();
             assert_eq!(&placed[..n], &data[..], "level {level}");
         }
     }
@@ -2141,7 +2176,7 @@ mod tests {
         let mut expect = a.clone();
         expect.extend_from_slice(&b);
         let mut out = Vec::new();
-        decode_to_vec_mt(&with_skip, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&with_skip, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(out, expect);
     }
 
@@ -2153,14 +2188,14 @@ mod tests {
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut small = vec![0u8; data.len() - 1];
-        assert!(decode_all_mt(&compressed, &mut small, 4, MAX_WINDOW).is_err());
+        assert!(decode_all_mt(&compressed, &mut small, 4, MAX_WINDOW, true).is_err());
 
         let tiny = textish(64 * 1024);
         let tiny_c = bulk::compress(&tiny, Level::Fastest);
         let mut a = vec![0u8; tiny.len()];
         let mut b = vec![0u8; tiny.len()];
         let mut decoder = FrameDecoder::new();
-        let n = decode_all_mt(&tiny_c, &mut a, 4, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&tiny_c, &mut a, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(n, decoder.decode_all(&tiny_c, &mut b).unwrap());
         assert_eq!(a, b);
     }
@@ -2184,10 +2219,10 @@ mod tests {
             bulk::compress_with(&data, &EncoderOptions::new(Level::from_zstd(9)).workers(4))
                 .unwrap();
         let mut out = vec![0u8; data.len()];
-        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(&out[..n], &data[..]);
         let mut vec_out = Vec::new();
-        decode_to_vec_mt(&compressed, &mut vec_out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&compressed, &mut vec_out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(vec_out, data);
     }
 
@@ -2201,7 +2236,7 @@ mod tests {
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut out = alloc::vec![0x41u8; 1024 * 1024];
         let prefix = out.clone();
-        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(&out[..prefix.len()], &prefix[..]);
         assert_eq!(&out[prefix.len()..], &data[..]);
     }
@@ -2265,7 +2300,7 @@ mod tests {
 
         // Both parallel entry points must agree, frame-scoped: the second
         // frame's untouched pledge is not what trips.
-        let err = decode_to_vec_mt(&input, &mut Vec::new(), 2, MAX_WINDOW).unwrap_err();
+        let err = decode_to_vec_mt(&input, &mut Vec::new(), 2, MAX_WINDOW, true).unwrap_err();
         assert!(matches!(
             err,
             crate::decoding::errors::FrameDecoderError::ContentSizeMismatch {
@@ -2274,7 +2309,7 @@ mod tests {
             } if declared == a.len() as u64 + 1 && actual == a.len() as u64
         ));
         let mut placed = vec![0u8; a.len() + b.len() + 1];
-        let err = decode_all_mt(&input, &mut placed, 2, MAX_WINDOW).unwrap_err();
+        let err = decode_all_mt(&input, &mut placed, 2, MAX_WINDOW, true).unwrap_err();
         assert!(matches!(
             err,
             crate::decoding::errors::FrameDecoderError::ContentSizeMismatch { .. }
@@ -2286,7 +2321,7 @@ mod tests {
         let mut expect = a.clone();
         expect.extend_from_slice(&b);
         let mut vec_out = Vec::new();
-        decode_to_vec_mt(&clean, &mut vec_out, 2, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&clean, &mut vec_out, 2, MAX_WINDOW, true).unwrap();
         assert_eq!(vec_out, expect);
     }
 
@@ -2513,11 +2548,11 @@ mod tests {
 
         for workers in [2u32, 4, 8] {
             let mut out = vec![0u8; expect.len()];
-            let n = decode_all_mt(&frame, &mut out, workers, MAX_WINDOW).unwrap();
+            let n = decode_all_mt(&frame, &mut out, workers, MAX_WINDOW, true).unwrap();
             assert_eq!((n, &out[..n]), (expect.len(), &expect[..]), "{workers}");
 
             let mut vec_out = Vec::new();
-            decode_to_vec_mt(&frame, &mut vec_out, workers, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(&frame, &mut vec_out, workers, MAX_WINDOW, true).unwrap();
             assert_eq!(vec_out, expect, "{workers}");
         }
     }
@@ -2752,10 +2787,10 @@ mod tests {
                     "{name}: no mid-epoch segment at {workers} workers"
                 );
                 let mut out = Vec::new();
-                decode_to_vec_mt(&frame, &mut out, workers, MAX_WINDOW).unwrap();
+                decode_to_vec_mt(&frame, &mut out, workers, MAX_WINDOW, true).unwrap();
                 assert_eq!(out, expect, "{name} at {workers} workers");
                 let mut placed = vec![0u8; expect.len()];
-                let n = decode_all_mt(&frame, &mut placed, workers, MAX_WINDOW).unwrap();
+                let n = decode_all_mt(&frame, &mut placed, workers, MAX_WINDOW, true).unwrap();
                 assert_eq!(&placed[..n], &expect[..], "{name} at {workers} workers");
             }
         }
@@ -2849,7 +2884,7 @@ mod tests {
             "the -9 records class must cut mid-epoch"
         );
         let mut out = Vec::new();
-        decode_to_vec_mt(&frame, &mut out, 4, MAX_WINDOW).unwrap();
+        decode_to_vec_mt(&frame, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(out, data);
     }
 
@@ -3056,7 +3091,7 @@ mod tests {
                 (&cb, &b)
             };
             let mut out = Vec::new();
-            decode_to_vec_mt(src, &mut out, 4, MAX_WINDOW).unwrap();
+            decode_to_vec_mt(src, &mut out, 4, MAX_WINDOW, true).unwrap();
             assert_eq!(out[..], expect[..], "round {round}");
         }
     }
@@ -3078,7 +3113,7 @@ mod tests {
         );
         super::STAGE_PANIC_AT.store(3, core::sync::atomic::Ordering::Relaxed);
         let blew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW);
+            let _ = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW, true);
         }));
         super::STAGE_PANIC_AT.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
         super::STAGE_PANIC_INPUT
@@ -3093,7 +3128,7 @@ mod tests {
         assert_eq!(msg, Some("injected stage-A panic"));
 
         out.fill(0);
-        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&compressed, &mut out, 4, MAX_WINDOW, true).unwrap();
         assert_eq!(&out[..n], &data[..]);
     }
 
@@ -3116,7 +3151,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut out = vec![0u8; n];
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = decode_all_mt(&compressed, &mut out[..], 4, MAX_WINDOW);
+                let _ = decode_all_mt(&compressed, &mut out[..], 4, MAX_WINDOW, true);
             }))
         });
         let blew = handle.join().expect("the decode must terminate, not hang");
@@ -3154,7 +3189,7 @@ mod tests {
         let compressed =
             bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
         let mut out = vec![0u8; data.len()];
-        let n = decode_all_mt(&compressed, &mut out, 8, MAX_WINDOW).unwrap();
+        let n = decode_all_mt(&compressed, &mut out, 8, MAX_WINDOW, true).unwrap();
         assert_eq!(&out[..n], &data[..]);
         // The workers served the lease and parked back in the pool.
         assert!(dec_pool_threads() > 0, "decode must lease pool threads");
@@ -3305,6 +3340,6 @@ mod tests {
         let mut out = Vec::new();
         // Errors (or the frame checksum flagging the mismatch) are both
         // acceptable; a panic or hang is not.
-        let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW);
+        let _ = decode_to_vec_mt(&compressed, &mut out, 4, MAX_WINDOW, true);
     }
 }

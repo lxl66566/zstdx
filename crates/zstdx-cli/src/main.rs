@@ -430,8 +430,8 @@ struct Cli {
     #[arg(short = 'C', long, conflicts_with = "no_check")]
     check: bool,
 
-    /// Omit the frame content checksum. Compression only: decoding always
-    /// validates a present checksum
+    /// Omit the frame content checksum on compression; skip its
+    /// verification on decompression (zstd 1.5.7's `-d --no-check`)
     #[arg(long)]
     no_check: bool,
 
@@ -1076,13 +1076,6 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         Mode::List => return list::run(cli).into(),
         Mode::Train => return train::run(cli),
         Mode::Compress | Mode::Decompress | Mode::Test => {},
-    }
-    if (cli.check || cli.no_check) && mode != Mode::Compress {
-        eprintln!(
-            "{PREFIX}--check/--no-check affect compression only: decoding always validates a \
-             present checksum"
-        );
-        return Exit::Failure;
     }
     if cli.memory.is_some() && mode == Mode::Compress {
         eprintln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
@@ -2360,7 +2353,9 @@ fn decompress(
                     Diagnostic::plain(vec![format!("{PREFIX}{name}: unsupported format ")]).into(),
                 );
             }
-            let mut options = DecoderOptions::new();
+            // The encode-side checksum flag doubles as the decode-side
+            // verification switch (zstd 1.5.7's `-d --no-check`).
+            let mut options = DecoderOptions::new().verify_checksum(settings.checksum);
             if settings.threads > 1 {
                 options = options.threads(settings.threads);
             }

@@ -252,6 +252,7 @@ impl<W: Write> Decoder<W> {
         if let Some(max) = options.max_window_size {
             inner.set_max_window_size(max);
         }
+        inner.set_verify_checksum(options.verify_checksum);
         if let Some(dict) = &options.dictionary {
             let dict = alloc::sync::Arc::new(
                 crate::decoding::Dictionary::load(dict).map_err(crate::Error::Dictionary)?,

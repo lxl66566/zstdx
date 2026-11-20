@@ -439,6 +439,7 @@ impl<R: Read> Decoder<R> {
         if let Some(max) = options.max_window_size {
             decoder.set_max_window_size(max);
         }
+        decoder.set_verify_checksum(options.verify_checksum);
         let mut build = || -> Result<()> {
             if let Some(dict) = &options.dictionary {
                 let dict = alloc::sync::Arc::new(

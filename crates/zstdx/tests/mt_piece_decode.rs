@@ -11,7 +11,7 @@ use std::{io::Write, sync::MutexGuard};
 
 use zstdx::{
     DecoderOptions, EncoderOptions, Level, bulk,
-    decoding::{DEFAULT_MAX_WINDOW_SIZE, FrameDecoder},
+    decoding::{DEFAULT_MAX_WINDOW_SIZE, FrameDecoder, errors::FrameDecoderError},
     piece_engagements, set_mt_ramp_depth_for_tests, set_piece_decode_for_tests,
 };
 
@@ -322,6 +322,46 @@ fn undersized_output_errors() {
     set_piece_decode_for_tests(false);
 }
 
+/// The piece executor honors the checksum-verification switch: a
+/// corrupted trailer decodes to the right bytes with verification off and
+/// reports the mismatch with the default.
+#[test]
+fn verify_checksum_off_decodes_corrupted_trailer() {
+    let _guard = serial();
+    set_mt_ramp_depth_for_tests(RAMP);
+    set_piece_decode_for_tests(true);
+    let data = textish(16 * 1024 * 1024);
+    let mut compressed =
+        bulk::compress_with(&data, &EncoderOptions::new(Level::Fastest).workers(4)).unwrap();
+    let last = compressed.len() - 1;
+    compressed[last] ^= 0xff;
+
+    let before = piece_engagements();
+    let out = bulk::decompress_with(
+        &compressed,
+        1 << 20,
+        &DecoderOptions::new().threads(4).verify_checksum(false),
+    )
+    .unwrap();
+    assert_eq!(out, data);
+    assert!(
+        piece_engagements() > before,
+        "the piece executor did not engage"
+    );
+
+    let err =
+        bulk::decompress_with(&compressed, 1 << 20, &DecoderOptions::new().threads(4)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            zstdx::Error::Frame(FrameDecoderError::ChecksumMismatch { .. })
+        ),
+        "{err}"
+    );
+    set_mt_ramp_depth_for_tests(u64::MAX);
+    set_piece_decode_for_tests(false);
+}
+
 /// Multi-frame and unpledged inputs must not route to the piece executor
 /// even with the router on (single pledged frame only), and stay correct.
 #[test]
@@ -531,7 +571,7 @@ fn overlong_frame_after_early_winner_errors() {
         let mut seq_out = Vec::with_capacity(capacity);
         match FrameDecoder::new().decode_all_to_vec(&frame, &mut seq_out) {
             Ok(()) => panic!("sequential decoder accepted the overlong frame"),
-            Err(zstdx::decoding::errors::FrameDecoderError::TargetTooSmall) => capacity *= 2,
+            Err(FrameDecoderError::TargetTooSmall) => capacity *= 2,
             Err(e) => break e,
         }
     };

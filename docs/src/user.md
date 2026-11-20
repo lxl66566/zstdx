@@ -158,6 +158,7 @@ let original = bulk::decompress_with(&compressed, 0, &dopts)?;
 - `InputShape::default().with_window_log(n)` forces the encoder window, clamped to 10..=27, for example to bound decoder memory. `.with_len(n)` feeds a known input size so the window and tables shrink to the source. A pledged size wins for the length when both are set.
 - `include_dictid(false)` omits the Dictionary_ID field from the frame header while the dictionary stays fully in effect, which is libzstd's `ZSTD_c_dictIDFlag = 0`. Such frames decode only when the dictionary is handed to the decoder explicitly. On this crate's option-based decode entries the attached dictionary fills that role.
 - `DecoderOptions::max_window_size(n)` rejects frames whose window exceeds `n` bytes. The default is `DEFAULT_MAX_WINDOW_SIZE`, which is 128 MiB plus one byte, so set a smaller cap on untrusted input.
+- `DecoderOptions::verify_checksum(false)` skips the frame checksum verification on every decode path (bulk, streaming and MT): the xxh64 over the decoded output is never computed and the trailer compare is skipped, so a frame with a corrupted checksum decodes without error. The default `true` matches libzstd, whose only equivalent is the experimental `ZSTD_d_forceIgnoreChecksum`. Use it only for trusted-data pipelines; it is the difference between `zstd -d` and `zstd -d --no-check`.
 
 ### Long-distance matching
 
@@ -250,7 +251,7 @@ The `zstdx-cli` binary mirrors the `zstd` command line with flags and no subcomm
 - `--[no-]progress` overrides the auto progress-bar rule, which shows a bar on an interactive stderr with a known size. The bar never pollutes pipes.
 - `--ignore-errors` is rejected with `Incorrect parameter: --ignore-errors`, matching zstd 1.5.7, which removed the flag.
 - `--long[=N]` forces the window log. The default is 27, the engine's maximum, and the accepted range is 10 to 27. A known source size still shrinks the window to the source, as zstd does. Unlike zstd, `--long` alone leaves the long-distance matcher off, because the engine arms LDM by level row once the effective window reaches 32 MiB.
-- `--[no-]check` toggles the frame checksum, default on. Both forms are compression-only. Decoding always validates a present checksum, and the flags are rejected in decode modes instead of ignored.
+- `--[no-]check` toggles the frame checksum, default on. On compression `--no-check` omits the trailer; on decompression it skips the checksum verification, so a frame with a corrupted checksum decodes cleanly, matching zstd 1.5.7's `-d --no-check`. `--check` is the explicit default in both modes.
 - `--stream-size=N` pledges the exact stdin size, and a mismatch fails, as in zstd. `--size-hint=N` sizes the encoder row for an approximate stdin size without a header promise. Both are stdin-only and rejected for file inputs, whose sizes are already pledged.
 - `-M N` and `--memory=N` bound decode memory by capping the frame window, with zstd's syntax of bare bytes or `K`, `M` and `G` suffixes. Values below 1K reject every frame and are refused, as in zstd. Compression rejects the flag, where zstd silently ignores it.
 - `--filelist LIST` reads the input list from LIST with one path per line. There is no `--file` alias and no stdin list form, matching zstd 1.5.7.

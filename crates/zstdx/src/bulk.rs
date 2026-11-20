@@ -144,6 +144,7 @@ fn decoder_from_options(options: &crate::DecoderOptions) -> Result<FrameDecoder>
     if let Some(max) = options.max_window_size {
         decoder.set_max_window_size(max);
     }
+    decoder.set_verify_checksum(options.verify_checksum);
     let dict = match (&options.parsed_dictionary, &options.dictionary) {
         (parsed, _) if parsed.is_some() => parsed.clone(),
         (_, Some(raw)) => Some(alloc::sync::Arc::new(
@@ -239,8 +240,14 @@ pub fn decompress_to_buffer_with(
         let max = options
             .max_window_size
             .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
-        return crate::decoding::mt::decode_all_mt(source, destination, options.threads, max)
-            .map_err(Into::into);
+        return crate::decoding::mt::decode_all_mt(
+            source,
+            destination,
+            options.threads,
+            max,
+            options.verify_checksum,
+        )
+        .map_err(Into::into);
     }
     let mut decoder = decoder_from_options(options)?;
     decoder.decode_all(source, destination).map_err(Into::into)
@@ -260,7 +267,13 @@ pub fn decompress_with(
             .max_window_size
             .unwrap_or(crate::decoding::DEFAULT_MAX_WINDOW_SIZE);
         let mut out = alloc::vec::Vec::with_capacity(capacity.max(64 * 1024));
-        match crate::decoding::mt::decode_to_vec_mt(source, &mut out, options.threads, max) {
+        match crate::decoding::mt::decode_to_vec_mt(
+            source,
+            &mut out,
+            options.threads,
+            max,
+            options.verify_checksum,
+        ) {
             Ok(()) => return Ok(out),
             Err(e) => return Err(e.into()),
         }
