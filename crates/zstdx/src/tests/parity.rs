@@ -289,17 +289,30 @@ fn repeat_modes_with_raw_content_dict_are_rejected() {
 }
 
 /// A corrupted literals jump table slides the four stream boundaries while
-/// every stream stays >= 8 bytes, so both decoders run their 4-stream X2
-/// interleave and accept the block with full-length garbage output. The
-/// reference hands the loop's window state to `HUF_decodeStreamX2`, whose
-/// double-symbol lookups keep decoding rotations of the frozen floor
-/// window; zstdx used to finish through the single-symbol X1 tail (a pair
-/// lookup consumes both symbols' bits in one step, so the rotation
-/// garbage differs) and its BMI2 asm stretch ran a fixed round count
-/// instead of the reference's op[3] `olimit` compare. Both sides still
-/// accepted, with different bytes from position 245 on. Byte equality
-/// with libzstd on the mutant is the pin, and the legal frame stays
-/// byte-identical on both decoders.
+/// every stream stays >= 8 bytes, so a 4-stream X2 interleave accepts the
+/// block with full-length garbage output. The reference hands the loop's
+/// window state to `HUF_decodeStreamX2`, whose double-symbol lookups keep
+/// decoding rotations of the frozen floor window; zstdx used to finish
+/// through the single-symbol X1 tail (a pair lookup consumes both symbols'
+/// bits in one step, so the rotation garbage differs) and its BMI2 asm
+/// stretch ran a fixed round count instead of the reference's op[3]
+/// `olimit` compare. Byte equality with libzstd on the mutant is the pin,
+/// and the legal frame stays byte-identical on both decoders.
+///
+/// libzstd's verdict on the mutant depends on its build. The 4-stream fast
+/// decode loop only runs on 64-bit little-endian targets:
+/// `HUF_DecompressFastArgs_init` answers "use the fallback" when
+/// `MEM_32bits() || !MEM_isLittleEndian()`. Every other build takes the
+/// strict default body, whose per-stream `BIT_endOfDStream`
+/// exact-consumption check rejects the slid boundaries. So i686 and s390x
+/// libzstd reject the mutant while x86_64 and aarch64 accept it.
+///
+/// zstdx ports the fast loop as portable Rust and runs it on every
+/// platform, so it accepts with byte-identical output everywhere. Mirroring
+/// the 32-bit and big-endian rejection would make the same frame's verdict
+/// depend on the build target, and would route those builds through the
+/// slow strict tail. The pin below therefore expects the verdict divergence
+/// and checks zstdx's bytes by checksum on every platform instead.
 #[test]
 fn four_stream_jump_table_corruption_matches_libzstd_bytes() {
     // Deterministic 5-symbol payload, the review harness's generator:
@@ -323,12 +336,35 @@ fn four_stream_jump_table_corruption_matches_libzstd_bytes() {
     // 60 bytes, far enough to run the tail dry mid-segment.
     let mut mutant = frame.clone();
     mutant[17] ^= 0xff;
-    let lib = zstd::stream::decode_all(mutant.as_slice()).expect("libzstd accepts the mutant");
-    let ours = decode(&mutant).expect("zstdx accepts the mutant");
-    assert_eq!(lib.len(), payload.len());
+
+    let lib = zstd::stream::decode_all(mutant.as_slice());
+    let ours = decode(&mutant).expect("zstdx accepts the mutant on every platform");
     assert_eq!(ours.len(), payload.len());
-    assert_eq!(
-        lib, ours,
-        "the accepted garbage must match libzstd byte for byte"
-    );
+    if cfg!(all(target_pointer_width = "64", target_endian = "little")) {
+        // The fast loop is eligible here, so the reference accepts.
+        let lib = lib.expect("64-bit LE libzstd accepts the mutant via the fast loop");
+        assert_eq!(lib.len(), payload.len());
+        assert_eq!(
+            lib, ours,
+            "the accepted garbage must match libzstd byte for byte"
+        );
+    } else {
+        // The strict fallback body runs here and rejects the slid stream
+        // boundaries. Both arms stay compiled: `if cfg!` keeps the 64-bit
+        // byte pin type-checked on every target.
+        assert!(
+            lib.is_err(),
+            "32-bit/BE libzstd runs the strict fallback and must reject the mutant"
+        );
+    }
+    // zstdx's accepted garbage is platform-invariant: pin the exact bytes
+    // by FNV-1a over the decoded output, so a 32-bit or big-endian codegen
+    // divergence in the interleave cannot hide behind the verdict pins.
+    // The constant is the hash of the libzstd-matching output recorded on
+    // x86_64. The i686 and s390x runs produce the same hash.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &ours {
+        hash = (hash ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    assert_eq!(hash, 0xe8e3_a58e_6e15_9199);
 }

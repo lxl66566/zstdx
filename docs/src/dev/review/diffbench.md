@@ -44,6 +44,12 @@ The X2 double-symbol interleaved path shares the mirrored tail, but the referenc
 
 The vendored zstd crate's libzstd may differ from the system CLI version. The adjudicator uses it only to classify asymmetries, and every hard divergence in this round was confirmed against a locally built reference libzstd 1.5.7, with and without asm.
 
+## Platform-dependent reference verdicts
+
+The reference's verdict on the accepted-garbage classes is a property of its build, not of the format. `HUF_DecompressFastArgs_init` answers "use the fallback" when `MEM_32bits() || !MEM_isLittleEndian()`, so the 4-stream fast loop and its length-only tail validation exist only on 64-bit little-endian builds. Every other build takes the old body, whose per-stream `BIT_endOfDStream` exact-consumption check rejects a slid or under-running stream as corruption.
+
+The cross CI surfaced this through the jump-table mutant, with identical frame bytes on every platform. libzstd 1.5.7 accepts the mutant on x86_64 and rejects it on i686 and s390x. zstdx ports the fast loop as portable Rust, so it accepts on every platform with byte-identical output, verified on x86_64, i686 and qemu-s390x. zstdx keeps this behavior instead of mirroring the 32-bit and big-endian rejection, because the same frame would then decode or fail depending on the build target, and those builds would lose the interleaved loop to the slow strict tail. `four_stream_jump_table_corruption_matches_libzstd_bytes` now pins libzstd's verdict per pointer width and endianness, keeps byte equality with libzstd on 64-bit LE, and pins the accepted garbage by FNV-1a on every platform, so a word-size or endianness divergence inside zstdx still fails the test.
+
 ## How to run
 
 ```bash
