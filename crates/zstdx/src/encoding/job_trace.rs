@@ -57,6 +57,12 @@ pub struct Snapshot {
     /// The LDM strip fill inside `prefill_window` (a sub-span of
     /// `prefill_ns`).
     pub ldm_fill_ns: u64,
+    /// The joiner's insert runs over the staged lane hits inside the LDM
+    /// fill (`insert_hits`; a sub-span of `ldm_fill_ns`, covering the
+    /// parallel fill's runs alone — the serial fills interleave their
+    /// inserts with the scan, so their insert share stays inside
+    /// `ldm_fill_ns`).
+    pub ldm_insert_ns: u64,
     /// The caller-side shared-prefix-fill build (`build_spf`'s segment
     /// loop plus its snapshot clone; the bulk path's
     /// `build_prefix_snapshot`). NOT a sub-span of `prefill_ns` — it runs
@@ -176,6 +182,7 @@ counters! {
     gate_ns,
     uniform_ns,
     ldm_fill_ns,
+    ldm_insert_ns,
     spf_build_ns,
     job_ns,
     prefill_ns,
@@ -300,6 +307,12 @@ pub fn add_uniform(started: Instant) {
 #[inline]
 pub fn add_ldm_fill(started: Instant) {
     add_ns(&C.ldm_fill_ns, started.elapsed());
+}
+
+/// Record one joiner insert-run span inside the LDM fill (`insert_hits`).
+#[inline]
+pub fn add_ldm_insert(started: Instant) {
+    add_ns(&C.ldm_insert_ns, started.elapsed());
 }
 
 /// Record one caller-side shared-prefix-fill build span (the stream core's

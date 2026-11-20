@@ -898,18 +898,24 @@ impl LdmState {
     /// inside the lane, and the lanes insert in chunk order — the stock
     /// loop's exact insert sequence. The stock loop interleaved these
     /// round-robin inserts with the next gear batch, hiding each miss
-    /// under scanning compute; standing alone they serialize on one
-    /// outstanding table line at a time, so the loop prefetches the
-    /// [`INSERT_PREFETCH_DIST`]-ahead hits' bucket lines instead — same
-    /// inserts, overlapped misses.
+    /// under scanning compute; standing alone the run's misses overlap
+    /// themselves well enough that software prefetching only added work:
+    /// the retired two-line DIST-16 T0 prefetch nearly doubled the run's
+    /// L3 fill traffic (1.62M against 0.86M fills per 1.04M-insert run)
+    /// for +8M instructions, reading -51.6 percent of the run
+    /// single-thread and -7.5 to -8.0 percent under 16-instance pressure
+    /// (the R115 probe, `docs/src/dev/bench/probe-r115.md`); the earlier
+    /// retunes (DIST 32/64, a one-line form) sat in the noise band
+    /// around a form that was already a pessimization.
     #[cfg(feature = "std")]
     fn insert_hits(&mut self, hits: &[SplitHit]) {
-        for (i, hit) in hits.iter().enumerate() {
-            if let Some(&ahead) = hits.get(i + INSERT_PREFETCH_DIST) {
-                prefetch_hit(&self.table, &self.bucket_offsets, ahead.hash as usize);
-            }
+        #[cfg(feature = "job_trace")]
+        let trace = std::time::Instant::now();
+        for hit in hits {
             self.insert(hit.hash as usize, hit.split, hit.cks);
         }
+        #[cfg(feature = "job_trace")]
+        super::job_trace::add_ldm_insert(trace);
     }
 
     /// The shared prefix fill's segmented fill (see `encoder_mt`): like
@@ -1223,34 +1229,6 @@ fn scan_lane(
         pos += n as u64;
     }
     hits
-}
-
-/// Prefetch-distance (inserts) of [`insert_hits`]: covers the round-robin
-/// bucket line misses of the inserts ahead while the current one retires.
-#[cfg(feature = "std")]
-const INSERT_PREFETCH_DIST: usize = 16;
-
-/// Pull one hit's bucket entries and its cursor byte into the caches the
-/// next insert will need (the round-robin slot lives in the bucket's
-/// first two lines; the exact slot depends on the cursor, so both).
-#[cfg(feature = "std")]
-#[inline(always)]
-fn prefetch_hit(table: &[u64], offsets: &[u8], hash: usize) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: `hash` is masked below the bucket count both slices are sized
-    // for, so the offsets stay in bounds; the prefetches are hints that
-    // never dereference.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch(
-            offsets.as_ptr().add(hash).cast::<i8>(),
-            core::arch::x86_64::_MM_HINT_T0,
-        );
-        let base = table.as_ptr().add(hash * ENTS_PER_BUCKET);
-        core::arch::x86_64::_mm_prefetch(base.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
-        core::arch::x86_64::_mm_prefetch(base.add(8).cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (table, offsets, hash);
 }
 
 /// Count of multi-lane fills in flight; [`LdmState::fill`] leases the

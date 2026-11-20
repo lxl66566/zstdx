@@ -199,6 +199,12 @@ mod trace {
             share(s.uniform_ns, s.job_ns),
         );
         println!(
+            "  ldm insert run {:>7.2} ms ({:4.1}% of job, {:>4.1}% of ldm)",
+            ms(s.ldm_insert_ns),
+            share(s.ldm_insert_ns, s.job_ns),
+            share(s.ldm_insert_ns, s.ldm_fill_ns),
+        );
+        println!(
             "  spf build  {:>8.2} ms (caller-side; not in the job sums above — retired builds \
              included)",
             ms(s.spf_build_ns),
@@ -311,6 +317,7 @@ mod trace {
             gate_ns,
             uniform_ns,
             ldm_fill_ns,
+            ldm_insert_ns,
             spf_build_ns,
             probe_ns,
             spf_ldm_ns,
@@ -360,6 +367,7 @@ mod trace {
         acc.gate_ns += gate_ns;
         acc.uniform_ns += uniform_ns;
         acc.ldm_fill_ns += ldm_fill_ns;
+        acc.ldm_insert_ns += ldm_insert_ns;
         acc.spf_ldm_ns += spf_ldm_ns;
         acc.spf_chain_ns += spf_chain_ns;
         acc.adopt_ldm_ns += adopt_ldm_ns;
