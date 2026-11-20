@@ -1675,6 +1675,24 @@ impl MatchGeneratorDriver {
                     // staging re-establishes it.
                     #[cfg(debug_assertions)]
                     self.win_poison_drop();
+                } else if self.win.len() <= need
+                    && self.win.capacity() > need + super::hugepage::HUGE_ALIGN
+                {
+                    // Level-down: release the kept capacity down to the
+                    // incoming row's declared need. A pooled core that
+                    // once served a far-window row otherwise runs every
+                    // later small-window frame inside the old
+                    // hugepage-backed mapping kept by capacity — the
+                    // settled-regime penalty measured at -18 to -19
+                    // percent (see docs/src/dev/perf/encoding.md). The
+                    // live prefix moves along; a later up-transition pays
+                    // one re-grow whose cost sits at noise on the deep
+                    // rows' own frames (the transition already zeroes
+                    // fresh DUBT tables). The one-hugepage slack keeps
+                    // same-class re-homes from thrashing.
+                    self.win.shrink_capacity_to(need);
+                    #[cfg(debug_assertions)]
+                    self.win_poison_drop();
                 }
             }
         }
@@ -3549,6 +3567,15 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn reset(&mut self, level: Level) {
+        // Teardown of the ended frame's window first: `apply_level`'s
+        // capacity policy (grow, and the level-down shrink) runs against
+        // an empty buffer, so a shrink never copies the dead prefix.
+        self.ext = None;
+        self.win.clear();
+        // The cleared backing's wall span is stale; the frame's first
+        // staging re-establishes it.
+        #[cfg(debug_assertions)]
+        self.win_poison_drop();
         // Every frame starts at the small-src row default (R8's swap): the
         // head verdict is per-frame state, resolved at the first matching
         // entry (see `resolve_small_src_row`).
@@ -3591,12 +3618,6 @@ impl Matcher for MatchGeneratorDriver {
             clear_table(self.tables.heads_mut());
             self.head_origin = 0;
         }
-        self.ext = None;
-        self.win.clear();
-        // The cleared backing's wall span is stale; the frame's first
-        // staging re-establishes it.
-        #[cfg(debug_assertions)]
-        self.win_poison_drop();
         self.win_base = 0;
         self.pos = 0;
         self.block_end = 0;

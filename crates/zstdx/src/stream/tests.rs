@@ -2292,6 +2292,12 @@ mod mt {
             let _ = stream(&a, Level::Fastest);
             assert_eq!(stream(&b, level), fresh, "cross-level burn at {level:?}");
         }
+        // The level-down the window-capacity shrink rides (see
+        // `apply_level`): a Fast frame after a Best frame on the pooled
+        // core must equal a fresh core's Fast bytes.
+        let fast_fresh = stream(&b, Level::Fast);
+        let _ = stream(&a, Level::Best);
+        assert_eq!(stream(&b, Level::Fast), fast_fresh, "fast after best");
     }
 
     /// One frame from the NT-store source reader over the same bytes, at

@@ -15,6 +15,33 @@ const UNIT: usize = 64 * 1024;
 /// continues it, and a builder that continues its own fill, both end
 /// with exactly the tables a from-scratch `prefill_job_strip` of the
 /// same strip produced.
+/// The pooled core's level-down shrink (see `apply_level`'s capacity
+/// policy): an owned-window driver that served a far-window row releases
+/// the kept window capacity down to the incoming row's declared need, so
+/// later small-window frames run in the small buffer a fast-only core
+/// holds — the persistent-geometry penalty's lever. A same-row reset
+/// never re-homes. Byte-neutrality across the transition is
+/// `pooled_st_core_reuse_is_output_neutral`'s cross-level burns.
+#[test]
+fn level_down_releases_kept_window_capacity() {
+    let mut d = MatchGeneratorDriver::new(128 * 1024);
+    d.set_input_shape(crate::InputShape {
+        len: Some(32 << 20),
+        window_log: None,
+    });
+    d.reset(crate::Level::Best);
+    let best_cap = d.win.capacity();
+    assert!(
+        best_cap >= 2 * (1 << 25) + 128 * 1024,
+        "the far-window row keeps its capacity, got {best_cap}"
+    );
+    d.reset(crate::Level::Fast);
+    let fast_need = 2 * d.params.window + 128 * 1024;
+    assert_eq!(d.win.capacity(), fast_need, "shrunk to the row's need");
+    d.reset(crate::Level::Fast);
+    assert_eq!(d.win.capacity(), fast_need, "same-row reset never re-homes");
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn strip_snapshot_adopt_is_exact() {

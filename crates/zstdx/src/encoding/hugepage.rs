@@ -29,7 +29,7 @@ pub(crate) const HUGE_MIN_BYTES: usize = 8 << 20;
 /// Mapping granularity (the x86-64 PMD size): sizes round up to it and
 /// the placement hint advances on it, so an aligned mapping is fully
 /// hugepage-eligible. Configurations with larger PMDs get partial backing.
-const HUGE_ALIGN: usize = 2 << 20;
+pub(crate) const HUGE_ALIGN: usize = 2 << 20;
 
 /// Address the aligned-mapping cursor starts at: a 2 MiB-aligned point in
 /// the low canonical range, far below the PIE/heap (~0x55…) and the
@@ -198,6 +198,25 @@ impl<T: BufElem> HugeBuf<T> {
                 }
             },
         }
+    }
+
+    /// Release kept capacity down to `cap` elements, moving the live
+    /// prefix into a fresh backing of exactly that capacity (the
+    /// level-down counterpart of [`Self::reserve`]). A no-op when `cap`
+    /// cannot hold the live prefix or the backing already fits: callers
+    /// gate on meaningful overshoot, so this never thrashes between
+    /// same-size re-homes. Element content, length and Deref semantics
+    /// are unchanged — the operation moves geometry only.
+    pub(crate) fn shrink_capacity_to(&mut self, cap: usize) {
+        let len = self.len();
+        if cap < len || self.capacity() <= cap {
+            return;
+        }
+        let mut next = Self::with_capacity(cap);
+        next.extend_from_slice(&self[..len]);
+        // Assigning drops the old backing through `Drop` (the mapping
+        // release included).
+        *self = next;
     }
 
     /// Keep the first `n` elements (`Vec::truncate`; the backing stays).
