@@ -42,6 +42,7 @@ fuzz_exports = []
 hash         = []
 job_trace    = ["std"]
 seq_dump     = ["std"]
+cfg_dump     = ["std"]
 std          = ["thiserror/std"]
 
 # Internal feature, only used when building as part of libstd, not part of the

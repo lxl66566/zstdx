@@ -626,6 +626,20 @@ impl LdmState {
         self.stale
     }
 
+    /// The bucket layout and fill state as a plain record for the
+    /// `cfg_dump` probe.
+    #[cfg(feature = "cfg_dump")]
+    pub(super) fn cfg_snapshot(&self) -> super::cfg_dump::LdmCfg {
+        super::cfg_dump::LdmCfg {
+            buckets: self.hash_mask + 1,
+            ents_per_bucket: ENTS_PER_BUCKET,
+            window: self.window,
+            fed: self.fed,
+            arm: self.arm,
+            stale: self.stale,
+        }
+    }
+
     #[cfg(feature = "std")]
     /// Capture the fill state for [`Self::restore`]: exactly the parts a
     /// prefix-fill continuation needs (`window`/`stop_mask`/`hash_mask`

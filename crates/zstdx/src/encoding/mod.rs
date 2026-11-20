@@ -28,6 +28,8 @@ pub(crate) mod reach_probe;
 pub(crate) mod seq_codes;
 pub(crate) mod util;
 
+#[cfg(feature = "cfg_dump")]
+pub mod cfg_dump;
 pub(crate) mod frame_compressor;
 #[cfg(feature = "job_trace")]
 pub mod job_trace;

@@ -220,6 +220,17 @@ pub(crate) fn reset_slice_state_mode(
     state.matcher.reset(level);
     state.dict_entropy = DictEntropy::plain(level, shape.len);
     reset_entropy_state(state);
+    #[cfg(feature = "cfg_dump")]
+    super::cfg_dump::record(super::cfg_dump::Record::Reset(
+        super::cfg_dump::ResetRecord {
+            level: level.as_i32(),
+            len: shape.len,
+            window_log: shape.window_log,
+            reach_keep: super::cfg_dump::reach_keep(choice),
+            arming: super::cfg_dump::arming_tag(ldm),
+            cfg: state.matcher.cfg_snapshot(),
+        },
+    ));
 }
 
 /// Zero the frame-scoped entropy state: the pre-split savings restart, the
@@ -448,13 +459,30 @@ pub(crate) fn compress_slice_shaped_ldm(
     // stands down with it (the row parses the frame whole; no reach is
     // traded away).
     let head_span = src.len().min(BALANCED_STORE_HEAD_SPAN);
-    let bal_row = level.as_i32() == 9
+    let mut bal_row = level.as_i32() == 9
         && shape.len.is_some_and(|n| n >= reach_probe::PROBE_MIN_FRAME)
         && balanced_store(&src[..head_span]) != BalancedStore::Chain;
+    // Probe latch (cfg_dump builds only, so stock paths never read it):
+    // keep the stock chain on the ST entry, making the balanced-row
+    // substitution's share of an ST-vs-MT delta measurable on real
+    // frames (`stmdiff` reads it through `ZSTDX_CFG_DUMP_ST_CHAIN`).
+    #[cfg(feature = "cfg_dump")]
+    if bal_row && std::env::var("ZSTDX_CFG_DUMP_ST_CHAIN").is_ok() {
+        bal_row = false;
+    }
     if !bal_row && reach_probe::eligible(level, shape) {
         // The probe's keep side donates: the first span blocks run as the
         // frame's own blocks through the full pipeline, and only a Shrink
         // verdict restarts the frame (see `compress_with_state_donated`).
+        #[cfg(feature = "cfg_dump")]
+        super::cfg_dump::record(super::cfg_dump::Record::StEntry(
+            super::cfg_dump::StEntryRecord {
+                level: level.as_i32(),
+                bal_row,
+                reach_keep: true,
+                arming: super::cfg_dump::arming_tag(ldm),
+            },
+        ));
         let mut state =
             take_slice_state_ldm(level, shape, reach_probe::ReachChoice::Keep, ldm, ldm_mode);
         let output = compress_with_state_donated(&mut state, src, level, checksum, shape, declared);
@@ -468,6 +496,15 @@ pub(crate) fn compress_slice_shaped_ldm(
     } else {
         reach_probe::probe_reach_choice(src, level, shape)
     };
+    #[cfg(feature = "cfg_dump")]
+    super::cfg_dump::record(super::cfg_dump::Record::StEntry(
+        super::cfg_dump::StEntryRecord {
+            level: level.as_i32(),
+            bal_row,
+            reach_keep: super::cfg_dump::reach_keep(choice),
+            arming: super::cfg_dump::arming_tag(ldm),
+        },
+    ));
     let mut state = take_slice_state_ldm(level, shape, choice, ldm, ldm_mode);
     if bal_row {
         state

@@ -225,6 +225,15 @@ cargo run --release -p zstdx-bench --features seq_dump -- jobrestart \
     bench/big/dll100.raw --level 1,3,9,19 --workers 8,16
 ```
 
+### `stmdiff`: ST-vs-MT parse decomposition
+
+Encodes one raw input through the bulk single-threaded and multithreaded entries, decodes both frames through the `seq_dump` hook, and diffs the two parses over matched-output bitmaps: the deficit (ST-matched, MT-literal bytes) and gain split per job into head, tail (the job-end pre-split clamp zone) and body, per power-of-two offset bin of the ST match's distance, and per source domain against the MT job geometry (`mt_frame_strip_for` / `mt_job_overlap_for` / `mt_frame_window_for`). It also reports the first divergence inside each job, the common-start match-length comparison, the top exact deficit offsets, and per-job TSVs under `--dump-dir`. The bin sums are assert-checked against the whole-frame deficit, so a coverage-mask bug cannot ship silently. With `--features seq_dump,cfg_dump`, each cell first prints the resolved matcher configuration of both entries side by side: the ST entry's reset and head-verdict flips, the MT frame's job geometry record, and every job's post-gate configuration. The latch `ZSTDX_CFG_DUMP_ST_CHAIN=1` keeps the stock chain row on the ST entry at level 9, which isolates the balanced-row substitution's share of the delta (the latch exists only in `cfg_dump` builds; stock paths never read it).
+
+```bash
+cargo run --release -p zstdx-bench --features seq_dump,cfg_dump -- stmdiff \
+    bench/big/dll100.raw --level 1,3,9,19 --workers 8,16 --dump-dir /tmp/stmdiff
+```
+
 ### `prefill`: `prefill_window` micro-benchmark
 
 Times the matcher's window prefill per strategy on window-sized corpus strips. `--shape` defaults to `random,text,json`, and `--level` selects strategies.

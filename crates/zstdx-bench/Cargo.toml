@@ -26,6 +26,11 @@ job_trace = ["zstdx/job_trace"]
 # default: the dump hook sits in the decode hot loop, so it must never be
 # compiled into timing builds (`cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...`).
 seq_dump  = ["zstdx/seq_dump"]
+# Enables `stmdiff --config` (encoder-side configuration dump). Off by
+# default: the reset hooks ride the state-preparation paths, so they stay
+# out of timing builds (`cargo run --release -p zstdx-bench --features
+# seq_dump,cfg_dump -- stmdiff ...`).
+cfg_dump  = ["zstdx/cfg_dump"]
 
 [lints]
 workspace = true

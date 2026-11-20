@@ -1786,6 +1786,55 @@ impl MatchGeneratorDriver {
         };
     }
 
+    /// The live configuration as a plain record for the `cfg_dump` probe.
+    #[cfg(feature = "cfg_dump")]
+    pub(crate) fn cfg_snapshot(&self) -> super::cfg_dump::DriverCfg {
+        use super::cfg_dump::{StoreTag, StrategyTag};
+        let strategy = match self.params.strategy {
+            Strategy::Fast => StrategyTag::Fast,
+            Strategy::Dfast(l) => StrategyTag::Dfast(l),
+            Strategy::Chain(l) => StrategyTag::Chain(l),
+            Strategy::Row(l) => StrategyTag::Row(l),
+            Strategy::Opt(k) => StrategyTag::Opt {
+                bt_log: k.bt_log,
+                hash3_log: k.hash3_log,
+            },
+            Strategy::BtLazy(k) => StrategyTag::BtLazy {
+                bt_log: k.bt_log,
+                hash3_log: k.hash3_log,
+            },
+        };
+        super::cfg_dump::DriverCfg {
+            strategy,
+            hash_log: self.params.hash_log,
+            window: self.params.window,
+            chain_reach: self.params.chain_reach,
+            search_depth: self.params.search_depth,
+            lazy_depth: self.params.lazy_depth,
+            min_match: self.params.min_match,
+            small_src: self.params.small_src,
+            row_attempts_light: self.row_attempts == RowAttempts::Light,
+            store: match self.bal_store {
+                BalancedStore::Chain => StoreTag::Chain,
+                BalancedStore::Row => StoreTag::Row,
+                BalancedStore::RowHead => StoreTag::RowHead,
+            },
+            small_src_row_stock: self.small_src_row == SmallSrcRow::Stock,
+            ldm: self.ldm.as_ref().map(|l| l.cfg_snapshot()),
+            rep_pending: self.rep_pending,
+            seed_offset: self.seed_offset,
+        }
+    }
+
+    /// Record a configuration flip for the `cfg_dump` probe.
+    #[cfg(feature = "cfg_dump")]
+    fn cfg_flip(&self, site: &'static str) {
+        super::cfg_dump::record(super::cfg_dump::Record::Flip(super::cfg_dump::FlipRecord {
+            site,
+            cfg: self.cfg_snapshot(),
+        }));
+    }
+
     /// Resolve the pending small-src 9/10 row verdict from the frame's
     /// head (R27): the band's frames are a single block, so the first
     /// matching entry holds the whole head in its window. A narrow
@@ -1804,6 +1853,8 @@ impl MatchGeneratorDriver {
                 self.small_src_row = SmallSrcRow::Stock;
                 self.apply_level(level);
                 self.strategy_phase_reset();
+                #[cfg(feature = "cfg_dump")]
+                self.cfg_flip("small_src_row_stock");
                 // The stock row at level 10 is the row matcher: the flip's
                 // re-apply armed the attempts verdict, and the same head
                 // sample decides it now (the frame is already inside its
@@ -1828,6 +1879,8 @@ impl MatchGeneratorDriver {
             if span > 0 && row_attempts_light(&head[..span]) {
                 self.row_attempts = RowAttempts::Light;
                 self.apply_level(level);
+                #[cfg(feature = "cfg_dump")]
+                self.cfg_flip("row_attempts_light");
             }
         }
     }
@@ -1860,6 +1913,8 @@ impl MatchGeneratorDriver {
         self.row_attempts = attempts;
         self.apply_level(level);
         self.strategy_phase_reset();
+        #[cfg(feature = "cfg_dump")]
+        self.cfg_flip("balanced_store");
     }
 
     /// Point the window at caller-owned memory: `data` holds the bytes at

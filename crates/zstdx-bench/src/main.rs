@@ -92,6 +92,11 @@ enum Command {
     /// MT job-boundary parse-restart loss probes (seq_dump decode hook):
     /// prices the repcode carry and the match-reach loss at job heads.
     Jobrestart(cmd::jobrestart::Args),
+    /// ST-vs-MT parse decomposition (seq_dump decode hook): per-job and
+    /// per-offset-band diff of the single-threaded frame's sequences
+    /// against the multithreaded frame's; with cfg_dump, the resolved
+    /// matcher configuration of both entries side by side.
+    Stmdiff(cmd::stmdiff::Args),
 }
 
 fn main() {
@@ -116,5 +121,6 @@ fn main() {
         Command::Tierdiff(args) => cmd::tierdiff::run(&args),
         Command::Twinspect(args) => cmd::twinspect::run(&args),
         Command::Jobrestart(args) => cmd::jobrestart::run(&args),
+        Command::Stmdiff(args) => cmd::stmdiff::run(&args),
     }
 }

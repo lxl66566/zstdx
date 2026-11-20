@@ -329,6 +329,7 @@ pub fn compress_slice_mt(
         ldm_mode,
     );
 
+    let donation_donated = donation.is_some();
     let donation = Mutex::new(donation);
     // The stock strip: the search domain the plain jobs prefill, the plain
     // grid's floor and the fallback job history. The banded classes widen
@@ -440,6 +441,29 @@ pub fn compress_slice_mt(
     } else {
         LdmArming::Job
     };
+    #[cfg(feature = "cfg_dump")]
+    super::cfg_dump::record(super::cfg_dump::Record::Frame(
+        super::cfg_dump::FrameRecord {
+            strip: strip as u64,
+            job_size: job_size as u64,
+            n_jobs: n_jobs as u64,
+            job_overlap: job_overlap as u64,
+            fast_window,
+            capture_window,
+            deep_ldm,
+            opt_feed,
+            job_prefix_ldm: job_ldm == LdmArming::JobPrefix,
+            header_window: window,
+            reach_keep: choice == reach_probe::ReachChoice::Keep,
+            donated: donation_donated,
+            spf: match spf.as_ref() {
+                None => super::cfg_dump::SpfTag::None,
+                Some(PrefixPlan::Whole { .. }) => super::cfg_dump::SpfTag::Whole,
+                Some(PrefixPlan::Windowed(_)) => super::cfg_dump::SpfTag::Windowed,
+                Some(PrefixPlan::SelfFill { .. }) => super::cfg_dump::SpfTag::SelfFill,
+            },
+        },
+    ));
 
     #[cfg(feature = "hash")]
     let mut frame_hash = checksum.then(|| crate::xxh64::Xxh64::new(0));
@@ -2061,6 +2085,13 @@ pub(crate) fn prepare_job_state(
             state.matcher.arm_ramp(job_start, depth);
         }
     }
+    #[cfg(feature = "cfg_dump")]
+    super::cfg_dump::record(super::cfg_dump::Record::Job(super::cfg_dump::JobRecord {
+        start: job_start,
+        rep_gated: job_start > 0,
+        ramp_depth: ramp_depth_from_env(),
+        cfg: state.matcher.cfg_snapshot(),
+    }));
 }
 
 /// Compress one job through `state`, resetting it for the job: fresh
