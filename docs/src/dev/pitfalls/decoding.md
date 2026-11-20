@@ -122,6 +122,14 @@ The old `consumed += n` lived inside `read`, so no-reload paths were accounted a
 
 The Huffman and FSE reload paths filled their bit registers with the target's native word order. On s390x every backward bitstream then consumed its bytes reversed, and all frames failed `ChecksumMismatch` even though the same frames decoded correctly through the reference CLI with the checksum suppressed. The frame carries the bytes in the stream's own order, so the register refill goes through `bit_io`'s little-endian load on every target, exactly like the bitstream writers' stores on the encoding side.
 
+### The X2 tail needs the pair table
+
+The X2 interleaved loop handed its window state to `finish_streams`, the single-symbol X1 mirror. On an under-running stream both tails decode rotations of the frozen floor window, and a pair lookup consumes both symbols' bits in one step while selecting its second symbol from the slot itself, so the rotation garbage differs from two single-symbol lookups. Both decoders accepted the frame, with different bytes from position 245 on a corrupted jump table. The X2 loop now finishes through `finish_streams_x2`, an exact mirror of `HUF_decodeStreamX2`'s three phases including `HUF_decodeLastSymbolX2`'s consumption clamp, and the phase shapes must stay separate: matching verdicts is not enough when the reference accepts observable garbage.
+
+### Asm templates are Intel operand order
+
+The `x2_inner_asm` template reads as Intel syntax, `dst, src` on every line, even though the emitted listing prints AT&T-style `%reg` names. Writing the new stretch exit as AT&T-style `cmp {olimit}, {op3}` therefore tested `olimit < op3` and looped the stretch away from its bound: the loop only ever grew op[3] by entry lengths, so an Intel-order reading of that line ran until an ip retreated far below the region and segfaulted. The exit is `cmp {op3}, {olimit}` with `jb`, op[3] minus olimit with a below branch, and any new template line must be written in Intel order. The round-bound removal that exposed this was sound on its own: op[3] advances at least 5 per round, five lookups of length at least 1, so the `olimit` compare terminates the stretch within the caller's `iters` envelope without a counter.
+
 ## Streaming and multi-frame semantics
 
 ### Streaming window semantics use a generation model

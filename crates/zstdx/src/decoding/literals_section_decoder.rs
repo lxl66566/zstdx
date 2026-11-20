@@ -523,10 +523,14 @@ fn decompress_4streams_interleaved(
     Ok(())
 }
 
-/// Per-stream tail of the interleaved fast loops: hands the u64 window state
+/// Per-stream tail of the X1 interleaved loop: hands the u64 window state
 /// (bit position `ip[s]`, marker at `bits[s].trailing_zeros()`) back to a
 /// regular bit reader and decodes the remaining symbols of the stream's
-/// segment one at a time through the single-symbol table.
+/// segment one at a time through the single-symbol table. The X2 loop has
+/// its own double-symbol tail (`finish_streams_x2`); the two must not be
+/// merged: on an exhausted stream the frozen window rotates, and a
+/// double-symbol lookup picks a different pair from those rotations than
+/// two single-symbol lookups, so the tails emit different garbage.
 #[allow(clippy::too_many_arguments)]
 fn finish_streams(
     table: &HuffmanTable,
@@ -627,6 +631,149 @@ fn finish_streams(
     Ok(())
 }
 
+/// Per-stream tail of the X2 interleaved loop, the double-symbol
+/// counterpart of `finish_streams`: same handoff bounds (the reference's
+/// `HUF_initRemainingDStream` gates), then an exact mirror of the
+/// reference's `HUF_decodeStreamX2` on a `BIT_DStream` over the whole
+/// region (`start` = the jump table, the reference's `ilowest` floor).
+/// Verdict parity alone is not enough here either: an exhausted tail
+/// decodes rotations of the frozen floor window and the reference ACCEPTS
+/// that output, and a pair lookup consumes both symbols' bits in one
+/// step, so the garbage bytes match only under this phase structure.
+#[allow(clippy::too_many_arguments)]
+fn finish_streams_x2(
+    table: &HuffmanTable,
+    region: &[u8],
+    stream_bounds: &[(usize, usize); 4],
+    seg_end: &[usize; 4],
+    ip: &[usize; 4],
+    bits: &[u64; 4],
+    op: &[usize; 4],
+    out: &mut [u8],
+) -> Result<(), DecompressLiteralsError> {
+    use DecompressLiteralsError as err;
+
+    let tl = table.max_num_bits as isize;
+    let dt = table.x2_table();
+    // The X2 table is always a full 2^11 grid (the fast loop's `dt.len()`
+    // contract), so every index below masks into it exactly like the
+    // reference's fixed-`dtLog` lookups.
+    debug_assert_eq!(dt.len(), 1 << 11);
+
+    for s in 0..4 {
+        let start = stream_bounds[s].0;
+        // The same handoff bounds as `finish_streams`.
+        if ip[s] + 8 < start {
+            return Err(err::BitstreamReadMismatch {
+                read_til: 0,
+                expected: -tl,
+            });
+        }
+        if op[s] > seg_end[s] {
+            return Err(err::DecodedLiteralCountMismatch {
+                decoded: op[s],
+                expected: seg_end[s],
+            });
+        }
+
+        let read64 = |p: usize| u64::from_le_bytes(region[p..][..8].try_into().unwrap());
+        let mut ptr = ip[s];
+        let mut consumed = bits[s].trailing_zeros();
+        let mut window = read64(ptr);
+        let mut o = op[s];
+        let end = seg_end[s];
+
+        // `BIT_reloadDStream` with `limitPtr` floored at the region start
+        // plus 8: the same condition-in-loop model `finish_streams` uses,
+        // shared by all three guarded phases below.
+        macro_rules! reload {
+            () => {{
+                let want = (consumed >> 3) as usize;
+                if consumed > 64 {
+                    false // overflow
+                } else if ptr >= 8 {
+                    ptr -= want;
+                    consumed &= 7;
+                    window = read64(ptr);
+                    true
+                } else if ptr > 0 {
+                    let clamped = want > ptr;
+                    let nb = want.min(ptr);
+                    ptr -= nb;
+                    consumed -= 8 * nb as u32;
+                    window = read64(ptr);
+                    !clamped
+                } else {
+                    // endOfBuffer (or completed) at the floor
+                    false
+                }
+            }};
+        }
+        // One `HUF_decodeSymbolX2`: an 11-bit index into the pair table,
+        // the two sequence bytes written together, then the summed bit
+        // count. `BIT_lookBitsFast` masks the shift at 63 bits, so
+        // past-64 consumption keeps rotating the (possibly frozen)
+        // window exactly like the reference.
+        macro_rules! decode_pair {
+            () => {{
+                let entry = dt[((window << (consumed & 63)) >> 53) as usize];
+                out[o..o + 2].copy_from_slice(&(entry as u16).to_le_bytes());
+                o += (entry >> 24) as usize;
+                consumed += (entry >> 16) & 0x3f;
+            }};
+        }
+
+        // Five pair lookups per round while ten bytes remain
+        // (`while ((reload == unfinished) & (p < pEnd-9))`); fewer than
+        // eight bytes left skips the phase but still refreshes once.
+        if end - o >= 8 {
+            loop {
+                let unfinished = reload!();
+                if !unfinished || o + 9 >= end {
+                    break;
+                }
+                for _ in 0..5 {
+                    decode_pair!();
+                }
+            }
+        } else {
+            reload!();
+        }
+        // Guarded single lookups while two bytes remain, then the same
+        // loop without the reload (the window stays frozen).
+        if end - o >= 2 {
+            loop {
+                let unfinished = reload!();
+                if !unfinished || o + 2 > end {
+                    break;
+                }
+                decode_pair!();
+            }
+            while o + 2 <= end {
+                decode_pair!();
+            }
+        }
+        // The last symbol: one byte written, and a pair entry's
+        // consumption clamps at the container width
+        // (`HUF_decodeLastSymbolX2`'s bitsConsumed hack).
+        if o < end {
+            let entry = dt[((window << (consumed & 63)) >> 53) as usize];
+            out[o] = entry as u8;
+            let nb = (entry >> 16) & 0x3f;
+            if entry >> 24 == 1 {
+                consumed += nb;
+            } else if consumed < 64 {
+                consumed += nb;
+                if consumed > 64 {
+                    consumed = 64;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Decide between the single-symbol (X1) and double-symbol (X2) huffman
 /// decoding table from the literals section sizes. Port of libzstd's
 /// `HUF_selectDecoder` / `algoTime`: Q quantizes the compression ratio of the
@@ -709,8 +856,8 @@ unsafe fn decompress_4streams_interleaved_x2_bmi2(
     decompress_4streams_interleaved_x2_impl(table, region, stream_bounds, out)
 }
 
-/// One `iters`-long stretch of the X2 interleaved fast loop as inline
-/// assembly, in the shape of libzstd's amd64
+/// One stretch of the X2 interleaved fast loop as inline assembly, in the
+/// shape of libzstd's amd64
 /// `HUF_decompress4X2_usingDTable_internal_fast_asm_loop`. Each lookup loads
 /// the entry's three fields as their own loads like the asm loop, so the
 /// count byte feeds `shlx` straight off its load with no extract shift on
@@ -728,16 +875,21 @@ unsafe fn decompress_4streams_interleaved_x2_bmi2(
 /// consumed-bit count comes from `bsf` on the marked window, then the
 /// retreat, the 8-byte refill and the marker-preserving shift, with the
 /// stream's ip moved in from its xmm slot first and stored back after.
+/// The loop bottom is the reference's `olimit` compare, not a round
+/// counter: op[3] advances by at least 5 per round (five lookups, entry
+/// lengths >= 1), so `olimit` bounds the rounds and the stretch ends on
+/// the same op[3] crossing the scalar stretch and the reference end on.
 ///
 /// # Safety
 ///
 /// `dt` must hold 2^11 u32 entries, and `ip`/`op`/`bits` must carry the
 /// per-stream window state bounded by the caller's stream bounds and
-/// segment ends. `iters` must be the value the caller derived from the
-/// `(ip[0] - base) / 7` and `(oend[s] - op[s]) / 10` bounds: every load,
-/// store and pointer retreat in the block stays inside that envelope, the
-/// same one the Rust stretch below relies on. BMI2 must be available,
-/// because the window shifts are `shlx`.
+/// segment ends. `olimit` must be `op[3] + 5 * iters` with `iters` the
+/// value the caller derived from the `(ip[0] - base) / 7` and
+/// `(oend[s] - op[s]) / 10` bounds: every load, store and pointer retreat
+/// in the block stays inside that envelope, the same one the Rust stretch
+/// below relies on. BMI2 must be available, because the window shifts are
+/// `shlx`.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "bmi2")]
 #[allow(clippy::too_many_lines)]
@@ -746,7 +898,7 @@ unsafe fn x2_inner_asm(
     ip: &mut [*const u8; 4],
     op: &mut [*mut u8; 4],
     bits: &mut [u64; 4],
-    iters: usize,
+    olimit: *mut u8,
 ) {
     let (mut op0, mut op1, mut op2, mut op3) = (
         op[0] as usize,
@@ -755,7 +907,6 @@ unsafe fn x2_inner_asm(
         op[3] as usize,
     );
     let (mut bits0, mut bits1, mut bits2, mut bits3) = (bits[0], bits[1], bits[2], bits[3]);
-    let mut n = iters as u64;
     // The ip[] pointers ride xmm slots; inout operands need assignable
     // places. The inner loop touches an ip only in its reload, so the
     // per-reload movq pair is the whole xmm cost.
@@ -994,10 +1145,11 @@ or {bits3}, 1
 shlx {bits3}, {bits3}, {c}
 movq {ip3x}, {a}
 ",
-                "dec {n}\n",
-                "jnz 2b\n",
+                "cmp {op3}, {olimit}\n",
+                "jb 2b\n",
             ),
             dt = in(reg) dt as usize,
+            olimit = in(reg) olimit as usize,
             ip0x = inout(xmm_reg) ip0x,
             ip1x = inout(xmm_reg) ip1x,
             ip2x = inout(xmm_reg) ip2x,
@@ -1010,7 +1162,6 @@ movq {ip3x}, {a}
             bits1 = inout(reg) bits1,
             bits2 = inout(reg) bits2,
             bits3 = inout(reg) bits3,
-            n = inout(reg) n,
             a = out(reg) a,
             b = out(reg) b,
             c = out(reg) c,
@@ -1031,7 +1182,7 @@ movq {ip3x}, {a}
         op3 as *mut u8,
     ];
     *bits = [bits0, bits1, bits2, bits3];
-    let _ = (a, b, c, n);
+    let _ = (a, b, c);
 }
 
 #[inline(always)]
@@ -1042,8 +1193,6 @@ fn decompress_4streams_interleaved_x2_impl(
     stream_bounds: &[(usize, usize); 4],
     out: &mut [u8],
 ) -> Result<(), DecompressLiteralsError> {
-    use DecompressLiteralsError as err;
-
     let dt = table.x2_table();
     debug_assert_eq!(dt.len(), 1 << 11);
 
@@ -1138,30 +1287,31 @@ fn decompress_4streams_interleaved_x2_impl(
         if iters == 0 {
             break;
         }
-        // A stream crossing below its predecessor indicates corruption
+        // A stream crossing below its predecessor ends the interleaved
+        // loop (`goto _out` in the reference): the per-stream window
+        // bound in `finish_streams_x2` is the corruption gate, not this.
         if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
-            return Err(err::BitstreamReadMismatch {
-                read_til: 0,
-                expected: -(table.max_num_bits as isize),
-            });
-        }
-        // BMI2 tier: run the stretch as the inline-asm loop (the amd64 asm
-        // loop's shape) for exactly `iters` iterations, then re-derive the
-        // bounds here. The scalar stretch below keeps the olimit early-exit;
-        // both consume the same `iters` safety envelope.
-        #[cfg(all(target_arch = "x86_64", feature = "std"))]
-        if super::simd_tier::bmi2() {
-            // SAFETY: bmi2() ran the runtime detection (or a forced tier
-            // asserted it), and `iters` carries the same bounds the olimit
-            // form derives from, so every access in the block stays inside
-            // the envelope the SAFETY comments below document.
-            unsafe { x2_inner_asm(dt.as_ptr(), &mut ip, &mut op, &mut bits, iters) };
-            continue;
+            break;
         }
         // each iteration advances op[3] by at least 5 bytes
         // SAFETY: `iters` is capped by every stream's `(oend[s] - op[s]) / 10`,
         // so the offset stays inside `out`.
         let olimit = unsafe { op[3].add(iters * 5) };
+
+        // BMI2 tier: run the stretch as the inline-asm loop (the amd64 asm
+        // loop's shape), which exits when op[3] crosses `olimit` — the
+        // reference asm loop's bottom compare. The scalar stretch below
+        // checks the same bound; both consume the same `iters` safety
+        // envelope.
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if super::simd_tier::bmi2() {
+            // SAFETY: bmi2() ran the runtime detection (or a forced tier
+            // asserted it), and `olimit` derives from the same `iters`
+            // bounds the scalar stretch uses, so every access in the block
+            // stays inside the envelope the SAFETY comments below document.
+            unsafe { x2_inner_asm(dt.as_ptr(), &mut ip, &mut op, &mut bits, olimit) };
+            continue;
+        }
 
         loop {
             // Decode 5 lookups in each of the 4 streams, column-major so the
@@ -1201,7 +1351,7 @@ fn decompress_4streams_interleaved_x2_impl(
     // hand the pointer state back to the scalar tail as region/out offsets
     let ip = ip.map(|p| p as usize - base as usize);
     let op = op.map(|p| p as usize - out_base as usize);
-    finish_streams(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
+    finish_streams_x2(table, region, stream_bounds, &seg_end, &ip, &bits, &op, out)?;
 
     Ok(())
 }

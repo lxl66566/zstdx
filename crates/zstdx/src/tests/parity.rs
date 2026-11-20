@@ -287,3 +287,48 @@ fn repeat_modes_with_raw_content_dict_are_rejected() {
     let n = reused.decode_all(&real, &mut out).unwrap();
     assert_eq!(&out[..n], &payload[..], "legal raw-dict frame decodes");
 }
+
+/// A corrupted literals jump table slides the four stream boundaries while
+/// every stream stays >= 8 bytes, so both decoders run their 4-stream X2
+/// interleave and accept the block with full-length garbage output. The
+/// reference hands the loop's window state to `HUF_decodeStreamX2`, whose
+/// double-symbol lookups keep decoding rotations of the frozen floor
+/// window; zstdx used to finish through the single-symbol X1 tail (a pair
+/// lookup consumes both symbols' bits in one step, so the rotation
+/// garbage differs) and its BMI2 asm stretch ran a fixed round count
+/// instead of the reference's op[3] `olimit` compare. Both sides still
+/// accepted, with different bytes from position 245 on. Byte equality
+/// with libzstd on the mutant is the pin, and the legal frame stays
+/// byte-identical on both decoders.
+#[test]
+fn four_stream_jump_table_corruption_matches_libzstd_bytes() {
+    // Deterministic 5-symbol payload, the review harness's generator:
+    // 2600 literals make the cost model pick the X2 table and give every
+    // stream a full 650-byte segment.
+    let mut payload = vec![0u8; 2600];
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    for b in payload.iter_mut() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        *b = ((rng >> 33) as u8) % 5;
+    }
+    let frame = zstd::bulk::compress(&payload, 19).unwrap();
+
+    // The legal frame round-trips identically on both decoders.
+    assert_eq!(zstd::stream::decode_all(frame.as_slice()).unwrap(), payload);
+    assert_eq!(decode(&frame).unwrap(), payload);
+
+    // First byte of the literals jump table: stream 1 shrinks from 195 to
+    // 60 bytes, far enough to run the tail dry mid-segment.
+    let mut mutant = frame.clone();
+    mutant[17] ^= 0xff;
+    let lib = zstd::stream::decode_all(mutant.as_slice()).expect("libzstd accepts the mutant");
+    let ours = decode(&mutant).expect("zstdx accepts the mutant");
+    assert_eq!(lib.len(), payload.len());
+    assert_eq!(ours.len(), payload.len());
+    assert_eq!(
+        lib, ours,
+        "the accepted garbage must match libzstd byte for byte"
+    );
+}
