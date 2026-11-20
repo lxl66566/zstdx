@@ -690,6 +690,30 @@ A Fast strip-prefill retention cap without seed confirmation grew text.fastest b
 
 Shared derived verdicts for the fast-row self-fill's span passes, computing `strip_is_uniform` and the gate probe table once per region and folding per job, were tried as the dll100 wall lever. The uniform scan is about 0 on real data, with jobdecomp `uniform_ns` at 0.02 ms over 40 jobs because AVX-512 early-exits on the first mismatching 64-byte block, and the gate replay's probe table is a last-writer-wins fold over a span-relative segment grid whose job offsets differ, so no byte-exact cross-job derivation exists. The earlier bandwidth-bound framing was wrong twice over: the wall was the gear-scan loop itself at 43.5% of job time, with `gear_feed` at 32.6% of process samples and spilled-checkpoint asm at about 7 uops per byte, and the only shareable quantities, the position-pure split values, are shareable precisely because the gear state forgets everything older than 64 bytes. The landed shape parallelizes the scan per job instead of sharing across jobs, in [matchers](../perf/matchers.md).
 
+### Intra-job software pipelining of parse and entropy emission
+
+The idea deferred block N's entropy emission so its ALU work would fill the memory stalls of block N+1's parse on the single-thread deep rows, whose walks run at IPC 0.54 with one memory latency per step. The R118 span probe was ported to the ST path (job_trace `match_ns` around `start_matching_codes`, `entropy_ns` around `encode_staged_block`, the jobdecomp "stage split" line) and the split measured on the 32 MiB corpus, ST bulk, before any lever build. The premise failed by an order of magnitude: the recorded 10-13 percent entropy share is dll400 l9 MT job time, and ST deep rows are parse-dominated, so the emission the pipeline would hide is under 1 percent of wall on every target cell:
+
+| cell | match ms | entropy ms | wall ms | entropy % |
+|---|---|---|---|---|
+| json l13 | 1308 | 10.6 | 1318 | 0.80 |
+| json l17 | 4239 | 10.0 | 4258 | 0.23 |
+| json l19 | 11540 | 10.1 | 11573 | 0.09 |
+| text l13 | 30.3 | 0.22 | 31.1 | 0.72 |
+| text l17 | 35.5 | 0.20 | 36.5 | 0.55 |
+| text l19 | 77.1 | 0.21 | 78.1 | 0.27 |
+| skewed l13 | 5582 | 35.0 | 5618 | 0.62 |
+| skewed l17 | 9275 | 13.9 | 9289 | 0.15 |
+| skewed l19 | 17379 | 14.6 | 17460 | 0.08 |
+| dll32 l13 | 856 | 7.8 | 864 | 0.90 |
+| dll32 l17 | 1371 | 10.5 | 1401 | 0.75 |
+| dll32 l19 | 2286 | 10.7 | 2315 | 0.46 |
+| dll32 l9 (control) | 172 | 8.9 | 189 | 4.7 |
+
+The residue `wall − match − entropy` is at most a couple of milliseconds, so no unmeasured emission work sits outside `encode_staged_block`. Even a perfect overlap hiding 100 percent of the entropy stage caps below the 3 percent bar on every deep cell, and the l9 control reads 4.7 percent, so the idea is dead before a prototype: no interleave shape converts a sub-percent term into a 3-percent wall win.
+
+Two design-review findings stand for any reopening. First, block-granular interleaving cannot produce the overlap at all: a deferred block's emission is tens of thousands of instructions against a reorder window of a few hundred, so only emission chunks woven into the parse loop's walk steps would fill the stalls, and the tail-of-emit against head-of-parse adjacency the serial order already has is all a block-level reorder ever buys. Second, the deferral is not byte-identical by construction on this tree: the raw-fallback repcode restore and the pre-split savings' `note_block` must complete before block N+1's boundary decision and parse, so an exact deferral needs the fallback verdict — the compressed size — before that parse, which is the emission itself. The `note_literal_costs` feedback is not a blocker: the raw fallback does not roll it back today, so applying it eagerly before block N+1's parse matches the serial order exactly. Killed R119 (2026-11-20) at the span measurement; the probe lives on branch `r119-pipe`.
+
 ## Dictionary-frame rows
 
 ### Chain-hash width on dictionary frames

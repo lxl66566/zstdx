@@ -256,6 +256,18 @@ mod trace {
             s.strip_fill_calls,
             jobs,
         );
+        println!(
+            "  stage split: match {:>8.2} ms ({:4.1}% of job)  entropy {:>8.2} ms ({:4.1}%, \
+             {:>6.2} ms/job over {} blocks)  raw emit {:>7.2} ms ({:4.1}%)",
+            ms(s.match_ns),
+            share(s.match_ns, s.job_ns),
+            ms(s.entropy_ns),
+            share(s.entropy_ns, s.job_ns),
+            ms(s.entropy_ns) / jobs as f64,
+            s.entropy_blocks,
+            ms(s.emit_raw_ns),
+            share(s.emit_raw_ns, s.job_ns),
+        );
     }
 
     fn run_cell(label: &str, raw: &[u8], encode: &mut dyn FnMut() -> Vec<u8>, iters: u32) {
@@ -342,6 +354,10 @@ mod trace {
             wloop_grow_calls,
             wloop_quiesce_ns,
             wloop_quiesce_waits,
+            match_ns,
+            entropy_ns,
+            entropy_blocks,
+            emit_raw_ns,
         } = s;
         acc.jobs += jobs;
         acc.pump_ns += pump_ns;
@@ -390,6 +406,10 @@ mod trace {
         acc.wloop_grow_calls += wloop_grow_calls;
         acc.wloop_quiesce_ns += wloop_quiesce_ns;
         acc.wloop_quiesce_waits += wloop_quiesce_waits;
+        acc.match_ns += match_ns;
+        acc.entropy_ns += entropy_ns;
+        acc.entropy_blocks += entropy_blocks;
+        acc.emit_raw_ns += emit_raw_ns;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {

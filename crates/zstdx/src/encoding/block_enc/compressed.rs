@@ -310,7 +310,11 @@ pub(crate) fn compress_block<M: Matcher>(
     }
     literals_vec.clear();
     seqs.clear();
+    #[cfg(feature = "job_trace")]
+    let trace_match = std::time::Instant::now();
     matcher.start_matching_codes(literals_vec, seqs);
+    #[cfg(feature = "job_trace")]
+    crate::encoding::job_trace::add_match(trace_match);
     #[cfg(debug_assertions)]
     {
         vec_poison::fill(literals_vec);
@@ -376,10 +380,14 @@ pub(crate) fn encode_staged_block<M: Matcher>(
     // the certain outcome. Signalling it here skips the encode-and-discard
     // writes (the block bytes are then copied and hashed exactly once, in
     // the raw writer).
+    #[cfg(feature = "job_trace")]
+    let trace_ent = std::time::Instant::now();
     if zero_seq
         && literals.len() > 1024
         && sampled_gate_rejects(literals, literals_gate_hold, dict_entropy.huff)
     {
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_entropy(trace_ent);
         return BlockOutcome::Raw;
     }
 
@@ -473,6 +481,8 @@ pub(crate) fn encode_staged_block<M: Matcher>(
         }
     }
     writer.flush();
+    #[cfg(feature = "job_trace")]
+    crate::encoding::job_trace::add_entropy(trace_ent);
     BlockOutcome::Encoded(tables)
 }
 

@@ -111,7 +111,11 @@ pub(crate) fn compress_split_block<M: Matcher>(
     }
     lits.clear();
     seqs.clear();
+    #[cfg(feature = "job_trace")]
+    let trace_match = std::time::Instant::now();
     matcher.start_matching_codes(lits, seqs);
+    #[cfg(feature = "job_trace")]
+    crate::encoding::job_trace::add_match(trace_match);
     #[cfg(debug_assertions)]
     {
         vec_poison::fill(lits);

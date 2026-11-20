@@ -138,6 +138,17 @@ pub struct Snapshot {
     /// The quiescence wait inside `make_space` (behind the in-flight jobs).
     pub wloop_quiesce_ns: u64,
     pub wloop_quiesce_waits: u64,
+    /// The match-finding span (`start_matching_codes`): the parse half of
+    /// a block the entropy pipelining probe overlaps against.
+    pub match_ns: u64,
+    /// The entropy/emit span (`encode_staged_block`: literal Huffman, FSE
+    /// table choice and description, sequence bitstreams, the block write).
+    pub entropy_ns: u64,
+    /// Blocks that paid an entropy span.
+    pub entropy_blocks: u64,
+    /// Raw-block emit spans (header plus the copy/hash of incompressible
+    /// blocks; RLE emits four bytes and stays uncounted).
+    pub emit_raw_ns: u64,
 }
 
 macro_rules! counters {
@@ -211,11 +222,34 @@ counters! {
     wloop_grow_calls,
     wloop_quiesce_ns,
     wloop_quiesce_waits,
+    match_ns,
+    entropy_ns,
+    entropy_blocks,
+    emit_raw_ns,
 }
 
 #[inline]
 fn add_ns(field: &AtomicU64, elapsed: std::time::Duration) {
     field.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Record one match-finding span (`start_matching_codes`).
+#[inline]
+pub fn add_match(started: Instant) {
+    add_ns(&C.match_ns, started.elapsed());
+}
+
+/// Record one entropy/emit span (`encode_staged_block`).
+#[inline]
+pub fn add_entropy(started: Instant) {
+    add_ns(&C.entropy_ns, started.elapsed());
+    C.entropy_blocks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one raw-block emit span (header plus copy/hash).
+#[inline]
+pub fn add_emit_raw(started: Instant) {
+    add_ns(&C.emit_raw_ns, started.elapsed());
 }
 
 /// Record one whole caller-thread `write` span (the FFI/enc-feed input

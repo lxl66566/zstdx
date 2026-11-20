@@ -68,7 +68,11 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
         };
         let at = output.len();
         header.serialize(output);
+        #[cfg(feature = "job_trace")]
+        let trace_raw = std::time::Instant::now();
         hasher.raw_out(output, state.matcher.get_last_space(), hashed);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_emit_raw(trace_raw);
         at
     } else {
         // The snapshot carries the job-start gate's remaining count with the
@@ -233,7 +237,11 @@ pub fn compress_fastest<M: Matcher, C: BlockChecksum>(
             };
             // Write the header, then the block (hashing as it goes)
             header.serialize(output);
+            #[cfg(feature = "job_trace")]
+            let trace_raw = std::time::Instant::now();
             hasher.raw_out(output, state.matcher.get_last_space(), hashed);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_emit_raw(trace_raw);
             start
         }
     }
