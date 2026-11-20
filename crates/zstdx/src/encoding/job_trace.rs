@@ -110,6 +110,28 @@ pub struct Snapshot {
     /// lengths — the compare volume the search pays, ST against job.
     pub cmp_calls: u64,
     pub cmp_bytes: u64,
+    /// Whole `write` spans on the caller thread (the FFI/enc-feed shape's
+    /// input path: chunk copies, `make_space` and posting).
+    pub wloop_write_ns: u64,
+    /// The `extend_from_slice` chunk copies inside `write` (the accepted
+    /// single input copy) and their byte volume.
+    pub wloop_chunk_ns: u64,
+    pub wloop_chunk_bytes: u64,
+    /// The `make_space` dead-prefix recycles (`copy_within` of the live
+    /// tail) and their byte volume.
+    pub wloop_recycle_ns: u64,
+    pub wloop_recycle_bytes: u64,
+    pub wloop_recycle_calls: u64,
+    /// The `make_space`/`reserve_decided` growth reallocs and the live
+    /// bytes they copied (`reserve_exact` may serve large grows through
+    /// mremap without a copy — the span then prices the call, the bytes
+    /// the memcpy share).
+    pub wloop_grow_ns: u64,
+    pub wloop_grow_bytes: u64,
+    pub wloop_grow_calls: u64,
+    /// The quiescence wait inside `make_space` (behind the in-flight jobs).
+    pub wloop_quiesce_ns: u64,
+    pub wloop_quiesce_waits: u64,
 }
 
 macro_rules! counters {
@@ -171,11 +193,65 @@ counters! {
     probe_ns,
     cmp_calls,
     cmp_bytes,
+    wloop_write_ns,
+    wloop_chunk_ns,
+    wloop_chunk_bytes,
+    wloop_recycle_ns,
+    wloop_recycle_bytes,
+    wloop_recycle_calls,
+    wloop_grow_ns,
+    wloop_grow_bytes,
+    wloop_grow_calls,
+    wloop_quiesce_ns,
+    wloop_quiesce_waits,
 }
 
 #[inline]
 fn add_ns(field: &AtomicU64, elapsed: std::time::Duration) {
     field.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Record one whole caller-thread `write` span (the FFI/enc-feed input
+/// path).
+#[inline]
+pub fn add_wloop_write(started: Instant) {
+    add_ns(&C.wloop_write_ns, started.elapsed());
+}
+
+/// Record one write-path chunk copy (`extend_from_slice` into the
+/// accumulate buffer) of `bytes` bytes.
+#[inline]
+pub fn add_wloop_chunk(started: Instant, bytes: usize) {
+    add_ns(&C.wloop_chunk_ns, started.elapsed());
+    C.wloop_chunk_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// Record one `make_space` dead-prefix recycle: the `copy_within` moved
+/// `bytes` bytes of live tail.
+#[inline]
+pub fn add_wloop_recycle(started: Instant, bytes: usize) {
+    add_ns(&C.wloop_recycle_ns, started.elapsed());
+    C.wloop_recycle_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    C.wloop_recycle_calls.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one accumulate-buffer growth (`reserve_exact`) that relocated
+/// `bytes` live bytes.
+#[inline]
+pub fn add_wloop_grow(started: Instant, bytes: usize) {
+    add_ns(&C.wloop_grow_ns, started.elapsed());
+    C.wloop_grow_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    C.wloop_grow_calls.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one quiescence wait inside `make_space`.
+#[inline]
+pub fn add_wloop_quiesce(started: Instant) {
+    add_ns(&C.wloop_quiesce_ns, started.elapsed());
+    C.wloop_quiesce_waits.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one completed job span.

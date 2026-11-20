@@ -1064,6 +1064,20 @@ fn mark_done(job: &Job) {
     }
 }
 
+/// Why a drain-side wait returned. The `Poisoned` arm is the load-bearing
+/// distinction: under a published poison the workers stop claiming, so a
+/// queued unclaimed job holds `n_incomplete` above zero forever and the
+/// quiescence-gated drain branches never fire — the caller must route it
+/// through `surface_poison` (the only site that aborts the queue) or its
+/// loop spins on the instant poison return.
+enum WaitOutcome {
+    /// A completion tick, quiescence or shutdown: the caller's own
+    /// predicate is due a re-evaluation.
+    Ticked,
+    /// A worker published a panic payload behind `inner.poison`.
+    Poisoned,
+}
+
 // Independent per-stream flags (checksum, pending probe, emitted header,
 // finished) that clear at different points, not one state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -1568,6 +1582,15 @@ impl MtEncoderCore {
     /// first overrun), before anything is buffered or any job posted — the
     /// error surfaces from the offending write itself, not only at finish.
     pub(crate) fn write(&mut self, data: &[u8]) -> crate::Result<()> {
+        #[cfg(feature = "job_trace")]
+        let w_t0 = std::time::Instant::now();
+        let out = self.write_inner(data);
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_wloop_write(w_t0);
+        out
+    }
+
+    fn write_inner(&mut self, data: &[u8]) -> crate::Result<()> {
         debug_assert!(!self.finished);
         // The owned feed's source is the whole input; no caller may append
         // to it (the zero-copy entry is the only owned-fed core, and it
@@ -1597,7 +1620,11 @@ impl MtEncoderCore {
                 continue;
             }
             let n = space.min(data.len());
+            #[cfg(feature = "job_trace")]
+            let c_t0 = std::time::Instant::now();
             self.buf.extend_from_slice(&data[..n]);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_chunk(c_t0, n);
             data = &data[n..];
             self.pos += n as u64;
             self.post_ready();
@@ -1833,7 +1860,12 @@ impl MtEncoderCore {
                 self.surface_poison();
                 continue;
             }
-            self.wait_progress();
+            if matches!(self.wait_progress(), WaitOutcome::Poisoned) {
+                // Same hole `drain_all` closes: a queued unclaimed job
+                // holds the incomplete count under the poison flag, so the
+                // quiescence branch above never fires.
+                self.surface_poison();
+            }
         }
     }
 
@@ -2186,10 +2218,18 @@ impl MtEncoderCore {
         // aborted task lands done without an outcome, and the unwind
         // resumes below.
         while !keep_job.is_done() {
-            self.wait_donation(&keep_job);
+            if matches!(self.wait_donation(&keep_job), WaitOutcome::Poisoned) {
+                // The queued donation is the same hostage a drain's queued
+                // job is: workers stop claiming under the poison flag, so
+                // the verdict never lands and this wait would spin on the
+                // instant poison return.
+                self.surface_poison();
+            }
         }
         while !shrink_job.is_done() {
-            self.wait_donation(&shrink_job);
+            if matches!(self.wait_donation(&shrink_job), WaitOutcome::Poisoned) {
+                self.surface_poison();
+            }
         }
         let keep = match &keep_job.kind {
             JobKind::DonateKeep { outcome, .. } => outcome.lock().unwrap().take(),
@@ -2634,8 +2674,13 @@ impl MtEncoderCore {
         .min(BUF_CAP_MAX);
         if self.buf.capacity() < want {
             let target = want.max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            let live = self.buf.len();
+            #[cfg(feature = "job_trace")]
+            let g_t0 = std::time::Instant::now();
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_grow(g_t0, live);
             // A realloc copies only the live bytes: the new tail starts
             // uninitialized.
             self.init_len = self.buf.len();
@@ -3477,7 +3522,13 @@ impl MtEncoderCore {
                 self.surface_poison();
                 continue;
             }
-            self.wait_progress();
+            if matches!(self.wait_progress(), WaitOutcome::Poisoned) {
+                // Workers stop claiming under the poison flag, so a queued
+                // job holds the incomplete count forever and neither branch
+                // above can fire — surface here or this loop spins on the
+                // instant poison return.
+                self.surface_poison();
+            }
         }
     }
 
@@ -3487,16 +3538,19 @@ impl MtEncoderCore {
     /// would otherwise fire its notify before this wait parks, leaving the
     /// snapshot already final and the loop sleeping on a condition that
     /// will never change again.
-    fn wait_progress(&self) {
+    fn wait_progress(&self) -> WaitOutcome {
         let mut inner = self.shared.inner.lock().unwrap();
         loop {
-            if inner.poison.is_some() || inner.shutdown {
-                return;
+            if inner.poison.is_some() {
+                return WaitOutcome::Poisoned;
+            }
+            if inner.shutdown {
+                return WaitOutcome::Ticked;
             }
             // Everything completed: the caller's predicate (drain or
             // recycle) is due a re-evaluation regardless of the snapshot.
             if self.shared.n_incomplete.load(Ordering::Acquire) == 0 {
-                return;
+                return WaitOutcome::Ticked;
             }
             let before = self.shared.completed.load(Ordering::Acquire);
             let (guard, _) = self
@@ -3506,7 +3560,7 @@ impl MtEncoderCore {
                 .unwrap();
             inner = guard;
             if self.shared.completed.load(Ordering::Acquire) != before {
-                return;
+                return WaitOutcome::Ticked;
             }
         }
     }
@@ -3519,19 +3573,23 @@ impl MtEncoderCore {
     /// already final and the delta test would sleep on a condition that
     /// never changes again; the done re-check and the bounded timeout keep
     /// the wait correct either way.
-    fn wait_donation(&self, job: &Job) {
+    fn wait_donation(&self, job: &Job) -> WaitOutcome {
         #[cfg(feature = "job_trace")]
         let t0 = std::time::Instant::now();
-        self.wait_donation_inner(job);
+        let outcome = self.wait_donation_inner(job);
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_don_wait(t0);
+        outcome
     }
 
-    fn wait_donation_inner(&self, job: &Job) {
+    fn wait_donation_inner(&self, job: &Job) -> WaitOutcome {
         let mut inner = self.shared.inner.lock().unwrap();
         loop {
-            if inner.poison.is_some() || inner.shutdown || job.is_done() {
-                return;
+            if inner.poison.is_some() {
+                return WaitOutcome::Poisoned;
+            }
+            if inner.shutdown || job.is_done() {
+                return WaitOutcome::Ticked;
             }
             let before = self.shared.completed.load(Ordering::Acquire);
             let (guard, _) = self
@@ -3541,7 +3599,7 @@ impl MtEncoderCore {
                 .unwrap();
             inner = guard;
             if job.is_done() || self.shared.completed.load(Ordering::Acquire) != before {
-                return;
+                return WaitOutcome::Ticked;
             }
         }
     }
@@ -3574,7 +3632,11 @@ impl MtEncoderCore {
             debug_assert!(self.buf.is_empty());
             return;
         }
+        #[cfg(feature = "job_trace")]
+        let q_t0 = std::time::Instant::now();
+        let mut waited = false;
         while !self.quiescent() {
+            waited = true;
             if self.shared.poisoned.load(Ordering::Acquire) {
                 // In-flight jobs still complete under poison; the unwind
                 // resumes from there and never returns here.
@@ -3582,14 +3644,22 @@ impl MtEncoderCore {
             }
             self.wait_progress();
         }
+        #[cfg(feature = "job_trace")]
+        if waited {
+            crate::encoding::job_trace::add_wloop_quiesce(q_t0);
+        }
         let keep = self.movable_lo();
         debug_assert!(self.buf_base <= keep);
         let drop_n = (keep - self.buf_base) as usize;
         if drop_n > 0 {
+            #[cfg(feature = "job_trace")]
+            let r_t0 = std::time::Instant::now();
             self.buf.copy_within(drop_n.., 0);
             let live = self.buf.len() - drop_n;
             self.buf.truncate(live);
             self.buf_base = keep;
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_recycle(r_t0, live);
         }
         if self.buf.len() + want > self.buf.capacity() || self.buf.capacity() < BUF_CAP_MAX {
             // Doubling below the cap at every recycle point: an epoch-sized
@@ -3600,8 +3670,13 @@ impl MtEncoderCore {
             // need.
             let target =
                 (self.buf.len() + want + 64 * 1024).max((self.buf.capacity() * 2).min(BUF_CAP_MAX));
+            let live = self.buf.len();
+            #[cfg(feature = "job_trace")]
+            let g_t0 = std::time::Instant::now();
             self.buf.reserve_exact(target - self.buf.len());
             advise_hugepages(&self.buf);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_wloop_grow(g_t0, live);
             // A realloc copies only the live bytes: the new tail starts
             // uninitialized.
             self.init_len = self.buf.len();
@@ -4551,6 +4626,81 @@ mod tests {
         }));
         let payload = attempt.expect_err("a published poison must resume, not drain as Ok");
         assert_eq!(payload.downcast_ref::<u32>(), Some(&41));
+    }
+
+    /// The drain livelock behind todo 39: a worker panic with another
+    /// posted job still queued keeps `n_incomplete` above zero (workers
+    /// stop claiming under the poison flag), so `drain_all` reaches
+    /// `surface_poison` on neither branch and the poisoned `wait_progress`
+    /// return spins the loop hot. The state is built by hand like the test
+    /// above — the panicking worker's epilogue (publish, own decrement,
+    /// tick) with the second job left unclaimed behind it — and the
+    /// watchdog bounds the drain, so a regression fails the suite instead
+    /// of hanging it.
+    #[test]
+    fn drain_all_surfaces_poison_behind_a_queued_job() {
+        fn queued_job(core: &MtEncoderCore) -> Arc<Job> {
+            Arc::new(Job {
+                level: Level::Fastest,
+                choice: ReachChoice::Keep,
+                shape: InputShape {
+                    len: None,
+                    window_log: None,
+                },
+                dict: None,
+                ldm_mode: crate::LdmMode::Auto,
+                head: None,
+                kind: JobKind::Encode {
+                    // The job never runs; the view only needs a stable
+                    // address for the struct to exist.
+                    src: FrozenSrc::freeze(&core.buf, 0, 0),
+                    first: 0,
+                    last_frame_block: false,
+                    overlap: 0,
+                    ldm: LdmArming::Job,
+                    spf: Mutex::new(JobSpfStream::None),
+                    donation: Mutex::new(None),
+                    out: Mutex::new(None),
+                    done: core::sync::atomic::AtomicBool::new(false),
+                },
+            })
+        }
+        let mut core = MtEncoderCore::new(&EncoderOptions::new(Level::Fastest).workers(1));
+        let claimed = queued_job(&core);
+        let queued = queued_job(&core);
+        // The posts' registration (each post increments before the queue
+        // push, see `post_job`).
+        core.shared.n_incomplete.fetch_add(2, Ordering::Release);
+        core.pending.push_back(claimed.clone());
+        core.pending.push_back(queued.clone());
+        // The claimed job left the queue before the panic; the queued one
+        // never does (workers stop claiming under the poison flag).
+        core.shared
+            .inner
+            .lock()
+            .unwrap()
+            .queue
+            .push_back(queued.clone());
+        // The panicking worker's epilogue from `serve_queue`'s Err arm:
+        // publish (payload, flag, abort the claimed job), decrement its own
+        // count, tick.
+        core.shared
+            .publish_poison(&claimed, alloc::boxed::Box::new(39u32));
+        core.shared.n_incomplete.fetch_sub(1, Ordering::Release);
+        core.shared.completed.fetch_add(1, Ordering::AcqRel);
+        core.shared.progressed.notify_all();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                core.drain_all();
+            }));
+            tx.send(attempt).unwrap();
+        });
+        let attempt = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("drain_all must surface the poison, not spin on the queued job");
+        let payload = attempt.expect_err("a published poison must resume, not drain as Ok");
+        assert_eq!(payload.downcast_ref::<u32>(), Some(&39));
     }
 
     /// The fail-safe arm of the `(poisoned, poison)` table: a set flag with

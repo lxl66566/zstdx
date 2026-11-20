@@ -30,6 +30,30 @@ jobs:
       - run: cargo test --doc --workspace --exclude zstdx-gungraun
       - run: cargo nextest run -p zstdx --no-default-features
 
+  test-os:
+    name: workspace + no-default-features (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS covers the Darwin userland (BSD libc, Mach VM, no /proc) on
+        # arm64; Windows covers the MSVC toolchain and Windows path/IO
+        # semantics. CLI parity tests skip themselves where the reference
+        # zstd binary is absent (Windows).
+        include:
+          - { name: macos, os: macos-latest }
+          - { name: windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --workspace --exclude zstdx-gungraun
+      - run: cargo test --doc --workspace --exclude zstdx-gungraun
+      - run: cargo nextest run -p zstdx --no-default-features
+
   ffi-c:
     name: ffi c harness
     runs-on: ubuntu-latest

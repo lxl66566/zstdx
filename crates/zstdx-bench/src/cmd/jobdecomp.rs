@@ -225,6 +225,22 @@ mod trace {
             ms(s.fin_post_ns),
             ms(s.fin_drain_ns),
         );
+        println!(
+            "  wloop: write {:>8.2} ms  chunk {:>7.2} ms ({:>6.1} MiB)  recycle {:>7.2} ms \
+             ({:>6.1} MiB in {} calls)  grow {:>7.2} ms ({:>6.1} MiB in {})  quiesce {:>7.2} ms \
+             ({} waits)",
+            ms(s.wloop_write_ns),
+            ms(s.wloop_chunk_ns),
+            mib(s.wloop_chunk_bytes),
+            ms(s.wloop_recycle_ns),
+            mib(s.wloop_recycle_bytes),
+            s.wloop_recycle_calls,
+            ms(s.wloop_grow_ns),
+            mib(s.wloop_grow_bytes),
+            s.wloop_grow_calls,
+            ms(s.wloop_quiesce_ns),
+            s.wloop_quiesce_waits,
+        );
         let fixed = s.strip_fill_ns + s.seed_ns + s.reset_ns + s.prefill_ns;
         println!(
             "  per job: fixed {:>7.3} ms of {:>7.3} ms job time ({:4.1}%)  [{} strips / {} jobs]",
@@ -308,6 +324,17 @@ mod trace {
             fin_drain_ns,
             cmp_calls,
             cmp_bytes,
+            wloop_write_ns,
+            wloop_chunk_ns,
+            wloop_chunk_bytes,
+            wloop_recycle_ns,
+            wloop_recycle_bytes,
+            wloop_recycle_calls,
+            wloop_grow_ns,
+            wloop_grow_bytes,
+            wloop_grow_calls,
+            wloop_quiesce_ns,
+            wloop_quiesce_waits,
         } = s;
         acc.jobs += jobs;
         acc.pump_ns += pump_ns;
@@ -344,6 +371,17 @@ mod trace {
         acc.fin_drain_ns += fin_drain_ns;
         acc.cmp_calls += cmp_calls;
         acc.cmp_bytes += cmp_bytes;
+        acc.wloop_write_ns += wloop_write_ns;
+        acc.wloop_chunk_ns += wloop_chunk_ns;
+        acc.wloop_chunk_bytes += wloop_chunk_bytes;
+        acc.wloop_recycle_ns += wloop_recycle_ns;
+        acc.wloop_recycle_bytes += wloop_recycle_bytes;
+        acc.wloop_recycle_calls += wloop_recycle_calls;
+        acc.wloop_grow_ns += wloop_grow_ns;
+        acc.wloop_grow_bytes += wloop_grow_bytes;
+        acc.wloop_grow_calls += wloop_grow_calls;
+        acc.wloop_quiesce_ns += wloop_quiesce_ns;
+        acc.wloop_quiesce_waits += wloop_quiesce_waits;
     }
 
     fn mode_name(mode: DecompMode) -> &'static str {
