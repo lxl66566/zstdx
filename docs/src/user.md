@@ -263,7 +263,7 @@ The `zstdx-cli` binary mirrors the `zstd` command line with flags and no subcomm
 - `--sparse` and `--no-sparse` are rejected with an explicit unsupported error, because output is always dense and sparse decode-to-seek is not implemented.
 - A failed compression or decompression to a file removes the partial output it created, mirroring zstd.
 - On Unix, a multithreaded compression of a regular input file of 1 MiB or more maps the file read-only and feeds the encoder zero-copy, skipping the read pump's input copies. stdin, pipes, small files, `-T1`, `--adapt` and a visible progress bar keep the reader feed. The frame bytes are identical either way.
-- Overwrite prompts read from the controlling terminal at `/dev/tty`, never from piped stdin. Without a terminal, existing outputs are refused unless `-f` is given.
+- Overwrite prompts read from the controlling terminal at `/dev/tty`, never from piped stdin. Without a terminal, existing outputs are refused unless `-f` is given. Windows has no `/dev/tty`, so the prompt always declines there.
 
 ### Patch mode
 

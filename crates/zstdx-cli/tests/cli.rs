@@ -1545,14 +1545,21 @@ fn qq_silences_collection_diagnostics() {
     );
 }
 
-/// `-o` onto a directory is the open failure ("Is a directory"), never
-/// the overwrite-prompt flow.
+/// `-o` onto a directory is the open failure (unix "Is a directory",
+/// Windows "Permission denied" — the CRT texts of EISDIR vs the access
+/// denial a directory create reports there), never the overwrite-prompt
+/// flow.
 #[test]
 fn output_directory_is_an_open_failure() {
     let scratch = Scratch::new("cli", "o-dir");
     let input = scratch.path("data.bin");
     fs::write(&input, b"payload").unwrap();
     let dir = scratch.root().to_str().unwrap();
+    let refused = if cfg!(windows) {
+        "Permission denied"
+    } else {
+        "Is a directory"
+    };
     for force in ["-f", ""] {
         let mut args: Vec<&str> = vec!["-q"];
         if !force.is_empty() {
@@ -1563,7 +1570,7 @@ fn output_directory_is_an_open_failure() {
         assert_eq!(output.status.code(), Some(1), "{force:?}: {output:?}");
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            format!("zstdx: {dir}: Is a directory\n"),
+            format!("zstdx: {dir}: {refused}\n"),
             "{force:?}"
         );
     }

@@ -177,9 +177,25 @@ fn parse_size(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size out of range: {text:?}"))
 }
 
-/// strerror text of an io error: its Display without the `(os error N)`
-/// suffix, matching the C library strings zstd prints.
+/// strerror text of an io error in the CRT vocabulary zstd prints, so
+/// diagnostics stay byte-identical to the reference on every platform.
 fn strerror(err: &io::Error) -> String {
+    // strerror(3) agrees on these texts across glibc and MSVC, while
+    // Rust's Display carries the platform's native phrasing ("The system
+    // cannot find the file specified." on Windows).
+    let crt = match err.kind() {
+        io::ErrorKind::NotFound => Some("No such file or directory"),
+        io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        io::ErrorKind::AlreadyExists => Some("File exists"),
+        io::ErrorKind::IsADirectory => Some("Is a directory"),
+        io::ErrorKind::NotADirectory => Some("Not a directory"),
+        io::ErrorKind::DirectoryNotEmpty => Some("Directory not empty"),
+        _ => None,
+    };
+    if let Some(text) = crt {
+        return text.to_string();
+    }
+    // No CRT equivalent: Display without the `(os error N)` suffix.
     let text = err.to_string();
     match text.find(" (os error") {
         Some(at) => text[..at].to_string(),

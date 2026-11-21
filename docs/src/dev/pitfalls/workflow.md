@@ -366,6 +366,8 @@ Any test whose expectation depends on a test-global's value takes the same mutex
 
 Windows has no `(dev, ino)`; its stat identity is the `BY_HANDLE_FILE_INFORMATION` pair of volume serial number plus 64-bit file index, which only exists on handle-backed metadata. Current std's `fs::metadata` does open the path with backup semantics and calls `GetFileInformationByHandle`, but the std accessors for those two fields are unstable (`windows_by_handle`), so the CLI opens the handle itself (`OpenOptions::access_mode(0)` plus `FILE_FLAG_BACKUP_SEMANTICS`, the same open std's metadata does) and reads the struct through windows-sys. The reference zstd 1.6.0 itself only compares names on Windows, so the identity check there goes beyond upstream to satisfy the shared test suite. `cargo check -p zstdx-cli --all-targets --target x86_64-pc-windows-msvc` compiles the whole graph, which is C-free, and serves as the pre-CI gate for `cfg(windows)` arms.
 
+The same sweep caught a second instance: `strerror` printed Rust's Display text, which on Windows is FormatMessageW phrasing ("The system cannot find the file specified.") while the reference prints CRT strerror(3) texts that agree across glibc and MSVC. Mapping io::ErrorKind back onto the CRT vocabulary keeps the diagnostics byte-identical everywhere, and three of the never-run tests assert exactly those literals.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.
