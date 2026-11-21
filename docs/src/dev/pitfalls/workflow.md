@@ -368,6 +368,10 @@ Windows has no `(dev, ino)`; its stat identity is the `BY_HANDLE_FILE_INFORMATIO
 
 The same sweep caught a second instance: `strerror` printed Rust's Display text, which on Windows is FormatMessageW phrasing ("The system cannot find the file specified.") while the reference prints CRT strerror(3) texts that agree across glibc and MSVC. Mapping io::ErrorKind back onto the CRT vocabulary keeps the diagnostics byte-identical everywhere, and three of the never-run tests assert exactly those literals.
 
+### A literal inBuffer size past its buffer faults by heap layout
+
+`load_dictionary_stage_and_stickiness` aborted on the Windows runner with 0xc0000005 at the first `ZSTD_compressStream2` call, and passed on the dev box and on Linux. The test declared `zin.size = 8192` over a 5096-byte payload; the streaming core ingests the whole declared size (block buffering reads everything before output pressure applies), so the call read 3 KB past the Vec. Whether that lands in mapped memory is pure allocator layout, which is why the same binary faults on one heap and survives on another — a green local run proves nothing for an overread. Every `ZSTD_inBuffer`/`ZSTD_outBuffer` site carries a size derived from its backing buffer (`payload.len().min(chunk)`), and a size literal is worth auditing whenever a test written on one platform first runs on another.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.

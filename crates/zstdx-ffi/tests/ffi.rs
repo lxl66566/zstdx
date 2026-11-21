@@ -1694,7 +1694,7 @@ fn load_dictionary_stage_and_stickiness() {
     let cctx = zstd::ZSTD_createCCtx();
     let mut zin = zstd::ZSTD_inBuffer {
         src: payload.as_ptr().cast(),
-        size: 8192,
+        size: payload.len().min(8192),
         pos: 0,
     };
     let mut small = [0u8; 256];
