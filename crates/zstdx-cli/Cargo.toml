@@ -26,6 +26,10 @@ dict_builder = ["zstdx/dict_builder"]
 # Read-only input mapping for the zero-copy encode feed.
 libc = { version = "0.2", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+# BY_HANDLE_FILE_INFORMATION file identity for the dict=input guard.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dependencies]
 # Used for the command line binary only
 clap               = { version = "4.5.46", features = ["derive"] }

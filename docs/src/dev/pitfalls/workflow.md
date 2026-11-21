@@ -360,6 +360,12 @@ The 2026-11-07 paranoid run failed `opt_feed_arming_caps_at_the_buffer` on the a
 
 Any test whose expectation depends on a test-global's value takes the same mutex the mutating tests use, for its whole body. The mutex exists precisely because the default harness runs tests in parallel threads of one process.
 
+### cfg(unix) stubs silently degrade Windows behavior
+
+`dict_input_is_refused` failed only on the Windows runner, exiting 0 where 1 was owed: the dict=input identity check lived behind `#[cfg(unix)]` as `(dev, ino)` while the `#[cfg(not(unix))]` twin answered `None`, so on Windows the guard degraded to plain path comparison and a hard-linked input passed through. The fallback compiles green on Linux, so local runs can never expose it. CI's nextest fails fast, so the 186 tests after the failure had never run on Windows either, and the whole tail of the suite must be treated as unverified when hunting the next one.
+
+Windows has no `(dev, ino)`; its stat identity is the `BY_HANDLE_FILE_INFORMATION` pair of volume serial number plus 64-bit file index, which only exists on handle-backed metadata. Current std's `fs::metadata` does open the path with backup semantics and calls `GetFileInformationByHandle`, but the std accessors for those two fields are unstable (`windows_by_handle`), so the CLI opens the handle itself (`OpenOptions::access_mode(0)` plus `FILE_FLAG_BACKUP_SEMANTICS`, the same open std's metadata does) and reads the struct through windows-sys. The reference zstd 1.6.0 itself only compares names on Windows, so the identity check there goes beyond upstream to satisfy the shared test suite. `cargo check -p zstdx-cli --all-targets --target x86_64-pc-windows-msvc` compiles the whole graph, which is C-free, and serves as the pre-CI gate for `cfg(windows)` arms.
+
 ## Corpus and reproducibility
 
 - Corpus comparability and cross-session drift pitfalls live in [benchmark methodology](../bench/methodology.md). That covers the text.raw shape transitions and the same-session A/B rule.

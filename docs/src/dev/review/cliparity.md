@@ -22,7 +22,7 @@ A missing dictionary or a missing patch reference matched the message but exited
 
 A pledged-size mismatch now reports `error 11 : Src size is incorrect ` and exits 11. The previous behavior was a long engine-flavored message and exit 1. `Error::PledgedSizeMismatch` maps both error-chain shapes to a code-11 `Diagnostic`.
 
-A compression input that is the dictionary itself is declined per input with `cannot use X as an input file and dictionary `, exit 1: path equality or dev+ino identity (hard links), compression only, exactly fileio.c's UTIL_isSameFileStat guard. Other inputs still process; decode modes have no guard, like zstd.
+A compression input that is the dictionary itself is declined per input with `cannot use X as an input file and dictionary `, exit 1: path equality or stat identity (unix dev+ino, Windows volume serial + file index; hard links match), compression only, after fileio.c's UTIL_isSameFileStat guard. Other inputs still process; decode modes have no guard, like zstd.
 
 Stdin yields its bytes once: a second stdin input cannot rewind the stream, and fileio's read pool answers `error 37 : Read error ` with exit 37 after the first pass wrote its frame. Summary suppression now also keys on an explicit `-` input, which streams to stdout, so `zstdx - -` prints only the error line.
 

@@ -671,42 +671,72 @@ enum Input {
 struct LoadedDict {
     bytes: Vec<u8>,
     path: PathBuf,
-    /// (dev, ino) of the dictionary file: hard links share it, so a
-    /// renamed input still matches.
-    id: Option<(u64, u64)>,
+    /// The dictionary file's identity: hard links share it, so a renamed
+    /// input still matches.
+    id: Option<FileId>,
 }
 
 impl LoadedDict {
     fn new(bytes: Vec<u8>, path: &Path) -> Self {
-        let id = fs::metadata(path).ok().as_ref().and_then(file_id);
         Self {
             bytes,
             path: path.to_path_buf(),
-            id,
+            id: path_file_id(path),
         }
     }
 
     /// Whether an input path is this dictionary: the same path, or the
     /// same file by identity.
     fn is_source(&self, path: &Path) -> bool {
-        path == self.path.as_path()
-            || self
-                .id
-                .is_some_and(|id| fs::metadata(path).ok().as_ref().and_then(file_id) == Some(id))
+        path == self.path.as_path() || self.id.is_some_and(|id| path_file_id(path) == Some(id))
     }
 }
 
-/// The stat identity POSIX compares files by; None where the platform has
-/// no equivalent (path comparison alone remains).
+/// The identity stat compares files by: unix `(dev, ino)`, Windows
+/// `(volume serial, file index)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId(u64, u64);
+
+/// The identity of the file at `path`; None where the platform has no
+/// equivalent (path comparison alone remains).
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)] // the non-unix twin returns None
-fn file_id(meta: &fs::Metadata) -> Option<(u64, u64)> {
+fn path_file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt as _;
-    Some((meta.dev(), meta.ino()))
+    fs::metadata(path)
+        .ok()
+        .map(|meta| FileId(meta.dev(), meta.ino()))
 }
 
-#[cfg(not(unix))]
-fn file_id(_meta: &fs::Metadata) -> Option<(u64, u64)> {
+/// `BY_HANDLE_FILE_INFORMATION` identity, the Windows equivalent of
+/// `(dev, ino)`: the volume serial number plus the 64-bit file index.
+/// Those fields exist only on handle-backed metadata, so open the path
+/// the way std's own `fs::metadata` does (zero access, backup semantics;
+/// no lock is taken).
+#[cfg(windows)]
+fn path_file_id(path: &Path) -> Option<FileId> {
+    use std::os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let info_ptr = &raw mut info;
+    // SAFETY: `file` owns the handle for the call's duration and `info_ptr`
+    // is a valid out-pointer of the declared type.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info_ptr) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some(FileId(u64::from(info.dwVolumeSerialNumber), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_file_id(_path: &Path) -> Option<FileId> {
     None
 }
 
