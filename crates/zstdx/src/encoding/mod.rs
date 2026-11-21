@@ -109,172 +109,6 @@ pub fn compress_to_vec_shaped<R: Read>(
     vec
 }
 
-#[cfg(test)]
-mod tests {
-    use alloc::{string::ToString, vec, vec::Vec};
-
-    use super::{compress_slice_to_vec, compress_to_vec};
-    use crate::Level;
-
-    /// Every numeric level 1-22 must roundtrip through its own parameter
-    /// row, and the ladder's ends must order (level 22 well below level 1).
-    /// Adjacent-level monotonicity is NOT asserted: the dfast→greedy
-    /// transition is genuinely weaker on interleaved random fragments, and
-    /// libzstd's own ladder inverts the same way on this input (its -1
-    /// output is 10% smaller than its -5).
-    #[test]
-    fn full_ladder_roundtrip() {
-        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rand = move || {
-            pseudo_random ^= pseudo_random << 13;
-            pseudo_random ^= pseudo_random >> 7;
-            pseudo_random ^= pseudo_random << 17;
-            pseudo_random
-        };
-        let mut input: Vec<u8> = Vec::new();
-        let mut fragment = alloc::string::String::new();
-        for i in 0..2000u32 {
-            use core::fmt::Write;
-            fragment.clear();
-            let _ = writeln!(fragment, "level-ladder row {i} alpha beta gamma");
-            input.extend_from_slice(fragment.as_bytes());
-            input.extend_from_slice(&rand().to_le_bytes());
-        }
-        input.extend((0..4096u32).map(|i| (i % 61) as u8));
-        let bottom = compress_slice_to_vec(&input, Level::Fastest).len();
-        let mut top = usize::MAX;
-        for lvl in 1..=22 {
-            let level = Level::from_zstd(lvl);
-            let compressed = compress_slice_to_vec(&input, level);
-            let decompressed = crate::bulk::decompress(&compressed, input.len()).unwrap();
-            assert_eq!(decompressed, input, "roundtrip failed at level {lvl}");
-            top = compressed.len();
-        }
-        assert!(
-            top * 6 < bottom * 5,
-            "level 22 ({top}) must beat level 1 ({bottom})"
-        );
-    }
-
-    /// The pre-split detector must keep the slice and Read-stream paths
-    /// byte-identical on heterogeneous content that actually triggers
-    /// cuts (dll-shaped: interleaved byte-code, text-ish and structured
-    /// binary phases), at levels from both detector families.
-    #[test]
-    fn pre_split_paths_stay_identical() {
-        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rand = move || {
-            pseudo_random ^= pseudo_random << 13;
-            pseudo_random ^= pseudo_random >> 7;
-            pseudo_random ^= pseudo_random << 17;
-            pseudo_random
-        };
-        let mut input: Vec<u8> = Vec::with_capacity(1600 * 1024);
-        while input.len() < 1600 * 1024 {
-            let phase = (input.len() / (128 * 1024)) % 3;
-            match phase {
-                // Byte-code-ish: wide alphabet over random u64s.
-                0 => input.extend_from_slice(&rand().to_le_bytes()),
-                // Text-ish: a fixed template plus drifting digits.
-                1 => {
-                    input.extend_from_slice(b"{\"k\":1234567890,\"v\":[1,2,3,4,5]}\n");
-                    input.extend_from_slice((rand() % 100).to_string().as_bytes());
-                },
-                // Structured binary: length-prefixed random runs.
-                _ => {
-                    let n = 8 + (rand() % 24) as usize;
-                    input.push(n as u8);
-                    input.extend((0..n).map(|_| (rand() & 0xff) as u8));
-                },
-            }
-        }
-        for level in [Level::Fastest, Level::Fast, Level::Balanced] {
-            let sliced = compress_slice_to_vec(&input, level);
-            let read_streamed = super::compress_to_vec_shaped(
-                input.as_slice(),
-                level,
-                crate::InputShape::default().with_len(input.len() as u64),
-            );
-            assert_eq!(
-                sliced,
-                read_streamed,
-                "slice vs Read stream at {level:?} ({} bytes)",
-                input.len()
-            );
-            let decoded = crate::bulk::decompress(&sliced, input.len()).unwrap();
-            assert_eq!(decoded, input, "roundtrip at {level:?}");
-        }
-    }
-
-    /// The slice path (borrowed matcher window, no staging) must produce the
-    /// same bytes as the streaming path for every input shape: empty, tiny,
-    /// block-boundary straddling, window-crossing, RLE and incompressible.
-    #[test]
-    fn slice_path_matches_stream_path() {
-        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rand = move || {
-            pseudo_random ^= pseudo_random << 13;
-            pseudo_random ^= pseudo_random >> 7;
-            pseudo_random ^= pseudo_random << 17;
-            pseudo_random
-        };
-        let mut inputs: Vec<Vec<u8>> = vec![
-            vec![],
-            vec![1],
-            vec![7u8; 5],
-            vec![b'x'; 300 * 1024],
-            (0..130 * 1024).map(|_| (rand() & 0xff) as u8).collect(),
-            (0..900 * 1024)
-                .flat_map(|i| [(i % 251) as u8, 7u8, 7, 7, (i % 13) as u8, 9])
-                .collect(),
-        ];
-        // Straddle block and window boundaries exactly.
-        for len in [128 * 1024, 128 * 1024 + 1, 128 * 1024 - 1, 900 * 1024 + 7] {
-            inputs.push((0..len).map(|i| (i % 61) as u8).collect());
-        }
-        for input in &inputs {
-            // Both streaming legs close at EOF — the exact-length hint is
-            // non-binding (`InputShape::len`) and never certifies the
-            // final block — so a grid-exact length closes with the empty
-            // last block (3 bytes) where the slice path marks the real
-            // final block: identical content, one documented frame shape
-            // apart.
-            let grid_exact = !input.is_empty() && input.len().is_multiple_of(128 * 1024);
-            let sliced = compress_slice_to_vec(input, Level::Fastest);
-            let shaped = super::compress_to_vec_shaped(
-                input.as_slice(),
-                Level::Fastest,
-                crate::InputShape::default().with_len(input.len() as u64),
-            );
-            if grid_exact {
-                assert_eq!(shaped.len(), sliced.len() + 3, "shaped len {}", input.len());
-                assert_eq!(
-                    crate::bulk::decompress(&shaped, input.len()).unwrap(),
-                    *input
-                );
-            } else {
-                assert_eq!(shaped, sliced, "shaped mismatch at len {}", input.len());
-            }
-            let sliced = compress_slice_to_vec(input, Level::Uncompressed);
-            let streamed = compress_to_vec(input.as_slice(), Level::Uncompressed);
-            if grid_exact {
-                assert_eq!(streamed.len(), sliced.len() + 3, "len {}", input.len());
-                assert_eq!(
-                    crate::bulk::decompress(&streamed, input.len()).unwrap(),
-                    *input
-                );
-            } else {
-                assert_eq!(
-                    sliced,
-                    streamed,
-                    "uncompressed mismatch at len {}",
-                    input.len()
-                );
-            }
-        }
-    }
-}
-
 /// A sequence as emitted into the encoder's collection buffers by
 /// [`Matcher::start_matching_into`]: literal length, match length and the
 /// wire-format offset (1..=3 select a repeated offset, larger values encode
@@ -588,4 +422,170 @@ pub enum Sequence<'data> {
     ///
     /// These literals will just be copied at the end of the sequence execution by the decoder
     Literals { literals: &'data [u8] },
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{string::ToString, vec, vec::Vec};
+
+    use super::{compress_slice_to_vec, compress_to_vec};
+    use crate::Level;
+
+    /// Every numeric level 1-22 must roundtrip through its own parameter
+    /// row, and the ladder's ends must order (level 22 well below level 1).
+    /// Adjacent-level monotonicity is NOT asserted: the dfast→greedy
+    /// transition is genuinely weaker on interleaved random fragments, and
+    /// libzstd's own ladder inverts the same way on this input (its -1
+    /// output is 10% smaller than its -5).
+    #[test]
+    fn full_ladder_roundtrip() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut input: Vec<u8> = Vec::new();
+        let mut fragment = alloc::string::String::new();
+        for i in 0..2000u32 {
+            use core::fmt::Write;
+            fragment.clear();
+            let _ = writeln!(fragment, "level-ladder row {i} alpha beta gamma");
+            input.extend_from_slice(fragment.as_bytes());
+            input.extend_from_slice(&rand().to_le_bytes());
+        }
+        input.extend((0..4096u32).map(|i| (i % 61) as u8));
+        let bottom = compress_slice_to_vec(&input, Level::Fastest).len();
+        let mut top = usize::MAX;
+        for lvl in 1..=22 {
+            let level = Level::from_zstd(lvl);
+            let compressed = compress_slice_to_vec(&input, level);
+            let decompressed = crate::bulk::decompress(&compressed, input.len()).unwrap();
+            assert_eq!(decompressed, input, "roundtrip failed at level {lvl}");
+            top = compressed.len();
+        }
+        assert!(
+            top * 6 < bottom * 5,
+            "level 22 ({top}) must beat level 1 ({bottom})"
+        );
+    }
+
+    /// The pre-split detector must keep the slice and Read-stream paths
+    /// byte-identical on heterogeneous content that actually triggers
+    /// cuts (dll-shaped: interleaved byte-code, text-ish and structured
+    /// binary phases), at levels from both detector families.
+    #[test]
+    fn pre_split_paths_stay_identical() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut input: Vec<u8> = Vec::with_capacity(1600 * 1024);
+        while input.len() < 1600 * 1024 {
+            let phase = (input.len() / (128 * 1024)) % 3;
+            match phase {
+                // Byte-code-ish: wide alphabet over random u64s.
+                0 => input.extend_from_slice(&rand().to_le_bytes()),
+                // Text-ish: a fixed template plus drifting digits.
+                1 => {
+                    input.extend_from_slice(b"{\"k\":1234567890,\"v\":[1,2,3,4,5]}\n");
+                    input.extend_from_slice((rand() % 100).to_string().as_bytes());
+                },
+                // Structured binary: length-prefixed random runs.
+                _ => {
+                    let n = 8 + (rand() % 24) as usize;
+                    input.push(n as u8);
+                    input.extend((0..n).map(|_| (rand() & 0xff) as u8));
+                },
+            }
+        }
+        for level in [Level::Fastest, Level::Fast, Level::Balanced] {
+            let sliced = compress_slice_to_vec(&input, level);
+            let read_streamed = super::compress_to_vec_shaped(
+                input.as_slice(),
+                level,
+                crate::InputShape::default().with_len(input.len() as u64),
+            );
+            assert_eq!(
+                sliced,
+                read_streamed,
+                "slice vs Read stream at {level:?} ({} bytes)",
+                input.len()
+            );
+            let decoded = crate::bulk::decompress(&sliced, input.len()).unwrap();
+            assert_eq!(decoded, input, "roundtrip at {level:?}");
+        }
+    }
+
+    /// The slice path (borrowed matcher window, no staging) must produce the
+    /// same bytes as the streaming path for every input shape: empty, tiny,
+    /// block-boundary straddling, window-crossing, RLE and incompressible.
+    #[test]
+    fn slice_path_matches_stream_path() {
+        let mut pseudo_random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            pseudo_random ^= pseudo_random << 13;
+            pseudo_random ^= pseudo_random >> 7;
+            pseudo_random ^= pseudo_random << 17;
+            pseudo_random
+        };
+        let mut inputs: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![1],
+            vec![7u8; 5],
+            vec![b'x'; 300 * 1024],
+            (0..130 * 1024).map(|_| (rand() & 0xff) as u8).collect(),
+            (0..900 * 1024)
+                .flat_map(|i| [(i % 251) as u8, 7u8, 7, 7, (i % 13) as u8, 9])
+                .collect(),
+        ];
+        // Straddle block and window boundaries exactly.
+        for len in [128 * 1024, 128 * 1024 + 1, 128 * 1024 - 1, 900 * 1024 + 7] {
+            inputs.push((0..len).map(|i| (i % 61) as u8).collect());
+        }
+        for input in &inputs {
+            // Both streaming legs close at EOF — the exact-length hint is
+            // non-binding (`InputShape::len`) and never certifies the
+            // final block — so a grid-exact length closes with the empty
+            // last block (3 bytes) where the slice path marks the real
+            // final block: identical content, one documented frame shape
+            // apart.
+            let grid_exact = !input.is_empty() && input.len().is_multiple_of(128 * 1024);
+            let sliced = compress_slice_to_vec(input, Level::Fastest);
+            let shaped = super::compress_to_vec_shaped(
+                input.as_slice(),
+                Level::Fastest,
+                crate::InputShape::default().with_len(input.len() as u64),
+            );
+            if grid_exact {
+                assert_eq!(shaped.len(), sliced.len() + 3, "shaped len {}", input.len());
+                assert_eq!(
+                    crate::bulk::decompress(&shaped, input.len()).unwrap(),
+                    *input
+                );
+            } else {
+                assert_eq!(shaped, sliced, "shaped mismatch at len {}", input.len());
+            }
+            let sliced = compress_slice_to_vec(input, Level::Uncompressed);
+            let streamed = compress_to_vec(input.as_slice(), Level::Uncompressed);
+            if grid_exact {
+                assert_eq!(streamed.len(), sliced.len() + 3, "len {}", input.len());
+                assert_eq!(
+                    crate::bulk::decompress(&streamed, input.len()).unwrap(),
+                    *input
+                );
+            } else {
+                assert_eq!(
+                    sliced,
+                    streamed,
+                    "uncompressed mismatch at len {}",
+                    input.len()
+                );
+            }
+        }
+    }
 }

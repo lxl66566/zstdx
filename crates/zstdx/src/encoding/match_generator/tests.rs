@@ -1381,25 +1381,25 @@ fn gate_probe_backward_replay_matches_forward() {
         }
         probe
     }
-    let mut d = MatchGeneratorDriver::new_direct();
-    d.reset(crate::Level::Balanced);
+    let mut driver = MatchGeneratorDriver::new_direct();
+    driver.reset(crate::Level::Balanced);
     // Warm the table so the sub-GATE_MIN_BLOCK early return keeps the
     // allocated probe (the pooled-matcher shape the empty-strip guard
     // exists for); the replay clears it on entry, so the forward reference
     // always starts from zeros.
     let warm: Vec<u8> = (0..super::GATE_MIN_BLOCK + 8).map(|i| i as u8).collect();
-    d.seed_gate_probe(&warm, false);
-    assert_eq!(d.probe.len(), 1 << super::GATE_PROBE_LOG);
+    driver.seed_gate_probe(&warm, false);
+    assert_eq!(driver.probe.len(), 1 << super::GATE_PROBE_LOG);
 
-    let mut s = 0x0123_4567_89ab_cdefu64;
+    let mut state = 0x0123_4567_89ab_cdefu64;
     let mut rng = move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
     };
     let motif: Vec<u8> = (0..97).map(|_| (rng() & 0xff) as u8).collect();
-    let block = d.block_size();
+    let block = driver.block_size();
     let mut cases: Vec<Vec<u8>> = Vec::new();
     let mut push = |n: usize, cases: &mut Vec<Vec<u8>>, periodic: bool| {
         let data: Vec<u8> = if periodic {
@@ -1427,18 +1427,18 @@ fn gate_probe_backward_replay_matches_forward() {
     // The warm-table second replay.
     push(block + 700, &mut cases, false);
     for data in &cases {
-        d.seed_gate_probe(data, false);
+        driver.seed_gate_probe(data, false);
         assert_eq!(
-            d.probe,
-            forward(&d, data),
+            driver.probe,
+            forward(&driver, data),
             "gate replay table at len {}",
             data.len()
         );
     }
 
     // The early-stop shape, planted: every sample-grid position (forward
-    // order, index k) carries an 8-byte value whose hash lands in slot
-    // k % 32K. Each value is the wanted hash multiplied by GATE_HASH_MUL's
+    // order, sample index) carries an 8-byte value whose hash lands in slot
+    // sample % 32K. Each value is the wanted hash multiplied by GATE_HASH_MUL's
     // modular inverse, so the planting is exact without brute force. The
     // backward walk then decides the last undecided slot at exactly its
     // 32,768th visit, mid-strip, and the equality above is the stop's
@@ -1460,33 +1460,37 @@ fn gate_probe_backward_replay_matches_forward() {
     for _ in 0..6 {
         inv = inv.wrapping_mul(2u64.wrapping_sub(super::GATE_HASH_MUL.wrapping_mul(inv)));
     }
-    let mut k = 0usize;
+    let mut sample = 0usize;
     for seg in 0..segs {
         let off = seg * block;
-        let mut i = off;
-        while i + super::HASH_READ <= off + block {
-            let slot = k % slots;
-            // Top bits name the slot; the k-keyed low bits keep the tags
-            // distinct per sample ((k << 20) stays under the slot field:
-            // k < 2^16).
-            let h = ((slot as u64) << slot_shift) | ((k as u64) << 20) | slot as u64;
-            let v = h.wrapping_mul(inv);
+        let mut cursor = off;
+        while cursor + super::HASH_READ <= off + block {
+            let slot = sample % slots;
+            // Top bits name the slot; the sample-keyed low bits keep the tags
+            // distinct per sample ((sample << 20) stays under the slot field:
+            // sample < 2^16).
+            let hash = ((slot as u64) << slot_shift) | ((sample as u64) << 20) | slot as u64;
+            let value = hash.wrapping_mul(inv);
             assert_eq!(
-                (v.wrapping_mul(super::GATE_HASH_MUL) >> slot_shift) as usize,
+                (value.wrapping_mul(super::GATE_HASH_MUL) >> slot_shift) as usize,
                 slot,
-                "planted sample {k} missed its slot"
+                "planted sample {sample} missed its slot"
             );
-            data[i..i + super::HASH_READ].copy_from_slice(&v.to_le_bytes());
-            i += stride;
-            k += 1;
+            data[cursor..cursor + super::HASH_READ].copy_from_slice(&value.to_le_bytes());
+            cursor += stride;
+            sample += 1;
         }
     }
     // The stop lands at forward sample n - 32K with at least two whole
     // segments of planted samples below it, so the fired break skips real
     // enumerated territory.
-    assert!(k >= slots + 2 * per_seg && (k - slots) * stride > 2 * block);
-    d.seed_gate_probe(&data, false);
-    assert_eq!(d.probe, forward(&d, &data), "planted early-stop table");
+    assert!(sample >= slots + 2 * per_seg && (sample - slots) * stride > 2 * block);
+    driver.seed_gate_probe(&data, false);
+    assert_eq!(
+        driver.probe,
+        forward(&driver, &data),
+        "planted early-stop table"
+    );
 }
 
 /// The x86-64 `extend_match` runs a hand-written two-copy loop entered

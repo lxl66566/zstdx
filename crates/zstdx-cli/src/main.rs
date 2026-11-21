@@ -1,3 +1,7 @@
+// clap's derive expands to parser paths holding Cli-sized temporaries on the
+// stack; the lint fires at the derive span, where item-level allows do not
+// reach, and a one-shot CLI entry point can afford the frames.
+#![allow(clippy::large_unopt_stack_frames)]
 extern crate zstdx;
 mod adapt;
 mod bench;
@@ -1736,7 +1740,7 @@ fn process(
                 Ok(written) => written,
                 Err(err) => {
                     let mapped = decode_failure_lines(input, read_bytes.get(), err.as_ref())
-                        .map_or_else(|| err, |lines| Diagnostic::plain(lines).into());
+                        .map_or(err, |lines| Diagnostic::plain(lines).into());
                     return Err(mapped);
                 },
             }

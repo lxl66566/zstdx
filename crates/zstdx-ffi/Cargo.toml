@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.89"
 description  = "libzstd-compatible C ABI (drop-in `libzstd`) over the zstdx codec"
 readme       = "../../README.md"
-homepage     = "https://github.com/lxl66566/zstdx"
 repository   = "https://github.com/lxl66566/zstdx"
 license      = "MIT"
 keywords     = ["compression", "zstandard", "zstd", "ffi", "bindings"]

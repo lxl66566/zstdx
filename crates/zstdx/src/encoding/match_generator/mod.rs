@@ -1057,6 +1057,8 @@ impl MatchGeneratorDriver {
 
     /// The row's clamped match window: what the trait's `window_size`
     /// returns for a live driver at this level and shape.
+    // Only the std-gated mt module's geometry helpers read it.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn window_size_for(level: Level, shape: InputShape) -> u64 {
         params_for(level, shape).window as u64
     }
@@ -1822,7 +1824,7 @@ impl MatchGeneratorDriver {
                 BalancedStore::RowHead => StoreTag::RowHead,
             },
             small_src_row_stock: self.small_src_row == SmallSrcRow::Stock,
-            ldm: self.ldm.as_ref().map(|l| l.cfg_snapshot()),
+            ldm: self.ldm.as_ref().map(LdmState::cfg_snapshot),
             rep_pending: self.rep_pending,
             seed_offset: self.seed_offset,
         }

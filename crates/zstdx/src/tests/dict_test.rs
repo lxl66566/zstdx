@@ -1425,8 +1425,9 @@ fn dict_opt_rows_stay_in_the_reference_class() {
 #[cfg(feature = "std")]
 #[test]
 fn dictionary_absurd_hint_saturates_the_shape_fold() {
-    let _mem = heavy_mem(HeavyMem::Mid);
     use alloc::vec::Vec;
+
+    let _mem = heavy_mem(HeavyMem::Mid);
 
     let dict: Vec<u8> = (0..4 * 1024u32).map(|i| (i % 251) as u8).collect();
     let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();

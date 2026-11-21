@@ -296,8 +296,9 @@ fn decode_from_to_leaves_trailing_bytes() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming() {
-    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read;
+
+    let _mem = heavy_mem(HeavyMem::Mid);
 
     let Some(compressed) = fixture_bytes("./decodecorpus_files/z000088.zst") else {
         return;
@@ -685,10 +686,11 @@ fn test_large_window_rejected_on_first_and_later_frames() {
 #[test]
 #[cfg(feature = "std")]
 fn test_streaming_decoder_max_window_size() {
-    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read;
 
     use crate::decoding::{StreamingDecoder, errors::FrameDecoderError};
+
+    let _mem = heavy_mem(HeavyMem::Mid);
 
     let compressed = include_bytes!("../../test_fixtures/window_256mib.zst");
     let expected = window_128_and_256mib_plaintext();
@@ -1066,8 +1068,9 @@ fn long_distance_matching_disable_overrides_auto_arming() {
 #[cfg(feature = "std")]
 #[test]
 fn forced_window_caps_the_far_class_lift() {
-    let _mem = heavy_mem(HeavyMem::Mid);
     use crate::io::Write as _;
+
+    let _mem = heavy_mem(HeavyMem::Mid);
     // The far-class mt fixture (32 MiB): its 768 KiB-period opening pair
     // clears the screen's cheap-reject gate (twins inside the first MiB)
     // and its tiled body the accept bar (the auto twins' 1<<26 headers

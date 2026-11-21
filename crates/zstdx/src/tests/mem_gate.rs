@@ -29,6 +29,8 @@ const SHARES: u32 = 4;
 /// paranoid profile (the table lives in docs/src/dev/testing.md).
 pub(crate) enum HeavyMem {
     /// Past 400 MiB: the whole gate.
+    // Every cap-scale test rides the std-gated mt/stream suites.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     CapScale,
     /// 100-400 MiB: one share.
     Mid,

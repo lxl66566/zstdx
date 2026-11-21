@@ -7,12 +7,16 @@
 //! sits, which offset bands the missed matches come from, and whether
 //! any of it is boundary-localized.
 
-use std::{fs, path::PathBuf};
+#[cfg(feature = "seq_dump")]
+use std::fs;
+use std::path::PathBuf;
 
+#[cfg(feature = "seq_dump")]
 use zstdx::Level;
 
 /// Executed sequence as the decoder logged it: absolute match position,
 /// match length, resolved offset.
+#[cfg(feature = "seq_dump")]
 type Exec = (u64, u32, u64);
 
 #[derive(clap::Args)]
@@ -38,10 +42,12 @@ pub struct Args {
 }
 
 /// Bitmap of matched output positions, one bit per byte.
+#[cfg(any(feature = "seq_dump", test))]
 struct Cov {
     words: Vec<u64>,
 }
 
+#[cfg(any(feature = "seq_dump", test))]
 impl Cov {
     fn new(len: u64) -> Self {
         Cov {
@@ -111,17 +117,18 @@ impl Cov {
     }
 
     /// First position in `[from, to)` where the two maps disagree.
-    fn first_diff(a: &Cov, b: &Cov, from: u64, to: u64) -> Option<u64> {
-        let mut i = from;
-        while i < to {
-            let w = (i / 64) as usize;
-            let x = (a.words[w] ^ b.words[w]) << (i % 64);
-            if x == 0 {
-                i = (w as u64 + 1) * 64;
+    #[cfg(feature = "seq_dump")]
+    fn first_diff(map_a: &Cov, map_b: &Cov, from: u64, to: u64) -> Option<u64> {
+        let mut bit = from;
+        while bit < to {
+            let word = (bit / 64) as usize;
+            let diff_word = (map_a.words[word] ^ map_b.words[word]) << (bit % 64);
+            if diff_word == 0 {
+                bit = (word as u64 + 1) * 64;
                 continue;
             }
-            let p = i + x.trailing_zeros() as u64;
-            return (p < to).then_some(p);
+            let diff_pos = bit + diff_word.trailing_zeros() as u64;
+            return (diff_pos < to).then_some(diff_pos);
         }
         None
     }
@@ -134,6 +141,7 @@ impl Cov {
 /// empty on stock frames where overlap == strip), 3 the frame window
 /// below the adopted history (far machinery territory for both parses),
 /// 4 below the frame window (neither parse can reach).
+#[cfg(feature = "seq_dump")]
 fn domain_idx(src: u64, pos: u64, job_start: u64, strip: u64, overlap: u64, window: u64) -> usize {
     if src >= job_start {
         0
@@ -148,14 +156,17 @@ fn domain_idx(src: u64, pos: u64, job_start: u64, strip: u64, overlap: u64, wind
     }
 }
 
+#[cfg(feature = "seq_dump")]
 const OFF_BINS: usize = 30;
 
+#[cfg(any(feature = "seq_dump", feature = "cfg_dump"))]
 fn mib(v: u64) -> String {
     format!("{:.2} MiB", v as f64 / 1048576.0)
 }
 
 /// Compact byte count for histogram cells: MiB at field scale, raw
 /// bytes below.
+#[cfg(feature = "seq_dump")]
 fn fb(v: u64) -> String {
     if v >= 1024 * 1024 {
         mib(v)
@@ -164,6 +175,7 @@ fn fb(v: u64) -> String {
     }
 }
 
+#[cfg(feature = "seq_dump")]
 fn off_bin(off: u64) -> usize {
     off.ilog2() as usize
 }
@@ -275,7 +287,7 @@ fn analyze(
     overlap: u64,
     window: u64,
 ) -> Cell {
-    let mut c = Cell {
+    let mut cell = Cell {
         def_bins: [0; OFF_BINS],
         gain_bins: [0; OFF_BINS],
         def_domain: [0; 5],
@@ -289,24 +301,22 @@ fn analyze(
         def_exact: std::collections::HashMap::new(),
     };
     // Common-start ml comparison: both logs are strictly position-ordered.
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < st.len() && j < mt.len() {
-        match st[i].0.cmp(&mt[j].0) {
+    let (mut st_idx, mut mt_idx) = (0usize, 0usize);
+    while st_idx < st.len() && mt_idx < mt.len() {
+        match st[st_idx].0.cmp(&mt[mt_idx].0) {
             std::cmp::Ordering::Equal => {
-                let d = i64::from(st[i].1) - i64::from(mt[j].1);
-                if d == 0 {
-                    c.ml_eq += 1;
-                } else if d > 0 {
-                    c.ml_st_longer += 1;
-                } else {
-                    c.ml_mt_longer += 1;
+                let d = i64::from(st[st_idx].1) - i64::from(mt[mt_idx].1);
+                match d.cmp(&0) {
+                    std::cmp::Ordering::Equal => cell.ml_eq += 1,
+                    std::cmp::Ordering::Greater => cell.ml_st_longer += 1,
+                    std::cmp::Ordering::Less => cell.ml_mt_longer += 1,
                 }
-                c.ml_sum_st_minus_mt += d;
-                i += 1;
-                j += 1;
+                cell.ml_sum_st_minus_mt += d;
+                st_idx += 1;
+                mt_idx += 1;
             },
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Less => st_idx += 1,
+            std::cmp::Ordering::Greater => mt_idx += 1,
         }
     }
     // Deficit/gain attribution per sequence.
@@ -317,32 +327,32 @@ fn analyze(
         let bin = off_bin(off.min((1 << OFF_BINS as u64) - 1));
         let def = Cov::count_def(cov_st, cov_mt, pos, pos + ml as u64);
         if def > 0 {
-            c.def_bins[bin] += def;
-            c.def_domain[dom] += def;
+            cell.def_bins[bin] += def;
+            cell.def_domain[dom] += def;
             if mt.binary_search_by(|probe| probe.0.cmp(&pos)).is_ok() {
-                c.def_matched_start += def;
+                cell.def_matched_start += def;
             } else {
-                c.def_missed_start += def;
+                cell.def_missed_start += def;
             }
-            *c.def_exact.entry(off).or_default() += def;
+            *cell.def_exact.entry(off).or_default() += def;
         }
     }
     for &(pos, ml, off) in mt {
         let bin = off_bin(off.min((1 << OFF_BINS as u64) - 1));
         let gain = Cov::count_def(cov_mt, cov_st, pos, pos + ml as u64);
         if gain > 0 {
-            c.gain_bins[bin] += gain;
+            cell.gain_bins[bin] += gain;
         }
     }
     // Per-job first divergence (jobs >= 1: job 0 shares the frame head
     // with ST).
-    for k in 1..n_jobs {
-        let ks = k * job_size;
-        let ke = ((k + 1) * job_size).min(len);
+    for job in 1..n_jobs {
+        let ks = job * job_size;
+        let ke = ((job + 1) * job_size).min(len);
         match Cov::first_diff(cov_st, cov_mt, ks, ke) {
-            None => c.first_div[6] += 1,
-            Some(p) => {
-                let b = match p - ks {
+            None => cell.first_div[6] += 1,
+            Some(div_pos) => {
+                let div_bin = match div_pos - ks {
                     0..=63 => 0,
                     64..=511 => 1,
                     512..=4095 => 2,
@@ -350,11 +360,11 @@ fn analyze(
                     65536..=1_048_575 => 4,
                     _ => 5,
                 };
-                c.first_div[b] += 1;
+                cell.first_div[div_bin] += 1;
             },
         }
     }
-    c
+    cell
 }
 
 #[cfg(feature = "seq_dump")]
@@ -527,6 +537,8 @@ fn run_cell(
     println!();
 
     if let Some(dir) = dump_dir {
+        use std::fmt::Write as _;
+
         let stem = input.rsplit('/').next().unwrap_or("input");
         let name = format!("{}/{stem}-l{level_num}-w{workers}.tsv", dir.display());
         let mut tsv =
@@ -554,12 +566,15 @@ fn run_cell(
                 mi += 1;
             }
             let gain = Cov::count_def(&cov_mt, cov_st, ks, ke);
-            tsv.push_str(&format!(
-                "{k}\t{ks}\t{st_n}\t{mt_n}\t{:.2}\t{:.2}\t{}\t{gain}\n",
+            write!(
+                tsv,
+                "{k}\t{ks}\t{st_n}\t{mt_n}\t{:.2}\t{:.2}\t{}\t{gain}",
                 st_ml as f64 / st_n.max(1) as f64,
                 mt_ml as f64 / mt_n.max(1) as f64,
                 per_job_def[k as usize],
-            ));
+            )
+            .unwrap();
+            tsv.push('\n');
         }
         fs::write(name, tsv).expect("write tsv");
     }

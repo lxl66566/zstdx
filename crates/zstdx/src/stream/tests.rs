@@ -2138,8 +2138,8 @@ mod mt {
     /// and stays worker-independent and run-to-run deterministic.
     #[test]
     fn fast_row_fullband_stream_capture_self_fills_midstream_jobs() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let total = 76 * MIB;
         let unit_len = 5 * MIB;
         let mut unit = lcg(unit_len);
@@ -3466,8 +3466,8 @@ mod mt_dict {
     /// chunking and the worker count.
     #[test]
     fn deep_rows_windowed_ldm_pledged_stream_matches_bulk() {
-        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::Mid);
         let total = 17 * MIB + 123 * 1024;
         let unit_len = 5 * MIB;
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -3535,8 +3535,8 @@ mod mt_dict {
     /// stock growing-grid model whatever the switch says.
     #[test]
     fn deep_rows_windowed_ldm_open_stream_arms_at_the_staging_span() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         // The deep-band far fixture itself (R88's inline form: the same
         // bytes DEEP_BAND_FAR generates).
@@ -3557,10 +3557,10 @@ mod mt_dict {
             sink
         };
         // The armed frame is worker- and chunking-independent.
-        let armed = encode(&data, 2, usize::MAX);
+        let armed = encode(data, 2, usize::MAX);
         for (workers, chunk) in [(4u32, 1024 * 1024), (4, 7 * 1024), (8, 256 * 1024)] {
             assert_eq!(
-                encode(&data, workers, chunk),
+                encode(data, workers, chunk),
                 armed,
                 "workers {workers} chunk {chunk}"
             );
@@ -3571,7 +3571,7 @@ mod mt_dict {
         // beat on this fixture (its tiled unit keeps a paying far class
         // while the per-job LDM restarts cost the stock row).
         crate::stream::encoder_mt::set_stream_deep_band_for_tests(false);
-        let stock = encode(&data, 4, 1024 * 1024);
+        let stock = encode(data, 4, 1024 * 1024);
         crate::stream::encoder_mt::set_stream_deep_band_for_tests(true);
         assert_ne!(
             stock, armed,
@@ -3682,8 +3682,8 @@ mod mt_dict {
     /// dead fixture.
     #[test]
     fn forced_small_window_keeps_the_stock_deep_grid() {
-        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::Mid);
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
         let encode = |shape: crate::InputShape| {
@@ -3739,8 +3739,8 @@ mod mt_dict {
     /// roundtrip-clean through both decoders at a second worker count.
     #[test]
     fn deep_band_open_stream_past_the_buffer_cap() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let _switch = DEEP_BAND_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(264 * MIB, 5 * MIB);
         let encode = |workers: u32| {
@@ -3802,8 +3802,8 @@ mod mt_dict {
     /// fixture.
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_matches_bulk() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
         let opts = |level: Level, workers: u32| {
@@ -3833,7 +3833,7 @@ mod mt_dict {
             (Level::Ultra, 4, 7 * 1024),
         ] {
             let frame = stream(level, workers, chunk);
-            let bulk = bulk::compress_with(&data, &opts(level, workers)).unwrap();
+            let bulk = bulk::compress_with(data, &opts(level, workers)).unwrap();
             assert_eq!(
                 frame, bulk,
                 "{level:?} workers {workers} chunk {chunk}: the armed stream equals the bulk feed \
@@ -3930,8 +3930,8 @@ mod mt_dict {
     /// across encoders, at a cut off the block lattice.
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_flush_cadence() {
-        let _mem = heavy_mem(HeavyMem::Mid);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::Mid);
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = &DEEP_BAND_FAR[..];
         let flushed = || {
@@ -3972,8 +3972,8 @@ mod mt_dict {
     /// need a pledge past 72 MiB before any job start exceeds it).
     #[test]
     fn opt_serial_ldm_feed_pledged_stream_matches_bulk_past_the_window() {
-        let _mem = heavy_mem(HeavyMem::CapScale);
         const MIB: usize = 1024 * 1024;
+        let _mem = heavy_mem(HeavyMem::CapScale);
         let _switch = encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
         let data = deep_band_far_fixture(41 * MIB + 123 * 1024, 5 * MIB);
         let shape = crate::InputShape::default().with_window_log(25);
@@ -4027,7 +4027,7 @@ mod mt_dict {
                     .checksum(false)
                     .pledged_size(pledged.then_some(data.len() as u64))
             };
-            let (owned, reference) = owned_vs_read_frame(&data, data.to_vec().into(), options);
+            let (owned, reference) = owned_vs_read_frame(data, data.to_vec().into(), options);
             assert_eq!(
                 owned, reference,
                 "deep band pledged {pledged}: owned feed diverged"
@@ -4052,7 +4052,7 @@ mod mt_dict {
                 .checksum(true)
                 .pledged_size(Some(data.len() as u64))
         };
-        let (owned, reference) = owned_vs_read_frame(&data, data.to_vec().into(), options);
+        let (owned, reference) = owned_vs_read_frame(data, data.to_vec().into(), options);
         assert_eq!(owned, reference, "opt feed: owned feed diverged");
         let back = bulk::decompress(&owned, 0).unwrap();
         assert_eq!(back, data, "owned opt feed roundtrip");

@@ -193,55 +193,6 @@ fn geomean_pct(ds: &[f64]) -> f64 {
     (factors.exp() - 1.0) * 100.0
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{Cell, RatioMode, Row, geomean_pct};
-    use crate::corpus::{LevelName, Shape};
-
-    /// A row from sizes alone: the verdict math only reads the lengths.
-    fn row(raw_len: u64, ours: u64, theirs: Option<u64>) -> Row {
-        Row {
-            cell: Cell {
-                shape: Shape::Json,
-                raw: Arc::new(Vec::new()),
-                level: LevelName::Fastest,
-                mode: RatioMode::BulkSt,
-            },
-            raw_len,
-            ours,
-            theirs,
-        }
-    }
-
-    /// The delta scale the summary verdict reports: `ours_ratio /
-    /// theirs_ratio - 1`, positive = denser than libzstd, and symmetric
-    /// size ratios cancel in the geo-mean.
-    #[test]
-    fn delta_scale_and_geomean_cancellation() {
-        // raw 1000, ours 100 (r 10), theirs 125 (r 8): 10/8 - 1 = +25%.
-        let denser = row(1000, 100, Some(125));
-        assert!((denser.delta().unwrap() - 0.25).abs() < 1e-12);
-
-        // the same sizes swapped: 8/10 - 1 = -20%, not the -25% a plain
-        // size difference would suggest.
-        let sparser = row(1000, 125, Some(100));
-        assert!((sparser.delta().unwrap() + 0.20).abs() < 1e-12);
-
-        // no reference side (--no-ref): no delta at all.
-        assert!(row(1000, 100, None).delta().is_none());
-
-        // an exact tie is ln(1) = 0, and the +25%/-20% pair multiplies
-        // back to 1, so the geo-mean over the pair is zero.
-        let tie = row(1000, 100, Some(100));
-        assert_eq!(tie.delta(), Some(0.0));
-        let pair = [denser.delta().unwrap(), sparser.delta().unwrap()];
-        assert!(geomean_pct(&pair).abs() < 1e-9);
-        assert_eq!(geomean_pct(&[0.0, 0.0]), 0.0);
-    }
-}
-
 /// Geo-mean Δ summary lines for one grouping of the rows.
 fn summary_group(title: &str, groups: &[(String, Vec<f64>)]) {
     println!("-- {title} (geo-mean Δ%, + = denser than zstd) --");
@@ -461,4 +412,53 @@ pub fn run(args: &Args) {
 
     print_rows(&rows);
     print_summary(&rows, args, t0);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Cell, RatioMode, Row, geomean_pct};
+    use crate::corpus::{LevelName, Shape};
+
+    /// A row from sizes alone: the verdict math only reads the lengths.
+    fn row(raw_len: u64, ours: u64, theirs: Option<u64>) -> Row {
+        Row {
+            cell: Cell {
+                shape: Shape::Json,
+                raw: Arc::new(Vec::new()),
+                level: LevelName::Fastest,
+                mode: RatioMode::BulkSt,
+            },
+            raw_len,
+            ours,
+            theirs,
+        }
+    }
+
+    /// The delta scale the summary verdict reports: `ours_ratio /
+    /// theirs_ratio - 1`, positive = denser than libzstd, and symmetric
+    /// size ratios cancel in the geo-mean.
+    #[test]
+    fn delta_scale_and_geomean_cancellation() {
+        // raw 1000, ours 100 (r 10), theirs 125 (r 8): 10/8 - 1 = +25%.
+        let denser = row(1000, 100, Some(125));
+        assert!((denser.delta().unwrap() - 0.25).abs() < 1e-12);
+
+        // the same sizes swapped: 8/10 - 1 = -20%, not the -25% a plain
+        // size difference would suggest.
+        let sparser = row(1000, 125, Some(100));
+        assert!((sparser.delta().unwrap() + 0.20).abs() < 1e-12);
+
+        // no reference side (--no-ref): no delta at all.
+        assert!(row(1000, 100, None).delta().is_none());
+
+        // an exact tie is ln(1) = 0, and the +25%/-20% pair multiplies
+        // back to 1, so the geo-mean over the pair is zero.
+        let tie = row(1000, 100, Some(100));
+        assert_eq!(tie.delta(), Some(0.0));
+        let pair = [denser.delta().unwrap(), sparser.delta().unwrap()];
+        assert!(geomean_pct(&pair).abs() < 1e-9);
+        assert_eq!(geomean_pct(&[0.0, 0.0]), 0.0);
+    }
 }

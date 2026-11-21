@@ -1946,7 +1946,11 @@ impl MtEncoderCore {
     /// Append one delivered span to the queue. Empty spans never queue:
     /// an aborted job's empty slot must not occupy an assembly order it
     /// did not encode for.
-    fn push_out_segment(&mut self, mut bytes: Vec<u8>) {
+    // The debug-only poison fill below is the only writer.
+    fn push_out_segment(
+        &mut self,
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))] mut bytes: Vec<u8>,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -2912,10 +2916,7 @@ impl MtEncoderCore {
                 // or its span would miss the splits near the boundary. The
                 // wait stays under one block of stream, so it never holds
                 // the pump behind the pledge.
-                if self.feed.is_some() && self.pos < self.feed_cover(end) {
-                    return false;
-                }
-                true
+                !(self.feed.is_some() && self.pos < self.feed_cover(end))
             },
             JobGrid::Growing => self.pos >= self.growing_epoch_end(self.job_start),
             // The capture lattice's boundaries are absolute like the fixed

@@ -5,7 +5,6 @@ edition      = "2024"
 rust-version = "1.89"
 description  = "A zstd-compatible command line interface built on the pure-Rust zstdx engine"
 readme       = "../../README.md"
-homepage     = "https://github.com/lxl66566/zstdx"
 repository   = "https://github.com/lxl66566/zstdx"
 license      = "MIT"
 keywords     = ["cli", "compression", "zstandard", "zstd"]

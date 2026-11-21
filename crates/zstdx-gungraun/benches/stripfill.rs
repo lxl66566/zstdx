@@ -70,7 +70,7 @@ fn replay(win: &[u8], strip_mib: usize) {
 #[bench::m48((dll_window(), 48))]
 #[bench::m64((dll_window(), 64))]
 fn strip_fill((win, strip_mib): (Vec<u8>, usize)) {
-    replay(&win, strip_mib)
+    replay(&win, strip_mib);
 }
 
 /// The FFI caller shape of `ffi-stream-gap` end to end: the whole

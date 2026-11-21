@@ -1370,8 +1370,9 @@ fn include_dictid_parity() {
 /// explicit disable. Both engines' frames decode on either side.
 #[test]
 fn long_distance_matching_parity() {
-    let _mem = heavy_mem(HeavyMem::Mid);
     use std::io::Read as _;
+
+    let _mem = heavy_mem(HeavyMem::Mid);
 
     // 4 MiB of a 1 MiB tile: repeats beyond the stock fast window.
     let tile: Vec<u8> = {

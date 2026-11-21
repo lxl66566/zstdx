@@ -55,7 +55,6 @@ pub struct Args {
 struct Seq {
     pos: u64,
     ll: u32,
-    ml: u32,
     wire_of: u32,
     off: u64,
 }
@@ -66,7 +65,7 @@ fn of_cost_bits(wire_of: u32) -> u32 {
     match wire_of {
         1 => 1,
         2 | 3 => 2,
-        v => 2 * (31 - v.leading_zeros()),
+        v => 2 * v.ilog2(),
     }
 }
 
@@ -192,24 +191,21 @@ fn probe_repcodes(seqs: &[Seq], job_size: u64, num_jobs: u64) -> RepReport {
                 full_seen += 1;
             }
             let actual = i64::from(of_cost_bits(s.wire_of));
-            let cf = match rep_idx(&t, s.ll, s.off) {
-                Some(idx) => {
-                    // Wire value idx+1: 1 costs 1 bit, 2 and 3 cost 2.
-                    let bits = if idx == 0 {
-                        1
-                    } else {
-                        2
-                    };
-                    apply_rep(&mut t, idx, s.off);
-                    bits
-                },
-                None => {
-                    let bits = of_cost_bits(s.off as u32 + 3);
-                    t[2] = t[1];
-                    t[1] = t[0];
-                    t[0] = s.off;
-                    bits
-                },
+            let cf = if let Some(idx) = rep_idx(&t, s.ll, s.off) {
+                // Wire value idx+1: 1 costs 1 bit, 2 and 3 cost 2.
+                let bits = if idx == 0 {
+                    1
+                } else {
+                    2
+                };
+                apply_rep(&mut t, idx, s.off);
+                bits
+            } else {
+                let bits = of_cost_bits(s.off as u32 + 3);
+                t[2] = t[1];
+                t[1] = t[0];
+                t[0] = s.off;
+                bits
             };
             let conv = u64::from(s.wire_of >= 4 && cf <= 2);
             let delta = actual - i64::from(cf);
@@ -430,7 +426,6 @@ fn run_cell(raw: &[u8], level_num: i32, workers: u32, head_span: u64, depth: u32
         seqs.push(Seq {
             pos,
             ll: w.ll,
-            ml,
             wire_of: w.of,
             off,
         });

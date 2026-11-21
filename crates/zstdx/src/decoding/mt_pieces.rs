@@ -972,7 +972,7 @@ pub(super) fn decode_pieces(
                 };
                 #[cfg(not(feature = "hash"))]
                 let mismatch = None;
-                mismatch.map_or_else(|| Ok(fcs), Err)
+                mismatch.map_or(Ok(fcs), Err)
             }
         };
         if verdict.is_err() {

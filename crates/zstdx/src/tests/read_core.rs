@@ -257,7 +257,7 @@ fn parsed_dictionary_matches_the_raw_form() {
     assert_eq!(raw_sink, parsed_sink);
     let header_id = crate::EncoderDictionary::parse(&dict).unwrap().header_id();
     assert_eq!(
-        zstd::zstd_safe::get_dict_id_from_frame(&raw_sink).map(|id| id.get()),
+        zstd::zstd_safe::get_dict_id_from_frame(&raw_sink).map(core::num::NonZero::get),
         header_id
     );
 }

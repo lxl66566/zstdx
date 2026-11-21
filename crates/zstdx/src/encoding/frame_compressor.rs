@@ -459,6 +459,8 @@ pub(crate) fn compress_slice_shaped_ldm(
     // stands down with it (the row parses the frame whole; no reach is
     // traded away).
     let head_span = src.len().min(BALANCED_STORE_HEAD_SPAN);
+    // The cfg_dump latch below is the only writer.
+    #[cfg_attr(not(feature = "cfg_dump"), allow(unused_mut))]
     let mut bal_row = level.as_i32() == 9
         && shape.len.is_some_and(|n| n >= reach_probe::PROBE_MIN_FRAME)
         && balanced_store(&src[..head_span]) != BalancedStore::Chain;
