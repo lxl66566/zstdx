@@ -9,7 +9,7 @@ use std::{fs, io::Write, path::PathBuf};
 #[cfg(feature = "dict_builder")]
 use zstdx::dict::{TrainConfig, TrainOutcome};
 
-use crate::{Cli, PREFIX};
+use crate::{Cli, PREFIX, display::errln};
 #[cfg(feature = "dict_builder")]
 use crate::{Input, collect_input, read_filelist};
 
@@ -31,7 +31,7 @@ pub fn run(cli: &Cli) -> crate::Exit {
     #[cfg(not(feature = "dict_builder"))]
     {
         let _ = cli;
-        eprintln!("{PREFIX}training mode not available (built without the dict_builder feature)");
+        errln!("{PREFIX}training mode not available (built without the dict_builder feature)");
         crate::Exit::Failure
     }
     #[cfg(feature = "dict_builder")]
@@ -43,7 +43,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
     if let Some(maxdict) = cli.maxdict
         && maxdict < MIN_DICT
     {
-        eprintln!("{PREFIX}--maxdict must be at least {MIN_DICT} bytes");
+        errln!("{PREFIX}--maxdict must be at least {MIN_DICT} bytes");
         return crate::Exit::Failure;
     }
 
@@ -53,7 +53,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
         Some(path) => match read_filelist(path) {
             Ok(list) => list,
             Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+                errln!("{PREFIX}{}: {err}", path.display());
                 return crate::Exit::Failure;
             },
         },
@@ -70,7 +70,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
         );
     }
     if inputs.iter().any(|i| matches!(i, Input::Stdin)) {
-        eprintln!("{PREFIX}--train does not support reading from standard input ");
+        errln!("{PREFIX}--train does not support reading from standard input ");
         return crate::Exit::Failure;
     }
 
@@ -82,7 +82,7 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
         match fs::read(path) {
             Ok(sample) => samples.push(sample),
             Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+                errln!("{PREFIX}{}: {err}", path.display());
                 return crate::Exit::Failure;
             },
         }
@@ -91,13 +91,13 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
     // dibio.c refuses under five samples with its own EXM_THROW shape
     // (dibio's has no zstd: prefix and exits with the number).
     if samples.len() < 5 {
-        eprintln!("Error 14 : nb of samples too low");
+        errln!("Error 14 : nb of samples too low");
         return crate::Exit::Error(14);
     }
     // Below the trainer's 16-byte trainable minimum the engine itself
     // cannot produce a dictionary.
     if total_bytes < 16 {
-        eprintln!("{PREFIX}nb of samples too low ");
+        errln!("{PREFIX}nb of samples too low ");
         return crate::Exit::Failure;
     }
 
@@ -109,8 +109,8 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
         .map(|sample| sample.len().min(128 * 1024) as u64)
         .sum();
     if cli.quiet == 0 && load_total < maxdict * 8 {
-        eprintln!("!  Warning : data size of samples too small for target dictionary size ");
-        eprintln!("!  Samples should be about 100x larger than target dictionary size ");
+        errln!("!  Warning : data size of samples too small for target dictionary size ");
+        errln!("!  Samples should be about 100x larger than target dictionary size ");
     }
 
     let out: PathBuf = cli
@@ -124,12 +124,13 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
     if cli.quiet < 2 {
         let ratio = outcome.dmers as f64 / maxdict as f64;
         if ratio < 10.0 {
-            eprintln!(
+            errln!(
                 "WARNING: The maximum dictionary size {} is too large compared to the source size \
                  {}! size(source)/size(dictionary) = {ratio:.6}, but it should be >= 10! This may \
                  lead to a subpar dictionary! We recommend training on sources at least 10x, and \
                  preferably 100x the size of the dictionary! ",
-                maxdict, outcome.dmers
+                maxdict,
+                outcome.dmers
             );
         }
     }
@@ -137,18 +138,18 @@ fn train_with_builder(cli: &Cli) -> crate::Exit {
     let mut file = match fs::File::create(&out) {
         Ok(file) => file,
         Err(err) => {
-            eprintln!("{PREFIX}{}: {err}", out.display());
+            errln!("{PREFIX}{}: {err}", out.display());
             return crate::Exit::Failure;
         },
     };
     if let Err(err) = file.write_all(&dict).and_then(|()| file.flush()) {
-        eprintln!("{PREFIX}{}: {err}", out.display());
+        errln!("{PREFIX}{}: {err}", out.display());
         return crate::Exit::Failure;
     }
     // dibio.c reports the result at display level 2: visible by default,
     // hidden under -q.
     if cli.quiet == 0 {
-        eprintln!(
+        errln!(
             "Save dictionary of size {} into file {} ",
             dict.len(),
             out.display()

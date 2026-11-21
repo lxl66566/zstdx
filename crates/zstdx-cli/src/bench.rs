@@ -14,7 +14,7 @@
 
 use std::{
     fs,
-    io::{BufRead as _, Cursor, Read as _, Seek, SeekFrom, Write, stdout},
+    io::{BufRead as _, Cursor, Read as _, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -25,7 +25,11 @@ use zstdx::{
     decoding::{Dictionary, errors::ReadFrameHeaderError, frame::read_frame_header},
 };
 
-use crate::{Cli, DEFAULT_LEVEL, MAX_WINDOW_LOG, MIN_WINDOW_LOG, PREFIX, read_filelist};
+use crate::{
+    Cli, DEFAULT_LEVEL, MAX_WINDOW_LOG, MIN_WINDOW_LOG, PREFIX,
+    display::{err, errln},
+    read_filelist,
+};
 
 /// zstd's default benchmark seconds (`BMK_TIMETEST_DEFAULT_S`).
 const DEFAULT_SECONDS: u64 = 3;
@@ -62,14 +66,14 @@ pub fn run(cli: &Cli) -> crate::Exit {
         Err(BenchFailure::Load) => {
             // benchzstd.c's loader failure: bare text, no newline, exit 15.
             if cli.quiet < 2 {
-                eprint!("Error loading files");
+                err!("Error loading files");
             }
             crate::Exit::Error(15)
         },
         Err(BenchFailure::Code(code)) => crate::Exit::Error(code),
         Err(BenchFailure::Message(err)) => {
             if cli.quiet < 2 {
-                eprintln!("{PREFIX}{err}");
+                errln!("{PREFIX}{err}");
             }
             crate::Exit::Failure
         },
@@ -147,7 +151,7 @@ fn bench(cli: &Cli) -> Result<(), BenchFailure> {
         // format minimum is the engine parameter error (and exit code);
         // above the maximum clamps silently.
         Some(log) if log < MIN_WINDOW_LOG => {
-            eprintln!("{PREFIX}error 11 : Parameter is out of bound ");
+            errln!("{PREFIX}error 11 : Parameter is out of bound ");
             return Err(BenchFailure::Code(11));
         },
         Some(log) if log > MAX_WINDOW_LOG => Some(MAX_WINDOW_LOG),
@@ -196,21 +200,21 @@ fn bench(cli: &Cli) -> Result<(), BenchFailure> {
         3
     };
     if display >= header_level {
-        eprint!("Benchmarking ");
+        err!("Benchmarking ");
     }
     let files = gather_files(cli)?;
     if display >= 3 && files.len() > 1 {
-        eprint!("{} files ", files.len());
+        err!("{} files ", files.len());
     }
     if display >= 3 {
         if end > start {
-            eprint!("from level {start} to {end} ");
+            err!("from level {start} to {end} ");
         } else {
-            eprint!("at level {start} ");
+            err!("at level {start} ");
         }
     }
     if display >= header_level {
-        eprintln!("using {threads} threads ");
+        errln!("using {threads} threads ");
     }
     if files.is_empty() {
         return bench_synthetic(&config, start, end).map_err(BenchFailure::Message);
@@ -312,7 +316,7 @@ fn gather_files(cli: &Cli) -> Result<Vec<PathBuf>, BenchFailure> {
                             }
                         }
                     },
-                    Err(err) => eprintln!("{PREFIX}{}: {err}", dir.display()),
+                    Err(err) => errln!("{PREFIX}{}: {err}", dir.display()),
                 }
             }
             continue;
@@ -342,7 +346,7 @@ fn load_corpus(files: &[PathBuf], config: &Config) -> Result<Corpus, BenchFailur
     }
     let benched = total.min(find_max_mem(total.saturating_mul(3)) / 3);
     if benched < total {
-        eprintln!("Not enough memory; testing {} MB only...", benched >> 20);
+        errln!("Not enough memory; testing {} MB only...", benched >> 20);
     }
 
     let mut src = Vec::with_capacity(benched as usize);
@@ -598,7 +602,7 @@ fn bench_level(level: i32, corpus: &Corpus, config: &Config) -> Result<(), Strin
             .zip(src.iter())
             .position(|(a, b)| a != b)
             .unwrap_or(src.len());
-        eprintln!(
+        errln!(
             "!!! WARNING !!! {:>14} : decoded output differs from the input at byte {at}   ",
             corpus.name
         );
@@ -642,9 +646,7 @@ fn speed_digits(speed: f64) -> usize {
 
 /// A line on stdout, flushed (zstd's `OUTPUT` + `fflush`).
 fn print_out(text: &str) {
-    let mut out = stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+    crate::display::out_flushed(text);
 }
 
 /// One timed phase over every chunk (`BMK_benchFunction`'s benchFn).
@@ -1257,6 +1259,8 @@ mod lorem {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     /// The lorem corpus starts with the canonical sentence and is

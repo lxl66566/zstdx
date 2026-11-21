@@ -93,3 +93,14 @@ pub fn system_zstd() -> bool {
 pub fn stderr_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
+
+/// stderr text with line endings normalized to `\n`: the binary mirrors the
+/// reference zstd's CRT text mode, which emits `\r\n` on Windows.
+pub fn stderr_text(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n")
+}
+
+/// The stdout counterpart of [`stderr_text`].
+pub fn stdout_text(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+}

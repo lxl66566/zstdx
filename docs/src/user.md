@@ -264,6 +264,7 @@ The `zstdx-cli` binary mirrors the `zstd` command line with flags and no subcomm
 - A failed compression or decompression to a file removes the partial output it created, mirroring zstd.
 - On Unix, a multithreaded compression of a regular input file of 1 MiB or more maps the file read-only and feeds the encoder zero-copy, skipping the read pump's input copies. stdin, pipes, small files, `-T1`, `--adapt` and a visible progress bar keep the reader feed. The frame bytes are identical either way.
 - Overwrite prompts read from the controlling terminal at `/dev/tty`, never from piped stdin. Without a terminal, existing outputs are refused unless `-f` is given. Windows has no `/dev/tty`, so the prompt always declines there.
+- Diagnostics, list output and summary lines end with `\r\n` on Windows and `\n` elsewhere, matching the C-runtime text mode the reference prints through.
 
 ### Patch mode
 

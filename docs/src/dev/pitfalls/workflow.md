@@ -94,11 +94,11 @@ The copy bodies are register-independent except that disp8, and the loop is `cmp
 
 The final 4x protocol closed to parity at a 6718 median against the base 6756, which is -0.6%, and +7.6% over the disturbed state, with a repeat round dead even at 6704. The zstd side ran at 5217 to 5291.
 
-| Run | Values | Median |
-|---|---|---|
-| base 47d2ffeb | 6828, 6767, 6739, 6745 | 6756 |
-| fix | 6692, 6544, 6723, 6718 | 6718 |
-| repeat | 6704, 6704 | dead even |
+| Run           | Values                 | Median    |
+| ------------- | ---------------------- | --------- |
+| base 47d2ffeb | 6828, 6767, 6739, 6745 | 6756      |
+| fix           | 6692, 6544, 6723, 6718 | 6718      |
+| repeat        | 6704, 6704             | dead even |
 
 Collateral was text.fast solo +8.0%, which is the fix itself, text.fastest -0.1%, json.fast -0.4%, json.fast mt8 -0.7%, text.best solo -1.1% with the DUBT +15.6% flagship win intact at 1004 to 993, text.best mt8 +1.3%, text.fastest mt8 +2.1%, and text.fast stream-mt8 -1.7% with fully overlapping ranges from 6102-6403 to 5983-6466, which is flat within that cell's ±5% noise and the 6180 class. `ratio --no-ref` is byte-identical to the base build, and the tests, clippy, fmt and no-default-features gates were clean.
 

@@ -1,6 +1,7 @@
 extern crate zstdx;
 mod adapt;
 mod bench;
+mod display;
 mod list;
 mod patch;
 mod progress;
@@ -17,6 +18,7 @@ use std::{
 };
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
+use display::{err, errln, outln};
 use progress::{ProgressMonitor, fmt_size};
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -779,7 +781,7 @@ fn main() -> ExitCode {
     let args = match normalize_args(std::env::args_os()) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}");
+            errln!("{message}");
             return ExitCode::FAILURE;
         },
     };
@@ -797,7 +799,7 @@ fn main() -> ExitCode {
         // default display level, which -q already lowers).
         Err(err) => {
             if let Some(line) = clap_diagnostic(&err, &spelled) {
-                eprintln!("{line}");
+                errln!("{line}");
                 return ExitCode::FAILURE;
             }
             err.exit()
@@ -938,7 +940,7 @@ fn precheck_input(
     if matches!(input, Input::Stdin) {
         if *stdin_done {
             if cli.quiet < 2 {
-                eprintln!("{PREFIX}error 37 : Read error ");
+                errln!("{PREFIX}error 37 : Read error ");
             }
             return Precheck::Abort(Exit::Error(37));
         }
@@ -950,7 +952,7 @@ fn precheck_input(
         && dict.is_source(path)
     {
         if cli.quiet < 2 {
-            eprintln!(
+            errln!(
                 "{PREFIX}cannot use {} as an input file and dictionary ",
                 path.display()
             );
@@ -973,10 +975,10 @@ fn report_input_failure(
     if cli.quiet < 2 {
         if let Some(diagnostic) = diagnostic {
             for line in &diagnostic.lines {
-                eprintln!("{line}");
+                errln!("{line}");
             }
         } else {
-            eprintln!("{PREFIX}{}: {err}", input_name(input));
+            errln!("{PREFIX}{}: {err}", input_name(input));
         }
     }
     diagnostic
@@ -1049,7 +1051,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     // zstd 1.5.7 removed --ignore-errors (v1.5.5 deprecation turned into
     // a hard parser rejection, before any mode runs).
     if cli.ignore_errors {
-        eprintln!("Incorrect parameter: --ignore-errors ");
+        errln!("Incorrect parameter: --ignore-errors ");
         return Exit::Failure;
     }
 
@@ -1068,41 +1070,41 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     // Flags whose meaning the engine cannot honor are rejected up front:
     // every accepted flag changes behavior below, none is a silent no-op.
     if cli.sparse || cli.no_sparse {
-        eprintln!("{PREFIX}--sparse/--no-sparse are not supported: output is always dense");
+        errln!("{PREFIX}--sparse/--no-sparse are not supported: output is always dense");
         return Exit::Failure;
     }
     if cli.dict_id.is_some() {
-        eprintln!(
+        errln!(
             "{PREFIX}--dictID is not supported: the trainer derives the dictionary ID from its \
              content"
         );
         return Exit::Failure;
     }
     if cli.train_cover.is_some() || cli.train_fastcover.is_some() || cli.train_legacy.is_some() {
-        eprintln!(
+        errln!(
             "{PREFIX}--train-cover/--train-fastcover/--train-legacy are not supported: the \
              in-tree trainer is the only algorithm"
         );
         return Exit::Failure;
     }
     if cli.maxdict.is_some() && mode != Mode::Train {
-        eprintln!("{PREFIX}--maxdict only applies with --train");
+        errln!("{PREFIX}--maxdict only applies with --train");
         return Exit::Failure;
     }
     // Parser-shaped rejections come first: a value the reference's own
     // parser never spells is an unknown flag there.
     if let Some(value) = cli.format.as_deref().filter(|format| *format != "zstd") {
-        eprintln!("Incorrect parameter: --format={value} ");
+        errln!("Incorrect parameter: --format={value} ");
         return Exit::Failure;
     }
     if let Some(value) = cli.priority.as_deref().filter(|value| *value != "rt") {
-        eprintln!("Incorrect parameter: --priority={value} ");
+        errln!("Incorrect parameter: --priority={value} ");
         return Exit::Failure;
     }
     // Flags with no engine knob reject loudly with their reason; the
     // identity flags never appear here (see their definitions).
     if let Some((flag, reason)) = unsupported_flag(cli) {
-        eprintln!("{PREFIX}{flag} is not supported: {reason}");
+        errln!("{PREFIX}{flag} is not supported: {reason}");
         return Exit::Failure;
     }
 
@@ -1124,15 +1126,15 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         Mode::Compress | Mode::Decompress | Mode::Test => {},
     }
     if cli.memory.is_some() && mode == Mode::Compress {
-        eprintln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
+        errln!("{PREFIX}-M/--memory bounds decoding only; it does not limit compression");
         return Exit::Failure;
     }
     if (cli.pass_through || cli.no_pass_through) && mode == Mode::Compress {
-        eprintln!("{PREFIX}--pass-through affects decoding only");
+        errln!("{PREFIX}--pass-through affects decoding only");
         return Exit::Failure;
     }
     if cli.memory.is_some_and(|limit| limit < MIN_WINDOW_BYTES) {
-        eprintln!(
+        errln!(
             "{PREFIX}-M values below {MIN_WINDOW_BYTES} reject every frame (the format's minimum \
              window); use at least 1K"
         );
@@ -1146,7 +1148,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         // ceiling zstd rejects with the engine parameter error and its
         // exit code (ZSTD_c_windowLog / ZSTD_d_maxWindowSize bounds).
         Some(log) if !(MIN_WINDOW_LOG..=MAX_LONG_WINDOW_LOG).contains(&log) => {
-            eprintln!("{PREFIX}error 11 : Parameter is out of bound ");
+            errln!("{PREFIX}error 11 : Parameter is out of bound ");
             return Exit::Error(11);
         },
         // Within libzstd's range but above the engine's ceiling: clamped
@@ -1170,7 +1172,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         Some(path) => match fs::read(path) {
             Ok(bytes) => Some(LoadedDict::new(bytes, path)),
             Err(err) => {
-                eprintln!(
+                errln!(
                     "{PREFIX}error 31 : Stat failed on dictionary file {}: {} ",
                     path.display(),
                     strerror(&err)
@@ -1183,7 +1185,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
 
     let filelist = if let Some(path) = &cli.filelist {
         let Ok(list) = read_filelist(path) else {
-            eprintln!("{PREFIX}error reading {} ", path.display());
+            errln!("{PREFIX}error reading {} ", path.display());
             return Exit::Failure;
         };
         list
@@ -1212,7 +1214,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     // and still exit 0. A collection error already decided the failure.
     if inputs.is_empty() && ok {
         if cli.quiet < 2 {
-            eprintln!("please provide correct input file(s) or non-empty directories -- ignored ");
+            errln!("please provide correct input file(s) or non-empty directories -- ignored ");
         }
         return Exit::Success;
     }
@@ -1222,25 +1224,23 @@ fn run(cli: &Cli, rm: bool) -> Exit {
     // number would silently do nothing (zstd ignores it there).
     let stdin_stream = matches!(inputs.as_slice(), [Input::Stdin]);
     if cli.stream_size.is_some() && !stdin_stream {
-        eprintln!("{PREFIX}--stream-size only applies to stdin input");
+        errln!("{PREFIX}--stream-size only applies to stdin input");
         return Exit::Failure;
     }
     if cli.adapt.is_some() && (cli.stream_size.is_some() || cli.size_hint.is_some()) {
-        eprintln!(
+        errln!(
             "{PREFIX}--stream-size/--size-hint cannot combine with --adapt: chunk frames pledge \
              their own sizes exactly"
         );
         return Exit::Failure;
     }
     if cli.size_hint.is_some() && !stdin_stream {
-        eprintln!(
-            "{PREFIX}--size-hint only applies to stdin input (file sizes are pledged exactly)"
-        );
+        errln!("{PREFIX}--size-hint only applies to stdin input (file sizes are pledged exactly)");
         return Exit::Failure;
     }
 
     if cli.output.is_some() && inputs.len() > 1 {
-        eprintln!("{PREFIX}-o/--output cannot be used with multiple input files");
+        errln!("{PREFIX}-o/--output cannot be used with multiple input files");
         return Exit::Failure;
     }
 
@@ -1255,7 +1255,7 @@ fn run(cli: &Cli, rm: bool) -> Exit {
         ) {
             Ok(adjustments) => (adjustments.window_log, adjustments.max_window),
             Err(msg) => {
-                eprintln!("{PREFIX}{msg}");
+                errln!("{PREFIX}{msg}");
                 return Exit::Failure;
             },
         },
@@ -1545,7 +1545,7 @@ fn collect_input(
     match fs::metadata(path) {
         Err(err) => {
             if quiet < 2 {
-                eprintln!(
+                errln!(
                     "{PREFIX}can't stat {} : {} -- ignored ",
                     path.display(),
                     strerror(&err)
@@ -1556,7 +1556,7 @@ fn collect_input(
         Ok(meta) if meta.is_dir() => {
             if !recursive {
                 if quiet < 2 {
-                    eprintln!("{PREFIX}{} is a directory -- ignored ", path.display());
+                    errln!("{PREFIX}{} is a directory -- ignored ", path.display());
                 }
                 *ok = false;
                 return;
@@ -1567,7 +1567,7 @@ fn collect_input(
         // (sockets, devices) is skipped with this diagnostic.
         Ok(meta) if !meta.is_file() && !is_fifo(&meta) => {
             if quiet < 2 {
-                eprintln!(
+                errln!(
                     "{PREFIX}{} is not a regular file -- ignored ",
                     path.display()
                 );
@@ -1587,7 +1587,7 @@ fn expand_dir(path: &Path, inputs: &mut Vec<Input>, ok: &mut bool, quiet: u8) {
         Ok(entries) => entries,
         Err(err) => {
             if quiet < 2 {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+                errln!("{PREFIX}{}: {err}", path.display());
             }
             *ok = false;
             return;
@@ -1829,7 +1829,7 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
     // zstd's interactive path: prompt on stderr, answer from the
     // controlling terminal (never stdin, which carries the payload); a
     // miss (no terminal, EOF, non-y) declines.
-    eprint!(
+    err!(
         "{PREFIX}{} already exists; overwrite (y/n) ? ",
         path.display()
     );
@@ -1840,7 +1840,7 @@ fn check_overwrite(path: &Path, cli: &Cli) -> AnyResult<()> {
             return Ok(());
         }
     }
-    eprintln!("Not overwritten  ");
+    errln!("Not overwritten  ");
     Err(Diagnostic::plain(vec![]).into())
 }
 
@@ -2657,7 +2657,9 @@ fn init_logging(cli: &Cli) {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(indicatif_layer.get_stderr_writer())
+                .with_writer(display::LineEndings::new(
+                    indicatif_layer.get_stderr_writer(),
+                ))
                 .without_time()
                 // Piped/captured stderr gets plain text: zstd's diagnostics
                 // never carry color codes.
@@ -2751,15 +2753,15 @@ fn early_exit<I: IntoIterator<Item = OsString>>(args: I) -> Option<ExitCode> {
 /// provenance.
 fn print_version(level: i32) {
     if level < 2 {
-        println!("{}", env!("CARGO_PKG_VERSION"));
+        outln!("{}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    println!(
+    outln!(
         "*** zstdx command line interface (64-bit) v{}, pure-Rust Zstandard ***",
         env!("CARGO_PKG_VERSION")
     );
     if level >= 3 {
-        println!("*** supports: zstd");
+        outln!("*** supports: zstd");
     }
 }
 
@@ -2768,7 +2770,7 @@ fn print_version(level: i32) {
 fn print_help() {
     let mut command = Cli::command();
     let help = command.render_help();
-    println!("{help}");
+    outln!("{help}");
 }
 
 /// Translate zstd's `-#` level flags (`-1` .. `-19`) into the hidden

@@ -14,7 +14,11 @@ use std::{
 
 use zstdx::decoding::frame::{FrameHeader, read_frame_header};
 
-use crate::{Cli, Input, PREFIX, ZSTD_MAGIC, collect_input, read_filelist};
+use crate::{
+    Cli, Input, PREFIX, ZSTD_MAGIC, collect_input,
+    display::{err, errln, outln},
+    read_filelist,
+};
 
 /// The short-mode table header, byte-identical to zstd's.
 const HEADER_ROW: &str = "Frames  Skips  Compressed  Uncompressed  Ratio  Check  Filename";
@@ -205,7 +209,7 @@ pub fn run(cli: &Cli) -> bool {
         Some(path) => match read_filelist(path) {
             Ok(list) => list,
             Err(err) => {
-                eprintln!("{PREFIX}{}: {err}", path.display());
+                errln!("{PREFIX}{}: {err}", path.display());
                 return false;
             },
         },
@@ -226,10 +230,10 @@ pub fn run(cli: &Cli) -> bool {
     }
     if no_files || inputs.iter().any(|i| matches!(i, Input::Stdin)) {
         if !io::stdin().is_terminal() {
-            eprintln!("{PREFIX}--list does not support reading from standard input ");
+            errln!("{PREFIX}--list does not support reading from standard input ");
         }
         if no_files {
-            eprintln!("No files given ");
+            errln!("No files given ");
         }
         return false;
     }
@@ -238,7 +242,7 @@ pub fn run(cli: &Cli) -> bool {
     // g_utilDisplayLevel > 3.
     let raw = cli.verbose >= 2;
     if cli.verbose == 0 {
-        println!("{HEADER_ROW}");
+        outln!("{HEADER_ROW}");
     }
     let mut total = FileInfo::new_total();
     let mut total_compressed = 0;
@@ -267,18 +271,18 @@ pub fn run(cli: &Cli) -> bool {
             } => {
                 display(cli, path, &info, compressed, raw);
                 if cli.quiet < 1 {
-                    eprintln!("{detail} ");
-                    eprintln!("Error while parsing \"{}\" ", path.display());
+                    errln!("{detail} ");
+                    errln!("Error while parsing \"{}\" ", path.display());
                 }
                 ok = false;
             },
             Analyzed::NotZstd { incomplete_tail } => {
                 if incomplete_tail && cli.quiet < 1 {
-                    eprintln!("Error: reached end of file with incomplete frame ");
+                    errln!("Error: reached end of file with incomplete frame ");
                 }
-                println!("File \"{}\" not compressed by zstd ", path.display());
+                outln!("File \"{}\" not compressed by zstd ", path.display());
                 if cli.verbose > 0 {
-                    println!();
+                    outln!();
                 }
                 ok = false;
             },
@@ -286,27 +290,27 @@ pub fn run(cli: &Cli) -> bool {
                 if cli.quiet < 1 {
                     // The message embeds a newline, so zstd's ERROR_IF
                     // epilogue (" \n") lands on a line of its own.
-                    eprintln!(
+                    errln!(
                         "Error: seeked to position {position}, which is beyond file size of \
                          {size}\n "
                     );
                 }
-                println!("File \"{}\" is truncated ", path.display());
+                outln!("File \"{}\" is truncated ", path.display());
                 if cli.verbose > 0 {
-                    println!();
+                    outln!();
                 }
                 ok = false;
             },
             Analyzed::FileError => {
                 if cli.verbose > 0 {
-                    println!();
+                    outln!();
                 }
                 ok = false;
             },
         }
     }
     if cli.verbose == 0 && inputs.len() > 1 {
-        println!("{TOTAL_RULE}");
+        outln!("{TOTAL_RULE}");
         let compressed = human_size(total_compressed, raw);
         // The grouped Check column ANDs across files; empty when any
         // listed file carried no checksum.
@@ -317,7 +321,7 @@ pub fn run(cli: &Cli) -> bool {
         };
         if total.decompressed_known {
             let decompressed = human_size(total.decompressed, raw);
-            println!(
+            outln!(
                 "{:>6}  {:>5}  {}  {}  {:>5.3}  {:>5}  {} files",
                 total.frames + total.skips,
                 total.skips,
@@ -328,7 +332,7 @@ pub fn run(cli: &Cli) -> bool {
                 total_files,
             );
         } else {
-            println!(
+            outln!(
                 "{:>6}  {:>5}  {}{UNKNOWN_SIZE_GAP}{check:>5}  {} files",
                 total.frames + total.skips,
                 total.skips,
@@ -369,14 +373,14 @@ fn analyze_file(path: &Path) -> Analyzed {
     let meta = match fs::metadata(path) {
         Ok(meta) if meta.is_file() => meta,
         _ => {
-            eprintln!("Error : {} is not a file ", path.display());
+            errln!("Error : {} is not a file ", path.display());
             return Analyzed::FileError;
         },
     };
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
-            eprintln!("Error : {} : {err} ", path.display());
+            errln!("Error : {} : {err} ", path.display());
             return Analyzed::FileError;
         },
     };
@@ -486,7 +490,7 @@ fn note_frame_header(info: &mut FileInfo, header: &FrameHeader) -> Result<(), Wa
     let dict_id = header.dictionary_id().unwrap_or(0);
     if info.dict_id != 0 && info.dict_id != dict_id {
         // zstd prints this warning without a trailing newline.
-        eprint!(
+        err!(
             "WARNING: File contains multiple frames with different dictionary IDs. Showing dictID \
              0 instead"
         );
@@ -567,7 +571,7 @@ fn display(cli: &Cli, path: &Path, info: &FileInfo, compressed: u64, raw: bool) 
         };
         let compressed_cell = human_size(compressed, raw).cell(6);
         if info.decompressed_known {
-            println!(
+            outln!(
                 "{frames:>6}  {:>5}  {compressed_cell}  {}  {:>5.3}  {check:>5}  {}",
                 info.skips,
                 human_size(info.decompressed, raw).cell(8),
@@ -575,7 +579,7 @@ fn display(cli: &Cli, path: &Path, info: &FileInfo, compressed: u64, raw: bool) 
                 path.display(),
             );
         } else {
-            println!(
+            outln!(
                 "{frames:>6}  {:>5}  {compressed_cell}{UNKNOWN_SIZE_GAP}{check:>5}  {}",
                 info.skips,
                 path.display(),
@@ -583,39 +587,39 @@ fn display(cli: &Cli, path: &Path, info: &FileInfo, compressed: u64, raw: bool) 
         }
         return;
     }
-    println!("{} ", path.display());
-    println!("# Zstandard Frames: {}", info.frames);
+    outln!("{} ", path.display());
+    outln!("# Zstandard Frames: {}", info.frames);
     if info.skips > 0 {
-        println!("# Skippable Frames: {}", info.skips);
+        outln!("# Skippable Frames: {}", info.skips);
     }
-    println!("DictID: {}", info.dict_id);
-    println!(
+    outln!("DictID: {}", info.dict_id);
+    outln!(
         "Window Size: {} ({} B)",
         human_size(info.window_size, raw).plain(),
         info.window_size
     );
-    println!(
+    outln!(
         "Compressed Size: {} ({} B)",
         human_size(compressed, raw).plain(),
         compressed
     );
     if info.decompressed_known {
-        println!(
+        outln!(
             "Decompressed Size: {} ({} B)",
             human_size(info.decompressed, raw).plain(),
             info.decompressed
         );
-        println!("Ratio: {:.4}", ratio(compressed, info.decompressed));
+        outln!("Ratio: {:.4}", ratio(compressed, info.decompressed));
     }
     // The checksum value only shows for exactly one checked frame.
     if info.uses_check && info.frames == 1 {
-        println!("Check: XXH64 {:08x}", u32::from_le_bytes(info.checksum));
+        outln!("Check: XXH64 {:08x}", u32::from_le_bytes(info.checksum));
     } else if info.uses_check {
-        println!("Check: XXH64");
+        outln!("Check: XXH64");
     } else {
-        println!("Check: None");
+        outln!("Check: None");
     }
-    println!();
+    outln!();
 }
 
 #[cfg(test)]

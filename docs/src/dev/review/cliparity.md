@@ -114,6 +114,8 @@ The `-r` walk is now pre-order depth-first in readdir order like `UTIL_prepareFi
 
 The collection diagnostics (`can't stat`, `is a directory`, `is not a regular file`, directory read errors) are display-level-1 lines and vanish at `-qq`, keeping exit 1. The overwrite prompt runs only for an existing regular file, so `-o <dir>` falls through to the open failure `zstdx: <dir>: Is a directory` like `FIO_openDstFile`. The same-file refusal line prints through a format! (the `{PREFIX}` placeholder used to reach stderr literally). A bare `-b` carries the default level and frees the next entry (a file or `-d`), because zstd reads `-b`'s value inline only; `-b` left the separated-value flag list. The tracing fmt layer disables ANSI when stderr is not a terminal, so piped diagnostics are plain text.
 
+Display line endings follow the reference's CRT text mode: on Windows every stdout and stderr line expands `\n` to `\r\n`, which the `display` module produces for all CLI printing (`outln!`/`errln!` over the print macros, bench's flushed OUTPUT path, and a `MakeWriter` wrap of the tracing writer). On unix the bytes are unchanged. The integration tests read both streams through `stderr_text`/`stdout_text`, normalizing the ending back, so expectations stay written with plain `\n`.
+
 ## Accepted deviations
 
 - `-l` with `-v` or `-vv` would print zstd's banner `*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***`, and at `-vv` the line `Compressing with N worker threads` with a machine-dependent N. Printing zstd's banner from zstdx would claim false provenance, and the thread line depends on the MT configuration.

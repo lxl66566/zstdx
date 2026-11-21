@@ -9,7 +9,7 @@ use std::fs;
 
 use zstdx::decoding::DEFAULT_MAX_WINDOW_SIZE;
 
-use crate::{Cli, Input, MAX_WINDOW_LOG, MIN_WINDOW_LOG, Mode, PREFIX};
+use crate::{Cli, Input, MAX_WINDOW_LOG, MIN_WINDOW_LOG, Mode, PREFIX, display::errln};
 
 /// The settings overrides patch mode derives for one invocation.
 #[derive(Debug)]
@@ -55,14 +55,14 @@ pub(crate) fn adjust(
         };
         let file_window_log = highbit64(max_src) + 1;
         if file_window_log > MAX_WINDOW_LOG {
-            eprintln!(
+            errln!(
                 "{PREFIX}Warning: --patch-from window log {file_window_log} above the engine's \
                  maximum {MAX_WINDOW_LOG}, reduced to {MAX_WINDOW_LOG} (compression ratio will \
                  suffer)"
             );
         }
         if dict_size > 1 << MAX_WINDOW_LOG {
-            eprintln!(
+            errln!(
                 "{PREFIX}Warning: --patch-from reference above the maximum window ({} bytes): its \
                  distant content is unreachable",
                 1u64 << MAX_WINDOW_LOG

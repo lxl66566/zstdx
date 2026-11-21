@@ -9,7 +9,7 @@ use std::{
 
 mod common;
 
-use common::{BIN, Scratch, run, run_piped};
+use common::{BIN, Scratch, run, run_piped, stderr_text, stdout_text};
 
 fn payload() -> Vec<u8> {
     // Repetitive enough to compress well, long enough to span blocks.
@@ -93,7 +93,7 @@ fn file_roundtrip_default_names() {
     // (-q: the non-interactive decline message, no prompt).
     let output = run(&["-q", "-d", compressed.to_str().unwrap()]);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(stderr.contains("already exists"), "{stderr}");
 
     fs::remove_file(&input).unwrap();
@@ -124,7 +124,7 @@ fn stdin_output_refuses_overwrite() {
     // No tty to answer the prompt on, so the existing file must stay.
     let (output, _) = run_piped(&["-q", "-o", out.to_str().unwrap()], b"piped payload");
     assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(stderr.contains("already exists"), "{stderr}");
     assert_eq!(fs::read(&out).unwrap(), b"existing content");
 
@@ -193,7 +193,7 @@ fn level_flags_and_fast() {
     fs::write(&input, payload()).unwrap();
     let output = run(&["-22", input.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reduced to 19"));
+    assert!(stderr_text(&output).contains("reduced to 19"));
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn decompress_requires_zst_suffix() {
     fs::write(&input, payload()).unwrap();
     let output = run(&["-d", input.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown suffix"));
+    assert!(stderr_text(&output).contains("unknown suffix"));
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn test_mode_reports_decoded_bytes() {
 
     let output = run(&["-t", scratch.path("data.bin.zst").to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(stderr.contains("tested ok"), "{stderr}");
     assert!(!stderr.contains("0B tested ok"), "{stderr}");
 }
@@ -275,7 +275,7 @@ fn directory_requires_recursive() {
 
     let output = run(&[dir.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("is a directory"));
+    assert!(stderr_text(&output).contains("is a directory"));
 
     let output = run(&["-r", dir.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
@@ -316,14 +316,14 @@ fn long_sets_window_log() {
     // exit code (zstd rejects the same way)
     let (output, _) = run_piped(&["-q", "--long=9"], &data);
     assert_eq!(output.status.code(), Some(11));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Parameter is out of bound"));
+    assert!(stderr_text(&output).contains("Parameter is out of bound"));
 
     // above the engine's ceiling: clamped silently, like zstd's own clamp
     // to its 30
     let (output, frame) = run_piped(&["--long=28"], &data);
     assert!(output.status.success(), "{output:?}");
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("reduced"),
+        !stderr_text(&output).contains("reduced"),
         "clamping is silent"
     );
     assert_eq!(frame[5], 17 << 3);
@@ -333,7 +333,7 @@ fn long_sets_window_log() {
     let (output, _) = run_piped(&["-d", "-q", "--long=20"], &data);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unsupported format"),
+        stderr_text(&output).contains("unsupported format"),
         "{output:?}"
     );
 }
@@ -365,11 +365,11 @@ fn check_flags_toggle_checksum() {
     assert_eq!(out, data);
     let (output, _) = run_piped(&["-d", "-q"], &corrupt);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("doesn't match checksum"));
+    assert!(stderr_text(&output).contains("doesn't match checksum"));
     // `--check` on decode is the explicit default: accepted, still fails.
     let (output, _) = run_piped(&["-d", "-q", "--check"], &corrupt);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("doesn't match checksum"));
+    assert!(stderr_text(&output).contains("doesn't match checksum"));
 }
 
 /// `--stream-size` pledges the stdin stream: the promise lands in the
@@ -392,7 +392,7 @@ fn stream_size_pledges_and_enforces() {
         "mismatching input must fail"
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Src size is incorrect"),
+        stderr_text(&output).contains("Src size is incorrect"),
         "zstd's parameter-class message"
     );
 
@@ -401,7 +401,7 @@ fn stream_size_pledges_and_enforces() {
     fs::write(&input, &data).unwrap();
     let output = run(&["--stream-size=1000", input.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("only applies to stdin"));
+    assert!(stderr_text(&output).contains("only applies to stdin"));
 }
 
 /// `--size-hint` sizes the encoder row without promising anything: the
@@ -423,7 +423,7 @@ fn size_hint_sizes_the_window() {
     fs::write(&input, &data).unwrap();
     let output = run(&["--size-hint=4096", input.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("only applies to stdin"));
+    assert!(stderr_text(&output).contains("only applies to stdin"));
 }
 
 /// `-M` bounds the decode window (the dominant decode memory): a cap under
@@ -438,7 +438,7 @@ fn memory_caps_decode_window() {
 
     let (output, _) = run_piped(&["-d", "-q", "-M", "64M"], &big);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(
         stderr.contains("Window size larger than maximum"),
         "{stderr}"
@@ -450,14 +450,14 @@ fn memory_caps_decode_window() {
 
     let (output, _) = run_piped(&["-d", "-q", "-M", "512"], &big);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("below"));
+    assert!(stderr_text(&output).contains("below"));
 
     let scratch = Scratch::new("cli", "memory-compress");
     let input = scratch.path("data.bin");
     fs::write(&input, &data).unwrap();
     let output = run(&["-q", "-M", "1M", input.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bounds decoding"));
+    assert!(stderr_text(&output).contains("bounds decoding"));
 }
 
 /// `--filelist` reads the input list from a file; zstd has no stdin list
@@ -484,10 +484,7 @@ fn filelist_reads_input_list() {
     // rejection matches the reference and leaves no outputs behind
     let output = run(&["-q", "-f", "--file", list.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "Incorrect parameter: --file \n"
-    );
+    assert_eq!(stderr_text(&output), "Incorrect parameter: --file \n");
     assert!(!scratch.path("a.bin.zst").exists());
     assert!(!scratch.path("b.bin.zst").exists());
 
@@ -511,14 +508,11 @@ fn filelist_reads_input_list() {
     // zstd's NEXT_FIELD rejects a dash as a separated value outright.
     let (output, _) = run_piped(&["-q", "-f", "--filelist", "-"], &contents);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("command cannot be separated from its argument")
-    );
+    assert!(stderr_text(&output).contains("command cannot be separated from its argument"));
     // `=-` is a literal (missing) file named `-`.
     let (output, _) = run_piped(&["-q", "-f", "--filelist=-"], &contents);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("error reading -"));
+    assert!(stderr_text(&output).contains("error reading -"));
     assert!(
         !scratch.path("b.bin.zst").exists(),
         "no stdin list is consumed"
@@ -552,11 +546,11 @@ fn ignore_errors_is_rejected() {
 
     let output = run(&["-d", "-q", "-r", dir.to_str().unwrap()]);
     assert!(!output.status.success(), "the corrupt frame fails the run");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bad.zst"));
+    assert!(stderr_text(&output).contains("bad.zst"));
 
     let output = run(&["-d", "-q", "-r", "--ignore-errors", dir.to_str().unwrap()]);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(
         stderr.contains("Incorrect parameter: --ignore-errors"),
         "{stderr}"
@@ -573,7 +567,7 @@ fn sparse_is_rejected_loudly() {
     for flag in ["--sparse", "--no-sparse"] {
         let output = run(&[flag, input.to_str().unwrap()]);
         assert!(!output.status.success(), "{flag} must be rejected");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not supported"));
+        assert!(stderr_text(&output).contains("not supported"));
         assert!(!scratch.path("data.bin.zst").exists());
     }
 }
@@ -588,7 +582,7 @@ fn version_prints_compat_note() {
     for flag in ["-V", "--version"] {
         let output = run(&[flag]);
         assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_text(&output);
         assert_eq!(
             stdout,
             format!(
@@ -598,24 +592,21 @@ fn version_prints_compat_note() {
     }
     // -q before -V drops below the default display level: bare version
     let output = run(&["-q", "-V"]);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        format!("{version}\n")
-    );
+    assert_eq!(stdout_text(&output), format!("{version}\n"));
     // -V before -q still sees the default level
     let output = run(&["-V", "-q"]);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("***"));
+    assert!(stdout_text(&output).contains("***"));
     // -v adds the format-support line; -V first does not
     let output = run(&["-v", "-V"]);
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        stdout_text(&output),
         format!(
             "*** zstdx command line interface (64-bit) v{version}, pure-Rust Zstandard ***\n*** \
              supports: zstd\n"
         )
     );
     let output = run(&["-V", "-v"]);
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("supports"));
+    assert!(!stdout_text(&output).contains("supports"));
     // after `--` a -V is a file name
     let output = run(&["--", "-V"]);
     assert_eq!(output.status.code(), Some(1));
@@ -628,7 +619,7 @@ fn help_variants_print_usage() {
     for flag in ["-h", "-H", "--help"] {
         let output = run(&[flag]);
         assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_text(&output);
         assert!(stdout.contains("Usage:"), "{stdout}");
     }
 }
@@ -639,7 +630,7 @@ fn help_variants_print_usage() {
 fn end_of_flags_treats_rest_as_files() {
     let output = run(&["--", "-3"]);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(stderr.contains("-3"), "{stderr}");
     assert!(!stderr.contains("level"), "{stderr}");
 }
@@ -704,12 +695,12 @@ fn recursive_walk_rules() {
     let output = run(&["-r", empty.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         "please provide correct input file(s) or non-empty directories -- ignored \n"
     );
     let output = run(&["-qq", "-r", empty.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(stderr_text(&output), "");
 
     // mixed args: one empty dir plus one file still processes the file
     let output = run(&[
@@ -781,7 +772,7 @@ fn no_dict_id_keeps_dictionary_effect() {
         (without_id.to_str().unwrap(), false),
     ] {
         let output = run(&["-l", "-v", path]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout_text(&output);
         let line = stdout.lines().find(|l| l.starts_with("DictID:")).unwrap();
         if expect_id {
             assert!(!line.contains("DictID: 0"), "{stdout}");
@@ -1001,7 +992,7 @@ fn output_dir_flat_relocates_names() {
     ]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         format!(
             "zstdx: {}: No such file or directory\n",
             missing.join("data.bin.zst").display()
@@ -1031,7 +1022,7 @@ fn repeated_value_flags_last_wins_end_to_end() {
     ]);
     assert_eq!(output.status.code(), Some(31), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         format!(
             "zstdx: error 31 : Stat failed on dictionary file {}: No such file or directory \n",
             scratch.path("missing.dict").display()
@@ -1157,7 +1148,7 @@ fn unsupported_flags_reject_loudly() {
     ] {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
-        assert_eq!(String::from_utf8_lossy(&output.stderr), line, "{args:?}");
+        assert_eq!(stderr_text(&output), line, "{args:?}");
     }
 }
 
@@ -1195,7 +1186,7 @@ fn identity_flags_and_format_selector() {
         let output = run(&[format!("--format={fmt}").as_str(), input.to_str().unwrap()]);
         assert_eq!(output.status.code(), Some(1), "{fmt}: {output:?}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+            stderr_text(&output),
             format!("Incorrect parameter: --format={fmt} \n"),
             "{fmt}"
         );
@@ -1204,7 +1195,7 @@ fn identity_flags_and_format_selector() {
     let output = run(&["--priority=idle", input.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         "Incorrect parameter: --priority=idle \n"
     );
 }
@@ -1221,7 +1212,7 @@ fn auto_threads_note_at_verbose() {
     fs::remove_file(scratch.path("data.bin.zst")).unwrap();
     let output = run(&["-v", "-T0", "-f", input.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(
         stderr.contains(" core(s) detected ") && stderr.contains("physical"),
         "{stderr}"
@@ -1238,7 +1229,7 @@ fn suppressed_stream_size_still_binds() {
     );
     assert_eq!(output.status.code(), Some(11), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         "zstdx: error 11 : Src size is incorrect \n"
     );
     let (output, stdout) = run_piped(
@@ -1268,7 +1259,7 @@ fn dict_input_is_refused() {
         ]);
         assert_eq!(output.status.code(), Some(1), "{dict_flag}: {output:?}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+            stderr_text(&output),
             format!(
                 "zstdx: cannot use {} as an input file and dictionary \n",
                 input.display()
@@ -1289,10 +1280,7 @@ fn dict_input_is_refused() {
     fs::hard_link(&dict, &linked).unwrap();
     let output = run(&["-D", dict.to_str().unwrap(), linked.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("cannot use"),
-        "{output:?}"
-    );
+    assert!(stderr_text(&output).contains("cannot use"), "{output:?}");
 
     // one refused input does not stop the others
     let other = scratch.path("other.txt");
@@ -1319,7 +1307,7 @@ fn dict_input_is_refused() {
         input.to_str().unwrap(),
     ]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(stderr_text(&output), "");
 
     // decode modes have no guard: the dict is read before the loop, so
     // an input that is its own dictionary still decodes
@@ -1389,7 +1377,7 @@ fn clap_value_errors_one_line() {
     ] {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
-        assert_eq!(String::from_utf8_lossy(&output.stderr), line, "{args:?}");
+        assert_eq!(stderr_text(&output), line, "{args:?}");
     }
 }
 
@@ -1405,7 +1393,7 @@ fn long_window_log_bounds() {
         let (output, _) = run_piped(&["-q", &format!("--long={n}")], &data);
         assert_eq!(output.status.code(), Some(11), "{n}: {output:?}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+            stderr_text(&output),
             "zstdx: error 11 : Parameter is out of bound \n",
             "{n}"
         );
@@ -1430,7 +1418,7 @@ fn long_window_log_bounds() {
     assert_eq!(output.status.code(), Some(11), "{output:?}");
     let (output, _) = run_piped(&["-q", "-d", "--long=10", "-c"], &frame);
     assert!(!output.status.success(), "the 128 MiB window exceeds 1 KiB");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     // the unpledged stdin frame declared a 2^27 window: the help block
     // names that window, exactly like the reference
     assert!(
@@ -1479,10 +1467,7 @@ fn bare_bench_flag_forms() {
     // an attached bad value is one Incorrect-parameter line
     let output = run(&["-b3x", input.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "Incorrect parameter: -b3x \n"
-    );
+    assert_eq!(stderr_text(&output), "Incorrect parameter: -b3x \n");
 }
 
 /// Stdin yields its bytes once: a second stdin input fails with the
@@ -1492,10 +1477,7 @@ fn stdin_twice_is_a_read_error() {
     let (_, one_frame) = run_piped(&["-q"], b"payload");
     let (output, stdout) = run_piped(&["-", "-"], b"payload");
     assert_eq!(output.status.code(), Some(37), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "zstdx: error 37 : Read error \n"
-    );
+    assert_eq!(stderr_text(&output), "zstdx: error 37 : Read error \n");
     assert_eq!(stdout, one_frame, "exactly the one frame of the first pass");
 
     // an exhausted stdin hits the same error on the second pass
@@ -1506,7 +1488,7 @@ fn stdin_twice_is_a_read_error() {
     // -qq hides the line, the exit status stays
     let (output, _) = run_piped(&["-qq", "-", "-"], b"");
     assert_eq!(output.status.code(), Some(37), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(stderr_text(&output), "");
 }
 
 /// The same-file refusal prints its message, not a format placeholder.
@@ -1517,7 +1499,7 @@ fn same_file_refusal_message() {
     fs::write(&input, b"payload").unwrap();
     let output = run(&["-f", input.to_str().unwrap(), "-o", input.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(
         stderr.contains("Refusing to open an output file which will overwrite the input file"),
         "{stderr}"
@@ -1533,11 +1515,11 @@ fn qq_silences_collection_diagnostics() {
     let missing = scratch.path("missing.txt");
     let output = run(&["-qq", missing.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(stderr_text(&output), "");
     let output = run(&["-q", missing.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        stderr_text(&output),
         format!(
             "zstdx: can't stat {} : No such file or directory -- ignored \n",
             missing.display()
@@ -1569,7 +1551,7 @@ fn output_directory_is_an_open_failure() {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(1), "{force:?}: {output:?}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+            stderr_text(&output),
             format!("zstdx: {dir}: {refused}\n"),
             "{force:?}"
         );
