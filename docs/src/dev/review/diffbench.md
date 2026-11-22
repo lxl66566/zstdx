@@ -20,7 +20,7 @@ An accept or reject mismatch is re-checked against libzstd's one-shot `ZSTD_deco
 
 ### Sweep control
 
-The full sweep is about 41k cases, each with one CLI spawn and N+1 zstdx decodes, and it runs in parallel. It must be wrapped in `flock /root/programs/fork/zstd-bench.lock`. `--cases N` stride-samples deterministically. `--dict` attaches a dictionary to both decoders and encodes the seeds with it, and the dedicated dictionary-frame sweep is tracked in the [todo list](../todo.md). `--dump <dir>` writes the bytes of divergent cases for replay, and `--decode <file>` decodes one file with all verdicts printed.
+The full sweep is about 41k cases, each with one CLI spawn and N+1 zstdx decodes, and it runs in parallel. It must be wrapped in `flock -x /tmp/myflock.lock`. `--cases N` stride-samples deterministically. `--dict` attaches a dictionary to both decoders and encodes the seeds with it, and the dedicated dictionary-frame sweep is tracked in the [todo list](../todo.md). `--dump <dir>` writes the bytes of divergent cases for replay, and `--decode <file>` decodes one file with all verdicts printed.
 
 ## Bugs fixed
 
@@ -53,7 +53,7 @@ The cross CI surfaced this through the jump-table mutant, with identical frame b
 ## How to run
 
 ```bash
-flock /root/programs/fork/zstd-bench.lock \
+flock -x /tmp/myflock.lock \
   cargo run --release -p zstdx-bench -- parity            # full sweep (~41k cases)
 cargo run --release -p zstdx-bench -- parity --cases 2000 # stride-sampled
 cargo run --release -p zstdx-bench -- parity --dict bench/dict-json

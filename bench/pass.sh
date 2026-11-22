@@ -23,7 +23,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BIN=target/release/zstdx-bench
-LOCK=/root/programs/fork/zstd-bench.lock
+LOCK=/tmp/myflock.lock
 
 out=bench/scratch/pass-$(date +%Y%m%d-%H%M%S)
 sections=()

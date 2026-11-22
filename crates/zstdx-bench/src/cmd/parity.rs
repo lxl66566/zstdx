@@ -7,7 +7,7 @@
 //!
 //! Each case shells out to the CLI once (the reference is the CLI by
 //! design); a full sweep is multi-core work — wrap wide runs in
-//! `flock /root/programs/fork/zstd-bench.lock`. Exits nonzero on any
+//! `flock -x /tmp/myflock.lock`. Exits nonzero on any
 //! hard divergence so it can gate. The one class where the CLI
 //! (streaming) and any one-shot decoder legitimately disagree
 //! (window-violating offsets, R65 parity.md finding 7) is adjudicated by

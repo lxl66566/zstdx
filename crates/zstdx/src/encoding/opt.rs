@@ -844,33 +844,47 @@ fn count_run_aligned(
     (len, diff)
 }
 
-/// The kernel dispatch, outlined and cold so the dispatching body stays
-/// exactly the scalar loop plus one gate. Not actually cold on the
-/// long-compare rows (the mt jobs' twin compares call it per candidate),
-/// where one extra call per multi-KiB compare is noise.
-#[cold]
+/// The kernel dispatch. The kernel choice is a pure function of the CPU
+/// and the env clamp, resolved once per process; the hot-path read is one
+/// relaxed load of a function pointer instead of the OnceLock's
+/// get_or_init branch (the switch-point gate is only reached by compares
+/// still running at 64 B, so the indirection is far off the hot compare
+/// mass). Not actually cold on the long-compare rows (the mt jobs' twin
+/// compares call it per candidate), where one extra call per multi-KiB
+/// compare is noise.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
+type Kernel = fn(&[u8], usize, usize, usize, usize) -> usize;
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+static KERNEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cold]
 fn count_from_kernel(win: &[u8], idx: usize, cand: usize, start: usize, limit: usize) -> usize {
+    use std::sync::atomic::Ordering;
+
     use crate::common::simd::{self, SimdTier};
-    type Kernel = fn(&[u8], usize, usize, usize, usize) -> usize;
-    // The kernel choice is a pure function of the CPU and the env clamp:
-    // resolved once per process, then one indirect call.
-    static KERNEL: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
-    let kernel = *KERNEL.get_or_init(|| {
-        if simd::allows(SimdTier::Avx512) && std::is_x86_feature_detected!("avx512bw") {
-            |win, idx, cand, start, limit| {
-                // SAFETY: avx512bw detected at selection.
-                unsafe { count_from_avx512(win, idx, cand, start, limit) }
+    let kernel = KERNEL.load(Ordering::Relaxed);
+    let kernel = if kernel != 0 {
+        // SAFETY: a nonzero cell was written from a fn item below.
+        unsafe { std::mem::transmute::<usize, Kernel>(kernel) }
+    } else {
+        let selected: Kernel = if simd::allows(SimdTier::Avx512)
+            && std::is_x86_feature_detected!("avx512bw")
+        {
+            // SAFETY: avx512bw detected at selection.
+            |win, idx, cand, start, limit| unsafe {
+                count_from_avx512(win, idx, cand, start, limit)
             }
         } else if simd::allows(SimdTier::Avx2) && std::is_x86_feature_detected!("avx2") {
-            |win, idx, cand, start, limit| {
-                // SAFETY: avx2 detected at selection.
-                unsafe { count_from_avx2(win, idx, cand, start, limit) }
-            }
+            // SAFETY: avx2 detected at selection.
+            |win, idx, cand, start, limit| unsafe { count_from_avx2(win, idx, cand, start, limit) }
         } else {
             count_from_scalar
-        }
-    });
+        };
+        KERNEL.store(selected as usize, Ordering::Relaxed);
+        selected
+    };
     kernel(win, idx, cand, start, limit)
 }
 
@@ -1042,6 +1056,22 @@ impl Finder<'_, '_> {
         (cand >= floor && cand < pos).then_some(cand)
     }
 
+    /// [`Self::resolve`] with the scan position's stored form hoisted by
+    /// the caller: `q` is `pack(pos).0`, computed once per walk, so each
+    /// step drops the two adds the stored form otherwise rebuilds. Only
+    /// [`Self::get_all_matches`]'s search walk uses this form — the
+    /// insert walk's hoist measured positive on every opt-row shape
+    /// (see the search site).
+    #[inline]
+    fn resolve_q(q: u32, entry: PackedPos, floor: u64, pos: u64) -> Option<u64> {
+        if entry == EMPTY {
+            return None;
+        }
+        let dist = q.wrapping_sub(entry.0);
+        let cand = pos.wrapping_sub(dist as u64);
+        (cand >= floor && cand < pos).then_some(cand)
+    }
+
     /// Pack an absolute position into its stored entry form.
     #[inline(always)]
     fn pack(&self, pos: u64) -> PackedPos {
@@ -1127,82 +1157,89 @@ impl Finder<'_, '_> {
         // heads. Search-side counts stay exact; a cap hit breaks the walk
         // with the same "equal tail" semantics as the block-end hit.
         let count_limit = self.block_end_idx.min(idx + OPT_NUM);
-        // Checked indexing (the walk is branchy per step; the masked ring
-        // slots and the count-capped window reads the raw-pointer form
-        // asserted by construction are index checks here).
         self.table[h] = self.pack(pos).slot();
-        let own = self.ring_base(pos);
-        let mut smaller = own;
-        let mut larger = own + 1;
         // The trailing EMPTY stores are suppressed when the walk stopped on
-        // the ring floor: that slot holds the freshly threaded link (the
-        // raw-pointer form pointed the cursor at a dummy local instead).
+        // the ring floor: that slot holds the freshly threaded link.
         let mut smaller_open = true;
         let mut larger_open = true;
-        while let Some(ca) = cand {
-            if nb == 0 {
-                break;
-            }
-            nb -= 1;
-            let cidx = (ca - self.win_base) as usize;
-            let mut ml = common_smaller.min(common_larger);
-            // The trace build records the compare like `dubt::count` does,
-            // so the opt rows' tree volume lands in the same counter;
-            // default builds keep the plain call.
-            #[cfg(feature = "job_trace")]
-            {
-                ml = if LONG {
-                    count_from_long(self.win, idx, cidx, ml, count_limit)
-                } else {
-                    count_from(self.win, idx, cidx, ml, count_limit)
-                };
-                super::job_trace::add_cmp(ml);
-            }
-            #[cfg(not(feature = "job_trace"))]
-            {
-                ml = if LONG {
-                    count_from_long(self.win, idx, cidx, ml, count_limit)
-                } else {
-                    count_from(self.win, idx, cidx, ml, count_limit)
-                };
-            }
-            if ml > best_len {
-                best_len = ml;
-                if ca + ml as u64 > match_end {
-                    match_end = ca + ml as u64;
-                }
-            }
-            // An equal tail cannot order the candidate; stop to keep the
-            // tree consistent. A cap hit is just as unordered.
-            if idx + ml >= count_limit {
-                break;
-            }
-            let node = self.ring_base(ca);
-            if self.win[cidx + ml] < self.win[idx + ml] {
-                self.bt[smaller] = self.pack(ca).slot();
-                common_smaller = ml;
-                if ca <= bt_low {
-                    smaller_open = false;
+        // SAFETY: as the search walk's block (see `get_all_matches`);
+        // the ordering byte reads stay under `count_limit` <= block_end_idx.
+        unsafe {
+            let bt = self.bt.as_mut_ptr();
+            let win = self.win;
+            debug_assert!(self.ring_base(pos) + 1 < self.bt.len());
+            let own = bt.add(self.ring_base(pos));
+            let mut smaller: *mut u32 = own;
+            let mut larger: *mut u32 = own.add(1);
+            while let Some(ca) = cand {
+                if nb == 0 {
                     break;
                 }
-                smaller = node + 1;
-                cand = self.resolve(PackedPos::from_slot(self.bt[node + 1]), floor, pos);
-            } else {
-                self.bt[larger] = self.pack(ca).slot();
-                common_larger = ml;
-                if ca <= bt_low {
-                    larger_open = false;
+                nb -= 1;
+                let cidx = (ca - self.win_base) as usize;
+                let mut ml = common_smaller.min(common_larger);
+                debug_assert!(self.ring_base(ca) + 1 < self.bt.len());
+                // The child-link address is ready under the count's
+                // latency (libzstd computes `nextPtr` before `ZSTD_count`).
+                let node = bt.add(self.ring_base(ca));
+                // The trace build records the compare like `dubt::count` does,
+                // so the opt rows' tree volume lands in the same counter;
+                // default builds keep the plain call.
+                #[cfg(feature = "job_trace")]
+                {
+                    ml = if LONG {
+                        count_from_long(win, idx, cidx, ml, count_limit)
+                    } else {
+                        count_from(win, idx, cidx, ml, count_limit)
+                    };
+                    super::job_trace::add_cmp(ml);
+                }
+                #[cfg(not(feature = "job_trace"))]
+                {
+                    ml = if LONG {
+                        count_from_long(win, idx, cidx, ml, count_limit)
+                    } else {
+                        count_from(win, idx, cidx, ml, count_limit)
+                    };
+                }
+                if ml > best_len {
+                    best_len = ml;
+                    if ca + ml as u64 > match_end {
+                        match_end = ca + ml as u64;
+                    }
+                }
+                // An equal tail cannot order the candidate; stop to keep the
+                // tree consistent. A cap hit is just as unordered.
+                if idx + ml >= count_limit {
                     break;
                 }
-                larger = node;
-                cand = self.resolve(PackedPos::from_slot(self.bt[node]), floor, pos);
+                debug_assert!(cidx + ml < win.len() && idx + ml < win.len());
+                if *win.get_unchecked(cidx + ml) < *win.get_unchecked(idx + ml) {
+                    *smaller = self.pack(ca).slot();
+                    common_smaller = ml;
+                    if ca <= bt_low {
+                        smaller_open = false;
+                        break;
+                    }
+                    smaller = node.add(1);
+                    cand = self.resolve(PackedPos::from_slot(*node.add(1)), floor, pos);
+                } else {
+                    *larger = self.pack(ca).slot();
+                    common_larger = ml;
+                    if ca <= bt_low {
+                        larger_open = false;
+                        break;
+                    }
+                    larger = node;
+                    cand = self.resolve(PackedPos::from_slot(*node), floor, pos);
+                }
             }
-        }
-        if smaller_open {
-            self.bt[smaller] = EMPTY.slot();
-        }
-        if larger_open {
-            self.bt[larger] = EMPTY.slot();
+            if smaller_open {
+                *smaller = EMPTY.slot();
+            }
+            if larger_open {
+                *larger = EMPTY.slot();
+            }
         }
         let positions = if best_len > 384 {
             (best_len - 384).min(192)
@@ -1412,82 +1449,104 @@ impl Finder<'_, '_> {
             }
         }
 
-        // Tree search.
-        let mut cand = self.resolve(PackedPos::from_slot(head), floor, pos);
+        // Tree search. The stored form `q` is hoisted per call so each
+        // step's resolve drops its two adds; the Option-driven walk shape
+        // stays (the raw-slot drive with the fused admission re-rolls the
+        // descent's register allocation: json ultra +2.5% Ir, measured
+        // twice), and `insert_bt1` keeps the plain resolve (its hoist
+        // regressed every opt-row shape by +0.1 to +0.4% Ir).
+        let q = self.pack(pos).0;
+        let mut cand = Self::resolve_q(q, PackedPos::from_slot(head), floor, pos);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut match_end = pos + 9;
         let mut nb = self.nb_compares;
         let bt_low = pos.saturating_sub((self.bt.len() / 2) as u64);
-        // Checked indexing throughout (see `insert_bt1`).
         self.table[h] = self.pack(pos).slot();
-        let own = self.ring_base(pos);
-        let mut smaller = own;
-        let mut larger = own + 1;
         // The trailing EMPTY stores are suppressed when the walk stopped on
         // the ring floor (see `insert_bt1`).
         let mut smaller_open = true;
         let mut larger_open = true;
-        while let Some(ca) = cand {
-            if nb == 0 {
-                break;
-            }
-            nb -= 1;
-            let cidx = (ca - self.win_base) as usize;
-            let mut ml = common_smaller.min(common_larger);
-            // Trace recording as at the `find_all_matches` site above.
-            #[cfg(feature = "job_trace")]
-            {
-                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
-                super::job_trace::add_cmp(ml);
-            }
-            #[cfg(not(feature = "job_trace"))]
-            {
-                ml = count_from(self.win, idx, cidx, ml, self.block_end_idx);
-            }
-            if ml > best_len {
-                if ca + ml as u64 > match_end {
-                    match_end = ca + ml as u64;
-                }
-                best_len = ml;
-                matches[mnum] = Match {
-                    off: (pos - ca + 3) as u32,
-                    len: ml as u32,
-                };
-                mnum += 1;
-                if ml > OPT_NUM || idx + ml >= self.block_end_idx {
+        // SAFETY: ring slots are masked by construction (debug-pinned at
+        // each raw site); the ordering byte reads stay inside the block
+        // (the equal-tail break precedes them, and block_end_idx <=
+        // win.len()); `mnum` is capped by the strictly-increasing best_len
+        // ladder, far below the OPT_SIZE scratch (debug-pinned).
+        unsafe {
+            let bt = self.bt.as_mut_ptr();
+            let win = self.win;
+            let matches_p = matches.as_mut_ptr();
+            debug_assert!(self.ring_base(pos) + 1 < self.bt.len());
+            let own = bt.add(self.ring_base(pos));
+            let mut smaller: *mut u32 = own;
+            let mut larger: *mut u32 = own.add(1);
+            while let Some(ca) = cand {
+                if nb == 0 {
                     break;
                 }
-            }
-            if idx + ml >= self.block_end_idx {
-                break;
-            }
-            let node = self.ring_base(ca);
-            if self.win[cidx + ml] < self.win[idx + ml] {
-                self.bt[smaller] = self.pack(ca).slot();
-                common_smaller = ml;
-                if ca <= bt_low {
-                    smaller_open = false;
+                nb -= 1;
+                let cidx = (ca - self.win_base) as usize;
+                let mut ml = common_smaller.min(common_larger);
+                debug_assert!(self.ring_base(ca) + 1 < self.bt.len());
+                // The child-link address is ready under the count's
+                // latency (libzstd computes `nextPtr` before `ZSTD_count`).
+                let node = bt.add(self.ring_base(ca));
+                // Trace recording as at the rep sites above (default
+                // builds keep the plain call).
+                #[cfg(feature = "job_trace")]
+                {
+                    ml = count_from(win, idx, cidx, ml, self.block_end_idx);
+                    super::job_trace::add_cmp(ml);
+                }
+                #[cfg(not(feature = "job_trace"))]
+                {
+                    ml = count_from(win, idx, cidx, ml, self.block_end_idx);
+                }
+                if ml > best_len {
+                    if ca + ml as u64 > match_end {
+                        match_end = ca + ml as u64;
+                    }
+                    best_len = ml;
+                    debug_assert!(mnum < matches.len());
+                    *matches_p.add(mnum) = Match {
+                        off: (pos - ca + 3) as u32,
+                        len: ml as u32,
+                    };
+                    mnum += 1;
+                    if ml > OPT_NUM || idx + ml >= self.block_end_idx {
+                        break;
+                    }
+                }
+                if idx + ml >= self.block_end_idx {
                     break;
                 }
-                smaller = node + 1;
-                cand = self.resolve(PackedPos::from_slot(self.bt[node + 1]), floor, pos);
-            } else {
-                self.bt[larger] = self.pack(ca).slot();
-                common_larger = ml;
-                if ca <= bt_low {
-                    larger_open = false;
-                    break;
+                debug_assert!(cidx + ml < win.len() && idx + ml < win.len());
+                if *win.get_unchecked(cidx + ml) < *win.get_unchecked(idx + ml) {
+                    *smaller = self.pack(ca).slot();
+                    common_smaller = ml;
+                    if ca <= bt_low {
+                        smaller_open = false;
+                        break;
+                    }
+                    smaller = node.add(1);
+                    cand = Self::resolve_q(q, PackedPos::from_slot(*node.add(1)), floor, pos);
+                } else {
+                    *larger = self.pack(ca).slot();
+                    common_larger = ml;
+                    if ca <= bt_low {
+                        larger_open = false;
+                        break;
+                    }
+                    larger = node;
+                    cand = Self::resolve_q(q, PackedPos::from_slot(*node), floor, pos);
                 }
-                larger = node;
-                cand = self.resolve(PackedPos::from_slot(self.bt[node]), floor, pos);
             }
-        }
-        if smaller_open {
-            self.bt[smaller] = EMPTY.slot();
-        }
-        if larger_open {
-            self.bt[larger] = EMPTY.slot();
+            if smaller_open {
+                *smaller = EMPTY.slot();
+            }
+            if larger_open {
+                *larger = EMPTY.slot();
+            }
         }
         // Skip re-indexing the interior of long repetitive stretches.
         *self.next_update = match_end - 8;
