@@ -7,17 +7,22 @@ description  = "Benchmark and dev-tool harness for the zstdx crate"
 publish      = false
 
 [dependencies]
-clap  = { version = "4.5", features = ["derive"] }
+clap  = { version = "4.6", features = ["derive"] }
 rayon = "1.12.0"
 # zstdmt enables libzstd's worker threads so the benches can compare the
 # multithreaded encoders against ours; experimental exposes CParameter's
 # SrcSizeHint, which the enc-feed section needs for the 7-Zip caller shape
-zstd  = { version = "0.13.2", features = ["zstdmt", "experimental"] }
+zstd  = { version = "0.14", features = ["experimental", "zstdmt"] }
 # fuzz_exports: the shared handcrafted-frame constructors of the
 # parity subcommand corpus (zstdx::parity).
 zstdx = { workspace = true, features = ["dict_builder", "fuzz_exports"] }
 
 [features]
+# Enables `stmdiff --config` (encoder-side configuration dump). Off by
+# default: the reset hooks ride the state-preparation paths, so they stay
+# out of timing builds (`cargo run --release -p zstdx-bench --features
+# seq_dump,cfg_dump -- stmdiff ...`).
+cfg_dump  = ["zstdx/cfg_dump"]
 # Enables `jobdecomp` (encoder-side per-job cost spans). Off by default:
 # the span hooks ride the job paths (`cargo run --release -p zstdx-bench
 # --features job_trace -- jobdecomp ...`).
@@ -26,11 +31,6 @@ job_trace = ["zstdx/job_trace"]
 # default: the dump hook sits in the decode hot loop, so it must never be
 # compiled into timing builds (`cargo run --release -p zstdx-bench --features seq_dump -- seqstats ...`).
 seq_dump  = ["zstdx/seq_dump"]
-# Enables `stmdiff --config` (encoder-side configuration dump). Off by
-# default: the reset hooks ride the state-preparation paths, so they stay
-# out of timing builds (`cargo run --release -p zstdx-bench --features
-# seq_dump,cfg_dump -- stmdiff ...`).
-cfg_dump  = ["zstdx/cfg_dump"]
 
 [lints]
 workspace = true

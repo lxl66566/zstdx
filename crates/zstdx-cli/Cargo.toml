@@ -1,42 +1,42 @@
 [package]
-name         = "zstdx-cli"
+name              = "zstdx-cli"
 version.workspace = true
-edition      = "2024"
-rust-version = "1.89"
-description  = "A zstd-compatible command line interface built on the pure-Rust zstdx engine"
-readme       = "../../README.md"
-repository   = "https://github.com/lxl66566/zstdx"
-license      = "MIT"
-keywords     = ["cli", "compression", "zstandard", "zstd"]
-categories   = ["command-line-utilities", "compression"]
+edition           = "2024"
+rust-version      = "1.89"
+description       = "A zstd-compatible command line interface built on the pure-Rust zstdx engine"
+readme            = "../../README.md"
+repository        = "https://github.com/lxl66566/zstdx"
+license           = "MIT"
+keywords          = ["cli", "compression", "zstandard", "zstd"]
+categories        = ["command-line-utilities", "compression"]
 
 [[bin]]
 name = "zstdx"
 path = "src/main.rs"
 
-[features]
-default = ["dict_builder"]
-# Dictionary training (`zstdx --train`), on by default for CLI parity with
-# zstd's built-in trainer; default-features = false drops it and the flag
-# explains itself when missing.
-dict_builder = ["zstdx/dict_builder"]
-
-[target.'cfg(unix)'.dependencies]
-# Read-only input mapping for the zero-copy encode feed.
-libc = { version = "0.2", default-features = false }
-
-[target.'cfg(windows)'.dependencies]
-# BY_HANDLE_FILE_INFORMATION file identity for the dict=input guard.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-
 [dependencies]
 # Used for the command line binary only
-clap               = { version = "4.5.46", features = ["derive"] }
+clap               = { version = "4.6.9", features = ["derive"] }
 indicatif          = { version = "0.18.0" }
 tracing            = { version = "0.1.41" }
 tracing-indicatif  = { version = "0.3.13" }
 tracing-subscriber = { version = "0.3.20" }
 zstdx              = { workspace = true, features = ["std"] }
+
+[target."cfg(unix)".dependencies]
+# Read-only input mapping for the zero-copy encode feed.
+libc = { version = "0.2", default-features = false }
+
+[target."cfg(windows)".dependencies]
+# BY_HANDLE_FILE_INFORMATION file identity for the dict=input guard.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[features]
+default      = ["dict_builder"]
+# Dictionary training (`zstdx --train`), on by default for CLI parity with
+# zstd's built-in trainer; default-features = false drops it and the flag
+# explains itself when missing.
+dict_builder = ["zstdx/dict_builder"]
 
 [lints]
 workspace = true

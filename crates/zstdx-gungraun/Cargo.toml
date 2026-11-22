@@ -41,11 +41,11 @@ test    = false
 [dependencies]
 # Reference implementation every benchmark compares against; also used by
 # the setup helpers to build interop frames and gate roundtrips.
-zstd  = "0.13.2"
+zstd  = "0.14"
 zstdx = { path = "../zstdx" }
 
 [dev-dependencies]
-gungraun = "0.19.4"
+gungraun = "0.20"
 
 [lints]
 workspace = true
