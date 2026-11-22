@@ -568,6 +568,16 @@ Result: the structure forbids the bound, three ways and independently. A search 
 
 Falsified: the class, on structure rather than measurement.
 
+### Seed-local diet for the ultra first-block statistics parse
+
+Premise: the btultra2 seed parse (`opt::run_block`'s `lit_length_sum == 0` branch) measured 18-21% of text l19 wall and over 30% on 1 MiB payloads, so a cut local to the seed path — reusing its tree for the main parse, cheaper seed knobs, skipping the discarded emit sink — would buy wall without touching the shared tier.
+
+Measurement on 2026-11-22 (callgrind exit-probe decomposition on a 128 KiB text block-0 slice, plus timing probes around both parses of the 32 MiB text frame): the seed parse reads 216.66M Ir (the exit-after-minus-exit-before callgrind delta) and 15.2-16.9 ms of a 71.5-72 ms frame, 20.6% of whole-frame Ir (216.7M of 1052.6M); the seed feature's net wall cost is 14.5 ms against a no-seed encoder at 57.5 ms, because the seeded main parse of block 0 runs 7 ms cheaper than the unseeded one (13.4 against 20.4 ms). On a 1 MiB text head the feature costs 20% of wall (64.5 against 51.4 ms); on json and skewed the block-0 parse pair is 37.8 and 20.4 ms against 11.9 and 19.1 s frames, under 0.4%.
+
+The decomposition falsifies the premise's "seed-local" framing: the frame-start seed parse is instruction-for-instruction the parse a no-seed encoder runs on block 0 — both start from the first-block price branch, an empty tree and the same rep, and the no-seed full encode's `get_all_matches` and `run_once` callgrind counts match the exit-after-seed profile's exactly (118,461,173 and 91,242,224 Ir; the profiles differ only by the 2.65M Ir entropy-and-frame-assembly tail). Every landed per-event diet — the DP bounds strips, live-field writes, u32 price sums, the fused resolve — therefore already applies to the seed parse, and its Ir splits like any block parse: 54.4% `get_all_matches`, 41.9% `run_once` (the mlen variant scan and its price terms about 22 points), 3.1% `update_tree`, with the discarded emit sink plus the per-sequence `update_stats` fold at 1-2M Ir, under 0.2% of text wall and below the interleaved A/B noise floor. The remaining candidates fail independently: tree reuse across the two parses breaks parity (libzstd's `initStats_ultra` rewinds `dictLimit`/`lowLimit` so pass-1 entries die below the window floor, the origin advance is the same invalidation, and the fill cursor diverges with prices so a kept tree would change the candidate set), and cheaper seed knobs or a smaller seed span change the seed's own sequence stream and through it the seeded prices. The wall anomaly is the corpus, not the seed: the rest of text.raw rides long-match DP jumps at about 20 Ir/B while a from-scratch block-0 parse pays about 1650 Ir/B, so block 0 (0.4% of bytes, parsed twice) carries 40% of frame wall and the seed parse is half of that pair.
+
+Falsified: every seed-local cut. The seed's cost carriers are the shared tier's — the descent's per-compare class (fused u32 resolve, raw-pointer ring discipline; the chain-tier precedent measured -13% Ir) and the DP mlen scan — so seed-side wall moves only when those tranches move. Re-evaluate only if the seed's purpose or placement changes.
+
 ## LDM integration
 
 ### Distance-keyed extension memoization
