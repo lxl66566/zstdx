@@ -2,7 +2,7 @@
 
 This page states what the implementation can do today and how far it is from libzstd. It carries the capability table, the level ladder, the completeness estimates with their basis, the code layout, and the verification discipline each commit follows.
 
-The snapshot is as of the 2026-11-21 release pass at `cc2e46ff`. The branch goal from `AGENTS.md` is feature parity with upstream zstd and performance beyond it. Upstreaming is out of scope, and arbitrary unsafe code, SIMD and new instruction sets are allowed.
+The snapshot is as of the 2026-11-23 release pass for v0.7.1. The branch goal from `AGENTS.md` is feature parity with upstream zstd and performance beyond it. Upstreaming is out of scope, and arbitrary unsafe code, SIMD and new instruction sets are allowed.
 
 ## Capability table
 
@@ -67,7 +67,7 @@ Bulk uses overlap jobs and streaming uses bursts. `workers` above 1 engages the 
 
 ### MT decoding
 
-Decoding is segment-parallel with a stage A worker pool and a serial stage B, and the stage-B executor runs the libzstd-shaped loop structure ported from the single-thread core. Ramp frames additionally get a piece-parallel stage B in `decoding/mt_pieces.rs`, which is env-paired with the encoder ramp and engaged by measured validation. On json.lvl3 at mt8 that reaches 3.2x over serial stage B at +0.00% size. Plain frames reach 1.87x the zstd stream reference on json at mt16, 1.85x on dll100 and 2.34x on skewed at mt8, from the 2026-11-21 release pass, at 1.66 and 1.74 times their own single-thread cells, and the multi-frame lane budget scales the multi payloads at 2.75x to 3.33x single-thread at mt16. The remaining walls are sequence-read and aggregate-bandwidth bound, tracked as todo 1 in the [todo list](todo.md). See [mt-stream](perf/mt-stream.md).
+Decoding is segment-parallel with a stage A worker pool and a serial stage B, and the stage-B executor runs the libzstd-shaped loop structure ported from the single-thread core. Ramp frames additionally get a piece-parallel stage B in `decoding/mt_pieces.rs`, which is env-paired with the encoder ramp and engaged by measured validation. On json.lvl3 at mt8 that reaches 3.2x over serial stage B at +0.00% size. Plain frames reach 1.87x the zstd stream reference on json at mt16, 1.92x on dll100 and 2.49x on skewed at mt8, from the 2026-11-23 release pass, and the multi-frame lane budget scales the multi payloads at 2.84x to 3.24x single-thread at mt16. The remaining walls are sequence-read and aggregate-bandwidth bound, tracked as todo 1 in the [todo list](todo.md). See [mt-stream](perf/mt-stream.md).
 
 The piece verdict is consumed only after staging completes, because an over-pledged frame could otherwise engage pieces off a partial prefix and silently drop the divergence. A handcrafted-frame regression covers that case. The piece gate narrows the pledge through `usize::try_from`, which covers the 32-bit wrap class. A seeded MT mutation smoke and the `decode_mt` fuzz target check MT output against sequential output byte for byte.
 
@@ -127,23 +127,23 @@ These are subjective estimates used for targeting.
 | Dimension | Estimate | Basis |
 |---|---|---|
 | decode features and correctness | ~90% | Spec compliance, dictionary decode, and corpus plus fuzz coverage. Parity rounds on 2026-10-23 swept entropy headers, sequence execution, literals tails and dictionary paths against libzstd. Decode window semantics match libzstd: streaming enforces the buffer generation model, one-shot decodes the whole history by design, and probes pin each decode path. See the [parity review](review/parity.md) and [window semantics review](review/winsem.md). |
-| decode performance | at parity or ahead on json, text and skewed, dll100 about 95% | The 2026-11-21 release pass: x0.81 to 1.03 bulk and 0.85 to 1.02 stream on json, text and skewed, and x0.93 to 1.02 on dll100. See [dec-gap](bench/dec-gap.md). |
+| decode performance | at parity or ahead on json, text and skewed, dll100 about 95% | The 2026-11-23 release pass: x0.80 to 1.02 bulk and 0.91 to 1.04 stream on json, text and skewed, and x0.93 to 1.01 on dll100. See [dec-gap](bench/dec-gap.md). |
 | encode features | ~90% | The full 1-22 ladder, dictionary encode on ST and MT, formatted-dictionary training and emission, adjustable window, LDM, MT, streaming, preSplit on the chain row, small-frame superblock literals, and the 135-symbol C FFI. |
 | encode speed | wins and losses split by tier | The ladder speed curve and the current per-tier x are below. |
-| encode ratio | matched at every tier | The full-corpus ratio sweep measured 2026-11-21 is below. |
+| encode ratio | matched at every tier | The full-corpus ratio sweep measured 2026-11-23 is below. |
 | API and ecosystem | ~85% | Bulk, streaming, the full non-experimental compat surface, and the CLI's zstd 1.5.7 core surface. The C FFI ships 132 of the 175 functions `libzstd` declares. The missing entries are the static-workspace, push-API, thread-pool, block-level, deprecated and sequence-producer families, with recorded verdicts, and language bindings. |
 
 ### Encode speed measurements
 
 The 2026-09-12 ladder speed curve on json 32 MiB ST through the CLI gives chain rows 137, 67 and 25 MiB/s at L6, L9 and L12 against libzstd's 423, 165 and 82, which is 0.25x to 0.33x. Opt rows give 7, 4 and 2 at L13, L17 and L19 against 54, 6 and 3, which is 0.13x at the btlazy2 slot and about 0.7x at btopt and above. Fastest and fast give 447 and 340 against 1118 and 812. Small calls win: 4 KiB at L19 takes 5.96 ms including spawn against 16.20 ms.
 
-The fresh 2026-11-21 release pass reads json tiers at x1.34, 1.06, 0.82, 1.38, 0.91 and 1.09, with fastest carrying the gated dense geometry and balanced reading the session's pooled-layout lottery in-pass at a solo 0.78. Balanced is ahead at 21% more ratio. text reads x0.63 in-pass at best (0.59 solo), 0.48 at opt and 0.61 at ultra, its fast row reads healthy in-pass at 0.84 and 0.57 for the first time since R86 after twelve passes of the page-dispersity collapse, and its balanced bulk cell carries the same lottery at 1.19 in-pass. skewed reads x1.52 at best, with opt ahead at x0.89 and ultra at parity on 1.01. zeros reads x0.27 and 0.18 at fastest and fast. dll reads x1.05, 0.97, 1.08, 1.13, 0.93 and 1.05, with 49.8% and 31.8% smaller output at fastest and fast and 12.8% to 16.6% smaller from balanced up, the balanced row carrying the dll diet's +0.36 percent trade.
+The fresh 2026-11-23 release pass reads json tiers at x1.34, 1.05, 0.78, 1.41, 0.82 and 0.97, with fastest carrying the gated dense geometry and the balanced row reading a healthy in-pass 0.78 at 21% more ratio. The opt-tier family moved the deep rows ahead at unchanged bytes: json opt and ultra read 0.82 and 0.97 against R110's 0.91 and 1.09, text opt and ultra 0.45 and 0.50 against 0.48 and 0.61, and dll opt and ultra 0.83 and 0.93 against 0.93 and 1.05. text reads its fast row at a healthy 0.83 and 0.58, x0.59 in-pass at best, skewed x1.53, and zeros x0.27 and 0.18 at fastest and fast. dll reads x1.07, 0.99, 1.01, 1.13, 0.83 and 0.93, with 49.8% and 31.8% smaller output at fastest and fast and 12.8% to 16.6% smaller from balanced up.
 
-Stream-mt8 wins every json tier at or below x0.67 and every text tier, with balanced at x0.83. On dll100, stream-mt8 is ahead at fast, opt and ultra at x0.49, 0.50 and 0.66. Fastest at x2.05, balanced at 1.42 (1.16 solo) and best at 1.58 carry the capture's 49.8%-smaller density and are not iso-ratio, tracked as todo 17 in the [todo list](todo.md); the balanced row's pass reading is a placement sample of its single-slowest-job wall, resolved in the [snapshot](bench/snapshot.md). json small payloads at l9 read x1.10, 0.94, 0.67 and 1.02 through the head verdict.
+Stream-mt8 wins every json tier at or below x0.67 and every text tier, with balanced at x0.79. On dll100, stream-mt8 is ahead at fast, opt and ultra at x0.51, 0.46 and 0.63. Fastest at x2.05, balanced at 1.13 and best at 1.57 carry the capture's 49.8%-smaller density and are not iso-ratio, tracked as todo 17 in the [todo list](todo.md); the balanced row's pass reading is a placement sample of its single-slowest-job wall, resolved in the [snapshot](bench/snapshot.md). json small payloads at l9 read x1.11, 0.95, 0.67 and 1.02 through the head verdict.
 
 ### Encode ratio measurements
 
-The 2026-11-21 release pass holds the +8.70% geometric mean over the full-corpus `ratio` sweep on 32 MiB at the same numeric levels as libzstd, with all 120 cells reproducing the R109 sizes byte for byte and the zstd reference side byte-flat, so the window moved no corpus byte.
+The 2026-11-23 release pass holds the +8.70% geometric mean over the full-corpus `ratio` sweep on 32 MiB at the same numeric levels as libzstd, with all 120 cells reproducing the R110 sizes byte for byte and the zstd reference side byte-flat through the binding move, so the window moved no corpus byte.
 
 The text.best cells read +0.12% to +0.20% after the cold-head probe step, measured 2026-09-18. The recorded losing residues are json.fast mt at -0.12% to -0.14% and skewed.opt at -0.06%, which is a near-tie. text.balanced holds +1.65% from the cold-start DUBT head, and 4 KiB json sits at ±1-5%.
 
