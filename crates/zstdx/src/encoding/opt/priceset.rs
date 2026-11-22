@@ -257,7 +257,9 @@ pub(super) unsafe fn price_set_avx2(
 }
 
 /// Whether the AVX-2 kernel may run: resolved once per block by the DP
-/// (never per node); `std` caches the feature probe.
+/// (never per node); `std` caches the feature probe. Targets without the
+/// probe answer false, and the kernel's call sites cfg their arm out, so
+/// the DP takes the scalar scan there.
 #[inline]
 pub(super) fn avx2_ready() -> bool {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -401,7 +403,13 @@ mod tests {
                 entries: stale_entries.clone(),
                 last_pos: stale_last,
             };
+            // The third twin receives the AVX-2 kernel, so it exists only
+            // where that kernel compiles; the last_pos assert walks
+            // `twins.len()`.
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
             let mut twins = [make_twin(), make_twin(), make_twin()];
+            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+            let mut twins = [make_twin(), make_twin()];
             for step in 0..8u32 {
                 let cur = (next(&mut rand) % 1800 + (scenario + step) % 400) as usize;
                 let mut matches = Vec::new();
@@ -417,7 +425,10 @@ mod tests {
                 let base_price = next(&mut rand);
                 let min_match = 3;
                 {
+                    #[cfg(all(target_arch = "x86_64", feature = "std"))]
                     let [reference, scalar, avx2] = &mut twins;
+                    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+                    let [reference, scalar] = &mut twins;
                     // SAFETY: the scenario keeps cur + 300 below OPT_NUM
                     // and lengths below the mirror's 1024 cells.
                     unsafe {
@@ -444,17 +455,20 @@ mod tests {
                             &mut scalar.last_pos,
                         );
                         if vector {
-                            price_set_avx2(
-                                &mut avx2.prices,
-                                &mut avx2.entries,
-                                &state,
-                                &matches,
-                                nb,
-                                min_match,
-                                cur,
-                                base_price,
-                                &mut avx2.last_pos,
-                            );
+                            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+                            {
+                                price_set_avx2(
+                                    &mut avx2.prices,
+                                    &mut avx2.entries,
+                                    &state,
+                                    &matches,
+                                    nb,
+                                    min_match,
+                                    cur,
+                                    base_price,
+                                    &mut avx2.last_pos,
+                                );
+                            }
                         }
                     }
                 }
@@ -469,15 +483,18 @@ mod tests {
                         "entry {p}, s{scenario} t{step}"
                     );
                     if vector {
-                        assert_eq!(
-                            twins[2].prices[p], twins[0].prices[p],
-                            "avx prices {p}, s{scenario} t{step}"
-                        );
-                        assert_eq!(
-                            twins[2].fields(p),
-                            twins[0].fields(p),
-                            "avx entry {p}, s{scenario} t{step}"
-                        );
+                        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+                        {
+                            assert_eq!(
+                                twins[2].prices[p], twins[0].prices[p],
+                                "avx prices {p}, s{scenario} t{step}"
+                            );
+                            assert_eq!(
+                                twins[2].fields(p),
+                                twins[0].fields(p),
+                                "avx entry {p}, s{scenario} t{step}"
+                            );
+                        }
                     }
                 }
                 for t in 1..twins.len() {

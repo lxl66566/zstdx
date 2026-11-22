@@ -692,7 +692,9 @@ impl OptState {
     /// off-base code (`off_base.ilog2()`) and the offset/ML base prices
     /// are invariant across every variant of one match. The split's
     /// wrapping adds commute mod 2^32, so it sums to the unsplit price
-    /// bit for bit.
+    /// bit for bit. Assembled form for the price-parity tests; the DP
+    /// reads the two halves separately.
+    #[cfg(test)]
     #[inline]
     fn match_price<const ULTRA: bool>(&self, off_base: u32, match_length: u32) -> u32 {
         self.match_price_off_term::<ULTRA>(off_base)
@@ -2212,23 +2214,26 @@ fn run_once<const ULTRA: bool>(
                         // The order-independent scan: one kernel call per
                         // position covers every candidate (see
                         // `opt/priceset.rs` for the bit-exactness argument).
-                        // SAFETY: the bounds the inline scan relies on
-                        // below OPT_NUM — the jump guard just took
-                        // `cur + longest >= OPT_NUM` — and below the
-                        // per-length mirror via `sufficient_len`, with
-                        // `nb2` this scan's own match count.
                         if priceset_avx2 {
-                            priceset::price_set_avx2(
-                                prices,
-                                opt,
-                                state,
-                                matches,
-                                nb2,
-                                min_match,
-                                cur,
-                                base_price,
-                                &mut last_pos,
-                            );
+                            // SAFETY: the bounds the inline scan relies on
+                            // below OPT_NUM — the jump guard just took
+                            // `cur + longest >= OPT_NUM` — and below the
+                            // per-length mirror via `sufficient_len`, with
+                            // `nb2` this scan's own match count.
+                            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+                            {
+                                priceset::price_set_avx2(
+                                    prices,
+                                    opt,
+                                    state,
+                                    matches,
+                                    nb2,
+                                    min_match,
+                                    cur,
+                                    base_price,
+                                    &mut last_pos,
+                                );
+                            }
                         } else {
                             priceset::price_set_scalar(
                                 prices,
